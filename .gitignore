@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+# generated C header is checked in (see include/), build artifacts are not
+/crates/*/target
+/tools/*/target
+node_modules/
+dist/

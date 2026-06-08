@@ -1,0 +1,42 @@
+[package]
+name = "lumen-core"
+description = "lumen shared protocol/transport/FEC core, exposed over a stable C ABI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "lumen_core"
+# `lib`       — so lumen-host / lumen-client-rs / tools link it as a normal Rust crate.
+# `staticlib` — `liblumen_core.a` for the C test harness and static embedding.
+# `cdylib`    — `liblumen_core.{so,dylib}` for Swift/Kotlin clients via the C ABI.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = []
+# Control-plane QUIC (pairing, config, reverse audio). tokio is permitted ONLY here,
+# never on the per-frame hot path. Off by default so the core stays runtime-free.
+quic = ["dep:quinn", "dep:tokio"]
+
+[dependencies]
+reed-solomon-simd = "3.1"      # GF(2^16) Leopard-RS, SIMD, O(n log n) — the wall-breaker (P2)
+reed-solomon-erasure = "6.0"   # GF(2^8) classic RS — GameStream/Moonlight compat (P1)
+aes-gcm = "0.10"               # AES-128-GCM session crypto, matches GameStream
+zerocopy = { version = "0.8", features = ["derive"] }
+bytes = "1"
+thiserror = "2"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+rand = "0.9"
+zeroize = "1"
+
+quinn = { version = "0.11", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "sync", "macros"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[build-dependencies]
+cbindgen = "0.29"

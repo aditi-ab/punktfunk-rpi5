@@ -1,0 +1,43 @@
+# CI for lumen (Gitea Actions, GitHub-Actions-compatible syntax).
+# Adjust `runs-on` to match your runner labels if not using the default ubuntu image.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          rustup component add rustfmt clippy
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test (unit + loopback + proptest + C ABI harness)
+        run: cargo test --workspace --locked
+
+      - name: C ABI harness (standalone link proof)
+        run: bash crates/lumen-core/tests/c/run.sh
+
+      - name: Verify generated header is committed & up to date
+        run: |
+          cargo build -p lumen-core
+          git diff --exit-code include/lumen_core.h \
+            || (echo "include/lumen_core.h is stale — commit the regenerated header" && exit 1)

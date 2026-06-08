@@ -1,0 +1,27 @@
+[package]
+name = "lumen-host"
+description = "lumen Linux streaming host: virtual display, capture, encode, input injection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lumen-core = { path = "../lumen-core" }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Linux backends are wired in M0/M2. They live behind `#[cfg(target_os = "linux")]`
+# so the workspace stays green on macOS; the dep list (per plan §4) is:
+#
+# [target.'cfg(target_os = "linux")'.dependencies]
+# pipewire   = "..."   # ScreenCast portal stream -> dmabuf (capture)
+# ashpd      = "..."   # xdg-desktop-portal: ScreenCast, RemoteDesktop
+# zbus       = "..."   # DBus: KWin/Mutter virtual-output creation
+# ffmpeg-next / rsmpeg # VAAPI / NVENC encode, dmabuf import
+# reis       = "..."   # libei input injection (Wayland-native)
+# input-linux = "..."  # uinput fallback
+# axum + tokio         # web config / pairing API

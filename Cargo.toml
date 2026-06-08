@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lumen-core",
+    "crates/lumen-host",
+    "crates/lumen-client-rs",
+    "tools/latency-probe",
+    "tools/loss-harness",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+authors = ["unom"]
+repository = "https://git.unom.io/unom/lumen"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# NOTE: deliberately NOT `panic = "abort"`. lumen-core ships as a cdylib/staticlib into
+# third-party apps (Swift/Kotlin/C) and its C ABI catches panics at the boundary
+# (`catch_unwind` → `LumenStatus::Panic`). `panic = "abort"` would make that guard a
+# no-op and let a stray panic abort the embedding application. Unwinding keeps the
+# documented isolation guarantee real.
+
+# The per-frame hot path must stay fast even in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
