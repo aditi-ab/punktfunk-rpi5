@@ -64,7 +64,7 @@ impl PortalCapturer {
             node_id,
             "ScreenCast portal session started; connecting PipeWire"
         );
-        let (frames, active) = spawn_pipewire(Some(fd), node_id)?;
+        let (frames, active) = spawn_pipewire(Some(fd), node_id, None)?;
         Ok(PortalCapturer {
             frames,
             active,
@@ -81,7 +81,7 @@ impl PortalCapturer {
             node_id = vout.node_id,
             "connecting PipeWire to virtual output"
         );
-        let (frames, active) = spawn_pipewire(vout.remote_fd, vout.node_id)?;
+        let (frames, active) = spawn_pipewire(vout.remote_fd, vout.node_id, vout.preferred_mode)?;
         Ok(PortalCapturer {
             frames,
             active,
@@ -92,9 +92,12 @@ impl PortalCapturer {
 
 /// Spawn the PipeWire consumer thread for `node_id` (fd `Some` = portal remote, `None` =
 /// default daemon) and return the frame channel + the activation flag it gates on.
+/// `preferred` seeds the format negotiation's default size/framerate — for Mutter virtual
+/// monitors this is what actually sizes the monitor.
 fn spawn_pipewire(
     fd: Option<OwnedFd>,
     node_id: u32,
+    preferred: Option<(u32, u32, u32)>,
 ) -> Result<(Receiver<CapturedFrame>, Arc<AtomicBool>)> {
     // Frames flow from the pipewire thread over a small bounded channel.
     let (frame_tx, frame_rx) = sync_channel::<CapturedFrame>(8);
@@ -104,7 +107,9 @@ fn spawn_pipewire(
     thread::Builder::new()
         .name("lumen-pipewire".into())
         .spawn(move || {
-            if let Err(e) = pipewire::pipewire_thread(fd, node_id, frame_tx, active_cb, zerocopy) {
+            if let Err(e) =
+                pipewire::pipewire_thread(fd, node_id, frame_tx, active_cb, zerocopy, preferred)
+            {
                 tracing::error!(error = %format!("{e:#}"), "pipewire capture thread failed");
             }
         })
@@ -424,7 +429,11 @@ mod pipewire {
     /// Build a BGRx dmabuf `EnumFormat` pod advertising the EGL-importable `modifiers` as a
     /// mandatory enum Choice; the compositor fixates to one of them that it can allocate, which
     /// we read back in `param_changed`.
-    fn build_dmabuf_format(modifiers: &[u64]) -> Result<Vec<u8>> {
+    fn build_dmabuf_format(
+        modifiers: &[u64],
+        preferred: Option<(u32, u32, u32)>,
+    ) -> Result<Vec<u8>> {
+        let (dw, dh, dhz) = preferred.unwrap_or((1920, 1080, 60));
         use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
         let mut obj = pw::spa::pod::object!(
             pw::spa::utils::SpaTypes::ObjectParamFormat,
@@ -438,8 +447,8 @@ mod pipewire {
                 Range,
                 Rectangle,
                 pw::spa::utils::Rectangle {
-                    width: 1920,
-                    height: 1080
+                    width: dw,
+                    height: dh
                 },
                 pw::spa::utils::Rectangle {
                     width: 1,
@@ -455,7 +464,7 @@ mod pipewire {
                 Choice,
                 Range,
                 Fraction,
-                pw::spa::utils::Fraction { num: 60, denom: 1 },
+                pw::spa::utils::Fraction { num: dhz, denom: 1 },
                 pw::spa::utils::Fraction { num: 0, denom: 1 },
                 pw::spa::utils::Fraction { num: 240, denom: 1 }
             ),
@@ -478,7 +487,8 @@ mod pipewire {
 
     /// The default (shm/CPU-path) format offer: raw video in any encoder-mappable layout, any
     /// size, any framerate (0/1 = variable allowed — gamescope fixates exactly that).
-    fn build_default_format_obj() -> pw::spa::pod::Object {
+    fn build_default_format_obj(preferred: Option<(u32, u32, u32)>) -> pw::spa::pod::Object {
+        let (dw, dh, dhz) = preferred.unwrap_or((1920, 1080, 60));
         pw::spa::pod::object!(
             pw::spa::utils::SpaTypes::ObjectParamFormat,
             pw::spa::param::ParamType::EnumFormat,
@@ -515,8 +525,8 @@ mod pipewire {
                 Range,
                 Rectangle,
                 pw::spa::utils::Rectangle {
-                    width: 1920,
-                    height: 1080
+                    width: dw,
+                    height: dh
                 },
                 pw::spa::utils::Rectangle {
                     width: 1,
@@ -532,7 +542,7 @@ mod pipewire {
                 Choice,
                 Range,
                 Fraction,
-                pw::spa::utils::Fraction { num: 60, denom: 1 },
+                pw::spa::utils::Fraction { num: dhz, denom: 1 },
                 pw::spa::utils::Fraction { num: 0, denom: 1 },
                 pw::spa::utils::Fraction { num: 240, denom: 1 }
             ),
@@ -579,6 +589,7 @@ mod pipewire {
         tx: SyncSender<CapturedFrame>,
         active: Arc<AtomicBool>,
         zerocopy: bool,
+        preferred: Option<(u32, u32, u32)>,
     ) -> Result<()> {
         crate::pwinit::ensure_init();
 
@@ -903,7 +914,7 @@ mod pipewire {
                 ),
             )
         } else {
-            build_default_format_obj()
+            build_default_format_obj(preferred)
         };
 
         // When zero-copy is on, offer ONLY a BGRx dmabuf format with our EGL-importable modifiers
@@ -914,7 +925,7 @@ mod pipewire {
         let shm_values = serialize_pod(obj)?;
         let (dmabuf_values, buffers_values) = if want_dmabuf {
             (
-                Some(build_dmabuf_format(&modifiers)?),
+                Some(build_dmabuf_format(&modifiers, preferred)?),
                 Some(build_dmabuf_buffers()?),
             )
         } else {

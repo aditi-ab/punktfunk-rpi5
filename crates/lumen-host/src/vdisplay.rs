@@ -29,6 +29,10 @@ pub struct VirtualOutput {
     /// RemoteDesktop+ScreenCast). `None` means the node is on the user's default PipeWire daemon
     /// (KWin `zkde_screencast`), captured by connecting to that daemon directly.
     pub remote_fd: Option<OwnedFd>,
+    /// `(width, height, refresh_hz)` to prefer in the PipeWire format negotiation. KWin and
+    /// gamescope outputs are created at the exact size, so this just confirms it; **Mutter sizes
+    /// its virtual monitor FROM the negotiation**, so here it's what makes the client's mode real.
+    pub preferred_mode: Option<(u32, u32, u32)>,
     /// Keeps the output — and whatever connection/thread backs it — alive; dropped on teardown.
     pub keepalive: Box<dyn Send>,
 }
@@ -94,11 +98,9 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
         match compositor {
             Compositor::Kwin => Ok(Box::new(kwin::KwinDisplay::new()?)),
             Compositor::Gamescope => Ok(Box::new(gamescope::GamescopeDisplay::new()?)),
+            Compositor::Mutter => Ok(Box::new(mutter::MutterDisplay::new()?)),
             Compositor::Wlroots => {
                 anyhow::bail!("wlroots virtual-output backend not yet implemented")
-            }
-            Compositor::Mutter => {
-                anyhow::bail!("mutter virtual-output backend not yet implemented")
             }
         }
     }
@@ -120,3 +122,5 @@ pub fn gamescope_ei_socket_file() -> &'static str {
 mod gamescope;
 #[cfg(target_os = "linux")]
 mod kwin;
+#[cfg(target_os = "linux")]
+mod mutter;

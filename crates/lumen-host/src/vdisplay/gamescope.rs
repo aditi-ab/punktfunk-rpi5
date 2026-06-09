@@ -44,6 +44,7 @@ impl VirtualDisplay for GamescopeDisplay {
             return Ok(VirtualOutput {
                 node_id,
                 remote_fd: None,
+                preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
                 keepalive: Box::new(()),
             });
         }
@@ -66,6 +67,7 @@ impl VirtualDisplay for GamescopeDisplay {
         Ok(VirtualOutput {
             node_id,
             remote_fd: None,
+            preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
             keepalive: Box::new(proc),
         })
     }
