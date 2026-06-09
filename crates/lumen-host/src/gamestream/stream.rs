@@ -58,6 +58,9 @@ fn run(
     force_idr: &AtomicBool,
     video_cap: &std::sync::Mutex<Option<Box<dyn Capturer>>>,
 ) -> Result<()> {
+    // Reject an out-of-range client mode before allocating capture/encode buffers.
+    encode::validate_dimensions(cfg.codec, cfg.width, cfg.height)
+        .context("client-requested video mode")?;
     let sock = UdpSocket::bind(("0.0.0.0", VIDEO_PORT)).context("bind video UDP")?;
     // The client pings the video port so we learn where to send; it re-pings until video
     // flows, so a missed early ping is fine.

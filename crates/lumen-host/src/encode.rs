@@ -50,6 +50,40 @@ pub trait Encoder: Send {
     fn flush(&mut self) -> Result<()>;
 }
 
+impl Codec {
+    /// Maximum encodable dimension (px) per side for this codec on NVENC. H.264 tops out at
+    /// 4096 (level constraint); HEVC and AV1 allow 8192. Used to reject out-of-range client
+    /// modes up front (see [`validate_dimensions`]).
+    pub fn max_dimension(self) -> u32 {
+        match self {
+            Codec::H264 => 4096,
+            Codec::H265 | Codec::Av1 => 8192,
+        }
+    }
+}
+
+/// Validate a requested encode resolution before we allocate buffers or open NVENC. Rejects
+/// zero/odd-sized and out-of-range modes with a clear error instead of letting buffer math
+/// overflow or the encoder open fail with an opaque NVENC code. A client can request any
+/// `mode=WxHxFPS`, so this is the gate on attacker/typo-controlled dimensions.
+pub fn validate_dimensions(codec: Codec, width: u32, height: u32) -> Result<()> {
+    if width == 0 || height == 0 {
+        anyhow::bail!("invalid encode resolution {width}x{height}: dimensions must be non-zero");
+    }
+    // NVENC requires even dimensions for the chroma subsampling it does internally.
+    if width % 2 != 0 || height % 2 != 0 {
+        anyhow::bail!("invalid encode resolution {width}x{height}: dimensions must be even");
+    }
+    let max = codec.max_dimension();
+    if width > max || height > max {
+        anyhow::bail!(
+            "{codec:?} max dimension is {max}px; requested {width}x{height} \
+             (use HEVC/AV1 above 4096, or lower the client resolution)"
+        );
+    }
+    Ok(())
+}
+
 /// Open an NVENC encoder for frames of the given `format` and mode. When `cuda` is true the
 /// encoder takes GPU frames (`AV_PIX_FMT_CUDA`) from the zero-copy path; otherwise it takes
 /// packed RGB/BGR CPU frames. `format`/`bitrate_bps`/`codec`/mode come from session
@@ -63,6 +97,7 @@ pub fn open_video(
     bitrate_bps: u64,
     cuda: bool,
 ) -> Result<Box<dyn Encoder>> {
+    validate_dimensions(codec, width, height)?;
     #[cfg(target_os = "linux")]
     {
         let enc = linux::NvencEncoder::open(codec, format, width, height, fps, bitrate_bps, cuda)?;
@@ -77,3 +112,43 @@ pub fn open_video(
 
 #[cfg(target_os = "linux")]
 mod linux;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_zero_and_odd_dimensions() {
+        assert!(validate_dimensions(Codec::H265, 0, 1080).is_err());
+        assert!(validate_dimensions(Codec::H265, 1920, 0).is_err());
+        assert!(validate_dimensions(Codec::H265, 1921, 1080).is_err()); // odd width
+        assert!(validate_dimensions(Codec::H265, 1920, 1081).is_err()); // odd height
+    }
+
+    #[test]
+    fn h264_capped_at_4096() {
+        assert!(validate_dimensions(Codec::H264, 3840, 2160).is_ok()); // 4K fits (width < 4096)
+        assert!(validate_dimensions(Codec::H264, 4096, 4096).is_ok()); // exactly at the limit
+        assert!(validate_dimensions(Codec::H264, 4098, 2160).is_err());
+        assert!(validate_dimensions(Codec::H264, 3840, 4098).is_err());
+    }
+
+    #[test]
+    fn hevc_and_av1_allow_up_to_8192() {
+        for c in [Codec::H265, Codec::Av1] {
+            assert!(validate_dimensions(c, 3840, 2160).is_ok());
+            assert!(validate_dimensions(c, 7680, 4320).is_ok()); // 8K fits
+            assert!(validate_dimensions(c, 8192, 8192).is_ok());
+            assert!(validate_dimensions(c, 8194, 4320).is_err());
+        }
+    }
+
+    #[test]
+    fn common_modes_accepted() {
+        for c in [Codec::H264, Codec::H265, Codec::Av1] {
+            for (w, h) in [(1280, 720), (1920, 1080), (2560, 1440)] {
+                assert!(validate_dimensions(c, w, h).is_ok(), "{c:?} {w}x{h}");
+            }
+        }
+    }
+}
