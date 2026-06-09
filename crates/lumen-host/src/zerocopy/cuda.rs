@@ -431,6 +431,12 @@ impl ExternalDmabuf {
         if dup < 0 {
             bail!("dup(dmabuf fd) failed");
         }
+        Self::import_owned_fd(dup, size)
+    }
+
+    /// Import an fd the caller hands over (e.g. a Vulkan-exported `OPAQUE_FD`) — consumed by
+    /// the driver on success, closed by us on failure.
+    pub fn import_owned_fd(dup: i32, size: u64) -> Result<ExternalDmabuf> {
         let mut desc = CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
             type_: CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
             size,

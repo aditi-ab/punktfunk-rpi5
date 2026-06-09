@@ -70,3 +70,7 @@ futures-util = "0.3"
 # eglCreateImage + the dma_buf import; the CUDA driver API (EGL interop) and libgbm are linked
 # via hand-rolled FFI in `src/zerocopy/` (no Rust crate exposes the EGL-interop driver calls).
 khronos-egl = { version = "6", features = ["dynamic"] }
+# Vulkan bridge for LINEAR dmabufs (gamescope): import via VK_EXT_external_memory_dma_buf,
+# GPU-copy into an exportable allocation, export OPAQUE_FD → cuImportExternalMemory (the
+# officially-supported CUDA pairing; raw dmabuf fds are rejected by the desktop driver).
+ash = "0.38"

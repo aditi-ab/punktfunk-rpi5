@@ -252,9 +252,9 @@ pub struct EglImporter {
     egl_image_target: EglImageTargetFn,
     /// Lazily-created GL blit machinery (recreated if the frame size changes).
     blit: Option<GlBlit>,
-    /// LINEAR-dmabuf path (gamescope): CUDA external-memory imports cached per buffer fd (the
-    /// producer's buffer pool keeps fds stable for the stream's life) + the destination pool.
-    linear: std::collections::HashMap<i32, cuda::ExternalDmabuf>,
+    /// LINEAR-dmabuf path (gamescope): a Vulkan bridge (dmabuf → exportable OPAQUE_FD → CUDA),
+    /// created lazily on the first LINEAR frame, + the destination pool.
+    vk: Option<super::vulkan::VkBridge>,
     linear_pool: Option<cuda::BufferPool>,
     gbm: *mut c_void,
     render_fd: c_int,
@@ -355,16 +355,16 @@ impl EglImporter {
             _gl_ctx: gl_ctx,
             egl_image_target,
             blit: None,
-            linear: std::collections::HashMap::new(),
+            vk: None,
             linear_pool: None,
             gbm,
             render_fd,
         })
     }
 
-    /// Import a LINEAR dmabuf via CUDA external memory (no EGL/GL involved — NVIDIA's EGL can't
-    /// sample LINEAR, but the bytes are directly addressable once imported). The import is
-    /// cached per fd; per frame this is one device→device copy into a pooled buffer.
+    /// Import a LINEAR dmabuf via the Vulkan bridge (no EGL/GL involved — NVIDIA's EGL can't
+    /// sample LINEAR, and the CUDA driver rejects raw dmabuf fds; Vulkan imports the dmabuf,
+    /// GPU-copies into an exportable allocation, and CUDA reads that). See [`super::vulkan`].
     pub fn import_linear(
         &mut self,
         plane: &DmabufPlane,
@@ -375,19 +375,16 @@ impl EglImporter {
         if self.linear_pool.as_ref().map(|p| (p.width(), p.height())) != Some((width, height)) {
             self.linear_pool = Some(cuda::BufferPool::new(width, height)?);
         }
-        let fd = plane.fd;
-        let ext = match self.linear.entry(fd) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                // Size from the fd itself (the chunk's size field is unreliable for dmabufs).
-                let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
-                anyhow::ensure!(size > 0, "lseek(dmabuf) failed");
-                e.insert(cuda::ExternalDmabuf::import(fd, size as u64)?)
-            }
-        };
-        let dst = self.linear_pool.as_ref().unwrap().get()?;
-        cuda::copy_pitched_to_buffer(ext.ptr + plane.offset as u64, plane.stride as usize, &dst)?;
-        Ok(dst)
+        if self.vk.is_none() {
+            self.vk = Some(super::vulkan::VkBridge::new()?);
+        }
+        self.vk.as_mut().unwrap().import_linear(
+            plane.fd,
+            plane.offset,
+            plane.stride,
+            height,
+            self.linear_pool.as_ref().unwrap(),
+        )
     }
 
     /// The DRM format modifiers the NVIDIA EGL stack can import for `fourcc`, via

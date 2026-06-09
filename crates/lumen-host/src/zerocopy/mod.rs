@@ -9,6 +9,7 @@
 
 pub mod cuda;
 pub mod egl;
+pub mod vulkan;
 
 pub use cuda::DeviceBuffer;
 pub use egl::{DmabufPlane, EglImporter};
