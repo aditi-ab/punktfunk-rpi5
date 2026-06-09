@@ -24,6 +24,9 @@ pub enum Source {
     Synthetic,
     /// Live monitor via the xdg ScreenCast portal + PipeWire.
     Portal,
+    /// KWin virtual output created at `width`x`height` (zkde_screencast). Lets us validate
+    /// capture (and zero-copy) at an arbitrary client resolution against a headless KWin.
+    KwinVirtual,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +59,23 @@ pub fn run(opts: Options) -> Result<()> {
         Source::Portal => {
             tracing::info!("M0 source: xdg ScreenCast portal (live monitor)");
             capture::open_portal_monitor().context("open portal capturer")?
+        }
+        Source::KwinVirtual => {
+            tracing::info!(
+                width = opts.width,
+                height = opts.height,
+                "M0 source: KWin virtual output (zkde_screencast)"
+            );
+            let mut vd = crate::vdisplay::open(crate::vdisplay::Compositor::Kwin)
+                .context("open KWin virtual display")?;
+            let vout = vd
+                .create(lumen_core::Mode {
+                    width: opts.width,
+                    height: opts.height,
+                    refresh_hz: opts.fps,
+                })
+                .context("create KWin virtual output")?;
+            capture::capture_virtual_output(vout).context("capture virtual output")?
         }
     };
 

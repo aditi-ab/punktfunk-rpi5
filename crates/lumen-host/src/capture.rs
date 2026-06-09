@@ -217,5 +217,20 @@ pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
     anyhow::bail!("portal capture requires Linux (xdg-desktop-portal + PipeWire)")
 }
 
+/// Build a capturer from an already-created virtual output (see [`crate::vdisplay`]). Consumes
+/// the output's PipeWire node + optional remote fd + keepalive — the capturer owns the keepalive,
+/// so dropping the capturer releases the virtual output. Compositor-agnostic: works for any
+/// [`crate::vdisplay::VirtualDisplay`] backend. The captured size is the size the output was
+/// created at — native, no scaling.
+#[cfg(target_os = "linux")]
+pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Box<dyn Capturer>> {
+    linux::PortalCapturer::from_virtual_output(vout).map(|c| Box::new(c) as Box<dyn Capturer>)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn capture_virtual_output(_vout: crate::vdisplay::VirtualOutput) -> Result<Box<dyn Capturer>> {
+    anyhow::bail!("virtual-output capture requires Linux")
+}
+
 #[cfg(target_os = "linux")]
 mod linux;

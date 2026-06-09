@@ -145,7 +145,10 @@ fn parse_m0(args: &[String]) -> Result<Options> {
                 source = match next()?.as_str() {
                     "synthetic" => Source::Synthetic,
                     "portal" => Source::Portal,
-                    other => bail!("unknown --source '{other}' (synthetic|portal)"),
+                    "kwin-virtual" => Source::KwinVirtual,
+                    other => {
+                        bail!("unknown --source '{other}' (synthetic|portal|kwin-virtual)")
+                    }
                 }
             }
             "--width" => {
@@ -223,7 +226,9 @@ USAGE:
     lumen-host m0 [OPTIONS]       M0 capture→encode→file pipeline spike
 
 OPTIONS:
-    --source <synthetic|portal>  frame source (default: portal)
+    --source <synthetic|portal|kwin-virtual>
+                                 frame source (default: portal). 'kwin-virtual' creates a
+                                 KWin virtual output at --width x --height and captures it
     --seconds <N>                capture duration in seconds (default: 5)
     --fps <N>                    target frame rate (default: 60)
     --codec <h264|h265|av1>      NVENC codec (default: h265)

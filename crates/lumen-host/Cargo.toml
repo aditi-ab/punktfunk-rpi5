@@ -49,6 +49,11 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
+# Codegen for KDE's `zkde_screencast_unstable_v1` (vendored in `protocols/`): create a KWin
+# virtual output sized to the client's resolution and get its PipeWire node (KRdp's path).
+# `wayland-backend` is referenced by the generated interface tables.
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
 # Builds/validates the xkb keymap uploaded to the virtual keyboard + tracks modifier state.
 xkbcommon = "0.8"
 # Opus encode for the GameStream audio stream (links system libopus).

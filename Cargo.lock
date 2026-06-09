@@ -1528,9 +1528,11 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
+ "wayland-scanner",
  "x509-parser",
  "xkbcommon",
 ]

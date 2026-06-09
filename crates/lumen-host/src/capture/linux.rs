@@ -31,6 +31,10 @@ use std::time::Duration;
 pub struct PortalCapturer {
     frames: Receiver<CapturedFrame>,
     active: Arc<AtomicBool>,
+    /// Owns the virtual output (if this capturer was built from one) — dropped when the capturer
+    /// is, releasing the compositor-side output via the keepalive's own `Drop`. `None` for the
+    /// portal source (its session ends with the portal thread's zbus connection).
+    _keepalive: Option<Box<dyn Send>>,
 }
 
 impl PortalCapturer {
@@ -60,28 +64,52 @@ impl PortalCapturer {
             node_id,
             "ScreenCast portal session started; connecting PipeWire"
         );
-
-        // Frames flow from the pipewire thread over a small bounded channel.
-        let (frame_tx, frame_rx) = sync_channel::<CapturedFrame>(8);
-        let active = Arc::new(AtomicBool::new(false));
-        let active_cb = active.clone();
-        let zerocopy = crate::zerocopy::enabled();
-        thread::Builder::new()
-            .name("lumen-pipewire".into())
-            .spawn(move || {
-                if let Err(e) =
-                    pipewire::pipewire_thread(fd, node_id, frame_tx, active_cb, zerocopy)
-                {
-                    tracing::error!(error = %format!("{e:#}"), "pipewire capture thread failed");
-                }
-            })
-            .context("spawn pipewire thread")?;
-
+        let (frames, active) = spawn_pipewire(Some(fd), node_id)?;
         Ok(PortalCapturer {
-            frames: frame_rx,
+            frames,
             active,
+            _keepalive: None,
         })
     }
+
+    /// Build a capturer from an already-created virtual output ([`crate::vdisplay::VirtualOutput`]):
+    /// connect PipeWire to its node (`remote_fd` selects portal-remote vs. default-daemon) and
+    /// take ownership of its keepalive so the output lives exactly as long as this capturer. This
+    /// is how the client's requested resolution becomes the captured resolution without scaling.
+    pub fn from_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<PortalCapturer> {
+        tracing::info!(
+            node_id = vout.node_id,
+            "connecting PipeWire to virtual output"
+        );
+        let (frames, active) = spawn_pipewire(vout.remote_fd, vout.node_id)?;
+        Ok(PortalCapturer {
+            frames,
+            active,
+            _keepalive: Some(vout.keepalive),
+        })
+    }
+}
+
+/// Spawn the PipeWire consumer thread for `node_id` (fd `Some` = portal remote, `None` =
+/// default daemon) and return the frame channel + the activation flag it gates on.
+fn spawn_pipewire(
+    fd: Option<OwnedFd>,
+    node_id: u32,
+) -> Result<(Receiver<CapturedFrame>, Arc<AtomicBool>)> {
+    // Frames flow from the pipewire thread over a small bounded channel.
+    let (frame_tx, frame_rx) = sync_channel::<CapturedFrame>(8);
+    let active = Arc::new(AtomicBool::new(false));
+    let active_cb = active.clone();
+    let zerocopy = crate::zerocopy::enabled();
+    thread::Builder::new()
+        .name("lumen-pipewire".into())
+        .spawn(move || {
+            if let Err(e) = pipewire::pipewire_thread(fd, node_id, frame_tx, active_cb, zerocopy) {
+                tracing::error!(error = %format!("{e:#}"), "pipewire capture thread failed");
+            }
+        })
+        .context("spawn pipewire thread")?;
+    Ok((frame_rx, active))
 }
 
 impl Capturer for PortalCapturer {
@@ -419,7 +447,7 @@ mod pipewire {
     }
 
     pub fn pipewire_thread(
-        fd: OwnedFd,
+        fd: Option<OwnedFd>,
         node_id: u32,
         tx: SyncSender<CapturedFrame>,
         active: Arc<AtomicBool>,
@@ -429,9 +457,16 @@ mod pipewire {
 
         let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
         let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
-        let core = context
-            .connect_fd_rc(fd, None)
-            .context("pw connect_fd (portal remote)")?;
+        // A portal source hands us an fd to a (sandboxed) PipeWire remote; the KWin
+        // virtual-output source has no fd — its node lives on the user's default daemon.
+        let core = match fd {
+            Some(fd) => context
+                .connect_fd_rc(fd, None)
+                .context("pw connect_fd (portal remote)")?,
+            None => context
+                .connect_rc(None)
+                .context("pw connect (default daemon)")?,
+        };
 
         // Build the EGL→CUDA importer up front; if it fails, log and fall back to the CPU path
         // (we simply won't request dmabuf below).

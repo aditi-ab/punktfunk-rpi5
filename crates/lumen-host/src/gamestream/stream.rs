@@ -77,6 +77,32 @@ fn run(
         .context("connect client video endpoint")?;
     tracing::info!(%client, "video: client endpoint learned");
 
+    // Native client-resolution source: create a compositor virtual output sized to the client's
+    // request and capture it (no scaling). Self-contained — deliberately NOT pooled in
+    // `video_cap`, since a reconnect at a different resolution needs a freshly-sized output; the
+    // output is released when this capturer drops at stream end (RAII via its keepalive).
+    if std::env::var("LUMEN_VIDEO_SOURCE").as_deref() == Ok("virtual") {
+        let compositor = crate::vdisplay::detect().context("detect compositor")?;
+        tracing::info!(
+            ?compositor,
+            w = cfg.width,
+            h = cfg.height,
+            "video source: virtual display (native client resolution)"
+        );
+        let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
+        let vout = vd
+            .create(lumen_core::Mode {
+                width: cfg.width,
+                height: cfg.height,
+                refresh_hz: cfg.fps,
+            })
+            .context("create virtual output at client resolution")?;
+        let mut capturer =
+            capture::capture_virtual_output(vout).context("capture virtual output")?;
+        capturer.set_active(true);
+        return stream_body(&mut *capturer, &sock, cfg, running, force_idr);
+    }
+
     // Reuse the persistent capturer (one screencast session → clean reconnect); create it on
     // the first stream. Borrow it for this stream and return it on exit.
     let mut capturer: Box<dyn Capturer> = match video_cap.lock().unwrap().take() {
