@@ -13,7 +13,7 @@
 
 #![allow(non_upper_case_globals)]
 
-use super::cuda::{self, DeviceBuffer, MappedTexture};
+use super::cuda::{self, DeviceBuffer};
 use anyhow::{bail, ensure, Context as _, Result};
 use khronos_egl as egl;
 use std::os::raw::{c_int, c_void};
@@ -145,6 +145,10 @@ struct GlBlit {
     src_tex: u32,
     width: u32,
     height: u32,
+    /// `dst_tex` registered with CUDA once (not per frame); mapped+copied each frame.
+    registered: cuda::RegisteredTexture,
+    /// Recycled CUDA device buffers (the imported frames handed to the encoder).
+    pool: cuda::BufferPool,
 }
 
 impl GlBlit {
@@ -183,6 +187,11 @@ impl GlBlit {
             status == GL_FRAMEBUFFER_COMPLETE,
             "blit FBO incomplete ({status:#x})"
         );
+        // Register the (immutable, reused) destination texture with CUDA once, and stand up the
+        // device-buffer pool — both per-resolution, not per-frame. Requires the CUDA context to be
+        // current (the caller makes it current before constructing the blit).
+        let registered = cuda::RegisteredTexture::register_gl(dst_tex)?;
+        let pool = cuda::BufferPool::new(width, height)?;
         Ok(GlBlit {
             program,
             vao,
@@ -191,6 +200,8 @@ impl GlBlit {
             src_tex,
             width,
             height,
+            registered,
+            pool,
         })
     }
 
@@ -462,12 +473,14 @@ impl EglImporter {
         if self.blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
             self.blit = Some(unsafe { GlBlit::new(width, height)? });
         }
-        let blit = self.blit.as_ref().unwrap();
+        let egl_image_target = self.egl_image_target;
+        let blit = self.blit.as_mut().unwrap();
         // SAFETY: GL + CUDA contexts current on this thread; `image` is a valid EGLImage.
-        unsafe { blit.run(self.egl_image_target, image)? };
-        let mapped = unsafe { MappedTexture::register_gl(blit.dst_tex)? };
-        let dst = DeviceBuffer::alloc(width, height)?;
-        mapped.copy_to(&dst)?;
+        unsafe { blit.run(egl_image_target, image)? };
+        // Persistent registration (mapped per frame) + a pooled buffer — no per-frame
+        // cuGraphicsGLRegisterImage / cuMemAllocPitch.
+        let dst = blit.pool.get()?;
+        blit.registered.copy_mapped_to(&dst)?;
         Ok(dst)
     }
 }
