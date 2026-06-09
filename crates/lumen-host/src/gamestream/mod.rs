@@ -9,6 +9,7 @@
 mod cert;
 mod control;
 mod crypto;
+mod input;
 mod mdns;
 mod nvhttp;
 mod pairing;
@@ -112,7 +113,7 @@ pub fn serve() -> Result<()> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let _advert = mdns::advertise(&state.host).context("mDNS advertise")?;
         rtsp::spawn(state.clone()).context("start RTSP server")?;
-        control::spawn().context("start ENet control server")?;
+        control::spawn(state.clone()).context("start ENet control server")?;
         nvhttp::run(state).await
     })
 }

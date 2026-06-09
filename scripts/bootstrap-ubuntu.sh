@@ -89,7 +89,7 @@ apt_install "build toolchain"   build-essential pkg-config cmake clang libclang-
 apt_install "PipeWire + dev"    pipewire pipewire-pulse wireplumber libpipewire-0.3-dev libspa-0.2-dev
 apt_install "desktop portals"   xdg-desktop-portal xdg-desktop-portal-wlr xdg-desktop-portal-gtk
 apt_install "Sway + wlroots"    sway swaybg xwayland wlr-randr foot seatd
-apt_install "Wayland dev"       libwayland-dev wayland-protocols wayland-utils
+apt_install "Wayland dev"       libwayland-dev wayland-protocols wayland-utils libxkbcommon-dev
 apt_install "DRM/EGL/GBM/VA"    libdrm-dev libgbm-dev libgbm1 libegl-dev libegl1 libgles-dev mesa-common-dev libva-dev
 apt_install "capture + dbus"    wf-recorder grim dbus-user-session drm-info mesa-utils
 apt_try     "NVIDIA EGL platform (multiverse)"  libnvidia-egl-wayland1 libnvidia-egl-gbm1

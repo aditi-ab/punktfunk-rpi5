@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["full"] }
 rsa = "0.9"
 sha2 = { version = "0.10", features = ["oid"] }
 aes = "0.8"
+aes-gcm = "0.10"
 rand = "0.8"
 hex = "0.4"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
@@ -41,3 +42,10 @@ pipewire = "0.9"
 # ashpd 0.13 uses the tokio runtime; a current-thread runtime drives the one-time
 # portal handshake (control plane — never the per-frame path).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+# Input injection into headless Sway via the wlroots virtual-input Wayland protocols
+# (uinput won't reach a compositor running with WLR_LIBINPUT_NO_DEVICES=1).
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+# Builds/validates the xkb keymap uploaded to the virtual keyboard + tracks modifier state.
+xkbcommon = "0.8"
