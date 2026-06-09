@@ -146,10 +146,16 @@ fn on_receive(
         return; // keepalive / QoS / unhandled input kind
     }
 
-    // Open the injector on demand — by the first input event Sway's Wayland socket is up.
+    // Open the injector on demand — by the first input event the compositor session is up.
+    // Backend auto-selects per desktop (wlr on Sway, libei on KWin/GNOME); override with
+    // LUMEN_INPUT_BACKEND.
     if injector.is_none() {
-        match crate::inject::open(crate::inject::Backend::WlrVirtual) {
-            Ok(i) => *injector = Some(i),
+        let backend = crate::inject::default_backend();
+        match crate::inject::open(backend) {
+            Ok(i) => {
+                tracing::info!(?backend, "input injection backend opened");
+                *injector = Some(i);
+            }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "input injection unavailable");
                 return;

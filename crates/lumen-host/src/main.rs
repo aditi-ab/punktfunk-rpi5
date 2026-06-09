@@ -49,6 +49,9 @@ fn real_main() -> Result<()> {
     match args.first().map(String::as_str) {
         // M2 GameStream host control plane (P1.1: mDNS + serverinfo).
         Some("serve") => gamestream::serve(),
+        // Standalone input-injection smoke test (no client needed): open the session's input
+        // backend and inject a scripted mouse/keyboard pattern. Watch a focused app / `wev`.
+        Some("input-test") => input_test(),
         // M0 pipeline spike.
         Some("m0") => m0::run(parse_m0(&args[1..])?),
         Some("-h") | Some("--help") | Some("help") | None => {
@@ -58,6 +61,56 @@ fn real_main() -> Result<()> {
         // Bare flags (no subcommand) default to the m0 spike for back-compat.
         Some(_) => m0::run(parse_m0(&args)?),
     }
+}
+
+/// Inject a scripted mouse + keyboard pattern through the session's input backend (libei on
+/// KWin/GNOME, wlr on Sway). Lets us validate input injection without a Moonlight client.
+#[cfg(target_os = "linux")]
+fn input_test() -> Result<()> {
+    use lumen_core::input::{InputEvent, InputKind};
+    use std::time::Duration;
+
+    let backend = inject::default_backend();
+    tracing::info!(?backend, "input-test: opening injector");
+    let mut inj = inject::open(backend)?;
+    // An async backend (libei) needs a moment to establish its portal/EIS session + device
+    // resume; events injected before then are dropped.
+    std::thread::sleep(Duration::from_secs(4));
+
+    let ev = |kind, code, x, y| InputEvent {
+        kind,
+        _pad: [0; 3],
+        code,
+        x,
+        y,
+        flags: 0,
+    };
+    tracing::info!("input-test: injecting a mouse square + 'A'/click taps for ~8s (watch wev / focused app)");
+    for i in 0..160u32 {
+        let (dx, dy) = match (i / 10) % 4 {
+            0 => (12, 0),
+            1 => (0, 12),
+            2 => (-12, 0),
+            _ => (0, -12),
+        };
+        if let Err(e) = inj.inject(&ev(InputKind::MouseMove, 0, dx, dy)) {
+            tracing::warn!(error = %format!("{e:#}"), "input-test: inject failed");
+        }
+        if i % 20 == 0 {
+            let _ = inj.inject(&ev(InputKind::KeyDown, 0x41, 0, 0)); // 'A'
+            let _ = inj.inject(&ev(InputKind::KeyUp, 0x41, 0, 0));
+            let _ = inj.inject(&ev(InputKind::MouseButtonDown, 1, 0, 0)); // left click
+            let _ = inj.inject(&ev(InputKind::MouseButtonUp, 1, 0, 0));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    tracing::info!("input-test: done");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn input_test() -> Result<()> {
+    bail!("input-test requires Linux")
 }
 
 fn parse_m0(args: &[String]) -> Result<Options> {
