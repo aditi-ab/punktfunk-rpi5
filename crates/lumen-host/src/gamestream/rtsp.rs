@@ -7,11 +7,14 @@
 //! Runs on its own native thread (control-plane setup, not the per-frame hot path), one
 //! thread per connection. Plaintext only for now (encryption is negotiated; P1.5).
 
+use super::stream::{self, StreamConfig};
 use super::{AppState, AUDIO_PORT, CONTROL_PORT, RTSP_PORT, VIDEO_PORT};
+use crate::encode::Codec;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 /// Opaque per-session payload the client echoes as its first UDP datagram (port-learning).
@@ -148,47 +151,32 @@ fn handle_request(req: &Request, state: &AppState) -> String {
             )
         }
         "ANNOUNCE" => {
-            let cfg = parse_announce(&req.body);
-            tracing::info!(
-                width = cfg
-                    .get("x-nv-video[0].clientViewportWd")
-                    .map(String::as_str)
-                    .unwrap_or("?"),
-                height = cfg
-                    .get("x-nv-video[0].clientViewportHt")
-                    .map(String::as_str)
-                    .unwrap_or("?"),
-                fps = cfg
-                    .get("x-nv-video[0].maxFPS")
-                    .map(String::as_str)
-                    .unwrap_or("?"),
-                bitrate_kbps = cfg
-                    .get("x-nv-vqos[0].bw.maximumBitrateKbps")
-                    .map(String::as_str)
-                    .unwrap_or("?"),
-                packet_size = cfg
-                    .get("x-nv-video[0].packetSize")
-                    .map(String::as_str)
-                    .unwrap_or("?"),
-                codec = cfg
-                    .get("x-nv-vqos[0].bitStreamFormat")
-                    .map(String::as_str)
-                    .unwrap_or("?"),
-                fec_pct = cfg
-                    .get("x-nv-vqos[0].fec.repairPercent")
-                    .map(String::as_str)
-                    .unwrap_or("?"),
-                "RTSP ANNOUNCE — negotiated stream config"
-            );
-            // TODO(P1.3): map `cfg` → lumen_core::Config and stash it for the media stages.
-            let _ = state;
+            let map = parse_announce(&req.body);
+            match stream_config(&map) {
+                Some(cfg) => {
+                    tracing::info!(?cfg, "RTSP ANNOUNCE — negotiated stream config");
+                    *state.stream.lock().unwrap() = Some(cfg);
+                }
+                None => tracing::warn!("RTSP ANNOUNCE — missing required video config keys"),
+            }
             response(&req.cseq, &[], None)
         }
         "PLAY" => {
-            tracing::info!("RTSP PLAY — client ready; media streams would start here (P1.3)");
+            let cfg = *state.stream.lock().unwrap();
+            match cfg {
+                Some(cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
+                    tracing::info!("RTSP PLAY — starting video stream");
+                    stream::start(cfg, state.streaming.clone());
+                }
+                Some(_) => tracing::info!("RTSP PLAY — stream already running"),
+                None => tracing::warn!("RTSP PLAY — no negotiated config (ANNOUNCE missing)"),
+            }
             response(&req.cseq, &[("Session", "DEADBEEFCAFE;timeout = 90")], None)
         }
-        "TEARDOWN" => response(&req.cseq, &[], None),
+        "TEARDOWN" => {
+            state.streaming.store(false, Ordering::SeqCst); // signal the stream thread to stop
+            response(&req.cseq, &[], None)
+        }
         other => {
             tracing::warn!(method = other, "RTSP unsupported method");
             response_status("501 Not Implemented", &req.cseq, &[], None)
@@ -222,6 +210,31 @@ fn parse_announce(body: &str) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Map the negotiated ANNOUNCE keys to a [`StreamConfig`] (resolution/packetSize required).
+fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
+    let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
+    let width = parse_u("x-nv-video[0].clientViewportWd")?;
+    let height = parse_u("x-nv-video[0].clientViewportHt")?;
+    let packet_size = parse_u("x-nv-video[0].packetSize")? as usize;
+    let fps = parse_u("x-nv-video[0].maxFPS")
+        .filter(|&f| f > 0)
+        .unwrap_or(60);
+    let bitrate_kbps = parse_u("x-nv-vqos[0].bw.maximumBitrateKbps").unwrap_or(20_000);
+    let codec = match map.get("x-nv-vqos[0].bitStreamFormat").map(|s| s.trim()) {
+        Some("1") => Codec::H265,
+        Some("2") => Codec::Av1,
+        _ => Codec::H264,
+    };
+    Some(StreamConfig {
+        width,
+        height,
+        fps,
+        packet_size,
+        bitrate_kbps,
+        codec,
+    })
 }
 
 /// Extract the stream type from a SETUP URI like `…/streamid=video/0/0`.

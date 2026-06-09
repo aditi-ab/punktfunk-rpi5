@@ -7,12 +7,14 @@
 //! the media streams follow (see the M2 task list / plan).
 
 mod cert;
+mod control;
 mod crypto;
 mod mdns;
 mod nvhttp;
 mod pairing;
 mod rtsp;
 mod serverinfo;
+mod stream;
 mod tls;
 mod video;
 
@@ -79,6 +81,10 @@ pub struct AppState {
     pub paired: std::sync::Mutex<Vec<Vec<u8>>>,
     /// The active launch session (set by `/launch`, consumed by RTSP/media).
     pub launch: std::sync::Mutex<Option<LaunchSession>>,
+    /// Negotiated video config from RTSP ANNOUNCE (consumed by the stream on PLAY).
+    pub stream: std::sync::Mutex<Option<stream::StreamConfig>>,
+    /// True while the video stream thread is running (also its keep-running flag).
+    pub streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run the GameStream control plane (blocks): mDNS advertisement + the nvhttp servers.
@@ -91,6 +97,8 @@ pub fn serve() -> Result<()> {
         pairing: pairing::Pairing::new(),
         paired: std::sync::Mutex::new(Vec::new()),
         launch: std::sync::Mutex::new(None),
+        stream: std::sync::Mutex::new(None),
+        streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     tracing::info!(
         hostname = %state.host.hostname,
@@ -104,6 +112,7 @@ pub fn serve() -> Result<()> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let _advert = mdns::advertise(&state.host).context("mDNS advertise")?;
         rtsp::spawn(state.clone()).context("start RTSP server")?;
+        control::spawn().context("start ENet control server")?;
         nvhttp::run(state).await
     })
 }

@@ -1458,6 +1458,7 @@ dependencies = [
  "rsa",
  "rustls",
  "rustls-pemfile",
+ "rusty_enet",
  "sha2",
  "tokio",
  "tracing",
@@ -2316,6 +2317,15 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
+]
+
+[[package]]
+name = "rusty_enet"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1c0b43e27d8d86bb3a15b9eac232b6d78a06afee258a9861deb5a0d15b65c33"
+dependencies = [
+ "js-sys",
 ]
 
 [[package]]
