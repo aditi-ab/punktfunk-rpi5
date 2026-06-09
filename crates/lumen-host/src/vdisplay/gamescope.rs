@@ -34,6 +34,19 @@ impl VirtualDisplay for GamescopeDisplay {
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
+        // Attach to an already-running gamescope (debug / Steam-launched session) instead of
+        // spawning one: LUMEN_GAMESCOPE_NODE=<pipewire node id>.
+        if let Ok(id) = std::env::var("LUMEN_GAMESCOPE_NODE") {
+            let node_id: u32 = id
+                .parse()
+                .context("LUMEN_GAMESCOPE_NODE must be a node id")?;
+            tracing::info!(node_id, "gamescope: attaching to existing PipeWire node");
+            return Ok(VirtualOutput {
+                node_id,
+                remote_fd: None,
+                keepalive: Box::new(()),
+            });
+        }
         let proc = GamescopeProc(spawn(mode.width, mode.height, mode.refresh_hz.max(1))?);
         // gamescope creates its PipeWire node a moment after start; poll for it (the proc is held
         // alive meanwhile, and killed if we give up).
@@ -84,18 +97,36 @@ fn spawn(w: u32, h: u32, hz: u32) -> Result<Child> {
         .context("spawn gamescope (is it installed? `apt install gamescope`)")
 }
 
-/// Poll `pw-dump` for gamescope's PipeWire node until it appears or `timeout` elapses.
+/// Wait for gamescope to report its PipeWire node. Authoritative source: gamescope's own log
+/// line `stream available on node ID: N` (its node carries `node.name=gamescope` on TWO objects
+/// — the adapter and the inner stream — and only the advertised id is the correct capture
+/// target). Falls back to `pw-dump` discovery if the log line doesn't show.
 fn wait_for_node(timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(id) = find_gamescope_node() {
+        if let Some(id) = node_from_log() {
             return Some(id);
         }
         if Instant::now() >= deadline {
-            return None;
+            return find_gamescope_node(); // last-resort fallback
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// Parse `stream available on node ID: N` from the spawned gamescope's log (ANSI-colored).
+fn node_from_log() -> Option<u32> {
+    let log = std::fs::read_to_string("/tmp/lumen-gamescope.log").ok()?;
+    for line in log.lines().rev() {
+        if let Some(pos) = line.find("stream available on node ID:") {
+            let tail = &line[pos + "stream available on node ID:".len()..];
+            let digits: String = tail.chars().filter(|c| c.is_ascii_digit()).collect();
+            if let Ok(id) = digits.parse() {
+                return Some(id);
+            }
+        }
+    }
+    None
 }
 
 /// Find the `gamescope` `Video/Source` node id in a `pw-dump` snapshot of the default daemon.

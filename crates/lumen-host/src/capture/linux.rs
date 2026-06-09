@@ -368,6 +368,49 @@ mod pipewire {
         importer: Option<crate::zerocopy::EglImporter>,
     }
 
+    /// Log a frame-drop reason once per process (the process callback runs per frame; a stuck
+    /// pipeline must say why without flooding).
+    fn warn_once(msg: &'static str) {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap();
+        if !seen.contains(&msg) {
+            seen.push(msg);
+            tracing::warn!("{msg}");
+        }
+    }
+
+    /// A read-only mmap of a dmabuf fd, unmapped on drop. Used when MAP_BUFFERS didn't map the
+    /// buffer (producers don't always flag dmabufs mappable, e.g. gamescope's Vulkan exports).
+    struct DmabufMap {
+        ptr: *mut std::ffi::c_void,
+        len: usize,
+    }
+
+    impl DmabufMap {
+        fn new(fd: i32, len: usize) -> Option<DmabufMap> {
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            (ptr != libc::MAP_FAILED).then_some(DmabufMap { ptr, len })
+        }
+    }
+
+    impl Drop for DmabufMap {
+        fn drop(&mut self) {
+            unsafe {
+                libc::munmap(self.ptr, self.len);
+            }
+        }
+    }
+
     fn serialize_pod(obj: pw::spa::pod::Object) -> Result<Vec<u8>> {
         Ok(pw::spa::pod::serialize::PodSerializer::serialize(
             std::io::Cursor::new(Vec::new()),
@@ -431,6 +474,90 @@ mod pipewire {
             )),
         });
         serialize_pod(obj)
+    }
+
+    /// The default (shm/CPU-path) format offer: raw video in any encoder-mappable layout, any
+    /// size, any framerate (0/1 = variable allowed — gamescope fixates exactly that).
+    fn build_default_format_obj() -> pw::spa::pod::Object {
+        pw::spa::pod::object!(
+            pw::spa::utils::SpaTypes::ObjectParamFormat,
+            pw::spa::param::ParamType::EnumFormat,
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::MediaType,
+                Id,
+                pw::spa::param::format::MediaType::Video
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::MediaSubtype,
+                Id,
+                pw::spa::param::format::MediaSubtype::Raw
+            ),
+            // Offer the layouts the encoder can map to an NVENC input format. wlroots
+            // commonly fixates packed RGB (3 bpp); other compositors offer 4 bpp. Only
+            // these are requested, so negotiation fails loudly rather than handing us a
+            // format we'd misinterpret.
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoFormat,
+                Choice,
+                Enum,
+                Id,
+                VideoFormat::RGB,
+                VideoFormat::RGB,
+                VideoFormat::BGR,
+                VideoFormat::RGBx,
+                VideoFormat::BGRx,
+                VideoFormat::RGBA,
+                VideoFormat::BGRA,
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoSize,
+                Choice,
+                Range,
+                Rectangle,
+                pw::spa::utils::Rectangle {
+                    width: 1920,
+                    height: 1080
+                },
+                pw::spa::utils::Rectangle {
+                    width: 1,
+                    height: 1
+                },
+                pw::spa::utils::Rectangle {
+                    width: 8192,
+                    height: 8192
+                }
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                pw::spa::utils::Fraction { num: 60, denom: 1 },
+                pw::spa::utils::Fraction { num: 0, denom: 1 },
+                pw::spa::utils::Fraction { num: 240, denom: 1 }
+            ),
+        )
+    }
+
+    /// Build a Buffers param for the CPU path accepting anything mappable: MemPtr, MemFd, and
+    /// DmaBuf. The DmaBuf bit matters for producers like gamescope whose format intersection
+    /// lands on their modifier-bearing (LINEAR) pod: they then offer *only* DmaBuf buffers, and
+    /// without this bit the buffer-type intersection is empty and the link silently stalls in
+    /// "negotiating". A LINEAR dmabuf is mmap-able by MAP_BUFFERS, so the CPU de-pad copy works.
+    fn build_mappable_buffers() -> Result<Vec<u8>> {
+        serialize_pod(pw::spa::pod::Object {
+            type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+            id: pw::spa::param::ParamType::Buffers.as_raw(),
+            properties: vec![pw::spa::pod::Property {
+                key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: pw::spa::pod::Value::Int(
+                    (1i32 << pw::spa::sys::SPA_DATA_MemPtr)
+                        | (1i32 << pw::spa::sys::SPA_DATA_MemFd)
+                        | (1i32 << pw::spa::sys::SPA_DATA_DmaBuf),
+                ),
+            }],
+        })
     }
 
     /// Build a Buffers param requesting dmabuf-only buffers.
@@ -514,6 +641,11 @@ mod pipewire {
                 *pw::keys::MEDIA_TYPE     => "Video",
                 *pw::keys::MEDIA_CATEGORY => "Capture",
                 *pw::keys::MEDIA_ROLE     => "Screen",
+                // Never let the session manager re-target this stream to a different node when
+                // its target goes away: an orphaned stream auto-linked to a fresh Video/Source
+                // wedges that node — and a stuck link head-blocks the PipeWire daemon's shared
+                // work queue, stalling ALL new link negotiation system-wide.
+                "node.dont-reconnect"     => "true",
             },
         )
         .context("pw Stream")?;
@@ -628,6 +760,10 @@ mod pipewire {
                 }
 
                 let d = &mut datas[0];
+                // CPU path may also receive LINEAR dmabufs (gamescope offers only those once its
+                // modifier-bearing format pod wins); capture the fd before `data()` borrows `d`.
+                let dmabuf_fd =
+                    (d.type_() == pw::spa::buffer::DataType::DmaBuf).then(|| d.fd());
                 let (size, offset, stride) = {
                     let c = d.chunk();
                     (
@@ -640,14 +776,42 @@ mod pipewire {
                 let bpp = fmt.bytes_per_pixel();
                 let row = w * bpp;
                 let stride = if stride == 0 { row } else { stride };
-                let Some(buf) = d.data() else { return };
+                if stride < row {
+                    warn_once("chunk stride < row — frames dropped");
+                    return;
+                }
+                let needed = stride * (h - 1) + row;
+                // dmabuf chunks commonly report size 0; fall back to the computed span.
+                let size = if size == 0 { needed } else { size };
+                // MAP_BUFFERS only maps buffers flagged mappable; Vulkan-exported dmabufs
+                // (gamescope) usually aren't, so mmap the fd ourselves for the de-pad read.
+                let _mapping; // keeps a manual mmap alive for the copy below
+                let buf: &[u8] = if let Some(data) = d.data() {
+                    data
+                } else if let Some(fd) = dmabuf_fd.filter(|&fd| fd > 0) {
+                    match DmabufMap::new(fd, offset + needed) {
+                        Some(m) => {
+                            _mapping = m;
+                            unsafe {
+                                std::slice::from_raw_parts(_mapping.ptr as *const u8, _mapping.len)
+                            }
+                        }
+                        None => {
+                            warn_once("mmap(dmabuf) failed — frames dropped");
+                            return;
+                        }
+                    }
+                } else {
+                    warn_once("buffer has no mappable data — frames dropped");
+                    return;
+                };
                 // Need stride*(h-1)+row valid bytes within [offset, offset+size).
-                if stride < row || offset > buf.len() {
+                if offset > buf.len() {
                     return;
                 }
                 let avail = buf.len() - offset;
-                let needed = stride * (h - 1) + row;
                 if needed > avail || needed > size {
+                    warn_once("buffer smaller than frame span — frames dropped");
                     return;
                 }
                 let region = &buf[offset..offset + size.min(avail)];
@@ -678,65 +842,51 @@ mod pipewire {
             .register()
             .context("register stream listener")?;
 
+        // Debug knob: offer a single fixed format (LUMEN_PW_FIXED_POD="WxH") to bisect
+        // negotiation failures against a producer's exact EnumFormat (e.g. gamescope).
+        let fixed_pod: Option<(u32, u32)> = std::env::var("LUMEN_PW_FIXED_POD")
+            .ok()
+            .and_then(|v| v.split_once('x').map(|(w, h)| (w.parse(), h.parse())))
+            .and_then(|(w, h)| Some((w.ok()?, h.ok()?)));
+
         // Request raw video in any encoder-mappable layout, any size/framerate.
-        let obj = pw::spa::pod::object!(
-            pw::spa::utils::SpaTypes::ObjectParamFormat,
-            pw::spa::param::ParamType::EnumFormat,
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::MediaType,
-                Id,
-                pw::spa::param::format::MediaType::Video
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::MediaSubtype,
-                Id,
-                pw::spa::param::format::MediaSubtype::Raw
-            ),
-            // Offer the layouts the encoder can map to an NVENC input format. wlroots
-            // commonly fixates packed RGB (3 bpp); other compositors offer 4 bpp. Only
-            // these are requested, so negotiation fails loudly rather than handing us a
-            // format we'd misinterpret.
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::VideoFormat,
-                Choice,
-                Enum,
-                Id,
-                VideoFormat::RGB,
-                VideoFormat::RGB,
-                VideoFormat::BGR,
-                VideoFormat::RGBx,
-                VideoFormat::BGRx,
-                VideoFormat::RGBA,
-                VideoFormat::BGRA,
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::VideoSize,
-                Choice,
-                Range,
-                Rectangle,
-                pw::spa::utils::Rectangle {
-                    width: 1920,
-                    height: 1080
-                },
-                pw::spa::utils::Rectangle {
-                    width: 1,
-                    height: 1
-                },
-                pw::spa::utils::Rectangle {
-                    width: 8192,
-                    height: 8192
-                }
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::VideoFramerate,
-                Choice,
-                Range,
-                Fraction,
-                pw::spa::utils::Fraction { num: 60, denom: 1 },
-                pw::spa::utils::Fraction { num: 0, denom: 1 },
-                pw::spa::utils::Fraction { num: 240, denom: 1 }
-            ),
-        );
+        let obj = if let Some((fw, fh)) = fixed_pod {
+            tracing::info!(fw, fh, "PW DEBUG: offering fixed BGRx pod");
+            pw::spa::pod::object!(
+                pw::spa::utils::SpaTypes::ObjectParamFormat,
+                pw::spa::param::ParamType::EnumFormat,
+                pw::spa::pod::property!(
+                    pw::spa::param::format::FormatProperties::MediaType,
+                    Id,
+                    pw::spa::param::format::MediaType::Video
+                ),
+                pw::spa::pod::property!(
+                    pw::spa::param::format::FormatProperties::MediaSubtype,
+                    Id,
+                    pw::spa::param::format::MediaSubtype::Raw
+                ),
+                pw::spa::pod::property!(
+                    pw::spa::param::format::FormatProperties::VideoFormat,
+                    Id,
+                    VideoFormat::BGRx
+                ),
+                pw::spa::pod::property!(
+                    pw::spa::param::format::FormatProperties::VideoSize,
+                    Rectangle,
+                    pw::spa::utils::Rectangle {
+                        width: fw,
+                        height: fh
+                    }
+                ),
+                pw::spa::pod::property!(
+                    pw::spa::param::format::FormatProperties::VideoFramerate,
+                    Fraction,
+                    pw::spa::utils::Fraction { num: 0, denom: 1 }
+                ),
+            )
+        } else {
+            build_default_format_obj()
+        };
 
         // When zero-copy is on, offer ONLY a BGRx dmabuf format with our EGL-importable modifiers
         // (offering shm too makes the compositor pick shm). The modifier list is advertised with
@@ -750,7 +900,9 @@ mod pipewire {
                 Some(build_dmabuf_buffers()?),
             )
         } else {
-            (None, None)
+            // CPU path still accepts mappable dmabufs (gamescope offers only those once its
+            // modifier-bearing format pod wins the intersection).
+            (None, Some(build_mappable_buffers()?))
         };
 
         let mut byte_slices: Vec<&[u8]> = Vec::new();
