@@ -6,6 +6,7 @@
 //! Status: P1.1 — mDNS `_nvstream._tcp` advertisement + `/serverinfo`. Pairing, RTSP, and
 //! the media streams follow (see the M2 task list / plan).
 
+mod audio;
 mod cert;
 mod control;
 mod crypto;
@@ -86,6 +87,8 @@ pub struct AppState {
     pub stream: std::sync::Mutex<Option<stream::StreamConfig>>,
     /// True while the video stream thread is running (also its keep-running flag).
     pub streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// True while the audio stream thread is running (also its keep-running flag).
+    pub audio_streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run the GameStream control plane (blocks): mDNS advertisement + the nvhttp servers.
@@ -100,6 +103,7 @@ pub fn serve() -> Result<()> {
         launch: std::sync::Mutex::new(None),
         stream: std::sync::Mutex::new(None),
         streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     tracing::info!(
         hostname = %state.host.hostname,

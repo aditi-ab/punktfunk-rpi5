@@ -84,13 +84,23 @@ fn run(cfg: StreamConfig, running: &AtomicBool) -> Result<()> {
     .context("open NVENC for stream")?;
     let mut pk = VideoPacketizer::new(cfg.packet_size);
 
-    let frame_interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
-    let mut frame_idx: u32 = 0;
+    // Pace at a steady rate (capped at 60fps), re-encoding the last captured frame when the
+    // compositor produced no new one. wlroots only emits frames on damage, so a static or
+    // slow-updating desktop would otherwise starve the client into a "network too slow" abort.
+    // Re-encoding an unchanged frame is cheap — NVENC emits a near-empty P-frame.
+    let target_fps = cfg.fps.clamp(1, 60);
+    let frame_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
     let mut sent_pkts: u64 = 0;
+    let mut fps_count: u32 = 0;
+    let mut fps_t = Instant::now();
     let stream_start = Instant::now();
 
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
+        // Advance to the freshest captured frame if one arrived; otherwise reuse the last.
+        if let Some(f) = capturer.try_latest().context("capture frame")? {
+            frame = f;
+        }
         enc.submit(&frame).context("encoder submit")?;
 
         // 90 kHz RTP timestamp from wall-clock, so a variable capture rate stays correct.
@@ -118,19 +128,16 @@ fn run(cfg: StreamConfig, running: &AtomicBool) -> Result<()> {
             break;
         }
 
-        frame_idx += 1;
-        if frame_idx % (cfg.fps.max(1) * 2) == 0 {
-            tracing::info!(frame_idx, sent_pkts, "video: streaming");
+        fps_count += 1;
+        if fps_t.elapsed() >= Duration::from_secs(1) {
+            tracing::info!(fps = fps_count, sent_pkts, "video: streaming");
+            fps_count = 0;
+            fps_t = Instant::now();
         }
-        // Synthetic produces instantly, so pace it; the portal's next_frame() blocks at the
-        // capture rate and paces itself.
-        if !use_portal {
-            let elapsed = tick.elapsed();
-            if elapsed < frame_interval {
-                std::thread::sleep(frame_interval - elapsed);
-            }
+        let elapsed = tick.elapsed();
+        if elapsed < frame_interval {
+            std::thread::sleep(frame_interval - elapsed);
         }
-        frame = capturer.next_frame().context("capture frame")?;
     }
     Ok(())
 }

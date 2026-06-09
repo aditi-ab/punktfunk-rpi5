@@ -7,6 +7,7 @@
 //! Runs on its own native thread (control-plane setup, not the per-frame hot path), one
 //! thread per connection. Plaintext only for now (encryption is negotiated; P1.5).
 
+use super::audio;
 use super::stream::{self, StreamConfig};
 use super::{AppState, AUDIO_PORT, CONTROL_PORT, RTSP_PORT, VIDEO_PORT};
 use crate::encode::Codec;
@@ -171,10 +172,21 @@ fn handle_request(req: &Request, state: &AppState) -> String {
                 Some(_) => tracing::info!("RTSP PLAY — stream already running"),
                 None => tracing::warn!("RTSP PLAY — no negotiated config (ANNOUNCE missing)"),
             }
+            // Audio runs independently (stereo Opus on UDP 48000); it needs the launch key for
+            // the AES-CBC payload encryption the client expects.
+            let launch = *state.launch.lock().unwrap();
+            if let Some(ls) = launch {
+                if !state.audio_streaming.swap(true, Ordering::SeqCst) {
+                    tracing::info!("RTSP PLAY — starting audio stream");
+                    audio::start(state.audio_streaming.clone(), ls.gcm_key, ls.rikeyid);
+                }
+            }
             response(&req.cseq, &[("Session", "DEADBEEFCAFE;timeout = 90")], None)
         }
         "TEARDOWN" => {
-            state.streaming.store(false, Ordering::SeqCst); // signal the stream thread to stop
+            // Signal both stream threads to stop.
+            state.streaming.store(false, Ordering::SeqCst);
+            state.audio_streaming.store(false, Ordering::SeqCst);
             response(&req.cseq, &[], None)
         }
         other => {
@@ -194,6 +206,10 @@ fn describe_sdp() -> String {
         "a=x-ss-general.encryptionRequested:0",
         "sprop-parameter-sets=AAAAAU", // HEVC capability indicator
         "a=rtpmap:98 AV1/90000",       // AV1 capability indicator
+        // Opus config the client matches by channel count (Sunshine emits one per config):
+        // surround-params = channelCount, streams, coupledStreams, then the channel mapping.
+        // The client negotiated stereo, so advertise just that.
+        "a=fmtp:97 surround-params=21101", // stereo: 2ch, 1 stream, 1 coupled, mapping [0,1]
         "",
     ]
     .join("\r\n")

@@ -13,12 +13,14 @@
 // Scaffold: trait methods and config paths are defined ahead of their backends.
 #![allow(dead_code)]
 
+mod audio;
 mod capture;
 mod encode;
 mod gamestream;
 mod inject;
 mod m0;
 mod pipeline;
+mod pwinit;
 mod vdisplay;
 mod web;
 

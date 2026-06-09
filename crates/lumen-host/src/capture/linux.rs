@@ -18,7 +18,7 @@
 use super::{CapturedFrame, Capturer, PixelFormat};
 use anyhow::{anyhow, Context, Result};
 use std::os::fd::OwnedFd;
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -69,6 +69,22 @@ impl Capturer for PortalCapturer {
             Err(RecvTimeoutError::Timeout) => Err(anyhow!("no PipeWire frame within 10s")),
             Err(RecvTimeoutError::Disconnected) => Err(anyhow!("PipeWire capture thread ended")),
         }
+    }
+
+    fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
+        // Drain to the newest queued frame without blocking; `None` means the compositor
+        // hasn't produced a new frame since last call (static/idle desktop).
+        let mut latest = None;
+        loop {
+            match self.frames.try_recv() {
+                Ok(frame) => latest = Some(frame),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(anyhow!("PipeWire capture thread ended"))
+                }
+            }
+        }
+        Ok(latest)
     }
 }
 
@@ -192,7 +208,7 @@ mod pipewire {
     }
 
     pub fn pipewire_thread(fd: OwnedFd, node_id: u32, tx: SyncSender<CapturedFrame>) -> Result<()> {
-        pw::init();
+        crate::pwinit::ensure_init();
 
         let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
         let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;

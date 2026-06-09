@@ -50,6 +50,14 @@ pub struct CapturedFrame {
 /// over a bounded drop-oldest channel (never block the compositor).
 pub trait Capturer: Send {
     fn next_frame(&mut self) -> Result<CapturedFrame>;
+
+    /// Non-blocking: the freshest frame available since the last call, or `None` if none has
+    /// arrived (the caller reuses its last frame to hold a steady output rate). The default
+    /// just produces a frame each call — fine for instant synthetic sources; the portal
+    /// overrides it to drain its channel without blocking.
+    fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
+        self.next_frame().map(Some)
+    }
 }
 
 /// A deterministic moving test pattern (BGRx). Lets M0 exercise the encode → file →
