@@ -19,6 +19,7 @@ mod encode;
 mod gamestream;
 mod inject;
 mod m0;
+mod m3;
 mod pipeline;
 mod pwinit;
 mod vdisplay;
@@ -59,6 +60,22 @@ fn real_main() -> Result<()> {
         Some("zerocopy-probe") => zerocopy::probe(),
         // M0 pipeline spike.
         Some("m0") => m0::run(parse_m0(&args[1..])?),
+        // M3 seed: native lumen/1 host (QUIC control plane + UDP data plane).
+        Some("m3-host") => {
+            let port = args
+                .iter()
+                .skip_while(|a| *a != "--port")
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(9777);
+            let frames = args
+                .iter()
+                .skip_while(|a| *a != "--frames")
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300);
+            m3::run(port, frames)
+        }
         Some("-h") | Some("--help") | Some("help") | None => {
             print_usage();
             Ok(())

@@ -31,6 +31,8 @@ pub mod error;
 pub mod fec;
 pub mod input;
 pub mod packet;
+#[cfg(feature = "quic")]
+pub mod quic;
 pub mod session;
 pub mod stats;
 pub mod transport;

@@ -9,7 +9,9 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-lumen-core = { path = "../lumen-core" }
+lumen-core = { path = "../lumen-core", features = ["quic"] }
+# M3 native control plane (the `lumen/1` QUIC handshake; data plane stays native-thread UDP).
+quinn = "0.11"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

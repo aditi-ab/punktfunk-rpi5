@@ -60,7 +60,7 @@ pub struct Mode {
 
 /// Per-block FEC parameters. Recovery count is derived from `fec_percent` exactly as
 /// GameStream does: `m = ceil(k * fec_percent / 100)`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FecConfig {
     pub scheme: FecScheme,
     /// Recovery overhead as a percentage of data shards (0 disables FEC).
