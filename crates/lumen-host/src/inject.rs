@@ -252,6 +252,21 @@ fn gs_button_to_evdev(b: u32) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
+pub mod gamepad;
+/// Stub — virtual gamepads need Linux uinput; events are dropped elsewhere.
+#[cfg(not(target_os = "linux"))]
+pub mod gamepad {
+    #[derive(Default)]
+    pub struct GamepadManager;
+    impl GamepadManager {
+        pub fn new() -> Self {
+            GamepadManager
+        }
+        pub fn handle(&mut self, _ev: &crate::gamestream::gamepad::GamepadEvent) {}
+        pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16)) {}
+    }
+}
+#[cfg(target_os = "linux")]
 mod libei;
 #[cfg(target_os = "linux")]
 mod wlr;

@@ -23,9 +23,10 @@
 //! Runs on its own native thread for the host's lifetime.
 
 use super::{AppState, CONTROL_PORT};
+use crate::inject::gamepad::GamepadManager;
 use crate::inject::InputInjector;
 use anyhow::{anyhow, Context, Result};
-use rusty_enet::{Event, Host, HostSettings};
+use rusty_enet::{Event, Host, HostSettings, Packet, PeerID};
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +41,9 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
         socket,
         HostSettings {
             peer_limit: 4,
-            channel_limit: 8,
+            // Moonlight connects with CTRL_CHANNEL_COUNT (0x30) channels and sends gamepad
+            // input on channel 0x10+n — a smaller limit silently discards controller input.
+            channel_limit: 0x30,
             ..Default::default()
         },
     )
@@ -56,16 +59,24 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
             let mut detected: Option<Scheme> = None;
             // Lazily opened on the first input event (Sway's Wayland socket is up by then).
             let mut injector: Option<Box<dyn InputInjector>> = None;
+            // Virtual gamepads (uinput) + the host→client rumble sequence counter.
+            let mut pads = GamepadManager::new();
+            let mut rumble_seq: u32 = 0;
+            let mut peer: Option<PeerID> = None;
             loop {
                 loop {
                     match host.service() {
                         Ok(Some(event)) => match event {
-                            Event::Connect { .. } => {
+                            Event::Connect { peer: p, .. } => {
                                 tracing::info!("control: client connected");
+                                peer = Some(p.id());
                             }
                             Event::Disconnect { .. } => {
                                 tracing::info!("control: client disconnected");
                                 detected = None;
+                                peer = None;
+                                // Unplug the session's virtual pads.
+                                pads = GamepadManager::new();
                             }
                             Event::Receive {
                                 channel_id, packet, ..
@@ -76,6 +87,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                                     packet.data(),
                                     &mut detected,
                                     &mut injector,
+                                    &mut pads,
                                 );
                             }
                         },
@@ -85,6 +97,28 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                             break;
                         }
                     }
+                }
+                // Service the pads' force-feedback protocol every tick (games block inside
+                // EVIOCSFF until answered) and relay mixed rumble levels to the client.
+                if let (Some(pid), Some(scheme)) = (peer, detected) {
+                    let key = state.launch.lock().unwrap().map(|s| s.gcm_key);
+                    if let Some(key) = key {
+                        let mut out: Vec<Vec<u8>> = Vec::new();
+                        pads.pump_rumble(|index, low, high| {
+                            let pt = super::gamepad::rumble_plaintext(index, low, high);
+                            out.push(encrypt_control(&key, &scheme, rumble_seq, &pt));
+                            rumble_seq = rumble_seq.wrapping_add(1);
+                        });
+                        for wire in out {
+                            if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..]))
+                            {
+                                tracing::warn!(error = %format!("{e:?}"), "rumble send failed");
+                            }
+                        }
+                    }
+                } else {
+                    // No client/scheme yet: still answer FF uploads so games don't block.
+                    pads.pump_rumble(|_, _, _| {});
                 }
                 // ENet needs frequent servicing for handshake/keepalive/retransmit.
                 std::thread::sleep(Duration::from_millis(2));
@@ -102,6 +136,7 @@ fn on_receive(
     d: &[u8],
     detected: &mut Option<Scheme>,
     injector: &mut Option<Box<dyn InputInjector>>,
+    pads: &mut GamepadManager,
 ) {
     let Some(key) = state.launch.lock().unwrap().map(|s| s.gcm_key) else {
         return; // control traffic before /launch — no key yet
@@ -139,6 +174,12 @@ fn on_receive(
             );
             return;
         }
+    }
+
+    // Controller events go to the uinput virtual pads (created on demand per the mask).
+    if let Some(gp) = super::gamepad::decode(&pt) {
+        pads.handle(&gp);
+        return;
     }
 
     let events = super::input::decode(&pt);
@@ -308,6 +349,60 @@ fn decrypt_control(
         }
     }
     None
+}
+
+/// Seal a host→client control message, mirroring the client's `detected` scheme with the
+/// direction flipped: V2 nonces use marker `H?` (host-originated) instead of `C?`; legacy
+/// nonces keep their construction with our own independent `seq` counter. Wire layout matches
+/// what the client sends us: `[0x0001][length][seq][tag|ct per scheme.tag_first]`.
+fn encrypt_control(key: &[u8; 16], scheme: &Scheme, seq: u32, pt: &[u8]) -> Vec<u8> {
+    let nonce_kind = match scheme.nonce {
+        NonceKind::V2 { seq_be, marker } => NonceKind::V2 {
+            seq_be,
+            marker: [b'H', marker[1]],
+        },
+        other => other,
+    };
+    let length = (4 + 16 + pt.len()) as u16;
+    let mut wire = Vec::with_capacity(8 + 16 + pt.len());
+    wire.extend_from_slice(&0x0001u16.to_le_bytes());
+    wire.extend_from_slice(&length.to_le_bytes());
+    wire.extend_from_slice(&seq.to_le_bytes());
+    let aad: Vec<u8> = match scheme.aad {
+        Aad::None => Vec::new(),
+        Aad::Header4 => wire[0..4].to_vec(),
+    };
+    let ct_tag = gcm_seal(&scheme.key(key), &nonce_kind.nonce(seq), pt, &aad);
+    let (ct, tag) = ct_tag.split_at(ct_tag.len() - 16);
+    if scheme.tag_first {
+        wire.extend_from_slice(tag);
+        wire.extend_from_slice(ct);
+    } else {
+        wire.extend_from_slice(ct);
+        wire.extend_from_slice(tag);
+    }
+    wire
+}
+
+/// AES-128-GCM seal (companion to [`gcm_open`]); returns `ciphertext || tag`.
+fn gcm_seal(key: &[u8; 16], nonce: &[u8], pt: &[u8], aad: &[u8]) -> Vec<u8> {
+    use aes_gcm::aead::consts::{U12, U16};
+    use aes_gcm::aead::generic_array::GenericArray;
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{aes::Aes128, AesGcm};
+
+    let p = Payload { msg: pt, aad };
+    match nonce.len() {
+        12 => AesGcm::<Aes128, U12>::new_from_slice(key)
+            .unwrap()
+            .encrypt(GenericArray::from_slice(nonce), p)
+            .expect("GCM seal"),
+        16 => AesGcm::<Aes128, U16>::new_from_slice(key)
+            .unwrap()
+            .encrypt(GenericArray::from_slice(nonce), p)
+            .expect("GCM seal"),
+        _ => unreachable!("nonce length"),
+    }
 }
 
 /// AES-128-GCM open with a 12- or 16-byte nonce and explicit AAD. Returns the plaintext iff

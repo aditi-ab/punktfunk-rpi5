@@ -10,6 +10,7 @@ mod audio;
 mod cert;
 mod control;
 mod crypto;
+pub mod gamepad;
 mod input;
 mod mdns;
 mod nvhttp;
