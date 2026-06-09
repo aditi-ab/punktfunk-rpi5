@@ -34,12 +34,21 @@ pub struct PortalCapturer {
 }
 
 impl PortalCapturer {
-    pub fn open() -> Result<PortalCapturer> {
+    /// `anchored` drives ScreenCast off a RemoteDesktop session (KWin/GNOME) so it inherits the
+    /// RemoteDesktop grant and never raises a separate ScreenCast dialog; `false` uses a plain
+    /// ScreenCast session (wlroots, which has no RemoteDesktop portal).
+    pub fn open(anchored: bool) -> Result<PortalCapturer> {
         // Portal handshake (async) on its own thread; hands back the PW fd + node id.
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
         thread::Builder::new()
             .name("lumen-portal".into())
-            .spawn(move || portal_thread(setup_tx))
+            .spawn(move || {
+                if anchored {
+                    portal_thread_remote_desktop(setup_tx)
+                } else {
+                    portal_thread(setup_tx)
+                }
+            })
             .context("spawn portal thread")?;
 
         let (fd, node_id) = match setup_rx.recv_timeout(Duration::from_secs(20)) {
@@ -176,6 +185,104 @@ fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String
             // capture; the cast is torn down when the connection drops (ashpd's `Session`
             // has no `Drop`), which here happens at process exit.
             let _keep_alive = (&proxy, &session);
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            let _ = err_tx.send(Err(format!("{e:#}")));
+        }
+    });
+}
+
+/// Combined RemoteDesktop+ScreenCast portal setup (KWin/GNOME). ScreenCast sources are selected
+/// on a session created via RemoteDesktop, so a single RemoteDesktop `start` grant —
+/// pre-authorized headlessly via the `kde-authorized` permission, exactly like the libei input
+/// path — also covers screen capture, with no separate ScreenCast dialog (which has no such
+/// bypass). Yields the same PipeWire fd + node id as the standalone path; the consumer is
+/// identical.
+fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>) {
+    use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
+    use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+    use ashpd::desktop::PersistMode;
+    use ashpd::enumflags2::BitFlags;
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = setup_tx.send(Err(format!("build tokio runtime: {e}")));
+            return;
+        }
+    };
+    let err_tx = setup_tx.clone();
+
+    rt.block_on(async move {
+        let result: Result<()> = async {
+            let remote = RemoteDesktop::new()
+                .await
+                .context("connect RemoteDesktop portal")?;
+            let screencast = Screencast::new()
+                .await
+                .context("connect ScreenCast portal")?;
+            let session = remote
+                .create_session(Default::default())
+                .await
+                .context("create RemoteDesktop session")?;
+            // RemoteDesktop requires a device selection; we never connect_to_eis on this session
+            // (input injection runs its own), but selecting devices is what makes `start` the
+            // RemoteDesktop grant the kde-authorized bypass covers.
+            remote
+                .select_devices(
+                    &session,
+                    SelectDevicesOptions::default()
+                        .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+                        .set_persist_mode(PersistMode::DoNot),
+                )
+                .await
+                .context("select_devices")?
+                .response()
+                .context("select_devices rejected")?;
+            screencast
+                .select_sources(
+                    &session,
+                    SelectSourcesOptions::default()
+                        .set_cursor_mode(CursorMode::Hidden)
+                        .set_sources(BitFlags::from_flag(SourceType::Monitor))
+                        .set_multiple(false)
+                        .set_persist_mode(PersistMode::DoNot),
+                )
+                .await
+                .context("select_sources")?
+                .response()
+                .context("select_sources rejected (unsupported source type?)")?;
+            let streams = remote
+                .start(&session, None, Default::default())
+                .await
+                .context("start RemoteDesktop+ScreenCast")?
+                .response()
+                .context("start response (grant not pre-authorized / headless dialog?)")?;
+            let stream = streams
+                .streams()
+                .first()
+                .context("portal returned no screencast streams")?
+                .clone();
+            let node_id = stream.pipe_wire_node_id();
+            let fd = screencast
+                .open_pipe_wire_remote(&session, Default::default())
+                .await
+                .context("open_pipe_wire_remote")?;
+
+            setup_tx
+                .send(Ok((fd, node_id)))
+                .map_err(|_| anyhow!("capturer dropped before setup completed"))?;
+
+            // Keep the proxies + session (and their zbus connection) alive for the capture.
+            let _keep_alive = (&remote, &screencast, &session);
             std::future::pending::<()>().await;
             Ok(())
         }

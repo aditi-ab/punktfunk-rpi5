@@ -182,7 +182,11 @@ impl Capturer for FastSyntheticCapturer {
 /// (`ashpd`) → PipeWire (`pipewire`). Implemented in the `linux` submodule.
 #[cfg(target_os = "linux")]
 pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
-    linux::PortalCapturer::open().map(|c| Box::new(c) as Box<dyn Capturer>)
+    // On RemoteDesktop-capable desktops (KWin/GNOME) anchor ScreenCast to a RemoteDesktop
+    // session so it inherits that grant headlessly; wlroots/Sway has no RemoteDesktop portal,
+    // so use a plain ScreenCast session there.
+    let anchored = crate::inject::default_backend() == crate::inject::Backend::Libei;
+    linux::PortalCapturer::open(anchored).map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
 #[cfg(not(target_os = "linux"))]
