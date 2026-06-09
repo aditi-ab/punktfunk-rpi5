@@ -34,13 +34,17 @@ bash crates/lumen-core/tests/c/run.sh   # standalone C-ABI link + round-trip pro
 
 `include/lumen_core.h` is generated from `crates/lumen-core/src/abi.rs` by cbindgen
 (`build.rs`) on every build and is **checked in**; CI fails if it drifts, so commit the
-regenerated header when the ABI changes.
+regenerated header when the ABI changes. Same deal for the management API's OpenAPI
+document: `docs/api/openapi.json` is **checked in** for client codegen and a test fails if
+it drifts — regenerate with `cargo run -p lumen-host -- openapi > docs/api/openapi.json`
+(the spec lives in `crates/lumen-host/src/mgmt.rs`).
 
 ## Layout
 
 ```
 crates/lumen-core/   protocol · FEC · pacing · crypto — the C ABI (lib + cdylib + staticlib)
-crates/lumen-host/   Linux host: vdisplay · capture · encode · inject · web · pipeline (cfg-gated)
+crates/lumen-host/   Linux host: vdisplay · capture · encode · inject · gamestream · mgmt · pipeline
+docs/api/openapi.json   generated management-API spec (codegen input)
 crates/lumen-client-rs/   reference client (M4)
 tools/{loss-harness,latency-probe}/   measurement (plan §10)
 clients/{apple,android}/   native client scaffolds (import lumen_core.h)

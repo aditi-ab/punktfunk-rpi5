@@ -19,10 +19,10 @@ mod encode;
 mod gamestream;
 mod inject;
 mod m0;
+mod mgmt;
 mod pipeline;
 mod pwinit;
 mod vdisplay;
-mod web;
 #[cfg(target_os = "linux")]
 mod zerocopy;
 
@@ -32,10 +32,12 @@ use m0::{Options, Source};
 use std::path::PathBuf;
 
 fn main() {
+    // Logs go to stderr so stdout stays machine-readable (`lumen-host openapi > spec.json`).
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     if let Err(e) = real_main() {
@@ -49,8 +51,13 @@ fn real_main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        // M2 GameStream host control plane (P1.1: mDNS + serverinfo).
-        Some("serve") => gamestream::serve(),
+        // M2 GameStream host control plane (P1.1: mDNS + serverinfo) + management API.
+        Some("serve") => gamestream::serve(parse_serve(&args[1..])?),
+        // Print the management API's OpenAPI document (for client codegen).
+        Some("openapi") => {
+            print!("{}", mgmt::openapi_json());
+            Ok(())
+        }
         // Standalone input-injection smoke test (no client needed): open the session's input
         // backend and inject a scripted mouse/keyboard pattern. Watch a focused app / `wev`.
         Some("input-test") => input_test(),
@@ -118,6 +125,42 @@ fn input_test() -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn input_test() -> Result<()> {
     bail!("input-test requires Linux")
+}
+
+/// `serve` options — all about the management API; the GameStream ports are protocol-fixed.
+fn parse_serve(args: &[String]) -> Result<mgmt::Options> {
+    let mut opts = mgmt::Options::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let mut next = || {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing value for {arg}"))
+        };
+        match arg {
+            "--mgmt-bind" => {
+                opts.bind = next()?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad --mgmt-bind (want IP:PORT)"))?
+            }
+            "--mgmt-token" => opts.token = Some(next()?),
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => bail!("unknown argument '{other}' (try --help)"),
+        }
+        i += 1;
+    }
+    // Flag wins over the environment so a unit file can set a default and a shell override it.
+    if opts.token.is_none() {
+        opts.token = std::env::var("LUMEN_MGMT_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+    }
+    Ok(opts)
 }
 
 fn parse_m0(args: &[String]) -> Result<Options> {
@@ -222,10 +265,17 @@ fn print_usage() {
         "lumen-host — Linux streaming host
 
 USAGE:
-    lumen-host serve              GameStream host control plane (M2: mDNS + serverinfo …)
+    lumen-host serve [OPTIONS]    GameStream host control plane (M2: mDNS + serverinfo …)
+                                  + the management REST API
+    lumen-host openapi            print the management API's OpenAPI document (codegen)
     lumen-host m0 [OPTIONS]       M0 capture→encode→file pipeline spike
 
-OPTIONS:
+SERVE OPTIONS:
+    --mgmt-bind <IP:PORT>        management API address (default: 127.0.0.1:47990)
+    --mgmt-token <TOKEN>         bearer token for the management API (or LUMEN_MGMT_TOKEN);
+                                 required when --mgmt-bind is not loopback
+
+M0 OPTIONS:
     --source <synthetic|portal|kwin-virtual>
                                  frame source (default: portal). 'kwin-virtual' creates a
                                  KWin virtual output at --width x --height and captures it

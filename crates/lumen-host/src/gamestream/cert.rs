@@ -42,6 +42,11 @@ impl ServerIdentity {
                 (c, k)
             }
         };
+        Self::from_pems(cert_pem, key_pem)
+    }
+
+    /// Build an identity from PEMs (no I/O).
+    pub fn from_pems(cert_pem: String, key_pem: String) -> Result<ServerIdentity> {
         let priv_key = RsaPrivateKey::from_pkcs8_pem(&key_pem).context("parse host private key")?;
         let signing_key = SigningKey::<Sha256>::new(priv_key);
         let signature = cert_signature(&cert_pem)?;
@@ -51,6 +56,12 @@ impl ServerIdentity {
             signature,
             signing_key,
         })
+    }
+
+    /// Throwaway in-memory identity — nothing touches the config dir (used by tests).
+    pub fn ephemeral() -> Result<ServerIdentity> {
+        let (cert_pem, key_pem) = generate()?;
+        Self::from_pems(cert_pem, key_pem)
     }
 }
 

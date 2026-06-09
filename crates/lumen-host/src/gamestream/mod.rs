@@ -7,7 +7,7 @@
 //! the media streams follow (see the M2 task list / plan).
 
 mod audio;
-mod cert;
+pub(crate) mod cert;
 mod control;
 mod crypto;
 mod input;
@@ -101,23 +101,31 @@ pub struct AppState {
     pub audio_cap: std::sync::Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>,
 }
 
-/// Run the GameStream control plane (blocks): mDNS advertisement + the nvhttp servers.
-pub fn serve() -> Result<()> {
+impl AppState {
+    /// Fresh control-plane state: no active session, empty pairing store.
+    pub fn new(host: Host, identity: cert::ServerIdentity) -> AppState {
+        AppState {
+            host,
+            identity,
+            pairing: pairing::Pairing::new(),
+            paired: std::sync::Mutex::new(Vec::new()),
+            launch: std::sync::Mutex::new(None),
+            stream: std::sync::Mutex::new(None),
+            streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            video_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+/// Run the GameStream control plane (blocks): mDNS advertisement, the nvhttp servers, and
+/// the management REST API.
+pub fn serve(mgmt: crate::mgmt::Options) -> Result<()> {
     let host = Host::detect()?;
     let identity = cert::ServerIdentity::load_or_create().context("host certificate")?;
-    let state = Arc::new(AppState {
-        host,
-        identity,
-        pairing: pairing::Pairing::new(),
-        paired: std::sync::Mutex::new(Vec::new()),
-        launch: std::sync::Mutex::new(None),
-        stream: std::sync::Mutex::new(None),
-        streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        video_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
-    });
+    let state = Arc::new(AppState::new(host, identity));
     tracing::info!(
         hostname = %state.host.hostname,
         uniqueid = %state.host.uniqueid,
@@ -131,7 +139,8 @@ pub fn serve() -> Result<()> {
         let _advert = mdns::advertise(&state.host).context("mDNS advertise")?;
         rtsp::spawn(state.clone()).context("start RTSP server")?;
         control::spawn(state.clone()).context("start ENet control server")?;
-        nvhttp::run(state).await
+        tokio::try_join!(nvhttp::run(state.clone()), crate::mgmt::run(state, mgmt))?;
+        Ok(())
     })
 }
 
