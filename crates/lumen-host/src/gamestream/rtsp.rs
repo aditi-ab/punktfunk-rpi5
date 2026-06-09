@@ -167,7 +167,7 @@ fn handle_request(req: &Request, state: &AppState) -> String {
             match cfg {
                 Some(cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
                     tracing::info!("RTSP PLAY — starting video stream");
-                    stream::start(cfg, state.streaming.clone());
+                    stream::start(cfg, state.streaming.clone(), state.force_idr.clone());
                 }
                 Some(_) => tracing::info!("RTSP PLAY — stream already running"),
                 None => tracing::warn!("RTSP PLAY — no negotiated config (ANNOUNCE missing)"),
@@ -243,6 +243,10 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         Some("2") => Codec::Av1,
         _ => Codec::H264,
     };
+    // Parity floor the client asks for (protects small frames); clamp to a sane max.
+    let min_fec = parse_u("x-nv-vqos[0].fec.minRequiredFecPackets")
+        .unwrap_or(2)
+        .min(16) as u8;
     Some(StreamConfig {
         width,
         height,
@@ -250,6 +254,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         packet_size,
         bitrate_kbps,
         codec,
+        min_fec,
     })
 }
 

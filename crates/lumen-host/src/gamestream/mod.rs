@@ -89,6 +89,9 @@ pub struct AppState {
     pub streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// True while the audio stream thread is running (also its keep-running flag).
     pub audio_streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the control stream when the client requests an IDR / invalidates reference
+    /// frames (recovery after loss); the video thread forces a keyframe and clears it.
+    pub force_idr: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run the GameStream control plane (blocks): mDNS advertisement + the nvhttp servers.
@@ -104,6 +107,7 @@ pub fn serve() -> Result<()> {
         stream: std::sync::Mutex::new(None),
         streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     tracing::info!(
         hostname = %state.host.hostname,

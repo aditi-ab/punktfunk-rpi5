@@ -42,6 +42,8 @@ pub struct NvencEncoder {
     fps: u32,
     /// Monotonic presentation index, in `1/fps` time-base units.
     frame_idx: i64,
+    /// Force the next submitted frame to be an IDR (set by [`request_keyframe`]).
+    force_kf: bool,
 }
 
 impl NvencEncoder {
@@ -95,6 +97,7 @@ impl NvencEncoder {
             height,
             fps,
             frame_idx: 0,
+            force_kf: false,
         })
     }
 }
@@ -147,8 +150,19 @@ impl Encoder for NvencEncoder {
         }
         self.frame.set_pts(Some(self.frame_idx));
         self.frame_idx += 1;
+        // Force an IDR when requested (client RFI); otherwise let NVENC pick (GOP/P-frame).
+        if self.force_kf {
+            self.frame.set_kind(ffmpeg::picture::Type::I);
+            self.force_kf = false;
+        } else {
+            self.frame.set_kind(ffmpeg::picture::Type::None);
+        }
         self.enc.send_frame(&self.frame).context("send_frame")?;
         Ok(())
+    }
+
+    fn request_keyframe(&mut self) {
+        self.force_kf = true;
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {

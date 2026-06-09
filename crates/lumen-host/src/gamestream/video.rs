@@ -43,17 +43,21 @@ pub struct VideoPacketizer {
     /// Requested FEC overhead percent (0 = data shards only). The wire carries the recomputed
     /// per-block `(100·m)/k` so Moonlight derives the same parity count.
     fec_percentage: usize,
+    /// Minimum parity shards per block (the client's `fec.minRequiredFecPackets`) — protects
+    /// small frames whose `⌈k·pct/100⌉` would otherwise be just 1.
+    min_fec: usize,
     frame_index: u32,
     /// Monotonic per-stream packet counter (the RTP sequence / streamPacketIndex source).
     seq: u32,
 }
 
 impl VideoPacketizer {
-    pub fn new(packet_size: usize, fec_percentage: u8) -> Self {
+    pub fn new(packet_size: usize, fec_percentage: u8, min_fec: u8) -> Self {
         VideoPacketizer {
             packet_size,
             payload_per_shard: packet_size + 16 - SHARD_HEADER,
             fec_percentage: fec_percentage as usize,
+            min_fec: min_fec as usize,
             frame_index: 0,
             seq: 0,
         }
@@ -130,9 +134,14 @@ impl VideoPacketizer {
                 shards.push(buf);
             }
 
-            // 2. m = ⌈k·pct/100⌉ parity shards over the full datagrams. The wire percentage is
-            //    recomputed from m so the client derives the same parity count.
-            let m = if pct > 0 { (k * pct).div_ceil(100) } else { 0 };
+            // 2. m = ⌈k·pct/100⌉ parity shards (floored at the client's min, capped so k+m≤255)
+            //    over the full datagrams. The wire percentage is recomputed from m so the client
+            //    derives the same count.
+            let m = if pct > 0 {
+                (k * pct).div_ceil(100).max(self.min_fec).min(255 - k)
+            } else {
+                0
+            };
             let wire_pct = if m > 0 { (100 * m) / k } else { 0 };
             let parity = if m > 0 {
                 Gf8Coder.encode(&shards, m).unwrap_or_default()
@@ -217,7 +226,7 @@ mod tests {
 
     #[test]
     fn single_block_layout() {
-        let mut pk = VideoPacketizer::new(1392, 0); // data-only; pps = 1392+16-32 = 1376
+        let mut pk = VideoPacketizer::new(1392, 0, 0); // data-only; pps = 1392+16-32 = 1376
         assert_eq!(pk.payload_per_shard, 1376);
         let au = vec![0xABu8; 4000]; // 8+4000 = 4008 → ceil(4008/1376) = 3 data shards
         let pkts = pk.packetize(&au, FrameType::Idr, 90_000);
@@ -245,7 +254,7 @@ mod tests {
 
     #[test]
     fn multi_block_split() {
-        let mut pk = VideoPacketizer::new(1392, 0); // data-only
+        let mut pk = VideoPacketizer::new(1392, 0, 0); // data-only
         let au = vec![0u8; 600_000];
         let pkts = pk.packetize(&au, FrameType::P, 0);
         let total = (8 + au.len()).div_ceil(1376);
@@ -257,7 +266,7 @@ mod tests {
 
     #[test]
     fn emits_parity_shards() {
-        let mut pk = VideoPacketizer::new(1392, 20); // pps = 1376, 20% FEC
+        let mut pk = VideoPacketizer::new(1392, 20, 0); // pps = 1376, 20% FEC
         let au = vec![0xABu8; 4000]; // 8+4000 = 4008 → 3 data shards (k=3)
         let pkts = pk.packetize(&au, FrameType::Idr, 0);
         // m = ceil(3*20/100) = 1 parity shard → 4 packets; wire_pct = 100*1/3 = 33.
@@ -284,7 +293,7 @@ mod tests {
     /// payload AND its NV `flags` byte (the byte Moonlight validates), proving the layout.
     #[test]
     fn parity_recovers_full_datagram_incl_flags() {
-        let mut pk = VideoPacketizer::new(1392, 50); // high pct → plenty of parity
+        let mut pk = VideoPacketizer::new(1392, 50, 0); // high pct → plenty of parity
         let au = vec![0x5Au8; 4000]; // k = 3
         let pkts = pk.packetize(&au, FrameType::Idr, 0);
         let k = 3usize;

@@ -125,6 +125,22 @@ fn on_receive(
         }
     };
 
+    // Recovery requests after loss: invalidate-reference-frames (0x0301, Gen7) or request-IDR
+    // (0x0302, Gen7Enc). Force a keyframe so the client can resync without a multi-second stall.
+    if pt.len() >= 2 {
+        let inner = u16::from_le_bytes([pt[0], pt[1]]);
+        if matches!(inner, 0x0301 | 0x0302 | 0x0305) {
+            state
+                .force_idr
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!(
+                ty = format!("{inner:#06x}"),
+                "control: IDR/RFI request → keyframe"
+            );
+            return;
+        }
+    }
+
     let events = super::input::decode(&pt);
     if events.is_empty() {
         return; // keepalive / QoS / unhandled input kind

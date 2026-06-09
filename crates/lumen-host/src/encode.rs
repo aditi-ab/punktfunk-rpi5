@@ -40,6 +40,9 @@ impl Codec {
 /// A hardware encoder. One per session; runs on the encode thread.
 pub trait Encoder: Send {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()>;
+    /// Force the next submitted frame to be an IDR keyframe (e.g. after a client
+    /// reference-frame-invalidation request). Default: no-op.
+    fn request_keyframe(&mut self) {}
     /// Pull the next encoded AU if one is ready.
     fn poll(&mut self) -> Result<Option<EncodedFrame>>;
     /// Signal end-of-stream. After this, drain the remaining AUs with [`poll`](Self::poll)
