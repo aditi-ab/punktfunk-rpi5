@@ -92,6 +92,13 @@ pub struct AppState {
     /// Set by the control stream when the client requests an IDR / invalidates reference
     /// frames (recovery after loss); the video thread forces a keyframe and clears it.
     pub force_idr: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Persistent screen capturer, reused across streams so reconnects don't spawn a second
+    /// (conflicting) screencast session. The video thread borrows it for the stream's duration
+    /// and returns it; `set_active` gates its cost while idle.
+    pub video_cap: std::sync::Arc<std::sync::Mutex<Option<Box<dyn crate::capture::Capturer>>>>,
+    /// Persistent audio capturer, reused across streams (avoids leaking a PipeWire capture
+    /// thread per reconnect); drained on reuse so no stale audio is sent.
+    pub audio_cap: std::sync::Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>,
 }
 
 /// Run the GameStream control plane (blocks): mDNS advertisement + the nvhttp servers.
@@ -108,6 +115,8 @@ pub fn serve() -> Result<()> {
         streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        video_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
     });
     tracing::info!(
         hostname = %state.host.hostname,

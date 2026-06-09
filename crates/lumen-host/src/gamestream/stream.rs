@@ -27,14 +27,24 @@ pub struct StreamConfig {
     pub min_fec: u8,
 }
 
+/// Slot for the persistent screen capturer, shared with the control plane and reused across
+/// streams so a reconnect doesn't open a second (conflicting) screencast session.
+pub type CapturerSlot = Arc<std::sync::Mutex<Option<Box<dyn Capturer>>>>;
+
 /// Spawn the video stream thread (idempotent via `running`). Stops when `running` clears.
-/// `force_idr` is set by the control stream on a client recovery request.
-pub fn start(cfg: StreamConfig, running: Arc<AtomicBool>, force_idr: Arc<AtomicBool>) {
+/// `force_idr` is set by the control stream on a client recovery request; `video_cap` holds
+/// the persistent capturer the thread borrows for the stream's duration.
+pub fn start(
+    cfg: StreamConfig,
+    running: Arc<AtomicBool>,
+    force_idr: Arc<AtomicBool>,
+    video_cap: CapturerSlot,
+) {
     let _ = std::thread::Builder::new()
         .name("lumen-video".into())
         .spawn(move || {
             tracing::info!(?cfg, "video stream starting");
-            if let Err(e) = run(cfg, &running, &force_idr) {
+            if let Err(e) = run(cfg, &running, &force_idr, &video_cap) {
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }
             running.store(false, Ordering::SeqCst);
@@ -42,7 +52,12 @@ pub fn start(cfg: StreamConfig, running: Arc<AtomicBool>, force_idr: Arc<AtomicB
         });
 }
 
-fn run(cfg: StreamConfig, running: &AtomicBool, force_idr: &AtomicBool) -> Result<()> {
+fn run(
+    cfg: StreamConfig,
+    running: &AtomicBool,
+    force_idr: &AtomicBool,
+    video_cap: &std::sync::Mutex<Option<Box<dyn Capturer>>>,
+) -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", VIDEO_PORT)).context("bind video UDP")?;
     // The client pings the video port so we learn where to send; it re-pings until video
     // flows, so a missed early ping is fine.
@@ -59,15 +74,37 @@ fn run(cfg: StreamConfig, running: &AtomicBool, force_idr: &AtomicBool) -> Resul
         .context("connect client video endpoint")?;
     tracing::info!(%client, "video: client endpoint learned");
 
-    let use_portal = std::env::var("LUMEN_VIDEO_SOURCE").is_ok_and(|v| v == "portal");
-    let mut capturer: Box<dyn Capturer> = if use_portal {
-        tracing::info!("video source: portal desktop capture");
-        capture::open_portal_monitor().context("open portal capturer")?
-    } else {
-        tracing::info!("video source: synthetic test pattern");
-        Box::new(FastSyntheticCapturer::new(cfg.width, cfg.height))
+    // Reuse the persistent capturer (one screencast session → clean reconnect); create it on
+    // the first stream. Borrow it for this stream and return it on exit.
+    let mut capturer: Box<dyn Capturer> = match video_cap.lock().unwrap().take() {
+        Some(c) => {
+            tracing::info!("video source: reusing capturer");
+            c
+        }
+        None if std::env::var("LUMEN_VIDEO_SOURCE").is_ok_and(|v| v == "portal") => {
+            tracing::info!("video source: portal desktop capture");
+            capture::open_portal_monitor().context("open portal capturer")?
+        }
+        None => {
+            tracing::info!("video source: synthetic test pattern");
+            Box::new(FastSyntheticCapturer::new(cfg.width, cfg.height))
+        }
     };
+    capturer.set_active(true);
+    let result = stream_body(&mut *capturer, &sock, cfg, running, force_idr);
+    capturer.set_active(false);
+    *video_cap.lock().unwrap() = Some(capturer);
+    result
+}
 
+/// The encode → packetize → paced-send loop, over a borrowed capturer.
+fn stream_body(
+    capturer: &mut dyn Capturer,
+    sock: &UdpSocket,
+    cfg: StreamConfig,
+    running: &AtomicBool,
+    force_idr: &AtomicBool,
+) -> Result<()> {
     // The first frame establishes the authoritative size/format for the encoder.
     let mut frame = capturer.next_frame().context("capture first frame")?;
     if frame.width != cfg.width || frame.height != cfg.height {

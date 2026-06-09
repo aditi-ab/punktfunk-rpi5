@@ -18,13 +18,19 @@
 use super::{CapturedFrame, Capturer, PixelFormat};
 use anyhow::{anyhow, Context, Result};
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-/// Live monitor capturer backed by the portal + PipeWire threads.
+/// Live monitor capturer backed by the portal + PipeWire threads. Kept alive (reused) across
+/// streams — [`set_active`](Capturer::set_active) gates the per-frame de-pad copy so it costs
+/// almost nothing between streams while the screencast session stays up (instant reconnect,
+/// and no second session to conflict with).
 pub struct PortalCapturer {
     frames: Receiver<CapturedFrame>,
+    active: Arc<AtomicBool>,
 }
 
 impl PortalCapturer {
@@ -48,16 +54,21 @@ impl PortalCapturer {
 
         // Frames flow from the pipewire thread over a small bounded channel.
         let (frame_tx, frame_rx) = sync_channel::<CapturedFrame>(8);
+        let active = Arc::new(AtomicBool::new(false));
+        let active_cb = active.clone();
         thread::Builder::new()
             .name("lumen-pipewire".into())
             .spawn(move || {
-                if let Err(e) = pipewire::pipewire_thread(fd, node_id, frame_tx) {
+                if let Err(e) = pipewire::pipewire_thread(fd, node_id, frame_tx, active_cb) {
                     tracing::error!(error = %format!("{e:#}"), "pipewire capture thread failed");
                 }
             })
             .context("spawn pipewire thread")?;
 
-        Ok(PortalCapturer { frames: frame_rx })
+        Ok(PortalCapturer {
+            frames: frame_rx,
+            active,
+        })
     }
 }
 
@@ -85,6 +96,10 @@ impl Capturer for PortalCapturer {
             }
         }
         Ok(latest)
+    }
+
+    fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Relaxed);
     }
 }
 
@@ -180,7 +195,9 @@ mod pipewire {
     use pipewire as pw;
     use pw::{properties::properties, spa};
     use std::os::fd::OwnedFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::SyncSender;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use spa::param::video::{VideoFormat, VideoInfoRaw};
@@ -205,9 +222,16 @@ mod pipewire {
         /// Negotiated layout (`None` until param_changed, or if unsupported).
         format: Option<PixelFormat>,
         tx: SyncSender<CapturedFrame>,
+        /// When false (no active stream), skip the de-pad copy — the buffer is just released.
+        active: Arc<AtomicBool>,
     }
 
-    pub fn pipewire_thread(fd: OwnedFd, node_id: u32, tx: SyncSender<CapturedFrame>) -> Result<()> {
+    pub fn pipewire_thread(
+        fd: OwnedFd,
+        node_id: u32,
+        tx: SyncSender<CapturedFrame>,
+        active: Arc<AtomicBool>,
+    ) -> Result<()> {
         crate::pwinit::ensure_init();
 
         let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
@@ -220,6 +244,7 @@ mod pipewire {
             info: VideoInfoRaw::default(),
             format: None,
             tx,
+            active,
         };
 
         let stream = pw::stream::StreamBox::new(
@@ -278,6 +303,10 @@ mod pipewire {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
                 };
+                // No active stream: release the buffer without the (expensive at 5K) de-pad.
+                if !ud.active.load(Ordering::Relaxed) {
+                    return;
+                }
                 let datas = buffer.datas_mut();
                 if datas.is_empty() {
                     return;

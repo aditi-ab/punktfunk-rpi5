@@ -12,7 +12,7 @@
 //! left in the clear). Reed-Solomon audio FEC is layered on top in P1.5.
 
 use super::AUDIO_PORT;
-use crate::audio::{self, CHANNELS, SAMPLE_RATE};
+use crate::audio::{self, AudioCapturer, CHANNELS, SAMPLE_RATE};
 use anyhow::{Context, Result};
 use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
 use opus::{Application, Bitrate, Channels, Encoder};
@@ -31,14 +31,17 @@ const SAMPLES_PER_FRAME: usize = SAMPLE_RATE as usize * FRAME_MS / 1000;
 const AUDIO_PACKET_TYPE: u8 = 97;
 const OPUS_BITRATE: i32 = 128_000;
 
+/// Slot for the persistent audio capturer, reused across streams (no leaked PipeWire thread).
+pub type AudioCapSlot = Arc<std::sync::Mutex<Option<Box<dyn AudioCapturer>>>>;
+
 /// Spawn the audio stream thread (idempotent via `running`). Stops when `running` clears.
 /// `gcm_key`/`rikeyid` come from `/launch` and key the AES-CBC payload encryption.
-pub fn start(running: Arc<AtomicBool>, gcm_key: [u8; 16], rikeyid: i32) {
+pub fn start(running: Arc<AtomicBool>, gcm_key: [u8; 16], rikeyid: i32, audio_cap: AudioCapSlot) {
     let _ = std::thread::Builder::new()
         .name("lumen-audio".into())
         .spawn(move || {
             tracing::info!("audio stream starting");
-            if let Err(e) = run(&running, &gcm_key, rikeyid) {
+            if let Err(e) = run(&running, &gcm_key, rikeyid, &audio_cap) {
                 tracing::error!(error = %format!("{e:#}"), "audio stream failed");
             }
             running.store(false, Ordering::SeqCst);
@@ -46,7 +49,12 @@ pub fn start(running: Arc<AtomicBool>, gcm_key: [u8; 16], rikeyid: i32) {
         });
 }
 
-fn run(running: &AtomicBool, gcm_key: &[u8; 16], rikeyid: i32) -> Result<()> {
+fn run(
+    running: &AtomicBool,
+    gcm_key: &[u8; 16],
+    rikeyid: i32,
+    audio_cap: &std::sync::Mutex<Option<Box<dyn AudioCapturer>>>,
+) -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", AUDIO_PORT)).context("bind audio UDP")?;
     // The client pings the audio port (~every 500ms) so we learn where to send.
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -59,7 +67,26 @@ fn run(running: &AtomicBool, gcm_key: &[u8; 16], rikeyid: i32) -> Result<()> {
         .context("connect client audio endpoint")?;
     tracing::info!(%client, "audio: client endpoint learned");
 
-    let mut cap = audio::open_audio_capture().context("open audio capture")?;
+    // Reuse the persistent capturer (create on first stream); drain stale buffered audio.
+    let mut cap = match audio_cap.lock().unwrap().take() {
+        Some(mut c) => {
+            c.drain();
+            c
+        }
+        None => audio::open_audio_capture().context("open audio capture")?,
+    };
+    let result = audio_body(&mut *cap, &sock, gcm_key, rikeyid, running);
+    *audio_cap.lock().unwrap() = Some(cap);
+    result
+}
+
+fn audio_body(
+    cap: &mut dyn AudioCapturer,
+    sock: &UdpSocket,
+    gcm_key: &[u8; 16],
+    rikeyid: i32,
+    running: &AtomicBool,
+) -> Result<()> {
     // RESTRICTED_LOWDELAY + CBR, matching Sunshine — CBR keeps the Opus TOC byte constant,
     // which the client asserts per stream.
     let mut enc = Encoder::new(SAMPLE_RATE, Channels::Stereo, Application::LowDelay)

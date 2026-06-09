@@ -58,6 +58,12 @@ pub trait Capturer: Send {
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
         self.next_frame().map(Some)
     }
+
+    /// Gate expensive per-frame work so the capturer can be kept alive (reused) between
+    /// streams without burning CPU. The portal capturer skips the de-pad copy while inactive;
+    /// the default is a no-op (synthetic sources are produced on demand). Set `true` for the
+    /// duration of a stream, `false` when it ends.
+    fn set_active(&self, _active: bool) {}
 }
 
 /// A deterministic moving test pattern (BGRx). Lets M0 exercise the encode → file →

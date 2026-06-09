@@ -39,6 +39,10 @@ impl AudioCapturer for PwAudioCapturer {
             Err(RecvTimeoutError::Disconnected) => Err(anyhow!("pipewire audio thread ended")),
         }
     }
+
+    fn drain(&mut self) {
+        while self.chunks.try_recv().is_ok() {}
+    }
 }
 
 fn pw_thread(tx: std::sync::mpsc::SyncSender<Vec<f32>>) -> Result<()> {

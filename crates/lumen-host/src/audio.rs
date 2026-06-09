@@ -15,6 +15,10 @@ pub trait AudioCapturer: Send {
     /// Block until the next chunk of interleaved samples is available (variable size). The
     /// caller reframes into fixed Opus frames.
     fn next_chunk(&mut self) -> Result<Vec<f32>>;
+
+    /// Discard any buffered chunks (called when a persistent capturer is reused for a new
+    /// stream, so the client doesn't hear stale audio captured while idle). Default: no-op.
+    fn drain(&mut self) {}
 }
 
 /// Open a live capturer for the default sink monitor (system output) via PipeWire.

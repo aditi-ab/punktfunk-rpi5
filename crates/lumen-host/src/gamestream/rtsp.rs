@@ -167,7 +167,12 @@ fn handle_request(req: &Request, state: &AppState) -> String {
             match cfg {
                 Some(cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
                     tracing::info!("RTSP PLAY — starting video stream");
-                    stream::start(cfg, state.streaming.clone(), state.force_idr.clone());
+                    stream::start(
+                        cfg,
+                        state.streaming.clone(),
+                        state.force_idr.clone(),
+                        state.video_cap.clone(),
+                    );
                 }
                 Some(_) => tracing::info!("RTSP PLAY — stream already running"),
                 None => tracing::warn!("RTSP PLAY — no negotiated config (ANNOUNCE missing)"),
@@ -178,7 +183,12 @@ fn handle_request(req: &Request, state: &AppState) -> String {
             if let Some(ls) = launch {
                 if !state.audio_streaming.swap(true, Ordering::SeqCst) {
                     tracing::info!("RTSP PLAY — starting audio stream");
-                    audio::start(state.audio_streaming.clone(), ls.gcm_key, ls.rikeyid);
+                    audio::start(
+                        state.audio_streaming.clone(),
+                        ls.gcm_key,
+                        ls.rikeyid,
+                        state.audio_cap.clone(),
+                    );
                 }
             }
             response(&req.cseq, &[("Session", "DEADBEEFCAFE;timeout = 90")], None)
