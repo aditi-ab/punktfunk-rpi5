@@ -50,9 +50,10 @@ pub trait Encoder: Send {
     fn flush(&mut self) -> Result<()>;
 }
 
-/// Open an NVENC encoder for packed RGB/BGR CPU frames of the given `format` and mode.
-/// `format`, `bitrate_bps`, `codec`, and the mode come from session negotiation; M0 takes
-/// them from the first captured frame.
+/// Open an NVENC encoder for frames of the given `format` and mode. When `cuda` is true the
+/// encoder takes GPU frames (`AV_PIX_FMT_CUDA`) from the zero-copy path; otherwise it takes
+/// packed RGB/BGR CPU frames. `format`/`bitrate_bps`/`codec`/mode come from session
+/// negotiation; the caller derives `cuda` from the first captured frame's payload.
 pub fn open_video(
     codec: Codec,
     format: PixelFormat,
@@ -60,15 +61,16 @@ pub fn open_video(
     height: u32,
     fps: u32,
     bitrate_bps: u64,
+    cuda: bool,
 ) -> Result<Box<dyn Encoder>> {
     #[cfg(target_os = "linux")]
     {
-        let enc = linux::NvencEncoder::open(codec, format, width, height, fps, bitrate_bps)?;
+        let enc = linux::NvencEncoder::open(codec, format, width, height, fps, bitrate_bps, cuda)?;
         Ok(Box::new(enc) as Box<dyn Encoder>)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (codec, format, width, height, fps, bitrate_bps);
+        let _ = (codec, format, width, height, fps, bitrate_bps, cuda);
         anyhow::bail!("NVENC encode requires Linux (FFmpeg + NVIDIA driver)")
     }
 }

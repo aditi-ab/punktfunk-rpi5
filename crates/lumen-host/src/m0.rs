@@ -75,9 +75,16 @@ pub fn run(opts: Options) -> Result<()> {
         bitrate_bps = opts.bitrate_bps,
         "opening NVENC encoder"
     );
-    let mut encoder =
-        encode::open_video(opts.codec, first.format, w, h, opts.fps, opts.bitrate_bps)
-            .context("open encoder")?;
+    let mut encoder = encode::open_video(
+        opts.codec,
+        first.format,
+        w,
+        h,
+        opts.fps,
+        opts.bitrate_bps,
+        first.is_cuda(),
+    )
+    .context("open encoder")?;
 
     let mut sink = BufWriter::new(
         File::create(&opts.out).with_context(|| format!("create {}", opts.out.display()))?,

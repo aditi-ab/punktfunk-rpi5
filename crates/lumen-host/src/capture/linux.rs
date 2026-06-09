@@ -15,7 +15,7 @@
 //! graceful stop (pipewire `channel` quit + Session close) belongs with the M2 session
 //! lifecycle.
 
-use super::{CapturedFrame, Capturer, PixelFormat};
+use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{anyhow, Context, Result};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,7 +148,7 @@ fn portal_thread(setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String
                 .select_sources(
                     &session,
                     SelectSourcesOptions::default()
-                        .set_cursor_mode(CursorMode::Hidden)
+                        .set_cursor_mode(CursorMode::Embedded)
                         // Only MONITOR is offered by the wlroots backend
                         // (AvailableSourceTypes=1); requesting unsupported types
                         // invalidates the session.
@@ -251,7 +251,7 @@ fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedF
                 .select_sources(
                     &session,
                     SelectSourcesOptions::default()
-                        .set_cursor_mode(CursorMode::Hidden)
+                        .set_cursor_mode(CursorMode::Embedded)
                         .set_sources(BitFlags::from_flag(SourceType::Monitor))
                         .set_multiple(false)
                         .set_persist_mode(PersistMode::DoNot),
@@ -297,7 +297,7 @@ fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedF
 mod pipewire {
     //! The PipeWire consumer, confined to its own thread (the PW types are `!Send`).
 
-    use super::{CapturedFrame, PixelFormat};
+    use super::{CapturedFrame, FramePayload, PixelFormat};
     use anyhow::{Context, Result};
     use pipewire as pw;
     use pw::{properties::properties, spa};
@@ -462,7 +462,7 @@ mod pipewire {
                     height: h as u32,
                     pts_ns,
                     format: fmt,
-                    cpu_bytes: tight,
+                    payload: FramePayload::Cpu(tight),
                 };
                 // Drop if the encoder is behind — never block the pipewire loop.
                 let _ = ud.tx.try_send(frame);

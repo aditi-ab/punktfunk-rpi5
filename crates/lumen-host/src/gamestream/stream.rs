@@ -121,6 +121,7 @@ fn stream_body(
         frame.height,
         cfg.fps,
         cfg.bitrate_kbps as u64 * 1000,
+        frame.is_cuda(),
     )
     .context("open NVENC for stream")?;
     // FEC overhead percent (Sunshine default 20). Override with LUMEN_FEC_PCT (0 = data-only).

@@ -58,3 +58,8 @@ opus = "0.3"
 reis = { version = "0.6.1", features = ["tokio"] }
 # `StreamExt::next` on reis's tokio event stream in the libei worker loop.
 futures-util = "0.3"
+# Zero-copy capture (plan §9): EGL imports the PipeWire dmabuf, CUDA maps it, NVENC encodes
+# it with no CPU roundtrip. `khronos-egl` (dynamic = load the NVIDIA libEGL at runtime) gives
+# eglCreateImage + the dma_buf import; the CUDA driver API (EGL interop) and libgbm are linked
+# via hand-rolled FFI in `src/zerocopy/` (no Rust crate exposes the EGL-interop driver calls).
+khronos-egl = { version = "6", features = ["dynamic"] }

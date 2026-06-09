@@ -8,12 +8,88 @@
 //! every IDR — the output is both a playable raw Annex-B stream and self-contained AUs.
 
 use super::{Codec, EncodedFrame, Encoder};
-use crate::capture::{CapturedFrame, PixelFormat};
-use anyhow::{anyhow, Context, Result};
+use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
+use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
 use ffmpeg::util::frame::Video as VideoFrame;
 use ffmpeg::{codec, encoder, Dictionary, Packet, Rational};
 use ffmpeg_next as ffmpeg;
+use std::os::raw::c_int;
+
+use ffmpeg::ffi; // = ffmpeg_sys_next
+
+/// `AVCUDADeviceContext` (libavutil/hwcontext_cuda.h) — not in the ffmpeg-sys bindings (the
+/// crate doesn't allowlist that header), so mirror its stable 3-pointer layout. We set the
+/// first field to *our* `CUcontext` so NVENC shares the context the EGL importer maps into.
+#[repr(C)]
+struct AVCUDADeviceContext {
+    cuda_ctx: *mut std::ffi::c_void, // CUcontext
+    stream: *mut std::ffi::c_void,   // CUstream (null = default)
+    internal: *mut std::ffi::c_void, // filled by ctx_init
+}
+
+/// CUDA hardware-frame contexts that wrap our shared `CUcontext`, so `hevc_nvenc` reads the
+/// imported device buffer directly. Owns two `AVBufferRef`s, unref'd on drop.
+struct CudaHw {
+    device_ref: *mut ffi::AVBufferRef,
+    frames_ref: *mut ffi::AVBufferRef,
+}
+
+impl CudaHw {
+    /// Build a CUDA hwdevice wrapping `cu_ctx` and a frames pool (`sw_format` = `pixel`).
+    unsafe fn new(cu_ctx: *mut std::ffi::c_void, sw_format: Pixel, w: u32, h: u32) -> Result<Self> {
+        let mut device_ref = ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA);
+        if device_ref.is_null() {
+            bail!("av_hwdevice_ctx_alloc(CUDA) failed");
+        }
+        let dev_ctx = (*device_ref).data as *mut ffi::AVHWDeviceContext;
+        let cu = (*dev_ctx).hwctx as *mut AVCUDADeviceContext;
+        (*cu).cuda_ctx = cu_ctx; // share the importer's context
+        let r = ffi::av_hwdevice_ctx_init(device_ref);
+        if r < 0 {
+            ffi::av_buffer_unref(&mut device_ref);
+            bail!("av_hwdevice_ctx_init failed ({r})");
+        }
+
+        let mut frames_ref = ffi::av_hwframe_ctx_alloc(device_ref);
+        if frames_ref.is_null() {
+            ffi::av_buffer_unref(&mut device_ref);
+            bail!("av_hwframe_ctx_alloc failed");
+        }
+        let fc = (*frames_ref).data as *mut ffi::AVHWFramesContext;
+        (*fc).format = ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
+        (*fc).sw_format = pixel_to_av(sw_format);
+        (*fc).width = w as c_int;
+        (*fc).height = h as c_int;
+        (*fc).initial_pool_size = 0; // we supply the device pointers
+        let r = ffi::av_hwframe_ctx_init(frames_ref);
+        if r < 0 {
+            ffi::av_buffer_unref(&mut frames_ref);
+            ffi::av_buffer_unref(&mut device_ref);
+            bail!("av_hwframe_ctx_init failed ({r})");
+        }
+        Ok(CudaHw {
+            device_ref,
+            frames_ref,
+        })
+    }
+}
+
+impl Drop for CudaHw {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::av_buffer_unref(&mut self.frames_ref);
+            ffi::av_buffer_unref(&mut self.device_ref);
+        }
+    }
+}
+
+/// `ffmpeg::format::Pixel` → raw `AVPixelFormat`.
+fn pixel_to_av(p: Pixel) -> ffi::AVPixelFormat {
+    // `Pixel` is `#[repr(i32)]`-compatible with `AVPixelFormat` (the bindgen enum) via this
+    // documented conversion in ffmpeg-next.
+    ffi::AVPixelFormat::from(p)
+}
 
 /// Map a captured layout to the NVENC input pixel format, and whether a 3→4 byte expand is
 /// needed (packed RGB/BGR have no padding byte; the NVENC `*0` formats do).
@@ -30,11 +106,13 @@ fn nvenc_input(format: PixelFormat) -> (Pixel, bool) {
 
 pub struct NvencEncoder {
     enc: encoder::video::Encoder,
-    /// Reusable 4-bpp input frame in `nvenc_pixel` (its plane stride may exceed width*4).
+    /// Reusable 4-bpp CPU input frame (CPU path only; `None` for the zero-copy/CUDA path).
     /// Mutating it in place across frames is sound only because the encoder is opened with
     /// `delay=0`/`bf=0`/`max_b_frames=0` and the caller drains `poll()` after each `submit`,
     /// so libavcodec holds no reference to the previous frame's buffer when we overwrite it.
-    frame: VideoFrame,
+    frame: Option<VideoFrame>,
+    /// Zero-copy path: CUDA hwdevice/hwframes contexts (the encoder takes `AV_PIX_FMT_CUDA`).
+    cuda: Option<CudaHw>,
     src_format: PixelFormat,
     expand: bool,
     width: u32,
@@ -46,6 +124,10 @@ pub struct NvencEncoder {
     force_kf: bool,
 }
 
+// `CudaHw` holds raw `AVBufferRef`s; the encoder lives on a single thread. The CPU encoder is
+// already `Send` via ffmpeg-next; assert it for the CUDA fields too.
+unsafe impl Send for NvencEncoder {}
+
 impl NvencEncoder {
     pub fn open(
         codec: Codec,
@@ -54,6 +136,7 @@ impl NvencEncoder {
         height: u32,
         fps: u32,
         bitrate_bps: u64,
+        cuda: bool,
     ) -> Result<Self> {
         ffmpeg::init().context("ffmpeg init")?;
         let name = codec.nvenc_name();
@@ -75,6 +158,23 @@ impl NvencEncoder {
         video.set_gop(fps.saturating_mul(2).max(1)); // ~2s keyframe interval
         video.set_max_b_frames(0);
 
+        // For the zero-copy path, take CUDA surfaces: wrap the shared CUcontext in CUDA
+        // hwdevice/hwframes contexts and set `pix_fmt = CUDA` on the raw encoder context
+        // *before* open (NVENC derives the device from `hw_frames_ctx`).
+        let cuda_hw = if cuda {
+            let cu_ctx = crate::zerocopy::cuda::context().context("shared CUDA context")?;
+            let hw = unsafe { CudaHw::new(cu_ctx, nvenc_pixel, width, height)? };
+            unsafe {
+                let raw = video.as_mut_ptr();
+                (*raw).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
+                (*raw).hw_device_ctx = ffi::av_buffer_ref(hw.device_ref);
+                (*raw).hw_frames_ctx = ffi::av_buffer_ref(hw.frames_ref);
+            }
+            Some(hw)
+        } else {
+            None
+        };
+
         // Low-latency NVENC tuning (plan §7 / linux-setup doc).
         let mut opts = Dictionary::new();
         opts.set("preset", "p1"); // fastest
@@ -87,10 +187,15 @@ impl NvencEncoder {
             .open_with(opts)
             .with_context(|| format!("open {name} ({width}x{height}@{fps}, {bitrate_bps} bps)"))?;
 
-        let frame = VideoFrame::new(nvenc_pixel, width, height);
+        let frame = if cuda {
+            None
+        } else {
+            Some(VideoFrame::new(nvenc_pixel, width, height))
+        };
         Ok(NvencEncoder {
             enc,
             frame,
+            cuda: cuda_hw,
             src_format: format,
             expand,
             width,
@@ -112,53 +217,15 @@ impl Encoder for NvencEncoder {
             self.width,
             self.height
         );
-        anyhow::ensure!(
-            captured.format == self.src_format,
-            "captured format {:?} != encoder source {:?}",
-            captured.format,
-            self.src_format
-        );
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let src_bpp = self.src_format.bytes_per_pixel();
-        let src_row = w * src_bpp;
-        anyhow::ensure!(
-            captured.cpu_bytes.len() >= src_row * h,
-            "captured buffer {} bytes < required {}",
-            captured.cpu_bytes.len(),
-            src_row * h
-        );
-
-        let stride = self.frame.stride(0); // dst is 4-bpp, aligned
-        let dst = self.frame.data_mut(0);
-        if self.expand {
-            // packed 3-bpp RGB/BGR → 4-bpp *0 (copy 3 bytes, zero the pad byte)
-            for y in 0..h {
-                let s = &captured.cpu_bytes[y * src_row..y * src_row + src_row];
-                let drow = &mut dst[y * stride..y * stride + w * 4];
-                for x in 0..w {
-                    drow[x * 4..x * 4 + 3].copy_from_slice(&s[x * 3..x * 3 + 3]);
-                    drow[x * 4 + 3] = 0;
-                }
-            }
-        } else {
-            // 4-bpp → 4-bpp, honoring the (possibly larger) dst stride
-            for y in 0..h {
-                dst[y * stride..y * stride + src_row]
-                    .copy_from_slice(&captured.cpu_bytes[y * src_row..y * src_row + src_row]);
-            }
-        }
-        self.frame.set_pts(Some(self.frame_idx));
+        let pts = self.frame_idx;
         self.frame_idx += 1;
         // Force an IDR when requested (client RFI); otherwise let NVENC pick (GOP/P-frame).
-        if self.force_kf {
-            self.frame.set_kind(ffmpeg::picture::Type::I);
-            self.force_kf = false;
-        } else {
-            self.frame.set_kind(ffmpeg::picture::Type::None);
+        let idr = self.force_kf;
+        self.force_kf = false;
+        match &captured.payload {
+            FramePayload::Cuda(buf) => self.submit_cuda(buf, pts, idr),
+            FramePayload::Cpu(bytes) => self.submit_cpu(bytes, captured.format, pts, idr),
         }
-        self.enc.send_frame(&self.frame).context("send_frame")?;
-        Ok(())
     }
 
     fn request_keyframe(&mut self) {
@@ -193,6 +260,99 @@ impl Encoder for NvencEncoder {
 
     fn flush(&mut self) -> Result<()> {
         self.enc.send_eof().context("send_eof")?;
+        Ok(())
+    }
+}
+
+impl NvencEncoder {
+    /// CPU path: expand/copy the packed RGB/BGR bytes into the reusable 4-bpp frame, then send.
+    fn submit_cpu(&mut self, bytes: &[u8], format: PixelFormat, pts: i64, idr: bool) -> Result<()> {
+        anyhow::ensure!(
+            format == self.src_format,
+            "captured format {:?} != encoder source {:?}",
+            format,
+            self.src_format
+        );
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let src_bpp = self.src_format.bytes_per_pixel();
+        let src_row = w * src_bpp;
+        anyhow::ensure!(
+            bytes.len() >= src_row * h,
+            "captured buffer {} bytes < required {}",
+            bytes.len(),
+            src_row * h
+        );
+        let frame = self
+            .frame
+            .as_mut()
+            .context("CPU frame missing (encoder opened in CUDA mode)")?;
+        let stride = frame.stride(0); // dst is 4-bpp, aligned
+        let dst = frame.data_mut(0);
+        if self.expand {
+            // packed 3-bpp RGB/BGR → 4-bpp *0 (copy 3 bytes, zero the pad byte)
+            for y in 0..h {
+                let s = &bytes[y * src_row..y * src_row + src_row];
+                let drow = &mut dst[y * stride..y * stride + w * 4];
+                for x in 0..w {
+                    drow[x * 4..x * 4 + 3].copy_from_slice(&s[x * 3..x * 3 + 3]);
+                    drow[x * 4 + 3] = 0;
+                }
+            }
+        } else {
+            // 4-bpp → 4-bpp, honoring the (possibly larger) dst stride
+            for y in 0..h {
+                dst[y * stride..y * stride + src_row]
+                    .copy_from_slice(&bytes[y * src_row..y * src_row + src_row]);
+            }
+        }
+        frame.set_pts(Some(pts));
+        frame.set_kind(if idr {
+            ffmpeg::picture::Type::I
+        } else {
+            ffmpeg::picture::Type::None
+        });
+        self.enc.send_frame(frame).context("send_frame")?;
+        Ok(())
+    }
+
+    /// Zero-copy path: wrap the imported CUDA device buffer in an `AV_PIX_FMT_CUDA` frame and
+    /// send it straight to NVENC (no CPU touch). `buf.ptr` aliases device memory we own, so
+    /// `buf[0]` is left null (ffmpeg must not free it); the frame shell is freed after send.
+    fn submit_cuda(
+        &mut self,
+        buf: &crate::zerocopy::DeviceBuffer,
+        pts: i64,
+        idr: bool,
+    ) -> Result<()> {
+        let frames_ref = self
+            .cuda
+            .as_ref()
+            .context("CUDA hw context missing (encoder opened in CPU mode)")?
+            .frames_ref;
+        unsafe {
+            let mut f = ffi::av_frame_alloc();
+            if f.is_null() {
+                bail!("av_frame_alloc failed");
+            }
+            (*f).format = ffi::AVPixelFormat::AV_PIX_FMT_CUDA as c_int;
+            (*f).width = self.width as c_int;
+            (*f).height = self.height as c_int;
+            (*f).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
+            (*f).data[0] = buf.ptr as *mut u8;
+            (*f).linesize[0] = buf.pitch as c_int;
+            (*f).pts = pts;
+            (*f).pict_type = if idr {
+                ffi::AVPictureType::AV_PICTURE_TYPE_I
+            } else {
+                ffi::AVPictureType::AV_PICTURE_TYPE_NONE
+            };
+            let r = ffi::avcodec_send_frame(self.enc.as_mut_ptr(), f);
+            ffi::av_frame_free(&mut f);
+            if r < 0 {
+                bail!("avcodec_send_frame(CUDA) failed ({r})");
+            }
+        }
         Ok(())
     }
 }

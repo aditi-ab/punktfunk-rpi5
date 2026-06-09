@@ -23,6 +23,8 @@ mod pipeline;
 mod pwinit;
 mod vdisplay;
 mod web;
+#[cfg(target_os = "linux")]
+mod zerocopy;
 
 use anyhow::{bail, Result};
 use encode::Codec;
@@ -52,6 +54,9 @@ fn real_main() -> Result<()> {
         // Standalone input-injection smoke test (no client needed): open the session's input
         // backend and inject a scripted mouse/keyboard pattern. Watch a focused app / `wev`.
         Some("input-test") => input_test(),
+        // Zero-copy FFI/GPU probe: init the EGL importer + CUDA context (no capture needed).
+        #[cfg(target_os = "linux")]
+        Some("zerocopy-probe") => zerocopy::probe(),
         // M0 pipeline spike.
         Some("m0") => m0::run(parse_m0(&args[1..])?),
         Some("-h") | Some("--help") | Some("help") | None => {

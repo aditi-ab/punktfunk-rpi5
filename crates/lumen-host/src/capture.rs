@@ -33,17 +33,40 @@ impl PixelFormat {
     }
 }
 
-/// A captured frame. For zero-copy the real type would wrap a dmabuf fd + modifier; the
-/// CPU buffer is the M0 fallback path (plan §9 risk: per-GPU dmabuf import quirks).
+/// A captured frame. [`format`](Self::format)/dimensions describe the pixels regardless of
+/// where they live — [`payload`](Self::payload) is either a CPU buffer (the M0/fallback path)
+/// or a GPU buffer already on the device (the zero-copy path, plan §9).
 pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub pts_ns: u64,
-    /// Pixel layout of `cpu_bytes`.
+    /// Pixel layout of the payload.
     pub format: PixelFormat,
-    /// Tightly-packed pixels in `format`, `width * height * format.bytes_per_pixel()`
-    /// bytes (no row padding).
-    pub cpu_bytes: Vec<u8>,
+    pub payload: FramePayload,
+}
+
+/// Where a captured frame's pixels live.
+pub enum FramePayload {
+    /// Tightly-packed CPU pixels in `format`, `width*height*bytes_per_pixel` (no row padding).
+    Cpu(Vec<u8>),
+    /// A pitched GPU buffer (BGRA-order, on the shared CUDA context) — the zero-copy path. The
+    /// dmabuf has already been imported + copied into this owned device buffer.
+    #[cfg(target_os = "linux")]
+    Cuda(crate::zerocopy::DeviceBuffer),
+}
+
+impl CapturedFrame {
+    /// True if the frame's pixels are a GPU/CUDA buffer (the zero-copy path).
+    pub fn is_cuda(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self.payload, FramePayload::Cuda(_))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
 }
 
 /// Produces frames from a captured output. Lives on its own thread, feeding the encoder
@@ -130,7 +153,7 @@ impl Capturer for SyntheticCapturer {
             height: self.height,
             pts_ns,
             format: PixelFormat::Bgrx,
-            cpu_bytes: self.buf.clone(),
+            payload: FramePayload::Cpu(self.buf.clone()),
         })
     }
 }
@@ -173,7 +196,7 @@ impl Capturer for FastSyntheticCapturer {
             height: self.height,
             pts_ns: 0,
             format: PixelFormat::Bgrx,
-            cpu_bytes: self.buf.clone(),
+            payload: FramePayload::Cpu(self.buf.clone()),
         })
     }
 }
