@@ -68,7 +68,10 @@ struct MgmtState {
 
 /// Run the management API server (control plane; spawned alongside the nvhttp servers).
 pub async fn run(state: Arc<AppState>, opts: Options) -> Result<()> {
-    if opts.token.is_none() && !opts.bind.ip().is_loopback() {
+    // A blank token is no token: it must neither satisfy the non-loopback guard below nor
+    // become a credential an empty `Authorization: Bearer ` header would match.
+    let token = opts.token.filter(|t| !t.trim().is_empty());
+    if token.is_none() && !opts.bind.ip().is_loopback() {
         bail!(
             "management API bind {} is not loopback — set --mgmt-token (or LUMEN_MGMT_TOKEN) \
              to expose it beyond this machine",
@@ -77,10 +80,10 @@ pub async fn run(state: Arc<AppState>, opts: Options) -> Result<()> {
     }
     tracing::info!(
         addr = %opts.bind,
-        auth = if opts.token.is_some() { "bearer" } else { "none (loopback)" },
+        auth = if token.is_some() { "bearer" } else { "none (loopback)" },
         "management API listening (docs at /api/docs, spec at /api/v1/openapi.json)"
     );
-    let app = app(state, opts.token, opts.bind.port());
+    let app = app(state, token, opts.bind.port());
     axum_server::bind(opts.bind)
         .serve(app.into_make_service())
         .await
@@ -335,6 +338,25 @@ fn api_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+/// `axum::Json` whose rejections (bad JSON → 400/422, wrong content-type → 415) are
+/// rewrapped in the [`ApiError`] envelope, keeping "every non-2xx body is `ApiError`" true.
+struct ApiJson<T>(T);
+
+impl<S, T> axum::extract::FromRequest<S> for ApiJson<T>
+where
+    Json<T>: axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err(api_error(rejection.status(), &rejection.body_text())),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------------------
@@ -377,6 +399,8 @@ fn token_eq(presented: &str, expected: &str) -> bool {
     path = "/health",
     tag = "host",
     operation_id = "getHealth",
+    // Override the document-global bearerAuth: this route is exempt in `require_auth`.
+    security(()),
     responses((status = OK, description = "Host is up", body = Health))
 )]
 async fn get_health() -> Json<Health> {
@@ -494,7 +518,10 @@ fn client_info(der: &[u8]) -> PairedClient {
 
 /// Unpair a client
 ///
-/// Removes the pinned certificate; the client must pair again to reconnect.
+/// Removes the client's certificate from the pairing store. Caveat: the nvhttp TLS layer
+/// does not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed
+/// client cert — a planned hardening step), so until that lands this removes the client
+/// from the listing without severing its ability to reconnect.
 #[utoipa::path(
     delete,
     path = "/clients/{fingerprint}",
@@ -566,14 +593,16 @@ async fn get_pairing_status(State(st): State<Arc<MgmtState>>) -> Json<PairingSta
     request_body = SubmitPin,
     responses(
         (status = NO_CONTENT, description = "PIN delivered to the waiting handshake"),
-        (status = BAD_REQUEST, description = "Malformed PIN", body = ApiError),
+        (status = BAD_REQUEST, description = "Malformed PIN or unparseable JSON body", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
         (status = CONFLICT, description = "No pairing handshake is waiting for a PIN", body = ApiError),
+        (status = UNSUPPORTED_MEDIA_TYPE, description = "Body is not application/json", body = ApiError),
+        (status = UNPROCESSABLE_ENTITY, description = "JSON body does not match the schema", body = ApiError),
     )
 )]
 async fn submit_pairing_pin(
     State(st): State<Arc<MgmtState>>,
-    Json(req): Json<SubmitPin>,
+    ApiJson(req): ApiJson<SubmitPin>,
 ) -> Response {
     let pin = req.pin.trim();
     if pin.is_empty() || pin.len() > 16 || !pin.bytes().all(|b| b.is_ascii_digit()) {
@@ -832,6 +861,31 @@ mod tests {
             send(&app, post(r#"{"pin":"1234"}"#)).await.0,
             StatusCode::CONFLICT
         );
+
+        // axum's own body rejections must still wear the ApiError envelope (ApiJson).
+        let (status, body) = send(&app, post("{not json")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].is_string(), "syntax error: {body}");
+        let (status, body) = send(&app, post(r#"{"wrong":"shape"}"#)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["error"].is_string(), "schema mismatch: {body}");
+        let no_ct = axum::http::Request::post("/api/v1/pair/pin")
+            .body(Body::from(r#"{"pin":"1234"}"#))
+            .unwrap();
+        let (status, body) = send(&app, no_ct).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(body["error"].is_string(), "media type: {body}");
+    }
+
+    /// A blank token must not satisfy the "non-loopback requires a token" guard.
+    #[tokio::test]
+    async fn blank_token_rejected_for_public_bind() {
+        let opts = Options {
+            bind: "0.0.0.0:0".parse().unwrap(),
+            token: Some("   ".into()),
+        };
+        let err = run(test_state(), opts).await.unwrap_err();
+        assert!(err.to_string().contains("not loopback"), "{err}");
     }
 
     #[tokio::test]
@@ -905,6 +959,12 @@ mod tests {
         op_ids.dedup();
         assert_eq!(total, op_ids.len(), "duplicate operationIds");
         assert!(doc["components"]["securitySchemes"]["bearerAuth"].is_object());
+        // The health probe overrides the document-global bearer requirement (the server
+        // exempts it in `require_auth`; the spec must agree).
+        assert_eq!(
+            doc["paths"]["/api/v1/health"]["get"]["security"],
+            serde_json::json!([{}])
+        );
 
         let checked_in = include_str!("../../../docs/api/openapi.json");
         assert_eq!(

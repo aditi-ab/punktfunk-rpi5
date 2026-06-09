@@ -145,7 +145,16 @@ fn parse_serve(args: &[String]) -> Result<mgmt::Options> {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("bad --mgmt-bind (want IP:PORT)"))?
             }
-            "--mgmt-token" => opts.token = Some(next()?),
+            "--mgmt-token" => {
+                let token = next()?;
+                // An empty token would satisfy the non-loopback "token required" guard
+                // while authenticating nobody (or, worse, everybody) — refuse it loudly
+                // rather than letting `--mgmt-token "$UNSET_VAR"` ship a dead credential.
+                if token.trim().is_empty() {
+                    bail!("--mgmt-token must not be empty");
+                }
+                opts.token = Some(token);
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);

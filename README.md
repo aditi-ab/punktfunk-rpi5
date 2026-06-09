@@ -24,16 +24,17 @@ loopback round-trip under loss, property tests, and a **C ABI harness**) passes 
 macOS/aarch64. **M0 is done:** `lumen-host` captures a headless wlroots output via the
 ScreenCast portal + PipeWire, encodes it with NVENC, writes a playable H.265 file, and
 round-trips every access unit through a `lumen_core` host→client session (see
-`docs/linux-setup.md`). The remaining Linux host backends (KWin/Mutter virtual displays,
-libei input, web/pairing) are `#[cfg(target_os = "linux")]` seams — defined and compiling,
-implementations pending (M2).
+`docs/linux-setup.md`). M2 is in flight: the GameStream control plane (`gamestream/`) and
+the management REST API (`mgmt.rs`, OpenAPI spec in `docs/api/`) are implemented; the
+remaining Linux host backends (KWin/Mutter virtual displays, libei input) are
+`#[cfg(target_os = "linux")]` seams — defined and compiling, implementations pending.
 
 ## Layout
 
 ```
 crates/
   lumen-core/        protocol · FEC · pacing · crypto — the C ABI (lib + cdylib + staticlib)
-  lumen-host/        Linux host: vdisplay · capture · encode · inject · web (cfg-gated)
+  lumen-host/        Linux host: vdisplay · capture · encode · inject · gamestream · mgmt
   lumen-client-rs/   reference client (M4): VAAPI decode + wgpu present
 clients/{apple,android}/   native client scaffolds (import lumen_core.h)
 include/lumen_core.h       cbindgen-generated C header (checked in)
