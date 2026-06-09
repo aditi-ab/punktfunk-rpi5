@@ -6,6 +6,7 @@
 //! Status: P1.1 — mDNS `_nvstream._tcp` advertisement + `/serverinfo`. Pairing, RTSP, and
 //! the media streams follow (see the M2 task list / plan).
 
+pub mod apps;
 mod audio;
 mod cert;
 mod control;
@@ -73,6 +74,8 @@ pub struct LaunchSession {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// `/launch?appid=N` — selects the app-catalog entry (session recipe).
+    pub appid: u32,
 }
 
 /// Shared control-plane state used as the axum app state.
@@ -110,7 +113,7 @@ pub fn serve() -> Result<()> {
         host,
         identity,
         pairing: pairing::Pairing::new(),
-        paired: std::sync::Mutex::new(Vec::new()),
+        paired: std::sync::Mutex::new(load_paired()),
         launch: std::sync::Mutex::new(None),
         stream: std::sync::Mutex::new(None),
         streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -176,4 +179,45 @@ fn primary_local_ip() -> Option<IpAddr> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
     sock.local_addr().ok().map(|a| a.ip())
+}
+
+/// Where the paired-client allow-list persists (survives host restarts, like Sunshine).
+fn paired_path() -> Option<std::path::PathBuf> {
+    Some(std::path::Path::new(&std::env::var("HOME").ok()?).join(".config/lumen/paired.json"))
+}
+
+/// Load the persisted paired-client certificate DERs (empty on first run / parse failure).
+fn load_paired() -> Vec<Vec<u8>> {
+    let Some(path) = paired_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    match serde_json::from_slice::<Vec<Vec<u8>>>(&raw) {
+        Ok(v) => {
+            tracing::info!(clients = v.len(), "loaded persisted pairings");
+            v
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "paired.json unreadable — starting unpaired");
+            Vec::new()
+        }
+    }
+}
+
+/// Persist the paired-client allow-list (called after each successful pairing).
+pub(crate) fn save_paired(paired: &[Vec<u8>]) {
+    let Some(path) = paired_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match serde_json::to_vec(paired) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                tracing::warn!(error = %e, "persisting pairings failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "serializing pairings failed"),
+    }
 }

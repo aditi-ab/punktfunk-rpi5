@@ -81,7 +81,7 @@ async fn h_pin(
 
 async fn h_applist(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
     // One app for now: the headless desktop (the wlroots virtual output).
-    xml("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\">\n<App>\n<IsHdrSupported>0</IsHdrSupported>\n<AppTitle>Desktop</AppTitle>\n<ID>1</ID>\n</App>\n</root>\n".to_string())
+    xml(super::apps::applist_xml())
 }
 
 async fn h_launch(
@@ -118,7 +118,13 @@ async fn h_resume(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn h_cancel(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     *st.launch.lock().unwrap() = None;
-    tracing::info!("cancel — launch session cleared");
+    // Quit semantics: stop the running media threads (they observe these flags) so the session
+    // actually ends — the virtual output/gamescope teardown follows via the capturer's RAII.
+    st.streaming
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    st.audio_streaming
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    tracing::info!("cancel — launch session cleared, streams stopping");
     xml("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\"><cancel>1</cancel></root>\n".to_string())
 }
 
@@ -137,12 +143,14 @@ fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> 
         .get("mode")
         .and_then(|m| parse_mode(m))
         .unwrap_or((1920, 1080, 60));
+    let appid = q.get("appid").and_then(|s| s.parse().ok()).unwrap_or(1);
     Ok(LaunchSession {
         gcm_key,
         rikeyid,
         width,
         height,
         fps,
+        appid,
     })
 }
 

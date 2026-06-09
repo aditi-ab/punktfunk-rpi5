@@ -166,9 +166,17 @@ fn handle_request(req: &Request, state: &AppState) -> String {
             let cfg = *state.stream.lock().unwrap();
             match cfg {
                 Some(cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
-                    tracing::info!("RTSP PLAY — starting video stream");
+                    // Resolve the launched catalog entry (session recipe) for the stream.
+                    let app = state
+                        .launch
+                        .lock()
+                        .unwrap()
+                        .map(|l| l.appid)
+                        .and_then(super::apps::by_id);
+                    tracing::info!(app = ?app.as_ref().map(|a| &a.title), "RTSP PLAY — starting video stream");
                     stream::start(
                         cfg,
+                        app,
                         state.streaming.clone(),
                         state.force_idr.clone(),
                         state.video_cap.clone(),

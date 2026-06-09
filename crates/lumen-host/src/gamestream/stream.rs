@@ -36,6 +36,7 @@ pub type CapturerSlot = Arc<std::sync::Mutex<Option<Box<dyn Capturer>>>>;
 /// the persistent capturer the thread borrows for the stream's duration.
 pub fn start(
     cfg: StreamConfig,
+    app: Option<super::apps::AppEntry>,
     running: Arc<AtomicBool>,
     force_idr: Arc<AtomicBool>,
     video_cap: CapturerSlot,
@@ -44,7 +45,7 @@ pub fn start(
         .name("lumen-video".into())
         .spawn(move || {
             tracing::info!(?cfg, "video stream starting");
-            if let Err(e) = run(cfg, &running, &force_idr, &video_cap) {
+            if let Err(e) = run(cfg, app.as_ref(), &running, &force_idr, &video_cap) {
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }
             running.store(false, Ordering::SeqCst);
@@ -54,6 +55,7 @@ pub fn start(
 
 fn run(
     cfg: StreamConfig,
+    app: Option<&super::apps::AppEntry>,
     running: &Arc<AtomicBool>,
     force_idr: &AtomicBool,
     video_cap: &std::sync::Mutex<Option<Box<dyn Capturer>>>,
@@ -82,9 +84,20 @@ fn run(
     // `video_cap`, since a reconnect at a different resolution needs a freshly-sized output; the
     // output is released when this capturer drops at stream end (RAII via its keepalive).
     if std::env::var("LUMEN_VIDEO_SOURCE").as_deref() == Ok("virtual") {
-        let compositor = crate::vdisplay::detect().context("detect compositor")?;
+        // The launched app picks the compositor (e.g. gamescope for game entries) and the
+        // nested command; env vars remain manual overrides / fallbacks.
+        let compositor = app
+            .and_then(|a| a.compositor)
+            .map(Ok)
+            .unwrap_or_else(|| crate::vdisplay::detect().context("detect compositor"))?;
+        if let Some(cmd) = app.and_then(|a| a.cmd.as_deref()) {
+            // The gamescope backend reads the nested command from this env var; setting it
+            // per-launch is safe (one stream session at a time).
+            std::env::set_var("LUMEN_GAMESCOPE_APP", cmd);
+        }
         tracing::info!(
             ?compositor,
+            app = ?app.map(|a| &a.title),
             w = cfg.width,
             h = cfg.height,
             "video source: virtual display (native client resolution)"

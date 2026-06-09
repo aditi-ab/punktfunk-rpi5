@@ -206,7 +206,11 @@ impl Pairing {
         let hash_ok = expected[..] == s.client_hash[..];
         let sig_ok = verify256(&s.client_pubkey, client_secret, client_sig).is_ok();
         if hash_ok && sig_ok {
-            paired_store.lock().unwrap().push(s.client_cert_der.clone());
+            {
+                let mut store = paired_store.lock().unwrap();
+                store.push(s.client_cert_der.clone());
+                super::save_paired(&store);
+            }
             tracing::info!(uniqueid, "pairing phase 4 — SUCCESS, client cert pinned");
             Ok(paired_xml("", true))
         } else {
