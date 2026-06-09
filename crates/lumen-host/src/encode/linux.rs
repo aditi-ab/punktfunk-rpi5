@@ -139,6 +139,9 @@ impl NvencEncoder {
         cuda: bool,
     ) -> Result<Self> {
         ffmpeg::init().context("ffmpeg init")?;
+        if std::env::var_os("LUMEN_FFMPEG_DEBUG").is_some() {
+            unsafe { ffi::av_log_set_level(48) }; // AV_LOG_DEBUG — surface NVENC hw-frame rejects
+        }
         let name = codec.nvenc_name();
         let av_codec = encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("{name} not built into libavcodec"))?;
@@ -316,9 +319,16 @@ impl NvencEncoder {
         Ok(())
     }
 
-    /// Zero-copy path: wrap the imported CUDA device buffer in an `AV_PIX_FMT_CUDA` frame and
-    /// send it straight to NVENC (no CPU touch). `buf.ptr` aliases device memory we own, so
-    /// `buf[0]` is left null (ffmpeg must not free it); the frame shell is freed after send.
+    /// Zero-copy path: hand the imported CUDA device buffer to NVENC with no CPU touch.
+    ///
+    /// We take a *pooled* surface from the CUDA hwframes context (`av_hwframe_get_buffer`) and
+    /// device→device-copy our imported buffer into it, rather than wrapping our own pointer in a
+    /// bare frame. Two reasons: (1) NVENC's `nvenc_send_frame` ignores frames whose `buf[0]` is
+    /// null and the generic encode path's `av_frame_ref` needs a refcounted buffer — a bare
+    /// frame is rejected with `EINVAL`; (2) NVENC caches CUDA-resource *registrations* keyed by
+    /// device pointer with a bounded table, so a fresh pointer every frame would thrash/overflow
+    /// it — the pool recycles a small set of pointers. The extra copy is device-local (~8 MB at
+    /// 1080p, sub-millisecond on the GPU) and keeps the host fully off the pixel path.
     fn submit_cuda(
         &mut self,
         buf: &crate::zerocopy::DeviceBuffer,
@@ -330,17 +340,28 @@ impl NvencEncoder {
             .as_ref()
             .context("CUDA hw context missing (encoder opened in CPU mode)")?
             .frames_ref;
+        // The device→device copy below uses our shared context directly; make it current on the
+        // encode thread (ffmpeg pushes its own around the pool alloc, so order is fine).
+        crate::zerocopy::cuda::make_current().context("CUDA context current (encode thread)")?;
         unsafe {
             let mut f = ffi::av_frame_alloc();
             if f.is_null() {
                 bail!("av_frame_alloc failed");
             }
-            (*f).format = ffi::AVPixelFormat::AV_PIX_FMT_CUDA as c_int;
-            (*f).width = self.width as c_int;
-            (*f).height = self.height as c_int;
-            (*f).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
-            (*f).data[0] = buf.ptr as *mut u8;
-            (*f).linesize[0] = buf.pitch as c_int;
+            // Pooled CUDA surface: sets format, width/height, data[0]/linesize[0], buf[0] and
+            // hw_frames_ctx. Reused across frames (the pool recycles), keeping NVENC's
+            // registration cache warm.
+            let r = ffi::av_hwframe_get_buffer(frames_ref, f, 0);
+            if r < 0 {
+                ffi::av_frame_free(&mut f);
+                bail!("av_hwframe_get_buffer(CUDA) failed ({r})");
+            }
+            let dst_ptr = (*f).data[0] as crate::zerocopy::cuda::CUdeviceptr;
+            let dst_pitch = (*f).linesize[0] as usize;
+            if let Err(e) = crate::zerocopy::cuda::copy_device_to_device(buf, dst_ptr, dst_pitch) {
+                ffi::av_frame_free(&mut f);
+                return Err(e).context("copy imported buffer into NVENC surface");
+            }
             (*f).pts = pts;
             (*f).pict_type = if idr {
                 ffi::AVPictureType::AV_PICTURE_TYPE_I

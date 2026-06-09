@@ -547,7 +547,7 @@ mod pipewire {
                 // Zero-copy path: if the buffer is a dmabuf and we have an importer, import it
                 // into a CUDA device buffer (no CPU touch) and deliver that. Otherwise fall
                 // through to the shm de-pad copy below.
-                if let (Some(importer), Some(fmt)) = (ud.importer.as_ref(), ud.format) {
+                if let (Some(importer), Some(fmt)) = (ud.importer.as_mut(), ud.format) {
                     if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
                         let plane = crate::zerocopy::DmabufPlane {
                             fd: datas[0].fd(),

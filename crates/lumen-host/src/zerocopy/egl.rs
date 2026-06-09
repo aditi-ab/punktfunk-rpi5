@@ -1,32 +1,223 @@
-//! EGL side of the zero-copy path: open a headless EGLDisplay on the NVIDIA EGL device and
-//! import a PipeWire dmabuf as an `EGLImage` with `EGL_LINUX_DMA_BUF_EXT`. The DRM format
-//! **modifier** is mandatory on NVIDIA (its buffers are tiled; importing without the modifier
-//! yields a corrupt image or `EGL_BAD_MATCH`). The image is handed to CUDA
-//! (`cuGraphicsEGLRegisterImage`) and copied device-to-device into an owned buffer so the
-//! dmabuf can be returned to the compositor immediately.
+//! EGL side of the zero-copy path: open a headless EGLDisplay on the NVIDIA GPU (GBM platform on
+//! the render node) and import a PipeWire dmabuf as an `EGLImage` with `EGL_LINUX_DMA_BUF_EXT`.
+//! The DRM format **modifier** is mandatory on NVIDIA (its buffers are tiled; importing without
+//! the modifier yields a corrupt image or `EGL_BAD_MATCH`).
 //!
-//! NOTE (WIP): the negotiation + EGL import are verified end-to-end against KWin (a tiled
-//! dmabuf reaches `eglCreateImage` successfully), but `cuGraphicsEGLRegisterImage` currently
-//! returns `CUDA_ERROR_INVALID_VALUE` on the dmabuf-imported `EGLImage`. The likely fix is to
-//! bind the `EGLImage` to a GL texture (`glEGLImageTargetTexture2DOES`) and register *that* via
-//! `cuGraphicsGLRegisterImage` (OBS/Sunshine's path), which needs a GL context.
+//! Desktop NVIDIA can't register a dmabuf `EGLImage` with CUDA directly — `cuGraphicsEGLRegisterImage`
+//! is Tegra-only and `cuGraphicsGLRegisterImage` rejects EGLImage-backed textures (their internal
+//! format is opaque). So we follow OBS/Sunshine: bind the `EGLImage` to a GL texture
+//! (`glEGLImageTargetTexture2DOES`), render it through a fullscreen-triangle shader into a plain
+//! immutable `GL_RGBA8` texture (de-tiling and swizzling to the BGRx the encoder wants), then
+//! register *that* texture with CUDA ([`MappedTexture`]) and copy it device-to-device into an
+//! owned [`DeviceBuffer`] so the dmabuf can be returned to the compositor immediately.
 
 #![allow(non_upper_case_globals)]
 
-use super::cuda::{self, DeviceBuffer, MappedImage};
-use anyhow::{ensure, Context as _, Result};
+use super::cuda::{self, DeviceBuffer, MappedTexture};
+use anyhow::{bail, ensure, Context as _, Result};
 use khronos_egl as egl;
-use std::os::raw::c_void;
+use std::os::raw::{c_int, c_void};
 
 // EGL_EXT_image_dma_buf_import / _modifiers + platform enums (not defined by khronos-egl).
 const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
-const EGL_PLATFORM_DEVICE_EXT: egl::Enum = 0x313F;
+const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
 const EGL_LINUX_DRM_FOURCC_EXT: egl::Attrib = 0x3271;
 const EGL_DMA_BUF_PLANE0_FD_EXT: egl::Attrib = 0x3272;
 const EGL_DMA_BUF_PLANE0_OFFSET_EXT: egl::Attrib = 0x3273;
 const EGL_DMA_BUF_PLANE0_PITCH_EXT: egl::Attrib = 0x3274;
 const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: egl::Attrib = 0x3443;
 const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Attrib = 0x3444;
+
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
+const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
+const GL_LINEAR: c_int = 0x2601;
+const GL_NEAREST: c_int = 0x2600;
+const GL_RGBA8: u32 = 0x8058;
+const GL_FRAMEBUFFER: u32 = 0x8D40;
+const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+const GL_TEXTURE0: u32 = 0x84C0;
+const GL_TRIANGLES: u32 = 0x0004;
+const GL_VERTEX_SHADER: u32 = 0x8B31;
+const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+const GL_COMPILE_STATUS: u32 = 0x8B81;
+const GL_LINK_STATUS: u32 = 0x8B82;
+
+// libglvnd's libGL dispatches these to the NVIDIA driver based on the current EGL/GL context.
+#[link(name = "GL")]
+extern "C" {
+    fn glGenTextures(n: c_int, textures: *mut u32);
+    fn glBindTexture(target: u32, texture: u32);
+    fn glTexParameteri(target: u32, pname: u32, param: c_int);
+    fn glDeleteTextures(n: c_int, textures: *const u32);
+    fn glTexStorage2D(target: u32, levels: c_int, internalformat: u32, width: c_int, height: c_int);
+    fn glGetError() -> u32;
+    fn glGenFramebuffers(n: c_int, framebuffers: *mut u32);
+    fn glBindFramebuffer(target: u32, framebuffer: u32);
+    fn glFramebufferTexture2D(
+        target: u32,
+        attachment: u32,
+        textarget: u32,
+        texture: u32,
+        level: c_int,
+    );
+    fn glCheckFramebufferStatus(target: u32) -> u32;
+    fn glViewport(x: c_int, y: c_int, width: c_int, height: c_int);
+    fn glGenVertexArrays(n: c_int, arrays: *mut u32);
+    fn glBindVertexArray(array: u32);
+    fn glDrawArrays(mode: u32, first: c_int, count: c_int);
+    fn glActiveTexture(texture: u32);
+    fn glUseProgram(program: u32);
+    fn glFlush();
+    fn glCreateShader(shader_type: u32) -> u32;
+    fn glShaderSource(shader: u32, count: c_int, string: *const *const i8, length: *const c_int);
+    fn glCompileShader(shader: u32);
+    fn glGetShaderiv(shader: u32, pname: u32, params: *mut c_int);
+    fn glDeleteShader(shader: u32);
+    fn glCreateProgram() -> u32;
+    fn glAttachShader(program: u32, shader: u32);
+    fn glLinkProgram(program: u32);
+    fn glGetProgramiv(program: u32, pname: u32, params: *mut c_int);
+    fn glGetUniformLocation(program: u32, name: *const i8) -> c_int;
+    fn glUniform1i(location: c_int, v0: c_int);
+}
+
+#[link(name = "gbm")]
+extern "C" {
+    fn gbm_create_device(fd: c_int) -> *mut c_void;
+    fn gbm_device_destroy(device: *mut c_void);
+}
+
+/// `glEGLImageTargetTexture2DOES(target, EGLImage)` — loaded via `eglGetProcAddress`.
+type EglImageTargetFn = unsafe extern "system" fn(u32, *mut c_void);
+
+// Fullscreen-triangle blit: sample the dmabuf EGLImage texture and write it (swizzled to BGRA,
+// to match the BGRx the encoder expects) into a normal GL_RGBA8 texture that CUDA *can* register.
+const VERT_SRC: &[u8] = b"#version 330 core\nout vec2 v_tex;\nvoid main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));v_tex=p;gl_Position=vec4(p*2.0-1.0,0.0,1.0);}\n";
+const FRAG_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){o_color=texture(image,v_tex).bgra;}\n";
+
+unsafe fn compile_shader(kind: u32, src: &[u8]) -> Result<u32> {
+    let sh = glCreateShader(kind);
+    ensure!(sh != 0, "glCreateShader failed");
+    let ptr = src.as_ptr() as *const i8;
+    let len = src.len() as c_int;
+    glShaderSource(sh, 1, &ptr, &len);
+    glCompileShader(sh);
+    let mut ok: c_int = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &mut ok);
+    if ok == 0 {
+        glDeleteShader(sh);
+        bail!("GL shader compile failed");
+    }
+    Ok(sh)
+}
+
+unsafe fn compile_program() -> Result<u32> {
+    let vs = compile_shader(GL_VERTEX_SHADER, VERT_SRC)?;
+    let fs = compile_shader(GL_FRAGMENT_SHADER, FRAG_SRC)?;
+    let prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    let mut ok: c_int = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &mut ok);
+    ensure!(ok != 0, "GL program link failed");
+    glUseProgram(prog);
+    let loc = glGetUniformLocation(prog, c"image".as_ptr());
+    if loc >= 0 {
+        glUniform1i(loc, 0); // sampler -> texture unit 0
+    }
+    glUseProgram(0);
+    Ok(prog)
+}
+
+/// Per-size GL machinery to blit a dmabuf EGLImage into a CUDA-registrable `GL_RGBA8` texture.
+struct GlBlit {
+    program: u32,
+    vao: u32,
+    fbo: u32,
+    /// CUDA-registrable destination (immutable GL_RGBA8).
+    dst_tex: u32,
+    /// Source texture re-targeted to each frame's EGLImage.
+    src_tex: u32,
+    width: u32,
+    height: u32,
+}
+
+impl GlBlit {
+    unsafe fn new(width: u32, height: u32) -> Result<GlBlit> {
+        let program = compile_program()?;
+        let mut vao = 0u32;
+        glGenVertexArrays(1, &mut vao); // core profile needs a bound VAO for glDrawArrays
+        let mut fbo = 0u32;
+        glGenFramebuffers(1, &mut fbo);
+
+        let mut dst_tex = 0u32;
+        glGenTextures(1, &mut dst_tex);
+        glBindTexture(GL_TEXTURE_2D, dst_tex);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width as c_int, height as c_int);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+        let mut src_tex = 0u32;
+        glGenTextures(1, &mut src_tex);
+        glBindTexture(GL_TEXTURE_2D, src_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            dst_tex,
+            0,
+        );
+        let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        ensure!(
+            status == GL_FRAMEBUFFER_COMPLETE,
+            "blit FBO incomplete ({status:#x})"
+        );
+        Ok(GlBlit {
+            program,
+            vao,
+            fbo,
+            dst_tex,
+            src_tex,
+            width,
+            height,
+        })
+    }
+
+    /// Bind `image` to the source texture and render it into `dst_tex`.
+    ///
+    /// # Safety: the GL context is current on this thread; `image` is a valid `EGLImage`.
+    unsafe fn run(&self, egl_image_target: EglImageTargetFn, image: *mut c_void) -> Result<()> {
+        glBindTexture(GL_TEXTURE_2D, self.src_tex);
+        let _ = glGetError();
+        egl_image_target(GL_TEXTURE_2D, image);
+        let e = glGetError();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        ensure!(e == 0, "glEGLImageTargetTexture2DOES failed ({e:#x})");
+
+        glBindFramebuffer(GL_FRAMEBUFFER, self.fbo);
+        glViewport(0, 0, self.width as c_int, self.height as c_int);
+        glUseProgram(self.program);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, self.src_tex);
+        glBindVertexArray(self.vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glFlush(); // submit GL work before CUDA maps the texture
+        Ok(())
+    }
+}
 
 /// One dmabuf plane as delivered by PipeWire (single-plane for BGRx).
 #[derive(Clone, Copy, Debug)]
@@ -38,12 +229,20 @@ pub struct DmabufPlane {
 
 type Egl = egl::DynamicInstance<egl::EGL1_5>;
 
-/// Headless EGLDisplay (NVIDIA device platform) used to import dmabufs. Lives on the capture
-/// thread. The device platform — not GBM — is what NVIDIA's CUDA-EGL interop registers against.
+/// Headless EGLDisplay (NVIDIA device platform) + a surfaceless desktop-GL context used to
+/// import dmabufs and bridge them to CUDA via a GL texture. Lives on the capture thread (the GL
+/// context is made current there once).
 pub struct EglImporter {
     egl: Egl,
     display: egl::Display,
     no_ctx: egl::Context,
+    /// Surfaceless GL context (current on the capture thread) for the EGLImage→texture bind.
+    _gl_ctx: egl::Context,
+    egl_image_target: EglImageTargetFn,
+    /// Lazily-created GL blit machinery (recreated if the frame size changes).
+    blit: Option<GlBlit>,
+    gbm: *mut c_void,
+    render_fd: c_int,
 }
 
 // The EGL handles are confined to the capture thread; the struct is moved there once.
@@ -53,43 +252,28 @@ impl EglImporter {
     /// Open a headless EGLDisplay on the NVIDIA EGL device. Also forces the shared CUDA context
     /// to exist (so a later `import` only touches the hot path).
     pub fn new() -> Result<EglImporter> {
+        // GBM platform on the NVIDIA render node: this ties the EGLDisplay (and its GL contexts)
+        // to the same DRM device CUDA-GL interop associates with, which the EGL device platform
+        // did not (cuGraphicsGLRegisterImage rejected device-platform GL textures).
+        let path = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
+        let render_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        ensure!(render_fd >= 0, "open /dev/dri/renderD128 for GBM");
+        let gbm = unsafe { gbm_create_device(render_fd) };
+        if gbm.is_null() {
+            unsafe { libc::close(render_fd) };
+            anyhow::bail!("gbm_create_device failed");
+        }
+
         let egl: Egl =
             unsafe { Egl::load_required() }.context("load libEGL (EGL 1.5 dynamic instance)")?;
-
-        // Enumerate EGL devices and use the first (the NVIDIA GPU on a single-GPU box).
-        type QueryDevicesFn = unsafe extern "system" fn(
-            max_devices: i32,
-            devices: *mut *mut c_void,
-            num_devices: *mut i32,
-        ) -> u32;
-        let query_devices: QueryDevicesFn = unsafe {
-            std::mem::transmute(
-                egl.get_proc_address("eglQueryDevicesEXT")
-                    .context("eglQueryDevicesEXT unavailable")?,
-            )
-        };
-        let device = unsafe {
-            let mut count: i32 = 0;
-            ensure!(
-                query_devices(0, std::ptr::null_mut(), &mut count) != 0 && count > 0,
-                "no EGL devices found"
-            );
-            let mut devices = vec![std::ptr::null_mut::<c_void>(); count as usize];
-            ensure!(
-                query_devices(count, devices.as_mut_ptr(), &mut count) != 0,
-                "eglQueryDevicesEXT enumeration failed"
-            );
-            devices[0]
-        };
-
         let display = unsafe {
             egl.get_platform_display(
-                EGL_PLATFORM_DEVICE_EXT,
-                device as egl::NativeDisplayType,
+                EGL_PLATFORM_GBM_KHR,
+                gbm as egl::NativeDisplayType,
                 &[egl::ATTRIB_NONE],
             )
         }
-        .context("eglGetPlatformDisplay(DEVICE) on the NVIDIA EGL device")?;
+        .context("eglGetPlatformDisplay(GBM) on the NVIDIA render node")?;
         egl.initialize(display).context("eglInitialize")?;
 
         let exts = egl
@@ -106,17 +290,58 @@ impl EglImporter {
             "EGL lacks EGL_EXT_image_dma_buf_import_modifiers (needed for NVIDIA tiled dmabufs)"
         );
 
+        // A surfaceless desktop-GL context so we can bind the dmabuf EGLImage to a GL texture
+        // (cuGraphicsEGLRegisterImage is Tegra-only; desktop CUDA interop goes through GL).
+        egl.bind_api(egl::OPENGL_API)
+            .context("eglBindAPI(OpenGL)")?;
+        // The default EGL_SURFACE_TYPE in eglChooseConfig is WINDOW_BIT, which a headless device
+        // display has none of — request a pbuffer-capable config (we run surfaceless anyway).
+        let config = egl
+            .choose_first_config(
+                display,
+                &[
+                    egl::SURFACE_TYPE,
+                    egl::PBUFFER_BIT,
+                    egl::RENDERABLE_TYPE,
+                    egl::OPENGL_BIT,
+                    egl::NONE,
+                ],
+            )
+            .context("eglChooseConfig")?
+            .context("no EGL config for OpenGL")?;
+        let gl_ctx = egl
+            .create_context(
+                display,
+                config,
+                None,
+                &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE],
+            )
+            .context("eglCreateContext(OpenGL)")?;
+        egl.make_current(display, None, None, Some(gl_ctx))
+            .context("eglMakeCurrent surfaceless (needs EGL_KHR_surfaceless_context)")?;
+        let egl_image_target: EglImageTargetFn = unsafe {
+            std::mem::transmute(
+                egl.get_proc_address("glEGLImageTargetTexture2DOES")
+                    .context("glEGLImageTargetTexture2DOES unavailable")?,
+            )
+        };
+
         // Create the shared CUDA context up front so import() is pure hot path.
         cuda::context().context("create CUDA context")?;
 
         let no_ctx = unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) };
         tracing::info!(
-            "zero-copy EGL importer ready (EGL device platform, dma_buf_import + modifiers)"
+            "zero-copy EGL importer ready (GBM platform + GL texture interop, dma_buf_import + modifiers)"
         );
         Ok(EglImporter {
             egl,
             display,
             no_ctx,
+            _gl_ctx: gl_ctx,
+            egl_image_target,
+            blit: None,
+            gbm,
+            render_fd,
         })
     }
 
@@ -175,7 +400,7 @@ impl EglImporter {
     /// negotiated, or `None` to import with the buffer's implicit modifier (base
     /// `EGL_EXT_image_dma_buf_import`, which the NVIDIA driver resolves for its own buffers).
     pub fn import(
-        &self,
+        &mut self,
         plane: &DmabufPlane,
         width: u32,
         height: u32,
@@ -217,17 +442,43 @@ impl EglImporter {
             )
             .context("eglCreateImage(EGL_LINUX_DMA_BUF_EXT) — modifier mismatch?")?;
 
-        // CUDA: register + map + copy out, then drop the registration and the EGL image.
-        let result = (|| -> Result<DeviceBuffer> {
-            cuda::make_current()?;
-            // SAFETY: `image` is a valid EGLImage we just created; context is current.
-            let mapped = unsafe { MappedImage::register(image.as_ptr()) }?;
-            let dst = DeviceBuffer::alloc(width, height)?;
-            mapped.copy_to(&dst)?;
-            Ok(dst)
-        })();
-
+        // EGLImage → (sampled by a shader) → GL_RGBA8 texture → register *that* with CUDA → map
+        // → array → copy out. Registering the EGLImage texture directly fails (its layout isn't a
+        // CUDA-registrable format); the RGBA8 render target is.
+        let result = self.blit_and_copy(image.as_ptr(), width, height);
         let _ = self.egl.destroy_image(self.display, image);
         result
+    }
+
+    /// Render the dmabuf `image` into the registrable RGBA8 texture and copy it to an owned CUDA
+    /// buffer. (Re)creates the per-size GL blit machinery as needed.
+    fn blit_and_copy(
+        &mut self,
+        image: *mut c_void,
+        width: u32,
+        height: u32,
+    ) -> Result<DeviceBuffer> {
+        cuda::make_current()?;
+        if self.blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
+            self.blit = Some(unsafe { GlBlit::new(width, height)? });
+        }
+        let blit = self.blit.as_ref().unwrap();
+        // SAFETY: GL + CUDA contexts current on this thread; `image` is a valid EGLImage.
+        unsafe { blit.run(self.egl_image_target, image)? };
+        let mapped = unsafe { MappedTexture::register_gl(blit.dst_tex)? };
+        let dst = DeviceBuffer::alloc(width, height)?;
+        mapped.copy_to(&dst)?;
+        Ok(dst)
+    }
+}
+
+impl Drop for EglImporter {
+    fn drop(&mut self) {
+        if !self.gbm.is_null() {
+            unsafe { gbm_device_destroy(self.gbm) };
+        }
+        if self.render_fd >= 0 {
+            unsafe { libc::close(self.render_fd) };
+        }
     }
 }

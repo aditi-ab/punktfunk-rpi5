@@ -1,8 +1,9 @@
-//! Minimal CUDA Driver API FFI for the zero-copy path. No Rust crate exposes the EGL-interop
-//! driver calls (`cuGraphicsEGLRegisterImage` / `cuGraphicsResourceGetMappedEglFrame`) nor
-//! `CUeglFrame`, so we hand-roll exactly what we need and link `libcuda.so.1` (the driver
-//! library — NOT `libcudart`). Symbol names verified against `cust_raw` + `cudaEGL.h`: the
-//! context/mem ops use the `_v2` ABI suffix; the graphics/EGL-interop ops are unsuffixed.
+//! Minimal CUDA Driver API FFI for the zero-copy path. No Rust crate exposes the GL-interop
+//! driver calls we need (`cuGraphicsGLRegisterImage` & co.), so we hand-roll exactly those and
+//! link `libcuda.so.1` (the driver library — NOT `libcudart`). Symbol names verified against
+//! `cust_raw` + `cudaGL.h`: the context/mem ops use the `_v2` ABI suffix; the graphics-interop
+//! ops are unsuffixed. (We use GL interop, not EGL interop: `cuGraphicsEGLRegisterImage` is
+//! Tegra-only on the desktop driver — see [`super::egl`].)
 //!
 //! One process-wide `CUcontext` is created lazily and shared by the EGL importer (capture
 //! thread) and ffmpeg's `hevc_nvenc` (encode thread); each thread makes it current before use.
@@ -24,26 +25,6 @@ pub type CUarray = *mut c_void;
 /// `CUmemorytype` (cuda.h): HOST=1, DEVICE=2, ARRAY=3, UNIFIED=4.
 pub const CU_MEMORYTYPE_DEVICE: c_uint = 2;
 pub const CU_MEMORYTYPE_ARRAY: c_uint = 3;
-
-/// `CUeglFrameType`: ARRAY=0, PITCH=1.
-pub const CU_EGL_FRAME_TYPE_ARRAY: c_uint = 0;
-pub const CU_EGL_FRAME_TYPE_PITCH: c_uint = 1;
-
-/// `CUeglFrame` — exact layout from `cudaEGL.h`. `frame` is a union of `CUarray pArray[3]` and
-/// `void* pPitch[3]`; both are three pointers, so `[*mut c_void; 3]` models it.
-#[repr(C)]
-pub struct CUeglFrame {
-    pub frame: [*mut c_void; 3],
-    pub width: c_uint,
-    pub height: c_uint,
-    pub depth: c_uint,
-    pub pitch: c_uint,
-    pub planeCount: c_uint,
-    pub numChannels: c_uint,
-    pub frameType: c_uint,
-    pub eglColorFormat: c_uint,
-    pub cuFormat: c_uint,
-}
 
 /// `CUDA_MEMCPY2D` (cuda.h, `_v2` ABI). Field order is load-bearing.
 #[repr(C)]
@@ -67,13 +48,6 @@ pub struct CUDA_MEMCPY2D {
     pub Height: usize,
 }
 
-impl Default for CUeglFrame {
-    fn default() -> Self {
-        // SAFETY: all fields are integers or pointers; zero is a valid bit pattern.
-        unsafe { std::mem::zeroed() }
-    }
-}
-
 #[link(name = "cuda")]
 extern "C" {
     fn cuInit(flags: c_uint) -> CUresult;
@@ -91,15 +65,28 @@ extern "C" {
     fn cuMemcpy2D_v2(copy: *const CUDA_MEMCPY2D) -> CUresult;
     fn cuCtxSynchronize() -> CUresult;
 
-    fn cuGraphicsEGLRegisterImage(
+    // GL interop (cudaGL.h) — these symbols have NO `_v2` suffix. `cuGraphicsEGLRegisterImage`
+    // is Tegra-only on the desktop driver, so we go EGLImage → GL texture → register the texture.
+    fn cuGraphicsGLRegisterImage(
         resource: *mut CUgraphicsResource,
-        image: *mut c_void, // EGLImage
-        flags: c_uint,      // CU_GRAPHICS_REGISTER_FLAGS_NONE = 0
+        texture: c_uint, // GLuint
+        target: c_uint,  // GL_TEXTURE_2D = 0x0DE1
+        flags: c_uint,   // CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY = 0x01
     ) -> CUresult;
-    fn cuGraphicsResourceGetMappedEglFrame(
-        egl_frame: *mut CUeglFrame,
+    fn cuGraphicsMapResources(
+        count: c_uint,
+        resources: *mut CUgraphicsResource,
+        stream: *mut c_void,
+    ) -> CUresult;
+    fn cuGraphicsUnmapResources(
+        count: c_uint,
+        resources: *mut CUgraphicsResource,
+        stream: *mut c_void,
+    ) -> CUresult;
+    fn cuGraphicsSubResourceGetMappedArray(
+        array: *mut CUarray,
         resource: CUgraphicsResource,
-        index: c_uint,
+        array_index: c_uint,
         mip_level: c_uint,
     ) -> CUresult;
     fn cuGraphicsUnregisterResource(resource: CUgraphicsResource) -> CUresult;
@@ -197,60 +184,61 @@ impl Drop for DeviceBuffer {
     }
 }
 
-/// A live EGL→CUDA registration. The mapped device memory aliases the dmabuf, so we copy out of
-/// it immediately and then unregister (the EGL image is destroyed by the caller).
-pub struct MappedImage {
+/// A live GL-texture→CUDA registration (mapped). The CUDA array aliases the texture/dmabuf, so
+/// we copy out of it immediately; unmap + unregister happen on drop.
+pub struct MappedTexture {
     resource: CUgraphicsResource,
-    /// `frameType` (ARRAY vs PITCH) determines how to copy out.
-    frame: CUeglFrame,
+    array: CUarray,
 }
 
-impl MappedImage {
-    /// Register an `EGLImage` with CUDA and map it to a `CUeglFrame`.
+impl MappedTexture {
+    /// Register a `GL_TEXTURE_2D` texture with CUDA, map it, and get its array. The desktop
+    /// NVIDIA driver only supports CUDA interop through GL textures (not dmabuf EGLImages
+    /// directly), so the EGLImage is first bound to a GL texture by the caller.
     ///
     /// # Safety
-    /// `image` must be a valid `EGLImage`; the shared context must be current on this thread.
-    pub unsafe fn register(image: *mut c_void) -> Result<MappedImage> {
-        // CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY (0x01): we only read the surface (encode from it).
+    /// The GL context and the shared CUDA context must both be current on this thread, and
+    /// `texture` must be a valid `GL_TEXTURE_2D` bound to the source image.
+    pub unsafe fn register_gl(texture: u32) -> Result<MappedTexture> {
+        const GL_TEXTURE_2D: c_uint = 0x0DE1;
+        const CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY: c_uint = 0x01;
         let mut resource: CUgraphicsResource = std::ptr::null_mut();
         ck(
-            cuGraphicsEGLRegisterImage(&mut resource, image, 0x01),
-            "cuGraphicsEGLRegisterImage",
+            cuGraphicsGLRegisterImage(
+                &mut resource,
+                texture,
+                GL_TEXTURE_2D,
+                CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY,
+            ),
+            "cuGraphicsGLRegisterImage",
         )?;
-        let mut frame = CUeglFrame::default();
-        let r = cuGraphicsResourceGetMappedEglFrame(&mut frame, resource, 0, 0);
-        if r != 0 {
+        if cuGraphicsMapResources(1, &mut resource, std::ptr::null_mut()) != 0 {
             let _ = cuGraphicsUnregisterResource(resource);
-            bail!("cuGraphicsResourceGetMappedEglFrame error {r}");
+            bail!("cuGraphicsMapResources failed");
         }
-        Ok(MappedImage { resource, frame })
+        let mut array: CUarray = std::ptr::null_mut();
+        if cuGraphicsSubResourceGetMappedArray(&mut array, resource, 0, 0) != 0 {
+            let _ = cuGraphicsUnmapResources(1, &mut resource, std::ptr::null_mut());
+            let _ = cuGraphicsUnregisterResource(resource);
+            bail!("cuGraphicsSubResourceGetMappedArray failed");
+        }
+        Ok(MappedTexture { resource, array })
     }
 
-    /// Device-to-device copy of this mapped frame into `dst` (de-tiling if the source is a tiled
-    /// CUarray). After this returns the dmabuf is no longer needed.
+    /// Copy the mapped array into `dst` (array → pitched device memory). The array is the GL
+    /// blit's already-linear RGBA8 output, so this is a straight copy. After it returns the
+    /// source dmabuf is no longer needed.
     pub fn copy_to(&self, dst: &DeviceBuffer) -> Result<()> {
-        let width_bytes = (self.frame.width as usize).min(dst.width as usize) * 4;
-        let height = (self.frame.height as usize).min(dst.height as usize);
-        let mut copy = CUDA_MEMCPY2D {
+        let copy = CUDA_MEMCPY2D {
+            srcMemoryType: CU_MEMORYTYPE_ARRAY,
+            srcArray: self.array,
             dstMemoryType: CU_MEMORYTYPE_DEVICE,
             dstDevice: dst.ptr,
             dstPitch: dst.pitch,
-            WidthInBytes: width_bytes,
-            Height: height,
+            WidthInBytes: dst.width as usize * 4, // 4 bytes/px (BGRx)
+            Height: dst.height as usize,
             ..Default::default()
         };
-        match self.frame.frameType {
-            CU_EGL_FRAME_TYPE_PITCH => {
-                copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-                copy.srcDevice = self.frame.frame[0] as CUdeviceptr;
-                copy.srcPitch = self.frame.pitch as usize;
-            }
-            CU_EGL_FRAME_TYPE_ARRAY => {
-                copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
-                copy.srcArray = self.frame.frame[0] as CUarray;
-            }
-            other => bail!("unexpected CUeglFrame frameType {other}"),
-        }
         unsafe {
             ck(cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2")?;
             // The copy must complete before the dmabuf is requeued / reused.
@@ -258,19 +246,39 @@ impl MappedImage {
         }
         Ok(())
     }
-
-    pub fn color_format(&self) -> c_uint {
-        self.frame.eglColorFormat
-    }
-    pub fn frame_kind(&self) -> c_uint {
-        self.frame.frameType
-    }
 }
 
-impl Drop for MappedImage {
+/// Copy a pitched device buffer into another device region (device→device), e.g. our imported
+/// [`DeviceBuffer`] into a pooled CUDA surface NVENC owns. Both are 4-byte (BGRx) pixels.
+/// The caller must have the shared context current on this thread (see [`make_current`]).
+pub fn copy_device_to_device(
+    src: &DeviceBuffer,
+    dst_ptr: CUdeviceptr,
+    dst_pitch: usize,
+) -> Result<()> {
+    let copy = CUDA_MEMCPY2D {
+        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+        srcDevice: src.ptr,
+        srcPitch: src.pitch,
+        dstMemoryType: CU_MEMORYTYPE_DEVICE,
+        dstDevice: dst_ptr,
+        dstPitch: dst_pitch,
+        WidthInBytes: src.width as usize * 4,
+        Height: src.height as usize,
+        ..Default::default()
+    };
+    unsafe {
+        ck(cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(dev->dev)")?;
+        ck(cuCtxSynchronize(), "cuCtxSynchronize")?;
+    }
+    Ok(())
+}
+
+impl Drop for MappedTexture {
     fn drop(&mut self) {
         if !self.resource.is_null() {
             unsafe {
+                let _ = cuGraphicsUnmapResources(1, &mut self.resource, std::ptr::null_mut());
                 let _ = cuGraphicsUnregisterResource(self.resource);
             }
         }
