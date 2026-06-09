@@ -608,12 +608,17 @@ mod pipewire {
         } else {
             None
         };
-        // Modifiers our EGL stack can import for BGRx (the layout KWin gives); if none, we can't
-        // negotiate dmabuf and fall back to the shm path.
-        let modifiers = importer
+        // Modifiers our import stack handles for BGRx: the EGL-importable (tiled) set, plus
+        // LINEAR (0) — NVIDIA's EGL won't list it, but LINEAR dmabufs (gamescope's only offer)
+        // import via CUDA external memory instead. Tiled stays first so allocators that can do
+        // both (KWin) prefer it. If none, we can't negotiate dmabuf → shm path.
+        let mut modifiers = importer
             .as_ref()
             .map(|i| i.supported_modifiers(crate::zerocopy::drm_fourcc(PixelFormat::Bgrx).unwrap()))
             .unwrap_or_default();
+        if importer.is_some() && !modifiers.contains(&0) {
+            modifiers.push(0); // DRM_FORMAT_MOD_LINEAR
+        }
         let want_dmabuf = importer.is_some() && !modifiers.is_empty();
         if zerocopy && !want_dmabuf {
             tracing::warn!("zero-copy: no EGL-importable dmabuf modifiers — using CPU path");
@@ -714,6 +719,7 @@ mod pipewire {
                 // Zero-copy path: if the buffer is a dmabuf and we have an importer, import it
                 // into a CUDA device buffer (no CPU touch) and deliver that. Otherwise fall
                 // through to the shm de-pad copy below.
+                let mut gpu_import_broken = false;
                 if let (Some(importer), Some(fmt)) = (ud.importer.as_mut(), ud.format) {
                     if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
                         let plane = crate::zerocopy::DmabufPlane {
@@ -721,11 +727,17 @@ mod pipewire {
                             offset: datas[0].chunk().offset(),
                             stride: datas[0].chunk().stride().max(0) as u32,
                         };
-                        // 0 (unset/LINEAR) → import with the implicit modifier; a real tiled
-                        // modifier (if the producer reported one) → import it explicitly.
+                        // Tiled modifier → EGL/GL de-tile import; LINEAR (0/unset, e.g.
+                        // gamescope) → direct CUDA external-memory import (NVIDIA EGL can't
+                        // sample LINEAR).
                         let modifier = (ud.modifier != 0).then_some(ud.modifier);
                         if let Some(fourcc) = crate::zerocopy::drm_fourcc(fmt) {
-                            match importer.import(&plane, w as u32, h as u32, fourcc, modifier) {
+                            let imported = if modifier.is_some() {
+                                importer.import(&plane, w as u32, h as u32, fourcc, modifier)
+                            } else {
+                                importer.import_linear(&plane, w as u32, h as u32)
+                            };
+                            match imported {
                                 Ok(devbuf) => {
                                     static ONCE: std::sync::atomic::AtomicBool =
                                         std::sync::atomic::AtomicBool::new(true);
@@ -744,19 +756,25 @@ mod pipewire {
                                         format: fmt,
                                         payload: FramePayload::Cuda(devbuf),
                                     });
+                                    return;
                                 }
                                 Err(e) => {
-                                    static ONCE: std::sync::atomic::AtomicBool =
-                                        std::sync::atomic::AtomicBool::new(true);
-                                    if ONCE.swap(false, Ordering::Relaxed) {
-                                        tracing::warn!(error = %format!("{e:#}"),
-                                            "dmabuf import failed — frames dropped (consider unsetting LUMEN_ZEROCOPY)");
-                                    }
+                                    // GPU import unavailable for this buffer kind (e.g. the
+                                    // driver rejects LINEAR external-memory import). Disable
+                                    // the importer and fall through to the CPU mmap path —
+                                    // degraded, not dead.
+                                    tracing::warn!(error = %format!("{e:#}"),
+                                        "dmabuf GPU import failed — falling back to the CPU copy path");
+                                    gpu_import_broken = true;
                                 }
                             }
+                        } else {
+                            return; // format has no DRM fourcc mapping — skip the frame
                         }
-                        return;
                     }
+                }
+                if gpu_import_broken {
+                    ud.importer = None;
                 }
 
                 let d = &mut datas[0];

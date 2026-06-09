@@ -21,6 +21,7 @@ pub type CUstream = *mut c_void; // opaque CUstream_st*
 pub type CUdeviceptr = u64;
 pub type CUgraphicsResource = *mut c_void;
 pub type CUarray = *mut c_void;
+pub type CUexternalMemory = *mut c_void; // opaque CUextMemory_st*
 
 /// `CUmemorytype` (cuda.h): HOST=1, DEVICE=2, ARRAY=3, UNIFIED=4.
 pub const CU_MEMORYTYPE_DEVICE: c_uint = 2;
@@ -47,6 +48,34 @@ pub struct CUDA_MEMCPY2D {
     pub WidthInBytes: usize,
     pub Height: usize,
 }
+
+/// `CUDA_EXTERNAL_MEMORY_HANDLE_DESC` (cuda.h, 64-bit layout). `handle` is a union whose
+/// largest member is the win32 two-pointer struct (16 bytes, align 8); for the OPAQUE_FD type
+/// only the first 4 bytes (the `int fd`) are read.
+#[repr(C)]
+#[derive(Default)]
+pub struct CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
+    pub type_: c_uint, // CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD = 1
+    _pad: u32,
+    pub handle: [u64; 2], // union { int fd; {void*,void*} win32; void* nvSciBufObject }
+    pub size: u64,
+    pub flags: c_uint,
+    reserved: [c_uint; 16],
+    _pad2: u32,
+}
+
+/// `CUDA_EXTERNAL_MEMORY_BUFFER_DESC` (cuda.h, 64-bit layout).
+#[repr(C)]
+#[derive(Default)]
+pub struct CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
+    pub offset: u64,
+    pub size: u64,
+    pub flags: c_uint,
+    reserved: [c_uint; 16],
+    _pad: u32,
+}
+
+pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
 
 #[link(name = "cuda")]
 extern "C" {
@@ -90,6 +119,19 @@ extern "C" {
         mip_level: c_uint,
     ) -> CUresult;
     fn cuGraphicsUnregisterResource(resource: CUgraphicsResource) -> CUresult;
+
+    // External memory (cuda.h, no `_v2` suffix) — imports a (Vulkan-exported) dmabuf fd as
+    // device memory. Used for LINEAR dmabufs (gamescope), which EGL/GL interop can't sample.
+    fn cuImportExternalMemory(
+        ext_mem_out: *mut CUexternalMemory,
+        mem_handle_desc: *const CUDA_EXTERNAL_MEMORY_HANDLE_DESC,
+    ) -> CUresult;
+    fn cuExternalMemoryGetMappedBuffer(
+        dev_ptr: *mut CUdeviceptr,
+        ext_mem: CUexternalMemory,
+        buffer_desc: *const CUDA_EXTERNAL_MEMORY_BUFFER_DESC,
+    ) -> CUresult;
+    fn cuDestroyExternalMemory(ext_mem: CUexternalMemory) -> CUresult;
 }
 
 #[inline]
@@ -195,6 +237,14 @@ impl BufferPool {
             height,
             pitch,
         })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
     }
 
     /// Take a buffer — recycled if one is free, else freshly allocated. The buffer returns to this
@@ -358,4 +408,96 @@ impl Drop for RegisteredTexture {
             }
         }
     }
+}
+
+/// A dmabuf fd imported as CUDA external memory and mapped to a device pointer — the LINEAR
+/// path (gamescope): the buffer's bytes are directly addressable, no GL de-tiling needed.
+/// Cached per PipeWire buffer (the fd pool is stable for a stream's life); destroyed on drop.
+pub struct ExternalDmabuf {
+    ext: CUexternalMemory,
+    pub ptr: CUdeviceptr,
+    pub size: u64,
+}
+
+// Raw driver handles; used from the single capture thread but moved with the importer.
+unsafe impl Send for ExternalDmabuf {}
+
+impl ExternalDmabuf {
+    /// Import `fd` (NOT consumed — an internal `dup` is handed to the driver, which owns it
+    /// from then on) and map its full `size` bytes to a device pointer. The shared context
+    /// must be current.
+    pub fn import(fd: i32, size: u64) -> Result<ExternalDmabuf> {
+        let dup = unsafe { libc::dup(fd) };
+        if dup < 0 {
+            bail!("dup(dmabuf fd) failed");
+        }
+        let mut desc = CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
+            type_: CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+            size,
+            ..Default::default()
+        };
+        desc.handle[0] = dup as u32 as u64; // union member `int fd` (little-endian low bytes)
+        let mut ext: CUexternalMemory = std::ptr::null_mut();
+        let r = unsafe { cuImportExternalMemory(&mut ext, &desc) };
+        if r != 0 {
+            unsafe { libc::close(dup) }; // import failed → the driver did not take the fd
+            bail!("cuImportExternalMemory failed ({r}) — LINEAR dmabuf import unsupported?");
+        }
+        let buf = CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
+            offset: 0,
+            size,
+            ..Default::default()
+        };
+        let mut ptr: CUdeviceptr = 0;
+        let r = unsafe { cuExternalMemoryGetMappedBuffer(&mut ptr, ext, &buf) };
+        if r != 0 {
+            unsafe {
+                let _ = cuDestroyExternalMemory(ext);
+            }
+            bail!("cuExternalMemoryGetMappedBuffer failed ({r})");
+        }
+        Ok(ExternalDmabuf { ext, ptr, size })
+    }
+}
+
+impl Drop for ExternalDmabuf {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(c) = CONTEXT.get() {
+                let _ = cuCtxSetCurrent(c.0);
+            }
+            if self.ptr != 0 {
+                let _ = cuMemFree_v2(self.ptr); // mapped buffers are freed like device memory
+            }
+            if !self.ext.is_null() {
+                let _ = cuDestroyExternalMemory(self.ext);
+            }
+        }
+    }
+}
+
+/// Copy a pitched span starting at `src_ptr` (e.g. an [`ExternalDmabuf`] mapping at the chunk
+/// offset) into `dst`. The shared context must be current on this thread.
+pub fn copy_pitched_to_buffer(
+    src_ptr: CUdeviceptr,
+    src_pitch: usize,
+    dst: &DeviceBuffer,
+) -> Result<()> {
+    let copy = CUDA_MEMCPY2D {
+        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+        srcDevice: src_ptr,
+        srcPitch: src_pitch,
+        dstMemoryType: CU_MEMORYTYPE_DEVICE,
+        dstDevice: dst.ptr,
+        dstPitch: dst.pitch,
+        WidthInBytes: dst.width as usize * 4,
+        Height: dst.height as usize,
+        ..Default::default()
+    };
+    unsafe {
+        ck(cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(ext->dev)")?;
+        // The copy must finish before the dmabuf is requeued to the producer.
+        ck(cuCtxSynchronize(), "cuCtxSynchronize")?;
+    }
+    Ok(())
 }
