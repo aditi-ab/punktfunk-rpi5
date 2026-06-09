@@ -85,7 +85,9 @@ fn input_test() -> Result<()> {
         y,
         flags: 0,
     };
-    tracing::info!("input-test: injecting a mouse square + 'A'/click taps for ~8s (watch wev / focused app)");
+    tracing::info!(
+        "input-test: injecting a mouse square + 'A'/click taps for ~8s (watch wev / focused app)"
+    );
     for i in 0..160u32 {
         let (dx, dy) = match (i / 10) % 4 {
             0 => (12, 0),

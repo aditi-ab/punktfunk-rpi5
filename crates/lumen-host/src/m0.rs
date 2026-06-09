@@ -59,6 +59,10 @@ pub fn run(opts: Options) -> Result<()> {
         }
     };
 
+    // Activate the capturer so the portal/PipeWire process callback actually delivers frames
+    // (it gates the per-frame de-pad on `active`; idle by default so reconnects are cheap).
+    capturer.set_active(true);
+
     // The first frame establishes the authoritative dimensions (the portal's negotiated
     // size, or the synthetic size) used to configure the encoder.
     let first = capturer.next_frame().context("capture first frame")?;
