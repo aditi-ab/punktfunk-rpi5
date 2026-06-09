@@ -10,10 +10,15 @@ Low-latency desktop streaming stack, Linux-first, with a shared Rust protocol co
   suite passes (FEC recovery, loopback-under-loss, proptests, a C ABI harness). It was put
   through an adversarial review and 13 verified findings were fixed + regression-tested
   (commit `a913042`).
-- **The host backends are `#[cfg(target_os = "linux")]` stubs.** They compile everywhere
-  but `bail!` until implemented. This is the next work (**M0**, then **M2**) and needs a
-  real Linux GPU + Wayland stack — which is why this repo is being moved to the NVIDIA
-  Ubuntu VM.
+- **M0 (the pipeline spike) is done and verified** on the NVIDIA box (Ubuntu 25.10, RTX
+  5070 Ti, driver 595): `lumen-host m0` captures a headless wlroots output via the
+  ScreenCast portal + PipeWire, NVENC-encodes it, writes a playable H.265 file, and
+  round-trips every access unit through a `lumen_core` host→client session (0 mismatches).
+  See [`docs/linux-setup.md`](docs/linux-setup.md); the code is in
+  `crates/lumen-host/src/{m0,capture,encode}.rs` (+ `capture/linux.rs`, `encode/linux.rs`).
+- **The remaining host backends are `#[cfg(target_os = "linux")]` stubs** — KWin/Mutter
+  virtual displays (`vdisplay.rs`), libei/uinput input (`inject.rs`), web/pairing
+  (`web.rs`). They compile everywhere but `bail!` until implemented. This is **M2**.
 
 ## Build / test / run
 
@@ -56,19 +61,26 @@ include/lumen_core.h   generated C header
   (`crypto.rs`); the ABI enforces `struct_size` and range-checks inputs. There are
   regression tests for these — keep them green.
 
-## Next: M0 (the pipeline spike) on this VM
+## Running the M0 spike on this box
 
-**Start here on the NVIDIA Ubuntu VM:** [`docs/linux-setup.md`](docs/linux-setup.md), then
-run `bash scripts/bootstrap-ubuntu.sh` (verifies NVIDIA/NVENC, installs the Rust/PipeWire/
-wlroots/FFmpeg-dev deps) and bring up headless Sway with `scripts/headless/`.
+[`docs/linux-setup.md`](docs/linux-setup.md) is the reference. One-time: `bash
+scripts/bootstrap-ubuntu.sh` (verifies NVIDIA/NVENC, installs deps incl. `libnvidia-gl`,
+adds the `render`/`video` groups — re-login after). Then per run: `bash
+scripts/headless/run-headless-sway.sh` (shell 1) and `bash
+scripts/headless/prepare-session.sh` (shell 2), then `cargo run -p lumen-host -- m0
+--source portal --out /tmp/lumen-m0.h265`. `--source synthetic` needs no capture session.
 
-Per plan §8/§12: drive a headless Sway/wlroots output → capture via PipeWire (ScreenCast
-portal, `ashpd` 0.13 + `pipewire` 0.10) → encode with NVENC (`ffmpeg-next` 7.x,
-`hevc_nvenc`) → write a playable H.265 file. Then wire that pipeline into a `lumen-core`
-host `Session` (M2). The module seams exist in
-`crates/lumen-host/src/{vdisplay,capture,encode,inject,pipeline}.rs`. **Budget for the
-CPU-copy fallback first** — dmabuf→NVENC zero-copy import is unreliable across NVIDIA
-driver versions (plan §9 risk); the setup doc covers it.
+M0 uses the **CPU-copy capture path** (portal → PipeWire shm, packed `RGB` on wlroots →
+NVENC `rgb0`); dmabuf→NVENC zero-copy is deferred (plan §9). Pinned crate facts (the setup
+doc has the why): `ashpd` **0.13** (`screencast` feature, options-struct API, multi-thread
+tokio runtime) + `pipewire` **0.9** (must match ashpd's; not 0.10) + `ffmpeg-next` **7.x**.
+
+## Next: M2 — P1 host to a stock Moonlight client
+
+Wire M0's capture→encode pipeline (`m0.rs` / `pipeline.rs`) into a streaming host: KWin
+virtual output (`vdisplay.rs`, study KRdp), `serverinfo`/pairing/RTSP (`web.rs`) enough for
+a real Moonlight client, input via reis/uinput (`inject.rs`). The module seams exist and
+`bail!` today.
 
 ## Conventions
 

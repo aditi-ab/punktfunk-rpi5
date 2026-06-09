@@ -6,20 +6,26 @@
 //! `#[cfg(target_os = "linux")]`; the crate compiles everywhere so the workspace builds
 //! on non-Linux dev machines — it just can't run the pipeline there.
 //!
-//! Status: scaffold. M0 wires capture→encode→file; M2 wires the full P1 host that a
-//! stock Moonlight client connects to.
+//! Status: M0. The `m0` subcommand runs the capture→encode→file pipeline spike and feeds
+//! the encoded AUs through a `lumen_core` loopback. M2 wires the full P1 host that a stock
+//! Moonlight client connects to.
 
 // Scaffold: trait methods and config paths are defined ahead of their backends.
 #![allow(dead_code)]
 
 mod capture;
 mod encode;
+mod gamestream;
 mod inject;
+mod m0;
 mod pipeline;
 mod vdisplay;
 mod web;
 
-use vdisplay::{Compositor, Mode};
+use anyhow::{bail, Result};
+use encode::Codec;
+use m0::{Options, Source};
+use std::path::PathBuf;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -28,34 +34,147 @@ fn main() {
         )
         .init();
 
-    tracing::info!(
-        "lumen-host scaffold (lumen_core ABI v{})",
-        lumen_core::ABI_VERSION
-    );
-
-    // The intended startup sequence (each step is a separate, pluggable subsystem):
-    //   1. negotiate mode + codec + FEC scheme over the control plane (web::WebConfig)
-    //   2. vdisplay::open(compositor).create(mode)  -> client-sized virtual output
-    //   3. capture::open_pipewire(node) ; encode::open(codec, bitrate)
-    //   4. build a lumen_core::Session (host role) over a UDP transport to the client
-    //   5. loop pipeline::pump_once(..)  until disconnect, then destroy the output
-    let target_mode = Mode {
-        width: 2560,
-        height: 1440,
-        refresh_hz: 240,
-    };
-    let compositor = Compositor::Kwin; // MVP target
-
-    if cfg!(target_os = "linux") {
-        tracing::info!(
-            ?compositor,
-            ?target_mode,
-            "would create a virtual output and start streaming (backends pending M0/M2)"
-        );
-    } else {
-        tracing::warn!(
-            "this is a Linux host; on {} only the shared lumen_core builds and is testable",
-            std::env::consts::OS
-        );
+    if let Err(e) = real_main() {
+        tracing::error!("{e:#}");
+        std::process::exit(1);
     }
+}
+
+fn real_main() -> Result<()> {
+    tracing::info!("lumen-host (lumen_core ABI v{})", lumen_core::ABI_VERSION);
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        // M2 GameStream host control plane (P1.1: mDNS + serverinfo).
+        Some("serve") => gamestream::serve(),
+        // M0 pipeline spike.
+        Some("m0") => m0::run(parse_m0(&args[1..])?),
+        Some("-h") | Some("--help") | Some("help") | None => {
+            print_usage();
+            Ok(())
+        }
+        // Bare flags (no subcommand) default to the m0 spike for back-compat.
+        Some(_) => m0::run(parse_m0(&args)?),
+    }
+}
+
+fn parse_m0(args: &[String]) -> Result<Options> {
+    let mut source = Source::Portal;
+    let mut width = 1920u32;
+    let mut height = 1080u32;
+    let mut fps = 60u32;
+    let mut seconds = 5u32;
+    let mut codec = Codec::H265;
+    let mut bitrate_mbps = 20u64;
+    let mut out: Option<PathBuf> = None;
+    let mut loopback = true;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let mut next = || {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing value for {arg}"))
+        };
+        match arg {
+            "--source" => {
+                source = match next()?.as_str() {
+                    "synthetic" => Source::Synthetic,
+                    "portal" => Source::Portal,
+                    other => bail!("unknown --source '{other}' (synthetic|portal)"),
+                }
+            }
+            "--width" => {
+                width = next()?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad --width"))?
+            }
+            "--height" => {
+                height = next()?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad --height"))?
+            }
+            "--fps" => fps = next()?.parse().map_err(|_| anyhow::anyhow!("bad --fps"))?,
+            "--seconds" => {
+                seconds = next()?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad --seconds"))?
+            }
+            "--codec" => {
+                codec = match next()?.as_str() {
+                    "h264" => Codec::H264,
+                    "h265" | "hevc" => Codec::H265,
+                    "av1" => Codec::Av1,
+                    other => bail!("unknown --codec '{other}' (h264|h265|av1)"),
+                }
+            }
+            "--bitrate" => {
+                bitrate_mbps = next()?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad --bitrate (Mbps)"))?
+            }
+            "--out" => out = Some(PathBuf::from(next()?)),
+            "--no-loopback" => loopback = false,
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => bail!("unknown argument '{other}' (try --help)"),
+        }
+        i += 1;
+    }
+
+    if fps == 0 || width == 0 || height == 0 || seconds == 0 {
+        bail!("--fps/--width/--height/--seconds must be > 0");
+    }
+
+    let out = out.unwrap_or_else(|| {
+        let ext = match codec {
+            Codec::H264 => "h264",
+            Codec::H265 => "h265",
+            Codec::Av1 => "obu",
+        };
+        PathBuf::from(format!("/tmp/lumen-m0.{ext}"))
+    });
+
+    Ok(Options {
+        source,
+        width,
+        height,
+        fps,
+        seconds,
+        codec,
+        bitrate_bps: bitrate_mbps.saturating_mul(1_000_000),
+        out,
+        loopback,
+    })
+}
+
+fn print_usage() {
+    eprintln!(
+        "lumen-host — Linux streaming host
+
+USAGE:
+    lumen-host serve              GameStream host control plane (M2: mDNS + serverinfo …)
+    lumen-host m0 [OPTIONS]       M0 capture→encode→file pipeline spike
+
+OPTIONS:
+    --source <synthetic|portal>  frame source (default: portal)
+    --seconds <N>                capture duration in seconds (default: 5)
+    --fps <N>                    target frame rate (default: 60)
+    --codec <h264|h265|av1>      NVENC codec (default: h265)
+    --bitrate <MBPS>             target bitrate in Mbps (default: 20)
+    --width <W> --height <H>     synthetic source size (default: 1920x1080)
+    --out <PATH>                 raw Annex-B output (default: /tmp/lumen-m0.<ext>)
+    --no-loopback                skip the lumen_core round-trip verification
+    -h, --help                   this help
+
+NOTES:
+    'portal' needs headless Sway + xdg-desktop-portal-wlr running in this session
+    (see docs/linux-setup.md). 'synthetic' needs no capture session and always runs.
+    Encoded AUs are written to a playable file AND (unless --no-loopback) fed through a
+    lumen_core host→client loopback that reassembles and byte-verifies each one."
+    );
 }

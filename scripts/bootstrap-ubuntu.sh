@@ -25,9 +25,10 @@ fi
 CODENAME="$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-unknown}")"
 case "$CODENAME" in
     noble) ok "Ubuntu 24.04 (noble) — the recommended target" ;;
+    questing) ok "Ubuntu 25.10 (questing) — newer than the tested 24.04; M0 verified here (Sway 1.10, FFmpeg 7.1)" ;;
     jammy) warn "Ubuntu 22.04 (jammy): Sway 1.7 / FFmpeg 4.4 are too old for the M0 path. \
-Strongly prefer 24.04, or build Sway/wlroots + FFmpeg 7.x from source here." ;;
-    *)     warn "Unrecognized release '$CODENAME' — proceeding, but package names are tuned for noble." ;;
+Strongly prefer 24.04+, or build Sway/wlroots + FFmpeg 7.x from source here." ;;
+    *)     warn "Unrecognized release '$CODENAME' — proceeding, but package names are tuned for noble/questing." ;;
 esac
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 
@@ -92,7 +93,50 @@ apt_install "Wayland dev"       libwayland-dev wayland-protocols wayland-utils
 apt_install "DRM/EGL/GBM/VA"    libdrm-dev libgbm-dev libgbm1 libegl-dev libegl1 libgles-dev mesa-common-dev libva-dev
 apt_install "capture + dbus"    wf-recorder grim dbus-user-session drm-info mesa-utils
 apt_try     "NVIDIA EGL platform (multiverse)"  libnvidia-egl-wayland1 libnvidia-egl-gbm1
-apt_try     "libei (noble only; reis is pure-Rust so optional)"  libei-dev
+apt_try     "libei (reis is pure-Rust so optional)"  libei-dev
+
+# ---------------------------------------------------------------------------
+log "NVIDIA GL/EGL userspace (headless GPU Wayland needs this — nvidia-utils alone is NOT enough)"
+# ---------------------------------------------------------------------------
+# nvidia-utils-NNN ships nvidia-smi + NVENC (libnvidia-encode) but NOT the GL/EGL libs.
+# Without libnvidia-gl-NNN there is no libEGL_nvidia.so.0 and no GLVND vendor JSON
+# (/usr/share/glvnd/egl_vendor.d/10_nvidia.json), so libglvnd falls back to Mesa, wlroots
+# can't init EGL on the NVIDIA GPU, Sway is forced to the pixman software renderer, and the
+# ScreenCast portal then can't negotiate a dmabuf buffer format (capture fails). Install the
+# GL package matching the running driver.
+if have nvidia-smi; then
+    if [ -e /usr/share/glvnd/egl_vendor.d/10_nvidia.json ] && ldconfig -p 2>/dev/null | grep -qi 'libEGL_nvidia'; then
+        ok "NVIDIA GL/EGL userspace present (libEGL_nvidia + 10_nvidia.json)"
+    elif [ -n "${DRV:-}" ]; then
+        apt_try "NVIDIA GL/EGL userspace (libnvidia-gl-$DRV)" "libnvidia-gl-$DRV"
+        [ -e /usr/share/glvnd/egl_vendor.d/10_nvidia.json ] \
+            && ok "10_nvidia.json now present — GPU EGL should work" \
+            || warn "10_nvidia.json still missing — install the libnvidia-gl package matching driver $DRV by hand."
+    else
+        warn "Couldn't determine the driver branch; install libnvidia-gl-<NNN> matching 'nvidia-smi' by hand."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+log "GPU device group membership (render + video) — required to open /dev/dri/*"
+# ---------------------------------------------------------------------------
+# wlroots opens the render node (/dev/dri/renderD128, group 'render') and the DRM card
+# (/dev/dri/card*, group 'video'); both are 0660. Without membership Sway aborts with
+# 'Permission denied' on the render node.
+TARGET_USER="${SUDO_USER:-$USER}"
+NEED_GROUPS=""
+for g in render video; do
+    id -nG "$TARGET_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$g" || NEED_GROUPS="$NEED_GROUPS $g"
+done
+if [ -n "$NEED_GROUPS" ]; then
+    warn "$TARGET_USER is not in:$NEED_GROUPS — adding (takes effect on next LOGIN; re-login or reboot):"
+    for g in $NEED_GROUPS; do echo "       $SUDO usermod -aG $g $TARGET_USER"; done
+    $SUDO usermod -aG "$(echo "$NEED_GROUPS" | tr ' ' ',' | sed 's/^,//')" "$TARGET_USER" 2>/dev/null \
+        && ok "added; LOG OUT AND BACK IN (or reboot) for it to apply" \
+        || warn "could not usermod automatically — run the commands above."
+else
+    ok "$TARGET_USER already in render + video"
+fi
 
 # ---------------------------------------------------------------------------
 log "FFmpeg dev headers (gated — must NOT clobber your custom NVENC build)"

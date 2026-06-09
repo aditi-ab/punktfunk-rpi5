@@ -13,16 +13,20 @@ negotiated extension. See [`docs/implementation-plan.md`](docs/implementation-pl
 | Milestone | State |
 |-----------|-------|
 | **M1 — `lumen-core` + C ABI** | ✅ done & tested (FEC, packetization, crypto, session, `lumen_core.h`) |
-| M0 — pipeline spike (wlroots→PipeWire→encode→file) | ⬜ needs Linux GPU |
-| M2 — P1 host → stock Moonlight | ⬜ scaffolded (`lumen-host`) |
+| **M0 — pipeline spike** (wlroots→PipeWire→NVENC→file→`lumen-core`) | ✅ done & verified on NVIDIA (RTX 5070 Ti / driver 595) |
+| M2 — P1 host → stock Moonlight | 🟡 capture+encode landed in M0; pairing/RTSP/vdisplay pending |
 | M3 — measurement harness | 🟡 `tools/loss-harness` runs; `latency-probe` scaffolded |
 | M4 — P2 transport + Rust client | 🟡 GF(2¹⁶) core done; `lumen-client-rs` scaffolded |
 | M5 — Apple client | ⬜ scaffolded (`clients/apple`) |
 
 `lumen-core` is complete and verified: it builds and its full test suite (FEC recovery,
 loopback round-trip under loss, property tests, and a **C ABI harness**) passes on
-macOS/aarch64. The Linux host backends (PipeWire, VAAPI/NVENC, KWin, libei) are
-`#[cfg(target_os = "linux")]` seams — defined and compiling, implementations pending.
+macOS/aarch64. **M0 is done:** `lumen-host` captures a headless wlroots output via the
+ScreenCast portal + PipeWire, encodes it with NVENC, writes a playable H.265 file, and
+round-trips every access unit through a `lumen_core` host→client session (see
+`docs/linux-setup.md`). The remaining Linux host backends (KWin/Mutter virtual displays,
+libei input, web/pairing) are `#[cfg(target_os = "linux")]` seams — defined and compiling,
+implementations pending (M2).
 
 ## Layout
 

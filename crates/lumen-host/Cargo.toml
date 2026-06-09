@@ -13,15 +13,30 @@ lumen-core = { path = "../lumen-core" }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.8"
+mdns-sd = "0.20"
+tokio = { version = "1", features = ["full"] }
+rsa = "0.9"
+sha2 = { version = "0.10", features = ["oid"] }
+aes = "0.8"
+rand = "0.8"
+hex = "0.4"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+x509-parser = "0.16"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+rustls-pemfile = "2"
 
-# Linux backends are wired in M0/M2. They live behind `#[cfg(target_os = "linux")]`
-# so the workspace stays green on macOS; the dep list (per plan §4) is:
-#
-# [target.'cfg(target_os = "linux")'.dependencies]
-# pipewire   = "..."   # ScreenCast portal stream -> dmabuf (capture)
-# ashpd      = "..."   # xdg-desktop-portal: ScreenCast, RemoteDesktop
-# zbus       = "..."   # DBus: KWin/Mutter virtual-output creation
-# ffmpeg-next / rsmpeg # VAAPI / NVENC encode, dmabuf import
-# reis       = "..."   # libei input injection (Wayland-native)
-# input-linux = "..."  # uinput fallback
-# axum + tokio         # web config / pairing API
+[target.'cfg(target_os = "linux")'.dependencies]
+# `screencast` gates the ScreenCast portal module; `tokio` is the default runtime.
+# `open_pipe_wire_remote` is unconditional, so ashpd's own `pipewire` feature is not
+# needed — we drive PipeWire with the `pipewire` crate below.
+ashpd = { version = "0.13", features = ["screencast"] }
+ffmpeg-next = "7"
+libc = "0.2"
+# Must match the pipewire crate ashpd 0.13 links (libspa/pipewire-sys `links` key is
+# unique per build), i.e. 0.9 — NOT the 0.10 the setup doc mentions.
+pipewire = "0.9"
+# ashpd 0.13 uses the tokio runtime; a current-thread runtime drives the one-time
+# portal handshake (control plane — never the per-frame path).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
