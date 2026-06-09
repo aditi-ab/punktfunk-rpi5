@@ -52,6 +52,9 @@ use zkde::zkde_screencast_unstable_v1::ZkdeScreencastUnstableV1 as Screencast;
 /// remote sees it move with injected input.
 const POINTER_EMBEDDED: u32 = 2;
 
+/// The name we give the created output; KWin exposes it to output-management as `Virtual-<name>`.
+const VOUT_NAME: &str = "lumen";
+
 /// Highest interface version we drive. KWin currently advertises 5; we rely on the `created`
 /// event (deprecated only since v6) for the node id, so cap the bind at 5.
 const MAX_VERSION: u32 = 5;
@@ -87,11 +90,47 @@ impl VirtualDisplay for KwinDisplay {
             Err(_) => bail!("timed out creating the KWin virtual output"),
         };
         tracing::info!(node_id, width, height, "KWin virtual output ready");
+        // KWin creates virtual outputs at a hardcoded 60 Hz and `stream_virtual_output` has no
+        // refresh argument, so when the client wants more we install + select a custom mode
+        // (supported on virtual outputs since KWin 6.6). Done before capture connects PipeWire so
+        // the stream negotiates at the higher rate. First cut shells out to kscreen-doctor; the
+        // in-process kde_output_management_v2 client is a follow-up.
+        if mode.refresh_hz > 60 {
+            set_custom_refresh(width, height, mode.refresh_hz);
+        }
         Ok(VirtualOutput {
             node_id,
             remote_fd: None,
             keepalive: Box::new(StopGuard(stop)),
         })
+    }
+}
+
+/// Best-effort: raise the just-created virtual output's refresh above KWin's default 60 Hz by
+/// installing + selecting a custom mode via `kscreen-doctor` (the output is `Virtual-<VOUT_NAME>`,
+/// refresh given in mHz). Failure leaves the source at 60 Hz — the stream still works, just capped.
+fn set_custom_refresh(width: u32, height: u32, hz: u32) {
+    let output = format!("Virtual-{VOUT_NAME}");
+    let mhz = hz.saturating_mul(1000);
+    let run = |arg: String| {
+        std::process::Command::new("kscreen-doctor")
+            .arg(arg)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    // Add the custom mode (a fresh output has none), then select it.
+    let _ = run(format!(
+        "output.{output}.addCustomMode.{width}.{height}.{mhz}.full"
+    ));
+    if run(format!("output.{output}.mode.{width}x{height}@{hz}")) {
+        tracing::info!(output, hz, "KWin virtual output: custom refresh applied");
+    } else {
+        tracing::warn!(
+            output,
+            hz,
+            "kscreen-doctor refresh set failed — source stays 60 Hz (is kscreen-doctor installed?)"
+        );
     }
 }
 
@@ -207,7 +246,7 @@ fn run(
 
     // Create the virtual output sized to the client, cursor composited into the stream.
     let stream = screencast.stream_virtual_output(
-        "lumen".to_string(),
+        VOUT_NAME.to_string(),
         width as i32,
         height as i32,
         1.0, // scale (logical == physical)
