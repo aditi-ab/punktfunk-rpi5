@@ -1,11 +1,11 @@
 //! The video data plane: on RTSP PLAY, learn the client's UDP endpoint (it pings the video
-//! port), then run capture → NVENC encode → [`VideoPacketizer`] → UDP send. P1.3 uses a fast
-//! synthetic test pattern (proves the wire format with no compositor); swapping in real
-//! portal desktop capture is a one-line source change. Runs on its own native thread.
+//! port), then run capture → NVENC encode → [`VideoPacketizer`] → UDP send. The source is
+//! either real portal desktop capture (`LUMEN_VIDEO_SOURCE=portal`, the M0 PipeWire path) or
+//! a synthetic test pattern (default). Runs on its own native thread.
 
 use super::video::{FrameType, VideoPacketizer};
 use super::VIDEO_PORT;
-use crate::capture::{CapturedFrame, PixelFormat};
+use crate::capture::{self, Capturer, FastSyntheticCapturer};
 use crate::encode::{self, Codec};
 use anyhow::{Context, Result};
 use std::net::UdpSocket;
@@ -55,48 +55,46 @@ fn run(cfg: StreamConfig, running: &AtomicBool) -> Result<()> {
         .context("connect client video endpoint")?;
     tracing::info!(%client, "video: client endpoint learned");
 
-    let (w, h, fps) = (cfg.width, cfg.height, cfg.fps);
+    let use_portal = std::env::var("LUMEN_VIDEO_SOURCE").is_ok_and(|v| v == "portal");
+    let mut capturer: Box<dyn Capturer> = if use_portal {
+        tracing::info!("video source: portal desktop capture");
+        capture::open_portal_monitor().context("open portal capturer")?
+    } else {
+        tracing::info!("video source: synthetic test pattern");
+        Box::new(FastSyntheticCapturer::new(cfg.width, cfg.height))
+    };
+
+    // The first frame establishes the authoritative size/format for the encoder.
+    let mut frame = capturer.next_frame().context("capture first frame")?;
+    if frame.width != cfg.width || frame.height != cfg.height {
+        tracing::warn!(
+            captured = ?(frame.width, frame.height),
+            negotiated = ?(cfg.width, cfg.height),
+            "captured size != negotiated size — Moonlight expects the negotiated size; resize the output"
+        );
+    }
     let mut enc = encode::open_video(
         cfg.codec,
-        PixelFormat::Bgrx,
-        w,
-        h,
-        fps,
+        frame.format,
+        frame.width,
+        frame.height,
+        cfg.fps,
         cfg.bitrate_kbps as u64 * 1000,
     )
     .context("open NVENC for stream")?;
     let mut pk = VideoPacketizer::new(cfg.packet_size);
 
-    let bpp = 4usize;
-    let row = w as usize * bpp;
-    let mut buf = vec![0u8; row * h as usize];
-    let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
+    let frame_interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
     let mut frame_idx: u32 = 0;
     let mut sent_pkts: u64 = 0;
+    let stream_start = Instant::now();
 
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
-
-        // Fast synthetic test pattern: a pulsing grey field + a white band sweeping down.
-        let shade = (frame_idx % 256) as u8;
-        buf.fill(shade);
-        let band_h = (h as usize / 20).max(1);
-        let band_y = (frame_idx as usize * 6) % h as usize;
-        for y in band_y..(band_y + band_h).min(h as usize) {
-            buf[y * row..(y + 1) * row].fill(0xff);
-        }
-
-        let frame = CapturedFrame {
-            width: w,
-            height: h,
-            pts_ns: frame_idx as u64 * 1_000_000_000 / fps as u64,
-            format: PixelFormat::Bgrx,
-            cpu_bytes: std::mem::take(&mut buf),
-        };
         enc.submit(&frame).context("encoder submit")?;
-        buf = frame.cpu_bytes; // reclaim the buffer (no per-frame realloc)
 
-        let ts = (frame_idx as u64 * 90_000 / fps as u64) as u32;
+        // 90 kHz RTP timestamp from wall-clock, so a variable capture rate stays correct.
+        let ts = (stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
         let mut client_gone = false;
         while let Some(au) = enc.poll().context("encoder poll")? {
             let ft = if au.keyframe {
@@ -121,13 +119,18 @@ fn run(cfg: StreamConfig, running: &AtomicBool) -> Result<()> {
         }
 
         frame_idx += 1;
-        if frame_idx % (fps.max(1) * 2) == 0 {
+        if frame_idx % (cfg.fps.max(1) * 2) == 0 {
             tracing::info!(frame_idx, sent_pkts, "video: streaming");
         }
-        let elapsed = tick.elapsed();
-        if elapsed < frame_interval {
-            std::thread::sleep(frame_interval - elapsed);
+        // Synthetic produces instantly, so pace it; the portal's next_frame() blocks at the
+        // capture rate and paces itself.
+        if !use_portal {
+            let elapsed = tick.elapsed();
+            if elapsed < frame_interval {
+                std::thread::sleep(frame_interval - elapsed);
+            }
         }
+        frame = capturer.next_frame().context("capture frame")?;
     }
     Ok(())
 }

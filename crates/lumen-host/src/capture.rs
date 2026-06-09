@@ -121,6 +121,49 @@ impl Capturer for SyntheticCapturer {
     }
 }
 
+/// A cheap moving test pattern (BGRx) for the streaming path: a pulsing field + a white band
+/// sweeping down, generated with whole-buffer `fill`s so it stays real-time even at 5K.
+pub struct FastSyntheticCapturer {
+    width: u32,
+    height: u32,
+    frame_idx: u64,
+    buf: Vec<u8>,
+}
+
+impl FastSyntheticCapturer {
+    pub fn new(width: u32, height: u32) -> Self {
+        assert!(width > 0 && height > 0);
+        FastSyntheticCapturer {
+            width,
+            height,
+            frame_idx: 0,
+            buf: vec![0u8; width as usize * height as usize * 4],
+        }
+    }
+}
+
+impl Capturer for FastSyntheticCapturer {
+    fn next_frame(&mut self) -> Result<CapturedFrame> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let row = w * 4;
+        let shade = (self.frame_idx % 256) as u8;
+        self.buf.fill(shade);
+        let band_h = (h / 20).max(1);
+        let band_y = (self.frame_idx as usize * 6) % h;
+        for y in band_y..(band_y + band_h).min(h) {
+            self.buf[y * row..(y + 1) * row].fill(0xff);
+        }
+        self.frame_idx += 1;
+        Ok(CapturedFrame {
+            width: self.width,
+            height: self.height,
+            pts_ns: 0,
+            format: PixelFormat::Bgrx,
+            cpu_bytes: self.buf.clone(),
+        })
+    }
+}
+
 /// Open a live capturer for a client-sized monitor via the xdg ScreenCast portal
 /// (`ashpd`) → PipeWire (`pipewire`). Implemented in the `linux` submodule.
 #[cfg(target_os = "linux")]
