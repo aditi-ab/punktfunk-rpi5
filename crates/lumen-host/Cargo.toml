@@ -36,7 +36,7 @@ rusty_enet = "0.4"
 # `open_pipe_wire_remote` is unconditional, so ashpd's own `pipewire` feature is not
 # needed — we drive PipeWire with the `pipewire` crate below.
 ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
-ffmpeg-next = "7"
+ffmpeg-next = "8"
 libc = "0.2"
 # Must match the pipewire crate ashpd 0.13 links (libspa/pipewire-sys `links` key is
 # unique per build), i.e. 0.9 — NOT the 0.10 the setup doc mentions.

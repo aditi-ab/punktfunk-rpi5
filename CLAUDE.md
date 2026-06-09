@@ -73,7 +73,8 @@ scripts/headless/prepare-session.sh` (shell 2), then `cargo run -p lumen-host --
 M0 uses the **CPU-copy capture path** (portal → PipeWire shm, packed `RGB` on wlroots →
 NVENC `rgb0`); dmabuf→NVENC zero-copy is deferred (plan §9). Pinned crate facts (the setup
 doc has the why): `ashpd` **0.13** (`screencast` feature, options-struct API, multi-thread
-tokio runtime) + `pipewire` **0.9** (must match ashpd's; not 0.10) + `ffmpeg-next` **7.x**.
+tokio runtime) + `pipewire` **0.9** (must match ashpd's; not 0.10) + `ffmpeg-next` **8.x**
+(binds the system FFmpeg **8.x** / libavcodec 62 on Ubuntu 26.04; bumped from 7.x).
 
 ## Next: M2 — P1 host to a stock Moonlight client
 

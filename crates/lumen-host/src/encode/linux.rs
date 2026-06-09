@@ -1,4 +1,4 @@
-//! NVENC encoder via `ffmpeg-next` (binds the system FFmpeg 7.x / libavcodec 61).
+//! NVENC encoder via `ffmpeg-next` (binds the system FFmpeg 8.x / libavcodec 62).
 //!
 //! Input is a packed RGB/BGR CPU frame; `*_nvenc` accepts `rgb0`/`bgr0`/`rgba`/`bgra`
 //! directly and does the RGB→YUV conversion on the GPU, so the host stays off the
