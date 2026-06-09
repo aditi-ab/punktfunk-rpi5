@@ -51,6 +51,8 @@ pub enum Compositor {
     Wlroots,
     /// Mutter / GNOME — headless backend + Mutter DBus `RecordVirtual`.
     Mutter,
+    /// gamescope — spawned headless at the client's size/refresh; capture its PipeWire node.
+    Gamescope,
 }
 
 /// Detect the compositor to drive: `LUMEN_COMPOSITOR` override, else `XDG_CURRENT_DESKTOP`.
@@ -60,7 +62,10 @@ pub fn detect() -> Result<Compositor> {
             "kwin" | "kde" | "plasma" => Ok(Compositor::Kwin),
             "wlroots" | "sway" | "hyprland" | "wlr" => Ok(Compositor::Wlroots),
             "mutter" | "gnome" => Ok(Compositor::Mutter),
-            other => anyhow::bail!("unknown LUMEN_COMPOSITOR '{other}' (kwin|wlroots|mutter)"),
+            "gamescope" => Ok(Compositor::Gamescope),
+            other => {
+                anyhow::bail!("unknown LUMEN_COMPOSITOR '{other}' (kwin|wlroots|mutter|gamescope)")
+            }
         };
     }
     let desktop = std::env::var("XDG_CURRENT_DESKTOP")
@@ -88,6 +93,7 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     {
         match compositor {
             Compositor::Kwin => Ok(Box::new(kwin::KwinDisplay::new()?)),
+            Compositor::Gamescope => Ok(Box::new(gamescope::GamescopeDisplay::new()?)),
             Compositor::Wlroots => {
                 anyhow::bail!("wlroots virtual-output backend not yet implemented")
             }
@@ -103,5 +109,7 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod gamescope;
 #[cfg(target_os = "linux")]
 mod kwin;

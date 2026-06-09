@@ -54,6 +54,8 @@ wayland-protocols-misc = { version = "0.3", features = ["client"] }
 # `wayland-backend` is referenced by the generated interface tables.
 wayland-scanner = "0.31"
 wayland-backend = "0.3"
+# Parse `pw-dump` JSON to find gamescope's PipeWire node (gamescope backend).
+serde_json = "1"
 # Builds/validates the xkb keymap uploaded to the virtual keyboard + tracks modifier state.
 xkbcommon = "0.8"
 # Opus encode for the GameStream audio stream (links system libopus).

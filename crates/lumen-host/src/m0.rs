@@ -61,20 +61,21 @@ pub fn run(opts: Options) -> Result<()> {
             capture::open_portal_monitor().context("open portal capturer")?
         }
         Source::KwinVirtual => {
+            let compositor = crate::vdisplay::detect().unwrap_or(crate::vdisplay::Compositor::Kwin);
             tracing::info!(
                 width = opts.width,
                 height = opts.height,
-                "M0 source: KWin virtual output (zkde_screencast)"
+                ?compositor,
+                "M0 source: virtual output (LUMEN_COMPOSITOR)"
             );
-            let mut vd = crate::vdisplay::open(crate::vdisplay::Compositor::Kwin)
-                .context("open KWin virtual display")?;
+            let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
             let vout = vd
                 .create(lumen_core::Mode {
                     width: opts.width,
                     height: opts.height,
                     refresh_hz: opts.fps,
                 })
-                .context("create KWin virtual output")?;
+                .context("create virtual output")?;
             capture::capture_virtual_output(vout).context("capture virtual output")?
         }
     };
