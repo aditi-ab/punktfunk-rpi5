@@ -194,6 +194,25 @@ impl NvencEncoder {
         opts.set("delay", "0");
         opts.set("forced-idr", "1"); // RFI/request_keyframe → real IDR under the infinite GOP
 
+        // Split-frame encode across both NVENC engines (GB203 has 2) when the pixel rate exceeds
+        // a single engine's HEVC capacity (~1 Gpix/s); e.g. 5120x1440@240 = 1.77 Gpix/s needs it,
+        // @120 = 0.88 Gpix/s does not. HEVC/AV1 only (not H.264). AUTO won't engage below ~2112px
+        // height, so we force `2`; below the threshold we leave it AUTO (split costs ~2% BD-rate).
+        // Output is standard HEVC — transparent to the client. Override with LUMEN_SPLIT_ENCODE.
+        let pix_rate = width as u64 * height as u64 * fps as u64;
+        let split = std::env::var("LUMEN_SPLIT_ENCODE").ok();
+        match split.as_deref() {
+            Some(mode) => opts.set("split_encode_mode", mode),
+            None if matches!(codec, Codec::H265 | Codec::Av1) && pix_rate > 1_000_000_000 => {
+                opts.set("split_encode_mode", "2");
+                tracing::info!(
+                    pix_rate,
+                    "NVENC: forcing 2-way split encode (high pixel rate)"
+                );
+            }
+            None => {}
+        }
+
         let enc = video
             .open_with(opts)
             .with_context(|| format!("open {name} ({width}x{height}@{fps}, {bitrate_bps} bps)"))?;
