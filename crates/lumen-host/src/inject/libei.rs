@@ -1,14 +1,18 @@
-//! libei input injection via the RemoteDesktop portal — the portable path for KWin and
-//! GNOME/Mutter, which (unlike wlroots/Sway) implement `org.freedesktop.portal.RemoteDesktop`
-//! and route emulated input through libei/EIS rather than the wlr virtual-input protocols.
+//! libei input injection — the portable EI-sender path.
 //!
-//! We use `ashpd` to open a RemoteDesktop session and obtain the EIS socket fd, then `reis` to
-//! drive it as an EI *sender*: bind the seat's pointer/keyboard/scroll/button capabilities and,
-//! per device, `start_emulating` → emit → `frame`. The portal session and the EIS connection
-//! must stay alive and the event stream must be polled continuously (resume/pause/ping/modifier
-//! traffic), so the whole thing runs on a dedicated thread with its own tokio runtime; the
-//! synchronous control thread reaches it through an unbounded channel and [`LibeiInjector::inject`]
-//! merely enqueues.
+//! Two ways to reach an EIS server ([`EiSource`]):
+//! * **Portal** — `org.freedesktop.portal.RemoteDesktop` via `ashpd` (KWin, GNOME/Mutter),
+//!   which hands us the EIS socket fd after the session grant.
+//! * **Socket** — connect directly to a compositor's own EIS socket. gamescope runs an EIS
+//!   server and exports its path to its children as `LIBEI_SOCKET`; our gamescope backend
+//!   relays that path through a file so the injector can connect (no portal involved).
+//!
+//! Either way, `reis` drives the connection as an EI *sender*: bind the seat's
+//! pointer/keyboard/scroll/button capabilities and, per device, `start_emulating` → emit →
+//! `frame`. The session and the EIS connection must stay alive and the event stream must be
+//! polled continuously (resume/pause/ping/modifier traffic), so the whole thing runs on a
+//! dedicated thread with its own tokio runtime; the synchronous control thread reaches it
+//! through an unbounded channel and [`LibeiInjector::inject`] merely enqueues.
 //!
 //! Keyboard codes are Linux evdev (the same space our VK→evdev table produces) and the
 //! compositor supplies the keymap, so — unlike the wlr path — there is no keymap to upload and
@@ -34,6 +38,16 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 /// `code` value marking a horizontal scroll event (mirrors `gamestream::input`).
 const SCROLL_HORIZONTAL: u32 = 1;
 
+/// Where to find the EIS server.
+#[derive(Clone, Debug)]
+pub enum EiSource {
+    /// `org.freedesktop.portal.RemoteDesktop` (KWin, GNOME/Mutter).
+    Portal,
+    /// A file containing the EIS socket path/name (gamescope's relayed `LIBEI_SOCKET`); polled
+    /// until it appears, since the compositor may still be starting.
+    SocketPathFile(std::path::PathBuf),
+}
+
 /// Handle held by the control thread; forwards events to the libei worker thread.
 pub struct LibeiInjector {
     tx: UnboundedSender<InputEvent>,
@@ -41,15 +55,19 @@ pub struct LibeiInjector {
 
 impl LibeiInjector {
     pub fn open() -> Result<Self> {
+        Self::open_with(EiSource::Portal)
+    }
+
+    pub fn open_with(source: EiSource) -> Result<Self> {
         let (tx, rx) = unbounded_channel::<InputEvent>();
         std::thread::Builder::new()
             .name("lumen-libei".into())
-            .spawn(move || worker(rx))
+            .spawn(move || worker(rx, source))
             .map_err(|e| anyhow!("spawn libei worker thread: {e}"))?;
-        // Return immediately — the portal handshake must NOT run on the caller's (control)
-        // thread, or a slow/denied portal would freeze the ENet control stream and drop the
-        // client. The worker establishes the session asynchronously and logs its status;
-        // events enqueue until devices resume (a few startup events may be dropped).
+        // Return immediately — the portal/socket handshake must NOT run on the caller's
+        // (control) thread, or a slow/denied setup would freeze the ENet control stream and
+        // drop the client. The worker establishes the session asynchronously and logs its
+        // status; events enqueue until devices resume (a few startup events may be dropped).
         Ok(Self { tx })
     }
 }
@@ -63,7 +81,7 @@ impl InputInjector for LibeiInjector {
 }
 
 /// Worker thread entry: build a tokio runtime and run the session to completion.
-fn worker(rx: UnboundedReceiver<InputEvent>) {
+fn worker(rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -75,17 +93,17 @@ fn worker(rx: UnboundedReceiver<InputEvent>) {
             return;
         }
     };
-    rt.block_on(session_main(rx));
+    rt.block_on(session_main(rx, source));
 }
 
-/// Open the portal + EIS (bounded), then pump events until disconnect or shutdown.
-async fn session_main(mut rx: UnboundedReceiver<InputEvent>) {
+/// Open the portal/socket + EIS (bounded), then pump events until disconnect or shutdown.
+async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     // Keep `_rd`/`_session` bound for the whole loop — dropping the portal session closes the
     // EIS connection. Bound the setup so a headless approval dialog (un-bypassed grant) can't
     // hang the worker forever.
-    let (_rd, _session, context, mut events) = match tokio::time::timeout(
+    let (_portal, context, mut events) = match tokio::time::timeout(
         Duration::from_secs(30),
-        connect(),
+        connect(source),
     )
     .await
     {
@@ -96,7 +114,7 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>) {
         }
         Err(_) => {
             tracing::error!(
-                    "libei: portal setup timed out (headless approval needed, or kde-authorized grant not seeded / app-id mismatch)"
+                    "libei: EIS setup timed out (headless approval needed / kde-authorized grant not seeded / gamescope socket never appeared)"
                 );
             return;
         }
@@ -119,17 +137,37 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>) {
     }
 }
 
-/// Tie down the verbose tuple the connect step returns.
+/// Tie down the verbose tuple the connect step returns. The portal pair must stay alive for
+/// the whole session (dropping it closes the EIS connection); `None` for the direct-socket path.
 type Connected = (
-    RemoteDesktop,
-    ashpd::desktop::Session<RemoteDesktop>,
+    Option<(RemoteDesktop, ashpd::desktop::Session<RemoteDesktop>)>,
     ei::Context,
     reis::tokio::EiConvertEventStream,
 );
 
-/// Open a RemoteDesktop portal session (pointer + keyboard), connect to EIS, and run the EI
-/// sender handshake. Returns the live portal + EI objects.
-async fn connect() -> Result<Connected> {
+/// Reach an EIS server per `source` and run the EI sender handshake.
+async fn connect(source: EiSource) -> Result<Connected> {
+    let (portal, stream) = match source {
+        EiSource::Portal => {
+            let (rd, session, fd) = connect_portal().await?;
+            (Some((rd, session)), UnixStream::from(fd))
+        }
+        EiSource::SocketPathFile(file) => (None, connect_socket_file(&file).await?),
+    };
+    let context = ei::Context::new(stream).map_err(|e| anyhow!("reis EI context: {e}"))?;
+    let (_conn, events) = context
+        .handshake_tokio("lumen-host", ei::handshake::ContextType::Sender)
+        .await
+        .map_err(|e| anyhow!("EI handshake: {e}"))?;
+    Ok((portal, context, events))
+}
+
+/// Open a RemoteDesktop portal session (pointer + keyboard) and obtain the EIS socket fd.
+async fn connect_portal() -> Result<(
+    RemoteDesktop,
+    ashpd::desktop::Session<RemoteDesktop>,
+    std::os::fd::OwnedFd,
+)> {
     let rd = RemoteDesktop::new()
         .await
         .map_err(|e| anyhow!("open RemoteDesktop portal (is xdg-desktop-portal-kde/gnome running and XDG_CURRENT_DESKTOP set?): {e}"))?;
@@ -160,14 +198,29 @@ async fn connect() -> Result<Connected> {
         .connect_to_eis(&session, ConnectToEISOptions::default())
         .await
         .map_err(|e| anyhow!("connect_to_eis (RemoteDesktop portal version < 2?): {e}"))?;
-    let context =
-        ei::Context::new(UnixStream::from(fd)).map_err(|e| anyhow!("reis EI context: {e}"))?;
-    let (_conn, events) = context
-        .handshake_tokio("lumen-host", ei::handshake::ContextType::Sender)
-        .await
-        .map_err(|e| anyhow!("EI handshake: {e}"))?;
+    Ok((rd, session, fd))
+}
 
-    Ok((rd, session, context, events))
+/// Poll `file` for the EIS socket path (the gamescope backend relays `LIBEI_SOCKET` there once
+/// the nested app launches), then connect. A bare name is resolved against `XDG_RUNTIME_DIR`,
+/// mirroring libei's own `LIBEI_SOCKET` semantics.
+async fn connect_socket_file(file: &std::path::Path) -> Result<UnixStream> {
+    let path = loop {
+        match std::fs::read_to_string(file) {
+            Ok(s) if !s.trim().is_empty() => break s.trim().to_string(),
+            _ => tokio::time::sleep(Duration::from_millis(300)).await,
+        }
+    };
+    let full = if path.starts_with('/') {
+        std::path::PathBuf::from(&path)
+    } else {
+        let runtime = std::env::var("XDG_RUNTIME_DIR").map_err(|_| {
+            anyhow!("XDG_RUNTIME_DIR unset (needed to resolve EIS socket '{path}')")
+        })?;
+        std::path::Path::new(&runtime).join(&path)
+    };
+    tracing::info!(socket = %full.display(), "libei: connecting to EIS socket");
+    UnixStream::connect(&full).map_err(|e| anyhow!("connect EIS socket {}: {e}", full.display()))
 }
 
 /// One EI device and its emulation state.

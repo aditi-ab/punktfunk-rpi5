@@ -71,17 +71,31 @@ impl VirtualDisplay for GamescopeDisplay {
     }
 }
 
+/// File where the wrapper below writes gamescope's `LIBEI_SOCKET` (its EIS server socket),
+/// read by the libei injector to drive input into the nested app. See [`crate::inject`].
+pub const EI_SOCKET_FILE: &str = "/tmp/lumen-gamescope-ei";
+
 /// Spawn `gamescope --backend headless -W w -H h -r hz -- <app>`. The app comes from
 /// `LUMEN_GAMESCOPE_APP` (default a no-op that just keeps gamescope alive — set it to a real
-/// game/GL app for actual content). stdout/stderr go to `/tmp/lumen-gamescope.log`.
+/// game/GL app for actual content, e.g. `steam -gamepadui` for the SteamOS-like session).
+/// stdout/stderr go to `/tmp/lumen-gamescope.log`. The app is launched through a tiny shell
+/// wrapper that relays gamescope's `LIBEI_SOCKET` (set for its children) to [`EI_SOCKET_FILE`]
+/// so the input injector can connect to gamescope's EIS server from outside.
 fn spawn(w: u32, h: u32, hz: u32) -> Result<Child> {
     let app = std::env::var("LUMEN_GAMESCOPE_APP").unwrap_or_else(|_| "sleep infinity".to_string());
+    let _ = std::fs::remove_file(EI_SOCKET_FILE); // stale socket path from a previous session
     let mut cmd = Command::new("gamescope");
     cmd.args(["--backend", "headless"])
         .args(["-W", &w.to_string()])
         .args(["-H", &h.to_string()])
         .args(["-r", &hz.to_string()])
         .args(["--xwayland-count", "1", "--"])
+        .args([
+            "sh",
+            "-c",
+            &format!("printf %s \"$LIBEI_SOCKET\" > {EI_SOCKET_FILE}; exec \"$@\""),
+            "sh",
+        ])
         .args(app.split_whitespace())
         // Prefer the NVIDIA GL vendor for the nested session (harmless on a pure-NVIDIA box).
         .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia");

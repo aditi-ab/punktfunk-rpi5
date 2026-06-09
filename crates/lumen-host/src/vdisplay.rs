@@ -109,6 +109,13 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     }
 }
 
+/// Path of the file where the gamescope backend relays the nested session's `LIBEI_SOCKET`
+/// (gamescope's EIS server) for the input injector.
+#[cfg(target_os = "linux")]
+pub fn gamescope_ei_socket_file() -> &'static str {
+    gamescope::EI_SOCKET_FILE
+}
+
 #[cfg(target_os = "linux")]
 mod gamescope;
 #[cfg(target_os = "linux")]

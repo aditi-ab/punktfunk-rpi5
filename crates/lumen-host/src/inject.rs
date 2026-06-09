@@ -26,6 +26,9 @@ pub enum Backend {
     WlrVirtual,
     /// libei via `reis` — Wayland-native (RemoteDesktop portal). Not yet implemented.
     Libei,
+    /// libei directly against gamescope's own EIS socket (no portal): input lands in the
+    /// nested game — the SteamOS-like session.
+    GamescopeEi,
     /// `/dev/uinput` — universal fallback (but invisible to `WLR_LIBINPUT_NO_DEVICES=1`).
     Uinput,
 }
@@ -52,25 +55,44 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
                 anyhow::bail!("libei input requires Linux + a RemoteDesktop portal")
             }
         }
+        Backend::GamescopeEi => {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Box::new(libei::LibeiInjector::open_with(
+                    libei::EiSource::SocketPathFile(
+                        crate::vdisplay::gamescope_ei_socket_file().into(),
+                    ),
+                )?))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::bail!("gamescope EIS input requires Linux")
+            }
+        }
         other => anyhow::bail!("injection backend {other:?} not implemented"),
     }
 }
 
-/// Pick the injection backend for the current session. wlroots/Sway only implements the
+/// Pick the injection backend for the current session. gamescope hosts its own EIS server (no
+/// portal), so a gamescope session injects directly into it. wlroots/Sway only implements the
 /// ScreenCast portal (no RemoteDesktop), so libei can't run there — use the wlr virtual-input
 /// protocols. KWin and GNOME implement RemoteDesktop but not the wlr protocols, so use libei.
-/// `LUMEN_INPUT_BACKEND=wlr|libei` overrides the auto-detection.
+/// `LUMEN_INPUT_BACKEND=wlr|libei|gamescope|uinput` overrides the auto-detection.
 pub fn default_backend() -> Backend {
     if let Ok(v) = std::env::var("LUMEN_INPUT_BACKEND") {
         match v.trim().to_ascii_lowercase().as_str() {
             "wlr" | "wlroots" | "wlrvirtual" => return Backend::WlrVirtual,
             "libei" | "ei" | "portal" => return Backend::Libei,
+            "gamescope" | "gamescope-ei" => return Backend::GamescopeEi,
             "uinput" => return Backend::Uinput,
             other => tracing::warn!(
                 value = other,
                 "unknown LUMEN_INPUT_BACKEND — auto-detecting"
             ),
         }
+    }
+    if std::env::var("LUMEN_COMPOSITOR").is_ok_and(|v| v.trim().eq_ignore_ascii_case("gamescope")) {
+        return Backend::GamescopeEi;
     }
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     let d = desktop.to_ascii_uppercase();
