@@ -11,7 +11,7 @@ pub mod cuda;
 pub mod egl;
 
 pub use cuda::DeviceBuffer;
-pub use egl::EglImporter;
+pub use egl::{DmabufPlane, EglImporter};
 
 /// Whether the zero-copy path is opted in (`LUMEN_ZEROCOPY` truthy).
 pub fn enabled() -> bool {

@@ -164,7 +164,13 @@ impl DeviceBuffer {
         let mut pitch: usize = 0;
         unsafe {
             ck(
-                cuMemAllocPitch_v2(&mut ptr, &mut pitch, width as usize * 4, height as usize, 16),
+                cuMemAllocPitch_v2(
+                    &mut ptr,
+                    &mut pitch,
+                    width as usize * 4,
+                    height as usize,
+                    16,
+                ),
                 "cuMemAllocPitch_v2",
             )?;
         }
@@ -205,9 +211,10 @@ impl MappedImage {
     /// # Safety
     /// `image` must be a valid `EGLImage`; the shared context must be current on this thread.
     pub unsafe fn register(image: *mut c_void) -> Result<MappedImage> {
+        // CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY (0x01): we only read the surface (encode from it).
         let mut resource: CUgraphicsResource = std::ptr::null_mut();
         ck(
-            cuGraphicsEGLRegisterImage(&mut resource, image, 0),
+            cuGraphicsEGLRegisterImage(&mut resource, image, 0x01),
             "cuGraphicsEGLRegisterImage",
         )?;
         let mut frame = CUeglFrame::default();
