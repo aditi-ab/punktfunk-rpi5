@@ -1,0 +1,17 @@
+[package]
+name = "fec-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A pure Rust Reed-Solomon erasure coding library with runtime SIMD acceleration"
+license = "BSD-2-Clause"
+repository = "https://github.com/hgaiser/fec-rs"
+keywords = ["reed-solomon", "erasure", "coding", "fec", "simd"]
+categories = ["algorithms", "encoding"]
+readme = "README.md"
+
+[dependencies]
+rayon = { version = "1", optional = true }
+
+[features]
+default = []
+parallel = ["rayon"]

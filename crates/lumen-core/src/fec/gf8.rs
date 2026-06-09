@@ -1,9 +1,12 @@
-//! GF(2⁸) classic Reed–Solomon backend (`reed-solomon-erasure`), equivalent to the
-//! `nanors` library Moonlight uses. Hard ceiling: data + recovery ≤ 255 shards/block.
+//! GF(2⁸) classic Reed–Solomon backend (vendored `fec-rs`). Uses the **Cauchy** generator
+//! matrix `M[j][i] = inv[(m+i)^j]` over GF(2⁸) (poly 0x1d) — byte-identical to the `nanors`
+//! library Moonlight uses, so the parity this produces is recoverable by a stock Moonlight
+//! client (unlike Vandermonde RS, whose parity is not interoperable). Hard ceiling: data +
+//! recovery ≤ 255 shards/block.
 
 use super::{validate_block_shape, validate_encode_shape, ErasureCoder, FecError};
 use crate::config::FecScheme;
-use reed_solomon_erasure::galois_8::ReedSolomon;
+use fec_rs::ReedSolomon;
 
 pub struct Gf8Coder;
 
@@ -21,7 +24,7 @@ impl ErasureCoder for Gf8Coder {
         let shard_len = data[0].len();
         let rs = ReedSolomon::new(k, recovery_count)
             .map_err(|_| FecError::Config("invalid GF(2^8) shard counts"))?;
-        // reed-solomon-erasure fills parity in place: shards = data || zeroed parity.
+        // fec-rs fills parity in place: shards = data || zeroed parity.
         let mut shards: Vec<Vec<u8>> = Vec::with_capacity(k + recovery_count);
         shards.extend_from_slice(data);
         shards.resize_with(k + recovery_count, || vec![0u8; shard_len]);
@@ -68,4 +71,70 @@ fn collect_originals(
         );
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks byte-exact compatibility with Moonlight's `nanors` (Cauchy matrix
+    /// `M[j][i] = inv[(m+i)^j]`, GF(2⁸) poly 0x1d). If the backend ever switched matrices,
+    /// these vectors would break and our parity would no longer be Moonlight-decodable.
+    #[test]
+    fn nanors_exact_parity_vectors() {
+        let coder = Gf8Coder;
+        // The definitive nanors vector (k=4, m=2): single-byte shards [10,20,30,40] → [136, 0].
+        let data = vec![vec![10u8], vec![20], vec![30], vec![40]];
+        let parity = coder.encode(&data, 2).unwrap();
+        assert_eq!(parity, vec![vec![136u8], vec![0u8]]);
+
+        // Cross-check independently from the Cauchy parity rows (proves the matrix, not just a
+        // memorized output): parity[j] = XOR_i M[j][i] · data[i] over GF(2⁸).
+        let rows = [[142u8, 244, 71, 167], [244, 142, 167, 71]];
+        let din = [10u8, 20, 30, 40];
+        for (j, row) in rows.iter().enumerate() {
+            let expect = row
+                .iter()
+                .zip(din)
+                .fold(0u8, |acc, (&m, d)| acc ^ gf_mul(m, d));
+            assert_eq!(parity[j][0], expect, "parity row {j}");
+        }
+    }
+
+    /// Round-trip: erase `m` data shards and confirm reconstruction recovers the originals.
+    #[test]
+    fn recovers_erased_data_shards() {
+        let coder = Gf8Coder;
+        let data: Vec<Vec<u8>> = (0..6).map(|i| vec![i as u8; 8]).collect();
+        let parity = coder.encode(&data, 3).unwrap();
+        let mut received: Vec<Option<Vec<u8>>> = data
+            .iter()
+            .cloned()
+            .map(Some)
+            .chain(parity.into_iter().map(Some))
+            .collect();
+        // Erase 3 data shards (the FEC budget) + nothing else.
+        received[1] = None;
+        received[3] = None;
+        received[5] = None;
+        let recovered = coder.reconstruct(6, 3, &mut received).unwrap();
+        assert_eq!(recovered, data);
+    }
+
+    /// GF(2⁸) multiply, reduction poly 0x1d — independent of the backend.
+    fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+        let mut p = 0u8;
+        for _ in 0..8 {
+            if b & 1 != 0 {
+                p ^= a;
+            }
+            let hi = a & 0x80;
+            a <<= 1;
+            if hi != 0 {
+                a ^= 0x1d;
+            }
+            b >>= 1;
+        }
+        p
+    }
 }

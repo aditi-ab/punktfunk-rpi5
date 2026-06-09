@@ -8,6 +8,7 @@ use super::VIDEO_PORT;
 use crate::capture::{self, Capturer, FastSyntheticCapturer};
 use crate::encode::{self, Codec};
 use anyhow::{Context, Result};
+use rand::Rng;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -82,7 +83,12 @@ fn run(cfg: StreamConfig, running: &AtomicBool) -> Result<()> {
         cfg.bitrate_kbps as u64 * 1000,
     )
     .context("open NVENC for stream")?;
-    let mut pk = VideoPacketizer::new(cfg.packet_size);
+    // FEC overhead percent (Sunshine default 20). Override with LUMEN_FEC_PCT (0 = data-only).
+    let fec_pct: u8 = std::env::var("LUMEN_FEC_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let mut pk = VideoPacketizer::new(cfg.packet_size, fec_pct);
 
     // Pace at a steady rate (capped at 60fps), re-encoding the last captured frame when the
     // compositor produced no new one. wlroots only emits frames on damage, so a static or
@@ -94,6 +100,13 @@ fn run(cfg: StreamConfig, running: &AtomicBool) -> Result<()> {
     let mut fps_count: u32 = 0;
     let mut fps_t = Instant::now();
     let stream_start = Instant::now();
+    // Test knob: drop this % of outbound packets to exercise FEC recovery (0 = off).
+    let drop_pct: u32 = std::env::var("LUMEN_VIDEO_DROP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut rng = rand::thread_rng();
+    let mut dropped: u64 = 0;
 
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
@@ -113,6 +126,11 @@ fn run(cfg: StreamConfig, running: &AtomicBool) -> Result<()> {
                 FrameType::P
             };
             for pkt in pk.packetize(&au.data, ft, ts) {
+                // Simulated network loss: build the packet (advances seq) but skip the send.
+                if drop_pct > 0 && rng.gen_range(0..100) < drop_pct {
+                    dropped += 1;
+                    continue;
+                }
                 if sock.send(&pkt).is_err() {
                     client_gone = true;
                     break;
@@ -130,7 +148,7 @@ fn run(cfg: StreamConfig, running: &AtomicBool) -> Result<()> {
 
         fps_count += 1;
         if fps_t.elapsed() >= Duration::from_secs(1) {
-            tracing::info!(fps = fps_count, sent_pkts, "video: streaming");
+            tracing::info!(fps = fps_count, sent_pkts, dropped, "video: streaming");
             fps_count = 0;
             fps_t = Instant::now();
         }

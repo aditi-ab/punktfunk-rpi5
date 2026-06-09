@@ -23,7 +23,11 @@ quic = ["dep:quinn", "dep:tokio"]
 
 [dependencies]
 reed-solomon-simd = "3.1"      # GF(2^16) Leopard-RS, SIMD, O(n log n) — the wall-breaker (P2)
-reed-solomon-erasure = "6.0"   # GF(2^8) classic RS — GameStream/Moonlight compat (P1)
+# Vendored fork of fec-rs: GF(2^8) classic RS with the *Cauchy* generator matrix
+# (M[j][i] = inv[(m+i)^j]) — byte-identical to the `nanors` library Moonlight uses, so our
+# parity is decodable by a stock Moonlight client. (reed-solomon-erasure is Vandermonde and is
+# NOT interoperable.) See vendor/fec-rs/LICENSE (BSD-2-Clause).
+fec-rs = { path = "vendor/fec-rs" }
 aes-gcm = "0.10"               # AES-128-GCM session crypto, matches GameStream
 zerocopy = { version = "0.8", features = ["derive"] }
 bytes = "1"
