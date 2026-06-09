@@ -158,8 +158,15 @@ impl NvencEncoder {
         video.set_frame_rate(Some(Rational(fps as i32, 1)));
         video.set_bit_rate(bitrate_bps as usize);
         video.set_max_bit_rate(bitrate_bps as usize);
-        video.set_gop(fps.saturating_mul(2).max(1)); // ~2s keyframe interval
         video.set_max_b_frames(0);
+        // Infinite GOP — NO periodic IDR. A keyframe at 5120x1440 is ~20-40x a P-frame, so a
+        // periodic IDR is a recurring multi-millisecond encode+packetize+send spike — the ~2s
+        // "freeze". NVENC emits one IDR at stream start, then P-frames only; `forced-idr` (below)
+        // turns a client recovery request (RFI, via `request_keyframe`) into an IDR on demand.
+        // This is the Moonlight/Sunshine low-latency model.
+        unsafe {
+            (*video.as_mut_ptr()).gop_size = -1;
+        }
 
         // For the zero-copy path, take CUDA surfaces: wrap the shared CUcontext in CUDA
         // hwdevice/hwframes contexts and set `pix_fmt = CUDA` on the raw encoder context
@@ -185,6 +192,7 @@ impl NvencEncoder {
         opts.set("rc", "cbr");
         opts.set("bf", "0");
         opts.set("delay", "0");
+        opts.set("forced-idr", "1"); // RFI/request_keyframe → real IDR under the infinite GOP
 
         let enc = video
             .open_with(opts)
