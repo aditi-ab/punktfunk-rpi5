@@ -6,8 +6,8 @@
 //! this trait:
 //!
 //! * **KWin** — privileged `zkde_screencast_unstable_v1::stream_virtual_output` ([`kwin`]).
-//! * **wlroots/Sway** — `swaymsg create_output` + `output mode --custom` (TODO).
-//! * **Mutter/GNOME** — D-Bus `RemoteDesktop` + `ScreenCast.RecordVirtual` (TODO).
+//! * **wlroots/Sway** — `swaymsg create_output` + `output mode --custom` ([`wlroots`]).
+//! * **Mutter/GNOME** — D-Bus `RemoteDesktop` + `ScreenCast.RecordVirtual` ([`mutter`]).
 //!
 //! [`VirtualDisplay::create`] returns a [`VirtualOutput`]: the PipeWire node to capture plus an
 //! owned keepalive whose `Drop` releases the output (RAII — no explicit `destroy`). Capture
@@ -101,9 +101,7 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
             Compositor::Kwin => Ok(Box::new(kwin::KwinDisplay::new()?)),
             Compositor::Gamescope => Ok(Box::new(gamescope::GamescopeDisplay::new()?)),
             Compositor::Mutter => Ok(Box::new(mutter::MutterDisplay::new()?)),
-            Compositor::Wlroots => {
-                anyhow::bail!("wlroots virtual-output backend not yet implemented")
-            }
+            Compositor::Wlroots => Ok(Box::new(wlroots::WlrootsDisplay::new()?)),
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -126,3 +124,5 @@ mod gamescope;
 mod kwin;
 #[cfg(target_os = "linux")]
 mod mutter;
+#[cfg(target_os = "linux")]
+mod wlroots;
