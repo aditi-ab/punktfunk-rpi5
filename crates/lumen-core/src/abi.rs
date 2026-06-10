@@ -441,3 +441,176 @@ pub unsafe extern "C" fn lumen_get_stats(
         LumenStatus::Ok
     })
 }
+
+// ---------------------------------------------------------------------------------------------
+// lumen/1 connection API (`quic` feature) — the embeddable client connector platform clients
+// link (SwiftUI/VideoToolbox, Android, …). In the generated header these are guarded by
+// `LUMEN_FEATURE_QUIC`; define it when linking a lumen-core built with `--features quic`.
+// ---------------------------------------------------------------------------------------------
+
+/// Opaque handle to a live `lumen/1` connection (QUIC control plane + UDP data plane, all
+/// pumped on internal threads).
+#[cfg(feature = "quic")]
+pub struct LumenConnection {
+    inner: crate::client::NativeClient,
+    /// Backs the pointer returned by the last `lumen_connection_next_au` (borrow-until-next-call).
+    last: Option<crate::session::Frame>,
+}
+
+/// Connect to a `lumen/1` host and start a session at `width`x`height`@`refresh_hz`.
+/// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure.
+///
+/// # Safety
+/// `host` is a NUL-terminated UTF-8 string (IP or hostname resolvable by the platform).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn lumen_connect(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    timeout_ms: u32,
+) -> *mut LumenConnection {
+    let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if host.is_null() {
+            return std::ptr::null_mut();
+        }
+        let host = match unsafe { std::ffi::CStr::from_ptr(host) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let mode = crate::config::Mode {
+            width,
+            height,
+            refresh_hz,
+        };
+        match crate::client::NativeClient::connect(
+            host,
+            port,
+            mode,
+            std::time::Duration::from_millis(timeout_ms as u64),
+        ) {
+            Ok(c) => Box::into_raw(Box::new(LumenConnection {
+                inner: c,
+                last: None,
+            })),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }));
+    r.unwrap_or(std::ptr::null_mut())
+}
+
+/// Pull the next reassembled access unit, waiting up to `timeout_ms`. Returns
+/// [`LumenStatus::NoFrame`] on timeout and [`LumenStatus::Closed`] once the session ended.
+/// On `Ok`, `*out` borrows connection memory **until the next call** on this handle.
+///
+/// # Safety
+/// `c` is a valid connection handle used from a single thread; `out` is writable.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn lumen_connection_next_au(
+    c: *mut LumenConnection,
+    out: *mut LumenFrame,
+    timeout_ms: u32,
+) -> LumenStatus {
+    guard(|| {
+        let c = match unsafe { c.as_mut() } {
+            Some(c) => c,
+            None => return LumenStatus::NullPointer,
+        };
+        if out.is_null() {
+            return LumenStatus::NullPointer;
+        }
+        match c
+            .inner
+            .next_frame(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(frame) => {
+                c.last = Some(frame);
+                let f = c.last.as_ref().unwrap();
+                unsafe {
+                    *out = LumenFrame {
+                        data: f.data.as_ptr(),
+                        len: f.data.len(),
+                        frame_index: f.frame_index,
+                        pts_ns: f.pts_ns,
+                        flags: f.flags,
+                    };
+                }
+                LumenStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Send one input event to the host as a QUIC datagram (non-blocking enqueue).
+///
+/// # Safety
+/// `c` is a valid connection handle; `ev` points to a valid [`InputEvent`].
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn lumen_connection_send_input(
+    c: *mut LumenConnection,
+    ev: *const InputEvent,
+) -> LumenStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return LumenStatus::NullPointer,
+        };
+        let ev = match unsafe { ev.as_ref() } {
+            Some(e) => e,
+            None => return LumenStatus::NullPointer,
+        };
+        match c.inner.send_input(ev) {
+            Ok(()) => LumenStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// The host-confirmed session mode (from the Welcome). Safe any time after connect.
+///
+/// # Safety
+/// `c` is a valid connection handle; out pointers are writable (NULLs are skipped).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn lumen_connection_mode(
+    c: *const LumenConnection,
+    width: *mut u32,
+    height: *mut u32,
+    refresh_hz: *mut u32,
+) -> LumenStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return LumenStatus::NullPointer,
+        };
+        unsafe {
+            if !width.is_null() {
+                *width = c.inner.mode.width;
+            }
+            if !height.is_null() {
+                *height = c.inner.mode.height;
+            }
+            if !refresh_hz.is_null() {
+                *refresh_hz = c.inner.mode.refresh_hz;
+            }
+        }
+        LumenStatus::Ok
+    })
+}
+
+/// Close the connection and free the handle (joins the internal threads). NULL is a no-op.
+///
+/// # Safety
+/// `c` was returned by [`lumen_connect`] and is not used after this call.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn lumen_connection_close(c: *mut LumenConnection) {
+    if !c.is_null() {
+        drop(unsafe { Box::from_raw(c) });
+    }
+}

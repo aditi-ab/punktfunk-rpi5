@@ -25,6 +25,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod abi;
+#[cfg(feature = "quic")]
+pub mod client;
 pub mod config;
 pub mod crypto;
 pub mod error;

@@ -36,8 +36,12 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
 
 ## What's left
 
-1. **M4 — client decode + present**: VAAPI/NVDEC + wgpu on `lumen-client-rs`'s skeleton;
-   then real glass-to-glass numbers via `tools/latency-probe` (scaffold).
+1. **M4 — client decode + present**: the SwiftUI client is scaffolded and handed off —
+   the lumen/1 connector is in the C ABI (`lumen_connect` & co., ABI-roundtrip-tested) with
+   an xcframework build script + LumenKit Swift package; **see
+   [`clients/apple/README.md`](clients/apple/README.md) for the Mac-side pickup**. Then
+   glass-to-glass numbers via `tools/latency-probe` (scaffold). The Linux reference client
+   (`lumen-client-rs`) gets VAAPI + wgpu on the same connector later.
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).

@@ -19,6 +19,10 @@ pub enum LumenError {
     Unsupported(&'static str),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("timed out")]
+    Timeout,
+    #[error("session closed")]
+    Closed,
 }
 
 pub type Result<T> = core::result::Result<T, LumenError>;
@@ -37,6 +41,8 @@ pub enum LumenStatus {
     Unsupported = -6,
     Io = -7,
     NullPointer = -8,
+    Timeout = -9,
+    Closed = -10,
     Panic = -99,
 }
 
@@ -51,6 +57,8 @@ impl LumenError {
             LumenError::NoFrame => LumenStatus::NoFrame,
             LumenError::Unsupported(_) => LumenStatus::Unsupported,
             LumenError::Io(_) => LumenStatus::Io,
+            LumenError::Timeout => LumenStatus::Timeout,
+            LumenError::Closed => LumenStatus::Closed,
         }
     }
 }

@@ -285,3 +285,76 @@ fn virtual_stream(
     tracing::info!(sent, "lumen/1 virtual stream complete");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end through the C ABI — the exact contract platform clients (Swift) link:
+    /// in-process lumen/1 host, `lumen_connect` → `lumen_connection_next_au` pulls verified
+    /// frames → `lumen_connection_send_input` enqueues → `lumen_connection_close`.
+    #[test]
+    fn c_abi_connection_roundtrip() {
+        use lumen_core::abi::{
+            lumen_connect, lumen_connection_close, lumen_connection_mode, lumen_connection_next_au,
+            lumen_connection_send_input,
+        };
+        use lumen_core::error::LumenStatus;
+
+        let host = std::thread::spawn(|| {
+            run(M3Options {
+                port: 19777,
+                source: M3Source::Synthetic,
+                seconds: 0,
+                frames: 25,
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let addr = std::ffi::CString::new("127.0.0.1").unwrap();
+        let conn = unsafe { lumen_connect(addr.as_ptr(), 19777, 1280, 720, 60, 10_000) };
+        assert!(!conn.is_null(), "lumen_connect failed");
+
+        let (mut w, mut h, mut hz) = (0u32, 0u32, 0u32);
+        assert_eq!(
+            unsafe { lumen_connection_mode(conn, &mut w, &mut h, &mut hz) },
+            LumenStatus::Ok
+        );
+        assert_eq!((w, h, hz), (1280, 720, 60));
+
+        let mut got = 0u32;
+        let mut frame = unsafe { std::mem::zeroed() };
+        while got < 25 {
+            match unsafe { lumen_connection_next_au(conn, &mut frame, 2000) } {
+                LumenStatus::Ok => {
+                    let data = unsafe { std::slice::from_raw_parts(frame.data, frame.len) };
+                    let idx = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                    assert_eq!(
+                        data,
+                        &test_frame(idx, data.len())[..],
+                        "frame {idx} content"
+                    );
+                    got += 1;
+                }
+                LumenStatus::NoFrame => continue,
+                other => panic!("next_au: {other:?}"),
+            }
+        }
+
+        let ev = lumen_core::input::InputEvent {
+            kind: lumen_core::input::InputKind::MouseMove,
+            _pad: [0; 3],
+            code: 0,
+            x: 1,
+            y: 2,
+            flags: 0,
+        };
+        assert_eq!(
+            unsafe { lumen_connection_send_input(conn, &ev) },
+            LumenStatus::Ok
+        );
+
+        unsafe { lumen_connection_close(conn) };
+        host.join().unwrap().unwrap();
+    }
+}

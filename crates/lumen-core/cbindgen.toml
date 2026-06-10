@@ -26,3 +26,6 @@ sort_by = "None"
 
 [struct]
 derive_eq = false
+
+[defines]
+"feature = quic" = "LUMEN_FEATURE_QUIC"

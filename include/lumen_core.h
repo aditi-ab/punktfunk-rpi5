@@ -54,6 +54,8 @@ enum LumenStatus
     LUMEN_STATUS_UNSUPPORTED = -6,
     LUMEN_STATUS_IO = -7,
     LUMEN_STATUS_NULL_POINTER = -8,
+    LUMEN_STATUS_TIMEOUT = -9,
+    LUMEN_STATUS_CLOSED = -10,
     LUMEN_STATUS_PANIC = -99,
 };
 #ifndef __cplusplus
@@ -91,6 +93,12 @@ typedef enum LumenInputKind LumenInputKind;
 typedef uint8_t LumenInputKind;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
+
+#if defined(LUMEN_FEATURE_QUIC)
+// Opaque handle to a live `lumen/1` connection (QUIC control plane + UDP data plane, all
+// pumped on internal threads).
+typedef struct LumenConnection LumenConnection;
+#endif
 
 // Opaque session handle. Pointer-only from C.
 typedef struct LumenSession LumenSession;
@@ -229,6 +237,57 @@ int32_t lumen_host_poll_input(LumenSession *s);
 // # Safety
 // `s` is a valid handle; `out` points to a writable `LumenStats`.
 LumenStatus lumen_get_stats(LumenSession *s, LumenStats *out);
+
+#if defined(LUMEN_FEATURE_QUIC)
+// Connect to a `lumen/1` host and start a session at `width`x`height`@`refresh_hz`.
+// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure.
+//
+// # Safety
+// `host` is a NUL-terminated UTF-8 string (IP or hostname resolvable by the platform).
+LumenConnection *lumen_connect(const char *host,
+                               uint16_t port,
+                               uint32_t width,
+                               uint32_t height,
+                               uint32_t refresh_hz,
+                               uint32_t timeout_ms);
+#endif
+
+#if defined(LUMEN_FEATURE_QUIC)
+// Pull the next reassembled access unit, waiting up to `timeout_ms`. Returns
+// [`LumenStatus::NoFrame`] on timeout and [`LumenStatus::Closed`] once the session ended.
+// On `Ok`, `*out` borrows connection memory **until the next call** on this handle.
+//
+// # Safety
+// `c` is a valid connection handle used from a single thread; `out` is writable.
+LumenStatus lumen_connection_next_au(LumenConnection *c, LumenFrame *out, uint32_t timeout_ms);
+#endif
+
+#if defined(LUMEN_FEATURE_QUIC)
+// Send one input event to the host as a QUIC datagram (non-blocking enqueue).
+//
+// # Safety
+// `c` is a valid connection handle; `ev` points to a valid [`InputEvent`].
+LumenStatus lumen_connection_send_input(LumenConnection *c, const LumenInputEvent *ev);
+#endif
+
+#if defined(LUMEN_FEATURE_QUIC)
+// The host-confirmed session mode (from the Welcome). Safe any time after connect.
+//
+// # Safety
+// `c` is a valid connection handle; out pointers are writable (NULLs are skipped).
+LumenStatus lumen_connection_mode(const LumenConnection *c,
+                                  uint32_t *width,
+                                  uint32_t *height,
+                                  uint32_t *refresh_hz);
+#endif
+
+#if defined(LUMEN_FEATURE_QUIC)
+// Close the connection and free the handle (joins the internal threads). NULL is a no-op.
+//
+// # Safety
+// `c` was returned by [`lumen_connect`] and is not used after this call.
+void lumen_connection_close(LumenConnection *c);
+#endif
 
 #ifdef __cplusplus
 }  // extern "C"

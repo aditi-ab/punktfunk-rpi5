@@ -10,6 +10,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/abi.rs");
     println!("cargo:rerun-if-changed=src/config.rs");
     println!("cargo:rerun-if-changed=src/input.rs");
+    println!("cargo:rerun-if-changed=src/client.rs");
+    println!("cargo:rerun-if-changed=src/error.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");

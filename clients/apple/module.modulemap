@@ -1,7 +1,0 @@
-// Exposes the lumen-core C ABI to Swift as `import LumenCore`.
-// Point Xcode's "Import Paths" (SWIFT_INCLUDE_PATHS) at this directory, and link
-// liblumen_core.a (or .dylib) built via `cargo build -p lumen-core --target <apple>`.
-module LumenCore {
-    header "../../include/lumen_core.h"
-    export *
-}
