@@ -40,3 +40,40 @@ pub fn serverinfo_xml(host: &Host, https: bool) -> String {
         local_ip = host.local_ip,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gamestream::{SCM_AV1_MAIN8, SCM_H264, SCM_HEVC, SCM_HEVC_MAIN10};
+
+    /// The advertised codec mask: H.264 + HEVC + AV1 Main8 (= 65793), and explicitly *no*
+    /// 10-bit bits — Moonlight gates its HDR mode on those, which we can't deliver (8-bit
+    /// SDR capture). Flag values are moonlight-common-c `Limelight.h`.
+    #[test]
+    fn codec_mode_support_mask() {
+        assert_eq!(SERVER_CODEC_MODE_SUPPORT, 0x1 | 0x100 | 0x10000);
+        assert_eq!(SERVER_CODEC_MODE_SUPPORT, 65793);
+        assert_eq!(
+            SERVER_CODEC_MODE_SUPPORT & SCM_HEVC_MAIN10,
+            0,
+            "no 10-bit/HDR claim"
+        );
+        assert_eq!(
+            SERVER_CODEC_MODE_SUPPORT,
+            SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8
+        );
+    }
+
+    #[test]
+    fn serverinfo_xml_carries_codec_mask() {
+        let host = Host {
+            hostname: "test".into(),
+            uniqueid: "uid".into(),
+            local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            http_port: 47989,
+            https_port: 47984,
+        };
+        let xml = serverinfo_xml(&host, false);
+        assert!(xml.contains("<ServerCodecModeSupport>65793</ServerCodecModeSupport>"));
+    }
+}

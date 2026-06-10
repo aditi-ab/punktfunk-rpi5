@@ -76,6 +76,10 @@ serde_json = "1"
 xkbcommon = "0.8"
 # Opus encode for the GameStream audio stream (links system libopus).
 opus = "0.3"
+# The safe `opus` crate is stereo-only; surround (5.1/7.1) needs the libopus *multistream*
+# encoder (`opus_multistream_encoder_*`). `audiopus_sys` is the sys layer `opus` already
+# vendors (same libopus link), so this adds bindings, not a second copy of the library.
+audiopus_sys = "0.2"
 # libei (EI sender) for the portable input path on KWin/GNOME (RemoteDesktop portal).
 # The `tokio` feature wires reis's event stream into tokio's reactor.
 reis = { version = "0.6.1", features = ["tokio"] }

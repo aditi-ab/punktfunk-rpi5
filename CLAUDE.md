@@ -62,7 +62,13 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    mid-stream mode renegotiation (the Welcome is one-shot today), concurrent sessions
    (today: one at a time, extras wait in the accept queue).
 4. **M2 polish**: wlroots/Sway `VirtualDisplay` backend (deferred; swaymsg `create_output`),
-   HDR/10-bit/AV1 negotiation, surround audio, reconnect-at-new-mode robustness.
+   HDR/10-bit (needs HDR capture + metadata plumbing; `av1_nvenc -highbitdepth 1` already
+   encodes Main10 from 8-bit input on this box), reconnect-at-new-mode robustness. **Done:**
+   AV1 negotiation (honest `ServerCodecModeSupport` 65793 = H264|HEVC|AV1_MAIN8, RTSP
+   `bitStreamFormat` → `av1_nvenc`, validated via `m0 --codec av1` + ffprobe) and surround
+   audio (5.1/7.1 Opus multistream + Sunshine-style RS(4,2) audio FEC, PipeWire capture at
+   the negotiated channel count, stereo wire unchanged; needs a live Moonlight surround
+   listen — unit/live-capture tests green).
 5. **Native clients** (`clients/{apple,android}` scaffolds) consuming `punktfunk_core.h`.
 
 Box one-time setup is complete: udev rule + `input` group (gamepads validated live),

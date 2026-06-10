@@ -105,7 +105,7 @@ async fn serve(opts: M3Options) -> Result<()> {
     );
 
     // One audio capturer for the whole host lifetime, handed from session to session
-    // (PipeWire streams have no cheap teardown — see AudioCapSlot).
+    // (avoids a PipeWire stream setup per session — see AudioCapSlot).
     let audio_cap: AudioCapSlot = Arc::new(std::sync::Mutex::new(None));
 
     let mut served = 0u32;
@@ -143,8 +143,8 @@ async fn serve(opts: M3Options) -> Result<()> {
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Persistent audio-capturer slot, reused across sessions (same pattern as the GameStream
-/// path): `PwAudioCapturer` has no teardown — dropping one per session would leak its
-/// PipeWire thread + core connection + live capture node on the daemon every session.
+/// path): keeps one warm PipeWire capture stream instead of a connect/negotiate cycle —
+/// and a daemon-side node churn — per session. (Drop now tears a capturer down cleanly.)
 type AudioCapSlot = Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>;
 
 /// One client session: handshake → input/audio planes → data plane until done/disconnect.
@@ -459,7 +459,7 @@ fn audio_thread(conn: quinn::Connection, stop: Arc<AtomicBool>, audio_cap: Audio
             c.drain(); // discard audio captured between sessions
             c
         }
-        None => match crate::audio::open_audio_capture() {
+        None => match crate::audio::open_audio_capture(CHANNELS as u32) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "punktfunk/1 audio unavailable — session continues without it");
