@@ -65,8 +65,11 @@ struct ContentView: View {
         VStack(alignment: .trailing, spacing: 4) {
             Text("\(conn.width)×\(conn.height)@\(conn.refreshHz)  \(model.fps) fps  \(model.mbps, specifier: "%.1f") Mb/s")
                 .font(.system(.caption, design: .monospaced))
-            Button("Disconnect") { model.disconnect() }
+            // ⌘D because the local cursor is hidden+frozen while streaming — the button
+            // can't be clicked. (Cmd+Tab away also frees the cursor.)
+            Button("Disconnect (⌘D)") { model.disconnect() }
                 .font(.caption)
+                .keyboardShortcut("d", modifiers: .command)
         }
         .padding(8)
         .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))

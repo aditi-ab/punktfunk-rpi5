@@ -9,8 +9,38 @@
 // UIViewRepresentable.
 
 #if os(macOS)
+import AppKit
 import AVFoundation
 import SwiftUI
+
+/// Hides the LOCAL cursor while streaming. The host renders its own cursor, and the local
+/// one both diverges from it (the host applies acceleration/clamping to our raw deltas)
+/// and can wander out of the window — a click there would focus another app. So while the
+/// stream has focus we do what Moonlight does: warp the cursor into the view, freeze it
+/// (`CGAssociateMouseAndMouseCursorPosition(false)` — GCMouse still delivers raw HID
+/// deltas), and hide it. hide/unhide and associate are balanced via `captured`.
+private final class CursorCapture {
+    private var captured = false
+
+    func capture(in view: NSView) {
+        guard !captured, let window = view.window, view.bounds.width > 0 else { return }
+        // Park the cursor mid-view so a click can't land in (and activate) another app.
+        let rectOnScreen = window.convertToScreen(view.convert(view.bounds, to: nil))
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        CGWarpMouseCursorPosition(
+            CGPoint(x: rectOnScreen.midX, y: primaryHeight - rectOnScreen.midY))
+        CGAssociateMouseAndMouseCursorPosition(0)
+        NSCursor.hide()
+        captured = true
+    }
+
+    func release() {
+        guard captured else { return }
+        CGAssociateMouseAndMouseCursorPosition(1)
+        NSCursor.unhide()
+        captured = false
+    }
+}
 
 public struct StreamView: NSViewRepresentable {
     private let connection: PunktfunkConnection
@@ -68,15 +98,43 @@ public final class StreamLayerView: NSView {
     private let displayLayer = AVSampleBufferDisplayLayer()
     private var token: PumpToken?
     public private(set) var connection: PunktfunkConnection?
+    private let cursorCapture = CursorCapture()
+    private var appObservers: [NSObjectProtocol] = []
 
     public override init(frame: NSRect) {
         super.init(frame: frame)
         displayLayer.videoGravity = .resizeAspect
         layer = displayLayer // layer-hosting: assign before wantsLayer
         wantsLayer = true
+        // The cursor comes back whenever the app loses focus (Cmd+Tab is the escape
+        // hatch) and is re-captured when the stream regains it.
+        appObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.cursorCapture.release()
+        })
+        appObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.captureCursorIfStreaming()
+        })
     }
 
     public required init?(coder: NSCoder) { fatalError("not used") }
+
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            cursorCapture.release()
+        } else {
+            captureCursorIfStreaming()
+        }
+    }
+
+    private func captureCursorIfStreaming() {
+        guard token != nil, NSApp.isActive else { return }
+        cursorCapture.capture(in: self)
+    }
 
     /// Pump thread: pull AUs from the connection, wrap, enqueue. The first IDR yields the
     /// format description; non-IDR AUs before it are dropped (the host opens with an IDR).
@@ -126,17 +184,20 @@ public final class StreamLayerView: NSView {
         thread.name = "punktfunk-pump"
         thread.qualityOfService = .userInteractive
         thread.start()
+        captureCursorIfStreaming()
     }
 
     /// Stop pumping (≤ one poll timeout). Does not close the connection — that stays with
     /// whoever owns it (PunktfunkConnection.close() is safe alongside a draining pump).
     public func stop() {
+        cursorCapture.release()
         token?.cancel()
         token = nil
         connection = nil
     }
 
     deinit {
+        appObservers.forEach(NotificationCenter.default.removeObserver(_:))
         token?.cancel()
     }
 }

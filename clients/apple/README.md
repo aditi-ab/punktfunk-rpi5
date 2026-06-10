@@ -103,9 +103,12 @@ PUNKTFUNK_AUTOCONNECT=<box-ip> PUNKTFUNK_MODE=1280x720x60 swift run PunktfunkCli
    doesn't persist fingerprints yet — add it alongside the "add host" UX.
 8. **Input capture caveats** (stage 1): GC handlers only fire while the app has focus —
    on focus loss `InputCapture` auto-releases everything still held (keys + buttons) so
-   nothing sticks down host-side. Local shortcuts (⌘-anything) still also reach the host;
-   a capture toggle is a small follow-up. One live capture per process (the GC mouse/
-   keyboard singletons have a single handler slot — ownership is tracked so a stale
+   nothing sticks down host-side. While the stream has focus the LOCAL cursor is hidden
+   and frozen mid-view (`CursorCapture` in StreamView.swift — the host renders its own
+   cursor; the local one diverges from it and a stray click would focus another app);
+   Cmd+Tab frees it, ⌘D disconnects. Local shortcuts (⌘-anything) still also reach the
+   host; a capture toggle is a small follow-up. One live capture per process (the GC
+   mouse/keyboard singletons have a single handler slot — ownership is tracked so a stale
    capture's stop() can't clobber a newer one).
 9. **iOS**: same package (`BUILD_IOS=1` for the xcframework slice); `StreamView` needs the
    `UIViewRepresentable` twin and touch→input mapping.
