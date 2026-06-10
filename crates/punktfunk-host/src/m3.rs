@@ -822,7 +822,8 @@ fn virtual_stream(
     let compositor = crate::vdisplay::detect().context("detect compositor")?;
     tracing::info!(?compositor, ?mode, "punktfunk/1 virtual display");
     let mut vd = crate::vdisplay::open(compositor)?;
-    let (mut capturer, mut enc, mut frame, mut interval) = build_pipeline(&mut vd, mode)?;
+    let (mut capturer, mut enc, mut frame, mut interval) =
+        build_pipeline_with_retry(&mut vd, mode)?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64);
     let mut next = std::time::Instant::now();
@@ -885,11 +886,98 @@ type Pipeline = (
     std::time::Duration,
 );
 
+/// Build the pipeline, retrying *transient* failures with bounded exponential backoff.
+///
+/// Bringing a virtual output to first-frame races several async steps — the compositor parenting
+/// the output, the portal/RemoteDesktop grant, PipeWire format negotiation — any of which can
+/// momentarily time out on a cold session. A single timed-out attempt shouldn't abort the whole
+/// punktfunk/1 session. But a *permanent* failure (unsupported compositor/mode, a KWin too old to
+/// create virtual outputs, a missing tool) must fail fast instead of burning the budget — so the
+/// error chain is classified and permanent ones short-circuit. Each failed attempt drops its
+/// capturer, which (via `PortalCapturer::Drop`) tears the PipeWire thread + virtual output down
+/// before the next attempt — no leak across retries.
+fn build_pipeline_with_retry(
+    vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
+    mode: punktfunk_core::Mode,
+) -> Result<Pipeline> {
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut backoff = std::time::Duration::from_millis(500);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match build_pipeline(vd, mode) {
+            Ok(pipe) => {
+                if attempt > 1 {
+                    tracing::info!(attempt, "pipeline up after retry");
+                }
+                return Ok(pipe);
+            }
+            Err(e) => {
+                let chain = format!("{e:#}");
+                let permanent = is_permanent_build_error(&chain);
+                if permanent || attempt == MAX_ATTEMPTS {
+                    let why = if permanent {
+                        "permanent"
+                    } else {
+                        "out of retries"
+                    };
+                    return Err(e).with_context(|| {
+                        format!("pipeline build failed ({why}) after {attempt} attempt(s)")
+                    });
+                }
+                tracing::warn!(
+                    attempt,
+                    max = MAX_ATTEMPTS,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %chain,
+                    "pipeline build failed — retrying"
+                );
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+    unreachable!("the final attempt returns inside the loop")
+}
+
+/// Is a pipeline-build error permanent (retrying won't help within this session)? Matches the
+/// error chain against signatures that don't change between attempts: unsupported compositor or
+/// mode, a KWin too old to expose virtual outputs, a missing/unparseable config, a tool that
+/// isn't installed. Everything else — portal/PipeWire negotiation timeouts, "no frame within
+/// 10s", transient node races — is treated as transient and retried. Biased toward "transient":
+/// a misjudged permanent error only costs a few seconds before it fails anyway.
+fn is_permanent_build_error(chain: &str) -> bool {
+    const PERMANENT: &[&str] = &[
+        "virtual displays require linux",
+        "unknown punktfunk_compositor",
+        "could not detect compositor",
+        "could not find output", // KWin < 6.5.6: createVirtualOutput unsupported
+        "must be a node id",     // PUNKTFUNK_GAMESCOPE_NODE not an integer
+        "is it installed",       // gamescope / kscreen-doctor not on PATH
+    ];
+    let lower = chain.to_ascii_lowercase();
+    PERMANENT.iter().any(|p| lower.contains(p))
+}
+
 fn build_pipeline(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     mode: punktfunk_core::Mode,
 ) -> Result<Pipeline> {
     let vout = vd.create(mode).context("create virtual output")?;
+    // The backend reports the refresh it actually achieved in `preferred_mode.2` (KWin may cap a
+    // virtual output at 60 Hz if the custom-mode install was rejected). Pace the encoder + frame
+    // clock to that, not the requested rate, so we don't emit phantom duplicate frames over a
+    // slower source. Falls back to the requested rate when a backend reports nothing.
+    let effective_hz = vout
+        .preferred_mode
+        .map(|(_, _, hz)| hz)
+        .filter(|&hz| hz > 0)
+        .unwrap_or(mode.refresh_hz);
+    if effective_hz != mode.refresh_hz {
+        tracing::warn!(
+            requested = mode.refresh_hz,
+            effective = effective_hz,
+            "compositor did not honor the requested refresh — encoding at the achieved rate"
+        );
+    }
     let mut capturer =
         crate::capture::capture_virtual_output(vout).context("capture virtual output")?;
     capturer.set_active(true);
@@ -899,18 +987,41 @@ fn build_pipeline(
         frame.format,
         frame.width,
         frame.height,
-        mode.refresh_hz,
+        effective_hz,
         20_000_000,
         frame.is_cuda(),
     )
     .context("open NVENC")?;
-    let interval = std::time::Duration::from_secs_f64(1.0 / mode.refresh_hz.max(1) as f64);
+    let interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
     Ok((capturer, enc, frame, interval))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permanent_errors_short_circuit_retry() {
+        // Permanent: config / version / missing-tool — retrying within a session can't fix these.
+        assert!(is_permanent_build_error(
+            "create virtual output: KWin virtual output failed: Could not find output"
+        ));
+        assert!(is_permanent_build_error(
+            "unknown PUNKTFUNK_COMPOSITOR 'foo' (kwin|wlroots|mutter|gamescope)"
+        ));
+        assert!(is_permanent_build_error(
+            "spawn gamescope (is it installed? `apt install gamescope`)"
+        ));
+        assert!(is_permanent_build_error("virtual displays require Linux"));
+        // Transient: negotiation/timeout races — exactly what backoff is for.
+        assert!(!is_permanent_build_error(
+            "first frame: no PipeWire frame within 10s (node 42): format negotiation never completed"
+        ));
+        assert!(!is_permanent_build_error(
+            "create virtual output: timed out creating the KWin virtual output"
+        ));
+        assert!(!is_permanent_build_error("open NVENC: device busy"));
+    }
 
     fn gp(kind: InputKind, code: u32, x: i32, pad: u32) -> InputEvent {
         InputEvent {

@@ -48,6 +48,7 @@ impl VirtualDisplay for GamescopeDisplay {
                 keepalive: Box::new(()),
             });
         }
+        check_gamescope_version(); // diagnostic only — warns on known-deadlock-prone versions
         let proc = GamescopeProc(spawn(mode.width, mode.height, mode.refresh_hz.max(1))?);
         // gamescope creates its PipeWire node a moment after start; poll for it (the proc is held
         // alive meanwhile, and killed if we give up).
@@ -147,24 +148,92 @@ fn node_from_log() -> Option<u32> {
 }
 
 /// Find the `gamescope` `Video/Source` node id in a `pw-dump` snapshot of the default daemon.
+///
+/// `node.name=gamescope` appears on TWO objects (the adapter *and* the inner stream node); only
+/// the one whose `media.class` is `Video/Source` is a valid capture target — connecting to the
+/// other wedges the link. So we require `Video/Source` first and fall back to a bare name match
+/// only if no class-tagged node is present (older gamescope that doesn't set media.class).
 fn find_gamescope_node() -> Option<u32> {
     let out = Command::new("pw-dump").output().ok()?;
     let dump: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    for obj in dump.as_array()? {
+    let nodes = dump.as_array()?;
+    let node_props = |obj: &serde_json::Value| -> Option<(u32, String, String)> {
         if obj.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
-            continue;
+            return None;
         }
+        let id = obj.get("id").and_then(|i| i.as_u64())? as u32;
         let props = obj.get("info").and_then(|i| i.get("props"));
         let name = props
             .and_then(|p| p.get("node.name"))
             .and_then(|n| n.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
         let class = props
             .and_then(|p| p.get("media.class"))
             .and_then(|n| n.as_str())
-            .unwrap_or("");
-        if name == "gamescope" || (class == "Video/Source" && name.contains("gamescope")) {
-            return obj.get("id").and_then(|i| i.as_u64()).map(|x| x as u32);
+            .unwrap_or("")
+            .to_string();
+        Some((id, name, class))
+    };
+    // Preferred: a Video/Source node named (or containing) "gamescope".
+    for obj in nodes {
+        if let Some((id, name, class)) = node_props(obj) {
+            if class == "Video/Source" && (name == "gamescope" || name.contains("gamescope")) {
+                return Some(id);
+            }
+        }
+    }
+    // Fallback: a node literally named "gamescope" with no usable class tag.
+    for obj in nodes {
+        if let Some((id, name, _)) = node_props(obj) {
+            if name == "gamescope" {
+                tracing::warn!(
+                    node_id = id,
+                    "gamescope node has no media.class=Video/Source tag — capturing it anyway"
+                );
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Minimum gamescope that captures reliably: below 3.16.22, headless PipeWire capture deadlocks
+/// against PipeWire ≥ 1.6 (a loop-lock bug) and a stuck link head-blocks the whole daemon.
+const MIN_GAMESCOPE: (u32, u32, u32) = (3, 16, 22);
+
+/// Best-effort: warn loudly if the installed gamescope is older than [`MIN_GAMESCOPE`]. Parsing
+/// failures are silent (don't block a possibly-fine custom build) — this is a diagnostic, not a
+/// gate. Returns the parsed version when it could read one.
+fn check_gamescope_version() -> Option<(u32, u32, u32)> {
+    let out = Command::new("gamescope").arg("--version").output().ok()?;
+    // gamescope prints the version banner to stderr on some builds, stdout on others.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ver = parse_version(&text)?;
+    if ver < MIN_GAMESCOPE {
+        tracing::warn!(
+            found = %format!("{}.{}.{}", ver.0, ver.1, ver.2),
+            min = %format!("{}.{}.{}", MIN_GAMESCOPE.0, MIN_GAMESCOPE.1, MIN_GAMESCOPE.2),
+            "gamescope is older than the minimum for reliable headless capture — expect a \
+             capture deadlock against PipeWire ≥ 1.6 (a wedged link head-blocks the daemon); \
+             upgrade gamescope or use PUNKTFUNK_COMPOSITOR=kwin|mutter"
+        );
+    }
+    Some(ver)
+}
+
+/// Extract the first `X.Y.Z` version triple from arbitrary text (e.g. `gamescope version 3.16.22`).
+fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    for token in text.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        let mut parts = token.split('.');
+        let (a, b, c) = (parts.next()?, parts.next(), parts.next());
+        let (Some(b), Some(c)) = (b, c) else { continue };
+        if let (Ok(a), Ok(b), Ok(c)) = (a.parse(), b.parse(), c.parse()) {
+            return Some((a, b, c));
         }
     }
     None
@@ -177,5 +246,30 @@ impl Drop for GamescopeProc {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_version, MIN_GAMESCOPE};
+
+    #[test]
+    fn parses_version_banner() {
+        assert_eq!(parse_version("gamescope version 3.16.22"), Some((3, 16, 22)));
+        assert_eq!(
+            parse_version("gamescope: version v3.15.9 (no PipeWire)"),
+            Some((3, 15, 9))
+        );
+        assert_eq!(parse_version("3.16.20-1.fc41"), Some((3, 16, 20)));
+        assert_eq!(parse_version("no version here"), None);
+        assert_eq!(parse_version("only 3.16 here"), None); // needs a full triple
+    }
+
+    #[test]
+    fn flags_known_bad_versions() {
+        // The 26.04-shipped 3.16.20 is below the minimum (PipeWire 1.6 deadlock).
+        assert!(parse_version("gamescope version 3.16.20").unwrap() < MIN_GAMESCOPE);
+        assert!(parse_version("gamescope version 3.16.22").unwrap() >= MIN_GAMESCOPE);
+        assert!(parse_version("gamescope version 3.17.0").unwrap() >= MIN_GAMESCOPE);
     }
 }

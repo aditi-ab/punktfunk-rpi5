@@ -91,17 +91,22 @@ impl VirtualDisplay for KwinDisplay {
         };
         tracing::info!(node_id, width, height, "KWin virtual output ready");
         // KWin creates virtual outputs at a hardcoded 60 Hz and `stream_virtual_output` has no
-        // refresh argument, so when the client wants more we install + select a custom mode
-        // (supported on virtual outputs since KWin 6.6). Done before capture connects PipeWire so
-        // the stream negotiates at the higher rate. First cut shells out to kscreen-doctor; the
-        // in-process kde_output_management_v2 client is a follow-up.
-        if mode.refresh_hz > 60 {
-            set_custom_refresh(width, height, mode.refresh_hz);
-        }
+        // refresh argument, so above 60 Hz we install + select a custom mode (supported on virtual
+        // outputs since KWin 6.6) before capture connects PipeWire, so the stream negotiates at the
+        // higher rate. First cut shells out to kscreen-doctor; the in-process
+        // kde_output_management_v2 client is a follow-up. `set_custom_refresh` reads back and
+        // returns what KWin *actually* achieved so the encoder paces to the real source rate (a
+        // rejected custom mode leaves the output at 60 Hz). At ≤60 Hz there's nothing to install —
+        // the source runs 60 Hz and the encoder downsamples — so carry the requested rate through.
+        let achieved_hz = if mode.refresh_hz > 60 {
+            set_custom_refresh(width, height, mode.refresh_hz)
+        } else {
+            mode.refresh_hz
+        };
         Ok(VirtualOutput {
             node_id,
             remote_fd: None,
-            preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
+            preferred_mode: Some((mode.width, mode.height, achieved_hz)),
             keepalive: Box::new(StopGuard(stop)),
         })
     }
@@ -109,8 +114,11 @@ impl VirtualDisplay for KwinDisplay {
 
 /// Best-effort: raise the just-created virtual output's refresh above KWin's default 60 Hz by
 /// installing + selecting a custom mode via `kscreen-doctor` (the output is `Virtual-<VOUT_NAME>`,
-/// refresh given in mHz). Failure leaves the source at 60 Hz — the stream still works, just capped.
-fn set_custom_refresh(width: u32, height: u32, hz: u32) {
+/// refresh given in mHz), then **read back the active mode** and return the refresh KWin actually
+/// gave us. The apply command can report success yet leave the output at 60 Hz (mode rejected),
+/// and a silent rate mismatch surfaces downstream as judder / duplicated frames — so the caller
+/// paces the encoder to the *achieved* rate, not the requested one.
+fn set_custom_refresh(width: u32, height: u32, hz: u32) -> u32 {
     let output = format!("Virtual-{VOUT_NAME}");
     let mhz = hz.saturating_mul(1000);
     let run = |arg: String| {
@@ -124,15 +132,68 @@ fn set_custom_refresh(width: u32, height: u32, hz: u32) {
     let _ = run(format!(
         "output.{output}.addCustomMode.{width}.{height}.{mhz}.full"
     ));
-    if run(format!("output.{output}.mode.{width}x{height}@{hz}")) {
-        tracing::info!(output, hz, "KWin virtual output: custom refresh applied");
-    } else {
-        tracing::warn!(
-            output,
-            hz,
-            "kscreen-doctor refresh set failed — source stays 60 Hz (is kscreen-doctor installed?)"
-        );
+    let applied = run(format!("output.{output}.mode.{width}x{height}@{hz}"));
+    match read_active_refresh(&output) {
+        Some(achieved) if achieved >= hz => {
+            tracing::info!(
+                output,
+                requested = hz,
+                achieved,
+                "KWin virtual output: custom refresh applied"
+            );
+            achieved
+        }
+        Some(achieved) => {
+            tracing::warn!(
+                output,
+                requested = hz,
+                achieved,
+                applied,
+                "KWin virtual output refresh below requested — pacing the encoder to the achieved \
+                 rate (custom-mode install rejected? is kscreen-doctor up to date?)"
+            );
+            achieved.max(1)
+        }
+        None => {
+            tracing::warn!(
+                output,
+                requested = hz,
+                applied,
+                "could not read back KWin virtual output refresh — assuming 60 Hz (is \
+                 kscreen-doctor installed?)"
+            );
+            60
+        }
     }
+}
+
+/// Read the active refresh (Hz, rounded) of `output` from `kscreen-doctor -j`. `None` if the
+/// tool, the output, or its current mode can't be found. Mode/output ids come through as either
+/// JSON strings or numbers depending on the KWin version, so both are accepted.
+fn read_active_refresh(output: &str) -> Option<u32> {
+    let out = std::process::Command::new("kscreen-doctor")
+        .arg("-j")
+        .output()
+        .ok()?;
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let as_id = |v: &serde_json::Value| -> Option<String> {
+        v.as_str()
+            .map(|s| s.to_string())
+            .or_else(|| v.as_u64().map(|n| n.to_string()))
+    };
+    let o = doc
+        .get("outputs")?
+        .as_array()?
+        .iter()
+        .find(|o| o.get("name").and_then(|n| n.as_str()) == Some(output))?;
+    let current = o.get("currentModeId").and_then(as_id)?;
+    let mode = o
+        .get("modes")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("id").and_then(as_id).as_deref() == Some(current.as_str()))?;
+    let hz = mode.get("refreshRate").and_then(|r| r.as_f64())?;
+    Some(hz.round() as u32)
 }
 
 /// Dropping this releases the KWin virtual output: it flips the keepalive thread's `stop`, which
