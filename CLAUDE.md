@@ -17,14 +17,14 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   **KWin** (`zkde_screencast stream_virtual_output`, needs KWin ≥ 6.5.6 headless; >60 Hz via
   custom modes), **gamescope** (spawned headless at WxH@Hz, its PipeWire node captured, needs
   gamescope ≥ 3.16.22 — older deadlocks on PipeWire ≥ 1.6), **Mutter** (D-Bus
-  `RecordVirtual`; implemented, live validation pending a gnome-shell install).
+  `RecordVirtual` virtual monitor; validated live on headless GNOME Shell 50, zero-copy).
   Performance work landed and measured: GPU **zero-copy** on all paths (tiled dmabuf →
   EGL/GL → CUDA; LINEAR dmabuf → **Vulkan bridge** → CUDA → NVENC), auto 2-way NVENC
   split-encode above ~1 Gpix/s (5K@240), infinite GOP + RFI keyframes (killed the periodic
   freeze), encode|send thread split with `sendmmsg` batching. Stable 240 fps at 5120×1440.
   Input: mouse/keyboard (libei via RemoteDesktop portal on KWin/GNOME, gamescope's own EIS
   socket, wlr protocols on Sway) and **gamepads** (uinput X-Box-360 pads + rumble
-  back-channel; live validation pending the udev rule below). Management REST API +
+  back-channel; validated live — pad created/destroyed with the session). Management REST API +
   checked-in OpenAPI doc (`mgmt.rs`).
 - **M3 (`lumen/1`, the native protocol): full session planes, validated live.** QUIC
   control plane (`lumen-core` `quic` feature: Hello{mode}/Welcome{full Config}/Start), data
@@ -62,13 +62,12 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    mid-stream mode renegotiation (the Welcome is one-shot today), concurrent sessions
    (today: one at a time, extras wait in the accept queue).
 4. **M2 polish**: wlroots/Sway `VirtualDisplay` backend (deferred; swaymsg `create_output`),
-   GNOME live validation, gamepad live validation (blocked on the udev rule below),
    HDR/10-bit/AV1 negotiation, surround audio, reconnect-at-new-mode robustness.
 5. **Native clients** (`clients/{apple,android}` scaffolds) consuming `lumen_core.h`.
-6. **This box, one-time setup still pending**: `sudo cp scripts/60-lumen.rules
-   /etc/udev/rules.d/` + user into `input` group (gamepads); `apt install gnome-shell`
-   (Mutter validation). Done since last update: gamescope 3.16.22 is installed at
-   `/usr/local/bin` — the `PATH=/tmp/gamescope-src/...` override is no longer needed.
+
+Box one-time setup is complete: udev rule + `input` group (gamepads validated live),
+gamescope 3.16.22 installed system-wide (no PATH override), gnome-shell installed (Mutter
+backend validated live). All three compositor backends are live-validated.
 
 ## Build / test / run
 
@@ -134,9 +133,9 @@ XDG_CURRENT_DESKTOP=KDE KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
 kwin_wayland --virtual --width 1920 --height 1080 --no-lockscreen --socket wayland-kde \
   --exit-with-session wev
 
-# host (shell 2; gamescope entries need the PATH override until ninja install):
+# host (shell 2):
 WAYLAND_DISPLAY=wayland-kde XDG_CURRENT_DESKTOP=KDE LUMEN_VIDEO_SOURCE=virtual \
-LUMEN_ZEROCOPY=1 PATH=/tmp/gamescope-src/build/src:$PATH cargo run -rp lumen-host -- serve
+LUMEN_ZEROCOPY=1 cargo run -rp lumen-host -- serve
 
 # lumen/1 native loopback test (no Moonlight needed; same env as serve, listener persists
 # across sessions — bound it with --max-sessions):
