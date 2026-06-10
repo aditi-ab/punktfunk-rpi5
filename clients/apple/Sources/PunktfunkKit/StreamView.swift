@@ -215,6 +215,23 @@ public final class StreamLayerView: NSView {
         super.mouseUp(with: event)
     }
 
+    /// Scroll is forwarded from here, not from GCMouse: trackpad/Magic Mouse gestures
+    /// never reach GameController's scroll dpad. While captured the cursor is parked
+    /// mid-view, so this view receives every scroll event. Precise (gesture) deltas are
+    /// pixels — ~0.1 wheel notch per pixel (SDL's factor) → ×12 for WHEEL_DELTA(120);
+    /// classic wheels report lines, one notch = ±1 → ×120. Signs pass through as-is,
+    /// preserving the user's local (natural-)scrolling preference.
+    public override func scrollWheel(with event: NSEvent) {
+        guard captured, let inputCapture else {
+            super.scrollWheel(with: event)
+            return
+        }
+        let scale: Float = event.hasPreciseScrollingDeltas ? 12 : 120
+        inputCapture.sendScroll(
+            dx: Float(event.scrollingDeltaX) * scale,
+            dy: Float(event.scrollingDeltaY) * scale)
+    }
+
     // While captured, the view is first responder and consumes key events — GC delivers
     // them to the host independently, and consuming here stops the responder chain's
     // "unhandled keyDown" beep without touching the event stream GC may rely on.

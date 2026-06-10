@@ -37,8 +37,9 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
     thread per view, token-cancelled so reconnects can't double-pump.
   - `InputCapture.swift` — `GCMouse` raw deltas + `GCKeyboard` HID→VK mapping (the host's
     `vk_to_evdev` consumes Windows VKs), with fractional-delta accumulation so sub-pixel
-    motion isn't truncated away. Buttons use GameStream ids (1=left … 5=X2); scroll is
-    WHEEL_DELTA(120)-scaled.
+    motion isn't truncated away. Buttons use GameStream ids (1=left … 5=X2). Scroll
+    arrives via the stream view's `scrollWheel` override instead of GC (trackpad/Magic
+    Mouse gestures never reach GCMouse's scroll dpad), WHEEL_DELTA(120)-scaled.
 - **`PunktfunkClient`** (the app): hosts grid (saved in UserDefaults), "+" toolbar
   sheet to add hosts, stream mode in Settings (⌘,), two trust flows — the
   trust-on-first-use fingerprint prompt over the live-but-blurred stream, and SPAKE2 PIN

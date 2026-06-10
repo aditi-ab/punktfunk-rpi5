@@ -237,18 +237,26 @@ public final class InputCapture {
                 }
             }
         }
-        input.scroll.valueChangedHandler = { [weak self] _, x, y in
-            guard let self, self.forwarding else { return }
-            // WHEEL_DELTA(120) per notch; positive = up / right (Moonlight's convention).
-            let fy = y * 120 + self.residualScrollY
-            let fx = x * 120 + self.residualScrollX
-            let iy = fy.rounded(.towardZero)
-            let ix = fx.rounded(.towardZero)
-            self.residualScrollY = fy - iy
-            self.residualScrollX = fx - ix
-            if iy != 0 { self.connection.send(.scroll(Int32(iy))) }
-            if ix != 0 { self.connection.send(.scroll(Int32(ix), horizontal: true)) }
-        }
+        // NOTE: no scroll handler here. GCMouse's scroll dpad only fires for plain HID
+        // wheel deltas — trackpad/Magic Mouse scrolling is gesture-based and never
+        // reaches GameController. Scroll arrives via the stream view's scrollWheel
+        // override (NSEvent covers wheels too) → sendScroll().
+    }
+
+    /// Forward a scroll gesture, WHEEL_DELTA(120)-scaled (positive = up / right,
+    /// Moonlight's convention). Fed by StreamLayerView.scrollWheel — the only delivery
+    /// path that covers trackpad/Magic Mouse gestures (GCMouse never reports them).
+    /// Fractional remainders accumulate so slow two-finger scrolling isn't truncated away.
+    public func sendScroll(dx: Float, dy: Float) {
+        guard forwarding else { return }
+        let fy = dy + residualScrollY
+        let fx = dx + residualScrollX
+        let iy = fy.rounded(.towardZero)
+        let ix = fx.rounded(.towardZero)
+        residualScrollY = fy - iy
+        residualScrollX = fx - ix
+        if iy != 0 { connection.send(.scroll(Int32(iy))) }
+        if ix != 0 { connection.send(.scroll(Int32(ix), horizontal: true)) }
     }
 
     private func attach(keyboard: GCKeyboard) {
