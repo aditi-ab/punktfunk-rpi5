@@ -58,7 +58,7 @@ struct ContentView: View {
             return nil
         }()
         return ZStack {
-            stream(capturesCursor: pendingFingerprint == nil)
+            stream(captureEnabled: pendingFingerprint == nil)
                 .blur(radius: pendingFingerprint != nil ? 32 : 0)
                 .overlay {
                     if pendingFingerprint != nil {
@@ -257,19 +257,22 @@ struct ContentView: View {
 
     // MARK: - Stream
 
-    private func stream(capturesCursor: Bool) -> some View {
+    private func stream(captureEnabled: Bool) -> some View {
         Group {
             if let conn = model.connection {
                 StreamView(
                     connection: conn,
-                    capturesCursor: capturesCursor,
+                    captureEnabled: captureEnabled,
+                    onCaptureChange: { [weak model] captured in
+                        model?.mouseCaptured = captured
+                    },
                     onFrame: { [meter = model.meter] au in meter.note(byteCount: au.data.count) },
                     onSessionEnd: { [weak model] in
                         Task { @MainActor in model?.sessionEnded() }
                     }
                 )
                 .overlay(alignment: .topTrailing) {
-                    if capturesCursor { hud(conn) }
+                    if captureEnabled { hud(conn) }
                 }
             }
         }
@@ -279,8 +282,13 @@ struct ContentView: View {
         VStack(alignment: .trailing, spacing: 4) {
             Text("\(conn.width)×\(conn.height)@\(conn.refreshHz)  \(model.fps) fps  \(model.mbps, specifier: "%.1f") Mb/s")
                 .font(.system(.caption, design: .monospaced))
-            // ⌘D because the local cursor is hidden+frozen while streaming — the button
-            // can't be clicked. (Cmd+Tab away also frees the cursor.)
+            // While captured the cursor is hidden+frozen, so the button is keyboard-only
+            // (⌘⎋ or Cmd+Tab release the cursor; released, it's clickable again).
+            Text(model.mouseCaptured
+                ? "⌘⎋ releases the mouse"
+                : "Click the stream to capture input")
+                .font(.caption2)
+                .opacity(0.8)
             Button("Disconnect (⌘D)") { model.disconnect() }
                 .font(.caption)
                 .keyboardShortcut("d", modifiers: .command)

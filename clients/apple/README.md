@@ -140,16 +140,19 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    the host rebuilds at the new mode in ~90 ms; the first new-mode AU is an IDR with
    fresh parameter sets (the refresh-on-IDR decode flow handles it untouched) and
    `currentMode()` reflects the switch. Wire it to window-resize events.
-8. **Input capture caveats** (stage 1): GC handlers only fire while the app has focus —
-   on focus loss `InputCapture` auto-releases everything still held (keys + buttons) so
-   nothing sticks down host-side. While the stream has focus the LOCAL cursor is hidden
-   and frozen mid-view (`CursorCapture` in StreamView.swift — the host renders its own
-   cursor; the local one diverges from it and a stray click would focus another app);
-   Cmd+Tab frees it, ⌘D disconnects. While captured, key NSEvents are swallowed by a
-   local event monitor (GC reads HID directly; without it every keystroke bubbles up the
-   responder chain unhandled and NSWindow beeps) — except ⌘-combos, which still reach
-   the local app (⌘D/⌘Q) in addition to the host; a capture toggle is a small
-   follow-up. One live capture per process (the GC
+8. **Input capture** (stage 1): capture is a deliberate, reversible STATE owned by
+   `StreamLayerView`, Moonlight-style. Engaged when the stream starts / trust is
+   confirmed and when the user clicks into the video (that click is suppressed toward
+   the host); released by ⌘⎋ (toggles) or focus loss; NEVER engaged by mere app
+   activation — activating clicks may be title-bar drags or resizes, which used to get
+   their cursor warped away mid-drag. While captured: the local cursor is hidden +
+   frozen mid-view (the host renders its own), all input is forwarded, and the view
+   consumes key events as first responder so unhandled keyDowns don't beep — ⌘-combos
+   still work locally (⌘D disconnect, ⌘Q) *and* reach the host via GC. While released:
+   nothing is forwarded (`InputCapture.forwarding` gates the GC handlers; held
+   keys/buttons are flushed host-side on release so nothing sticks down), the cursor is
+   free, and the HUD shows "Click the stream to capture input". GC handlers only fire
+   while the app has focus, and focus loss also auto-releases everything held. One live capture per process (the GC
    mouse/keyboard singletons have a single handler slot — ownership is tracked so a stale
    capture's stop() can't clobber a newer one).
 9. **iOS**: same package (`BUILD_IOS=1` for the xcframework slice); `StreamView` needs the

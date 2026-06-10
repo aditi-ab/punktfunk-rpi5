@@ -14,6 +14,11 @@
 // didResignActive and on stop(). All GC handlers and notifications fire on the main
 // queue (the framework default), so the mutable state here needs no locking.
 //
+// Forwarding is gated by `forwarding` (driven by StreamLayerView's capture state): the
+// handlers stay attached for the whole session, but while the user has released capture
+// (⌘⎋, focus loss) nothing reaches the host and key events travel the responder chain
+// normally. Everything held is flushed host-side on each transition to released.
+//
 // GCMouse.current/GCKeyboard.coalesced are process-global singletons with one handler
 // slot each: only one InputCapture can be live per process. `activeCapture` tracks
 // ownership so a stale capture's stop() can't clobber a newer one's handlers.
@@ -40,14 +45,66 @@ public final class InputCapture {
     private var residualScrollY: Float = 0
     private var pressedVKs: Set<UInt32> = []
     private var pressedButtons: Set<UInt32> = []
+    /// One-shot: the left click that engaged capture belongs to the local UI — GC sees
+    /// it at the HID layer regardless, so its press AND release are dropped here.
+    private var suppressedButton: UInt32?
+
+    /// One-shot twin of `suppressedButton` for the ⌘⎋ toggle: the physical Esc also
+    /// reaches GCKeyboard, racing the NSEvent monitor — latched here so it can't type
+    /// an Escape into the host in either toggle direction.
+    private var suppressedVK: UInt32?
+
+    /// While true, mouse/keyboard flow to the host and key NSEvents are swallowed
+    /// locally; while false the user is interacting with the local UI (dragging the
+    /// window, clicking the HUD) and nothing is forwarded. Main-queue only.
+    public private(set) var forwarding = false
+
+    /// Fired on ⌘⎋ (the capture toggle — detected here so it works in both states; the
+    /// event itself is swallowed). Main queue.
+    public var onToggleCapture: (() -> Void)?
+
+    /// Fired when a newer InputCapture takes the process-global GC handler slots (the
+    /// singletons hold ONE handler each): the preempted owner must drop its capture
+    /// state — its handlers are gone, so it would otherwise sit "captured" with dead
+    /// input. Main queue.
+    public var onPreempted: (() -> Void)?
 
     public init(connection: PunktfunkConnection) {
         self.connection = connection
     }
 
+    /// Gate the forwarding without detaching the GC handlers. `suppressClick` marks the
+    /// transition as click-driven: that click's press/release are not forwarded. Every
+    /// transition to false flushes held keys/buttons host-side.
+    public func setForwarding(_ on: Bool, suppressClick: Bool = false) {
+        if on {
+            forwarding = true
+            suppressedButton = suppressClick ? 1 : nil
+        } else if forwarding {
+            releaseAll()
+            forwarding = false
+            suppressedButton = nil
+        }
+    }
+
+    /// The engage click is over (its NSEvent mouseUp processed) — stop suppressing.
+    /// Backstop for the GC-vs-NSEvent ordering where both halves of the click landed
+    /// before mouseDown armed the latch, which would otherwise eat the next real click.
+    public func endClickSuppression() {
+        suppressedButton = nil
+    }
+
     /// Begin forwarding the current (and future) mouse/keyboard to the host. Steals the
-    /// global GC handler slots from any previous capture (one live capture per process).
+    /// global GC handler slots from any previous capture (one live capture per process),
+    /// notifying it via `onPreempted` so its owner releases its capture state.
     public func start() {
+        if let previous = Self.activeCapture, previous !== self {
+            // Drop the previous owner's device lists first: its stop() must not be able
+            // to nil out the handler slots this capture is about to claim.
+            previous.mice.removeAll()
+            previous.keyboards.removeAll()
+            previous.onPreempted?()
+        }
         Self.activeCapture = self
         if let mouse = GCMouse.current { attach(mouse: mouse) }
         if let keyboard = GCKeyboard.coalesced { attach(keyboard: keyboard) }
@@ -67,15 +124,21 @@ public final class InputCapture {
         ) { [weak self] _ in
             self?.releaseAll()
         })
-        // GC reads the HID state directly — the NSEvents still travel the responder
-        // chain, where every unhandled keyDown makes NSWindow beep ("invalid input").
-        // Swallow key events while captured, EXCEPT ⌘-combos: those stay local (the
-        // HUD's ⌘D disconnect, ⌘Q, …) in addition to reaching the host via GC.
+        // ⌘⎋ — the capture toggle — is detected here so it works in both states. ONLY
+        // that one combo is intercepted: swallowing keys wholesale at the monitor level
+        // risks starving GC's own delivery, so the no-beep behavior lives in
+        // StreamLayerView (first responder consumes keyDown/keyUp while captured).
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.keyDown, .keyUp]
-        ) { event in
-            event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
-                ? event : nil
+            matching: [.keyDown]
+        ) { [weak self] event in
+            guard let self else { return event }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if event.keyCode == 53 /* Esc */, flags == .command {
+                self.suppressedVK = 0x1B // the same physical Esc is en route via GC
+                self.onToggleCapture?()
+                return nil
+            }
+            return event
         }
     }
 
@@ -126,6 +189,11 @@ public final class InputCapture {
     }
 
     private func sendButton(_ button: UInt32, pressed: Bool) {
+        guard forwarding else { return }
+        if button == suppressedButton {
+            if !pressed { suppressedButton = nil } // capture click over — stop suppressing
+            return
+        }
         if pressed {
             pressedButtons.insert(button)
         } else {
@@ -140,7 +208,7 @@ public final class InputCapture {
         else { return }
         mice.append(mouse)
         input.mouseMovedHandler = { [weak self] _, dx, dy in
-            guard let self else { return }
+            guard let self, self.forwarding else { return }
             // GC gives +y up; the host expects screen-space (+y down).
             let fx = dx + self.residualX
             let fy = -dy + self.residualY
@@ -170,7 +238,7 @@ public final class InputCapture {
             }
         }
         input.scroll.valueChangedHandler = { [weak self] _, x, y in
-            guard let self else { return }
+            guard let self, self.forwarding else { return }
             // WHEEL_DELTA(120) per notch; positive = up / right (Moonlight's convention).
             let fy = y * 120 + self.residualScrollY
             let fx = x * 120 + self.residualScrollX
@@ -188,6 +256,18 @@ public final class InputCapture {
         keyboards.append(keyboard)
         keyboard.keyboardInput?.keyChangedHandler = { [weak self] _, _, keyCode, pressed in
             guard let self, let vk = Self.hidToVK[keyCode.rawValue] else { return }
+            // The ⌘⎋ toggle's Esc — checked before the forwarding gate, because in the
+            // engage direction forwarding is already true when this fires.
+            if vk == self.suppressedVK {
+                if !pressed { self.suppressedVK = nil }
+                return
+            }
+            guard self.forwarding else { return }
+            // Release direction of the toggle: GC's Esc-down can beat the NSEvent
+            // monitor — never type Esc into the host while ⌘ is held (⌘⎋ is reserved).
+            if vk == 0x1B, self.pressedVKs.contains(0x5B) || self.pressedVKs.contains(0x5C) {
+                return
+            }
             if pressed {
                 self.pressedVKs.insert(vk)
             } else {

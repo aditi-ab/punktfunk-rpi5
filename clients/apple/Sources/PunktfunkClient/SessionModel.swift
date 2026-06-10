@@ -53,9 +53,11 @@ final class SessionModel: ObservableObject {
     @Published var fps = 0
     @Published var mbps = 0.0
     @Published var totalFrames = 0
+    /// Mirrors StreamView's capture state (it owns the input capture; this drives the
+    /// HUD's "click to capture" / "⌘⎋ releases" hint).
+    @Published var mouseCaptured = false
 
     let meter = FrameMeter()
-    private var inputCapture: InputCapture?
     private var statsTimer: Timer?
 
     var isBusy: Bool { phase != .idle }
@@ -118,8 +120,6 @@ final class SessionModel: ObservableObject {
     }
 
     func disconnect() {
-        inputCapture?.stop()
-        inputCapture = nil
         statsTimer?.invalidate()
         statsTimer = nil
         if let conn = connection {
@@ -132,6 +132,7 @@ final class SessionModel: ObservableObject {
         phase = .idle
         fps = 0
         mbps = 0
+        mouseCaptured = false
     }
 
     /// Called (via the main actor) when the pump hits end-of-session.
@@ -143,11 +144,10 @@ final class SessionModel: ObservableObject {
     }
 
     private func beginStreaming() {
-        guard let conn = connection else { return }
+        guard connection != nil else { return }
+        // Input capture itself is owned by StreamView (engaged by the captureEnabled
+        // flip this phase change causes, released/re-engaged by the user from there).
         phase = .streaming
-        let capture = InputCapture(connection: conn)
-        capture.start()
-        inputCapture = capture
     }
 
     private func startStatsTimer() {
