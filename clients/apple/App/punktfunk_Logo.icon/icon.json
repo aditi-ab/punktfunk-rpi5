@@ -1,0 +1,137 @@
+{
+  "features" : [
+    "refractivity",
+    "specular-location"
+  ],
+  "fill" : {
+    "automatic-gradient" : "display-p3:0.39502,0.30640,0.96338,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "fill-specializations" : [
+            {
+              "appearance" : "dark",
+              "value" : {
+                "linear-gradient" : [
+                  "display-p3:0.50857,0.42359,0.99951,1.00000",
+                  "display-p3:0.79872,0.76251,0.99951,1.00000"
+                ],
+                "orientation" : {
+                  "start" : {
+                    "x" : 0.760399408577226,
+                    "y" : 0.23565405496698932
+                  },
+                  "stop" : {
+                    "x" : 0.22975170002255774,
+                    "y" : 0.7672556579447137
+                  }
+                }
+              }
+            }
+          ],
+          "image-name" : "punktfunk_Minimal_Icon-Composer_Layer-3 2.svg",
+          "name" : "punktfunk_Minimal_Icon-Composer_Layer-3 2"
+        }
+      ],
+      "name" : "Group",
+      "refractivity" : {
+        "depth" : 0.0419921875,
+        "enabled" : true,
+        "strength" : 0.5463671875
+      },
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.6
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.6
+      }
+    },
+    {
+      "blur-material" : null,
+      "layers" : [
+        {
+          "fill-specializations" : [
+            {
+              "appearance" : "dark",
+              "value" : {
+                "solid" : "display-p3:0.38965,0.33936,0.91504,1.00000"
+              }
+            }
+          ],
+          "image-name" : "punktfunk_Minimal_Icon-Composer_Layer-2.svg",
+          "name" : "punktfunk_Minimal_Icon-Composer_Layer-2"
+        }
+      ],
+      "lighting" : "individual",
+      "name" : "Group",
+      "refractivity" : {
+        "depth" : 0.1,
+        "enabled" : false,
+        "strength" : 0.57
+      },
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 0.56
+      },
+      "specular" : true,
+      "translucency" : {
+        "enabled" : true,
+        "value" : 1
+      }
+    },
+    {
+      "blur-material" : 0,
+      "layers" : [
+        {
+          "fill-specializations" : [
+            {
+              "appearance" : "dark",
+              "value" : {
+                "automatic-gradient" : "display-p3:0.38965,0.33936,0.91504,1.00000"
+              }
+            }
+          ],
+          "image-name" : "punktfunk_Minimal_Icon-Composer_Layer-1.svg",
+          "name" : "punktfunk_Minimal_Icon-Composer_Layer-1"
+        }
+      ],
+      "refractivity" : {
+        "depth" : 0.5808984375,
+        "enabled" : true,
+        "strength" : 0.2508984375
+      },
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.6
+      },
+      "specular" : "outside",
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.53
+      }
+    },
+    {
+      "layers" : [
+
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.6
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.2
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
