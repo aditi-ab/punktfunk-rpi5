@@ -13,11 +13,13 @@ cd "$(dirname "$0")/.."
 TARGETS_MAC=(aarch64-apple-darwin x86_64-apple-darwin)
 BUILD_IOS="${BUILD_IOS:-0}" # BUILD_IOS=1 adds an iOS slice (requires the ios target installed)
 
+# Deployment targets must match Package.swift's platforms, or every consumer link emits
+# "object file was built for newer macOS version" warnings.
 for t in "${TARGETS_MAC[@]}"; do
-    cargo build --release -p lumen-core --features quic --target "$t"
+    MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release -p lumen-core --features quic --target "$t"
 done
 if [[ "$BUILD_IOS" == "1" ]]; then
-    cargo build --release -p lumen-core --features quic --target aarch64-apple-ios
+    IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo build --release -p lumen-core --features quic --target aarch64-apple-ios
 fi
 
 STAGE="$(mktemp -d)"
@@ -48,6 +50,18 @@ ARGS=(-library "$STAGE/macos/liblumen_core.a" -headers "$STAGE/include")
 if [[ "$BUILD_IOS" == "1" ]]; then
     ARGS+=(-library target/aarch64-apple-ios/release/liblumen_core.a -headers "$STAGE/include")
 fi
+
+# Cargo does NOT fingerprint MACOSX_DEPLOYMENT_TARGET — units cached from a build without
+# it keep their old minos forever. Refuse to ship anything newer than the package floor
+# (objects BELOW it, e.g. rustup's precompiled std at 11.0, are fine and unavoidable).
+for obj in "$STAGE"/macos/liblumen_core.a; do
+    bad=$(otool -l "$obj" 2>/dev/null | awk '/minos/ {print $2}' | sort -uV | awk -F. '$1 > 14' | head -1)
+    if [[ -n "$bad" ]]; then
+        echo "ERROR: $obj contains objects built for macOS $bad (> 14.0)." >&2
+        echo "Stale cache — rm -rf target/{aarch64,x86_64}-apple-darwin and rebuild." >&2
+        exit 1
+    fi
+done
 
 rm -rf clients/apple/LumenCore.xcframework
 xcodebuild -create-xcframework "${ARGS[@]}" -output clients/apple/LumenCore.xcframework

@@ -17,7 +17,7 @@ negotiated extension. See [`docs/implementation-plan.md`](docs/implementation-pl
 | M2 — P1 host → stock Moonlight | 🟡 capture+encode landed in M0; pairing/RTSP/vdisplay pending |
 | M3 — measurement harness | 🟡 `tools/loss-harness` runs; `latency-probe` scaffolded |
 | M4 — P2 transport + Rust client | 🟡 GF(2¹⁶) core done; `lumen-client-rs` scaffolded |
-| M5 — Apple client | ⬜ scaffolded (`clients/apple`) |
+| M5 — Apple client | 🟡 macOS first light: HEVC on glass + input over `lumen/1` (`clients/apple`) |
 
 `lumen-core` is complete and verified: it builds and its full test suite (FEC recovery,
 loopback round-trip under loss, property tests, and a **C ABI harness**) passes on

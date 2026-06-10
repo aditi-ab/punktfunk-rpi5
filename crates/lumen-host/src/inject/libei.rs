@@ -370,10 +370,12 @@ impl EiState {
             InputKind::MouseScroll => match slot.interface::<ei::Scroll>() {
                 Some(s) => {
                     // GameStream sends WHEEL_DELTA(120)-scaled deltas in `x`; ei scroll_discrete
-                    // uses the same 120-per-detent unit. Positive GameStream = up/left, which is
-                    // negative on the ei axis (matches wl_pointer).
+                    // uses the same 120-per-detent unit. Positive GameStream = up (vertical),
+                    // which is negative on the ei axis, but = RIGHT (horizontal), which is
+                    // already positive there (moonlight-qt/Sunshine pass horizontal through
+                    // unnegated) — only the vertical axis flips.
                     if ev.code == SCROLL_HORIZONTAL {
-                        s.scroll_discrete(-ev.x, 0);
+                        s.scroll_discrete(ev.x, 0);
                     } else {
                         s.scroll_discrete(0, -ev.x);
                     }

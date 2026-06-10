@@ -8,7 +8,8 @@ let package = Package(
     name: "LumenKit",
     platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
-        .library(name: "LumenKit", targets: ["LumenKit"])
+        .library(name: "LumenKit", targets: ["LumenKit"]),
+        .executable(name: "LumenClient", targets: ["LumenClient"]),
     ],
     targets: [
         .binaryTarget(name: "LumenCore", path: "LumenCore.xcframework"),
@@ -22,5 +23,8 @@ let package = Package(
                 .linkedLibrary("resolv"),
             ]
         ),
+        // Development app shell (swift run LumenClient): connect form → stream + input.
+        .executableTarget(name: "LumenClient", dependencies: ["LumenKit"]),
+        .testTarget(name: "LumenKitTests", dependencies: ["LumenKit"]),
     ]
 )

@@ -448,6 +448,7 @@ fn input_thread(rx: std::sync::mpsc::Receiver<InputEvent>, conn: quinn::Connecti
 /// The audio thread: desktop capture → Opus (48 kHz stereo, 5 ms, CBR — same tuning as the
 /// GameStream path) → `AUDIO_MAGIC` datagrams. QUIC already encrypts; no extra layer.
 /// The capturer comes from (and returns to) the persistent slot — see [`AudioCapSlot`].
+#[cfg(target_os = "linux")]
 fn audio_thread(conn: quinn::Connection, stop: Arc<AtomicBool>, audio_cap: AudioCapSlot) {
     use crate::audio::{CHANNELS, SAMPLE_RATE};
     const FRAME_MS: usize = 5;
@@ -517,6 +518,15 @@ fn audio_thread(conn: quinn::Connection, stop: Arc<AtomicBool>, audio_cap: Audio
     if !capture_dead {
         *audio_cap.lock().unwrap() = Some(capturer);
     }
+}
+
+/// Stub — lumen/1 audio needs Linux (PipeWire capture + libopus); non-Linux dev builds
+/// run sessions without it, same as when the capturer fails to open.
+#[cfg(not(target_os = "linux"))]
+fn audio_thread(_conn: quinn::Connection, _stop: Arc<AtomicBool>, _audio_cap: AudioCapSlot) {
+    tracing::warn!(
+        "lumen/1 audio requires Linux (PipeWire + libopus) — session continues without it"
+    );
 }
 
 fn synthetic_stream(session: &mut Session, frames: u32, stop: &AtomicBool) -> Result<()> {

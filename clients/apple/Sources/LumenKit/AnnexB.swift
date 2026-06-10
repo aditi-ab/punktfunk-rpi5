@@ -12,6 +12,9 @@ import Foundation
 
 public enum AnnexB {
     /// Split an Annex-B stream into NAL units (start codes 00 00 01 / 00 00 00 01 stripped).
+    /// All zeros immediately preceding a start code are dropped: they're either the
+    /// 4-byte-code prefix or `trailing_zero_8bits` padding, never NAL payload (emulation
+    /// prevention keeps 00 00 0x out of conforming NAL bytes) — same policy as ffmpeg.
     public static func nalUnits(in data: Data) -> [Data] {
         var nals: [Data] = []
         let bytes = [UInt8](data)
@@ -19,8 +22,11 @@ public enum AnnexB {
         var start = -1
         while i + 2 < bytes.count {
             if bytes[i] == 0, bytes[i + 1] == 0, bytes[i + 2] == 1 {
-                let codeStart = (i > 0 && bytes[i - 1] == 0) ? i - 1 : i
-                if start >= 0 {
+                var codeStart = i
+                while codeStart > 0, bytes[codeStart - 1] == 0 {
+                    codeStart -= 1
+                }
+                if start >= 0, start < codeStart {
                     nals.append(Data(bytes[start..<codeStart]))
                 }
                 start = i + 3

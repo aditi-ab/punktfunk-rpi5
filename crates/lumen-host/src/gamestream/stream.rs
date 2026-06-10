@@ -144,6 +144,7 @@ type PacketBatch = Vec<Vec<u8>>;
 
 /// Send `pkts` with as few syscalls as possible (`sendmmsg`, up to 64 per call). The socket is
 /// connected, so no per-message address. Returns an error on the first send failure.
+#[cfg(target_os = "linux")]
 fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     const CHUNK: usize = 64;
@@ -175,6 +176,16 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
             }
             off += n as usize;
         }
+    }
+    Ok(())
+}
+
+/// Portable fallback (non-Linux dev builds — GameStream hosting never ships there): one
+/// syscall per packet.
+#[cfg(not(target_os = "linux"))]
+fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
+    for p in pkts {
+        sock.send(p)?;
     }
     Ok(())
 }

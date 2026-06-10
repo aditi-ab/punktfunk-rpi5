@@ -7,7 +7,26 @@
 //! the media streams follow (see the M2 task list / plan).
 
 pub mod apps;
+#[cfg(target_os = "linux")]
 mod audio;
+/// Stub — the audio plane needs Linux (PipeWire capture + libopus); this keeps non-Linux
+/// dev builds compiling (crate doc: "the crate compiles everywhere"). Reports failure the
+/// same way the real stream thread does: by clearing `running`.
+#[cfg(not(target_os = "linux"))]
+mod audio {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    pub fn start(
+        running: Arc<AtomicBool>,
+        _gcm_key: [u8; 16],
+        _rikeyid: i32,
+        _audio_cap: Arc<Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>,
+    ) {
+        tracing::error!("GameStream audio requires Linux (PipeWire + libopus)");
+        running.store(false, Ordering::SeqCst);
+    }
+}
 pub(crate) mod cert;
 mod control;
 mod crypto;

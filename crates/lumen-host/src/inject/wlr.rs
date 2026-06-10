@@ -226,10 +226,17 @@ impl InputInjector for WlrootsInjector {
                     wl_pointer::Axis::VerticalScroll
                 };
                 // GameStream sends WHEEL_DELTA(120)-scaled units; a notch ≈ 15px. Positive
-                // GameStream = scroll up, which is negative on the Wayland axis.
+                // GameStream = up (vertical), negative on the Wayland axis; but = RIGHT
+                // (horizontal), already positive there (moonlight-qt/Sunshine pass
+                // horizontal through unnegated) — only the vertical axis flips.
                 let notches = event.x as f64 / 120.0;
+                let sign = if event.code == SCROLL_HORIZONTAL {
+                    1.0
+                } else {
+                    -1.0
+                };
                 self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
-                self.pointer.axis(t, axis, -notches * 15.0);
+                self.pointer.axis(t, axis, sign * notches * 15.0);
                 self.pointer.frame();
             }
             InputKind::KeyDown | InputKind::KeyUp => {

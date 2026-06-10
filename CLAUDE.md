@@ -44,11 +44,16 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
 
 ## What's left
 
-1. **M4 — client decode + present**: the SwiftUI client is scaffolded and handed off —
-   the lumen/1 connector is in the C ABI (`lumen_connect` & co., ABI-roundtrip-tested) with
-   an xcframework build script + LumenKit Swift package; **see
-   [`clients/apple/README.md`](clients/apple/README.md) for the Mac-side pickup**. Then
-   glass-to-glass numbers via `tools/latency-probe` (scaffold). The Linux reference client
+1. **M4 — client decode + present: macOS stage 1 done, first light achieved
+   (2026-06-10).** LumenKit compiles and is tested on macOS (AnnexB → VideoToolbox →
+   `AVSampleBufferDisplayLayer`, GCMouse/GCKeyboard capture, `LumenClient` app shell);
+   validated live Mac ↔ this box at 720p60 — vkcube on glass, input injected via gamescope
+   EIS. Tests: `swift test` in `clients/apple` (unit + real-codec round trip),
+   `test-loopback.sh` (Swift client vs synthetic m3-host on loopback — runs on macOS),
+   `RemoteFirstLightTests` (full pipeline over the LAN). See
+   [`clients/apple/README.md`](clients/apple/README.md). Next: stage 2 presenter
+   (`VTDecompressionSession` + `CAMetalLayer` frame pacing), glass-to-glass numbers via
+   `tools/latency-probe` (scaffold), iOS variant. The Linux reference client
    (`lumen-client-rs`) gets VAAPI + wgpu on the same connector later.
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
@@ -61,9 +66,9 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    HDR/10-bit/AV1 negotiation, surround audio, reconnect-at-new-mode robustness.
 5. **Native clients** (`clients/{apple,android}` scaffolds) consuming `lumen_core.h`.
 6. **This box, one-time setup still pending**: `sudo cp scripts/60-lumen.rules
-   /etc/udev/rules.d/` + user into `input` group (gamepads); `sudo ninja -C
-   /tmp/gamescope-src/build install` (the fixed gamescope ≥ 3.16.22 — until then use
-   `PATH=/tmp/gamescope-src/build/src:$PATH`); `apt install gnome-shell` (Mutter validation).
+   /etc/udev/rules.d/` + user into `input` group (gamepads); `apt install gnome-shell`
+   (Mutter validation). Done since last update: gamescope 3.16.22 is installed at
+   `/usr/local/bin` — the `PATH=/tmp/gamescope-src/...` override is no longer needed.
 
 ## Build / test / run
 
