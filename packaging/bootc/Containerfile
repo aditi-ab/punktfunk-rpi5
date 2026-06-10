@@ -1,0 +1,39 @@
+# bootc / OCI image layer that bakes punktfunk into a Bazzite-based atomic image.
+#
+# Bazzite is already a bootc image (Fedora Atomic + gamescope + PipeWire + the NVIDIA
+# stack), so we layer punktfunk on top: enable RPM Fusion (for the NVENC ffmpeg) and our
+# COPR, install the package, and pre-enable the udev rule. Build + push this image, then
+# `bootc switch` (or rebase) a Bazzite host onto it for an image-based, atomic install —
+# no per-host `rpm-ostree install` drift.
+#
+#   podman build -t ghcr.io/<you>/bazzite-punktfunk -f packaging/bootc/Containerfile .
+#   podman push  ghcr.io/<you>/bazzite-punktfunk
+#   # on the target Bazzite host:
+#   sudo bootc switch ghcr.io/<you>/bazzite-punktfunk   # then reboot
+#
+# Pick the base tag that matches your hardware (NVIDIA shown). See ublue-os/bazzite tags.
+ARG BASE_IMAGE=ghcr.io/ublue-os/bazzite-nvidia:stable
+FROM ${BASE_IMAGE}
+
+# COPR project that hosts the punktfunk RPM (see packaging/copr/README). Override at build.
+ARG PUNKTFUNK_COPR=enricobuehler/punktfunk
+
+# RPM Fusion nonfree provides the NVENC-capable ffmpeg-libs punktfunk records/encodes with.
+# (Bazzite usually has RPM Fusion enabled already; this is belt-and-suspenders.)
+RUN dnf5 -y install \
+        https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm \
+        https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm \
+    || true
+
+# Enable our COPR and install punktfunk.
+RUN dnf5 -y copr enable ${PUNKTFUNK_COPR} && \
+    dnf5 -y install punktfunk && \
+    dnf5 -y copr disable ${PUNKTFUNK_COPR} && \
+    dnf5 clean all
+
+# The udev rule + systemd *user* unit ship in the RPM; nothing else to enable at image
+# build time (the host runs per-user in the graphical session, enabled with
+# `systemctl --user enable --now punktfunk-host` after first boot).
+
+# bootc image hygiene: the container build must leave a clean ostree commit.
+RUN ostree container commit
