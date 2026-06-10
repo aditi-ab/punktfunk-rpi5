@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useGetHostInfo } from '@/api/gen/host/host'
+import { useGetHostInfo, useListCompositors } from '@/api/gen/host/host'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { QueryState } from '@/components/query-state'
@@ -11,6 +11,7 @@ export const Route = createFileRoute('/host')({ component: HostPage })
 function HostPage() {
   useLocale()
   const host = useGetHostInfo()
+  const compositors = useListCompositors()
   const h = host.data
 
   return (
@@ -65,6 +66,37 @@ function HostPage() {
           </div>
         )}
       </QueryState>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>{m.host_compositors()}</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-sm text-muted-foreground">{m.host_compositors_help()}</p>
+          <QueryState
+            isLoading={compositors.isLoading}
+            error={compositors.error}
+            refetch={compositors.refetch}
+          >
+            <ul className="divide-y rounded-md border">
+              {compositors.data?.map((c) => (
+                <li key={c.id} className="flex items-center justify-between gap-4 px-4 py-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium">{c.label}</span>
+                      {c.default && <Badge variant="secondary">{m.compositor_default()}</Badge>}
+                    </div>
+                    <code className="text-xs text-muted-foreground">{c.id}</code>
+                  </div>
+                  <Badge variant={c.available ? 'default' : 'outline'}>
+                    {c.available ? m.compositor_available() : m.compositor_unavailable()}
+                  </Badge>
+                </li>
+              ))}
+            </ul>
+          </QueryState>
+        </CardContent>
+      </Card>
     </div>
   )
 }

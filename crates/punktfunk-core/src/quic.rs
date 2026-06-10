@@ -22,7 +22,7 @@
 //! reported back for persisting). The data plane adds AES-GCM on top.
 //! All integers little-endian; every message is `u16 length || payload`.
 
-use crate::config::{Config, FecConfig, FecScheme, Mode, ProtocolPhase, Role};
+use crate::config::{CompositorPref, Config, FecConfig, FecScheme, Mode, ProtocolPhase, Role};
 use crate::error::{PunktfunkError, Result};
 
 /// Protocol magic + version, first bytes of the positional handshake (Hello/Welcome/Start).
@@ -40,6 +40,11 @@ pub const CTL_MAGIC: &[u8; 4] = b"PKFc";
 pub struct Hello {
     pub abi_version: u32,
     pub mode: Mode,
+    /// Which compositor the client would like the host to drive (`Auto` = host decides). The
+    /// host honors it only if that backend is available, else falls back and reports the real
+    /// choice in [`Welcome::compositor`]. Appended to the wire form — omitted by older clients
+    /// (decodes to `Auto`).
+    pub compositor: CompositorPref,
 }
 
 /// `host → client`: the complete session offer.
@@ -56,6 +61,10 @@ pub struct Welcome {
     pub salt: [u8; 4],
     /// Seed/testing: how many frames the host will send (0 = unbounded).
     pub frames: u32,
+    /// The compositor the host actually resolved for this session (the client's
+    /// [`Hello::compositor`] preference if available, else the host's auto-detected choice).
+    /// Appended to the wire form — `Auto` when an older host omitted it (i.e. "unknown").
+    pub compositor: CompositorPref,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -350,12 +359,13 @@ pub mod pake {
 
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(20);
+        let mut b = Vec::with_capacity(21);
         b.extend_from_slice(MAGIC);
         b.extend_from_slice(&self.abi_version.to_le_bytes());
         b.extend_from_slice(&self.mode.width.to_le_bytes());
         b.extend_from_slice(&self.mode.height.to_le_bytes());
         b.extend_from_slice(&self.mode.refresh_hz.to_le_bytes());
+        b.push(self.compositor.to_u8()); // appended at offset 20 — older hosts read [0..20] and skip it
         b
     }
 
@@ -371,6 +381,11 @@ impl Hello {
                 height: u32at(12),
                 refresh_hz: u32at(16),
             },
+            // Optional trailing byte — an older client that omits it requests `Auto`.
+            compositor: b
+                .get(20)
+                .map(|&v| CompositorPref::from_u8(v))
+                .unwrap_or_default(),
         })
     }
 }
@@ -395,13 +410,14 @@ impl Welcome {
         b.extend_from_slice(&self.key);
         b.extend_from_slice(&self.salt);
         b.extend_from_slice(&self.frames.to_le_bytes());
+        b.push(self.compositor.to_u8()); // appended at offset 53 — older clients read [0..53] and skip it
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<Welcome> {
         // Layout (LE): magic[0..4] abi[4..8] port[8..10] w[10..14] h[14..18] hz[18..22]
         // scheme[22] pct[23] max_data[24..26] shard[26..28] encrypt[28] key[29..45]
-        // salt[45..49] frames[49..53].
+        // salt[45..49] frames[49..53] compositor[53] (optional trailing byte).
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -433,6 +449,12 @@ impl Welcome {
             key,
             salt,
             frames: u32at(49),
+            // Optional trailing byte — an older host that omits it leaves the resolved
+            // compositor unknown (`Auto`).
+            compositor: b
+                .get(53)
+                .map(|&v| CompositorPref::from_u8(v))
+                .unwrap_or_default(),
         })
     }
 
@@ -931,6 +953,7 @@ mod tests {
             key: [7u8; 16],
             salt: [1, 2, 3, 4],
             frames: 600,
+            compositor: CompositorPref::Gamescope,
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
     }
@@ -944,12 +967,81 @@ mod tests {
                 height: 720,
                 refresh_hz: 120,
             },
+            compositor: CompositorPref::Kwin,
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
             client_udp_port: 1234,
         };
         assert_eq!(Start::decode(&s.encode()).unwrap(), s);
+    }
+
+    #[test]
+    fn compositor_pref_wire_and_names() {
+        for p in [
+            CompositorPref::Auto,
+            CompositorPref::Kwin,
+            CompositorPref::Wlroots,
+            CompositorPref::Mutter,
+            CompositorPref::Gamescope,
+        ] {
+            assert_eq!(CompositorPref::from_u8(p.to_u8()), p);
+            assert_eq!(CompositorPref::from_name(p.as_str()), Some(p));
+        }
+        // Aliases + unknowns.
+        assert_eq!(CompositorPref::from_name("KDE"), Some(CompositorPref::Kwin));
+        assert_eq!(
+            CompositorPref::from_name("sway"),
+            Some(CompositorPref::Wlroots)
+        );
+        assert_eq!(CompositorPref::from_name("nope"), None);
+        // Unknown wire byte degrades to Auto (forward-compatible).
+        assert_eq!(CompositorPref::from_u8(200), CompositorPref::Auto);
+    }
+
+    #[test]
+    fn hello_welcome_compositor_back_compat() {
+        // A new client/host appends one byte; the field is optional on decode, so a legacy
+        // peer's shorter message still decodes (compositor = Auto), and a legacy peer reading a
+        // new message ignores the trailing byte. Simulate both directions by truncation.
+        let h = Hello {
+            abi_version: 2,
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            compositor: CompositorPref::Mutter,
+        };
+        let enc = h.encode();
+        assert_eq!(enc.len(), 21);
+        // Legacy (20-byte) Hello → Auto, mode intact.
+        let legacy = Hello::decode(&enc[..20]).unwrap();
+        assert_eq!(legacy.compositor, CompositorPref::Auto);
+        assert_eq!(legacy.mode, h.mode);
+
+        let w = Welcome {
+            abi_version: 2,
+            udp_port: 7000,
+            mode: h.mode,
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 20,
+                max_data_per_block: 4096,
+            },
+            shard_payload: 1200,
+            encrypt: true,
+            key: [3u8; 16],
+            salt: [9, 8, 7, 6],
+            frames: 0,
+            compositor: CompositorPref::Kwin,
+        };
+        let wenc = w.encode();
+        assert_eq!(wenc.len(), 54);
+        let legacy_w = Welcome::decode(&wenc[..53]).unwrap();
+        assert_eq!(legacy_w.compositor, CompositorPref::Auto);
+        assert_eq!(legacy_w.frames, 0);
+        assert_eq!(legacy_w.key, w.key);
     }
 
     #[test]
@@ -992,6 +1084,7 @@ mod tests {
                     height: 720,
                     refresh_hz: 60,
                 },
+                compositor: CompositorPref::Auto,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");

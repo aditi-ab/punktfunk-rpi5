@@ -59,6 +59,91 @@ pub enum Compositor {
     Gamescope,
 }
 
+impl Compositor {
+    /// Stable lowercase id used on the wire / management API (matches
+    /// [`punktfunk_core::CompositorPref::as_str`]).
+    pub fn id(self) -> &'static str {
+        match self {
+            Compositor::Kwin => "kwin",
+            Compositor::Wlroots => "wlroots",
+            Compositor::Mutter => "mutter",
+            Compositor::Gamescope => "gamescope",
+        }
+    }
+
+    /// Human label for UIs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Compositor::Kwin => "KWin / KDE Plasma",
+            Compositor::Wlroots => "wlroots (Sway / Hyprland)",
+            Compositor::Mutter => "Mutter / GNOME",
+            Compositor::Gamescope => "gamescope",
+        }
+    }
+
+    /// The protocol [`punktfunk_core::CompositorPref`] naming this backend.
+    pub fn as_pref(self) -> punktfunk_core::CompositorPref {
+        use punktfunk_core::CompositorPref as P;
+        match self {
+            Compositor::Kwin => P::Kwin,
+            Compositor::Wlroots => P::Wlroots,
+            Compositor::Mutter => P::Mutter,
+            Compositor::Gamescope => P::Gamescope,
+        }
+    }
+
+    /// The concrete backend a [`punktfunk_core::CompositorPref`] names, or `None` for `Auto`.
+    pub fn from_pref(p: punktfunk_core::CompositorPref) -> Option<Compositor> {
+        use punktfunk_core::CompositorPref as P;
+        Some(match p {
+            P::Auto => return None,
+            P::Kwin => Compositor::Kwin,
+            P::Wlroots => Compositor::Wlroots,
+            P::Mutter => Compositor::Mutter,
+            P::Gamescope => Compositor::Gamescope,
+        })
+    }
+
+    /// Every backend, in a stable display order (for enumeration / UIs).
+    pub fn all() -> [Compositor; 4] {
+        [
+            Compositor::Kwin,
+            Compositor::Gamescope,
+            Compositor::Mutter,
+            Compositor::Wlroots,
+        ]
+    }
+}
+
+/// The compositor backends usable on this host *right now*: gamescope wherever its binary is
+/// installed (it spawns a nested session — independent of the running desktop), plus the live
+/// session's own compositor (KWin / Mutter / wlroots) when the host runs inside it. Cheap,
+/// side-effect-free probes — safe to call per management request. A concrete client preference
+/// is validated against this set before it's honored (see the m3 handshake's resolution).
+pub fn available() -> Vec<Compositor> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut v = Vec::new();
+        if kwin::is_available() {
+            v.push(Compositor::Kwin);
+        }
+        if gamescope::is_available() {
+            v.push(Compositor::Gamescope);
+        }
+        if mutter::is_available() {
+            v.push(Compositor::Mutter);
+        }
+        if wlroots::is_available() {
+            v.push(Compositor::Wlroots);
+        }
+        v
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Detect the compositor to drive: `PUNKTFUNK_COMPOSITOR` override, else `XDG_CURRENT_DESKTOP`.
 pub fn detect() -> Result<Compositor> {
     if let Ok(v) = std::env::var("PUNKTFUNK_COMPOSITOR") {

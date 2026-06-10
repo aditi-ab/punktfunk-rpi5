@@ -23,7 +23,7 @@
 //! with GameStream pairing) and logs the SHA-256 fingerprint clients pin.
 
 use anyhow::{anyhow, Context, Result};
-use punktfunk_core::config::{FecConfig, FecScheme, Role};
+use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, Role};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_SOF};
 use punktfunk_core::quic::{
@@ -395,6 +395,21 @@ async fn serve_session(
         )
         .context("client-requested mode")?;
 
+        // Resolve the client's compositor preference to a concrete backend *now*, so the Welcome
+        // can report what we'll actually drive. Only the Virtual source has a compositor; the
+        // synthetic source has no virtual output. Blocking probes → spawn_blocking.
+        let compositor = match source {
+            M3Source::Virtual => {
+                let pref = hello.compositor;
+                Some(
+                    tokio::task::spawn_blocking(move || resolve_compositor(pref))
+                        .await
+                        .context("resolve compositor task")??,
+                )
+            }
+            M3Source::Synthetic => None,
+        };
+
         // Reserve a UDP port for the data plane (bind, read it back, rebind in UdpTransport).
         let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
         let udp_port = probe.local_addr()?.port();
@@ -420,19 +435,30 @@ async fn serve_session(
                 M3Source::Synthetic => frames,
                 M3Source::Virtual => 0, // unbounded — client streams until we close
             },
+            // Report the resolved backend back to the client (Auto for the synthetic source).
+            compositor: compositor
+                .map(|c| c.as_pref())
+                .unwrap_or(CompositorPref::Auto),
         };
         io::write_msg(&mut send, &welcome.encode()).await?;
 
         let start = Start::decode(&io::read_msg(&mut recv).await?)
             .map_err(|e| anyhow!("Start decode: {e:?}"))?;
-        Ok::<_, anyhow::Error>((hello, welcome, udp_port, start))
+        Ok::<_, anyhow::Error>((hello, welcome, udp_port, start, compositor))
     };
-    let (hello, welcome, udp_port, start) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
-        .await
-        .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
+    let (hello, welcome, udp_port, start, compositor) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+            .await
+            .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
     let (mut ctrl_send, mut ctrl_recv) = (send, recv);
     let client_udp = std::net::SocketAddr::new(peer.ip(), start.client_udp_port);
-    tracing::info!(%client_udp, udp_port, mode = ?hello.mode, "handshake complete — streaming");
+    tracing::info!(
+        %client_udp,
+        udp_port,
+        mode = ?hello.mode,
+        compositor = compositor.map(|c| c.id()).unwrap_or("none"),
+        "handshake complete — streaming"
+    );
 
     // Control task: the handshake stream stays open for mid-stream renegotiation. A
     // validated Reconfigure is acked, then handed to the data-plane thread, which rebuilds
@@ -541,7 +567,16 @@ async fn serve_session(
             match source {
                 M3Source::Synthetic => synthetic_stream(&mut session, frames, &stop_stream),
                 M3Source::Virtual => {
-                    virtual_stream(&mut session, mode, seconds, &stop_stream, &reconfig_rx)
+                    let compositor = compositor
+                        .expect("the Virtual source resolves a compositor during the handshake");
+                    virtual_stream(
+                        &mut session,
+                        mode,
+                        seconds,
+                        &stop_stream,
+                        &reconfig_rx,
+                        compositor,
+                    )
                 }
             }
         })
@@ -805,6 +840,56 @@ fn synthetic_stream(session: &mut Session, frames: u32, stop: &AtomicBool) -> Re
     Ok(())
 }
 
+/// Pure selection: choose the backend to drive from the client's `pref`, the set `available`
+/// right now, and the auto-`detected` default. A concrete preference wins only if it's available;
+/// otherwise (and for `Auto`) fall back to the detected default. `None` only when nothing is
+/// available *and* nothing was detected — the caller turns that into a handshake error.
+fn pick_compositor(
+    pref: CompositorPref,
+    available: &[crate::vdisplay::Compositor],
+    detected: Option<crate::vdisplay::Compositor>,
+) -> Option<crate::vdisplay::Compositor> {
+    if let Some(want) = crate::vdisplay::Compositor::from_pref(pref) {
+        if available.contains(&want) {
+            return Some(want);
+        }
+    }
+    detected
+}
+
+/// Resolve the client's compositor preference to a concrete backend (the I/O shell around
+/// [`pick_compositor`]): enumerate what's available, auto-detect the default, pick, and log
+/// whether the explicit request was honored or fell back. Runs blocking probes — call off the
+/// async reactor (`spawn_blocking`).
+fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Compositor> {
+    use crate::vdisplay::Compositor;
+    let available = crate::vdisplay::available();
+    let detected = crate::vdisplay::detect().ok();
+    let chosen = pick_compositor(pref, &available, detected).ok_or_else(|| {
+        anyhow!("no usable compositor (set PUNKTFUNK_COMPOSITOR or run inside a supported desktop)")
+    })?;
+    let avail_ids: Vec<&str> = available.iter().map(|c| c.id()).collect();
+    match Compositor::from_pref(pref) {
+        Some(want) if want == chosen => {
+            tracing::info!(
+                compositor = chosen.id(),
+                "honoring client compositor request"
+            )
+        }
+        Some(want) => tracing::warn!(
+            requested = want.id(),
+            chosen = chosen.id(),
+            available = ?avail_ids,
+            "client-requested compositor unavailable — falling back to auto-detect"
+        ),
+        None => tracing::info!(
+            compositor = chosen.id(),
+            "auto-detected compositor (client: auto)"
+        ),
+    }
+    Ok(chosen)
+}
+
 /// Real capture→encode→punktfunk/1: a native virtual output at the client's mode, NVENC AUs
 /// stamped with the capture wall clock (the client derives per-frame pipeline latency).
 ///
@@ -818,9 +903,13 @@ fn virtual_stream(
     seconds: u32,
     stop: &AtomicBool,
     reconfig: &std::sync::mpsc::Receiver<punktfunk_core::Mode>,
+    compositor: crate::vdisplay::Compositor,
 ) -> Result<()> {
-    let compositor = crate::vdisplay::detect().context("detect compositor")?;
-    tracing::info!(?compositor, ?mode, "punktfunk/1 virtual display");
+    tracing::info!(
+        compositor = compositor.id(),
+        ?mode,
+        "punktfunk/1 virtual display"
+    );
     let mut vd = crate::vdisplay::open(compositor)?;
     let (mut capturer, mut enc, mut frame, mut interval) =
         build_pipeline_with_retry(&mut vd, mode)?;
@@ -999,6 +1088,36 @@ fn build_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compositor_resolution_precedence() {
+        use crate::vdisplay::Compositor::*;
+        // A concrete, available preference is honored.
+        assert_eq!(
+            pick_compositor(CompositorPref::Gamescope, &[Kwin, Gamescope], Some(Kwin)),
+            Some(Gamescope)
+        );
+        // A concrete but UNavailable preference falls back to the detected default.
+        assert_eq!(
+            pick_compositor(CompositorPref::Mutter, &[Kwin, Gamescope], Some(Kwin)),
+            Some(Kwin)
+        );
+        // Auto always uses the detected default.
+        assert_eq!(
+            pick_compositor(CompositorPref::Auto, &[Kwin, Gamescope], Some(Kwin)),
+            Some(Kwin)
+        );
+        // Unavailable preference + nothing detected → None (caller errors the handshake).
+        assert_eq!(
+            pick_compositor(CompositorPref::Mutter, &[Gamescope], None),
+            None
+        );
+        // Available preference still wins even when nothing was auto-detected.
+        assert_eq!(
+            pick_compositor(CompositorPref::Gamescope, &[Gamescope], None),
+            Some(Gamescope)
+        );
+    }
 
     #[test]
     fn permanent_errors_short_circuit_retry() {
@@ -1287,7 +1406,16 @@ mod tests {
 
         // 2: anonymous session on a pairing-required host → rejected (connect fails).
         assert!(
-            NativeClient::connect("127.0.0.1", 19778, mode, None, None, timeout).is_err(),
+            NativeClient::connect(
+                "127.0.0.1",
+                19778,
+                mode,
+                CompositorPref::Auto,
+                None,
+                None,
+                timeout
+            )
+            .is_err(),
             "anonymous session must be rejected"
         );
 
@@ -1305,6 +1433,7 @@ mod tests {
             "127.0.0.1",
             19778,
             mode,
+            CompositorPref::Auto,
             Some(host_fp),
             Some((cert.clone(), key.clone())),
             timeout,

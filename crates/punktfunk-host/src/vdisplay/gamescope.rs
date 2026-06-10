@@ -198,6 +198,17 @@ fn find_gamescope_node() -> Option<u32> {
     None
 }
 
+/// gamescope is usable wherever its binary runs — it spawns its own nested session, so it does
+/// not require any particular desktop to be running. Quiet (no version warning — that's for the
+/// create path); just checks the binary executes.
+pub fn is_available() -> bool {
+    std::process::Command::new("gamescope")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Minimum gamescope that captures reliably: below 3.16.22, headless PipeWire capture deadlocks
 /// against PipeWire ≥ 1.6 (a loop-lock bug) and a stuck link head-blocks the whole daemon.
 const MIN_GAMESCOPE: (u32, u32, u32) = (3, 16, 22);
@@ -255,7 +266,10 @@ mod tests {
 
     #[test]
     fn parses_version_banner() {
-        assert_eq!(parse_version("gamescope version 3.16.22"), Some((3, 16, 22)));
+        assert_eq!(
+            parse_version("gamescope version 3.16.22"),
+            Some((3, 16, 22))
+        );
         assert_eq!(
             parse_version("gamescope: version v3.15.9 (no PipeWire)"),
             Some((3, 15, 9))

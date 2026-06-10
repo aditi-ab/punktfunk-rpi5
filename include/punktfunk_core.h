@@ -19,6 +19,24 @@
 // added `punktfunk_pair` / `punktfunk_generate_identity` / `punktfunk_connection_request_mode`.
 #define ABI_VERSION 2
 
+// Compositor preference for [`punktfunk_connect_ex`] (`compositor` arg). `AUTO` lets the host
+// pick (auto-detect from its running desktop); a concrete value is honored only if that backend
+// is available on the host right now, else the host falls back to auto-detect. The resolved
+// choice is reported back over the protocol (see `punktfunk/1` `Welcome`).
+#define PUNKTFUNK_COMPOSITOR_AUTO 0
+
+// KWin / KDE Plasma.
+#define PUNKTFUNK_COMPOSITOR_KWIN 1
+
+// wlroots (Sway / Hyprland).
+#define PUNKTFUNK_COMPOSITOR_WLROOTS 2
+
+// Mutter / GNOME.
+#define PUNKTFUNK_COMPOSITOR_MUTTER 3
+
+// gamescope (spawned nested).
+#define PUNKTFUNK_COMPOSITOR_GAMESCOPE 4
+
 // 16-byte AEAD authentication tag appended by GCM.
 #define TAG_LEN 16
 
@@ -350,7 +368,8 @@ PunktfunkStatus punktfunk_get_stats(PunktfunkSession *s, PunktfunkStats *out);
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
-// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure.
+// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
+// [`punktfunk_connect_ex`] with `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
 //
 // Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's
 // certificate — a mismatching host is rejected. NULL = trust on first use; persist the
@@ -376,6 +395,27 @@ PunktfunkConnection *punktfunk_connect(const char *host,
                                        const char *client_cert_pem,
                                        const char *client_key_pem,
                                        uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect`], but requests a specific `compositor` backend on the host (one of
+// the `PUNKTFUNK_COMPOSITOR_*` values). `PUNKTFUNK_COMPOSITOR_AUTO` (or any unrecognized value)
+// lets the host decide; a concrete value is honored only if available, else the host falls back
+// to auto-detect. The resolved choice is logged host-side and returned over the protocol.
+//
+// # Safety
+// Same as [`punktfunk_connect`].
+PunktfunkConnection *punktfunk_connect_ex(const char *host,
+                                          uint16_t port,
+                                          uint32_t width,
+                                          uint32_t height,
+                                          uint32_t refresh_hz,
+                                          uint32_t compositor,
+                                          const uint8_t *pin_sha256,
+                                          uint8_t *observed_sha256_out,
+                                          const char *client_cert_pem,
+                                          const char *client_key_pem,
+                                          uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

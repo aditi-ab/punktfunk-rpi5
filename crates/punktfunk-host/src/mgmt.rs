@@ -120,6 +120,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
             OpenApiRouter::new()
                 .routes(routes!(get_health))
                 .routes(routes!(get_host_info))
+                .routes(routes!(list_compositors))
                 .routes(routes!(get_status))
                 .routes(routes!(list_paired_clients))
                 .routes(routes!(unpair_client))
@@ -444,6 +445,52 @@ async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<HostInfo> {
             audio: AUDIO_PORT,
         },
     })
+}
+
+/// A compositor backend the host can drive a virtual output on, and whether it's usable now.
+#[derive(Serialize, ToSchema)]
+struct AvailableCompositor {
+    /// Stable identifier (`"kwin"` | `"wlroots"` | `"mutter"` | `"gamescope"`) — pass this to a
+    /// client's `--compositor` flag.
+    id: String,
+    /// Human-readable label for UIs.
+    label: String,
+    /// Usable on this host right now: the live session's own compositor, or gamescope wherever
+    /// its binary is installed.
+    available: bool,
+    /// True for the backend an `Auto` (unspecified) request resolves to right now.
+    default: bool,
+}
+
+/// Available compositor backends
+///
+/// Lists every backend the host knows how to drive, flags which are usable right now, and marks
+/// the one an unspecified (`Auto`) client request resolves to. Clients pass an `id` to their
+/// `--compositor` flag (or `PUNKTFUNK_COMPOSITOR_*` over the C ABI) to request it.
+#[utoipa::path(
+    get,
+    path = "/compositors",
+    tag = "host",
+    operation_id = "listCompositors",
+    responses(
+        (status = OK, description = "Compositor backends with availability + the auto-detected default", body = [AvailableCompositor]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn list_compositors() -> Json<Vec<AvailableCompositor>> {
+    let available = crate::vdisplay::available();
+    let default = crate::vdisplay::detect().ok();
+    Json(
+        crate::vdisplay::Compositor::all()
+            .into_iter()
+            .map(|c| AvailableCompositor {
+                id: c.id().into(),
+                label: c.label().into(),
+                available: available.contains(&c),
+                default: default == Some(c),
+            })
+            .collect(),
+    )
 }
 
 /// Live host status
@@ -772,6 +819,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compositors_lists_all_backends_with_flags() {
+        let app = test_app(test_state(), None);
+        let (status, body) = send(&app, get_req("/api/v1/compositors")).await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body.as_array().expect("array");
+        // Every backend the host knows, in stable order.
+        let ids: Vec<&str> = arr.iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["kwin", "gamescope", "mutter", "wlroots"]);
+        for c in arr {
+            assert!(c["available"].is_boolean());
+            assert!(c["default"].is_boolean());
+            assert!(c["label"].as_str().is_some_and(|s| !s.is_empty()));
+        }
+        // At most one backend is the auto-detect default (none, if the test env has no desktop).
+        assert!(arr.iter().filter(|c| c["default"] == true).count() <= 1);
+    }
+
+    #[tokio::test]
     async fn status_reflects_runtime_state() {
         let state = test_state();
         let app = test_app(state.clone(), None);
@@ -808,7 +873,14 @@ mod tests {
             x509_parser::pem::parse_x509_pem(state.identity.cert_pem.as_bytes()).unwrap();
         let der = pem.contents.clone();
         let fingerprint = hex::encode(Sha256::digest(&der));
-        state.paired.lock().unwrap().push(der);
+        // Isolate from any real paired store on the dev box: AppState::new loads
+        // ~/.config/punktfunk/paired.json, so clear it before seeding our stand-in — otherwise
+        // a real GameStream-paired client lands at body[0] and this assertion sees its hash.
+        {
+            let mut p = state.paired.lock().unwrap();
+            p.clear();
+            p.push(der);
+        }
 
         let (status, body) = send(&app, get_req("/api/v1/clients")).await;
         assert_eq!(status, StatusCode::OK);

@@ -307,6 +307,12 @@ pub fn probe() -> Result<()> {
     Ok(())
 }
 
+/// KWin is usable iff we're inside a KWin session exposing `zkde_screencast` — exactly what
+/// [`probe`] checks, surfaced as a bool for compositor enumeration.
+pub fn is_available() -> bool {
+    probe().is_ok()
+}
+
 fn run(
     width: u32,
     height: u32,

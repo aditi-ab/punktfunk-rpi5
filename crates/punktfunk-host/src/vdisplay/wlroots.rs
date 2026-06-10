@@ -62,6 +62,12 @@ impl WlrootsDisplay {
     }
 }
 
+/// wlroots/Sway is usable when the host runs inside a Sway session — signalled by `SWAYSOCK`
+/// (the IPC socket `swaymsg create_output` needs). Cheap env check for the enumeration path.
+pub fn is_available() -> bool {
+    std::env::var_os("SWAYSOCK").is_some()
+}
+
 impl VirtualDisplay for WlrootsDisplay {
     fn name(&self) -> &'static str {
         "wlroots"

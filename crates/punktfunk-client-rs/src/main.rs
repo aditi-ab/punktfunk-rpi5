@@ -17,15 +17,19 @@
 //! Host→client datagrams (Opus audio, rumble) are counted and reported with the stream
 //! stats — decode/playback is the platform clients' job.
 //!
+//! `--compositor NAME` requests a host compositor backend (`auto`|`kwin`|`wlroots`|`mutter`|
+//! `gamescope`); the host honors it if available, else auto-detects and reports the resolved
+//! choice in its Welcome (logged as `session offer … compositor=…`).
+//!
 //! Usage: `punktfunk-client-rs [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE] [--input-test]
-//!         [--pin HEX]` (M4 adds VAAPI decode + wgpu present on this same skeleton.)
+//!         [--pin HEX] [--compositor NAME]` (M4 adds VAAPI decode + wgpu present on this skeleton.)
 
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::Role;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::quic::{endpoint, io, Hello, Reconfigure, Reconfigured, Start, Welcome};
 use punktfunk_core::transport::UdpTransport;
-use punktfunk_core::{Mode, PunktfunkError, Session};
+use punktfunk_core::{CompositorPref, Mode, PunktfunkError, Session};
 use std::io::Write;
 
 struct Args {
@@ -40,6 +44,8 @@ struct Args {
     pair: Option<String>,
     /// `--name LABEL` — how the host labels this client when pairing.
     name: String,
+    /// `--compositor NAME` — request a host compositor backend (auto|kwin|wlroots|mutter|gamescope).
+    compositor: CompositorPref,
 }
 
 fn parse_mode(m: &str) -> Option<Mode> {
@@ -115,6 +121,17 @@ fn parse_args() -> Args {
             }
         }
     };
+    // A present-but-unrecognized --compositor must abort rather than silently auto-detect.
+    let compositor = match get("--compositor") {
+        None => CompositorPref::Auto,
+        Some(s) => match CompositorPref::from_name(s) {
+            Some(c) => c,
+            None => {
+                eprintln!("--compositor must be one of: auto, kwin, wlroots, mutter, gamescope");
+                std::process::exit(2);
+            }
+        },
+    };
     Args {
         connect: get("--connect").unwrap_or("127.0.0.1:9777").to_string(),
         mode,
@@ -124,6 +141,7 @@ fn parse_args() -> Args {
         remode,
         pair: get("--pair").map(String::from),
         name: get("--name").unwrap_or("punktfunk-client-rs").to_string(),
+        compositor,
     }
 }
 
@@ -207,6 +225,7 @@ async fn session(args: Args) -> Result<()> {
         &Hello {
             abi_version: punktfunk_core::ABI_VERSION,
             mode: args.mode,
+            compositor: args.compositor,
         }
         .encode(),
     )
@@ -218,6 +237,7 @@ async fn session(args: Args) -> Result<()> {
         fec = ?welcome.fec,
         encrypt = welcome.encrypt,
         frames = welcome.frames,
+        compositor = welcome.compositor.as_str(),
         "session offer"
     );
 

@@ -58,6 +58,78 @@ pub struct Mode {
     pub refresh_hz: u32,
 }
 
+/// Which compositor backend a client would like the host to drive for its virtual output.
+///
+/// Sent in [`Hello`](crate::quic::Hello) as a *preference* and echoed back — resolved to the
+/// backend actually chosen — in [`Welcome`](crate::quic::Welcome). `Auto` (the default) lets the
+/// host decide (auto-detect from the running desktop). A concrete preference is honored only if
+/// that backend is available on the host right now; otherwise the host falls back to auto-detect
+/// and reports the real choice in `Welcome`. The wire form is a single byte (`0 = Auto`,
+/// `1..=4` concrete), appended to `Hello`/`Welcome` — older peers simply omit/ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CompositorPref {
+    /// Let the host pick (auto-detect from the running desktop / its configured default).
+    #[default]
+    Auto,
+    /// KWin / KDE Plasma.
+    Kwin,
+    /// wlroots (Sway / Hyprland).
+    Wlroots,
+    /// Mutter / GNOME.
+    Mutter,
+    /// gamescope (spawned nested — available wherever the binary is installed).
+    Gamescope,
+}
+
+impl CompositorPref {
+    /// Wire byte. `0 = Auto`, `1 = Kwin`, `2 = Wlroots`, `3 = Mutter`, `4 = Gamescope`.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            CompositorPref::Auto => 0,
+            CompositorPref::Kwin => 1,
+            CompositorPref::Wlroots => 2,
+            CompositorPref::Mutter => 3,
+            CompositorPref::Gamescope => 4,
+        }
+    }
+
+    /// Inverse of [`to_u8`](Self::to_u8). An unknown byte decodes to `Auto` — forward-compatible:
+    /// a future concrete value a peer doesn't recognize degrades to "let the host decide".
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => CompositorPref::Kwin,
+            2 => CompositorPref::Wlroots,
+            3 => CompositorPref::Mutter,
+            4 => CompositorPref::Gamescope,
+            _ => CompositorPref::Auto,
+        }
+    }
+
+    /// Parse a CLI/config name (case-insensitive, with the usual desktop aliases). `None` for an
+    /// unrecognized name, so callers can error rather than silently defaulting to `Auto`.
+    pub fn from_name(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "detect" | "default" => CompositorPref::Auto,
+            "kwin" | "kde" | "plasma" => CompositorPref::Kwin,
+            "wlroots" | "sway" | "hyprland" | "wlr" => CompositorPref::Wlroots,
+            "mutter" | "gnome" => CompositorPref::Mutter,
+            "gamescope" => CompositorPref::Gamescope,
+            _ => return None,
+        })
+    }
+
+    /// Canonical lowercase identifier (`"auto"`, `"kwin"`, `"wlroots"`, `"mutter"`, `"gamescope"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompositorPref::Auto => "auto",
+            CompositorPref::Kwin => "kwin",
+            CompositorPref::Wlroots => "wlroots",
+            CompositorPref::Mutter => "mutter",
+            CompositorPref::Gamescope => "gamescope",
+        }
+    }
+}
+
 /// Per-block FEC parameters. Recovery count is derived from `fec_percent` exactly as
 /// GameStream does: `m = ceil(k * fec_percent / 100)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

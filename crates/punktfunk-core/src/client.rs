@@ -11,7 +11,7 @@
 //! invariant) plus a blocking data-plane pump; frames cross to the embedder over a bounded
 //! channel. All methods are safe to call from any single embedder thread.
 
-use crate::config::{Mode, Role};
+use crate::config::{CompositorPref, Mode, Role};
 use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
 use crate::quic::{endpoint, io, Hello, Reconfigure, Reconfigured, Start, Welcome};
@@ -76,6 +76,7 @@ impl NativeClient {
         host: &str,
         port: u16,
         mode: Mode,
+        compositor: CompositorPref,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
         timeout: Duration,
@@ -110,6 +111,7 @@ impl NativeClient {
                     host,
                     port,
                     mode,
+                    compositor,
                     pin,
                     identity,
                     frame_tx,
@@ -309,6 +311,7 @@ struct WorkerArgs {
     host: String,
     port: u16,
     mode: Mode,
+    compositor: CompositorPref,
     pin: Option<[u8; 32]>,
     identity: Option<(String, String)>,
     frame_tx: SyncSender<Frame>,
@@ -328,6 +331,7 @@ async fn worker_main(args: WorkerArgs) {
         host,
         port,
         mode,
+        compositor,
         pin,
         identity,
         frame_tx,
@@ -374,11 +378,18 @@ async fn worker_main(args: WorkerArgs) {
             &Hello {
                 abi_version: crate::ABI_VERSION,
                 mode,
+                compositor,
             }
             .encode(),
         )
         .await?;
         let welcome = Welcome::decode(&io::read_msg(&mut recv).await?)?;
+        if welcome.compositor != CompositorPref::Auto {
+            tracing::info!(
+                compositor = welcome.compositor.as_str(),
+                "host resolved compositor"
+            );
+        }
 
         // Reserve our data-plane port, then start the host.
         let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;

@@ -46,6 +46,15 @@ impl MutterDisplay {
     }
 }
 
+/// Mutter is usable when the host runs inside a GNOME session (its `RecordVirtual` D-Bus API
+/// drives the *live* compositor). Cheap signal: `XDG_CURRENT_DESKTOP` names GNOME — same basis
+/// as [`super::detect`], avoiding a blocking D-Bus round-trip on the enumeration path.
+pub fn is_available() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|d| d.to_ascii_uppercase().contains("GNOME"))
+        .unwrap_or(false)
+}
+
 impl VirtualDisplay for MutterDisplay {
     fn name(&self) -> &'static str {
         "mutter"

@@ -477,8 +477,23 @@ unsafe fn opt_cstr<'a>(p: *const std::os::raw::c_char) -> std::result::Result<Op
         .map_err(|_| ())
 }
 
+/// Compositor preference for [`punktfunk_connect_ex`] (`compositor` arg). `AUTO` lets the host
+/// pick (auto-detect from its running desktop); a concrete value is honored only if that backend
+/// is available on the host right now, else the host falls back to auto-detect. The resolved
+/// choice is reported back over the protocol (see `punktfunk/1` `Welcome`).
+pub const PUNKTFUNK_COMPOSITOR_AUTO: u32 = 0;
+/// KWin / KDE Plasma.
+pub const PUNKTFUNK_COMPOSITOR_KWIN: u32 = 1;
+/// wlroots (Sway / Hyprland).
+pub const PUNKTFUNK_COMPOSITOR_WLROOTS: u32 = 2;
+/// Mutter / GNOME.
+pub const PUNKTFUNK_COMPOSITOR_MUTTER: u32 = 3;
+/// gamescope (spawned nested).
+pub const PUNKTFUNK_COMPOSITOR_GAMESCOPE: u32 = 4;
+
 /// Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
-/// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure.
+/// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
+/// [`punktfunk_connect_ex`] with `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
 ///
 /// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's
 /// certificate — a mismatching host is rejected. NULL = trust on first use; persist the
@@ -508,6 +523,45 @@ pub unsafe extern "C" fn punktfunk_connect(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
+    unsafe {
+        punktfunk_connect_ex(
+            host,
+            port,
+            width,
+            height,
+            refresh_hz,
+            PUNKTFUNK_COMPOSITOR_AUTO,
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            timeout_ms,
+        )
+    }
+}
+
+/// Like [`punktfunk_connect`], but requests a specific `compositor` backend on the host (one of
+/// the `PUNKTFUNK_COMPOSITOR_*` values). `PUNKTFUNK_COMPOSITOR_AUTO` (or any unrecognized value)
+/// lets the host decide; a concrete value is honored only if available, else the host falls back
+/// to auto-detect. The resolved choice is logged host-side and returned over the protocol.
+///
+/// # Safety
+/// Same as [`punktfunk_connect`].
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connect_ex(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    timeout_ms: u32,
+) -> *mut PunktfunkConnection {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if host.is_null() {
             return std::ptr::null_mut();
@@ -521,6 +575,7 @@ pub unsafe extern "C" fn punktfunk_connect(
             height,
             refresh_hz,
         };
+        let pref = crate::config::CompositorPref::from_u8(compositor as u8);
         let pin = if pin_sha256.is_null() {
             None
         } else {
@@ -539,6 +594,7 @@ pub unsafe extern "C" fn punktfunk_connect(
             host,
             port,
             mode,
+            pref,
             pin,
             identity,
             std::time::Duration::from_millis(timeout_ms as u64),

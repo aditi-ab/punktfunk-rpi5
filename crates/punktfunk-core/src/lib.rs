@@ -39,7 +39,7 @@ pub mod session;
 pub mod stats;
 pub mod transport;
 
-pub use config::{Config, FecConfig, FecScheme, Mode, ProtocolPhase, Role};
+pub use config::{CompositorPref, Config, FecConfig, FecScheme, Mode, ProtocolPhase, Role};
 pub use error::{PunktfunkError, PunktfunkStatus, Result};
 pub use session::{Frame, Session};
 pub use stats::Stats;
