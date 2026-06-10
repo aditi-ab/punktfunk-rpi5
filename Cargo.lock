@@ -1952,6 +1952,7 @@ dependencies = [
  "anyhow",
  "ash",
  "ashpd",
+ "audiopus_sys",
  "axum",
  "axum-server",
  "cbc",

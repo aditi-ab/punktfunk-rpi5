@@ -160,6 +160,9 @@ fn handle_request(req: &Request, state: &AppState) -> String {
                 }
                 None => tracing::warn!("RTSP ANNOUNCE — missing required video config keys"),
             }
+            let ap = audio_params(&map);
+            tracing::info!(?ap, "RTSP ANNOUNCE — negotiated audio params");
+            *state.audio_params.lock().unwrap() = ap;
             response(&req.cseq, &[], None)
         }
         "PLAY" => {
@@ -185,8 +188,9 @@ fn handle_request(req: &Request, state: &AppState) -> String {
                 Some(_) => tracing::info!("RTSP PLAY — stream already running"),
                 None => tracing::warn!("RTSP PLAY — no negotiated config (ANNOUNCE missing)"),
             }
-            // Audio runs independently (stereo Opus on UDP 48000); it needs the launch key for
-            // the AES-CBC payload encryption the client expects.
+            // Audio runs independently (Opus on UDP 48000, stereo or 5.1/7.1 multistream per
+            // the ANNOUNCE); it needs the launch key for the AES-CBC payload encryption the
+            // client expects.
             let launch = *state.launch.lock().unwrap();
             if let Some(ls) = launch {
                 if !state.audio_streaming.swap(true, Ordering::SeqCst) {
@@ -195,6 +199,7 @@ fn handle_request(req: &Request, state: &AppState) -> String {
                         state.audio_streaming.clone(),
                         ls.gcm_key,
                         ls.rikeyid,
+                        *state.audio_params.lock().unwrap(),
                         state.audio_cap.clone(),
                     );
                 }
@@ -218,19 +223,34 @@ fn handle_request(req: &Request, state: &AppState) -> String {
 /// (plaintext streams for now; P1.5 adds the negotiated AES paths).
 fn describe_sdp() -> String {
     // Line-oriented a=key:value, matching what moonlight-common-c scans for.
-    [
-        "a=x-ss-general.featureFlags:0",
-        "a=x-ss-general.encryptionSupported:0",
-        "a=x-ss-general.encryptionRequested:0",
-        "sprop-parameter-sets=AAAAAU", // HEVC capability indicator
-        "a=rtpmap:98 AV1/90000",       // AV1 capability indicator
-        // Opus config the client matches by channel count (Sunshine emits one per config):
-        // surround-params = channelCount, streams, coupledStreams, then the channel mapping.
-        // The client negotiated stereo, so advertise just that.
-        "a=fmtp:97 surround-params=21101", // stereo: 2ch, 1 stream, 1 coupled, mapping [0,1]
-        "",
-    ]
-    .join("\r\n")
+    let mut lines: Vec<String> = vec![
+        "a=x-ss-general.featureFlags:0".into(),
+        "a=x-ss-general.encryptionSupported:0".into(),
+        "a=x-ss-general.encryptionRequested:0".into(),
+        "sprop-parameter-sets=AAAAAU".into(), // HEVC capability indicator
+        "a=rtpmap:98 AV1/90000".into(),       // AV1 capability indicator
+    ];
+    // Opus configs, one line per layout (Sunshine's order): the client scans for the FIRST
+    // `surround-params=<channelCount>` match as its normal-quality decoder config and a
+    // SECOND match as the high-quality config (which is also what makes it offer HQ at all),
+    // so normal must precede HQ per channel count. Stereo lines are emitted for parity with
+    // Sunshine but ignored by 2-channel clients (they hardcode 21101). See
+    // `audio::surround_params` for the mapping pre-rotation the normal-quality lines carry.
+    for (layout, hq) in [
+        (&audio::LAYOUT_STEREO, false),
+        (&audio::LAYOUT_STEREO, true),
+        (&audio::LAYOUT_51, false),
+        (&audio::LAYOUT_51_HQ, true),
+        (&audio::LAYOUT_71, false),
+        (&audio::LAYOUT_71_HQ, true),
+    ] {
+        lines.push(format!(
+            "a=fmtp:97 surround-params={}",
+            audio::surround_params(layout, hq)
+        ));
+    }
+    lines.push(String::new());
+    lines.join("\r\n")
 }
 
 /// Parse an ANNOUNCE SDP body's `a=key:value` lines into a map.
@@ -256,11 +276,20 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         .filter(|&f| f > 0)
         .unwrap_or(60);
     let bitrate_kbps = parse_u("x-nv-vqos[0].bw.maximumBitrateKbps").unwrap_or(20_000);
+    // Client codec choice (moonlight-common-c SdpGenerator.c): 0=H264, 1=HEVC, 2=AV1.
     let codec = match map.get("x-nv-vqos[0].bitStreamFormat").map(|s| s.trim()) {
         Some("1") => Codec::H265,
         Some("2") => Codec::Av1,
         _ => Codec::H264,
     };
+    // 10-bit/HDR request flag. We never advertise the Main10 SCM bits, so a compliant
+    // client can't ask — if one does anyway, stream 8-bit SDR rather than failing.
+    if parse_u("x-nv-video[0].dynamicRangeMode").unwrap_or(0) != 0 {
+        tracing::warn!(
+            "client requested HDR/10-bit (dynamicRangeMode != 0) — not advertised/supported, \
+             streaming 8-bit SDR"
+        );
+    }
     // Parity floor the client asks for (protects small frames); clamp to a sane max.
     let min_fec = parse_u("x-nv-vqos[0].fec.minRequiredFecPackets")
         .unwrap_or(2)
@@ -274,6 +303,33 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         codec,
         min_fec,
     })
+}
+
+/// Map the negotiated ANNOUNCE keys to the session [`audio::AudioParams`]. Attribute names
+/// per moonlight-common-c `SdpGenerator.c` (verified 2026-06-10): the client always emits
+/// `x-nv-audio.surround.numChannels`/`channelMask` and `x-nv-aqos.packetDuration`;
+/// `x-nv-audio.surround.AudioQuality` is 1 only when it saw our second surround-params line
+/// and opted into high-quality surround. Unknown channel counts fall back to stereo.
+fn audio_params(map: &HashMap<String, String>) -> audio::AudioParams {
+    let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
+    let requested = parse_u("x-nv-audio.surround.numChannels").unwrap_or(2);
+    let channels = match requested {
+        2 | 6 | 8 => requested as u8,
+        other => {
+            tracing::warn!(channels = other, "unsupported channel count — using stereo");
+            2
+        }
+    };
+    let high_quality = parse_u("x-nv-audio.surround.AudioQuality") == Some(1);
+    // Moonlight uses 5 ms (default) or 10 ms (slow decoder / low-bitrate links).
+    let packet_duration_ms = parse_u("x-nv-aqos.packetDuration")
+        .map(|d| d.clamp(5, 10) as u8)
+        .unwrap_or(5);
+    audio::AudioParams {
+        channels,
+        high_quality,
+        packet_duration_ms,
+    }
 }
 
 /// Extract the stream type from a SETUP URI like `…/streamid=video/0/0`.
@@ -315,4 +371,114 @@ fn header_value<'a>(head: &'a str, key_lower: &str) -> Option<&'a str> {
         let (k, v) = line.split_once(':')?;
         (k.trim().eq_ignore_ascii_case(key_lower)).then(|| v.trim_start())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn announce(extra: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut body = String::from(
+            "v=0\r\n\
+             a=x-nv-video[0].clientViewportWd:1920\r\n\
+             a=x-nv-video[0].clientViewportHt:1080\r\n\
+             a=x-nv-video[0].packetSize:1392\r\n\
+             a=x-nv-video[0].maxFPS:120\r\n\
+             a=x-nv-vqos[0].bw.maximumBitrateKbps:40000\r\n",
+        );
+        for (k, v) in extra {
+            body.push_str(&format!("a={k}:{v}\r\n"));
+        }
+        parse_announce(&body)
+    }
+
+    /// `x-nv-vqos[0].bitStreamFormat` → codec (0=H264, 1=HEVC, 2=AV1; missing = H264).
+    #[test]
+    fn announce_codec_selection() {
+        for (fmt, codec) in [
+            (Some("0"), Codec::H264),
+            (Some("1"), Codec::H265),
+            (Some("2"), Codec::Av1),
+            (None, Codec::H264),
+        ] {
+            let map = match fmt {
+                Some(f) => announce(&[("x-nv-vqos[0].bitStreamFormat", f)]),
+                None => announce(&[]),
+            };
+            let cfg = stream_config(&map).expect("required keys present");
+            assert_eq!(cfg.codec, codec, "bitStreamFormat {fmt:?}");
+            assert_eq!((cfg.width, cfg.height, cfg.fps), (1920, 1080, 120));
+            assert_eq!(cfg.bitrate_kbps, 40_000);
+        }
+    }
+
+    /// Missing required video keys → no config (the PLAY handler then refuses to stream).
+    #[test]
+    fn announce_missing_required_keys() {
+        let mut map = announce(&[]);
+        map.remove("x-nv-video[0].packetSize");
+        assert!(stream_config(&map).is_none());
+    }
+
+    /// Audio negotiation: numChannels/AudioQuality/packetDuration, with Moonlight defaults.
+    #[test]
+    fn announce_audio_params() {
+        // Stereo defaults when the attributes are absent (and the legacy path).
+        assert_eq!(audio_params(&announce(&[])), audio::AudioParams::default());
+        // 5.1 normal quality at 5 ms.
+        let ap = audio_params(&announce(&[
+            ("x-nv-audio.surround.numChannels", "6"),
+            ("x-nv-audio.surround.channelMask", "63"),
+            ("x-nv-audio.surround.AudioQuality", "0"),
+            ("x-nv-aqos.packetDuration", "5"),
+        ]));
+        assert_eq!(
+            (ap.channels, ap.high_quality, ap.packet_duration_ms),
+            (6, false, 5)
+        );
+        // 7.1 high quality; 10 ms duration honored.
+        let ap = audio_params(&announce(&[
+            ("x-nv-audio.surround.numChannels", "8"),
+            ("x-nv-audio.surround.AudioQuality", "1"),
+            ("x-nv-aqos.packetDuration", "10"),
+        ]));
+        assert_eq!(
+            (ap.channels, ap.high_quality, ap.packet_duration_ms),
+            (8, true, 10)
+        );
+        // Bogus channel count falls back to stereo.
+        let ap = audio_params(&announce(&[("x-nv-audio.surround.numChannels", "4")]));
+        assert_eq!(ap.channels, 2);
+    }
+
+    /// The DESCRIBE SDP carries the codec indicators and all six Opus configs, normal
+    /// quality before high quality per channel count (the client takes the first match as
+    /// its normal config and a second match as HQ).
+    #[test]
+    fn describe_advertises_codecs_and_surround() {
+        let sdp = describe_sdp();
+        assert!(
+            sdp.contains("sprop-parameter-sets=AAAAAU"),
+            "HEVC indicator"
+        );
+        assert!(sdp.contains("a=rtpmap:98 AV1/90000"), "AV1 indicator");
+        for params in [
+            "21101",       // stereo (clients hardcode this; emitted for Sunshine parity)
+            "642012453",   // 5.1 normal — pre-rotated for the client's GFE-order swap
+            "660012345",   // 5.1 high quality — verbatim
+            "85301245673", // 7.1 normal — pre-rotated over [3, 8)
+            "88001234567", // 7.1 high quality — verbatim
+        ] {
+            assert!(
+                sdp.contains(&format!("a=fmtp:97 surround-params={params}")),
+                "missing surround-params={params} in:\n{sdp}"
+            );
+        }
+        // Normal precedes HQ for each surround channel count.
+        let n51 = sdp.find("surround-params=642").unwrap();
+        let h51 = sdp.find("surround-params=660").unwrap();
+        let n71 = sdp.find("surround-params=853").unwrap();
+        let h71 = sdp.find("surround-params=880").unwrap();
+        assert!(n51 < h51 && n71 < h71);
+    }
 }

@@ -5,29 +5,58 @@
 //! default sink's monitor into us — no portal needed (unlike screen capture). The (`!Send`)
 //! MainLoop/Stream live on a dedicated thread; interleaved `f32` chunks leave over a bounded
 //! channel (dropped if the encoder falls behind, never blocking the PipeWire loop).
+//!
+//! The stream is opened at the *session's* channel count (2/6/8). If the sink has fewer
+//! channels than requested, PipeWire's channel-mixer fills the extra positions with silence
+//! (zero upmix), so a stereo desktop still produces a valid 5.1/7.1 capture. Dropping the
+//! capturer quits the loop thread (via a `pipewire::channel` Terminate message), tearing the
+//! stream down promptly — required so a surround session can replace a stereo capturer
+//! without leaking a PipeWire consumer (see CLAUDE.md: a wedged link head-blocks the daemon).
 
-use super::{AudioCapturer, CHANNELS, SAMPLE_RATE};
+use super::{AudioCapturer, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
+/// Message asking the PipeWire loop thread to quit (sent from `Drop`).
+struct Terminate;
+
 pub struct PwAudioCapturer {
     chunks: Receiver<Vec<f32>>,
+    channels: u32,
+    quit: pipewire::channel::Sender<Terminate>,
 }
 
 impl PwAudioCapturer {
-    pub fn open() -> Result<PwAudioCapturer> {
+    pub fn open(channels: u32) -> Result<PwAudioCapturer> {
+        anyhow::ensure!(
+            matches!(channels, 1 | 2 | 6 | 8),
+            "unsupported audio channel count {channels} (want 2, 6 or 8)"
+        );
         let (tx, rx) = sync_channel::<Vec<f32>>(64);
+        let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
         thread::Builder::new()
             .name("punktfunk-pw-audio".into())
             .spawn(move || {
-                if let Err(e) = pw_thread(tx) {
+                if let Err(e) = pw_thread(tx, quit_rx, channels) {
                     tracing::error!(error = %format!("{e:#}"), "pipewire audio thread failed");
                 }
             })
             .context("spawn pipewire audio thread")?;
-        Ok(PwAudioCapturer { chunks: rx })
+        Ok(PwAudioCapturer {
+            chunks: rx,
+            channels,
+            quit: quit_tx,
+        })
+    }
+}
+
+impl Drop for PwAudioCapturer {
+    fn drop(&mut self) {
+        // Ask the loop thread to quit; the stream/core/loop unwind there (RAII). A failed
+        // send means the thread already exited — nothing to tear down.
+        let _ = self.quit.send(Terminate);
     }
 }
 
@@ -40,12 +69,47 @@ impl AudioCapturer for PwAudioCapturer {
         }
     }
 
+    fn channels(&self) -> u32 {
+        self.channels
+    }
+
     fn drain(&mut self) {
         while self.chunks.try_recv().is_ok() {}
     }
 }
 
-fn pw_thread(tx: std::sync::mpsc::SyncSender<Vec<f32>>) -> Result<()> {
+/// SPA channel position array for the GameStream surround order FL FR FC LFE RL RR [SL SR]
+/// (= the PipeWire/PulseAudio default map for 6/8 channels, and the order Moonlight's
+/// renderers expect — moonlight-common-c: "we use FL FR C LFE RL RR SL SR"). Values are
+/// `enum spa_audio_channel` (spa/param/audio/raw.h): FL=3 FR=4 FC=5 LFE=6 SL=7 SR=8 RL=12
+/// RR=13.
+fn spa_positions(channels: u32) -> [u32; 64] {
+    const FL: u32 = 3;
+    const FR: u32 = 4;
+    const FC: u32 = 5;
+    const LFE: u32 = 6;
+    const SL: u32 = 7;
+    const SR: u32 = 8;
+    const RL: u32 = 12;
+    const RR: u32 = 13;
+    const MONO: u32 = 2;
+    let mut pos = [0u32; 64];
+    let order: &[u32] = match channels {
+        1 => &[MONO],
+        2 => &[FL, FR],
+        6 => &[FL, FR, FC, LFE, RL, RR],
+        8 => &[FL, FR, FC, LFE, RL, RR, SL, SR],
+        _ => unreachable!("validated in open()"),
+    };
+    pos[..order.len()].copy_from_slice(order);
+    pos
+}
+
+fn pw_thread(
+    tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+    quit_rx: pipewire::channel::Receiver<Terminate>,
+    channels: u32,
+) -> Result<()> {
     use pipewire as pw;
     use pw::{properties::properties, spa};
     use spa::param::audio::{AudioFormat, AudioInfoRaw};
@@ -57,6 +121,12 @@ fn pw_thread(tx: std::sync::mpsc::SyncSender<Vec<f32>>) -> Result<()> {
     let core = context
         .connect_rc(None)
         .context("pw audio connect (is PipeWire running in this session?)")?;
+
+    // Cross-thread teardown: the capturer's Drop sends Terminate; quit the loop here.
+    let _quit_guard = quit_rx.attach(mainloop.loop_(), {
+        let mainloop = mainloop.clone();
+        move |_| mainloop.quit()
+    });
 
     let stream = pw::stream::StreamBox::new(
         &core,
@@ -118,7 +188,7 @@ fn pw_thread(tx: std::sync::mpsc::SyncSender<Vec<f32>>) -> Result<()> {
                 static FIRST: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(true);
                 if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                    tracing::info!(samples = n, frames = n / 2, "audio first capture buffer");
+                    tracing::info!(samples = n, "audio first capture buffer");
                 }
                 let mut samples = Vec::with_capacity(n);
                 for i in 0..n {
@@ -139,11 +209,13 @@ fn pw_thread(tx: std::sync::mpsc::SyncSender<Vec<f32>>) -> Result<()> {
         .register()
         .context("register audio stream listener")?;
 
-    // Request F32LE, 48 kHz, stereo.
+    // Request F32LE, 48 kHz, at the session's channel count with explicit positions —
+    // PipeWire's channel-mixer up/downmixes the sink monitor to this layout.
     let mut info = AudioInfoRaw::new();
     info.set_format(AudioFormat::F32LE);
     info.set_rate(SAMPLE_RATE);
-    info.set_channels(CHANNELS as u32);
+    info.set_channels(channels);
+    info.set_position(spa_positions(channels));
     let obj = pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: pw::spa::param::ParamType::EnumFormat.as_raw(),
@@ -168,5 +240,6 @@ fn pw_thread(tx: std::sync::mpsc::SyncSender<Vec<f32>>) -> Result<()> {
         .context("pw audio stream connect")?;
 
     mainloop.run();
+    tracing::debug!("pipewire audio loop exited (capturer dropped)");
     Ok(())
 }

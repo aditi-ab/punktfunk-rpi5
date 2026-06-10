@@ -7,26 +7,9 @@
 //! the media streams follow (see the M2 task list / plan).
 
 pub mod apps;
-#[cfg(target_os = "linux")]
+// Platform-neutral wire/negotiation logic + the Linux capture/encode pipeline (non-Linux
+// builds get a stub `start` inside the module).
 mod audio;
-/// Stub — the audio plane needs Linux (PipeWire capture + libopus); this keeps non-Linux
-/// dev builds compiling (crate doc: "the crate compiles everywhere"). Reports failure the
-/// same way the real stream thread does: by clearing `running`.
-#[cfg(not(target_os = "linux"))]
-mod audio {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    pub fn start(
-        running: Arc<AtomicBool>,
-        _gcm_key: [u8; 16],
-        _rikeyid: i32,
-        _audio_cap: Arc<Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>,
-    ) {
-        tracing::error!("GameStream audio requires Linux (PipeWire + libopus)");
-        running.store(false, Ordering::SeqCst);
-    }
-}
 pub(crate) mod cert;
 mod control;
 mod crypto;
@@ -57,8 +40,20 @@ pub const AUDIO_PORT: u16 = 48000;
 /// Advertised host version. Major ≥ 7 tells Moonlight to use SHA-256 for pairing.
 pub const APP_VERSION: &str = "7.1.431.-1";
 pub const GFE_VERSION: &str = "3.23.0.74";
-/// Codec support bitmask: 3=H264, 259=+HEVC, 3843=+AV1 (we encode HEVC/H264/AV1 via NVENC).
-pub const SERVER_CODEC_MODE_SUPPORT: u32 = 3843;
+/// `ServerCodecModeSupport` flags, from moonlight-common-c `src/Limelight.h` (verified
+/// against master, 2026-06-10): SCM_H264 0x1, SCM_HEVC 0x100, SCM_HEVC_MAIN10 0x200,
+/// SCM_AV1_MAIN8 0x10000, SCM_AV1_MAIN10 0x20000 (+ 4:4:4 Sunshine extensions we don't do).
+pub const SCM_H264: u32 = 0x0000_0001;
+pub const SCM_HEVC: u32 = 0x0000_0100;
+pub const SCM_HEVC_MAIN10: u32 = 0x0000_0200;
+pub const SCM_AV1_MAIN8: u32 = 0x0001_0000;
+pub const SCM_AV1_MAIN10: u32 = 0x0002_0000;
+/// What we actually encode via NVENC: H.264, HEVC Main, AV1 Main 8-bit (= 65793). The
+/// 10-bit flags are deliberately NOT advertised: Moonlight only selects Main10 profiles for
+/// HDR streaming, and our capture path is 8-bit SDR BGRx with no HDR metadata plumbing —
+/// advertising them would let clients enable an HDR mode we can't deliver. (The previous
+/// placeholder 3843 = 0xF03 wrongly claimed HEVC Main10 + 4:4:4 and *no* AV1.)
+pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
 
 /// Stable host identity + advertised capabilities, shared across control-plane handlers.
 pub struct Host {
@@ -108,6 +103,9 @@ pub struct AppState {
     pub launch: std::sync::Mutex<Option<LaunchSession>>,
     /// Negotiated video config from RTSP ANNOUNCE (consumed by the stream on PLAY).
     pub stream: std::sync::Mutex<Option<stream::StreamConfig>>,
+    /// Negotiated audio parameters from RTSP ANNOUNCE (channels/quality/packet duration);
+    /// defaults to stereo when a client never ANNOUNCEs them.
+    pub audio_params: std::sync::Mutex<audio::AudioParams>,
     /// True while the video stream thread is running (also its keep-running flag).
     pub streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// True while the audio stream thread is running (also its keep-running flag).
@@ -119,8 +117,9 @@ pub struct AppState {
     /// (conflicting) screencast session. The video thread borrows it for the stream's duration
     /// and returns it; `set_active` gates its cost while idle.
     pub video_cap: std::sync::Arc<std::sync::Mutex<Option<Box<dyn crate::capture::Capturer>>>>,
-    /// Persistent audio capturer, reused across streams (avoids leaking a PipeWire capture
-    /// thread per reconnect); drained on reuse so no stale audio is sent.
+    /// Persistent audio capturer, reused across streams when the channel count still matches
+    /// (avoids a PipeWire stream setup per reconnect); drained on reuse so no stale audio is
+    /// sent, dropped + reopened when a session negotiates a different channel count.
     pub audio_cap: std::sync::Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>,
 }
 
@@ -135,6 +134,7 @@ impl AppState {
             paired: std::sync::Mutex::new(load_paired()),
             launch: std::sync::Mutex::new(None),
             stream: std::sync::Mutex::new(None),
+            audio_params: std::sync::Mutex::new(audio::AudioParams::default()),
             streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

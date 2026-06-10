@@ -68,7 +68,11 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    at high res).
 3. **punktfunk/1 protocol growth**: concurrent sessions (today: one at a time, extras wait
    in the accept queue); mgmt REST endpoints for the punktfunk/1 paired-client list.
-4. **M2 polish**: HDR negotiation, reconnect-at-new-mode robustness.
+4. **M2 polish**: HDR/10-bit (needs HDR capture + metadata plumbing; `av1_nvenc
+   -highbitdepth 1` already encodes Main10 from 8-bit input on this box),
+   reconnect-at-new-mode robustness. AV1 negotiation and surround audio are implemented
+   and unit/live-capture tested — both still need a live Moonlight confirmation (select
+   AV1 in a stock client; a real 5.1/7.1 listen incl. FEC under loss).
 5. **Native clients** (`clients/{apple,android}` scaffolds) consuming `punktfunk_core.h`.
 
 Box one-time setup is complete: udev rule + `input` group (gamepads validated live),
