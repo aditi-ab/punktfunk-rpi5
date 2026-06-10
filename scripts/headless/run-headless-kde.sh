@@ -2,10 +2,13 @@
 # Headless KDE Plasma session for the punktfunk host (no KMS scanout → kwin --virtual).
 #
 # Brings up the full desktop, not just the compositor, and waits for it to be *actually
-# ready* before starting the portals/plasma — no blind `sleep`. The env matters: without
-# XDG_MENU_PREFIX=plasma- the launcher resolves ${XDG_MENU_PREFIX}applications.menu →
-# "applications.menu", which doesn't exist on KDE installs (it ships
-# plasma-applications.menu) — plasmashell runs fine but the menu shows NO applications.
+# ready* before starting the portals/plasma — no blind `sleep`. A bare session is missing
+# pieces a full Plasma login would start, so this also: exports the Xwayland DISPLAY (X11 apps
+# like Steam need it), starts the polkit authentication agent (Discover/PackageKit need it to
+# authorize installs), and supervises plasmashell (it draws wallpaper + panels; a crash must
+# not leave the desktop gone). The env matters: without XDG_MENU_PREFIX=plasma- the launcher
+# resolves ${XDG_MENU_PREFIX}applications.menu → "applications.menu", which doesn't exist on KDE
+# installs (it ships plasma-applications.menu) — plasmashell runs fine but the menu is EMPTY.
 #
 #   bash scripts/headless/run-headless-kde.sh [WxH]    # default 1920x1080
 #
@@ -65,21 +68,58 @@ until "${PROBE[@]}" >/dev/null 2>&1; do
 done
 echo "KWin ready."
 
+# Detect the Xwayland display KWin started and export it. Without DISPLAY, X11 apps launched in
+# this session (Steam, many games/launchers) fail with "can't open display" even though Xwayland
+# is running — KWin sets DISPLAY only for its own children, not for apps launched via the
+# plasma menu / D-Bus activation. KWin brings Xwayland up a moment after itself; poll for it.
+DISPLAY_NUM=""
+for _ in $(seq 1 20); do
+    d=$(pgrep -a Xwayland 2>/dev/null | grep -oE ' :[0-9]+' | tr -d ' :' | head -1)
+    if [[ -n "$d" && -S "/tmp/.X11-unix/X$d" ]]; then DISPLAY_NUM="$d"; break; fi
+    sleep 0.25
+done
+if [[ -n "$DISPLAY_NUM" ]]; then
+    export DISPLAY=":$DISPLAY_NUM"
+    echo "Xwayland on $DISPLAY"
+else
+    echo "WARN: no Xwayland display detected — X11 apps (Steam) won't open a display" >&2
+fi
+
 # Only NOW restart the portals, and against the correct env: the xdg-desktop-portal chain
 # binds the compositor that existed when it started, so a stale portal points at a dead
 # socket and RemoteDesktop/EIS (input injection) times out. Import the session env into the
 # systemd/D-Bus activation environment FIRST (the missing piece — the Sway script does this;
-# without it the restarted portal can inherit an empty WAYLAND_DISPLAY), then restart.
-systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR 2>/dev/null || true
-dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS 2>/dev/null || true
+# without it the restarted portal can inherit an empty WAYLAND_DISPLAY) — including DISPLAY so
+# D-Bus-activated X11 apps inherit it — then restart.
+systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR ${DISPLAY:+DISPLAY} 2>/dev/null || true
+dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS ${DISPLAY:+DISPLAY} 2>/dev/null || true
 # --no-block: queue the restart and return immediately. A synchronous try-restart of the
 # portal chain blocks bring-up ~30s (xdg-desktop-portal is Type=dbus and waits for its bus
 # name); the portal only needs to be ready before the FIRST client streams (seconds later,
 # user-driven), not before plasmashell starts.
 systemctl --user --no-block try-restart plasma-xdg-desktop-portal-kde.service xdg-desktop-portal-kde.service xdg-desktop-portal.service 2>/dev/null || true
 
+# Polkit authentication agent: without it, Discover / PackageKit can't get authorization to
+# install packages (polkitd is the policy engine; the *agent* is the GUI prompt). A full Plasma
+# session starts it; our bare session must do it explicitly. Force the Qt Wayland platform — it
+# exits immediately if it can't pick one. comm is truncated to 15 chars ("polkit-kde-auth").
+POLKIT_AGENT=/usr/lib/x86_64-linux-gnu/libexec/polkit-kde-authentication-agent-1
+if [[ -x "$POLKIT_AGENT" ]] && ! pgrep -x polkit-kde-auth >/dev/null; then
+    QT_QPA_PLATFORM=wayland setsid "$POLKIT_AGENT" \
+        >"${TMPDIR:-/tmp}/punktfunk-polkit-agent.log" 2>&1 &
+fi
+
 kbuildsycoca6 >/dev/null 2>&1 || true # rebuild the menu cache under the correct env
-plasmashell &
+
+# Supervise plasmashell: it draws the desktop (wallpaper + panels). It can crash (a transient
+# GPU/QML hiccup), and a single unsupervised `plasmashell &` then leaves the streamed session
+# with only app windows — no desktop, no wallpaper, no launcher. Restart it for as long as KWin
+# lives, so the desktop self-heals.
+( while kill -0 "$KWIN_PID" 2>/dev/null; do
+      plasmashell
+      echo "plasmashell exited — restarting in 2s" >&2
+      sleep 2
+  done ) &
 
 echo "headless KDE up on $WAYLAND_DISPLAY ($RES), kwin pid $KWIN_PID (log: $KWIN_LOG)"
 wait "$KWIN_PID"
