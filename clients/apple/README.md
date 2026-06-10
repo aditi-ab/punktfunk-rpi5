@@ -145,8 +145,11 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    nothing sticks down host-side. While the stream has focus the LOCAL cursor is hidden
    and frozen mid-view (`CursorCapture` in StreamView.swift — the host renders its own
    cursor; the local one diverges from it and a stray click would focus another app);
-   Cmd+Tab frees it, ⌘D disconnects. Local shortcuts (⌘-anything) still also reach the
-   host; a capture toggle is a small follow-up. One live capture per process (the GC
+   Cmd+Tab frees it, ⌘D disconnects. While captured, key NSEvents are swallowed by a
+   local event monitor (GC reads HID directly; without it every keystroke bubbles up the
+   responder chain unhandled and NSWindow beeps) — except ⌘-combos, which still reach
+   the local app (⌘D/⌘Q) in addition to the host; a capture toggle is a small
+   follow-up. One live capture per process (the GC
    mouse/keyboard singletons have a single handler slot — ownership is tracked so a stale
    capture's stop() can't clobber a newer one).
 9. **iOS**: same package (`BUILD_IOS=1` for the xcframework slice); `StreamView` needs the

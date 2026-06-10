@@ -31,6 +31,7 @@ public final class InputCapture {
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
     private var keyboards: [GCKeyboard] = []
+    private var keyEventMonitor: Any?
 
     // Main-queue-only state (see header comment).
     private var residualX: Float = 0
@@ -66,12 +67,26 @@ public final class InputCapture {
         ) { [weak self] _ in
             self?.releaseAll()
         })
+        // GC reads the HID state directly — the NSEvents still travel the responder
+        // chain, where every unhandled keyDown makes NSWindow beep ("invalid input").
+        // Swallow key events while captured, EXCEPT ⌘-combos: those stay local (the
+        // HUD's ⌘D disconnect, ⌘Q, …) in addition to reaching the host via GC.
+        keyEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.keyDown, .keyUp]
+        ) { event in
+            event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
+                ? event : nil
+        }
     }
 
     public func stop() {
         releaseAll()
         observers.forEach(NotificationCenter.default.removeObserver(_:))
         observers.removeAll()
+        if let monitor = keyEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyEventMonitor = nil
+        }
         // Don't clobber the handlers if a newer capture has taken the global devices.
         if Self.activeCapture === self || Self.activeCapture == nil {
             for mouse in mice {
