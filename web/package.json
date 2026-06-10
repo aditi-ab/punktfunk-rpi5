@@ -1,0 +1,41 @@
+{
+  "name": "punktfunk-web",
+  "private": true,
+  "type": "module",
+  "description": "punktfunk management console — TanStack Start + React Query (orval) + shadcn/ui + Paraglide i18n",
+  "scripts": {
+    "prepare": "pnpm run codegen",
+    "codegen": "orval --config orval.config.ts && paraglide-js compile --project ./project.inlang --outdir ./src/paraglide",
+    "predev": "orval --config orval.config.ts",
+    "dev": "vite dev --port 3000",
+    "prebuild": "orval --config orval.config.ts",
+    "build": "vite build",
+    "start": "node .output/server/index.mjs",
+    "api:gen": "orval --config orval.config.ts",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.62.0",
+    "@tanstack/react-router": "^1.121.0",
+    "@tanstack/react-start": "^1.121.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.469.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwind-merge": "^2.6.0"
+  },
+  "devDependencies": {
+    "@inlang/paraglide-js": "^2.0.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "orval": "^8.16.0",
+    "tailwindcss": "^4.0.0",
+    "tw-animate-css": "^1.2.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "vite-tsconfig-paths": "^5.1.0"
+  }
+}
