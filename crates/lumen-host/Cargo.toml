@@ -31,6 +31,20 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 rusty_enet = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Management/control-plane REST API + OpenAPI (control pane, M2). `axum_extras` wires
+# utoipa into axum 0.8 extractors; utoipa-axum collects `#[utoipa::path]` routes into the
+# spec; utoipa-scalar serves the interactive docs. Codegen-friendly: the spec is emitted
+# verbatim by the `openapi` subcommand. Control plane only — never the per-frame path.
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-axum = "0.2"
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+[dev-dependencies]
+# Drive the management API router in-process (no socket) in the handler tests.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `screencast` gates the ScreenCast portal module; `remote_desktop` adds the RemoteDesktop

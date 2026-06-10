@@ -12,15 +12,20 @@ use rsa::signature::{SignatureEncoding, Signer, Verifier};
 use rsa::RsaPublicKey;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::Notify;
 
 /// Out-of-band PIN delivery. Moonlight generates + displays a PIN; the user submits it
-/// (here via `GET /pin?pin=NNNN`). `getservercert` parks until a PIN arrives.
+/// (via the management API's `POST /api/v1/pair/pin` or nvhttp's `GET /pin?pin=NNNN`).
+/// `getservercert` parks until a PIN arrives.
 pub struct PinGate {
     pin: Mutex<Option<String>>,
     notify: Notify,
+    /// Handshakes currently parked in [`take`](Self::take) — drives the management API's
+    /// `pin_pending` so a control pane knows when to prompt for the PIN.
+    waiters: AtomicUsize,
 }
 
 impl PinGate {
@@ -28,6 +33,7 @@ impl PinGate {
         PinGate {
             pin: Mutex::new(None),
             notify: Notify::new(),
+            waiters: AtomicUsize::new(0),
         }
     }
 
@@ -36,7 +42,22 @@ impl PinGate {
         self.notify.notify_waiters();
     }
 
+    /// True while a pairing handshake is parked waiting for the user's PIN.
+    pub fn awaiting_pin(&self) -> bool {
+        self.waiters.load(Ordering::SeqCst) > 0
+    }
+
     async fn take(&self, timeout: Duration) -> Option<String> {
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        // Decrement on every exit path (PIN delivered, timeout, or future cancellation).
+        struct WaiterGuard<'a>(&'a AtomicUsize);
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _guard = WaiterGuard(&self.waiters);
+
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if let Some(p) = self.pin.lock().unwrap().take() {
@@ -252,4 +273,34 @@ fn paired_xml(inner: &str, paired: bool) -> String {
         u8::from(paired),
         inner
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// `awaiting_pin` flips true while `take` is parked and back to false on every exit
+    /// path (delivered + timeout) — the management API's pairing UX depends on it.
+    #[tokio::test]
+    async fn pin_gate_reports_waiting() {
+        let pairing = Arc::new(Pairing::new());
+        assert!(!pairing.pin.awaiting_pin());
+
+        let waiter = {
+            let p = pairing.clone();
+            tokio::spawn(async move { p.pin.take(Duration::from_secs(5)).await })
+        };
+        while !pairing.pin.awaiting_pin() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        pairing.pin.submit("1234".into());
+        assert_eq!(waiter.await.unwrap().as_deref(), Some("1234"));
+        assert!(!pairing.pin.awaiting_pin());
+
+        // Timeout path also clears the flag.
+        assert_eq!(pairing.pin.take(Duration::from_millis(10)).await, None);
+        assert!(!pairing.pin.awaiting_pin());
+    }
 }

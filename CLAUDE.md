@@ -16,9 +16,11 @@ Low-latency desktop streaming stack, Linux-first, with a shared Rust protocol co
   round-trips every access unit through a `lumen_core` host→client session (0 mismatches).
   See [`docs/linux-setup.md`](docs/linux-setup.md); the code is in
   `crates/lumen-host/src/{m0,capture,encode}.rs` (+ `capture/linux.rs`, `encode/linux.rs`).
-- **The remaining host backends are `#[cfg(target_os = "linux")]` stubs** — KWin/Mutter
-  virtual displays (`vdisplay.rs`), libei/uinput input (`inject.rs`), web/pairing
-  (`web.rs`). They compile everywhere but `bail!` until implemented. This is **M2**.
+- **M2 is in flight.** The GameStream control plane lives in `gamestream/` (mDNS,
+  serverinfo, pairing, RTSP, ENet control, video/audio streams) and the management REST
+  API in `mgmt.rs`; the remaining `#[cfg(target_os = "linux")]` backends — KWin/Mutter
+  virtual displays (`vdisplay.rs`), libei/uinput input (`inject.rs`) — compile everywhere
+  and `bail!` where unimplemented.
 
 ## Build / test / run
 
@@ -34,13 +36,17 @@ bash crates/lumen-core/tests/c/run.sh   # standalone C-ABI link + round-trip pro
 
 `include/lumen_core.h` is generated from `crates/lumen-core/src/abi.rs` by cbindgen
 (`build.rs`) on every build and is **checked in**; CI fails if it drifts, so commit the
-regenerated header when the ABI changes.
+regenerated header when the ABI changes. Same deal for the management API's OpenAPI
+document: `docs/api/openapi.json` is **checked in** for client codegen and a test fails if
+it drifts — regenerate with `cargo run -p lumen-host -- openapi > docs/api/openapi.json`
+(the spec lives in `crates/lumen-host/src/mgmt.rs`).
 
 ## Layout
 
 ```
 crates/lumen-core/   protocol · FEC · pacing · crypto — the C ABI (lib + cdylib + staticlib)
-crates/lumen-host/   Linux host: vdisplay · capture · encode · inject · web · pipeline (cfg-gated)
+crates/lumen-host/   Linux host: vdisplay · capture · encode · inject · gamestream · mgmt · pipeline
+docs/api/openapi.json   generated management-API spec (codegen input)
 crates/lumen-client-rs/   reference client (M4)
 tools/{loss-harness,latency-probe}/   measurement (plan §10)
 clients/{apple,android}/   native client scaffolds (import lumen_core.h)
@@ -79,9 +85,9 @@ tokio runtime) + `pipewire` **0.9** (must match ashpd's; not 0.10) + `ffmpeg-nex
 ## Next: M2 — P1 host to a stock Moonlight client
 
 Wire M0's capture→encode pipeline (`m0.rs` / `pipeline.rs`) into a streaming host: KWin
-virtual output (`vdisplay.rs`, study KRdp), `serverinfo`/pairing/RTSP (`web.rs`) enough for
-a real Moonlight client, input via reis/uinput (`inject.rs`). The module seams exist and
-`bail!` today.
+virtual output (`vdisplay.rs`, study KRdp), `serverinfo`/pairing/RTSP
+(`gamestream/{nvhttp,pairing,rtsp}.rs`) enough for a real Moonlight client, input via
+reis/uinput (`inject.rs`), management/config REST API (`mgmt.rs`).
 
 ## Conventions
 
