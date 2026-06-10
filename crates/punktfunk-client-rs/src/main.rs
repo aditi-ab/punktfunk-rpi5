@@ -20,7 +20,7 @@
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::Role;
 use punktfunk_core::input::{InputEvent, InputKind};
-use punktfunk_core::quic::{endpoint, io, Hello, Start, Welcome};
+use punktfunk_core::quic::{endpoint, io, Hello, Reconfigure, Reconfigured, Start, Welcome};
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::{Mode, PunktfunkError, Session};
 use std::io::Write;
@@ -31,6 +31,21 @@ struct Args {
     out: Option<String>,
     input_test: bool,
     pin: Option<[u8; 32]>,
+    /// `--remode WxHxFPS:SECS` — request this mode SECS seconds into the stream.
+    remode: Option<(Mode, u32)>,
+    /// `--pair PIN` — run the pairing ceremony instead of a session.
+    pair: Option<String>,
+    /// `--name LABEL` — how the host labels this client when pairing.
+    name: String,
+}
+
+fn parse_mode(m: &str) -> Option<Mode> {
+    let mut it = m.split('x');
+    Some(Mode {
+        width: it.next()?.parse().ok()?,
+        height: it.next()?.parse().ok()?,
+        refresh_hz: it.next()?.parse().ok()?,
+    })
 }
 
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
@@ -48,6 +63,24 @@ fn hex(fp: &[u8; 32]) -> String {
     fp.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// This client's persistent identity (`~/.config/punktfunk/client-{cert,key}.pem`),
+/// generated on first use — presented on every connect so hosts can recognize it once
+/// paired.
+fn load_or_create_identity() -> Result<(String, String)> {
+    let home = std::env::var("HOME").context("HOME unset")?;
+    let dir = std::path::PathBuf::from(home).join(".config/punktfunk");
+    let (cp, kp) = (dir.join("client-cert.pem"), dir.join("client-key.pem"));
+    if let (Ok(c), Ok(k)) = (std::fs::read_to_string(&cp), std::fs::read_to_string(&kp)) {
+        return Ok((c, k));
+    }
+    let (c, k) = endpoint::generate_identity().map_err(|e| anyhow!("generate identity: {e}"))?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&cp, &c)?;
+    std::fs::write(&kp, &k)?;
+    tracing::info!(cert = %cp.display(), "generated client identity");
+    Ok((c, k))
+}
+
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
     let get = |flag: &str| {
@@ -56,20 +89,15 @@ fn parse_args() -> Args {
             .nth(1)
             .map(String::as_str)
     };
-    let mode = get("--mode")
-        .and_then(|m| {
-            let mut it = m.split('x');
-            Some(Mode {
-                width: it.next()?.parse().ok()?,
-                height: it.next()?.parse().ok()?,
-                refresh_hz: it.next()?.parse().ok()?,
-            })
-        })
-        .unwrap_or(Mode {
-            width: 1280,
-            height: 720,
-            refresh_hz: 60,
-        });
+    let mode = get("--mode").and_then(parse_mode).unwrap_or(Mode {
+        width: 1280,
+        height: 720,
+        refresh_hz: 60,
+    });
+    let remode = get("--remode").and_then(|s| {
+        let (m, secs) = s.split_once(':')?;
+        Some((parse_mode(m)?, secs.parse().ok()?))
+    });
     // A present-but-malformed --pin must abort, not silently downgrade to trust-on-first-use
     // (the user asked for verification; fail closed).
     let pin = match get("--pin") {
@@ -90,6 +118,9 @@ fn parse_args() -> Args {
         out: get("--out").map(String::from),
         input_test: argv.iter().any(|a| a == "--input-test"),
         pin,
+        remode,
+        pair: get("--pair").map(String::from),
+        name: get("--name").unwrap_or("punktfunk-client-rs").to_string(),
     }
 }
 
@@ -114,6 +145,29 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<()> {
+    // Pairing mode: run the PIN ceremony and print the fingerprint to pin, then exit.
+    if let Some(pin) = &args.pair {
+        let (host, port) = args
+            .connect
+            .rsplit_once(':')
+            .context("--connect host:port")?;
+        let identity = load_or_create_identity()?;
+        let fp = punktfunk_core::client::NativeClient::pair(
+            host,
+            port.parse().context("port")?,
+            (&identity.0, &identity.1),
+            pin,
+            &args.name,
+            std::time::Duration::from_secs(90),
+        )
+        .map_err(|e| anyhow!("pairing failed: {e:?} (wrong PIN?)"))?;
+        tracing::info!(
+            fingerprint = %hex(&fp),
+            "PAIRED — connect with --pin {} from now on",
+            hex(&fp)
+        );
+        return Ok(());
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -123,7 +177,11 @@ fn run(args: Args) -> Result<()> {
 
 async fn session(args: Args) -> Result<()> {
     let remote: std::net::SocketAddr = args.connect.parse().context("--connect host:port")?;
-    let (ep, observed) = endpoint::client_pinned(args.pin);
+    let identity = load_or_create_identity()?;
+    let (ep, observed) = endpoint::client_pinned_with_identity(
+        args.pin,
+        Some((identity.0.as_str(), identity.1.as_str())),
+    );
     let ep = ep.map_err(|e| anyhow!("QUIC client endpoint: {e}"))?;
     let conn = ep
         .connect(remote, "punktfunk")
@@ -172,6 +230,35 @@ async fn session(args: Args) -> Result<()> {
         .encode(),
     )
     .await?;
+
+    // Mid-stream renegotiation test: after a delay, ask the host to switch modes on the
+    // still-open control stream. The stream then carries new-mode AUs (IDR + in-band
+    // parameter sets) — ffprobe the --out file to see both resolutions.
+    if let Some((new_mode, after_secs)) = args.remode {
+        let mut rs = send;
+        let mut rr = recv;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(after_secs as u64)).await;
+            tracing::info!(?new_mode, "requesting mid-stream mode switch");
+            if io::write_msg(&mut rs, &Reconfigure { mode: new_mode }.encode())
+                .await
+                .is_err()
+            {
+                tracing::error!("Reconfigure write failed");
+                return;
+            }
+            match io::read_msg(&mut rr)
+                .await
+                .map(|b| Reconfigured::decode(&b))
+            {
+                Ok(Ok(ack)) if ack.accepted => {
+                    tracing::info!(mode = ?ack.mode, "mode switch ACCEPTED")
+                }
+                Ok(Ok(ack)) => tracing::warn!(active = ?ack.mode, "mode switch REJECTED"),
+                other => tracing::error!(?other, "bad Reconfigured"),
+            }
+        });
+    }
 
     // Input plane: scripted events as QUIC datagrams (mouse square + 'A' taps), proving the
     // low-latency input path without a real input device.

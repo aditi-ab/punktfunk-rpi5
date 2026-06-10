@@ -465,6 +465,18 @@ pub struct PunktfunkConnection {
     last_audio: std::sync::Mutex<Option<crate::client::AudioPacket>>,
 }
 
+/// Read an optional NUL-terminated UTF-8 string parameter; `Err` = invalid pointer/UTF-8.
+#[cfg(feature = "quic")]
+unsafe fn opt_cstr<'a>(p: *const std::os::raw::c_char) -> std::result::Result<Option<&'a str>, ()> {
+    if p.is_null() {
+        return Ok(None);
+    }
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_str()
+        .map(Some)
+        .map_err(|_| ())
+}
+
 /// Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
 /// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure.
 ///
@@ -473,9 +485,15 @@ pub struct PunktfunkConnection {
 /// fingerprint written to `observed_sha256_out` (NULL or 32 bytes, filled on success) and
 /// pass it as the pin on every later connect.
 ///
+/// Identity: `client_cert_pem`/`client_key_pem` (both NULL, or both NUL-terminated PEM
+/// strings — see [`punktfunk_generate_identity`]) are presented via TLS client auth so a
+/// host can recognize this client once paired ([`punktfunk_pair`]). NULL = anonymous;
+/// hosts running `--require-pairing` reject anonymous sessions.
+///
 /// # Safety
 /// `host` is a NUL-terminated UTF-8 string (IP or hostname resolvable by the platform);
-/// `pin_sha256`/`observed_sha256_out` are each NULL or valid for 32 bytes.
+/// `pin_sha256`/`observed_sha256_out` are each NULL or valid for 32 bytes;
+/// `client_cert_pem`/`client_key_pem` are each NULL or NUL-terminated UTF-8.
 #[cfg(feature = "quic")]
 #[no_mangle]
 pub unsafe extern "C" fn punktfunk_connect(
@@ -486,6 +504,8 @@ pub unsafe extern "C" fn punktfunk_connect(
     refresh_hz: u32,
     pin_sha256: *const u8,
     observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -508,11 +528,19 @@ pub unsafe extern "C" fn punktfunk_connect(
             p.copy_from_slice(unsafe { std::slice::from_raw_parts(pin_sha256, 32) });
             Some(p)
         };
+        let identity = match (unsafe { opt_cstr(client_cert_pem) }, unsafe {
+            opt_cstr(client_key_pem)
+        }) {
+            (Ok(Some(c)), Ok(Some(k))) => Some((c.to_string(), k.to_string())),
+            (Ok(None), Ok(None)) => None,
+            _ => return std::ptr::null_mut(), // half an identity / bad UTF-8: fail closed
+        };
         match crate::client::NativeClient::connect(
             host,
             port,
             mode,
             pin,
+            identity,
             std::time::Duration::from_millis(timeout_ms as u64),
         ) {
             Ok(c) => {
@@ -532,6 +560,97 @@ pub unsafe extern "C" fn punktfunk_connect(
         }
     }));
     r.unwrap_or(std::ptr::null_mut())
+}
+
+/// Generate a persistent client identity: a self-signed certificate + private key, both
+/// PEM, NUL-terminated, written into the caller's buffers. Generate ONCE, store both
+/// strings (Keychain etc.), pass them to [`punktfunk_pair`] and every
+/// [`punktfunk_connect`] — the certificate's fingerprint is how hosts recognize this
+/// client. 4096-byte buffers are ample.
+///
+/// # Safety
+/// `cert_pem_out` is writable for `cert_cap` bytes; `key_pem_out` for `key_cap`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_generate_identity(
+    cert_pem_out: *mut std::os::raw::c_char,
+    cert_cap: usize,
+    key_pem_out: *mut std::os::raw::c_char,
+    key_cap: usize,
+) -> PunktfunkStatus {
+    guard(|| {
+        if cert_pem_out.is_null() || key_pem_out.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        let (cert, key) = match crate::quic::endpoint::generate_identity() {
+            Ok(t) => t,
+            Err(_) => return PunktfunkStatus::Io,
+        };
+        if cert.len() + 1 > cert_cap || key.len() + 1 > key_cap {
+            return PunktfunkStatus::InvalidArg;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(cert.as_ptr(), cert_pem_out as *mut u8, cert.len());
+            *cert_pem_out.add(cert.len()) = 0;
+            std::ptr::copy_nonoverlapping(key.as_ptr(), key_pem_out as *mut u8, key.len());
+            *key_pem_out.add(key.len()) = 0;
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// Run the PIN pairing ceremony against a host (see the protocol docs in punktfunk-core):
+/// the host displays a short PIN; the user types it into the client app, which passes it
+/// here. On success the host has stored this client's identity, the now-verified host
+/// fingerprint is written to `host_sha256_out` (32 bytes) — persist it and pass it as
+/// `pin_sha256` to [`punktfunk_connect`] from then on. Returns
+/// [`PunktfunkStatus::Crypto`] for a wrong PIN.
+///
+/// # Safety
+/// `host`/`client_cert_pem`/`client_key_pem`/`pin`/`name` are NUL-terminated UTF-8;
+/// `host_sha256_out` is writable for 32 bytes.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_pair(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    pin: *const std::os::raw::c_char,
+    name: *const std::os::raw::c_char,
+    host_sha256_out: *mut u8,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let (Ok(Some(host)), Ok(Some(cert)), Ok(Some(key)), Ok(Some(pin)), Ok(Some(name))) = (
+            unsafe { opt_cstr(host) },
+            unsafe { opt_cstr(client_cert_pem) },
+            unsafe { opt_cstr(client_key_pem) },
+            unsafe { opt_cstr(pin) },
+            unsafe { opt_cstr(name) },
+        ) else {
+            return PunktfunkStatus::NullPointer;
+        };
+        if host_sha256_out.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        match crate::client::NativeClient::pair(
+            host,
+            port,
+            (cert, key),
+            pin,
+            name,
+            std::time::Duration::from_millis(timeout_ms as u64),
+        ) {
+            Ok(fp) => {
+                unsafe {
+                    std::slice::from_raw_parts_mut(host_sha256_out, 32).copy_from_slice(&fp);
+                }
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
 }
 
 /// Pull the next reassembled access unit, waiting up to `timeout_ms`. Returns
@@ -710,7 +829,8 @@ pub unsafe extern "C" fn punktfunk_connection_send_input(
     })
 }
 
-/// The host-confirmed session mode (from the Welcome). Safe any time after connect.
+/// The currently active session mode — the Welcome's, until an accepted
+/// [`punktfunk_connection_request_mode`] switches it. Safe any time after connect.
 ///
 /// # Safety
 /// `c` is a valid connection handle; out pointers are writable (NULLs are skipped).
@@ -727,18 +847,52 @@ pub unsafe extern "C" fn punktfunk_connection_mode(
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
+        let mode = c.inner.mode();
         unsafe {
             if !width.is_null() {
-                *width = c.inner.mode.width;
+                *width = mode.width;
             }
             if !height.is_null() {
-                *height = c.inner.mode.height;
+                *height = mode.height;
             }
             if !refresh_hz.is_null() {
-                *refresh_hz = c.inner.mode.refresh_hz;
+                *refresh_hz = mode.refresh_hz;
             }
         }
         PunktfunkStatus::Ok
+    })
+}
+
+/// Ask the host to switch the live session to `width`x`height`@`refresh_hz` without
+/// reconnecting (window resized, refresh changed). Non-blocking enqueue: on acceptance the
+/// stream continues at the new mode — the first new-mode access unit is an IDR with
+/// in-band parameter sets (rebuild the decoder from it) — and
+/// [`punktfunk_connection_mode`] reflects the switch. A rejected request leaves the
+/// session unchanged.
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_request_mode(
+    c: *const PunktfunkConnection,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        match c.inner.request_mode(crate::config::Mode {
+            width,
+            height,
+            refresh_hz,
+        }) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
     })
 }
 

@@ -19,7 +19,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 default = []
 # Control-plane QUIC (pairing, config, reverse audio). tokio is permitted ONLY here,
 # never on the per-frame hot path. Off by default so the core stays runtime-free.
-quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:sha2"]
+quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:sha2", "dep:hmac"]
 
 [dependencies]
 reed-solomon-simd = "3.1"      # GF(2^16) Leopard-RS, SIMD, O(n log n) — the wall-breaker (P2)
@@ -38,9 +38,10 @@ zeroize = "1"
 
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
-rcgen = { version = "0.13", optional = true, default-features = false, features = ["aws_lc_rs"] }
+rcgen = { version = "0.13", optional = true, default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls-pki-types = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "sync", "macros"] }
 
 [dev-dependencies]

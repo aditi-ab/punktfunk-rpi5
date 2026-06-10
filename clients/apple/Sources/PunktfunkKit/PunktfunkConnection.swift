@@ -49,8 +49,67 @@ public enum PunktfunkClientError: Error {
     /// `pinSHA256` was non-nil but not exactly 32 bytes. Failing closed: connecting
     /// unpinned when the caller asked for verification would be a silent trust downgrade.
     case invalidPin
+    /// Pairing rejected — wrong PIN.
+    case wrongPIN
     case closed
     case status(Int32)
+}
+
+/// This client's persistent self-signed identity. Generate ONCE with `generateIdentity()`,
+/// store both PEMs (Keychain), present on every connect — the certificate's fingerprint is
+/// how hosts recognize this client after pairing.
+public struct ClientIdentity: Sendable {
+    public let certPEM: String
+    public let keyPEM: String
+    public init(certPEM: String, keyPEM: String) {
+        self.certPEM = certPEM
+        self.keyPEM = keyPEM
+    }
+}
+
+/// Generate a fresh client identity (self-signed cert + key, PEM).
+public func generateIdentity() throws -> ClientIdentity {
+    var cert = [CChar](repeating: 0, count: 4096)
+    var key = [CChar](repeating: 0, count: 4096)
+    let rc = punktfunk_generate_identity(&cert, cert.count, &key, key.count)
+    guard rc.rawValue == PUNKTFUNK_STATUS_OK.rawValue else {
+        throw PunktfunkClientError.status(rc.rawValue)
+    }
+    return ClientIdentity(certPEM: String(cString: cert), keyPEM: String(cString: key))
+}
+
+/// Run the PIN pairing ceremony: the host displays a 4-digit PIN (its log/UI), the user
+/// types it here. On success the host stores this client's identity and the returned
+/// fingerprint is the host's now-VERIFIED identity — persist it and pass it as `pinSHA256`
+/// to every later connect. Throws `.wrongPIN` when the proof is rejected.
+public func pair(
+    host: String, port: UInt16 = 9777,
+    identity: ClientIdentity, pin: String, name: String,
+    timeoutMs: UInt32 = 90_000
+) throws -> Data {
+    var observed = [UInt8](repeating: 0, count: 32)
+    let rc = host.withCString { cs in
+        identity.certPEM.withCString { cert in
+            identity.keyPEM.withCString { key in
+                pin.withCString { p in
+                    name.withCString { n in
+                        punktfunk_pair(cs, port, cert, key, p, n, &observed, timeoutMs)
+                    }
+                }
+            }
+        }
+    }
+    switch rc.rawValue {
+    case PUNKTFUNK_STATUS_OK.rawValue: return Data(observed)
+    case PUNKTFUNK_STATUS_CRYPTO.rawValue: throw PunktfunkClientError.wrongPIN
+    default: throw PunktfunkClientError.status(rc.rawValue)
+    }
+}
+
+/// `withCString` over an optional — nil maps to a NULL C pointer.
+func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+    guard let s else { return body(nil) }
+    return s.withCString { body($0) }
 }
 
 public final class PunktfunkConnection {
@@ -82,23 +141,34 @@ public final class PunktfunkConnection {
     /// `pinSHA256`: the host's expected certificate fingerprint (exactly 32 bytes, else
     /// `invalidPin` is thrown — never silently downgraded); nil = trust on first use
     /// (check `hostFingerprint` afterwards). A pinned mismatch throws.
+    ///
+    /// `identity`: this client's persistent identity (from `generateIdentity()`, stored in
+    /// the Keychain) — presented so a host recognizes a paired client. nil = anonymous;
+    /// hosts running `--require-pairing` reject anonymous sessions.
     public init(
         host: String, port: UInt16 = 9777,
         width: UInt32, height: UInt32, refreshHz: UInt32,
         pinSHA256: Data? = nil,
+        identity: ClientIdentity? = nil,
         timeoutMs: UInt32 = 10_000
     ) throws {
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
         var observed = [UInt8](repeating: 0, count: 32)
         handle = host.withCString { cs in
-            if let pin = pinSHA256 {
-                return pin.withUnsafeBytes { p in
-                    punktfunk_connect(
-                        cs, port, width, height, refreshHz,
-                        p.bindMemory(to: UInt8.self).baseAddress, &observed, timeoutMs)
+            withOptionalCString(identity?.certPEM) { cert in
+                withOptionalCString(identity?.keyPEM) { key in
+                    if let pin = pinSHA256 {
+                        return pin.withUnsafeBytes { p in
+                            punktfunk_connect(
+                                cs, port, width, height, refreshHz,
+                                p.bindMemory(to: UInt8.self).baseAddress, &observed,
+                                cert, key, timeoutMs)
+                        }
+                    }
+                    return punktfunk_connect(
+                        cs, port, width, height, refreshHz, nil, &observed, cert, key, timeoutMs)
                 }
             }
-            return punktfunk_connect(cs, port, width, height, refreshHz, nil, &observed, timeoutMs)
         }
         guard handle != nil else { throw PunktfunkClientError.connectFailed }
         hostFingerprint = Data(observed)
@@ -107,6 +177,28 @@ public final class PunktfunkConnection {
         self.width = w
         self.height = h
         self.refreshHz = hz
+    }
+
+    /// Ask the host to switch the live session to a new mode (window resized) — no
+    /// reconnect. Non-blocking; on acceptance the stream continues at the new mode (the
+    /// first new-mode AU is an IDR with fresh parameter sets — `AnnexB.formatDescription`
+    /// refresh-on-IDR already handles it) and `currentMode()` reflects the switch.
+    public func requestMode(width: UInt32, height: UInt32, refreshHz: UInt32) {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        _ = punktfunk_connection_request_mode(h, width, height, refreshHz)
+    }
+
+    /// The currently active session mode (updated by accepted `requestMode` switches).
+    public func currentMode() -> (width: UInt32, height: UInt32, refreshHz: UInt32) {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        var w: UInt32 = 0, h: UInt32 = 0, hz: UInt32 = 0
+        if let hd = handle, !closeRequested {
+            _ = punktfunk_connection_mode(hd, &w, &h, &hz)
+        }
+        return (w, h, hz)
     }
 
     /// Pull the next access unit; nil on timeout, throws `.closed` once the session ended.

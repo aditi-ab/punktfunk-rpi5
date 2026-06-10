@@ -83,6 +83,36 @@
 #define MAX_DATAGRAM_BYTES 2048
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`Reconfigure`] (first byte after the magic).
+#define MSG_RECONFIGURE 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`Reconfigured`].
+#define MSG_RECONFIGURED 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`PairRequest`].
+#define MSG_PAIR_REQUEST 16
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`PairChallenge`].
+#define MSG_PAIR_CHALLENGE 17
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`PairProof`].
+#define MSG_PAIR_PROOF 18
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`PairResult`].
+#define MSG_PAIR_RESULT 19
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
 // demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8),
 // audio = [`AUDIO_MAGIC`], rumble = [`RUMBLE_MAGIC`].
@@ -324,9 +354,15 @@ PunktfunkStatus punktfunk_get_stats(PunktfunkSession *s, PunktfunkStats *out);
 // fingerprint written to `observed_sha256_out` (NULL or 32 bytes, filled on success) and
 // pass it as the pin on every later connect.
 //
+// Identity: `client_cert_pem`/`client_key_pem` (both NULL, or both NUL-terminated PEM
+// strings — see [`punktfunk_generate_identity`]) are presented via TLS client auth so a
+// host can recognize this client once paired ([`punktfunk_pair`]). NULL = anonymous;
+// hosts running `--require-pairing` reject anonymous sessions.
+//
 // # Safety
 // `host` is a NUL-terminated UTF-8 string (IP or hostname resolvable by the platform);
-// `pin_sha256`/`observed_sha256_out` are each NULL or valid for 32 bytes.
+// `pin_sha256`/`observed_sha256_out` are each NULL or valid for 32 bytes;
+// `client_cert_pem`/`client_key_pem` are each NULL or NUL-terminated UTF-8.
 PunktfunkConnection *punktfunk_connect(const char *host,
                                        uint16_t port,
                                        uint32_t width,
@@ -334,7 +370,45 @@ PunktfunkConnection *punktfunk_connect(const char *host,
                                        uint32_t refresh_hz,
                                        const uint8_t *pin_sha256,
                                        uint8_t *observed_sha256_out,
+                                       const char *client_cert_pem,
+                                       const char *client_key_pem,
                                        uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Generate a persistent client identity: a self-signed certificate + private key, both
+// PEM, NUL-terminated, written into the caller's buffers. Generate ONCE, store both
+// strings (Keychain etc.), pass them to [`punktfunk_pair`] and every
+// [`punktfunk_connect`] — the certificate's fingerprint is how hosts recognize this
+// client. 4096-byte buffers are ample.
+//
+// # Safety
+// `cert_pem_out` is writable for `cert_cap` bytes; `key_pem_out` for `key_cap`.
+PunktfunkStatus punktfunk_generate_identity(char *cert_pem_out,
+                                            uintptr_t cert_cap,
+                                            char *key_pem_out,
+                                            uintptr_t key_cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Run the PIN pairing ceremony against a host (see the protocol docs in punktfunk-core):
+// the host displays a short PIN; the user types it into the client app, which passes it
+// here. On success the host has stored this client's identity, the now-verified host
+// fingerprint is written to `host_sha256_out` (32 bytes) — persist it and pass it as
+// `pin_sha256` to [`punktfunk_connect`] from then on. Returns
+// [`PunktfunkStatus::Crypto`] for a wrong PIN.
+//
+// # Safety
+// `host`/`client_cert_pem`/`client_key_pem`/`pin`/`name` are NUL-terminated UTF-8;
+// `host_sha256_out` is writable for 32 bytes.
+PunktfunkStatus punktfunk_pair(const char *host,
+                               uint16_t port,
+                               const char *client_cert_pem,
+                               const char *client_key_pem,
+                               const char *pin,
+                               const char *name,
+                               uint8_t *host_sha256_out,
+                               uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -391,7 +465,8 @@ PunktfunkStatus punktfunk_connection_send_input(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The host-confirmed session mode (from the Welcome). Safe any time after connect.
+// The currently active session mode — the Welcome's, until an accepted
+// [`punktfunk_connection_request_mode`] switches it. Safe any time after connect.
 //
 // # Safety
 // `c` is a valid connection handle; out pointers are writable (NULLs are skipped).
@@ -399,6 +474,22 @@ PunktfunkStatus punktfunk_connection_mode(const PunktfunkConnection *c,
                                           uint32_t *width,
                                           uint32_t *height,
                                           uint32_t *refresh_hz);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Ask the host to switch the live session to `width`x`height`@`refresh_hz` without
+// reconnecting (window resized, refresh changed). Non-blocking enqueue: on acceptance the
+// stream continues at the new mode — the first new-mode access unit is an IDR with
+// in-band parameter sets (rebuild the decoder from it) — and
+// [`punktfunk_connection_mode`] reflects the switch. A rejected request leaves the
+// session unchanged.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_request_mode(const PunktfunkConnection *c,
+                                                  uint32_t width,
+                                                  uint32_t height,
+                                                  uint32_t refresh_hz);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

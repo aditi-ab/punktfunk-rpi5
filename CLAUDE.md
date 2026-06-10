@@ -17,7 +17,9 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   **KWin** (`zkde_screencast stream_virtual_output`, needs KWin ≥ 6.5.6 headless; >60 Hz via
   custom modes), **gamescope** (spawned headless at WxH@Hz, its PipeWire node captured, needs
   gamescope ≥ 3.16.22 — older deadlocks on PipeWire ≥ 1.6), **Mutter** (D-Bus
-  `RecordVirtual` virtual monitor; validated live on headless GNOME Shell 50, zero-copy).
+  `RecordVirtual` virtual monitor; validated live on headless GNOME Shell 50, zero-copy),
+  **Sway/wlroots** (`swaymsg create_output` + custom mode, xdpw portal capture with a
+  managed chooser config; validated live on sway 1.11, zero-copy).
   Performance work landed and measured: GPU **zero-copy** on all paths (tiled dmabuf →
   EGL/GL → CUDA; LINEAR dmabuf → **Vulkan bridge** → CUDA → NVENC), auto 2-way NVENC
   split-encode above ~1 Gpix/s (5K@240), infinite GOP + RFI keyframes (killed the periodic
@@ -36,7 +38,13 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   audio** 0xC9 (48 kHz stereo, 5 ms, host→client), **rumble** 0xCA (host→client). **Trust:**
   host serves its persistent identity (`~/.config/punktfunk/cert.pem`, shared with GameStream
   pairing) and logs the SHA-256 fingerprint; clients pin it (TOFU on first connect —
-  `endpoint::client_pinned`). Measured on-box at 720p120: 1680/1680 frames, **p50 0.83 ms**
+  `endpoint::client_pinned`), and a **PIN pairing ceremony** (host displays a 4-digit PIN,
+  proof = HMAC over both cert fingerprints, single attempt) establishes mutual trust:
+  clients present persistent identities via QUIC client auth, the host stores paired
+  fingerprints (`punktfunk1-paired.json`) and can gate sessions with `--require-pairing`.
+  **Mid-stream mode renegotiation**: `Reconfigure` on the still-open control stream — the
+  host rebuilds output+encoder at the new mode in ~90 ms while the data plane runs on
+  (validated live: one .h265 with 720p and 1080p segments). Measured on-box at 720p120: 1680/1680 frames, **p50 0.83 ms**
   capture→…→reassembled; audio measured live (~200 pkts/s). `punktfunk-client-rs` is the
   working reference client (`--pin`, datagram counters, `--input-test` incl. gamepad).
   The embeddable connector (`NativeClient`) exposes it all over the C ABI: `punktfunk_connect`
@@ -58,11 +66,9 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).
-3. **punktfunk/1 protocol growth**: a PIN-style pairing ceremony on top of fingerprint pinning,
-   mid-stream mode renegotiation (the Welcome is one-shot today), concurrent sessions
-   (today: one at a time, extras wait in the accept queue).
-4. **M2 polish**: wlroots/Sway `VirtualDisplay` backend (deferred; swaymsg `create_output`),
-   HDR/10-bit/AV1 negotiation, surround audio, reconnect-at-new-mode robustness.
+3. **punktfunk/1 protocol growth**: concurrent sessions (today: one at a time, extras wait
+   in the accept queue); mgmt REST endpoints for the punktfunk/1 paired-client list.
+4. **M2 polish**: HDR negotiation, reconnect-at-new-mode robustness.
 5. **Native clients** (`clients/{apple,android}` scaffolds) consuming `punktfunk_core.h`.
 
 Box one-time setup is complete: udev rule + `input` group (gamepads validated live),
@@ -73,7 +79,7 @@ backend validated live). All three compositor backends are live-validated.
 
 ```sh
 cargo build --workspace          # green on Linux and macOS
-cargo test  --workspace          # unit + loopback + proptest + C ABI harness (~97 tests)
+cargo test  --workspace          # unit + loopback + proptest + C ABI harness (~100 tests)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 
@@ -91,7 +97,7 @@ Generated artifacts are **checked in** and CI fails on drift: `include/punktfunk
 crates/punktfunk-core/        protocol · FEC · crypto · quic (punktfunk/1 control plane, feature-gated)
 crates/punktfunk-host/
   gamestream/             Moonlight compat: nvhttp · pairing · rtsp · control · stream · gamepad · apps
-  vdisplay/{kwin,gamescope,mutter}.rs   per-compositor client-sized virtual outputs
+  vdisplay/{kwin,gamescope,mutter,wlroots}.rs   per-compositor client-sized virtual outputs
   zerocopy/{egl,cuda,vulkan}.rs         dmabuf → CUDA → NVENC (tiled via EGL/GL, LINEAR via Vulkan)
   inject/{libei,wlr,gamepad}.rs         input backends (+ uinput virtual gamepads)
   capture.rs · encode.rs · audio.rs · m0.rs · m3.rs · mgmt.rs

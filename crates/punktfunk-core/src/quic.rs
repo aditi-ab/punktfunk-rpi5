@@ -58,6 +58,179 @@ pub struct Start {
     pub client_udp_port: u16,
 }
 
+/// `client → host`, any time after [`Start`]: switch the session to a new display mode
+/// (window resized, refresh changed) without reconnecting. The host answers with
+/// [`Reconfigured`]; on acceptance it rebuilds its virtual output + encoder at the new
+/// mode and the stream continues over the unchanged data plane — the first new-mode frame
+/// is an IDR with in-band parameter sets, which is all a decoder needs to follow.
+///
+/// Post-handshake messages carry a type byte after the magic (the handshake itself is
+/// positional and stays untyped for wire compatibility).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reconfigure {
+    pub mode: Mode,
+}
+
+/// `host → client`: answer to [`Reconfigure`]. `accepted = false` means the requested
+/// mode was rejected (e.g. exceeds encoder limits) and the session continues at `mode`
+/// (the still-active one); `true` means `mode` is now being switched to live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reconfigured {
+    pub accepted: bool,
+    pub mode: Mode,
+}
+
+/// Type byte of [`Reconfigure`] (first byte after the magic).
+pub const MSG_RECONFIGURE: u8 = 0x01;
+/// Type byte of [`Reconfigured`].
+pub const MSG_RECONFIGURED: u8 = 0x02;
+
+// ---------------------------------------------------------------------------------------------
+// Pairing ceremony (typed messages 0x10..): instead of a session Hello, a client may open
+// the control stream with PairRequest. The host shows a short PIN out-of-band (log/UI);
+// the user types it into the client, which proves knowledge with an HMAC bound to BOTH
+// certificate fingerprints — a MITM would need the PIN within its single attempt, and any
+// substituted certificate changes the proof. On success the host persists the client's
+// fingerprint (presented via QUIC client auth) and the client pins the host's.
+// ---------------------------------------------------------------------------------------------
+
+/// Type byte of [`PairRequest`].
+pub const MSG_PAIR_REQUEST: u8 = 0x10;
+/// Type byte of [`PairChallenge`].
+pub const MSG_PAIR_CHALLENGE: u8 = 0x11;
+/// Type byte of [`PairProof`].
+pub const MSG_PAIR_PROOF: u8 = 0x12;
+/// Type byte of [`PairResult`].
+pub const MSG_PAIR_RESULT: u8 = 0x13;
+
+/// `client → host`: begin pairing. `name` is the human label the host stores (e.g.
+/// "Enrico's Mac"), at most 64 bytes of UTF-8.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairRequest {
+    pub name: String,
+}
+
+/// `host → client`: a fresh random salt for the proof; the host has generated (and is
+/// displaying) the PIN. One proof attempt per challenge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairChallenge {
+    pub salt: [u8; 16],
+}
+
+/// `client → host`: the proof, see [`pair_proof`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairProof {
+    pub hmac: [u8; 32],
+}
+
+/// `host → client`: ceremony outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairResult {
+    pub ok: bool,
+}
+
+impl PairRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let name = self.name.as_bytes();
+        let n = name.len().min(64);
+        let mut b = Vec::with_capacity(6 + n);
+        b.extend_from_slice(MAGIC);
+        b.push(MSG_PAIR_REQUEST);
+        b.push(n as u8);
+        b.extend_from_slice(&name[..n]);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PairRequest> {
+        if b.len() < 6 || &b[0..4] != MAGIC || b[4] != MSG_PAIR_REQUEST {
+            return Err(PunktfunkError::InvalidArg("bad PairRequest"));
+        }
+        let n = b[5] as usize;
+        if n > 64 || b.len() < 6 + n {
+            return Err(PunktfunkError::InvalidArg("bad PairRequest name"));
+        }
+        Ok(PairRequest {
+            name: String::from_utf8_lossy(&b[6..6 + n]).into_owned(),
+        })
+    }
+}
+
+impl PairChallenge {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(21);
+        b.extend_from_slice(MAGIC);
+        b.push(MSG_PAIR_CHALLENGE);
+        b.extend_from_slice(&self.salt);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PairChallenge> {
+        if b.len() < 21 || &b[0..4] != MAGIC || b[4] != MSG_PAIR_CHALLENGE {
+            return Err(PunktfunkError::InvalidArg("bad PairChallenge"));
+        }
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&b[5..21]);
+        Ok(PairChallenge { salt })
+    }
+}
+
+impl PairProof {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(37);
+        b.extend_from_slice(MAGIC);
+        b.push(MSG_PAIR_PROOF);
+        b.extend_from_slice(&self.hmac);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PairProof> {
+        if b.len() < 37 || &b[0..4] != MAGIC || b[4] != MSG_PAIR_PROOF {
+            return Err(PunktfunkError::InvalidArg("bad PairProof"));
+        }
+        let mut hmac = [0u8; 32];
+        hmac.copy_from_slice(&b[5..37]);
+        Ok(PairProof { hmac })
+    }
+}
+
+impl PairResult {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(6);
+        b.extend_from_slice(MAGIC);
+        b.push(MSG_PAIR_RESULT);
+        b.push(self.ok as u8);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PairResult> {
+        if b.len() < 6 || &b[0..4] != MAGIC || b[4] != MSG_PAIR_RESULT {
+            return Err(PunktfunkError::InvalidArg("bad PairResult"));
+        }
+        Ok(PairResult { ok: b[5] != 0 })
+    }
+}
+
+/// The pairing proof both sides compute: `HMAC-SHA256(key = PIN ‖ salt,
+/// msg = client_fp ‖ host_fp)`. Binding both fingerprints into the MAC means a
+/// man-in-the-middle (whose certificates differ on at least one side) cannot replay or
+/// forward a valid proof; the PIN is single-attempt on the host, so a 4-digit space
+/// cannot be searched online.
+pub fn pair_proof(
+    pin: &str,
+    salt: &[u8; 16],
+    client_fp: &[u8; 32],
+    host_fp: &[u8; 32],
+) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut key = Vec::with_capacity(pin.len() + 16);
+    key.extend_from_slice(pin.as_bytes());
+    key.extend_from_slice(salt);
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key).expect("hmac key");
+    mac.update(client_fp);
+    mac.update(host_fp);
+    mac.finalize().into_bytes().into()
+}
+
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(20);
@@ -173,6 +346,62 @@ impl Start {
         }
         Ok(Start {
             client_udp_port: u16::from_le_bytes([b[4], b[5]]),
+        })
+    }
+}
+
+impl Reconfigure {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] w[5..9] h[9..13] hz[13..17]
+        let mut b = Vec::with_capacity(17);
+        b.extend_from_slice(MAGIC);
+        b.push(MSG_RECONFIGURE);
+        b.extend_from_slice(&self.mode.width.to_le_bytes());
+        b.extend_from_slice(&self.mode.height.to_le_bytes());
+        b.extend_from_slice(&self.mode.refresh_hz.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Reconfigure> {
+        if b.len() < 17 || &b[0..4] != MAGIC || b[4] != MSG_RECONFIGURE {
+            return Err(PunktfunkError::InvalidArg("bad Reconfigure"));
+        }
+        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        Ok(Reconfigure {
+            mode: Mode {
+                width: u32at(5),
+                height: u32at(9),
+                refresh_hz: u32at(13),
+            },
+        })
+    }
+}
+
+impl Reconfigured {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] accepted[5] w[6..10] h[10..14] hz[14..18]
+        let mut b = Vec::with_capacity(18);
+        b.extend_from_slice(MAGIC);
+        b.push(MSG_RECONFIGURED);
+        b.push(self.accepted as u8);
+        b.extend_from_slice(&self.mode.width.to_le_bytes());
+        b.extend_from_slice(&self.mode.height.to_le_bytes());
+        b.extend_from_slice(&self.mode.refresh_hz.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Reconfigured> {
+        if b.len() < 18 || &b[0..4] != MAGIC || b[4] != MSG_RECONFIGURED {
+            return Err(PunktfunkError::InvalidArg("bad Reconfigured"));
+        }
+        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        Ok(Reconfigured {
+            accepted: b[5] != 0,
+            mode: Mode {
+                width: u32at(6),
+                height: u32at(10),
+                refresh_hz: u32at(14),
+            },
         })
     }
 }
@@ -293,9 +522,36 @@ pub mod endpoint {
         key_der: rustls::pki_types::PrivateKeyDer<'static>,
         addr: std::net::SocketAddr,
     ) -> anyhow_result::Result<quinn::Endpoint> {
-        let server_config = quinn::ServerConfig::with_single_cert(vec![cert_der], key_der)
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Client auth is OFFERED but optional: a client that presents its self-signed
+        // identity is fingerprinted post-handshake (pairing / --require-pairing checks);
+        // one that presents none still connects (and is rejected at the app layer when
+        // pairing is required).
+        let rustls_cfg = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(AcceptAnyClientCert))
+            .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| anyhow_result::Error::msg(format!("server config: {e}")))?;
+        let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
+            .map_err(|e| anyhow_result::Error::msg(format!("quic server config: {e}")))?;
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
         Ok(quinn::Endpoint::server(server_config, addr)?)
+    }
+
+    /// Generate a fresh self-signed identity (certificate + PKCS#8 key, both PEM) — what a
+    /// client persists once and presents on every connect so hosts can recognize it.
+    pub fn generate_identity() -> anyhow_result::Result<(String, String)> {
+        let cert = rcgen::generate_simple_self_signed(vec!["punktfunk-client".into()])
+            .map_err(|e| anyhow_result::Error::msg(format!("self-signed cert: {e}")))?;
+        Ok((cert.cert.pem(), cert.key_pair.serialize_pem()))
+    }
+
+    /// Fingerprint of the client certificate a connection presented (host side), if any.
+    pub fn peer_fingerprint(conn: &quinn::Connection) -> Option<[u8; 32]> {
+        let identity = conn.peer_identity()?;
+        let certs = identity
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()?;
+        certs.first().map(|c| cert_fingerprint(c.as_ref()))
     }
 
     /// SHA-256 of a certificate's DER encoding — the fingerprint clients pin.
@@ -332,16 +588,40 @@ pub mod endpoint {
     /// `None` accepts any (trust-on-first-use). Either way the observed fingerprint is
     /// written to the returned slot during the handshake, so a TOFU caller can persist it.
     pub fn client_pinned(pin: Option<[u8; 32]>) -> PinnedClient {
+        client_pinned_with_identity(pin, None)
+    }
+
+    /// [`client_pinned`], additionally presenting a client identity (PEM cert + PKCS#8
+    /// key) via TLS client auth — how a paired client identifies itself to the host.
+    pub fn client_pinned_with_identity(
+        pin: Option<[u8; 32]>,
+        identity: Option<(&str, &str)>,
+    ) -> PinnedClient {
         let observed = Arc::new(Mutex::new(None));
         let ep = (|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
-            let rustls_cfg = rustls::ClientConfig::builder()
+            let builder = rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(PinVerify {
                     pin,
                     observed: observed.clone(),
-                }))
-                .with_no_client_auth();
+                }));
+            let rustls_cfg = match identity {
+                None => builder.with_no_client_auth(),
+                Some((cert_pem, key_pem)) => {
+                    use rustls::pki_types::pem::PemObject;
+                    let cert =
+                        rustls::pki_types::CertificateDer::from_pem_slice(cert_pem.as_bytes())
+                            .map_err(|e| {
+                                anyhow_result::Error::msg(format!("client cert pem: {e}"))
+                            })?;
+                    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+                        .map_err(|e| anyhow_result::Error::msg(format!("client key pem: {e}")))?;
+                    builder
+                        .with_client_auth_cert(vec![cert], key)
+                        .map_err(|e| anyhow_result::Error::msg(format!("client auth: {e}")))?
+                }
+            };
             let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
                 .map_err(|e| anyhow_result::Error::msg(format!("quic client config: {e}")))?;
             let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
@@ -377,6 +657,69 @@ pub mod endpoint {
     /// Fingerprint-pinning verifier: trust is the SHA-256 of the host's (self-signed) leaf
     /// cert, not a CA chain. With no pin it accepts any cert (TOFU) but still records what
     /// it saw, so the embedder can persist the fingerprint and pin it from then on.
+    /// Server-side client-cert verifier: accept any (self-signed) client certificate but
+    /// verify the handshake signature for real — possession of the presented cert's key is
+    /// what makes the post-handshake fingerprint ([`peer_fingerprint`]) meaningful.
+    /// Authorization (is this fingerprint paired?) happens at the application layer.
+    #[derive(Debug)]
+    struct AcceptAnyClientCert;
+
+    impl rustls::server::danger::ClientCertVerifier for AcceptAnyClientCert {
+        fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+            &[]
+        }
+
+        fn client_auth_mandatory(&self) -> bool {
+            false // unpaired/legacy clients still connect; gating is per-feature
+        }
+
+        fn verify_client_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _now: rustls::pki_types::UnixTime,
+        ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error>
+        {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
     #[derive(Debug)]
     struct PinVerify {
         pin: Option<[u8; 32]>,
@@ -490,6 +833,34 @@ mod tests {
             client_udp_port: 1234,
         };
         assert_eq!(Start::decode(&s.encode()).unwrap(), s);
+    }
+
+    #[test]
+    fn reconfigure_roundtrip() {
+        let rq = Reconfigure {
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 144,
+            },
+        };
+        assert_eq!(Reconfigure::decode(&rq.encode()).unwrap(), rq);
+        for accepted in [true, false] {
+            let rs = Reconfigured {
+                accepted,
+                mode: rq.mode,
+            };
+            assert_eq!(Reconfigured::decode(&rs.encode()).unwrap(), rs);
+        }
+        // The type byte separates the post-handshake messages from each other.
+        assert!(Reconfigure::decode(
+            &Reconfigured {
+                accepted: true,
+                mode: rq.mode
+            }
+            .encode()
+        )
+        .is_err());
     }
 
     #[test]

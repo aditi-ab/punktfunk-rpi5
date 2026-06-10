@@ -26,7 +26,10 @@ use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::{FecConfig, FecScheme, Role};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_SOF};
-use punktfunk_core::quic::{endpoint, io, Hello, Start, Welcome};
+use punktfunk_core::quic::{
+    endpoint, io, Hello, PairChallenge, PairProof, PairRequest, PairResult, Reconfigure,
+    Reconfigured, Start, Welcome,
+};
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
 use rand::RngCore;
@@ -50,6 +53,62 @@ pub struct M3Options {
     pub frames: u32,
     /// Exit after this many sessions (0 = serve forever).
     pub max_sessions: u32,
+    /// Only serve clients whose certificate fingerprint is in the paired set (pairing
+    /// ceremonies themselves are always allowed — that's how a client gets in).
+    pub require_pairing: bool,
+    /// Fixed pairing PIN (tests); `None` = a fresh random 4-digit PIN per ceremony.
+    pub pairing_pin: Option<String>,
+    /// Paired-clients store path override (tests); `None` = the default config path.
+    pub paired_store: Option<std::path::PathBuf>,
+}
+
+/// The host's paired punktfunk/1 clients: `~/.config/punktfunk/punktfunk1-paired.json`.
+/// (Separate from GameStream pairing, which has its own store and ceremony.)
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PairedClients {
+    clients: Vec<PairedClient>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PairedClient {
+    name: String,
+    /// Hex SHA-256 of the client's certificate.
+    fingerprint: String,
+}
+
+/// The store plus where it persists (the path is injectable for tests).
+struct PairedState {
+    path: std::path::PathBuf,
+    clients: PairedClients,
+}
+
+type PairedStore = Arc<std::sync::Mutex<PairedState>>;
+
+fn paired_path() -> Result<std::path::PathBuf> {
+    let home = std::env::var("HOME").context("HOME unset")?;
+    Ok(std::path::PathBuf::from(home).join(".config/punktfunk/punktfunk1-paired.json"))
+}
+
+fn load_paired(path: &std::path::Path) -> PairedClients {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_paired(state: &PairedState) -> Result<()> {
+    if let Some(dir) = state.path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&state.path, serde_json::to_vec_pretty(&state.clients)?)?;
+    Ok(())
+}
+
+impl PairedClients {
+    fn contains(&self, fp: &[u8; 32]) -> bool {
+        let hex = fingerprint_hex(fp);
+        self.clients.iter().any(|c| c.fingerprint == hex)
+    }
 }
 
 /// Deterministic test frame: `u32 LE index` then `data[i] = idx + i` (wrapping).
@@ -107,6 +166,18 @@ async fn serve(opts: M3Options) -> Result<()> {
     // One audio capturer for the whole host lifetime, handed from session to session
     // (PipeWire streams have no cheap teardown — see AudioCapSlot).
     let audio_cap: AudioCapSlot = Arc::new(std::sync::Mutex::new(None));
+    let paired_at = match &opts.paired_store {
+        Some(p) => p.clone(),
+        None => paired_path()?,
+    };
+    let paired: PairedStore = Arc::new(std::sync::Mutex::new(PairedState {
+        clients: load_paired(&paired_at),
+        path: paired_at,
+    }));
+    if opts.require_pairing {
+        let n = paired.lock().unwrap().clients.clients.len();
+        tracing::info!(paired = n, "pairing required for sessions");
+    }
 
     let mut served = 0u32;
     loop {
@@ -123,7 +194,7 @@ async fn serve(opts: M3Options) -> Result<()> {
         };
         let peer = conn.remote_address();
         tracing::info!(%peer, "punktfunk/1 client connected");
-        if let Err(e) = serve_session(conn, &opts, &audio_cap).await {
+        if let Err(e) = serve_session(conn, &opts, &audio_cap, &fingerprint, &paired).await {
             tracing::warn!(%peer, error = %format!("{e:#}"), "session ended with error");
         } else {
             tracing::info!(%peer, "session complete");
@@ -147,28 +218,119 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// PipeWire thread + core connection + live capture node on the daemon every session.
 type AudioCapSlot = Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>;
 
+/// Pairing needs a human in the loop (reading the PIN off the host, typing it into the
+/// client), so its budget is far larger than the machine-speed session handshake.
+const PAIRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The host side of the PIN ceremony (see `punktfunk_core::quic::pair_proof`): generate a
+/// PIN, display it (log), challenge with a fresh salt, verify the client's single proof
+/// attempt, and persist the client's certificate fingerprint on success.
+async fn pair_ceremony(
+    conn: &quinn::Connection,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    req: PairRequest,
+    host_fp: &[u8; 32],
+    paired: &PairedStore,
+    opts: &M3Options,
+) -> Result<()> {
+    let client_fp = endpoint::peer_fingerprint(conn)
+        .ok_or_else(|| anyhow!("pairing requires the client to present a certificate"))?;
+
+    let pin = opts.pairing_pin.clone().unwrap_or_else(|| {
+        use rand::Rng;
+        format!("{:04}", rand::thread_rng().gen_range(0..10_000u32))
+    });
+    let mut salt = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt);
+    tracing::info!(
+        name = %req.name,
+        client = %fingerprint_hex(&client_fp),
+        "PAIRING REQUEST — enter this PIN on the client: {pin}"
+    );
+
+    io::write_msg(&mut send, &PairChallenge { salt }.encode()).await?;
+    let proof = tokio::time::timeout(PAIRING_TIMEOUT, io::read_msg(&mut recv))
+        .await
+        .map_err(|_| anyhow!("pairing timed out waiting for the PIN proof"))??;
+    let proof = PairProof::decode(&proof).map_err(|e| anyhow!("PairProof decode: {e:?}"))?;
+
+    let expected = punktfunk_core::quic::pair_proof(&pin, &salt, &client_fp, host_fp);
+    // Constant-time compare — don't leak a prefix-match timing oracle on the proof.
+    let ok = proof
+        .hmac
+        .iter()
+        .zip(expected.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0;
+
+    if ok {
+        let mut store = paired.lock().unwrap();
+        let hex = fingerprint_hex(&client_fp);
+        store.clients.clients.retain(|c| c.fingerprint != hex); // re-pair updates the name
+        store.clients.clients.push(PairedClient {
+            name: req.name.clone(),
+            fingerprint: hex,
+        });
+        if let Err(e) = save_paired(&store) {
+            tracing::error!(error = %format!("{e:#}"), "could not persist paired clients");
+        }
+        tracing::info!(name = %req.name, "pairing complete — client trusted");
+    } else {
+        tracing::warn!(name = %req.name, "pairing FAILED (wrong PIN) — fingerprint not stored");
+    }
+    io::write_msg(&mut send, &PairResult { ok }.encode()).await?;
+    let _ = send.finish();
+    // Let the result reach the client before the connection drops.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    conn.close(0u32.into(), b"pairing done");
+    anyhow::ensure!(ok, "pairing rejected (wrong PIN)");
+    Ok(())
+}
+
 /// One client session: handshake → input/audio planes → data plane until done/disconnect.
 /// Everything torn down on return (RAII: virtual output, encoder, threads via channel close).
+/// A connection whose first message is a PairRequest runs the pairing ceremony instead.
 async fn serve_session(
     conn: quinn::Connection,
     opts: &M3Options,
     audio_cap: &AudioCapSlot,
+    host_fp: &[u8; 32],
+    paired: &PairedStore,
 ) -> Result<()> {
     let peer = conn.remote_address();
+
+    // First message decides what this connection is: a pairing ceremony or a session.
+    let (mut send, mut recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.accept_bi())
+        .await
+        .map_err(|_| anyhow!("control stream timeout"))?
+        .context("accept control stream")?;
+    let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, io::read_msg(&mut recv))
+        .await
+        .map_err(|_| anyhow!("first message timeout"))??;
+    if let Ok(req) = PairRequest::decode(&first) {
+        return pair_ceremony(&conn, send, recv, req, host_fp, paired, opts).await;
+    }
 
     let source = opts.source;
     let frames = opts.frames;
     let handshake = async {
-        let (mut send, mut recv) = conn.accept_bi().await.context("accept control stream")?;
-
-        let hello = Hello::decode(&io::read_msg(&mut recv).await?)
-            .map_err(|e| anyhow!("Hello decode: {e:?}"))?;
+        let hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
         anyhow::ensure!(
             hello.abi_version == punktfunk_core::ABI_VERSION,
             "ABI mismatch: client {} host {}",
             hello.abi_version,
             punktfunk_core::ABI_VERSION
         );
+        if opts.require_pairing {
+            let known = endpoint::peer_fingerprint(&conn)
+                .map(|fp| paired.lock().unwrap().clients.contains(&fp))
+                .unwrap_or(false);
+            anyhow::ensure!(
+                known,
+                "unpaired client rejected (this host requires pairing — run the PIN ceremony first)"
+            );
+        }
         crate::encode::validate_dimensions(
             crate::encode::Codec::H265,
             hello.mode.width,
@@ -211,8 +373,45 @@ async fn serve_session(
     let (hello, welcome, udp_port, start) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
         .await
         .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
+    let (mut ctrl_send, mut ctrl_recv) = (send, recv);
     let client_udp = std::net::SocketAddr::new(peer.ip(), start.client_udp_port);
     tracing::info!(%client_udp, udp_port, mode = ?hello.mode, "handshake complete — streaming");
+
+    // Control task: the handshake stream stays open for mid-stream renegotiation. A
+    // validated Reconfigure is acked, then handed to the data-plane thread, which rebuilds
+    // capture/encoder/virtual output at the new mode (the data plane itself is untouched).
+    let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<punktfunk_core::Mode>();
+    tokio::spawn(async move {
+        let mut active = hello.mode;
+        while let Ok(msg) = io::read_msg(&mut ctrl_recv).await {
+            let Ok(req) = Reconfigure::decode(&msg) else {
+                tracing::warn!("unknown control message — ignoring");
+                continue;
+            };
+            let ok = crate::encode::validate_dimensions(
+                crate::encode::Codec::H265,
+                req.mode.width,
+                req.mode.height,
+            )
+            .is_ok();
+            if ok {
+                active = req.mode;
+                tracing::info!(mode = ?req.mode, "mode switch accepted");
+            } else {
+                tracing::warn!(mode = ?req.mode, "mode switch rejected (invalid dimensions)");
+            }
+            let ack = Reconfigured {
+                accepted: ok,
+                mode: active,
+            };
+            if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
+                break;
+            }
+            if ok && reconfig_tx.send(req.mode).is_err() {
+                break; // data plane gone
+            }
+        }
+    });
 
     // Input plane: QUIC datagrams → channel → a native injector thread (the injector owns
     // non-Send compositor state, so it lives on its own thread). The thread also owns the
@@ -283,7 +482,9 @@ async fn serve_session(
                 .map_err(|e| anyhow!("host session: {e:?}"))?;
             match source {
                 M3Source::Synthetic => synthetic_stream(&mut session, frames, &stop_stream),
-                M3Source::Virtual => virtual_stream(&mut session, mode, seconds, &stop_stream),
+                M3Source::Virtual => {
+                    virtual_stream(&mut session, mode, seconds, &stop_stream, &reconfig_rx)
+                }
             }
         })
         .await
@@ -548,37 +749,36 @@ fn synthetic_stream(session: &mut Session, frames: u32, stop: &AtomicBool) -> Re
 
 /// Real capture→encode→punktfunk/1: a native virtual output at the client's mode, NVENC AUs
 /// stamped with the capture wall clock (the client derives per-frame pipeline latency).
+///
+/// `reconfig` delivers accepted mid-stream mode switches: the capture/encode pipeline is
+/// rebuilt at the new mode (capturer drop tears down the PipeWire stream and, via its
+/// keepalive, the virtual output) while the data-plane `session` continues untouched —
+/// the rebuilt encoder opens with an IDR + in-band parameter sets.
 fn virtual_stream(
     session: &mut Session,
     mode: punktfunk_core::Mode,
     seconds: u32,
     stop: &AtomicBool,
+    reconfig: &std::sync::mpsc::Receiver<punktfunk_core::Mode>,
 ) -> Result<()> {
     let compositor = crate::vdisplay::detect().context("detect compositor")?;
     tracing::info!(?compositor, ?mode, "punktfunk/1 virtual display");
     let mut vd = crate::vdisplay::open(compositor)?;
-    let vout = vd.create(mode).context("create virtual output")?;
-    let mut capturer =
-        crate::capture::capture_virtual_output(vout).context("capture virtual output")?;
-    capturer.set_active(true);
+    let (mut capturer, mut enc, mut frame, mut interval) = build_pipeline(&mut vd, mode)?;
 
-    let mut frame = capturer.next_frame().context("first frame")?;
-    let mut enc = crate::encode::open_video(
-        crate::encode::Codec::H265,
-        frame.format,
-        frame.width,
-        frame.height,
-        mode.refresh_hz,
-        20_000_000,
-        frame.is_cuda(),
-    )
-    .context("open NVENC")?;
-
-    let interval = std::time::Duration::from_secs_f64(1.0 / mode.refresh_hz.max(1) as f64);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64);
     let mut next = std::time::Instant::now();
     let mut sent: u64 = 0;
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        if let Ok(new_mode) = reconfig.try_recv() {
+            tracing::info!(?new_mode, "rebuilding pipeline for mode switch");
+            // Tear down in order — capture stream (and with it the virtual output) before
+            // the new output appears, encoder with it. The data plane keeps running.
+            drop(enc);
+            drop(capturer);
+            (capturer, enc, frame, interval) = build_pipeline(&mut vd, new_mode)?;
+            next = std::time::Instant::now();
+        }
         if let Some(f) = capturer.try_latest().context("capture")? {
             frame = f;
         }
@@ -603,6 +803,38 @@ fn virtual_stream(
     }
     tracing::info!(sent, "punktfunk/1 virtual stream complete");
     Ok(())
+}
+
+/// One mode's capture/encode pipeline: (capturer, encoder, first frame, frame interval).
+/// Dropping the capturer tears down the PipeWire stream and the virtual output with it.
+type Pipeline = (
+    Box<dyn crate::capture::Capturer>,
+    Box<dyn crate::encode::Encoder>,
+    crate::capture::CapturedFrame,
+    std::time::Duration,
+);
+
+fn build_pipeline(
+    vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
+    mode: punktfunk_core::Mode,
+) -> Result<Pipeline> {
+    let vout = vd.create(mode).context("create virtual output")?;
+    let mut capturer =
+        crate::capture::capture_virtual_output(vout).context("capture virtual output")?;
+    capturer.set_active(true);
+    let frame = capturer.next_frame().context("first frame")?;
+    let enc = crate::encode::open_video(
+        crate::encode::Codec::H265,
+        frame.format,
+        frame.width,
+        frame.height,
+        mode.refresh_hz,
+        20_000_000,
+        frame.is_cuda(),
+    )
+    .context("open NVENC")?;
+    let interval = std::time::Duration::from_secs_f64(1.0 / mode.refresh_hz.max(1) as f64);
+    Ok((capturer, enc, frame, interval))
 }
 
 #[cfg(test)]
@@ -692,6 +924,9 @@ mod tests {
                 seconds: 0,
                 frames: 25,
                 max_sessions: 3,
+                require_pairing: false,
+                pairing_pin: None,
+                paired_store: None,
             })
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -708,6 +943,8 @@ mod tests {
                 60,
                 std::ptr::null(),
                 observed.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
                 10_000,
             )
         };
@@ -720,6 +957,30 @@ mod tests {
             PunktfunkStatus::Ok
         );
         assert_eq!((w, h, hz), (1280, 720, 60));
+
+        // Mid-stream renegotiation: request a new mode, the host acks on the control
+        // stream, and punktfunk_connection_mode reflects the switch.
+        assert_eq!(
+            unsafe {
+                punktfunk_core::abi::punktfunk_connection_request_mode(conn, 1920, 1080, 144)
+            },
+            PunktfunkStatus::Ok
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert_eq!(
+                unsafe { punktfunk_connection_mode(conn, &mut w, &mut h, &mut hz) },
+                PunktfunkStatus::Ok
+            );
+            if (w, h, hz) == (1920, 1080, 144) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mode switch not acked (still {w}x{h}@{hz})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
         unsafe { pull_verified(conn, 25) };
 
@@ -747,6 +1008,8 @@ mod tests {
                 60,
                 observed.as_ptr(),
                 std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
                 10_000,
             )
         };
@@ -765,6 +1028,8 @@ mod tests {
                 60,
                 bad.as_ptr(),
                 std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
                 10_000,
             )
         };
@@ -782,12 +1047,85 @@ mod tests {
                 60,
                 std::ptr::null(),
                 std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
                 10_000,
             )
         };
         assert!(!conn4.is_null());
         unsafe { pull_verified(conn4, 25) };
         unsafe { punktfunk_connection_close(conn4) };
+
+        host.join().unwrap().unwrap();
+    }
+
+    fn test_paired_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("punktfunk-paired-test-{}.json", std::process::id()))
+    }
+
+    /// The PIN pairing ceremony + the --require-pairing gate, end to end in-process:
+    /// wrong PIN rejected; right PIN pairs and returns the host fingerprint; a paired
+    /// identity gets a session on a pairing-required host; an anonymous client does not.
+    #[test]
+    fn pairing_ceremony_and_gate() {
+        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::quic::endpoint;
+
+        let host = std::thread::spawn(|| {
+            run(M3Options {
+                port: 19778,
+                source: M3Source::Synthetic,
+                seconds: 0,
+                frames: 25,
+                max_sessions: 4,
+                require_pairing: true,
+                pairing_pin: Some("4321".into()),
+                paired_store: Some(test_paired_path()),
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let timeout = std::time::Duration::from_secs(10);
+        let (cert, key) = endpoint::generate_identity().unwrap();
+        let identity = (cert.as_str(), key.as_str());
+        let mode = punktfunk_core::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+
+        // 1: wrong PIN → Crypto, nothing stored.
+        let err = NativeClient::pair("127.0.0.1", 19778, identity, "0000", "imposter", timeout)
+            .unwrap_err();
+        assert!(
+            matches!(err, punktfunk_core::PunktfunkError::Crypto),
+            "{err:?}"
+        );
+
+        // 2: anonymous session on a pairing-required host → rejected (connect fails).
+        assert!(
+            NativeClient::connect("127.0.0.1", 19778, mode, None, None, timeout).is_err(),
+            "anonymous session must be rejected"
+        );
+
+        // 3: correct PIN → paired, host fingerprint returned.
+        let host_fp =
+            NativeClient::pair("127.0.0.1", 19778, identity, "4321", "test-client", timeout)
+                .expect("pairing with the right PIN");
+        assert!(test_paired_path().exists());
+        let _ = std::fs::remove_file(test_paired_path()); // already loaded; tidy /tmp
+
+        // 4: the paired identity gets a session — pinned to the ceremony's fingerprint.
+        let client = NativeClient::connect(
+            "127.0.0.1",
+            19778,
+            mode,
+            Some(host_fp),
+            Some((cert.clone(), key.clone())),
+            timeout,
+        )
+        .expect("paired session");
+        assert_eq!(client.host_fingerprint, host_fp);
+        drop(client);
 
         host.join().unwrap().unwrap();
     }

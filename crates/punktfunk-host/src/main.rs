@@ -90,6 +90,9 @@ fn real_main() -> Result<()> {
                 max_sessions: get("--max-sessions")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0),
+                require_pairing: args.iter().any(|a| a == "--require-pairing"),
+                pairing_pin: None,
+                paired_store: None,
             })
         }
         Some("-h") | Some("--help") | Some("help") | None => {
@@ -317,6 +320,8 @@ M3-HOST OPTIONS:
     --seconds <N>                per-session stream duration, virtual source (default: 30)
     --frames <N>                 per-session frame count, synthetic source (default: 300)
     --max-sessions <N>           exit after N sessions; 0 = serve forever (default: 0)
+    --require-pairing            only serve PIN-paired clients (the host logs a 4-digit
+                                 PIN when a client starts the ceremony)
 
 M0 OPTIONS:
     --source <synthetic|portal|kwin-virtual>

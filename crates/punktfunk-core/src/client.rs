@@ -14,7 +14,7 @@
 use crate::config::{Mode, Role};
 use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
-use crate::quic::{endpoint, io, Hello, Start, Welcome};
+use crate::quic::{endpoint, io, Hello, Reconfigure, Reconfigured, Start, Welcome};
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,10 +50,12 @@ pub struct NativeClient {
     audio: Receiver<AudioPacket>,
     rumble: Receiver<(u16, u16, u16)>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
+    reconfig_tx: tokio::sync::mpsc::UnboundedSender<Mode>,
     shutdown: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
-    /// The host-confirmed session mode (from the Welcome).
-    pub mode: Mode,
+    /// The currently active session mode (the Welcome's, then updated by every accepted
+    /// [`NativeClient::request_mode`]).
+    mode: Arc<std::sync::Mutex<Mode>>,
     /// SHA-256 fingerprint of the certificate the host actually presented. A TOFU caller
     /// (`pin = None`) persists this and passes it as the pin from then on.
     pub host_fingerprint: [u8; 32],
@@ -66,22 +68,30 @@ impl NativeClient {
     /// `pin`: expected SHA-256 of the host's certificate. `Some` and the host presents
     /// anything else → the handshake is rejected ([`PunktfunkError::Crypto`]). `None` = trust on
     /// first use; check [`NativeClient::host_fingerprint`] after connecting.
+    ///
+    /// `identity`: this client's persistent self-signed identity (PEM cert + PKCS#8 key,
+    /// see [`endpoint::generate_identity`]), presented via TLS client auth so a host can
+    /// recognize a paired client. `None` = anonymous (rejected by hosts requiring pairing).
     pub fn connect(
         host: &str,
         port: u16,
         mode: Mode,
         pin: Option<[u8; 32]>,
+        identity: Option<(String, String)>,
         timeout: Duration,
     ) -> Result<NativeClient> {
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(FRAME_QUEUE);
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(AUDIO_QUEUE);
         let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<(u16, u16, u16)>(RUMBLE_QUEUE);
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
+        let (reconfig_tx, reconfig_rx) = tokio::sync::mpsc::unbounded_channel::<Mode>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(Mode, [u8; 32])>>();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let mode_slot = Arc::new(std::sync::Mutex::new(mode));
 
         let host = host.to_string();
         let shutdown_w = shutdown.clone();
+        let mode_slot_w = mode_slot.clone();
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
             .spawn(move || {
@@ -101,12 +111,15 @@ impl NativeClient {
                     port,
                     mode,
                     pin,
+                    identity,
                     frame_tx,
                     audio_tx,
                     rumble_tx,
                     input_rx,
+                    reconfig_rx,
                     ready_tx,
                     shutdown: shutdown_w,
+                    mode_slot: mode_slot_w,
                 }));
             })
             .map_err(PunktfunkError::Io)?;
@@ -119,16 +132,98 @@ impl NativeClient {
                 return Err(PunktfunkError::Timeout);
             }
         };
+        *mode_slot.lock().unwrap() = negotiated;
         Ok(NativeClient {
             frames: frame_rx,
             audio: audio_rx,
             rumble: rumble_rx,
             input_tx,
+            reconfig_tx,
             shutdown,
             worker: Some(worker),
-            mode: negotiated,
+            mode: mode_slot,
             host_fingerprint: fingerprint,
         })
+    }
+
+    /// Run the PIN pairing ceremony against a host: connect (trust-on-first-use — the PIN
+    /// proof is what authenticates the certificates), prove knowledge of the PIN the host
+    /// is displaying, and return the host's now-verified fingerprint for pinning. The host
+    /// persists this client's fingerprint in its paired set.
+    ///
+    /// `identity` is this client's persistent PEM identity (cert, key) — the same one
+    /// later passed to [`NativeClient::connect`]; `pin` is what the user read off the host
+    /// (its log / UI); `name` is the label the host stores.
+    pub fn pair(
+        host: &str,
+        port: u16,
+        identity: (&str, &str),
+        pin: &str,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<[u8; 32]> {
+        use crate::quic::{PairChallenge, PairRequest, PairResult};
+
+        let client_fp = endpoint::fingerprint_of_pem(identity.0)
+            .map_err(|_| PunktfunkError::InvalidArg("client cert pem"))?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(PunktfunkError::Io)?;
+        let pin = pin.to_string();
+        let name = name.to_string();
+        let remote: std::net::SocketAddr = format!("{host}:{port}")
+            .parse()
+            .map_err(|_| PunktfunkError::InvalidArg("host:port"))?;
+
+        rt.block_on(async move {
+            // The quinn endpoint must be created inside the runtime (it spawns its driver).
+            let (ep, observed) = endpoint::client_pinned_with_identity(None, Some(identity));
+            let ep = ep.map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
+            let ceremony = async {
+                let conn = ep
+                    .connect(remote, "punktfunk")
+                    .map_err(|_| PunktfunkError::InvalidArg("connect"))?
+                    .await
+                    .map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
+                let host_fp = observed.lock().unwrap().ok_or(PunktfunkError::Crypto)?;
+                let (mut send, mut recv) = conn
+                    .open_bi()
+                    .await
+                    .map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
+
+                io::write_msg(&mut send, &PairRequest { name }.encode()).await?;
+                let challenge = PairChallenge::decode(&io::read_msg(&mut recv).await?)?;
+                let proof = crate::quic::pair_proof(&pin, &challenge.salt, &client_fp, &host_fp);
+                io::write_msg(&mut send, &crate::quic::PairProof { hmac: proof }.encode()).await?;
+                let result = PairResult::decode(&io::read_msg(&mut recv).await?)?;
+                conn.close(0u32.into(), b"pair done");
+                if result.ok {
+                    Ok(host_fp)
+                } else {
+                    Err(PunktfunkError::Crypto) // wrong PIN (or refused)
+                }
+            };
+            tokio::time::timeout(timeout, ceremony)
+                .await
+                .map_err(|_| PunktfunkError::Timeout)?
+        })
+    }
+
+    /// The currently active session mode — the Welcome's, until an accepted
+    /// [`NativeClient::request_mode`] switches it.
+    pub fn mode(&self) -> Mode {
+        *self.mode.lock().unwrap()
+    }
+
+    /// Ask the host to switch the live session to `mode` (no reconnect). Non-blocking:
+    /// the request is queued; on acceptance the stream continues at the new mode (next
+    /// frames open with an IDR carrying new parameter sets) and [`NativeClient::mode`]
+    /// reflects it. A rejected request leaves the session unchanged.
+    pub fn request_mode(&self, mode: Mode) -> Result<()> {
+        self.reconfig_tx
+            .send(mode)
+            .map_err(|_| PunktfunkError::Closed)
     }
 
     /// Pull the next reassembled, FEC-recovered access unit; [`PunktfunkError::NoFrame`] on
@@ -187,33 +282,43 @@ struct WorkerArgs {
     port: u16,
     mode: Mode,
     pin: Option<[u8; 32]>,
+    identity: Option<(String, String)>,
     frame_tx: SyncSender<Frame>,
     audio_tx: SyncSender<AudioPacket>,
     rumble_tx: SyncSender<(u16, u16, u16)>,
     input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    reconfig_rx: tokio::sync::mpsc::UnboundedReceiver<Mode>,
     ready_tx: std::sync::mpsc::Sender<Result<(Mode, [u8; 32])>>,
     shutdown: Arc<AtomicBool>,
+    mode_slot: Arc<std::sync::Mutex<Mode>>,
 }
 
-/// The worker: QUIC handshake, then the input/datagram tasks + the blocking data-plane pump.
+/// The worker: QUIC handshake, then the input/datagram/control tasks + the blocking
+/// data-plane pump.
 async fn worker_main(args: WorkerArgs) {
     let WorkerArgs {
         host,
         port,
         mode,
         pin,
+        identity,
         frame_tx,
         audio_tx,
         rumble_tx,
         mut input_rx,
+        mut reconfig_rx,
         ready_tx,
         shutdown,
+        mode_slot,
     } = args;
     let setup = async {
         let remote: std::net::SocketAddr = format!("{host}:{port}")
             .parse()
             .map_err(|_| PunktfunkError::InvalidArg("host:port"))?;
-        let (ep, observed) = endpoint::client_pinned(pin);
+        let (ep, observed) = endpoint::client_pinned_with_identity(
+            pin,
+            identity.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+        );
         let ep = ep.map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
         let conn = ep
             .connect(remote, "punktfunk")
@@ -264,16 +369,17 @@ async fn worker_main(args: WorkerArgs) {
         let transport =
             UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())?;
         let session = Session::new(welcome.session_config(Role::Client), Box::new(transport))?;
-        Ok::<_, PunktfunkError>((conn, session, welcome.mode, fingerprint))
+        Ok::<_, PunktfunkError>((conn, session, send, recv, welcome.mode, fingerprint))
     };
 
-    let (conn, mut session, negotiated, fingerprint) = match setup.await {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
-            return;
-        }
-    };
+    let (conn, mut session, mut ctrl_send, mut ctrl_recv, negotiated, fingerprint) =
+        match setup.await {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
     let _ = ready_tx.send(Ok((negotiated, fingerprint)));
 
     // Input task: embedder events → QUIC datagrams.
@@ -283,6 +389,35 @@ async fn worker_main(args: WorkerArgs) {
             let _ = input_conn.send_datagram(ev.encode().to_vec().into());
         }
     });
+
+    // Control task: the handshake stream stays open for mid-stream renegotiation. One
+    // request at a time — write Reconfigure, await Reconfigured, publish the active mode.
+    {
+        let mode_slot = mode_slot.clone();
+        tokio::spawn(async move {
+            while let Some(want) = reconfig_rx.recv().await {
+                if io::write_msg(&mut ctrl_send, &Reconfigure { mode: want }.encode())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let ack = match io::read_msg(&mut ctrl_recv).await {
+                    Ok(b) => match Reconfigured::decode(&b) {
+                        Ok(a) => a,
+                        Err(_) => break, // protocol error — stop renegotiating
+                    },
+                    Err(_) => break, // stream closed
+                };
+                if ack.accepted {
+                    *mode_slot.lock().unwrap() = ack.mode;
+                    tracing::info!(mode = ?ack.mode, "host accepted mode switch");
+                } else {
+                    tracing::warn!(requested = ?want, active = ?ack.mode, "host rejected mode switch");
+                }
+            }
+        });
+    }
 
     // Datagram demux: host → client audio/rumble (try_send: a lagging embedder drops the
     // newest packet rather than backing up the QUIC receive path).

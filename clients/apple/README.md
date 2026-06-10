@@ -117,15 +117,19 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    contract documented on the constructors; the host accumulates them into a virtual
    Xbox 360 pad). Poll `nextRumble()` and feed `GCDeviceHaptics` for force feedback.
    Client-side capture isn't in `InputCapture` yet.
-7. **Trust**: connect once with `pinSHA256: nil` (TOFU), persist `hostFingerprint` keyed
-   by host, pass it on every later connect — a mismatch throws `.connectFailed`. The host
-   logs its fingerprint at startup ("clients pin this fingerprint") for out-of-band
-   verification UX; a PIN-style pairing ceremony is a later punktfunk-core task.
-   `PunktfunkClient` implements exactly this: explicit fingerprint confirmation on first
-   connect (input/cursor capture held back until confirmed), pin stored per host
-   (`HostStore`), "Forget Identity" in the card's context menu for legitimate host
-   reinstalls. Note the OTHER direction is still open: the host authorizes no one — any
-   client that reaches the port gets a session (fine on a LAN, not on the internet).
+7. **Trust — the full ceremony exists now.** `generateIdentity()` once (persist both
+   PEMs in the Keychain), then `pair(host:identity:pin:name:)` with the 4-digit PIN the
+   host displays (its log; UI later) — returns the host's VERIFIED fingerprint; persist
+   it and pass `pinSHA256:` + `identity:` to every connect. A wrong-size pin throws
+   `.invalidPin`, a wrong PIN `.wrongPIN`. The TOFU flow `PunktfunkClient` already
+   implements (fingerprint confirmation sheet, per-host `HostStore`, "Forget Identity")
+   keeps working against hosts not running `--require-pairing`; upgrading the sheet to a
+   PIN-entry field closes the remaining gap — with `--require-pairing` the host now
+   authorizes clients too (the "other direction" is no longer open, opt-in per host).
+7b. **Resize without reconnect**: `requestMode(width:height:refreshHz:)` mid-stream —
+   the host rebuilds at the new mode in ~90 ms; the first new-mode AU is an IDR with
+   fresh parameter sets (the refresh-on-IDR decode flow handles it untouched) and
+   `currentMode()` reflects the switch. Wire it to window-resize events.
 8. **Input capture caveats** (stage 1): GC handlers only fire while the app has focus —
    on focus loss `InputCapture` auto-releases everything still held (keys + buttons) so
    nothing sticks down host-side. While the stream has focus the LOCAL cursor is hidden
