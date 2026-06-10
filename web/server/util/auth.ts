@@ -34,7 +34,22 @@ export function sessionConfig(): SessionConfig {
   const password = secret && secret.length >= 32
     ? secret
     : createHash('sha256').update(`punktfunk-session-v1:${uiPassword()}`).digest('hex')
-  return { name: SESSION_NAME, password }
+  return {
+    name: SESSION_NAME,
+    password,
+    // Bounds a stolen/replayed cookie's lifetime (sets the cookie Max-Age AND the iron
+    // seal TTL). 7 days for a single-user console.
+    maxAge: 60 * 60 * 24 * 7,
+    cookie: {
+      httpOnly: true,
+      sameSite: 'lax',
+      path: '/',
+      // h3 defaults Secure to true, which browsers DROP over plain http:// (so login
+      // silently fails on a LAN HTTP server). Only mark Secure when actually behind TLS
+      // (set PUNKTFUNK_UI_SECURE=1 / =true then).
+      secure: /^(1|true)$/i.test(process.env.PUNKTFUNK_UI_SECURE ?? ''),
+    },
+  }
 }
 
 /** Constant-time string comparison (avoids leaking the password via timing). */
@@ -45,16 +60,27 @@ export function timingSafeEqual(a: string, b: string): boolean {
   return nodeTimingSafeEqual(ab, bb)
 }
 
-/** Paths reachable WITHOUT a session: the login page, the auth endpoints, and static
- * assets (the login page needs its own CSS/JS). Everything else is gated. */
+/** Paths reachable WITHOUT a session: the login page, the auth endpoints, and the build's
+ * static assets (the login page needs its own CSS/JS, all of which live under /assets/).
+ * Everything else — crucially ALL of /api — is gated.
+ *
+ * Note: do NOT allowlist by file extension. The client assets are all under /assets/, and a
+ * generic `*.json` allowlist would expose `/api/v1/openapi.json` (and any future
+ * `.json`/`.png` management route) through the proxy unauthenticated. */
 export function isPublicPath(pathname: string): boolean {
+  if (pathname === '/api' || pathname.startsWith('/api/')) return false // always gated
   if (pathname === '/login') return true
   if (pathname.startsWith('/_auth/')) return true
   if (pathname.startsWith('/assets/')) return true
   if (pathname === '/favicon.ico' || pathname === '/robots.txt') return true
-  // Vite/TanStack client chunks and source maps requested by the login page.
-  if (/\.(js|css|map|ico|svg|png|woff2?|json)$/.test(pathname)) return true
   return false
+}
+
+/** Validate a post-login redirect target: a same-origin path only. Rejects protocol-
+ * relative (`//evil.com`) and absolute URLs to prevent an open redirect. */
+export function safeNextPath(next: string | undefined): string {
+  if (!next || !next.startsWith('/') || next.startsWith('//')) return '/'
+  return next
 }
 
 export interface SessionData {

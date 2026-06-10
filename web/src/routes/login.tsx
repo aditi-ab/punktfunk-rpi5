@@ -38,8 +38,10 @@ function LoginPage() {
         setBusy(false)
         return
       }
-      // Full reload to the target so SSR re-runs WITH the new session cookie.
-      window.location.href = next && next.startsWith('/') ? next : '/'
+      // Full reload to the target so SSR re-runs WITH the new session cookie. Only a
+      // same-origin path — reject protocol-relative/absolute URLs (open-redirect guard).
+      const safe = next && next.startsWith('/') && !next.startsWith('//') ? next : '/'
+      window.location.href = safe
     } catch {
       setError(true)
       setBusy(false)
