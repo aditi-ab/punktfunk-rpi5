@@ -19,17 +19,40 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            switch model.phase {
-            case .idle, .connecting:
+            // The stream view's structural identity MUST be stable across the
+            // awaiting-trust → streaming transition: recreating it restarts the pump,
+            // which has then already missed the opening IDR (infinite GOP — no other
+            // keyframe ever comes) and decodes nothing. So: one branch per connection,
+            // trust prompt as an overlay.
+            if model.connection != nil {
+                sessionView
+            } else {
                 home
-            case .awaitingTrust(let fingerprint):
-                trustPrompt(fingerprint)
-            case .streaming:
-                stream(capturesCursor: true)
             }
         }
         .onAppear { autoConnectIfAsked() }
         .onDisappear { model.disconnect() } // window closed mid-session (Cmd+N spawns more)
+    }
+
+    private var sessionView: some View {
+        let pendingFingerprint: Data? = {
+            if case .awaitingTrust(let fp) = model.phase { return fp }
+            return nil
+        }()
+        return ZStack {
+            stream(capturesCursor: pendingFingerprint == nil)
+                .blur(radius: pendingFingerprint != nil ? 32 : 0)
+                .overlay {
+                    if pendingFingerprint != nil {
+                        Color.black.opacity(0.45)
+                    }
+                }
+            if let fp = pendingFingerprint {
+                trustCard(fp)
+            }
+        }
+        .frame(minWidth: 640, minHeight: 360)
+        .background(Color.black)
     }
 
     // MARK: - Home (hosts grid)
@@ -156,47 +179,38 @@ struct ContentView: View {
 
     // MARK: - Trust on first use
 
-    private func trustPrompt(_ fingerprint: Data) -> some View {
-        ZStack {
-            // Keep the stream pumping (the opening IDR must be consumed) but blurred and
-            // cursor-free until the host is verified.
-            stream(capturesCursor: false)
-                .blur(radius: 32)
-                .overlay(.black.opacity(0.45))
-            VStack(spacing: 14) {
-                Image(systemName: "lock.shield")
-                    .font(.system(size: 36, weight: .light))
-                Text("Verify \(model.activeHost?.displayName ?? "host")")
-                    .font(.title3.weight(.semibold))
-                Text("First connection. Compare this fingerprint with the one "
-                    + "punktfunk-host logged at startup (\u{201C}clients pin this "
-                    + "fingerprint\u{201D}):")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                Text(Self.format(fingerprint: fingerprint))
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(10)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-                HStack(spacing: 12) {
-                    Button("Cancel", role: .cancel) { model.rejectTrust() }
-                        .keyboardShortcut(.cancelAction)
-                    Button("Trust & Connect") {
-                        if let fp = model.confirmTrust(), let host = model.activeHost {
-                            store.pin(host.id, fingerprint: fp)
-                        }
+    private func trustCard(_ fingerprint: Data) -> some View {
+        VStack(spacing: 14) {
+            Image(systemName: "lock.shield")
+                .font(.system(size: 36, weight: .light))
+            Text("Verify \(model.activeHost?.displayName ?? "host")")
+                .font(.title3.weight(.semibold))
+            Text("First connection. Compare this fingerprint with the one "
+                + "punktfunk-host logged at startup (\u{201C}clients pin this "
+                + "fingerprint\u{201D}):")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Text(Self.format(fingerprint: fingerprint))
+                .font(.system(.callout, design: .monospaced))
+                .textSelection(.enabled)
+                .padding(10)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            HStack(spacing: 12) {
+                Button("Cancel", role: .cancel) { model.rejectTrust() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Trust & Connect") {
+                    if let fp = model.confirmTrust(), let host = model.activeHost {
+                        store.pin(host.id, fingerprint: fp)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
                 }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
             }
-            .padding(28)
-            .frame(maxWidth: 440)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
         }
-        .frame(minWidth: 640, minHeight: 360)
-        .background(Color.black)
+        .padding(28)
+        .frame(maxWidth: 440)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
     }
 
     /// 64 hex chars → four groups per line, two lines — easy to eyeball against the log.
@@ -226,8 +240,6 @@ struct ContentView: View {
                 .overlay(alignment: .topTrailing) {
                     if capturesCursor { hud(conn) }
                 }
-                .frame(minWidth: 640, minHeight: 360)
-                .background(Color.black)
             }
         }
     }
