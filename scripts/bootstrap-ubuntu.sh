@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bootstrap an Ubuntu (24.04 "noble") NVIDIA-GPU VM to build/run the lumen Linux host
+# Bootstrap an Ubuntu (24.04 "noble") NVIDIA-GPU VM to build/run the punktfunk Linux host
 # and the M0 capture spike (headless Sway/wlroots -> PipeWire -> NVENC).
 #
 # Assumes the NVIDIA driver + an FFmpeg-with-NVENC are ALREADY installed (verify-only).
@@ -57,10 +57,10 @@ if have ffmpeg; then
         ok "FFmpeg has NVENC: $(ffmpeg -hide_banner -encoders 2>/dev/null | grep -oE '(hevc|h264)_nvenc' | paste -sd' ' -)"
         log "  smoke-test: 1s HEVC NVENC encode to null"
         if ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=black:s=1280x720:d=1 \
-               -c:v hevc_nvenc -preset p1 -tune ull -f null - 2>/tmp/lumen_nvenc.err; then
+               -c:v hevc_nvenc -preset p1 -tune ull -f null - 2>/tmp/punktfunk_nvenc.err; then
             ok "hevc_nvenc encode succeeded — NVENC is usable in this guest"
         else
-            warn "hevc_nvenc encode FAILED (see /tmp/lumen_nvenc.err). Common cause on a VM: \
+            warn "hevc_nvenc encode FAILED (see /tmp/punktfunk_nvenc.err). Common cause on a VM: \
 missing libnvidia-encode.so.1 or an unlicensed vGPU."
         fi
     else

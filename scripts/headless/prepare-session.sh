@@ -2,8 +2,8 @@
 # Run AFTER headless Sway is up (run-headless-sway.sh), from a second shell on the same
 # user. It: (1) points this shell at the running Sway, (2) gives HEADLESS-1 a real refresh
 # clock (an idle/0 mHz output produces no frames), (3) imports the env the ScreenCast portal
-# needs to find Sway and pick the wlr backend, and (4) writes /tmp/lumen-sway-env.sh so
-# other shells (e.g. `cargo run -p lumen-host`) can `source` it.
+# needs to find Sway and pick the wlr backend, and (4) writes /tmp/punktfunk-sway-env.sh so
+# other shells (e.g. `cargo run -p punktfunk-host`) can `source` it.
 #
 # Usage: bash scripts/headless/prepare-session.sh [WxH@RHz]   (default 1920x1080@60Hz)
 set -euo pipefail
@@ -32,7 +32,7 @@ echo "HEADLESS-1 set to $MODE"
 systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP SWAYSOCK XDG_RUNTIME_DIR 2>/dev/null || true
 dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP SWAYSOCK 2>/dev/null || true
 
-cat > /tmp/lumen-sway-env.sh <<EOF
+cat > /tmp/punktfunk-sway-env.sh <<EOF
 export XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
 export WAYLAND_DISPLAY=$WAYLAND_DISPLAY
 export XDG_CURRENT_DESKTOP=sway
@@ -42,8 +42,8 @@ EOF
 
 cat <<EOF
 session ready. From any shell on this user:
-    source /tmp/lumen-sway-env.sh
+    source /tmp/punktfunk-sway-env.sh
     swaymsg exec foot          # optional: animated on-screen content
-    cargo run -p lumen-host -- m0 --source portal --seconds 5 --out /tmp/lumen-m0.h265
-    ffprobe /tmp/lumen-m0.h265
+    cargo run -p punktfunk-host -- m0 --source portal --seconds 5 --out /tmp/punktfunk-m0.h265
+    ffprobe /tmp/punktfunk-m0.h265
 EOF

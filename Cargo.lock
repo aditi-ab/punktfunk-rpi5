@@ -1451,7 +1451,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 name = "loss-harness"
 version = "0.0.1"
 dependencies = [
- "lumen-core",
+ "punktfunk-core",
 ]
 
 [[package]]
@@ -1459,90 +1459,6 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
-
-[[package]]
-name = "lumen-client-rs"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "lumen-core",
- "quinn",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "lumen-core"
-version = "0.0.1"
-dependencies = [
- "aes-gcm",
- "bytes",
- "cbindgen",
- "fec-rs",
- "proptest",
- "quinn",
- "rand 0.9.4",
- "rcgen",
- "reed-solomon-simd",
- "rustls",
- "rustls-pki-types",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "zerocopy",
- "zeroize",
-]
-
-[[package]]
-name = "lumen-host"
-version = "0.0.1"
-dependencies = [
- "aes",
- "aes-gcm",
- "anyhow",
- "ash",
- "ashpd",
- "axum",
- "axum-server",
- "cbc",
- "ffmpeg-next",
- "futures-util",
- "hex",
- "http-body-util",
- "khronos-egl",
- "libc",
- "lumen-core",
- "mdns-sd",
- "opus",
- "pipewire",
- "quinn",
- "rand 0.8.6",
- "rcgen",
- "reis",
- "rsa",
- "rustls",
- "rustls-pemfile",
- "rusty_enet",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
- "utoipa",
- "utoipa-axum",
- "utoipa-scalar",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols-misc",
- "wayland-protocols-wlr",
- "wayland-scanner",
- "x509-parser",
- "xkbcommon",
-]
 
 [[package]]
 name = "matchers"
@@ -1979,6 +1895,90 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "punktfunk-client-rs"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "punktfunk-core",
+ "quinn",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "punktfunk-core"
+version = "0.0.1"
+dependencies = [
+ "aes-gcm",
+ "bytes",
+ "cbindgen",
+ "fec-rs",
+ "proptest",
+ "quinn",
+ "rand 0.9.4",
+ "rcgen",
+ "reed-solomon-simd",
+ "rustls",
+ "rustls-pki-types",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zerocopy",
+ "zeroize",
+]
+
+[[package]]
+name = "punktfunk-host"
+version = "0.0.1"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "anyhow",
+ "ash",
+ "ashpd",
+ "axum",
+ "axum-server",
+ "cbc",
+ "ffmpeg-next",
+ "futures-util",
+ "hex",
+ "http-body-util",
+ "khronos-egl",
+ "libc",
+ "mdns-sd",
+ "opus",
+ "pipewire",
+ "punktfunk-core",
+ "quinn",
+ "rand 0.8.6",
+ "rcgen",
+ "reis",
+ "rsa",
+ "rustls",
+ "rustls-pemfile",
+ "rusty_enet",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "utoipa",
+ "utoipa-axum",
+ "utoipa-scalar",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "wayland-scanner",
+ "x509-parser",
+ "xkbcommon",
 ]
 
 [[package]]

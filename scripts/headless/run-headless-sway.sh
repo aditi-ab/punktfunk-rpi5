@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Launch headless Sway on the NVIDIA box for the lumen M0 capture spike.
+# Launch headless Sway on the NVIDIA box for the punktfunk M0 capture spike.
 #
 # Runs on the user's *shared* session bus (NOT a private dbus-run-session) so that the
-# ScreenCast portal (xdg-desktop-portal-wlr) and the lumen host share one bus. After this
+# ScreenCast portal (xdg-desktop-portal-wlr) and the punktfunk host share one bus. After this
 # is up, run `prepare-session.sh` from a second shell to set the mode + portal env.
 #
 # Prereqs (see docs/linux-setup.md / scripts/bootstrap-ubuntu.sh):

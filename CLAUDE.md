@@ -1,17 +1,17 @@
-# CLAUDE.md — lumen
+# CLAUDE.md — punktfunk
 
 Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protocol core
-(`lumen-core`) exposed over a C ABI and native clients per platform. Full design:
+(`punktfunk-core`) exposed over a C ABI and native clients per platform. Full design:
 [`docs/implementation-plan.md`](docs/implementation-plan.md). Status table: `README.md`.
 
 ## Where the work stands
 
-- **M1 (`lumen-core` + C ABI): complete and hardened.** FEC recovery, loopback-under-loss,
+- **M1 (`punktfunk-core` + C ABI): complete and hardened.** FEC recovery, loopback-under-loss,
   proptests, C ABI harness all green; 13 adversarial-review findings fixed +
   regression-tested (`a913042`).
 - **M2 (GameStream host): working end-to-end with a stock Moonlight client.** Validated live
   on this box: pairing (persists across restarts), serverinfo/applist (app catalog from
-  `~/.config/lumen/apps.json` → each entry picks a compositor + nested command), RTSP, ENet
+  `~/.config/punktfunk/apps.json` → each entry picks a compositor + nested command), RTSP, ENet
   control, audio, and video at the **client's native resolution and refresh** — the host
   creates a per-session virtual output via per-compositor `VirtualDisplay` backends:
   **KWin** (`zkde_screencast stream_virtual_output`, needs KWin ≥ 6.5.6 headless; >60 Hz via
@@ -26,27 +26,27 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   socket, wlr protocols on Sway) and **gamepads** (uinput X-Box-360 pads + rumble
   back-channel; validated live — pad created/destroyed with the session). Management REST API +
   checked-in OpenAPI doc (`mgmt.rs`).
-- **M3 (`lumen/1`, the native protocol): full session planes, validated live.** QUIC
-  control plane (`lumen-core` `quic` feature: Hello{mode}/Welcome{full Config}/Start), data
+- **M3 (`punktfunk/1`, the native protocol): full session planes, validated live.** QUIC
+  control plane (`punktfunk-core` `quic` feature: Hello{mode}/Welcome{full Config}/Start), data
   plane = the hardened M1 `Session` over raw UDP with **GF(2¹⁶) Leopard FEC + AES-GCM**
   (inexpressible in GameStream), host creates the native virtual output at the client's
   requested mode. `m3-host` is a **persistent listener** (sessions back to back;
   `--max-sessions`). QUIC datagrams carry the side planes, demuxed by first byte: input
   0xC8 (incl. **gamepads** — incremental events accumulated into the uinput xpad), **Opus
   audio** 0xC9 (48 kHz stereo, 5 ms, host→client), **rumble** 0xCA (host→client). **Trust:**
-  host serves its persistent identity (`~/.config/lumen/cert.pem`, shared with GameStream
+  host serves its persistent identity (`~/.config/punktfunk/cert.pem`, shared with GameStream
   pairing) and logs the SHA-256 fingerprint; clients pin it (TOFU on first connect —
   `endpoint::client_pinned`). Measured on-box at 720p120: 1680/1680 frames, **p50 0.83 ms**
-  capture→…→reassembled; audio measured live (~200 pkts/s). `lumen-client-rs` is the
+  capture→…→reassembled; audio measured live (~200 pkts/s). `punktfunk-client-rs` is the
   working reference client (`--pin`, datagram counters, `--input-test` incl. gamepad).
-  The embeddable connector (`NativeClient`) exposes it all over the C ABI: `lumen_connect`
+  The embeddable connector (`NativeClient`) exposes it all over the C ABI: `punktfunk_connect`
   (pin/TOFU) + `next_au`/`next_audio`/`next_rumble`/`send_input`.
 
 ## What's left
 
 1. **M4 — client decode + present: macOS stage 1 done, first light achieved
-   (2026-06-10).** LumenKit compiles and is tested on macOS (AnnexB → VideoToolbox →
-   `AVSampleBufferDisplayLayer`, GCMouse/GCKeyboard capture, `LumenClient` app shell);
+   (2026-06-10).** PunktfunkKit compiles and is tested on macOS (AnnexB → VideoToolbox →
+   `AVSampleBufferDisplayLayer`, GCMouse/GCKeyboard capture, `PunktfunkClient` app shell);
    validated live Mac ↔ this box at 720p60 — vkcube on glass, input injected via gamescope
    EIS. Tests: `swift test` in `clients/apple` (unit + real-codec round trip),
    `test-loopback.sh` (Swift client vs synthetic m3-host on loopback — runs on macOS),
@@ -54,16 +54,16 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    [`clients/apple/README.md`](clients/apple/README.md). Next: stage 2 presenter
    (`VTDecompressionSession` + `CAMetalLayer` frame pacing), glass-to-glass numbers via
    `tools/latency-probe` (scaffold), iOS variant. The Linux reference client
-   (`lumen-client-rs`) gets VAAPI + wgpu on the same connector later.
+   (`punktfunk-client-rs`) gets VAAPI + wgpu on the same connector later.
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).
-3. **lumen/1 protocol growth**: a PIN-style pairing ceremony on top of fingerprint pinning,
+3. **punktfunk/1 protocol growth**: a PIN-style pairing ceremony on top of fingerprint pinning,
    mid-stream mode renegotiation (the Welcome is one-shot today), concurrent sessions
    (today: one at a time, extras wait in the accept queue).
 4. **M2 polish**: wlroots/Sway `VirtualDisplay` backend (deferred; swaymsg `create_output`),
    HDR/10-bit/AV1 negotiation, surround audio, reconnect-at-new-mode robustness.
-5. **Native clients** (`clients/{apple,android}` scaffolds) consuming `lumen_core.h`.
+5. **Native clients** (`clients/{apple,android}` scaffolds) consuming `punktfunk_core.h`.
 
 Box one-time setup is complete: udev rule + `input` group (gamepads validated live),
 gamescope 3.16.22 installed system-wide (no PATH override), gnome-shell installed (Mutter
@@ -78,32 +78,32 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 
 cargo run -p loss-harness        # FEC loss-resilience sweep (no network needed)
-bash crates/lumen-core/tests/c/run.sh   # standalone C-ABI link + round-trip proof
+bash crates/punktfunk-core/tests/c/run.sh   # standalone C-ABI link + round-trip proof
 ```
 
-Generated artifacts are **checked in** and CI fails on drift: `include/lumen_core.h`
-(cbindgen from `lumen-core/src/abi.rs`) and `docs/api/openapi.json` (regenerate with
-`cargo run -p lumen-host -- openapi > docs/api/openapi.json`; spec lives in `mgmt.rs`).
+Generated artifacts are **checked in** and CI fails on drift: `include/punktfunk_core.h`
+(cbindgen from `punktfunk-core/src/abi.rs`) and `docs/api/openapi.json` (regenerate with
+`cargo run -p punktfunk-host -- openapi > docs/api/openapi.json`; spec lives in `mgmt.rs`).
 
 ## Layout
 
 ```
-crates/lumen-core/        protocol · FEC · crypto · quic (lumen/1 control plane, feature-gated)
-crates/lumen-host/
+crates/punktfunk-core/        protocol · FEC · crypto · quic (punktfunk/1 control plane, feature-gated)
+crates/punktfunk-host/
   gamestream/             Moonlight compat: nvhttp · pairing · rtsp · control · stream · gamepad · apps
   vdisplay/{kwin,gamescope,mutter}.rs   per-compositor client-sized virtual outputs
   zerocopy/{egl,cuda,vulkan}.rs         dmabuf → CUDA → NVENC (tiled via EGL/GL, LINEAR via Vulkan)
   inject/{libei,wlr,gamepad}.rs         input backends (+ uinput virtual gamepads)
   capture.rs · encode.rs · audio.rs · m0.rs · m3.rs · mgmt.rs
-crates/lumen-client-rs/   lumen/1 reference client (M3 headless; M4 adds decode+present)
+crates/punktfunk-client-rs/   punktfunk/1 reference client (M3 headless; M4 adds decode+present)
 tools/{loss-harness,latency-probe}/     measurement (plan §10)
-scripts/                  60-lumen.rules · lumen-host.service · host.env.example · headless/
-include/lumen_core.h      generated C header
+scripts/                  60-punktfunk.rules · punktfunk-host.service · host.env.example · headless/
+include/punktfunk_core.h      generated C header
 ```
 
 ## Design invariants — do not regress
 
-- **One core, linked everywhere.** Protocol/FEC/crypto live only in `lumen-core`, behind a
+- **One core, linked everywhere.** Protocol/FEC/crypto live only in `punktfunk-core`, behind a
   stable, versioned C ABI. `tokio`/`quinn` exist only behind the `quic` feature (control
   plane); **no async on the per-frame path** — native threads only.
 - **Native client resolution, no scaling.** A session gets a virtual output at exactly the
@@ -111,7 +111,7 @@ include/lumen_core.h      generated C header
   remote_fd, preferred_mode, keepalive }`, RAII teardown). There is no cross-compositor
   protocol for this — each compositor keeps its own backend.
 - **FEC is the wall-breaker.** GF(2⁸) (≤255 shards/block, Moonlight-compatible) and GF(2¹⁶)
-  Leopard (≤65535 shards/block) — lumen/1 negotiates the latter, removing the ~1 Gbps
+  Leopard (≤65535 shards/block) — punktfunk/1 negotiates the latter, removing the ~1 Gbps
   ceiling.
 - **M1 security hardening stays intact**: reassembler bounds attacker-controlled fields
   before allocating (`ReassemblerLimits`); AES-GCM per-direction nonce salts + seq-as-AAD;
@@ -127,27 +127,26 @@ module — a kernel update silently drops it; reinstall `nvidia-driver-595-open`
 scanout → KWin `--drm` impossible; everything renders offscreen via `renderD128`.
 
 ```sh
-# compositor session (shell 1, or the systemd unit in scripts/):
-XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
-XDG_CURRENT_DESKTOP=KDE KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-kwin_wayland --virtual --width 1920 --height 1080 --no-lockscreen --socket wayland-kde \
-  --exit-with-session wev
+# compositor session (shell 1, or the systemd unit in scripts/): full headless Plasma.
+# The script sets XDG_MENU_PREFIX=plasma- & co. — without it plasmashell runs but the
+# launcher menu is EMPTY (no apps, no System Settings).
+bash scripts/headless/run-headless-kde.sh 1920x1080
 
 # host (shell 2):
-WAYLAND_DISPLAY=wayland-kde XDG_CURRENT_DESKTOP=KDE LUMEN_VIDEO_SOURCE=virtual \
-LUMEN_ZEROCOPY=1 cargo run -rp lumen-host -- serve
+WAYLAND_DISPLAY=wayland-kde XDG_CURRENT_DESKTOP=KDE PUNKTFUNK_VIDEO_SOURCE=virtual \
+PUNKTFUNK_ZEROCOPY=1 cargo run -rp punktfunk-host -- serve
 
-# lumen/1 native loopback test (no Moonlight needed; same env as serve, listener persists
+# punktfunk/1 native loopback test (no Moonlight needed; same env as serve, listener persists
 # across sessions — bound it with --max-sessions):
-cargo run -rp lumen-host -- m3-host --source virtual --seconds 10 --max-sessions 1
-cargo run -rp lumen-client-rs -- --mode 1280x720x120 --out /tmp/a.h265 --input-test  # + --pin HEX
+cargo run -rp punktfunk-host -- m3-host --source virtual --seconds 10 --max-sessions 1
+cargo run -rp punktfunk-client-rs -- --mode 1280x720x120 --out /tmp/a.h265 --input-test  # + --pin HEX
 ```
 
 Pinned crate facts: `ashpd` 0.13 + `pipewire` 0.9 (must match ashpd's) + `ffmpeg-next` 8.x
-(system FFmpeg 8 / libavcodec 62). Env knobs: `LUMEN_VIDEO_SOURCE=virtual|portal`,
-`LUMEN_COMPOSITOR=kwin|gamescope|mutter`, `LUMEN_ZEROCOPY=1`, `LUMEN_GAMESCOPE_APP=...`,
-`LUMEN_INPUT_BACKEND=...`, `LUMEN_PERF=1` (per-stage timing), `LUMEN_VIDEO_DROP=N` (FEC
-test), `LUMEN_FEC_PCT=N`.
+(system FFmpeg 8 / libavcodec 62). Env knobs: `PUNKTFUNK_VIDEO_SOURCE=virtual|portal`,
+`PUNKTFUNK_COMPOSITOR=kwin|gamescope|mutter`, `PUNKTFUNK_ZEROCOPY=1`, `PUNKTFUNK_GAMESCOPE_APP=...`,
+`PUNKTFUNK_INPUT_BACKEND=...`, `PUNKTFUNK_PERF=1` (per-stage timing), `PUNKTFUNK_VIDEO_DROP=N` (FEC
+test), `PUNKTFUNK_FEC_PCT=N`.
 
 ## Conventions
 
@@ -155,4 +154,4 @@ test), `LUMEN_FEC_PCT=N`.
 - Match the surrounding code's comment density and naming.
 - Commit messages end with the Co-Authored-By trailer (see `git log`).
 - `pkill` caution on this box: match exact comm names (`pkill -x gamescope-wl`,
-  `pkill -x lumen-host`) — `pkill -f` self-matches the invoking shell.
+  `pkill -x punktfunk-host`) — `pkill -f` self-matches the invoking shell.

@@ -1,31 +1,31 @@
-# lumen Apple client (SwiftUI)
+# punktfunk Apple client (SwiftUI)
 
-The native macOS/iOS client for **`lumen/1`** (the post-GameStream protocol). All
+The native macOS/iOS client for **`punktfunk/1`** (the post-GameStream protocol). All
 networking/protocol work — QUIC control plane, UDP data plane, GF(2¹⁶) FEC, AES-GCM,
 input datagrams, Opus audio, cert pinning — lives in the shared Rust core (statically
-linked as `LumenCore.xcframework`); this package is the Swift shell: decode
+linked as `PunktfunkCore.xcframework`); this package is the Swift shell: decode
 (VideoToolbox), present (SwiftUI), input capture.
 
 ## Status — first light achieved (2026-06-10)
 
 Validated live, Mac ↔ Linux box over the LAN: gamescope virtual output → NVENC HEVC →
-`lumen/1` (GF(2¹⁶) FEC + AES-GCM over UDP, QUIC control) → VideoToolbox →
+`punktfunk/1` (GF(2¹⁶) FEC + AES-GCM over UDP, QUIC control) → VideoToolbox →
 `AVSampleBufferDisplayLayer` on glass at 1280×720@60, with mouse/keyboard flowing back as
 QUIC datagrams into the host's gamescope EIS injector (thousands of events injected during
 the session). Headless variant of the same proof: `RemoteFirstLightTests` decoded 60/60
 received AUs spanning 983 ms of host capture clock.
 
-The connector underneath (`lumen_core::client::NativeClient` over the C ABI) carries the
+The connector underneath (`punktfunk_core::client::NativeClient` over the C ABI) carries the
 full session: video AUs, **Opus audio** (`nextAudio()`), **rumble** (`nextRumble()`),
 input incl. gamepads, and **cert pinning + TOFU** (`pinSHA256:`/`hostFingerprint`) — see
 `m3.rs::tests::c_abi_connection_roundtrip` (three sequential sessions: TOFU, pinned
-reconnect, wrong-pin rejection). The host (`lumen-host m3-host`) is a persistent listener:
+reconnect, wrong-pin rejection). The host (`punktfunk-host m3-host`) is a persistent listener:
 reconnect at will during development.
 
 What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
 
-- **`LumenKit`** (library)
-  - `LumenConnection.swift` — wrapper over the C ABI. AUs/audio are copied into `Data`
+- **`PunktfunkKit`** (library)
+  - `PunktfunkConnection.swift` — wrapper over the C ABI. AUs/audio are copied into `Data`
     (the C pointer is only valid until the next call of the same kind). `close()` is safe
     from any thread: per-plane locks enforce the C contract ("never close with a
     `next_au`/`next_audio` in flight") instead of leaving it to callers. Pinning + TOFU
@@ -39,7 +39,7 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
     `vk_to_evdev` consumes Windows VKs), with fractional-delta accumulation so sub-pixel
     motion isn't truncated away. Buttons use GameStream ids (1=left … 5=X2); scroll is
     WHEEL_DELTA(120)-scaled.
-- **`LumenClient`** (development app shell): connect form → stream + input, fps/Mb-s HUD.
+- **`PunktfunkClient`** (development app shell): connect form → stream + input, fps/Mb-s HUD.
   (Audio playback and gamepad capture are not wired into the app yet — the connector
   surface is there; see notes 5–6.)
 - **Tests** (`swift test`): byte-level Annex-B units; a real-codec round trip
@@ -51,29 +51,29 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
 
 ```sh
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
-bash scripts/build-xcframework.sh        # → clients/apple/LumenCore.xcframework
+bash scripts/build-xcframework.sh        # → clients/apple/PunktfunkCore.xcframework
 cd clients/apple
 swift build && swift test                # loopback/remote tests self-skip without a host
-swift run LumenClient                    # the app; or open Package.swift in Xcode
+swift run PunktfunkClient                    # the app; or open Package.swift in Xcode
 
-bash test-loopback.sh                    # full loopback proof: builds lumen-host
+bash test-loopback.sh                    # full loopback proof: builds punktfunk-host
                                          # (synthetic source — runs on macOS), streams
                                          # byte-verified frames into the Swift client
 
 # against the real host (Linux box, see CLAUDE.md "Running on this box") — m3-host is a
 # persistent listener, reconnect at will:
-#   LUMEN_COMPOSITOR=gamescope LUMEN_GAMESCOPE_APP=vkcube LUMEN_ZEROCOPY=1 \
-#   cargo run -rp lumen-host -- m3-host --source virtual --seconds 60
-LUMEN_REMOTE_HOST=<box-ip> swift test --filter RemoteFirstLightTests   # headless
-LUMEN_AUTOCONNECT=<box-ip> LUMEN_MODE=1280x720x60 swift run LumenClient # on glass
+#   PUNKTFUNK_COMPOSITOR=gamescope PUNKTFUNK_GAMESCOPE_APP=vkcube PUNKTFUNK_ZEROCOPY=1 \
+#   cargo run -rp punktfunk-host -- m3-host --source virtual --seconds 60
+PUNKTFUNK_REMOTE_HOST=<box-ip> swift test --filter RemoteFirstLightTests   # headless
+PUNKTFUNK_AUTOCONNECT=<box-ip> PUNKTFUNK_MODE=1280x720x60 swift run PunktfunkClient # on glass
 ```
 
 ## Notes for whoever picks this up next
 
 1. **cbindgen import quirk** (the predicted "small compile fixes", now fixed): the
-   C17-compatible header spells `LumenStatus`/`LumenInputKind` as integer typedefs while
+   C17-compatible header spells `PunktfunkStatus`/`PunktfunkInputKind` as integer typedefs while
    the enum *constants* import into Swift as a distinct same-named type — bridge with
-   `.rawValue` (see the top of `LumenConnection.swift`). Don't fight the generated header.
+   `.rawValue` (see the top of `PunktfunkConnection.swift`). Don't fight the generated header.
 2. **ABI contract**: one video pump thread per connection, plus optionally one *separate*
    audio drain thread for `nextAudio()`/`nextRumble()` (the core keeps per-plane borrow
    slots, so the planes never alias); `send()` is enqueue-only and safe alongside all of
@@ -91,7 +91,7 @@ LUMEN_AUTOCONNECT=<box-ip> LUMEN_MODE=1280x720x60 swift run LumenClient # on gla
    `AVAudioEngine` source node; conceal gaps (drop/dup) rather than blocking — the Rust
    side buffers 320 ms and drops the newest packet when the puller lags. Wall-clock
    `ptsNs` shares the host clock with video AUs for A/V sync. Wiring this into
-   `LumenClient` is the next app-side task.
+   `PunktfunkClient` is the next app-side task.
 6. **Gamepads**: `GCController` → `.gamepadButton(...)`/`.gamepadAxis(...)` events (wire
    contract documented on the constructors; the host accumulates them into a virtual
    Xbox 360 pad). Poll `nextRumble()` and feed `GCDeviceHaptics` for force feedback.
@@ -99,7 +99,7 @@ LUMEN_AUTOCONNECT=<box-ip> LUMEN_MODE=1280x720x60 swift run LumenClient # on gla
 7. **Trust**: connect once with `pinSHA256: nil` (TOFU), persist `hostFingerprint` keyed
    by host, pass it on every later connect — a mismatch throws `.connectFailed`. The host
    logs its fingerprint at startup ("clients pin this fingerprint") for out-of-band
-   verification UX; a PIN-style pairing ceremony is a later lumen-core task. `LumenClient`
+   verification UX; a PIN-style pairing ceremony is a later punktfunk-core task. `PunktfunkClient`
    doesn't persist fingerprints yet — add it alongside the "add host" UX.
 8. **Input capture caveats** (stage 1): GC handlers only fire while the app has focus —
    on focus loss `InputCapture` auto-releases everything still held (keys + buttons) so

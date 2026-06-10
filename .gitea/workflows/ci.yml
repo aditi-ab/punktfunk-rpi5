@@ -1,4 +1,4 @@
-# CI for lumen (Gitea Actions, GitHub-Actions-compatible syntax).
+# CI for punktfunk (Gitea Actions, GitHub-Actions-compatible syntax).
 # Adjust `runs-on` to match your runner labels if not using the default ubuntu image.
 name: ci
 
@@ -34,10 +34,10 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: C ABI harness (standalone link proof)
-        run: bash crates/lumen-core/tests/c/run.sh
+        run: bash crates/punktfunk-core/tests/c/run.sh
 
       - name: Verify generated header is committed & up to date
         run: |
-          cargo build -p lumen-core
-          git diff --exit-code include/lumen_core.h \
-            || (echo "include/lumen_core.h is stale — commit the regenerated header" && exit 1)
+          cargo build -p punktfunk-core
+          git diff --exit-code include/punktfunk_core.h \
+            || (echo "include/punktfunk_core.h is stale — commit the regenerated header" && exit 1)

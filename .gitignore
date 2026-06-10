@@ -9,5 +9,5 @@ node_modules/
 dist/
 # Swift package build artifacts + the locally-built xcframework (rebuild via scripts/build-xcframework.sh)
 clients/apple/.build/
-clients/apple/LumenCore.xcframework/
+clients/apple/PunktfunkCore.xcframework/
 clients/apple/.swiftpm/

@@ -1,6 +1,6 @@
 [package]
 name = "loss-harness"
-description = "FEC loss-resilience sweep over the lumen-core loopback (plan §10)"
+description = "FEC loss-resilience sweep over the punktfunk-core loopback (plan §10)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,4 +9,4 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-lumen-core = { path = "../../crates/lumen-core" }
+punktfunk-core = { path = "../../crates/punktfunk-core" }

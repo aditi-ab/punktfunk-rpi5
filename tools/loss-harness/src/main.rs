@@ -2,20 +2,20 @@
 //!
 //! Drives access units through the in-process loopback at increasing loss rates, for
 //! both FEC schemes, and prints how many frames survive. A pure-software stand-in for
-//! `tc netem` that needs no network and runs anywhere `lumen_core` builds. The real M3
+//! `tc netem` that needs no network and runs anywhere `punktfunk_core` builds. The real M3
 //! harness adds `tc netem` jitter/reorder on the UDP path.
 
-use lumen_core::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
-use lumen_core::error::LumenError;
-use lumen_core::session::Session;
-use lumen_core::transport::loopback_pair;
+use punktfunk_core::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
+use punktfunk_core::error::PunktfunkError;
+use punktfunk_core::session::Session;
+use punktfunk_core::transport::loopback_pair;
 
 fn config(role: Role, scheme: FecScheme, drop_period: u32) -> Config {
     Config {
         role,
         phase: match scheme {
             FecScheme::Gf8 => ProtocolPhase::P1GameStream,
-            FecScheme::Gf16 => ProtocolPhase::P2Lumen,
+            FecScheme::Gf16 => ProtocolPhase::P2Punktfunk,
         },
         fec: FecConfig {
             scheme,
@@ -47,7 +47,7 @@ fn run(scheme: FecScheme, drop_period: u32, frames: usize, frame_len: usize) -> 
                     completed += 1;
                 }
             }
-            Err(LumenError::NoFrame) => {} // unrecoverable at this loss rate
+            Err(PunktfunkError::NoFrame) => {} // unrecoverable at this loss rate
             Err(e) => panic!("unexpected error: {e}"),
         }
     }
@@ -59,7 +59,7 @@ fn main() {
     let frame_len = 100_000; // ~98 shards across 2 FEC blocks
     let periods = [0u32, 32, 16, 8, 6, 4, 3, 2];
 
-    println!("lumen loss-harness — 25% FEC, {frames} frames of {frame_len} bytes");
+    println!("punktfunk loss-harness — 25% FEC, {frames} frames of {frame_len} bytes");
     println!("(GF8 = P1/GameStream-compat, GF16 = P2/wall-breaker)\n");
     println!(
         "{:>10}  {:>9}  {:>14}  {:>14}",

@@ -1,0 +1,11 @@
+# udev rules for the punktfunk streaming host (mirrors Sunshine's 60-sunshine.rules).
+#
+# Grants the `input` group access to /dev/uinput so the host can create virtual gamepads
+# (one X-Box-360-class pad per connected Moonlight controller). `static_node` makes the node
+# exist before the uinput module loads.
+#
+# Install:
+#   sudo cp scripts/60-punktfunk.rules /etc/udev/rules.d/
+#   sudo usermod -aG input $USER       # then re-login (or reboot)
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", GROUP="input", MODE="0660", TAG+="uaccess"
