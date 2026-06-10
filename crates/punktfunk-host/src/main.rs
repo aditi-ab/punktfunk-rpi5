@@ -27,7 +27,7 @@ mod vdisplay;
 #[cfg(target_os = "linux")]
 mod zerocopy;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use encode::Codec;
 use m0::{Options, Source};
 use std::path::PathBuf;
@@ -68,6 +68,15 @@ fn real_main() -> Result<()> {
         // Zero-copy FFI/GPU probe: init the EGL importer + CUDA context (no capture needed).
         #[cfg(target_os = "linux")]
         Some("zerocopy-probe") => zerocopy::probe(),
+        // Compositor readiness probe: exit 0 iff the (detected or PUNKTFUNK_COMPOSITOR-forced)
+        // compositor is up and able to create a virtual output *now*. A session-bringup
+        // script polls this to gate on real readiness instead of a blind `sleep`.
+        Some("probe-compositor") => {
+            let compositor = vdisplay::detect()?;
+            vdisplay::probe(compositor).with_context(|| format!("{compositor:?} not ready"))?;
+            println!("{compositor:?} ready");
+            Ok(())
+        }
         // M0 pipeline spike.
         Some("m0") => m0::run(parse_m0(&args[1..])?),
         // M3: native punktfunk/1 host (QUIC control plane + UDP data plane).
@@ -308,6 +317,7 @@ USAGE:
                                   + the management REST API
     punktfunk-host openapi            print the management API's OpenAPI document (codegen)
     punktfunk-host m3-host [OPTIONS]  native punktfunk/1 host (QUIC control plane + UDP data plane)
+    punktfunk-host probe-compositor   exit 0 iff the compositor is up + ready (session-bringup gate)
     punktfunk-host m0 [OPTIONS]       M0 capture→encode→file pipeline spike
 
 SERVE OPTIONS:

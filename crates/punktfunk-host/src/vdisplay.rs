@@ -111,6 +111,30 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     }
 }
 
+/// Readiness probe for `compositor`: is it up and able to create a virtual output *right
+/// now*? A session-bringup script polls this (via `punktfunk-host probe-compositor`) to gate
+/// on actual readiness instead of racing the compositor with a blind sleep.
+///
+/// KWin gets a real check (the privileged `zkde_screencast` global must be advertised). The
+/// others are spawn/D-Bus/portal-based and have no equivalent pre-flight global, so a probe
+/// just confirms the backend opens — `Ok(())` means "go ahead and try `create`".
+pub fn probe(compositor: Compositor) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        match compositor {
+            Compositor::Kwin => kwin::probe(),
+            // gamescope spawns its own nested session per `create`; Mutter is D-Bus on demand;
+            // wlroots creates the output on demand — nothing to pre-check beyond "Linux".
+            Compositor::Gamescope | Compositor::Mutter | Compositor::Wlroots => Ok(()),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = compositor;
+        anyhow::bail!("virtual displays require Linux (Wayland compositor)")
+    }
+}
+
 /// Path of the file where the gamescope backend relays the nested session's `LIBEI_SOCKET`
 /// (gamescope's EIS server) for the input injector.
 #[cfg(target_os = "linux")]

@@ -223,6 +223,29 @@ fn virtual_output_thread(
     }
 }
 
+/// Readiness probe: connect to the KWin Wayland socket, roundtrip the registry, and confirm
+/// the privileged `zkde_screencast` global is actually advertised. This is exactly what
+/// [`run`] needs before it can create a virtual output, so a session-bringup script can poll
+/// this to gate on the compositor being *ready* (not merely the socket existing) instead of
+/// racing it with a blind sleep. `Ok(())` = ready; `Err` = not ready / no global yet.
+pub fn probe() -> Result<()> {
+    let conn = Connection::connect_to_env()
+        .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
+    let mut queue = conn.new_event_queue();
+    let qh = queue.handle();
+    let _registry = conn.display().get_registry(&qh, ());
+    let mut state = State::default();
+    queue.roundtrip(&mut state).context("registry roundtrip")?;
+    if state.screencast.is_none() {
+        bail!(
+            "KWin is up but does not (yet) expose zkde_screencast_unstable_v1 — needs a real \
+             KDE session (or KWIN_WAYLAND_NO_PERMISSION_CHECKS=1), and KWin ≥ 6.5.6 for the \
+             headless virtual output"
+        );
+    }
+    Ok(())
+}
+
 fn run(
     width: u32,
     height: u32,
