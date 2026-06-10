@@ -71,9 +71,9 @@ public struct ClientIdentity: Sendable {
 public func generateIdentity() throws -> ClientIdentity {
     var cert = [CChar](repeating: 0, count: 4096)
     var key = [CChar](repeating: 0, count: 4096)
-    let rc = punktfunk_generate_identity(&cert, cert.count, &key, key.count)
-    guard rc.rawValue == PUNKTFUNK_STATUS_OK.rawValue else {
-        throw PunktfunkClientError.status(rc.rawValue)
+    let rc = punktfunk_generate_identity(&cert, UInt(cert.count), &key, UInt(key.count))
+    guard rc == PUNKTFUNK_STATUS_OK.rawValue else {
+        throw PunktfunkClientError.status(rc)
     }
     return ClientIdentity(certPEM: String(cString: cert), keyPEM: String(cString: key))
 }
@@ -88,6 +88,9 @@ public func pair(
     timeoutMs: UInt32 = 90_000
 ) throws -> Data {
     var observed = [UInt8](repeating: 0, count: 32)
+    // The C header types PunktfunkStatus as a bare int32 (C17, no enum import), so the ABI
+    // functions return Int32 directly — compare against the enum constants' rawValue, the
+    // same bridging the connection methods use (statusOK etc.).
     let rc = host.withCString { cs in
         identity.certPEM.withCString { cert in
             identity.keyPEM.withCString { key in
@@ -99,10 +102,10 @@ public func pair(
             }
         }
     }
-    switch rc.rawValue {
+    switch rc {
     case PUNKTFUNK_STATUS_OK.rawValue: return Data(observed)
     case PUNKTFUNK_STATUS_CRYPTO.rawValue: throw PunktfunkClientError.wrongPIN
-    default: throw PunktfunkClientError.status(rc.rawValue)
+    default: throw PunktfunkClientError.status(rc)
     }
 }
 

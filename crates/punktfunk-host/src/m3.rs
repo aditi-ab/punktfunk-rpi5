@@ -53,9 +53,14 @@ pub struct M3Options {
     pub frames: u32,
     /// Exit after this many sessions (0 = serve forever).
     pub max_sessions: u32,
-    /// Only serve clients whose certificate fingerprint is in the paired set (pairing
-    /// ceremonies themselves are always allowed — that's how a client gets in).
+    /// Only serve clients whose certificate fingerprint is in the paired set. Implies
+    /// `allow_pairing` (a host that requires pairing must accept ceremonies to admit
+    /// anyone).
     pub require_pairing: bool,
+    /// Accept pairing ceremonies (the operator "arming" pairing mode). Default off: a host
+    /// with neither flag set rejects unsolicited PairRequests outright, closing that
+    /// attack surface. `require_pairing` forces this on.
+    pub allow_pairing: bool,
     /// Fixed pairing PIN (tests); `None` = a fresh random 4-digit PIN per ceremony.
     pub pairing_pin: Option<String>,
     /// Paired-clients store path override (tests); `None` = the default config path.
@@ -100,9 +105,18 @@ fn save_paired(state: &PairedState) -> Result<()> {
     if let Some(dir) = state.path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&state.path, serde_json::to_vec_pretty(&state.clients)?)?;
+    // Atomic replace: a crash/full-disk mid-write must not truncate the trust store (which
+    // would silently lock out every paired client on a --require-pairing host). Write a
+    // temp beside the target, then rename.
+    let tmp = state.path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&state.clients)?)?;
+    std::fs::rename(&tmp, &state.path)?;
     Ok(())
 }
+
+/// Minimum spacing between accepted pairing ceremonies (bounds online PIN guessing — with
+/// SPAKE2 an attacker already gets only one guess per ceremony; this caps the rate).
+const PAIRING_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl PairedClients {
     fn contains(&self, fp: &[u8; 32]) -> bool {
@@ -174,10 +188,25 @@ async fn serve(opts: M3Options) -> Result<()> {
         clients: load_paired(&paired_at),
         path: paired_at,
     }));
-    if opts.require_pairing {
+    // The arming PIN: one PIN for the whole pairing window (NOT per-ceremony), because the
+    // SPAKE2 client must know the PIN to build its first message — so the user has to read
+    // the PIN before connecting. Generated once when pairing is armed, displayed here.
+    let arming_pin = if opts.allow_pairing || opts.require_pairing {
+        let pin = opts.pairing_pin.clone().unwrap_or_else(|| {
+            use rand::Rng;
+            format!("{:04}", rand::thread_rng().gen_range(0..10_000u32))
+        });
         let n = paired.lock().unwrap().clients.clients.len();
-        tracing::info!(paired = n, "pairing required for sessions");
-    }
+        tracing::info!(
+            paired = n,
+            require = opts.require_pairing,
+            "PAIRING ARMED — enter this PIN on the client to pair: {pin}"
+        );
+        Some(pin)
+    } else {
+        None
+    };
+    let last_pairing = std::sync::Mutex::new(None::<std::time::Instant>);
 
     let mut served = 0u32;
     loop {
@@ -194,7 +223,17 @@ async fn serve(opts: M3Options) -> Result<()> {
         };
         let peer = conn.remote_address();
         tracing::info!(%peer, "punktfunk/1 client connected");
-        if let Err(e) = serve_session(conn, &opts, &audio_cap, &fingerprint, &paired).await {
+        if let Err(e) = serve_session(
+            conn,
+            &opts,
+            &audio_cap,
+            &fingerprint,
+            &paired,
+            &last_pairing,
+            arming_pin.as_deref(),
+        )
+        .await
+        {
             tracing::warn!(%peer, error = %format!("{e:#}"), "session ended with error");
         } else {
             tracing::info!(%peer, "session complete");
@@ -222,9 +261,10 @@ type AudioCapSlot = Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCaptu
 /// client), so its budget is far larger than the machine-speed session handshake.
 const PAIRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The host side of the PIN ceremony (see `punktfunk_core::quic::pair_proof`): generate a
-/// PIN, display it (log), challenge with a fresh salt, verify the client's single proof
-/// attempt, and persist the client's certificate fingerprint on success.
+/// The host side of the SPAKE2 pairing ceremony (see `punktfunk_core::quic::pake`):
+/// generate + display a PIN, run SPAKE2 as B binding both cert fingerprints, verify the
+/// client's key-confirmation MAC (its single online guess), and persist the client's
+/// fingerprint on success.
 async fn pair_ceremony(
     conn: &quinn::Connection,
     mut send: quinn::SendStream,
@@ -232,37 +272,40 @@ async fn pair_ceremony(
     req: PairRequest,
     host_fp: &[u8; 32],
     paired: &PairedStore,
-    opts: &M3Options,
+    pin: &str,
 ) -> Result<()> {
+    use punktfunk_core::quic::pake;
     let client_fp = endpoint::peer_fingerprint(conn)
         .ok_or_else(|| anyhow!("pairing requires the client to present a certificate"))?;
 
-    let pin = opts.pairing_pin.clone().unwrap_or_else(|| {
-        use rand::Rng;
-        format!("{:04}", rand::thread_rng().gen_range(0..10_000u32))
-    });
-    let mut salt = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt);
     tracing::info!(
         name = %req.name,
         client = %fingerprint_hex(&client_fp),
-        "PAIRING REQUEST — enter this PIN on the client: {pin}"
+        "PAIRING REQUEST — verifying against the armed PIN"
     );
 
-    io::write_msg(&mut send, &PairChallenge { salt }.encode()).await?;
+    // SPAKE2 as B; bind our own host_fp + the client cert we actually received.
+    let (pake, spake_b) = pake::start(false, pin, &client_fp, host_fp);
+    let confirms = pake.finish(&req.spake_a)?; // Err only on a malformed peer message
+
+    io::write_msg(
+        &mut send,
+        &PairChallenge {
+            spake_b,
+            confirm: confirms.host,
+        }
+        .encode(),
+    )
+    .await?;
+
     let proof = tokio::time::timeout(PAIRING_TIMEOUT, io::read_msg(&mut recv))
         .await
-        .map_err(|_| anyhow!("pairing timed out waiting for the PIN proof"))??;
+        .map_err(|_| anyhow!("pairing timed out waiting for the client's confirmation"))??;
     let proof = PairProof::decode(&proof).map_err(|e| anyhow!("PairProof decode: {e:?}"))?;
 
-    let expected = punktfunk_core::quic::pair_proof(&pin, &salt, &client_fp, host_fp);
-    // Constant-time compare — don't leak a prefix-match timing oracle on the proof.
-    let ok = proof
-        .hmac
-        .iter()
-        .zip(expected.iter())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0;
+    // A wrong PIN (or a MITM with mismatched cert views) yields a different SPAKE2 key, so
+    // the client's confirmation MAC won't match ours — one online attempt, no offline search.
+    let ok = pake::verify(&confirms.client, &proof.confirm);
 
     if ok {
         let mut store = paired.lock().unwrap();
@@ -281,8 +324,9 @@ async fn pair_ceremony(
     }
     io::write_msg(&mut send, &PairResult { ok }.encode()).await?;
     let _ = send.finish();
-    // Let the result reach the client before the connection drops.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Wait for the client to acknowledge by closing, so the PairResult isn't dropped by our
+    // close on a slow link (bounded so a vanished client can't wedge the sequential host).
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
     conn.close(0u32.into(), b"pairing done");
     anyhow::ensure!(ok, "pairing rejected (wrong PIN)");
     Ok(())
@@ -297,6 +341,8 @@ async fn serve_session(
     audio_cap: &AudioCapSlot,
     host_fp: &[u8; 32],
     paired: &PairedStore,
+    last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
+    arming_pin: Option<&str>,
 ) -> Result<()> {
     let peer = conn.remote_address();
 
@@ -309,7 +355,18 @@ async fn serve_session(
         .await
         .map_err(|_| anyhow!("first message timeout"))??;
     if let Ok(req) = PairRequest::decode(&first) {
-        return pair_ceremony(&conn, send, recv, req, host_fp, paired, opts).await;
+        let pin = arming_pin.context("pairing not armed (start with --allow-pairing)")?;
+        {
+            let mut last = last_pairing.lock().unwrap();
+            if let Some(t) = *last {
+                anyhow::ensure!(
+                    t.elapsed() >= PAIRING_COOLDOWN,
+                    "pairing rate-limited — retry shortly"
+                );
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        return pair_ceremony(&conn, send, recv, req, host_fp, paired, pin).await;
     }
 
     let source = opts.source;
@@ -388,12 +445,13 @@ async fn serve_session(
                 tracing::warn!("unknown control message — ignoring");
                 continue;
             };
-            let ok = crate::encode::validate_dimensions(
-                crate::encode::Codec::H265,
-                req.mode.width,
-                req.mode.height,
-            )
-            .is_ok();
+            let ok = req.mode.refresh_hz > 0
+                && crate::encode::validate_dimensions(
+                    crate::encode::Codec::H265,
+                    req.mode.width,
+                    req.mode.height,
+                )
+                .is_ok();
             if ok {
                 active = req.mode;
                 tracing::info!(mode = ?req.mode, "mode switch accepted");
@@ -770,14 +828,27 @@ fn virtual_stream(
     let mut next = std::time::Instant::now();
     let mut sent: u64 = 0;
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-        if let Ok(new_mode) = reconfig.try_recv() {
+        // Drain to the NEWEST requested mode (a resize drag queues many) so we rebuild once,
+        // not once per stale intermediate mode.
+        let mut want = None;
+        while let Ok(m) = reconfig.try_recv() {
+            want = Some(m);
+        }
+        if let Some(new_mode) = want {
             tracing::info!(?new_mode, "rebuilding pipeline for mode switch");
-            // Tear down in order — capture stream (and with it the virtual output) before
-            // the new output appears, encoder with it. The data plane keeps running.
-            drop(enc);
-            drop(capturer);
-            (capturer, enc, frame, interval) = build_pipeline(&mut vd, new_mode)?;
-            next = std::time::Instant::now();
+            // Build the new pipeline BEFORE dropping the old one: the host already acked
+            // the switch as accepted, so a rebuild failure must not kill an otherwise
+            // healthy session — keep streaming the current mode and log instead.
+            match build_pipeline(&mut vd, new_mode) {
+                Ok(next_pipe) => {
+                    (capturer, enc, frame, interval) = next_pipe;
+                    next = std::time::Instant::now();
+                }
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), ?new_mode,
+                        "mode-switch rebuild failed — staying on the current mode");
+                }
+            }
         }
         if let Some(f) = capturer.try_latest().context("capture")? {
             frame = f;
@@ -925,6 +996,7 @@ mod tests {
                 frames: 25,
                 max_sessions: 3,
                 require_pairing: false,
+                allow_pairing: false,
                 pairing_pin: None,
                 paired_store: None,
             })
@@ -1079,6 +1151,7 @@ mod tests {
                 frames: 25,
                 max_sessions: 4,
                 require_pairing: true,
+                allow_pairing: false,
                 pairing_pin: Some("4321".into()),
                 paired_store: Some(test_paired_path()),
             })
@@ -1107,7 +1180,9 @@ mod tests {
             "anonymous session must be rejected"
         );
 
-        // 3: correct PIN → paired, host fingerprint returned.
+        // 3: correct PIN → paired, host fingerprint returned. Space past the pairing
+        // cooldown that the wrong-PIN attempt above just triggered (a real retry is slower).
+        std::thread::sleep(PAIRING_COOLDOWN + std::time::Duration::from_millis(200));
         let host_fp =
             NativeClient::pair("127.0.0.1", 19778, identity, "4321", "test-client", timeout)
                 .expect("pairing with the right PIN");

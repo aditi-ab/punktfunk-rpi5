@@ -11,6 +11,9 @@
 //!
 //! `--pin <64-hex>` pins the host's certificate fingerprint (the host logs it at startup);
 //! without it the client trusts on first use and prints the observed fingerprint to pin.
+//! `--pair <PIN>` runs the SPAKE2 pairing ceremony: read the PIN the host prints when it
+//! arms pairing (`--allow-pairing`/`--require-pairing`), pass it here; on success the
+//! client prints the verified host fingerprint to `--pin` from then on.
 //! Host→client datagrams (Opus audio, rumble) are counted and reported with the stream
 //! stats — decode/playback is the platform clients' job.
 //!

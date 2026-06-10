@@ -38,8 +38,9 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   audio** 0xC9 (48 kHz stereo, 5 ms, host→client), **rumble** 0xCA (host→client). **Trust:**
   host serves its persistent identity (`~/.config/punktfunk/cert.pem`, shared with GameStream
   pairing) and logs the SHA-256 fingerprint; clients pin it (TOFU on first connect —
-  `endpoint::client_pinned`), and a **PIN pairing ceremony** (host displays a 4-digit PIN,
-  proof = HMAC over both cert fingerprints, single attempt) establishes mutual trust:
+  `endpoint::client_pinned`), and a **SPAKE2 PIN pairing ceremony** (host arms pairing and displays a
+  4-digit PIN; a PAKE binds both cert fingerprints so an attacker gets one online guess,
+  no offline dictionary attack) establishes mutual trust:
   clients present persistent identities via QUIC client auth, the host stores paired
   fingerprints (`punktfunk1-paired.json`) and can gate sessions with `--require-pairing`.
   **Mid-stream mode renegotiation**: `Reconfigure` on the still-open control stream — the

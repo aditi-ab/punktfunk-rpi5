@@ -9,7 +9,7 @@
 //! 3. The ScreenCast portal yields the output's PipeWire node. There is no GUI to pick an
 //!    output headlessly, so xdpw is steered through its chooser hook: a managed config
 //!    (`~/.config/xdg-desktop-portal-wlr/config`, written once + portal restarted on change)
-//!    sets `chooser_type=simple` with a `chooser_cmd` that cats [`CHOOSER_FILE`], which we
+//!    sets `chooser_type=simple` with a `chooser_cmd` that cats the chooser file, which we
 //!    write per session (`Monitor: <NAME>` — xdpw 0.8 parses that prefix strictly).
 //! 4. Teardown is RAII: drop stops the portal thread (its zbus connection ends the cast) and
 //!    runs `swaymsg output <NAME> unplug` (headless outputs support unplug since sway 1.8).
@@ -29,18 +29,28 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// File the xdpw output chooser reads the selected output from (see [`XDPW_CONFIG`]); we write
-/// `Monitor: <NAME>\n` here right before the portal handshake selects sources.
-const CHOOSER_FILE: &str = "/tmp/punktfunk-xdpw-output";
+/// File the xdpw output chooser reads the selected output from (see [`xdpw_config`]); we
+/// write `Monitor: <NAME>\n` here right before the portal handshake selects sources. Lives
+/// under `$XDG_RUNTIME_DIR` (per-user, mode 0700) — NOT a fixed world-writable /tmp path,
+/// where another local user could pre-create it (DoS) or rewrite it between our write and
+/// xdpw's read (steer capture at a different output).
+fn chooser_file() -> String {
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    format!("{dir}/punktfunk-xdpw-output")
+}
 
 /// The managed xdpw config: per-session output selection with no GUI. The `|| echo` fallback
 /// keeps plain portal capture (`--source portal`, M0 flow) working when no session has written
 /// the chooser file. xdpw runs `chooser_cmd` via `/bin/sh -c`, reads stdout.
-const XDPW_CONFIG: &str =
-    "# managed by punktfunk (vdisplay/wlroots.rs) — per-session output selection.\n\
+fn xdpw_config() -> String {
+    format!(
+        "# managed by punktfunk (vdisplay/wlroots.rs) — per-session output selection.\n\
 [screencast]\n\
 chooser_type=simple\n\
-chooser_cmd=cat /tmp/punktfunk-xdpw-output 2>/dev/null || echo 'Monitor: HEADLESS-1'\n";
+chooser_cmd=cat {} 2>/dev/null || echo 'Monitor: HEADLESS-1'\n",
+        chooser_file()
+    )
+}
 
 /// The wlroots/Sway virtual-display driver. Stateless — each [`create`](VirtualDisplay::create)
 /// adds one headless output and spins up a portal thread owning the cast on it.
@@ -82,8 +92,9 @@ impl VirtualDisplay for WlrootsDisplay {
         // Steer xdpw's headless output chooser at our new output, then run the portal
         // handshake on its own thread (it parks to keep the cast alive, like the other backends).
         ensure_xdpw_config()?;
-        std::fs::write(CHOOSER_FILE, format!("Monitor: {name}\n"))
-            .with_context(|| format!("write {CHOOSER_FILE}"))?;
+        let chooser = chooser_file();
+        std::fs::write(&chooser, format!("Monitor: {name}\n"))
+            .with_context(|| format!("write {chooser}"))?;
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
@@ -207,7 +218,7 @@ fn wait_new_output(before: &[String], timeout: Duration) -> Result<String> {
 
 /// Make sure xdpw uses our output chooser. xdpw reads its config only at startup, so on a
 /// change restart it if running (`try-restart`; if it isn't, D-Bus activation will start it
-/// with the new config). The config itself is static — the *selection* is [`CHOOSER_FILE`].
+/// with the new config). The config itself is static — the *selection* is the chooser file.
 fn ensure_xdpw_config() -> Result<()> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -215,11 +226,12 @@ fn ensure_xdpw_config() -> Result<()> {
         .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME set"))?;
     let dir = base.join("xdg-desktop-portal-wlr");
     let path = dir.join("config");
-    if std::fs::read_to_string(&path).is_ok_and(|c| c == XDPW_CONFIG) {
+    let cfg = xdpw_config();
+    if std::fs::read_to_string(&path).is_ok_and(|c| c == cfg) {
         return Ok(());
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    std::fs::write(&path, XDPW_CONFIG).with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&path, &cfg).with_context(|| format!("write {}", path.display()))?;
     tracing::info!(path = %path.display(), "wrote managed xdg-desktop-portal-wlr config");
     let _ = Command::new("systemctl")
         .args(["--user", "try-restart", "xdg-desktop-portal-wlr.service"])

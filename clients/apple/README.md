@@ -117,11 +117,13 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    contract documented on the constructors; the host accumulates them into a virtual
    Xbox 360 pad). Poll `nextRumble()` and feed `GCDeviceHaptics` for force feedback.
    Client-side capture isn't in `InputCapture` yet.
-7. **Trust — the full ceremony exists now.** `generateIdentity()` once (persist both
-   PEMs in the Keychain), then `pair(host:identity:pin:name:)` with the 4-digit PIN the
-   host displays (its log; UI later) — returns the host's VERIFIED fingerprint; persist
-   it and pass `pinSHA256:` + `identity:` to every connect. A wrong-size pin throws
-   `.invalidPin`, a wrong PIN `.wrongPIN`. The TOFU flow `PunktfunkClient` already
+7. **Trust — the full ceremony exists now (SPAKE2).** `generateIdentity()` once (persist
+   both PEMs in the Keychain), then `pair(host:identity:pin:name:)` with the 4-digit PIN
+   the host prints when it ARMS pairing (`--allow-pairing`/`--require-pairing`; one PIN
+   per arming window, shown at startup — the user reads it before pairing). Returns the
+   host's VERIFIED fingerprint; persist it and pass `pinSHA256:` + `identity:` to every
+   connect. Pairing is a real PAKE: a wrong PIN gets ONE online guess (no offline
+   dictionary attack), throwing `.wrongPIN`; a wrong-size pin throws `.invalidPin`. The TOFU flow `PunktfunkClient` already
    implements (fingerprint confirmation sheet, per-host `HostStore`, "Forget Identity")
    keeps working against hosts not running `--require-pairing`; upgrading the sheet to a
    PIN-entry field closes the remaining gap — with `--require-pairing` the host now

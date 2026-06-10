@@ -466,7 +466,13 @@ fn audio_body(
     let mut enc = SessionEncoder::new(layout)?;
     // Opus frame duration; Moonlight negotiates 5 ms (default) or 10 ms via
     // `x-nv-aqos.packetDuration` and sizes its decoder at `48 * duration` samples.
-    let frame_ms = params.packet_duration_ms.clamp(5, 10) as usize;
+    // Already snapped to {5, 10} at parse time; guard here too so only legal Opus frame
+    // sizes (48 kHz × {5,10} ms = 240/480 samples) ever reach the encoder.
+    let frame_ms = if params.packet_duration_ms >= 10 {
+        10
+    } else {
+        5
+    } as usize;
     let samples_per_channel = SAMPLE_RATE as usize * frame_ms / 1000;
     let frame_len = samples_per_channel * layout.channels as usize; // interleaved samples
     let mut acc: Vec<f32> = Vec::with_capacity(frame_len * 4);

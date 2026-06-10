@@ -46,4 +46,7 @@ pub use stats::Stats;
 
 /// Bump on any breaking change to the [C ABI](crate::abi). Mirrors
 /// `punktfunk_abi_version()` and is checked by clients before use.
-pub const ABI_VERSION: u32 = 1;
+///
+/// v2: `punktfunk_connect` gained `client_cert_pem`/`client_key_pem` (pairing identities);
+/// added `punktfunk_pair` / `punktfunk_generate_identity` / `punktfunk_connection_request_mode`.
+pub const ABI_VERSION: u32 = 2;

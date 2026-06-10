@@ -321,10 +321,13 @@ fn audio_params(map: &HashMap<String, String>) -> audio::AudioParams {
         }
     };
     let high_quality = parse_u("x-nv-audio.surround.AudioQuality") == Some(1);
-    // Moonlight uses 5 ms (default) or 10 ms (slow decoder / low-bitrate links).
-    let packet_duration_ms = parse_u("x-nv-aqos.packetDuration")
-        .map(|d| d.clamp(5, 10) as u8)
-        .unwrap_or(5);
+    // Moonlight uses 5 ms (default) or 10 ms (slow decoder / low-bitrate links). Snap to
+    // those two — an in-between value like 7 isn't a legal Opus frame size and would make
+    // every encode fail; clamping (not snapping) would let it through.
+    let packet_duration_ms = match parse_u("x-nv-aqos.packetDuration") {
+        Some(d) if d >= 10 => 10,
+        _ => 5,
+    };
     audio::AudioParams {
         channels,
         high_quality,

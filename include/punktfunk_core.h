@@ -14,7 +14,10 @@
 
 // Bump on any breaking change to the [C ABI](crate::abi). Mirrors
 // `punktfunk_abi_version()` and is checked by clients before use.
-#define ABI_VERSION 1
+//
+// v2: `punktfunk_connect` gained `client_cert_pem`/`client_key_pem` (pairing identities);
+// added `punktfunk_pair` / `punktfunk_generate_identity` / `punktfunk_connection_request_mode`.
+#define ABI_VERSION 2
 
 // 16-byte AEAD authentication tag appended by GCM.
 #define TAG_LEN 16

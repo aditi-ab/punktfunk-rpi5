@@ -25,8 +25,14 @@
 use crate::config::{Config, FecConfig, FecScheme, Mode, ProtocolPhase, Role};
 use crate::error::{PunktfunkError, Result};
 
-/// Protocol magic + version, first bytes of every message payload.
+/// Protocol magic + version, first bytes of the positional handshake (Hello/Welcome/Start).
 pub const MAGIC: &[u8; 4] = b"PKF1";
+
+/// Magic for typed post-handshake / pairing control messages. A distinct magic keeps the
+/// typed namespace disjoint from the positional handshake: a `Hello` (whose abi_version
+/// byte sits where a type byte would) can never be misparsed as a control message, and
+/// vice-versa, regardless of field values.
+pub const CTL_MAGIC: &[u8; 4] = b"PKFc";
 
 /// `client → host`: open the session, requesting a display mode (the host creates its
 /// virtual output at exactly this size/refresh — native resolution end to end).
@@ -86,12 +92,19 @@ pub const MSG_RECONFIGURE: u8 = 0x01;
 pub const MSG_RECONFIGURED: u8 = 0x02;
 
 // ---------------------------------------------------------------------------------------------
-// Pairing ceremony (typed messages 0x10..): instead of a session Hello, a client may open
-// the control stream with PairRequest. The host shows a short PIN out-of-band (log/UI);
-// the user types it into the client, which proves knowledge with an HMAC bound to BOTH
-// certificate fingerprints — a MITM would need the PIN within its single attempt, and any
-// substituted certificate changes the proof. On success the host persists the client's
-// fingerprint (presented via QUIC client auth) and the client pins the host's.
+// Pairing ceremony (typed control messages): instead of a session Hello, a client may open
+// the control stream with PairRequest. The host shows a short PIN out-of-band (log/UI); the
+// user types it into the client.
+//
+// Trust is established by **SPAKE2** (a balanced PAKE), NOT a hash of the PIN. SPAKE2 turns
+// the low-entropy PIN into a high-entropy shared key via a Diffie-Hellman exchange; the only
+// thing an active man-in-the-middle who terminates the (TOFU) ceremony learns is whether a
+// single PIN guess was right — there is no transcript value that reveals the PIN to an
+// *offline* dictionary search (the fatal flaw of an HMAC-of-PIN proof over a 4-digit space).
+// Both peers' certificate fingerprints are bound in as the SPAKE2 identities, so the
+// established key — and the key-confirmation MACs derived from it — only agree when both
+// sides saw the same two certificates. After mutual key confirmation the host persists the
+// client's fingerprint and the client pins the host's.
 // ---------------------------------------------------------------------------------------------
 
 /// Type byte of [`PairRequest`].
@@ -103,24 +116,27 @@ pub const MSG_PAIR_PROOF: u8 = 0x12;
 /// Type byte of [`PairResult`].
 pub const MSG_PAIR_RESULT: u8 = 0x13;
 
-/// `client → host`: begin pairing. `name` is the human label the host stores (e.g.
-/// "Enrico's Mac"), at most 64 bytes of UTF-8.
+/// `client → host`: begin pairing. `name` is the human label the host stores (≤64 bytes
+/// UTF-8); `spake_a` is the client's SPAKE2 message (see [`SpakeRole::start`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairRequest {
     pub name: String,
+    pub spake_a: Vec<u8>,
 }
 
-/// `host → client`: a fresh random salt for the proof; the host has generated (and is
-/// displaying) the PIN. One proof attempt per challenge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `host → client`: the host's SPAKE2 message + its key-confirmation MAC. The client
+/// finishes SPAKE2, verifies `confirm` (proving the host derived the same key, i.e. knows
+/// the PIN and saw the same certs), then sends its own confirmation.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairChallenge {
-    pub salt: [u8; 16],
+    pub spake_b: Vec<u8>,
+    pub confirm: [u8; 32],
 }
 
-/// `client → host`: the proof, see [`pair_proof`].
+/// `client → host`: the client's key-confirmation MAC (its single proof attempt).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PairProof {
-    pub hmac: [u8; 32],
+    pub confirm: [u8; 32],
 }
 
 /// `host → client`: ceremony outcome.
@@ -129,106 +145,207 @@ pub struct PairResult {
     pub ok: bool,
 }
 
+/// A length-prefixed (u16 LE) byte field within a control message.
+fn put_bytes(b: &mut Vec<u8>, x: &[u8]) {
+    b.extend_from_slice(&(x.len() as u16).to_le_bytes());
+    b.extend_from_slice(x);
+}
+
+/// Read a length-prefixed field at `off`, returning the bytes and the next offset.
+fn get_bytes(b: &[u8], off: usize) -> Result<(&[u8], usize)> {
+    if off + 2 > b.len() {
+        return Err(PunktfunkError::InvalidArg("truncated field"));
+    }
+    let n = u16::from_le_bytes([b[off], b[off + 1]]) as usize;
+    let start = off + 2;
+    if start + n > b.len() {
+        return Err(PunktfunkError::InvalidArg("field overruns message"));
+    }
+    Ok((&b[start..start + n], start + n))
+}
+
 impl PairRequest {
     pub fn encode(&self) -> Vec<u8> {
         let name = self.name.as_bytes();
         let n = name.len().min(64);
-        let mut b = Vec::with_capacity(6 + n);
-        b.extend_from_slice(MAGIC);
+        let mut b = Vec::with_capacity(8 + n + self.spake_a.len());
+        b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_PAIR_REQUEST);
         b.push(n as u8);
         b.extend_from_slice(&name[..n]);
+        put_bytes(&mut b, &self.spake_a);
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<PairRequest> {
-        if b.len() < 6 || &b[0..4] != MAGIC || b[4] != MSG_PAIR_REQUEST {
+        if b.len() < 6 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PAIR_REQUEST {
             return Err(PunktfunkError::InvalidArg("bad PairRequest"));
         }
         let n = b[5] as usize;
         if n > 64 || b.len() < 6 + n {
             return Err(PunktfunkError::InvalidArg("bad PairRequest name"));
         }
+        let name = String::from_utf8_lossy(&b[6..6 + n]).into_owned();
+        let (spake_a, end) = get_bytes(b, 6 + n)?;
+        if end != b.len() {
+            return Err(PunktfunkError::InvalidArg("trailing bytes"));
+        }
         Ok(PairRequest {
-            name: String::from_utf8_lossy(&b[6..6 + n]).into_owned(),
+            name,
+            spake_a: spake_a.to_vec(),
         })
     }
 }
 
 impl PairChallenge {
     pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(21);
-        b.extend_from_slice(MAGIC);
+        let mut b = Vec::with_capacity(7 + self.spake_b.len() + 32);
+        b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_PAIR_CHALLENGE);
-        b.extend_from_slice(&self.salt);
+        put_bytes(&mut b, &self.spake_b);
+        b.extend_from_slice(&self.confirm);
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<PairChallenge> {
-        if b.len() < 21 || &b[0..4] != MAGIC || b[4] != MSG_PAIR_CHALLENGE {
+        if b.len() < 5 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PAIR_CHALLENGE {
             return Err(PunktfunkError::InvalidArg("bad PairChallenge"));
         }
-        let mut salt = [0u8; 16];
-        salt.copy_from_slice(&b[5..21]);
-        Ok(PairChallenge { salt })
+        let (spake_b, end) = get_bytes(b, 5)?;
+        if end + 32 != b.len() {
+            return Err(PunktfunkError::InvalidArg("bad PairChallenge confirm"));
+        }
+        let mut confirm = [0u8; 32];
+        confirm.copy_from_slice(&b[end..end + 32]);
+        Ok(PairChallenge {
+            spake_b: spake_b.to_vec(),
+            confirm,
+        })
     }
 }
 
 impl PairProof {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(37);
-        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_PAIR_PROOF);
-        b.extend_from_slice(&self.hmac);
+        b.extend_from_slice(&self.confirm);
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<PairProof> {
-        if b.len() < 37 || &b[0..4] != MAGIC || b[4] != MSG_PAIR_PROOF {
+        if b.len() != 37 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PAIR_PROOF {
             return Err(PunktfunkError::InvalidArg("bad PairProof"));
         }
-        let mut hmac = [0u8; 32];
-        hmac.copy_from_slice(&b[5..37]);
-        Ok(PairProof { hmac })
+        let mut confirm = [0u8; 32];
+        confirm.copy_from_slice(&b[5..37]);
+        Ok(PairProof { confirm })
     }
 }
 
 impl PairResult {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(6);
-        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_PAIR_RESULT);
         b.push(self.ok as u8);
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<PairResult> {
-        if b.len() < 6 || &b[0..4] != MAGIC || b[4] != MSG_PAIR_RESULT {
+        if b.len() != 6 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PAIR_RESULT {
             return Err(PunktfunkError::InvalidArg("bad PairResult"));
         }
         Ok(PairResult { ok: b[5] != 0 })
     }
 }
 
-/// The pairing proof both sides compute: `HMAC-SHA256(key = PIN ‖ salt,
-/// msg = client_fp ‖ host_fp)`. Binding both fingerprints into the MAC means a
-/// man-in-the-middle (whose certificates differ on at least one side) cannot replay or
-/// forward a valid proof; the PIN is single-attempt on the host, so a 4-digit space
-/// cannot be searched online.
-pub fn pair_proof(
-    pin: &str,
-    salt: &[u8; 16],
-    client_fp: &[u8; 32],
-    host_fp: &[u8; 32],
-) -> [u8; 32] {
+/// SPAKE2 over Ed25519 for the pairing ceremony. The two roles use the asymmetric flow so
+/// the identities are ordered; each side binds **both** certificate fingerprints as the
+/// SPAKE2 identities, so the derived key only matches when client and host agree on the PIN
+/// *and* saw the same two certificates (a MITM, presenting different certs to each leg,
+/// cannot reach a shared key).
+pub mod pake {
+    use super::*;
     use hmac::{Hmac, Mac};
-    let mut key = Vec::with_capacity(pin.len() + 16);
-    key.extend_from_slice(pin.as_bytes());
-    key.extend_from_slice(salt);
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key).expect("hmac key");
-    mac.update(client_fp);
-    mac.update(host_fp);
-    mac.finalize().into_bytes().into()
+    use spake2::{Ed25519Group, Identity, Password, Spake2};
+
+    /// In-progress SPAKE2 state plus the identity transcript for key confirmation.
+    pub struct PairingPake {
+        state: Spake2<Ed25519Group>,
+        transcript: Vec<u8>,
+    }
+
+    /// Start the exchange. `client_fp`/`host_fp` are the two certificate fingerprints (the
+    /// client passes what it observed via TOFU; the host passes its own + the client's
+    /// presented cert). Returns the state and this side's outbound SPAKE2 message.
+    pub fn start(
+        is_client: bool,
+        pin: &str,
+        client_fp: &[u8; 32],
+        host_fp: &[u8; 32],
+    ) -> (PairingPake, Vec<u8>) {
+        let pw = Password::new(pin.as_bytes());
+        let id_client = Identity::new(client_fp);
+        let id_host = Identity::new(host_fp);
+        let (state, msg) = if is_client {
+            Spake2::<Ed25519Group>::start_a(&pw, &id_client, &id_host)
+        } else {
+            Spake2::<Ed25519Group>::start_b(&pw, &id_client, &id_host)
+        };
+        let mut transcript = Vec::with_capacity(64);
+        transcript.extend_from_slice(client_fp);
+        transcript.extend_from_slice(host_fp);
+        (PairingPake { state, transcript }, msg)
+    }
+
+    /// Key confirmation MAC for one direction (`label` distinguishes host vs client), keyed
+    /// by the SPAKE2 shared key and bound to the fingerprint transcript.
+    fn confirm(key: &[u8], label: &[u8], transcript: &[u8]) -> [u8; 32] {
+        let mut mac =
+            <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("hmac takes any key length");
+        mac.update(label);
+        mac.update(transcript);
+        mac.finalize().into_bytes().into()
+    }
+
+    /// `Hmac` verification is constant-time via `ct_eq` in the underlying crate; we compare
+    /// our recomputed tag the same way.
+    fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+        a.iter()
+            .zip(b.iter())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+    }
+
+    /// Confirmation tags both sides expect, given the agreed SPAKE2 key.
+    pub struct Confirmations {
+        /// MAC the host sends (client verifies).
+        pub host: [u8; 32],
+        /// MAC the client sends (host verifies).
+        pub client: [u8; 32],
+    }
+
+    impl PairingPake {
+        /// Finish SPAKE2 with the peer's message → the pair of confirmation tags. `Err` if
+        /// the peer's message is malformed (a wrong PIN does NOT error here — it yields a
+        /// *different* key, so the confirmation MACs simply won't match).
+        pub fn finish(self, peer_msg: &[u8]) -> Result<Confirmations> {
+            let key = self
+                .state
+                .finish(peer_msg)
+                .map_err(|_| PunktfunkError::Crypto)?;
+            Ok(Confirmations {
+                host: confirm(&key, b"punktfunk-pair-host", &self.transcript),
+                client: confirm(&key, b"punktfunk-pair-client", &self.transcript),
+            })
+        }
+    }
+
+    /// Constant-time tag comparison for the confirmation step.
+    pub fn verify(expected: &[u8; 32], got: &[u8; 32]) -> bool {
+        ct_eq(expected, got)
+    }
 }
 
 impl Hello {
@@ -354,7 +471,7 @@ impl Reconfigure {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] w[5..9] h[9..13] hz[13..17]
         let mut b = Vec::with_capacity(17);
-        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_RECONFIGURE);
         b.extend_from_slice(&self.mode.width.to_le_bytes());
         b.extend_from_slice(&self.mode.height.to_le_bytes());
@@ -363,7 +480,7 @@ impl Reconfigure {
     }
 
     pub fn decode(b: &[u8]) -> Result<Reconfigure> {
-        if b.len() < 17 || &b[0..4] != MAGIC || b[4] != MSG_RECONFIGURE {
+        if b.len() != 17 || &b[0..4] != CTL_MAGIC || b[4] != MSG_RECONFIGURE {
             return Err(PunktfunkError::InvalidArg("bad Reconfigure"));
         }
         let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
@@ -381,7 +498,7 @@ impl Reconfigured {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] accepted[5] w[6..10] h[10..14] hz[14..18]
         let mut b = Vec::with_capacity(18);
-        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_RECONFIGURED);
         b.push(self.accepted as u8);
         b.extend_from_slice(&self.mode.width.to_le_bytes());
@@ -391,7 +508,7 @@ impl Reconfigured {
     }
 
     pub fn decode(b: &[u8]) -> Result<Reconfigured> {
-        if b.len() < 18 || &b[0..4] != MAGIC || b[4] != MSG_RECONFIGURED {
+        if b.len() != 18 || &b[0..4] != CTL_MAGIC || b[4] != MSG_RECONFIGURED {
             return Err(PunktfunkError::InvalidArg("bad Reconfigured"));
         }
         let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
@@ -861,6 +978,86 @@ mod tests {
             .encode()
         )
         .is_err());
+    }
+
+    #[test]
+    fn control_messages_disjoint_from_hello() {
+        // A Hello uses MAGIC (PKF1); control messages use CTL_MAGIC (PKFc). No Hello — at
+        // any abi_version — can be misparsed as a control message, and vice-versa.
+        for abi in [1u32, 2, 16, 0x10, 0x0113, 0x1410] {
+            let h = Hello {
+                abi_version: abi,
+                mode: Mode {
+                    width: 1280,
+                    height: 720,
+                    refresh_hz: 60,
+                },
+            }
+            .encode();
+            assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");
+            assert!(Reconfigure::decode(&h).is_err());
+        }
+        // And a PairRequest never parses as a Hello.
+        let pr = PairRequest {
+            name: "x".into(),
+            spake_a: vec![0u8; 33],
+        }
+        .encode();
+        assert!(Hello::decode(&pr).is_err());
+    }
+
+    #[test]
+    fn pair_messages_roundtrip() {
+        let pr = PairRequest {
+            name: "Enrico's Mac".into(),
+            spake_a: vec![1, 2, 3, 4, 5],
+        };
+        assert_eq!(PairRequest::decode(&pr.encode()).unwrap(), pr);
+        let pc = PairChallenge {
+            spake_b: vec![9; 33],
+            confirm: [7u8; 32],
+        };
+        assert_eq!(PairChallenge::decode(&pc.encode()).unwrap(), pc);
+        let pp = PairProof { confirm: [3u8; 32] };
+        assert_eq!(PairProof::decode(&pp.encode()).unwrap(), pp);
+        for ok in [true, false] {
+            assert_eq!(
+                PairResult::decode(&PairResult { ok }.encode()).unwrap().ok,
+                ok
+            );
+        }
+        // Length-exact: a truncated/padded PairProof is rejected.
+        let mut bad = pp.encode();
+        bad.push(0);
+        assert!(PairProof::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn spake2_pairing_agrees_only_on_matching_pin_and_certs() {
+        let cfp = [0x11u8; 32];
+        let hfp = [0x22u8; 32];
+
+        // Right PIN, same fingerprint views on both sides → both confirmations agree.
+        let (ca, ma) = pake::start(true, "4321", &cfp, &hfp);
+        let (cb, mb) = pake::start(false, "4321", &cfp, &hfp);
+        let a = ca.finish(&mb).unwrap();
+        let b = cb.finish(&ma).unwrap();
+        assert!(pake::verify(&a.host, &b.host) && pake::verify(&a.client, &b.client));
+
+        // Wrong PIN → different keys → confirmations DON'T match (one online guess wasted).
+        let (ca, ma) = pake::start(true, "0000", &cfp, &hfp);
+        let (cb, mb) = pake::start(false, "4321", &cfp, &hfp);
+        let a = ca.finish(&mb).unwrap();
+        let b = cb.finish(&ma).unwrap();
+        assert!(!pake::verify(&a.client, &b.client));
+
+        // MITM: the two legs saw different host certs → no agreement even with the right PIN.
+        let attacker_hfp = [0x33u8; 32];
+        let (ca, ma) = pake::start(true, "4321", &cfp, &attacker_hfp);
+        let (cb, mb) = pake::start(false, "4321", &cfp, &hfp);
+        let a = ca.finish(&mb).unwrap();
+        let b = cb.finish(&ma).unwrap();
+        assert!(!pake::verify(&a.client, &b.client));
     }
 
     #[test]
