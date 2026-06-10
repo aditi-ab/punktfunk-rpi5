@@ -27,22 +27,57 @@ use std::time::Duration;
 /// (display freshness over completeness — FEC/keyframes recover).
 const FRAME_QUEUE: usize = 16;
 
+/// Audio packets buffered for the embedder: 64 × 5 ms = 320 ms of slack. A lagging
+/// embedder drops the newest packet (the audio renderer conceals the gap).
+const AUDIO_QUEUE: usize = 64;
+
+/// Rumble updates buffered for the embedder. Overflow drops the NEWEST update (same
+/// `try_send` discipline as the other planes) — the host re-sends rumble state
+/// periodically, so a dropped transition (including a stop) heals within ~500 ms.
+const RUMBLE_QUEUE: usize = 16;
+
+/// One Opus packet from the host's audio datagram stream (48 kHz stereo, 5 ms frames).
+#[derive(Clone, Debug)]
+pub struct AudioPacket {
+    pub seq: u32,
+    pub pts_ns: u64,
+    /// The raw Opus payload — feed it to an Opus decoder as one frame.
+    pub data: Vec<u8>,
+}
+
 pub struct NativeClient {
     frames: Receiver<Frame>,
+    audio: Receiver<AudioPacket>,
+    rumble: Receiver<(u16, u16, u16)>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     shutdown: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     /// The host-confirmed session mode (from the Welcome).
     pub mode: Mode,
+    /// SHA-256 fingerprint of the certificate the host actually presented. A TOFU caller
+    /// (`pin = None`) persists this and passes it as the pin from then on.
+    pub host_fingerprint: [u8; 32],
 }
 
 impl NativeClient {
     /// Connect to a `lumen/1` host and start the session at (up to) `mode`. Blocks until the
     /// handshake completes or `timeout` elapses.
-    pub fn connect(host: &str, port: u16, mode: Mode, timeout: Duration) -> Result<NativeClient> {
+    ///
+    /// `pin`: expected SHA-256 of the host's certificate. `Some` and the host presents
+    /// anything else → the handshake is rejected ([`LumenError::Crypto`]). `None` = trust on
+    /// first use; check [`NativeClient::host_fingerprint`] after connecting.
+    pub fn connect(
+        host: &str,
+        port: u16,
+        mode: Mode,
+        pin: Option<[u8; 32]>,
+        timeout: Duration,
+    ) -> Result<NativeClient> {
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(FRAME_QUEUE);
+        let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(AUDIO_QUEUE);
+        let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<(u16, u16, u16)>(RUMBLE_QUEUE);
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Mode>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(Mode, [u8; 32])>>();
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let host = host.to_string();
@@ -61,14 +96,23 @@ impl NativeClient {
                         return;
                     }
                 };
-                rt.block_on(worker_main(
-                    host, port, mode, frame_tx, input_rx, ready_tx, shutdown_w,
-                ));
+                rt.block_on(worker_main(WorkerArgs {
+                    host,
+                    port,
+                    mode,
+                    pin,
+                    frame_tx,
+                    audio_tx,
+                    rumble_tx,
+                    input_rx,
+                    ready_tx,
+                    shutdown: shutdown_w,
+                }));
             })
             .map_err(LumenError::Io)?;
 
-        let negotiated = match ready_rx.recv_timeout(timeout) {
-            Ok(Ok(m)) => m,
+        let (negotiated, fingerprint) = match ready_rx.recv_timeout(timeout) {
+            Ok(Ok(t)) => t,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 shutdown.store(true, Ordering::SeqCst);
@@ -77,18 +121,47 @@ impl NativeClient {
         };
         Ok(NativeClient {
             frames: frame_rx,
+            audio: audio_rx,
+            rumble: rumble_rx,
             input_tx,
             shutdown,
             worker: Some(worker),
             mode: negotiated,
+            host_fingerprint: fingerprint,
         })
     }
 
     /// Pull the next reassembled, FEC-recovered access unit; [`LumenError::NoFrame`] on
     /// timeout, [`LumenError::Closed`]-class errors once the session ended.
-    pub fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
+    ///
+    /// Plane concurrency: each pull method drains its own queue, so video, audio and
+    /// rumble may each be pulled from their own thread — but at most one thread per plane
+    /// (`&self` here supports the cross-plane sharing; a plane's queue is still
+    /// single-consumer by contract).
+    pub fn next_frame(&self, timeout: Duration) -> Result<Frame> {
         match self.frames.recv_timeout(timeout) {
             Ok(f) => Ok(f),
+            Err(RecvTimeoutError::Timeout) => Err(LumenError::NoFrame),
+            Err(RecvTimeoutError::Disconnected) => Err(LumenError::Closed),
+        }
+    }
+
+    /// Pull the next Opus audio packet; [`LumenError::NoFrame`] on timeout,
+    /// [`LumenError::Closed`] once the session ended. Drain on a dedicated audio thread —
+    /// packets arrive every 5 ms.
+    pub fn next_audio(&self, timeout: Duration) -> Result<AudioPacket> {
+        match self.audio.recv_timeout(timeout) {
+            Ok(p) => Ok(p),
+            Err(RecvTimeoutError::Timeout) => Err(LumenError::NoFrame),
+            Err(RecvTimeoutError::Disconnected) => Err(LumenError::Closed),
+        }
+    }
+
+    /// Pull the next rumble update `(pad, low, high)`; same semantics as
+    /// [`NativeClient::next_audio`]. Amplitudes are 0..0xFFFF, `(0, 0)` = stop.
+    pub fn next_rumble(&self, timeout: Duration) -> Result<(u16, u16, u16)> {
+        match self.rumble.recv_timeout(timeout) {
+            Ok(r) => Ok(r),
             Err(RecvTimeoutError::Timeout) => Err(LumenError::NoFrame),
             Err(RecvTimeoutError::Disconnected) => Err(LumenError::Closed),
         }
@@ -109,27 +182,55 @@ impl Drop for NativeClient {
     }
 }
 
-/// The worker: QUIC handshake, then the input task + the blocking data-plane pump.
-async fn worker_main(
+struct WorkerArgs {
     host: String,
     port: u16,
     mode: Mode,
+    pin: Option<[u8; 32]>,
     frame_tx: SyncSender<Frame>,
-    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
-    ready_tx: std::sync::mpsc::Sender<Result<Mode>>,
+    audio_tx: SyncSender<AudioPacket>,
+    rumble_tx: SyncSender<(u16, u16, u16)>,
+    input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    ready_tx: std::sync::mpsc::Sender<Result<(Mode, [u8; 32])>>,
     shutdown: Arc<AtomicBool>,
-) {
+}
+
+/// The worker: QUIC handshake, then the input/datagram tasks + the blocking data-plane pump.
+async fn worker_main(args: WorkerArgs) {
+    let WorkerArgs {
+        host,
+        port,
+        mode,
+        pin,
+        frame_tx,
+        audio_tx,
+        rumble_tx,
+        mut input_rx,
+        ready_tx,
+        shutdown,
+    } = args;
     let setup = async {
         let remote: std::net::SocketAddr = format!("{host}:{port}")
             .parse()
             .map_err(|_| LumenError::InvalidArg("host:port"))?;
-        let ep = endpoint::client_insecure()
-            .map_err(|e| LumenError::Io(std::io::Error::other(e.to_string())))?;
+        let (ep, observed) = endpoint::client_pinned(pin);
+        let ep = ep.map_err(|e| LumenError::Io(std::io::Error::other(e.to_string())))?;
         let conn = ep
             .connect(remote, "lumen")
             .map_err(|_| LumenError::InvalidArg("connect"))?
             .await
-            .map_err(|e| LumenError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| {
+                // A pin mismatch surfaces as a TLS failure; report it as a crypto error so
+                // the embedder can distinguish "wrong host identity" from plain IO trouble.
+                let fp_mismatch = pin.is_some()
+                    && observed.lock().unwrap().map(|fp| Some(fp) != pin) == Some(true);
+                if fp_mismatch {
+                    LumenError::Crypto
+                } else {
+                    LumenError::Io(std::io::Error::other(e.to_string()))
+                }
+            })?;
+        let fingerprint = observed.lock().unwrap().unwrap_or([0u8; 32]);
         let (mut send, mut recv) = conn
             .open_bi()
             .await
@@ -163,23 +264,48 @@ async fn worker_main(
         let transport =
             UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())?;
         let session = Session::new(welcome.session_config(Role::Client), Box::new(transport))?;
-        Ok::<_, LumenError>((conn, session, welcome.mode))
+        Ok::<_, LumenError>((conn, session, welcome.mode, fingerprint))
     };
 
-    let (conn, mut session, negotiated) = match setup.await {
+    let (conn, mut session, negotiated, fingerprint) = match setup.await {
         Ok(t) => t,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
             return;
         }
     };
-    let _ = ready_tx.send(Ok(negotiated));
+    let _ = ready_tx.send(Ok((negotiated, fingerprint)));
 
     // Input task: embedder events → QUIC datagrams.
     let input_conn = conn.clone();
     tokio::spawn(async move {
         while let Some(ev) = input_rx.recv().await {
             let _ = input_conn.send_datagram(ev.encode().to_vec().into());
+        }
+    });
+
+    // Datagram demux: host → client audio/rumble (try_send: a lagging embedder drops the
+    // newest packet rather than backing up the QUIC receive path).
+    let dgram_conn = conn.clone();
+    tokio::spawn(async move {
+        while let Ok(d) = dgram_conn.read_datagram().await {
+            match d.first() {
+                Some(&crate::quic::AUDIO_MAGIC) => {
+                    if let Some((seq, pts_ns, opus)) = crate::quic::decode_audio_datagram(&d) {
+                        let _ = audio_tx.try_send(AudioPacket {
+                            seq,
+                            pts_ns,
+                            data: opus.to_vec(),
+                        });
+                    }
+                }
+                Some(&crate::quic::RUMBLE_MAGIC) => {
+                    if let Some(r) = crate::quic::decode_rumble_datagram(&d) {
+                        let _ = rumble_tx.try_send(r);
+                    }
+                }
+                _ => {} // unknown tag — a newer host; ignore
+            }
         }
     });
 

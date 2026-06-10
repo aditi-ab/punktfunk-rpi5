@@ -23,9 +23,47 @@ pub enum InputKind {
     MouseButtonUp = 5,
     /// `x` carries the (signed) scroll delta.
     MouseScroll = 6,
+    /// `code` = button bit ([`gamepad`] `BTN_*`), `x` ≠ 0 = pressed, `flags` = pad index.
     GamepadButton = 7,
-    /// `code` = axis id, `x` = axis value.
+    /// `code` = axis id ([`gamepad`] `AXIS_*`), `x` = axis value, `flags` = pad index.
+    /// Sticks are i16 range (−32768..32767) in the XInput/Moonlight convention — **+y =
+    /// up** (unlike mouse coordinates); triggers 0..255.
     GamepadAxis = 8,
+}
+
+/// The gamepad wire contract for [`InputKind::GamepadButton`]/[`InputKind::GamepadAxis`].
+///
+/// Everything follows the GameStream/XInput conventions end to end: buttons reuse
+/// GameStream's `buttonFlags` bit positions, sticks are −32768..32767 with **+y = up**,
+/// triggers 0..255 (what Moonlight sends and what the host's virtual xpad already
+/// consumes). One event carries one transition: `code` = the bit below, `x` = 1 pressed /
+/// 0 released. Axes are sent individually; the host accumulates per-pad state and emits
+/// one evdev SYN per event.
+pub mod gamepad {
+    pub const BTN_DPAD_UP: u32 = 0x0001;
+    pub const BTN_DPAD_DOWN: u32 = 0x0002;
+    pub const BTN_DPAD_LEFT: u32 = 0x0004;
+    pub const BTN_DPAD_RIGHT: u32 = 0x0008;
+    pub const BTN_START: u32 = 0x0010;
+    pub const BTN_BACK: u32 = 0x0020;
+    pub const BTN_LS_CLICK: u32 = 0x0040;
+    pub const BTN_RS_CLICK: u32 = 0x0080;
+    pub const BTN_LB: u32 = 0x0100;
+    pub const BTN_RB: u32 = 0x0200;
+    pub const BTN_GUIDE: u32 = 0x0400;
+    pub const BTN_A: u32 = 0x1000;
+    pub const BTN_B: u32 = 0x2000;
+    pub const BTN_X: u32 = 0x4000;
+    pub const BTN_Y: u32 = 0x8000;
+
+    /// Axis ids for `InputKind::GamepadAxis`.
+    pub const AXIS_LS_X: u32 = 0;
+    pub const AXIS_LS_Y: u32 = 1;
+    pub const AXIS_RS_X: u32 = 2;
+    pub const AXIS_RS_Y: u32 = 3;
+    /// Triggers: value range 0..255.
+    pub const AXIS_LT: u32 = 4;
+    pub const AXIS_RT: u32 = 5;
 }
 
 impl InputKind {

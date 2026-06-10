@@ -9,8 +9,13 @@
 //! `--input-test` exercises the input plane: scripted mouse/keyboard datagrams during the
 //! stream (watch them land in the host session, e.g. xev inside gamescope).
 //!
-//! Usage: `lumen-client-rs [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE] [--input-test]`
-//! (M4 adds VAAPI decode + wgpu present on this same skeleton.)
+//! `--pin <64-hex>` pins the host's certificate fingerprint (the host logs it at startup);
+//! without it the client trusts on first use and prints the observed fingerprint to pin.
+//! Host→client datagrams (Opus audio, rumble) are counted and reported with the stream
+//! stats — decode/playback is the platform clients' job.
+//!
+//! Usage: `lumen-client-rs [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE] [--input-test]
+//!         [--pin HEX]` (M4 adds VAAPI decode + wgpu present on this same skeleton.)
 
 use anyhow::{anyhow, Context, Result};
 use lumen_core::config::Role;
@@ -25,6 +30,22 @@ struct Args {
     mode: Mode,
     out: Option<String>,
     input_test: bool,
+    pin: Option<[u8; 32]>,
+}
+
+fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn hex(fp: &[u8; 32]) -> String {
+    fp.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn parse_args() -> Args {
@@ -49,11 +70,26 @@ fn parse_args() -> Args {
             height: 720,
             refresh_hz: 60,
         });
+    // A present-but-malformed --pin must abort, not silently downgrade to trust-on-first-use
+    // (the user asked for verification; fail closed).
+    let pin = match get("--pin") {
+        None => None,
+        Some(s) => {
+            match parse_hex32(s) {
+                Some(p) => Some(p),
+                None => {
+                    eprintln!("--pin must be exactly 64 hex chars (the host logs its fingerprint at startup)");
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
     Args {
         connect: get("--connect").unwrap_or("127.0.0.1:9777").to_string(),
         mode,
         out: get("--out").map(String::from),
         input_test: argv.iter().any(|a| a == "--input-test"),
+        pin,
     }
 }
 
@@ -87,13 +123,22 @@ fn run(args: Args) -> Result<()> {
 
 async fn session(args: Args) -> Result<()> {
     let remote: std::net::SocketAddr = args.connect.parse().context("--connect host:port")?;
-    let ep = endpoint::client_insecure().map_err(|e| anyhow!("QUIC client endpoint: {e}"))?;
+    let (ep, observed) = endpoint::client_pinned(args.pin);
+    let ep = ep.map_err(|e| anyhow!("QUIC client endpoint: {e}"))?;
     let conn = ep
         .connect(remote, "lumen")
         .context("connect")?
         .await
-        .context("QUIC handshake")?;
-    tracing::info!(%remote, "lumen/1 connected");
+        .context("QUIC handshake (a pin mismatch fails here)")?;
+    match (args.pin, *observed.lock().unwrap()) {
+        (Some(_), _) => tracing::info!(%remote, "lumen/1 connected — host fingerprint pinned"),
+        (None, Some(fp)) => tracing::info!(
+            %remote,
+            fingerprint = %hex(&fp),
+            "lumen/1 connected (trust-on-first-use) — pass --pin to verify this host"
+        ),
+        (None, None) => tracing::info!(%remote, "lumen/1 connected"),
+    }
     let (mut send, mut recv) = conn.open_bi().await.context("open control stream")?;
 
     io::write_msg(
@@ -163,6 +208,29 @@ async fn session(args: Args) -> Result<()> {
                         };
                         let _ = conn2.send_datagram(key.encode().to_vec().into());
                     }
+                    // Gamepad plane: tap A + sweep the left stick on pad 0 (the host
+                    // accumulates these into its virtual xpad; needs /dev/uinput access).
+                    use lumen_core::input::gamepad::{AXIS_LS_X, BTN_A};
+                    let pad_events = [
+                        (InputKind::GamepadButton, BTN_A, 1),
+                        (InputKind::GamepadButton, BTN_A, 0),
+                        (
+                            InputKind::GamepadAxis,
+                            AXIS_LS_X,
+                            ((i as i32) % 64 - 32) * 1024,
+                        ),
+                    ];
+                    for (kind, code, x) in pad_events {
+                        let ev = InputEvent {
+                            kind,
+                            _pad: [0; 3],
+                            code,
+                            x,
+                            y: 0,
+                            flags: 0, // pad index 0
+                        };
+                        let _ = conn2.send_datagram(ev.encode().to_vec().into());
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(40)).await;
             }
@@ -181,13 +249,34 @@ async fn session(args: Args) -> Result<()> {
         });
     }
 
+    // Host→client datagrams: count Opus audio + rumble (playback is the platform clients'
+    // job; here we verify the planes flow).
+    let audio_pkts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let audio_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let rumble_pkts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let (a, ab, r) = (audio_pkts.clone(), audio_bytes.clone(), rumble_pkts.clone());
+        let conn2 = conn.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            while let Ok(d) = conn2.read_datagram().await {
+                if let Some((_, _, opus)) = lumen_core::quic::decode_audio_datagram(&d) {
+                    a.fetch_add(1, Relaxed);
+                    ab.fetch_add(opus.len() as u64, Relaxed);
+                } else if lumen_core::quic::decode_rumble_datagram(&d).is_some() {
+                    r.fetch_add(1, Relaxed);
+                }
+            }
+        });
+    }
+
     let host_udp = std::net::SocketAddr::new(remote.ip(), welcome.udp_port);
     let cfg = welcome.session_config(Role::Client);
     let expected = welcome.frames;
     let out_path = args.out.clone();
 
     // Data plane on a blocking thread (native threads only on the frame path).
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
         let transport =
             UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())
                 .context("bind data plane")?;
@@ -281,10 +370,28 @@ async fn session(args: Args) -> Result<()> {
         }
         Ok(())
     })
-    .await??;
+    .await?;
+
+    // Report the side planes whether or not the video plane succeeded.
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (a, ab, r) = (
+            audio_pkts.load(Relaxed),
+            audio_bytes.load(Relaxed),
+            rumble_pkts.load(Relaxed),
+        );
+        if a > 0 || r > 0 {
+            tracing::info!(
+                audio_pkts = a,
+                audio_kb = ab / 1000,
+                rumble_pkts = r,
+                "host→client datagrams (Opus 48 kHz stereo, 5 ms frames)"
+            );
+        }
+    }
 
     conn.close(0u32.into(), b"done");
-    Ok(())
+    result
 }
 
 /// The host's deterministic test frame (mirror of `lumen-host::m3::test_frame`).

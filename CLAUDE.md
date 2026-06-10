@@ -26,13 +26,21 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   socket, wlr protocols on Sway) and **gamepads** (uinput X-Box-360 pads + rumble
   back-channel; live validation pending the udev rule below). Management REST API +
   checked-in OpenAPI doc (`mgmt.rs`).
-- **M3 (`lumen/1`, the native protocol): seeded and validated.** QUIC control plane
-  (`lumen-core` `quic` feature: Hello{mode}/Welcome{full Config}/Start), data plane = the
-  hardened M1 `Session` over raw UDP with **GF(2¹⁶) Leopard FEC + AES-GCM** (inexpressible
-  in GameStream), input over **QUIC datagrams**, host creates the native virtual output at
-  the client's requested mode. Measured on-box at 720p120: 1680/1680 frames, **p50 0.83 ms**
-  capture→encode→FEC→crypto→UDP→reassembled. `lumen-client-rs` is a working (headless)
-  reference client. Trust is seed-stage (self-signed / accept-any).
+- **M3 (`lumen/1`, the native protocol): full session planes, validated live.** QUIC
+  control plane (`lumen-core` `quic` feature: Hello{mode}/Welcome{full Config}/Start), data
+  plane = the hardened M1 `Session` over raw UDP with **GF(2¹⁶) Leopard FEC + AES-GCM**
+  (inexpressible in GameStream), host creates the native virtual output at the client's
+  requested mode. `m3-host` is a **persistent listener** (sessions back to back;
+  `--max-sessions`). QUIC datagrams carry the side planes, demuxed by first byte: input
+  0xC8 (incl. **gamepads** — incremental events accumulated into the uinput xpad), **Opus
+  audio** 0xC9 (48 kHz stereo, 5 ms, host→client), **rumble** 0xCA (host→client). **Trust:**
+  host serves its persistent identity (`~/.config/lumen/cert.pem`, shared with GameStream
+  pairing) and logs the SHA-256 fingerprint; clients pin it (TOFU on first connect —
+  `endpoint::client_pinned`). Measured on-box at 720p120: 1680/1680 frames, **p50 0.83 ms**
+  capture→…→reassembled; audio measured live (~200 pkts/s). `lumen-client-rs` is the
+  working reference client (`--pin`, datagram counters, `--input-test` incl. gamepad).
+  The embeddable connector (`NativeClient`) exposes it all over the C ABI: `lumen_connect`
+  (pin/TOFU) + `next_au`/`next_audio`/`next_rumble`/`send_input`.
 
 ## What's left
 
@@ -45,10 +53,12 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).
-3. **lumen/1 trust model**: pairing + certificate pinning to replace accept-any.
+3. **lumen/1 protocol growth**: a PIN-style pairing ceremony on top of fingerprint pinning,
+   mid-stream mode renegotiation (the Welcome is one-shot today), concurrent sessions
+   (today: one at a time, extras wait in the accept queue).
 4. **M2 polish**: wlroots/Sway `VirtualDisplay` backend (deferred; swaymsg `create_output`),
-   GNOME live validation, gamepad live validation, HDR/10-bit/AV1 negotiation, surround
-   audio, reconnect-at-new-mode robustness.
+   GNOME live validation, gamepad live validation (blocked on the udev rule below),
+   HDR/10-bit/AV1 negotiation, surround audio, reconnect-at-new-mode robustness.
 5. **Native clients** (`clients/{apple,android}` scaffolds) consuming `lumen_core.h`.
 6. **This box, one-time setup still pending**: `sudo cp scripts/60-lumen.rules
    /etc/udev/rules.d/` + user into `input` group (gamepads); `sudo ninja -C
@@ -59,7 +69,7 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
 
 ```sh
 cargo build --workspace          # green on Linux and macOS
-cargo test  --workspace          # unit + loopback + proptest + C ABI harness (~92 tests)
+cargo test  --workspace          # unit + loopback + proptest + C ABI harness (~97 tests)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 
@@ -123,9 +133,10 @@ kwin_wayland --virtual --width 1920 --height 1080 --no-lockscreen --socket wayla
 WAYLAND_DISPLAY=wayland-kde XDG_CURRENT_DESKTOP=KDE LUMEN_VIDEO_SOURCE=virtual \
 LUMEN_ZEROCOPY=1 PATH=/tmp/gamescope-src/build/src:$PATH cargo run -rp lumen-host -- serve
 
-# lumen/1 native loopback test (no Moonlight needed):
-cargo run -rp lumen-host -- m3-host --source virtual --seconds 10   # + LUMEN_COMPOSITOR=gamescope etc.
-cargo run -rp lumen-client-rs -- --mode 1280x720x120 --out /tmp/a.h265 --input-test
+# lumen/1 native loopback test (no Moonlight needed; same env as serve, listener persists
+# across sessions — bound it with --max-sessions):
+cargo run -rp lumen-host -- m3-host --source virtual --seconds 10 --max-sessions 1
+cargo run -rp lumen-client-rs -- --mode 1280x720x120 --out /tmp/a.h265 --input-test  # + --pin HEX
 ```
 
 Pinned crate facts: `ashpd` 0.13 + `pipewire` 0.9 (must match ashpd's) + `ffmpeg-next` 8.x

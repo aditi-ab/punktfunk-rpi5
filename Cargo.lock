@@ -1486,6 +1486,8 @@ dependencies = [
  "rcgen",
  "reed-solomon-simd",
  "rustls",
+ "rustls-pki-types",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

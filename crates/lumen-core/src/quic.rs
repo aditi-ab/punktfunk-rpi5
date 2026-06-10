@@ -16,9 +16,11 @@
 //! Leopard, which GameStream can't express), shard sizing, crypto key/salt — so the data
 //! plane is exactly the hardened M1 `Session`.
 //!
-//! Seed-stage transport security: the host presents a self-signed certificate and the client
-//! accepts any (pairing/pinning lands with the trust model; the data plane's AES-GCM is
-//! already real). All integers little-endian; every message is `u16 length || payload`.
+//! Transport security: the host presents a long-lived self-signed certificate
+//! ([`endpoint::server_with_identity`]) and the client pins its SHA-256 fingerprint
+//! ([`endpoint::client_pinned`]; no pin = trust-on-first-use, with the observed fingerprint
+//! reported back for persisting). The data plane adds AES-GCM on top.
+//! All integers little-endian; every message is `u16 length || payload`.
 
 use crate::config::{Config, FecConfig, FecScheme, Mode, ProtocolPhase, Role};
 use crate::error::{LumenError, Result};
@@ -183,6 +185,53 @@ pub fn frame(payload: &[u8]) -> Vec<u8> {
     b
 }
 
+/// Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
+/// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8),
+/// audio = [`AUDIO_MAGIC`], rumble = [`RUMBLE_MAGIC`].
+pub const AUDIO_MAGIC: u8 = 0xC9;
+pub const RUMBLE_MAGIC: u8 = 0xCA;
+
+/// Audio datagram, host → client: `[0xC9][u32 seq LE][u64 pts_ns LE][opus payload]`.
+/// One Opus frame per datagram (5 ms — well under any MTU); QUIC already encrypts.
+pub fn encode_audio_datagram(seq: u32, pts_ns: u64, opus: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(13 + opus.len());
+    b.push(AUDIO_MAGIC);
+    b.extend_from_slice(&seq.to_le_bytes());
+    b.extend_from_slice(&pts_ns.to_le_bytes());
+    b.extend_from_slice(opus);
+    b
+}
+
+/// Parse an audio datagram → `(seq, pts_ns, opus payload)`. `None` on bad tag/length.
+pub fn decode_audio_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
+    if b.len() < 13 || b[0] != AUDIO_MAGIC {
+        return None;
+    }
+    let seq = u32::from_le_bytes(b[1..5].try_into().unwrap());
+    let pts_ns = u64::from_le_bytes(b[5..13].try_into().unwrap());
+    Some((seq, pts_ns, &b[13..]))
+}
+
+/// Rumble datagram, host → client: `[0xCA][u16 pad LE][u16 low LE][u16 high LE]`.
+/// Force-feedback state for pad `pad` (0xFFFF amplitudes, 0/0 = stop).
+pub fn encode_rumble_datagram(pad: u16, low: u16, high: u16) -> [u8; 7] {
+    let mut b = [0u8; 7];
+    b[0] = RUMBLE_MAGIC;
+    b[1..3].copy_from_slice(&pad.to_le_bytes());
+    b[3..5].copy_from_slice(&low.to_le_bytes());
+    b[5..7].copy_from_slice(&high.to_le_bytes());
+    b
+}
+
+/// Parse a rumble datagram → `(pad, low, high)`. `None` on bad tag/length.
+pub fn decode_rumble_datagram(b: &[u8]) -> Option<(u16, u16, u16)> {
+    if b.len() < 7 || b[0] != RUMBLE_MAGIC {
+        return None;
+    }
+    let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    Some((u16at(1), u16at(3), u16at(5)))
+}
+
 /// Async framed-message IO over a quinn stream (`u16 LE length || payload`).
 pub mod io {
     /// Read one framed message (bounded at 64 KiB — control messages are tiny).
@@ -207,35 +256,99 @@ pub mod io {
     }
 }
 
-/// quinn endpoint constructors (host self-signed; client accepts-any — seed-stage trust).
+/// quinn endpoint constructors. Host: self-signed identity (fresh, or persisted PEMs via
+/// [`endpoint::server_with_identity`]). Client: fingerprint pinning / TOFU via
+/// [`endpoint::client_pinned`] ([`endpoint::client_insecure`] is the no-pin special case).
 pub mod endpoint {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    /// Server endpoint with a fresh self-signed certificate.
+    /// Server endpoint with a fresh self-signed certificate (tests/dev — production hosts
+    /// persist an identity and use [`server_with_identity`] so clients can pin it).
     pub fn server(addr: std::net::SocketAddr) -> anyhow_result::Result<quinn::Endpoint> {
         let cert = rcgen::generate_simple_self_signed(vec!["lumen".into()])
             .map_err(|e| anyhow_result::Error::msg(format!("self-signed cert: {e}")))?;
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
         let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let server_config =
-            quinn::ServerConfig::with_single_cert(vec![cert_der], key_der.into())
-                .map_err(|e| anyhow_result::Error::msg(format!("server config: {e}")))?;
+        server_from_der(cert_der, key_der.into(), addr)
+    }
+
+    /// Server endpoint from a persisted PEM identity (certificate + PKCS#8 private key) —
+    /// the host's long-lived self-signed cert, so the fingerprint clients pin is stable
+    /// across restarts.
+    pub fn server_with_identity(
+        addr: std::net::SocketAddr,
+        cert_pem: &str,
+        key_pem: &str,
+    ) -> anyhow_result::Result<quinn::Endpoint> {
+        use rustls::pki_types::pem::PemObject;
+        let cert_der = rustls::pki_types::CertificateDer::from_pem_slice(cert_pem.as_bytes())
+            .map_err(|e| anyhow_result::Error::msg(format!("cert pem: {e}")))?;
+        let key_der = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+            .map_err(|e| anyhow_result::Error::msg(format!("key pem: {e}")))?;
+        server_from_der(cert_der, key_der, addr)
+    }
+
+    fn server_from_der(
+        cert_der: rustls::pki_types::CertificateDer<'static>,
+        key_der: rustls::pki_types::PrivateKeyDer<'static>,
+        addr: std::net::SocketAddr,
+    ) -> anyhow_result::Result<quinn::Endpoint> {
+        let server_config = quinn::ServerConfig::with_single_cert(vec![cert_der], key_der)
+            .map_err(|e| anyhow_result::Error::msg(format!("server config: {e}")))?;
         Ok(quinn::Endpoint::server(server_config, addr)?)
     }
 
-    /// Client endpoint that skips certificate verification (seed stage; pinning lands with
-    /// the pairing/trust model).
+    /// SHA-256 of a certificate's DER encoding — the fingerprint clients pin.
+    pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(cert_der).into()
+    }
+
+    /// Fingerprint of a PEM-encoded certificate (what a host logs/shows for pairing UX —
+    /// must match what the client's verifier computes from the DER on the wire).
+    pub fn fingerprint_of_pem(cert_pem: &str) -> anyhow_result::Result<[u8; 32]> {
+        use rustls::pki_types::pem::PemObject;
+        let der = rustls::pki_types::CertificateDer::from_pem_slice(cert_pem.as_bytes())
+            .map_err(|e| anyhow_result::Error::msg(format!("cert pem: {e}")))?;
+        Ok(cert_fingerprint(der.as_ref()))
+    }
+
+    /// Client endpoint that skips certificate verification (TOFU bootstrap — read the
+    /// observed fingerprint off the slot and pin it on the next connect).
     pub fn client_insecure() -> anyhow_result::Result<quinn::Endpoint> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let rustls_cfg = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipVerify))
-            .with_no_client_auth();
-        let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
-            .map_err(|e| anyhow_result::Error::msg(format!("quic client config: {e}")))?;
-        let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
-        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_cfg)));
-        Ok(ep)
+        client_pinned(None).0
+    }
+
+    /// What [`client_pinned`] returns: the endpoint plus the slot the verifier writes the
+    /// observed host fingerprint into during the handshake.
+    pub type PinnedClient = (
+        anyhow_result::Result<quinn::Endpoint>,
+        Arc<Mutex<Option<[u8; 32]>>>,
+    );
+
+    /// Client endpoint that verifies the host by certificate fingerprint.
+    ///
+    /// `pin = Some(sha256)` rejects any host whose leaf cert doesn't hash to `sha256`;
+    /// `None` accepts any (trust-on-first-use). Either way the observed fingerprint is
+    /// written to the returned slot during the handshake, so a TOFU caller can persist it.
+    pub fn client_pinned(pin: Option<[u8; 32]>) -> PinnedClient {
+        let observed = Arc::new(Mutex::new(None));
+        let ep = (|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let rustls_cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(PinVerify {
+                    pin,
+                    observed: observed.clone(),
+                }))
+                .with_no_client_auth();
+            let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
+                .map_err(|e| anyhow_result::Error::msg(format!("quic client config: {e}")))?;
+            let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+            ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_cfg)));
+            Ok(ep)
+        })();
+        (ep, observed)
     }
 
     /// Minimal error plumbing without pulling anyhow into lumen-core's public API.
@@ -261,40 +374,69 @@ pub mod endpoint {
         }
     }
 
+    /// Fingerprint-pinning verifier: trust is the SHA-256 of the host's (self-signed) leaf
+    /// cert, not a CA chain. With no pin it accepts any cert (TOFU) but still records what
+    /// it saw, so the embedder can persist the fingerprint and pin it from then on.
     #[derive(Debug)]
-    struct SkipVerify;
+    struct PinVerify {
+        pin: Option<[u8; 32]>,
+        observed: Arc<Mutex<Option<[u8; 32]>>>,
+    }
 
-    impl rustls::client::danger::ServerCertVerifier for SkipVerify {
+    impl rustls::client::danger::ServerCertVerifier for PinVerify {
         fn verify_server_cert(
             &self,
-            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
             _intermediates: &[rustls::pki_types::CertificateDer<'_>],
             _server_name: &rustls::pki_types::ServerName<'_>,
             _ocsp: &[u8],
             _now: rustls::pki_types::UnixTime,
         ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error>
         {
+            let fp = cert_fingerprint(end_entity.as_ref());
+            *self.observed.lock().unwrap() = Some(fp);
+            if let Some(expected) = self.pin {
+                if fp != expected {
+                    return Err(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::ApplicationVerificationFailure,
+                    ));
+                }
+            }
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         }
 
+        // The handshake signatures MUST be verified for real even though we pin the cert:
+        // CertificateVerify is what proves the peer *holds the pinned cert's private key* —
+        // skip it and an active MITM can replay the host's (public) certificate, match the
+        // pin, and complete the handshake with its own key.
         fn verify_tls12_signature(
             &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
         ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
         {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
         }
 
         fn verify_tls13_signature(
             &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
         ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
         {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
         }
 
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -348,5 +490,38 @@ mod tests {
             client_udp_port: 1234,
         };
         assert_eq!(Start::decode(&s.encode()).unwrap(), s);
+    }
+
+    #[test]
+    fn audio_datagram_roundtrip() {
+        let opus = [0x42u8; 97];
+        let d = encode_audio_datagram(7, 1_000_000_123, &opus);
+        assert_eq!(d[0], AUDIO_MAGIC);
+        let (seq, pts, payload) = decode_audio_datagram(&d).unwrap();
+        assert_eq!((seq, pts), (7, 1_000_000_123));
+        assert_eq!(payload, opus);
+        assert!(decode_audio_datagram(&d[..12]).is_none()); // truncated header
+        assert!(decode_audio_datagram(&[0u8; 13]).is_none()); // bad magic
+
+        // Empty payload is legal (DTX) — header-only datagram.
+        let header_only = encode_audio_datagram(0, 0, &[]);
+        let (_, _, empty) = decode_audio_datagram(&header_only).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn rumble_datagram_roundtrip() {
+        let d = encode_rumble_datagram(1, 0x1234, 0xFFFF);
+        assert_eq!(d[0], RUMBLE_MAGIC);
+        assert_eq!(decode_rumble_datagram(&d), Some((1, 0x1234, 0xFFFF)));
+        assert!(decode_rumble_datagram(&d[..6]).is_none());
+    }
+
+    #[test]
+    fn fingerprint_is_sha256_of_der() {
+        // Stable across calls, distinct for distinct certs.
+        let a = endpoint::cert_fingerprint(b"cert-a");
+        assert_eq!(a, endpoint::cert_fingerprint(b"cert-a"));
+        assert_ne!(a, endpoint::cert_fingerprint(b"cert-b"));
     }
 }

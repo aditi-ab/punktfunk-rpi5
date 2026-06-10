@@ -84,6 +84,9 @@ fn real_main() -> Result<()> {
                 source,
                 seconds: get("--seconds").and_then(|s| s.parse().ok()).unwrap_or(30),
                 frames: get("--frames").and_then(|s| s.parse().ok()).unwrap_or(300),
+                max_sessions: get("--max-sessions")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
             })
         }
         Some("-h") | Some("--help") | Some("help") | None => {
@@ -297,12 +300,20 @@ USAGE:
     lumen-host serve [OPTIONS]    GameStream host control plane (M2: mDNS + serverinfo …)
                                   + the management REST API
     lumen-host openapi            print the management API's OpenAPI document (codegen)
+    lumen-host m3-host [OPTIONS]  native lumen/1 host (QUIC control plane + UDP data plane)
     lumen-host m0 [OPTIONS]       M0 capture→encode→file pipeline spike
 
 SERVE OPTIONS:
     --mgmt-bind <IP:PORT>        management API address (default: 127.0.0.1:47990)
     --mgmt-token <TOKEN>         bearer token for the management API (or LUMEN_MGMT_TOKEN);
                                  required when --mgmt-bind is not loopback
+
+M3-HOST OPTIONS:
+    --port <N>                   QUIC listen port (default: 9777)
+    --source <synthetic|virtual> test frames, or virtual display + NVENC (default: synthetic)
+    --seconds <N>                per-session stream duration, virtual source (default: 30)
+    --frames <N>                 per-session frame count, synthetic source (default: 300)
+    --max-sessions <N>           exit after N sessions; 0 = serve forever (default: 0)
 
 M0 OPTIONS:
     --source <synthetic|portal|kwin-virtual>

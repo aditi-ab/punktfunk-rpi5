@@ -25,6 +25,50 @@
 // Fixed serialized size of an [`InputEvent`] on the wire (tag + fields).
 #define INPUT_WIRE_LEN (((((1 + 1) + 4) + 4) + 4) + 4)
 
+#define LUMEN_BTN_DPAD_UP 1
+
+#define LUMEN_BTN_DPAD_DOWN 2
+
+#define LUMEN_BTN_DPAD_LEFT 4
+
+#define LUMEN_BTN_DPAD_RIGHT 8
+
+#define LUMEN_BTN_START 16
+
+#define LUMEN_BTN_BACK 32
+
+#define LUMEN_BTN_LS_CLICK 64
+
+#define LUMEN_BTN_RS_CLICK 128
+
+#define LUMEN_BTN_LB 256
+
+#define LUMEN_BTN_RB 512
+
+#define LUMEN_BTN_GUIDE 1024
+
+#define LUMEN_BTN_A 4096
+
+#define LUMEN_BTN_B 8192
+
+#define LUMEN_BTN_X 16384
+
+#define LUMEN_BTN_Y 32768
+
+// Axis ids for `InputKind::GamepadAxis`.
+#define LUMEN_AXIS_LS_X 0
+
+#define LUMEN_AXIS_LS_Y 1
+
+#define LUMEN_AXIS_RS_X 2
+
+#define LUMEN_AXIS_RS_Y 3
+
+// Triggers: value range 0..255.
+#define LUMEN_AXIS_LT 4
+
+#define LUMEN_AXIS_RT 5
+
 // Identifies a lumen video packet (vs. an input datagram, see [`crate::input`]).
 #define LUMEN_MAGIC 201
 
@@ -37,6 +81,17 @@
 // Largest UDP datagram the core will send or accept. `Config::validate` bounds
 // `shard_payload` so `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD ≤ MAX_DATAGRAM_BYTES`.
 #define MAX_DATAGRAM_BYTES 2048
+
+#if defined(LUMEN_FEATURE_QUIC)
+// Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
+// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8),
+// audio = [`AUDIO_MAGIC`], rumble = [`RUMBLE_MAGIC`].
+#define LUMEN_AUDIO_MAGIC 201
+#endif
+
+#if defined(LUMEN_FEATURE_QUIC)
+#define LUMEN_RUMBLE_MAGIC 202
+#endif
 
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
 // test `rc < 0`. Do not renumber existing variants — only append.
@@ -82,8 +137,11 @@ enum LumenInputKind
     LUMEN_INPUT_KIND_MOUSE_BUTTON_UP = 5,
     // `x` carries the (signed) scroll delta.
     LUMEN_INPUT_KIND_MOUSE_SCROLL = 6,
+    // `code` = button bit ([`gamepad`] `BTN_*`), `x` ≠ 0 = pressed, `flags` = pad index.
     LUMEN_INPUT_KIND_GAMEPAD_BUTTON = 7,
-    // `code` = axis id, `x` = axis value.
+    // `code` = axis id ([`gamepad`] `AXIS_*`), `x` = axis value, `flags` = pad index.
+    // Sticks are i16 range (−32768..32767) in the XInput/Moonlight convention — **+y =
+    // up** (unlike mouse coordinates); triggers 0..255.
     LUMEN_INPUT_KIND_GAMEPAD_AXIS = 8,
 };
 #ifndef __cplusplus
@@ -97,6 +155,11 @@ typedef uint8_t LumenInputKind;
 #if defined(LUMEN_FEATURE_QUIC)
 // Opaque handle to a live `lumen/1` connection (QUIC control plane + UDP data plane, all
 // pumped on internal threads).
+//
+// Thread contract: each plane (video `next_au`, audio `next_audio`, rumble `next_rumble`)
+// may be pulled from its own thread, at most one thread per plane. The accessors only
+// take shared references internally (per-plane mutexed borrow slots), so cross-plane
+// concurrency is sound — never two threads on the *same* plane.
 typedef struct LumenConnection LumenConnection;
 #endif
 
@@ -163,6 +226,17 @@ typedef struct {
     uint64_t bytes_sent;
     uint64_t bytes_received;
 } LumenStats;
+
+#if defined(LUMEN_FEATURE_QUIC)
+// One Opus audio packet pulled off a `lumen/1` connection (48 kHz stereo, 5 ms frames).
+// `data` borrows connection memory until the next `lumen_connection_next_audio` call.
+typedef struct {
+    const uint8_t *data;
+    uintptr_t len;
+    uint32_t seq;
+    uint64_t pts_ns;
+} LumenAudioPacket;
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -242,24 +316,64 @@ LumenStatus lumen_get_stats(LumenSession *s, LumenStats *out);
 // Connect to a `lumen/1` host and start a session at `width`x`height`@`refresh_hz`.
 // Blocks up to `timeout_ms` for the handshake. Returns NULL on failure.
 //
+// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's
+// certificate — a mismatching host is rejected. NULL = trust on first use; persist the
+// fingerprint written to `observed_sha256_out` (NULL or 32 bytes, filled on success) and
+// pass it as the pin on every later connect.
+//
 // # Safety
-// `host` is a NUL-terminated UTF-8 string (IP or hostname resolvable by the platform).
+// `host` is a NUL-terminated UTF-8 string (IP or hostname resolvable by the platform);
+// `pin_sha256`/`observed_sha256_out` are each NULL or valid for 32 bytes.
 LumenConnection *lumen_connect(const char *host,
                                uint16_t port,
                                uint32_t width,
                                uint32_t height,
                                uint32_t refresh_hz,
+                               const uint8_t *pin_sha256,
+                               uint8_t *observed_sha256_out,
                                uint32_t timeout_ms);
 #endif
 
 #if defined(LUMEN_FEATURE_QUIC)
 // Pull the next reassembled access unit, waiting up to `timeout_ms`. Returns
 // [`LumenStatus::NoFrame`] on timeout and [`LumenStatus::Closed`] once the session ended.
-// On `Ok`, `*out` borrows connection memory **until the next call** on this handle.
+// On `Ok`, `*out` borrows connection memory **until the next `next_au` call** on this
+// handle (the audio/rumble planes do not invalidate it).
 //
 // # Safety
-// `c` is a valid connection handle used from a single thread; `out` is writable.
+// `c` is a valid connection handle; `out` is writable. At most one thread pulls video —
+// it may run concurrently with one audio-pulling and one rumble-pulling thread.
 LumenStatus lumen_connection_next_au(LumenConnection *c, LumenFrame *out, uint32_t timeout_ms);
+#endif
+
+#if defined(LUMEN_FEATURE_QUIC)
+// Pull the next Opus audio packet, waiting up to `timeout_ms`. Returns
+// [`LumenStatus::NoFrame`] on timeout and [`LumenStatus::Closed`] once the session ended.
+// On `Ok`, `out->data` borrows connection memory **until the next audio call** on this
+// handle (independent of the video slot). Drain from a dedicated audio thread — packets
+// arrive every 5 ms and the internal queue holds 320 ms.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio —
+// it may run concurrently with the video/rumble pullers.
+LumenStatus lumen_connection_next_audio(LumenConnection *c,
+                                        LumenAudioPacket *out,
+                                        uint32_t timeout_ms);
+#endif
+
+#if defined(LUMEN_FEATURE_QUIC)
+// Pull the next rumble (force-feedback) update, waiting up to `timeout_ms`. Amplitudes
+// are 0..0xFFFF (`low` = low-frequency motor, `high` = high-frequency), `(0, 0)` = stop.
+// Same timeout/closed semantics as [`lumen_connection_next_audio`].
+//
+// # Safety
+// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At
+// most one thread pulls rumble — it may run concurrently with the video/audio pullers.
+LumenStatus lumen_connection_next_rumble(LumenConnection *c,
+                                         uint16_t *pad,
+                                         uint16_t *low,
+                                         uint16_t *high,
+                                         uint32_t timeout_ms);
 #endif
 
 #if defined(LUMEN_FEATURE_QUIC)

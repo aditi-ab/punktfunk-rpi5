@@ -8,15 +8,20 @@ is the Swift shell: decode (VideoToolbox), present (SwiftUI), input capture.
 ## What exists (built + tested on the Linux host)
 
 - **The connector**: `lumen_core::client::NativeClient` (Rust) exposed over the C ABI as
-  `lumen_connect` / `lumen_connection_next_au` / `lumen_connection_send_input` /
-  `lumen_connection_mode` / `lumen_connection_close` (see `include/lumen_core.h`, guarded
-  by `LUMEN_FEATURE_QUIC`). **End-to-end tested through the C ABI** against an in-process
-  host (`crates/lumen-host/src/m3.rs::tests::c_abi_connection_roundtrip`).
+  `lumen_connect` / `lumen_connection_next_au` / `lumen_connection_next_audio` /
+  `lumen_connection_next_rumble` / `lumen_connection_send_input` / `lumen_connection_mode`
+  / `lumen_connection_close` (see `include/lumen_core.h`, guarded by `LUMEN_FEATURE_QUIC`).
+  **End-to-end tested through the C ABI** against an in-process host
+  (`crates/lumen-host/src/m3.rs::tests::c_abi_connection_roundtrip` — three sequential
+  sessions: TOFU, pinned reconnect, wrong-pin rejection).
 - **The host to test against**: `lumen-host m3-host --source virtual --seconds 60` on the
-  Linux box (it creates a native virtual output at whatever mode the client requests and
-  streams HEVC; `LUMEN_COMPOSITOR=gamescope LUMEN_GAMESCOPE_APP=vkcube` for moving content).
+  Linux box — a **persistent listener** (sessions back to back, reconnect at will during
+  development; `--max-sessions N` to bound it). It creates a native virtual output at
+  whatever mode the client requests and streams HEVC + desktop **Opus audio**;
+  `LUMEN_COMPOSITOR=gamescope LUMEN_GAMESCOPE_APP=vkcube` for moving content.
 - **This package (SCAFFOLD — written on Linux, never compiled in Xcode)**:
-  - `LumenConnection.swift` — Swift wrapper over the C ABI (AUs copied into `Data`).
+  - `LumenConnection.swift` — Swift wrapper over the C ABI (AUs/audio copied into `Data`;
+    certificate pinning + TOFU fingerprint via `pinSHA256:`/`hostFingerprint`).
   - `AnnexB.swift` — in-band VPS/SPS/PPS → `CMVideoFormatDescription`; Annex-B → AVCC
     `CMSampleBuffer` with `DisplayImmediately` set.
   - `StreamView.swift` — SwiftUI `NSViewRepresentable` over `AVSampleBufferDisplayLayer`
@@ -62,8 +67,9 @@ struct ContentView: View {
    zero-init, `_pad` tuple shape on `LumenInputEvent`.
 2. **ABI contract** (matches `lumen_core.h` docs): `next_au`'s pointer is valid only until
    the *next* call on that handle (we copy to `Data` immediately); one pump thread per
-   connection; `send_input` is enqueue-only and thread-safe alongside it; `close` joins the
-   Rust threads — never call it with a `next_au` call in flight.
+   connection, plus optionally one *separate* audio thread for `next_audio` (independent
+   borrow slots); `send_input` is enqueue-only and thread-safe alongside both; `close`
+   joins the Rust threads — never call it with a `next_au`/`next_audio` call in flight.
 3. **Decode flow**: the host opens every stream with an IDR carrying VPS/SPS/PPS in-band,
    and recovery keyframes re-send them — so "wait for the first format description, refresh
    it on every IDR" (already what `StreamView` does) is sufficient; there is no out-of-band
@@ -79,21 +85,27 @@ struct ContentView: View {
    and add glass-to-glass measurement (`tools/latency-probe` is the scaffold; the host
    already stamps `pts_ns` with its capture wall clock — across machines you'll need a
    clock-offset estimate from the QUIC RTT, or the probe's visual timestamp loop).
-6. **Gamepads**: `GCController` → `GamepadButton`/`GamepadAxis` `LumenInputEvent`s. The
-   host does NOT yet route those kinds in `m3.rs`'s injector path (mouse/keys work; the
-   gamepad kinds need a `GamepadManager` hookup like the GameStream control stream has —
-   small host-side task).
-7. **Trust model is seed-stage**: the client accepts any host certificate
-   (`endpoint::client_insecure`). Pairing + pinning is a planned lumen-core task; design it
-   alongside this client's "add host" UX.
-8. **iOS**: same package (`BUILD_IOS=1` for the xcframework slice); `StreamView` needs the
+6. **Audio**: `nextAudio()` yields raw Opus packets (48 kHz stereo, one 5 ms frame each,
+   sequence-numbered). Decode with libopus or `AVAudioConverter`/`kAudioFormatOpus` into an
+   `AVAudioEngine` source node; conceal gaps (drop/dup) rather than blocking — the Rust
+   side buffers 320 ms and drops the newest packet when the puller lags. Wall-clock
+   `ptsNs` shares the host clock with video AUs for A/V sync.
+7. **Gamepads**: `GCController` → `.gamepadButton(...)`/`.gamepadAxis(...)` events (wire
+   contract documented on the constructors; the host accumulates them into a virtual
+   Xbox 360 pad). Poll `nextRumble()` and feed `GCDeviceHaptics` for force feedback.
+8. **Trust**: connect once with `pinSHA256: nil` (TOFU), persist `hostFingerprint` keyed
+   by host, pass it on every later connect — a mismatch throws `.connectFailed`. The host
+   logs its fingerprint at startup ("clients pin this fingerprint") for out-of-band
+   verification UX; a PIN-style pairing ceremony is a later lumen-core task.
+9. **iOS**: same package (`BUILD_IOS=1` for the xcframework slice); `StreamView` needs the
    `UIViewRepresentable` twin and touch→input mapping.
 
 ## Known limitations of the current host (relevant to client UX)
 
-- `m3-host` serves **one session and exits** — fine for development; the persistent
-  lumen/1 listener (serve-style) is a small host-side task.
-- No audio on lumen/1 yet (the GameStream path has it; porting the Opus stream onto a
-  second datagram flow is straightforward).
+- One session **at a time** (the listener is persistent, but a second concurrent client
+  waits in the accept queue until the current session ends — the virtual output and
+  encoder are single-tenant).
 - Mid-stream renegotiation (resolution change without reconnect) is designed-for but not
   implemented (the Welcome is one-shot today).
+- Host-side gamepad injection needs `/dev/uinput` access on the box (udev rule from
+  `docs/linux-setup.md`).

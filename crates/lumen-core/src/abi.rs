@@ -450,18 +450,31 @@ pub unsafe extern "C" fn lumen_get_stats(
 
 /// Opaque handle to a live `lumen/1` connection (QUIC control plane + UDP data plane, all
 /// pumped on internal threads).
+///
+/// Thread contract: each plane (video `next_au`, audio `next_audio`, rumble `next_rumble`)
+/// may be pulled from its own thread, at most one thread per plane. The accessors only
+/// take shared references internally (per-plane mutexed borrow slots), so cross-plane
+/// concurrency is sound — never two threads on the *same* plane.
 #[cfg(feature = "quic")]
 pub struct LumenConnection {
     inner: crate::client::NativeClient,
     /// Backs the pointer returned by the last `lumen_connection_next_au` (borrow-until-next-call).
-    last: Option<crate::session::Frame>,
+    last: std::sync::Mutex<Option<crate::session::Frame>>,
+    /// Same, for `lumen_connection_next_audio` (independent of the video slot).
+    last_audio: std::sync::Mutex<Option<crate::client::AudioPacket>>,
 }
 
 /// Connect to a `lumen/1` host and start a session at `width`x`height`@`refresh_hz`.
 /// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure.
 ///
+/// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's
+/// certificate — a mismatching host is rejected. NULL = trust on first use; persist the
+/// fingerprint written to `observed_sha256_out` (NULL or 32 bytes, filled on success) and
+/// pass it as the pin on every later connect.
+///
 /// # Safety
-/// `host` is a NUL-terminated UTF-8 string (IP or hostname resolvable by the platform).
+/// `host` is a NUL-terminated UTF-8 string (IP or hostname resolvable by the platform);
+/// `pin_sha256`/`observed_sha256_out` are each NULL or valid for 32 bytes.
 #[cfg(feature = "quic")]
 #[no_mangle]
 pub unsafe extern "C" fn lumen_connect(
@@ -470,6 +483,8 @@ pub unsafe extern "C" fn lumen_connect(
     width: u32,
     height: u32,
     refresh_hz: u32,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
     timeout_ms: u32,
 ) -> *mut LumenConnection {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -485,16 +500,33 @@ pub unsafe extern "C" fn lumen_connect(
             height,
             refresh_hz,
         };
+        let pin = if pin_sha256.is_null() {
+            None
+        } else {
+            let mut p = [0u8; 32];
+            p.copy_from_slice(unsafe { std::slice::from_raw_parts(pin_sha256, 32) });
+            Some(p)
+        };
         match crate::client::NativeClient::connect(
             host,
             port,
             mode,
+            pin,
             std::time::Duration::from_millis(timeout_ms as u64),
         ) {
-            Ok(c) => Box::into_raw(Box::new(LumenConnection {
-                inner: c,
-                last: None,
-            })),
+            Ok(c) => {
+                if !observed_sha256_out.is_null() {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(observed_sha256_out, 32)
+                            .copy_from_slice(&c.host_fingerprint);
+                    }
+                }
+                Box::into_raw(Box::new(LumenConnection {
+                    inner: c,
+                    last: std::sync::Mutex::new(None),
+                    last_audio: std::sync::Mutex::new(None),
+                }))
+            }
             Err(_) => std::ptr::null_mut(),
         }
     }));
@@ -503,10 +535,12 @@ pub unsafe extern "C" fn lumen_connect(
 
 /// Pull the next reassembled access unit, waiting up to `timeout_ms`. Returns
 /// [`LumenStatus::NoFrame`] on timeout and [`LumenStatus::Closed`] once the session ended.
-/// On `Ok`, `*out` borrows connection memory **until the next call** on this handle.
+/// On `Ok`, `*out` borrows connection memory **until the next `next_au` call** on this
+/// handle (the audio/rumble planes do not invalidate it).
 ///
 /// # Safety
-/// `c` is a valid connection handle used from a single thread; `out` is writable.
+/// `c` is a valid connection handle; `out` is writable. At most one thread pulls video —
+/// it may run concurrently with one audio-pulling and one rumble-pulling thread.
 #[cfg(feature = "quic")]
 #[no_mangle]
 pub unsafe extern "C" fn lumen_connection_next_au(
@@ -515,7 +549,8 @@ pub unsafe extern "C" fn lumen_connection_next_au(
     timeout_ms: u32,
 ) -> LumenStatus {
     guard(|| {
-        let c = match unsafe { c.as_mut() } {
+        // Shared reference only: video and audio threads must never alias a `&mut`.
+        let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return LumenStatus::NullPointer,
         };
@@ -527,8 +562,9 @@ pub unsafe extern "C" fn lumen_connection_next_au(
             .next_frame(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(frame) => {
-                c.last = Some(frame);
-                let f = c.last.as_ref().unwrap();
+                let mut slot = c.last.lock().unwrap();
+                *slot = Some(frame);
+                let f = slot.as_ref().unwrap();
                 unsafe {
                     *out = LumenFrame {
                         data: f.data.as_ptr(),
@@ -537,6 +573,108 @@ pub unsafe extern "C" fn lumen_connection_next_au(
                         pts_ns: f.pts_ns,
                         flags: f.flags,
                     };
+                }
+                LumenStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// One Opus audio packet pulled off a `lumen/1` connection (48 kHz stereo, 5 ms frames).
+/// `data` borrows connection memory until the next `lumen_connection_next_audio` call.
+#[cfg(feature = "quic")]
+#[repr(C)]
+pub struct LumenAudioPacket {
+    pub data: *const u8,
+    pub len: usize,
+    pub seq: u32,
+    pub pts_ns: u64,
+}
+
+/// Pull the next Opus audio packet, waiting up to `timeout_ms`. Returns
+/// [`LumenStatus::NoFrame`] on timeout and [`LumenStatus::Closed`] once the session ended.
+/// On `Ok`, `out->data` borrows connection memory **until the next audio call** on this
+/// handle (independent of the video slot). Drain from a dedicated audio thread — packets
+/// arrive every 5 ms and the internal queue holds 320 ms.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio —
+/// it may run concurrently with the video/rumble pullers.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn lumen_connection_next_audio(
+    c: *mut LumenConnection,
+    out: *mut LumenAudioPacket,
+    timeout_ms: u32,
+) -> LumenStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return LumenStatus::NullPointer,
+        };
+        if out.is_null() {
+            return LumenStatus::NullPointer;
+        }
+        match c
+            .inner
+            .next_audio(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(pkt) => {
+                let mut slot = c.last_audio.lock().unwrap();
+                *slot = Some(pkt);
+                let p = slot.as_ref().unwrap();
+                unsafe {
+                    *out = LumenAudioPacket {
+                        data: p.data.as_ptr(),
+                        len: p.data.len(),
+                        seq: p.seq,
+                        pts_ns: p.pts_ns,
+                    };
+                }
+                LumenStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Pull the next rumble (force-feedback) update, waiting up to `timeout_ms`. Amplitudes
+/// are 0..0xFFFF (`low` = low-frequency motor, `high` = high-frequency), `(0, 0)` = stop.
+/// Same timeout/closed semantics as [`lumen_connection_next_audio`].
+///
+/// # Safety
+/// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At
+/// most one thread pulls rumble — it may run concurrently with the video/audio pullers.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn lumen_connection_next_rumble(
+    c: *mut LumenConnection,
+    pad: *mut u16,
+    low: *mut u16,
+    high: *mut u16,
+    timeout_ms: u32,
+) -> LumenStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return LumenStatus::NullPointer,
+        };
+        match c
+            .inner
+            .next_rumble(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok((p, l, h)) => {
+                unsafe {
+                    if !pad.is_null() {
+                        *pad = p;
+                    }
+                    if !low.is_null() {
+                        *low = l;
+                    }
+                    if !high.is_null() {
+                        *high = h;
+                    }
                 }
                 LumenStatus::Ok
             }
