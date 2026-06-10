@@ -72,7 +72,11 @@ echo "KWin ready."
 # without it the restarted portal can inherit an empty WAYLAND_DISPLAY), then restart.
 systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR 2>/dev/null || true
 dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS 2>/dev/null || true
-systemctl --user try-restart plasma-xdg-desktop-portal-kde.service xdg-desktop-portal-kde.service xdg-desktop-portal.service 2>/dev/null || true
+# --no-block: queue the restart and return immediately. A synchronous try-restart of the
+# portal chain blocks bring-up ~30s (xdg-desktop-portal is Type=dbus and waits for its bus
+# name); the portal only needs to be ready before the FIRST client streams (seconds later,
+# user-driven), not before plasmashell starts.
+systemctl --user --no-block try-restart plasma-xdg-desktop-portal-kde.service xdg-desktop-portal-kde.service xdg-desktop-portal.service 2>/dev/null || true
 
 kbuildsycoca6 >/dev/null 2>&1 || true # rebuild the menu cache under the correct env
 plasmashell &
