@@ -1,32 +1,61 @@
 # CLAUDE.md — lumen
 
-Low-latency desktop streaming stack, Linux-first, with a shared Rust protocol core
+Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protocol core
 (`lumen-core`) exposed over a C ABI and native clients per platform. Full design:
 [`docs/implementation-plan.md`](docs/implementation-plan.md). Status table: `README.md`.
 
 ## Where the work stands
 
-- **M1 (`lumen-core` + C ABI) is complete, tested, and hardened.** It builds and its full
-  suite passes (FEC recovery, loopback-under-loss, proptests, a C ABI harness). It was put
-  through an adversarial review and 13 verified findings were fixed + regression-tested
-  (commit `a913042`).
-- **M0 (the pipeline spike) is done and verified** on the NVIDIA box (Ubuntu 25.10, RTX
-  5070 Ti, driver 595): `lumen-host m0` captures a headless wlroots output via the
-  ScreenCast portal + PipeWire, NVENC-encodes it, writes a playable H.265 file, and
-  round-trips every access unit through a `lumen_core` host→client session (0 mismatches).
-  See [`docs/linux-setup.md`](docs/linux-setup.md); the code is in
-  `crates/lumen-host/src/{m0,capture,encode}.rs` (+ `capture/linux.rs`, `encode/linux.rs`).
-- **M2 is in flight.** The GameStream control plane lives in `gamestream/` (mDNS,
-  serverinfo, pairing, RTSP, ENet control, video/audio streams) and the management REST
-  API in `mgmt.rs`; the remaining `#[cfg(target_os = "linux")]` backends — KWin/Mutter
-  virtual displays (`vdisplay.rs`), libei/uinput input (`inject.rs`) — compile everywhere
-  and `bail!` where unimplemented.
+- **M1 (`lumen-core` + C ABI): complete and hardened.** FEC recovery, loopback-under-loss,
+  proptests, C ABI harness all green; 13 adversarial-review findings fixed +
+  regression-tested (`a913042`).
+- **M2 (GameStream host): working end-to-end with a stock Moonlight client.** Validated live
+  on this box: pairing (persists across restarts), serverinfo/applist (app catalog from
+  `~/.config/lumen/apps.json` → each entry picks a compositor + nested command), RTSP, ENet
+  control, audio, and video at the **client's native resolution and refresh** — the host
+  creates a per-session virtual output via per-compositor `VirtualDisplay` backends:
+  **KWin** (`zkde_screencast stream_virtual_output`, needs KWin ≥ 6.5.6 headless; >60 Hz via
+  custom modes), **gamescope** (spawned headless at WxH@Hz, its PipeWire node captured, needs
+  gamescope ≥ 3.16.22 — older deadlocks on PipeWire ≥ 1.6), **Mutter** (D-Bus
+  `RecordVirtual`; implemented, live validation pending a gnome-shell install).
+  Performance work landed and measured: GPU **zero-copy** on all paths (tiled dmabuf →
+  EGL/GL → CUDA; LINEAR dmabuf → **Vulkan bridge** → CUDA → NVENC), auto 2-way NVENC
+  split-encode above ~1 Gpix/s (5K@240), infinite GOP + RFI keyframes (killed the periodic
+  freeze), encode|send thread split with `sendmmsg` batching. Stable 240 fps at 5120×1440.
+  Input: mouse/keyboard (libei via RemoteDesktop portal on KWin/GNOME, gamescope's own EIS
+  socket, wlr protocols on Sway) and **gamepads** (uinput X-Box-360 pads + rumble
+  back-channel; live validation pending the udev rule below). Management REST API +
+  checked-in OpenAPI doc (`mgmt.rs`).
+- **M3 (`lumen/1`, the native protocol): seeded and validated.** QUIC control plane
+  (`lumen-core` `quic` feature: Hello{mode}/Welcome{full Config}/Start), data plane = the
+  hardened M1 `Session` over raw UDP with **GF(2¹⁶) Leopard FEC + AES-GCM** (inexpressible
+  in GameStream), input over **QUIC datagrams**, host creates the native virtual output at
+  the client's requested mode. Measured on-box at 720p120: 1680/1680 frames, **p50 0.83 ms**
+  capture→encode→FEC→crypto→UDP→reassembled. `lumen-client-rs` is a working (headless)
+  reference client. Trust is seed-stage (self-signed / accept-any).
+
+## What's left
+
+1. **M4 — client decode + present**: VAAPI/NVDEC + wgpu on `lumen-client-rs`'s skeleton;
+   then real glass-to-glass numbers via `tools/latency-probe` (scaffold).
+2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
+   NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
+   at high res).
+3. **lumen/1 trust model**: pairing + certificate pinning to replace accept-any.
+4. **M2 polish**: wlroots/Sway `VirtualDisplay` backend (deferred; swaymsg `create_output`),
+   GNOME live validation, gamepad live validation, HDR/10-bit/AV1 negotiation, surround
+   audio, reconnect-at-new-mode robustness.
+5. **Native clients** (`clients/{apple,android}` scaffolds) consuming `lumen_core.h`.
+6. **This box, one-time setup still pending**: `sudo cp scripts/60-lumen.rules
+   /etc/udev/rules.d/` + user into `input` group (gamepads); `sudo ninja -C
+   /tmp/gamescope-src/build install` (the fixed gamescope ≥ 3.16.22 — until then use
+   `PATH=/tmp/gamescope-src/build/src:$PATH`); `apt install gnome-shell` (Mutter validation).
 
 ## Build / test / run
 
 ```sh
 cargo build --workspace          # green on Linux and macOS
-cargo test  --workspace          # unit + loopback + proptest + C ABI harness
+cargo test  --workspace          # unit + loopback + proptest + C ABI harness (~92 tests)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 
@@ -34,63 +63,77 @@ cargo run -p loss-harness        # FEC loss-resilience sweep (no network needed)
 bash crates/lumen-core/tests/c/run.sh   # standalone C-ABI link + round-trip proof
 ```
 
-`include/lumen_core.h` is generated from `crates/lumen-core/src/abi.rs` by cbindgen
-(`build.rs`) on every build and is **checked in**; CI fails if it drifts, so commit the
-regenerated header when the ABI changes. Same deal for the management API's OpenAPI
-document: `docs/api/openapi.json` is **checked in** for client codegen and a test fails if
-it drifts — regenerate with `cargo run -p lumen-host -- openapi > docs/api/openapi.json`
-(the spec lives in `crates/lumen-host/src/mgmt.rs`).
+Generated artifacts are **checked in** and CI fails on drift: `include/lumen_core.h`
+(cbindgen from `lumen-core/src/abi.rs`) and `docs/api/openapi.json` (regenerate with
+`cargo run -p lumen-host -- openapi > docs/api/openapi.json`; spec lives in `mgmt.rs`).
 
 ## Layout
 
 ```
-crates/lumen-core/   protocol · FEC · pacing · crypto — the C ABI (lib + cdylib + staticlib)
-crates/lumen-host/   Linux host: vdisplay · capture · encode · inject · gamestream · mgmt · pipeline
-docs/api/openapi.json   generated management-API spec (codegen input)
-crates/lumen-client-rs/   reference client (M4)
-tools/{loss-harness,latency-probe}/   measurement (plan §10)
-clients/{apple,android}/   native client scaffolds (import lumen_core.h)
-include/lumen_core.h   generated C header
+crates/lumen-core/        protocol · FEC · crypto · quic (lumen/1 control plane, feature-gated)
+crates/lumen-host/
+  gamestream/             Moonlight compat: nvhttp · pairing · rtsp · control · stream · gamepad · apps
+  vdisplay/{kwin,gamescope,mutter}.rs   per-compositor client-sized virtual outputs
+  zerocopy/{egl,cuda,vulkan}.rs         dmabuf → CUDA → NVENC (tiled via EGL/GL, LINEAR via Vulkan)
+  inject/{libei,wlr,gamepad}.rs         input backends (+ uinput virtual gamepads)
+  capture.rs · encode.rs · audio.rs · m0.rs · m3.rs · mgmt.rs
+crates/lumen-client-rs/   lumen/1 reference client (M3 headless; M4 adds decode+present)
+tools/{loss-harness,latency-probe}/     measurement (plan §10)
+scripts/                  60-lumen.rules · lumen-host.service · host.env.example · headless/
+include/lumen_core.h      generated C header
 ```
 
 ## Design invariants — do not regress
 
-- **One core, linked everywhere.** Protocol/FEC/crypto/pacing live only in `lumen-core`,
-  behind a stable, versioned C ABI (`lumen_abi_version`, `LumenConfig.struct_size`).
-- **No async on the hot path.** The per-frame pipeline uses native threads only;
-  `tokio`/`quinn` are gated behind the off-by-default `quic` feature (control plane only).
-- **FEC is the wall-breaker.** GF(2⁸) (≤255 shards/block, Moonlight-compatible) and
-  GF(2¹⁶) Leopard-RS (≤65535 shards/block, SIMD) — the latter removes the ~1 Gbps ceiling.
-- **Security hardening from the M1 review must stay intact:** the reassembler bounds every
-  attacker-controlled header field against negotiated limits *before allocating*
-  (`ReassemblerLimits` in `packet.rs`); AES-GCM uses per-direction nonce salts + seq-as-AAD
-  (`crypto.rs`); the ABI enforces `struct_size` and range-checks inputs. There are
-  regression tests for these — keep them green.
+- **One core, linked everywhere.** Protocol/FEC/crypto live only in `lumen-core`, behind a
+  stable, versioned C ABI. `tokio`/`quinn` exist only behind the `quic` feature (control
+  plane); **no async on the per-frame path** — native threads only.
+- **Native client resolution, no scaling.** A session gets a virtual output at exactly the
+  client's WxH@Hz via the `VirtualDisplay` trait (`create(mode) → VirtualOutput { node_id,
+  remote_fd, preferred_mode, keepalive }`, RAII teardown). There is no cross-compositor
+  protocol for this — each compositor keeps its own backend.
+- **FEC is the wall-breaker.** GF(2⁸) (≤255 shards/block, Moonlight-compatible) and GF(2¹⁶)
+  Leopard (≤65535 shards/block) — lumen/1 negotiates the latter, removing the ~1 Gbps
+  ceiling.
+- **M1 security hardening stays intact**: reassembler bounds attacker-controlled fields
+  before allocating (`ReassemblerLimits`); AES-GCM per-direction nonce salts + seq-as-AAD;
+  ABI `struct_size` checks. Regression tests exist — keep them green.
+- **PipeWire consumer discipline**: our capture streams set `node.dont-reconnect` and tear
+  down promptly on negotiation timeout — one wedged link head-blocks the daemon's shared
+  work queue system-wide.
 
-## Running the M0 spike on this box
+## Running on this box
 
-[`docs/linux-setup.md`](docs/linux-setup.md) is the reference. One-time: `bash
-scripts/bootstrap-ubuntu.sh` (verifies NVIDIA/NVENC, installs deps incl. `libnvidia-gl`,
-adds the `render`/`video` groups — re-login after). Then per run: `bash
-scripts/headless/run-headless-sway.sh` (shell 1) and `bash
-scripts/headless/prepare-session.sh` (shell 2), then `cargo run -p lumen-host -- m0
---source portal --out /tmp/lumen-m0.h265`. `--source synthetic` needs no capture session.
+Headless QEMU VM (Ubuntu 26.04, kernel 7.0), passthrough RTX 5070 Ti (driver 595 **open**
+module — a kernel update silently drops it; reinstall `nvidia-driver-595-open`), no KMS
+scanout → KWin `--drm` impossible; everything renders offscreen via `renderD128`.
 
-M0 uses the **CPU-copy capture path** (portal → PipeWire shm, packed `RGB` on wlroots →
-NVENC `rgb0`); dmabuf→NVENC zero-copy is deferred (plan §9). Pinned crate facts (the setup
-doc has the why): `ashpd` **0.13** (`screencast` feature, options-struct API, multi-thread
-tokio runtime) + `pipewire` **0.9** (must match ashpd's; not 0.10) + `ffmpeg-next` **8.x**
-(binds the system FFmpeg **8.x** / libavcodec 62 on Ubuntu 26.04; bumped from 7.x).
+```sh
+# compositor session (shell 1, or the systemd unit in scripts/):
+XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+XDG_CURRENT_DESKTOP=KDE KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
+kwin_wayland --virtual --width 1920 --height 1080 --no-lockscreen --socket wayland-kde \
+  --exit-with-session wev
 
-## Next: M2 — P1 host to a stock Moonlight client
+# host (shell 2; gamescope entries need the PATH override until ninja install):
+WAYLAND_DISPLAY=wayland-kde XDG_CURRENT_DESKTOP=KDE LUMEN_VIDEO_SOURCE=virtual \
+LUMEN_ZEROCOPY=1 PATH=/tmp/gamescope-src/build/src:$PATH cargo run -rp lumen-host -- serve
 
-Wire M0's capture→encode pipeline (`m0.rs` / `pipeline.rs`) into a streaming host: KWin
-virtual output (`vdisplay.rs`, study KRdp), `serverinfo`/pairing/RTSP
-(`gamestream/{nvhttp,pairing,rtsp}.rs`) enough for a real Moonlight client, input via
-reis/uinput (`inject.rs`), management/config REST API (`mgmt.rs`).
+# lumen/1 native loopback test (no Moonlight needed):
+cargo run -rp lumen-host -- m3-host --source virtual --seconds 10   # + LUMEN_COMPOSITOR=gamescope etc.
+cargo run -rp lumen-client-rs -- --mode 1280x720x120 --out /tmp/a.h265 --input-test
+```
+
+Pinned crate facts: `ashpd` 0.13 + `pipewire` 0.9 (must match ashpd's) + `ffmpeg-next` 8.x
+(system FFmpeg 8 / libavcodec 62). Env knobs: `LUMEN_VIDEO_SOURCE=virtual|portal`,
+`LUMEN_COMPOSITOR=kwin|gamescope|mutter`, `LUMEN_ZEROCOPY=1`, `LUMEN_GAMESCOPE_APP=...`,
+`LUMEN_INPUT_BACKEND=...`, `LUMEN_PERF=1` (per-stage timing), `LUMEN_VIDEO_DROP=N` (FEC
+test), `LUMEN_FEC_PCT=N`.
 
 ## Conventions
 
 - Rust 2021, `rustfmt` + `clippy -D warnings` clean before commit.
 - Match the surrounding code's comment density and naming.
 - Commit messages end with the Co-Authored-By trailer (see `git log`).
+- `pkill` caution on this box: match exact comm names (`pkill -x gamescope-wl`,
+  `pkill -x lumen-host`) — `pkill -f` self-matches the invoking shell.
