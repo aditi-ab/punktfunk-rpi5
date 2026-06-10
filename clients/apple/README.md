@@ -39,9 +39,11 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
     `vk_to_evdev` consumes Windows VKs), with fractional-delta accumulation so sub-pixel
     motion isn't truncated away. Buttons use GameStream ids (1=left … 5=X2); scroll is
     WHEEL_DELTA(120)-scaled.
-- **`PunktfunkClient`** (development app shell): connect form → stream + input, fps/Mb-s HUD.
-  (Audio playback and gamepad capture are not wired into the app yet — the connector
-  surface is there; see notes 5–6.)
+- **`PunktfunkClient`** (the app): hosts grid (saved in UserDefaults), "+" toolbar
+  sheet to add hosts, stream mode in Settings (⌘,), trust-on-first-use fingerprint prompt
+  over the live-but-blurred stream → pinned reconnects, fps/Mb-s HUD. (Audio playback and
+  gamepad capture are not wired into the app yet — the connector surface is there; see
+  notes 5–6.)
 - **Tests** (`swift test`): byte-level Annex-B units; a real-codec round trip
   (VTCompressionSession-encoded HEVC rebuilt as the host's wire shape → `AnnexB` →
   VTDecompressionSession → pixels); loopback integration against a real local host
@@ -118,8 +120,12 @@ signing, bundle id `io.unom.punktfunk`. Notes:
 7. **Trust**: connect once with `pinSHA256: nil` (TOFU), persist `hostFingerprint` keyed
    by host, pass it on every later connect — a mismatch throws `.connectFailed`. The host
    logs its fingerprint at startup ("clients pin this fingerprint") for out-of-band
-   verification UX; a PIN-style pairing ceremony is a later punktfunk-core task. `PunktfunkClient`
-   doesn't persist fingerprints yet — add it alongside the "add host" UX.
+   verification UX; a PIN-style pairing ceremony is a later punktfunk-core task.
+   `PunktfunkClient` implements exactly this: explicit fingerprint confirmation on first
+   connect (input/cursor capture held back until confirmed), pin stored per host
+   (`HostStore`), "Forget Identity" in the card's context menu for legitimate host
+   reinstalls. Note the OTHER direction is still open: the host authorizes no one — any
+   client that reaches the port gets a session (fine on a LAN, not on the internet).
 8. **Input capture caveats** (stage 1): GC handlers only fire while the app has focus —
    on focus loss `InputCapture` auto-releases everything still held (keys + buttons) so
    nothing sticks down host-side. While the stream has focus the LOCAL cursor is hidden

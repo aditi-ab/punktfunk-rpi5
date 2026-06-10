@@ -1,5 +1,5 @@
-// Session state for the app shell: owns the connection, the input capture, and the
-// pump-thread → main-actor stats relay.
+// Session state for the app shell: owns the connection, the input capture, the trust
+// handshake phase, and the pump-thread → main-actor stats relay.
 
 import Foundation
 import PunktfunkKit
@@ -35,8 +35,20 @@ final class FrameMeter: @unchecked Sendable {
 
 @MainActor
 final class SessionModel: ObservableObject {
-    @Published var connection: PunktfunkConnection?
-    @Published var connecting = false
+    enum Phase: Equatable {
+        case idle
+        case connecting
+        /// Connected to an unpinned host: the stream is live (and pumping — the opening
+        /// IDR must not be missed) but input/cursor capture wait for the user to confirm
+        /// the observed fingerprint.
+        case awaitingTrust(fingerprint: Data)
+        case streaming
+    }
+
+    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var connection: PunktfunkConnection?
+    /// The host this session is for (a value copy; identity = id).
+    @Published private(set) var activeHost: StoredHost?
     @Published var errorMessage: String?
     @Published var fps = 0
     @Published var mbps = 0.0
@@ -46,28 +58,55 @@ final class SessionModel: ObservableObject {
     private var inputCapture: InputCapture?
     private var statsTimer: Timer?
 
-    func connect(host: String, port: UInt16, width: UInt32, height: UInt32, hz: UInt32) {
-        guard !connecting else { return }
-        connecting = true
+    var isBusy: Bool { phase != .idle }
+
+    func connect(to host: StoredHost, width: UInt32, height: UInt32, hz: UInt32,
+                 autoTrust: Bool = false) {
+        guard phase == .idle else { return }
+        phase = .connecting
+        activeHost = host
         errorMessage = nil
+        let pin = host.pinnedSHA256
         Task.detached(priority: .userInitiated) {
             // PunktfunkConnection.init blocks on the QUIC handshake — keep it off the main actor.
             let result = Result { try PunktfunkConnection(
-                host: host, port: port, width: width, height: height, refreshHz: hz) }
+                host: host.address, port: host.port,
+                width: width, height: height, refreshHz: hz,
+                pinSHA256: pin) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.connecting = false
                 switch result {
                 case .success(let conn):
                     self.connection = conn
-                    self.startInput(conn)
                     self.startStatsTimer()
+                    if pin != nil || autoTrust {
+                        self.beginStreaming()
+                    } else {
+                        self.phase = .awaitingTrust(fingerprint: conn.hostFingerprint)
+                    }
                 case .failure:
-                    self.errorMessage = "Connection failed — is the host running? " +
-                        "(punktfunk-host m3-host on \(host):\(port))"
+                    self.phase = .idle
+                    self.activeHost = nil
+                    self.errorMessage = pin != nil
+                        ? "Could not connect to \(host.displayName) — host unreachable, "
+                            + "not running, or its identity no longer matches the pinned "
+                            + "fingerprint."
+                        : "Could not connect to \(host.displayName) — is punktfunk-host "
+                            + "running on \(host.address):\(host.port)?"
                 }
             }
         }
+    }
+
+    /// The user confirmed the fingerprint: returns it for pinning and enters streaming.
+    func confirmTrust() -> Data? {
+        guard case .awaitingTrust(let fingerprint) = phase else { return nil }
+        beginStreaming()
+        return fingerprint
+    }
+
+    func rejectTrust() {
+        disconnect()
     }
 
     func disconnect() {
@@ -81,6 +120,8 @@ final class SessionModel: ObservableObject {
             Task.detached { conn.close() }
         }
         connection = nil
+        activeHost = nil
+        phase = .idle
         fps = 0
         mbps = 0
     }
@@ -88,11 +129,14 @@ final class SessionModel: ObservableObject {
     /// Called (via the main actor) when the pump hits end-of-session.
     func sessionEnded() {
         guard connection != nil else { return }
+        let name = activeHost?.displayName ?? "host"
         disconnect()
-        errorMessage = "Session ended by host."
+        errorMessage = "Session ended by \(name)."
     }
 
-    private func startInput(_ conn: PunktfunkConnection) {
+    private func beginStreaming() {
+        guard let conn = connection else { return }
+        phase = .streaming
         let capture = InputCapture(connection: conn)
         capture.start()
         inputCapture = capture

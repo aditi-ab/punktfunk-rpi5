@@ -44,27 +44,34 @@ private final class CursorCapture {
 
 public struct StreamView: NSViewRepresentable {
     private let connection: PunktfunkConnection
+    private let capturesCursor: Bool
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
     private let onSessionEnd: (@Sendable () -> Void)?
 
     /// `onFrame`/`onSessionEnd` fire on the pump thread — hop to the main actor for UI.
+    /// `capturesCursor: false` keeps the local cursor usable while UI (e.g. a trust
+    /// prompt) is layered over the stream; flip it to true to enter capture.
     public init(
         connection: PunktfunkConnection,
+        capturesCursor: Bool = true,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
         onSessionEnd: (@Sendable () -> Void)? = nil
     ) {
         self.connection = connection
+        self.capturesCursor = capturesCursor
         self.onFrame = onFrame
         self.onSessionEnd = onSessionEnd
     }
 
     public func makeNSView(context: Context) -> StreamLayerView {
         let view = StreamLayerView()
+        view.capturesCursor = capturesCursor
         view.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         return view
     }
 
     public func updateNSView(_ view: StreamLayerView, context: Context) {
+        view.capturesCursor = capturesCursor
         // SwiftUI reuses the NSView across state changes — repoint the pump only when the
         // connection identity actually changed.
         if view.connection !== connection {
@@ -101,6 +108,18 @@ public final class StreamLayerView: NSView {
     private let cursorCapture = CursorCapture()
     private var appObservers: [NSObjectProtocol] = []
 
+    /// Main-thread only. False = leave the local cursor alone (UI layered over the
+    /// stream); switching back to true re-enters capture immediately.
+    public var capturesCursor = true {
+        didSet {
+            if capturesCursor {
+                captureCursorIfStreaming()
+            } else {
+                cursorCapture.release()
+            }
+        }
+    }
+
     public override init(frame: NSRect) {
         super.init(frame: frame)
         displayLayer.videoGravity = .resizeAspect
@@ -132,7 +151,7 @@ public final class StreamLayerView: NSView {
     }
 
     private func captureCursorIfStreaming() {
-        guard token != nil, NSApp.isActive else { return }
+        guard capturesCursor, token != nil, NSApp.isActive else { return }
         cursorCapture.capture(in: self)
     }
 

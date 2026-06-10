@@ -1,5 +1,5 @@
-// PunktfunkClient — development app shell around PunktfunkKit (swift run PunktfunkClient).
-// Connect form → StreamView (AVSampleBufferDisplayLayer HEVC) + InputCapture.
+// PunktfunkClient — the macOS client app (also runs unbundled via swift run).
+// Hosts grid → trust-on-first-use → StreamView (AVSampleBufferDisplayLayer HEVC) + input.
 
 import AppKit
 import SwiftUI
@@ -11,6 +11,9 @@ struct PunktfunkClientApp: App {
     var body: some Scene {
         WindowGroup("punktfunk") {
             ContentView()
+        }
+        Settings {
+            SettingsView()
         }
     }
 }
