@@ -29,6 +29,14 @@ pub enum InputKind {
     /// Sticks are i16 range (−32768..32767) in the XInput/Moonlight convention — **+y =
     /// up** (unlike mouse coordinates); triggers 0..255.
     GamepadAxis = 8,
+    /// Touch begins. `code` = touch id (which finger; reusable after `TouchUp`), `x`/`y` =
+    /// pixel coordinates and `flags` = `(width << 16) | height` of the client's touch surface
+    /// — the same absolute mapping as [`MouseMoveAbs`](Self::MouseMoveAbs).
+    TouchDown = 9,
+    /// Touch moves. Same field meaning as [`TouchDown`](Self::TouchDown).
+    TouchMove = 10,
+    /// Touch ends. Only `code` (the touch id) is used.
+    TouchUp = 11,
 }
 
 /// The gamepad wire contract for [`InputKind::GamepadButton`]/[`InputKind::GamepadAxis`].
@@ -79,6 +87,9 @@ impl InputKind {
             6 => MouseScroll,
             7 => GamepadButton,
             8 => GamepadAxis,
+            9 => TouchDown,
+            10 => TouchMove,
+            11 => TouchUp,
             _ => return None,
         })
     }
@@ -147,5 +158,27 @@ mod tests {
         };
         assert_eq!(InputEvent::decode(&e.encode()), Some(e));
         assert!(InputEvent::decode(&[0u8; INPUT_WIRE_LEN]).is_none()); // bad magic
+    }
+
+    #[test]
+    fn touch_kinds_roundtrip() {
+        for kind in [
+            InputKind::TouchDown,
+            InputKind::TouchMove,
+            InputKind::TouchUp,
+        ] {
+            assert_eq!(InputKind::from_u8(kind as u8), Some(kind));
+            let e = InputEvent {
+                kind,
+                _pad: [0; 3],
+                code: 2, // touch id
+                x: 640,
+                y: 360,
+                flags: (1280u32 << 16) | 720, // client surface w/h
+            };
+            assert_eq!(InputEvent::decode(&e.encode()), Some(e));
+        }
+        // 12 (one past TouchUp) is not a valid kind.
+        assert_eq!(InputKind::from_u8(12), None);
     }
 }

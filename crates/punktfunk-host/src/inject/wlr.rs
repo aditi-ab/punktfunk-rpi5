@@ -249,6 +249,8 @@ impl InputInjector for WlrootsInjector {
                 }
             }
             InputKind::GamepadButton | InputKind::GamepadAxis => {} // not yet injected
+            // wlroots has no virtual-touch protocol wired here; touch is the libei path only.
+            InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {}
         }
         // Surface protocol errors / disconnects, then push the batch to the compositor.
         self.queue

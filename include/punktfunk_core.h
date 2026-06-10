@@ -201,6 +201,14 @@ enum PunktfunkInputKind
     // Sticks are i16 range (−32768..32767) in the XInput/Moonlight convention — **+y =
     // up** (unlike mouse coordinates); triggers 0..255.
     PUNKTFUNK_INPUT_KIND_GAMEPAD_AXIS = 8,
+    // Touch begins. `code` = touch id (which finger; reusable after `TouchUp`), `x`/`y` =
+    // pixel coordinates and `flags` = `(width << 16) | height` of the client's touch surface
+    // — the same absolute mapping as [`MouseMoveAbs`](Self::MouseMoveAbs).
+    PUNKTFUNK_INPUT_KIND_TOUCH_DOWN = 9,
+    // Touch moves. Same field meaning as [`TouchDown`](Self::TouchDown).
+    PUNKTFUNK_INPUT_KIND_TOUCH_MOVE = 10,
+    // Touch ends. Only `code` (the touch id) is used.
+    PUNKTFUNK_INPUT_KIND_TOUCH_UP = 11,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

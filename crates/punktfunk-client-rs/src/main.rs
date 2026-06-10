@@ -9,7 +9,8 @@
 //! `--input-test` exercises the input plane: scripted mouse/keyboard datagrams during the
 //! stream (watch them land in the host session, e.g. xev inside gamescope). `--mic-test`
 //! exercises the mic uplink: a synthetic 440 Hz tone streamed as Opus (0xCB) → the host's
-//! virtual microphone source (record it host-side to hear the tone).
+//! virtual microphone source (record it host-side to hear the tone). `--touch-test` drags a
+//! synthetic finger in a circle → host libei `ei_touchscreen` injection.
 //!
 //! `--pin <64-hex>` pins the host's certificate fingerprint (the host logs it at startup);
 //! without it the client trusts on first use and prints the observed fingerprint to pin.
@@ -41,6 +42,8 @@ struct Args {
     input_test: bool,
     /// `--mic-test` — stream a synthetic 440 Hz tone as the mic uplink (proves the mic path).
     mic_test: bool,
+    /// `--touch-test` — drag a synthetic finger in a circle (proves the touch path).
+    touch_test: bool,
     pin: Option<[u8; 32]>,
     /// `--remode WxHxFPS:SECS` — request this mode SECS seconds into the stream.
     remode: Option<(Mode, u32)>,
@@ -142,6 +145,7 @@ fn parse_args() -> Args {
         out: get("--out").map(String::from),
         input_test: argv.iter().any(|a| a == "--input-test"),
         mic_test: argv.iter().any(|a| a == "--mic-test"),
+        touch_test: argv.iter().any(|a| a == "--touch-test"),
         pin,
         remode,
         pair: get("--pair").map(String::from),
@@ -393,6 +397,51 @@ async fn session(args: Args) -> Result<()> {
                 }
             }
             tracing::info!("mic-test: done");
+        });
+    }
+
+    // Touch plane: drag a synthetic finger (touch id 0) in a circle on the client surface, so
+    // the host injects it via libei ei_touchscreen — proves the touch path end to end. `flags`
+    // packs the surface w/h; x/y are pixels (the host maps them into the device region).
+    if args.touch_test {
+        let conn2 = conn.clone();
+        let (w, h) = (args.mode.width, args.mode.height);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let flags = (w << 16) | (h & 0xffff);
+            let (cx, cy, r) = (w as f32 / 2.0, h as f32 / 2.0, h as f32 / 4.0);
+            let touch = |kind, x: f32, y: f32| InputEvent {
+                kind,
+                _pad: [0; 3],
+                code: 0, // touch id 0
+                x: x as i32,
+                y: y as i32,
+                flags,
+            };
+            tracing::info!("touch-test: dragging a finger in a circle for ~6s");
+            for loop_i in 0..3u32 {
+                let _ = conn2.send_datagram(
+                    touch(InputKind::TouchDown, cx + r, cy)
+                        .encode()
+                        .to_vec()
+                        .into(),
+                );
+                for i in 0..60u32 {
+                    let a = std::f32::consts::TAU * i as f32 / 60.0;
+                    let mv = touch(InputKind::TouchMove, cx + r * a.cos(), cy + r * a.sin());
+                    let _ = conn2.send_datagram(mv.encode().to_vec().into());
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                }
+                let _ = conn2.send_datagram(
+                    touch(InputKind::TouchUp, cx + r, cy)
+                        .encode()
+                        .to_vec()
+                        .into(),
+                );
+                let _ = loop_i;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            tracing::info!("touch-test: done");
         });
     }
 

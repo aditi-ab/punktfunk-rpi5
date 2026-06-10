@@ -178,7 +178,7 @@ async fn connect_portal() -> Result<(
     rd.select_devices(
         &session,
         SelectDevicesOptions::default()
-            .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+            .set_devices(DeviceType::Keyboard | DeviceType::Pointer | DeviceType::Touchscreen)
             .set_persist_mode(PersistMode::DoNot),
     )
     .await
@@ -263,7 +263,8 @@ impl EiState {
                         | DeviceCapability::PointerAbsolute
                         | DeviceCapability::Keyboard
                         | DeviceCapability::Scroll
-                        | DeviceCapability::Button,
+                        | DeviceCapability::Button
+                        | DeviceCapability::Touch,
                 );
                 let _ = ctx.flush();
             }
@@ -321,10 +322,31 @@ impl EiState {
             InputKind::MouseButtonDown | InputKind::MouseButtonUp => DeviceCapability::Button,
             InputKind::MouseScroll => DeviceCapability::Scroll,
             InputKind::KeyDown | InputKind::KeyUp => DeviceCapability::Keyboard,
+            InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {
+                DeviceCapability::Touch
+            }
             InputKind::GamepadButton | InputKind::GamepadAxis => return, // uinput path (later)
         };
         let Some(idx) = self.device_for(cap) else {
-            return; // no resumed device with this capability yet
+            // No resumed device with this capability yet. For touch this is usually permanent on
+            // this compositor — the RemoteDesktop portal may grant the Touchscreen *device type*
+            // while the EIS server never creates a touchscreen *device* (observed on headless
+            // KWin). Surface it once so touch silently going nowhere is diagnosable.
+            if matches!(
+                ev.kind,
+                InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp
+            ) {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "touch received but the compositor's EIS exposed no touchscreen device — \
+                         touch is dropped (KWin's libei may not implement ei_touchscreen yet; \
+                         gamescope / a newer compositor may)"
+                    );
+                }
+            }
+            return;
         };
         let dev = self.devices[idx].device.device().clone();
         self.ensure_emulating(idx, &dev);
@@ -398,6 +420,32 @@ impl EiState {
                     }
                 }
             }
+            // Touch: `code` is the touch id, `x`/`y` are client pixels and `flags` packs the
+            // client surface w/h — mapped into the device's region exactly like MouseMoveAbs.
+            // One InputEvent = one frame, which satisfies the ei_touchscreen rule that a down /
+            // motion / up must not share a frame.
+            InputKind::TouchDown | InputKind::TouchMove => {
+                let w = ((ev.flags >> 16) & 0xffff) as f32;
+                let h = (ev.flags & 0xffff) as f32;
+                match (slot.interface::<ei::Touchscreen>(), slot.regions().first()) {
+                    (Some(t), Some(region)) if w > 0.0 && h > 0.0 => {
+                        let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
+                        let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
+                        let x = region.x as f32 + nx * region.width as f32;
+                        let y = region.y as f32 + ny * region.height as f32;
+                        if ev.kind == InputKind::TouchDown {
+                            t.down(ev.code, x, y);
+                        } else {
+                            t.motion(ev.code, x, y);
+                        }
+                    }
+                    _ => emitted = false,
+                }
+            }
+            InputKind::TouchUp => match slot.interface::<ei::Touchscreen>() {
+                Some(t) => t.up(ev.code),
+                None => emitted = false,
+            },
             InputKind::GamepadButton | InputKind::GamepadAxis => emitted = false,
         }
 
