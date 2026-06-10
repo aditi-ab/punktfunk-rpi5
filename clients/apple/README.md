@@ -54,7 +54,8 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 bash scripts/build-xcframework.sh        # → clients/apple/PunktfunkCore.xcframework
 cd clients/apple
 swift build && swift test                # loopback/remote tests self-skip without a host
-swift run PunktfunkClient                    # the app; or open Package.swift in Xcode
+swift run PunktfunkClient                # the unbundled dev shell (CLI)
+open Punktfunk.xcodeproj                 # the real app: ⌘R builds + runs Punktfunk.app
 
 bash test-loopback.sh                    # full loopback proof: builds punktfunk-host
                                          # (synthetic source — runs on macOS), streams
@@ -67,6 +68,24 @@ bash test-loopback.sh                    # full loopback proof: builds punktfunk
 PUNKTFUNK_REMOTE_HOST=<box-ip> swift test --filter RemoteFirstLightTests   # headless
 PUNKTFUNK_AUTOCONNECT=<box-ip> PUNKTFUNK_MODE=1280x720x60 swift run PunktfunkClient # on glass
 ```
+
+## Xcode project (`Punktfunk.xcodeproj`)
+
+The app target **Punktfunk** wraps the same sources as the `swift run` shell
+(`Sources/PunktfunkClient`, a synchronized folder — no duplication) plus `App/` (asset
+catalog) and links `PunktfunkKit` from the local package. Generated Info.plist, ad-hoc
+signing, bundle id `io.unom.punktfunk`. Notes:
+
+- **App icon**: `App/Assets.xcassets` ships an empty `AppIcon` slot. For an Icon Composer
+  `.icon`: add the file to the project (target Punktfunk), set it as the App Icon in the
+  target's General tab, and delete the placeholder `AppIcon.appiconset`. Heads-up: CLI
+  `actool` (Xcode 26.5) crashed compiling `punktfunk_Logo.icon` — if Xcode does the same,
+  suspect the icon bundle (it has a duplicate-named layer, "…Layer-3 2.svg"), not the
+  project.
+- **Tests from Xcode**: the package tests run with `swift test`; to get them on ⌘U, add
+  `PunktfunkKitTests` once via Edit Scheme → Test → + (Xcode persists it into the shared
+  scheme — a hand-written package-test reference doesn't resolve headlessly).
+- `xcodebuild -project Punktfunk.xcodeproj -scheme Punktfunk build` works headlessly.
 
 ## Notes for whoever picks this up next
 

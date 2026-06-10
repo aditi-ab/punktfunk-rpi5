@@ -11,3 +11,5 @@ dist/
 clients/apple/.build/
 clients/apple/PunktfunkCore.xcframework/
 clients/apple/.swiftpm/
+# Xcode per-user state
+xcuserdata/
