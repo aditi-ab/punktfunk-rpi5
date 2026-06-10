@@ -60,21 +60,24 @@ fn real_main() -> Result<()> {
         Some("zerocopy-probe") => zerocopy::probe(),
         // M0 pipeline spike.
         Some("m0") => m0::run(parse_m0(&args[1..])?),
-        // M3 seed: native lumen/1 host (QUIC control plane + UDP data plane).
+        // M3: native lumen/1 host (QUIC control plane + UDP data plane).
         Some("m3-host") => {
-            let port = args
-                .iter()
-                .skip_while(|a| *a != "--port")
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(9777);
-            let frames = args
-                .iter()
-                .skip_while(|a| *a != "--frames")
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300);
-            m3::run(port, frames)
+            let get = |flag: &str| {
+                args.iter()
+                    .skip_while(|a| *a != flag)
+                    .nth(1)
+                    .map(String::as_str)
+            };
+            let source = match get("--source") {
+                Some("virtual") => m3::M3Source::Virtual,
+                _ => m3::M3Source::Synthetic,
+            };
+            m3::run(m3::M3Options {
+                port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(9777),
+                source,
+                seconds: get("--seconds").and_then(|s| s.parse().ok()).unwrap_or(30),
+                frames: get("--frames").and_then(|s| s.parse().ok()).unwrap_or(300),
+            })
         }
         Some("-h") | Some("--help") | Some("help") | None => {
             print_usage();

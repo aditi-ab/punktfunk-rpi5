@@ -26,10 +26,12 @@ use crate::error::{LumenError, Result};
 /// Protocol magic + version, first bytes of every message payload.
 pub const MAGIC: &[u8; 4] = b"LMN1";
 
-/// `client → host`: open the session.
+/// `client → host`: open the session, requesting a display mode (the host creates its
+/// virtual output at exactly this size/refresh — native resolution end to end).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hello {
     pub abi_version: u32,
+    pub mode: Mode,
 }
 
 /// `host → client`: the complete session offer.
@@ -56,18 +58,27 @@ pub struct Start {
 
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(8);
+        let mut b = Vec::with_capacity(20);
         b.extend_from_slice(MAGIC);
         b.extend_from_slice(&self.abi_version.to_le_bytes());
+        b.extend_from_slice(&self.mode.width.to_le_bytes());
+        b.extend_from_slice(&self.mode.height.to_le_bytes());
+        b.extend_from_slice(&self.mode.refresh_hz.to_le_bytes());
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<Hello> {
-        if b.len() < 8 || &b[0..4] != MAGIC {
+        if b.len() < 20 || &b[0..4] != MAGIC {
             return Err(LumenError::InvalidArg("bad Hello"));
         }
+        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         Ok(Hello {
-            abi_version: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            abi_version: u32at(4),
+            mode: Mode {
+                width: u32at(8),
+                height: u32at(12),
+                refresh_hz: u32at(16),
+            },
         })
     }
 }
@@ -324,7 +335,14 @@ mod tests {
 
     #[test]
     fn hello_start_roundtrip() {
-        let h = Hello { abi_version: 1 };
+        let h = Hello {
+            abi_version: 1,
+            mode: Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 120,
+            },
+        };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
             client_udp_port: 1234,
