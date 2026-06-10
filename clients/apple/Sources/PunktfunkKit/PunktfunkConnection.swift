@@ -138,6 +138,31 @@ public final class PunktfunkConnection {
     /// trust-on-first-use connect, persist this and pass it as `pinSHA256` next time.
     public private(set) var hostFingerprint: Data = Data()
 
+    /// Compositor preference for the host's per-session virtual output (the
+    /// `PUNKTFUNK_COMPOSITOR_*` ABI values). `.auto` lets the host auto-detect from its
+    /// running desktop; a concrete backend is honored only if available on the host right
+    /// now — else the host falls back to auto-detect and logs the real choice.
+    public enum Compositor: UInt32, CaseIterable, Sendable {
+        case auto = 0
+        case kwin = 1
+        case wlroots = 2
+        case mutter = 3
+        case gamescope = 4
+
+        /// Loose name parsing for env/dev hooks ("kde" and "sway" are accepted aliases,
+        /// mirroring the host's `CompositorPref::from_name`).
+        public init?(name: String) {
+            switch name.lowercased() {
+            case "auto": self = .auto
+            case "kwin", "kde": self = .kwin
+            case "wlroots", "sway", "hyprland": self = .wlroots
+            case "mutter", "gnome": self = .mutter
+            case "gamescope": self = .gamescope
+            default: return nil
+            }
+        }
+    }
+
     /// Connect and start a session at the requested mode (the host creates a native virtual
     /// output at exactly this size/refresh). Blocks up to `timeoutMs`.
     ///
@@ -148,11 +173,15 @@ public final class PunktfunkConnection {
     /// `identity`: this client's persistent identity (from `generateIdentity()`, stored in
     /// the Keychain) — presented so a host recognizes a paired client. nil = anonymous;
     /// hosts running `--require-pairing` reject anonymous sessions.
+    ///
+    /// `compositor`: which backend should drive the virtual output host-side (see
+    /// `Compositor`; `.auto` = host decides).
     public init(
         host: String, port: UInt16 = 9777,
         width: UInt32, height: UInt32, refreshHz: UInt32,
         pinSHA256: Data? = nil,
         identity: ClientIdentity? = nil,
+        compositor: Compositor = .auto,
         timeoutMs: UInt32 = 10_000
     ) throws {
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
@@ -162,14 +191,15 @@ public final class PunktfunkConnection {
                 withOptionalCString(identity?.keyPEM) { key in
                     if let pin = pinSHA256 {
                         return pin.withUnsafeBytes { p in
-                            punktfunk_connect(
-                                cs, port, width, height, refreshHz,
+                            punktfunk_connect_ex(
+                                cs, port, width, height, refreshHz, compositor.rawValue,
                                 p.bindMemory(to: UInt8.self).baseAddress, &observed,
                                 cert, key, timeoutMs)
                         }
                     }
-                    return punktfunk_connect(
-                        cs, port, width, height, refreshHz, nil, &observed, cert, key, timeoutMs)
+                    return punktfunk_connect_ex(
+                        cs, port, width, height, refreshHz, compositor.rawValue,
+                        nil, &observed, cert, key, timeoutMs)
                 }
             }
         }

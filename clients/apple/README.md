@@ -44,7 +44,9 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
   trust-on-first-use fingerprint prompt over the live-but-blurred stream, and SPAKE2 PIN
   pairing (`PairSheet`, from a host card's context menu or the trust prompt;
   `ClientIdentityStore` keeps the client identity in the Keychain and presents it on
-  every connect) — then pinned reconnects, fps/Mb-s HUD. (Audio playback and
+  every connect) — then pinned reconnects, fps/Mb-s HUD. Settings also picks the HOST
+  compositor (KWin/wlroots/Mutter/gamescope, default automatic — the host honors it
+  only if that backend is available there). (Audio playback and
   gamepad capture are not wired into the app yet — the connector surface is there; see
   notes 5–6.)
 - **Tests** (`swift test`): byte-level Annex-B units; a real-codec round trip
@@ -73,6 +75,8 @@ bash test-loopback.sh                    # full loopback proof: builds punktfunk
 #   PUNKTFUNK_COMPOSITOR=gamescope PUNKTFUNK_GAMESCOPE_APP=vkcube PUNKTFUNK_ZEROCOPY=1 \
 #   cargo run -rp punktfunk-host -- m3-host --source virtual --seconds 60
 PUNKTFUNK_REMOTE_HOST=<box-ip> swift test --filter RemoteFirstLightTests   # headless
+#   (+ PUNKTFUNK_REMOTE_PORT / PUNKTFUNK_REMOTE_COMPOSITOR=gamescope|kwin|… /
+#    PUNKTFUNK_REMOTE_PIN=<arming-pin> for the remote pairing test)
 PUNKTFUNK_AUTOCONNECT=<box-ip> PUNKTFUNK_MODE=1280x720x60 swift run PunktfunkClient # on glass
 ```
 

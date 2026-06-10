@@ -63,6 +63,7 @@ final class SessionModel: ObservableObject {
     var isBusy: Bool { phase != .idle }
 
     func connect(to host: StoredHost, width: UInt32, height: UInt32, hz: UInt32,
+                 compositor: PunktfunkConnection.Compositor = .auto,
                  autoTrust: Bool = false) {
         guard phase == .idle else { return }
         phase = .connecting
@@ -78,7 +79,7 @@ final class SessionModel: ObservableObject {
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,
-                pinSHA256: pin, identity: identity) }
+                pinSHA256: pin, identity: identity, compositor: compositor) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 switch result {

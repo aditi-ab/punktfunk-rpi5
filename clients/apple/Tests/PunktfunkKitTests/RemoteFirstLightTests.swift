@@ -53,11 +53,16 @@ final class RemoteFirstLightTests: XCTestCase {
             throw XCTSkip("set PUNKTFUNK_REMOTE_HOST (and start m3-host --source virtual there)")
         }
         let port = env["PUNKTFUNK_REMOTE_PORT"].flatMap(UInt16.init) ?? 9777
+        // PUNKTFUNK_REMOTE_COMPOSITOR=kwin|gamescope|… asks the host for a specific
+        // backend (verify in its log: "punktfunk/1 virtual display compositor=…").
+        let compositor = env["PUNKTFUNK_REMOTE_COMPOSITOR"]
+            .flatMap(PunktfunkConnection.Compositor.init(name:)) ?? .auto
         let width: UInt32 = 1280
         let height: UInt32 = 720
 
         let conn = try PunktfunkConnection(
-            host: host, port: port, width: width, height: height, refreshHz: 60)
+            host: host, port: port, width: width, height: height, refreshHz: 60,
+            compositor: compositor)
         defer { conn.close() }
         XCTAssertEqual(conn.width, width)
         XCTAssertEqual(conn.height, height)

@@ -18,6 +18,7 @@ struct ContentView: View {
     @AppStorage("punktfunk.width") private var width = 1920
     @AppStorage("punktfunk.height") private var height = 1080
     @AppStorage("punktfunk.hz") private var hz = 60
+    @AppStorage("punktfunk.compositor") private var compositor = 0
     @State private var showAddHost = false
     @State private var pairingTarget: StoredHost?
 
@@ -196,7 +197,9 @@ struct ContentView: View {
         model.connect(
             to: host,
             width: UInt32(clamping: width), height: UInt32(clamping: height),
-            hz: UInt32(clamping: hz))
+            hz: UInt32(clamping: hz),
+            compositor: PunktfunkConnection.Compositor(
+                rawValue: UInt32(clamping: compositor)) ?? .auto)
     }
 
     // MARK: - Trust on first use
@@ -303,7 +306,8 @@ struct ContentView: View {
 
     /// PUNKTFUNK_AUTOCONNECT=host[:port] connects immediately (trust-on-first-use,
     /// auto-confirmed — dev only) at the saved or PUNKTFUNK_MODE=WxHxHz mode, without
-    /// touching the saved host list. (IPv4/hostname only.)
+    /// touching the saved host list. PUNKTFUNK_COMPOSITOR=kwin|gamescope|… overrides the
+    /// compositor preference (same names as the host env knob). (IPv4/hostname only.)
     private func autoConnectIfAsked() {
         guard let target = ProcessInfo.processInfo.environment["PUNKTFUNK_AUTOCONNECT"],
               !target.isEmpty, model.phase == .idle
@@ -319,10 +323,17 @@ struct ContentView: View {
                 hz = dims[2]
             }
         }
+        var pref = PunktfunkConnection.Compositor(
+            rawValue: UInt32(clamping: compositor)) ?? .auto
+        if let name = ProcessInfo.processInfo.environment["PUNKTFUNK_COMPOSITOR"],
+           let c = PunktfunkConnection.Compositor(name: name) {
+            pref = c
+        }
         model.connect(
             to: host,
             width: UInt32(clamping: width), height: UInt32(clamping: height),
             hz: UInt32(clamping: hz),
+            compositor: pref,
             autoTrust: true)
     }
 }
