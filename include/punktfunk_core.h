@@ -135,13 +135,20 @@
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
-// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8),
-// audio = [`AUDIO_MAGIC`], rumble = [`RUMBLE_MAGIC`].
+// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
+// audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
+// mic = [`MIC_MAGIC`] (0xCB, client→host).
 #define PUNKTFUNK_AUDIO_MAGIC 201
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 #define PUNKTFUNK_RUMBLE_MAGIC 202
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Microphone uplink: the client's mic, Opus-encoded, client → host (the inverse of
+// [`AUDIO_MAGIC`]). The host feeds it into a virtual PipeWire source so its apps can record it.
+#define MIC_MAGIC 203
 #endif
 
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
@@ -505,6 +512,21 @@ PunktfunkStatus punktfunk_connection_next_rumble(PunktfunkConnection *c,
 // `c` is a valid connection handle; `ev` points to a valid [`InputEvent`].
 PunktfunkStatus punktfunk_connection_send_input(PunktfunkConnection *c,
                                                 const PunktfunkInputEvent *ev);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Send one Opus mic frame to the host as a QUIC datagram (48 kHz; the host decodes it into a
+// virtual microphone source its apps can record). Non-blocking enqueue; the host uses `seq`/
+// `pts_ns` (the caller's own counters) only for diagnostics. `opus_data`/`len` may be empty
+// (a DTX silence frame). The data is copied; the caller may reuse the buffer after this returns.
+//
+// # Safety
+// `c` is a valid connection handle; `opus_data` is valid for `len` bytes (or `len == 0`).
+PunktfunkStatus punktfunk_connection_send_mic(PunktfunkConnection *c,
+                                              const uint8_t *opus_data,
+                                              uintptr_t len,
+                                              uint32_t seq,
+                                              uint64_t pts_ns);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

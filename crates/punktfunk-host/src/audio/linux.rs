@@ -13,8 +13,9 @@
 //! stream down promptly — required so a surround session can replace a stereo capturer
 //! without leaking a PipeWire consumer (see CLAUDE.md: a wedged link head-blocks the daemon).
 
-use super::{AudioCapturer, SAMPLE_RATE};
+use super::{AudioCapturer, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
+use std::collections::VecDeque;
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
@@ -103,6 +104,232 @@ fn spa_positions(channels: u32) -> [u32; 64] {
     };
     pos[..order.len()].copy_from_slice(order);
     pos
+}
+
+/// Virtual microphone: a PipeWire `Audio/Source` node host apps can record from. The host pushes
+/// decoded client-mic PCM in; the loop thread's producer callback drains it (silence on
+/// underrun) into PipeWire buffers. Mirrors [`PwAudioCapturer`] but inverted (Direction::Output).
+pub struct PwMicSource {
+    pcm: std::sync::mpsc::SyncSender<Vec<f32>>,
+    channels: u32,
+    quit: pipewire::channel::Sender<Terminate>,
+}
+
+impl PwMicSource {
+    pub fn open(channels: u32) -> Result<PwMicSource> {
+        anyhow::ensure!(
+            matches!(channels, 1 | 2),
+            "virtual mic supports 1 or 2 channels, got {channels}"
+        );
+        let (pcm_tx, pcm_rx) = sync_channel::<Vec<f32>>(64);
+        let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
+        thread::Builder::new()
+            .name("punktfunk-pw-mic".into())
+            .spawn(move || {
+                if let Err(e) = mic_pw_thread(pcm_rx, quit_rx, channels) {
+                    tracing::error!(error = %format!("{e:#}"), "pipewire virtual-mic thread failed");
+                }
+            })
+            .context("spawn pipewire virtual-mic thread")?;
+        Ok(PwMicSource {
+            pcm: pcm_tx,
+            channels,
+            quit: quit_tx,
+        })
+    }
+}
+
+impl Drop for PwMicSource {
+    fn drop(&mut self) {
+        let _ = self.quit.send(Terminate);
+    }
+}
+
+impl VirtualMic for PwMicSource {
+    fn push(&self, pcm: &[f32]) {
+        let _ = self.pcm.try_send(pcm.to_vec()); // drop if the PipeWire side is behind
+    }
+    fn channels(&self) -> u32 {
+        self.channels
+    }
+}
+
+/// Producer-side state for the virtual-mic loop: incoming decoded PCM and a small ring buffer
+/// the process callback drains into PipeWire buffers (capped, so latency stays bounded).
+/// `primed` is a jitter buffer gate — see the process callback.
+struct MicUserData {
+    rx: Receiver<Vec<f32>>,
+    ring: VecDeque<f32>,
+    channels: usize,
+    primed: bool,
+}
+
+fn mic_pw_thread(
+    pcm_rx: Receiver<Vec<f32>>,
+    quit_rx: pipewire::channel::Receiver<Terminate>,
+    channels: u32,
+) -> Result<()> {
+    use pipewire as pw;
+    use pw::{properties::properties, spa};
+    use spa::param::audio::{AudioFormat, AudioInfoRaw};
+    use spa::pod::Pod;
+
+    crate::pwinit::ensure_init();
+    let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw mic MainLoop")?;
+    let context = pw::context::ContextRc::new(&mainloop, None).context("pw mic Context")?;
+    let core = context
+        .connect_rc(None)
+        .context("pw mic connect (is PipeWire running in this session?)")?;
+
+    let _quit_guard = quit_rx.attach(mainloop.loop_(), {
+        let mainloop = mainloop.clone();
+        move |_| mainloop.quit()
+    });
+
+    // media.class=Audio/Source advertises us as a microphone (a recordable source), NOT a
+    // playback stream — without it, Direction::Output + Playback would route to the speakers.
+    let stream = pw::stream::StreamBox::new(
+        &core,
+        "punktfunk-mic",
+        properties! {
+            *pw::keys::MEDIA_TYPE        => "Audio",
+            *pw::keys::MEDIA_CLASS       => "Audio/Source",
+            *pw::keys::NODE_NAME         => "punktfunk-mic",
+            *pw::keys::NODE_DESCRIPTION  => "Punktfunk Remote Microphone",
+            // ~5 ms quantum (one Opus frame) so recording apps get smooth low-latency chunks.
+            *pw::keys::NODE_LATENCY      => "240/48000",
+        },
+    )
+    .context("pw mic Stream")?;
+
+    let ud = MicUserData {
+        rx: pcm_rx,
+        ring: VecDeque::new(),
+        channels: channels as usize,
+        primed: false,
+    };
+
+    let _listener = stream
+        .add_local_listener_with_user_data(ud)
+        .state_changed(|_s, _ud, old, new| {
+            tracing::info!(?old, ?new, "pipewire virtual-mic stream state");
+        })
+        .param_changed(|_s, _ud, id, param| {
+            let Some(param) = param else { return };
+            if id != pw::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let mut info = AudioInfoRaw::default();
+            if info.parse(param).is_ok() {
+                tracing::info!(
+                    format = ?info.format(),
+                    rate = info.rate(),
+                    channels = info.channels(),
+                    "virtual-mic format negotiated"
+                );
+            }
+        })
+        .process(|stream, ud| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Some(mut buffer) = stream.dequeue_buffer() else {
+                    return;
+                };
+                // Pull all newly-decoded PCM into the ring.
+                while let Ok(frame) = ud.rx.try_recv() {
+                    ud.ring.extend(frame);
+                }
+                let stride = 4 * ud.channels; // F32LE interleaved
+                let datas = buffer.datas_mut();
+                if datas.is_empty() {
+                    return;
+                }
+                let data = &mut datas[0];
+                let want_frames = data.data().map(|s| s.len() / stride).unwrap_or(0);
+                let want = want_frames * ud.channels; // interleaved samples this quantum needs
+                static FIRST: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(true);
+                if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        quantum_frames = want_frames,
+                        quantum_ms = want_frames as f32 / 48.0,
+                        "virtual-mic consumer connected"
+                    );
+                }
+
+                // Adaptive jitter buffer. The client pushes 5 ms frames; the recorder pulls a
+                // whole *quantum* (often 20–43 ms) from an independent clock. A drain of one
+                // quantum must not outrun what's buffered, or every call underruns to silence
+                // (the original ~58% gaps). So prime to ~3 quanta before producing, hold there,
+                // and re-prime only after a genuine full drain (the client went quiet). The ring
+                // is capped at a few quanta so latency stays bounded.
+                let target = (3 * want).clamp(720 * ud.channels, 9600 * ud.channels);
+                while ud.ring.len() > target.max(want) + want {
+                    ud.ring.pop_front(); // bound latency: drop the oldest beyond ~1 quantum slack
+                }
+                if !ud.primed && ud.ring.len() >= target {
+                    ud.primed = true;
+                }
+
+                let n_frames = if let Some(slice) = data.data() {
+                    for k in 0..want {
+                        let s = if ud.primed {
+                            ud.ring.pop_front().unwrap_or(0.0) // silence on a momentary underrun
+                        } else {
+                            0.0 // not yet primed — emit silence while the buffer fills
+                        };
+                        let off = k * 4;
+                        slice[off..off + 4].copy_from_slice(&s.to_le_bytes());
+                    }
+                    want_frames
+                } else {
+                    0
+                };
+                if ud.ring.is_empty() {
+                    ud.primed = false; // fully drained — re-prime before producing again
+                }
+                let chunk = data.chunk_mut();
+                *chunk.offset_mut() = 0;
+                *chunk.stride_mut() = stride as _;
+                *chunk.size_mut() = (stride * n_frames) as _;
+            }));
+            if outcome.is_err() {
+                tracing::error!("panic in pipewire virtual-mic callback");
+            }
+        })
+        .register()
+        .context("register virtual-mic stream listener")?;
+
+    let mut info = AudioInfoRaw::new();
+    info.set_format(AudioFormat::F32LE);
+    info.set_rate(SAMPLE_RATE);
+    info.set_channels(channels);
+    info.set_position(spa_positions(channels));
+    let obj = pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: pw::spa::param::ParamType::EnumFormat.as_raw(),
+        properties: info.into(),
+    };
+    let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(obj),
+    )
+    .context("serialize mic format pod")?
+    .0
+    .into_inner();
+    let mut params = [Pod::from_bytes(&values).context("mic pod from bytes")?];
+
+    stream
+        .connect(
+            spa::utils::Direction::Output, // we PRODUCE samples (a source)
+            None,
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+            &mut params,
+        )
+        .context("pw mic stream connect")?;
+
+    mainloop.run();
+    tracing::debug!("pipewire virtual-mic loop exited (source dropped)");
+    Ok(())
 }
 
 fn pw_thread(

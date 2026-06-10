@@ -185,6 +185,9 @@ async fn serve(opts: M3Options) -> Result<()> {
     // session — which, under rapid client reconnects, raced a prior session's portal teardown and
     // wedged KWin's EIS setup ("EIS setup timed out"). Gamepads stay per-session (uinput).
     let injector = InjectorService::start();
+    // One virtual microphone for the whole host lifetime (see MicService): the client's mic uplink
+    // (0xCB) is Opus-decoded and fed into a persistent PipeWire Audio/Source host apps record from.
+    let mic_service = MicService::start();
     let paired_at = match &opts.paired_store {
         Some(p) => p.clone(),
         None => paired_path()?,
@@ -233,6 +236,7 @@ async fn serve(opts: M3Options) -> Result<()> {
             &opts,
             &audio_cap,
             injector.sender(),
+            mic_service.sender(),
             &fingerprint,
             &paired,
             &last_pairing,
@@ -350,6 +354,7 @@ async fn serve_session(
     opts: &M3Options,
     audio_cap: &AudioCapSlot,
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
+    mic_tx: std::sync::mpsc::Sender<Vec<u8>>,
     host_fp: &[u8; 32],
     paired: &PairedStore,
     last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
@@ -521,18 +526,30 @@ async fn serve_session(
             .spawn(move || input_thread(input_rx, conn, inj_tx))
             .context("spawn input thread")?
     };
+    // One reader for ALL client→host datagrams, demuxed by magic byte (two read_datagram loops
+    // would race for datagrams): 0xCB → mic uplink (Opus, forwarded to the host-lifetime mic
+    // service), 0xC8 → input (forwarded to the per-session input thread). The magics are disjoint,
+    // so decode order doesn't matter. Unknown tags are ignored.
     let input_conn = conn.clone();
     tokio::spawn(async move {
-        let mut count = 0u64;
+        let (mut input_count, mut mic_count) = (0u64, 0u64);
         while let Ok(d) = input_conn.read_datagram().await {
-            if let Some(ev) = InputEvent::decode(&d) {
-                count += 1;
+            if let Some((_seq, _pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
+                mic_count += 1;
+                // Host-lifetime mic service; a send error just means the host is shutting down.
+                let _ = mic_tx.send(opus.to_vec());
+            } else if let Some(ev) = InputEvent::decode(&d) {
+                input_count += 1;
                 if input_tx.send(ev).is_err() {
                     break;
                 }
             }
         }
-        tracing::info!(count, "input datagram stream ended");
+        tracing::info!(
+            input = input_count,
+            mic = mic_count,
+            "client datagram stream ended"
+        );
     });
 
     // Stop signal: stream duration elapsed or the client went away.
@@ -756,6 +773,92 @@ fn injector_service_thread(rx: std::sync::mpsc::Receiver<InputEvent>) {
         }
     }
     tracing::debug!("injector service stopped (host shutting down)");
+}
+
+/// Mic is 48 kHz stereo — matches the Opus stereo decoder and the host→client audio layout.
+const MIC_CHANNELS: u32 = 2;
+
+/// Host-lifetime virtual microphone, shared across punktfunk/1 sessions (mirror of
+/// [`InjectorService`]). One thread owns the PipeWire `Audio/Source` + an Opus decoder; sessions
+/// forward the client's Opus mic frames over a clonable `Send` channel, the thread decodes and
+/// feeds the source. Opened lazily on the first frame, the source node persists across sessions
+/// (no per-session registration churn), and reopens after a backoff if the source/decoder fails.
+struct MicService {
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl MicService {
+    fn start() -> MicService {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        if let Err(e) = std::thread::Builder::new()
+            .name("punktfunk-m3-mic".into())
+            .spawn(move || mic_service_thread(rx))
+        {
+            tracing::error!(error = %e, "mic service thread spawn failed — mic passthrough disabled");
+        }
+        MicService { tx }
+    }
+
+    /// A sender a session forwards the client's Opus mic frames to. Cloned per session; dropping a
+    /// clone does NOT stop the service (it holds the original sender for the host life).
+    fn sender(&self) -> std::sync::mpsc::Sender<Vec<u8>> {
+        self.tx.clone()
+    }
+}
+
+/// The host-lifetime mic worker: lazily open the virtual mic + decoder, then Opus-decode each
+/// forwarded frame and push the PCM into the source. Reopen (after [`INJECTOR_REOPEN_BACKOFF`])
+/// on open failure or a decode error. Exits when every session sender and the service's own
+/// sender drop (host shutdown), tearing the PipeWire source down.
+fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
+    let mut mic: Option<Box<dyn crate::audio::VirtualMic>> = None;
+    let mut decoder: Option<opus::Decoder> = None;
+    let mut last_failed: Option<std::time::Instant> = None;
+    let mut pcm = vec![0f32; 5760 * MIC_CHANNELS as usize]; // up to 120 ms scratch
+    for opus_frame in rx {
+        if opus_frame.is_empty() {
+            continue; // DTX silence — the source underruns to silence on its own
+        }
+        if mic.is_none() || decoder.is_none() {
+            if last_failed.is_some_and(|t| t.elapsed() < INJECTOR_REOPEN_BACKOFF) {
+                continue; // still within the reopen backoff window
+            }
+            let opened = crate::audio::open_virtual_mic(MIC_CHANNELS).and_then(|m| {
+                let d = opus::Decoder::new(48_000, opus::Channels::Stereo)
+                    .map_err(|e| anyhow!("opus decoder: {e}"))?;
+                Ok((m, d))
+            });
+            match opened {
+                Ok((m, d)) => {
+                    tracing::info!("punktfunk/1 virtual mic ready (host-lifetime)");
+                    mic = Some(m);
+                    decoder = Some(d);
+                    last_failed = None;
+                }
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "virtual mic unavailable — will retry");
+                    last_failed = Some(std::time::Instant::now());
+                    continue;
+                }
+            }
+        }
+        let (Some(m), Some(dec)) = (mic.as_ref(), decoder.as_mut()) else {
+            continue;
+        };
+        match dec.decode_float(&opus_frame, &mut pcm, false) {
+            Ok(samples_per_ch) => {
+                let total = (samples_per_ch * MIC_CHANNELS as usize).min(pcm.len());
+                m.push(&pcm[..total]);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "mic opus decode failed — reopening");
+                mic = None;
+                decoder = None;
+                last_failed = Some(std::time::Instant::now());
+            }
+        }
+    }
+    tracing::debug!("mic service stopped (host shutting down)");
 }
 
 /// The per-session input thread: route pointer/keyboard events to the host-lifetime injector

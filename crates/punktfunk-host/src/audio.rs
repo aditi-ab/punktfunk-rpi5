@@ -42,5 +42,32 @@ pub fn open_audio_capture(_channels: u32) -> Result<Box<dyn AudioCapturer>> {
     anyhow::bail!("audio capture requires Linux + PipeWire")
 }
 
+/// The inverse of [`AudioCapturer`]: a virtual microphone the host *produces*. It registers a
+/// PipeWire `Audio/Source` node that host apps can record from; the host [`push`](Self::push)es
+/// decoded client-mic PCM (interleaved `f32` at [`SAMPLE_RATE`]) into it, and PipeWire delivers
+/// it to whichever app records the source — silence when no input is flowing. This is how the
+/// client's microphone reaches host applications (mic passthrough).
+pub trait VirtualMic: Send {
+    /// Push one chunk of interleaved `f32` PCM. Non-blocking — drops if PipeWire is behind
+    /// (mic audio is lossy/real-time; a stale chunk is worse than a dropped one).
+    fn push(&self, pcm: &[f32]);
+
+    /// The interleaved channel count the source was opened with.
+    fn channels(&self) -> u32 {
+        CHANNELS as u32
+    }
+}
+
+/// Open a virtual microphone PipeWire source with `channels` interleaved channels (1 or 2).
+#[cfg(target_os = "linux")]
+pub fn open_virtual_mic(channels: u32) -> Result<Box<dyn VirtualMic>> {
+    linux::PwMicSource::open(channels).map(|m| Box::new(m) as Box<dyn VirtualMic>)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_virtual_mic(_channels: u32) -> Result<Box<dyn VirtualMic>> {
+    anyhow::bail!("virtual mic requires Linux + PipeWire")
+}
+
 #[cfg(target_os = "linux")]
 mod linux;

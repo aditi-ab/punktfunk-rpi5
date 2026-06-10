@@ -885,6 +885,42 @@ pub unsafe extern "C" fn punktfunk_connection_send_input(
     })
 }
 
+/// Send one Opus mic frame to the host as a QUIC datagram (48 kHz; the host decodes it into a
+/// virtual microphone source its apps can record). Non-blocking enqueue; the host uses `seq`/
+/// `pts_ns` (the caller's own counters) only for diagnostics. `opus_data`/`len` may be empty
+/// (a DTX silence frame). The data is copied; the caller may reuse the buffer after this returns.
+///
+/// # Safety
+/// `c` is a valid connection handle; `opus_data` is valid for `len` bytes (or `len == 0`).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_send_mic(
+    c: *mut PunktfunkConnection,
+    opus_data: *const u8,
+    len: usize,
+    seq: u32,
+    pts_ns: u64,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if opus_data.is_null() && len != 0 {
+            return PunktfunkStatus::NullPointer;
+        }
+        let opus = if len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(opus_data, len) }.to_vec()
+        };
+        match c.inner.send_mic(seq, pts_ns, opus) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
 /// The currently active session mode — the Welcome's, until an accepted
 /// [`punktfunk_connection_request_mode`] switches it. Safe any time after connect.
 ///

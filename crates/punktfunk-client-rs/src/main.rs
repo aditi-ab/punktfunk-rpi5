@@ -7,7 +7,9 @@
 //!   stamps each frame with its capture wall clock; same-host runs share that clock).
 //!
 //! `--input-test` exercises the input plane: scripted mouse/keyboard datagrams during the
-//! stream (watch them land in the host session, e.g. xev inside gamescope).
+//! stream (watch them land in the host session, e.g. xev inside gamescope). `--mic-test`
+//! exercises the mic uplink: a synthetic 440 Hz tone streamed as Opus (0xCB) → the host's
+//! virtual microphone source (record it host-side to hear the tone).
 //!
 //! `--pin <64-hex>` pins the host's certificate fingerprint (the host logs it at startup);
 //! without it the client trusts on first use and prints the observed fingerprint to pin.
@@ -37,6 +39,8 @@ struct Args {
     mode: Mode,
     out: Option<String>,
     input_test: bool,
+    /// `--mic-test` — stream a synthetic 440 Hz tone as the mic uplink (proves the mic path).
+    mic_test: bool,
     pin: Option<[u8; 32]>,
     /// `--remode WxHxFPS:SECS` — request this mode SECS seconds into the stream.
     remode: Option<(Mode, u32)>,
@@ -137,6 +141,7 @@ fn parse_args() -> Args {
         mode,
         out: get("--out").map(String::from),
         input_test: argv.iter().any(|a| a == "--input-test"),
+        mic_test: argv.iter().any(|a| a == "--mic-test"),
         pin,
         remode,
         pair: get("--pair").map(String::from),
@@ -345,6 +350,49 @@ async fn session(args: Args) -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(40)).await;
             }
             tracing::info!("input-test: done");
+        });
+    }
+
+    // Mic plane: stream a synthetic 440 Hz tone as the mic uplink (0xCB), Opus-encoded 5 ms
+    // stereo frames — proves client→host mic passthrough end to end without a real microphone
+    // (the host decodes it into its virtual PipeWire source; record that source to hear the tone).
+    if args.mic_test {
+        let conn2 = conn.clone();
+        tokio::spawn(async move {
+            let mut enc =
+                match opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!(error = %e, "mic-test: opus encoder init failed");
+                        return;
+                    }
+                };
+            let _ = enc.set_bitrate(opus::Bitrate::Bits(64_000));
+            tracing::info!("mic-test: streaming a 440 Hz tone as the mic uplink");
+            let mut phase = 0.0f32;
+            let step = 2.0 * std::f32::consts::PI * 440.0 / 48_000.0;
+            let mut pcm = [0f32; 240 * 2]; // 5 ms stereo
+            let mut out = [0u8; 4000];
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
+            for seq in 0u32.. {
+                interval.tick().await;
+                for f in 0..240 {
+                    let s = (phase.sin()) * 0.25;
+                    phase += step;
+                    if phase > std::f32::consts::PI * 2.0 {
+                        phase -= std::f32::consts::PI * 2.0;
+                    }
+                    pcm[f * 2] = s;
+                    pcm[f * 2 + 1] = s;
+                }
+                if let Ok(n) = enc.encode_float(&pcm, &mut out) {
+                    let d = punktfunk_core::quic::encode_mic_datagram(seq, now_ns(), &out[..n]);
+                    if conn2.send_datagram(d.into()).is_err() {
+                        break;
+                    }
+                }
+            }
+            tracing::info!("mic-test: done");
         });
     }
 

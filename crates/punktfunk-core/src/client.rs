@@ -50,6 +50,8 @@ pub struct NativeClient {
     audio: Receiver<AudioPacket>,
     rumble: Receiver<(u16, u16, u16)>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
+    /// Outbound mic frames `(seq, pts_ns, opus)` → encoded as 0xCB datagrams by the worker.
+    mic_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64, Vec<u8>)>,
     reconfig_tx: tokio::sync::mpsc::UnboundedSender<Mode>,
     shutdown: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -85,6 +87,7 @@ impl NativeClient {
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(AUDIO_QUEUE);
         let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<(u16, u16, u16)>(RUMBLE_QUEUE);
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
+        let (mic_tx, mic_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u64, Vec<u8>)>();
         let (reconfig_tx, reconfig_rx) = tokio::sync::mpsc::unbounded_channel::<Mode>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(Mode, [u8; 32])>>();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -118,6 +121,7 @@ impl NativeClient {
                     audio_tx,
                     rumble_tx,
                     input_rx,
+                    mic_rx,
                     reconfig_rx,
                     ready_tx,
                     shutdown: shutdown_w,
@@ -140,6 +144,7 @@ impl NativeClient {
             audio: audio_rx,
             rumble: rumble_rx,
             input_tx,
+            mic_tx,
             reconfig_tx,
             shutdown,
             worker: Some(worker),
@@ -296,6 +301,16 @@ impl NativeClient {
     pub fn send_input(&self, ev: &InputEvent) -> Result<()> {
         self.input_tx.send(*ev).map_err(|_| PunktfunkError::Closed)
     }
+
+    /// Queue one Opus mic frame for delivery as a 0xCB uplink datagram (the inverse of
+    /// [`next_audio`](Self::next_audio)). `seq`/`pts_ns` are the caller's own counters (the host
+    /// uses them only for diagnostics). The host decodes it into a virtual microphone source.
+    /// Best-effort — like every datagram, it's dropped under loss; no retransmit.
+    pub fn send_mic(&self, seq: u32, pts_ns: u64, opus: Vec<u8>) -> Result<()> {
+        self.mic_tx
+            .send((seq, pts_ns, opus))
+            .map_err(|_| PunktfunkError::Closed)
+    }
 }
 
 impl Drop for NativeClient {
@@ -318,6 +333,7 @@ struct WorkerArgs {
     audio_tx: SyncSender<AudioPacket>,
     rumble_tx: SyncSender<(u16, u16, u16)>,
     input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    mic_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, u64, Vec<u8>)>,
     reconfig_rx: tokio::sync::mpsc::UnboundedReceiver<Mode>,
     ready_tx: std::sync::mpsc::Sender<Result<(Mode, [u8; 32])>>,
     shutdown: Arc<AtomicBool>,
@@ -338,6 +354,7 @@ async fn worker_main(args: WorkerArgs) {
         audio_tx,
         rumble_tx,
         mut input_rx,
+        mut mic_rx,
         mut reconfig_rx,
         ready_tx,
         shutdown,
@@ -426,6 +443,15 @@ async fn worker_main(args: WorkerArgs) {
     tokio::spawn(async move {
         while let Some(ev) = input_rx.recv().await {
             let _ = input_conn.send_datagram(ev.encode().to_vec().into());
+        }
+    });
+
+    // Mic task: embedder Opus mic frames → 0xCB uplink datagrams (best-effort, dropped on loss).
+    let mic_conn = conn.clone();
+    tokio::spawn(async move {
+        while let Some((seq, pts_ns, opus)) = mic_rx.recv().await {
+            let d = crate::quic::encode_mic_datagram(seq, pts_ns, &opus);
+            let _ = mic_conn.send_datagram(d.into());
         }
     });
 

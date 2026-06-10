@@ -554,10 +554,14 @@ pub fn frame(payload: &[u8]) -> Vec<u8> {
 }
 
 /// Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
-/// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8),
-/// audio = [`AUDIO_MAGIC`], rumble = [`RUMBLE_MAGIC`].
+/// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
+/// audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
+/// mic = [`MIC_MAGIC`] (0xCB, client→host).
 pub const AUDIO_MAGIC: u8 = 0xC9;
 pub const RUMBLE_MAGIC: u8 = 0xCA;
+/// Microphone uplink: the client's mic, Opus-encoded, client → host (the inverse of
+/// [`AUDIO_MAGIC`]). The host feeds it into a virtual PipeWire source so its apps can record it.
+pub const MIC_MAGIC: u8 = 0xCB;
 
 /// Audio datagram, host → client: `[0xC9][u32 seq LE][u64 pts_ns LE][opus payload]`.
 /// One Opus frame per datagram (5 ms — well under any MTU); QUIC already encrypts.
@@ -598,6 +602,27 @@ pub fn decode_rumble_datagram(b: &[u8]) -> Option<(u16, u16, u16)> {
     }
     let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
     Some((u16at(1), u16at(3), u16at(5)))
+}
+
+/// Mic datagram, client → host: `[0xCB][u32 seq LE][u64 pts_ns LE][opus payload]` — the same
+/// layout as [`encode_audio_datagram`] with [`MIC_MAGIC`], one Opus frame per datagram.
+pub fn encode_mic_datagram(seq: u32, pts_ns: u64, opus: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(13 + opus.len());
+    b.push(MIC_MAGIC);
+    b.extend_from_slice(&seq.to_le_bytes());
+    b.extend_from_slice(&pts_ns.to_le_bytes());
+    b.extend_from_slice(opus);
+    b
+}
+
+/// Parse a mic datagram → `(seq, pts_ns, opus payload)`. `None` on bad tag/length.
+pub fn decode_mic_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
+    if b.len() < 13 || b[0] != MIC_MAGIC {
+        return None;
+    }
+    let seq = u32::from_le_bytes(b[1..5].try_into().unwrap());
+    let pts_ns = u64::from_le_bytes(b[5..13].try_into().unwrap());
+    Some((seq, pts_ns, &b[13..]))
 }
 
 /// Async framed-message IO over a quinn stream (`u16 LE length || payload`).
@@ -1176,6 +1201,25 @@ mod tests {
         assert_eq!(d[0], RUMBLE_MAGIC);
         assert_eq!(decode_rumble_datagram(&d), Some((1, 0x1234, 0xFFFF)));
         assert!(decode_rumble_datagram(&d[..6]).is_none());
+    }
+
+    #[test]
+    fn mic_datagram_roundtrip_and_disjoint_from_audio() {
+        let opus = [0x5Au8; 80];
+        let d = encode_mic_datagram(42, 9_999, &opus);
+        assert_eq!(d[0], MIC_MAGIC);
+        let (seq, pts, payload) = decode_mic_datagram(&d).unwrap();
+        assert_eq!((seq, pts), (42, 9_999));
+        assert_eq!(payload, opus);
+        assert!(decode_mic_datagram(&d[..12]).is_none()); // truncated
+                                                          // Tag separation: a mic datagram is not an audio datagram and vice-versa.
+        assert!(decode_audio_datagram(&d).is_none());
+        assert!(decode_mic_datagram(&encode_audio_datagram(1, 2, &opus)).is_none());
+        // Empty payload (DTX) is legal.
+        assert!(decode_mic_datagram(&encode_mic_datagram(0, 0, &[]))
+            .unwrap()
+            .2
+            .is_empty());
     }
 
     #[test]
