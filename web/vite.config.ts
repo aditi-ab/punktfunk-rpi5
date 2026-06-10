@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import { tanstackStart } from '@tanstack/react-start/plugin/vite'
+import viteReact from '@vitejs/plugin-react'
 import viteTsConfigPaths from 'vite-tsconfig-paths'
 import tailwindcss from '@tailwindcss/vite'
 import { paraglideVitePlugin } from '@inlang/paraglide-js'
@@ -28,5 +29,8 @@ export default defineConfig({
       // fetching against a token-gated local API), still on the TanStack Start runtime.
       spa: { enabled: true },
     }),
+    // Must come AFTER tanstackStart — provides the React JSX transform + Refresh runtime
+    // that Start's dev mode requires (omitting it leaves the client JS unable to load).
+    viteReact(),
   ],
 })
