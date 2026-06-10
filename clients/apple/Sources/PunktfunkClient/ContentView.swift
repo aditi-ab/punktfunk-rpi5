@@ -1,9 +1,12 @@
 // Hosts grid ⇄ trust prompt ⇄ live stream.
 //
 // Home is a grid of saved hosts (click to connect); "+" in the toolbar adds one; the
-// stream mode lives in Settings (⌘,). First connect to a host shows its certificate
-// fingerprint over the live-but-blurred stream for explicit trust-on-first-use; once
-// pinned, reconnects are silent and a changed host identity refuses to connect.
+// stream mode lives in Settings (⌘,). Two ways to establish trust on first contact:
+// the TOFU prompt (host fingerprint over the live-but-blurred stream, user compares it
+// with the host's log) or the PIN pairing ceremony (right-click a card → "Pair with
+// PIN…", or from the trust prompt itself) — pairing verifies both sides at once and is
+// the only way into hosts running --require-pairing. Once pinned, reconnects are silent
+// and a changed host identity refuses to connect.
 
 import AppKit
 import PunktfunkKit
@@ -16,6 +19,7 @@ struct ContentView: View {
     @AppStorage("punktfunk.height") private var height = 1080
     @AppStorage("punktfunk.hz") private var hz = 60
     @State private var showAddHost = false
+    @State private var pairingTarget: StoredHost?
 
     var body: some View {
         Group {
@@ -32,6 +36,20 @@ struct ContentView: View {
         }
         .onAppear { autoConnectIfAsked() }
         .onDisappear { model.disconnect() } // window closed mid-session (Cmd+N spawns more)
+        // On the outer Group so the sheet survives the trust-prompt → home transition
+        // (the "Pair with PIN instead" path disconnects first — the host's accept loop
+        // is sequential, a pairing connection would queue behind the live session).
+        .sheet(item: $pairingTarget) { host in
+            PairSheet(host: host) { fingerprint in
+                // Backstop against a stale ceremony surfacing after dismissal (PairSheet
+                // also self-discards those): only act while this host's sheet is up.
+                guard pairingTarget?.id == host.id else { return }
+                store.pin(host.id, fingerprint: fingerprint)
+                var pinned = host
+                pinned.pinnedSHA256 = fingerprint
+                connect(pinned)
+            }
+        }
     }
 
     private var sessionView: some View {
@@ -163,6 +181,10 @@ struct ContentView: View {
         .buttonStyle(.plain)
         .disabled(model.isBusy)
         .contextMenu {
+            Button("Pair with PIN…") {
+                guard !model.isBusy else { return }
+                pairingTarget = host
+            }
             if host.pinnedSHA256 != nil {
                 Button("Forget Identity") { store.forgetIdentity(host) }
             }
@@ -207,6 +229,15 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
             }
+            // The verified alternative to eyeballing hex: drop this session (the host
+            // serves one connection at a time) and run the SPAKE2 PIN ceremony instead.
+            Button("Pair with PIN instead…") {
+                let host = model.activeHost
+                model.rejectTrust()
+                pairingTarget = host
+            }
+            .buttonStyle(.link)
+            .font(.callout)
         }
         .padding(28)
         .frame(maxWidth: 440)

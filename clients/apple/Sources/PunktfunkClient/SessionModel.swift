@@ -68,11 +68,15 @@ final class SessionModel: ObservableObject {
         errorMessage = nil
         let pin = host.pinnedSHA256
         Task.detached(priority: .userInitiated) {
-            // PunktfunkConnection.init blocks on the QUIC handshake — keep it off the main actor.
+            // PunktfunkConnection.init blocks on the QUIC handshake — keep it off the main
+            // actor. The persistent identity is presented on every connect so a paired
+            // host recognizes this Mac (nil = anonymous, fine for hosts without
+            // --require-pairing; Keychain/generation failure must not block connecting).
+            let identity = (try? ClientIdentityStore.shared.load())?.identity
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,
-                pinSHA256: pin) }
+                pinSHA256: pin, identity: identity) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 switch result {
@@ -89,10 +93,14 @@ final class SessionModel: ObservableObject {
                     self.activeHost = nil
                     self.errorMessage = pin != nil
                         ? "Could not connect to \(host.displayName) — host unreachable, "
-                            + "not running, or its identity no longer matches the pinned "
-                            + "fingerprint."
+                            + "not running, its identity no longer matches the pinned "
+                            + "fingerprint, or it requires pairing and no longer "
+                            + "recognizes this Mac (right-click the host card to pair "
+                            + "again)."
                         : "Could not connect to \(host.displayName) — is punktfunk-host "
-                            + "running on \(host.address):\(host.port)?"
+                            + "running on \(host.address):\(host.port)? If it requires "
+                            + "pairing, right-click the host card and pair with its PIN "
+                            + "first."
                 }
             }
         }

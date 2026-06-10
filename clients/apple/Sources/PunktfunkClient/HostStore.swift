@@ -1,11 +1,12 @@
 // Saved hosts + their pinned identities, persisted as JSON in UserDefaults.
 //
 // Trust model (client side of punktfunk/1): the host serves a persistent certificate and
-// logs its SHA-256 fingerprint at startup. First connect is trust-on-first-use — the user
-// explicitly confirms the observed fingerprint against the host's log, and we pin it here.
-// Every later connect passes the pin into punktfunk-core, which refuses a host whose
-// identity changed. (Host→client authorization — a pairing PIN — is a roadmap item; today
-// the host accepts any client that can reach its port.)
+// logs its SHA-256 fingerprint at startup. The pin lands here one of two ways — the
+// trust-on-first-use prompt (user compares the observed fingerprint against the host's
+// log) or the SPAKE2 PIN pairing ceremony (PairSheet; mutually verified, and the host
+// stores our identity from ClientIdentityStore in return). Every later connect passes
+// the pin into punktfunk-core, which refuses a host whose identity changed. Hosts running
+// --require-pairing only admit paired clients, so for them pairing is the only way in.
 
 import Foundation
 import SwiftUI

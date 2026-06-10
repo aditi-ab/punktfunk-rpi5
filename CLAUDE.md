@@ -57,8 +57,12 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    (2026-06-10).** PunktfunkKit compiles and is tested on macOS (AnnexB → VideoToolbox →
    `AVSampleBufferDisplayLayer`, GCMouse/GCKeyboard capture, `PunktfunkClient` app shell);
    validated live Mac ↔ this box at 720p60 — vkcube on glass, input injected via gamescope
-   EIS. Tests: `swift test` in `clients/apple` (unit + real-codec round trip),
-   `test-loopback.sh` (Swift client vs synthetic m3-host on loopback — runs on macOS),
+   EIS. The app speaks the full ABI v2 trust surface: Keychain-persisted client identity
+   presented on every connect, SPAKE2 PIN pairing UI (host-card context menu + the trust
+   prompt's "Pair with PIN instead…"), TOFU fingerprint prompt. Tests: `swift test` in
+   `clients/apple` (unit + real-codec round trip),
+   `test-loopback.sh` (Swift client vs synthetic m3-hosts on loopback — runs on macOS;
+   includes the pairing ceremony + `--require-pairing` gate),
    `RemoteFirstLightTests` (full pipeline over the LAN). See
    [`clients/apple/README.md`](clients/apple/README.md). Next: stage 2 presenter
    (`VTDecompressionSession` + `CAMetalLayer` frame pacing), glass-to-glass numbers via

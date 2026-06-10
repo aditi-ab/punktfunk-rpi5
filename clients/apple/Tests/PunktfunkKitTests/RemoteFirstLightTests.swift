@@ -15,15 +15,49 @@ import XCTest
 @testable import PunktfunkKit
 
 final class RemoteFirstLightTests: XCTestCase {
+    /// The pairing ceremony over the real LAN, exactly as the app runs it: fresh identity,
+    /// SPAKE2 with the host's arming PIN, then a pinned + identified session. Needs the
+    /// host armed (--allow-pairing) and its logged PIN in PUNKTFUNK_REMOTE_PIN. Heads-up:
+    /// every run durably adds one throwaway "remote-test" identity to the host's
+    /// ~/.config/punktfunk/punktfunk1-paired.json — prune those entries at will.
+    func testRemotePairingThenPinnedStream() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let host = env["PUNKTFUNK_REMOTE_HOST"], let pin = env["PUNKTFUNK_REMOTE_PIN"]
+        else {
+            throw XCTSkip("set PUNKTFUNK_REMOTE_HOST + PUNKTFUNK_REMOTE_PIN "
+                + "(host armed with --allow-pairing)")
+        }
+        let port = env["PUNKTFUNK_REMOTE_PORT"].flatMap(UInt16.init) ?? 9777
+
+        let identity = try generateIdentity()
+        let fingerprint = try pair(
+            host: host, port: port, identity: identity, pin: pin, name: "remote-test")
+        XCTAssertEqual(fingerprint.count, 32)
+
+        let conn = try PunktfunkConnection(
+            host: host, port: port, width: 1280, height: 720, refreshHz: 60,
+            pinSHA256: fingerprint, identity: identity)
+        defer { conn.close() }
+        XCTAssertEqual(conn.hostFingerprint, fingerprint)
+        var got = 0
+        let deadline = Date().addingTimeInterval(20)
+        while got < 10, Date() < deadline {
+            if try conn.nextAU(timeoutMs: 2000) != nil { got += 1 }
+        }
+        XCTAssertGreaterThanOrEqual(got, 10, "paired + pinned session must stream")
+    }
+
     func testRemoteStreamDecodesToPixels() throws {
-        guard let host = ProcessInfo.processInfo.environment["PUNKTFUNK_REMOTE_HOST"] else {
+        let env = ProcessInfo.processInfo.environment
+        guard let host = env["PUNKTFUNK_REMOTE_HOST"] else {
             throw XCTSkip("set PUNKTFUNK_REMOTE_HOST (and start m3-host --source virtual there)")
         }
+        let port = env["PUNKTFUNK_REMOTE_PORT"].flatMap(UInt16.init) ?? 9777
         let width: UInt32 = 1280
         let height: UInt32 = 720
 
         let conn = try PunktfunkConnection(
-            host: host, width: width, height: height, refreshHz: 60)
+            host: host, port: port, width: width, height: height, refreshHz: 60)
         defer { conn.close() }
         XCTAssertEqual(conn.width, width)
         XCTAssertEqual(conn.height, height)

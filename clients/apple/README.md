@@ -40,14 +40,19 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
     motion isn't truncated away. Buttons use GameStream ids (1=left … 5=X2); scroll is
     WHEEL_DELTA(120)-scaled.
 - **`PunktfunkClient`** (the app): hosts grid (saved in UserDefaults), "+" toolbar
-  sheet to add hosts, stream mode in Settings (⌘,), trust-on-first-use fingerprint prompt
-  over the live-but-blurred stream → pinned reconnects, fps/Mb-s HUD. (Audio playback and
+  sheet to add hosts, stream mode in Settings (⌘,), two trust flows — the
+  trust-on-first-use fingerprint prompt over the live-but-blurred stream, and SPAKE2 PIN
+  pairing (`PairSheet`, from a host card's context menu or the trust prompt;
+  `ClientIdentityStore` keeps the client identity in the Keychain and presents it on
+  every connect) — then pinned reconnects, fps/Mb-s HUD. (Audio playback and
   gamepad capture are not wired into the app yet — the connector surface is there; see
   notes 5–6.)
 - **Tests** (`swift test`): byte-level Annex-B units; a real-codec round trip
   (VTCompressionSession-encoded HEVC rebuilt as the host's wire shape → `AnnexB` →
-  VTDecompressionSession → pixels); loopback integration against a real local host
-  (`test-loopback.sh`); the remote first-light test above.
+  VTDecompressionSession → pixels); loopback integration against real local hosts
+  (`test-loopback.sh` — stream round trip, plus the PIN pairing ceremony and the
+  `--require-pairing` gate against a second, armed host); the remote first-light test
+  above.
 
 ## Build / run / test (on a Mac)
 
@@ -123,11 +128,14 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    per arming window, shown at startup — the user reads it before pairing). Returns the
    host's VERIFIED fingerprint; persist it and pass `pinSHA256:` + `identity:` to every
    connect. Pairing is a real PAKE: a wrong PIN gets ONE online guess (no offline
-   dictionary attack), throwing `.wrongPIN`; a wrong-size pin throws `.invalidPin`. The TOFU flow `PunktfunkClient` already
-   implements (fingerprint confirmation sheet, per-host `HostStore`, "Forget Identity")
-   keeps working against hosts not running `--require-pairing`; upgrading the sheet to a
-   PIN-entry field closes the remaining gap — with `--require-pairing` the host now
-   authorizes clients too (the "other direction" is no longer open, opt-in per host).
+   dictionary attack), throwing `.wrongPIN`; a wrong-size pin throws `.invalidPin`. `PunktfunkClient` implements both flows:
+   the TOFU fingerprint sheet keeps working against hosts not running
+   `--require-pairing`, and the PIN ceremony is wired in — `ClientIdentityStore`
+   (Keychain) on every connect, `PairSheet` from a host card's context menu or the trust
+   prompt's "Pair with PIN instead…" (the host's accept loop is sequential, so that path
+   drops the live session before pairing). With `--require-pairing` the host now
+   authorizes clients too (the "other direction" is no longer open, opt-in per host);
+   the whole gate is regression-tested in `testPairingCeremonyAndRequirePairingGate`.
 7b. **Resize without reconnect**: `requestMode(width:height:refreshHz:)` mid-stream —
    the host rebuilds at the new mode in ~90 ms; the first new-mode AU is an IDR with
    fresh parameter sets (the refresh-on-IDR decode flow handles it untouched) and

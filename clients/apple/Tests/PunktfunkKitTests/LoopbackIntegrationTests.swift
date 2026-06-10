@@ -62,4 +62,59 @@ final class LoopbackIntegrationTests: XCTestCase {
                 host: "127.0.0.1", port: 9, width: 640, height: 480, refreshHz: 30,
                 timeoutMs: 2000))
     }
+
+    /// The PIN pairing ceremony + the --require-pairing gate through the Swift wrapper:
+    /// anonymous rejection, the single wrong-PIN online guess, the real ceremony, and a
+    /// paired + pinned session. Driven by test-loopback.sh, which arms a second host with
+    /// --require-pairing and parses its random PIN out of the log.
+    func testPairingCeremonyAndRequirePairingGate() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let portStr = env["PUNKTFUNK_PAIRING_PORT"], let port = UInt16(portStr),
+              let pin = env["PUNKTFUNK_PAIRING_PIN"]
+        else {
+            throw XCTSkip("needs an armed m3-host — use clients/apple/test-loopback.sh")
+        }
+
+        let identity = try generateIdentity()
+
+        // 1. Unpaired clients don't get sessions from a --require-pairing host.
+        XCTAssertThrowsError(
+            try PunktfunkConnection(
+                host: "127.0.0.1", port: port, width: 1280, height: 720, refreshHz: 60,
+                identity: identity, timeoutMs: 5000),
+            "unpaired client must be rejected")
+
+        // 2. A wrong PIN is exactly one failed online guess — distinguishable from
+        //    transport errors so the UI can say "try again".
+        XCTAssertThrowsError(
+            try pair(
+                host: "127.0.0.1", port: port, identity: identity,
+                pin: pin == "0000" ? "9999" : "0000", name: "wrong-pin", timeoutMs: 5000)
+        ) { error in
+            guard case PunktfunkClientError.wrongPIN = error else {
+                return XCTFail("expected .wrongPIN, got \(error)")
+            }
+        }
+
+        // 3. The real ceremony (after the host's 2 s pairing cooldown).
+        Thread.sleep(forTimeInterval: 2.2)
+        let fingerprint = try pair(
+            host: "127.0.0.1", port: port, identity: identity,
+            pin: pin, name: "loopback-test", timeoutMs: 5000)
+        XCTAssertEqual(fingerprint.count, 32)
+
+        // 4. Paired + pinned: the same identity now gets a session, and the ceremony's
+        //    fingerprint matches the certificate the host actually serves.
+        let conn = try PunktfunkConnection(
+            host: "127.0.0.1", port: port, width: 1280, height: 720, refreshHz: 60,
+            pinSHA256: fingerprint, identity: identity, timeoutMs: 5000)
+        XCTAssertEqual(conn.hostFingerprint, fingerprint)
+        var got = 0
+        let deadline = Date().addingTimeInterval(15)
+        while got < 5, Date() < deadline {
+            if try conn.nextAU(timeoutMs: 2000) != nil { got += 1 }
+        }
+        conn.close()
+        XCTAssertGreaterThanOrEqual(got, 5, "paired session must stream")
+    }
 }
