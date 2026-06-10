@@ -34,6 +34,11 @@ kwin_wayland --virtual --width "$W" --height "$H" --no-lockscreen \
 KWIN_PID=$!
 sleep 2
 
+# The xdg-desktop-portal processes bind to the compositor that existed when THEY started;
+# after a kwin restart the stale instances point at a dead socket and RemoteDesktop/EIS
+# (mouse/keyboard injection) times out. Restart them against the fresh compositor.
+systemctl --user try-restart plasma-xdg-desktop-portal-kde.service xdg-desktop-portal.service 2>/dev/null || true
+
 kbuildsycoca6 >/dev/null 2>&1 || true # rebuild the menu cache under the correct env
 plasmashell &
 
