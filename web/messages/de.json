@@ -54,5 +54,12 @@
   "common_retry": "Erneut versuchen",
   "common_yes": "Ja",
   "common_cancel": "Abbrechen",
-  "common_unauthorized": "Nicht autorisiert — gültiges API-Token in den Einstellungen setzen."
+  "common_unauthorized": "Sitzung abgelaufen — Weiterleitung zur Anmeldung…",
+  "login_title": "Anmelden",
+  "login_subtitle": "Gib das Verwaltungspasswort ein, um fortzufahren.",
+  "login_password": "Passwort",
+  "login_submit": "Anmelden",
+  "login_error": "Falsches Passwort.",
+  "login_signing_in": "Anmeldung läuft…",
+  "action_logout": "Abmelden"
 }

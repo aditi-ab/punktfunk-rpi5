@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vite'
 import { tanstackStart } from '@tanstack/react-start/plugin/vite'
 import { nitroV2Plugin } from '@tanstack/nitro-v2-vite-plugin'
@@ -5,6 +6,10 @@ import viteReact from '@vitejs/plugin-react'
 import viteTsConfigPaths from 'vite-tsconfig-paths'
 import tailwindcss from '@tailwindcss/vite'
 import { paraglideVitePlugin } from '@inlang/paraglide-js'
+
+// Absolute path to our Nitro server source (middleware + routes). Passed as a scanDir
+// because the TanStack Nitro plugin doesn't auto-scan a server/ dir.
+const serverDir = fileURLToPath(new URL('./server', import.meta.url))
 
 // The management API the console drives. The browser always talks same-origin (/api/...):
 // in `vite dev` the dev server proxies it (below); in the built Bun/Nitro server a Nitro
@@ -30,15 +35,15 @@ export default defineConfig({
     // renders a data-free shell that hydrates in the browser).
     tanstackStart(),
     // Nitro v2 is the deployment target: the `bun` preset bundles a Bun-runnable server to
-    // .output/ (`bun run .output/server/index.mjs`). The route-rule keeps the browser
-    // same-origin by proxying /api/** to the management host, so the bearer token and
-    // cookies ride along with no CORS.
+    // .output/ (`bun run .output/server/index.mjs`). Auth + the /api proxy live in the
+    // scanned `server/` dir (middleware/auth.ts gates every request; routes/api/[...].ts
+    // proxies to the management host injecting the bearer token server-side) — NOT a static
+    // routeRule, so the proxy runs behind the login gate and reads env at runtime.
     nitroV2Plugin({
       preset: 'bun',
       compatibilityDate: '2026-06-10',
-      routeRules: {
-        '/api/**': { proxy: `${MGMT_URL}/api/**` },
-      },
+      // Scan server/{middleware,routes} for the auth gate + the /api proxy.
+      scanDirs: [serverDir],
     }),
     // Must come AFTER tanstackStart — provides the React JSX transform + Refresh runtime
     // that Start's dev mode requires (omitting it leaves the client JS unable to load).

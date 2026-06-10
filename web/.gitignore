@@ -9,3 +9,6 @@ dist
 src/routeTree.gen.ts
 src/api/gen
 src/paraglide
+
+# local env (PUNKTFUNK_UI_PASSWORD etc.)
+.env

@@ -35,14 +35,32 @@ If the host runs with `--mgmt-token`, set it under **Settings → API token** (s
 
 ```sh
 bun run build             # → .output/  (Nitro server, `bun` preset, + .output/public assets)
-PORT=3000 HOST=0.0.0.0 bun run start    # = bun run .output/server/index.mjs
+PORT=3000 HOST=0.0.0.0 \
+  PUNKTFUNK_UI_PASSWORD=… PUNKTFUNK_MGMT_TOKEN=… \
+  bun run start           # = bun run .output/server/index.mjs
 bun run lint              # tsc --noEmit
 ```
 
-The built **Nitro Bun server** SSR-renders the app and proxies `/api/**` to the management
-host (a Nitro `routeRules` proxy → `PUNKTFUNK_MGMT_URL`, default `127.0.0.1:47990`), so the
-browser stays same-origin (bearer token rides along, no CORS). Run it on the same box as
-the host; it serves the console on `:3000` (or `$PORT`).
+The built **Nitro Bun server** SSR-renders the app and is the only thing exposed on the LAN.
+Run it on the same box as the host; it serves the console on `:3000` (or `$PORT`).
+
+## Auth (backend-for-frontend)
+
+Single-user, login-gated. Config via env (see `.env.example`):
+
+- The console requires a **login** (`PUNKTFUNK_UI_PASSWORD`). On success the server sets a
+  **sealed session cookie** (h3 `useSession`, AES-GCM). `server/middleware/auth.ts` gates
+  *every* request — pages redirect to `/login`, `/api` returns 401 — and **fails closed**
+  (503) if `PUNKTFUNK_UI_PASSWORD` is unset, so a misconfigured LAN server admits no one.
+- The **management API stays loopback-only + token** — never LAN-exposed. The web server
+  holds `PUNKTFUNK_MGMT_TOKEN` server-side and injects it when proxying `/api/**` →
+  `PUNKTFUNK_MGMT_URL` (`server/routes/api/[...].ts`). **The token never reaches the
+  browser**; the browser only ever holds the session cookie.
+
+So: `browser ──password──▶ web server (session cookie) ──mgmt token, server-side──▶ mgmt API`.
+Run the host with a matching token: `cargo run -rp punktfunk-host -- serve` +
+`PUNKTFUNK_MGMT_TOKEN=…` (or `--mgmt-token …`). `vite dev` has no gate (localhost-only) and
+proxies straight to the loopback mgmt API.
 
 > Toolchain notes (load-bearing): TanStack Start's `start-plugin-core` peer-requires
 > **Vite ≥ 7** — on Vite 6 the build's prerender/post-build hook silently doesn't run.

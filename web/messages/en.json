@@ -54,5 +54,12 @@
   "common_retry": "Retry",
   "common_yes": "Yes",
   "common_cancel": "Cancel",
-  "common_unauthorized": "Unauthorized — set a valid API token in Settings."
+  "common_unauthorized": "Session expired — redirecting to sign in…",
+  "login_title": "Sign in",
+  "login_subtitle": "Enter the management password to continue.",
+  "login_password": "Password",
+  "login_submit": "Sign in",
+  "login_error": "Wrong password.",
+  "login_signing_in": "Signing in…",
+  "action_logout": "Sign out"
 }

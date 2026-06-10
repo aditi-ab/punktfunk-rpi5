@@ -4,6 +4,7 @@ import {
   HeadContent,
   Outlet,
   Scripts,
+  useRouterState,
 } from '@tanstack/react-router'
 import type { QueryClient } from '@tanstack/react-query'
 import { AppShell } from '@/components/app-shell'
@@ -27,15 +28,21 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 })
 
 function RootComponent() {
+  // The login screen renders bare (no sidebar); everything else gets the app shell.
+  const isLogin = useRouterState({ select: (s) => s.location.pathname === '/login' })
   return (
     <html lang="en" className="dark">
       <head>
         <HeadContent />
       </head>
       <body className="min-h-screen">
-        <AppShell>
+        {isLogin ? (
           <Outlet />
-        </AppShell>
+        ) : (
+          <AppShell>
+            <Outlet />
+          </AppShell>
+        )}
         <Scripts />
       </body>
     </html>
