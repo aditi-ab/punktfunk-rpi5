@@ -34,4 +34,25 @@ pub trait Transport: Send + Sync {
     }
 
     fn recv(&self) -> std::io::Result<Option<Vec<u8>>>;
+
+    /// Receive up to `out.len()` datagrams in as few syscalls as possible, writing each into its
+    /// `out[i]` buffer (sized ≥ a max datagram) and its byte count into `lens[i]`; returns how many
+    /// arrived (`0` = none available; non-blocking). The recv counterpart of [`send_batch`]: the
+    /// [`UdpTransport`](super::UdpTransport) override uses `recvmmsg` into a caller-owned, reused
+    /// buffer ring — no per-packet allocation or syscall at line rate. The default does a single
+    /// scalar [`recv`](Self::recv) into `out[0]` (correct for the loopback transport + non-Linux).
+    fn recv_batch(&self, out: &mut [Vec<u8>], lens: &mut [usize]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        match self.recv()? {
+            Some(pkt) => {
+                let n = pkt.len().min(out[0].len());
+                out[0][..n].copy_from_slice(&pkt[..n]);
+                lens[0] = n;
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
 }

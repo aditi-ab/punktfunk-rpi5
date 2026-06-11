@@ -1,9 +1,10 @@
 //! Real UDP datagram transport — native sockets, no async runtime.
 //!
-//! Send is batched via `sendmmsg` ([`Transport::send_batch`], up to 64 datagrams/syscall) — the
-//! 1 Gbps+ syscall lever (~125k → ~2k syscalls/sec at line rate). Recv is still one syscall per
-//! packet; a `recvmmsg` batch on the client + a paced send thread on the host are the remaining
-//! steps of the 1 Gbps data-plane work, layered on this same [`Transport`] seam.
+//! Send is batched via `sendmmsg` ([`Transport::send_batch`], ≤64/syscall) and recv via `recvmmsg`
+//! ([`Transport::recv_batch`], ≤32/syscall into a reused ring) — the 1 Gbps+ syscall lever
+//! (~125k → a few-k syscalls/sec at line rate). The host additionally paces each frame's send
+//! across the frame interval (see `m3.rs::paced_submit`) so a real NIC doesn't drop a line-rate
+//! burst. All three layer on this same [`Transport`] seam (scalar fallbacks for loopback/non-Linux).
 
 use super::Transport;
 use crate::packet::MAX_DATAGRAM_BYTES;
@@ -41,6 +42,11 @@ impl UdpTransport {
         Self::grow_buffers(&socket);
         socket.set_nonblocking(true)?;
         Ok(UdpTransport { socket })
+    }
+
+    /// The bound local address (e.g. to learn the OS-assigned ephemeral port).
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.socket.local_addr()
     }
 
     /// Best-effort grow of SO_SNDBUF/SO_RCVBUF (see [`TARGET_SOCKBUF`]). A failure isn't fatal
@@ -144,6 +150,58 @@ impl Transport for UdpTransport {
             Err(e) => Err(e),
         }
     }
+
+    /// Batched receive via `recvmmsg` — drains up to `out.len()` datagrams in one syscall into the
+    /// caller's reused buffers (no per-packet allocation). `MSG_DONTWAIT` keeps it non-blocking
+    /// (the socket already is); `EAGAIN` → `0`. A datagram larger than a buffer is truncated and
+    /// `lens[i]` reaches the buffer size — the reassembler then rejects it as malformed, matching
+    /// `recv`'s oversized-drop. Non-Linux falls back to the trait's scalar `recv` default.
+    #[cfg(target_os = "linux")]
+    fn recv_batch(&self, out: &mut [Vec<u8>], lens: &mut [usize]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let fd = self.socket.as_raw_fd();
+        let n_bufs = out.len().min(lens.len());
+        if n_bufs == 0 {
+            return Ok(0);
+        }
+        // `hdrs` borrow `iovs` (one per buffer) by raw pointer; both live through the recvmmsg call.
+        let mut iovs: Vec<libc::iovec> = out[..n_bufs]
+            .iter_mut()
+            .map(|b| libc::iovec {
+                iov_base: b.as_mut_ptr() as *mut libc::c_void,
+                iov_len: b.len(),
+            })
+            .collect();
+        let mut hdrs: Vec<libc::mmsghdr> = iovs
+            .iter_mut()
+            .map(|iov| {
+                let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                h.msg_hdr.msg_iov = iov;
+                h.msg_hdr.msg_iovlen = 1;
+                h
+            })
+            .collect();
+        let n = unsafe {
+            libc::recvmmsg(
+                fd,
+                hdrs.as_mut_ptr(),
+                n_bufs as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+        for (i, h) in hdrs[..n as usize].iter().enumerate() {
+            lens[i] = h.msg_len as usize;
+        }
+        Ok(n as usize)
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +253,50 @@ mod tests {
             seen.len(),
             N as usize,
             "every batched packet should arrive over loopback"
+        );
+    }
+
+    /// `recv_batch` drains many datagrams per call over real loopback UDP — exercising `recvmmsg`
+    /// on Linux (the scalar `recv` default elsewhere). Send 50 distinct packets, then drain in
+    /// batches and assert every one arrives intact with the right length.
+    #[test]
+    fn recv_batch_drains_over_loopback() {
+        // Receiver is the UdpTransport (the thing under test); sender is a raw socket bound to a
+        // known addr so the connected receiver accepts its datagrams.
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx_addr = tx.local_addr().unwrap().to_string();
+        let rx = UdpTransport::connect("127.0.0.1:0", &tx_addr).unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+
+        const N: u32 = 50;
+        for i in 0..N {
+            let mut p = vec![0u8; 300];
+            p[0..4].copy_from_slice(&i.to_le_bytes());
+            tx.send_to(&p, rx_addr).unwrap();
+        }
+
+        let mut bufs: Vec<Vec<u8>> = (0..16).map(|_| vec![0u8; RECV_BUF]).collect();
+        let mut lens = vec![0usize; 16];
+        let mut seen = std::collections::HashSet::new();
+        // A few drains absorb scheduling jitter; stop once all N are in or we go dry.
+        for _ in 0..50 {
+            let n = rx.recv_batch(&mut bufs, &mut lens).unwrap();
+            if n == 0 {
+                if seen.len() == N as usize {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            for i in 0..n {
+                assert_eq!(lens[i], 300, "recvmmsg reports the datagram length");
+                seen.insert(u32::from_le_bytes(bufs[i][0..4].try_into().unwrap()));
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            N as usize,
+            "every datagram should be drained via recv_batch"
         );
     }
 }

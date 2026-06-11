@@ -13,7 +13,7 @@ use crate::crypto::SessionCrypto;
 use crate::error::{PunktfunkError, Result};
 use crate::fec::{coder_for, ErasureCoder};
 use crate::input::InputEvent;
-use crate::packet::{Packetizer, Reassembler, ReassemblerLimits};
+use crate::packet::{Packetizer, Reassembler, ReassemblerLimits, MAX_DATAGRAM_BYTES};
 use crate::stats::{Stats, StatsCounters};
 use crate::transport::Transport;
 
@@ -43,7 +43,19 @@ pub struct Session {
     stats: StatsCounters,
     /// Monotonic wire sequence, also the AES-GCM nonce counter.
     next_seq: u64,
+    /// Client recv ring (reused across [`poll_frame`](Self::poll_frame)): `recvmmsg` drains a batch
+    /// of datagrams into `recv_scratch` in one syscall, and poll_frame consumes them one at a time
+    /// across calls (`recv_idx`..`recv_count`), refilling when drained. Allocated lazily on the
+    /// first client poll so host sessions don't carry it. No per-packet recv alloc at line rate.
+    recv_scratch: Vec<Vec<u8>>,
+    recv_lens: Vec<usize>,
+    recv_count: usize,
+    recv_idx: usize,
 }
+
+/// Datagrams drained per `recvmmsg` syscall on the client (the reused ring's size). At ~125k
+/// pkt/s this is ~4k syscalls/s instead of 125k; the buffers cost `RECV_BATCH × RECV_BUF` (~64 KB).
+const RECV_BATCH: usize = 32;
 
 impl Session {
     pub fn new(config: Config, transport: Box<dyn Transport>) -> Result<Session> {
@@ -62,6 +74,10 @@ impl Session {
             reassembler,
             stats: StatsCounters::default(),
             next_seq: 0,
+            recv_scratch: Vec::new(),
+            recv_lens: Vec::new(),
+            recv_count: 0,
+            recv_idx: 0,
             config,
         })
     }
@@ -193,12 +209,29 @@ impl Session {
                 "poll_frame called on a host session",
             ));
         }
+        // Lazily allocate the recv ring on first client poll (host sessions never get here).
+        if self.recv_scratch.is_empty() {
+            // Each buffer holds a max datagram + 1 (an oversized read fills it → reassembler rejects).
+            self.recv_scratch = (0..RECV_BATCH)
+                .map(|_| vec![0u8; MAX_DATAGRAM_BYTES + 1])
+                .collect();
+            self.recv_lens = vec![0usize; RECV_BATCH];
+        }
         loop {
-            let wire = match self.transport.recv()? {
-                Some(w) => w,
-                None => return Err(PunktfunkError::NoFrame),
-            };
-            let pkt = match self.open_from_wire(&wire) {
+            // Refill the ring with one `recvmmsg` batch when the current one is drained.
+            if self.recv_idx >= self.recv_count {
+                self.recv_count = self
+                    .transport
+                    .recv_batch(&mut self.recv_scratch, &mut self.recv_lens)?;
+                self.recv_idx = 0;
+                if self.recv_count == 0 {
+                    return Err(PunktfunkError::NoFrame);
+                }
+            }
+            let i = self.recv_idx;
+            self.recv_idx += 1;
+            let len = self.recv_lens[i];
+            let pkt = match self.open_from_wire(&self.recv_scratch[i][..len]) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
