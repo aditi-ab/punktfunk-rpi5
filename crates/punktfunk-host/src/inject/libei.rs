@@ -122,10 +122,23 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     tracing::info!("libei: EIS connected — awaiting devices");
 
     let mut state = EiState::new();
+    // Watchdog: a healthy EIS server adds + resumes an input device within a beat of the handshake.
+    // If none has resumed by this deadline, the connection is dead-on-arrival (stale/half-ready
+    // gamescope socket the handshake passed but no real server is behind) — exit so the next
+    // inject() fails and InjectorService reopens against a fresh socket, instead of silently
+    // swallowing every event for the whole session.
+    let resume_deadline = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(resume_deadline);
+    let mut resumed_once = false;
     loop {
         tokio::select! {
             ei = events.next() => match ei {
-                Some(Ok(ev)) => state.handle_ei(ev, &context),
+                Some(Ok(ev)) => {
+                    state.handle_ei(ev, &context);
+                    if !resumed_once && state.devices.iter().any(|d| d.resumed) {
+                        resumed_once = true;
+                    }
+                }
                 Some(Err(e)) => { tracing::warn!(error = %e, "libei: event stream error"); break; }
                 None => { tracing::info!("libei: EIS disconnected"); break; }
             },
@@ -133,6 +146,13 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
                 Some(input) => state.inject(&input, &context),
                 None => { tracing::info!("libei: injector closed — ending session"); break; }
             },
+            _ = &mut resume_deadline, if !resumed_once => {
+                tracing::warn!(
+                    "libei: no input device resumed within 5s of connecting — treating the EIS \
+                     connection as dead and reopening (stale or half-ready compositor socket)"
+                );
+                break;
+            }
         }
     }
 }
@@ -155,10 +175,19 @@ async fn connect(source: EiSource) -> Result<Connected> {
         EiSource::SocketPathFile(file) => (None, connect_socket_file(&file).await?),
     };
     let context = ei::Context::new(stream).map_err(|e| anyhow!("reis EI context: {e}"))?;
-    let (_conn, events) = context
-        .handshake_tokio("punktfunk-host", ei::handshake::ContextType::Sender)
-        .await
-        .map_err(|e| anyhow!("EI handshake: {e}"))?;
+    // Bound the handshake. `UnixStream::connect` to a socket *file* succeeds the moment the path
+    // exists, but a stale/half-ready gamescope (its socket created early in startup, or left behind
+    // by a SIGKILLed prior session) may never drive the EI handshake — which would otherwise hang
+    // this worker forever. A bounded handshake lets the worker error out so InjectorService reopens.
+    let (_conn, events) = tokio::time::timeout(
+        Duration::from_secs(8),
+        context.handshake_tokio("punktfunk-host", ei::handshake::ContextType::Sender),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!("EI handshake timed out (EIS server not responding — stale/half-ready socket?)")
+    })?
+    .map_err(|e| anyhow!("EI handshake: {e}"))?;
     Ok((portal, context, events))
 }
 
@@ -268,6 +297,31 @@ struct EiState {
     last_serial: u32,
     sequence: u32,
     start: Instant,
+    /// Total inject() calls — used only to throttle diagnostic logging.
+    injected: u64,
+    /// Bitmask of [`InputKind`]s already logged once (diagnostics: surface the FIRST of each
+    /// kind a client sends + whether it emitted, so an unexpected client — e.g. a touch-only
+    /// tablet hitting a compositor without ei_touchscreen — is immediately diagnosable).
+    seen_kinds: u32,
+}
+
+/// Stable small index per [`InputKind`] for the `seen_kinds` bitmask.
+fn kind_bit(kind: InputKind) -> u32 {
+    let i = match kind {
+        InputKind::MouseMove => 0,
+        InputKind::MouseMoveAbs => 1,
+        InputKind::MouseButtonDown => 2,
+        InputKind::MouseButtonUp => 3,
+        InputKind::MouseScroll => 4,
+        InputKind::KeyDown => 5,
+        InputKind::KeyUp => 6,
+        InputKind::TouchDown => 7,
+        InputKind::TouchMove => 8,
+        InputKind::TouchUp => 9,
+        InputKind::GamepadButton => 10,
+        InputKind::GamepadAxis => 11,
+    };
+    1 << i
 }
 
 impl EiState {
@@ -277,6 +331,8 @@ impl EiState {
             last_serial: 0,
             sequence: 0,
             start: Instant::now(),
+            injected: 0,
+            seen_kinds: 0,
         }
     }
 
@@ -315,6 +371,16 @@ impl EiState {
                     d.resumed = true;
                     d.emulating = false; // must re-issue start_emulating after a resume
                 }
+                let dev = &e.device;
+                tracing::info!(
+                    name = ?dev.name(),
+                    pointer = dev.has_capability(DeviceCapability::Pointer),
+                    pointer_abs = dev.has_capability(DeviceCapability::PointerAbsolute),
+                    keyboard = dev.has_capability(DeviceCapability::Keyboard),
+                    button = dev.has_capability(DeviceCapability::Button),
+                    scroll = dev.has_capability(DeviceCapability::Scroll),
+                    "libei: device RESUMED (now emittable)"
+                );
             }
             EiEvent::DevicePaused(e) => {
                 if let Some(d) = self.devices.iter_mut().find(|d| d.device == e.device) {
@@ -357,7 +423,24 @@ impl EiState {
             }
             InputKind::GamepadButton | InputKind::GamepadAxis => return, // uinput path (later)
         };
+        self.injected += 1;
+        let n = self.injected;
+        // Log the first of each kind always (diagnostics), then occasionally.
+        let bit = kind_bit(ev.kind);
+        let first = self.seen_kinds & bit == 0;
+        self.seen_kinds |= bit;
+        let loud = first || n <= 5 || n % 600 == 0;
         let Some(idx) = self.device_for(cap) else {
+            if loud {
+                tracing::warn!(
+                    n,
+                    kind = ?ev.kind,
+                    ?cap,
+                    devices = self.devices.len(),
+                    resumed = self.devices.iter().filter(|d| d.resumed).count(),
+                    "libei: DROP — no resumed device exposes this capability"
+                );
+            }
             // No resumed device with this capability yet. For touch this is usually permanent on
             // this compositor — the RemoteDesktop portal may grant the Touchscreen *device type*
             // while the EIS server never creates a touchscreen *device* (observed on headless
@@ -482,6 +565,11 @@ impl EiState {
         if emitted {
             dev.frame(self.last_serial, self.now_us());
         }
-        let _ = ctx.flush();
+        if let Err(e) = ctx.flush() {
+            tracing::warn!(error = %e, "libei: ctx.flush failed");
+        }
+        if loud {
+            tracing::info!(n, kind = ?ev.kind, idx, emitted, "libei: emitted");
+        }
     }
 }
