@@ -4,10 +4,15 @@ The punktfunk host is Linux-only and links system FFmpeg (NVENC), PipeWire, Opus
 the NVIDIA driver. This directory packages it for the **Fedora Atomic / Bazzite** world
 (rpm-ostree + bootc), where most of those deps are already present.
 
+> 👉 **End-to-end Bazzite setup walkthrough** (install → udev/group → `host.env` → service →
+> firewall → verify → troubleshooting): [`bazzite/README.md`](bazzite/README.md). This file is the
+> higher-level packaging rationale.
+
 ```
 packaging/
   rpm/punktfunk.spec      # the RPM (builds punktfunk-host from source with cargo)
   bazzite/host.env        # gamescope-default config for a Bazzite appliance
+  bazzite/README.md       # step-by-step Bazzite setup guide
   bootc/Containerfile     # bake punktfunk into a Bazzite-based atomic image
   copr/                   # COPR build-from-SCM settings
 ```
