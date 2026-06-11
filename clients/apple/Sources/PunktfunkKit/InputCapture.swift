@@ -1,10 +1,18 @@
-// Input capture → punktfunk/1 datagrams, via the GameController framework.
+// Input capture → punktfunk/1 datagrams.
 //
-// GCMouse delivers RAW deltas (not the accelerated cursor) — exactly what the host-side
-// injector expects for relative motion. GCKeyboard gives HID keycodes which we map to the
-// Windows VK space the host's vk_to_evdev table consumes (same space Moonlight uses).
-// Gamepads (GCController) come later — the host's uinput pads already speak the
-// GamepadButton/GamepadAxis event kinds, but m3's injector path doesn't route them yet.
+// Mouse MOTION and BUTTONS take different paths per platform. On macOS GCMouse's
+// mouseMovedHandler/pressedChangedHandler proved unreliable in the field (delivered
+// nothing on a live Mac while GCKeyboard worked — a documented GameController quirk), so
+// macOS drives motion + buttons from NSEvent under cursor disassociation instead (fed by
+// StreamLayerView, the same channel that already carries scroll), and the GCMouse motion/
+// button handlers are not installed there. NSEvent deltas under
+// CGAssociateMouseAndMouseCursorPosition(false) are the relative motion — OS-acceleration-
+// applied (not raw HID), which is exactly what Moonlight's macOS client ships and is fine.
+// iOS keeps the GCMouse path (raw deltas under pointer lock). GCKeyboard (both platforms)
+// gives HID keycodes which we map to the Windows VK space the host's vk_to_evdev table
+// consumes (same space Moonlight uses). Gamepads (GCController) come later — the host's
+// uinput pads already speak the GamepadButton/GamepadAxis event kinds, but m3's injector
+// path doesn't route them yet.
 //
 // The wire carries integer deltas; GC hands us Floats. We accumulate the fractional
 // remainder per axis so slow, sub-pixel motion isn't truncated away.
@@ -32,6 +40,14 @@ import UIKit
 import Foundation
 import GameController
 import PunktfunkCore
+import os
+
+/// Diagnostic logging for the input path. Off by default (input is high-rate); set
+/// PUNKTFUNK_INPUT_DEBUG=1 in the environment to surface whether relative motion + buttons
+/// are actually being SENT to the host without needing host-side logs. Motion is throttled
+/// to once per second (see `motionDebugTick`); buttons log every transition.
+private let inputLog = Logger(subsystem: "io.unom.punktfunk", category: "input")
+private let inputDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_INPUT_DEBUG"] == "1"
 
 public final class InputCapture {
     private static weak var activeCapture: InputCapture?
@@ -54,6 +70,11 @@ public final class InputCapture {
     /// One-shot: the left click that engaged capture belongs to the local UI — GC sees
     /// it at the HID layer regardless, so its press AND release are dropped here.
     private var suppressedButton: UInt32?
+
+    /// Throttle for the PUNKTFUNK_INPUT_DEBUG motion counter (motion is high-rate — we log
+    /// a rolling count + the last delta once per second, never per event). Main-queue only.
+    private var motionDebugCount = 0
+    private var motionDebugTick = Date.distantPast
 
     /// One-shot twin of `suppressedButton` for the ⌘⎋ toggle: the physical Esc also
     /// reaches GCKeyboard, racing the NSEvent monitor — latched here so it can't type
@@ -122,6 +143,16 @@ public final class InputCapture {
         ) { [weak self] n in
             if let m = n.object as? GCMouse { self?.attach(mouse: m) }
         })
+        #if os(iOS)
+        // The mouse can become the *current* one after it connected (and after our start()
+        // already ran) — re-attach on that too so a launch-time race doesn't leave the iOS
+        // GCMouse path without handlers. attach() is idempotent (dedupes by identity).
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .GCMouseDidBecomeCurrent, object: nil, queue: .main
+        ) { [weak self] n in
+            if let m = n.object as? GCMouse { self?.attach(mouse: m) }
+        })
+        #endif
         observers.append(NotificationCenter.default.addObserver(
             forName: .GCKeyboardDidConnect, object: nil, queue: .main
         ) { [weak self] n in
@@ -215,6 +246,10 @@ public final class InputCapture {
         guard forwarding else { return }
         if button == suppressedButton {
             if !pressed { suppressedButton = nil } // capture click over — stop suppressing
+            if inputDebug {
+                inputLog.debug(
+                    "button \(button, privacy: .public) \(pressed ? "down" : "up", privacy: .public) SUPPRESSED (engage click)")
+            }
             return
         }
         if pressed {
@@ -222,7 +257,19 @@ public final class InputCapture {
         } else {
             pressedButtons.remove(button)
         }
+        if inputDebug {
+            inputLog.debug(
+                "button \(button, privacy: .public) \(pressed ? "down" : "up", privacy: .public) sent")
+        }
         connection.send(.mouseButton(button, down: pressed))
+    }
+
+    /// NSEvent button path (macOS): StreamLayerView's local mouse monitor routes physical
+    /// button transitions here so they go through the same `suppressedButton` engage-click
+    /// latch and `pressedButtons` release-on-blur set as the (iOS) GCMouse path. Wire ids:
+    /// 1=left 2=middle 3=right 4=X1 5=X2.
+    public func sendMouseButton(_ button: UInt32, pressed: Bool) {
+        sendButton(button, pressed: pressed)
     }
 
     private func attach(mouse: GCMouse) {
@@ -230,6 +277,11 @@ public final class InputCapture {
               !mice.contains(where: { $0 === mouse }) // re-delivered on wake — attach once
         else { return }
         mice.append(mouse)
+        // macOS drives motion + buttons from NSEvent (StreamLayerView's local monitor →
+        // sendMotion/sendMouseButton) because GCMouse's handlers proved unreliable there;
+        // installing them too would double-send. iOS keeps GCMouse (raw deltas under
+        // pointer lock). See the file header.
+        #if !os(macOS)
         input.mouseMovedHandler = { [weak self] _, dx, dy in
             guard let self, self.forwarding else { return }
             // GC gives +y up; the host expects screen-space (+y down).
@@ -241,6 +293,16 @@ public final class InputCapture {
             self.residualY = fy - iy
             if ix != 0 || iy != 0 {
                 self.connection.send(.mouseMove(dx: Int32(ix), dy: Int32(iy)))
+                if inputDebug {
+                    self.motionDebugCount += 1
+                    let now = Date()
+                    if now.timeIntervalSince(self.motionDebugTick) >= 1 {
+                        inputLog.debug(
+                            "motion forwarded: \(self.motionDebugCount, privacy: .public) events, last dx \(Int(ix), privacy: .public) dy \(Int(iy), privacy: .public)")
+                        self.motionDebugCount = 0
+                        self.motionDebugTick = now
+                    }
+                }
             }
         }
         input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
@@ -260,10 +322,40 @@ public final class InputCapture {
                 }
             }
         }
+        #endif
         // NOTE: no scroll handler here. GCMouse's scroll dpad only fires for plain HID
         // wheel deltas — trackpad/Magic Mouse scrolling is gesture-based and never
         // reaches GameController. Scroll arrives via the stream view's scrollWheel
         // override (NSEvent covers wheels too) → sendScroll().
+    }
+
+    /// Forward relative mouse motion (macOS). Fed by StreamLayerView's NSEvent monitor —
+    /// while captured the cursor is disassociated (CGAssociateMouseAndMouseCursorPosition
+    /// (false)), so mouseMoved/dragged deltaX/deltaY ARE the relative motion, the same
+    /// channel sendScroll already uses. Unlike the (iOS) GCMouse path this is NOT y-negated:
+    /// NSEvent deltaY is already screen-space (+y down), which is what the host expects.
+    /// Fractional remainders accumulate so slow, sub-pixel motion isn't truncated away.
+    public func sendMotion(dx: Float, dy: Float) {
+        guard forwarding else { return }
+        let fx = dx + residualX
+        let fy = dy + residualY
+        let ix = fx.rounded(.towardZero)
+        let iy = fy.rounded(.towardZero)
+        residualX = fx - ix
+        residualY = fy - iy
+        guard ix != 0 || iy != 0 else { return }
+        connection.send(.mouseMove(dx: Int32(ix), dy: Int32(iy)))
+        if inputDebug {
+            // High-rate — log a rolling count + the last delta once per second, not per event.
+            motionDebugCount += 1
+            let now = Date()
+            if now.timeIntervalSince(motionDebugTick) >= 1 {
+                inputLog.debug(
+                    "motion forwarded: \(self.motionDebugCount, privacy: .public) events, last dx \(Int(ix), privacy: .public) dy \(Int(iy), privacy: .public)")
+                motionDebugCount = 0
+                motionDebugTick = now
+            }
+        }
     }
 
     /// Forward a scroll gesture, WHEEL_DELTA(120)-scaled (positive = up / right,

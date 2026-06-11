@@ -21,6 +21,14 @@ import GameController
 import PunktfunkCore
 import SwiftUI
 import UIKit
+import os
+
+/// Same diagnostic switch as InputCapture (PUNKTFUNK_INPUT_DEBUG=1): on iOS we log the
+/// resolved pointer-lock state each time capture engages, so the user can see whether the
+/// scene actually locked (GCMouse only delivers deltas while it did) or whether we're on
+/// the touch fallback.
+private let iosInputLog = Logger(subsystem: "io.unom.punktfunk", category: "input")
+private let iosInputDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_INPUT_DEBUG"] == "1"
 
 public struct StreamView: UIViewControllerRepresentable {
     private let connection: PunktfunkConnection
@@ -76,6 +84,17 @@ public final class StreamViewController: UIViewController {
     private var pointerInteraction: UIPointerInteraction?
     #endif
 
+    /// Reads whether the scene's pointer is actually locked right now; nil = state
+    /// unavailable (no scene yet, or pre-availability). Only while this is true does GCMouse
+    /// deliver relative deltas — otherwise the touch path carries input.
+    private func pointerLockEngaged() -> Bool? {
+        #if os(iOS)
+        return view.window?.windowScene?.pointerLockState?.isLocked
+        #else
+        return nil
+        #endif
+    }
+
     var onCaptureChange: ((Bool) -> Void)?
 
     var captureEnabled = true {
@@ -96,9 +115,9 @@ public final class StreamViewController: UIViewController {
         view = StreamLayerUIView()
         #if os(iOS)
         // Hide the iPadOS cursor while it hovers the video: the host renders its own
-        // cursor from our raw deltas, so the local one only diverges from it. (True
-        // pointer LOCK — prefersPointerLocked — isn't consulted through
-        // UIHostingController; this hides the pointer without locking it.)
+        // cursor from our deltas, so the local one only diverges from it. This hides the
+        // pointer; true pointer LOCK (below) is what makes GCMouse deliver relative deltas
+        // — and the system only grants it on a full-screen, frontmost iPad scene.
         let interaction = UIPointerInteraction(delegate: self)
         view.addInteraction(interaction)
         pointerInteraction = interaction
@@ -106,8 +125,19 @@ public final class StreamViewController: UIViewController {
     }
 
     #if os(iOS)
-    public override var prefersPointerLocked: Bool { captured }
+    // Pointer lock is only meaningful on iPad (iPhone has no hardware-pointer lock) and
+    // only when capture is engaged. The system additionally requires full-screen + frontmost
+    // and may drop it (Slide Over/Stage Manager/backgrounding) — verified in setCaptured().
+    public override var prefersPointerLocked: Bool {
+        captured && UIDevice.current.userInterfaceIdiom == .pad
+    }
     public override var prefersHomeIndicatorAutoHidden: Bool { true }
+
+    // If SwiftUI's UIHostingController reparents us, a plain container parent that forwards
+    // its pointer-lock decision to its children will then reach this VC. (UIHostingController
+    // itself does not consult children, which is why GCMouse deltas can never arrive there —
+    // the touch path, always forwarded, is the unconditional fallback.)
+    public override var childViewControllerForPointerLock: UIViewController? { self }
     #endif
 
     func start(
@@ -157,6 +187,16 @@ public final class StreamViewController: UIViewController {
         ) { [weak self] _ in
             self?.setCaptured(false)
         })
+        // The system can drop the lock without us asking (Slide Over, Stage Manager, leaving
+        // foregroundActive). Surface it so the user sees, in PUNKTFUNK_INPUT_DEBUG, when
+        // GCMouse delivery has silently stopped and we've fallen back to touch.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, iosInputDebug else { return }
+            let locked = self.pointerLockEngaged().map(String.init(describing:)) ?? "unavailable"
+            iosInputLog.debug("pointer lock changed: isLocked=\(locked, privacy: .public)")
+        })
 
         if captureEnabled {
             setCaptured(true) // entering a session is the deliberate "capture me" moment
@@ -194,7 +234,16 @@ public final class StreamViewController: UIViewController {
         pointerInteraction?.invalidate() // re-resolve the hidden/visible pointer style
         let onCaptureChange = onCaptureChange
         let captured = captured
-        DispatchQueue.main.async { onCaptureChange?(captured) }
+        DispatchQueue.main.async { [weak self] in
+            onCaptureChange?(captured)
+            // The lock request is async — read the resolved state next turn. If it didn't
+            // engage, GCMouse won't deliver and the always-on touch path carries input.
+            if iosInputDebug, let self {
+                let locked = self.pointerLockEngaged().map(String.init(describing:)) ?? "unavailable"
+                iosInputLog.debug(
+                    "setCaptured(\(captured, privacy: .public)) → pointer lock isLocked=\(locked, privacy: .public)")
+            }
+        }
     }
     #endif
 

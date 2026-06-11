@@ -19,13 +19,22 @@
 import AppKit
 import AVFoundation
 import SwiftUI
+import os
+
+/// Same diagnostic switch as InputCapture: PUNKTFUNK_INPUT_DEBUG=1 logs when the macOS
+/// NSEvent mouse monitor (relative motion + buttons) is installed/removed, so the user can
+/// confirm the new motion path is actually live for a session.
+private let streamInputLog = Logger(subsystem: "io.unom.punktfunk", category: "input")
+private let streamInputDebug =
+    ProcessInfo.processInfo.environment["PUNKTFUNK_INPUT_DEBUG"] == "1"
 
 /// Hides the LOCAL cursor while captured. The host renders its own cursor, and the local
-/// one both diverges from it (the host applies acceleration/clamping to our raw deltas)
-/// and can wander out of the window — a click there would focus another app. So while
-/// captured we do what Moonlight does: warp the cursor into the view, freeze it
-/// (`CGAssociateMouseAndMouseCursorPosition(false)` — GCMouse still delivers raw HID
-/// deltas), and hide it. hide/unhide and associate are balanced via `captured`.
+/// one both diverges from it (the host applies acceleration/clamping to our deltas) and
+/// can wander out of the window — a click there would focus another app. So while captured
+/// we do what Moonlight does: warp the cursor into the view, freeze it
+/// (`CGAssociateMouseAndMouseCursorPosition(false)` — under which NSEvent mouseMoved/
+/// dragged deltas become the relative motion StreamLayerView forwards), and hide it.
+/// hide/unhide and associate are balanced via `captured`.
 private final class CursorCapture {
     private var captured = false
 
@@ -106,6 +115,10 @@ public final class StreamLayerView: NSView {
     private var inputCapture: InputCapture?
     private var appObservers: [NSObjectProtocol] = []
     private var windowObservers: [NSObjectProtocol] = []
+    /// Local NSEvent monitor carrying relative mouse MOTION + BUTTONS to the host while
+    /// captured (GCMouse's own delivery proved unreliable on macOS — see InputCapture).
+    /// Installed on engage, removed on release; nil while not captured.
+    private var mouseEventMonitor: Any?
 
     /// Whether input capture is currently engaged (cursor hidden+frozen, mouse/keyboard
     /// forwarded). Main-thread only.
@@ -249,6 +262,10 @@ public final class StreamLayerView: NSView {
         else { return }
         cursorCapture.capture(in: self)
         inputCapture?.setForwarding(true, suppressClick: fromClick)
+        // Install AFTER the warp + setForwarding: the engage warp generates no forwarded
+        // delta (the monitor isn't up yet), and the engage click's suppression latch is
+        // already armed, so the monitor only ever sees genuine post-engage input.
+        installMouseMonitor()
         captured = true
         window?.makeFirstResponder(self)
         notifyCaptureChange(true)
@@ -256,10 +273,64 @@ public final class StreamLayerView: NSView {
 
     private func releaseCapture() {
         guard captured else { return }
+        removeMouseMonitor()
         cursorCapture.release()
         inputCapture?.setForwarding(false)
         captured = false
         notifyCaptureChange(false)
+    }
+
+    /// A single local monitor for motion + buttons, installed only while captured. A local
+    /// monitor is more robust than view overrides for relative motion: it sidesteps the
+    /// `window.acceptsMouseMovedEvents`/tracking-area/responder-chain requirements, and
+    /// since the cursor is frozen mid-view while captured every such event belongs here.
+    /// ALL four motion types are covered so motion keeps flowing during a button-held drag,
+    /// not just `.mouseMoved`. NSEvent deltas under disassociation are OS-pointer-
+    /// acceleration-applied (not raw HID) — what Moonlight's macOS client ships; if the
+    /// host re-accelerates there's mild double-acceleration, acceptable and fixable later
+    /// via IOHID. Events are returned (not swallowed): the cursor is frozen, so they're
+    /// inert locally.
+    private func installMouseMonitor() {
+        guard mouseEventMonitor == nil else { return }
+        mouseEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [
+            .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
+            .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+            .otherMouseDown, .otherMouseUp,
+        ]) { [weak self] event in
+            guard let self, self.captured, let ic = self.inputCapture else { return event }
+            switch event.type {
+            case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+                ic.sendMotion(dx: Float(event.deltaX), dy: Float(event.deltaY)) // no y-negation
+            case .leftMouseDown: ic.sendMouseButton(1, pressed: true)
+            case .leftMouseUp: ic.sendMouseButton(1, pressed: false)
+            case .rightMouseDown: ic.sendMouseButton(3, pressed: true)
+            case .rightMouseUp: ic.sendMouseButton(3, pressed: false)
+            case .otherMouseDown: ic.sendMouseButton(self.wireButton(for: event), pressed: true)
+            case .otherMouseUp: ic.sendMouseButton(self.wireButton(for: event), pressed: false)
+            default: break
+            }
+            return event
+        }
+        if streamInputDebug { streamInputLog.debug("mouse NSEvent monitor installed (capture engaged)") }
+    }
+
+    private func removeMouseMonitor() {
+        if let monitor = mouseEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseEventMonitor = nil
+            if streamInputDebug { streamInputLog.debug("mouse NSEvent monitor removed (capture released)") }
+        }
+    }
+
+    /// NSEvent `buttonNumber` → GameStream wire id for the "other" buttons: 2 = middle,
+    /// 3 = first side (X1), 4 = second side (X2). Unknown extras fall back to middle.
+    private func wireButton(for event: NSEvent) -> UInt32 {
+        switch event.buttonNumber {
+        case 2: return 2 // middle
+        case 3: return 4 // X1
+        case 4: return 5 // X2
+        default: return 2
+        }
     }
 
     /// Engage/release can run inside a SwiftUI update pass (captureEnabled flips in
@@ -315,6 +386,7 @@ public final class StreamLayerView: NSView {
     /// whoever owns it (PunktfunkConnection.close() is safe alongside a draining pump).
     public func stop() {
         releaseCapture()
+        removeMouseMonitor() // belt-and-suspenders: releaseCapture no-ops if not captured
         inputCapture?.stop()
         inputCapture = nil
         pump?.stop()
@@ -323,6 +395,7 @@ public final class StreamLayerView: NSView {
     }
 
     deinit {
+        removeMouseMonitor()
         appObservers.forEach(NotificationCenter.default.removeObserver(_:))
         windowObservers.forEach(NotificationCenter.default.removeObserver(_:))
         pump?.stop()
