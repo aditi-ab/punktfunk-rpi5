@@ -13,6 +13,9 @@ import AppKit
 #endif
 import PunktfunkKit
 import SwiftUI
+#if os(tvOS)
+import SwiftUINavigationTransitions
+#endif
 
 struct ContentView: View {
     @StateObject private var model = SessionModel()
@@ -55,6 +58,7 @@ struct ContentView: View {
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
         // is sequential, a pairing connection would queue behind the live session).
+        #if !os(tvOS)
         .sheet(item: $pairingTarget) { host in
             PairSheet(host: host) { fingerprint in
                 // Backstop against a stale ceremony surfacing after dismissal (PairSheet
@@ -66,6 +70,7 @@ struct ContentView: View {
                 connect(pinned)
             }
         }
+        #endif
     }
 
     private var sessionView: some View {
@@ -110,18 +115,54 @@ struct ContentView: View {
                     emptyState
                 } else {
                     ScrollView {
-                        LazyVGrid(columns: gridColumns, spacing: 16) {
+                        LazyVGrid(columns: gridColumns, spacing: gridSpacing) {
                             ForEach(store.hosts) { host in
                                 hostCard(host)
                             }
                         }
                         .padding()
+                        #if os(tvOS)
+                        // Actions live below the hosts, not between them.
+                        HStack(spacing: 32) {
+                            Button {
+                                showAddHost = true
+                            } label: {
+                                Label("Add Host", systemImage: "plus")
+                            }
+                            Button {
+                                showSettings = true
+                            } label: {
+                                Label("Settings", systemImage: "gearshape")
+                            }
+                        }
+                        .padding(.top, 24)
+                        #endif
                     }
                 }
             }
             .navigationTitle("Punktfunkempfänger")
+            #if os(tvOS)
+            // Pushed routes — the Settings-app navigation feel (push animation, Menu
+            // pops) instead of modal overlays.
+            .navigationDestination(isPresented: $showAddHost) {
+                AddHostSheet { store.add($0) }
+            }
+            .navigationDestination(isPresented: $showSettings) {
+                SettingsView()
+            }
+            .navigationDestination(item: $pairingTarget) { host in
+                PairSheet(host: host) { fingerprint in
+                    guard pairingTarget?.id == host.id else { return }
+                    store.pin(host.id, fingerprint: fingerprint)
+                    var pinned = host
+                    pinned.pinnedSHA256 = fingerprint
+                    connect(pinned)
+                }
+            }
+            #endif
+            #if !os(tvOS)
             .toolbar {
-                #if !os(macOS)
+                #if os(iOS)
                 // Adjacent trailing items share one glass pill (the system default).
                 ToolbarItem(placement: .topBarTrailing) { settingsButton }
                 ToolbarItem(placement: .topBarTrailing) { addHostButton }
@@ -138,14 +179,24 @@ struct ContentView: View {
                 }
                 #endif
             }
+            #endif
         }
         #if os(macOS)
         .frame(minWidth: 480, minHeight: 360)
         #endif
+        #if os(tvOS)
+        // The Settings-app slide for every push in this stack (top-level routes AND
+        // the pickers' drill-ins) — SwiftUI's default on tvOS is a bare crossfade.
+        // Spring-driven (UISpringTimingParameters): ~0.87 damping ratio — settles fast
+        // with just a hint of life, no visible overshoot ping-pong.
+        .customNavigationTransition(
+            .slide.animation(.interpolatingSpring(stiffness: 300, damping: 30)))
+        #endif
+        #if !os(tvOS)
         .sheet(isPresented: $showAddHost) {
             AddHostSheet { store.add($0) }
         }
-        #if !os(macOS)
+        #if os(iOS)
         .sheet(isPresented: $showSettings) {
             NavigationStack {
                 SettingsView()
@@ -155,6 +206,7 @@ struct ContentView: View {
                     }
             }
         }
+        #endif
         #endif
         .alert(
             "Connection failed",
@@ -175,8 +227,18 @@ struct ContentView: View {
     private var gridColumns: [GridItem] {
         #if os(macOS)
         [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 16)]
+        #elseif os(tvOS)
+        [GridItem(.adaptive(minimum: 320), spacing: 48)]
         #else
         [GridItem(.adaptive(minimum: 280), spacing: 16)]
+        #endif
+    }
+
+    private var gridSpacing: CGFloat {
+        #if os(tvOS)
+        48 // the focused card scales up — give it room instead of overlapping siblings
+        #else
+        16
         #endif
     }
 
@@ -209,6 +271,9 @@ struct ContentView: View {
                 #if os(iOS)
                 .controlSize(.large)
                 #endif
+            #if os(tvOS)
+            Button("Settings") { showSettings = true }
+            #endif
         }
     }
 
@@ -265,6 +330,9 @@ struct ContentView: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, cardPadding)
             .padding(.horizontal, 12)
+            #if !os(tvOS)
+            // tvOS: the .card button style owns platter + focus motion — extra chrome
+            // inside it mutes the grow/tilt. Material + accent ring are for pointer UIs.
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
             .overlay {
                 if host.id == mostRecentHostID {
@@ -272,6 +340,7 @@ struct ContentView: View {
                         .strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 1.5)
                 }
             }
+            #endif
         }
         #if os(tvOS)
         .buttonStyle(.card)

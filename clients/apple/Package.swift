@@ -24,6 +24,9 @@ let package = Package(
             ]
         ),
         // Development app shell (swift run PunktfunkClient): connect form → stream + input.
+        // (The tvOS slide-transition package is referenced by the Xcode PROJECT only —
+        // its manifest breaks SwiftPM whole-graph validation on macOS, and only the
+        // Punktfunk-tvOS target links it; the #if os(tvOS) import never compiles here.)
         .executableTarget(name: "PunktfunkClient", dependencies: ["PunktfunkKit"]),
         .testTarget(name: "PunktfunkKitTests", dependencies: ["PunktfunkKit"]),
     ]
