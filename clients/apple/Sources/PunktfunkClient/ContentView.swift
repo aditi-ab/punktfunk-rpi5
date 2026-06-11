@@ -110,16 +110,9 @@ struct ContentView: View {
             #endif
             .toolbar {
                 #if os(iOS)
-                // Each action gets its own full-size glass circle (system-app style)
-                // instead of sharing one compact pill.
-                if #available(iOS 26.0, *) {
-                    ToolbarItem(placement: .topBarTrailing) { settingsButton }
-                    ToolbarSpacer(.fixed, placement: .topBarTrailing)
-                    ToolbarItem(placement: .topBarTrailing) { addHostButton }
-                } else {
-                    ToolbarItem { settingsButton }
-                    ToolbarItem(placement: .primaryAction) { addHostButton }
-                }
+                // Adjacent trailing items share one glass pill (the system default).
+                ToolbarItem(placement: .topBarTrailing) { settingsButton }
+                ToolbarItem(placement: .topBarTrailing) { addHostButton }
                 #else
                 ToolbarItem(placement: .primaryAction) {
                     addHostButton
