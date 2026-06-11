@@ -31,8 +31,17 @@ impl UdpTransport {
 
 impl Transport for UdpTransport {
     fn send(&self, packet: &[u8]) -> std::io::Result<()> {
-        self.socket.send(packet)?;
-        Ok(())
+        match self.socket.send(packet) {
+            Ok(_) => Ok(()),
+            // The kernel UDP send buffer is momentarily full (a frame burst saturated the
+            // tx queue — common right after attaching to an already-running source that
+            // emits at full rate). Drop this packet rather than fail the whole stream: the
+            // data plane is lossy + FEC-protected and the next frame/RFI keyframe recovers,
+            // whereas blocking would queue stale frames and add latency, and erroring tears
+            // the session down. Mirrors the `recv` WouldBlock handling above.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     fn recv(&self) -> std::io::Result<Option<Vec<u8>>> {
