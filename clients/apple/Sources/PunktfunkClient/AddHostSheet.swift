@@ -17,8 +17,16 @@ struct AddHostSheet: View {
                 TextField("Name", text: $name, prompt: Text("Optional — e.g. Living Room"))
                 TextField("Address", text: $address, prompt: Text("IP or hostname"))
                 TextField("Port", value: $port, format: .number.grouping(.never))
+                    #if os(tvOS)
+                    // tvOS floats the label above a non-empty field INSIDE the pill,
+                    // shoving the value off-center — the field is always prefilled
+                    // here, so drop the label there.
+                    .labelsHidden()
+                    #endif
             }
-            .formStyle(.grouped)
+            #if !os(tvOS)
+        .formStyle(.grouped)
+        #endif
             HStack {
                 Button("Cancel", role: .cancel) { dismiss() }
                     #if !os(tvOS)

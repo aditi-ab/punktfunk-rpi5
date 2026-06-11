@@ -173,8 +173,10 @@ struct ContentView: View {
                 .background(.thickMaterial, ignoresSafeAreaEdges: .all)
         }
         .fullScreenCover(isPresented: $showSettings) {
-            SettingsView()
-                .background(.thickMaterial, ignoresSafeAreaEdges: .all)
+            NavigationStack {
+                SettingsView()
+            }
+            .background(.thickMaterial, ignoresSafeAreaEdges: .all)
         }
         #else
         .sheet(isPresented: $showAddHost) {

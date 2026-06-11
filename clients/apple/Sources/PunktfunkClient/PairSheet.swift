@@ -46,6 +46,9 @@ struct PairSheet: View {
                     TextField(
                         "Client name", text: $clientName,
                         prompt: Text("How the host lists this Mac"))
+                        #if os(tvOS)
+                        .labelsHidden() // prefilled → tvOS floats the label off-center
+                        #endif
                 } header: {
                     Label("Pair with \(host.displayName)", systemImage: "lock.shield")
                         .foregroundStyle(.tint)
@@ -65,7 +68,9 @@ struct PairSheet: View {
                     }
                 }
             }
-            .formStyle(.grouped)
+            #if !os(tvOS)
+        .formStyle(.grouped)
+        #endif
             HStack {
                 Button("Cancel", role: .cancel) {
                     token.cancelled = true
