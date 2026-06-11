@@ -23,8 +23,6 @@ struct AddHostSheet: View {
         // No inline text editing on tvOS — Settings-style value rows; pressing one
         // raises the SYSTEM fullscreen keyboard (TVTextEntry).
         VStack(spacing: 24) {
-            Text("Add Host")
-                .font(.title3.weight(.semibold))
             TVFieldRow(
                 label: "Name", value: name, placeholder: "Optional"
             ) { editing = .name }
@@ -43,6 +41,7 @@ struct AddHostSheet: View {
         }
         .frame(maxWidth: 1000)
         .padding(60)
+        .navigationTitle("Add Host")
         .fullScreenCover(item: $editing) { field in
             switch field {
             case .name:

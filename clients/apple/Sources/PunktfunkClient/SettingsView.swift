@@ -87,9 +87,6 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Section {
-                Button("Done") { dismiss() }
-            }
         }
         .navigationTitle("Settings")
     }

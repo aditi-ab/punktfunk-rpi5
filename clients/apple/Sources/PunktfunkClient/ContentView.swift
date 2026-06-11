@@ -55,18 +55,7 @@ struct ContentView: View {
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
         // is sequential, a pairing connection would queue behind the live session).
-        #if os(tvOS)
-        .fullScreenCover(item: $pairingTarget) { host in
-            PairSheet(host: host) { fingerprint in
-                guard pairingTarget?.id == host.id else { return }
-                store.pin(host.id, fingerprint: fingerprint)
-                var pinned = host
-                pinned.pinnedSHA256 = fingerprint
-                connect(pinned)
-            }
-            .background(.thickMaterial, ignoresSafeAreaEdges: .all)
-        }
-        #else
+        #if !os(tvOS)
         .sheet(item: $pairingTarget) { host in
             PairSheet(host: host) { fingerprint in
                 // Backstop against a stale ceremony surfacing after dismissal (PairSheet
@@ -149,6 +138,25 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Punktfunkempfänger")
+            #if os(tvOS)
+            // Pushed routes — the Settings-app navigation feel (push animation, Menu
+            // pops) instead of modal overlays.
+            .navigationDestination(isPresented: $showAddHost) {
+                AddHostSheet { store.add($0) }
+            }
+            .navigationDestination(isPresented: $showSettings) {
+                SettingsView()
+            }
+            .navigationDestination(item: $pairingTarget) { host in
+                PairSheet(host: host) { fingerprint in
+                    guard pairingTarget?.id == host.id else { return }
+                    store.pin(host.id, fingerprint: fingerprint)
+                    var pinned = host
+                    pinned.pinnedSHA256 = fingerprint
+                    connect(pinned)
+                }
+            }
+            #endif
             #if !os(tvOS)
             .toolbar {
                 #if os(iOS)
@@ -173,20 +181,7 @@ struct ContentView: View {
         #if os(macOS)
         .frame(minWidth: 480, minHeight: 360)
         #endif
-        #if os(tvOS)
-        // tvOS forms/lists have CLEAR backgrounds and a cover only shows what the
-        // presented view paints — back them with the standard tv blur-over-content.
-        .fullScreenCover(isPresented: $showAddHost) {
-            AddHostSheet { store.add($0) }
-                .background(.thickMaterial, ignoresSafeAreaEdges: .all)
-        }
-        .fullScreenCover(isPresented: $showSettings) {
-            NavigationStack {
-                SettingsView()
-            }
-            .background(.thickMaterial, ignoresSafeAreaEdges: .all)
-        }
-        #else
+        #if !os(tvOS)
         .sheet(isPresented: $showAddHost) {
             AddHostSheet { store.add($0) }
         }

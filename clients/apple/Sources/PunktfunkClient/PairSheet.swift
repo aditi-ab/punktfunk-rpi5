@@ -44,9 +44,6 @@ struct PairSheet: View {
     var body: some View {
         #if os(tvOS)
         VStack(spacing: 24) {
-            Label("Pair with \(host.displayName)", systemImage: "lock.shield")
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(.tint)
             Text("The host prints the PIN when pairing is armed "
                 + "(--allow-pairing, \u{201C}PAIRING ARMED\u{201D} in its log). "
                 + "Pairing verifies both sides at once — no fingerprint comparison "
@@ -80,6 +77,7 @@ struct PairSheet: View {
         }
         .frame(maxWidth: 1000)
         .padding(60)
+        .navigationTitle("Pair with \(host.displayName)")
         .onDisappear { token.cancelled = true }
         .fullScreenCover(item: $editing) { field in
             switch field {
