@@ -115,7 +115,24 @@ fn fingerprint_hex(fp: &[u8; 32]) -> String {
 /// served one at a time (the virtual output + NVENC are single-tenant); a client that
 /// connects mid-session waits in the accept queue. A failed session logs and the loop
 /// keeps serving — only endpoint-level failures are fatal.
-async fn serve(opts: M3Options, np: Arc<NativePairing>) -> Result<()> {
+/// Default options for the native host when the unified `serve --native` runs it in-process:
+/// real virtual capture, persistent (no session/duration cut), pairing armed on demand via the
+/// management API (the shared [`NativePairing`] starts disarmed).
+pub(crate) fn native_serve_opts(port: u16) -> M3Options {
+    M3Options {
+        port,
+        source: M3Source::Virtual,
+        seconds: 7 * 24 * 3600, // per-session cap; large enough not to cut a live stream
+        frames: 0,
+        max_sessions: 0,
+        require_pairing: false,
+        allow_pairing: false,
+        pairing_pin: None,
+        paired_store: None,
+    }
+}
+
+pub(crate) async fn serve(opts: M3Options, np: Arc<NativePairing>) -> Result<()> {
     let identity = crate::gamestream::cert::ServerIdentity::load_or_create()
         .context("load host identity (~/.config/punktfunk)")?;
     let fingerprint = endpoint::fingerprint_of_pem(&identity.cert_pem)

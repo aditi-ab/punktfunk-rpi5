@@ -61,13 +61,21 @@ impl Default for Options {
 /// Axum state for the management routes: the shared control-plane state + auth config.
 struct MgmtState {
     app: Arc<AppState>,
+    /// Native (punktfunk/1) pairing — shared with the QUIC host when the unified `serve --native`
+    /// runs it. `None` ⇒ GameStream-only host (the native endpoints report `enabled: false`).
+    native: Option<Arc<crate::native_pairing::NativePairing>>,
     token: Option<String>,
     /// The port we serve on, echoed in [`PortMap`] so a client can persist a full endpoint map.
     port: u16,
 }
 
-/// Run the management API server (control plane; spawned alongside the nvhttp servers).
-pub async fn run(state: Arc<AppState>, opts: Options) -> Result<()> {
+/// Run the management API server (control plane; spawned alongside the nvhttp servers). `native`
+/// is the shared punktfunk/1 pairing handle when the unified host runs the native QUIC server.
+pub async fn run(
+    state: Arc<AppState>,
+    opts: Options,
+    native: Option<Arc<crate::native_pairing::NativePairing>>,
+) -> Result<()> {
     // A blank token is no token: it must neither satisfy the non-loopback guard below nor
     // become a credential an empty `Authorization: Bearer ` header would match.
     let token = opts.token.filter(|t| !t.trim().is_empty());
@@ -83,7 +91,7 @@ pub async fn run(state: Arc<AppState>, opts: Options) -> Result<()> {
         auth = if token.is_some() { "bearer" } else { "none (loopback)" },
         "management API listening (docs at /api/docs, spec at /api/v1/openapi.json)"
     );
-    let app = app(state, token, opts.bind.port());
+    let app = app(state, token, opts.bind.port(), native);
     axum_server::bind(opts.bind)
         .serve(app.into_make_service())
         .await
@@ -91,9 +99,15 @@ pub async fn run(state: Arc<AppState>, opts: Options) -> Result<()> {
 }
 
 /// Compose the full management router (also used directly by the handler tests).
-fn app(state: Arc<AppState>, token: Option<String>, port: u16) -> Router {
+fn app(
+    state: Arc<AppState>,
+    token: Option<String>,
+    port: u16,
+    native: Option<Arc<crate::native_pairing::NativePairing>>,
+) -> Router {
     let shared = Arc::new(MgmtState {
         app: state,
+        native,
         token,
         port,
     });
@@ -126,6 +140,11 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(unpair_client))
                 .routes(routes!(get_pairing_status))
                 .routes(routes!(submit_pairing_pin))
+                .routes(routes!(get_native_pairing))
+                .routes(routes!(arm_native_pairing))
+                .routes(routes!(disarm_native_pairing))
+                .routes(routes!(list_native_clients))
+                .routes(routes!(unpair_native_client))
                 .routes(routes!(stop_session))
                 .routes(routes!(request_idr)),
         )
@@ -156,6 +175,7 @@ pub fn openapi_json() -> String {
         (name = "host", description = "Host identity, capabilities, and liveness"),
         (name = "clients", description = "Paired Moonlight client management"),
         (name = "pairing", description = "Pairing PIN delivery (the out-of-band half of the GameStream pairing handshake)"),
+        (name = "native", description = "Native punktfunk/1 pairing: arm a window, display the host PIN, manage paired devices"),
         (name = "session", description = "Active streaming session control"),
     )
 )]
@@ -321,6 +341,42 @@ struct SubmitPin {
     /// 1–16 ASCII digits (Moonlight shows 4).
     #[schema(example = "1234")]
     pin: String,
+}
+
+/// Native (punktfunk/1) pairing status. Unlike GameStream, the **host** mints the PIN (the SPAKE2
+/// ceremony needs it client-side first), so the console **displays** `pin` for the user to enter on
+/// their device — armed on demand for a short window.
+#[derive(Serialize, ToSchema)]
+struct NativePairStatus {
+    /// Whether the native host is running (the unified host started with `--native`).
+    enabled: bool,
+    /// True while a pairing window is open.
+    armed: bool,
+    /// The PIN to display while armed (null when disarmed).
+    #[schema(example = "1234")]
+    pin: Option<String>,
+    /// Seconds left in the window (null = disarmed, or armed with no expiry via the CLI flag).
+    expires_in_secs: Option<u64>,
+    /// Number of paired native clients.
+    paired_clients: u32,
+}
+
+/// Arm-native-pairing request body.
+#[derive(Deserialize, ToSchema)]
+struct ArmNativePairing {
+    /// Window length in seconds (default 120; clamped to 15–600).
+    #[schema(example = 120)]
+    ttl_secs: Option<u32>,
+}
+
+/// A paired native (punktfunk/1) client.
+#[derive(Serialize, ToSchema)]
+struct NativeClient {
+    /// The name the client supplied when pairing.
+    #[schema(example = "Living Room iPad")]
+    name: String,
+    /// Hex SHA-256 of the client certificate — its stable id here.
+    fingerprint: String,
 }
 
 /// Error envelope for every non-2xx response.
@@ -667,6 +723,168 @@ async fn submit_pairing_pin(
     StatusCode::NO_CONTENT.into_response()
 }
 
+fn native_status(st: &MgmtState) -> NativePairStatus {
+    match &st.native {
+        Some(np) => {
+            let s = np.status();
+            NativePairStatus {
+                enabled: true,
+                armed: s.armed,
+                pin: s.pin,
+                expires_in_secs: s.expires_in_secs,
+                paired_clients: s.paired_clients,
+            }
+        }
+        None => NativePairStatus {
+            enabled: false,
+            armed: false,
+            pin: None,
+            expires_in_secs: None,
+            paired_clients: 0,
+        },
+    }
+}
+
+/// Native pairing status
+///
+/// The native (punktfunk/1) pairing window. Poll while armed to show the PIN + countdown.
+/// `enabled: false` means this host runs GameStream only (no `--native`).
+#[utoipa::path(
+    get,
+    path = "/native/pair",
+    tag = "native",
+    operation_id = "getNativePairing",
+    responses(
+        (status = OK, description = "Native pairing status", body = NativePairStatus),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn get_native_pairing(State(st): State<Arc<MgmtState>>) -> Json<NativePairStatus> {
+    Json(native_status(&st))
+}
+
+/// Arm native pairing
+///
+/// Opens a pairing window and mints a fresh PIN to display. The user enters it on their device
+/// within `ttl_secs`; the device then appears in the native client list.
+#[utoipa::path(
+    post,
+    path = "/native/pair/arm",
+    tag = "native",
+    operation_id = "armNativePairing",
+    request_body = ArmNativePairing,
+    responses(
+        (status = OK, description = "Pairing armed; the response carries the PIN to display", body = NativePairStatus),
+        (status = SERVICE_UNAVAILABLE, description = "Native host not enabled (run `serve --native`)", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn arm_native_pairing(
+    State(st): State<Arc<MgmtState>>,
+    ApiJson(req): ApiJson<ArmNativePairing>,
+) -> Response {
+    let Some(np) = &st.native else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native host not enabled (run `serve --native`)",
+        );
+    };
+    let ttl = req.ttl_secs.unwrap_or(120).clamp(15, 600);
+    let _pin = np.arm(std::time::Duration::from_secs(ttl as u64));
+    tracing::info!(ttl_secs = ttl, "management API: native pairing armed");
+    Json(native_status(&st)).into_response()
+}
+
+/// Disarm native pairing
+///
+/// Closes the pairing window immediately (no new ceremonies accepted).
+#[utoipa::path(
+    delete,
+    path = "/native/pair",
+    tag = "native",
+    operation_id = "disarmNativePairing",
+    responses(
+        (status = NO_CONTENT, description = "Pairing disarmed"),
+        (status = SERVICE_UNAVAILABLE, description = "Native host not enabled", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn disarm_native_pairing(State(st): State<Arc<MgmtState>>) -> Response {
+    let Some(np) = &st.native else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "native host not enabled");
+    };
+    np.disarm();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// List native paired clients
+#[utoipa::path(
+    get,
+    path = "/native/clients",
+    tag = "native",
+    operation_id = "listNativeClients",
+    responses(
+        (status = OK, description = "Paired native clients", body = [NativeClient]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn list_native_clients(State(st): State<Arc<MgmtState>>) -> Json<Vec<NativeClient>> {
+    let clients = match &st.native {
+        Some(np) => np
+            .list()
+            .into_iter()
+            .map(|c| NativeClient {
+                name: c.name,
+                fingerprint: c.fingerprint,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    Json(clients)
+}
+
+/// Unpair a native client
+///
+/// Removes a punktfunk/1 client from the native trust store by fingerprint.
+#[utoipa::path(
+    delete,
+    path = "/native/clients/{fingerprint}",
+    tag = "native",
+    operation_id = "unpairNativeClient",
+    params(
+        ("fingerprint" = String, Path,
+         description = "Hex SHA-256 of the client certificate (case-insensitive)")
+    ),
+    responses(
+        (status = NO_CONTENT, description = "Client unpaired"),
+        (status = SERVICE_UNAVAILABLE, description = "Native host not enabled", body = ApiError),
+        (status = NOT_FOUND, description = "No paired native client with that fingerprint", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn unpair_native_client(
+    State(st): State<Arc<MgmtState>>,
+    Path(fingerprint): Path<String>,
+) -> Response {
+    let Some(np) = &st.native else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "native host not enabled");
+    };
+    match np.remove(&fingerprint) {
+        Ok(true) => {
+            tracing::info!(fingerprint, "management API: native client unpaired");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => api_error(
+            StatusCode::NOT_FOUND,
+            "no paired native client with that fingerprint",
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not persist trust store: {e}"),
+        ),
+    }
+}
+
 /// Stop the active session
 ///
 /// Kicks the connected client: stops the video/audio stream threads and clears the launch
@@ -739,7 +957,14 @@ mod tests {
     }
 
     fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
-        app(state, token.map(String::from), DEFAULT_PORT)
+        app(state, token.map(String::from), DEFAULT_PORT, None)
+    }
+
+    fn test_app_native(
+        state: Arc<AppState>,
+        np: Arc<crate::native_pairing::NativePairing>,
+    ) -> Router {
+        app(state, None, DEFAULT_PORT, Some(np))
     }
 
     async fn send(app: &Router, req: axum::http::Request<Body>) -> (StatusCode, serde_json::Value) {
@@ -957,7 +1182,7 @@ mod tests {
             bind: "0.0.0.0:0".parse().unwrap(),
             token: Some("   ".into()),
         };
-        let err = run(test_state(), opts).await.unwrap_err();
+        let err = run(test_state(), opts, None).await.unwrap_err();
         assert!(err.to_string().contains("not loopback"), "{err}");
     }
 
@@ -1047,5 +1272,90 @@ mod tests {
             "docs/api/openapi.json is stale — regenerate with: \
              cargo run -p punktfunk-host -- openapi > docs/api/openapi.json"
         );
+    }
+
+    fn post_json(path: &str, body: serde_json::Value) -> axum::http::Request<Body> {
+        axum::http::Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_pairing_arm_show_and_unpair() {
+        let np = Arc::new(
+            crate::native_pairing::NativePairing::load_with(
+                Some(std::env::temp_dir().join(format!("pf-mgmt-np-{}.json", std::process::id()))),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let app = test_app_native(test_state(), np.clone());
+
+        // Disarmed: enabled, not armed, no PIN.
+        let (s, b) = send(&app, get_req("/api/v1/native/pair")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["enabled"], true);
+        assert_eq!(b["armed"], false);
+        assert!(b["pin"].is_null());
+
+        // Arm → a PIN appears and is readable via status.
+        let (s, b) = send(
+            &app,
+            post_json(
+                "/api/v1/native/pair/arm",
+                serde_json::json!({"ttl_secs": 60}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["armed"], true);
+        let pin = b["pin"].as_str().unwrap().to_string();
+        assert_eq!(pin.len(), 4);
+        let (_, b) = send(&app, get_req("/api/v1/native/pair")).await;
+        assert_eq!(b["pin"], pin);
+        assert!(b["expires_in_secs"].as_u64().unwrap() <= 60);
+
+        // The QUIC side would read the same live PIN.
+        assert_eq!(np.current_pin().as_deref(), Some(pin.as_str()));
+
+        // Pair a client out-of-band, then it shows in the list + can be unpaired.
+        np.add("Test Device", "abc123").unwrap();
+        let (s, b) = send(&app, get_req("/api/v1/native/clients")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b[0]["name"], "Test Device");
+        assert_eq!(b[0]["fingerprint"], "abc123");
+        let del = axum::http::Request::delete("/api/v1/native/clients/ABC123")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, del).await.0, StatusCode::NO_CONTENT);
+        let missing = axum::http::Request::delete("/api/v1/native/clients/abc123")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, missing).await.0, StatusCode::NOT_FOUND);
+
+        // Disarm clears the window.
+        let del = axum::http::Request::delete("/api/v1/native/pair")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, del).await.0, StatusCode::NO_CONTENT);
+        let (_, b) = send(&app, get_req("/api/v1/native/pair")).await;
+        assert_eq!(b["armed"], false);
+    }
+
+    #[tokio::test]
+    async fn native_endpoints_report_disabled_without_native_host() {
+        let app = test_app(test_state(), None);
+        let (s, b) = send(&app, get_req("/api/v1/native/pair")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["enabled"], false);
+        // Arming a host that isn't running the native server is a 503.
+        let (s, _) = send(
+            &app,
+            post_json("/api/v1/native/pair/arm", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

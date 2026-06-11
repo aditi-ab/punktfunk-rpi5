@@ -144,17 +144,30 @@ impl AppState {
     }
 }
 
-/// Run the GameStream control plane (blocks): mDNS advertisement, the nvhttp servers, and
-/// the management REST API.
-pub fn serve(mgmt: crate::mgmt::Options) -> Result<()> {
+/// Run the host (blocks): mDNS, the nvhttp servers, and the management REST API.
+/// `native_port = Some(p)` makes this the **unified** host — it also runs the native punktfunk/1
+/// QUIC server on `p` in the same process, sharing one [`crate::native_pairing`] handle with the
+/// management API so the web console can arm pairing and show the PIN. `None` = GameStream only
+/// (the mgmt API's native endpoints report `enabled: false`).
+pub fn serve(mgmt: crate::mgmt::Options, native_port: Option<u16>) -> Result<()> {
     let host = Host::detect()?;
     let identity = cert::ServerIdentity::load_or_create().context("host certificate")?;
     let state = Arc::new(AppState::new(host, identity));
+    // The shared native-pairing handle exists only when we run the native host; it links the QUIC
+    // ceremony and the management API.
+    let native = match native_port {
+        Some(_) => Some(Arc::new(
+            crate::native_pairing::NativePairing::load_with(None, None, false)
+                .context("native pairing store")?,
+        )),
+        None => None,
+    };
     tracing::info!(
         hostname = %state.host.hostname,
         uniqueid = %state.host.uniqueid,
         ip = %state.host.local_ip,
-        "punktfunk GameStream host (P1.1: serverinfo + pairing + mDNS)"
+        native = native_port.is_some(),
+        "punktfunk host (GameStream P1.1: serverinfo + pairing + mDNS)"
     );
     let rt = tokio::runtime::Runtime::new().context("build tokio runtime")?;
     rt.block_on(async move {
@@ -163,7 +176,22 @@ pub fn serve(mgmt: crate::mgmt::Options) -> Result<()> {
         let _advert = mdns::advertise(&state.host).context("mDNS advertise")?;
         rtsp::spawn(state.clone()).context("start RTSP server")?;
         control::spawn(state.clone()).context("start ENet control server")?;
-        tokio::try_join!(nvhttp::run(state.clone()), crate::mgmt::run(state, mgmt))?;
+        match (native_port, native) {
+            (Some(port), Some(np)) => {
+                tracing::info!(port, "unified host: also serving native punktfunk/1 (QUIC)");
+                tokio::try_join!(
+                    nvhttp::run(state.clone()),
+                    crate::mgmt::run(state.clone(), mgmt, Some(np.clone())),
+                    crate::m3::serve(crate::m3::native_serve_opts(port), np),
+                )?;
+            }
+            _ => {
+                tokio::try_join!(
+                    nvhttp::run(state.clone()),
+                    crate::mgmt::run(state, mgmt, None)
+                )?;
+            }
+        }
         Ok(())
     })
 }
