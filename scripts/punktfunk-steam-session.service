@@ -10,6 +10,7 @@
 #   sudo loginctl enable-linger $USER         # user services run without a graphical login
 #   sudo systemctl set-default multi-user.target   # don't auto-start the local gaming session
 #   sudo systemctl isolate multi-user.target       # stop it now (or reboot)
+#   sudo cp scripts/99-punktfunk-net.conf /etc/sysctl.d/ && sudo sysctl --system  # big UDP buffers (4K/5K)
 #
 # Install:
 #   mkdir -p ~/.config/systemd/user && cp scripts/punktfunk-steam-session.service ~/.config/systemd/user/
