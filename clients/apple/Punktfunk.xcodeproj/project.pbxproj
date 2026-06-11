@@ -8,10 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		AA0000000000000000000005 /* PunktfunkKit in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000006 /* PunktfunkKit */; };
+		BB0000000000000000000005 /* PunktfunkKit in Frameworks */ = {isa = PBXBuildFile; productRef = BB0000000000000000000006 /* PunktfunkKit */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		AA0000000000000000000001 /* Punktfunk.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Punktfunk.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		BB0000000000000000000001 /* Punktfunk-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Punktfunk-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -36,6 +38,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		BB0000000000000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BB0000000000000000000005 /* PunktfunkKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -52,6 +62,7 @@
 			isa = PBXGroup;
 			children = (
 				AA0000000000000000000001 /* Punktfunk.app */,
+				BB0000000000000000000001 /* Punktfunk-iOS.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -81,6 +92,30 @@
 			);
 			productName = Punktfunk;
 			productReference = AA0000000000000000000001 /* Punktfunk.app */;
+			productType = "com.apple.product-type.application";
+		};
+		BB0000000000000000000009 /* Punktfunk-iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = BB000000000000000000000A /* Build configuration list for PBXNativeTarget "Punktfunk-iOS" */;
+			buildPhases = (
+				BB000000000000000000000B /* Sources */,
+				BB0000000000000000000004 /* Frameworks */,
+				BB000000000000000000000C /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				AA0000000000000000000002 /* App */,
+				AA0000000000000000000003 /* Sources/PunktfunkClient */,
+			);
+			name = "Punktfunk-iOS";
+			packageProductDependencies = (
+				BB0000000000000000000006 /* PunktfunkKit */,
+			);
+			productName = "Punktfunk-iOS";
+			productReference = BB0000000000000000000001 /* Punktfunk-iOS.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -114,6 +149,7 @@
 			projectRoot = "";
 			targets = (
 				AA0000000000000000000009 /* Punktfunk */,
+				BB0000000000000000000009 /* Punktfunk-iOS */,
 			);
 		};
 /* End PBXProject section */
@@ -126,10 +162,24 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		BB000000000000000000000C /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		AA000000000000000000000B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		BB000000000000000000000B /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -257,6 +307,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Your microphone is streamed to the connected punktfunk host, where it appears as a virtual microphone.";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -284,6 +335,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Your microphone is streamed to the connected punktfunk host, where it appears as a virtual microphone.";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -298,9 +350,84 @@
 			};
 			name = Release;
 		};
+			BB0000000000000000000012 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = punktfunk_Logo;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Your microphone is streamed to the connected punktfunk host, where it appears as a virtual microphone.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = io.unom.punktfunk.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		BB0000000000000000000013 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = punktfunk_Logo;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Your microphone is streamed to the connected punktfunk host, where it appears as a virtual microphone.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = io.unom.punktfunk.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		BB000000000000000000000A /* Build configuration list for PBXNativeTarget "Punktfunk-iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BB0000000000000000000012 /* Debug */,
+				BB0000000000000000000013 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		AA000000000000000000000A /* Build configuration list for PBXNativeTarget "Punktfunk" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -330,6 +457,10 @@
 
 /* Begin XCSwiftPackageProductDependency section */
 		AA0000000000000000000006 /* PunktfunkKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PunktfunkKit;
+		};
+		BB0000000000000000000006 /* PunktfunkKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = PunktfunkKit;
 		};

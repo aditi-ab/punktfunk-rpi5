@@ -1,23 +1,30 @@
 // PunktfunkClient — the macOS client app (also runs unbundled via swift run).
 // Hosts grid → trust-on-first-use → StreamView (AVSampleBufferDisplayLayer HEVC) + input.
 
+#if os(macOS)
 import AppKit
+#endif
 import SwiftUI
 
 @main
 struct PunktfunkClientApp: App {
+    #if os(macOS)
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    #endif
 
     var body: some Scene {
         WindowGroup("punktfunk") {
             ContentView()
         }
+        #if os(macOS)
         Settings {
             SettingsView()
         }
+        #endif
     }
 }
 
+#if os(macOS)
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // `swift run` launches an unbundled binary; promote it to a regular app so the
@@ -30,3 +37,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 }
+#endif

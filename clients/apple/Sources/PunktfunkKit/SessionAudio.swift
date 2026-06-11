@@ -14,7 +14,6 @@
 // AVAudioEngine ties input+output to one aggregate clock, separate engines keep
 // arbitrary mic/speaker combinations trivial.
 
-#if os(macOS)
 import AVFoundation
 import os
 
@@ -140,9 +139,29 @@ public final class SessionAudio {
     }
 
     /// Start playback (and, if enabled+authorized, the mic uplink). Empty UIDs = system
-    /// default device. Main thread (engine setup); returns after the engines start —
-    /// the mic may start slightly later if the permission prompt is pending.
+    /// default device; on iOS the UIDs are ignored entirely (routes are
+    /// AVAudioSession-managed). Main thread (engine setup); returns after the engines
+    /// start — the mic may start slightly later if the permission prompt is pending.
     public func start(speakerUID: String, micUID: String, micEnabled: Bool) {
+        #if os(iOS)
+        // Route + policy live in the session, not per-engine: stereo playback, mic
+        // capture when enabled, Bluetooth allowed. Failure is non-fatal (defaults).
+        let session = AVAudioSession.sharedInstance()
+        do {
+            if micEnabled {
+                // .defaultToSpeaker: .playAndRecord otherwise routes to the iPhone
+                // EARPIECE; only affects the built-in route (headphones/BT still win).
+                try session.setCategory(
+                    .playAndRecord, mode: .default,
+                    options: [.allowBluetoothA2DP, .defaultToSpeaker])
+            } else {
+                try session.setCategory(.playback, mode: .default)
+            }
+            try session.setActive(true)
+        } catch {
+            log.warning("AVAudioSession setup failed: \(error.localizedDescription)")
+        }
+        #endif
         startPlayback(speakerUID: speakerUID)
         guard micEnabled else { return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -180,6 +199,16 @@ public final class SessionAudio {
         if wasDraining {
             _ = drainDone.wait(timeout: .now() + .milliseconds(400))
         }
+        #if os(iOS)
+        // Release the session so audio we interrupted (Music, podcasts) gets its
+        // resume cue.
+        do {
+            try AVAudioSession.sharedInstance().setActive(
+                false, options: .notifyOthersOnDeactivation)
+        } catch {
+            log.warning("AVAudioSession deactivation failed: \(error.localizedDescription)")
+        }
+        #endif
     }
 
     // MARK: - Playback (host → speaker)
@@ -190,6 +219,7 @@ public final class SessionAudio {
         let ring = AudioRing(capacity: 96_000, prefill: 1920)
 
         let engine = AVAudioEngine()
+        #if os(macOS)
         if !speakerUID.isEmpty {
             if let dev = AudioDevices.deviceID(forUID: speakerUID),
                let unit = engine.outputNode.audioUnit {
@@ -200,6 +230,7 @@ public final class SessionAudio {
                 log.warning("speaker \(speakerUID) not present — using default")
             }
         }
+        #endif
 
         // Engine-native deinterleaved float; the render block deinterleaves from the ring.
         guard let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)
@@ -282,6 +313,7 @@ public final class SessionAudio {
     private func startCapture(micUID: String) {
         let engine = AVAudioEngine()
         let input = engine.inputNode
+        #if os(macOS)
         if !micUID.isEmpty {
             if let dev = AudioDevices.deviceID(forUID: micUID), let unit = input.audioUnit {
                 if !Self.setDevice(dev, on: unit) {
@@ -291,6 +323,7 @@ public final class SessionAudio {
                 log.warning("microphone \(micUID) not present — using default")
             }
         }
+        #endif
 
         let inFormat = input.outputFormat(forBus: 0)
         guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
@@ -376,11 +409,12 @@ public final class SessionAudio {
         log.info("mic uplink started (\(micUID.isEmpty ? "default input" : micUID))")
     }
 
+    #if os(macOS)
     private static func setDevice(_ id: AudioDeviceID, on unit: AudioUnit) -> Bool {
         var dev = id
         return AudioUnitSetProperty(
             unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
             &dev, UInt32(MemoryLayout<AudioDeviceID>.size)) == noErr
     }
+    #endif
 }
-#endif

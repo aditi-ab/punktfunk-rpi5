@@ -8,7 +8,9 @@
 // the only way into hosts running --require-pairing. Once pinned, reconnects are silent
 // and a changed host identity refuses to connect.
 
+#if os(macOS)
 import AppKit
+#endif
 import PunktfunkKit
 import SwiftUI
 
@@ -21,6 +23,9 @@ struct ContentView: View {
     @AppStorage("punktfunk.compositor") private var compositor = 0
     @State private var showAddHost = false
     @State private var pairingTarget: StoredHost?
+    #if os(iOS)
+    @State private var showSettings = false
+    #endif
 
     var body: some View {
         Group {
@@ -70,7 +75,9 @@ struct ContentView: View {
                 trustCard(fp)
             }
         }
+        #if os(macOS)
         .frame(minWidth: 640, minHeight: 360)
+        #endif
         .background(Color.black)
     }
 
@@ -106,17 +113,38 @@ struct ContentView: View {
                     .help("Add a host")
                 }
                 ToolbarItem {
+                    #if os(macOS)
                     SettingsLink {
                         Label("Settings", systemImage: "gearshape")
                     }
                     .help("Stream mode and settings")
+                    #else
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                    #endif
                 }
             }
         }
+        #if os(macOS)
         .frame(minWidth: 480, minHeight: 360)
+        #endif
         .sheet(isPresented: $showAddHost) {
             AddHostSheet { store.add($0) }
         }
+        #if os(iOS)
+        .sheet(isPresented: $showSettings) {
+            NavigationStack {
+                SettingsView()
+                    .navigationTitle("Settings")
+                    .toolbar {
+                        Button("Done") { showSettings = false }
+                    }
+            }
+        }
+        #endif
         .alert(
             "Connection failed",
             isPresented: Binding(
@@ -239,7 +267,11 @@ struct ContentView: View {
                 model.rejectTrust()
                 pairingTarget = host
             }
+            #if os(macOS)
             .buttonStyle(.link)
+            #else
+            .buttonStyle(.borderless)
+            #endif
             .font(.callout)
         }
         .padding(28)
@@ -287,11 +319,20 @@ struct ContentView: View {
                 .font(.system(.caption, design: .monospaced))
             // While captured the cursor is hidden+frozen, so the button is keyboard-only
             // (⌘⎋ or Cmd+Tab release the cursor; released, it's clickable again).
+            #if os(macOS)
             Text(model.mouseCaptured
                 ? "⌘⎋ releases the mouse"
                 : "Click the stream to capture input")
                 .font(.caption2)
                 .opacity(0.8)
+            #else
+            // Touch always plays directly; ⌘⎋ (hardware keyboard) toggles kb/mouse.
+            Text(model.mouseCaptured
+                ? "⌘⎋ releases keyboard & mouse"
+                : "⌘⎋ captures keyboard & mouse")
+                .font(.caption2)
+                .opacity(0.8)
+            #endif
             Button("Disconnect (⌘D)") { model.disconnect() }
                 .font(.caption)
                 .keyboardShortcut("d", modifiers: .command)

@@ -2,7 +2,9 @@
 // virtual output at exactly this size/refresh — there is no scaling anywhere in the
 // pipeline.
 
+#if os(macOS)
 import AppKit
+#endif
 import PunktfunkKit
 import SwiftUI
 
@@ -11,11 +13,13 @@ struct SettingsView: View {
     @AppStorage("punktfunk.height") private var height = 1080
     @AppStorage("punktfunk.hz") private var hz = 60
     @AppStorage("punktfunk.compositor") private var compositor = 0
+    @AppStorage("punktfunk.micEnabled") private var micEnabled = true
+    #if os(macOS)
     @AppStorage("punktfunk.speakerUID") private var speakerUID = ""
     @AppStorage("punktfunk.micUID") private var micUID = ""
-    @AppStorage("punktfunk.micEnabled") private var micEnabled = true
     @State private var outputDevices: [AudioDevice] = []
     @State private var inputDevices: [AudioDevice] = []
+    #endif
 
     var body: some View {
         Form {
@@ -39,6 +43,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Section {
+                #if os(macOS)
                 Picker("Speaker", selection: $speakerUID) {
                     Text("System default").tag("")
                     ForEach(outputDevices) { device in
@@ -49,7 +54,9 @@ struct SettingsView: View {
                         Text("Unavailable device").tag(speakerUID)
                     }
                 }
+                #endif
                 Toggle("Send microphone to the host", isOn: $micEnabled)
+                #if os(macOS)
                 Picker("Microphone", selection: $micUID) {
                     Text("System default").tag("")
                     ForEach(inputDevices) { device in
@@ -61,6 +68,7 @@ struct SettingsView: View {
                     }
                 }
                 .disabled(!micEnabled)
+                #endif
             } header: {
                 Text("Audio")
             } footer: {
@@ -89,19 +97,29 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        #if os(macOS)
         .frame(width: 380)
         .fixedSize()
         .onAppear {
             outputDevices = AudioDevices.outputs()
             inputDevices = AudioDevices.inputs()
         }
+        #endif
     }
 
     private func fillFromMainScreen() {
+        #if os(macOS)
         guard let screen = NSScreen.main else { return }
         let scale = screen.backingScaleFactor
         width = Int(screen.frame.width * scale)
         height = Int(screen.frame.height * scale)
         hz = screen.maximumFramesPerSecond
+        #else
+        // nativeBounds is portrait-oriented pixels — streams are landscape.
+        let bounds = UIScreen.main.nativeBounds
+        width = Int(max(bounds.width, bounds.height))
+        height = Int(min(bounds.width, bounds.height))
+        hz = UIScreen.main.maximumFramesPerSecond
+        #endif
     }
 }

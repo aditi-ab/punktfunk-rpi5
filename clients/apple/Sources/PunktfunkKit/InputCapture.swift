@@ -25,6 +25,10 @@
 
 #if os(macOS)
 import AppKit
+#endif
+#if os(iOS)
+import UIKit
+#endif
 import Foundation
 import GameController
 import PunktfunkCore
@@ -36,7 +40,9 @@ public final class InputCapture {
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
     private var keyboards: [GCKeyboard] = []
+    #if os(macOS)
     private var keyEventMonitor: Any?
+    #endif
 
     // Main-queue-only state (see header comment).
     private var residualX: Float = 0
@@ -53,6 +59,9 @@ public final class InputCapture {
     /// reaches GCKeyboard, racing the NSEvent monitor — latched here so it can't type
     /// an Escape into the host in either toggle direction.
     private var suppressedVK: UInt32?
+    /// Physical ⌘ keys currently held (tracked even while released — the ⌘⎋ toggle and
+    /// its Esc suppression need it in both states).
+    private var cmdKeysDown: Set<UInt32> = []
 
     /// While true, mouse/keyboard flow to the host and key NSEvents are swallowed
     /// locally; while false the user is interacting with the local UI (dragging the
@@ -119,8 +128,13 @@ public final class InputCapture {
             if let k = n.object as? GCKeyboard { self?.attach(keyboard: k) }
         })
         // Focus loss: GC stops delivering, so release everything still held host-side.
+        #if os(macOS)
+        let resignActive = NSApplication.didResignActiveNotification
+        #else
+        let resignActive = UIApplication.willResignActiveNotification
+        #endif
         observers.append(NotificationCenter.default.addObserver(
-            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+            forName: resignActive, object: nil, queue: .main
         ) { [weak self] _ in
             self?.releaseAll()
         })
@@ -128,6 +142,8 @@ public final class InputCapture {
         // that one combo is intercepted: swallowing keys wholesale at the monitor level
         // risks starving GC's own delivery, so the no-beep behavior lives in
         // StreamLayerView (first responder consumes keyDown/keyUp while captured).
+        // (On iOS there is no NSEvent monitor — the GC key handler detects the combo.)
+        #if os(macOS)
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.keyDown]
         ) { [weak self] event in
@@ -140,16 +156,19 @@ public final class InputCapture {
             }
             return event
         }
+        #endif
     }
 
     public func stop() {
         releaseAll()
         observers.forEach(NotificationCenter.default.removeObserver(_:))
         observers.removeAll()
+        #if os(macOS)
         if let monitor = keyEventMonitor {
             NSEvent.removeMonitor(monitor)
             keyEventMonitor = nil
         }
+        #endif
         // Don't clobber the handlers if a newer capture has taken the global devices.
         if Self.activeCapture === self || Self.activeCapture == nil {
             for mouse in mice {
@@ -172,8 +191,12 @@ public final class InputCapture {
 
     deinit { stop() }
 
-    /// Send release events for everything currently held, and drop the motion residuals.
+    /// Send release events for everything currently held, and drop the motion residuals
+    /// and modifier/latch tracking (GC delivers nothing while inactive, so a ⌘ released
+    /// in another app would otherwise stay "held" here forever — hijacking Esc).
     private func releaseAll() {
+        cmdKeysDown.removeAll()
+        suppressedVK = nil
         for vk in pressedVKs {
             connection.send(.key(vk, down: false))
         }
@@ -264,16 +287,32 @@ public final class InputCapture {
         keyboards.append(keyboard)
         keyboard.keyboardInput?.keyChangedHandler = { [weak self] _, _, keyCode, pressed in
             guard let self, let vk = Self.hidToVK[keyCode.rawValue] else { return }
+            if vk == 0x5B || vk == 0x5C { // physical ⌘ state, tracked in both states
+                if pressed {
+                    self.cmdKeysDown.insert(vk)
+                } else {
+                    self.cmdKeysDown.remove(vk)
+                }
+            }
             // The ⌘⎋ toggle's Esc — checked before the forwarding gate, because in the
             // engage direction forwarding is already true when this fires.
             if vk == self.suppressedVK {
                 if !pressed { self.suppressedVK = nil }
                 return
             }
+            #if os(iOS)
+            // No NSEvent monitor here — the toggle combo is detected from the HID
+            // stream itself.
+            if pressed, vk == 0x1B, !self.cmdKeysDown.isEmpty {
+                self.suppressedVK = 0x1B
+                self.onToggleCapture?()
+                return
+            }
+            #endif
             guard self.forwarding else { return }
             // Release direction of the toggle: GC's Esc-down can beat the NSEvent
             // monitor — never type Esc into the host while ⌘ is held (⌘⎋ is reserved).
-            if vk == 0x1B, self.pressedVKs.contains(0x5B) || self.pressedVKs.contains(0x5C) {
+            if vk == 0x1B, !self.cmdKeysDown.isEmpty {
                 return
             }
             if pressed {
@@ -325,4 +364,3 @@ public final class InputCapture {
         return m
     }()
 }
-#endif

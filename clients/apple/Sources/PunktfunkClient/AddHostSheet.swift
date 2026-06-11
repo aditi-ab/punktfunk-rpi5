@@ -36,7 +36,9 @@ struct AddHostSheet: View {
             }
             .padding(16)
         }
+        #if os(macOS)
         .frame(width: 380)
         .fixedSize(horizontal: false, vertical: true)
+        #endif
     }
 }

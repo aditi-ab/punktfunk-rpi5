@@ -97,7 +97,10 @@ signing, bundle id `io.unom.punktfunk`. Notes:
 - **Tests from Xcode**: the package tests run with `swift test`; to get them on ⌘U, add
   `PunktfunkKitTests` once via Edit Scheme → Test → + (Xcode persists it into the shared
   scheme — a hand-written package-test reference doesn't resolve headlessly).
-- `xcodebuild -project Punktfunk.xcodeproj -scheme Punktfunk build` works headlessly.
+- `xcodebuild -project Punktfunk.xcodeproj -scheme Punktfunk build` works headlessly;
+  same for `-scheme Punktfunk-iOS -destination 'generic/platform=iOS Simulator'` (run it
+  in a simulator via `xcrun simctl install/launch` — `SIMCTL_CHILD_PUNKTFUNK_AUTOCONNECT=…`
+  passes the dev autoconnect env through).
 
 ## Notes for whoever picks this up next
 
@@ -170,8 +173,28 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    while the app has focus, and focus loss also auto-releases everything held. One live capture per process (the GC
    mouse/keyboard singletons have a single handler slot — ownership is tracked so a stale
    capture's stop() can't clobber a newer one).
-9. **iOS**: same package (`BUILD_IOS=1` for the xcframework slice); `StreamView` needs the
-   `UIViewRepresentable` twin and touch→input mapping.
+9. **iOS/iPadOS — ported and first-lit** (iPad simulator ↔ the real host, 60 fps).
+   `BUILD_IOS=1 bash scripts/build-xcframework.sh` builds device + universal-simulator
+   slices; the Xcode project has a second target, **Punktfunk-iOS**, sharing the same
+   synchronized sources. The iOS `StreamView` (StreamViewIOS.swift — same name/signature
+   as the macOS one, so the SwiftUI shell is identical) hosts the shared `StreamPump` in
+   a view controller for `prefersPointerLocked`: with a hardware mouse/trackpad that is
+   the iPadOS cursor capture (system honors it fullscreen-and-frontmost; in Stage
+   Manager it degrades to both-cursors forwarding). Touch is always forwarded — every
+   finger gets a wire touch id and coordinates map through the aspect-fit letterbox
+   into host-mode pixels (surface == host mode, so the host rescale is the identity).
+   `InputCapture` is cross-platform (GC works the same on iPadOS; ⌘⎋ is detected from
+   the HID stream there); audio routes via `AVAudioSession` (the Settings device
+   pickers are macOS-only). For the iPad-with-external-display setup: the target
+   enables multiple scenes + indirect input events — on Stage Manager iPads, drag the
+   punktfunk window onto the external screen and the stream runs there with full
+   keyboard/mouse/touch. Known gaps: `prefersPointerLocked` is declared on the stream
+   view controller but UIHostingController doesn't forward the preference from
+   representable children, so the system cursor stays visible (relative-mouse
+   forwarding works regardless — fixing it means putting the controller into the UIKit
+   presentation chain, e.g. a full-screen UIKit presentation on session start); and
+   AVAudioSession interruptions (calls, Siri) don't auto-restart the audio engines yet
+   (reconnect recovers).
 
 ## Known limitations of the current host (relevant to client UX)
 

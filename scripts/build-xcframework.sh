@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TARGETS_MAC=(aarch64-apple-darwin x86_64-apple-darwin)
-BUILD_IOS="${BUILD_IOS:-0}" # BUILD_IOS=1 adds an iOS slice (requires the ios target installed)
+BUILD_IOS="${BUILD_IOS:-0}" # BUILD_IOS=1 adds iOS device + simulator slices (rustup targets aarch64-apple-ios{,-sim})
 
 # Deployment targets must match Package.swift's platforms, or every consumer link emits
 # "object file was built for newer macOS version" warnings.
@@ -20,6 +20,8 @@ for t in "${TARGETS_MAC[@]}"; do
 done
 if [[ "$BUILD_IOS" == "1" ]]; then
     IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo build --release -p punktfunk-core --features quic --target aarch64-apple-ios
+    IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo build --release -p punktfunk-core --features quic --target aarch64-apple-ios-sim
+    IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo build --release -p punktfunk-core --features quic --target x86_64-apple-ios
 fi
 
 STAGE="$(mktemp -d)"
@@ -48,7 +50,14 @@ EOF
 
 ARGS=(-library "$STAGE/macos/libpunktfunk_core.a" -headers "$STAGE/include")
 if [[ "$BUILD_IOS" == "1" ]]; then
+    # Universal simulator lib (arm64 Macs run arm64 sims, but generic builds link x86_64 too).
+    mkdir -p "$STAGE/iossim"
+    lipo -create \
+        target/aarch64-apple-ios-sim/release/libpunktfunk_core.a \
+        target/x86_64-apple-ios/release/libpunktfunk_core.a \
+        -output "$STAGE/iossim/libpunktfunk_core.a"
     ARGS+=(-library target/aarch64-apple-ios/release/libpunktfunk_core.a -headers "$STAGE/include")
+    ARGS+=(-library "$STAGE/iossim/libpunktfunk_core.a" -headers "$STAGE/include")
 fi
 
 # Cargo does NOT fingerprint MACOSX_DEPLOYMENT_TARGET — units cached from a build without

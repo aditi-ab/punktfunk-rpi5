@@ -25,7 +25,11 @@ struct PairSheet: View {
     let onPaired: (Data) -> Void
 
     @State private var pin = ""
+    #if os(macOS)
     @State private var clientName = Host.current().localizedName ?? "Mac"
+    #else
+    @State private var clientName = UIDevice.current.name
+    #endif
     @State private var busy = false
     @State private var errorText: String?
     @State private var token = CeremonyToken()
@@ -77,8 +81,10 @@ struct PairSheet: View {
             }
             .padding(16)
         }
+        #if os(macOS)
         .frame(width: 400)
         .fixedSize(horizontal: false, vertical: true)
+        #endif
         .interactiveDismissDisabled(busy)
         .onDisappear { token.cancelled = true } // any other dismissal path
     }

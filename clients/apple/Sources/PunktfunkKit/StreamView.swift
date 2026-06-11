@@ -99,25 +99,8 @@ public struct StreamView: NSViewRepresentable {
 }
 
 public final class StreamLayerView: NSView {
-    /// Cancellation handle owned by exactly one pump thread — a restart hands the old pump
-    /// its own token, so it can never be revived by a newer start().
-    private final class PumpToken: @unchecked Sendable {
-        private let lock = NSLock()
-        private var live = true
-        var isLive: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return live
-        }
-        func cancel() {
-            lock.lock()
-            live = false
-            lock.unlock()
-        }
-    }
-
     private let displayLayer = AVSampleBufferDisplayLayer()
-    private var token: PumpToken?
+    private var pump: StreamPump?
     public private(set) var connection: PunktfunkConnection?
     private let cursorCapture = CursorCapture()
     private var inputCapture: InputCapture?
@@ -261,7 +244,7 @@ public final class StreamLayerView: NSView {
         // A click is explicit intent AND may arrive mid-activation (acceptsFirstMouse:
         // NSApp.isActive / isKeyWindow are still false for the click coming in from
         // another app) — only the auto-engage paths require already-held key status.
-        guard captureEnabled, !captured, token != nil, window != nil,
+        guard captureEnabled, !captured, pump != nil, window != nil,
               fromClick || (NSApp.isActive && window?.isKeyWindow == true)
         else { return }
         cursorCapture.capture(in: self)
@@ -297,11 +280,7 @@ public final class StreamLayerView: NSView {
         onSessionEnd: (@Sendable () -> Void)? = nil
     ) {
         stop()
-        let token = PumpToken()
-        self.token = token
         self.connection = connection
-        let layer = displayLayer
-        layer.flush() // drop any frames a previous connection left queued
 
         // The view owns the session's input capture: handlers attach now, but nothing is
         // forwarded until capture engages (captureEnabled + auto-engage or a click).
@@ -324,40 +303,11 @@ public final class StreamLayerView: NSView {
         capture.start()
         inputCapture = capture
 
-        let thread = Thread {
-            var format: CMVideoFormatDescription?
-            while token.isLive {
-                do {
-                    guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
-                    onFrame?(au)
-                    if let f = AnnexB.formatDescription(fromIDR: au.data) {
-                        format = f // refreshed on every IDR (mode changes included)
-                    }
-                    if layer.status == .failed {
-                        // Decode wedged: flush and re-gate on the next in-band parameter
-                        // sets — resuming with a delta frame can't recover. (A
-                        // request-IDR channel on punktfunk/1 is a host-side TODO; with the
-                        // host's infinite GOP this may otherwise stay black until the
-                        // next recovery keyframe.)
-                        layer.flush()
-                        format = AnnexB.formatDescription(fromIDR: au.data)
-                    }
-                    guard let f = format,
-                          let sample = AnnexB.sampleBuffer(au: au, format: f),
-                          token.isLive // don't enqueue a stale frame after a restart
-                    else { continue }
-                    layer.enqueue(sample)
-                } catch {
-                    if token.isLive {
-                        onSessionEnd?()
-                    }
-                    break // session closed
-                }
-            }
-        }
-        thread.name = "punktfunk-pump"
-        thread.qualityOfService = .userInteractive
-        thread.start()
+        let pump = StreamPump()
+        pump.start(
+            connection: connection, layer: displayLayer,
+            onFrame: onFrame, onSessionEnd: onSessionEnd)
+        self.pump = pump
         requestAutoCapture() // entering a session is the deliberate "capture me" moment
     }
 
@@ -367,15 +317,15 @@ public final class StreamLayerView: NSView {
         releaseCapture()
         inputCapture?.stop()
         inputCapture = nil
-        token?.cancel()
-        token = nil
+        pump?.stop()
+        pump = nil
         connection = nil
     }
 
     deinit {
         appObservers.forEach(NotificationCenter.default.removeObserver(_:))
         windowObservers.forEach(NotificationCenter.default.removeObserver(_:))
-        token?.cancel()
+        pump?.stop()
     }
 }
 #endif
