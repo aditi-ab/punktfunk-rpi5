@@ -232,12 +232,16 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// (`Hello::bitrate_kbps == 0`) — the long-standing 20 Mbps default. A client that knows its
 /// link (e.g. after a speed test) requests an explicit rate instead.
 const DEFAULT_BITRATE_KBPS: u32 = 20_000;
-/// Bounds a client's requested bitrate to a sane range before configuring NVENC: a 500 kbps floor
-/// keeps the stream above unusable, and a 500 Mbps ceiling guards against an absurd request
-/// exhausting the encoder / link (GF(2¹⁶) FEC lifts the old ~1 Gbps wall, but 500 Mbps already
-/// covers 5K@240). Resolved value is echoed in `Welcome::bitrate_kbps`.
+/// Bounds a client's requested bitrate before configuring NVENC: a 500 kbps floor keeps the stream
+/// above unusable, and a **2 Gbps** ceiling is generous headroom over the 1 Gbps+ target that
+/// GF(2¹⁶) Leopard FEC was built to reach — it lifts the GF(2⁸)/~1 Gbps wall, and at 1 Gbps a frame
+/// is only a few-hundred shards in one block (far under the 65535 limit). Enough for 5K@240 with
+/// margin. Resolved value is echoed in `Welcome::bitrate_kbps`. CAVEAT: the native data plane still
+/// does one `send()` syscall per packet (no `sendmmsg` batching / paced send thread yet), so
+/// sustained multi-hundred-Mbps can show send-buffer drops (counted as `packets_send_dropped`)
+/// until that lands — see the 1 Gbps work in the roadmap.
 const MIN_BITRATE_KBPS: u32 = 500;
-const MAX_BITRATE_KBPS: u32 = 500_000;
+const MAX_BITRATE_KBPS: u32 = 2_000_000;
 
 /// Resolve a client's [`Hello::bitrate_kbps`] request to the rate the host will configure:
 /// `0` → host default; anything else clamped into `[MIN, MAX]`.
@@ -1294,10 +1298,12 @@ fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Composito
     Ok(chosen)
 }
 
-/// Bounds a speed-test [`ProbeRequest`] before bursting: a 1 Gbps / 5 s ceiling keeps a probe from
-/// monopolizing the link or stalling the stream for too long. GF(2¹⁶) FEC makes ~1 Gbps reachable
-/// on a LAN — ample headroom to find a session's sustainable bitrate.
-const MAX_PROBE_KBPS: u32 = 1_000_000;
+/// Bounds a speed-test [`ProbeRequest`] before bursting: a 3 Gbps / 5 s ceiling keeps a probe from
+/// monopolizing the link or stalling the stream for too long. The ceiling is set ABOVE the session
+/// bitrate cap ([`MAX_BITRATE_KBPS`], 2 Gbps) on purpose — a probe should be able to demonstrate
+/// headroom past the rate a session will actually be configured to use, so the client can pick a
+/// confident 1 Gbps+ bitrate. GF(2¹⁶) FEC makes multi-Gbps reachable on a LAN.
+const MAX_PROBE_KBPS: u32 = 3_000_000;
 const MAX_PROBE_MS: u32 = 5_000;
 
 /// Run a bandwidth probe over `session`: burst zero-filled access units flagged [`FLAG_PROBE`] at
@@ -1322,6 +1328,9 @@ fn run_probe_burst(session: &mut Session, req: ProbeRequest, stop: &AtomicBool) 
     // AU fragments into many UDP shards via sendmmsg).
     let chunk = (bytes_per_sec / 240).clamp(1200, 256 * 1024) as usize;
     let filler = vec![0u8; chunk];
+    // Host send-buffer drops over the burst — at high target rates this is where the native
+    // single-send()-per-packet path first loses, so report it alongside what we offered.
+    let send_dropped0 = session.stats().packets_send_dropped;
     let start = std::time::Instant::now();
     let deadline = start + std::time::Duration::from_millis(duration_ms as u64);
     let mut bytes_sent = 0u64;
@@ -1339,11 +1348,13 @@ fn run_probe_burst(session: &mut Session, req: ProbeRequest, stop: &AtomicBool) 
         }
     }
     let actual_ms = start.elapsed().as_millis() as u32;
+    let send_dropped = session.stats().packets_send_dropped - send_dropped0;
     tracing::info!(
         target_kbps,
         duration_ms = actual_ms,
         bytes_sent,
         packets_sent,
+        send_dropped,
         "speed-test probe burst complete"
     );
     ProbeResult {
@@ -1400,6 +1411,12 @@ fn virtual_stream(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64);
     let mut next = std::time::Instant::now();
     let mut sent: u64 = 0;
+    // Throughput/drop instrumentation (PUNKTFUNK_PERF) — makes a high-bitrate / 1 Gbps soak
+    // observable: wire goodput + send-buffer drops (the dominant 1 Gbps+ loss mode) as they happen.
+    let perf = std::env::var("PUNKTFUNK_PERF").is_ok();
+    let mut last_perf = std::time::Instant::now();
+    let mut last_bytes = 0u64;
+    let mut last_send_dropped = 0u64;
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
         // Service speed-test probes between frames (each burst pauses video for its duration).
         service_probes(session, stop, probe_rx, probe_result_tx);
@@ -1440,6 +1457,22 @@ fn virtual_stream(
                 .submit_frame(&au.data, capture_ns, flags)
                 .map_err(|e| anyhow!("submit_frame: {e:?}"))?;
             sent += 1;
+        }
+        if perf && last_perf.elapsed() >= std::time::Duration::from_secs(2) {
+            let s = session.stats();
+            let secs = last_perf.elapsed().as_secs_f64();
+            let wire_mbps = (s.bytes_sent - last_bytes) as f64 * 8.0 / secs / 1_000_000.0;
+            tracing::info!(
+                wire_mbps = format!("{wire_mbps:.0}"),
+                frames = sent,
+                packets_sent = s.packets_sent,
+                send_dropped = s.packets_send_dropped - last_send_dropped,
+                send_dropped_total = s.packets_send_dropped,
+                "perf"
+            );
+            last_perf = std::time::Instant::now();
+            last_bytes = s.bytes_sent;
+            last_send_dropped = s.packets_send_dropped;
         }
         next += interval;
         match next.checked_duration_since(std::time::Instant::now()) {

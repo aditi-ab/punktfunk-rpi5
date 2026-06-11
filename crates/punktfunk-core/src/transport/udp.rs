@@ -25,7 +25,12 @@ impl UdpTransport {
     /// packets) or drops on the client recv — and with infinite-GOP a single lost frame
     /// freezes the decode until the next RFI refresh. Requested large; the OS clamps to
     /// `net.core.{wmem,rmem}_max` (Linux) / `kern.ipc.maxsockbuf` (macOS).
-    const TARGET_SOCKBUF: usize = 8 * 1024 * 1024;
+    ///
+    /// Sized for 1 Gbps+: at ~1.2 Gbps on the wire an 8 MB buffer is only ~49 ms of steady state,
+    /// and a single multi-MB IDR keyframe (~4 MB ≈ 3300 packets) instantly fills most of it. 32 MB
+    /// gives ~200 ms of headroom and absorbs a keyframe burst without EAGAIN drops. (Paced sending
+    /// will reduce the buffer actually needed once it lands — see the 1 Gbps roadmap work.)
+    const TARGET_SOCKBUF: usize = 32 * 1024 * 1024;
 
     /// Bind `local` and `connect` to `peer`, so `send`/`recv` need no address and the
     /// kernel filters to this peer. Non-blocking, matching the [`Transport`] contract.
@@ -60,16 +65,18 @@ impl UdpTransport {
 }
 
 impl Transport for UdpTransport {
-    fn send(&self, packet: &[u8]) -> std::io::Result<()> {
+    fn send(&self, packet: &[u8]) -> std::io::Result<bool> {
         match self.socket.send(packet) {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(true),
             // The kernel UDP send buffer is momentarily full (a frame burst saturated the
             // tx queue — common right after attaching to an already-running source that
-            // emits at full rate). Drop this packet rather than fail the whole stream: the
-            // data plane is lossy + FEC-protected and the next frame/RFI keyframe recovers,
-            // whereas blocking would queue stale frames and add latency, and erroring tears
-            // the session down. Mirrors the `recv` WouldBlock handling above.
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            // emits at full rate, and the dominant failure mode at 1 Gbps+). Drop this packet
+            // rather than fail the whole stream: the data plane is lossy + FEC-protected and the
+            // next frame/RFI keyframe recovers, whereas blocking would queue stale frames and add
+            // latency, and erroring tears the session down. `Ok(false)` surfaces the drop so the
+            // session counts it (`packets_send_dropped`) instead of it being invisible. Mirrors
+            // the `recv` WouldBlock handling above.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
             Err(e) => Err(e),
         }
     }

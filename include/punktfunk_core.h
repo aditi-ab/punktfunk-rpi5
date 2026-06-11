@@ -356,6 +356,9 @@ typedef struct {
     uint64_t packets_sent;
     uint64_t packets_received;
     uint64_t packets_dropped;
+    // Packets dropped on the host send path because the kernel buffer was full (WouldBlock) — the
+    // dominant loss mode at very high bitrate; distinct from `packets_dropped` (recv-side).
+    uint64_t packets_send_dropped;
     uint64_t fec_recovered_shards;
     uint64_t bytes_sent;
     uint64_t bytes_received;

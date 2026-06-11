@@ -136,6 +136,9 @@ pub struct PunktfunkStats {
     pub packets_sent: u64,
     pub packets_received: u64,
     pub packets_dropped: u64,
+    /// Packets dropped on the host send path because the kernel buffer was full (WouldBlock) — the
+    /// dominant loss mode at very high bitrate; distinct from `packets_dropped` (recv-side).
+    pub packets_send_dropped: u64,
     pub fec_recovered_shards: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
@@ -150,6 +153,7 @@ impl From<Stats> for PunktfunkStats {
             packets_sent: s.packets_sent,
             packets_received: s.packets_received,
             packets_dropped: s.packets_dropped,
+            packets_send_dropped: s.packets_send_dropped,
             fec_recovered_shards: s.fec_recovered_shards,
             bytes_sent: s.bytes_sent,
             bytes_received: s.bytes_received,

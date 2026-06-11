@@ -11,6 +11,11 @@ pub struct Stats {
     pub packets_sent: u64,
     pub packets_received: u64,
     pub packets_dropped: u64,
+    /// Packets the host could NOT hand to the kernel because the send buffer was full (WouldBlock)
+    /// — the dominant loss mode at very high bitrate. Distinct from `packets_dropped` (recv-side
+    /// reassembler rejects). A non-zero, growing value means the link/encoder is outrunning the
+    /// send path; raise `net.core.wmem_max` / lower the bitrate, or wait for paced batched sending.
+    pub packets_send_dropped: u64,
     pub fec_recovered_shards: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
@@ -27,6 +32,7 @@ pub struct StatsCounters {
     pub packets_sent: AtomicU64,
     pub packets_received: AtomicU64,
     pub packets_dropped: AtomicU64,
+    pub packets_send_dropped: AtomicU64,
     pub fec_recovered_shards: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub bytes_received: AtomicU64,
@@ -47,6 +53,7 @@ impl StatsCounters {
             packets_sent: self.packets_sent.load(l),
             packets_received: self.packets_received.load(l),
             packets_dropped: self.packets_dropped.load(l),
+            packets_send_dropped: self.packets_send_dropped.load(l),
             fec_recovered_shards: self.fec_recovered_shards.load(l),
             bytes_sent: self.bytes_sent.load(l),
             bytes_received: self.bytes_received.load(l),

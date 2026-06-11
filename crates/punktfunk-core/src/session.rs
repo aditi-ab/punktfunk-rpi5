@@ -122,7 +122,9 @@ impl Session {
             let wire = self.seal_for_wire(&pkt)?;
             StatsCounters::add(&self.stats.packets_sent, 1);
             StatsCounters::add(&self.stats.bytes_sent, wire.len() as u64);
-            self.transport.send(&wire)?;
+            if !self.transport.send(&wire)? {
+                StatsCounters::add(&self.stats.packets_send_dropped, 1);
+            }
         }
         Ok(())
     }
@@ -192,7 +194,9 @@ impl Session {
         let wire = self.seal_for_wire(&pkt)?;
         StatsCounters::add(&self.stats.packets_sent, 1);
         StatsCounters::add(&self.stats.bytes_sent, wire.len() as u64);
-        self.transport.send(&wire)?;
+        if !self.transport.send(&wire)? {
+            StatsCounters::add(&self.stats.packets_send_dropped, 1);
+        }
         Ok(())
     }
 }
