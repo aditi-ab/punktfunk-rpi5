@@ -59,8 +59,8 @@ fn real_main() -> Result<()> {
         // GameStream host control plane (P1.1: mDNS + serverinfo) + management API, and (with
         // --native) the native punktfunk/1 host in the same process — the unified host.
         Some("serve") => {
-            let (mgmt_opts, native_port) = parse_serve(&args[1..])?;
-            gamestream::serve(mgmt_opts, native_port)
+            let (mgmt_opts, native) = parse_serve(&args[1..])?;
+            gamestream::serve(mgmt_opts, native)
         }
         // Print the management API's OpenAPI document (for client codegen).
         Some("openapi") => {
@@ -226,10 +226,12 @@ fn input_test() -> Result<()> {
 
 /// `serve` options: the management API (GameStream ports are protocol-fixed) + whether to also run
 /// the native punktfunk/1 host in-process (`--native`, the unified host). Returns the mgmt options
-/// and the native QUIC port (`None` = GameStream only).
-fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<u16>)> {
+/// and the native host config (`None` = GameStream only). Native pairing is **required by default**
+/// (an open host any LAN device can stream from is insecure); `--open` turns it off.
+fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<m3::NativeServe>)> {
     let mut opts = mgmt::Options::default();
     let mut native_port: Option<u16> = None;
+    let mut open = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -265,6 +267,9 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<u16>)> {
                         .map_err(|_| anyhow::anyhow!("bad --native-port (want a port number)"))?,
                 )
             }
+            // Disable mandatory native pairing — any device can connect (trusted single-user
+            // setups only). The default REQUIRES pairing.
+            "--open" => open = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -279,7 +284,11 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<u16>)> {
             .ok()
             .filter(|t| !t.is_empty());
     }
-    Ok((opts, native_port))
+    let native = native_port.map(|port| m3::NativeServe {
+        port,
+        require_pairing: !open,
+    });
+    Ok((opts, native))
 }
 
 fn parse_m0(args: &[String]) -> Result<Options> {
@@ -398,6 +407,8 @@ SERVE OPTIONS:
     --native                     also run the native punktfunk/1 (QUIC) host in this process —
                                  the unified host; pairing is armed from the management API/console
     --native-port <PORT>         native QUIC port (default 9777; implies --native)
+    --open                       disable mandatory native pairing (default: pairing REQUIRED —
+                                 an open host any LAN device can stream from is insecure)
 
 M3-HOST OPTIONS:
     --port <N>                   QUIC listen port (default: 9777)

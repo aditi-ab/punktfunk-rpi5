@@ -115,17 +115,26 @@ fn fingerprint_hex(fp: &[u8; 32]) -> String {
 /// served one at a time (the virtual output + NVENC are single-tenant); a client that
 /// connects mid-session waits in the accept queue. A failed session logs and the loop
 /// keeps serving — only endpoint-level failures are fatal.
-/// Default options for the native host when the unified `serve --native` runs it in-process:
-/// real virtual capture, persistent (no session/duration cut), pairing armed on demand via the
-/// management API (the shared [`NativePairing`] starts disarmed).
-pub(crate) fn native_serve_opts(port: u16) -> M3Options {
+/// Config for the native (punktfunk/1) host when the unified `serve` runs it in-process.
+pub(crate) struct NativeServe {
+    pub port: u16,
+    /// Gate sessions on pairing. **Default on** — an open host any LAN device can stream from is
+    /// insecure; `serve --open` turns it off (trusted single-user setups). Pairing is armed on
+    /// demand from the web console (arm → PIN); paired devices persist.
+    pub require_pairing: bool,
+}
+
+/// Options for the native host when the unified `serve --native` runs it: real virtual capture,
+/// persistent (no session/duration cut), pairing armed on demand via the management API (the
+/// shared [`NativePairing`] starts disarmed).
+pub(crate) fn native_serve_opts(cfg: &NativeServe) -> M3Options {
     M3Options {
-        port,
+        port: cfg.port,
         source: M3Source::Virtual,
         seconds: 7 * 24 * 3600, // per-session cap; large enough not to cut a live stream
         frames: 0,
         max_sessions: 0,
-        require_pairing: false,
+        require_pairing: cfg.require_pairing,
         allow_pairing: false,
         pairing_pin: None,
         paired_store: None,
