@@ -34,6 +34,9 @@ struct AddHostSheet: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
             }
+            #if os(iOS)
+            .controlSize(.large)
+            #endif
             .padding(16)
         }
         #if os(macOS)

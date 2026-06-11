@@ -104,28 +104,29 @@ struct ContentView: View {
             }
             .navigationTitle("punktfunk")
             .toolbar {
+                #if os(iOS)
+                // Each action gets its own full-size glass circle (system-app style)
+                // instead of sharing one compact pill.
+                if #available(iOS 26.0, *) {
+                    ToolbarItem(placement: .topBarTrailing) { settingsButton }
+                    ToolbarSpacer(.fixed, placement: .topBarTrailing)
+                    ToolbarItem(placement: .topBarTrailing) { addHostButton }
+                } else {
+                    ToolbarItem { settingsButton }
+                    ToolbarItem(placement: .primaryAction) { addHostButton }
+                }
+                #else
                 ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        showAddHost = true
-                    } label: {
-                        Label("Add Host", systemImage: "plus")
-                    }
-                    .help("Add a host")
+                    addHostButton
+                        .help("Add a host")
                 }
                 ToolbarItem {
-                    #if os(macOS)
                     SettingsLink {
                         Label("Settings", systemImage: "gearshape")
                     }
                     .help("Stream mode and settings")
-                    #else
-                    Button {
-                        showSettings = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
-                    }
-                    #endif
                 }
+                #endif
             }
         }
         #if os(macOS)
@@ -158,6 +159,24 @@ struct ContentView: View {
         }
     }
 
+    private var addHostButton: some View {
+        Button {
+            showAddHost = true
+        } label: {
+            Label("Add Host", systemImage: "plus")
+        }
+    }
+
+    #if os(iOS)
+    private var settingsButton: some View {
+        Button {
+            showSettings = true
+        } label: {
+            Label("Settings", systemImage: "gearshape")
+        }
+    }
+    #endif
+
     private var emptyState: some View {
         ContentUnavailableView {
             Label("No Hosts", systemImage: "rectangle.connected.to.line.below")
@@ -166,6 +185,9 @@ struct ContentView: View {
         } actions: {
             Button("Add Host") { showAddHost = true }
                 .buttonStyle(.borderedProminent)
+                #if os(iOS)
+                .controlSize(.large)
+                #endif
         }
     }
 
@@ -260,6 +282,9 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
             }
+            #if os(iOS)
+            .controlSize(.large)
+            #endif
             // The verified alternative to eyeballing hex: drop this session (the host
             // serves one connection at a time) and run the SPAKE2 PIN ceremony instead.
             Button("Pair with PIN instead…") {

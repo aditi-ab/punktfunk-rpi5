@@ -79,6 +79,9 @@ struct PairSheet: View {
                     .keyboardShortcut(.defaultAction)
                     .disabled(busy || pin.trimmingCharacters(in: .whitespaces).isEmpty)
             }
+            #if os(iOS)
+            .controlSize(.large)
+            #endif
             .padding(16)
         }
         #if os(macOS)
