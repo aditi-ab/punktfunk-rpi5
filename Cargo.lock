@@ -1970,6 +1970,7 @@ dependencies = [
  "cbindgen",
  "fec-rs",
  "hmac",
+ "libc",
  "proptest",
  "quinn",
  "rand 0.9.4",
