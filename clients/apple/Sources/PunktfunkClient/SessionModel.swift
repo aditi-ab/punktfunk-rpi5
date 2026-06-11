@@ -59,6 +59,7 @@ final class SessionModel: ObservableObject {
 
     let meter = FrameMeter()
     private var statsTimer: Timer?
+    private var audio: SessionAudio?
 
     var isBusy: Bool { phase != .idle }
 
@@ -82,6 +83,15 @@ final class SessionModel: ObservableObject {
                 pinSHA256: pin, identity: identity, compositor: compositor) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                // The user may have abandoned this attempt (window closed, another host
+                // clicked) while the handshake was in flight — don't resurrect a session
+                // for a dead window, and especially don't start its mic uplink.
+                guard self.phase == .connecting, self.activeHost?.id == host.id else {
+                    if case .success(let conn) = result {
+                        Task.detached { conn.close() } // joins Rust threads — off-main
+                    }
+                    return
+                }
                 switch result {
                 case .success(let conn):
                     self.connection = conn
@@ -123,10 +133,18 @@ final class SessionModel: ObservableObject {
     func disconnect() {
         statsTimer?.invalidate()
         statsTimer = nil
+        let audio = self.audio
+        self.audio = nil
         if let conn = connection {
-            // close() waits out an in-flight poll (≤100 ms) and joins the Rust worker
-            // threads — keep that off the main actor.
-            Task.detached { conn.close() }
+            // Audio teardown waits its drain thread out and close() waits out in-flight
+            // polls + joins the Rust worker threads — keep both off the main actor, in
+            // this order (no audio poll left when the handle is freed).
+            Task.detached {
+                audio?.stop()
+                conn.close()
+            }
+        } else {
+            Task.detached { audio?.stop() }
         }
         connection = nil
         activeHost = nil
@@ -145,10 +163,20 @@ final class SessionModel: ObservableObject {
     }
 
     private func beginStreaming() {
-        guard connection != nil else { return }
+        guard let conn = connection else { return }
         // Input capture itself is owned by StreamView (engaged by the captureEnabled
         // flip this phase change causes, released/re-engaged by the user from there).
         phase = .streaming
+        // Audio starts with streaming, not during the trust prompt — no host sound (or
+        // mic uplink!) before the user trusted the host. Devices come from Settings;
+        // "" = system default.
+        let defaults = UserDefaults.standard
+        let audio = SessionAudio(connection: conn)
+        audio.start(
+            speakerUID: defaults.string(forKey: "punktfunk.speakerUID") ?? "",
+            micUID: defaults.string(forKey: "punktfunk.micUID") ?? "",
+            micEnabled: defaults.object(forKey: "punktfunk.micEnabled") as? Bool ?? true)
+        self.audio = audio
     }
 
     private func startStatsTimer() {

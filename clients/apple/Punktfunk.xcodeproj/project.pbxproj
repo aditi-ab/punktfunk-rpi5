@@ -257,6 +257,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Your microphone is streamed to the connected punktfunk host, where it appears as a virtual microphone.";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -283,6 +284,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Your microphone is streamed to the connected punktfunk host, where it appears as a virtual microphone.";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

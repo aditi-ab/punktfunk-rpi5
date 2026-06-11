@@ -11,6 +11,11 @@ struct SettingsView: View {
     @AppStorage("punktfunk.height") private var height = 1080
     @AppStorage("punktfunk.hz") private var hz = 60
     @AppStorage("punktfunk.compositor") private var compositor = 0
+    @AppStorage("punktfunk.speakerUID") private var speakerUID = ""
+    @AppStorage("punktfunk.micUID") private var micUID = ""
+    @AppStorage("punktfunk.micEnabled") private var micEnabled = true
+    @State private var outputDevices: [AudioDevice] = []
+    @State private var inputDevices: [AudioDevice] = []
 
     var body: some View {
         Form {
@@ -30,6 +35,38 @@ struct SettingsView: View {
             } footer: {
                 Text("The host creates a virtual output at exactly this mode — "
                     + "native resolution, no scaling.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                Picker("Speaker", selection: $speakerUID) {
+                    Text("System default").tag("")
+                    ForEach(outputDevices) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                    if !speakerUID.isEmpty,
+                       !outputDevices.contains(where: { $0.uid == speakerUID }) {
+                        Text("Unavailable device").tag(speakerUID)
+                    }
+                }
+                Toggle("Send microphone to the host", isOn: $micEnabled)
+                Picker("Microphone", selection: $micUID) {
+                    Text("System default").tag("")
+                    ForEach(inputDevices) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                    if !micUID.isEmpty,
+                       !inputDevices.contains(where: { $0.uid == micUID }) {
+                        Text("Unavailable device").tag(micUID)
+                    }
+                }
+                .disabled(!micEnabled)
+            } header: {
+                Text("Audio")
+            } footer: {
+                Text("Host audio plays through the speaker; the microphone feeds the "
+                    + "host's virtual mic. System default follows macOS device changes. "
+                    + "Applies from the next session.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -54,6 +91,10 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 380)
         .fixedSize()
+        .onAppear {
+            outputDevices = AudioDevices.outputs()
+            inputDevices = AudioDevices.inputs()
+        }
     }
 
     private func fillFromMainScreen() {

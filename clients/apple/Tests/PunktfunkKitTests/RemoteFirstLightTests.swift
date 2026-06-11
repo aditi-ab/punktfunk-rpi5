@@ -9,6 +9,7 @@
 // Then here:
 //   PUNKTFUNK_REMOTE_HOST=192.168.1.70 swift test --filter RemoteFirstLightTests
 
+import AVFoundation
 import CoreMedia
 import VideoToolbox
 import XCTest
@@ -45,6 +46,61 @@ final class RemoteFirstLightTests: XCTestCase {
             if try conn.nextAU(timeoutMs: 2000) != nil { got += 1 }
         }
         XCTAssertGreaterThanOrEqual(got, 10, "paired + pinned session must stream")
+    }
+
+    /// Audio both ways against the real host: drain the Opus plane and decode it to PCM
+    /// (host → speaker path minus the speaker), and uplink an encoded tone (mic path
+    /// minus the mic) — the host logs "punktfunk/1 virtual mic ready" on first frame.
+    func testRemoteAudioBothDirections() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let host = env["PUNKTFUNK_REMOTE_HOST"] else {
+            throw XCTSkip("set PUNKTFUNK_REMOTE_HOST (and start m3-host --source virtual there)")
+        }
+        let port = env["PUNKTFUNK_REMOTE_PORT"].flatMap(UInt16.init) ?? 9777
+
+        let conn = try PunktfunkConnection(
+            host: host, port: port, width: 1280, height: 720, refreshHz: 60)
+        defer { conn.close() }
+
+        // Mic uplink: 2 s of 440 Hz tone (the host's mic service opens its virtual
+        // source on the first frame — check its log).
+        let encoder = try OpusEncoder()
+        let chunk = AVAudioPCMBuffer(
+            pcmFormat: encoder.pcmFormat, frameCapacity: OpusEncoder.framesPerPacket)!
+        var phase: Float = 0
+        let step = 2 * Float.pi * 440 / 48_000
+        var seq: UInt32 = 0
+        for _ in 0..<100 {
+            chunk.frameLength = OpusEncoder.framesPerPacket
+            let p = chunk.floatChannelData![0]
+            for f in 0..<Int(OpusEncoder.framesPerPacket) {
+                let s = sin(phase) * 0.25
+                phase += step
+                p[f * 2] = s
+                p[f * 2 + 1] = s
+            }
+            for packet in try encoder.encode(chunk) {
+                conn.sendMic(packet, seq: seq, ptsNs: UInt64(seq) * 20_000_000)
+                seq &+= 1
+            }
+        }
+        XCTAssertGreaterThanOrEqual(seq, 95, "mic encoder must emit ~one packet per chunk")
+
+        // Downlink: pull host audio packets and decode them (the host streams its sink
+        // monitor — silence still produces packets).
+        let decoder = try OpusDecoder(framesPerPacket: 240)
+        let pcm = AVAudioPCMBuffer(pcmFormat: decoder.pcmFormat, frameCapacity: 5760)!
+        var packets = 0
+        var decodedFrames = 0
+        let deadline = Date().addingTimeInterval(10)
+        while packets < 100, Date() < deadline {
+            guard let pkt = try conn.nextAudio(timeoutMs: 1000) else { continue }
+            packets += 1
+            decodedFrames += Int(try decoder.decode(pkt.data, into: pcm))
+        }
+        XCTAssertGreaterThanOrEqual(packets, 100, "host audio plane must deliver")
+        // 100 packets × 5 ms × 48 kHz = 24000 frames.
+        XCTAssertGreaterThan(decodedFrames, 20_000, "host packets must decode to PCM")
     }
 
     func testRemoteStreamDecodesToPixels() throws {

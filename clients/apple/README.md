@@ -117,10 +117,18 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    control (ProMotion/120 Hz), glass-to-glass measurement via `tools/latency-probe` (the
    host stamps `pts_ns` with its capture wall clock; across machines you need a clock
    offset estimate from the QUIC RTT).
-5. **Audio**: `nextAudio()` yields raw Opus packets (48 kHz stereo, one 5 ms frame each,
-   sequence-numbered). The inverse direction exists too: `sendMic(_:seq:ptsNs:)` uplinks
-   the client's mic as Opus frames into a virtual PipeWire source on the host (wire it
-   to AVAudioEngine input + an Opus encoder alongside playback). Decode with libopus or `AVAudioConverter`/`kAudioFormatOpus` into an
+5. **Audio — wired, both directions.** Playback: `SessionAudio` drains `nextAudio()`
+   on its own thread, decodes through CoreAudio's built-in Opus codec (`OpusCodec.swift`
+   — kAudioFormatOpus, no bundled libopus; round-trip unit-tested) into a priming
+   jitter ring feeding an `AVAudioSourceNode`. Mic: a second engine taps the input
+   device, resamples to 48 kHz stereo, Opus-encodes 20 ms chunks and `sendMic()`s them
+   (the host's virtual PipeWire source accepts any frame size ≤ 120 ms). Speaker/mic
+   are chosen in Settings (`AudioDevices.swift` — persisted by UID; "System default"
+   leaves the engines unpinned so they follow macOS device changes), mic on/off toggle
+   included; the app asks for mic permission on first use
+   (NSMicrophoneUsageDescription is in the Xcode target). A/V sync and packet-loss
+   concealment beyond silence-fill are still open (AudioPacket.seq/ptsNs carry what's
+   needed). Decode with libopus or `AVAudioConverter`/`kAudioFormatOpus` into an
    `AVAudioEngine` source node; conceal gaps (drop/dup) rather than blocking — the Rust
    side buffers 320 ms and drops the newest packet when the puller lags. Wall-clock
    `ptsNs` shares the host clock with video AUs for A/V sync. Wiring this into
