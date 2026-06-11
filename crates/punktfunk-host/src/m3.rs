@@ -67,63 +67,12 @@ pub struct M3Options {
     pub paired_store: Option<std::path::PathBuf>,
 }
 
-/// The host's paired punktfunk/1 clients: `~/.config/punktfunk/punktfunk1-paired.json`.
-/// (Separate from GameStream pairing, which has its own store and ceremony.)
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct PairedClients {
-    clients: Vec<PairedClient>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PairedClient {
-    name: String,
-    /// Hex SHA-256 of the client's certificate.
-    fingerprint: String,
-}
-
-/// The store plus where it persists (the path is injectable for tests).
-struct PairedState {
-    path: std::path::PathBuf,
-    clients: PairedClients,
-}
-
-type PairedStore = Arc<std::sync::Mutex<PairedState>>;
-
-fn paired_path() -> Result<std::path::PathBuf> {
-    let home = std::env::var("HOME").context("HOME unset")?;
-    Ok(std::path::PathBuf::from(home).join(".config/punktfunk/punktfunk1-paired.json"))
-}
-
-fn load_paired(path: &std::path::Path) -> PairedClients {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
-}
-
-fn save_paired(state: &PairedState) -> Result<()> {
-    if let Some(dir) = state.path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Atomic replace: a crash/full-disk mid-write must not truncate the trust store (which
-    // would silently lock out every paired client on a --require-pairing host). Write a
-    // temp beside the target, then rename.
-    let tmp = state.path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&state.clients)?)?;
-    std::fs::rename(&tmp, &state.path)?;
-    Ok(())
-}
+/// The native (punktfunk/1) trust store + on-demand arming PIN, shared with the management API.
+use crate::native_pairing::NativePairing;
 
 /// Minimum spacing between accepted pairing ceremonies (bounds online PIN guessing — with
 /// SPAKE2 an attacker already gets only one guess per ceremony; this caps the rate).
 const PAIRING_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
-
-impl PairedClients {
-    fn contains(&self, fp: &[u8; 32]) -> bool {
-        let hex = fingerprint_hex(fp);
-        self.clients.iter().any(|c| c.fingerprint == hex)
-    }
-}
 
 /// Deterministic test frame: `u32 LE index` then `data[i] = idx + i` (wrapping).
 pub fn test_frame(idx: u32, len: usize) -> Vec<u8> {
@@ -148,7 +97,14 @@ pub fn run(opts: M3Options) -> Result<()> {
         .enable_all()
         .build()
         .context("tokio runtime")?;
-    rt.block_on(serve(opts))
+    // Standalone CLI: arm at startup iff --allow-pairing/--require-pairing (back-compat — the PIN
+    // is logged). The unified `serve --native` path instead arms on demand via the management API.
+    let np = Arc::new(NativePairing::load_with(
+        opts.paired_store.clone(),
+        opts.pairing_pin.clone(),
+        opts.allow_pairing || opts.require_pairing,
+    )?);
+    rt.block_on(serve(opts, np))
 }
 
 fn fingerprint_hex(fp: &[u8; 32]) -> String {
@@ -159,7 +115,7 @@ fn fingerprint_hex(fp: &[u8; 32]) -> String {
 /// served one at a time (the virtual output + NVENC are single-tenant); a client that
 /// connects mid-session waits in the accept queue. A failed session logs and the loop
 /// keeps serving — only endpoint-level failures are fatal.
-async fn serve(opts: M3Options) -> Result<()> {
+async fn serve(opts: M3Options, np: Arc<NativePairing>) -> Result<()> {
     let identity = crate::gamestream::cert::ServerIdentity::load_or_create()
         .context("load host identity (~/.config/punktfunk)")?;
     let fingerprint = endpoint::fingerprint_of_pem(&identity.cert_pem)
@@ -188,32 +144,17 @@ async fn serve(opts: M3Options) -> Result<()> {
     // One virtual microphone for the whole host lifetime (see MicService): the client's mic uplink
     // (0xCB) is Opus-decoded and fed into a persistent PipeWire Audio/Source host apps record from.
     let mic_service = MicService::start();
-    let paired_at = match &opts.paired_store {
-        Some(p) => p.clone(),
-        None => paired_path()?,
-    };
-    let paired: PairedStore = Arc::new(std::sync::Mutex::new(PairedState {
-        clients: load_paired(&paired_at),
-        path: paired_at,
-    }));
-    // The arming PIN: one PIN for the whole pairing window (NOT per-ceremony), because the
-    // SPAKE2 client must know the PIN to build its first message — so the user has to read
-    // the PIN before connecting. Generated once when pairing is armed, displayed here.
-    let arming_pin = if opts.allow_pairing || opts.require_pairing {
-        let pin = opts.pairing_pin.clone().unwrap_or_else(|| {
-            use rand::Rng;
-            format!("{:04}", rand::thread_rng().gen_range(0..10_000u32))
-        });
-        let n = paired.lock().unwrap().clients.clients.len();
+    // Pairing state (arming PIN + trust store) is shared with the management API. If it was armed
+    // at startup (the CLI flags), surface the PIN the headless operator reads from the log; the
+    // web console arms it on demand instead (a fresh, time-limited PIN).
+    let st = np.status();
+    if let Some(pin) = &st.pin {
         tracing::info!(
-            paired = n,
+            paired = st.paired_clients,
             require = opts.require_pairing,
             "PAIRING ARMED — enter this PIN on the client to pair: {pin}"
         );
-        Some(pin)
-    } else {
-        None
-    };
+    }
     let last_pairing = std::sync::Mutex::new(None::<std::time::Instant>);
 
     let mut served = 0u32;
@@ -238,9 +179,8 @@ async fn serve(opts: M3Options) -> Result<()> {
             injector.sender(),
             mic_service.sender(),
             &fingerprint,
-            &paired,
+            &np,
             &last_pairing,
-            arming_pin.as_deref(),
         )
         .await
         {
@@ -281,7 +221,7 @@ async fn pair_ceremony(
     mut recv: quinn::RecvStream,
     req: PairRequest,
     host_fp: &[u8; 32],
-    paired: &PairedStore,
+    np: &NativePairing,
     pin: &str,
 ) -> Result<()> {
     use punktfunk_core::quic::pake;
@@ -318,14 +258,7 @@ async fn pair_ceremony(
     let ok = pake::verify(&confirms.client, &proof.confirm);
 
     if ok {
-        let mut store = paired.lock().unwrap();
-        let hex = fingerprint_hex(&client_fp);
-        store.clients.clients.retain(|c| c.fingerprint != hex); // re-pair updates the name
-        store.clients.clients.push(PairedClient {
-            name: req.name.clone(),
-            fingerprint: hex,
-        });
-        if let Err(e) = save_paired(&store) {
+        if let Err(e) = np.add(&req.name, &fingerprint_hex(&client_fp)) {
             tracing::error!(error = %format!("{e:#}"), "could not persist paired clients");
         }
         tracing::info!(name = %req.name, "pairing complete — client trusted");
@@ -356,9 +289,8 @@ async fn serve_session(
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
     mic_tx: std::sync::mpsc::Sender<Vec<u8>>,
     host_fp: &[u8; 32],
-    paired: &PairedStore,
+    np: &NativePairing,
     last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
-    arming_pin: Option<&str>,
 ) -> Result<()> {
     let peer = conn.remote_address();
 
@@ -371,7 +303,10 @@ async fn serve_session(
         .await
         .map_err(|_| anyhow!("first message timeout"))??;
     if let Ok(req) = PairRequest::decode(&first) {
-        let pin = arming_pin.context("pairing not armed (start with --allow-pairing)")?;
+        // Read the live arming PIN per attempt, so a window that lapsed no longer pairs.
+        let pin = np
+            .current_pin()
+            .context("pairing not armed (arm it in the console, or start with --allow-pairing)")?;
         {
             let mut last = last_pairing.lock().unwrap();
             if let Some(t) = *last {
@@ -382,7 +317,7 @@ async fn serve_session(
             }
             *last = Some(std::time::Instant::now());
         }
-        return pair_ceremony(&conn, send, recv, req, host_fp, paired, pin).await;
+        return pair_ceremony(&conn, send, recv, req, host_fp, np, &pin).await;
     }
 
     let source = opts.source;
@@ -397,7 +332,7 @@ async fn serve_session(
         );
         if opts.require_pairing {
             let known = endpoint::peer_fingerprint(&conn)
-                .map(|fp| paired.lock().unwrap().clients.contains(&fp))
+                .map(|fp| np.is_paired(&fingerprint_hex(&fp)))
                 .unwrap_or(false);
             anyhow::ensure!(
                 known,

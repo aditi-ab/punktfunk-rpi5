@@ -21,6 +21,7 @@ mod inject;
 mod m0;
 mod m3;
 mod mgmt;
+mod native_pairing;
 mod pipeline;
 mod pwinit;
 mod vdisplay;
