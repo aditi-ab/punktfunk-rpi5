@@ -106,7 +106,11 @@ fn real_main() -> Result<()> {
             let deadline = Instant::now() + Duration::from_secs(secs);
             let (mut i, mut last_write) = (0i32, Instant::now());
             while Instant::now() < deadline {
-                for o in pad.service(0) {
+                let fb = pad.service(0);
+                if let Some((low, high)) = fb.rumble {
+                    println!("  rumble from kernel/game: low={low} high={high}");
+                }
+                for o in fb.hidout {
                     println!("  hid output from kernel/game: {o:?}");
                 }
                 if last_write.elapsed() >= Duration::from_millis(300) {

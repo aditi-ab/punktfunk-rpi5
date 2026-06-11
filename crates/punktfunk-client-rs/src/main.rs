@@ -10,7 +10,10 @@
 //! stream (watch them land in the host session, e.g. xev inside gamescope). `--mic-test`
 //! exercises the mic uplink: a synthetic 440 Hz tone streamed as Opus (0xCB) → the host's
 //! virtual microphone source (record it host-side to hear the tone). `--touch-test` drags a
-//! synthetic finger in a circle → host libei `ei_touchscreen` injection.
+//! synthetic finger in a circle → host libei `ei_touchscreen` injection. `--rich-input-test`
+//! drives a virtual DualSense touchpad + motion over the 0xCC plane (host on
+//! `PUNKTFUNK_GAMEPAD=dualsense`) and logs the 0xCD HID-output feedback (lightbar / adaptive
+//! triggers) that comes back.
 //!
 //! `--pin <64-hex>` pins the host's certificate fingerprint (the host logs it at startup);
 //! without it the client trusts on first use and prints the observed fingerprint to pin.
@@ -44,6 +47,9 @@ struct Args {
     mic_test: bool,
     /// `--touch-test` — drag a synthetic finger in a circle (proves the touch path).
     touch_test: bool,
+    /// `--rich-input-test` — drive the DualSense touchpad + motion over 0xCC (host needs
+    /// `PUNKTFUNK_GAMEPAD=dualsense`); also logs the 0xCD HID-output feedback that comes back.
+    rich_input_test: bool,
     pin: Option<[u8; 32]>,
     /// `--remode WxHxFPS:SECS` — request this mode SECS seconds into the stream.
     remode: Option<(Mode, u32)>,
@@ -146,6 +152,7 @@ fn parse_args() -> Args {
         input_test: argv.iter().any(|a| a == "--input-test"),
         mic_test: argv.iter().any(|a| a == "--mic-test"),
         touch_test: argv.iter().any(|a| a == "--touch-test"),
+        rich_input_test: argv.iter().any(|a| a == "--rich-input-test"),
         pin,
         remode,
         pair: get("--pair").map(String::from),
@@ -450,6 +457,60 @@ async fn session(args: Args) -> Result<()> {
         });
     }
 
+    // Rich-input plane: instantiate pad 0 on the host (a gamepad event creates the virtual
+    // DualSense), then drive its touchpad (drag a finger across) + motion (gyro wobble) over the
+    // 0xCC plane. Proves the rich client→host path; the 0xCD feedback is logged by the receive
+    // loop below. Requires the host on the DualSense backend (`PUNKTFUNK_GAMEPAD=dualsense`).
+    if args.rich_input_test {
+        let conn2 = conn.clone();
+        tokio::spawn(async move {
+            use punktfunk_core::input::gamepad::AXIS_LS_X;
+            use punktfunk_core::quic::RichInput;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // A neutral gamepad axis event makes the host create the virtual DualSense pad 0.
+            let arrive = InputEvent {
+                kind: InputKind::GamepadAxis,
+                _pad: [0; 3],
+                code: AXIS_LS_X,
+                x: 0,
+                y: 0,
+                flags: 0,
+            };
+            let _ = conn2.send_datagram(arrive.encode().to_vec().into());
+            tracing::info!(
+                "rich-input-test: dragging the DualSense touchpad + wobbling motion for ~6s"
+            );
+            let touch = |active, x, y| RichInput::Touchpad {
+                pad: 0,
+                finger: 0,
+                active,
+                x,
+                y,
+            };
+            for _ in 0..3u32 {
+                let _ = conn2.send_datagram(touch(true, 0, 32768).encode().into());
+                for i in 0..60u32 {
+                    let x = ((i * 65535) / 60) as u16;
+                    let _ = conn2.send_datagram(touch(true, x, 32768).encode().into());
+                    let g = (((i as i32 % 20) - 10) * 500) as i16; // gyro wobble
+                    let _ = conn2.send_datagram(
+                        RichInput::Motion {
+                            pad: 0,
+                            gyro: [g, 0, 0],
+                            accel: [0, 0, 16384],
+                        }
+                        .encode()
+                        .into(),
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                }
+                let _ = conn2.send_datagram(touch(false, 65535, 32768).encode().into());
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            tracing::info!("rich-input-test: done");
+        });
+    }
+
     // Closed-flag for the blocking receive loop.
     let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
@@ -466,8 +527,14 @@ async fn session(args: Args) -> Result<()> {
     let audio_pkts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let audio_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let rumble_pkts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let hidout_pkts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
-        let (a, ab, r) = (audio_pkts.clone(), audio_bytes.clone(), rumble_pkts.clone());
+        let (a, ab, r, h) = (
+            audio_pkts.clone(),
+            audio_bytes.clone(),
+            rumble_pkts.clone(),
+            hidout_pkts.clone(),
+        );
         let conn2 = conn.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
@@ -477,6 +544,12 @@ async fn session(args: Args) -> Result<()> {
                     ab.fetch_add(opus.len() as u64, Relaxed);
                 } else if punktfunk_core::quic::decode_rumble_datagram(&d).is_some() {
                     r.fetch_add(1, Relaxed);
+                } else if let Some(hid) = punktfunk_core::quic::HidOutput::decode(&d) {
+                    // The DualSense feedback plane (lightbar / player LEDs / adaptive triggers).
+                    // Log the first few so a playtest can see triggers/LEDs arrive without spam.
+                    if h.fetch_add(1, Relaxed) < 12 {
+                        tracing::info!(?hid, "DualSense HID output (0xCD)");
+                    }
                 }
             }
         });
@@ -587,17 +660,19 @@ async fn session(args: Args) -> Result<()> {
     // Report the side planes whether or not the video plane succeeded.
     {
         use std::sync::atomic::Ordering::Relaxed;
-        let (a, ab, r) = (
+        let (a, ab, r, h) = (
             audio_pkts.load(Relaxed),
             audio_bytes.load(Relaxed),
             rumble_pkts.load(Relaxed),
+            hidout_pkts.load(Relaxed),
         );
-        if a > 0 || r > 0 {
+        if a > 0 || r > 0 || h > 0 {
             tracing::info!(
                 audio_pkts = a,
                 audio_kb = ab / 1000,
                 rumble_pkts = r,
-                "host→client datagrams (Opus 48 kHz stereo, 5 ms frames)"
+                hidout_pkts = h,
+                "host→client datagrams (Opus 48 kHz stereo, 5 ms frames; rumble; DualSense HID)"
             );
         }
     }

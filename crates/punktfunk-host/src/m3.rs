@@ -519,25 +519,32 @@ async fn serve_session(
     // per-session) and sends force feedback back over `conn`. It exits when the channel closes
     // (datagram task ends on disconnect) — fresh gamepad state per session.
     let (input_tx, input_rx) = std::sync::mpsc::channel::<InputEvent>();
+    let (rich_tx, rich_rx) = std::sync::mpsc::channel::<punktfunk_core::quic::RichInput>();
     let input_handle = {
         let conn = conn.clone();
         std::thread::Builder::new()
             .name("punktfunk-m3-input".into())
-            .spawn(move || input_thread(input_rx, conn, inj_tx))
+            .spawn(move || input_thread(input_rx, rich_rx, conn, inj_tx))
             .context("spawn input thread")?
     };
     // One reader for ALL client→host datagrams, demuxed by magic byte (two read_datagram loops
     // would race for datagrams): 0xCB → mic uplink (Opus, forwarded to the host-lifetime mic
-    // service), 0xC8 → input (forwarded to the per-session input thread). The magics are disjoint,
-    // so decode order doesn't matter. Unknown tags are ignored.
+    // service), 0xCC → rich input (DualSense touchpad / motion, to the per-session input thread),
+    // 0xC8 → input (also the input thread). The magics are disjoint, so decode order doesn't
+    // matter. Unknown tags are ignored.
     let input_conn = conn.clone();
     tokio::spawn(async move {
-        let (mut input_count, mut mic_count) = (0u64, 0u64);
+        let (mut input_count, mut mic_count, mut rich_count) = (0u64, 0u64, 0u64);
         while let Ok(d) = input_conn.read_datagram().await {
             if let Some((_seq, _pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
                 mic_count += 1;
                 // Host-lifetime mic service; a send error just means the host is shutting down.
                 let _ = mic_tx.send(opus.to_vec());
+            } else if let Some(rich) = punktfunk_core::quic::RichInput::decode(&d) {
+                rich_count += 1;
+                if rich_tx.send(rich).is_err() {
+                    break;
+                }
             } else if let Some(ev) = InputEvent::decode(&d) {
                 input_count += 1;
                 if input_tx.send(ev).is_err() {
@@ -548,6 +555,7 @@ async fn serve_session(
         tracing::info!(
             input = input_count,
             mic = mic_count,
+            rich = rich_count,
             "client datagram stream ended"
         );
     });
@@ -873,17 +881,77 @@ fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
     tracing::debug!("mic service stopped (host shutting down)");
 }
 
+/// The session's virtual-gamepad backend. Default = uinput X-Box-360 pads
+/// ([`GamepadManager`](crate::inject::gamepad::GamepadManager)); `PUNKTFUNK_GAMEPAD=dualsense`
+/// switches to virtual DualSense pads (UHID + the kernel `hid-playstation` driver) so a game sees
+/// a *real* DualSense — adaptive triggers, lightbar, touchpad, motion — and a game's feedback
+/// flows back over the rich HID-output plane. Selected once per session (sessions run serially).
+enum PadBackend {
+    Xbox360(crate::inject::gamepad::GamepadManager),
+    #[cfg(target_os = "linux")]
+    DualSense(crate::inject::dualsense::DualSenseManager),
+}
+
+impl PadBackend {
+    fn select() -> PadBackend {
+        #[cfg(target_os = "linux")]
+        if std::env::var("PUNKTFUNK_GAMEPAD").as_deref() == Ok("dualsense") {
+            tracing::info!("gamepad backend: virtual DualSense (UHID hid-playstation)");
+            return PadBackend::DualSense(crate::inject::dualsense::DualSenseManager::new());
+        }
+        PadBackend::Xbox360(crate::inject::gamepad::GamepadManager::new())
+    }
+
+    fn handle(&mut self, ev: &crate::gamestream::gamepad::GamepadEvent) {
+        match self {
+            PadBackend::Xbox360(m) => m.handle(ev),
+            #[cfg(target_os = "linux")]
+            PadBackend::DualSense(m) => m.handle(ev),
+        }
+    }
+
+    /// Apply a rich client→host event (DualSense touchpad / motion). A no-op for the X-Box pad,
+    /// which has no equivalent.
+    fn apply_rich(&mut self, _rich: punktfunk_core::quic::RichInput) {
+        #[cfg(target_os = "linux")]
+        if let PadBackend::DualSense(m) = self {
+            m.apply_rich(_rich);
+        }
+    }
+
+    /// Service feedback every cycle. `rumble` carries motor force-feedback on the universal plane
+    /// (both backends); `hidout` carries DualSense-only rich feedback (lightbar / player LEDs /
+    /// adaptive triggers — DualSense backend only).
+    fn pump(
+        &mut self,
+        rumble: impl FnMut(u16, u16, u16),
+        hidout: impl FnMut(punktfunk_core::quic::HidOutput),
+    ) {
+        match self {
+            PadBackend::Xbox360(m) => {
+                let _ = hidout; // the X-Box pad has no rich-feedback plane
+                m.pump_rumble(rumble)
+            }
+            #[cfg(target_os = "linux")]
+            PadBackend::DualSense(m) => m.pump(rumble, hidout),
+        }
+    }
+}
+
 /// The per-session input thread: route pointer/keyboard events to the host-lifetime injector
-/// service (`inj_tx`) and gamepad events to this session's own [`GamepadManager`]
-/// (crate::inject::gamepad), with force feedback pumped between events and sent back as rumble
-/// datagrams. The gamepads (uinput) are created and torn down with the session; the
-/// pointer/keyboard injector (and its portal grant) lives in the service, across sessions.
+/// service (`inj_tx`) and gamepad events to this session's [`PadBackend`] (uinput X-Box pads or,
+/// with `PUNKTFUNK_GAMEPAD=dualsense`, virtual DualSense pads), with rich client→host input
+/// (touchpad / motion, `rich_rx`) merged in and feedback pumped between events — rumble on the
+/// universal datagram plane, DualSense LED/trigger feedback on the HID-output plane. The gamepads
+/// are created and torn down with the session; the pointer/keyboard injector (and its portal
+/// grant) lives in the service, across sessions.
 fn input_thread(
     rx: std::sync::mpsc::Receiver<InputEvent>,
+    rich_rx: std::sync::mpsc::Receiver<punktfunk_core::quic::RichInput>,
     conn: quinn::Connection,
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
 ) {
-    let mut pads = crate::inject::gamepad::GamepadManager::new();
+    let mut pads = PadBackend::select();
     let mut pad_state = [PadState::default(); MAX_WIRE_PADS];
     let mut pad_mask = 0u16;
     // Rumble is idempotent state on a lossy channel (client-side overflow drops datagrams),
@@ -896,13 +964,15 @@ fn input_thread(
         match rx.recv_timeout(std::time::Duration::from_millis(4)) {
             Ok(ev) => match ev.kind {
                 InputKind::GamepadButton | InputKind::GamepadAxis => {
+                    // A bad index / unknown axis just doesn't update a pad — fall through (no
+                    // `continue`) so the rich-input drain + feedback pump below still run every
+                    // iteration (the DualSense GET_REPORT handshake must be serviced promptly).
                     let idx = ev.flags as usize;
-                    if idx >= MAX_WIRE_PADS || !pad_state[idx].apply(&ev) {
-                        continue;
+                    if idx < MAX_WIRE_PADS && pad_state[idx].apply(&ev) {
+                        pad_mask |= 1 << idx;
+                        let frame = pad_state[idx].frame(idx, pad_mask);
+                        pads.handle(&crate::gamestream::gamepad::GamepadEvent::State(frame));
                     }
-                    pad_mask |= 1 << idx;
-                    let frame = pad_state[idx].frame(idx, pad_mask);
-                    pads.handle(&crate::gamestream::gamepad::GamepadEvent::State(frame));
                 }
                 _ => {
                     // Pointer/keyboard → the host-lifetime injector service (one persistent
@@ -915,15 +985,26 @@ fn input_thread(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        // Service force feedback every iteration (≤4 ms latency; games block on EVIOCSFF).
-        pads.pump_rumble(|pad, low, high| {
-            if let Some(s) = rumble_state.get_mut(pad as usize) {
-                *s = (low, high);
-                rumble_seen[pad as usize] = true;
-            }
-            let d = punktfunk_core::quic::encode_rumble_datagram(pad, low, high);
-            let _ = conn.send_datagram(d.to_vec().into());
-        });
+        // Drain rich client→host input (DualSense touchpad / motion) into the pad backend.
+        while let Ok(rich) = rich_rx.try_recv() {
+            pads.apply_rich(rich);
+        }
+        // Service feedback every iteration (≤4 ms latency; games block on EVIOCSFF, and the
+        // DualSense kernel handshake must be answered promptly). Rumble → the universal 0xCA
+        // plane; DualSense rich feedback (lightbar / player LEDs / adaptive triggers) → 0xCD.
+        pads.pump(
+            |pad, low, high| {
+                if let Some(s) = rumble_state.get_mut(pad as usize) {
+                    *s = (low, high);
+                    rumble_seen[pad as usize] = true;
+                }
+                let d = punktfunk_core::quic::encode_rumble_datagram(pad, low, high);
+                let _ = conn.send_datagram(d.to_vec().into());
+            },
+            |h| {
+                let _ = conn.send_datagram(h.encode().into());
+            },
+        );
         if last_refresh.elapsed() >= std::time::Duration::from_millis(500) {
             last_refresh = std::time::Instant::now();
             for (i, &(low, high)) in rumble_state.iter().enumerate() {

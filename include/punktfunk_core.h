@@ -19,6 +19,24 @@
 // added `punktfunk_pair` / `punktfunk_generate_identity` / `punktfunk_connection_request_mode`.
 #define ABI_VERSION 2
 
+// `PunktfunkHidOutput::kind` — lightbar RGB (`r`/`g`/`b` valid).
+#define PUNKTFUNK_HIDOUT_LED 1
+
+// `PunktfunkHidOutput::kind` — player-indicator LEDs (`player_bits` valid, low 5 bits).
+#define PUNKTFUNK_HIDOUT_PLAYER_LEDS 2
+
+// `PunktfunkHidOutput::kind` — one adaptive-trigger effect (`which` + `effect`/`effect_len` valid).
+#define PUNKTFUNK_HIDOUT_TRIGGER 3
+
+// Capacity of `PunktfunkHidOutput::effect` (the DualSense trigger parameter block).
+#define PUNKTFUNK_HID_EFFECT_MAX 11
+
+// `PunktfunkRichInput::kind` — a touchpad contact (`finger`/`active`/`x`/`y` valid).
+#define PUNKTFUNK_RICH_TOUCHPAD 1
+
+// `PunktfunkRichInput::kind` — a motion sample (`gyro`/`accel` valid).
+#define PUNKTFUNK_RICH_MOTION 2
+
 // Compositor preference for [`punktfunk_connect_ex`] (`compositor` arg). `AUTO` lets the host
 // pick (auto-detect from its running desktop); a concrete value is honored only if that backend
 // is available on the host right now, else the host falls back to auto-detect. The resolved
@@ -319,6 +337,57 @@ typedef struct {
 } PunktfunkAudioPacket;
 #endif
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One DualSense HID-output feedback event a game wrote to the host's virtual pad
+// ([`punktfunk_connection_next_hidout`]). `kind` selects which fields are meaningful — replay it
+// on a real DualSense (lightbar color, player LEDs, or an adaptive-trigger effect via the
+// platform's `GCDualSenseAdaptiveTrigger`-style API).
+typedef struct {
+    // One of `PUNKTFUNK_HIDOUT_*`.
+    uint8_t kind;
+    // Gamepad index.
+    uint8_t pad;
+    // LED: lightbar red.
+    uint8_t r;
+    // LED: lightbar green.
+    uint8_t g;
+    // LED: lightbar blue.
+    uint8_t b;
+    // PlayerLeds: lit player indicators (low 5 bits).
+    uint8_t player_bits;
+    // Trigger: 0 = L2, 1 = R2.
+    uint8_t which;
+    // Trigger: number of valid bytes in `effect` (≤ `PUNKTFUNK_HID_EFFECT_MAX`).
+    uint8_t effect_len;
+    // Trigger: the raw DualSense trigger parameter block (mode + params).
+    uint8_t effect[11];
+} PunktfunkHidOutput;
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One rich client→host input for the host's virtual DualSense
+// ([`punktfunk_connection_send_rich_input`]): a touchpad contact or a motion sample. Set `kind`
+// and the matching fields; the others are ignored.
+typedef struct {
+    // One of `PUNKTFUNK_RICH_*`.
+    uint8_t kind;
+    // Gamepad index.
+    uint8_t pad;
+    // Touchpad: contact id (0 or 1).
+    uint8_t finger;
+    // Touchpad: 1 = finger down, 0 = lifted.
+    uint8_t active;
+    // Touchpad: normalized x, 0..=65535 across the touchpad.
+    uint16_t x;
+    // Touchpad: normalized y, 0..=65535 across the touchpad.
+    uint16_t y;
+    // Motion: gyro (pitch, yaw, roll), raw signed-16.
+    int16_t gyro[3];
+    // Motion: accelerometer (x, y, z), raw signed-16.
+    int16_t accel[3];
+} PunktfunkRichInput;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -529,6 +598,20 @@ PunktfunkStatus punktfunk_connection_next_rumble(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pull the next DualSense HID-output feedback event (lightbar / player LEDs / adaptive trigger)
+// the host's virtual pad received from a game, into `*out`. [`PunktfunkStatus::NoFrame`] on
+// timeout, [`PunktfunkStatus::Closed`] once the session ended. Only the DualSense host backend
+// emits these. Same threading rules as [`punktfunk_connection_next_rumble`] (one puller, may run
+// alongside the other planes).
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable for one `PunktfunkHidOutput`.
+PunktfunkStatus punktfunk_connection_next_hidout(PunktfunkConnection *c,
+                                                 PunktfunkHidOutput *out,
+                                                 uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Send one input event to the host as a QUIC datagram (non-blocking enqueue).
 //
 // # Safety
@@ -550,6 +633,18 @@ PunktfunkStatus punktfunk_connection_send_mic(PunktfunkConnection *c,
                                               uintptr_t len,
                                               uint32_t seq,
                                               uint64_t pts_ns);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Send one rich input event (DualSense touchpad contact or motion sample) to the host as a QUIC
+// datagram (non-blocking enqueue). The host applies it to its virtual DualSense pad — a no-op
+// unless the host runs the DualSense gamepad backend. [`PunktfunkStatus::InvalidArg`] on an
+// unknown `kind`.
+//
+// # Safety
+// `c` is a valid connection handle; `rich` points to a valid [`PunktfunkRichInput`].
+PunktfunkStatus punktfunk_connection_send_rich_input(PunktfunkConnection *c,
+                                                     const PunktfunkRichInput *rich);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

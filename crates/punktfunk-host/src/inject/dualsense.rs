@@ -11,7 +11,9 @@
 //! The report descriptor + field layout are the canonical inputtino ones (games-on-whales/
 //! inputtino `src/uhid/include/uhid/ps5.hpp`), so `hid-playstation` binds the same as a USB pad.
 
+use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use anyhow::{Context, Result};
+use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -254,6 +256,16 @@ fn pack_touch(dst: &mut [u8], t: &Touch) {
     dst[3] = ((y >> 4) & 0xFF) as u8;
 }
 
+/// What one [`DualSensePad::service`] pass extracted from the device's HID output reports.
+/// Rich feedback (lightbar / player LEDs / adaptive triggers) rides the HID-output plane (0xCD);
+/// motor rumble rides the universal rumble plane (0xCA) so non-DualSense clients still feel it.
+#[derive(Default)]
+pub struct DsFeedback {
+    pub hidout: Vec<HidOutput>,
+    /// `(low, high)` motor levels (0..=0xFFFF), if a report carried them.
+    pub rumble: Option<(u16, u16)>,
+}
+
 /// A virtual DualSense backed by `/dev/uhid` (hand-rolled codec — no bindgen, mirroring the
 /// uinput pad's style). Dropping it destroys the device (the kernel tears down the bound
 /// `hid-playstation` interface).
@@ -341,10 +353,10 @@ impl DualSensePad {
     /// Service the device, non-blocking: answer the kernel's feature-report GET_REPORTs (calibration
     /// / pairing / firmware — required during `hid-playstation` init, or no input devices appear)
     /// and parse any HID OUTPUT reports (rumble / lightbar / player LEDs / adaptive triggers) into
-    /// [`HidOutput`] events for pad `pad`. Call frequently — especially right after [`open`] so the
+    /// a [`DsFeedback`] for pad `pad`. Call frequently — especially right after [`open`] so the
     /// init handshake completes. The fd is `O_NONBLOCK`, so once drained `read` returns `WouldBlock`.
-    pub fn service(&mut self, pad: u8) -> Vec<punktfunk_core::quic::HidOutput> {
-        let mut out = Vec::new();
+    pub fn service(&mut self, pad: u8) -> DsFeedback {
+        let mut fb = DsFeedback::default();
         let mut ev = [0u8; UHID_EVENT_SIZE];
         while let Ok(n) = self.fd.read(&mut ev) {
             if n < UHID_EVENT_SIZE {
@@ -355,7 +367,7 @@ impl DualSensePad {
                     // uhid_output_req: data[4096] at [4..4100], size u16 at [4100..4102].
                     let size = u16::from_ne_bytes([ev[4100], ev[4101]]) as usize;
                     let end = 4 + size.min(HID_MAX_DESCRIPTOR_SIZE);
-                    parse_ds_output(pad, &ev[4..end], &mut out);
+                    parse_ds_output(pad, &ev[4..end], &mut fb);
                 }
                 UHID_GET_REPORT => {
                     // uhid_get_report_req: id u32 [4..8], rnum u8 [8].
@@ -371,7 +383,7 @@ impl DualSensePad {
                 _ => {} // Start/Stop/Open/Close/SetReport — ignore
             }
         }
-        out
+        fb
     }
 
     fn reply_get_report(&mut self, id: u32, data: &[u8]) -> Result<()> {
@@ -398,33 +410,257 @@ impl Drop for DualSensePad {
     }
 }
 
-/// Parse a DualSense USB output report (`0x02`) into [`HidOutput`] events. The byte layout below
-/// is the USB DualSense common report; only the well-understood fields (motor rumble, lightbar
-/// RGB, player LEDs) are surfaced — adaptive-trigger blocks are forwarded raw for the client.
-fn parse_ds_output(pad: u8, data: &[u8], out: &mut Vec<punktfunk_core::quic::HidOutput>) {
-    use punktfunk_core::quic::HidOutput;
+/// Parse a DualSense USB output report (`0x02`) into a [`DsFeedback`]. The byte layout below is
+/// the USB DualSense common report; only the well-understood fields (motor rumble, lightbar RGB,
+/// player LEDs) are surfaced — adaptive-trigger blocks are forwarded raw for the client.
+fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
     // data[0] is the report id (0x02). Be defensive about short reports.
     if data.first() != Some(&0x02) || data.len() < 48 {
         return;
     }
+    // Motor rumble: high-frequency (small/right) motor at data[3], low-frequency (big/left) at
+    // data[4]. Scale 0..255 → 0..0xFFFF, same (low, high) convention as the uinput pad's mixer,
+    // and route to the universal rumble plane (0xCA). We don't gate on the report's valid-flags
+    // (matching the LED/trigger handling) — the manager only forwards a *change*, so a report
+    // that touches only the LED doesn't spam a rumble-stop.
+    let high = (data[3] as u16) << 8;
+    let low = (data[4] as u16) << 8;
+    fb.rumble = Some((low, high));
     // Lightbar RGB (USB common report: bytes 45..48). Player LEDs at byte 44.
     let (r, g, b) = (data[45], data[46], data[47]);
-    out.push(HidOutput::Led { pad, r, g, b });
-    out.push(HidOutput::PlayerLeds {
+    fb.hidout.push(HidOutput::Led { pad, r, g, b });
+    fb.hidout.push(HidOutput::PlayerLeds {
         pad,
         bits: data[44] & 0x1F,
     });
     // Adaptive-trigger parameter blocks: L2 at bytes 11..22, R2 at 22..33 (11 bytes each).
     if data.len() >= 33 {
-        out.push(HidOutput::Trigger {
+        fb.hidout.push(HidOutput::Trigger {
             pad,
             which: 0,
             effect: data[11..22].to_vec(),
         });
-        out.push(HidOutput::Trigger {
+        fb.hidout.push(HidOutput::Trigger {
             pad,
             which: 1,
             effect: data[22..33].to_vec(),
         });
+    }
+}
+
+/// All virtual DualSense pads of a session — the rich-controller analog of
+/// [`GamepadManager`](super::gamepad::GamepadManager), selected with `PUNKTFUNK_GAMEPAD=dualsense`.
+///
+/// Unlike the uinput pad, a DualSense carries touchpad + motion, which arrive on a *separate*
+/// rich-input plane ([`apply_rich`](Self::apply_rich)) from the button/stick frames
+/// ([`handle`](Self::handle)). So the manager keeps each pad's full [`DsState`] and re-emits the
+/// merged report whenever either source changes. [`pump`](Self::pump) services the kernel
+/// handshake and routes a game's feedback back out: motor rumble on the universal plane, the rich
+/// LED/player-LED/trigger feedback on the HID-output plane.
+pub struct DualSenseManager {
+    pads: Vec<Option<DualSensePad>>,
+    /// Each pad's current full report — buttons/sticks merged with persisted touch + motion.
+    state: Vec<DsState>,
+    /// Last rumble forwarded per pad, so a report that only changes the LED doesn't re-send it.
+    last_rumble: Vec<(u16, u16)>,
+    /// Pad creation failed (e.g. /dev/uhid permissions) — warn once, drop events.
+    broken: bool,
+}
+
+impl Default for DualSenseManager {
+    fn default() -> DualSenseManager {
+        DualSenseManager::new()
+    }
+}
+
+impl DualSenseManager {
+    pub fn new() -> DualSenseManager {
+        DualSenseManager {
+            pads: (0..MAX_PADS).map(|_| None).collect(),
+            state: vec![DsState::neutral(); MAX_PADS],
+            last_rumble: vec![(0, 0); MAX_PADS],
+            broken: false,
+        }
+    }
+
+    /// Handle one decoded controller event (create/destroy by mask, then merge button/stick state).
+    pub fn handle(&mut self, ev: &GamepadEvent) {
+        match ev {
+            GamepadEvent::Arrival { index, kind, .. } => {
+                tracing::info!(index, kind, "controller arrival (DualSense)");
+                self.ensure(*index as usize);
+            }
+            GamepadEvent::State(f) => {
+                let idx = f.index as usize;
+                if idx >= MAX_PADS {
+                    return;
+                }
+                // Unplugs: drop any allocated pad whose mask bit cleared, resetting its state.
+                for (i, slot) in self.pads.iter_mut().enumerate() {
+                    if slot.is_some() && f.active_mask & (1 << i) == 0 {
+                        tracing::info!(index = i, "controller unplugged (DualSense)");
+                        *slot = None;
+                        self.state[i] = DsState::neutral();
+                        self.last_rumble[i] = (0, 0);
+                    }
+                }
+                if f.active_mask & (1 << idx) == 0 {
+                    return; // this event WAS the unplug
+                }
+                self.ensure(idx);
+                // Merge buttons/sticks/triggers from the frame, preserving touch + motion (those
+                // come on the rich-input plane and must survive a button-only frame).
+                let prev = self.state[idx];
+                let mut s = DsState::from_gamepad(
+                    f.buttons,
+                    f.ls_x,
+                    f.ls_y,
+                    f.rs_x,
+                    f.rs_y,
+                    f.left_trigger,
+                    f.right_trigger,
+                );
+                s.touch = prev.touch;
+                s.gyro = prev.gyro;
+                s.accel = prev.accel;
+                self.state[idx] = s;
+                self.write(idx);
+            }
+        }
+    }
+
+    /// Apply one rich client→host event (touchpad contact / motion sample) to an existing pad,
+    /// preserving its button/stick state. Rich events never create a pad (a controller must have
+    /// arrived first); they're dropped if the pad isn't present.
+    pub fn apply_rich(&mut self, rich: RichInput) {
+        let idx = match rich {
+            RichInput::Touchpad { pad, .. } | RichInput::Motion { pad, .. } => pad as usize,
+        };
+        if idx >= MAX_PADS || self.pads[idx].is_none() {
+            return;
+        }
+        match rich {
+            RichInput::Touchpad {
+                finger,
+                active,
+                x,
+                y,
+                ..
+            } => {
+                // The DualSense touchpad carries two contacts; clamp to a valid slot and keep the
+                // reported contact id consistent with it (the wire `finger` is untrusted).
+                let slot = (finger as usize).min(1);
+                let t = &mut self.state[idx].touch[slot];
+                t.active = active;
+                t.id = slot as u8;
+                // Normalized 0..=65535 → the touchpad's reported resolution.
+                t.x = ((x as u32 * DS_TOUCH_W as u32) / u16::MAX as u32) as u16;
+                t.y = ((y as u32 * DS_TOUCH_H as u32) / u16::MAX as u32) as u16;
+            }
+            RichInput::Motion { gyro, accel, .. } => {
+                self.state[idx].gyro = gyro;
+                self.state[idx].accel = accel;
+            }
+        }
+        self.write(idx);
+    }
+
+    fn write(&mut self, idx: usize) {
+        let st = self.state[idx];
+        if let Some(pad) = self.pads[idx].as_mut() {
+            let _ = pad.write_state(&st);
+        }
+    }
+
+    fn ensure(&mut self, idx: usize) {
+        if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
+            return;
+        }
+        match DualSensePad::open(idx as u8) {
+            Ok(p) => {
+                self.pads[idx] = Some(p);
+                self.state[idx] = DsState::neutral();
+                self.last_rumble[idx] = (0, 0);
+            }
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — controller input disabled");
+                self.broken = true;
+            }
+        }
+    }
+
+    /// Service every pad: answer the kernel's init handshake and parse a game's feedback. `rumble`
+    /// is invoked `(index, low, high)` only when the motor level *changes* (the universal 0xCA
+    /// plane — both backends use it); `hidout` is invoked for each DualSense-only rich feedback
+    /// event (lightbar / player LEDs / adaptive triggers — the 0xCD plane). Call frequently:
+    /// the kernel blocks `hid-playstation` init until its GET_REPORTs are answered.
+    pub fn pump(
+        &mut self,
+        mut rumble: impl FnMut(u16, u16, u16),
+        mut hidout: impl FnMut(HidOutput),
+    ) {
+        for i in 0..self.pads.len() {
+            let Some(pad) = self.pads[i].as_mut() else {
+                continue;
+            };
+            let fb = pad.service(i as u8);
+            if let Some(r) = fb.rumble {
+                if self.last_rumble[i] != r {
+                    self.last_rumble[i] = r;
+                    rumble(i as u16, r.0, r.1);
+                }
+            }
+            for h in fb.hidout {
+                hidout(h);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A DualSense USB output report (`0x02`) parses into motor rumble (0xCA), lightbar, player
+    /// LEDs, and both adaptive-trigger blocks (0xCD).
+    #[test]
+    fn parse_output_report() {
+        let mut data = vec![0u8; 48];
+        data[0] = 0x02; // report id
+        data[3] = 0x80; // right (high-freq) motor
+        data[4] = 0x40; // left (low-freq) motor
+        data[44] = 0x03; // player LEDs (low 5 bits)
+        data[45] = 10; // R
+        data[46] = 20; // G
+        data[47] = 30; // B
+        let mut fb = DsFeedback::default();
+        parse_ds_output(0, &data, &mut fb);
+        // (low, high) = (left<<8, right<<8).
+        assert_eq!(fb.rumble, Some((0x4000, 0x8000)));
+        assert!(fb.hidout.contains(&HidOutput::Led {
+            pad: 0,
+            r: 10,
+            g: 20,
+            b: 30
+        }));
+        assert!(fb
+            .hidout
+            .contains(&HidOutput::PlayerLeds { pad: 0, bits: 3 }));
+        assert_eq!(
+            fb.hidout
+                .iter()
+                .filter(|h| matches!(h, HidOutput::Trigger { .. }))
+                .count(),
+            2
+        );
+    }
+
+    /// A short / wrong-id report yields nothing.
+    #[test]
+    fn parse_output_rejects_garbage() {
+        let mut fb = DsFeedback::default();
+        parse_ds_output(0, &[0x01, 0, 0], &mut fb); // wrong report id, too short
+        assert!(fb.rumble.is_none());
+        assert!(fb.hidout.is_empty());
     }
 }

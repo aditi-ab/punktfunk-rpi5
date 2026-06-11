@@ -14,7 +14,9 @@
 use crate::config::{CompositorPref, Mode, Role};
 use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
-use crate::quic::{endpoint, io, Hello, Reconfigure, Reconfigured, Start, Welcome};
+use crate::quic::{
+    endpoint, io, Hello, HidOutput, Reconfigure, Reconfigured, RichInput, Start, Welcome,
+};
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +38,10 @@ const AUDIO_QUEUE: usize = 64;
 /// periodically, so a dropped transition (including a stop) heals within ~500 ms.
 const RUMBLE_QUEUE: usize = 16;
 
+/// HID-output (DualSense lightbar / player LEDs / adaptive triggers) buffered for the embedder.
+/// Same overflow discipline as rumble; the host re-sends on the next feedback change.
+const HIDOUT_QUEUE: usize = 32;
+
 /// One Opus packet from the host's audio datagram stream (48 kHz stereo, 5 ms frames).
 #[derive(Clone, Debug)]
 pub struct AudioPacket {
@@ -49,9 +55,13 @@ pub struct NativeClient {
     frames: Receiver<Frame>,
     audio: Receiver<AudioPacket>,
     rumble: Receiver<(u16, u16, u16)>,
+    /// Inbound DualSense feedback (lightbar / player LEDs / adaptive triggers) — 0xCD datagrams.
+    hidout: Receiver<HidOutput>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     /// Outbound mic frames `(seq, pts_ns, opus)` → encoded as 0xCB datagrams by the worker.
     mic_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64, Vec<u8>)>,
+    /// Outbound rich input (DualSense touchpad / motion) → 0xCC datagrams by the worker.
+    rich_input_tx: tokio::sync::mpsc::UnboundedSender<RichInput>,
     reconfig_tx: tokio::sync::mpsc::UnboundedSender<Mode>,
     shutdown: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -86,8 +96,10 @@ impl NativeClient {
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(FRAME_QUEUE);
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(AUDIO_QUEUE);
         let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<(u16, u16, u16)>(RUMBLE_QUEUE);
+        let (hidout_tx, hidout_rx) = std::sync::mpsc::sync_channel::<HidOutput>(HIDOUT_QUEUE);
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
         let (mic_tx, mic_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u64, Vec<u8>)>();
+        let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<RichInput>();
         let (reconfig_tx, reconfig_rx) = tokio::sync::mpsc::unbounded_channel::<Mode>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(Mode, [u8; 32])>>();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -120,8 +132,10 @@ impl NativeClient {
                     frame_tx,
                     audio_tx,
                     rumble_tx,
+                    hidout_tx,
                     input_rx,
                     mic_rx,
+                    rich_input_rx,
                     reconfig_rx,
                     ready_tx,
                     shutdown: shutdown_w,
@@ -143,8 +157,10 @@ impl NativeClient {
             frames: frame_rx,
             audio: audio_rx,
             rumble: rumble_rx,
+            hidout: hidout_rx,
             input_tx,
             mic_tx,
+            rich_input_tx,
             reconfig_tx,
             shutdown,
             worker: Some(worker),
@@ -297,6 +313,18 @@ impl NativeClient {
         }
     }
 
+    /// Pull the next DualSense HID-output feedback event (lightbar / player LEDs / adaptive
+    /// trigger) the host's virtual pad received from a game; same timeout/closed semantics as
+    /// [`NativeClient::next_rumble`]. Replay it on a real DualSense (e.g. via the platform's
+    /// `GCDualSenseAdaptiveTrigger` API). Only the DualSense host backend emits these.
+    pub fn next_hidout(&self, timeout: Duration) -> Result<HidOutput> {
+        match self.hidout.recv_timeout(timeout) {
+            Ok(h) => Ok(h),
+            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
+            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
+        }
+    }
+
     /// Queue one input event for delivery as a QUIC datagram.
     pub fn send_input(&self, ev: &InputEvent) -> Result<()> {
         self.input_tx.send(*ev).map_err(|_| PunktfunkError::Closed)
@@ -309,6 +337,15 @@ impl NativeClient {
     pub fn send_mic(&self, seq: u32, pts_ns: u64, opus: Vec<u8>) -> Result<()> {
         self.mic_tx
             .send((seq, pts_ns, opus))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Queue one rich input event (DualSense touchpad contact or motion sample) for delivery as a
+    /// 0xCC datagram. The host applies it to its virtual DualSense pad. Best-effort, dropped under
+    /// loss like every datagram. No-op unless the host runs the DualSense gamepad backend.
+    pub fn send_rich_input(&self, rich: RichInput) -> Result<()> {
+        self.rich_input_tx
+            .send(rich)
             .map_err(|_| PunktfunkError::Closed)
     }
 }
@@ -332,8 +369,10 @@ struct WorkerArgs {
     frame_tx: SyncSender<Frame>,
     audio_tx: SyncSender<AudioPacket>,
     rumble_tx: SyncSender<(u16, u16, u16)>,
+    hidout_tx: SyncSender<HidOutput>,
     input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     mic_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, u64, Vec<u8>)>,
+    rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<RichInput>,
     reconfig_rx: tokio::sync::mpsc::UnboundedReceiver<Mode>,
     ready_tx: std::sync::mpsc::Sender<Result<(Mode, [u8; 32])>>,
     shutdown: Arc<AtomicBool>,
@@ -353,8 +392,10 @@ async fn worker_main(args: WorkerArgs) {
         frame_tx,
         audio_tx,
         rumble_tx,
+        hidout_tx,
         mut input_rx,
         mut mic_rx,
+        mut rich_input_rx,
         mut reconfig_rx,
         ready_tx,
         shutdown,
@@ -455,6 +496,14 @@ async fn worker_main(args: WorkerArgs) {
         }
     });
 
+    // Rich-input task: embedder DualSense touchpad / motion → 0xCC uplink datagrams.
+    let rich_conn = conn.clone();
+    tokio::spawn(async move {
+        while let Some(rich) = rich_input_rx.recv().await {
+            let _ = rich_conn.send_datagram(rich.encode().into());
+        }
+    });
+
     // Control task: the handshake stream stays open for mid-stream renegotiation. One
     // request at a time — write Reconfigure, await Reconfigured, publish the active mode.
     {
@@ -502,6 +551,11 @@ async fn worker_main(args: WorkerArgs) {
                 Some(&crate::quic::RUMBLE_MAGIC) => {
                     if let Some(r) = crate::quic::decode_rumble_datagram(&d) {
                         let _ = rumble_tx.try_send(r);
+                    }
+                }
+                Some(&crate::quic::HIDOUT_MAGIC) => {
+                    if let Some(h) = HidOutput::decode(&d) {
+                        let _ = hidout_tx.try_send(h);
                     }
                 }
                 _ => {} // unknown tag — a newer host; ignore

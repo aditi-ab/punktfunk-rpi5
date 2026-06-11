@@ -465,6 +465,136 @@ pub struct PunktfunkConnection {
     last_audio: std::sync::Mutex<Option<crate::client::AudioPacket>>,
 }
 
+/// `PunktfunkHidOutput::kind` — lightbar RGB (`r`/`g`/`b` valid).
+pub const PUNKTFUNK_HIDOUT_LED: u8 = 1;
+/// `PunktfunkHidOutput::kind` — player-indicator LEDs (`player_bits` valid, low 5 bits).
+pub const PUNKTFUNK_HIDOUT_PLAYER_LEDS: u8 = 2;
+/// `PunktfunkHidOutput::kind` — one adaptive-trigger effect (`which` + `effect`/`effect_len` valid).
+pub const PUNKTFUNK_HIDOUT_TRIGGER: u8 = 3;
+/// Capacity of `PunktfunkHidOutput::effect` (the DualSense trigger parameter block).
+pub const PUNKTFUNK_HID_EFFECT_MAX: u8 = 11;
+
+/// One DualSense HID-output feedback event a game wrote to the host's virtual pad
+/// ([`punktfunk_connection_next_hidout`]). `kind` selects which fields are meaningful — replay it
+/// on a real DualSense (lightbar color, player LEDs, or an adaptive-trigger effect via the
+/// platform's `GCDualSenseAdaptiveTrigger`-style API).
+#[cfg(feature = "quic")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PunktfunkHidOutput {
+    /// One of `PUNKTFUNK_HIDOUT_*`.
+    pub kind: u8,
+    /// Gamepad index.
+    pub pad: u8,
+    /// LED: lightbar red.
+    pub r: u8,
+    /// LED: lightbar green.
+    pub g: u8,
+    /// LED: lightbar blue.
+    pub b: u8,
+    /// PlayerLeds: lit player indicators (low 5 bits).
+    pub player_bits: u8,
+    /// Trigger: 0 = L2, 1 = R2.
+    pub which: u8,
+    /// Trigger: number of valid bytes in `effect` (≤ `PUNKTFUNK_HID_EFFECT_MAX`).
+    pub effect_len: u8,
+    /// Trigger: the raw DualSense trigger parameter block (mode + params).
+    pub effect: [u8; 11],
+}
+
+#[cfg(feature = "quic")]
+impl PunktfunkHidOutput {
+    fn from_hid(h: &crate::quic::HidOutput) -> PunktfunkHidOutput {
+        use crate::quic::HidOutput;
+        let mut out = PunktfunkHidOutput {
+            kind: 0,
+            pad: 0,
+            r: 0,
+            g: 0,
+            b: 0,
+            player_bits: 0,
+            which: 0,
+            effect_len: 0,
+            effect: [0u8; 11],
+        };
+        match h {
+            HidOutput::Led { pad, r, g, b } => {
+                out.kind = PUNKTFUNK_HIDOUT_LED;
+                out.pad = *pad;
+                out.r = *r;
+                out.g = *g;
+                out.b = *b;
+            }
+            HidOutput::PlayerLeds { pad, bits } => {
+                out.kind = PUNKTFUNK_HIDOUT_PLAYER_LEDS;
+                out.pad = *pad;
+                out.player_bits = *bits;
+            }
+            HidOutput::Trigger { pad, which, effect } => {
+                out.kind = PUNKTFUNK_HIDOUT_TRIGGER;
+                out.pad = *pad;
+                out.which = *which;
+                let n = effect.len().min(out.effect.len());
+                out.effect[..n].copy_from_slice(&effect[..n]);
+                out.effect_len = n as u8;
+            }
+        }
+        out
+    }
+}
+
+/// `PunktfunkRichInput::kind` — a touchpad contact (`finger`/`active`/`x`/`y` valid).
+pub const PUNKTFUNK_RICH_TOUCHPAD: u8 = 1;
+/// `PunktfunkRichInput::kind` — a motion sample (`gyro`/`accel` valid).
+pub const PUNKTFUNK_RICH_MOTION: u8 = 2;
+
+/// One rich client→host input for the host's virtual DualSense
+/// ([`punktfunk_connection_send_rich_input`]): a touchpad contact or a motion sample. Set `kind`
+/// and the matching fields; the others are ignored.
+#[cfg(feature = "quic")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PunktfunkRichInput {
+    /// One of `PUNKTFUNK_RICH_*`.
+    pub kind: u8,
+    /// Gamepad index.
+    pub pad: u8,
+    /// Touchpad: contact id (0 or 1).
+    pub finger: u8,
+    /// Touchpad: 1 = finger down, 0 = lifted.
+    pub active: u8,
+    /// Touchpad: normalized x, 0..=65535 across the touchpad.
+    pub x: u16,
+    /// Touchpad: normalized y, 0..=65535 across the touchpad.
+    pub y: u16,
+    /// Motion: gyro (pitch, yaw, roll), raw signed-16.
+    pub gyro: [i16; 3],
+    /// Motion: accelerometer (x, y, z), raw signed-16.
+    pub accel: [i16; 3],
+}
+
+#[cfg(feature = "quic")]
+impl PunktfunkRichInput {
+    fn to_rich(self) -> Option<crate::quic::RichInput> {
+        use crate::quic::RichInput;
+        match self.kind {
+            PUNKTFUNK_RICH_TOUCHPAD => Some(RichInput::Touchpad {
+                pad: self.pad,
+                finger: self.finger,
+                active: self.active != 0,
+                x: self.x,
+                y: self.y,
+            }),
+            PUNKTFUNK_RICH_MOTION => Some(RichInput::Motion {
+                pad: self.pad,
+                gyro: self.gyro,
+                accel: self.accel,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Read an optional NUL-terminated UTF-8 string parameter; `Err` = invalid pointer/UTF-8.
 #[cfg(feature = "quic")]
 unsafe fn opt_cstr<'a>(p: *const std::os::raw::c_char) -> std::result::Result<Option<&'a str>, ()> {
@@ -859,6 +989,42 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble(
     })
 }
 
+/// Pull the next DualSense HID-output feedback event (lightbar / player LEDs / adaptive trigger)
+/// the host's virtual pad received from a game, into `*out`. [`PunktfunkStatus::NoFrame`] on
+/// timeout, [`PunktfunkStatus::Closed`] once the session ended. Only the DualSense host backend
+/// emits these. Same threading rules as [`punktfunk_connection_next_rumble`] (one puller, may run
+/// alongside the other planes).
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable for one `PunktfunkHidOutput`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_next_hidout(
+    c: *mut PunktfunkConnection,
+    out: *mut PunktfunkHidOutput,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if out.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        match c
+            .inner
+            .next_hidout(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(h) => {
+                unsafe { *out = PunktfunkHidOutput::from_hid(&h) };
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
 /// Send one input event to the host as a QUIC datagram (non-blocking enqueue).
 ///
 /// # Safety
@@ -917,6 +1083,38 @@ pub unsafe extern "C" fn punktfunk_connection_send_mic(
         match c.inner.send_mic(seq, pts_ns, opus) {
             Ok(()) => PunktfunkStatus::Ok,
             Err(e) => e.status(),
+        }
+    })
+}
+
+/// Send one rich input event (DualSense touchpad contact or motion sample) to the host as a QUIC
+/// datagram (non-blocking enqueue). The host applies it to its virtual DualSense pad — a no-op
+/// unless the host runs the DualSense gamepad backend. [`PunktfunkStatus::InvalidArg`] on an
+/// unknown `kind`.
+///
+/// # Safety
+/// `c` is a valid connection handle; `rich` points to a valid [`PunktfunkRichInput`].
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_send_rich_input(
+    c: *mut PunktfunkConnection,
+    rich: *const PunktfunkRichInput,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        let rich = match unsafe { rich.as_ref() } {
+            Some(r) => r,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        match rich.to_rich() {
+            Some(r) => match c.inner.send_rich_input(r) {
+                Ok(()) => PunktfunkStatus::Ok,
+                Err(e) => e.status(),
+            },
+            None => PunktfunkStatus::InvalidArg,
         }
     })
 }
