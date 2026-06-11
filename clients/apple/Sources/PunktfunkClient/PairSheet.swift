@@ -33,6 +33,13 @@ struct PairSheet: View {
     @State private var busy = false
     @State private var errorText: String?
     @State private var token = CeremonyToken()
+    #if os(tvOS)
+    private enum EditField: String, Identifiable {
+        case pin, clientName
+        var id: String { rawValue }
+    }
+    @State private var editing: EditField?
+    #endif
 
     var body: some View {
         #if os(tvOS)
@@ -47,12 +54,12 @@ struct PairSheet: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            TextField("PIN", text: $pin, prompt: Text("Shown in the host's log"))
-                .labelsHidden()
-            TextField(
-                "Client name", text: $clientName,
-                prompt: Text("How the host lists this device"))
-                .labelsHidden()
+            TVFieldRow(
+                label: "PIN", value: pin, placeholder: "Shown in the host's log"
+            ) { editing = .pin }
+            TVFieldRow(
+                label: "Device name", value: clientName, placeholder: "Apple TV"
+            ) { editing = .clientName }
             if let errorText {
                 Text(errorText)
                     .font(.callout)
@@ -74,6 +81,23 @@ struct PairSheet: View {
         .frame(maxWidth: 1000)
         .padding(60)
         .onDisappear { token.cancelled = true }
+        .fullScreenCover(item: $editing) { field in
+            switch field {
+            case .pin:
+                TVTextEntry(
+                    title: "PIN (shown in the host's log)", text: pin,
+                    keyboardType: .numberPad
+                ) {
+                    pin = $0.trimmingCharacters(in: .whitespaces)
+                    editing = nil
+                }
+            case .clientName:
+                TVTextEntry(title: "Device name", text: clientName) {
+                    clientName = $0
+                    editing = nil
+                }
+            }
+        }
         #else
         VStack(spacing: 0) {
             Form {

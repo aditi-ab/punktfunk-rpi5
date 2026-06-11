@@ -8,22 +8,32 @@ struct AddHostSheet: View {
     @State private var name = ""
     @State private var address = ""
     @State private var port = 9777
+    #if os(tvOS)
+    private enum EditField: String, Identifiable {
+        case name, address, port
+        var id: String { rawValue }
+    }
+    @State private var editing: EditField?
+    #endif
 
     let onAdd: (StoredHost) -> Void
 
     var body: some View {
         #if os(tvOS)
-        // No Form here: tvOS list rows add a full-width focus fill + row platter
-        // behind the field's own pill. Standalone fields have exactly one pill.
-        VStack(spacing: 28) {
+        // No inline text editing on tvOS — Settings-style value rows; pressing one
+        // raises the SYSTEM fullscreen keyboard (TVTextEntry).
+        VStack(spacing: 24) {
             Text("Add Host")
                 .font(.title3.weight(.semibold))
-            TextField("Name", text: $name, prompt: Text("Optional — e.g. Living Room"))
-                .labelsHidden()
-            TextField("Address", text: $address, prompt: Text("IP or hostname"))
-                .labelsHidden()
-            TextField("Port", value: $port, format: .number.grouping(.never))
-                .labelsHidden()
+            TVFieldRow(
+                label: "Name", value: name, placeholder: "Optional"
+            ) { editing = .name }
+            TVFieldRow(
+                label: "Address", value: address, placeholder: "IP or hostname"
+            ) { editing = .address }
+            TVFieldRow(
+                label: "Port", value: String(port), placeholder: ""
+            ) { editing = .port }
             HStack(spacing: 32) {
                 Button("Cancel", role: .cancel) { dismiss() }
                 Button("Add Host") { add() }
@@ -33,6 +43,29 @@ struct AddHostSheet: View {
         }
         .frame(maxWidth: 1000)
         .padding(60)
+        .fullScreenCover(item: $editing) { field in
+            switch field {
+            case .name:
+                TVTextEntry(title: "Name (optional, e.g. Living Room)", text: name) {
+                    name = $0
+                    editing = nil
+                }
+            case .address:
+                TVTextEntry(title: "IP or hostname", text: address) {
+                    address = $0.trimmingCharacters(in: .whitespaces)
+                    editing = nil
+                }
+            case .port:
+                TVTextEntry(
+                    title: "Port", text: String(port), keyboardType: .numberPad
+                ) {
+                    if let value = Int($0), (1...65535).contains(value) {
+                        port = value
+                    }
+                    editing = nil
+                }
+            }
+        }
         #else
         VStack(spacing: 0) {
             Form {
