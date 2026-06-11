@@ -62,6 +62,9 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
 ```sh
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 bash scripts/build-xcframework.sh        # → clients/apple/PunktfunkCore.xcframework
+# + BUILD_IOS=1 for the iOS slices (rustup target add aarch64-apple-ios{,-sim} x86_64-apple-ios)
+# + BUILD_TVOS=1 for tvOS — TIER-3 Rust targets, built from source:
+#   rustup toolchain install nightly && rustup component add rust-src --toolchain nightly
 cd clients/apple
 swift build && swift test                # loopback/remote tests self-skip without a host
 swift run PunktfunkClient                # the unbundled dev shell (CLI)
@@ -192,7 +195,11 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    status bar + home indicator hidden) and the iPadOS cursor is hidden over the video
    (`UIPointerInteraction` `.hidden()` — visible again when ⌘⎋ releases capture); on
    iOS first run the stream mode defaults to the device's native screen so the video
-   fills the display. Known gaps: true pointer LOCK (`prefersPointerLocked`) isn't
+   fills the display. **tvOS** runs the same app (target **Punktfunk-tvOS**, first-lit
+   in the Apple TV simulator at 720p60): playback-only audio (no mic on tvOS),
+   focus-driven UI (`.card` host tiles), no kb/mouse capture yet — input lands with
+   gamepad support, the natural tvOS input anyway; core slices are tier-3 Rust targets
+   (see Build above). Known gaps: true pointer LOCK (`prefersPointerLocked`) isn't
    consulted through UIHostingController, so the hidden cursor can still drift onto a
    second screen (fixing it means putting the controller into the UIKit presentation
    chain); and
