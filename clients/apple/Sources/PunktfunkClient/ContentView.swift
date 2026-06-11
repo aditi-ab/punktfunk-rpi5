@@ -103,6 +103,11 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("punktfunk")
+            #if os(iOS)
+            // Liquid-glass header: the large title shares the bar row with the action
+            // circles instead of stacking under them.
+            .toolbarTitleDisplayMode(.inlineLarge)
+            #endif
             .toolbar {
                 #if os(iOS)
                 // Each action gets its own full-size glass circle (system-app style)
