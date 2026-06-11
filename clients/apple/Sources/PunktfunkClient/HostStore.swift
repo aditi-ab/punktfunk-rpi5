@@ -18,6 +18,8 @@ struct StoredHost: Identifiable, Codable, Hashable {
     var port: UInt16 = 9777
     /// SHA-256 of the host's certificate, set after the user explicitly trusted it.
     var pinnedSHA256: Data?
+    /// Last time a streaming session actually started (nil until the first one).
+    var lastConnected: Date?
 
     var displayName: String { name.isEmpty ? address : name }
 }
@@ -45,6 +47,11 @@ final class HostStore: ObservableObject {
 
     func remove(_ host: StoredHost) {
         hosts.removeAll { $0.id == host.id }
+    }
+
+    func markConnected(_ hostID: UUID) {
+        guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
+        hosts[i].lastConnected = Date()
     }
 
     func pin(_ hostID: UUID, fingerprint: Data) {

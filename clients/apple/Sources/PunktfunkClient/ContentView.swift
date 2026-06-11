@@ -44,6 +44,13 @@ struct ContentView: View {
             seedDefaultModeIfNeeded()
             autoConnectIfAsked()
         }
+        .onChange(of: model.phase) { _, phase in
+            // A session actually started — remember it on the card ("Connected … ago"
+            // plus the accent ring on the most recent host).
+            if case .streaming = phase, let host = model.activeHost {
+                store.markConnected(host.id)
+            }
+        }
         .onDisappear { model.disconnect() } // window closed mid-session (Cmd+N spawns more)
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
@@ -244,12 +251,24 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
+                    if let last = host.lastConnected {
+                        Text("Connected \(last, format: .relative(presentation: .named))")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
                 }
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, cardPadding)
             .padding(.horizontal, 12)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .overlay {
+                if host.id == mostRecentHostID {
+                    RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 1.5)
+                }
+            }
         }
         .buttonStyle(.plain)
         .disabled(model.isBusy)
@@ -280,6 +299,13 @@ struct ContentView: View {
         #endif
     }
 
+    /// The host of the most recent session — its card carries the accent ring.
+    private var mostRecentHostID: UUID? {
+        store.hosts
+            .compactMap { host in host.lastConnected.map { (host.id, $0) } }
+            .max { $0.1 < $1.1 }?.0
+    }
+
     private func connect(_ host: StoredHost) {
         model.connect(
             to: host,
@@ -295,6 +321,7 @@ struct ContentView: View {
         VStack(spacing: 14) {
             Image(systemName: "lock.shield")
                 .font(.system(size: 36, weight: .light))
+                .foregroundStyle(.tint)
             Text("Verify \(model.activeHost?.displayName ?? "host")")
                 .font(.title3.weight(.semibold))
             Text("First connection. Compare this fingerprint with the one "
@@ -377,8 +404,13 @@ struct ContentView: View {
 
     private func hud(_ conn: PunktfunkConnection) -> some View {
         VStack(alignment: .trailing, spacing: 4) {
-            Text("\(conn.width)×\(conn.height)@\(conn.refreshHz)  \(model.fps) fps  \(model.mbps, specifier: "%.1f") Mb/s")
-                .font(.system(.caption, design: .monospaced))
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(Color.accentColor)
+                    .frame(width: 7, height: 7)
+                Text("\(conn.width)×\(conn.height)@\(conn.refreshHz)  \(model.fps) fps  \(model.mbps, specifier: "%.1f") Mb/s")
+                    .font(.system(.caption, design: .monospaced))
+            }
             // While captured the cursor is hidden+frozen, so the button is keyboard-only
             // (⌘⎋ or Cmd+Tab release the cursor; released, it's clickable again).
             #if os(macOS)
@@ -386,22 +418,21 @@ struct ContentView: View {
                 ? "⌘⎋ releases the mouse"
                 : "Click the stream to capture input")
                 .font(.caption2)
-                .opacity(0.8)
+                .foregroundStyle(.secondary)
             #else
             // Touch always plays directly; ⌘⎋ (hardware keyboard) toggles kb/mouse.
             Text(model.mouseCaptured
                 ? "⌘⎋ releases keyboard & mouse"
                 : "⌘⎋ captures keyboard & mouse")
                 .font(.caption2)
-                .opacity(0.8)
+                .foregroundStyle(.secondary)
             #endif
             Button("Disconnect (⌘D)") { model.disconnect() }
                 .font(.caption)
                 .keyboardShortcut("d", modifiers: .command)
         }
-        .padding(8)
-        .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
-        .foregroundStyle(.white)
+        .padding(10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
         .padding(10)
     }
 

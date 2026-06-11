@@ -39,12 +39,16 @@ struct PairSheet: View {
             Form {
                 Section {
                     TextField("PIN", text: $pin, prompt: Text("Shown in the host's log"))
-                        .font(.system(.body, design: .monospaced))
+                        .font(.system(.title3, design: .monospaced))
+                        #if os(iOS)
+                        .keyboardType(.numberPad)
+                        #endif
                     TextField(
                         "Client name", text: $clientName,
                         prompt: Text("How the host lists this Mac"))
                 } header: {
-                    Text("Pair with \(host.displayName)")
+                    Label("Pair with \(host.displayName)", systemImage: "lock.shield")
+                        .foregroundStyle(.tint)
                 } footer: {
                     Text("The host prints the PIN when pairing is armed "
                         + "(--allow-pairing, \u{201C}PAIRING ARMED\u{201D} in its log). "
