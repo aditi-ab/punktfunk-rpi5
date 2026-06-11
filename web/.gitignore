@@ -12,3 +12,6 @@ src/paraglide
 
 # local env (PUNKTFUNK_UI_PASSWORD etc.)
 .env
+
+# Paraglide/inlang machine-local cache:
+project.inlang/cache

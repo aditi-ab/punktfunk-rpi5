@@ -13,6 +13,10 @@ punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 quinn = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
 anyhow = "1"
-opus = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Linux-only: --mic-test's Opus encoder (libopus). The mic UPLINK itself is portable —
+# only this synthetic-tone test rig needs the encoder.
+[target.'cfg(target_os = "linux")'.dependencies]
+opus = "0.3"

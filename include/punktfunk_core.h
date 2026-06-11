@@ -137,7 +137,8 @@
 // Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
 // demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
 // audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
-// mic = [`MIC_MAGIC`] (0xCB, client→host).
+// mic = [`MIC_MAGIC`] (0xCB, client→host), rich-input = [`RICH_INPUT_MAGIC`] (0xCC, client→host),
+// HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client).
 #define PUNKTFUNK_AUDIO_MAGIC 201
 #endif
 
@@ -149,6 +150,20 @@
 // Microphone uplink: the client's mic, Opus-encoded, client → host (the inverse of
 // [`AUDIO_MAGIC`]). The host feeds it into a virtual PipeWire source so its apps can record it.
 #define MIC_MAGIC 203
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Rich client→host input: events too big for the fixed 18-byte [`InputEvent`]
+// (crate::input::InputEvent) — the DualSense touchpad and motion sensors. Variable-length,
+// kind-tagged (see [`RichInput`]).
+#define RICH_INPUT_MAGIC 204
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// HID output, host → client: DualSense feedback a game wrote to the host's virtual controller
+// (lightbar, player LEDs, adaptive triggers) — the rich analog of [`RUMBLE_MAGIC`]. See
+// [`HidOutput`].
+#define HIDOUT_MAGIC 205
 #endif
 
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can

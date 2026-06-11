@@ -360,6 +360,11 @@ async fn session(args: Args) -> Result<()> {
     // Mic plane: stream a synthetic 440 Hz tone as the mic uplink (0xCB), Opus-encoded 5 ms
     // stereo frames — proves client→host mic passthrough end to end without a real microphone
     // (the host decodes it into its virtual PipeWire source; record that source to hear the tone).
+    #[cfg(not(target_os = "linux"))]
+    if args.mic_test {
+        tracing::warn!("--mic-test requires Linux (libopus) — skipped");
+    }
+    #[cfg(target_os = "linux")]
     if args.mic_test {
         let conn2 = conn.clone();
         tokio::spawn(async move {

@@ -12,7 +12,16 @@ use std::process::Command;
 /// `rustc --print native-static-libs`.
 fn native_libs() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
-        &["-liconv", "-lm"]
+        // The workspace build unifies features into the staticlib, and `quic` pulls
+        // rustls's platform verifier → Security/CoreFoundation.
+        &[
+            "-liconv",
+            "-lm",
+            "-framework",
+            "Security",
+            "-framework",
+            "CoreFoundation",
+        ]
     } else if cfg!(target_os = "linux") {
         &["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl"]
     } else {

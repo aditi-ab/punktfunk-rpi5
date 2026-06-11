@@ -17,6 +17,7 @@
 //! data packets are consumed immediately and missing parity only costs loss recovery — so
 //! the validated stereo path stays byte-identical (data packets only, exactly as before).
 
+#[cfg(any(target_os = "linux", test))]
 use crate::audio::SAMPLE_RATE;
 #[cfg(target_os = "linux")]
 use {

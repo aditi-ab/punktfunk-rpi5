@@ -690,15 +690,15 @@ impl RichInput {
         if b.first() != Some(&RICH_INPUT_MAGIC) {
             return None;
         }
-        match b.get(1)? {
-            &RICH_TOUCHPAD if b.len() >= 9 => Some(RichInput::Touchpad {
+        match *b.get(1)? {
+            RICH_TOUCHPAD if b.len() >= 9 => Some(RichInput::Touchpad {
                 pad: b[2],
                 finger: b[3],
                 active: b[4] != 0,
                 x: u16::from_le_bytes([b[5], b[6]]),
                 y: u16::from_le_bytes([b[7], b[8]]),
             }),
-            &RICH_MOTION if b.len() >= 15 => {
+            RICH_MOTION if b.len() >= 15 => {
                 let i16at = |o: usize| i16::from_le_bytes([b[o], b[o + 1]]);
                 Some(RichInput::Motion {
                     pad: b[2],
@@ -751,18 +751,18 @@ impl HidOutput {
         if b.first() != Some(&HIDOUT_MAGIC) {
             return None;
         }
-        match b.get(1)? {
-            &HIDOUT_LED if b.len() >= 6 => Some(HidOutput::Led {
+        match *b.get(1)? {
+            HIDOUT_LED if b.len() >= 6 => Some(HidOutput::Led {
                 pad: b[2],
                 r: b[3],
                 g: b[4],
                 b: b[5],
             }),
-            &HIDOUT_PLAYER_LEDS if b.len() >= 4 => Some(HidOutput::PlayerLeds {
+            HIDOUT_PLAYER_LEDS if b.len() >= 4 => Some(HidOutput::PlayerLeds {
                 pad: b[2],
                 bits: b[3],
             }),
-            &HIDOUT_TRIGGER if b.len() >= 4 => Some(HidOutput::Trigger {
+            HIDOUT_TRIGGER if b.len() >= 4 => Some(HidOutput::Trigger {
                 pad: b[2],
                 which: b[3],
                 effect: b[4..].to_vec(),

@@ -806,10 +806,22 @@ impl MicService {
     }
 }
 
+/// Stub — mic passthrough needs Linux (PipeWire source + libopus); non-Linux dev builds
+/// drain and drop the frames (sessions still count the datagrams), same as when the
+/// source fails to open.
+#[cfg(not(target_os = "linux"))]
+fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
+    tracing::warn!(
+        "punktfunk/1 mic passthrough requires Linux (PipeWire + libopus) — frames dropped"
+    );
+    for _ in rx {}
+}
+
 /// The host-lifetime mic worker: lazily open the virtual mic + decoder, then Opus-decode each
 /// forwarded frame and push the PCM into the source. Reopen (after [`INJECTOR_REOPEN_BACKOFF`])
 /// on open failure or a decode error. Exits when every session sender and the service's own
 /// sender drop (host shutdown), tearing the PipeWire source down.
+#[cfg(target_os = "linux")]
 fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
     let mut mic: Option<Box<dyn crate::audio::VirtualMic>> = None;
     let mut decoder: Option<opus::Decoder> = None;
