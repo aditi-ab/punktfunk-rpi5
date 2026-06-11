@@ -1,6 +1,6 @@
-// PIN pairing sheet. The host, started with --allow-pairing (or --require-pairing),
-// prints a short PIN at startup ("PAIRING ARMED — enter this PIN on the client to
-// pair"); the user types it here. The ceremony is SPAKE2, so a wrong PIN buys an
+// PIN pairing sheet. The host shows the pairing PIN in its web console (port 3000 →
+// Pairing; also printed in the host's log when armed via --allow-pairing); the user
+// types it here. The ceremony is SPAKE2, so a wrong PIN buys an
 // attacker exactly one online guess — for the user a typo just means "try again" (the
 // host rate-limits ceremonies to one per 2 s). Success returns the host's now-VERIFIED
 // fingerprint: the caller pins it, no manual comparison needed, and the host stores this
@@ -44,15 +44,15 @@ struct PairSheet: View {
     var body: some View {
         #if os(tvOS)
         VStack(spacing: 24) {
-            Text("The host prints the PIN when pairing is armed "
-                + "(--allow-pairing, \u{201C}PAIRING ARMED\u{201D} in its log). "
+            Text("The PIN is shown in the host's web console "
+                + "(http://<host>:3000 → Pairing). "
                 + "Pairing verifies both sides at once — no fingerprint comparison "
                 + "needed.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             TVFieldRow(
-                label: "PIN", value: pin, placeholder: "Shown in the host's log"
+                label: "PIN", value: pin, placeholder: "Shown in the host's web console"
             ) { editing = .pin }
             TVFieldRow(
                 label: "Device name", value: clientName, placeholder: "Apple TV"
@@ -83,7 +83,7 @@ struct PairSheet: View {
             switch field {
             case .pin:
                 TVTextEntry(
-                    title: "PIN (shown in the host's log)", text: pin,
+                    title: "PIN (shown in the host's web console)", text: pin,
                     keyboardType: .numberPad
                 ) {
                     pin = $0.trimmingCharacters(in: .whitespaces)
@@ -100,7 +100,9 @@ struct PairSheet: View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    TextField("PIN", text: $pin, prompt: Text("Shown in the host's log"))
+                    TextField(
+                        "PIN", text: $pin,
+                        prompt: Text("Shown in the host's web console"))
                         .font(.system(.title3, design: .monospaced))
                         #if os(iOS)
                         .keyboardType(.numberPad)
@@ -115,8 +117,8 @@ struct PairSheet: View {
                     Label("Pair with \(host.displayName)", systemImage: "lock.shield")
                         .foregroundStyle(.tint)
                 } footer: {
-                    Text("The host prints the PIN when pairing is armed "
-                        + "(--allow-pairing, \u{201C}PAIRING ARMED\u{201D} in its log). "
+                    Text("The PIN is shown in the host's web console "
+                        + "(http://<host>:3000 → Pairing). "
                         + "Pairing verifies both sides at once — no fingerprint "
                         + "comparison needed.")
                         .font(.caption)
@@ -194,16 +196,16 @@ struct PairSheet: View {
                     onPaired(fingerprint)
                     dismiss()
                 case .failure(PunktfunkClientError.wrongPIN):
-                    errorText = "Wrong PIN — check the host's \u{201C}PAIRING ARMED\u{201D} "
-                        + "line and try again."
+                    errorText = "Wrong PIN — check the host's web console (port 3000) "
+                        + "and try again."
                 case .failure(is ClientIdentityStore.IdentityError):
                     errorText = "Can't store this Mac's identity in the Keychain, so the "
                         + "pairing would not survive a relaunch. Unlock the login "
                         + "keychain and try again."
                 case .failure:
-                    errorText = "Pairing failed. Is the host reachable, armed with "
-                        + "--allow-pairing, and not mid-session? Retries are rate-limited "
-                        + "to one per 2 seconds."
+                    errorText = "Pairing failed. Is the host reachable, pairing armed "
+                        + "(web console → Pairing), and not mid-session? Retries are "
+                        + "rate-limited to one per 2 seconds."
                 }
             }
         }

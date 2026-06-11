@@ -146,7 +146,8 @@ signing, bundle id `io.unom.punktfunk`. Notes:
 7. **Trust — the full ceremony exists now (SPAKE2).** `generateIdentity()` once (persist
    both PEMs in the Keychain), then `pair(host:identity:pin:name:)` with the 4-digit PIN
    the host prints when it ARMS pairing (`--allow-pairing`/`--require-pairing`; one PIN
-   per arming window, shown at startup — the user reads it before pairing). Returns the
+   per arming window, surfaced in the host's web console — port 3000 → Pairing — and
+   printed at startup; the user reads it before pairing). Returns the
    host's VERIFIED fingerprint; persist it and pass `pinSHA256:` + `identity:` to every
    connect. Pairing is a real PAKE: a wrong PIN gets ONE online guess (no offline
    dictionary attack), throwing `.wrongPIN`; a wrong-size pin throws `.invalidPin`. `PunktfunkClient` implements both flows:
