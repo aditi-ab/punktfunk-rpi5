@@ -187,7 +187,10 @@ struct ContentView: View {
         #if os(tvOS)
         // The Settings-app slide for every push in this stack (top-level routes AND
         // the pickers' drill-ins) — SwiftUI's default on tvOS is a bare crossfade.
-        .customNavigationTransition(.slide)
+        // Spring-driven (UISpringTimingParameters): ~0.87 damping ratio — settles fast
+        // with just a hint of life, no visible overshoot ping-pong.
+        .customNavigationTransition(
+            .slide.animation(.interpolatingSpring(stiffness: 300, damping: 30)))
         #endif
         #if !os(tvOS)
         .sheet(isPresented: $showAddHost) {
