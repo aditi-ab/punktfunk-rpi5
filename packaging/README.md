@@ -62,7 +62,8 @@ sudo bootc switch ghcr.io/<you>/bazzite-punktfunk && systemctl reboot
 ## First-run setup (either option)
 
 ```sh
-sudo usermod -aG input "$USER"          # virtual gamepads need /dev/uinput (then re-login)
+ujust add-user-to-input-group           # virtual gamepads need /dev/uinput (then re-login).
+                                        # On Bazzite use ujust, NOT `usermod -aG input` (atomic OS — it won't stick).
 mkdir -p ~/.config/punktfunk
 cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env   # edit (gamescope app, etc.)
 systemctl --user enable --now punktfunk-host

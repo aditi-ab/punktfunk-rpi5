@@ -114,8 +114,14 @@ The RPM **already installs** the rule to `/usr/lib/udev/rules.d/60-punktfunk.rul
 reloads udev. So on a packaged install (Path A or B) **you only need to join the `input` group**:
 
 ```sh
-sudo usermod -aG input "$USER"     # then LOG OUT and back in (or reboot)
+ujust add-user-to-input-group     # then LOG OUT and back in (or reboot)
 ```
+
+> ⚠️ **On Bazzite use `ujust add-user-to-input-group`, NOT `sudo usermod -aG input $USER`.** Bazzite
+> is an atomic (rpm-ostree) OS where `/etc/group` is managed declaratively — a plain `usermod` either
+> doesn't stick or gets reverted on the next update. The `ujust` recipe edits the group the
+> immutable-OS-correct way (and reloads udev). (`ujust` ships with Bazzite; `ujust --list` shows all
+> recipes.)
 
 > 🔁 **The group change does not apply to your current login session** — you must re-login (or
 > reboot). Until then, gamepad creation fails with a permission error on `/dev/uinput`. This is the
@@ -126,7 +132,7 @@ manually — the exact commands from the rule file's header (`scripts/60-punktfu
 
 ```sh
 sudo cp scripts/60-punktfunk.rules /etc/udev/rules.d/
-sudo usermod -aG input "$USER"     # then re-login (or reboot)
+ujust add-user-to-input-group      # NOT `usermod` on Bazzite (see the note above); then re-login
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
@@ -313,9 +319,13 @@ desktop viewer.
 
 ## 8. Troubleshooting (grounded in the repo's real gotchas)
 
-- **Gamepads don't appear / permission denied on `/dev/uinput` or `/dev/uhid`.** You haven't
-  re-logged-in after `usermod -aG input`. Log out and back in (or reboot) — group membership only
-  takes effect on a new session. (`scripts/60-punktfunk.rules`, `packaging/README.md`.)
+- **Gamepads don't appear / permission denied on `/dev/uinput` or `/dev/uhid`.** Either you haven't
+  joined the `input` group, or you haven't re-logged-in since. On Bazzite join it with
+  `ujust add-user-to-input-group` (a plain `sudo usermod -aG input` doesn't stick on an atomic OS —
+  see section 3), then log out and back in (or reboot): group membership only takes effect on a new
+  session. The host log makes this unambiguous — it prints `virtual gamepad created` /
+  `virtual DualSense created` on success, or `… creation failed — controller input disabled` when
+  the device node isn't writable. (`scripts/60-punktfunk.rules`, `packaging/README.md`.)
 
 - **No video / NVENC fails to encode.** RPM Fusion's `ffmpeg-libs` (with NVENC) is missing — it's a
   weak dependency, so the package installed without it. Re-run the RPM Fusion step in section 1.
