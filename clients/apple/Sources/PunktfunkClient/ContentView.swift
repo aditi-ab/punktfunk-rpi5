@@ -13,6 +13,9 @@ import AppKit
 #endif
 import PunktfunkKit
 import SwiftUI
+#if os(tvOS)
+import SwiftUINavigationTransitions
+#endif
 
 struct ContentView: View {
     @StateObject private var model = SessionModel()
@@ -180,6 +183,11 @@ struct ContentView: View {
         }
         #if os(macOS)
         .frame(minWidth: 480, minHeight: 360)
+        #endif
+        #if os(tvOS)
+        // The Settings-app slide for every push in this stack (top-level routes AND
+        // the pickers' drill-ins) — SwiftUI's default on tvOS is a bare crossfade.
+        .customNavigationTransition(.slide)
         #endif
         #if !os(tvOS)
         .sheet(isPresented: $showAddHost) {

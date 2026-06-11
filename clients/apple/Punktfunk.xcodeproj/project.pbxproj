@@ -10,6 +10,7 @@
 		AA0000000000000000000005 /* PunktfunkKit in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000006 /* PunktfunkKit */; };
 		BB0000000000000000000005 /* PunktfunkKit in Frameworks */ = {isa = PBXBuildFile; productRef = BB0000000000000000000006 /* PunktfunkKit */; };
 		CC0000000000000000000005 /* PunktfunkKit in Frameworks */ = {isa = PBXBuildFile; productRef = CC0000000000000000000006 /* PunktfunkKit */; };
+		DD0000000000000000000003 /* SwiftUINavigationTransitions in Frameworks */ = {isa = PBXBuildFile; productRef = DD0000000000000000000002 /* SwiftUINavigationTransitions */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -53,6 +54,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				CC0000000000000000000005 /* PunktfunkKit in Frameworks */,
+				DD0000000000000000000003 /* SwiftUINavigationTransitions in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -148,6 +150,7 @@
 			name = "Punktfunk-tvOS";
 			packageProductDependencies = (
 				CC0000000000000000000006 /* PunktfunkKit */,
+				DD0000000000000000000002 /* SwiftUINavigationTransitions */,
 			);
 			productName = "Punktfunk-tvOS";
 			productReference = CC0000000000000000000001 /* Punktfunk-tvOS.app */;
@@ -177,6 +180,7 @@
 			mainGroup = AA0000000000000000000007;
 			packageReferences = (
 				AA000000000000000000000F /* XCLocalSwiftPackageReference "." */,
+				DD0000000000000000000001 /* XCRemoteSwiftPackageReference "swiftui-navigation-transitions" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AA0000000000000000000008 /* Products */;
@@ -588,6 +592,17 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		DD0000000000000000000001 /* XCRemoteSwiftPackageReference "swiftui-navigation-transitions" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/davdroman/swiftui-navigation-transitions";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.18.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		AA0000000000000000000006 /* PunktfunkKit */ = {
 			isa = XCSwiftPackageProductDependency;
@@ -600,6 +615,11 @@
 		CC0000000000000000000006 /* PunktfunkKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = PunktfunkKit;
+		};
+		DD0000000000000000000002 /* SwiftUINavigationTransitions */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DD0000000000000000000001 /* XCRemoteSwiftPackageReference "swiftui-navigation-transitions" */;
+			productName = SwiftUINavigationTransitions;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
