@@ -118,13 +118,22 @@ impl Session {
             .packetizer
             .packetize(data, pts_ns, user_flags, self.coder.as_ref())?;
         StatsCounters::add(&self.stats.frames_submitted, 1);
-        for pkt in packets {
-            let wire = self.seal_for_wire(&pkt)?;
-            StatsCounters::add(&self.stats.packets_sent, 1);
-            StatsCounters::add(&self.stats.bytes_sent, wire.len() as u64);
-            if !self.transport.send(&wire)? {
-                StatsCounters::add(&self.stats.packets_send_dropped, 1);
-            }
+        // Seal every shard (the nonce counter advances per packet, in order), then hand the whole
+        // frame to the transport in ONE batched call — `sendmmsg` does ~64 packets/syscall instead
+        // of a `send` each, the dominant 1 Gbps+ lever. (Sealing must finish before the immutable
+        // `send_batch` borrow; collecting the wires also keeps them alive for the batch's iovecs.)
+        let mut wires: Vec<Vec<u8>> = Vec::with_capacity(packets.len());
+        for pkt in &packets {
+            wires.push(self.seal_for_wire(pkt)?);
+        }
+        let total = wires.len();
+        let bytes: u64 = wires.iter().map(|w| w.len() as u64).sum();
+        StatsCounters::add(&self.stats.packets_sent, total as u64);
+        StatsCounters::add(&self.stats.bytes_sent, bytes);
+        let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+        let sent = self.transport.send_batch(&refs)?;
+        if sent < total {
+            StatsCounters::add(&self.stats.packets_send_dropped, (total - sent) as u64);
         }
         Ok(())
     }
