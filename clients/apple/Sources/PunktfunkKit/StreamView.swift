@@ -228,18 +228,43 @@ public final class StreamLayerView: NSView {
             dy: Float(event.scrollingDeltaY) * scale)
     }
 
-    // While captured, the view is first responder and consumes key events — GC delivers
-    // them to the host independently, and consuming here stops the responder chain's
-    // "unhandled keyDown" beep without touching the event stream GC may rely on.
-    // ⌘-combos arrive via performKeyEquivalent instead and stay fully functional (⌘D).
+    // While captured, the view is first responder and SENDS key events to the host straight
+    // from NSEvent — GCKeyboard delivery proved unreliable on macOS (the same GameController
+    // quirk that killed GCMouse motion, fixed in e414ec0), so the macOS GCKeyboard send path
+    // is disabled and NSEvent is the single source. We map NSEvent.keyCode (a Carbon virtual
+    // keycode) → Windows VK and forward via InputCapture.sendKey, then CONSUME (return without
+    // super) to stop the responder chain's "unhandled keyDown" beep. Keys with no VK mapping
+    // are still consumed while captured so they don't beep either. The ⌘⎋ toggle's Esc is
+    // swallowed upstream by InputCapture's keyDown monitor (suppressedVK), so it never gets
+    // here as a send; ⌘-combos still arrive via performKeyEquivalent and stay functional (⌘D).
+    // Modifier keys never fire keyDown/keyUp — they come through flagsChanged below.
     public override var acceptsFirstResponder: Bool { true }
     public override func keyDown(with event: NSEvent) {
-        if captured { return }
+        if captured {
+            if let ic = inputCapture, let vk = InputCapture.keyCodeToVK[event.keyCode] {
+                ic.sendKey(vk, down: true) // autorepeat (event.isARepeat) passes through — fine for VK
+            }
+            return // consume even unmapped keys while captured (no beep)
+        }
         super.keyDown(with: event)
     }
     public override func keyUp(with event: NSEvent) {
-        if captured { return }
+        if captured {
+            if let ic = inputCapture, let vk = InputCapture.keyCodeToVK[event.keyCode] {
+                ic.sendKey(vk, down: false)
+            }
+            return
+        }
         super.keyUp(with: event)
+    }
+    /// Modifier keys (shift/control/option/command) arrive ONLY as flagsChanged on macOS,
+    /// never keyDown/keyUp — InputCapture diffs the raw flags to recover each L/R down/up.
+    public override func flagsChanged(with event: NSEvent) {
+        if captured, let inputCapture {
+            inputCapture.handleFlagsChanged(UInt(event.modifierFlags.rawValue))
+            return
+        }
+        super.flagsChanged(with: event)
     }
 
     private func requestAutoCapture() {

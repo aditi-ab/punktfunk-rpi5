@@ -84,6 +84,15 @@ public final class InputCapture {
     /// its Esc suppression need it in both states).
     private var cmdKeysDown: Set<UInt32> = []
 
+    #if os(macOS)
+    /// Previous raw `NSEvent.modifierFlags.rawValue` (LOW 16 bits intact — those carry the
+    /// device-dependent L/R bits). Modifier keys never fire keyDown/keyUp on macOS; they
+    /// arrive as flagsChanged, which doesn't carry down-vs-up — we recover that by diffing
+    /// this snapshot. Resynced (not diffed) while forwarding is off so a modifier held
+    /// across a capture toggle can't produce a phantom transition on re-engage.
+    private var prevModFlags: UInt = 0
+    #endif
+
     /// While true, mouse/keyboard flow to the host and key NSEvents are swallowed
     /// locally; while false the user is interacting with the local UI (dragging the
     /// window, clicking the HUD) and nothing is forwarded. Main-queue only.
@@ -240,6 +249,12 @@ public final class InputCapture {
         residualY = 0
         residualScrollX = 0
         residualScrollY = 0
+        #if os(macOS)
+        // Drop the modifier snapshot too: a flagsChanged transition can be missed if focus
+        // leaves mid-chord, and the next handleFlagsChanged resyncs from a clean slate (it
+        // resyncs while released anyway, but this keeps stuck state from outliving a blur).
+        prevModFlags = 0
+        #endif
     }
 
     private func sendButton(_ button: UInt32, pressed: Bool) {
@@ -271,6 +286,73 @@ public final class InputCapture {
     public func sendMouseButton(_ button: UInt32, pressed: Bool) {
         sendButton(button, pressed: pressed)
     }
+
+    #if os(macOS)
+    /// NSEvent key path (macOS): StreamLayerView's keyDown/keyUp/flagsChanged route Windows
+    /// VKs here while captured. Mirrors `sendButton` — gated by `forwarding`, honours the
+    /// ⌘⎋ toggle's `suppressedVK` latch, and tracks into `pressedVKs` so releaseAll()/blur
+    /// flushes anything still held (a flagsChanged up can be missed on focus change). macOS
+    /// has no GCKeyboard send (that path is iOS-only now), so this is the single key source.
+    public func sendKey(_ vk: UInt32, down: Bool) {
+        guard forwarding else { return }
+        // The ⌘⎋ toggle's Esc is latched here (see the keyDown monitor) so it never types
+        // an Escape into the host — clear the latch on its release, in front of the send.
+        if vk == suppressedVK {
+            if !down { suppressedVK = nil }
+            if inputDebug {
+                inputLog.debug(
+                    "key \(vk, privacy: .public) \(down ? "down" : "up", privacy: .public) SUPPRESSED (⌘⎋ toggle)")
+            }
+            return
+        }
+        if down {
+            pressedVKs.insert(vk)
+        } else {
+            pressedVKs.remove(vk)
+        }
+        if inputDebug {
+            inputLog.debug(
+                "key \(vk, privacy: .public) \(down ? "down" : "up", privacy: .public) sent")
+        }
+        connection.send(.key(vk, down: down))
+    }
+
+    /// NSEvent modifier path (macOS): modifier keys never fire keyDown/keyUp — they arrive
+    /// as flagsChanged, which carries no down-vs-up. We diff the raw flags against the prior
+    /// snapshot to recover each transition, and the changed key's L/R identity from the
+    /// device-dependent bits in the LOW 16 bits (the .deviceIndependentFlagsMask the ⌘⎋
+    /// monitor uses deliberately strips exactly these — do NOT pre-mask here). Each side maps
+    /// to the same L/R modifier VK `hidToVK` already emits, so the host needs no change.
+    /// Fed `UInt(event.modifierFlags.rawValue)`.
+    public func handleFlagsChanged(_ rawFlags: UInt) {
+        // While released we only resync the snapshot, so a modifier held across a capture
+        // toggle doesn't show up as a spurious transition the moment forwarding re-engages.
+        guard forwarding else {
+            prevModFlags = rawFlags
+            return
+        }
+        // (device-dependent mask, VK). LOW-16-bit masks from IOLLEvent.h (NX_DEVICE*MASK):
+        // Lshift 0x2 Rshift 0x4 | Lctrl 0x1 Rctrl 0x2000 | Lalt 0x20 Ralt 0x40 | Lcmd 0x8 Rcmd 0x10.
+        let table: [(UInt, UInt32)] = [
+            (0x2, 0xA0), (0x4, 0xA1), // VK_LSHIFT / VK_RSHIFT
+            (0x1, 0xA2), (0x2000, 0xA3), // VK_LCONTROL / VK_RCONTROL
+            (0x20, 0xA4), (0x40, 0xA5), // VK_LMENU / VK_RMENU (left/right alt-option)
+            (0x8, 0x5B), (0x10, 0x5C), // VK_LWIN / VK_RWIN (left/right command)
+        ]
+        for (mask, vk) in table {
+            let now = (rawFlags & mask) != 0
+            let was = (prevModFlags & mask) != 0
+            guard now != was else { continue }
+            // Keep cmdKeysDown in step (the ⌘⎋ toggle + Esc suppression read it); sendKey
+            // adds the VK to pressedVKs so releaseAll/blur flushes a held modifier cleanly.
+            if vk == 0x5B || vk == 0x5C {
+                if now { cmdKeysDown.insert(vk) } else { cmdKeysDown.remove(vk) }
+            }
+            sendKey(vk, down: now)
+        }
+        prevModFlags = rawFlags
+    }
+    #endif
 
     private func attach(mouse: GCMouse) {
         guard let input = mouse.mouseInput,
@@ -377,6 +459,14 @@ public final class InputCapture {
     private func attach(keyboard: GCKeyboard) {
         guard !keyboards.contains(where: { $0 === keyboard }) else { return }
         keyboards.append(keyboard)
+        // macOS sends keys from NSEvent (StreamLayerView's keyDown/keyUp/flagsChanged →
+        // sendKey/handleFlagsChanged) because GCKeyboard delivery proved unreliable there —
+        // the same GameController quirk that killed GCMouse motion (fixed in e414ec0).
+        // Installing this handler too would double-send, so on macOS we leave the keyboard
+        // tracked (for stop()'s cleanup) but attach no send handler: NSEvent is the only
+        // key path. iOS keeps the GCKeyboard path (and detects the ⌘⎋ toggle from the HID
+        // stream, since there's no NSEvent monitor there). See the file header.
+        #if !os(macOS)
         keyboard.keyboardInput?.keyChangedHandler = { [weak self] _, _, keyCode, pressed in
             guard let self, let vk = Self.hidToVK[keyCode.rawValue] else { return }
             if vk == 0x5B || vk == 0x5C { // physical ⌘ state, tracked in both states
@@ -414,6 +504,7 @@ public final class InputCapture {
             }
             self.connection.send(.key(vk, down: pressed))
         }
+        #endif
     }
 
     /// HID usage (GCKeyCode raw) → Windows VK (the host maps VK → evdev; every VK emitted
@@ -455,4 +546,61 @@ public final class InputCapture {
         m[0xE4] = 0xA3; m[0xE5] = 0xA1; m[0xE6] = 0xA5; m[0xE7] = 0x5C // Rctrl Rshift Ralt Rcmd
         return m
     }()
+
+    #if os(macOS)
+    /// NSEvent.keyCode (Carbon virtual keycode, kVK_*) → Windows VK. The macOS NSEvent key
+    /// path is keyed by keyCode (a layout-independent hardware position), NOT by HID usage,
+    /// so it needs its own table — but it emits the EXACT SAME Windows VK integers `hidToVK`
+    /// already produces for each physical key (A→0x41, Return→0x0D, KeypadEnter→0x6C, …), so
+    /// the host's vk_to_evdev (inject.rs) accepts both with zero change. Modifier keys come
+    /// via flagsChanged (handleFlagsChanged), not keyDown, so they're absent here. Keys with
+    /// no host evdev arm (F13–F20, KeypadEquals, the Fn key) are omitted → nil → swallowed.
+    static let keyCodeToVK: [UInt16: UInt32] = {
+        var m: [UInt16: UInt32] = [:]
+        // Letters — kVK_ANSI_A..Z (scattered keycodes) → VK 'A'..'Z'.
+        m[0x00] = 0x41; m[0x01] = 0x53; m[0x02] = 0x44; m[0x03] = 0x46 // A S D F
+        m[0x04] = 0x48; m[0x05] = 0x47; m[0x06] = 0x5A; m[0x07] = 0x58 // H G Z X
+        m[0x08] = 0x43; m[0x09] = 0x56; m[0x0B] = 0x42; m[0x0C] = 0x51 // C V B Q
+        m[0x0D] = 0x57; m[0x0E] = 0x45; m[0x0F] = 0x52; m[0x10] = 0x59 // W E R Y
+        m[0x11] = 0x54; m[0x1F] = 0x4F; m[0x20] = 0x55; m[0x22] = 0x49 // T O U I
+        m[0x23] = 0x50; m[0x25] = 0x4C; m[0x26] = 0x4A; m[0x28] = 0x4B // P L J K
+        m[0x2D] = 0x4E; m[0x2E] = 0x4D // N M
+        // Digit row — kVK_ANSI_1..0 (scattered) → VK '1'..'9','0'.
+        m[0x12] = 0x31; m[0x13] = 0x32; m[0x14] = 0x33; m[0x15] = 0x34 // 1 2 3 4
+        m[0x16] = 0x36; m[0x17] = 0x35; m[0x19] = 0x39; m[0x1A] = 0x37 // 6 5 9 7
+        m[0x1C] = 0x38; m[0x1D] = 0x30 // 8 0
+        // Whitespace / control.
+        m[0x24] = 0x0D // return
+        m[0x30] = 0x09 // tab
+        m[0x31] = 0x20 // space
+        m[0x33] = 0x08 // delete (backspace)
+        m[0x35] = 0x1B // escape
+        m[0x75] = 0x2E // forward delete (VK_DELETE)
+        m[0x39] = 0x14 // caps lock
+        // Punctuation (US ANSI) + ISO 102nd key.
+        m[0x1B] = 0xBD; m[0x18] = 0xBB // - = (OEM_MINUS OEM_PLUS)
+        m[0x21] = 0xDB; m[0x1E] = 0xDD; m[0x2A] = 0xDC // [ ] backslash (OEM_4 6 5)
+        m[0x29] = 0xBA; m[0x27] = 0xDE; m[0x32] = 0xC0 // ; ' ` (OEM_1 7 3)
+        m[0x2B] = 0xBC; m[0x2F] = 0xBE; m[0x2C] = 0xBF // , . / (OEM_COMMA PERIOD 2)
+        m[0x0A] = 0xE2 // ISO 102nd key (<> next to left shift; OEM_102)
+        // Function keys F1..F12 (scattered) → VK 0x70..0x7B. F13+ omitted (no host arm).
+        m[0x7A] = 0x70; m[0x78] = 0x71; m[0x63] = 0x72; m[0x76] = 0x73 // F1 F2 F3 F4
+        m[0x60] = 0x74; m[0x61] = 0x75; m[0x62] = 0x76; m[0x64] = 0x77 // F5 F6 F7 F8
+        m[0x65] = 0x78; m[0x6D] = 0x79; m[0x67] = 0x7A; m[0x6F] = 0x7B // F9 F10 F11 F12
+        // Arrows.
+        m[0x7B] = 0x25; m[0x7C] = 0x27; m[0x7D] = 0x28; m[0x7E] = 0x26 // left right down up
+        // Nav cluster (Apple keycodes; Help sits where Insert is).
+        m[0x72] = 0x2D; m[0x73] = 0x24; m[0x74] = 0x21 // insert home pageup
+        m[0x77] = 0x23; m[0x79] = 0x22 // end pagedown (forward-delete handled above)
+        // Keypad — kVK_ANSI_Keypad0..9 (scattered) → VK_NUMPAD0..9, plus the operators.
+        m[0x52] = 0x60; m[0x53] = 0x61; m[0x54] = 0x62; m[0x55] = 0x63 // KP0 KP1 KP2 KP3
+        m[0x56] = 0x64; m[0x57] = 0x65; m[0x58] = 0x66; m[0x59] = 0x67 // KP4 KP5 KP6 KP7
+        m[0x5B] = 0x68; m[0x5C] = 0x69 // KP8 KP9
+        m[0x41] = 0x6E; m[0x43] = 0x6A; m[0x45] = 0x6B // KP decimal multiply plus
+        m[0x4E] = 0x6D; m[0x4B] = 0x6F // KP minus divide
+        m[0x4C] = 0x6C // KP enter → VK_SEPARATOR (host maps to KEY_KPENTER, matching hidToVK)
+        m[0x47] = 0x90 // KP clear sits where NumLock is → VK_NUMLOCK. (KP equals 0x51 dropped.)
+        return m
+    }()
+    #endif
 }
