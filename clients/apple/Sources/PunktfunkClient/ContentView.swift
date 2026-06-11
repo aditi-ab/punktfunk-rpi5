@@ -109,7 +109,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("punktfunk")
+            .navigationTitle("Punktfunkempfänger")
             .toolbar {
                 #if os(iOS)
                 // Adjacent trailing items share one glass pill (the system default).

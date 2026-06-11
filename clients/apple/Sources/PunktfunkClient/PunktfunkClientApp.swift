@@ -13,7 +13,7 @@ struct PunktfunkClientApp: App {
     #endif
 
     var body: some Scene {
-        WindowGroup("punktfunk") {
+        WindowGroup("Punktfunkempfänger") {
             ContentView()
         }
         #if os(macOS)
