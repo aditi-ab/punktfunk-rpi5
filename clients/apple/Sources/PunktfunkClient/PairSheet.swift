@@ -71,7 +71,9 @@ struct PairSheet: View {
                     token.cancelled = true
                     dismiss()
                 }
+                #if !os(tvOS)
                 .keyboardShortcut(.cancelAction)
+                #endif
                 Spacer()
                 if busy {
                     ProgressView()
@@ -80,7 +82,9 @@ struct PairSheet: View {
                 }
                 Button("Pair & Connect") { runCeremony() }
                     .buttonStyle(.borderedProminent)
+                    #if !os(tvOS)
                     .keyboardShortcut(.defaultAction)
+                    #endif
                     .disabled(busy || pin.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             #if os(iOS)

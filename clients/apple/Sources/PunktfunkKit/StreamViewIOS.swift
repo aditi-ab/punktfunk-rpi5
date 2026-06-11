@@ -15,7 +15,7 @@
 // The public type is named StreamView like its macOS twin (each is platform-gated), so
 // the SwiftUI app layer is identical on both platforms.
 
-#if os(iOS)
+#if os(iOS) || os(tvOS)
 import AVFoundation
 import GameController
 import PunktfunkCore
@@ -66,20 +66,24 @@ public struct StreamView: UIViewControllerRepresentable {
     }
 }
 
-public final class StreamViewController: UIViewController, UIPointerInteractionDelegate {
+public final class StreamViewController: UIViewController {
     public private(set) var connection: PunktfunkConnection?
     private var pump: StreamPump?
-    private var inputCapture: InputCapture?
-    private var captured = false
     private var observers: [NSObjectProtocol] = []
+    #if os(iOS)
+    private var inputCapture: InputCapture?
+    fileprivate var captured = false
     private var pointerInteraction: UIPointerInteraction?
+    #endif
 
     var onCaptureChange: ((Bool) -> Void)?
 
     var captureEnabled = true {
         didSet {
             guard captureEnabled != oldValue else { return }
+            #if os(iOS)
             setCaptured(captureEnabled)
+            #endif
         }
     }
 
@@ -90,6 +94,7 @@ public final class StreamViewController: UIViewController, UIPointerInteractionD
 
     public override func loadView() {
         view = StreamLayerUIView()
+        #if os(iOS)
         // Hide the iPadOS cursor while it hovers the video: the host renders its own
         // cursor from our raw deltas, so the local one only diverges from it. (True
         // pointer LOCK — prefersPointerLocked — isn't consulted through
@@ -97,16 +102,13 @@ public final class StreamViewController: UIViewController, UIPointerInteractionD
         let interaction = UIPointerInteraction(delegate: self)
         view.addInteraction(interaction)
         pointerInteraction = interaction
+        #endif
     }
 
-    public func pointerInteraction(
-        _ interaction: UIPointerInteraction, styleFor region: UIPointerRegion
-    ) -> UIPointerStyle? {
-        captured ? .hidden() : nil
-    }
-
+    #if os(iOS)
     public override var prefersPointerLocked: Bool { captured }
     public override var prefersHomeIndicatorAutoHidden: Bool { true }
+    #endif
 
     func start(
         connection: PunktfunkConnection,
@@ -116,6 +118,7 @@ public final class StreamViewController: UIViewController, UIPointerInteractionD
         stop()
         self.connection = connection
         loadViewIfNeeded()
+        #if os(iOS)
         // Read the LIVE mode per touch batch — an accepted requestMode() mid-stream
         // changes the letterbox, and touches must follow it.
         streamView.currentHostMode = { [weak connection] in
@@ -137,6 +140,7 @@ public final class StreamViewController: UIViewController, UIPointerInteractionD
         }
         capture.start()
         inputCapture = capture
+        #endif
 
         let pump = StreamPump()
         pump.start(
@@ -144,6 +148,7 @@ public final class StreamViewController: UIViewController, UIPointerInteractionD
             onFrame: onFrame, onSessionEnd: onSessionEnd)
         self.pump = pump
 
+        #if os(iOS)
         // GC only delivers while active; everything held is flushed by InputCapture's
         // own resign observer — here we just mirror the capture state for the HUD and
         // the pointer lock.
@@ -156,21 +161,25 @@ public final class StreamViewController: UIViewController, UIPointerInteractionD
         if captureEnabled {
             setCaptured(true) // entering a session is the deliberate "capture me" moment
         }
+        #endif
     }
 
     func stop() {
-        setCaptured(false)
         observers.forEach(NotificationCenter.default.removeObserver(_:))
         observers.removeAll()
+        #if os(iOS)
+        setCaptured(false)
         inputCapture?.stop()
         inputCapture = nil
+        streamView.onTouchEvent = nil
+        streamView.currentHostMode = nil
+        #endif
         pump?.stop()
         pump = nil
         connection = nil
-        streamView.onTouchEvent = nil
-        streamView.currentHostMode = nil
     }
 
+    #if os(iOS)
     private func setCaptured(_ on: Bool) {
         if on {
             guard captureEnabled, !captured, pump != nil else { return }
@@ -187,12 +196,23 @@ public final class StreamViewController: UIViewController, UIPointerInteractionD
         let captured = captured
         DispatchQueue.main.async { onCaptureChange?(captured) }
     }
+    #endif
 
     deinit {
         observers.forEach(NotificationCenter.default.removeObserver(_:))
         pump?.stop()
     }
 }
+
+#if os(iOS)
+extension StreamViewController: UIPointerInteractionDelegate {
+    public func pointerInteraction(
+        _ interaction: UIPointerInteraction, styleFor region: UIPointerRegion
+    ) -> UIPointerStyle? {
+        captured ? .hidden() : nil
+    }
+}
+#endif
 
 /// The layer-backed video surface + touch source. Touches are mapped through the
 /// aspect-fit letterbox into host-mode pixels (surface == host mode, so the host-side
@@ -204,23 +224,28 @@ final class StreamLayerUIView: UIView {
         layer as! AVSampleBufferDisplayLayer
     }
 
+    #if os(iOS)
     /// Reads the LIVE negotiated mode in pixels (the touch coordinate space).
     var currentHostMode: (() -> CGSize)?
     var onTouchEvent: ((PunktfunkInputEvent) -> Void)?
 
     /// Wire touch ids per active UITouch; ids are reused after the touch ends.
     private var touchIDs: [ObjectIdentifier: UInt32] = [:]
+    #endif
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         displayLayer.videoGravity = .resizeAspect
+        #if os(iOS)
         isMultipleTouchEnabled = true
+        #endif
         backgroundColor = .black
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not used") }
 
+    #if os(iOS)
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         forward(touches, kind: .down)
     }
@@ -277,11 +302,14 @@ final class StreamLayerUIView: UIView {
         while touchIDs.values.contains(id) { id += 1 }
         return id
     }
+    #endif
 }
 
+#if os(iOS)
 extension CGFloat {
     fileprivate func clamped(to range: ClosedRange<CGFloat>) -> CGFloat {
         Swift.min(Swift.max(self, range.lowerBound), range.upperBound)
     }
 }
+#endif
 #endif

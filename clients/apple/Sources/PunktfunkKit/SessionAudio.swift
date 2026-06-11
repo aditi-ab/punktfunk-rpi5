@@ -161,8 +161,18 @@ public final class SessionAudio {
         } catch {
             log.warning("AVAudioSession setup failed: \(error.localizedDescription)")
         }
+        #elseif os(tvOS)
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            log.warning("AVAudioSession setup failed: \(error.localizedDescription)")
+        }
         #endif
         startPlayback(speakerUID: speakerUID)
+        #if os(tvOS)
+        // No app-accessible microphone input on tvOS — playback only.
+        #else
         guard micEnabled else { return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -177,6 +187,7 @@ public final class SessionAudio {
         default:
             log.warning("microphone access denied — mic uplink disabled (System Settings → Privacy)")
         }
+        #endif
     }
 
     /// Stop both directions. Safe from any thread; waits the drain thread out (≤ its
@@ -199,7 +210,7 @@ public final class SessionAudio {
         if wasDraining {
             _ = drainDone.wait(timeout: .now() + .milliseconds(400))
         }
-        #if os(iOS)
+        #if !os(macOS)
         // Release the session so audio we interrupted (Music, podcasts) gets its
         // resume cue.
         do {
@@ -310,6 +321,7 @@ public final class SessionAudio {
 
     // MARK: - Mic (mic → host)
 
+    #if !os(tvOS)
     private func startCapture(micUID: String) {
         let engine = AVAudioEngine()
         let input = engine.inputNode
@@ -408,6 +420,7 @@ public final class SessionAudio {
         stateLock.unlock()
         log.info("mic uplink started (\(micUID.isEmpty ? "default input" : micUID))")
     }
+    #endif
 
     #if os(macOS)
     private static func setDevice(_ id: AudioDeviceID, on unit: AudioUnit) -> Bool {

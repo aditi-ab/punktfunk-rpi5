@@ -26,7 +26,7 @@
 #if os(macOS)
 import AppKit
 #endif
-#if os(iOS)
+#if canImport(UIKit)
 import UIKit
 #endif
 import Foundation

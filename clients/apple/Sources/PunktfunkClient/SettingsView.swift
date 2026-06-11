@@ -42,6 +42,7 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            #if !os(tvOS)
             Section {
                 #if os(macOS)
                 Picker("Speaker", selection: $speakerUID) {
@@ -55,7 +56,9 @@ struct SettingsView: View {
                     }
                 }
                 #endif
+                #if !os(tvOS)
                 Toggle("Send microphone to the host", isOn: $micEnabled)
+                #endif
                 #if os(macOS)
                 Picker("Microphone", selection: $micUID) {
                     Text("System default").tag("")
@@ -78,6 +81,7 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            #endif
             Section {
                 Picker("Compositor", selection: $compositor) {
                     Text("Automatic").tag(0)

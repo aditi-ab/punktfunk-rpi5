@@ -12,6 +12,7 @@ cd "$(dirname "$0")/.."
 
 TARGETS_MAC=(aarch64-apple-darwin x86_64-apple-darwin)
 BUILD_IOS="${BUILD_IOS:-0}" # BUILD_IOS=1 adds iOS device + simulator slices (rustup targets aarch64-apple-ios{,-sim})
+BUILD_TVOS="${BUILD_TVOS:-0}" # BUILD_TVOS=1 adds tvOS slices — TIER-3 Rust targets: needs `rustup toolchain install nightly` + `rustup component add rust-src --toolchain nightly`
 
 # Deployment targets must match Package.swift's platforms, or every consumer link emits
 # "object file was built for newer macOS version" warnings.
@@ -22,6 +23,15 @@ if [[ "$BUILD_IOS" == "1" ]]; then
     IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo build --release -p punktfunk-core --features quic --target aarch64-apple-ios
     IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo build --release -p punktfunk-core --features quic --target aarch64-apple-ios-sim
     IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo build --release -p punktfunk-core --features quic --target x86_64-apple-ios
+fi
+if [[ "$BUILD_TVOS" == "1" ]]; then
+    # Tier-3 targets: no prebuilt std — nightly + -Zbuild-std compiles it from rust-src.
+    TVOS_DEPLOYMENT_TARGET=17.0 cargo +nightly build --release -p punktfunk-core --features quic \
+        -Z build-std=std,panic_abort --target aarch64-apple-tvos
+    TVOS_DEPLOYMENT_TARGET=17.0 cargo +nightly build --release -p punktfunk-core --features quic \
+        -Z build-std=std,panic_abort --target aarch64-apple-tvos-sim
+    TVOS_DEPLOYMENT_TARGET=17.0 cargo +nightly build --release -p punktfunk-core --features quic \
+        -Z build-std=std,panic_abort --target x86_64-apple-tvos
 fi
 
 STAGE="$(mktemp -d)"
@@ -58,6 +68,15 @@ if [[ "$BUILD_IOS" == "1" ]]; then
         -output "$STAGE/iossim/libpunktfunk_core.a"
     ARGS+=(-library target/aarch64-apple-ios/release/libpunktfunk_core.a -headers "$STAGE/include")
     ARGS+=(-library "$STAGE/iossim/libpunktfunk_core.a" -headers "$STAGE/include")
+fi
+if [[ "$BUILD_TVOS" == "1" ]]; then
+    mkdir -p "$STAGE/tvossim"
+    lipo -create \
+        target/aarch64-apple-tvos-sim/release/libpunktfunk_core.a \
+        target/x86_64-apple-tvos/release/libpunktfunk_core.a \
+        -output "$STAGE/tvossim/libpunktfunk_core.a"
+    ARGS+=(-library target/aarch64-apple-tvos/release/libpunktfunk_core.a -headers "$STAGE/include")
+    ARGS+=(-library "$STAGE/tvossim/libpunktfunk_core.a" -headers "$STAGE/include")
 fi
 
 # Cargo does NOT fingerprint MACOSX_DEPLOYMENT_TARGET — units cached from a build without

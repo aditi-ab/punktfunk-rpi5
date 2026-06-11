@@ -21,7 +21,9 @@ struct AddHostSheet: View {
             .formStyle(.grouped)
             HStack {
                 Button("Cancel", role: .cancel) { dismiss() }
+                    #if !os(tvOS)
                     .keyboardShortcut(.cancelAction)
+                    #endif
                 Spacer()
                 Button("Add Host") {
                     onAdd(StoredHost(
@@ -31,7 +33,9 @@ struct AddHostSheet: View {
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
+                #if !os(tvOS)
                 .keyboardShortcut(.defaultAction)
+                #endif
                 .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             #if os(iOS)

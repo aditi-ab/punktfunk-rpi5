@@ -6,7 +6,7 @@ import PackageDescription
 
 let package = Package(
     name: "PunktfunkKit",
-    platforms: [.macOS(.v14), .iOS(.v17)],
+    platforms: [.macOS(.v14), .iOS(.v17), .tvOS(.v17)],
     products: [
         .library(name: "PunktfunkKit", targets: ["PunktfunkKit"]),
         .executable(name: "PunktfunkClient", targets: ["PunktfunkClient"]),

@@ -9,11 +9,13 @@
 /* Begin PBXBuildFile section */
 		AA0000000000000000000005 /* PunktfunkKit in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000006 /* PunktfunkKit */; };
 		BB0000000000000000000005 /* PunktfunkKit in Frameworks */ = {isa = PBXBuildFile; productRef = BB0000000000000000000006 /* PunktfunkKit */; };
+		CC0000000000000000000005 /* PunktfunkKit in Frameworks */ = {isa = PBXBuildFile; productRef = CC0000000000000000000006 /* PunktfunkKit */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		AA0000000000000000000001 /* Punktfunk.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Punktfunk.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		BB0000000000000000000001 /* Punktfunk-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Punktfunk-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		CC0000000000000000000001 /* Punktfunk-tvOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Punktfunk-tvOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -46,6 +48,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CC0000000000000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CC0000000000000000000005 /* PunktfunkKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -63,6 +73,7 @@
 			children = (
 				AA0000000000000000000001 /* Punktfunk.app */,
 				BB0000000000000000000001 /* Punktfunk-iOS.app */,
+				CC0000000000000000000001 /* Punktfunk-tvOS.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -118,6 +129,30 @@
 			productReference = BB0000000000000000000001 /* Punktfunk-iOS.app */;
 			productType = "com.apple.product-type.application";
 		};
+		CC0000000000000000000009 /* Punktfunk-tvOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CC000000000000000000000A /* Build configuration list for PBXNativeTarget "Punktfunk-tvOS" */;
+			buildPhases = (
+				CC000000000000000000000B /* Sources */,
+				CC0000000000000000000004 /* Frameworks */,
+				CC000000000000000000000C /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				AA0000000000000000000002 /* App */,
+				AA0000000000000000000003 /* Sources/PunktfunkClient */,
+			);
+			name = "Punktfunk-tvOS";
+			packageProductDependencies = (
+				CC0000000000000000000006 /* PunktfunkKit */,
+			);
+			productName = "Punktfunk-tvOS";
+			productReference = CC0000000000000000000001 /* Punktfunk-tvOS.app */;
+			productType = "com.apple.product-type.application";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -150,6 +185,7 @@
 			targets = (
 				AA0000000000000000000009 /* Punktfunk */,
 				BB0000000000000000000009 /* Punktfunk-iOS */,
+				CC0000000000000000000009 /* Punktfunk-tvOS */,
 			);
 		};
 /* End PBXProject section */
@@ -169,6 +205,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CC000000000000000000000C /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -180,6 +223,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		BB000000000000000000000B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CC000000000000000000000B /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -434,9 +484,70 @@
 			};
 			name = Release;
 		};
+		CC0000000000000000000012 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = io.unom.punktfunk.tvos;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = appletvos;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 3;
+				TVOS_DEPLOYMENT_TARGET = 17.0;
+			};
+			name = Debug;
+		};
+		CC0000000000000000000013 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = io.unom.punktfunk.tvos;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = appletvos;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 3;
+				TVOS_DEPLOYMENT_TARGET = 17.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		CC000000000000000000000A /* Build configuration list for PBXNativeTarget "Punktfunk-tvOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CC0000000000000000000012 /* Debug */,
+				CC0000000000000000000013 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		AA000000000000000000000A /* Build configuration list for PBXNativeTarget "Punktfunk" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -479,6 +590,10 @@
 			productName = PunktfunkKit;
 		};
 		BB0000000000000000000006 /* PunktfunkKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PunktfunkKit;
+		};
+		CC0000000000000000000006 /* PunktfunkKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = PunktfunkKit;
 		};

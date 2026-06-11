@@ -23,7 +23,7 @@ struct ContentView: View {
     @AppStorage("punktfunk.compositor") private var compositor = 0
     @State private var showAddHost = false
     @State private var pairingTarget: StoredHost?
-    #if os(iOS)
+    #if !os(macOS)
     @State private var showSettings = false
     #endif
 
@@ -88,13 +88,16 @@ struct ContentView: View {
         #if os(macOS)
         .frame(minWidth: 640, minHeight: 360)
         .background(Color.black)
-        #else
+        #elseif os(iOS)
         // Streaming is immersive: edge-to-edge under the status bar and home
         // indicator, both hidden for the session (they return with the hosts grid).
         .background(Color.black)
         .ignoresSafeArea()
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        #else
+        .background(Color.black)
+        .ignoresSafeArea()
         #endif
     }
 
@@ -118,7 +121,7 @@ struct ContentView: View {
             }
             .navigationTitle("Punktfunkempfänger")
             .toolbar {
-                #if os(iOS)
+                #if !os(macOS)
                 // Adjacent trailing items share one glass pill (the system default).
                 ToolbarItem(placement: .topBarTrailing) { settingsButton }
                 ToolbarItem(placement: .topBarTrailing) { addHostButton }
@@ -142,7 +145,7 @@ struct ContentView: View {
         .sheet(isPresented: $showAddHost) {
             AddHostSheet { store.add($0) }
         }
-        #if os(iOS)
+        #if !os(macOS)
         .sheet(isPresented: $showSettings) {
             NavigationStack {
                 SettingsView()
@@ -185,7 +188,7 @@ struct ContentView: View {
         }
     }
 
-    #if os(iOS)
+    #if !os(macOS)
     private var settingsButton: some View {
         Button {
             showSettings = true
@@ -270,7 +273,11 @@ struct ContentView: View {
                 }
             }
         }
+        #if os(tvOS)
+        .buttonStyle(.card)
+        #else
         .buttonStyle(.plain)
+        #endif
         .disabled(model.isBusy)
         .contextMenu {
             Button("Pair with PIN…") {
@@ -289,7 +296,7 @@ struct ContentView: View {
     /// compiled-in AppStorage defaults only apply until any value is saved; macOS keeps
     /// 1080p — a desktop window is not the screen.)
     private func seedDefaultModeIfNeeded() {
-        #if os(iOS)
+        #if !os(macOS)
         let defaults = UserDefaults.standard
         guard defaults.object(forKey: "punktfunk.width") == nil else { return }
         let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels
@@ -332,19 +339,25 @@ struct ContentView: View {
                 .multilineTextAlignment(.center)
             Text(Self.format(fingerprint: fingerprint))
                 .font(.system(.callout, design: .monospaced))
+                #if !os(tvOS)
                 .textSelection(.enabled)
+                #endif
                 .padding(10)
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
             HStack(spacing: 12) {
                 Button("Cancel", role: .cancel) { model.rejectTrust() }
+                    #if !os(tvOS)
                     .keyboardShortcut(.cancelAction)
+                    #endif
                 Button("Trust & Connect") {
                     if let fp = model.confirmTrust(), let host = model.activeHost {
                         store.pin(host.id, fingerprint: fp)
                     }
                 }
                 .buttonStyle(.borderedProminent)
+                #if !os(tvOS)
                 .keyboardShortcut(.defaultAction)
+                #endif
             }
             #if os(iOS)
             .controlSize(.large)
@@ -419,7 +432,7 @@ struct ContentView: View {
                 : "Click the stream to capture input")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            #else
+            #elseif os(iOS)
             // Touch always plays directly; ⌘⎋ (hardware keyboard) toggles kb/mouse.
             Text(model.mouseCaptured
                 ? "⌘⎋ releases keyboard & mouse"
@@ -429,7 +442,9 @@ struct ContentView: View {
             #endif
             Button("Disconnect (⌘D)") { model.disconnect() }
                 .font(.caption)
+                #if !os(tvOS)
                 .keyboardShortcut("d", modifiers: .command)
+                #endif
         }
         .padding(10)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
