@@ -607,6 +607,7 @@ impl DualSenseManager {
         }
         match DualSensePad::open(idx as u8) {
             Ok(p) => {
+                tracing::info!(index = idx, "virtual DualSense created (UHID hid-playstation)");
                 self.pads[idx] = Some(p);
                 self.state[idx] = DsState::neutral();
                 self.last_rumble[idx] = (0, 0);
