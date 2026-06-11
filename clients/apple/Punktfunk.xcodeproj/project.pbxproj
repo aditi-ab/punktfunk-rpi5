@@ -489,6 +489,7 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = F4H37KF6WC;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
@@ -501,6 +502,7 @@
 				MARKETING_VERSION = 0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = io.unom.punktfunk.tvos;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
 				SDKROOT = appletvos;
 				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -515,6 +517,7 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = F4H37KF6WC;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
@@ -527,6 +530,7 @@
 				MARKETING_VERSION = 0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = io.unom.punktfunk.tvos;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
 				SDKROOT = appletvos;
 				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -539,15 +543,6 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		CC000000000000000000000A /* Build configuration list for PBXNativeTarget "Punktfunk-tvOS" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				CC0000000000000000000012 /* Debug */,
-				CC0000000000000000000013 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
 		AA000000000000000000000A /* Build configuration list for PBXNativeTarget "Punktfunk" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -571,6 +566,15 @@
 			buildConfigurations = (
 				BB0000000000000000000012 /* Debug */,
 				BB0000000000000000000013 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		CC000000000000000000000A /* Build configuration list for PBXNativeTarget "Punktfunk-tvOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CC0000000000000000000012 /* Debug */,
+				CC0000000000000000000013 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
