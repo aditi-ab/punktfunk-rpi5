@@ -257,6 +257,9 @@ impl Drop for GamescopeProc {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        // Clear the relayed EIS socket name so the host-lifetime injector can't reconnect to this
+        // now-dead session's socket between sessions (the stale path is the "Connection refused").
+        let _ = std::fs::remove_file(EI_SOCKET_FILE);
     }
 }
 

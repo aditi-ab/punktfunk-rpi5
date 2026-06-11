@@ -205,22 +205,52 @@ async fn connect_portal() -> Result<(
 /// the nested app launches), then connect. A bare name is resolved against `XDG_RUNTIME_DIR`,
 /// mirroring libei's own `LIBEI_SOCKET` semantics.
 async fn connect_socket_file(file: &std::path::Path) -> Result<UnixStream> {
-    let path = loop {
-        match std::fs::read_to_string(file) {
-            Ok(s) if !s.trim().is_empty() => break s.trim().to_string(),
-            _ => tokio::time::sleep(Duration::from_millis(300)).await,
+    // The relay file is rewritten each session with the CURRENT gamescope's `LIBEI_SOCKET`, and the
+    // socket may not be `listen()`ing the instant its name appears — or the file may briefly still
+    // hold a prior, now-dead session's name (the host-lifetime injector reconnecting between
+    // sessions). So poll: RE-READ the file and RETRY the connect, treating "refused"/"missing" as
+    // not-ready-yet (the exact "Connection refused" we saw when a stale socket lingered). Bounded so
+    // a genuinely wedged setup still surfaces an error.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut logged = String::new();
+    loop {
+        if let Ok(s) = std::fs::read_to_string(file) {
+            let name = s.trim();
+            if !name.is_empty() {
+                let full = if name.starts_with('/') {
+                    std::path::PathBuf::from(name)
+                } else {
+                    let runtime = std::env::var("XDG_RUNTIME_DIR").map_err(|_| {
+                        anyhow!("XDG_RUNTIME_DIR unset (needed to resolve EIS socket '{name}')")
+                    })?;
+                    std::path::Path::new(&runtime).join(name)
+                };
+                if logged != name {
+                    tracing::info!(socket = %full.display(), "libei: connecting to EIS socket");
+                    logged = name.to_string();
+                }
+                match UnixStream::connect(&full) {
+                    Ok(stream) => return Ok(stream),
+                    // Refused = socket file exists but no listener yet (or a dead session);
+                    // NotFound = path not created yet. Both heal once the live gamescope's EIS is
+                    // up — retry. Anything else (e.g. permission) is a real failure.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) => {}
+                    Err(e) => return Err(anyhow!("connect EIS socket {}: {e}", full.display())),
+                }
+            }
         }
-    };
-    let full = if path.starts_with('/') {
-        std::path::PathBuf::from(&path)
-    } else {
-        let runtime = std::env::var("XDG_RUNTIME_DIR").map_err(|_| {
-            anyhow!("XDG_RUNTIME_DIR unset (needed to resolve EIS socket '{path}')")
-        })?;
-        std::path::Path::new(&runtime).join(&path)
-    };
-    tracing::info!(socket = %full.display(), "libei: connecting to EIS socket");
-    UnixStream::connect(&full).map_err(|e| anyhow!("connect EIS socket {}: {e}", full.display()))
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "EIS socket from {} never became connectable (gamescope not up, or its EIS crashed)",
+                file.display()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// One EI device and its emulation state.
