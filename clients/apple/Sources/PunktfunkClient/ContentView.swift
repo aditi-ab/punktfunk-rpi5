@@ -160,12 +160,13 @@ struct ContentView: View {
     }
 
     /// macOS caps card width (a huge window shouldn't yield huge cards); on iOS the
-    /// columns FILL the width so the cards stay edge-aligned with the title and bars.
+    /// columns FILL the width so the cards stay edge-aligned with the title and bars —
+    /// sized touch-first: one column on iPhone portrait, 3–4 generous cards on iPad.
     private var gridColumns: [GridItem] {
         #if os(macOS)
         [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 16)]
         #else
-        [GridItem(.adaptive(minimum: 160), spacing: 16)]
+        [GridItem(.adaptive(minimum: 280), spacing: 16)]
         #endif
     }
 
@@ -203,23 +204,34 @@ struct ContentView: View {
 
     private func hostCard(_ host: StoredHost) -> some View {
         let isConnecting = model.phase == .connecting && model.activeHost?.id == host.id
+        #if os(iOS)
+        let iconSize: CGFloat = 56
+        let iconBox: CGFloat = 76
+        let cardPadding: CGFloat = 28
+        let nameFont = Font.title3.weight(.semibold)
+        #else
+        let iconSize: CGFloat = 42
+        let iconBox: CGFloat = 56
+        let cardPadding: CGFloat = 18
+        let nameFont = Font.headline
+        #endif
         return Button {
             connect(host)
         } label: {
             VStack(spacing: 10) {
                 ZStack {
                     Image(systemName: "play.display")
-                        .font(.system(size: 42, weight: .light))
+                        .font(.system(size: iconSize, weight: .light))
                         .foregroundStyle(.tint)
                         .opacity(isConnecting ? 0.3 : 1)
                     if isConnecting {
                         ProgressView()
                     }
                 }
-                .frame(height: 56)
+                .frame(height: iconBox)
                 VStack(spacing: 2) {
                     Text(host.displayName)
-                        .font(.headline)
+                        .font(nameFont)
                         .lineLimit(1)
                     HStack(spacing: 4) {
                         if host.pinnedSHA256 != nil {
@@ -235,7 +247,7 @@ struct ContentView: View {
                 }
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 18)
+            .padding(.vertical, cardPadding)
             .padding(.horizontal, 12)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
         }
