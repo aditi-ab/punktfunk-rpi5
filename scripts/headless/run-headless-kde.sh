@@ -74,7 +74,11 @@ echo "KWin ready."
 # plasma menu / D-Bus activation. KWin brings Xwayland up a moment after itself; poll for it.
 DISPLAY_NUM=""
 for _ in $(seq 1 20); do
-    d=$(pgrep -a Xwayland 2>/dev/null | grep -oE ' :[0-9]+' | tr -d ' :' | head -1)
+    # `|| true`: under `set -euo pipefail`, pgrep/grep exit non-zero when Xwayland isn't up yet
+    # (common a few seconds into a systemd-launched boot), which would abort the WHOLE script —
+    # killing KWin — on the first iteration instead of retrying. Tolerate it so the loop polls,
+    # and so a session with no Xwayland at all still proceeds (DISPLAY just stays unset → warn).
+    d=$(pgrep -a Xwayland 2>/dev/null | grep -oE ' :[0-9]+' | tr -d ' :' | head -1 || true)
     if [[ -n "$d" && -S "/tmp/.X11-unix/X$d" ]]; then DISPLAY_NUM="$d"; break; fi
     sleep 0.25
 done
