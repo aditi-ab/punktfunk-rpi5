@@ -556,12 +556,21 @@ pub fn frame(payload: &[u8]) -> Vec<u8> {
 /// Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
 /// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
 /// audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
-/// mic = [`MIC_MAGIC`] (0xCB, client→host).
+/// mic = [`MIC_MAGIC`] (0xCB, client→host), rich-input = [`RICH_INPUT_MAGIC`] (0xCC, client→host),
+/// HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client).
 pub const AUDIO_MAGIC: u8 = 0xC9;
 pub const RUMBLE_MAGIC: u8 = 0xCA;
 /// Microphone uplink: the client's mic, Opus-encoded, client → host (the inverse of
 /// [`AUDIO_MAGIC`]). The host feeds it into a virtual PipeWire source so its apps can record it.
 pub const MIC_MAGIC: u8 = 0xCB;
+/// Rich client→host input: events too big for the fixed 18-byte [`InputEvent`]
+/// (crate::input::InputEvent) — the DualSense touchpad and motion sensors. Variable-length,
+/// kind-tagged (see [`RichInput`]).
+pub const RICH_INPUT_MAGIC: u8 = 0xCC;
+/// HID output, host → client: DualSense feedback a game wrote to the host's virtual controller
+/// (lightbar, player LEDs, adaptive triggers) — the rich analog of [`RUMBLE_MAGIC`]. See
+/// [`HidOutput`].
+pub const HIDOUT_MAGIC: u8 = 0xCD;
 
 /// Audio datagram, host → client: `[0xC9][u32 seq LE][u64 pts_ns LE][opus payload]`.
 /// One Opus frame per datagram (5 ms — well under any MTU); QUIC already encrypts.
@@ -623,6 +632,144 @@ pub fn decode_mic_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
     let seq = u32::from_le_bytes(b[1..5].try_into().unwrap());
     let pts_ns = u64::from_le_bytes(b[5..13].try_into().unwrap());
     Some((seq, pts_ns, &b[13..]))
+}
+
+const RICH_TOUCHPAD: u8 = 0x01;
+const RICH_MOTION: u8 = 0x02;
+
+/// A rich client→host controller input beyond the fixed [`InputEvent`](crate::input::InputEvent):
+/// the DualSense touchpad and motion sensors. `pad` is the gamepad index. Wire form is
+/// `[0xCC][kind][fields…]` — variable-length and kind-tagged (forward-compatible: an unknown
+/// kind decodes to `None` and is dropped).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RichInput {
+    /// One touchpad contact. `x`/`y` are normalized `0..=65535` (the host scales to the
+    /// DualSense touchpad resolution); `active = false` lifts the finger.
+    Touchpad {
+        pad: u8,
+        finger: u8,
+        active: bool,
+        x: u16,
+        y: u16,
+    },
+    /// Motion sensors: `gyro` (pitch/yaw/roll) + `accel`, raw signed-16 in the sensor's own
+    /// units — passed straight into the DualSense report.
+    Motion {
+        pad: u8,
+        gyro: [i16; 3],
+        accel: [i16; 3],
+    },
+}
+
+impl RichInput {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![RICH_INPUT_MAGIC];
+        match *self {
+            RichInput::Touchpad {
+                pad,
+                finger,
+                active,
+                x,
+                y,
+            } => {
+                out.extend_from_slice(&[RICH_TOUCHPAD, pad, finger, active as u8]);
+                out.extend_from_slice(&x.to_le_bytes());
+                out.extend_from_slice(&y.to_le_bytes());
+            }
+            RichInput::Motion { pad, gyro, accel } => {
+                out.extend_from_slice(&[RICH_MOTION, pad]);
+                for v in gyro.iter().chain(accel.iter()) {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Option<RichInput> {
+        if b.first() != Some(&RICH_INPUT_MAGIC) {
+            return None;
+        }
+        match b.get(1)? {
+            &RICH_TOUCHPAD if b.len() >= 9 => Some(RichInput::Touchpad {
+                pad: b[2],
+                finger: b[3],
+                active: b[4] != 0,
+                x: u16::from_le_bytes([b[5], b[6]]),
+                y: u16::from_le_bytes([b[7], b[8]]),
+            }),
+            &RICH_MOTION if b.len() >= 15 => {
+                let i16at = |o: usize| i16::from_le_bytes([b[o], b[o + 1]]);
+                Some(RichInput::Motion {
+                    pad: b[2],
+                    gyro: [i16at(3), i16at(5), i16at(7)],
+                    accel: [i16at(9), i16at(11), i16at(13)],
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+const HIDOUT_LED: u8 = 0x01;
+const HIDOUT_PLAYER_LEDS: u8 = 0x02;
+const HIDOUT_TRIGGER: u8 = 0x03;
+
+/// DualSense feedback flowing host → client (what a game wrote to the host's virtual pad).
+/// Wire form `[0xCD][kind][pad][fields…]`. The rich analog of the fixed rumble datagram;
+/// rumble itself stays on [`RUMBLE_MAGIC`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HidOutput {
+    /// Lightbar RGB.
+    Led { pad: u8, r: u8, g: u8, b: u8 },
+    /// Player-indicator LEDs (low 5 bits).
+    PlayerLeds { pad: u8, bits: u8 },
+    /// One adaptive-trigger effect: `which` 0 = L2, 1 = R2; `effect` is the raw DualSense
+    /// trigger parameter block (mode + params) for the client to replay on a real controller.
+    Trigger { pad: u8, which: u8, effect: Vec<u8> },
+}
+
+impl HidOutput {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![HIDOUT_MAGIC];
+        match self {
+            HidOutput::Led { pad, r, g, b } => {
+                out.extend_from_slice(&[HIDOUT_LED, *pad, *r, *g, *b])
+            }
+            HidOutput::PlayerLeds { pad, bits } => {
+                out.extend_from_slice(&[HIDOUT_PLAYER_LEDS, *pad, *bits])
+            }
+            HidOutput::Trigger { pad, which, effect } => {
+                out.extend_from_slice(&[HIDOUT_TRIGGER, *pad, *which]);
+                out.extend_from_slice(effect);
+            }
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Option<HidOutput> {
+        if b.first() != Some(&HIDOUT_MAGIC) {
+            return None;
+        }
+        match b.get(1)? {
+            &HIDOUT_LED if b.len() >= 6 => Some(HidOutput::Led {
+                pad: b[2],
+                r: b[3],
+                g: b[4],
+                b: b[5],
+            }),
+            &HIDOUT_PLAYER_LEDS if b.len() >= 4 => Some(HidOutput::PlayerLeds {
+                pad: b[2],
+                bits: b[3],
+            }),
+            &HIDOUT_TRIGGER if b.len() >= 4 => Some(HidOutput::Trigger {
+                pad: b[2],
+                which: b[3],
+                effect: b[4..].to_vec(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Async framed-message IO over a quinn stream (`u16 LE length || payload`).
@@ -1220,6 +1367,70 @@ mod tests {
             .unwrap()
             .2
             .is_empty());
+    }
+
+    #[test]
+    fn rich_input_roundtrip() {
+        for ev in [
+            RichInput::Touchpad {
+                pad: 1,
+                finger: 0,
+                active: true,
+                x: 40000,
+                y: 12345,
+            },
+            RichInput::Motion {
+                pad: 0,
+                gyro: [-100, 200, -300],
+                accel: [16384, -8192, 1],
+            },
+        ] {
+            let d = ev.encode();
+            assert_eq!(d[0], RICH_INPUT_MAGIC);
+            assert_eq!(RichInput::decode(&d), Some(ev));
+        }
+        // Disjoint from the fixed input datagram (0xC8); unknown kind + truncation → None.
+        assert!(RichInput::decode(&[crate::input::INPUT_MAGIC; 18]).is_none());
+        assert!(RichInput::decode(&[RICH_INPUT_MAGIC, 0x7F]).is_none()); // unknown kind
+        assert!(RichInput::decode(&[RICH_INPUT_MAGIC, RICH_TOUCHPAD, 0]).is_none());
+        // short
+    }
+
+    #[test]
+    fn hid_output_roundtrip() {
+        let cases = [
+            HidOutput::Led {
+                pad: 2,
+                r: 0xAA,
+                g: 0xBB,
+                b: 0xCC,
+            },
+            HidOutput::PlayerLeds {
+                pad: 0,
+                bits: 0b10101,
+            },
+            HidOutput::Trigger {
+                pad: 1,
+                which: 1,
+                effect: vec![0x26, 0x90, 0xA0, 0xFF, 0x00, 0x00],
+            },
+        ];
+        for ev in &cases {
+            let d = ev.encode();
+            assert_eq!(d[0], HIDOUT_MAGIC);
+            assert_eq!(HidOutput::decode(&d).as_ref(), Some(ev));
+        }
+        assert!(HidOutput::decode(&[HIDOUT_MAGIC, 0x7F]).is_none()); // unknown kind
+                                                                     // A rich-input datagram is not a HID-output datagram.
+        assert!(HidOutput::decode(
+            &RichInput::Motion {
+                pad: 0,
+                gyro: [0; 3],
+                accel: [0; 3]
+            }
+            .encode()
+        )
+        .is_none());
     }
 
     #[test]
