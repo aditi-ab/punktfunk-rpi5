@@ -64,29 +64,29 @@ struct SettingsView: View {
         if !options.contains(where: { $0.tag == currentTag }) {
             options.insert(("Custom (\(width)×\(height) @ \(hz))", currentTag), at: 0)
         }
-        return Form {
-            Section {
-                Picker("Stream mode", selection: modeTag) {
-                    ForEach(options, id: \.tag) { option in
-                        Text(option.label).tag(option.tag)
-                    }
-                }
-                .pickerStyle(.navigationLink)
-                Picker("Compositor", selection: $compositor) {
-                    Text("Automatic").tag(0)
-                    Text("KWin (KDE Plasma)").tag(1)
-                    Text("wlroots (Sway / Hyprland)").tag(2)
-                    Text("Mutter (GNOME)").tag(3)
-                    Text("gamescope").tag(4)
-                }
-                .pickerStyle(.navigationLink)
-            } footer: {
+        let compositors: [(label: String, tag: Int)] = [
+            ("Automatic", 0),
+            ("KWin (KDE Plasma)", 1),
+            ("wlroots (Sway / Hyprland)", 2),
+            ("Mutter (GNOME)", 3),
+            ("gamescope", 4),
+        ]
+        return ScrollView {
+            VStack(spacing: 16) {
+                TVSelectionRow(title: "Stream mode", options: options, selection: modeTag)
+                TVSelectionRow(
+                    title: "Compositor", options: compositors, selection: $compositor)
                 Text("The host creates a virtual output at exactly this mode — native "
                     + "resolution, no scaling. A specific compositor is honored only if "
                     + "available on the host.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 8)
             }
+            .frame(maxWidth: 1000)
+            .frame(maxWidth: .infinity)
+            .padding(60)
         }
         .navigationTitle("Settings")
     }

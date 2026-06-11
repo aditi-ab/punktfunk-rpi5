@@ -87,4 +87,58 @@ struct TVFieldRow: View {
         }
     }
 }
+/// A Settings-app-style selection screen: pushed list of option rows, checkmark on the
+/// current value, selecting pops back. Replaces Picker(.navigationLink), whose internal
+/// list renders rows in the focused (dark-text) style while the push animates.
+struct TVSelectionList<Tag: Hashable>: View {
+    let title: String
+    let options: [(label: String, tag: Tag)]
+    @Binding var selection: Tag
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                ForEach(options, id: \.tag) { option in
+                    Button {
+                        selection = option.tag
+                        dismiss()
+                    } label: {
+                        HStack {
+                            Text(option.label)
+                            Spacer()
+                            if option.tag == selection {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: 900)
+            .frame(maxWidth: .infinity)
+            .padding(60)
+        }
+        .navigationTitle(title)
+    }
+}
+
+/// The pushing row for a TVSelectionList: label leading, current value trailing.
+struct TVSelectionRow<Tag: Hashable>: View {
+    let title: String
+    let options: [(label: String, tag: Tag)]
+    @Binding var selection: Tag
+
+    var body: some View {
+        NavigationLink {
+            TVSelectionList(title: title, options: options, selection: $selection)
+        } label: {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(options.first { $0.tag == selection }?.label ?? "—")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
 #endif
