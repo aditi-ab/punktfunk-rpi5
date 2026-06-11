@@ -9,6 +9,7 @@ import PunktfunkKit
 import SwiftUI
 
 struct SettingsView: View {
+    @Environment(\.dismiss) private var dismiss
     @AppStorage("punktfunk.width") private var width = 1920
     @AppStorage("punktfunk.height") private var height = 1080
     @AppStorage("punktfunk.hz") private var hz = 60
@@ -99,6 +100,11 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            #if os(tvOS)
+            Section {
+                Button("Done") { dismiss() }
+            }
+            #endif
         }
         .formStyle(.grouped)
         #if os(macOS)

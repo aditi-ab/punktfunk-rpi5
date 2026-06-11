@@ -55,6 +55,17 @@ struct ContentView: View {
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
         // is sequential, a pairing connection would queue behind the live session).
+        #if os(tvOS)
+        .fullScreenCover(item: $pairingTarget) { host in
+            PairSheet(host: host) { fingerprint in
+                guard pairingTarget?.id == host.id else { return }
+                store.pin(host.id, fingerprint: fingerprint)
+                var pinned = host
+                pinned.pinnedSHA256 = fingerprint
+                connect(pinned)
+            }
+        }
+        #else
         .sheet(item: $pairingTarget) { host in
             PairSheet(host: host) { fingerprint in
                 // Backstop against a stale ceremony surfacing after dismissal (PairSheet
@@ -66,6 +77,7 @@ struct ContentView: View {
                 connect(pinned)
             }
         }
+        #endif
     }
 
     private var sessionView: some View {
@@ -114,14 +126,23 @@ struct ContentView: View {
                             ForEach(store.hosts) { host in
                                 hostCard(host)
                             }
+                            #if os(tvOS)
+                            actionTile("Add Host", systemImage: "plus") {
+                                showAddHost = true
+                            }
+                            actionTile("Settings", systemImage: "gearshape") {
+                                showSettings = true
+                            }
+                            #endif
                         }
                         .padding()
                     }
                 }
             }
             .navigationTitle("Punktfunkempfänger")
+            #if !os(tvOS)
             .toolbar {
-                #if !os(macOS)
+                #if os(iOS)
                 // Adjacent trailing items share one glass pill (the system default).
                 ToolbarItem(placement: .topBarTrailing) { settingsButton }
                 ToolbarItem(placement: .topBarTrailing) { addHostButton }
@@ -138,14 +159,23 @@ struct ContentView: View {
                 }
                 #endif
             }
+            #endif
         }
         #if os(macOS)
         .frame(minWidth: 480, minHeight: 360)
         #endif
+        #if os(tvOS)
+        .fullScreenCover(isPresented: $showAddHost) {
+            AddHostSheet { store.add($0) }
+        }
+        .fullScreenCover(isPresented: $showSettings) {
+            SettingsView()
+        }
+        #else
         .sheet(isPresented: $showAddHost) {
             AddHostSheet { store.add($0) }
         }
-        #if !os(macOS)
+        #if os(iOS)
         .sheet(isPresented: $showSettings) {
             NavigationStack {
                 SettingsView()
@@ -155,6 +185,7 @@ struct ContentView: View {
                     }
             }
         }
+        #endif
         #endif
         .alert(
             "Connection failed",
@@ -305,6 +336,30 @@ struct ContentView: View {
         defaults.set(UIScreen.main.maximumFramesPerSecond, forKey: "punktfunk.hz")
         #endif
     }
+
+    #if os(tvOS)
+    /// Grid-resident replacement for the toolbar (whose items are neither sized nor
+    /// focusable on tvOS): a full-size, focus-native tile per action.
+    private func actionTile(
+        _ label: String, systemImage: String, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 56, weight: .light))
+                    .foregroundStyle(.tint)
+                    .frame(height: 76)
+                Text(label)
+                    .font(.title3.weight(.semibold))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 28)
+            .padding(.horizontal, 12)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        }
+        .buttonStyle(.card)
+    }
+    #endif
 
     /// The host of the most recent session — its card carries the accent ring.
     private var mostRecentHostID: UUID? {
