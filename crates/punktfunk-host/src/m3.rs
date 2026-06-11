@@ -1378,6 +1378,48 @@ fn service_probes(
     }
 }
 
+/// Seal one access unit and send its packets PACED over the budget until `deadline` (the next
+/// frame's due time), in 16-packet `sendmmsg` chunks — so a high-bitrate frame spreads across the
+/// frame interval instead of bursting all at once into the NIC. A real link drops a line-rate burst
+/// (the host send buffer EAGAINs), and under infinite GOP a single dropped frame freezes the decode
+/// until the next keyframe — the cause of the "freezes over ~150 Mbps, no image at 400 Mbps"
+/// symptom. When there's little/no slack (encode ≈ interval at very high fps) the budget collapses
+/// to ~0 and every chunk goes out immediately, so this is never slower than the unpaced path.
+fn paced_submit(
+    session: &mut Session,
+    data: &[u8],
+    pts_ns: u64,
+    flags: u32,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    const PACE_CHUNK: usize = 16;
+    let wires = session
+        .seal_frame(data, pts_ns, flags)
+        .map_err(|e| anyhow!("seal_frame: {e:?}"))?;
+    let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+    let n_chunks = refs.len().div_ceil(PACE_CHUNK).max(1);
+    let start = std::time::Instant::now();
+    // Spread sends over ~90% of the time to the deadline (10% margin for the caller's tail sleep);
+    // 0 when we're already at/past the deadline → no sleeps → immediate send.
+    let budget = deadline
+        .checked_duration_since(start)
+        .unwrap_or_default()
+        .mul_f32(0.9);
+    for (i, chunk) in refs.chunks(PACE_CHUNK).enumerate() {
+        session
+            .send_sealed(chunk)
+            .map_err(|e| anyhow!("send_sealed: {e:?}"))?;
+        // Sleep toward this chunk's slice of the budget; skip sub-500µs waits (scheduler jitter).
+        let target = start + budget.mul_f64((i + 1) as f64 / n_chunks as f64);
+        if let Some(ahead) = target.checked_duration_since(std::time::Instant::now()) {
+            if ahead > std::time::Duration::from_micros(500) {
+                std::thread::sleep(ahead);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Real capture→encode→punktfunk/1: a native virtual output at the client's mode, NVENC AUs
 /// stamped with the capture wall clock (the client derives per-frame pipeline latency).
 ///
@@ -1447,15 +1489,17 @@ fn virtual_stream(
         }
         let capture_ns = now_ns();
         enc.submit(&frame).context("encoder submit")?;
+        // The deadline for this frame's packets: pace the send up to here so a high-bitrate frame
+        // spreads over the interval instead of bursting all at once into the NIC (a real link drops
+        // the burst, freezing the infinite-GOP stream until the next keyframe — the 1 Gbps+ fix).
+        next += interval;
         while let Some(au) = enc.poll().context("encoder poll")? {
             let flags = if au.keyframe {
                 (FLAG_PIC | FLAG_SOF) as u32
             } else {
                 FLAG_PIC as u32
             };
-            session
-                .submit_frame(&au.data, capture_ns, flags)
-                .map_err(|e| anyhow!("submit_frame: {e:?}"))?;
+            paced_submit(session, &au.data, capture_ns, flags, next)?;
             sent += 1;
         }
         if perf && last_perf.elapsed() >= std::time::Duration::from_secs(2) {
@@ -1474,7 +1518,6 @@ fn virtual_stream(
             last_bytes = s.bytes_sent;
             last_send_dropped = s.packets_send_dropped;
         }
-        next += interval;
         match next.checked_duration_since(std::time::Instant::now()) {
             Some(d) => std::thread::sleep(d),
             None => next = std::time::Instant::now(),

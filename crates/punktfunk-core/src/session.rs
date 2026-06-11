@@ -107,34 +107,58 @@ impl Session {
 
     // -- Host path --------------------------------------------------------
 
-    /// Host: FEC-protect, packetize, seal, and send one encoded access unit.
-    pub fn submit_frame(&mut self, data: &[u8], pts_ns: u64, user_flags: u32) -> Result<()> {
+    /// Host: FEC-protect, packetize, and seal one encoded access unit into wire packets WITHOUT
+    /// sending them. Counts the frame + its packets/bytes as submitted; the caller transmits the
+    /// returned packets via [`send_sealed`](Self::send_sealed) — in one call, or in chunks paced
+    /// over the frame interval so a real NIC doesn't drop the whole frame as a line-rate burst (the
+    /// 1 Gbps+ freeze fix). The nonce counter advances per packet, in order, so seal once and send
+    /// the result intact. (Holding the `Vec<Vec<u8>>` also keeps the buffers alive for the batch.)
+    pub fn seal_frame(
+        &mut self,
+        data: &[u8],
+        pts_ns: u64,
+        user_flags: u32,
+    ) -> Result<Vec<Vec<u8>>> {
         if self.config.role != Role::Host {
             return Err(PunktfunkError::InvalidArg(
-                "submit_frame called on a client session",
+                "seal_frame called on a client session",
             ));
         }
         let packets = self
             .packetizer
             .packetize(data, pts_ns, user_flags, self.coder.as_ref())?;
         StatsCounters::add(&self.stats.frames_submitted, 1);
-        // Seal every shard (the nonce counter advances per packet, in order), then hand the whole
-        // frame to the transport in ONE batched call — `sendmmsg` does ~64 packets/syscall instead
-        // of a `send` each, the dominant 1 Gbps+ lever. (Sealing must finish before the immutable
-        // `send_batch` borrow; collecting the wires also keeps them alive for the batch's iovecs.)
         let mut wires: Vec<Vec<u8>> = Vec::with_capacity(packets.len());
         for pkt in &packets {
             wires.push(self.seal_for_wire(pkt)?);
         }
-        let total = wires.len();
         let bytes: u64 = wires.iter().map(|w| w.len() as u64).sum();
-        StatsCounters::add(&self.stats.packets_sent, total as u64);
+        StatsCounters::add(&self.stats.packets_sent, wires.len() as u64);
         StatsCounters::add(&self.stats.bytes_sent, bytes);
-        let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
-        let sent = self.transport.send_batch(&refs)?;
-        if sent < total {
-            StatsCounters::add(&self.stats.packets_send_dropped, (total - sent) as u64);
+        Ok(wires)
+    }
+
+    /// Host: transmit one chunk of already-[`seal_frame`](Self::seal_frame)ed packets in a single
+    /// batched `sendmmsg`, returning how many the kernel accepted. The rest (`packets.len() - n`)
+    /// are counted as send-buffer drops. Call once for the whole frame, or per paced chunk.
+    pub fn send_sealed(&self, packets: &[&[u8]]) -> Result<usize> {
+        let sent = self.transport.send_batch(packets)?;
+        if sent < packets.len() {
+            StatsCounters::add(
+                &self.stats.packets_send_dropped,
+                (packets.len() - sent) as u64,
+            );
         }
+        Ok(sent)
+    }
+
+    /// Host: FEC-protect, packetize, seal, and send one encoded access unit (the whole frame in one
+    /// batched send). Convenience composition of [`seal_frame`](Self::seal_frame) +
+    /// [`send_sealed`](Self::send_sealed) for callers that don't pace (synthetic source, probe).
+    pub fn submit_frame(&mut self, data: &[u8], pts_ns: u64, user_flags: u32) -> Result<()> {
+        let wires = self.seal_frame(data, pts_ns, user_flags)?;
+        let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+        self.send_sealed(&refs)?;
         Ok(())
     }
 
