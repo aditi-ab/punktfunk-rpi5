@@ -334,6 +334,21 @@ public final class PunktfunkConnection {
         }
     }
 
+    /// Send one Opus mic frame (48 kHz) to the host, where it feeds a virtual
+    /// microphone source the host's apps can record. Non-blocking enqueue, safe
+    /// alongside the pull threads (same discipline as `send`). `seq`/`ptsNs` are the
+    /// caller's own counters (host uses them only for diagnostics); empty `opus` is a
+    /// DTX silence frame.
+    public func sendMic(_ opus: Data, seq: UInt32, ptsNs: UInt64) {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        opus.withUnsafeBytes { p in
+            _ = punktfunk_connection_send_mic(
+                h, p.bindMemory(to: UInt8.self).baseAddress, UInt(opus.count), seq, ptsNs)
+        }
+    }
+
     deinit { close() }
 
     /// Snapshot the handle unless close is pending (callers hold their plane lock).
@@ -386,5 +401,31 @@ public extension PunktfunkInputEvent {
     /// `GCControllerDirectionPad.yAxis` already matches, no flip), 4=LT 5=RT (0...255).
     static func gamepadAxis(_ axis: UInt32, value: Int32, pad: UInt32 = 0) -> PunktfunkInputEvent {
         make(PUNKTFUNK_INPUT_KIND_GAMEPAD_AXIS.rawValue, code: axis, x: value, y: 0, flags: pad)
+    }
+
+    // Touch (host-side: libei ei_touchscreen on the virtual output). `id` distinguishes
+    // fingers and is reusable after touchUp; coordinates are absolute pixels on the
+    // client's touch surface, whose size rides in `flags` so the host can rescale —
+    // the surface dimensions must each fit in 16 bits. Built for the iOS variant
+    // (UITouch → these); nothing on macOS emits them yet.
+
+    static func touchDown(
+        id: UInt32, x: Int32, y: Int32, surfaceWidth: UInt32, surfaceHeight: UInt32
+    ) -> PunktfunkInputEvent {
+        make(
+            PUNKTFUNK_INPUT_KIND_TOUCH_DOWN.rawValue, code: id, x: x, y: y,
+            flags: ((surfaceWidth & 0xFFFF) << 16) | (surfaceHeight & 0xFFFF))
+    }
+
+    static func touchMove(
+        id: UInt32, x: Int32, y: Int32, surfaceWidth: UInt32, surfaceHeight: UInt32
+    ) -> PunktfunkInputEvent {
+        make(
+            PUNKTFUNK_INPUT_KIND_TOUCH_MOVE.rawValue, code: id, x: x, y: y,
+            flags: ((surfaceWidth & 0xFFFF) << 16) | (surfaceHeight & 0xFFFF))
+    }
+
+    static func touchUp(id: UInt32) -> PunktfunkInputEvent {
+        make(PUNKTFUNK_INPUT_KIND_TOUCH_UP.rawValue, code: id, x: 0, y: 0)
     }
 }

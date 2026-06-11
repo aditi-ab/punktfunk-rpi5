@@ -42,10 +42,17 @@ final class LoopbackIntegrationTests: XCTestCase {
         }
         XCTAssertGreaterThanOrEqual(lastIndex, 24)
 
-        // Input goes the other way (enqueue-only; the host logs the count on close).
+        // Input goes the other way (enqueue-only; the host logs the count on close) —
+        // including the touch kinds and the mic uplink plane (the synthetic host counts
+        // the datagrams; injection/decoding are Linux-side concerns).
         conn.send(.mouseMove(dx: 1, dy: 2))
         conn.send(.key(0x41, down: true))
         conn.send(.key(0x41, down: false))
+        conn.send(.touchDown(id: 0, x: 100, y: 200, surfaceWidth: 1280, surfaceHeight: 720))
+        conn.send(.touchMove(id: 0, x: 110, y: 210, surfaceWidth: 1280, surfaceHeight: 720))
+        conn.send(.touchUp(id: 0))
+        conn.sendMic(Data([0xFC, 0xFF, 0xFE]), seq: 0, ptsNs: 1)  // tiny opus-ish frame
+        conn.sendMic(Data(), seq: 1, ptsNs: 2)  // DTX silence frame
 
         conn.close()
         XCTAssertThrowsError(try conn.nextAU(timeoutMs: 10)) { error in

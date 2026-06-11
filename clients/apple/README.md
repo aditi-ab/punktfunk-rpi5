@@ -118,7 +118,9 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    host stamps `pts_ns` with its capture wall clock; across machines you need a clock
    offset estimate from the QUIC RTT).
 5. **Audio**: `nextAudio()` yields raw Opus packets (48 kHz stereo, one 5 ms frame each,
-   sequence-numbered). Decode with libopus or `AVAudioConverter`/`kAudioFormatOpus` into an
+   sequence-numbered). The inverse direction exists too: `sendMic(_:seq:ptsNs:)` uplinks
+   the client's mic as Opus frames into a virtual PipeWire source on the host (wire it
+   to AVAudioEngine input + an Opus encoder alongside playback). Decode with libopus or `AVAudioConverter`/`kAudioFormatOpus` into an
    `AVAudioEngine` source node; conceal gaps (drop/dup) rather than blocking — the Rust
    side buffers 320 ms and drops the newest packet when the puller lags. Wall-clock
    `ptsNs` shares the host clock with video AUs for A/V sync. Wiring this into
