@@ -14,15 +14,70 @@
 use crate::config::{CompositorPref, GamepadPref, Mode, Role};
 use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
+use crate::packet::FLAG_PROBE;
 use crate::quic::{
-    endpoint, io, Hello, HidOutput, Reconfigure, Reconfigured, RichInput, Start, Welcome,
+    endpoint, io, Hello, HidOutput, ProbeRequest, ProbeResult, Reconfigure, Reconfigured,
+    RichInput, Start, Welcome,
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// A control-stream request the embedder makes on the open handshake stream: a mode switch or a
+/// speed test. One outbound channel carries both so the worker's `select!` has a single writer
+/// (two `&mut ctrl_send` borrows across select branches don't compile).
+enum CtrlRequest {
+    Mode(Mode),
+    Probe(ProbeRequest),
+}
+
+/// What the worker reports to [`NativeClient::connect`] once the handshake lands: the negotiated
+/// mode, the host-resolved gamepad backend, the host's certificate fingerprint, and the resolved
+/// encoder bitrate (kbps).
+type Negotiated = (Mode, GamepadPref, [u8; 32], u32);
+
+/// Accumulated state of an in-flight / finished speed test. The data-plane pump folds each
+/// received [`FLAG_PROBE`] access unit in; the control task records the host's [`ProbeResult`]
+/// when it lands. Read (and finalized into numbers) by [`NativeClient::probe_result`].
+#[derive(Default)]
+struct ProbeState {
+    /// A probe is in progress (set by `request_probe`, cleared by nothing — the latest one wins).
+    active: bool,
+    /// Probe access-unit payload bytes the client received, and their count.
+    recv_bytes: u64,
+    recv_packets: u32,
+    /// First/last probe AU arrival — the measured receive window.
+    start: Option<Instant>,
+    last: Option<Instant>,
+    /// The host's report ([`ProbeResult`]); present once the burst finished.
+    host_bytes: u64,
+    host_packets: u32,
+    /// The host's `ProbeResult` arrived → the measurement is final.
+    done: bool,
+}
+
+/// A finished/partial speed-test measurement, returned by [`NativeClient::probe_result`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeOutcome {
+    /// The host's end-of-burst report has arrived — the numbers below are final.
+    pub done: bool,
+    /// Probe payload bytes / packets the client received.
+    pub recv_bytes: u64,
+    pub recv_packets: u32,
+    /// Probe payload bytes / packets the host reported sending.
+    pub host_bytes: u64,
+    pub host_packets: u32,
+    /// The client-measured receive window (first→last probe AU), in milliseconds.
+    pub elapsed_ms: u32,
+    /// Measured goodput = `recv_bytes * 8 / elapsed_ms` (kilobits/second). This is the figure to
+    /// drive a [`Hello::bitrate_kbps`] choice from.
+    pub throughput_kbps: u32,
+    /// Delivery loss = `(host_bytes - recv_bytes) / host_bytes`, as a percentage (0 if unknown).
+    pub loss_pct: f32,
+}
 
 /// Frames buffered between the data-plane pump and the embedder. Small: the embedder
 /// (decoder) should drain at frame rate; when it falls behind, the newest frame is dropped
@@ -62,7 +117,10 @@ pub struct NativeClient {
     mic_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64, Vec<u8>)>,
     /// Outbound rich input (DualSense touchpad / motion) → 0xCC datagrams by the worker.
     rich_input_tx: tokio::sync::mpsc::UnboundedSender<RichInput>,
-    reconfig_tx: tokio::sync::mpsc::UnboundedSender<Mode>,
+    /// Outbound control-stream requests (mode switch, speed test) → the worker's control task.
+    ctrl_tx: tokio::sync::mpsc::UnboundedSender<CtrlRequest>,
+    /// Speed-test accumulator, shared with the data-plane pump + control task.
+    probe: Arc<Mutex<ProbeState>>,
     shutdown: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     /// The currently active session mode (the Welcome's, then updated by every accepted
@@ -74,6 +132,10 @@ pub struct NativeClient {
     /// The virtual gamepad backend the host actually resolved ([`Welcome::gamepad`]).
     /// `Auto` = an older host that didn't say (assume X-Box 360, no DualSense feedback).
     pub resolved_gamepad: GamepadPref,
+    /// The encoder bitrate the host actually configured ([`Welcome::bitrate_kbps`], kbps): our
+    /// requested rate clamped to the host's range, or its default if we requested `0`. `0` = an
+    /// older host that didn't report it.
+    pub resolved_bitrate_kbps: u32,
 }
 
 impl NativeClient {
@@ -94,6 +156,7 @@ impl NativeClient {
         mode: Mode,
         compositor: CompositorPref,
         gamepad: GamepadPref,
+        bitrate_kbps: u32,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
         timeout: Duration,
@@ -105,15 +168,17 @@ impl NativeClient {
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
         let (mic_tx, mic_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u64, Vec<u8>)>();
         let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<RichInput>();
-        let (reconfig_tx, reconfig_rx) = tokio::sync::mpsc::unbounded_channel::<Mode>();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<CtrlRequest>();
         let (ready_tx, ready_rx) =
-            std::sync::mpsc::channel::<Result<(Mode, GamepadPref, [u8; 32])>>();
+            std::sync::mpsc::channel::<Result<Negotiated>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mode_slot = Arc::new(std::sync::Mutex::new(mode));
+        let probe = Arc::new(Mutex::new(ProbeState::default()));
 
         let host = host.to_string();
         let shutdown_w = shutdown.clone();
         let mode_slot_w = mode_slot.clone();
+        let probe_w = probe.clone();
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
             .spawn(move || {
@@ -134,6 +199,7 @@ impl NativeClient {
                     mode,
                     compositor,
                     gamepad,
+                    bitrate_kbps,
                     pin,
                     identity,
                     frame_tx,
@@ -143,22 +209,24 @@ impl NativeClient {
                     input_rx,
                     mic_rx,
                     rich_input_rx,
-                    reconfig_rx,
+                    ctrl_rx,
                     ready_tx,
                     shutdown: shutdown_w,
                     mode_slot: mode_slot_w,
+                    probe: probe_w,
                 }));
             })
             .map_err(PunktfunkError::Io)?;
 
-        let (negotiated, resolved_gamepad, fingerprint) = match ready_rx.recv_timeout(timeout) {
-            Ok(Ok(t)) => t,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                shutdown.store(true, Ordering::SeqCst);
-                return Err(PunktfunkError::Timeout);
-            }
-        };
+        let (negotiated, resolved_gamepad, fingerprint, resolved_bitrate_kbps) =
+            match ready_rx.recv_timeout(timeout) {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    shutdown.store(true, Ordering::SeqCst);
+                    return Err(PunktfunkError::Timeout);
+                }
+            };
         *mode_slot.lock().unwrap() = negotiated;
         Ok(NativeClient {
             frames: frame_rx,
@@ -168,12 +236,14 @@ impl NativeClient {
             input_tx,
             mic_tx,
             rich_input_tx,
-            reconfig_tx,
+            ctrl_tx,
+            probe,
             shutdown,
             worker: Some(worker),
             mode: mode_slot,
             host_fingerprint: fingerprint,
             resolved_gamepad,
+            resolved_bitrate_kbps,
         })
     }
 
@@ -280,9 +350,59 @@ impl NativeClient {
     /// frames open with an IDR carrying new parameter sets) and [`NativeClient::mode`]
     /// reflects it. A rejected request leaves the session unchanged.
     pub fn request_mode(&self, mode: Mode) -> Result<()> {
-        self.reconfig_tx
-            .send(mode)
+        self.ctrl_tx
+            .send(CtrlRequest::Mode(mode))
             .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Start a bandwidth speed test: ask the host to burst filler over the data plane at
+    /// `target_kbps` of goodput for `duration_ms`, *briefly pausing video*. Non-blocking — the
+    /// measurement accumulates in the background; poll [`NativeClient::probe_result`] until its
+    /// `done` flag is set. Starting a probe resets any prior measurement. The host clamps both
+    /// fields (≤ 1 Gbps, ≤ 5 s).
+    pub fn request_probe(&self, target_kbps: u32, duration_ms: u32) -> Result<()> {
+        // Reset the accumulator so a fresh run doesn't blend into the previous one.
+        *self.probe.lock().unwrap() = ProbeState {
+            active: true,
+            ..Default::default()
+        };
+        self.ctrl_tx
+            .send(CtrlRequest::Probe(ProbeRequest {
+                target_kbps,
+                duration_ms,
+            }))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Read the current speed-test measurement (partial until `done`, final once the host's
+    /// end-of-burst report lands). Derives goodput + loss from the accumulated probe bytes.
+    pub fn probe_result(&self) -> ProbeOutcome {
+        let p = self.probe.lock().unwrap();
+        let elapsed_ms = match (p.start, p.last) {
+            (Some(s), Some(l)) => l.duration_since(s).as_millis() as u32,
+            _ => 0,
+        };
+        // bytes × 8 / ms = kilobits/second.
+        let throughput_kbps = if elapsed_ms > 0 {
+            (p.recv_bytes.saturating_mul(8) / elapsed_ms as u64) as u32
+        } else {
+            0
+        };
+        let loss_pct = if p.host_bytes > 0 {
+            p.host_bytes.saturating_sub(p.recv_bytes) as f64 / p.host_bytes as f64 * 100.0
+        } else {
+            0.0
+        } as f32;
+        ProbeOutcome {
+            done: p.done,
+            recv_bytes: p.recv_bytes,
+            recv_packets: p.recv_packets,
+            host_bytes: p.host_bytes,
+            host_packets: p.host_packets,
+            elapsed_ms,
+            throughput_kbps,
+            loss_pct,
+        }
     }
 
     /// Pull the next reassembled, FEC-recovered access unit; [`PunktfunkError::NoFrame`] on
@@ -373,6 +493,7 @@ struct WorkerArgs {
     mode: Mode,
     compositor: CompositorPref,
     gamepad: GamepadPref,
+    bitrate_kbps: u32,
     pin: Option<[u8; 32]>,
     identity: Option<(String, String)>,
     frame_tx: SyncSender<Frame>,
@@ -382,10 +503,11 @@ struct WorkerArgs {
     input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     mic_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, u64, Vec<u8>)>,
     rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<RichInput>,
-    reconfig_rx: tokio::sync::mpsc::UnboundedReceiver<Mode>,
-    ready_tx: std::sync::mpsc::Sender<Result<(Mode, GamepadPref, [u8; 32])>>,
+    ctrl_rx: tokio::sync::mpsc::UnboundedReceiver<CtrlRequest>,
+    ready_tx: std::sync::mpsc::Sender<Result<Negotiated>>,
     shutdown: Arc<AtomicBool>,
     mode_slot: Arc<std::sync::Mutex<Mode>>,
+    probe: Arc<Mutex<ProbeState>>,
 }
 
 /// The worker: QUIC handshake, then the input/datagram/control tasks + the blocking
@@ -397,6 +519,7 @@ async fn worker_main(args: WorkerArgs) {
         mode,
         compositor,
         gamepad,
+        bitrate_kbps,
         pin,
         identity,
         frame_tx,
@@ -406,10 +529,11 @@ async fn worker_main(args: WorkerArgs) {
         mut input_rx,
         mut mic_rx,
         mut rich_input_rx,
-        mut reconfig_rx,
+        mut ctrl_rx,
         ready_tx,
         shutdown,
         mode_slot,
+        probe,
     } = args;
     let setup = async {
         let remote: std::net::SocketAddr = format!("{host}:{port}")
@@ -448,6 +572,7 @@ async fn worker_main(args: WorkerArgs) {
                 mode,
                 compositor,
                 gamepad,
+                bitrate_kbps,
             }
             .encode(),
         )
@@ -491,6 +616,7 @@ async fn worker_main(args: WorkerArgs) {
             welcome.mode,
             welcome.gamepad,
             fingerprint,
+            welcome.bitrate_kbps,
         ))
     };
 
@@ -502,6 +628,7 @@ async fn worker_main(args: WorkerArgs) {
         negotiated,
         resolved_gamepad,
         fingerprint,
+        resolved_bitrate_kbps,
     ) = match setup.await {
         Ok(t) => t,
         Err(e) => {
@@ -509,7 +636,12 @@ async fn worker_main(args: WorkerArgs) {
             return;
         }
     };
-    let _ = ready_tx.send(Ok((negotiated, resolved_gamepad, fingerprint)));
+    let _ = ready_tx.send(Ok((
+        negotiated,
+        resolved_gamepad,
+        fingerprint,
+        resolved_bitrate_kbps,
+    )));
 
     // Input task: embedder events → QUIC datagrams.
     let input_conn = conn.clone();
@@ -536,30 +668,50 @@ async fn worker_main(args: WorkerArgs) {
         }
     });
 
-    // Control task: the handshake stream stays open for mid-stream renegotiation. One
-    // request at a time — write Reconfigure, await Reconfigured, publish the active mode.
+    // Control task: the handshake stream stays open for mid-stream renegotiation + speed tests.
+    // Outbound requests (mode switch, probe) and inbound replies (Reconfigured, ProbeResult) are
+    // multiplexed with `select!`; a single outbound channel (`ctrl_rx`) keeps one writer so the
+    // two `&mut ctrl_send` borrows don't collide across branches.
     {
         let mode_slot = mode_slot.clone();
+        let probe = probe.clone();
         tokio::spawn(async move {
-            while let Some(want) = reconfig_rx.recv().await {
-                if io::write_msg(&mut ctrl_send, &Reconfigure { mode: want }.encode())
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                let ack = match io::read_msg(&mut ctrl_recv).await {
-                    Ok(b) => match Reconfigured::decode(&b) {
-                        Ok(a) => a,
-                        Err(_) => break, // protocol error — stop renegotiating
-                    },
-                    Err(_) => break, // stream closed
-                };
-                if ack.accepted {
-                    *mode_slot.lock().unwrap() = ack.mode;
-                    tracing::info!(mode = ?ack.mode, "host accepted mode switch");
-                } else {
-                    tracing::warn!(requested = ?want, active = ?ack.mode, "host rejected mode switch");
+            loop {
+                tokio::select! {
+                    req = ctrl_rx.recv() => {
+                        let Some(req) = req else { break }; // client dropped
+                        let bytes = match req {
+                            CtrlRequest::Mode(m) => Reconfigure { mode: m }.encode(),
+                            CtrlRequest::Probe(p) => p.encode(),
+                        };
+                        if io::write_msg(&mut ctrl_send, &bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    msg = io::read_msg(&mut ctrl_recv) => {
+                        let Ok(msg) = msg else { break }; // stream closed
+                        if let Ok(ack) = Reconfigured::decode(&msg) {
+                            if ack.accepted {
+                                *mode_slot.lock().unwrap() = ack.mode;
+                                tracing::info!(mode = ?ack.mode, "host accepted mode switch");
+                            } else {
+                                tracing::warn!(active = ?ack.mode, "host rejected mode switch");
+                            }
+                        } else if let Ok(result) = ProbeResult::decode(&msg) {
+                            let mut p = probe.lock().unwrap();
+                            p.host_bytes = result.bytes_sent;
+                            p.host_packets = result.packets_sent;
+                            p.done = true;
+                            tracing::info!(
+                                bytes_sent = result.bytes_sent,
+                                packets_sent = result.packets_sent,
+                                duration_ms = result.duration_ms,
+                                "speed-test probe result"
+                            );
+                        } else {
+                            tracing::warn!("unknown control message — ignoring");
+                        }
+                    }
                 }
             }
         });
@@ -607,11 +759,25 @@ async fn worker_main(args: WorkerArgs) {
 
     // Data-plane pump on a blocking thread: poll the session, hand frames to the embedder.
     // try_send drops the newest frame when the embedder lags (freshness over completeness).
+    // Speed-test filler ([`FLAG_PROBE`]) is folded into the probe accumulator instead of the
+    // decoder queue — it isn't video.
     let pump_shutdown = shutdown.clone();
+    let pump_probe = probe.clone();
     let _ = tokio::task::spawn_blocking(move || {
         while !pump_shutdown.load(Ordering::SeqCst) {
             match session.poll_frame() {
                 Ok(frame) => {
+                    if frame.flags & FLAG_PROBE as u32 != 0 {
+                        let mut p = pump_probe.lock().unwrap();
+                        if p.active {
+                            let now = Instant::now();
+                            p.start.get_or_insert(now);
+                            p.last = Some(now);
+                            p.recv_bytes += frame.data.len() as u64;
+                            p.recv_packets += 1;
+                        }
+                        continue; // not video — never enqueue for the decoder
+                    }
                     let _ = frame_tx.try_send(frame);
                 }
                 Err(PunktfunkError::NoFrame) => {

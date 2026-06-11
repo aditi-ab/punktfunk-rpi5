@@ -25,10 +25,10 @@
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
 use punktfunk_core::input::{InputEvent, InputKind};
-use punktfunk_core::packet::{FLAG_PIC, FLAG_SOF};
+use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
-    endpoint, io, Hello, PairChallenge, PairProof, PairRequest, PairResult, Reconfigure,
-    Reconfigured, Start, Welcome,
+    endpoint, io, Hello, PairChallenge, PairProof, PairRequest, PairResult, ProbeRequest,
+    ProbeResult, Reconfigure, Reconfigured, Start, Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
@@ -228,6 +228,27 @@ pub(crate) async fn serve(opts: M3Options, np: Arc<NativePairing>) -> Result<()>
 /// connects and never finishes the handshake would otherwise wedge the host for everyone.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Encoder bitrate (kbps) the host falls back to when the client expresses no preference
+/// (`Hello::bitrate_kbps == 0`) — the long-standing 20 Mbps default. A client that knows its
+/// link (e.g. after a speed test) requests an explicit rate instead.
+const DEFAULT_BITRATE_KBPS: u32 = 20_000;
+/// Bounds a client's requested bitrate to a sane range before configuring NVENC: a 500 kbps floor
+/// keeps the stream above unusable, and a 500 Mbps ceiling guards against an absurd request
+/// exhausting the encoder / link (GF(2¹⁶) FEC lifts the old ~1 Gbps wall, but 500 Mbps already
+/// covers 5K@240). Resolved value is echoed in `Welcome::bitrate_kbps`.
+const MIN_BITRATE_KBPS: u32 = 500;
+const MAX_BITRATE_KBPS: u32 = 500_000;
+
+/// Resolve a client's [`Hello::bitrate_kbps`] request to the rate the host will configure:
+/// `0` → host default; anything else clamped into `[MIN, MAX]`.
+fn resolve_bitrate_kbps(requested: u32) -> u32 {
+    if requested == 0 {
+        DEFAULT_BITRATE_KBPS
+    } else {
+        requested.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)
+    }
+}
+
 /// Persistent audio-capturer slot, reused across sessions (same pattern as the GameStream
 /// path): keeps one warm PipeWire capture stream instead of a connect/negotiate cycle —
 /// and a daemon-side node churn — per session. (Drop now tears a capturer down cleanly.)
@@ -391,6 +412,14 @@ async fn serve_session(
         // needed; the actual pads are created lazily by the input thread).
         let gamepad = resolve_gamepad(hello.gamepad);
 
+        // Resolve the encoder bitrate (client request clamped to a sane range, or host default).
+        let bitrate_kbps = resolve_bitrate_kbps(hello.bitrate_kbps);
+        tracing::info!(
+            requested_kbps = hello.bitrate_kbps,
+            resolved_kbps = bitrate_kbps,
+            "encoder bitrate"
+        );
+
         // Reserve a UDP port for the data plane (bind, read it back, rebind in UdpTransport).
         let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
         let udp_port = probe.local_addr()?.port();
@@ -422,6 +451,7 @@ async fn serve_session(
                 .map(|c| c.as_pref())
                 .unwrap_or(CompositorPref::Auto),
             gamepad,
+            bitrate_kbps,
         };
         io::write_msg(&mut send, &welcome.encode()).await?;
 
@@ -444,39 +474,62 @@ async fn serve_session(
         "handshake complete — streaming"
     );
 
-    // Control task: the handshake stream stays open for mid-stream renegotiation. A
-    // validated Reconfigure is acked, then handed to the data-plane thread, which rebuilds
-    // capture/encoder/virtual output at the new mode (the data plane itself is untouched).
+    // Control task: the handshake stream stays open for mid-stream renegotiation and speed
+    // tests. A validated Reconfigure is acked, then handed to the data-plane thread, which
+    // rebuilds capture/encoder/virtual output at the new mode (the data plane itself is
+    // untouched). A ProbeRequest is handed to the data plane, which bursts FLAG_PROBE filler and
+    // hands back a ProbeResult that this task writes to the client. The two control directions
+    // (inbound requests, outbound probe results) are multiplexed with `select!`.
     let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<punktfunk_core::Mode>();
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
+    let (probe_result_tx, mut probe_result_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
     tokio::spawn(async move {
         let mut active = hello.mode;
-        while let Ok(msg) = io::read_msg(&mut ctrl_recv).await {
-            let Ok(req) = Reconfigure::decode(&msg) else {
-                tracing::warn!("unknown control message — ignoring");
-                continue;
-            };
-            let ok = req.mode.refresh_hz > 0
-                && crate::encode::validate_dimensions(
-                    crate::encode::Codec::H265,
-                    req.mode.width,
-                    req.mode.height,
-                )
-                .is_ok();
-            if ok {
-                active = req.mode;
-                tracing::info!(mode = ?req.mode, "mode switch accepted");
-            } else {
-                tracing::warn!(mode = ?req.mode, "mode switch rejected (invalid dimensions)");
-            }
-            let ack = Reconfigured {
-                accepted: ok,
-                mode: active,
-            };
-            if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
-                break;
-            }
-            if ok && reconfig_tx.send(req.mode).is_err() {
-                break; // data plane gone
+        loop {
+            tokio::select! {
+                msg = io::read_msg(&mut ctrl_recv) => {
+                    let Ok(msg) = msg else { break }; // stream closed
+                    if let Ok(req) = Reconfigure::decode(&msg) {
+                        let ok = req.mode.refresh_hz > 0
+                            && crate::encode::validate_dimensions(
+                                crate::encode::Codec::H265,
+                                req.mode.width,
+                                req.mode.height,
+                            )
+                            .is_ok();
+                        if ok {
+                            active = req.mode;
+                            tracing::info!(mode = ?req.mode, "mode switch accepted");
+                        } else {
+                            tracing::warn!(mode = ?req.mode, "mode switch rejected (invalid dimensions)");
+                        }
+                        let ack = Reconfigured { accepted: ok, mode: active };
+                        if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
+                            break;
+                        }
+                        if ok && reconfig_tx.send(req.mode).is_err() {
+                            break; // data plane gone
+                        }
+                    } else if let Ok(req) = ProbeRequest::decode(&msg) {
+                        tracing::info!(
+                            target_kbps = req.target_kbps,
+                            duration_ms = req.duration_ms,
+                            "speed-test probe requested"
+                        );
+                        if probe_tx.send(req).is_err() {
+                            break; // data plane gone
+                        }
+                    } else {
+                        tracing::warn!("unknown control message — ignoring");
+                    }
+                }
+                result = probe_result_rx.recv() => {
+                    let Some(result) = result else { break }; // data plane gone
+                    if io::write_msg(&mut ctrl_send, &result.encode()).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -593,6 +646,7 @@ async fn serve_session(
     let source = opts.source;
     let (seconds, frames) = (opts.seconds, opts.frames);
     let mode = hello.mode;
+    let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
     let stop_stream = stop.clone();
     let result: Result<()> = async {
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -602,7 +656,13 @@ async fn serve_session(
             let mut session = Session::new(cfg, Box::new(transport))
                 .map_err(|e| anyhow!("host session: {e:?}"))?;
             match source {
-                M3Source::Synthetic => synthetic_stream(&mut session, frames, &stop_stream),
+                M3Source::Synthetic => synthetic_stream(
+                    &mut session,
+                    frames,
+                    &stop_stream,
+                    &probe_rx,
+                    &probe_result_tx,
+                ),
                 M3Source::Virtual => {
                     let compositor = compositor
                         .expect("the Virtual source resolves a compositor during the handshake");
@@ -613,6 +673,9 @@ async fn serve_session(
                         &stop_stream,
                         &reconfig_rx,
                         compositor,
+                        bitrate_kbps,
+                        &probe_rx,
+                        &probe_result_tx,
                     )
                 }
             }
@@ -1107,12 +1170,20 @@ fn audio_thread(_conn: quinn::Connection, _stop: Arc<AtomicBool>, _audio_cap: Au
     );
 }
 
-fn synthetic_stream(session: &mut Session, frames: u32, stop: &AtomicBool) -> Result<()> {
+fn synthetic_stream(
+    session: &mut Session,
+    frames: u32,
+    stop: &AtomicBool,
+    probe_rx: &std::sync::mpsc::Receiver<ProbeRequest>,
+    probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+) -> Result<()> {
     let interval = std::time::Duration::from_millis(1000 / 60);
     for idx in 0..frames {
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        // Service speed-test probes between synthetic frames (loopback bandwidth tests).
+        service_probes(session, stop, probe_rx, probe_result_tx);
         let data = test_frame(idx, 64 * 1024);
         session
             .submit_frame(&data, now_ns(), (FLAG_PIC | FLAG_SOF) as u32)
@@ -1223,13 +1294,88 @@ fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Composito
     Ok(chosen)
 }
 
+/// Bounds a speed-test [`ProbeRequest`] before bursting: a 1 Gbps / 5 s ceiling keeps a probe from
+/// monopolizing the link or stalling the stream for too long. GF(2¹⁶) FEC makes ~1 Gbps reachable
+/// on a LAN — ample headroom to find a session's sustainable bitrate.
+const MAX_PROBE_KBPS: u32 = 1_000_000;
+const MAX_PROBE_MS: u32 = 5_000;
+
+/// Run a bandwidth probe over `session`: burst zero-filled access units flagged [`FLAG_PROBE`] at
+/// `req.target_kbps` of goodput for `req.duration_ms` (both clamped to `MAX_PROBE_*`), pacing by a
+/// "bytes allowed so far" budget so scheduling jitter doesn't overshoot the target. Returns what
+/// was actually offered so the client can compute delivery ratio (`received / bytes_sent`) and
+/// throughput. Video is paused for the duration (the caller's loop is blocked here) — a speed test
+/// is a deliberate, short interruption the client initiates.
+fn run_probe_burst(session: &mut Session, req: ProbeRequest, stop: &AtomicBool) -> ProbeResult {
+    let target_kbps = req.target_kbps.min(MAX_PROBE_KBPS);
+    let duration_ms = req.duration_ms.min(MAX_PROBE_MS);
+    if target_kbps == 0 || duration_ms == 0 {
+        return ProbeResult {
+            bytes_sent: 0,
+            packets_sent: 0,
+            duration_ms: 0,
+        };
+    }
+    // kbps -> bytes/s (x1000/8).
+    let bytes_per_sec = target_kbps as u64 * 125;
+    // ~240 AUs/s for smooth pacing, each capped so one submit_frame stays a bounded burst (a large
+    // AU fragments into many UDP shards via sendmmsg).
+    let chunk = (bytes_per_sec / 240).clamp(1200, 256 * 1024) as usize;
+    let filler = vec![0u8; chunk];
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_millis(duration_ms as u64);
+    let mut bytes_sent = 0u64;
+    let mut packets_sent = 0u32;
+    while std::time::Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
+        let allowed = (start.elapsed().as_secs_f64() * bytes_per_sec as f64) as u64;
+        if bytes_sent < allowed {
+            // A full send buffer drops on WouldBlock (UdpTransport returns Ok) — that loss is part
+            // of what the probe measures, so count what we offered and keep going.
+            let _ = session.submit_frame(&filler, now_ns(), FLAG_PROBE as u32);
+            bytes_sent += chunk as u64;
+            packets_sent += 1;
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+    let actual_ms = start.elapsed().as_millis() as u32;
+    tracing::info!(
+        target_kbps,
+        duration_ms = actual_ms,
+        bytes_sent,
+        packets_sent,
+        "speed-test probe burst complete"
+    );
+    ProbeResult {
+        bytes_sent,
+        packets_sent,
+        duration_ms: actual_ms,
+    }
+}
+
+/// Drain any pending speed-test requests and run each burst, replying with its [`ProbeResult`].
+/// Called once per data-plane loop iteration so a probe runs between frames.
+fn service_probes(
+    session: &mut Session,
+    stop: &AtomicBool,
+    probe_rx: &std::sync::mpsc::Receiver<ProbeRequest>,
+    probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+) {
+    while let Ok(req) = probe_rx.try_recv() {
+        let result = run_probe_burst(session, req, stop);
+        let _ = probe_result_tx.send(result);
+    }
+}
+
 /// Real capture→encode→punktfunk/1: a native virtual output at the client's mode, NVENC AUs
 /// stamped with the capture wall clock (the client derives per-frame pipeline latency).
 ///
 /// `reconfig` delivers accepted mid-stream mode switches: the capture/encode pipeline is
 /// rebuilt at the new mode (capturer drop tears down the PipeWire stream and, via its
 /// keepalive, the virtual output) while the data-plane `session` continues untouched —
-/// the rebuilt encoder opens with an IDR + in-band parameter sets.
+/// the rebuilt encoder opens with an IDR + in-band parameter sets. `probe_rx`/`probe_result_tx`
+/// carry speed-test bursts (see [`service_probes`]).
+#[allow(clippy::too_many_arguments)]
 fn virtual_stream(
     session: &mut Session,
     mode: punktfunk_core::Mode,
@@ -1237,20 +1383,26 @@ fn virtual_stream(
     stop: &AtomicBool,
     reconfig: &std::sync::mpsc::Receiver<punktfunk_core::Mode>,
     compositor: crate::vdisplay::Compositor,
+    bitrate_kbps: u32,
+    probe_rx: &std::sync::mpsc::Receiver<ProbeRequest>,
+    probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
 ) -> Result<()> {
     tracing::info!(
         compositor = compositor.id(),
         ?mode,
+        bitrate_kbps,
         "punktfunk/1 virtual display"
     );
     let mut vd = crate::vdisplay::open(compositor)?;
     let (mut capturer, mut enc, mut frame, mut interval) =
-        build_pipeline_with_retry(&mut vd, mode)?;
+        build_pipeline_with_retry(&mut vd, mode, bitrate_kbps)?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64);
     let mut next = std::time::Instant::now();
     let mut sent: u64 = 0;
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        // Service speed-test probes between frames (each burst pauses video for its duration).
+        service_probes(session, stop, probe_rx, probe_result_tx);
         // Drain to the NEWEST requested mode (a resize drag queues many) so we rebuild once,
         // not once per stale intermediate mode.
         let mut want = None;
@@ -1262,7 +1414,7 @@ fn virtual_stream(
             // Build the new pipeline BEFORE dropping the old one: the host already acked
             // the switch as accepted, so a rebuild failure must not kill an otherwise
             // healthy session — keep streaming the current mode and log instead.
-            match build_pipeline(&mut vd, new_mode) {
+            match build_pipeline(&mut vd, new_mode, bitrate_kbps) {
                 Ok(next_pipe) => {
                     (capturer, enc, frame, interval) = next_pipe;
                     next = std::time::Instant::now();
@@ -1321,11 +1473,12 @@ type Pipeline = (
 fn build_pipeline_with_retry(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     mode: punktfunk_core::Mode,
+    bitrate_kbps: u32,
 ) -> Result<Pipeline> {
     const MAX_ATTEMPTS: u32 = 4;
     let mut backoff = std::time::Duration::from_millis(500);
     for attempt in 1..=MAX_ATTEMPTS {
-        match build_pipeline(vd, mode) {
+        match build_pipeline(vd, mode, bitrate_kbps) {
             Ok(pipe) => {
                 if attempt > 1 {
                     tracing::info!(attempt, "pipeline up after retry");
@@ -1382,6 +1535,7 @@ fn is_permanent_build_error(chain: &str) -> bool {
 fn build_pipeline(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     mode: punktfunk_core::Mode,
+    bitrate_kbps: u32,
 ) -> Result<Pipeline> {
     let vout = vd.create(mode).context("create virtual output")?;
     // The backend reports the refresh it actually achieved in `preferred_mode.2` (KWin may cap a
@@ -1410,7 +1564,7 @@ fn build_pipeline(
         frame.width,
         frame.height,
         effective_hz,
-        20_000_000,
+        bitrate_kbps as u64 * 1000,
         frame.is_cuda(),
     )
     .context("open NVENC")?;
@@ -1762,6 +1916,7 @@ mod tests {
                 mode,
                 CompositorPref::Auto,
                 GamepadPref::Auto,
+                0,
                 None,
                 None,
                 timeout
@@ -1786,6 +1941,7 @@ mod tests {
             mode,
             CompositorPref::Auto,
             GamepadPref::Auto,
+            0,
             Some(host_fp),
             Some((cert.clone(), key.clone())),
             timeout,

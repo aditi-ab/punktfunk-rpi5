@@ -52,6 +52,11 @@ pub struct Hello {
     /// [`Welcome::gamepad`]. Appended to the wire form — omitted by older clients (decodes
     /// to `Auto`).
     pub gamepad: GamepadPref,
+    /// The client's desired video encoder bitrate, in kilobits per second. `0` = no preference
+    /// (the host uses its default). The host clamps the request to a supported range and reports
+    /// the value it actually configured in [`Welcome::bitrate_kbps`]. Appended to the wire form —
+    /// omitted by older clients (decodes to `0`, i.e. host default).
+    pub bitrate_kbps: u32,
 }
 
 /// `host → client`: the complete session offer.
@@ -77,6 +82,11 @@ pub struct Welcome {
     /// DualSense feedback (0xCD) can arrive at all. Appended to the wire form — `Auto` when an
     /// older host omitted it (i.e. "unknown, assume X-Box 360").
     pub gamepad: GamepadPref,
+    /// The encoder bitrate the host actually configured for this session, in kilobits per second
+    /// (the client's [`Hello::bitrate_kbps`] clamped to the host's supported range, or the host
+    /// default when the client requested `0`). Appended to the wire form — `0` when an older host
+    /// omitted it (i.e. "unknown").
+    pub bitrate_kbps: u32,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -107,10 +117,41 @@ pub struct Reconfigured {
     pub mode: Mode,
 }
 
+/// `client → host`, any time after [`Start`]: run a bandwidth speed test. The host bursts
+/// filler access units (flagged [`crate::packet::FLAG_PROBE`]) over the data plane at
+/// `target_kbps` of application goodput for `duration_ms`, *pausing video for the duration*, then
+/// replies with [`ProbeResult`]. The client measures the received probe bytes + time to estimate
+/// the link's sustainable rate (and the loss vs. the host's reported send count) so it can pick a
+/// [`Hello::bitrate_kbps`]. The host clamps both fields to sane bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeRequest {
+    /// Goodput rate the host should send the probe at, in kilobits per second.
+    pub target_kbps: u32,
+    /// How long to burst, in milliseconds.
+    pub duration_ms: u32,
+}
+
+/// `host → client`: the probe burst is finished. Reports what the host actually sent so the
+/// client can compute delivery ratio (loss) = `received / bytes_sent` and throughput =
+/// `received_bytes * 8 / elapsed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeResult {
+    /// Total access-unit payload bytes the host emitted for the probe.
+    pub bytes_sent: u64,
+    /// Number of probe access units the host emitted.
+    pub packets_sent: u32,
+    /// The burst's actual duration in milliseconds (the host clamps/measures the request).
+    pub duration_ms: u32,
+}
+
 /// Type byte of [`Reconfigure`] (first byte after the magic).
 pub const MSG_RECONFIGURE: u8 = 0x01;
 /// Type byte of [`Reconfigured`].
 pub const MSG_RECONFIGURED: u8 = 0x02;
+/// Type byte of [`ProbeRequest`].
+pub const MSG_PROBE_REQUEST: u8 = 0x20;
+/// Type byte of [`ProbeResult`].
+pub const MSG_PROBE_RESULT: u8 = 0x21;
 
 // ---------------------------------------------------------------------------------------------
 // Pairing ceremony (typed control messages): instead of a session Hello, a client may open
@@ -379,6 +420,7 @@ impl Hello {
         b.extend_from_slice(&self.mode.refresh_hz.to_le_bytes());
         b.push(self.compositor.to_u8()); // appended at offset 20 — older hosts read [0..20] and skip it
         b.push(self.gamepad.to_u8()); // appended at offset 21 — same back-compat discipline
+        b.extend_from_slice(&self.bitrate_kbps.to_le_bytes()); // appended at offset 22..26
         b
     }
 
@@ -403,6 +445,11 @@ impl Hello {
                 .get(21)
                 .map(|&v| GamepadPref::from_u8(v))
                 .unwrap_or_default(),
+            // Optional trailing 4 bytes (LE) — absent on an older client → `0` (host default).
+            bitrate_kbps: b
+                .get(22..26)
+                .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+                .unwrap_or(0),
         })
     }
 }
@@ -429,13 +476,15 @@ impl Welcome {
         b.extend_from_slice(&self.frames.to_le_bytes());
         b.push(self.compositor.to_u8()); // appended at offset 53 — older clients read [0..53] and skip it
         b.push(self.gamepad.to_u8()); // appended at offset 54 — same back-compat discipline
+        b.extend_from_slice(&self.bitrate_kbps.to_le_bytes()); // appended at offset 55..59
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<Welcome> {
         // Layout (LE): magic[0..4] abi[4..8] port[8..10] w[10..14] h[14..18] hz[18..22]
         // scheme[22] pct[23] max_data[24..26] shard[26..28] encrypt[28] key[29..45]
-        // salt[45..49] frames[49..53] compositor[53] gamepad[54] (optional trailing bytes).
+        // salt[45..49] frames[49..53] compositor[53] gamepad[54] bitrate_kbps[55..59]
+        // (compositor/gamepad/bitrate are optional trailing bytes).
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -477,6 +526,11 @@ impl Welcome {
                 .get(54)
                 .map(|&v| GamepadPref::from_u8(v))
                 .unwrap_or_default(),
+            // Optional trailing 4 bytes (LE) — absent on an older host → `0` (unknown).
+            bitrate_kbps: b
+                .get(55..59)
+                .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+                .unwrap_or(0),
         })
     }
 
@@ -563,6 +617,53 @@ impl Reconfigured {
                 height: u32at(10),
                 refresh_hz: u32at(14),
             },
+        })
+    }
+}
+
+impl ProbeRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] target_kbps[5..9] duration_ms[9..13]
+        let mut b = Vec::with_capacity(13);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_PROBE_REQUEST);
+        b.extend_from_slice(&self.target_kbps.to_le_bytes());
+        b.extend_from_slice(&self.duration_ms.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ProbeRequest> {
+        if b.len() != 13 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PROBE_REQUEST {
+            return Err(PunktfunkError::InvalidArg("bad ProbeRequest"));
+        }
+        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        Ok(ProbeRequest {
+            target_kbps: u32at(5),
+            duration_ms: u32at(9),
+        })
+    }
+}
+
+impl ProbeResult {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] bytes_sent[5..13] packets_sent[13..17] duration_ms[17..21]
+        let mut b = Vec::with_capacity(21);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_PROBE_RESULT);
+        b.extend_from_slice(&self.bytes_sent.to_le_bytes());
+        b.extend_from_slice(&self.packets_sent.to_le_bytes());
+        b.extend_from_slice(&self.duration_ms.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ProbeResult> {
+        if b.len() != 21 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PROBE_RESULT {
+            return Err(PunktfunkError::InvalidArg("bad ProbeResult"));
+        }
+        Ok(ProbeResult {
+            bytes_sent: u64::from_le_bytes(b[5..13].try_into().unwrap()),
+            packets_sent: u32::from_le_bytes(b[13..17].try_into().unwrap()),
+            duration_ms: u32::from_le_bytes(b[17..21].try_into().unwrap()),
         })
     }
 }
@@ -1149,6 +1250,7 @@ mod tests {
             frames: 600,
             compositor: CompositorPref::Gamescope,
             gamepad: GamepadPref::DualSense,
+            bitrate_kbps: 50_000,
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
     }
@@ -1164,6 +1266,7 @@ mod tests {
             },
             compositor: CompositorPref::Kwin,
             gamepad: GamepadPref::DualSense,
+            bitrate_kbps: 25_000,
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -1227,18 +1330,26 @@ mod tests {
             },
             compositor: CompositorPref::Mutter,
             gamepad: GamepadPref::DualSense,
+            bitrate_kbps: 80_000,
         };
         let enc = h.encode();
-        assert_eq!(enc.len(), 22);
-        // Legacy (20-byte) Hello → both Auto, mode intact.
+        assert_eq!(enc.len(), 26);
+        // Legacy (20-byte) Hello → both Auto, no bitrate, mode intact.
         let legacy = Hello::decode(&enc[..20]).unwrap();
         assert_eq!(legacy.compositor, CompositorPref::Auto);
         assert_eq!(legacy.gamepad, GamepadPref::Auto);
+        assert_eq!(legacy.bitrate_kbps, 0);
         assert_eq!(legacy.mode, h.mode);
         // Compositor-era (21-byte) Hello → compositor intact, gamepad Auto.
         let mid = Hello::decode(&enc[..21]).unwrap();
         assert_eq!(mid.compositor, CompositorPref::Mutter);
         assert_eq!(mid.gamepad, GamepadPref::Auto);
+        // Gamepad-era (22-byte) Hello → compositor + gamepad intact, bitrate 0 (host default).
+        let pre_bitrate = Hello::decode(&enc[..22]).unwrap();
+        assert_eq!(pre_bitrate.gamepad, GamepadPref::DualSense);
+        assert_eq!(pre_bitrate.bitrate_kbps, 0);
+        // Full message → bitrate intact.
+        assert_eq!(Hello::decode(&enc).unwrap().bitrate_kbps, 80_000);
 
         let w = Welcome {
             abi_version: 2,
@@ -1256,17 +1367,24 @@ mod tests {
             frames: 0,
             compositor: CompositorPref::Kwin,
             gamepad: GamepadPref::Xbox360,
+            bitrate_kbps: 120_000,
         };
         let wenc = w.encode();
-        assert_eq!(wenc.len(), 55);
+        assert_eq!(wenc.len(), 59);
         let legacy_w = Welcome::decode(&wenc[..53]).unwrap();
         assert_eq!(legacy_w.compositor, CompositorPref::Auto);
         assert_eq!(legacy_w.gamepad, GamepadPref::Auto);
+        assert_eq!(legacy_w.bitrate_kbps, 0);
         assert_eq!(legacy_w.frames, 0);
         assert_eq!(legacy_w.key, w.key);
         let mid_w = Welcome::decode(&wenc[..54]).unwrap();
         assert_eq!(mid_w.compositor, CompositorPref::Kwin);
         assert_eq!(mid_w.gamepad, GamepadPref::Auto);
+        // Gamepad-era (55-byte) Welcome → gamepad intact, bitrate 0 (unknown).
+        let pre_bitrate_w = Welcome::decode(&wenc[..55]).unwrap();
+        assert_eq!(pre_bitrate_w.gamepad, GamepadPref::Xbox360);
+        assert_eq!(pre_bitrate_w.bitrate_kbps, 0);
+        assert_eq!(Welcome::decode(&wenc).unwrap().bitrate_kbps, 120_000);
     }
 
     #[test]
@@ -1298,6 +1416,25 @@ mod tests {
     }
 
     #[test]
+    fn probe_messages_roundtrip() {
+        let req = ProbeRequest {
+            target_kbps: 250_000,
+            duration_ms: 2000,
+        };
+        assert_eq!(ProbeRequest::decode(&req.encode()).unwrap(), req);
+        let res = ProbeResult {
+            bytes_sent: 62_500_000,
+            packets_sent: 480,
+            duration_ms: 2003,
+        };
+        assert_eq!(ProbeResult::decode(&res.encode()).unwrap(), res);
+        // Type bytes keep the control messages disjoint from each other.
+        assert!(ProbeRequest::decode(&res.encode()).is_err());
+        assert!(Reconfigure::decode(&req.encode()).is_err());
+        assert!(ProbeResult::decode(&req.encode()).is_err());
+    }
+
+    #[test]
     fn control_messages_disjoint_from_hello() {
         // A Hello uses MAGIC (PKF1); control messages use CTL_MAGIC (PKFc). No Hello — at
         // any abi_version — can be misparsed as a control message, and vice-versa.
@@ -1311,6 +1448,7 @@ mod tests {
                 },
                 compositor: CompositorPref::Auto,
                 gamepad: GamepadPref::Auto,
+                bitrate_kbps: 0,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");

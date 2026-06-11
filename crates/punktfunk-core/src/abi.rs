@@ -749,6 +749,50 @@ pub unsafe extern "C" fn punktfunk_connect_ex2(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
+    unsafe {
+        punktfunk_connect_ex3(
+            host,
+            port,
+            width,
+            height,
+            refresh_hz,
+            compositor,
+            gamepad,
+            0, // bitrate_kbps = 0: let the host pick its default
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            timeout_ms,
+        )
+    }
+}
+
+/// Like [`punktfunk_connect_ex2`], but additionally requests the video encoder `bitrate_kbps`
+/// (kilobits per second). `0` lets the host pick its default; any other value is clamped to the
+/// host's supported range. After a speed test ([`punktfunk_connection_speed_test`]) a client can
+/// reconnect (or pick at connect time) with the measured rate. The value the host actually
+/// configured is readable via [`punktfunk_connection_bitrate`].
+///
+/// # Safety
+/// Same as [`punktfunk_connect`].
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connect_ex3(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    gamepad: u32,
+    bitrate_kbps: u32,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    timeout_ms: u32,
+) -> *mut PunktfunkConnection {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if host.is_null() {
             return std::ptr::null_mut();
@@ -790,6 +834,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex2(
             mode,
             pref,
             gamepad,
+            bitrate_kbps,
             pin,
             identity,
             std::time::Duration::from_millis(timeout_ms as u64),
@@ -1245,6 +1290,32 @@ pub unsafe extern "C" fn punktfunk_connection_gamepad(
     })
 }
 
+/// The video encoder bitrate (kilobits per second) the host actually configured for this session
+/// — the [`punktfunk_connect_ex3`] request clamped to the host's range, or its default when `0`
+/// was requested. `0` = an older host that didn't report it. Safe any time after connect.
+///
+/// # Safety
+/// `c` is a valid connection handle; `bitrate_kbps` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_bitrate(
+    c: *const PunktfunkConnection,
+    bitrate_kbps: *mut u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        unsafe {
+            if !bitrate_kbps.is_null() {
+                *bitrate_kbps = c.inner.resolved_bitrate_kbps;
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// Ask the host to switch the live session to `width`x`height`@`refresh_hz` without
 /// reconnecting (window resized, refresh changed). Non-blocking enqueue: on acceptance the
 /// stream continues at the new mode — the first new-mode access unit is an IDR with
@@ -1275,6 +1346,91 @@ pub unsafe extern "C" fn punktfunk_connection_request_mode(
             Ok(()) => PunktfunkStatus::Ok,
             Err(e) => e.status(),
         }
+    })
+}
+
+/// A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
+/// the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
+/// measured goodput to drive a bitrate choice from; `loss_pct` is the delivery loss at that rate.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PunktfunkProbeResult {
+    /// 1 once the host's end-of-burst report arrived (measurement final); else 0 (partial).
+    pub done: u8,
+    /// Probe payload bytes / packets the client received.
+    pub recv_bytes: u64,
+    pub recv_packets: u32,
+    /// Probe payload bytes / packets the host reported sending.
+    pub host_bytes: u64,
+    pub host_packets: u32,
+    /// Client-measured receive window (first→last probe AU), milliseconds.
+    pub elapsed_ms: u32,
+    /// Measured goodput = `recv_bytes * 8 / elapsed_ms` (kilobits/second).
+    pub throughput_kbps: u32,
+    /// Delivery loss `(host_bytes - recv_bytes) / host_bytes` as a percentage (0 if unknown).
+    pub loss_pct: f32,
+}
+
+/// Start a bandwidth speed test: ask the host to burst filler over the data plane at
+/// `target_kbps` of goodput for `duration_ms` (each clamped host-side to ≤ 1 Gbps / ≤ 5 s),
+/// *briefly pausing video*. Non-blocking — poll [`punktfunk_connection_probe_result`] until its
+/// `done` field is 1. Starting a probe resets any prior measurement.
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_speed_test(
+    c: *const PunktfunkConnection,
+    target_kbps: u32,
+    duration_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        match c.inner.request_probe(target_kbps, duration_ms) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Read the current speed-test measurement into `*out` (partial until `out->done == 1`). Safe to
+/// poll repeatedly after [`punktfunk_connection_speed_test`]; before any probe it reports zeros.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable for one `PunktfunkProbeResult` (NULL is an
+/// error).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_probe_result(
+    c: *const PunktfunkConnection,
+    out: *mut PunktfunkProbeResult,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if out.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        let o = c.inner.probe_result();
+        unsafe {
+            *out = PunktfunkProbeResult {
+                done: o.done as u8,
+                recv_bytes: o.recv_bytes,
+                recv_packets: o.recv_packets,
+                host_bytes: o.host_bytes,
+                host_packets: o.host_packets,
+                elapsed_ms: o.elapsed_ms,
+                throughput_kbps: o.throughput_kbps,
+                loss_pct: o.loss_pct,
+            };
+        }
+        PunktfunkStatus::Ok
     })
 }
 

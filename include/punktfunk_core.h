@@ -137,6 +137,11 @@
 
 #define FLAG_SOF 4
 
+// Bandwidth-probe filler, not decodable video: a [`crate::quic::ProbeRequest`] speed test makes
+// the host burst access units carrying this flag so the client measures throughput/loss without
+// feeding them to the decoder. Punktfunk/1 only (GameStream never sets it).
+#define FLAG_PROBE 8
+
 // Largest UDP datagram the core will send or accept. `Config::validate` bounds
 // `shard_payload` so `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD ≤ MAX_DATAGRAM_BYTES`.
 #define MAX_DATAGRAM_BYTES 2048
@@ -149,6 +154,16 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`Reconfigured`].
 #define MSG_RECONFIGURED 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ProbeRequest`].
+#define MSG_PROBE_REQUEST 32
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ProbeResult`].
+#define MSG_PROBE_RESULT 33
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -408,6 +423,26 @@ typedef struct {
 } PunktfunkRichInput;
 #endif
 
+// A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
+// the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
+// measured goodput to drive a bitrate choice from; `loss_pct` is the delivery loss at that rate.
+typedef struct {
+    // 1 once the host's end-of-burst report arrived (measurement final); else 0 (partial).
+    uint8_t done;
+    // Probe payload bytes / packets the client received.
+    uint64_t recv_bytes;
+    uint32_t recv_packets;
+    // Probe payload bytes / packets the host reported sending.
+    uint64_t host_bytes;
+    uint32_t host_packets;
+    // Client-measured receive window (first→last probe AU), milliseconds.
+    uint32_t elapsed_ms;
+    // Measured goodput = `recv_bytes * 8 / elapsed_ms` (kilobits/second).
+    uint32_t throughput_kbps;
+    // Delivery loss `(host_bytes - recv_bytes) / host_bytes` as a percentage (0 if unknown).
+    float loss_pct;
+} PunktfunkProbeResult;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -555,6 +590,30 @@ PunktfunkConnection *punktfunk_connect_ex2(const char *host,
                                            uint32_t refresh_hz,
                                            uint32_t compositor,
                                            uint32_t gamepad,
+                                           const uint8_t *pin_sha256,
+                                           uint8_t *observed_sha256_out,
+                                           const char *client_cert_pem,
+                                           const char *client_key_pem,
+                                           uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect_ex2`], but additionally requests the video encoder `bitrate_kbps`
+// (kilobits per second). `0` lets the host pick its default; any other value is clamped to the
+// host's supported range. After a speed test ([`punktfunk_connection_speed_test`]) a client can
+// reconnect (or pick at connect time) with the measured rate. The value the host actually
+// configured is readable via [`punktfunk_connection_bitrate`].
+//
+// # Safety
+// Same as [`punktfunk_connect`].
+PunktfunkConnection *punktfunk_connect_ex3(const char *host,
+                                           uint16_t port,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t refresh_hz,
+                                           uint32_t compositor,
+                                           uint32_t gamepad,
+                                           uint32_t bitrate_kbps,
                                            const uint8_t *pin_sha256,
                                            uint8_t *observed_sha256_out,
                                            const char *client_cert_pem,
@@ -716,6 +775,16 @@ PunktfunkStatus punktfunk_connection_gamepad(const PunktfunkConnection *c, uint3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// The video encoder bitrate (kilobits per second) the host actually configured for this session
+// — the [`punktfunk_connect_ex3`] request clamped to the host's range, or its default when `0`
+// was requested. `0` = an older host that didn't report it. Safe any time after connect.
+//
+// # Safety
+// `c` is a valid connection handle; `bitrate_kbps` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_bitrate(const PunktfunkConnection *c, uint32_t *bitrate_kbps);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Ask the host to switch the live session to `width`x`height`@`refresh_hz` without
 // reconnecting (window resized, refresh changed). Non-blocking enqueue: on acceptance the
 // stream continues at the new mode — the first new-mode access unit is an IDR with
@@ -729,6 +798,30 @@ PunktfunkStatus punktfunk_connection_request_mode(const PunktfunkConnection *c,
                                                   uint32_t width,
                                                   uint32_t height,
                                                   uint32_t refresh_hz);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Start a bandwidth speed test: ask the host to burst filler over the data plane at
+// `target_kbps` of goodput for `duration_ms` (each clamped host-side to ≤ 1 Gbps / ≤ 5 s),
+// *briefly pausing video*. Non-blocking — poll [`punktfunk_connection_probe_result`] until its
+// `done` field is 1. Starting a probe resets any prior measurement.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_speed_test(const PunktfunkConnection *c,
+                                                uint32_t target_kbps,
+                                                uint32_t duration_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Read the current speed-test measurement into `*out` (partial until `out->done == 1`). Safe to
+// poll repeatedly after [`punktfunk_connection_speed_test`]; before any probe it reports zeros.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable for one `PunktfunkProbeResult` (NULL is an
+// error).
+PunktfunkStatus punktfunk_connection_probe_result(const PunktfunkConnection *c,
+                                                  PunktfunkProbeResult *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

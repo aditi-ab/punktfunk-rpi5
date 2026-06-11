@@ -30,6 +30,10 @@ pub const PUNKTFUNK_MAGIC: u8 = 0xC9;
 pub const FLAG_PIC: u8 = 0x1;
 pub const FLAG_EOF: u8 = 0x2;
 pub const FLAG_SOF: u8 = 0x4;
+/// Bandwidth-probe filler, not decodable video: a [`crate::quic::ProbeRequest`] speed test makes
+/// the host burst access units carrying this flag so the client measures throughput/loss without
+/// feeding them to the decoder. Punktfunk/1 only (GameStream never sets it).
+pub const FLAG_PROBE: u8 = 0x8;
 
 /// Crypto framing overhead [`Session`](crate::session::Session) adds when encrypting:
 /// an 8-byte sequence prefix plus the GCM tag.

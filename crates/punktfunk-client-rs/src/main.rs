@@ -39,7 +39,10 @@ use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::GamepadPref;
 use punktfunk_core::config::Role;
 use punktfunk_core::input::{InputEvent, InputKind};
-use punktfunk_core::quic::{endpoint, io, Hello, Reconfigure, Reconfigured, Start, Welcome};
+use punktfunk_core::packet::FLAG_PROBE;
+use punktfunk_core::quic::{
+    endpoint, io, Hello, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, Start, Welcome,
+};
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::{CompositorPref, Mode, PunktfunkError, Session};
 use std::io::Write;
@@ -67,6 +70,11 @@ struct Args {
     compositor: CompositorPref,
     /// `--gamepad NAME` — request a host virtual-pad backend (auto|xbox360|dualsense).
     gamepad: GamepadPref,
+    /// `--bitrate KBPS` — request this encoder bitrate (kilobits/s); 0 = host default.
+    bitrate_kbps: u32,
+    /// `--speed-test KBPS:MS` — after the stream starts, ask the host for a `MS`-millisecond
+    /// bandwidth probe burst at `KBPS`, then report measured throughput + loss.
+    speed_test: Option<(u32, u32)>,
 }
 
 fn parse_mode(m: &str) -> Option<Mode> {
@@ -178,6 +186,11 @@ fn parse_args() -> Args {
         name: get("--name").unwrap_or("punktfunk-client-rs").to_string(),
         compositor,
         gamepad,
+        bitrate_kbps: get("--bitrate").and_then(|s| s.parse().ok()).unwrap_or(0),
+        speed_test: get("--speed-test").and_then(|s| {
+            let (kbps, ms) = s.split_once(':')?;
+            Some((kbps.parse().ok()?, ms.parse().ok()?))
+        }),
     }
 }
 
@@ -263,6 +276,7 @@ async fn session(args: Args) -> Result<()> {
             mode: args.mode,
             compositor: args.compositor,
             gamepad: args.gamepad,
+            bitrate_kbps: args.bitrate_kbps,
         }
         .encode(),
     )
@@ -292,9 +306,18 @@ async fn session(args: Args) -> Result<()> {
     )
     .await?;
 
+    // Speed-test accumulators: the data-plane loop folds each FLAG_PROBE filler AU in here; the
+    // --speed-test reporter below reads them once the host's ProbeResult lands. first/last hold
+    // now_ns timestamps of the receive window (0 = unset).
+    let probe_recv_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let probe_recv_packets = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let probe_first_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let probe_last_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // Mid-stream renegotiation test: after a delay, ask the host to switch modes on the
     // still-open control stream. The stream then carries new-mode AUs (IDR + in-band
-    // parameter sets) — ffprobe the --out file to see both resolutions.
+    // parameter sets) — ffprobe the --out file to see both resolutions. Mutually exclusive with
+    // --speed-test (both own the control stream).
     if let Some((new_mode, after_secs)) = args.remode {
         let mut rs = send;
         let mut rr = recv;
@@ -318,6 +341,70 @@ async fn session(args: Args) -> Result<()> {
                 Ok(Ok(ack)) => tracing::warn!(active = ?ack.mode, "mode switch REJECTED"),
                 other => tracing::error!(?other, "bad Reconfigured"),
             }
+        });
+    } else if let Some((target_kbps, duration_ms)) = args.speed_test {
+        // Bandwidth probe: after the stream warms up, ask the host to burst FLAG_PROBE filler;
+        // measure what arrives vs. what it reports sending.
+        let mut ss = send;
+        let mut sr = recv;
+        let (pb, pp, pf, pl) = (
+            probe_recv_bytes.clone(),
+            probe_recv_packets.clone(),
+            probe_first_ns.clone(),
+            probe_last_ns.clone(),
+        );
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await; // let the stream warm up
+            tracing::info!(target_kbps, duration_ms, "requesting speed-test probe");
+            if io::write_msg(
+                &mut ss,
+                &ProbeRequest {
+                    target_kbps,
+                    duration_ms,
+                }
+                .encode(),
+            )
+            .await
+            .is_err()
+            {
+                tracing::error!("ProbeRequest write failed");
+                return;
+            }
+            let res = match io::read_msg(&mut sr).await.map(|b| ProbeResult::decode(&b)) {
+                Ok(Ok(r)) => r,
+                other => {
+                    tracing::error!(?other, "bad ProbeResult");
+                    return;
+                }
+            };
+            // The reliable result can beat the last UDP shards — let them reassemble.
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let recv_bytes = pb.load(Relaxed);
+            let recv_packets = pp.load(Relaxed);
+            let (first, last) = (pf.load(Relaxed), pl.load(Relaxed));
+            let window_ms = if first > 0 && last > first {
+                (last - first) / 1_000_000
+            } else {
+                0
+            };
+            let throughput_kbps = recv_bytes.saturating_mul(8).checked_div(window_ms).unwrap_or(0);
+            let loss_pct = if res.bytes_sent > 0 {
+                res.bytes_sent.saturating_sub(recv_bytes) as f64 / res.bytes_sent as f64 * 100.0
+            } else {
+                0.0
+            };
+            tracing::info!(
+                target_kbps,
+                host_sent_bytes = res.bytes_sent,
+                host_sent_packets = res.packets_sent,
+                recv_bytes,
+                recv_packets,
+                window_ms,
+                throughput_kbps,
+                loss_pct = format!("{loss_pct:.1}%"),
+                "SPEED TEST complete",
+            );
         });
     }
 
@@ -581,6 +668,12 @@ async fn session(args: Args) -> Result<()> {
     let cfg = welcome.session_config(Role::Client);
     let expected = welcome.frames;
     let out_path = args.out.clone();
+    let (pb, pp, pf, pl) = (
+        probe_recv_bytes.clone(),
+        probe_recv_packets.clone(),
+        probe_first_ns.clone(),
+        probe_last_ns.clone(),
+    );
 
     // Data plane on a blocking thread (native threads only on the frame path).
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -619,6 +712,17 @@ async fn session(args: Args) -> Result<()> {
             match session.poll_frame() {
                 Ok(frame) => {
                     last_rx = std::time::Instant::now();
+                    // Speed-test filler isn't video: fold it into the probe accumulators and skip
+                    // verification / the --out sink.
+                    if frame.flags & FLAG_PROBE as u32 != 0 {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let n = now_ns();
+                        let _ = pf.compare_exchange(0, n, Relaxed, Relaxed);
+                        pl.store(n, Relaxed);
+                        pb.fetch_add(frame.data.len() as u64, Relaxed);
+                        pp.fetch_add(1, Relaxed);
+                        continue;
+                    }
                     bytes += frame.data.len() as u64;
                     // The host stamps pts with its capture wall clock; same-host runs share it.
                     let lat = now_ns().saturating_sub(frame.pts_ns);
