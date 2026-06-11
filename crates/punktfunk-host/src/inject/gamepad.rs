@@ -357,7 +357,11 @@ impl VirtualPad {
             if n != buf.len() as isize {
                 break; // EAGAIN / short read — queue drained
             }
-            let ev: InputEventRaw = unsafe { std::ptr::read(buf.as_ptr() as *const _) };
+            // SAFETY: `buf` is exactly `size_of::<InputEventRaw>()` bytes and fully written by the
+            // `read` above. `read_unaligned` (not `read`) because the `[u8]` buffer is 1-aligned but
+            // `InputEventRaw` needs 8 (it holds a `timeval`) — a plain `ptr::read` would be UB.
+            let ev: InputEventRaw =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const InputEventRaw) };
             match (ev.type_, ev.code) {
                 (EV_UINPUT, UI_FF_UPLOAD) => {
                     let mut up: UinputFfUpload = unsafe { std::mem::zeroed() };

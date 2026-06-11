@@ -1578,9 +1578,10 @@ fn virtual_stream(
         if perf && last_perf.elapsed() >= std::time::Duration::from_secs(2) {
             let s = session.stats();
             let secs = last_perf.elapsed().as_secs_f64();
-            let wire_mbps = (s.bytes_sent - last_bytes) as f64 * 8.0 / secs / 1_000_000.0;
+            // Attempted (sealed) transmit rate; `send_dropped` below is what didn't reach the wire.
+            let tx_mbps = (s.bytes_sent - last_bytes) as f64 * 8.0 / secs / 1_000_000.0;
             tracing::info!(
-                wire_mbps = format!("{wire_mbps:.0}"),
+                tx_mbps = format!("{tx_mbps:.0}"),
                 frames = sent,
                 send_dropped = s.packets_send_dropped - last_send_dropped,
                 send_dropped_total = s.packets_send_dropped,

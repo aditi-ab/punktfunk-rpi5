@@ -231,6 +231,12 @@ impl Session {
             let i = self.recv_idx;
             self.recv_idx += 1;
             let len = self.recv_lens[i];
+            // An oversized datagram fills the whole buffer (recvmmsg truncates + caps msg_len at the
+            // buffer size) — drop it rather than hand up a truncated, corrupt packet, mirroring the
+            // scalar `recv`'s `n >= RECV_BUF` check.
+            if len > MAX_DATAGRAM_BYTES {
+                continue;
+            }
             let pkt = match self.open_from_wire(&self.recv_scratch[i][..len]) {
                 Ok(p) => p,
                 Err(_) => continue,

@@ -16,6 +16,23 @@ use std::net::UdpSocket;
 /// silently truncating it.
 const RECV_BUF: usize = MAX_DATAGRAM_BYTES + 1;
 
+/// Build one `mmsghdr` per `iovec` (each a single-buffer message) for `sendmmsg`/`recvmmsg`. Shared
+/// by `send_batch` + `recv_batch` so the raw-pointer scaffolding lives in exactly one place.
+///
+/// SAFETY (caller's): each returned header holds a raw pointer into `iovs`; the caller MUST keep
+/// `iovs` alive and unmoved for as long as the headers are passed to the syscall.
+#[cfg(target_os = "linux")]
+fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<libc::mmsghdr> {
+    iovs.iter_mut()
+        .map(|iov| {
+            let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            h.msg_hdr.msg_iov = iov;
+            h.msg_hdr.msg_iovlen = 1;
+            h
+        })
+        .collect()
+}
+
 pub struct UdpTransport {
     socket: UdpSocket,
 }
@@ -31,7 +48,8 @@ impl UdpTransport {
     /// Sized for 1 Gbps+: at ~1.2 Gbps on the wire an 8 MB buffer is only ~49 ms of steady state,
     /// and a single multi-MB IDR keyframe (~4 MB ≈ 3300 packets) instantly fills most of it. 32 MB
     /// gives ~200 ms of headroom and absorbs a keyframe burst without EAGAIN drops. (Paced sending
-    /// will reduce the buffer actually needed once it lands — see the 1 Gbps roadmap work.)
+    /// — `m3.rs::paced_submit` — now spreads a big frame's overflow, so this buffer mostly absorbs
+    /// the immediate microburst rather than a whole unpaced frame.)
     const TARGET_SOCKBUF: usize = 32 * 1024 * 1024;
 
     /// Bind `local` and `connect` to `peer`, so `send`/`recv` need no address and the
@@ -109,15 +127,7 @@ impl Transport for UdpTransport {
                     iov_len: p.len(),
                 })
                 .collect();
-            let mut hdrs: Vec<libc::mmsghdr> = iovs
-                .iter_mut()
-                .map(|iov| {
-                    let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                    h.msg_hdr.msg_iov = iov;
-                    h.msg_hdr.msg_iovlen = 1;
-                    h
-                })
-                .collect();
+            let mut hdrs = mmsghdrs(&mut iovs);
             let n = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as libc::c_uint, 0) };
             if n < 0 {
                 let err = std::io::Error::last_os_error();
@@ -172,15 +182,7 @@ impl Transport for UdpTransport {
                 iov_len: b.len(),
             })
             .collect();
-        let mut hdrs: Vec<libc::mmsghdr> = iovs
-            .iter_mut()
-            .map(|iov| {
-                let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                h.msg_hdr.msg_iov = iov;
-                h.msg_hdr.msg_iovlen = 1;
-                h
-            })
-            .collect();
+        let mut hdrs = mmsghdrs(&mut iovs);
         let n = unsafe {
             libc::recvmmsg(
                 fd,

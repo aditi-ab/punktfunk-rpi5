@@ -11,7 +11,8 @@
 //! Requirements: gamescope built with PipeWire + libei input emulation (distro packages are);
 //! a usable Vulkan device (the NVIDIA render node). Headless capture on the proprietary NVIDIA
 //! driver is plausible-by-architecture but not a well-trodden path — validate empirically.
-//! Input is a gamescope-specific libei/EIS socket (`LIBEI_SOCKET`), wired separately (TODO).
+//! Input uses gamescope's own libei/EIS socket (`LIBEI_SOCKET`), relayed to the libei backend (see
+//! `inject/libei.rs`) — wired and live-validated.
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, Context, Result};
