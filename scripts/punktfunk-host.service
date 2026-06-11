@@ -1,19 +1,29 @@
-# punktfunk streaming host — systemd USER unit.
+# punktfunk streaming host — systemd USER unit (`serve --native` = GameStream + punktfunk/1).
 #
-# Install:
+# Install (against an already-running compositor session):
 #   mkdir -p ~/.config/systemd/user && cp scripts/punktfunk-host.service ~/.config/systemd/user/
-#   cp scripts/host.env.example ~/.config/punktfunk/host.env   # then edit
+#   cp scripts/host.env.example ~/.config/punktfunk/host.env   # then edit for your backend
 #   systemctl --user daemon-reload && systemctl --user enable --now punktfunk-host
 #
-# The unit assumes the compositor session (e.g. headless KWin on wayland-kde) is already up;
-# for a fully self-contained appliance, pair it with a kwin_wayland user unit it can After=.
+# Self-contained boot appliance (no login, no manual steps after boot):
+#   - kwin backend (stream the Plasma desktop): also install + enable
+#     punktfunk-kde-session.service (it brings up the headless KWin session this After=s), and set
+#     PUNKTFUNK_COMPOSITOR=kwin + WAYLAND_DISPLAY=wayland-kde in host.env.
+#   - gamescope backend (stream a nested app, no desktop): set PUNKTFUNK_COMPOSITOR=gamescope in
+#     host.env — the host spawns gamescope per session, so no kde-session unit is needed.
+#   Then `sudo loginctl enable-linger "$USER"` so user units start at boot, and reboot.
+#
+# The host LISTENS as soon as it starts and only touches the compositor per session (on a client
+# connect), so the After= below is a soft ordering, not a hard readiness gate — the kde-session
+# unit (when present) just needs to be up by the time a client streams (seconds later, user-driven).
+# A missing After= unit (e.g. gamescope backend, no kde-session installed) is simply ignored.
 [Unit]
-Description=punktfunk GameStream host
-After=pipewire.service
+Description=punktfunk GameStream + punktfunk/1 host
+After=pipewire.service punktfunk-kde-session.service
 
 [Service]
 EnvironmentFile=%h/.config/punktfunk/host.env
-ExecStart=%h/punktfunk/target/release/punktfunk-host serve
+ExecStart=%h/punktfunk/target/release/punktfunk-host serve --native
 Restart=on-failure
 RestartSec=2
 

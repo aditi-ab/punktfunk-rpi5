@@ -1,0 +1,33 @@
+# punktfunk headless KDE Plasma session — systemd USER unit.
+#
+# Brings up `kwin --virtual` on WAYLAND_DISPLAY=wayland-kde plus the full Plasma desktop
+# (portals, polkit agent, a supervised plasmashell) via run-headless-kde.sh, so the punktfunk
+# host's *kwin* backend can stream the live desktop. This is what makes a headless box a
+# self-contained streaming appliance: no display manager, no login, no manual script — the
+# session comes up at boot. Pair it with punktfunk-host.service (kwin backend) + linger.
+#
+# The script foregrounds on `wait $KWIN_PID` and re-spawns plasmashell for KWin's lifetime, so
+# Type=simple + Restart=always keeps the desktop alive (a KWin crash brings the whole session
+# back). It sets its own env (XDG_CURRENT_DESKTOP=KDE, WAYLAND_DISPLAY=wayland-kde,
+# XDG_MENU_PREFIX=plasma-, …) — see run-headless-kde.sh.
+#
+# Appliance install (boot with no interaction):
+#   cp scripts/punktfunk-kde-session.service scripts/punktfunk-host.service ~/.config/systemd/user/
+#   cp scripts/host.env.example ~/.config/punktfunk/host.env   # edit for the kwin backend
+#   systemctl --user daemon-reload
+#   systemctl --user enable punktfunk-kde-session punktfunk-host
+#   sudo loginctl enable-linger "$USER"   # <-- starts user units at boot WITHOUT a login
+#   reboot                                #     (or: systemctl --user start … to bring up now)
+[Unit]
+Description=punktfunk headless KDE Plasma session (kwin --virtual on wayland-kde)
+After=pipewire.service pipewire-pulse.service dbus.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bash %h/punktfunk/scripts/headless/run-headless-kde.sh 1920x1080
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
