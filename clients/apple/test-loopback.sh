@@ -19,7 +19,9 @@ CFG="$(mktemp -d "${TMPDIR:-/tmp}/punktfunk-loopback.XXXXXX")"
 PAIR_LOG="$CFG/pairing-host.log"
 mkdir -p "$CFG/open" "$CFG/paired"
 trap 'kill "${HOST_PID:-}" "${PAIR_PID:-}" 2>/dev/null || true' EXIT
-HOME="$CFG/open" XDG_CONFIG_HOME="$CFG/open/.config" \
+# The open host also scripts a feedback burst (rumble + DualSense hidout) right after the
+# handshake, so the Swift test can assert the host→client feedback planes end to end.
+HOME="$CFG/open" XDG_CONFIG_HOME="$CFG/open/.config" PUNKTFUNK_TEST_FEEDBACK=1 \
     target/release/punktfunk-host m3-host --port "$PORT" --source synthetic --frames 300 &
 HOST_PID=$!
 HOME="$CFG/paired" XDG_CONFIG_HOME="$CFG/paired/.config" \
@@ -41,4 +43,5 @@ fi
 
 cd clients/apple
 PUNKTFUNK_LOOPBACK_PORT="$PORT" PUNKTFUNK_PAIRING_PORT="$PAIR_PORT" PUNKTFUNK_PAIRING_PIN="$PIN" \
+    PUNKTFUNK_TEST_FEEDBACK=1 \
     swift test --filter LoopbackIntegrationTests

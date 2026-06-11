@@ -55,6 +55,21 @@
 // gamescope (spawned nested).
 #define PUNKTFUNK_COMPOSITOR_GAMESCOPE 4
 
+// Gamepad-backend preference for [`punktfunk_connect_ex2`] (`gamepad` arg): which virtual pad
+// the host creates for this session's controllers. Precedence host-side: an explicit client
+// choice > the host's `PUNKTFUNK_GAMEPAD` env var > X-Box 360. `AUTO` (or any unrecognized
+// value) = host decides. The resolved choice is echoed over the protocol (`Welcome`) and
+// readable via [`punktfunk_connection_gamepad`].
+#define PUNKTFUNK_GAMEPAD_AUTO 0
+
+// uinput X-Box 360 pad (the universal default — every game speaks XInput).
+#define PUNKTFUNK_GAMEPAD_XBOX360 1
+
+// UHID DualSense (kernel `hid-playstation`): adaptive triggers, lightbar, touchpad, motion —
+// feedback arrives on the HID-output plane ([`punktfunk_connection_next_hidout`]). Honored
+// only where available (Linux hosts); otherwise the host falls back to X-Box 360.
+#define PUNKTFUNK_GAMEPAD_DUALSENSE 2
+
 // 16-byte AEAD authentication tag appended by GCM.
 #define TAG_LEN 16
 
@@ -93,6 +108,11 @@
 #define PUNKTFUNK_BTN_X 16384
 
 #define PUNKTFUNK_BTN_Y 32768
+
+// DualSense touchpad click. Moonlight's extended-button position (`buttonFlags2`
+// merges in at `<< 16`, see `gamestream/gamepad.rs`), so GameStream clients land on
+// the same bit. Only the DualSense backend renders it; the xpad has no such button.
+#define PUNKTFUNK_BTN_TOUCHPAD 1048576
 
 // Axis ids for `InputKind::GamepadAxis`.
 #define PUNKTFUNK_AXIS_LS_X 0
@@ -501,6 +521,7 @@ PunktfunkConnection *punktfunk_connect(const char *host,
 // the `PUNKTFUNK_COMPOSITOR_*` values). `PUNKTFUNK_COMPOSITOR_AUTO` (or any unrecognized value)
 // lets the host decide; a concrete value is honored only if available, else the host falls back
 // to auto-detect. The resolved choice is logged host-side and returned over the protocol.
+// Equivalent to [`punktfunk_connect_ex2`] with `gamepad = PUNKTFUNK_GAMEPAD_AUTO`.
 //
 // # Safety
 // Same as [`punktfunk_connect`].
@@ -515,6 +536,30 @@ PunktfunkConnection *punktfunk_connect_ex(const char *host,
                                           const char *client_cert_pem,
                                           const char *client_key_pem,
                                           uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect_ex`], but additionally requests which virtual `gamepad` backend the
+// host creates for this session's pads (one of the `PUNKTFUNK_GAMEPAD_*` values).
+// `PUNKTFUNK_GAMEPAD_AUTO` (or any unrecognized value) lets the host decide (its
+// `PUNKTFUNK_GAMEPAD` env var, else X-Box 360); a concrete value is honored only if that
+// backend is available on the host. The resolved choice is readable via
+// [`punktfunk_connection_gamepad`] — only a DualSense session emits HID-output feedback.
+//
+// # Safety
+// Same as [`punktfunk_connect`].
+PunktfunkConnection *punktfunk_connect_ex2(const char *host,
+                                           uint16_t port,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t refresh_hz,
+                                           uint32_t compositor,
+                                           uint32_t gamepad,
+                                           const uint8_t *pin_sha256,
+                                           uint8_t *observed_sha256_out,
+                                           const char *client_cert_pem,
+                                           const char *client_key_pem,
+                                           uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -657,6 +702,17 @@ PunktfunkStatus punktfunk_connection_mode(const PunktfunkConnection *c,
                                           uint32_t *width,
                                           uint32_t *height,
                                           uint32_t *refresh_hz);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The virtual gamepad backend the host actually resolved for this session (one of the
+// `PUNKTFUNK_GAMEPAD_*` values; the `Welcome`'s echo of the [`punktfunk_connect_ex2`]
+// preference). `PUNKTFUNK_GAMEPAD_AUTO` = an older host that didn't say — assume X-Box 360,
+// no HID-output feedback. Safe any time after connect.
+//
+// # Safety
+// `c` is a valid connection handle; `gamepad` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_gamepad(const PunktfunkConnection *c, uint32_t *gamepad);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

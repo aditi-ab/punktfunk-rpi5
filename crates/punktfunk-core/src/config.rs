@@ -130,6 +130,67 @@ impl CompositorPref {
     }
 }
 
+/// Which virtual gamepad the host should create for a client's pads.
+///
+/// Sent in [`Hello`](crate::quic::Hello) as a *preference* and echoed back — resolved to the
+/// backend actually chosen — in [`Welcome`](crate::quic::Welcome). `Auto` (the default) lets the
+/// host decide (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360). A concrete preference is
+/// honored only if that backend is available on the host (DualSense needs Linux UHID); otherwise
+/// the host falls back and reports the real choice in `Welcome`. The wire form is a single byte
+/// (`0 = Auto`, `1 = Xbox360`, `2 = DualSense`), appended to `Hello`/`Welcome` — older peers
+/// simply omit/ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GamepadPref {
+    /// Let the host pick (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360).
+    #[default]
+    Auto,
+    /// uinput X-Box 360 pad (the universal default — every game speaks XInput).
+    Xbox360,
+    /// UHID DualSense (kernel `hid-playstation`) — adaptive triggers, lightbar, touchpad, motion.
+    DualSense,
+}
+
+impl GamepadPref {
+    /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            GamepadPref::Auto => 0,
+            GamepadPref::Xbox360 => 1,
+            GamepadPref::DualSense => 2,
+        }
+    }
+
+    /// Inverse of [`to_u8`](Self::to_u8). An unknown byte decodes to `Auto` — forward-compatible:
+    /// a future concrete value a peer doesn't recognize degrades to "let the host decide".
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => GamepadPref::Xbox360,
+            2 => GamepadPref::DualSense,
+            _ => GamepadPref::Auto,
+        }
+    }
+
+    /// Parse a CLI/config name (case-insensitive, with the usual aliases). `None` for an
+    /// unrecognized name, so callers can error rather than silently defaulting to `Auto`.
+    pub fn from_name(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "default" => GamepadPref::Auto,
+            "xbox" | "xbox360" | "x360" | "uinput" => GamepadPref::Xbox360,
+            "dualsense" | "ds" | "ps5" => GamepadPref::DualSense,
+            _ => return None,
+        })
+    }
+
+    /// Canonical lowercase identifier (`"auto"`, `"xbox360"`, `"dualsense"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GamepadPref::Auto => "auto",
+            GamepadPref::Xbox360 => "xbox360",
+            GamepadPref::DualSense => "dualsense",
+        }
+    }
+}
+
 /// Per-block FEC parameters. Recovery count is derived from `fec_percent` exactly as
 /// GameStream does: `m = ceil(k * fec_percent / 100)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -23,7 +23,7 @@
 //! with GameStream pairing) and logs the SHA-256 fingerprint clients pin.
 
 use anyhow::{anyhow, Context, Result};
-use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, Role};
+use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_SOF};
 use punktfunk_core::quic::{
@@ -387,6 +387,10 @@ async fn serve_session(
             M3Source::Synthetic => None,
         };
 
+        // Resolve the client's gamepad-backend preference (pure env/cfg check — no probing
+        // needed; the actual pads are created lazily by the input thread).
+        let gamepad = resolve_gamepad(hello.gamepad);
+
         // Reserve a UDP port for the data plane (bind, read it back, rebind in UdpTransport).
         let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
         let udp_port = probe.local_addr()?.port();
@@ -412,10 +416,12 @@ async fn serve_session(
                 M3Source::Synthetic => frames,
                 M3Source::Virtual => 0, // unbounded — client streams until we close
             },
-            // Report the resolved backend back to the client (Auto for the synthetic source).
+            // Report the resolved backends back to the client (compositor: Auto for the
+            // synthetic source).
             compositor: compositor
                 .map(|c| c.as_pref())
                 .unwrap_or(CompositorPref::Auto),
+            gamepad,
         };
         io::write_msg(&mut send, &welcome.encode()).await?;
 
@@ -434,6 +440,7 @@ async fn serve_session(
         udp_port,
         mode = ?hello.mode,
         compositor = compositor.map(|c| c.id()).unwrap_or("none"),
+        gamepad = welcome.gamepad.as_str(),
         "handshake complete — streaming"
     );
 
@@ -483,9 +490,10 @@ async fn serve_session(
     let (rich_tx, rich_rx) = std::sync::mpsc::channel::<punktfunk_core::quic::RichInput>();
     let input_handle = {
         let conn = conn.clone();
+        let gamepad = welcome.gamepad;
         std::thread::Builder::new()
             .name("punktfunk-m3-input".into())
-            .spawn(move || input_thread(input_rx, rich_rx, conn, inj_tx))
+            .spawn(move || input_thread(input_rx, rich_rx, conn, inj_tx, gamepad))
             .context("spawn input thread")?
     };
     // One reader for ALL client→host datagrams, demuxed by magic byte (two read_datagram loops
@@ -548,6 +556,37 @@ async fn serve_session(
     } else {
         None
     };
+
+    // Test hook (synthetic source only): a scripted feedback burst on the host→client
+    // planes — rumble (0xCA) + DualSense HID-output (0xCD) — so loopback tests can assert
+    // the client's feedback path without a real game writing output reports to a real pad.
+    if opts.source == M3Source::Synthetic
+        && std::env::var("PUNKTFUNK_TEST_FEEDBACK").as_deref() == Ok("1")
+    {
+        use punktfunk_core::quic::HidOutput;
+        let d = punktfunk_core::quic::encode_rumble_datagram(0, 0x4000, 0x8000);
+        let _ = conn.send_datagram(d.to_vec().into());
+        for h in [
+            HidOutput::Led {
+                pad: 0,
+                r: 10,
+                g: 20,
+                b: 30,
+            },
+            HidOutput::PlayerLeds {
+                pad: 0,
+                bits: 0b00100,
+            },
+            HidOutput::Trigger {
+                pad: 0,
+                which: 1,
+                effect: vec![0x21, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            },
+        ] {
+            let _ = conn.send_datagram(h.encode().into());
+        }
+        tracing::info!("PUNKTFUNK_TEST_FEEDBACK: scripted rumble + hidout burst sent");
+    }
 
     // Data plane on a native thread (no async on the hot path — design invariant).
     let cfg = welcome.session_config(Role::Host);
@@ -854,12 +893,16 @@ enum PadBackend {
 }
 
 impl PadBackend {
-    fn select() -> PadBackend {
+    /// `kind` is the session's resolved backend (see [`resolve_gamepad`] — client preference,
+    /// env var, X-Box 360, in that order). Defensive cfg guard: a non-Linux build can only
+    /// ever construct the X-Box backend, whatever the resolution said.
+    fn select(kind: GamepadPref) -> PadBackend {
         #[cfg(target_os = "linux")]
-        if std::env::var("PUNKTFUNK_GAMEPAD").as_deref() == Ok("dualsense") {
+        if kind == GamepadPref::DualSense {
             tracing::info!("gamepad backend: virtual DualSense (UHID hid-playstation)");
             return PadBackend::DualSense(crate::inject::dualsense::DualSenseManager::new());
         }
+        let _ = kind;
         PadBackend::Xbox360(crate::inject::gamepad::GamepadManager::new())
     }
 
@@ -900,19 +943,20 @@ impl PadBackend {
 }
 
 /// The per-session input thread: route pointer/keyboard events to the host-lifetime injector
-/// service (`inj_tx`) and gamepad events to this session's [`PadBackend`] (uinput X-Box pads or,
-/// with `PUNKTFUNK_GAMEPAD=dualsense`, virtual DualSense pads), with rich client→host input
-/// (touchpad / motion, `rich_rx`) merged in and feedback pumped between events — rumble on the
-/// universal datagram plane, DualSense LED/trigger feedback on the HID-output plane. The gamepads
-/// are created and torn down with the session; the pointer/keyboard injector (and its portal
-/// grant) lives in the service, across sessions.
+/// service (`inj_tx`) and gamepad events to this session's [`PadBackend`] (`gamepad` — the
+/// resolved Hello preference: uinput X-Box pads or virtual DualSense pads), with rich
+/// client→host input (touchpad / motion, `rich_rx`) merged in and feedback pumped between
+/// events — rumble on the universal datagram plane, DualSense LED/trigger feedback on the
+/// HID-output plane. The gamepads are created and torn down with the session; the
+/// pointer/keyboard injector (and its portal grant) lives in the service, across sessions.
 fn input_thread(
     rx: std::sync::mpsc::Receiver<InputEvent>,
     rich_rx: std::sync::mpsc::Receiver<punktfunk_core::quic::RichInput>,
     conn: quinn::Connection,
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
+    gamepad: GamepadPref,
 ) {
-    let mut pads = PadBackend::select();
+    let mut pads = PadBackend::select(gamepad);
     let mut pad_state = [PadState::default(); MAX_WIRE_PADS];
     let mut pad_mask = 0u16;
     // Rumble is idempotent state on a lossy channel (client-side overflow drops datagrams),
@@ -1077,6 +1121,56 @@ fn synthetic_stream(session: &mut Session, frames: u32, stop: &AtomicBool) -> Re
     }
     tracing::info!(frames, "synthetic stream complete");
     Ok(())
+}
+
+/// Pure selection of the session's virtual-gamepad backend: the client's explicit `pref` wins,
+/// then the host's `PUNKTFUNK_GAMEPAD` env var (under a client `Auto`), then X-Box 360. The
+/// DualSense backend needs Linux UHID — when unavailable any DualSense wish degrades to
+/// X-Box 360 (never an error: a session without rich pads still streams).
+fn pick_gamepad(pref: GamepadPref, env: Option<&str>, dualsense_available: bool) -> GamepadPref {
+    let want = match pref {
+        GamepadPref::Auto => env
+            .and_then(GamepadPref::from_name)
+            .unwrap_or(GamepadPref::Auto),
+        explicit => explicit,
+    };
+    match want {
+        GamepadPref::DualSense if dualsense_available => GamepadPref::DualSense,
+        _ => GamepadPref::Xbox360,
+    }
+}
+
+/// Resolve the client's gamepad-backend preference (the env/logging shell around
+/// [`pick_gamepad`]). Always concrete — the `Welcome` reports what the session will drive.
+fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
+    let env = std::env::var("PUNKTFUNK_GAMEPAD").ok();
+    let chosen = pick_gamepad(pref, env.as_deref(), cfg!(target_os = "linux"));
+    match pref {
+        GamepadPref::Auto => {
+            // The operator's env knob deserves a diagnostic when it didn't drive the
+            // choice — a typo, or a DualSense wish on a non-UHID host, would otherwise
+            // degrade silently.
+            if let Some(env) = env.as_deref() {
+                if GamepadPref::from_name(env) != Some(chosen) {
+                    tracing::warn!(
+                        env,
+                        chosen = chosen.as_str(),
+                        "PUNKTFUNK_GAMEPAD unrecognized or unavailable — falling back"
+                    );
+                }
+            }
+            tracing::info!(gamepad = chosen.as_str(), "gamepad backend (client: auto)")
+        }
+        want if want == chosen => {
+            tracing::info!(gamepad = chosen.as_str(), "honoring client gamepad request")
+        }
+        want => tracing::warn!(
+            requested = want.as_str(),
+            chosen = chosen.as_str(),
+            "client-requested gamepad backend unavailable — falling back"
+        ),
+    }
+    chosen
 }
 
 /// Pure selection: choose the backend to drive from the client's `pref`, the set `available`
@@ -1356,6 +1450,23 @@ mod tests {
             pick_compositor(CompositorPref::Gamescope, &[Gamescope], None),
             Some(Gamescope)
         );
+    }
+
+    #[test]
+    fn gamepad_resolution_precedence() {
+        use GamepadPref::*;
+        // An explicit client choice wins over the env var.
+        assert_eq!(pick_gamepad(DualSense, Some("xbox360"), true), DualSense);
+        assert_eq!(pick_gamepad(Xbox360, Some("dualsense"), true), Xbox360);
+        // Client Auto defers to the env var.
+        assert_eq!(pick_gamepad(Auto, Some("dualsense"), true), DualSense);
+        assert_eq!(pick_gamepad(Auto, Some("xbox360"), true), Xbox360);
+        // Auto + no env (or an unparseable one) → X-Box 360.
+        assert_eq!(pick_gamepad(Auto, None, true), Xbox360);
+        assert_eq!(pick_gamepad(Auto, Some("bogus"), true), Xbox360);
+        // DualSense degrades to X-Box 360 where the backend doesn't exist (non-Linux).
+        assert_eq!(pick_gamepad(DualSense, None, false), Xbox360);
+        assert_eq!(pick_gamepad(Auto, Some("dualsense"), false), Xbox360);
     }
 
     #[test]
@@ -1650,6 +1761,7 @@ mod tests {
                 19778,
                 mode,
                 CompositorPref::Auto,
+                GamepadPref::Auto,
                 None,
                 None,
                 timeout
@@ -1673,12 +1785,17 @@ mod tests {
             19778,
             mode,
             CompositorPref::Auto,
+            GamepadPref::Auto,
             Some(host_fp),
             Some((cert.clone(), key.clone())),
             timeout,
         )
         .expect("paired session");
         assert_eq!(client.host_fingerprint, host_fp);
+        // The Welcome always reports a CONCRETE resolved gamepad backend. (Not asserted
+        // against a specific one: resolve_gamepad honors an ambient PUNKTFUNK_GAMEPAD —
+        // a dev box exporting it must not fail the suite.)
+        assert_ne!(client.resolved_gamepad, GamepadPref::Auto);
         drop(client);
 
         host.join().unwrap().unwrap();

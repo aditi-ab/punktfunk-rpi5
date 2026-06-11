@@ -1,11 +1,13 @@
 // Swift wrapper around the punktfunk-core C ABI's punktfunk/1 connection API.
 //
 // Threading contract (mirrors the C header): one PunktfunkConnection is pumped from a single
-// video thread via nextAU(); nextAudio()/nextRumble() may each run on their own (single)
-// drain thread — the core keeps per-plane borrow slots, so the planes never alias;
-// send() is enqueue-only and safe alongside all of them. The pointers inside an AU/audio
-// packet are only valid until the next call of the same kind, so we copy into Data here —
-// the copies are small and keep the Swift side memory-safe.
+// video thread via nextAU(); nextAudio() runs on its own (single) drain thread, and
+// nextRumble()/nextHidOutput() share one feedback drain thread (two core planes, one puller
+// each — polling them sequentially from one thread is within the contract); the core keeps
+// per-plane borrow slots, so the planes never alias. send() is enqueue-only and safe
+// alongside all of them. The pointers inside an AU/audio packet are only valid until the
+// next call of the same kind, so we copy into Data here — the copies are small and keep the
+// Swift side memory-safe.
 //
 // Trust: pass the host's pinned certificate fingerprint (the host logs it at startup, and
 // `hostFingerprint` reports what a trust-on-first-use connect observed — persist it, e.g.
@@ -126,8 +128,11 @@ public final class PunktfunkConnection {
     /// Held across the blocking next_au call; close() takes it (same plane-lock → abiLock
     /// order as the pullers) so it can never free the handle under an in-flight poll.
     private let pumpLock = NSLock()
-    /// Same role for the audio/rumble drain thread (its own plane in the core).
+    /// Same role for the audio drain thread (its own plane in the core).
     private let audioLock = NSLock()
+    /// Same role for the feedback drain thread (rumble + HID-output — two core planes,
+    /// drained sequentially by one thread).
+    private let feedbackLock = NSLock()
 
     /// Negotiated session mode (host-confirmed).
     public private(set) var width: UInt32 = 0
@@ -163,6 +168,33 @@ public final class PunktfunkConnection {
         }
     }
 
+    /// Which virtual gamepad the host creates for this session's pads (the
+    /// `PUNKTFUNK_GAMEPAD_*` ABI values). `.auto` lets the host decide (its env var, else
+    /// X-Box 360); `.dualSense` is honored only on hosts with UHID (Linux) — games then see
+    /// a real DualSense and their lightbar / adaptive-trigger writes come back on the
+    /// HID-output plane (`nextHidOutput`). The host's actual choice is `resolvedGamepad`.
+    public enum GamepadType: UInt32, CaseIterable, Sendable {
+        case auto = 0
+        case xbox360 = 1
+        case dualSense = 2
+
+        /// Loose name parsing for env/dev hooks, mirroring the host's
+        /// `GamepadPref::from_name`.
+        public init?(name: String) {
+            switch name.lowercased() {
+            case "auto", "default": self = .auto
+            case "xbox", "xbox360", "x360", "uinput": self = .xbox360
+            case "dualsense", "ds", "ps5": self = .dualSense
+            default: return nil
+            }
+        }
+    }
+
+    /// The virtual gamepad backend the host actually resolved (the Welcome's echo of the
+    /// requested `gamepad`). `.auto` = an older host that didn't say — assume Xbox 360, no
+    /// DualSense feedback.
+    public private(set) var resolvedGamepad: GamepadType = .auto
+
     /// Connect and start a session at the requested mode (the host creates a native virtual
     /// output at exactly this size/refresh). Blocks up to `timeoutMs`.
     ///
@@ -176,12 +208,16 @@ public final class PunktfunkConnection {
     ///
     /// `compositor`: which backend should drive the virtual output host-side (see
     /// `Compositor`; `.auto` = host decides).
+    ///
+    /// `gamepad`: which virtual pad the host creates for this session's controllers (see
+    /// `GamepadType`; `.auto` = host decides). Check `resolvedGamepad` afterwards.
     public init(
         host: String, port: UInt16 = 9777,
         width: UInt32, height: UInt32, refreshHz: UInt32,
         pinSHA256: Data? = nil,
         identity: ClientIdentity? = nil,
         compositor: Compositor = .auto,
+        gamepad: GamepadType = .auto,
         timeoutMs: UInt32 = 10_000
     ) throws {
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
@@ -191,14 +227,16 @@ public final class PunktfunkConnection {
                 withOptionalCString(identity?.keyPEM) { key in
                     if let pin = pinSHA256 {
                         return pin.withUnsafeBytes { p in
-                            punktfunk_connect_ex(
+                            punktfunk_connect_ex2(
                                 cs, port, width, height, refreshHz, compositor.rawValue,
+                                gamepad.rawValue,
                                 p.bindMemory(to: UInt8.self).baseAddress, &observed,
                                 cert, key, timeoutMs)
                         }
                     }
-                    return punktfunk_connect_ex(
+                    return punktfunk_connect_ex2(
                         cs, port, width, height, refreshHz, compositor.rawValue,
+                        gamepad.rawValue,
                         nil, &observed, cert, key, timeoutMs)
                 }
             }
@@ -210,6 +248,9 @@ public final class PunktfunkConnection {
         self.width = w
         self.height = h
         self.refreshHz = hz
+        var gp: UInt32 = 0
+        _ = punktfunk_connection_gamepad(handle, &gp)
+        resolvedGamepad = GamepadType(rawValue: gp) ?? .auto
     }
 
     /// Ask the host to switch the live session to a new mode (window resized) — no
@@ -285,10 +326,10 @@ public final class PunktfunkConnection {
 
     /// Pull the next force-feedback update for the GCController haptics engine:
     /// `(pad, lowFrequency, highFrequency)` with 0...0xFFFF amplitudes, (0, 0) = stop.
-    /// Shares the audio drain thread's plane (call from that thread).
+    /// Drain from the (single) feedback thread, alongside `nextHidOutput`.
     public func nextRumble(timeoutMs: UInt32 = 0) throws -> (pad: UInt16, low: UInt16, high: UInt16)? {
-        audioLock.lock()
-        defer { audioLock.unlock() }
+        feedbackLock.lock()
+        defer { feedbackLock.unlock() }
         guard let h = liveHandle() else { throw PunktfunkClientError.closed }
 
         var pad: UInt16 = 0, low: UInt16 = 0, high: UInt16 = 0
@@ -296,6 +337,55 @@ public final class PunktfunkConnection {
         switch rc {
         case statusOK:
             return (pad, low, high)
+        case statusNoFrame:
+            return nil
+        case statusClosed:
+            throw PunktfunkClientError.closed
+        default:
+            throw PunktfunkClientError.status(rc)
+        }
+    }
+
+    /// One DualSense feedback event a game wrote to the host's virtual pad — replay it on
+    /// the real controller (GCDeviceLight, GCControllerPlayerIndex,
+    /// GCDualSenseAdaptiveTrigger). Only a `.dualSense` session emits these.
+    public enum HidOutputEvent: Sendable, Equatable {
+        /// Lightbar color.
+        case led(pad: UInt8, r: UInt8, g: UInt8, b: UInt8)
+        /// Player-indicator LEDs (low 5 bits).
+        case playerLEDs(pad: UInt8, bits: UInt8)
+        /// Adaptive-trigger effect: `which` 0 = L2, 1 = R2; `effect` is the raw DualSense
+        /// trigger parameter block (mode byte + params, ≤ 11 bytes) — parse with
+        /// `DualSenseTriggerEffect`.
+        case triggerEffect(pad: UInt8, which: UInt8, effect: [UInt8])
+    }
+
+    /// Pull the next DualSense feedback event (lightbar / player LEDs / adaptive triggers);
+    /// nil on timeout, throws `.closed` once the session ended. Drain from the (single)
+    /// feedback thread, alongside `nextRumble`. Nothing ever arrives unless
+    /// `resolvedGamepad == .dualSense` — poll with a short timeout, never spin.
+    public func nextHidOutput(timeoutMs: UInt32 = 0) throws -> HidOutputEvent? {
+        feedbackLock.lock()
+        defer { feedbackLock.unlock() }
+        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
+
+        var out = PunktfunkHidOutput()
+        let rc = punktfunk_connection_next_hidout(h, &out, timeoutMs)
+        switch rc {
+        case statusOK:
+            switch Int32(out.kind) {
+            case PUNKTFUNK_HIDOUT_LED:
+                return .led(pad: out.pad, r: out.r, g: out.g, b: out.b)
+            case PUNKTFUNK_HIDOUT_PLAYER_LEDS:
+                return .playerLEDs(pad: out.pad, bits: out.player_bits)
+            case PUNKTFUNK_HIDOUT_TRIGGER:
+                // The fixed C array imports as a tuple — copy out the valid prefix.
+                let len = Int(min(out.effect_len, UInt8(PUNKTFUNK_HID_EFFECT_MAX)))
+                let effect = withUnsafeBytes(of: out.effect) { Array($0.prefix(len)) }
+                return .triggerEffect(pad: out.pad, which: out.which, effect: effect)
+            default:
+                return nil // unknown kind from a newer host — skip (forward-compatible)
+            }
         case statusNoFrame:
             return nil
         case statusClosed:
@@ -323,10 +413,12 @@ public final class PunktfunkConnection {
         abiLock.unlock()
         pumpLock.lock() // pullers exit at their next poll boundary, releasing these
         audioLock.lock()
+        feedbackLock.lock()
         abiLock.lock()
         let h = handle
         handle = nil
         abiLock.unlock()
+        feedbackLock.unlock()
         audioLock.unlock()
         pumpLock.unlock()
         if let h {
@@ -347,6 +439,43 @@ public final class PunktfunkConnection {
             _ = punktfunk_connection_send_mic(
                 h, p.bindMemory(to: UInt8.self).baseAddress, UInt(opus.count), seq, ptsNs)
         }
+    }
+
+    /// Send one DualSense touchpad contact to the host's virtual pad (rich-input plane).
+    /// `x`/`y` are normalized 0...65535 across the touchpad, origin top-left, +y down.
+    /// Non-blocking enqueue (same discipline as `send`); pointless on non-DualSense
+    /// sessions — the host ignores it there.
+    public func sendTouchpad(pad: UInt8 = 0, finger: UInt8, active: Bool, x: UInt16, y: UInt16) {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        var rich = PunktfunkRichInput()
+        rich.kind = UInt8(PUNKTFUNK_RICH_TOUCHPAD)
+        rich.pad = pad
+        rich.finger = finger
+        rich.active = active ? 1 : 0
+        rich.x = x
+        rich.y = y
+        _ = punktfunk_connection_send_rich_input(h, &rich)
+    }
+
+    /// Send one DualSense motion sample to the host's virtual pad (rich-input plane). The
+    /// values are raw DualSense sensor units, written verbatim into the virtual pad's input
+    /// report — convert with `GamepadCapture`'s scale constants (gyro: rad/s → 20 LSB per
+    /// deg/s; accel: g → 10000 LSB per g).
+    public func sendMotion(
+        pad: UInt8 = 0,
+        gyro: (Int16, Int16, Int16), accel: (Int16, Int16, Int16)
+    ) {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        var rich = PunktfunkRichInput()
+        rich.kind = UInt8(PUNKTFUNK_RICH_MOTION)
+        rich.pad = pad
+        rich.gyro = gyro
+        rich.accel = accel
+        _ = punktfunk_connection_send_rich_input(h, &rich)
     }
 
     deinit { close() }
@@ -387,10 +516,12 @@ public extension PunktfunkInputEvent {
     }
 
     // Gamepad (wire contract in punktfunk_core::input::gamepad): one transition per event,
-    // `pad` = controller index, accumulated host-side into a virtual Xbox 360 pad.
+    // `pad` = controller index, accumulated host-side into a virtual Xbox 360 or DualSense
+    // pad (the session's negotiated `GamepadType`).
 
     /// `button` is a GameStream buttonFlags bit (A=0x1000 B=0x2000 X=0x4000 Y=0x8000,
-    /// dpad=0x1/2/4/8, start=0x10 back=0x20 LS=0x40 RS=0x80 LB=0x100 RB=0x200 guide=0x400).
+    /// dpad=0x1/2/4/8, start=0x10 back=0x20 LS=0x40 RS=0x80 LB=0x100 RB=0x200 guide=0x400,
+    /// touchpad click=0x100000 — DualSense sessions only, the xpad has no such button).
     static func gamepadButton(_ button: UInt32, down: Bool, pad: UInt32 = 0) -> PunktfunkInputEvent {
         make(
             PUNKTFUNK_INPUT_KIND_GAMEPAD_BUTTON.rawValue,

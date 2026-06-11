@@ -621,6 +621,19 @@ pub const PUNKTFUNK_COMPOSITOR_MUTTER: u32 = 3;
 /// gamescope (spawned nested).
 pub const PUNKTFUNK_COMPOSITOR_GAMESCOPE: u32 = 4;
 
+/// Gamepad-backend preference for [`punktfunk_connect_ex2`] (`gamepad` arg): which virtual pad
+/// the host creates for this session's controllers. Precedence host-side: an explicit client
+/// choice > the host's `PUNKTFUNK_GAMEPAD` env var > X-Box 360. `AUTO` (or any unrecognized
+/// value) = host decides. The resolved choice is echoed over the protocol (`Welcome`) and
+/// readable via [`punktfunk_connection_gamepad`].
+pub const PUNKTFUNK_GAMEPAD_AUTO: u32 = 0;
+/// uinput X-Box 360 pad (the universal default — every game speaks XInput).
+pub const PUNKTFUNK_GAMEPAD_XBOX360: u32 = 1;
+/// UHID DualSense (kernel `hid-playstation`): adaptive triggers, lightbar, touchpad, motion —
+/// feedback arrives on the HID-output plane ([`punktfunk_connection_next_hidout`]). Honored
+/// only where available (Linux hosts); otherwise the host falls back to X-Box 360.
+pub const PUNKTFUNK_GAMEPAD_DUALSENSE: u32 = 2;
+
 /// Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
 /// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
 /// [`punktfunk_connect_ex`] with `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
@@ -674,6 +687,7 @@ pub unsafe extern "C" fn punktfunk_connect(
 /// the `PUNKTFUNK_COMPOSITOR_*` values). `PUNKTFUNK_COMPOSITOR_AUTO` (or any unrecognized value)
 /// lets the host decide; a concrete value is honored only if available, else the host falls back
 /// to auto-detect. The resolved choice is logged host-side and returned over the protocol.
+/// Equivalent to [`punktfunk_connect_ex2`] with `gamepad = PUNKTFUNK_GAMEPAD_AUTO`.
 ///
 /// # Safety
 /// Same as [`punktfunk_connect`].
@@ -686,6 +700,49 @@ pub unsafe extern "C" fn punktfunk_connect_ex(
     height: u32,
     refresh_hz: u32,
     compositor: u32,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    timeout_ms: u32,
+) -> *mut PunktfunkConnection {
+    unsafe {
+        punktfunk_connect_ex2(
+            host,
+            port,
+            width,
+            height,
+            refresh_hz,
+            compositor,
+            PUNKTFUNK_GAMEPAD_AUTO,
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            timeout_ms,
+        )
+    }
+}
+
+/// Like [`punktfunk_connect_ex`], but additionally requests which virtual `gamepad` backend the
+/// host creates for this session's pads (one of the `PUNKTFUNK_GAMEPAD_*` values).
+/// `PUNKTFUNK_GAMEPAD_AUTO` (or any unrecognized value) lets the host decide (its
+/// `PUNKTFUNK_GAMEPAD` env var, else X-Box 360); a concrete value is honored only if that
+/// backend is available on the host. The resolved choice is readable via
+/// [`punktfunk_connection_gamepad`] — only a DualSense session emits HID-output feedback.
+///
+/// # Safety
+/// Same as [`punktfunk_connect`].
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connect_ex2(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    gamepad: u32,
     pin_sha256: *const u8,
     observed_sha256_out: *mut u8,
     client_cert_pem: *const std::os::raw::c_char,
@@ -705,7 +762,14 @@ pub unsafe extern "C" fn punktfunk_connect_ex(
             height,
             refresh_hz,
         };
-        let pref = crate::config::CompositorPref::from_u8(compositor as u8);
+        // "Any unrecognized value = Auto" must hold for the FULL u32 domain — `as u8`
+        // would wrap 0x101 into a concrete choice before from_u8's fallback could apply.
+        let pref = u8::try_from(compositor)
+            .map(crate::config::CompositorPref::from_u8)
+            .unwrap_or_default();
+        let gamepad = u8::try_from(gamepad)
+            .map(crate::config::GamepadPref::from_u8)
+            .unwrap_or_default();
         let pin = if pin_sha256.is_null() {
             None
         } else {
@@ -725,6 +789,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex(
             port,
             mode,
             pref,
+            gamepad,
             pin,
             identity,
             std::time::Duration::from_millis(timeout_ms as u64),
@@ -1147,6 +1212,33 @@ pub unsafe extern "C" fn punktfunk_connection_mode(
             }
             if !refresh_hz.is_null() {
                 *refresh_hz = mode.refresh_hz;
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// The virtual gamepad backend the host actually resolved for this session (one of the
+/// `PUNKTFUNK_GAMEPAD_*` values; the `Welcome`'s echo of the [`punktfunk_connect_ex2`]
+/// preference). `PUNKTFUNK_GAMEPAD_AUTO` = an older host that didn't say — assume X-Box 360,
+/// no HID-output feedback. Safe any time after connect.
+///
+/// # Safety
+/// `c` is a valid connection handle; `gamepad` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_gamepad(
+    c: *const PunktfunkConnection,
+    gamepad: *mut u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        unsafe {
+            if !gamepad.is_null() {
+                *gamepad = c.inner.resolved_gamepad.to_u8() as u32;
             }
         }
         PunktfunkStatus::Ok

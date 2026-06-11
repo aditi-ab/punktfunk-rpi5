@@ -43,16 +43,50 @@ final class LoopbackIntegrationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(lastIndex, 24)
 
         // Input goes the other way (enqueue-only; the host logs the count on close) —
-        // including the touch kinds and the mic uplink plane (the synthetic host counts
-        // the datagrams; injection/decoding are Linux-side concerns).
+        // including the touch kinds, gamepad events, the rich-input plane (DualSense
+        // touchpad/motion), and the mic uplink plane (the synthetic host counts the
+        // datagrams; injection/decoding are Linux-side concerns).
         conn.send(.mouseMove(dx: 1, dy: 2))
         conn.send(.key(0x41, down: true))
         conn.send(.key(0x41, down: false))
         conn.send(.touchDown(id: 0, x: 100, y: 200, surfaceWidth: 1280, surfaceHeight: 720))
         conn.send(.touchMove(id: 0, x: 110, y: 210, surfaceWidth: 1280, surfaceHeight: 720))
         conn.send(.touchUp(id: 0))
+        conn.send(.gamepadButton(GamepadWire.a, down: true, pad: 0))
+        conn.send(.gamepadButton(GamepadWire.a, down: false, pad: 0))
+        conn.send(.gamepadAxis(GamepadWire.axisLSX, value: 12345, pad: 0))
+        conn.send(.gamepadAxis(GamepadWire.axisRT, value: 200, pad: 0))
+        conn.sendTouchpad(finger: 0, active: true, x: 32768, y: 16384)
+        conn.sendTouchpad(finger: 0, active: false, x: 0, y: 0)
+        conn.sendMotion(gyro: (100, -100, 0), accel: (0, 0, 10000))
         conn.sendMic(Data([0xFC, 0xFF, 0xFE]), seq: 0, ptsNs: 1)  // tiny opus-ish frame
         conn.sendMic(Data(), seq: 1, ptsNs: 2)  // DTX silence frame
+
+        // The synthetic host (PUNKTFUNK_TEST_FEEDBACK=1, set by test-loopback.sh) scripts
+        // one feedback burst on the host→client planes — drain both and verify, end to
+        // end through the xcframework: rumble (0xCA) + the three hidout kinds (0xCD).
+        if ProcessInfo.processInfo.environment["PUNKTFUNK_TEST_FEEDBACK"] == "1" {
+            var rumble: (pad: UInt16, low: UInt16, high: UInt16)?
+            var hidout: [PunktfunkConnection.HidOutputEvent] = []
+            let feedbackDeadline = Date().addingTimeInterval(10)
+            while (rumble == nil || hidout.count < 3), Date() < feedbackDeadline {
+                if rumble == nil, let r = try conn.nextRumble(timeoutMs: 100) { rumble = r }
+                if let ev = try conn.nextHidOutput(timeoutMs: 100) { hidout.append(ev) }
+            }
+            XCTAssertEqual(rumble?.pad, 0)
+            XCTAssertEqual(rumble?.low, 0x4000)
+            XCTAssertEqual(rumble?.high, 0x8000)
+            XCTAssertTrue(
+                hidout.contains(.led(pad: 0, r: 10, g: 20, b: 30)),
+                "missing the scripted lightbar event: \(hidout)")
+            XCTAssertTrue(
+                hidout.contains(.playerLEDs(pad: 0, bits: 0b00100)),
+                "missing the scripted player-LED event: \(hidout)")
+            XCTAssertTrue(
+                hidout.contains(.triggerEffect(
+                    pad: 0, which: 1, effect: [0x21, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])),
+                "missing the scripted trigger event: \(hidout)")
+        }
 
         conn.close()
         XCTAssertThrowsError(try conn.nextAU(timeoutMs: 10)) { error in

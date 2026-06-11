@@ -24,6 +24,7 @@ struct ContentView: View {
     @AppStorage("punktfunk.height") private var height = 1080
     @AppStorage("punktfunk.hz") private var hz = 60
     @AppStorage("punktfunk.compositor") private var compositor = 0
+    @AppStorage("punktfunk.gamepadType") private var gamepadType = 0
     @State private var showAddHost = false
     @State private var pairingTarget: StoredHost?
     #if !os(macOS)
@@ -383,12 +384,17 @@ struct ContentView: View {
     }
 
     private func connect(_ host: StoredHost) {
+        // The gamepad-type setting resolves NOW (Automatic → match the active physical
+        // controller): the host's virtual pad backend is fixed per session.
         model.connect(
             to: host,
             width: UInt32(clamping: width), height: UInt32(clamping: height),
             hz: UInt32(clamping: hz),
             compositor: PunktfunkConnection.Compositor(
-                rawValue: UInt32(clamping: compositor)) ?? .auto)
+                rawValue: UInt32(clamping: compositor)) ?? .auto,
+            gamepad: GamepadManager.shared.resolveType(
+                setting: PunktfunkConnection.GamepadType(
+                    rawValue: UInt32(clamping: gamepadType)) ?? .auto))
     }
 
     // MARK: - Trust on first use
@@ -525,7 +531,8 @@ struct ContentView: View {
     /// PUNKTFUNK_AUTOCONNECT=host[:port] connects immediately (trust-on-first-use,
     /// auto-confirmed — dev only) at the saved or PUNKTFUNK_MODE=WxHxHz mode, without
     /// touching the saved host list. PUNKTFUNK_COMPOSITOR=kwin|gamescope|… overrides the
-    /// compositor preference (same names as the host env knob). (IPv4/hostname only.)
+    /// compositor preference and PUNKTFUNK_REMOTE_GAMEPAD=xbox360|dualsense the virtual
+    /// pad type (same names as the host env knobs). (IPv4/hostname only.)
     private func autoConnectIfAsked() {
         guard let target = ProcessInfo.processInfo.environment["PUNKTFUNK_AUTOCONNECT"],
               !target.isEmpty, model.phase == .idle
@@ -547,11 +554,19 @@ struct ContentView: View {
            let c = PunktfunkConnection.Compositor(name: name) {
             pref = c
         }
+        var pad = GamepadManager.shared.resolveType(
+            setting: PunktfunkConnection.GamepadType(
+                rawValue: UInt32(clamping: gamepadType)) ?? .auto)
+        if let name = ProcessInfo.processInfo.environment["PUNKTFUNK_REMOTE_GAMEPAD"],
+           let g = PunktfunkConnection.GamepadType(name: name) {
+            pad = g
+        }
         model.connect(
             to: host,
             width: UInt32(clamping: width), height: UInt32(clamping: height),
             hz: UInt32(clamping: hz),
             compositor: pref,
+            gamepad: pad,
             autoTrust: true)
     }
 }

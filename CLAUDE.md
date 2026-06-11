@@ -49,7 +49,11 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   capture→…→reassembled; audio measured live (~200 pkts/s). `punktfunk-client-rs` is the
   working reference client (`--pin`, datagram counters, `--input-test` incl. gamepad).
   The embeddable connector (`NativeClient`) exposes it all over the C ABI: `punktfunk_connect`
-  (pin/TOFU) + `next_au`/`next_audio`/`next_rumble`/`send_input`.
+  (pin/TOFU) + `next_au`/`next_audio`/`next_rumble`/`next_hidout`/`send_input`/
+  `send_rich_input`. **Client-negotiated virtual pad type**: the Hello carries a gamepad
+  preference byte (same trailing-byte back-compat pattern as the compositor), the Welcome
+  echoes the resolved backend — precedence: explicit client choice > `PUNKTFUNK_GAMEPAD`
+  env > uinput Xbox 360; DualSense (UHID) only on Linux hosts.
 
 ## What's left
 
@@ -59,7 +63,15 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    validated live Mac ↔ this box at 720p60 — vkcube on glass, input injected via gamescope
    EIS. The app speaks the full ABI v2 trust surface: Keychain-persisted client identity
    presented on every connect, SPAKE2 PIN pairing UI (host-card context menu + the trust
-   prompt's "Pair with PIN instead…"), TOFU fingerprint prompt. Tests: `swift test` in
+   prompt's "Pair with PIN instead…"), TOFU fingerprint prompt. **Gamepads (2026-06-11):**
+   controller discovery + selection in Settings (`GamepadManager` — exactly one pad
+   forwarded as pad 0, auto or pinned; pad TYPE auto-resolves from the physical
+   controller, user-overridable), capture incl. DualSense touchpad/motion
+   (`GamepadCapture`/`GamepadWire`), feedback rendering (rumble → CoreHaptics; lightbar /
+   player LEDs / adaptive triggers → `GCDeviceLight`/`playerIndex`/
+   `GCDualSenseAdaptiveTrigger` via the table-driven `DualSenseTriggerEffect` parser).
+   Loopback-tested end to end (`PUNKTFUNK_TEST_FEEDBACK=1` scripted burst); DualSense
+   motion sign/scale derived, not yet live-verified. Tests: `swift test` in
    `clients/apple` (unit + real-codec round trip),
    `test-loopback.sh` (Swift client vs synthetic m3-hosts on loopback — runs on macOS;
    includes the pairing ceremony + `--require-pairing` gate),

@@ -27,10 +27,16 @@
 //! `gamescope`); the host honors it if available, else auto-detects and reports the resolved
 //! choice in its Welcome (logged as `session offer … compositor=…`).
 //!
+//! `--gamepad NAME` requests a host virtual-pad backend (`auto`|`xbox360`|`dualsense`); the
+//! host honors it where available (DualSense needs Linux UHID), else falls back to X-Box 360,
+//! and reports the resolved choice in its Welcome (logged as `session offer … gamepad=…`).
+//!
 //! Usage: `punktfunk-client-rs [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE] [--input-test]
-//!         [--pin HEX] [--compositor NAME]` (M4 adds VAAPI decode + wgpu present on this skeleton.)
+//!         [--pin HEX] [--compositor NAME] [--gamepad NAME]`
+//! (M4 adds VAAPI decode + wgpu present on this skeleton.)
 
 use anyhow::{anyhow, Context, Result};
+use punktfunk_core::config::GamepadPref;
 use punktfunk_core::config::Role;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::quic::{endpoint, io, Hello, Reconfigure, Reconfigured, Start, Welcome};
@@ -59,6 +65,8 @@ struct Args {
     name: String,
     /// `--compositor NAME` — request a host compositor backend (auto|kwin|wlroots|mutter|gamescope).
     compositor: CompositorPref,
+    /// `--gamepad NAME` — request a host virtual-pad backend (auto|xbox360|dualsense).
+    gamepad: GamepadPref,
 }
 
 fn parse_mode(m: &str) -> Option<Mode> {
@@ -145,6 +153,17 @@ fn parse_args() -> Args {
             }
         },
     };
+    // Same fail-closed discipline for --gamepad.
+    let gamepad = match get("--gamepad") {
+        None => GamepadPref::Auto,
+        Some(s) => match GamepadPref::from_name(s) {
+            Some(g) => g,
+            None => {
+                eprintln!("--gamepad must be one of: auto, xbox360, dualsense");
+                std::process::exit(2);
+            }
+        },
+    };
     Args {
         connect: get("--connect").unwrap_or("127.0.0.1:9777").to_string(),
         mode,
@@ -158,6 +177,7 @@ fn parse_args() -> Args {
         pair: get("--pair").map(String::from),
         name: get("--name").unwrap_or("punktfunk-client-rs").to_string(),
         compositor,
+        gamepad,
     }
 }
 
@@ -242,6 +262,7 @@ async fn session(args: Args) -> Result<()> {
             abi_version: punktfunk_core::ABI_VERSION,
             mode: args.mode,
             compositor: args.compositor,
+            gamepad: args.gamepad,
         }
         .encode(),
     )
@@ -254,6 +275,7 @@ async fn session(args: Args) -> Result<()> {
         encrypt = welcome.encrypt,
         frames = welcome.frames,
         compositor = welcome.compositor.as_str(),
+        gamepad = welcome.gamepad.as_str(),
         "session offer"
     );
 

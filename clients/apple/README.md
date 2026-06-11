@@ -17,7 +17,9 @@ received AUs spanning 983 ms of host capture clock.
 
 The connector underneath (`punktfunk_core::client::NativeClient` over the C ABI) carries the
 full session: video AUs, **Opus audio** (`nextAudio()`), **rumble** (`nextRumble()`),
-input incl. gamepads, and **cert pinning + TOFU** (`pinSHA256:`/`hostFingerprint`) — see
+**DualSense feedback** (`nextHidOutput()` — lightbar, player LEDs, adaptive-trigger
+effects), input incl. gamepads + DualSense touchpad/motion (`sendTouchpad`/`sendMotion`),
+and **cert pinning + TOFU** (`pinSHA256:`/`hostFingerprint`) — see
 `m3.rs::tests::c_abi_connection_roundtrip` (three sequential sessions: TOFU, pinned
 reconnect, wrong-pin rejection). The host (`punktfunk-host m3-host`) is a persistent listener:
 reconnect at will during development.
@@ -40,6 +42,20 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
     motion isn't truncated away. Buttons use GameStream ids (1=left … 5=X2). Scroll
     arrives via the stream view's `scrollWheel` override instead of GC (trackpad/Magic
     Mouse gestures never reach GCMouse's scroll dpad), WHEEL_DELTA(120)-scaled.
+  - `GamepadManager.swift` — app-lifetime controller discovery + selection (`.shared`):
+    watches `GCController` connect/disconnect, fingerprints each pad for the Settings UI
+    (name, capabilities, battery), and selects the ONE controller forwarded to the host
+    (user pin via "Use controller", else most recently connected extended gamepad).
+  - `GamepadCapture.swift` — the active controller → wire: snapshot-diff over
+    `GCExtendedGamepad` into incremental `gamepadButton`/`gamepadAxis` events (pad 0),
+    plus DualSense touchpad contacts and ~250 Hz motion samples on the rich-input plane
+    (the GC→DualSense unit conversions live in `GamepadWire`, one place). Held state is
+    released on the wire on controller switch / app deactivation / stop.
+  - `GamepadFeedback.swift` + `DualSenseTriggerEffect.swift` — host feedback → the real
+    controller: one drain thread for `nextRumble()` (→ `CHHapticEngine` per handle
+    locality) and `nextHidOutput()` (lightbar → `GCDeviceLight`, player LEDs →
+    `playerIndex`, adaptive-trigger effect blocks → a total, table-driven parser →
+    `GCDualSenseAdaptiveTrigger`, exact for the 10-zone positional modes).
 - **`PunktfunkClient`** (the app): hosts grid (saved in UserDefaults), "+" toolbar
   sheet to add hosts, stream mode in Settings (⌘,), two trust flows — the
   trust-on-first-use fingerprint prompt over the live-but-blurred stream, and SPAKE2 PIN
@@ -47,13 +63,20 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
   `ClientIdentityStore` keeps the client identity in the Keychain and presents it on
   every connect) — then pinned reconnects, fps/Mb-s HUD. Settings also picks the HOST
   compositor (KWin/wlroots/Mutter/gamescope, default automatic — the host honors it
-  only if that backend is available there). (Audio playback and
-  gamepad capture are not wired into the app yet — the connector surface is there; see
-  notes 5–6.)
+  only if that backend is available there) and has a **Controllers** section: every
+  detected controller (capability glyphs, battery, "In use" badge), which one to forward
+  ("Use controller", default automatic), and the virtual pad type the host creates
+  ("Controller type": Automatic / Xbox 360 / DualSense — Automatic matches the physical
+  pad; resolved at connect time, the host pad is fixed per session). Gamepad capture +
+  feedback run with streaming (`SessionModel` owns them, same trust gate as audio).
 - **Tests** (`swift test`): byte-level Annex-B units; a real-codec round trip
   (VTCompressionSession-encoded HEVC rebuilt as the host's wire shape → `AnnexB` →
-  VTDecompressionSession → pixels); loopback integration against real local hosts
-  (`test-loopback.sh` — stream round trip, plus the PIN pairing ceremony and the
+  VTDecompressionSession → pixels); table-driven DualSense trigger-effect parsing
+  (`DualSenseTriggerEffectTests`) and the gamepad wire conversions
+  (`GamepadWireTests`); loopback integration against real local hosts
+  (`test-loopback.sh` — stream round trip incl. gamepad/touchpad/motion sends and a
+  host-scripted feedback burst asserted on the rumble + HID-output planes
+  (`PUNKTFUNK_TEST_FEEDBACK=1`), plus the PIN pairing ceremony and the
   `--require-pairing` gate against a second, armed host); the remote first-light test
   above.
 
@@ -112,10 +135,12 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    the enum *constants* import into Swift as a distinct same-named type — bridge with
    `.rawValue` (see the top of `PunktfunkConnection.swift`). Don't fight the generated header.
 2. **ABI contract**: one video pump thread per connection, plus optionally one *separate*
-   audio drain thread for `nextAudio()`/`nextRumble()` (the core keeps per-plane borrow
-   slots, so the planes never alias); `send()` is enqueue-only and safe alongside all of
-   them. The wrapper's per-plane locks make `close()` safe from anywhere (it waits out
-   in-flight polls, ≤ their timeouts).
+   audio drain thread for `nextAudio()` and one feedback drain thread for
+   `nextRumble()`/`nextHidOutput()` (the core keeps per-plane borrow slots, so the planes
+   never alias; rumble + HID-output are two planes drained sequentially by the one
+   feedback thread); `send()` is enqueue-only and safe alongside all of them. The
+   wrapper's per-plane locks make `close()` safe from anywhere (it waits out in-flight
+   polls, ≤ their timeouts).
 3. **Decode flow**: the host opens every stream with an IDR carrying VPS/SPS/PPS in-band
    and recovery keyframes re-send them — "refresh the format description on every IDR"
    (what `StreamView` does) is sufficient; there is no out-of-band extradata, ever.
@@ -139,10 +164,20 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    side buffers 320 ms and drops the newest packet when the puller lags. Wall-clock
    `ptsNs` shares the host clock with video AUs for A/V sync. Wiring this into
    `PunktfunkClient` is the next app-side task.
-6. **Gamepads**: `GCController` → `.gamepadButton(...)`/`.gamepadAxis(...)` events (wire
-   contract documented on the constructors; the host accumulates them into a virtual
-   Xbox 360 pad). Poll `nextRumble()` and feed `GCDeviceHaptics` for force feedback.
-   Client-side capture isn't in `InputCapture` yet.
+6. **Gamepads — wired end to end.** Exactly ONE controller (the `GamepadManager`
+   selection) forwards as pad 0; the host accumulates the incremental events into a
+   virtual pad whose TYPE the client negotiates in the Hello (`gamepad:` connect
+   parameter, echoed resolved in `resolvedGamepad` — Automatic resolves from the physical
+   pad at connect time; host precedence: explicit client choice > host `PUNKTFUNK_GAMEPAD`
+   env > Xbox 360). A DualSense session carries the full feel: adaptive-trigger blocks
+   (`DualSenseTriggerEffect.parse` — mode bytes per the community convention
+   (Nielk1/ds5w/inputtino), total, unknown → `.off`), lightbar, player LEDs, touchpad,
+   motion. **Motion scale constants** (`GamepadWire.gyroLSBPerRadS` = 20 LSB per deg/s,
+   `accelLSBPerG` = 10000) are derived from hid-playstation's math over the host's fixed
+   calibration blob, not yet live-verified — if gyro/accel feel wrong in a real game,
+   correct sign/scale in `GamepadCapture.forwardMotion`/`GamepadWire` and `evtest` the
+   host's virtual pad. Twin identical controllers share a fingerprint base, so a manual
+   pin can swap between them across reconnects (documented in the Settings footer).
 7. **Trust — the full ceremony exists now (SPAKE2).** `generateIdentity()` once (persist
    both PEMs in the Keychain), then `pair(host:identity:pin:name:)` with the 4-digit PIN
    the host prints when it ARMS pairing (`--allow-pairing`/`--require-pairing`; one PIN

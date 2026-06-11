@@ -1,6 +1,6 @@
-// App settings (⌘,): the stream mode + the host compositor. The host creates a native
-// virtual output at exactly this size/refresh — there is no scaling anywhere in the
-// pipeline.
+// App settings (⌘,): the stream mode, the host compositor, and controllers. The host
+// creates a native virtual output at exactly this size/refresh — there is no scaling
+// anywhere in the pipeline.
 
 #if os(macOS)
 import AppKit
@@ -8,13 +8,16 @@ import AppKit
 import PunktfunkKit
 import SwiftUI
 
+@MainActor
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("punktfunk.width") private var width = 1920
     @AppStorage("punktfunk.height") private var height = 1080
     @AppStorage("punktfunk.hz") private var hz = 60
     @AppStorage("punktfunk.compositor") private var compositor = 0
+    @AppStorage("punktfunk.gamepadType") private var gamepadType = 0
     @AppStorage("punktfunk.micEnabled") private var micEnabled = true
+    @ObservedObject private var gamepads = GamepadManager.shared
     #if os(macOS)
     @AppStorage("punktfunk.speakerUID") private var speakerUID = ""
     @AppStorage("punktfunk.micUID") private var micUID = ""
@@ -83,14 +86,106 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.top, 8)
+                ForEach(gamepads.controllers) { controller in
+                    controllerRow(controller)
+                        .padding(.horizontal, 24)
+                }
+                TVSelectionRow(
+                    title: "Use controller", options: controllerOptions,
+                    selection: $gamepads.preferredID)
+                TVSelectionRow(
+                    title: "Controller type", options: Self.padTypes, selection: $gamepadType)
+                Text(Self.controllersFooter)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 8)
             }
             .frame(maxWidth: 1000)
             .frame(maxWidth: .infinity)
             .padding(60)
         }
         .navigationTitle("Settings")
+        .onAppear {
+            gamepads.refresh()
+            gamepads.startDiscovery()
+        }
+        .onDisappear { gamepads.stopDiscovery() }
     }
     #endif
+
+    // MARK: - Controllers
+
+    private static let padTypes: [(label: String, tag: Int)] = [
+        ("Automatic", 0),
+        ("Xbox 360", 1),
+        ("DualSense", 2),
+    ]
+
+    private static let controllersFooter =
+        "One controller is forwarded to the host, as player 1 — Automatic picks the most "
+        + "recently connected one. The type is the virtual pad the host creates: Automatic "
+        + "matches the controller (a DualSense gets adaptive triggers, lightbar, touchpad "
+        + "and motion), and changes apply from the next session. Two identical controllers "
+        + "may swap a manual selection after reconnecting."
+
+    /// "Use controller" choices: Automatic, every forwardable controller, and — so a stale
+    /// pin stays visible instead of leaving the Picker selection tag-less — any pinned id
+    /// that is NOT among the selectable (extended) entries, present-but-unusable included.
+    private var controllerOptions: [(label: String, tag: String)] {
+        let selectable = gamepads.controllers.filter(\.isExtended)
+        var options: [(label: String, tag: String)] = [("Automatic", "")]
+        options += selectable.map { ($0.name, $0.id) }
+        if !gamepads.preferredID.isEmpty,
+           !selectable.contains(where: { $0.id == gamepads.preferredID }) {
+            options.append(("Unavailable controller", gamepads.preferredID))
+        }
+        return options
+    }
+
+    private func controllerRow(_ controller: GamepadManager.DiscoveredController) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: controller.isDualSense ? "playstation.logo" : "gamecontroller.fill")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(controller.name)
+                HStack(spacing: 8) {
+                    if !controller.isExtended {
+                        Text(controller.productCategory)
+                    }
+                    if controller.hasAdaptiveTriggers {
+                        Image(systemName: "r2.button.roundedtop.horizontal")
+                    }
+                    if controller.hasLight {
+                        Image(systemName: "lightbulb.fill")
+                    }
+                    if controller.hasMotion {
+                        Image(systemName: "gyroscope")
+                    }
+                    if controller.hasHaptics {
+                        Image(systemName: "waveform")
+                    }
+                    if let level = controller.batteryLevel {
+                        Text("\(Int(level * 100))%")
+                        if controller.isCharging {
+                            Image(systemName: "bolt.fill")
+                        }
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if gamepads.active?.id == controller.id {
+                Text("In use")
+                    .font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(.green.opacity(0.2)))
+                    .foregroundStyle(.green)
+            }
+        }
+    }
 
     private var sharedBody: some View {
         Form {
@@ -170,8 +265,39 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section {
+                if gamepads.controllers.isEmpty {
+                    Text("No controllers detected")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(gamepads.controllers) { controller in
+                        controllerRow(controller)
+                    }
+                }
+                Picker("Use controller", selection: $gamepads.preferredID) {
+                    ForEach(controllerOptions, id: \.tag) { option in
+                        Text(option.label).tag(option.tag)
+                    }
+                }
+                Picker("Controller type", selection: $gamepadType) {
+                    ForEach(Self.padTypes, id: \.tag) { option in
+                        Text(option.label).tag(option.tag)
+                    }
+                }
+            } header: {
+                Text("Controllers")
+            } footer: {
+                Text(Self.controllersFooter)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
+        .onAppear {
+            gamepads.refresh()
+            gamepads.startDiscovery()
+        }
+        .onDisappear { gamepads.stopDiscovery() }
         #if os(macOS)
         .frame(width: 380)
         .fixedSize()

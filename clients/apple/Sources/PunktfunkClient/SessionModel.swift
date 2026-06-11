@@ -60,11 +60,14 @@ final class SessionModel: ObservableObject {
     let meter = FrameMeter()
     private var statsTimer: Timer?
     private var audio: SessionAudio?
+    private var gamepadCapture: GamepadCapture?
+    private var gamepadFeedback: GamepadFeedback?
 
     var isBusy: Bool { phase != .idle }
 
     func connect(to host: StoredHost, width: UInt32, height: UInt32, hz: UInt32,
                  compositor: PunktfunkConnection.Compositor = .auto,
+                 gamepad: PunktfunkConnection.GamepadType = .auto,
                  autoTrust: Bool = false) {
         guard phase == .idle else { return }
         phase = .connecting
@@ -80,7 +83,8 @@ final class SessionModel: ObservableObject {
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,
-                pinSHA256: pin, identity: identity, compositor: compositor) }
+                pinSHA256: pin, identity: identity, compositor: compositor,
+                gamepad: gamepad) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 // The user may have abandoned this attempt (window closed, another host
@@ -135,16 +139,26 @@ final class SessionModel: ObservableObject {
         statsTimer = nil
         let audio = self.audio
         self.audio = nil
+        // Gamepad capture is main-actor (releases held buttons on the wire while the
+        // connection is still up); the feedback drain joins off-main like audio.
+        gamepadCapture?.stop()
+        gamepadCapture = nil
+        let feedback = gamepadFeedback
+        gamepadFeedback = nil
         if let conn = connection {
-            // Audio teardown waits its drain thread out and close() waits out in-flight
-            // polls + joins the Rust worker threads — keep both off the main actor, in
-            // this order (no audio poll left when the handle is freed).
+            // Drain-thread teardown waits the pullers out and close() waits out in-flight
+            // polls + joins the Rust worker threads — keep all of it off the main actor,
+            // in this order (no poll left on any plane when the handle is freed).
             Task.detached {
                 audio?.stop()
+                feedback?.stop()
                 conn.close()
             }
         } else {
-            Task.detached { audio?.stop() }
+            Task.detached {
+                audio?.stop()
+                feedback?.stop()
+            }
         }
         connection = nil
         activeHost = nil
@@ -177,6 +191,16 @@ final class SessionModel: ObservableObject {
             micUID: defaults.string(forKey: "punktfunk.micUID") ?? "",
             micEnabled: defaults.object(forKey: "punktfunk.micEnabled") as? Bool ?? true)
         self.audio = audio
+        // Gamepads: forward GamepadManager's active controller as pad 0 and render the
+        // host's feedback (rumble always; lightbar/player-LEDs/adaptive-triggers when the
+        // session's virtual pad is a DualSense). Same trust gate as audio — nothing is
+        // forwarded during the trust prompt.
+        let capture = GamepadCapture(connection: conn, manager: .shared)
+        capture.start()
+        gamepadCapture = capture
+        let feedback = GamepadFeedback(connection: conn, manager: .shared)
+        feedback.start()
+        gamepadFeedback = feedback
     }
 
     private func startStatsTimer() {

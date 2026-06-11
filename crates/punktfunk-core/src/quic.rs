@@ -22,7 +22,9 @@
 //! reported back for persisting). The data plane adds AES-GCM on top.
 //! All integers little-endian; every message is `u16 length || payload`.
 
-use crate::config::{CompositorPref, Config, FecConfig, FecScheme, Mode, ProtocolPhase, Role};
+use crate::config::{
+    CompositorPref, Config, FecConfig, FecScheme, GamepadPref, Mode, ProtocolPhase, Role,
+};
 use crate::error::{PunktfunkError, Result};
 
 /// Protocol magic + version, first bytes of the positional handshake (Hello/Welcome/Start).
@@ -45,6 +47,11 @@ pub struct Hello {
     /// choice in [`Welcome::compositor`]. Appended to the wire form — omitted by older clients
     /// (decodes to `Auto`).
     pub compositor: CompositorPref,
+    /// Which virtual gamepad the host should create for this session's pads (`Auto` = host
+    /// decides: its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360). Resolved choice echoed in
+    /// [`Welcome::gamepad`]. Appended to the wire form — omitted by older clients (decodes
+    /// to `Auto`).
+    pub gamepad: GamepadPref,
 }
 
 /// `host → client`: the complete session offer.
@@ -65,6 +72,11 @@ pub struct Welcome {
     /// [`Hello::compositor`] preference if available, else the host's auto-detected choice).
     /// Appended to the wire form — `Auto` when an older host omitted it (i.e. "unknown").
     pub compositor: CompositorPref,
+    /// The virtual gamepad backend the host actually resolved (the client's [`Hello::gamepad`]
+    /// preference if available, else env var / X-Box 360). A client uses this to know whether
+    /// DualSense feedback (0xCD) can arrive at all. Appended to the wire form — `Auto` when an
+    /// older host omitted it (i.e. "unknown, assume X-Box 360").
+    pub gamepad: GamepadPref,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -359,13 +371,14 @@ pub mod pake {
 
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(21);
+        let mut b = Vec::with_capacity(22);
         b.extend_from_slice(MAGIC);
         b.extend_from_slice(&self.abi_version.to_le_bytes());
         b.extend_from_slice(&self.mode.width.to_le_bytes());
         b.extend_from_slice(&self.mode.height.to_le_bytes());
         b.extend_from_slice(&self.mode.refresh_hz.to_le_bytes());
         b.push(self.compositor.to_u8()); // appended at offset 20 — older hosts read [0..20] and skip it
+        b.push(self.gamepad.to_u8()); // appended at offset 21 — same back-compat discipline
         b
     }
 
@@ -381,10 +394,14 @@ impl Hello {
                 height: u32at(12),
                 refresh_hz: u32at(16),
             },
-            // Optional trailing byte — an older client that omits it requests `Auto`.
+            // Optional trailing bytes — an older client that omits them requests `Auto`.
             compositor: b
                 .get(20)
                 .map(|&v| CompositorPref::from_u8(v))
+                .unwrap_or_default(),
+            gamepad: b
+                .get(21)
+                .map(|&v| GamepadPref::from_u8(v))
                 .unwrap_or_default(),
         })
     }
@@ -411,13 +428,14 @@ impl Welcome {
         b.extend_from_slice(&self.salt);
         b.extend_from_slice(&self.frames.to_le_bytes());
         b.push(self.compositor.to_u8()); // appended at offset 53 — older clients read [0..53] and skip it
+        b.push(self.gamepad.to_u8()); // appended at offset 54 — same back-compat discipline
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<Welcome> {
         // Layout (LE): magic[0..4] abi[4..8] port[8..10] w[10..14] h[14..18] hz[18..22]
         // scheme[22] pct[23] max_data[24..26] shard[26..28] encrypt[28] key[29..45]
-        // salt[45..49] frames[49..53] compositor[53] (optional trailing byte).
+        // salt[45..49] frames[49..53] compositor[53] gamepad[54] (optional trailing bytes).
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -449,11 +467,15 @@ impl Welcome {
             key,
             salt,
             frames: u32at(49),
-            // Optional trailing byte — an older host that omits it leaves the resolved
-            // compositor unknown (`Auto`).
+            // Optional trailing bytes — an older host that omits them leaves the resolved
+            // compositor / gamepad backend unknown (`Auto`).
             compositor: b
                 .get(53)
                 .map(|&v| CompositorPref::from_u8(v))
+                .unwrap_or_default(),
+            gamepad: b
+                .get(54)
+                .map(|&v| GamepadPref::from_u8(v))
                 .unwrap_or_default(),
         })
     }
@@ -1126,6 +1148,7 @@ mod tests {
             salt: [1, 2, 3, 4],
             frames: 600,
             compositor: CompositorPref::Gamescope,
+            gamepad: GamepadPref::DualSense,
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
     }
@@ -1140,6 +1163,7 @@ mod tests {
                 refresh_hz: 120,
             },
             compositor: CompositorPref::Kwin,
+            gamepad: GamepadPref::DualSense,
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -1172,10 +1196,28 @@ mod tests {
     }
 
     #[test]
+    fn gamepad_pref_wire_and_names() {
+        for p in [
+            GamepadPref::Auto,
+            GamepadPref::Xbox360,
+            GamepadPref::DualSense,
+        ] {
+            assert_eq!(GamepadPref::from_u8(p.to_u8()), p);
+            assert_eq!(GamepadPref::from_name(p.as_str()), Some(p));
+        }
+        // Aliases + unknowns.
+        assert_eq!(GamepadPref::from_name("PS5"), Some(GamepadPref::DualSense));
+        assert_eq!(GamepadPref::from_name("x360"), Some(GamepadPref::Xbox360));
+        assert_eq!(GamepadPref::from_name("nope"), None);
+        // Unknown wire byte degrades to Auto (forward-compatible).
+        assert_eq!(GamepadPref::from_u8(200), GamepadPref::Auto);
+    }
+
+    #[test]
     fn hello_welcome_compositor_back_compat() {
-        // A new client/host appends one byte; the field is optional on decode, so a legacy
-        // peer's shorter message still decodes (compositor = Auto), and a legacy peer reading a
-        // new message ignores the trailing byte. Simulate both directions by truncation.
+        // Trailing optional bytes (compositor at 20/53, gamepad at 21/54): a legacy peer's
+        // shorter message still decodes (missing fields = Auto), and a legacy peer reading a
+        // new message ignores the trailing bytes. Simulate both directions by truncation.
         let h = Hello {
             abi_version: 2,
             mode: Mode {
@@ -1184,13 +1226,19 @@ mod tests {
                 refresh_hz: 60,
             },
             compositor: CompositorPref::Mutter,
+            gamepad: GamepadPref::DualSense,
         };
         let enc = h.encode();
-        assert_eq!(enc.len(), 21);
-        // Legacy (20-byte) Hello → Auto, mode intact.
+        assert_eq!(enc.len(), 22);
+        // Legacy (20-byte) Hello → both Auto, mode intact.
         let legacy = Hello::decode(&enc[..20]).unwrap();
         assert_eq!(legacy.compositor, CompositorPref::Auto);
+        assert_eq!(legacy.gamepad, GamepadPref::Auto);
         assert_eq!(legacy.mode, h.mode);
+        // Compositor-era (21-byte) Hello → compositor intact, gamepad Auto.
+        let mid = Hello::decode(&enc[..21]).unwrap();
+        assert_eq!(mid.compositor, CompositorPref::Mutter);
+        assert_eq!(mid.gamepad, GamepadPref::Auto);
 
         let w = Welcome {
             abi_version: 2,
@@ -1207,13 +1255,18 @@ mod tests {
             salt: [9, 8, 7, 6],
             frames: 0,
             compositor: CompositorPref::Kwin,
+            gamepad: GamepadPref::Xbox360,
         };
         let wenc = w.encode();
-        assert_eq!(wenc.len(), 54);
+        assert_eq!(wenc.len(), 55);
         let legacy_w = Welcome::decode(&wenc[..53]).unwrap();
         assert_eq!(legacy_w.compositor, CompositorPref::Auto);
+        assert_eq!(legacy_w.gamepad, GamepadPref::Auto);
         assert_eq!(legacy_w.frames, 0);
         assert_eq!(legacy_w.key, w.key);
+        let mid_w = Welcome::decode(&wenc[..54]).unwrap();
+        assert_eq!(mid_w.compositor, CompositorPref::Kwin);
+        assert_eq!(mid_w.gamepad, GamepadPref::Auto);
     }
 
     #[test]
@@ -1257,6 +1310,7 @@ mod tests {
                     refresh_hz: 60,
                 },
                 compositor: CompositorPref::Auto,
+                gamepad: GamepadPref::Auto,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");

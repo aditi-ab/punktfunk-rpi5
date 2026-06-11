@@ -106,8 +106,6 @@ mod btn1 {
 /// `buttons[2]`: PS, touchpad click, mute (+ a rolling counter in the high bits).
 mod btn2 {
     pub const PS: u8 = 0x01;
-    /// Set from a touchpad-press rich event (no equivalent on the GameStream xpad).
-    #[allow(dead_code)]
     pub const TOUCHPAD: u8 = 0x02;
     #[allow(dead_code)]
     pub const MUTE: u8 = 0x04;
@@ -227,6 +225,9 @@ impl DsState {
         if on(gs::BTN_GUIDE) {
             s.buttons[2] |= btn2::PS;
         }
+        if on(gs::BTN_TOUCHPAD) {
+            s.buttons[2] |= btn2::TOUCHPAD;
+        }
         s
     }
 
@@ -247,10 +248,40 @@ impl DsState {
     }
 }
 
+/// Serialize a full input report `0x01` (pure — unit-testable without `/dev/uhid`). Field
+/// offsets per the kernel's `struct dualsense_input_report`, this report's one consumer:
+/// x..rz 0-5, seq 6, buttons[4] 7-10, reserved[4] 11-14, gyro[3] 15-20, accel[3] 21-26,
+/// sensor_timestamp 27-30, reserved2 31, points[2] 32-39 (static_assert(sizeof == 63)).
+/// The report id occupies r[0], so struct offset N = r[N + 1].
+fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8, ts: u32) {
+    r[0] = 0x01; // report id; the struct fields follow (struct offset 0 == r[1])
+    r[1] = st.lx;
+    r[2] = st.ly;
+    r[3] = st.rx;
+    r[4] = st.ry;
+    r[5] = st.l2;
+    r[6] = st.r2;
+    r[7] = seq; // seq_number (struct off 6)
+    r[8] = (st.dpad & 0x0F) | (st.buttons[0] & 0xF0); // off 7: dpad + face buttons
+    r[9] = st.buttons[1]; // off 8
+    r[10] = st.buttons[2]; // off 9
+    r[11] = st.buttons[3]; // off 10
+    for (i, v) in st.gyro.iter().enumerate() {
+        r[16 + i * 2..18 + i * 2].copy_from_slice(&v.to_le_bytes()); // gyro at struct off 15
+    }
+    for (i, v) in st.accel.iter().enumerate() {
+        r[22 + i * 2..24 + i * 2].copy_from_slice(&v.to_le_bytes()); // accel at struct off 21
+    }
+    r[28..32].copy_from_slice(&ts.to_le_bytes()); // sensor_timestamp (struct off 27)
+    pack_touch(&mut r[33..37], &st.touch[0]); // touch point 1 (struct off 32)
+    pack_touch(&mut r[37..41], &st.touch[1]); // touch point 2
+}
+
 fn pack_touch(dst: &mut [u8], t: &Touch) {
     // byte0: bit7 = NOT active (1 = no contact), bits0-6 = contact id.
     dst[0] = (t.id & 0x7F) | if t.active { 0 } else { 0x80 };
-    let (x, y) = (t.x.min(DS_TOUCH_W), t.y.min(DS_TOUCH_H));
+    // The kernel advertises ABS_MT ranges 0..=W-1 / 0..=H-1 — never emit the size itself.
+    let (x, y) = (t.x.min(DS_TOUCH_W - 1), t.y.min(DS_TOUCH_H - 1));
     dst[1] = (x & 0xFF) as u8;
     dst[2] = (((x >> 8) & 0x0F) as u8) | (((y & 0x0F) as u8) << 4);
     dst[3] = ((y >> 4) & 0xFF) as u8;
@@ -317,30 +348,10 @@ impl DualSensePad {
 
     /// Serialize `st` into report `0x01` and write it to the kernel (UHID_INPUT2).
     pub fn write_state(&mut self, st: &DsState) -> Result<()> {
-        let mut r = [0u8; DS_INPUT_REPORT_LEN];
-        r[0] = 0x01; // report id; the struct fields follow (struct offset 0 == r[1])
-        r[1] = st.lx;
-        r[2] = st.ly;
-        r[3] = st.rx;
-        r[4] = st.ry;
-        r[5] = st.l2;
-        r[6] = st.r2;
         self.seq = self.seq.wrapping_add(1);
-        r[7] = self.seq; // seq_number (struct off 6)
-        r[8] = (st.dpad & 0x0F) | (st.buttons[0] & 0xF0); // off 7: dpad + face buttons
-        r[9] = st.buttons[1]; // off 8
-        r[10] = st.buttons[2]; // off 9
-        r[11] = st.buttons[3]; // off 10
-        for (i, v) in st.gyro.iter().enumerate() {
-            r[15 + i * 2..17 + i * 2].copy_from_slice(&v.to_le_bytes()); // gyro at struct off 14
-        }
-        for (i, v) in st.accel.iter().enumerate() {
-            r[21 + i * 2..23 + i * 2].copy_from_slice(&v.to_le_bytes()); // accel at struct off 20
-        }
         self.ts = self.ts.wrapping_add(1); // monotonic sensor timestamp is all the kernel needs
-        r[27..31].copy_from_slice(&self.ts.to_le_bytes()); // sensor_timestamp (struct off 26)
-        pack_touch(&mut r[34..38], &st.touch[0]); // touch point 1 (struct off 33)
-        pack_touch(&mut r[38..42], &st.touch[1]); // touch point 2
+        let mut r = [0u8; DS_INPUT_REPORT_LEN];
+        serialize_state(&mut r, st, self.seq, self.ts);
 
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
@@ -413,38 +424,55 @@ impl Drop for DualSensePad {
 /// Parse a DualSense USB output report (`0x02`) into a [`DsFeedback`]. The byte layout below is
 /// the USB DualSense common report; only the well-understood fields (motor rumble, lightbar RGB,
 /// player LEDs) are surfaced — adaptive-trigger blocks are forwarded raw for the client.
+///
+/// Every field is gated on the report's valid-flags (`valid_flag0` at data[1], `valid_flag1`
+/// at data[2]) — writers only set the bits for fields they mean to change (the kernel zeroes
+/// the rest), so an ungated parse would turn every plain rumble write into a lightbar-off +
+/// triggers-off broadcast.
 fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
     // data[0] is the report id (0x02). Be defensive about short reports.
     if data.first() != Some(&0x02) || data.len() < 48 {
         return;
     }
+    let flag0 = data[1]; // BIT0 compat vibration, BIT1 haptics select, BIT2 R2, BIT3 L2
+    let flag1 = data[2]; // BIT2 lightbar, BIT4 player indicators
     // Motor rumble: high-frequency (small/right) motor at data[3], low-frequency (big/left) at
     // data[4]. Scale 0..255 → 0..0xFFFF, same (low, high) convention as the uinput pad's mixer,
-    // and route to the universal rumble plane (0xCA). We don't gate on the report's valid-flags
-    // (matching the LED/trigger handling) — the manager only forwards a *change*, so a report
-    // that touches only the LED doesn't spam a rumble-stop.
-    let high = (data[3] as u16) << 8;
-    let low = (data[4] as u16) << 8;
-    fb.rumble = Some((low, high));
+    // and route to the universal rumble plane (0xCA).
+    if flag0 & 0x03 != 0 {
+        let high = (data[3] as u16) << 8;
+        let low = (data[4] as u16) << 8;
+        fb.rumble = Some((low, high));
+    }
     // Lightbar RGB (USB common report: bytes 45..48). Player LEDs at byte 44.
-    let (r, g, b) = (data[45], data[46], data[47]);
-    fb.hidout.push(HidOutput::Led { pad, r, g, b });
-    fb.hidout.push(HidOutput::PlayerLeds {
-        pad,
-        bits: data[44] & 0x1F,
-    });
-    // Adaptive-trigger parameter blocks: L2 at bytes 11..22, R2 at 22..33 (11 bytes each).
+    if flag1 & 0x04 != 0 {
+        let (r, g, b) = (data[45], data[46], data[47]);
+        fb.hidout.push(HidOutput::Led { pad, r, g, b });
+    }
+    if flag1 & 0x10 != 0 {
+        fb.hidout.push(HidOutput::PlayerLeds {
+            pad,
+            bits: data[44] & 0x1F,
+        });
+    }
+    // Adaptive-trigger parameter blocks, 11 bytes each: the RIGHT trigger comes FIRST in the
+    // report (bytes 11..22), the left at 22..33 — per SDL's DS5EffectsState_t / inputtino's
+    // ps5.hpp. Wire convention: which 0 = L2, 1 = R2.
     if data.len() >= 33 {
-        fb.hidout.push(HidOutput::Trigger {
-            pad,
-            which: 0,
-            effect: data[11..22].to_vec(),
-        });
-        fb.hidout.push(HidOutput::Trigger {
-            pad,
-            which: 1,
-            effect: data[22..33].to_vec(),
-        });
+        if flag0 & 0x04 != 0 {
+            fb.hidout.push(HidOutput::Trigger {
+                pad,
+                which: 1,
+                effect: data[11..22].to_vec(),
+            });
+        }
+        if flag0 & 0x08 != 0 {
+            fb.hidout.push(HidOutput::Trigger {
+                pad,
+                which: 0,
+                effect: data[22..33].to_vec(),
+            });
+        }
     }
 }
 
@@ -553,9 +581,10 @@ impl DualSenseManager {
                 let t = &mut self.state[idx].touch[slot];
                 t.active = active;
                 t.id = slot as u8;
-                // Normalized 0..=65535 → the touchpad's reported resolution.
-                t.x = ((x as u32 * DS_TOUCH_W as u32) / u16::MAX as u32) as u16;
-                t.y = ((y as u32 * DS_TOUCH_H as u32) / u16::MAX as u32) as u16;
+                // Normalized 0..=65535 → the touchpad's coordinate range (0..=W-1 / 0..=H-1,
+                // what the kernel advertises as the ABS_MT extents).
+                t.x = ((x as u32 * (DS_TOUCH_W - 1) as u32) / u16::MAX as u32) as u16;
+                t.y = ((y as u32 * (DS_TOUCH_H - 1) as u32) / u16::MAX as u32) as u16;
             }
             RichInput::Motion { gyro, accel, .. } => {
                 self.state[idx].gyro = gyro;
@@ -621,14 +650,19 @@ impl DualSenseManager {
 mod tests {
     use super::*;
 
-    /// A DualSense USB output report (`0x02`) parses into motor rumble (0xCA), lightbar, player
-    /// LEDs, and both adaptive-trigger blocks (0xCD).
+    /// A DualSense USB output report (`0x02`) with all valid-flags set parses into motor
+    /// rumble (0xCA), lightbar, player LEDs, and both adaptive-trigger blocks (0xCD) — with
+    /// the report's right-trigger-first layout mapped onto the wire's `which` (0 = L2).
     #[test]
     fn parse_output_report() {
         let mut data = vec![0u8; 48];
         data[0] = 0x02; // report id
+        data[1] = 0x0F; // valid_flag0: vibration + haptics + R2 + L2 triggers
+        data[2] = 0x14; // valid_flag1: lightbar + player indicators
         data[3] = 0x80; // right (high-freq) motor
         data[4] = 0x40; // left (low-freq) motor
+        data[11] = 0x21; // right-trigger block mode byte (report bytes 11..22)
+        data[22] = 0x26; // left-trigger block mode byte (report bytes 22..33)
         data[44] = 0x03; // player LEDs (low 5 bits)
         data[45] = 10; // R
         data[46] = 20; // G
@@ -646,13 +680,86 @@ mod tests {
         assert!(fb
             .hidout
             .contains(&HidOutput::PlayerLeds { pad: 0, bits: 3 }));
-        assert_eq!(
-            fb.hidout
-                .iter()
-                .filter(|h| matches!(h, HidOutput::Trigger { .. }))
-                .count(),
-            2
-        );
+        // The report's FIRST block (bytes 11..22) is the RIGHT trigger → wire which = 1.
+        let triggers: Vec<_> = fb
+            .hidout
+            .iter()
+            .filter_map(|h| match h {
+                HidOutput::Trigger { which, effect, .. } => Some((*which, effect[0])),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(triggers, vec![(1, 0x21), (0, 0x26)]);
+    }
+
+    /// Writers set only the valid-flag bits for the fields they mean to change (the kernel
+    /// zeroes the rest of the report) — a plain rumble write must NOT blank the lightbar /
+    /// player LEDs / triggers, and an LED-only write must not stop the motors.
+    #[test]
+    fn parse_output_respects_valid_flags() {
+        // Kernel-style rumble write: only the vibration flags set, everything else zero.
+        let mut data = vec![0u8; 48];
+        data[0] = 0x02;
+        data[1] = 0x03; // compatible vibration + haptics select
+        data[3] = 0xFF;
+        data[4] = 0xFF;
+        let mut fb = DsFeedback::default();
+        parse_ds_output(0, &data, &mut fb);
+        assert_eq!(fb.rumble, Some((0xFF00, 0xFF00)));
+        assert!(fb.hidout.is_empty(), "rumble write must not emit hidout");
+
+        // Lightbar-only write: no rumble surfaced (would otherwise spam rumble-stops).
+        let mut data = vec![0u8; 48];
+        data[0] = 0x02;
+        data[2] = 0x04; // lightbar control enable
+        data[45] = 1;
+        let mut fb = DsFeedback::default();
+        parse_ds_output(0, &data, &mut fb);
+        assert!(fb.rumble.is_none());
+        assert_eq!(fb.hidout.len(), 1);
+        assert!(matches!(fb.hidout[0], HidOutput::Led { r: 1, .. }));
+    }
+
+    /// The input report's sensor/touch bytes must land exactly where the kernel's
+    /// `struct dualsense_input_report` reads them (gyro at struct offset 15, accel 21,
+    /// timestamp 27, touch points 32 — report byte = struct offset + 1). A one-byte slip
+    /// here turns client motion into noise and conjures phantom touch contacts.
+    #[test]
+    fn input_report_layout_matches_hid_playstation() {
+        let mut st = DsState::neutral();
+        st.gyro = [0x1122, 0x3344, 0x5566];
+        st.accel = [0x778, 0x99A, 0xBBC];
+        st.touch[0] = Touch {
+            active: true,
+            id: 5,
+            x: 0x123,
+            y: 0x356,
+        };
+        // touch[1] stays inactive — its NOT-active bit must be set.
+        let mut r = [0u8; DS_INPUT_REPORT_LEN];
+        serialize_state(&mut r, &st, 7, 0xAABBCCDD);
+        assert_eq!(r[0], 0x01);
+        assert_eq!(r[7], 7); // seq_number (struct off 6)
+        assert_eq!(&r[16..22], &[0x22, 0x11, 0x44, 0x33, 0x66, 0x55]); // gyro LE
+        assert_eq!(&r[22..28], &[0x78, 0x07, 0x9A, 0x09, 0xBC, 0x0B]); // accel LE
+        assert_eq!(&r[28..32], &[0xDD, 0xCC, 0xBB, 0xAA]); // sensor_timestamp LE
+        // Touch point 1 at struct off 32 = r[33..37]: contact byte (active → bit7 clear),
+        // then 12-bit x / 12-bit y packed.
+        assert_eq!(r[33], 5);
+        assert_eq!(r[34], 0x23);
+        assert_eq!(r[35], 0x61); // x_hi nibble 0x1 | (y & 0xF) << 4 (y=0x356 → 0x6 << 4)
+        assert_eq!(r[36], 0x35); // y >> 4
+        assert_eq!(r[37] & 0x80, 0x80); // touch point 2 inactive
+    }
+
+    /// The wire touchpad-click bit (Moonlight's extended position) lands in `buttons[2]`.
+    #[test]
+    fn from_gamepad_maps_touchpad_click() {
+        use punktfunk_core::input::gamepad as gs;
+        let s = DsState::from_gamepad(gs::BTN_TOUCHPAD | gs::BTN_GUIDE, 0, 0, 0, 0, 0, 0);
+        assert_eq!(s.buttons[2], btn2::PS | btn2::TOUCHPAD);
+        let s = DsState::from_gamepad(gs::BTN_A, 0, 0, 0, 0, 0, 0);
+        assert_eq!(s.buttons[2], 0);
     }
 
     /// A short / wrong-id report yields nothing.

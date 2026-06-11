@@ -63,6 +63,10 @@ pub mod gamepad {
     pub const BTN_B: u32 = 0x2000;
     pub const BTN_X: u32 = 0x4000;
     pub const BTN_Y: u32 = 0x8000;
+    /// DualSense touchpad click. Moonlight's extended-button position (`buttonFlags2`
+    /// merges in at `<< 16`, see `gamestream/gamepad.rs`), so GameStream clients land on
+    /// the same bit. Only the DualSense backend renders it; the xpad has no such button.
+    pub const BTN_TOUCHPAD: u32 = 0x10_0000;
 
     /// Axis ids for `InputKind::GamepadAxis`.
     pub const AXIS_LS_X: u32 = 0;

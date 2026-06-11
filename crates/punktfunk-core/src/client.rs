@@ -11,7 +11,7 @@
 //! invariant) plus a blocking data-plane pump; frames cross to the embedder over a bounded
 //! channel. All methods are safe to call from any single embedder thread.
 
-use crate::config::{CompositorPref, Mode, Role};
+use crate::config::{CompositorPref, GamepadPref, Mode, Role};
 use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
 use crate::quic::{
@@ -71,6 +71,9 @@ pub struct NativeClient {
     /// SHA-256 fingerprint of the certificate the host actually presented. A TOFU caller
     /// (`pin = None`) persists this and passes it as the pin from then on.
     pub host_fingerprint: [u8; 32],
+    /// The virtual gamepad backend the host actually resolved ([`Welcome::gamepad`]).
+    /// `Auto` = an older host that didn't say (assume X-Box 360, no DualSense feedback).
+    pub resolved_gamepad: GamepadPref,
 }
 
 impl NativeClient {
@@ -84,11 +87,13 @@ impl NativeClient {
     /// `identity`: this client's persistent self-signed identity (PEM cert + PKCS#8 key,
     /// see [`endpoint::generate_identity`]), presented via TLS client auth so a host can
     /// recognize a paired client. `None` = anonymous (rejected by hosts requiring pairing).
+    #[allow(clippy::too_many_arguments)]
     pub fn connect(
         host: &str,
         port: u16,
         mode: Mode,
         compositor: CompositorPref,
+        gamepad: GamepadPref,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
         timeout: Duration,
@@ -101,7 +106,8 @@ impl NativeClient {
         let (mic_tx, mic_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u64, Vec<u8>)>();
         let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<RichInput>();
         let (reconfig_tx, reconfig_rx) = tokio::sync::mpsc::unbounded_channel::<Mode>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(Mode, [u8; 32])>>();
+        let (ready_tx, ready_rx) =
+            std::sync::mpsc::channel::<Result<(Mode, GamepadPref, [u8; 32])>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mode_slot = Arc::new(std::sync::Mutex::new(mode));
 
@@ -127,6 +133,7 @@ impl NativeClient {
                     port,
                     mode,
                     compositor,
+                    gamepad,
                     pin,
                     identity,
                     frame_tx,
@@ -144,7 +151,7 @@ impl NativeClient {
             })
             .map_err(PunktfunkError::Io)?;
 
-        let (negotiated, fingerprint) = match ready_rx.recv_timeout(timeout) {
+        let (negotiated, resolved_gamepad, fingerprint) = match ready_rx.recv_timeout(timeout) {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -166,6 +173,7 @@ impl NativeClient {
             worker: Some(worker),
             mode: mode_slot,
             host_fingerprint: fingerprint,
+            resolved_gamepad,
         })
     }
 
@@ -364,6 +372,7 @@ struct WorkerArgs {
     port: u16,
     mode: Mode,
     compositor: CompositorPref,
+    gamepad: GamepadPref,
     pin: Option<[u8; 32]>,
     identity: Option<(String, String)>,
     frame_tx: SyncSender<Frame>,
@@ -374,7 +383,7 @@ struct WorkerArgs {
     mic_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, u64, Vec<u8>)>,
     rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<RichInput>,
     reconfig_rx: tokio::sync::mpsc::UnboundedReceiver<Mode>,
-    ready_tx: std::sync::mpsc::Sender<Result<(Mode, [u8; 32])>>,
+    ready_tx: std::sync::mpsc::Sender<Result<(Mode, GamepadPref, [u8; 32])>>,
     shutdown: Arc<AtomicBool>,
     mode_slot: Arc<std::sync::Mutex<Mode>>,
 }
@@ -387,6 +396,7 @@ async fn worker_main(args: WorkerArgs) {
         port,
         mode,
         compositor,
+        gamepad,
         pin,
         identity,
         frame_tx,
@@ -437,6 +447,7 @@ async fn worker_main(args: WorkerArgs) {
                 abi_version: crate::ABI_VERSION,
                 mode,
                 compositor,
+                gamepad,
             }
             .encode(),
         )
@@ -446,6 +457,12 @@ async fn worker_main(args: WorkerArgs) {
             tracing::info!(
                 compositor = welcome.compositor.as_str(),
                 "host resolved compositor"
+            );
+        }
+        if welcome.gamepad != GamepadPref::Auto {
+            tracing::info!(
+                gamepad = welcome.gamepad.as_str(),
+                "host resolved gamepad backend"
             );
         }
 
@@ -466,18 +483,33 @@ async fn worker_main(args: WorkerArgs) {
         let transport =
             UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())?;
         let session = Session::new(welcome.session_config(Role::Client), Box::new(transport))?;
-        Ok::<_, PunktfunkError>((conn, session, send, recv, welcome.mode, fingerprint))
+        Ok::<_, PunktfunkError>((
+            conn,
+            session,
+            send,
+            recv,
+            welcome.mode,
+            welcome.gamepad,
+            fingerprint,
+        ))
     };
 
-    let (conn, mut session, mut ctrl_send, mut ctrl_recv, negotiated, fingerprint) =
-        match setup.await {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
-        };
-    let _ = ready_tx.send(Ok((negotiated, fingerprint)));
+    let (
+        conn,
+        mut session,
+        mut ctrl_send,
+        mut ctrl_recv,
+        negotiated,
+        resolved_gamepad,
+        fingerprint,
+    ) = match setup.await {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+    let _ = ready_tx.send(Ok((negotiated, resolved_gamepad, fingerprint)));
 
     // Input task: embedder events → QUIC datagrams.
     let input_conn = conn.clone();
