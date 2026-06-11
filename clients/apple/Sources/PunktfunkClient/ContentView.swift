@@ -64,6 +64,7 @@ struct ContentView: View {
                 pinned.pinnedSHA256 = fingerprint
                 connect(pinned)
             }
+            .background(.thickMaterial, ignoresSafeAreaEdges: .all)
         }
         #else
         .sheet(item: $pairingTarget) { host in
@@ -165,11 +166,15 @@ struct ContentView: View {
         .frame(minWidth: 480, minHeight: 360)
         #endif
         #if os(tvOS)
+        // tvOS forms/lists have CLEAR backgrounds and a cover only shows what the
+        // presented view paints — back them with the standard tv blur-over-content.
         .fullScreenCover(isPresented: $showAddHost) {
             AddHostSheet { store.add($0) }
+                .background(.thickMaterial, ignoresSafeAreaEdges: .all)
         }
         .fullScreenCover(isPresented: $showSettings) {
             SettingsView()
+                .background(.thickMaterial, ignoresSafeAreaEdges: .all)
         }
         #else
         .sheet(isPresented: $showAddHost) {
