@@ -66,12 +66,13 @@ public struct StreamView: UIViewControllerRepresentable {
     }
 }
 
-public final class StreamViewController: UIViewController {
+public final class StreamViewController: UIViewController, UIPointerInteractionDelegate {
     public private(set) var connection: PunktfunkConnection?
     private var pump: StreamPump?
     private var inputCapture: InputCapture?
     private var captured = false
     private var observers: [NSObjectProtocol] = []
+    private var pointerInteraction: UIPointerInteraction?
 
     var onCaptureChange: ((Bool) -> Void)?
 
@@ -89,6 +90,19 @@ public final class StreamViewController: UIViewController {
 
     public override func loadView() {
         view = StreamLayerUIView()
+        // Hide the iPadOS cursor while it hovers the video: the host renders its own
+        // cursor from our raw deltas, so the local one only diverges from it. (True
+        // pointer LOCK — prefersPointerLocked — isn't consulted through
+        // UIHostingController; this hides the pointer without locking it.)
+        let interaction = UIPointerInteraction(delegate: self)
+        view.addInteraction(interaction)
+        pointerInteraction = interaction
+    }
+
+    public func pointerInteraction(
+        _ interaction: UIPointerInteraction, styleFor region: UIPointerRegion
+    ) -> UIPointerStyle? {
+        captured ? .hidden() : nil
     }
 
     public override var prefersPointerLocked: Bool { captured }
@@ -168,6 +182,7 @@ public final class StreamViewController: UIViewController {
             captured = false
         }
         setNeedsUpdateOfPrefersPointerLocked()
+        pointerInteraction?.invalidate() // re-resolve the hidden/visible pointer style
         let onCaptureChange = onCaptureChange
         let captured = captured
         DispatchQueue.main.async { onCaptureChange?(captured) }

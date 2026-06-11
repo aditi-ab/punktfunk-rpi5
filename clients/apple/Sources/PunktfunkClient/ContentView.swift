@@ -40,7 +40,10 @@ struct ContentView: View {
                 home
             }
         }
-        .onAppear { autoConnectIfAsked() }
+        .onAppear {
+            seedDefaultModeIfNeeded()
+            autoConnectIfAsked()
+        }
         .onDisappear { model.disconnect() } // window closed mid-session (Cmd+N spawns more)
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
@@ -77,8 +80,15 @@ struct ContentView: View {
         }
         #if os(macOS)
         .frame(minWidth: 640, minHeight: 360)
-        #endif
         .background(Color.black)
+        #else
+        // Streaming is immersive: edge-to-edge under the status bar and home
+        // indicator, both hidden for the session (they return with the hosts grid).
+        .background(Color.black)
+        .ignoresSafeArea()
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
+        #endif
     }
 
     // MARK: - Home (hosts grid)
@@ -241,6 +251,21 @@ struct ContentView: View {
             }
             Button("Remove", role: .destructive) { store.remove(host) }
         }
+    }
+
+    /// First run on iOS: default the stream mode to this device's native screen so the
+    /// video fills the display instead of letterboxing 1920×1080 onto a 4:3 iPad. (The
+    /// compiled-in AppStorage defaults only apply until any value is saved; macOS keeps
+    /// 1080p — a desktop window is not the screen.)
+    private func seedDefaultModeIfNeeded() {
+        #if os(iOS)
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: "punktfunk.width") == nil else { return }
+        let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels
+        defaults.set(Int(max(bounds.width, bounds.height)), forKey: "punktfunk.width")
+        defaults.set(Int(min(bounds.width, bounds.height)), forKey: "punktfunk.height")
+        defaults.set(UIScreen.main.maximumFramesPerSecond, forKey: "punktfunk.hz")
+        #endif
     }
 
     private func connect(_ host: StoredHost) {

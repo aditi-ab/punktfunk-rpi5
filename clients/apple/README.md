@@ -188,11 +188,14 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    pickers are macOS-only). For the iPad-with-external-display setup: the target
    enables multiple scenes + indirect input events — on Stage Manager iPads, drag the
    punktfunk window onto the external screen and the stream runs there with full
-   keyboard/mouse/touch. Known gaps: `prefersPointerLocked` is declared on the stream
-   view controller but UIHostingController doesn't forward the preference from
-   representable children, so the system cursor stays visible (relative-mouse
-   forwarding works regardless — fixing it means putting the controller into the UIKit
-   presentation chain, e.g. a full-screen UIKit presentation on session start); and
+   keyboard/mouse/touch. While streaming the session is immersive (edge-to-edge,
+   status bar + home indicator hidden) and the iPadOS cursor is hidden over the video
+   (`UIPointerInteraction` `.hidden()` — visible again when ⌘⎋ releases capture); on
+   iOS first run the stream mode defaults to the device's native screen so the video
+   fills the display. Known gaps: true pointer LOCK (`prefersPointerLocked`) isn't
+   consulted through UIHostingController, so the hidden cursor can still drift onto a
+   second screen (fixing it means putting the controller into the UIKit presentation
+   chain); and
    AVAudioSession interruptions (calls, Siri) don't auto-restart the audio engines yet
    (reconnect recovers).
 
