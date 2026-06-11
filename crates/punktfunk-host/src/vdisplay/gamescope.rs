@@ -34,12 +34,43 @@ impl VirtualDisplay for GamescopeDisplay {
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        // Attach to an already-running gamescope (debug / Steam-launched session) instead of
-        // spawning one: PUNKTFUNK_GAMESCOPE_NODE=<pipewire node id>.
+        // Attach to an already-running gamescope (e.g. a headless `gamescope-session-plus` Steam
+        // session, or a debug/Steam-launched one) instead of spawning our own: capture its node
+        // AND inject into its EIS socket. PUNKTFUNK_GAMESCOPE_NODE=<id|auto>; "auto" discovers the
+        // gamescope `Video/Source` node so nothing has to be hand-wired. This is the Bazzite path:
+        // a persistent headless Steam-Deck-UI session (full gamescope-session-plus polish, at the
+        // client's resolution) that punktfunk streams + drives, instead of nesting a second Steam.
         if let Ok(id) = std::env::var("PUNKTFUNK_GAMESCOPE_NODE") {
-            let node_id: u32 = id
-                .parse()
-                .context("PUNKTFUNK_GAMESCOPE_NODE must be a node id")?;
+            let node_id: u32 = if id.trim().eq_ignore_ascii_case("auto") {
+                find_gamescope_node().ok_or_else(|| {
+                    anyhow!(
+                        "PUNKTFUNK_GAMESCOPE_NODE=auto but no running gamescope Video/Source node \
+                         was found — is the headless gamescope/Steam session up?"
+                    )
+                })?
+            } else {
+                id.parse()
+                    .context("PUNKTFUNK_GAMESCOPE_NODE must be a node id or 'auto'")?
+            };
+            // Point the libei injector at the running gamescope's EIS socket: it reads the relay
+            // file [`EI_SOCKET_FILE`], so write the live socket's name there. Best-effort — video
+            // still works without it (input just won't reach the attached session).
+            match find_gamescope_eis_socket() {
+                Some(sock) => match std::fs::write(EI_SOCKET_FILE, &sock) {
+                    Ok(()) => tracing::info!(
+                        socket = %sock,
+                        "gamescope attach: pointed injector at the running session's EIS socket"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "gamescope attach: could not write the EIS relay file — input may not reach the session"
+                    ),
+                },
+                None => tracing::warn!(
+                    "gamescope attach: no connectable gamescope EIS socket found — input injection \
+                     will not reach the attached session"
+                ),
+            }
             tracing::info!(node_id, "gamescope: attaching to existing PipeWire node");
             return Ok(VirtualOutput {
                 node_id,
@@ -196,6 +227,37 @@ fn find_gamescope_node() -> Option<u32> {
         }
     }
     None
+}
+
+/// Find the live gamescope EIS (libei) socket to inject into when ATTACHING to an existing
+/// session (the spawn path instead relays the nested gamescope's `LIBEI_SOCKET` through a file).
+///
+/// gamescope names its EIS socket `gamescope-<display>-ei` in `XDG_RUNTIME_DIR` (alongside the
+/// `gamescope-<display>` wayland socket). Stale sockets from dead sessions linger, so we don't
+/// trust the name — we `connect()` each candidate and keep the connectable ones, returning the
+/// most recently created (the live session). Returns the bare socket *name* (the injector
+/// resolves it against `XDG_RUNTIME_DIR`, matching libei's own `LIBEI_SOCKET` semantics).
+fn find_gamescope_eis_socket() -> Option<String> {
+    let runtime = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    let mut live: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for entry in std::fs::read_dir(&runtime).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // The EIS socket itself, not its `.lock` sidecar or the bare wayland socket.
+        if !(name.starts_with("gamescope-") && name.ends_with("-ei")) {
+            continue;
+        }
+        // Connectable == a live listener is behind it (a dead session's socket refuses).
+        if std::os::unix::net::UnixStream::connect(entry.path()).is_err() {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        live.push((mtime, name));
+    }
+    live.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // newest first
+    live.into_iter().next().map(|(_, n)| n)
 }
 
 /// gamescope is usable wherever its binary runs — it spawns its own nested session, so it does

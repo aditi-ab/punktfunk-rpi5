@@ -1,0 +1,41 @@
+# punktfunk headless Steam session — systemd USER unit (Bazzite / SteamOS-like hosts).
+#
+# Runs the FULL gamescope-session-plus Steam Deck UI (MangoApp/VRR/controller config — all the
+# polish) headless, at your streaming client's resolution, with no physical display. punktfunk's
+# host then ATTACHES to it (capture its PipeWire node + inject into its libei socket) instead of
+# nesting a second, conflicting Steam — set the host's PUNKTFUNK_GAMESCOPE_NODE=auto +
+# PUNKTFUNK_INPUT_BACKEND=gamescope (see scripts/host.env.example).
+#
+# Prereq — free Steam from the local gaming session (so this owns it), on a headless box:
+#   sudo loginctl enable-linger $USER         # user services run without a graphical login
+#   sudo systemctl set-default multi-user.target   # don't auto-start the local gaming session
+#   sudo systemctl isolate multi-user.target       # stop it now (or reboot)
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user && cp scripts/punktfunk-steam-session.service ~/.config/systemd/user/
+#   # edit SCREEN_WIDTH/HEIGHT below to your client's resolution, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now punktfunk-steam-session
+#
+# Revert to local gaming mode anytime:
+#   systemctl --user disable --now punktfunk-steam-session
+#   sudo systemctl set-default graphical.target && sudo systemctl isolate graphical.target
+[Unit]
+Description=punktfunk headless Steam Big Picture session (gamescope-session-plus)
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire.service
+
+[Service]
+# Headless gamescope at the streamed resolution. gamescope-session-plus reads all of these from
+# the environment (see /usr/share/gamescope-session-plus/gamescope-session-plus). Set the WIDTH/
+# HEIGHT to your client's mode; CUSTOM_REFRESH_RATES advertises selectable rates to Big Picture.
+Environment=BACKEND=headless
+Environment=SCREEN_WIDTH=5120
+Environment=SCREEN_HEIGHT=1440
+Environment=CUSTOM_REFRESH_RATES=60,120,240
+Environment=STEAM_DISPLAY_REFRESH_LIMITS=60,240
+ExecStart=/usr/share/gamescope-session-plus/gamescope-session-plus steam
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
