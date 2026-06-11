@@ -1,10 +1,12 @@
 # punktfunk headless Steam session — systemd USER unit (Bazzite / SteamOS-like hosts).
 #
-# Runs the FULL gamescope-session-plus Steam Deck UI (MangoApp/VRR/controller config — all the
-# polish) headless, at your streaming client's resolution, with no physical display. punktfunk's
-# host then ATTACHES to it (capture its PipeWire node + inject into its libei socket) instead of
-# nesting a second, conflicting Steam — set the host's PUNKTFUNK_GAMESCOPE_NODE=auto +
-# PUNKTFUNK_INPUT_BACKEND=gamescope (see scripts/host.env.example).
+# DEPRECATED — superseded by the host-managed session (`PUNKTFUNK_GAMESCOPE_SESSION=steam` in
+# host.env). The host now LAUNCHES gamescope-session-plus on demand AT THE CLIENT'S mode (so games
+# see the client's exact resolution + refresh, dynamically per connection) and relaunches it on a
+# mode change. Do NOT enable this fixed-resolution unit alongside the host-managed path — two
+# gamescope sessions publish two Video/Source nodes and break node discovery. Kept only for the
+# legacy fixed-mode ATTACH setup (`PUNKTFUNK_GAMESCOPE_NODE=auto`); it caps every game at this
+# unit's resolution. The PREREQS below still apply to the host-managed path too.
 #
 # Prereq — free Steam from the local gaming session (so this owns it), on a headless box:
 #   sudo loginctl enable-linger $USER         # user services run without a graphical login

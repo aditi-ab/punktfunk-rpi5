@@ -18,9 +18,32 @@ use anyhow::{anyhow, Context, Result};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The gamescope virtual-display driver. Each [`create`](VirtualDisplay::create) spawns one
-/// headless gamescope process sized to the requested mode.
+/// The gamescope virtual-display driver. Three modes by env, in precedence order:
+/// * `PUNKTFUNK_GAMESCOPE_SESSION=<client>` — host-MANAGE a `gamescope-session-plus` session
+///   (full Steam-Deck-UI polish) headless at the CLIENT's mode; relaunch it when the mode changes.
+/// * `PUNKTFUNK_GAMESCOPE_NODE=<id|auto>` — ATTACH to an already-running gamescope (capture +
+///   inject, no lifecycle ownership).
+/// * else — SPAWN a bare headless gamescope sized to the mode, running `PUNKTFUNK_GAMESCOPE_APP`.
 pub struct GamescopeDisplay;
+
+/// A running host-managed session (its transient systemd --user unit) + the mode it was launched at.
+struct SessionState {
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+}
+
+/// The host-managed `gamescope-session-plus` session, tracked at **host lifetime** (NOT per
+/// `GamescopeDisplay`, which is recreated per client session and would otherwise cold-start Steam on
+/// every reconnect). A same-mode reconnect reuses the running session (no Steam restart); a
+/// different mode relaunches it. Cleared/relaunched by `launch_session`; survives across client
+/// connections; on host restart the next launch stops the leftover unit by name and starts fresh.
+static MANAGED_SESSION: std::sync::Mutex<Option<SessionState>> = std::sync::Mutex::new(None);
+
+/// systemd --user transient unit name for the host-managed gamescope-session-plus session.
+const SESSION_UNIT: &str = "punktfunk-gamescope";
+/// The gamescope-session-plus launcher script (Bazzite / SteamOS-like hosts).
+const SESSION_PLUS_BIN: &str = "/usr/share/gamescope-session-plus/gamescope-session-plus";
 
 impl GamescopeDisplay {
     pub fn new() -> Result<Self> {
@@ -34,12 +57,16 @@ impl VirtualDisplay for GamescopeDisplay {
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        // Attach to an already-running gamescope (e.g. a headless `gamescope-session-plus` Steam
-        // session, or a debug/Steam-launched one) instead of spawning our own: capture its node
-        // AND inject into its EIS socket. PUNKTFUNK_GAMESCOPE_NODE=<id|auto>; "auto" discovers the
-        // gamescope `Video/Source` node so nothing has to be hand-wired. This is the Bazzite path:
-        // a persistent headless Steam-Deck-UI session (full gamescope-session-plus polish, at the
-        // client's resolution) that punktfunk streams + drives, instead of nesting a second Steam.
+        // Host-managed gamescope-session-plus at the CLIENT's mode (the Bazzite path): launch the
+        // full Steam-Deck-UI session headless at the client's resolution + refresh — so games SEE
+        // them (via the injected --nested-refresh + generated CVT modes, not the box's TV EDID) —
+        // and relaunch it when the client's mode changes. Reuses the node + EIS discovery below.
+        if let Ok(client) = std::env::var("PUNKTFUNK_GAMESCOPE_SESSION") {
+            return create_managed_session(&client, mode);
+        }
+        // Attach to an already-running gamescope (a foreign / externally-launched session) instead
+        // of spawning our own: capture its node AND inject into its EIS socket.
+        // PUNKTFUNK_GAMESCOPE_NODE=<id|auto>; "auto" discovers the gamescope `Video/Source` node.
         if let Ok(id) = std::env::var("PUNKTFUNK_GAMESCOPE_NODE") {
             let node_id: u32 = if id.trim().eq_ignore_ascii_case("auto") {
                 find_gamescope_node().ok_or_else(|| {
@@ -52,25 +79,7 @@ impl VirtualDisplay for GamescopeDisplay {
                 id.parse()
                     .context("PUNKTFUNK_GAMESCOPE_NODE must be a node id or 'auto'")?
             };
-            // Point the libei injector at the running gamescope's EIS socket: it reads the relay
-            // file [`EI_SOCKET_FILE`], so write the live socket's name there. Best-effort — video
-            // still works without it (input just won't reach the attached session).
-            match find_gamescope_eis_socket() {
-                Some(sock) => match std::fs::write(EI_SOCKET_FILE, &sock) {
-                    Ok(()) => tracing::info!(
-                        socket = %sock,
-                        "gamescope attach: pointed injector at the running session's EIS socket"
-                    ),
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "gamescope attach: could not write the EIS relay file — input may not reach the session"
-                    ),
-                },
-                None => tracing::warn!(
-                    "gamescope attach: no connectable gamescope EIS socket found — input injection \
-                     will not reach the attached session"
-                ),
-            }
+            point_injector_at_eis();
             tracing::info!(node_id, "gamescope: attaching to existing PipeWire node");
             return Ok(VirtualOutput {
                 node_id,
@@ -103,6 +112,164 @@ impl VirtualDisplay for GamescopeDisplay {
             keepalive: Box::new(proc),
         })
     }
+}
+
+/// Host-managed `gamescope-session-plus` at the client's mode (state in [`MANAGED_SESSION`], so it
+/// persists across client connections — a reconnect at the same mode reuses it instantly). REUSE
+/// the running session if the mode is unchanged and its node is still live (no Steam restart);
+/// otherwise stop the old transient unit and RELAUNCH at the new mode (gamescope can't change output
+/// mode live). Then discover the node + point the injector, exactly as the attach path does.
+fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
+    let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    let same_mode = guard.as_ref().is_some_and(|s| {
+        s.width == mode.width && s.height == mode.height && s.refresh_hz == mode.refresh_hz
+    });
+    if same_mode {
+        if let Some(node_id) = find_gamescope_node() {
+            point_injector_at_eis();
+            tracing::info!(
+                node_id,
+                w = mode.width,
+                h = mode.height,
+                hz = mode.refresh_hz,
+                "gamescope session: reusing the running session (same mode — no Steam restart)"
+            );
+            return Ok(VirtualOutput {
+                node_id,
+                remote_fd: None,
+                preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
+                keepalive: Box::new(()),
+            });
+        }
+        tracing::warn!("gamescope session: tracked session has no live node — relaunching");
+        *guard = None;
+    }
+    // (Re)launch at the new mode. `launch_session` stops the old unit by name first, so there is
+    // exactly one gamescope `Video/Source` node for discovery.
+    let node_id = launch_session(client, SESSION_UNIT, mode)?;
+    point_injector_at_eis();
+    *guard = Some(SessionState {
+        width: mode.width,
+        height: mode.height,
+        refresh_hz: mode.refresh_hz,
+    });
+    tracing::info!(
+        node_id,
+        w = mode.width,
+        h = mode.height,
+        hz = mode.refresh_hz,
+        "gamescope session: launched gamescope-session-plus at the client's mode"
+    );
+    Ok(VirtualOutput {
+        node_id,
+        remote_fd: None,
+        preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
+        keepalive: Box::new(()),
+    })
+}
+
+/// Point the libei injector at the running gamescope's EIS socket (it reads the relay file
+/// [`EI_SOCKET_FILE`]). Best-effort — video still works without it (input just won't reach the
+/// session). Shared by the attach and host-managed-session paths.
+fn point_injector_at_eis() {
+    match find_gamescope_eis_socket() {
+        Some(sock) => match std::fs::write(EI_SOCKET_FILE, &sock) {
+            Ok(()) => {
+                tracing::info!(socket = %sock, "gamescope: pointed injector at the session's EIS socket")
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "gamescope: could not write the EIS relay file — input may not reach the session"
+            ),
+        },
+        None => tracing::warn!(
+            "gamescope: no connectable gamescope EIS socket found — input won't reach the session"
+        ),
+    }
+}
+
+/// Path of the host-written `GAMESCOPE_BIN` wrapper (per-user, in tmpfs).
+fn gamescope_bin_wrapper_path() -> std::path::PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::Path::new(&base).join("punktfunk-gamescope-bin")
+}
+
+/// Write the `GAMESCOPE_BIN` wrapper that injects `--nested-refresh $PF_HZ` — the flag
+/// gamescope-session-plus does NOT expose, and the one that makes games see the client's refresh
+/// instead of ~60 Hz. The body is constant (the rate comes from the `PF_HZ` env per launch), so the
+/// write is idempotent. Returns its path.
+fn write_gamescope_bin_wrapper() -> Result<std::path::PathBuf> {
+    let path = gamescope_bin_wrapper_path();
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nexec /usr/bin/gamescope --nested-refresh \"${PF_HZ:-60}\" \"$@\"\n",
+    )
+    .with_context(|| format!("write GAMESCOPE_BIN wrapper {}", path.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod the GAMESCOPE_BIN wrapper {}", path.display()))?;
+    Ok(path)
+}
+
+/// Launch `gamescope-session-plus <client>` headless at `mode` as a transient `systemd --user`
+/// unit (clean cgroup teardown of the whole Steam tree on stop). Injects `--nested-refresh` (via
+/// the wrapper) + `--generate-drm-mode cvt` so games see exactly `mode` (resolution + refresh) and
+/// not the box's physical-display EDID. Blocks until the gamescope `Video/Source` node appears
+/// (Steam Big Picture cold-start is slow), returning its id; on timeout it stops the unit and errors.
+fn launch_session(client: &str, unit_name: &str, mode: Mode) -> Result<u32> {
+    if !std::path::Path::new(SESSION_PLUS_BIN).exists() {
+        anyhow::bail!(
+            "PUNKTFUNK_GAMESCOPE_SESSION is set but {SESSION_PLUS_BIN} is missing — the host-managed \
+             session needs gamescope-session-plus (a Bazzite / SteamOS-like host)"
+        );
+    }
+    let wrapper = write_gamescope_bin_wrapper()?;
+    stop_session(unit_name); // clear any stale unit + relay so a relaunch is clean
+    let hz = mode.refresh_hz.max(1);
+    let status = Command::new("systemd-run")
+        .args(["--user", "--collect", &format!("--unit={unit_name}")])
+        .arg("--setenv=BACKEND=headless")
+        .arg(format!("--setenv=SCREEN_WIDTH={}", mode.width))
+        .arg(format!("--setenv=SCREEN_HEIGHT={}", mode.height))
+        .arg(format!("--setenv=PF_HZ={hz}"))
+        .arg(format!("--setenv=GAMESCOPE_BIN={}", wrapper.display()))
+        .arg("--setenv=DRM_MODE=cvt")
+        .arg(format!("--setenv=CUSTOM_REFRESH_RATES={hz}"))
+        .arg("--")
+        .arg(SESSION_PLUS_BIN)
+        .arg(client)
+        .status()
+        .context(
+            "launch gamescope-session-plus via `systemd-run --user` (is the user systemd manager \
+             up with XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS set?)",
+        )?;
+    if !status.success() {
+        anyhow::bail!("`systemd-run --user` failed to start the gamescope session (exit {status})");
+    }
+    // Steam Big Picture cold-start is far slower than a bare app — poll the node for up to 45s.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if let Some(id) = find_gamescope_node() {
+            return Ok(id);
+        }
+        if Instant::now() >= deadline {
+            stop_session(unit_name);
+            anyhow::bail!(
+                "gamescope-session-plus '{client}' did not publish a Video/Source node within 45s \
+                 (Steam failed to start? — `journalctl --user -u {unit_name}`)"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Stop the host-managed session's transient unit (best-effort) and clear the EIS relay so a dead
+/// session's socket name can't be reconnected.
+fn stop_session(unit_name: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", unit_name])
+        .status();
+    let _ = std::fs::remove_file(EI_SOCKET_FILE);
 }
 
 /// File where the wrapper below writes gamescope's `LIBEI_SOCKET` (its EIS server socket),
