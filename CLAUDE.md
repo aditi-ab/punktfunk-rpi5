@@ -158,7 +158,9 @@ cargo run -rp punktfunk-client-rs -- --mode 1280x720x120 --out /tmp/a.h265 --inp
 ```
 
 Pinned crate facts: `ashpd` 0.13 + `pipewire` 0.9 (must match ashpd's) + `ffmpeg-next` 8.x
-(system FFmpeg 8 / libavcodec 62). Env knobs: `PUNKTFUNK_VIDEO_SOURCE=virtual|portal`,
+(`ffmpeg-sys-next` auto-detects the system FFmpeg, so it builds against **FFmpeg 7.x/libavcodec 61
+or 8.x/libavcodec 62** — validated live on Ubuntu 26.04 (8) and Bazzite F43 (7.1); the zero-copy
+FFI also link-needs `libGL`/`libgbm`/`libcuda` at build time). Env knobs: `PUNKTFUNK_VIDEO_SOURCE=virtual|portal`,
 `PUNKTFUNK_COMPOSITOR=kwin|gamescope|mutter`, `PUNKTFUNK_ZEROCOPY=1`, `PUNKTFUNK_GAMESCOPE_APP=...`,
 `PUNKTFUNK_INPUT_BACKEND=...`, `PUNKTFUNK_PERF=1` (per-stage timing), `PUNKTFUNK_VIDEO_DROP=N` (FEC
 test), `PUNKTFUNK_FEC_PCT=N`.

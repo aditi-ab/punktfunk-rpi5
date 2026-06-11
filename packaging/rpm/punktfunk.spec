@@ -47,9 +47,19 @@ BuildRequires:  pkgconfig(wayland-client)
 BuildRequires:  pkgconfig(xkbcommon)
 BuildRequires:  pkgconfig(opus)
 # FFmpeg dev headers with NVENC — from RPM Fusion (ffmpeg-devel), NOT ffmpeg-free.
+# Version-agnostic: ffmpeg-sys-next auto-detects the installed FFmpeg, so this builds
+# against FFmpeg 7.x (libavcodec 61, e.g. Fedora 43 / Bazzite) or 8.x (libavcodec 62).
 BuildRequires:  pkgconfig(libavcodec)
 BuildRequires:  pkgconfig(libavformat)
 BuildRequires:  pkgconfig(libavutil)
+# Zero-copy GPU path: src/zerocopy/ links libGL + libgbm (mesa) via hand-rolled FFI.
+BuildRequires:  pkgconfig(gl)
+BuildRequires:  pkgconfig(gbm)
+# It ALSO links the NVIDIA CUDA driver lib (-lcuda) via FFI, so libcuda.so must be present
+# at LINK time. A normal NVIDIA host (or Bazzite -nvidia) has it; a headless COPR/koji builder
+# without a GPU does NOT — point %build at the CUDA toolkit stub (…/stubs/libcuda.so) there,
+# e.g. `ln -s $(rpm -ql cuda-cudart-devel | grep stubs/libcuda.so | head -1) /usr/lib64/`.
+# (Proper fix tracked separately: make the cuda/gbm/GL FFI dlopen-based like khronos-egl.)
 
 # --- Runtime -----------------------------------------------------------------
 Requires:       pipewire

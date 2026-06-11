@@ -1,4 +1,6 @@
-//! NVENC encoder via `ffmpeg-next` (binds the system FFmpeg 8.x / libavcodec 62).
+//! NVENC encoder via `ffmpeg-next` (binds the system FFmpeg — `ffmpeg-sys-next` auto-detects the
+//! installed version, so this builds against FFmpeg 7.x/libavcodec 61 *or* 8.x/libavcodec 62;
+//! validated live on Ubuntu 26.04 (FFmpeg 8) and Bazzite F43 (FFmpeg 7.1)).
 //!
 //! Input is a packed RGB/BGR CPU frame; `*_nvenc` accepts `rgb0`/`bgr0`/`rgba`/`bgra`
 //! directly and does the RGB→YUV conversion on the GPU, so the host stays off the
