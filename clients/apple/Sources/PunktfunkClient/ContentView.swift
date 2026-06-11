@@ -90,24 +90,16 @@ struct ContentView: View {
                     emptyState
                 } else {
                     ScrollView {
-                        LazyVGrid(
-                            columns: [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 16)],
-                            spacing: 16
-                        ) {
+                        LazyVGrid(columns: gridColumns, spacing: 16) {
                             ForEach(store.hosts) { host in
                                 hostCard(host)
                             }
                         }
-                        .padding(20)
+                        .padding()
                     }
                 }
             }
             .navigationTitle("punktfunk")
-            #if os(iOS)
-            // Liquid-glass header: the large title shares the bar row with the action
-            // circles instead of stacking under them.
-            .toolbarTitleDisplayMode(.inlineLarge)
-            #endif
             .toolbar {
                 #if os(iOS)
                 // Adjacent trailing items share one glass pill (the system default).
@@ -155,6 +147,16 @@ struct ContentView: View {
         } message: {
             Text(model.errorMessage ?? "")
         }
+    }
+
+    /// macOS caps card width (a huge window shouldn't yield huge cards); on iOS the
+    /// columns FILL the width so the cards stay edge-aligned with the title and bars.
+    private var gridColumns: [GridItem] {
+        #if os(macOS)
+        [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 16)]
+        #else
+        [GridItem(.adaptive(minimum: 160), spacing: 16)]
+        #endif
     }
 
     private var addHostButton: some View {
