@@ -12,34 +12,36 @@ negotiated extension. See [`docs/implementation-plan.md`](docs/implementation-pl
 
 | Milestone | State |
 |-----------|-------|
-| **M1 — `punktfunk-core` + C ABI** | ✅ done & tested (FEC, packetization, crypto, session, `punktfunk_core.h`) |
-| **M0 — pipeline spike** (wlroots→PipeWire→NVENC→file→`punktfunk-core`) | ✅ done & verified on NVIDIA (RTX 5070 Ti / driver 595) |
-| M2 — P1 host → stock Moonlight | 🟡 capture+encode landed in M0; pairing/RTSP/vdisplay pending |
-| M3 — measurement harness | 🟡 `tools/loss-harness` runs; `latency-probe` scaffolded |
-| M4 — P2 transport + Rust client | 🟡 GF(2¹⁶) core done; `punktfunk-client-rs` scaffolded |
-| M5 — Apple client | 🟡 macOS first light: HEVC on glass + input over `punktfunk/1` (`clients/apple`) |
+| **M1 — `punktfunk-core` + C ABI** | ✅ done & hardened (FEC, packetization, AES-GCM, session, adversarial-review fixes, `punktfunk_core.h`) |
+| **M2 — GameStream host → stock Moonlight** | ✅ live end-to-end: pairing, RTSP, audio, per-client virtual output at native res, GPU zero-copy NVENC, gamepads |
+| **M3 — `punktfunk/1` native protocol** | ✅ validated live: QUIC control + GF(2¹⁶) FEC/AES data plane, SPAKE2 PIN pairing, mid-stream mode renegotiation |
+| **M4 — client decode + present (Apple)** | 🟡 macOS first light: AnnexB→VideoToolbox HEVC on glass + input/pairing over `punktfunk/1` (`clients/apple`); iOS + presenter next |
+| **Web console + management API** | ✅ TanStack web console (`web/`) over the OpenAPI mgmt API: host status, paired devices, on-demand native pairing (arm → show PIN) |
 
-`punktfunk-core` is complete and verified: it builds and its full test suite (FEC recovery,
-loopback round-trip under loss, property tests, and a **C ABI harness**) passes on
-macOS/aarch64. **M0 is done:** `punktfunk-host` captures a headless wlroots output via the
-ScreenCast portal + PipeWire, encodes it with NVENC, writes a playable H.265 file, and
-round-trips every access unit through a `punktfunk_core` host→client session (see
-`docs/linux-setup.md`). M2 is in flight: the GameStream control plane (`gamestream/`) and
-the management REST API (`mgmt.rs`, OpenAPI spec in `docs/api/`) are implemented; the
-remaining Linux host backends (KWin/Mutter virtual displays, libei input) are
-`#[cfg(target_os = "linux")]` seams — defined and compiling, implementations pending.
+The **GameStream host works with a stock Moonlight client** — validated live on NVIDIA
+(RTX 5070 Ti & RTX 4090, driver 595): trust-on-first-use pairing that persists, an app
+catalog, RTSP/ENet/audio, and **video at the client's exact resolution and refresh** via a
+per-session virtual output (KWin, gamescope, Mutter, Sway backends), encoded with GPU
+**zero-copy** (dmabuf → CUDA/Vulkan → NVENC) at up to 5120×1440@240. The native
+**`punktfunk/1`** protocol adds a QUIC control plane and a GF(2¹⁶) Leopard-FEC + AES-GCM data
+plane (p50 ~0.8 ms capture→reassembled at 720p120), with a SPAKE2 PIN pairing ceremony. Both
+run from **one process** (`serve --native`), managed through a REST API + web console. Builds
+against FFmpeg 7 or 8; deployed live on Bazzite. Full status: [`CLAUDE.md`](CLAUDE.md);
+roadmap: [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Layout
 
 ```
 crates/
-  punktfunk-core/        protocol · FEC · pacing · crypto — the C ABI (lib + cdylib + staticlib)
-  punktfunk-host/        Linux host: vdisplay · capture · encode · inject · gamestream · mgmt
-  punktfunk-client-rs/   reference client (M4): VAAPI decode + wgpu present
-clients/{apple,android}/   native client scaffolds (import punktfunk_core.h)
+  punktfunk-core/        protocol · FEC · pacing · crypto · quic — the C ABI (lib + cdylib + staticlib)
+  punktfunk-host/        Linux host: vdisplay · capture · encode · inject · gamestream · m3 · mgmt · native_pairing
+  punktfunk-client-rs/   punktfunk/1 reference client (M3 headless; M4 adds decode+present)
+clients/{apple,android}/   native client scaffolds (import punktfunk_core.h); apple = macOS first light
+web/                       TanStack web console (host status · paired devices · pairing) over the mgmt API
+packaging/                 Fedora/Bazzite RPM · bootc image · COPR (see packaging/bazzite/README.md)
 include/punktfunk_core.h       cbindgen-generated C header (checked in)
 tools/{latency-probe,loss-harness}/   measurement (plan §10)
-docs/implementation-plan.md
+docs/{implementation-plan,roadmap,windows-host,dualsense-haptics}.md
 ```
 
 ## Build & test

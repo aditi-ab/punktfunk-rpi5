@@ -72,7 +72,11 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).
 3. **punktfunk/1 protocol growth**: concurrent sessions (today: one at a time, extras wait
-   in the accept queue); mgmt REST endpoints for the punktfunk/1 paired-client list.
+   in the accept queue). **Done:** unified host (`serve --native` runs GameStream + the
+   punktfunk/1 QUIC host in one process) with native pairing driven over the mgmt API /
+   web console (`mod native_pairing`: arm-on-demand → display PIN, paired-device list). Next
+   (see roadmap): **mandatory PIN pairing by default** (TOFU-without-pairing is insecure on a
+   LAN) + **delegated pairing approval** (an already-paired device approves a new one).
 4. **M2 polish**: HDR/10-bit (needs HDR capture + metadata plumbing; `av1_nvenc
    -highbitdepth 1` already encodes Main10 from 8-bit input on this box),
    reconnect-at-new-mode robustness. AV1 negotiation and surround audio are implemented
@@ -108,9 +112,11 @@ crates/punktfunk-host/
   gamestream/             Moonlight compat: nvhttp · pairing · rtsp · control · stream · gamepad · apps
   vdisplay/{kwin,gamescope,mutter,wlroots}.rs   per-compositor client-sized virtual outputs
   zerocopy/{egl,cuda,vulkan}.rs         dmabuf → CUDA → NVENC (tiled via EGL/GL, LINEAR via Vulkan)
-  inject/{libei,wlr,gamepad}.rs         input backends (+ uinput virtual gamepads)
-  capture.rs · encode.rs · audio.rs · m0.rs · m3.rs · mgmt.rs
+  inject/{libei,wlr,gamepad,dualsense}.rs   input backends (uinput xpad + UHID DualSense)
+  capture.rs · encode.rs · audio.rs · m0.rs · m3.rs · mgmt.rs · native_pairing.rs
 crates/punktfunk-client-rs/   punktfunk/1 reference client (M3 headless; M4 adds decode+present)
+web/                          TanStack web console over the mgmt API (status · devices · pairing)
+packaging/                    Fedora/Bazzite RPM · bootc · COPR (packaging/bazzite/README.md)
 tools/{loss-harness,latency-probe}/     measurement (plan §10)
 scripts/                  60-punktfunk.rules · punktfunk-host.service · host.env.example · headless/
 include/punktfunk_core.h      generated C header
