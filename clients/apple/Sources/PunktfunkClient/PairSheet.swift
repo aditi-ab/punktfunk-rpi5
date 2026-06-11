@@ -35,6 +35,46 @@ struct PairSheet: View {
     @State private var token = CeremonyToken()
 
     var body: some View {
+        #if os(tvOS)
+        VStack(spacing: 24) {
+            Label("Pair with \(host.displayName)", systemImage: "lock.shield")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.tint)
+            Text("The host prints the PIN when pairing is armed "
+                + "(--allow-pairing, \u{201C}PAIRING ARMED\u{201D} in its log). "
+                + "Pairing verifies both sides at once — no fingerprint comparison "
+                + "needed.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            TextField("PIN", text: $pin, prompt: Text("Shown in the host's log"))
+                .labelsHidden()
+            TextField(
+                "Client name", text: $clientName,
+                prompt: Text("How the host lists this device"))
+                .labelsHidden()
+            if let errorText {
+                Text(errorText)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+            }
+            HStack(spacing: 32) {
+                Button("Cancel", role: .cancel) {
+                    token.cancelled = true
+                    dismiss()
+                }
+                if busy {
+                    ProgressView()
+                }
+                Button("Pair & Connect") { runCeremony() }
+                    .disabled(busy || pin.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding(.top, 12)
+        }
+        .frame(maxWidth: 1000)
+        .padding(60)
+        .onDisappear { token.cancelled = true }
+        #else
         VStack(spacing: 0) {
             Form {
                 Section {
@@ -103,6 +143,7 @@ struct PairSheet: View {
         #endif
         .interactiveDismissDisabled(busy)
         .onDisappear { token.cancelled = true } // any other dismissal path
+        #endif
     }
 
     private func runCeremony() {

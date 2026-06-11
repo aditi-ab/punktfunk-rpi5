@@ -12,6 +12,28 @@ struct AddHostSheet: View {
     let onAdd: (StoredHost) -> Void
 
     var body: some View {
+        #if os(tvOS)
+        // No Form here: tvOS list rows add a full-width focus fill + row platter
+        // behind the field's own pill. Standalone fields have exactly one pill.
+        VStack(spacing: 28) {
+            Text("Add Host")
+                .font(.title3.weight(.semibold))
+            TextField("Name", text: $name, prompt: Text("Optional — e.g. Living Room"))
+                .labelsHidden()
+            TextField("Address", text: $address, prompt: Text("IP or hostname"))
+                .labelsHidden()
+            TextField("Port", value: $port, format: .number.grouping(.never))
+                .labelsHidden()
+            HStack(spacing: 32) {
+                Button("Cancel", role: .cancel) { dismiss() }
+                Button("Add Host") { add() }
+                    .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding(.top, 12)
+        }
+        .frame(maxWidth: 1000)
+        .padding(60)
+        #else
         VStack(spacing: 0) {
             Form {
                 TextField("Name", text: $name, prompt: Text("Optional — e.g. Living Room"))
@@ -33,13 +55,7 @@ struct AddHostSheet: View {
                     .keyboardShortcut(.cancelAction)
                     #endif
                 Spacer()
-                Button("Add Host") {
-                    onAdd(StoredHost(
-                        name: name.trimmingCharacters(in: .whitespaces),
-                        address: address.trimmingCharacters(in: .whitespaces),
-                        port: UInt16(clamping: port)))
-                    dismiss()
-                }
+                Button("Add Host") { add() }
                 .buttonStyle(.borderedProminent)
                 #if !os(tvOS)
                 .keyboardShortcut(.defaultAction)
@@ -55,5 +71,14 @@ struct AddHostSheet: View {
         .frame(width: 380)
         .fixedSize(horizontal: false, vertical: true)
         #endif
+        #endif
+    }
+
+    private func add() {
+        onAdd(StoredHost(
+            name: name.trimmingCharacters(in: .whitespaces),
+            address: address.trimmingCharacters(in: .whitespaces),
+            port: UInt16(clamping: port)))
+        dismiss()
     }
 }

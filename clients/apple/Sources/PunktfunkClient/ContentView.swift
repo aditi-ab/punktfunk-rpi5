@@ -123,20 +123,28 @@ struct ContentView: View {
                     emptyState
                 } else {
                     ScrollView {
-                        LazyVGrid(columns: gridColumns, spacing: 16) {
+                        LazyVGrid(columns: gridColumns, spacing: gridSpacing) {
                             ForEach(store.hosts) { host in
                                 hostCard(host)
                             }
-                            #if os(tvOS)
-                            actionTile("Add Host", systemImage: "plus") {
-                                showAddHost = true
-                            }
-                            actionTile("Settings", systemImage: "gearshape") {
-                                showSettings = true
-                            }
-                            #endif
                         }
                         .padding()
+                        #if os(tvOS)
+                        // Actions live below the hosts, not between them.
+                        HStack(spacing: 32) {
+                            Button {
+                                showAddHost = true
+                            } label: {
+                                Label("Add Host", systemImage: "plus")
+                            }
+                            Button {
+                                showSettings = true
+                            } label: {
+                                Label("Settings", systemImage: "gearshape")
+                            }
+                        }
+                        .padding(.top, 24)
+                        #endif
                     }
                 }
             }
@@ -213,8 +221,18 @@ struct ContentView: View {
     private var gridColumns: [GridItem] {
         #if os(macOS)
         [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 16)]
+        #elseif os(tvOS)
+        [GridItem(.adaptive(minimum: 320), spacing: 48)]
         #else
         [GridItem(.adaptive(minimum: 280), spacing: 16)]
+        #endif
+    }
+
+    private var gridSpacing: CGFloat {
+        #if os(tvOS)
+        48 // the focused card scales up — give it room instead of overlapping siblings
+        #else
+        16
         #endif
     }
 
@@ -247,6 +265,9 @@ struct ContentView: View {
                 #if os(iOS)
                 .controlSize(.large)
                 #endif
+            #if os(tvOS)
+            Button("Settings") { showSettings = true }
+            #endif
         }
     }
 
@@ -303,6 +324,9 @@ struct ContentView: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, cardPadding)
             .padding(.horizontal, 12)
+            #if !os(tvOS)
+            // tvOS: the .card button style owns platter + focus motion — extra chrome
+            // inside it mutes the grow/tilt. Material + accent ring are for pointer UIs.
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
             .overlay {
                 if host.id == mostRecentHostID {
@@ -310,6 +334,7 @@ struct ContentView: View {
                         .strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 1.5)
                 }
             }
+            #endif
         }
         #if os(tvOS)
         .buttonStyle(.card)
@@ -343,30 +368,6 @@ struct ContentView: View {
         defaults.set(UIScreen.main.maximumFramesPerSecond, forKey: "punktfunk.hz")
         #endif
     }
-
-    #if os(tvOS)
-    /// Grid-resident replacement for the toolbar (whose items are neither sized nor
-    /// focusable on tvOS): a full-size, focus-native tile per action.
-    private func actionTile(
-        _ label: String, systemImage: String, action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            VStack(spacing: 10) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 56, weight: .light))
-                    .foregroundStyle(.tint)
-                    .frame(height: 76)
-                Text(label)
-                    .font(.title3.weight(.semibold))
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 28)
-            .padding(.horizontal, 12)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-        }
-        .buttonStyle(.card)
-    }
-    #endif
 
     /// The host of the most recent session — its card carries the accent ring.
     private var mostRecentHostID: UUID? {
