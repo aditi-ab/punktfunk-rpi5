@@ -254,6 +254,8 @@ fn gs_button_to_evdev(b: u32) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
+pub mod dualsense;
+#[cfg(target_os = "linux")]
 pub mod gamepad;
 /// Stub — virtual gamepads need Linux uinput; events are dropped elsewhere.
 #[cfg(not(target_os = "linux"))]

@@ -77,6 +77,55 @@ fn real_main() -> Result<()> {
             println!("{compositor:?} ready");
             Ok(())
         }
+        // Create a virtual DualSense via UHID and exercise it (validation, no streaming session):
+        // toggles the Cross button, sweeps the left stick, and prints any HID output the kernel
+        // sends back. Verify with `evtest` / `ls /dev/input/by-id/*Punktfunk*` / `wpctl status`.
+        #[cfg(target_os = "linux")]
+        Some("dualsense-test") => {
+            use inject::dualsense::{DsState, DualSensePad};
+            let secs: u64 = args
+                .iter()
+                .skip_while(|a| *a != "--seconds")
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20);
+            use std::time::{Duration, Instant};
+            let mut pad =
+                DualSensePad::open(0).context("create virtual DualSense via /dev/uhid")?;
+            // Answer the kernel's init GET_REPORTs promptly so hid-playstation creates the input
+            // devices before we start streaming state.
+            let init = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < init {
+                pad.service(0);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            println!(
+                "virtual DualSense created — check `evtest`, `ls /dev/input/by-id/*Punktfunk*`, \
+                 `ls /sys/class/leds/`. Cycling Cross + sweeping LS for {secs}s."
+            );
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            let (mut i, mut last_write) = (0i32, Instant::now());
+            while Instant::now() < deadline {
+                for o in pad.service(0) {
+                    println!("  hid output from kernel/game: {o:?}");
+                }
+                if last_write.elapsed() >= Duration::from_millis(300) {
+                    last_write = Instant::now();
+                    i += 1;
+                    let buttons = if i % 2 == 0 {
+                        punktfunk_core::input::gamepad::BTN_A
+                    } else {
+                        0
+                    };
+                    let lx = (((i % 64) - 32) * 1024) as i16; // sweep left stick X
+                    let st = DsState::from_gamepad(buttons, lx, 0, 0, 0, 0, 0);
+                    pad.write_state(&st).context("write DualSense report")?;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            println!("dualsense-test: done");
+            Ok(())
+        }
         // M0 pipeline spike.
         Some("m0") => m0::run(parse_m0(&args[1..])?),
         // M3: native punktfunk/1 host (QUIC control plane + UDP data plane).
