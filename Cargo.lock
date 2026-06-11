@@ -1978,6 +1978,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sha2",
+ "socket2",
  "spake2",
  "thiserror 2.0.18",
  "tokio",
