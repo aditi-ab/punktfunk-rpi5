@@ -158,11 +158,11 @@ fn pump(
                     Ok(Some(decoded)) => {
                         total_frames += 1;
                         if total_frames == 1 {
-                            tracing::info!(
-                                width = decoded.width,
-                                height = decoded.height,
-                                "first frame decoded"
-                            );
+                            let (w, h, path) = match &decoded {
+                                DecodedFrame::Cpu(c) => (c.width, c.height, "software"),
+                                DecodedFrame::Dmabuf(d) => (d.width, d.height, "vaapi-dmabuf"),
+                            };
+                            tracing::info!(width = w, height = h, path, "first frame decoded");
                         }
                         // Latency: our wall clock expressed in the host's capture clock,
                         // minus the host-stamped capture pts (same math as client-rs).

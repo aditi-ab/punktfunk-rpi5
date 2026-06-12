@@ -212,20 +212,60 @@ pub fn new(
     // --- Frame consumer: newest texture wins, set on the GTK frame clock's cadence. ---
     {
         let picture = picture.downgrade();
+        // The host encodes BT.709 limited-range; without an explicit color state GDK
+        // would convert NV12 dmabufs with the (BT.601) dmabuf default.
+        let rec709 = {
+            let cicp = gdk::CicpParams::new();
+            cicp.set_color_primaries(1);
+            cicp.set_transfer_function(1);
+            cicp.set_matrix_coefficients(1);
+            cicp.set_range(gdk::CicpRange::Narrow);
+            cicp.build_color_state().ok()
+        };
         glib::spawn_future_local(async move {
             while let Ok(f) = frames.recv().await {
                 let Some(picture) = picture.upgrade() else {
                     break;
                 };
-                let bytes = glib::Bytes::from_owned(f.rgba);
-                let tex = gdk::MemoryTexture::new(
-                    f.width as i32,
-                    f.height as i32,
-                    gdk::MemoryFormat::R8g8b8a8,
-                    &bytes,
-                    f.stride,
-                );
-                picture.set_paintable(Some(&tex));
+                match f {
+                    DecodedFrame::Cpu(c) => {
+                        let bytes = glib::Bytes::from_owned(c.rgba);
+                        let tex = gdk::MemoryTexture::new(
+                            c.width as i32,
+                            c.height as i32,
+                            gdk::MemoryFormat::R8g8b8a8,
+                            &bytes,
+                            c.stride,
+                        );
+                        picture.set_paintable(Some(&tex));
+                    }
+                    DecodedFrame::Dmabuf(d) => {
+                        let mut b = gdk::DmabufTextureBuilder::new()
+                            .set_display(&picture.display())
+                            .set_width(d.width)
+                            .set_height(d.height)
+                            .set_fourcc(d.fourcc)
+                            .set_modifier(d.modifier)
+                            .set_n_planes(d.planes.len() as u32)
+                            .set_color_state(rec709.as_ref());
+                        for (i, p) in d.planes.iter().enumerate() {
+                            b = unsafe { b.set_fd(i as u32, p.fd) }
+                                .set_offset(i as u32, p.offset)
+                                .set_stride(i as u32, p.stride);
+                        }
+                        let guard = d.guard;
+                        // GDK runs the release func whether the import succeeds or not.
+                        match unsafe { b.build_with_release_func(move || drop(guard)) } {
+                            Ok(tex) => picture.set_paintable(Some(&tex)),
+                            Err(e) => {
+                                // Import rejected (format/modifier) — surfaces once per
+                                // session in practice; the stream continues on the next
+                                // frame, and PUNKTFUNK_DECODER=software is the escape.
+                                tracing::warn!(error = %e, "dmabuf texture import failed");
+                            }
+                        }
+                    }
+                }
             }
         });
     }

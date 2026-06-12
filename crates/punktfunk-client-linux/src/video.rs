@@ -1,23 +1,35 @@
-//! Video decode: reassembled HEVC access units → RGBA frames for the GTK presenter.
+//! Video decode: reassembled HEVC access units → frames for the GTK presenter.
 //!
-//! Stage 1 is libavcodec software decode + swscale to RGBA (`GdkMemoryTexture` upload on
-//! the UI side). The host encodes zero-reorder streams (no B-frames, in-band parameter
-//! sets on every IDR), so with `AV_CODEC_FLAG_LOW_DELAY` the decoder is strictly
-//! one-in/one-out with no hidden queue. Slice threading only — frame threading would add
-//! a frame of latency per extra thread.
+//! Two backends, picked at session start (override: `PUNKTFUNK_DECODER=software|vaapi`):
 //!
-//! Stage 1.5 (Intel/AMD boxes): VAAPI hwaccel → DRM-PRIME dmabuf → `GdkDmabufTexture`,
-//! slotting in behind the same `decode()` signature. Stage 2 (NVIDIA): Vulkan Video in
-//! the bespoke presenter (see the design notes in docs-site).
+//! * **VAAPI** (Intel/AMD): libavcodec hwaccel decodes on the GPU; each frame is mapped
+//!   to a DRM-PRIME dmabuf (`av_hwframe_map`, zero copy) and handed to the UI as fds +
+//!   plane layout for `GdkDmabufTextureBuilder` — inside `GtkGraphicsOffload` that is the
+//!   decoder-to-subsurface path, direct-scanout eligible when fullscreen. NVIDIA boxes
+//!   have no usable VAAPI (nvidia-vaapi-driver is broken for this — Moonlight blacklists
+//!   it); device creation fails there and the software path takes over. A mid-session
+//!   VAAPI error also falls back — the host's IDR/RFI recovery resynchronizes.
+//! * **Software**: libavcodec on the CPU + swscale to RGBA (`GdkMemoryTexture` upload).
+//!   Slice threading only — frame threading would add a frame of latency per thread.
+//!
+//! Both run `AV_CODEC_FLAG_LOW_DELAY`; the host encodes zero-reorder streams (no
+//! B-frames, in-band parameter sets on every IDR), so decode is strictly one-in/one-out.
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
 use ffmpeg::util::frame::Video as AvFrame;
 use ffmpeg_next as ffmpeg;
+use std::os::fd::RawFd;
+use std::ptr;
 
-/// One decoded frame, tightly enough packed for `GdkMemoryTexture` (which takes a stride).
-pub struct DecodedFrame {
+pub enum DecodedFrame {
+    Cpu(CpuFrame),
+    Dmabuf(DmabufFrame),
+}
+
+/// RGBA pixels for `GdkMemoryTexture` (which takes a stride).
+pub struct CpuFrame {
     pub width: u32,
     pub height: u32,
     /// RGBA row stride in bytes (≥ width*4 — swscale pads rows for SIMD).
@@ -25,15 +37,100 @@ pub struct DecodedFrame {
     pub rgba: Vec<u8>,
 }
 
+/// A decoded frame still on the GPU: dmabuf fds + plane layout for
+/// `GdkDmabufTextureBuilder`. The fds belong to `guard`'s mapped DRM frame — they stay
+/// valid until the guard drops (the texture's release func).
+pub struct DmabufFrame {
+    pub width: u32,
+    pub height: u32,
+    /// DRM fourcc of the layer (NV12 for 8-bit VAAPI output).
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub planes: Vec<DmabufPlane>,
+    pub guard: DrmFrameGuard,
+}
+
+pub struct DmabufPlane {
+    pub fd: RawFd,
+    pub offset: u32,
+    pub stride: u32,
+}
+
+/// Owns the mapped DRM-PRIME `AVFrame` (which in turn references the VAAPI surface).
+/// Dropping it releases the surface back to the decoder pool and closes the fds.
+pub struct DrmFrameGuard(*mut ffmpeg::ffi::AVFrame);
+// An AVFrame is plain refcounted data; freeing it from the GTK main thread is fine.
+unsafe impl Send for DrmFrameGuard {}
+
+impl Drop for DrmFrameGuard {
+    fn drop(&mut self) {
+        unsafe { ffmpeg::ffi::av_frame_free(&mut self.0) };
+    }
+}
+
+enum Backend {
+    Vaapi(VaapiDecoder),
+    Software(SoftwareDecoder),
+}
+
 pub struct Decoder {
-    decoder: ffmpeg::decoder::Video,
-    /// Rebuilt whenever the decoded format/size changes (mid-stream `Reconfigure`).
-    sws: Option<(scaling::Context, Pixel, u32, u32)>,
+    backend: Backend,
 }
 
 impl Decoder {
     pub fn new() -> Result<Decoder> {
         ffmpeg::init().context("ffmpeg init")?;
+        let choice = std::env::var("PUNKTFUNK_DECODER").unwrap_or_default();
+        if choice != "software" {
+            match VaapiDecoder::new() {
+                Ok(v) => {
+                    tracing::info!("VAAPI hardware decode active (zero-copy dmabuf)");
+                    return Ok(Decoder {
+                        backend: Backend::Vaapi(v),
+                    });
+                }
+                Err(e) => {
+                    if choice == "vaapi" {
+                        return Err(e.context("PUNKTFUNK_DECODER=vaapi but VAAPI failed"));
+                    }
+                    tracing::info!(reason = %e, "VAAPI unavailable — software decode");
+                }
+            }
+        }
+        Ok(Decoder {
+            backend: Backend::Software(SoftwareDecoder::new()?),
+        })
+    }
+
+    /// Feed one access unit; returns the decoded frame (the host's streams are
+    /// one-in/one-out). A software decode error after packet loss is survivable — log
+    /// upstream and keep feeding. A VAAPI error demotes to software for the rest of the
+    /// session (broken driver, e.g. nvidia-vaapi-driver) — the next IDR resynchronizes.
+    pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedFrame>> {
+        match &mut self.backend {
+            Backend::Vaapi(v) => match v.decode(au) {
+                Ok(f) => Ok(f.map(DecodedFrame::Dmabuf)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "VAAPI decode failed — falling back to software");
+                    self.backend = Backend::Software(SoftwareDecoder::new()?);
+                    Ok(None)
+                }
+            },
+            Backend::Software(s) => Ok(s.decode(au)?.map(DecodedFrame::Cpu)),
+        }
+    }
+}
+
+// --- software backend ---------------------------------------------------------------
+
+struct SoftwareDecoder {
+    decoder: ffmpeg::decoder::Video,
+    /// Rebuilt whenever the decoded format/size changes (mid-stream `Reconfigure`).
+    sws: Option<(scaling::Context, Pixel, u32, u32)>,
+}
+
+impl SoftwareDecoder {
+    fn new() -> Result<SoftwareDecoder> {
         let codec =
             ffmpeg::decoder::find(ffmpeg::codec::Id::HEVC).ok_or(anyhow!("no HEVC decoder"))?;
         let mut ctx = ffmpeg::codec::Context::new_with_codec(codec);
@@ -45,13 +142,10 @@ impl Decoder {
             (*raw).thread_count = 0; // auto
         }
         let decoder = ctx.decoder().video().context("open HEVC decoder")?;
-        Ok(Decoder { decoder, sws: None })
+        Ok(SoftwareDecoder { decoder, sws: None })
     }
 
-    /// Feed one access unit; returns the decoded frame (the host's streams are
-    /// one-in/one-out). A decode error after packet loss is survivable — log upstream and
-    /// keep feeding; the host's RFI/IDR recovery resynchronizes the reference chain.
-    pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedFrame>> {
+    fn decode(&mut self, au: &[u8]) -> Result<Option<CpuFrame>> {
         let packet = ffmpeg::Packet::copy(au);
         self.decoder
             .send_packet(&packet)
@@ -64,7 +158,7 @@ impl Decoder {
         Ok(out)
     }
 
-    fn convert_rgba(&mut self, frame: &AvFrame) -> Result<DecodedFrame> {
+    fn convert_rgba(&mut self, frame: &AvFrame) -> Result<CpuFrame> {
         let (fmt, w, h) = (frame.format(), frame.width(), frame.height());
         let rebuild =
             !matches!(&self.sws, Some((_, f, sw, sh)) if *f == fmt && *sw == w && *sh == h);
@@ -76,11 +170,178 @@ impl Decoder {
         let (sws, ..) = self.sws.as_mut().unwrap();
         let mut rgba = AvFrame::empty();
         sws.run(frame, &mut rgba).map_err(|e| anyhow!("sws: {e}"))?;
-        Ok(DecodedFrame {
+        Ok(CpuFrame {
             width: w,
             height: h,
             stride: rgba.stride(0),
             rgba: rgba.data(0).to_vec(),
         })
+    }
+}
+
+// --- VAAPI backend --------------------------------------------------------------------
+//
+// Raw FFI: ffmpeg-next has no hwaccel wrappers. All pointers are owned here and freed in
+// Drop; decoded surfaces transfer out through DrmFrameGuard.
+
+const AVERROR_EAGAIN: i32 = -11; // -EAGAIN; Linux-only crate
+
+fn averr(what: &str, code: i32) -> anyhow::Error {
+    anyhow!("{what}: {}", ffmpeg::Error::from(code))
+}
+
+/// libavcodec offers the formats it can decode into; pick the VAAPI hw surface. Falling
+/// back to the first (software) entry would silently decode on the CPU *and* break our
+/// dmabuf mapping — return NONE instead so the error surfaces and the session demotes
+/// to the software backend explicitly.
+unsafe extern "C" fn pick_vaapi(
+    _ctx: *mut ffmpeg::ffi::AVCodecContext,
+    mut list: *const ffmpeg::ffi::AVPixelFormat,
+) -> ffmpeg::ffi::AVPixelFormat {
+    unsafe {
+        while *list != ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            if *list == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI {
+                return ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            }
+            list = list.add(1);
+        }
+    }
+    ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE
+}
+
+struct VaapiDecoder {
+    ctx: *mut ffmpeg::ffi::AVCodecContext,
+    hw_device: *mut ffmpeg::ffi::AVBufferRef,
+    packet: *mut ffmpeg::ffi::AVPacket,
+    frame: *mut ffmpeg::ffi::AVFrame,
+}
+
+// Single-owner pointers, only touched from the session pump thread.
+unsafe impl Send for VaapiDecoder {}
+
+impl VaapiDecoder {
+    fn new() -> Result<VaapiDecoder> {
+        use ffmpeg::ffi;
+        unsafe {
+            let mut hw_device: *mut ffi::AVBufferRef = ptr::null_mut();
+            let r = ffi::av_hwdevice_ctx_create(
+                &mut hw_device,
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            );
+            if r < 0 {
+                bail!("no VAAPI device ({})", ffmpeg::Error::from(r));
+            }
+            let codec = ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_HEVC);
+            if codec.is_null() {
+                ffi::av_buffer_unref(&mut hw_device);
+                bail!("no HEVC decoder");
+            }
+            let ctx = ffi::avcodec_alloc_context3(codec);
+            (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device);
+            (*ctx).get_format = Some(pick_vaapi);
+            (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+            (*ctx).thread_count = 1; // hwaccel: threads only add latency
+            let r = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
+            if r < 0 {
+                let mut ctx = ctx;
+                ffi::avcodec_free_context(&mut ctx);
+                let mut hw_device = hw_device;
+                ffi::av_buffer_unref(&mut hw_device);
+                bail!("avcodec_open2: {}", ffmpeg::Error::from(r));
+            }
+            Ok(VaapiDecoder {
+                ctx,
+                hw_device,
+                packet: ffi::av_packet_alloc(),
+                frame: ffi::av_frame_alloc(),
+            })
+        }
+    }
+
+    fn decode(&mut self, au: &[u8]) -> Result<Option<DmabufFrame>> {
+        use ffmpeg::ffi;
+        unsafe {
+            let r = ffi::av_new_packet(self.packet, au.len() as i32);
+            if r < 0 {
+                return Err(averr("av_new_packet", r));
+            }
+            ptr::copy_nonoverlapping(au.as_ptr(), (*self.packet).data, au.len());
+            let r = ffi::avcodec_send_packet(self.ctx, self.packet);
+            ffi::av_packet_unref(self.packet);
+            if r < 0 {
+                return Err(averr("send_packet", r));
+            }
+            let mut out = None;
+            loop {
+                let r = ffi::avcodec_receive_frame(self.ctx, self.frame);
+                if r == AVERROR_EAGAIN {
+                    break;
+                }
+                if r < 0 {
+                    return Err(averr("receive_frame", r));
+                }
+                out = Some(self.map_dmabuf()?); // newest wins; older guards drop here
+                ffi::av_frame_unref(self.frame);
+            }
+            Ok(out)
+        }
+    }
+
+    /// Map the VAAPI surface to DRM PRIME (zero copy) and lift the descriptor into a
+    /// `DmabufFrame`. The mapped frame keeps the surface alive via its buffer refs.
+    unsafe fn map_dmabuf(&mut self) -> Result<DmabufFrame> {
+        use ffmpeg::ffi;
+        unsafe {
+            if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
+                bail!("decoder returned a software frame (no VAAPI surface)");
+            }
+            let drm = ffi::av_frame_alloc();
+            (*drm).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+            let r = ffi::av_hwframe_map(drm, self.frame, ffi::AV_HWFRAME_MAP_READ as i32);
+            if r < 0 {
+                let mut drm = drm;
+                ffi::av_frame_free(&mut drm);
+                return Err(averr("av_hwframe_map", r));
+            }
+            let desc = (*drm).data[0] as *const ffi::AVDRMFrameDescriptor;
+            let guard = DrmFrameGuard(drm);
+            let d = &*desc;
+            if d.nb_layers < 1 {
+                bail!("DRM descriptor without layers");
+            }
+            let layer = &d.layers[0];
+            let mut planes = Vec::with_capacity(layer.nb_planes as usize);
+            for p in &layer.planes[..layer.nb_planes as usize] {
+                let obj = &d.objects[p.object_index as usize];
+                planes.push(DmabufPlane {
+                    fd: obj.fd,
+                    offset: p.offset as u32,
+                    stride: p.pitch as u32,
+                });
+            }
+            Ok(DmabufFrame {
+                width: (*self.frame).width as u32,
+                height: (*self.frame).height as u32,
+                fourcc: layer.format,
+                modifier: d.objects[0].format_modifier,
+                planes,
+                guard,
+            })
+        }
+    }
+}
+
+impl Drop for VaapiDecoder {
+    fn drop(&mut self) {
+        use ffmpeg::ffi;
+        unsafe {
+            ffi::av_packet_free(&mut self.packet);
+            ffi::av_frame_free(&mut self.frame);
+            ffi::avcodec_free_context(&mut self.ctx);
+            ffi::av_buffer_unref(&mut self.hw_device);
+        }
     }
 }

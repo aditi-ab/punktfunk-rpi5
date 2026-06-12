@@ -95,11 +95,19 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    jitter ring inverted), SDL3 gamepad capture + rumble/lightbar feedback, keyboard via
    exact inverse of the host VK table, absolute mouse + 120-unit scroll. Validated live
    against `serve --native` on this box: 1080p60, steady 60 fps, capture→decoded p50
-   ≈6.4 ms (debug build). `--connect host[:port]` for scripting. Next (per the 2026-06-12
-   research, memory `linux-client-option-a`): VAAPI dmabuf → `GdkDmabufTexture` (Tier-1
-   zero-copy on Intel/AMD), then the stage-2 raw-Wayland presenter (wp_presentation
-   feedback, tearing-control, Vulkan Video on NVIDIA) — **wgpu/winit rejected** (no dmabuf
-   import / presentation feedback / shortcuts-inhibit).
+   ≈6.4 ms (debug build). `--connect host[:port]` for scripting. **Swift-parity batch +
+   stage 1.5 (2026-06-12 evening)**: capture state machine (click-to-capture,
+   Ctrl+Alt+Shift+Q / focus-loss release, held-state flush), app-lifetime SDL gamepad
+   service (pad pin UI, auto type from the physical pad, DualSense touchpad/motion 0xCC +
+   raw-DS5-effects trigger/player-LED replay — needs a physical pad to live-verify), mic
+   uplink (validated live), per-host speed test, compositor pref, native-display mode
+   default, saved-hosts list, .deb + RPM-subpackage CI (deb.yml/rpm.yml). **VAAPI decode
+   → DRM-PRIME dmabuf → `GdkDmabufTexture`** (BT.709 color state; Tier-1 zero-copy on
+   Intel/AMD, `PUNKTFUNK_DECODER=software|vaapi` override) with a proven fallback ladder —
+   no VAAPI device (NVIDIA) or mid-session VAAPI error → software decode; needs an
+   Intel/AMD client box to live-verify the hw path. Next: the stage-2 raw-Wayland
+   presenter (wp_presentation feedback, tearing-control, Vulkan Video on NVIDIA) —
+   **wgpu/winit rejected** (no dmabuf import / presentation feedback / shortcuts-inhibit).
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).
