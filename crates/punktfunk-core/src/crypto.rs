@@ -20,7 +20,7 @@
 
 use crate::config::Role;
 use crate::error::{PunktfunkError, Result};
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Key, Nonce};
 
 /// 16-byte AEAD authentication tag appended by GCM.
@@ -58,6 +58,23 @@ impl SessionCrypto {
                 },
             )
             .map_err(|_| PunktfunkError::Crypto)
+    }
+
+    /// Seal in place, no per-packet allocation: `buf` is laid out as `[plaintext .. ][TAG_LEN]` (the
+    /// last `TAG_LEN` bytes are scratch); on return it holds `[ciphertext .. ][tag]` — byte-identical
+    /// to `seal`'s `ciphertext || tag`, just written in place. The hot-path sealer (`Session`) uses
+    /// this to avoid the `Vec` that `seal`'s convenience API allocates for every packet.
+    pub fn seal_in_place(&self, seq: u64, buf: &mut [u8]) -> Result<()> {
+        debug_assert!(buf.len() >= TAG_LEN);
+        let nonce = nonce(self.send_salt, seq);
+        let split = buf.len() - TAG_LEN;
+        let (plaintext, tag_slot) = buf.split_at_mut(split);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &seq.to_be_bytes(), plaintext)
+            .map_err(|_| PunktfunkError::Crypto)?;
+        tag_slot.copy_from_slice(&tag);
+        Ok(())
     }
 
     /// Open `ciphertext || tag` for sequence `seq` (also bound as associated data).
@@ -145,5 +162,29 @@ mod tests {
             host.seal(0, b"abc").unwrap(),
             client.seal(0, b"abc").unwrap()
         );
+    }
+
+    #[test]
+    fn seal_in_place_matches_seal_and_opens() {
+        let key = random_key();
+        let salt = random_salt();
+        let host = SessionCrypto::new(&key, salt, Role::Host);
+        let client = SessionCrypto::new(&key, salt, Role::Client);
+        for msg in [
+            &b""[..],
+            b"x",
+            b"the quick brown fox jumps over 13 lazy dogs!!",
+        ] {
+            let reference = host.seal(7, msg).unwrap(); // ciphertext || tag
+                                                        // In-place: [plaintext .. ][TAG_LEN scratch].
+            let mut buf = msg.to_vec();
+            buf.resize(msg.len() + TAG_LEN, 0);
+            host.seal_in_place(7, &mut buf).unwrap();
+            assert_eq!(
+                buf, reference,
+                "in-place seal must be byte-identical to seal"
+            );
+            assert_eq!(client.open(7, &buf).unwrap(), msg);
+        }
     }
 }

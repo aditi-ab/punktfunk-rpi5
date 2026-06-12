@@ -1588,10 +1588,10 @@ fn paced_submit(
             }
         }
     }
-    Ok(PaceStat {
-        spread_us: start.elapsed().as_micros() as u32,
-        paced,
-    })
+    let spread_us = start.elapsed().as_micros() as u32;
+    drop(refs); // release the borrow of `wires` so it can return to the seal pool
+    session.reclaim_wires(wires);
+    Ok(PaceStat { spread_us, paced })
 }
 
 /// Percentile of a slice (sorts it in place first). `q` in 0.0..=1.0.

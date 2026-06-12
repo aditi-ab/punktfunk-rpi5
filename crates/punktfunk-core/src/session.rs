@@ -51,6 +51,10 @@ pub struct Session {
     recv_lens: Vec<usize>,
     recv_count: usize,
     recv_idx: usize,
+    /// Host send pool: reused wire buffers (`seal_frame` seals in place into these, the caller sends
+    /// then returns them via [`reclaim_wires`](Self::reclaim_wires)). After warmup each buffer keeps
+    /// its capacity, so the per-packet ciphertext + wire `Vec` allocations vanish from the hot path.
+    wire_pool: Vec<Vec<u8>>,
 }
 
 /// Datagrams drained per `recvmmsg` syscall on the client (the reused ring's size). At ~125k
@@ -78,6 +82,7 @@ impl Session {
             recv_lens: Vec::new(),
             recv_count: 0,
             recv_idx: 0,
+            wire_pool: Vec::new(),
             config,
         })
     }
@@ -92,19 +97,23 @@ impl Session {
 
     /// Wrap a packet for the wire: when encrypting, prepend the 8-byte big-endian
     /// sequence (the receiver derives the GCM nonce from it) then the ciphertext.
-    fn seal_for_wire(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
+    /// Seal one plaintext packet into the reused `wire` buffer in place (no allocation): the wire is
+    /// `seq(8) || ciphertext || tag` with crypto on, or just the packet with crypto off (probe).
+    /// Byte-identical to the previous `seal` + concat path; `clear()` keeps the buffer's capacity.
+    fn seal_into(&mut self, packet: &[u8], wire: &mut Vec<u8>) -> Result<()> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
+        wire.clear();
         match &self.crypto {
             Some(c) => {
-                let ct = c.seal(seq, packet)?;
-                let mut wire = Vec::with_capacity(8 + ct.len());
-                wire.extend_from_slice(&seq.to_be_bytes());
-                wire.extend_from_slice(&ct);
-                Ok(wire)
+                wire.extend_from_slice(&seq.to_be_bytes()); // [0..8] plaintext seq prefix
+                wire.extend_from_slice(packet); // [8..8+n] plaintext to encrypt
+                wire.resize(wire.len() + crate::crypto::TAG_LEN, 0); // tag scratch
+                c.seal_in_place(seq, &mut wire[8..])?; // encrypt [8..] in place, tag written at the end
             }
-            None => Ok(packet.to_vec()),
+            None => wire.extend_from_slice(packet),
         }
+        Ok(())
     }
 
     /// Unwrap a wire datagram back into a plaintext packet.
@@ -144,14 +153,25 @@ impl Session {
             .packetizer
             .packetize(data, pts_ns, user_flags, self.coder.as_ref())?;
         StatsCounters::add(&self.stats.frames_submitted, 1);
-        let mut wires: Vec<Vec<u8>> = Vec::with_capacity(packets.len());
-        for pkt in &packets {
-            wires.push(self.seal_for_wire(pkt)?);
+        // Reuse the wire-buffer pool the caller returns via `reclaim_wires`: one buffer per packet,
+        // sealed in place — after warmup there is no per-packet ciphertext/wire allocation. (`wires`
+        // is a local, so `seal_into`'s `&mut self` doesn't alias the `&mut` iteration over it.)
+        let mut wires = std::mem::take(&mut self.wire_pool);
+        wires.resize_with(packets.len(), Vec::new);
+        for (wire, pkt) in wires.iter_mut().zip(packets.iter()) {
+            self.seal_into(pkt, wire)?;
         }
         let bytes: u64 = wires.iter().map(|w| w.len() as u64).sum();
         StatsCounters::add(&self.stats.packets_sent, wires.len() as u64);
         StatsCounters::add(&self.stats.bytes_sent, bytes);
         Ok(wires)
+    }
+
+    /// Return the wire buffers from [`seal_frame`](Self::seal_frame) to the reuse pool once the caller
+    /// has finished sending them, so the next frame reseals in place with no allocation. Optional —
+    /// dropping the buffers instead just forfeits the reuse (correctness is unaffected).
+    pub fn reclaim_wires(&mut self, wires: Vec<Vec<u8>>) {
+        self.wire_pool = wires;
     }
 
     /// Host: transmit one chunk of already-[`seal_frame`](Self::seal_frame)ed packets in a single
@@ -175,8 +195,10 @@ impl Session {
     pub fn submit_frame(&mut self, data: &[u8], pts_ns: u64, user_flags: u32) -> Result<()> {
         let wires = self.seal_frame(data, pts_ns, user_flags)?;
         let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
-        self.send_sealed(&refs)?;
-        Ok(())
+        let r = self.send_sealed(&refs);
+        drop(refs); // release the borrow of `wires` before returning the buffers to the pool
+        self.reclaim_wires(wires);
+        r.map(|_| ())
     }
 
     /// Host: drain one pending input event from the client, if any.
@@ -264,7 +286,8 @@ impl Session {
             ));
         }
         let pkt = event.encode();
-        let wire = self.seal_for_wire(&pkt)?;
+        let mut wire = Vec::new(); // input is rare + per-event; no pool needed
+        self.seal_into(&pkt, &mut wire)?;
         StatsCounters::add(&self.stats.packets_sent, 1);
         StatsCounters::add(&self.stats.bytes_sent, wire.len() as u64);
         if !self.transport.send(&wire)? {
