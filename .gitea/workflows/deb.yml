@@ -60,9 +60,10 @@ jobs:
         # BEFORE 0.0.1 (the '~') yet monotonically increases by run number, so `apt upgrade`
         # always moves the boxes to the newest main build.
         run: |
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}" ;;
-            *)            V="0.0.1~ci${GITHUB_RUN_NUMBER}.g${GITHUB_SHA::8}" ;;
+            *)            V="0.0.1~ci${GITHUB_RUN_NUMBER}.g${SHORT}" ;;
           esac
           echo "VERSION=$V" >> "$GITHUB_ENV"
           echo "package version $V"

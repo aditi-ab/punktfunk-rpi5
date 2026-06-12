@@ -46,9 +46,10 @@ jobs:
         # sorts BEFORE the eventual "1" yet increases by run number, so `rpm-ostree upgrade`
         # always moves to the newest main build.
         run: |
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; R="1" ;;
-            *)            V="0.0.1"; R="0.ci${GITHUB_RUN_NUMBER}.g${GITHUB_SHA::8}" ;;
+            *)            V="0.0.1"; R="0.ci${GITHUB_RUN_NUMBER}.g${SHORT}" ;;
           esac
           echo "PF_VERSION=$V" >> "$GITHUB_ENV"
           echo "PF_RELEASE=$R" >> "$GITHUB_ENV"
