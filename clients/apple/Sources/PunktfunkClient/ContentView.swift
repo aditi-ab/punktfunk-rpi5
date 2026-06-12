@@ -20,13 +20,16 @@ import SwiftUINavigationTransitions
 struct ContentView: View {
     @StateObject private var model = SessionModel()
     @StateObject private var store = HostStore()
+    @StateObject private var discovery = HostDiscovery()
     @AppStorage("punktfunk.width") private var width = 1920
     @AppStorage("punktfunk.height") private var height = 1080
     @AppStorage("punktfunk.hz") private var hz = 60
     @AppStorage("punktfunk.compositor") private var compositor = 0
     @AppStorage("punktfunk.gamepadType") private var gamepadType = 0
+    @AppStorage("punktfunk.bitrateKbps") private var bitrateKbps = 0
     @State private var showAddHost = false
     @State private var pairingTarget: StoredHost?
+    @State private var speedTestTarget: StoredHost?
     #if !os(macOS)
     @State private var showSettings = false
     #endif
@@ -71,6 +74,9 @@ struct ContentView: View {
                 connect(pinned)
             }
         }
+        .sheet(item: $speedTestTarget) { host in
+            SpeedTestSheet(host: host)
+        }
         #endif
     }
 
@@ -104,6 +110,11 @@ struct ContentView: View {
         #else
         .background(Color.black)
         .ignoresSafeArea()
+        // Siri Remote MENU = disconnect (the idiomatic tvOS "back"). With no focusable
+        // disconnect control during play, the controller's buttons flow to the host instead of
+        // driving the focus engine. NOTE: a game controller's Menu is also forwarded to the
+        // host as Start — the Siri Remote is the intended disconnect path.
+        .onExitCommand { model.disconnect() }
         #endif
     }
 
@@ -112,16 +123,21 @@ struct ContentView: View {
     private var home: some View {
         NavigationStack {
             Group {
-                if store.hosts.isEmpty {
+                if store.hosts.isEmpty && discoveredUnsaved.isEmpty {
                     emptyState
                 } else {
                     ScrollView {
-                        LazyVGrid(columns: gridColumns, spacing: gridSpacing) {
-                            ForEach(store.hosts) { host in
-                                hostCard(host)
+                        if !store.hosts.isEmpty {
+                            LazyVGrid(columns: gridColumns, spacing: gridSpacing) {
+                                ForEach(store.hosts) { host in
+                                    hostCard(host)
+                                }
                             }
+                            .padding()
                         }
-                        .padding()
+                        if !discoveredUnsaved.isEmpty {
+                            discoveredSection
+                        }
                         #if os(tvOS)
                         // Actions live below the hosts, not between them.
                         HStack(spacing: 32) {
@@ -142,6 +158,10 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Punktfunkempfänger")
+            // Browse the LAN for advertised hosts only while the grid is up — not during a
+            // session. The home appears/disappears as the stream swaps in and out.
+            .onAppear { discovery.start() }
+            .onDisappear { discovery.stop() }
             #if os(tvOS)
             // Pushed routes — the Settings-app navigation feel (push animation, Menu
             // pops) instead of modal overlays.
@@ -159,6 +179,9 @@ struct ContentView: View {
                     pinned.pinnedSHA256 = fingerprint
                     connect(pinned)
                 }
+            }
+            .navigationDestination(item: $speedTestTarget) { host in
+                SpeedTestSheet(host: host)
             }
             #endif
             #if !os(tvOS)
@@ -354,6 +377,10 @@ struct ContentView: View {
                 guard !model.isBusy else { return }
                 pairingTarget = host
             }
+            Button("Test Network Speed…") {
+                guard !model.isBusy else { return }
+                speedTestTarget = host
+            }
             if host.pinnedSHA256 != nil {
                 Button("Forget Identity") { store.forgetIdentity(host) }
             }
@@ -394,7 +421,106 @@ struct ContentView: View {
                 rawValue: UInt32(clamping: compositor)) ?? .auto,
             gamepad: GamepadManager.shared.resolveType(
                 setting: PunktfunkConnection.GamepadType(
-                    rawValue: UInt32(clamping: gamepadType)) ?? .auto))
+                    rawValue: UInt32(clamping: gamepadType)) ?? .auto),
+            bitrateKbps: UInt32(clamping: bitrateKbps))
+    }
+
+    // MARK: - LAN discovery (mDNS)
+
+    /// Discovered hosts not already saved (matched by address+port) — the saved grid shows
+    /// the rest, so this section only surfaces genuinely-new hosts on the network.
+    private var discoveredUnsaved: [DiscoveredHost] {
+        discovery.hosts.filter { d in
+            !store.hosts.contains { $0.address == d.host && $0.port == d.port }
+        }
+    }
+
+    private var discoveredSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("On this network", systemImage: "antenna.radiowaves.left.and.right")
+                .font(.headline)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
+            LazyVGrid(columns: gridColumns, spacing: gridSpacing) {
+                ForEach(discoveredUnsaved) { discoveredCard($0) }
+            }
+        }
+        .padding([.horizontal, .bottom])
+        .padding(.top, store.hosts.isEmpty ? 0 : 8)
+    }
+
+    private func discoveredCard(_ d: DiscoveredHost) -> some View {
+        #if os(iOS)
+        let iconSize: CGFloat = 56
+        let iconBox: CGFloat = 76
+        let cardPadding: CGFloat = 28
+        let nameFont = Font.title3.weight(.semibold)
+        #else
+        let iconSize: CGFloat = 42
+        let iconBox: CGFloat = 56
+        let cardPadding: CGFloat = 18
+        let nameFont = Font.headline
+        #endif
+        return Button {
+            connectDiscovered(d)
+        } label: {
+            VStack(spacing: 10) {
+                Image(systemName: "play.display")
+                    .font(.system(size: iconSize, weight: .light))
+                    .foregroundStyle(.tint)
+                    .frame(height: iconBox)
+                VStack(spacing: 2) {
+                    Text(d.name)
+                        .font(nameFont)
+                        .lineLimit(1)
+                    HStack(spacing: 4) {
+                        Image(systemName: d.requiresPairing ? "lock.fill" : "wifi")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                        Text("\(d.host):\(String(d.port))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Text(d.requiresPairing ? "Pairing required" : "Discovered")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, cardPadding)
+            .padding(.horizontal, 12)
+            #if !os(tvOS)
+            // A dashed ring distinguishes a not-yet-saved discovered host from saved cards.
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(
+                        Color.secondary.opacity(0.25),
+                        style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+            }
+            #endif
+        }
+        #if os(tvOS)
+        .buttonStyle(.card)
+        #else
+        .buttonStyle(.plain)
+        #endif
+        .disabled(model.isBusy)
+    }
+
+    /// Tap a discovered host: save it (so the session has a stored identity and the trust pin
+    /// persists), then connect — TOFU shows the fingerprint, which should match the advertised
+    /// `fp`. A `pair=required` host goes straight to the pairing ceremony instead.
+    private func connectDiscovered(_ d: DiscoveredHost) {
+        guard !model.isBusy else { return }
+        let host = StoredHost(name: d.name, address: d.host, port: d.port)
+        store.add(host)
+        if d.requiresPairing {
+            pairingTarget = host
+        } else {
+            connect(host)
+        }
     }
 
     // MARK: - Trust on first use
@@ -505,8 +631,7 @@ struct ContentView: View {
             if model.latencyValid {
                 // Capture→client-receipt (skew-corrected); excludes the layer's decode+present —
                 // see LatencyMeter. "(same-host)" when the host didn't answer the skew handshake.
-                Text("capture→client \(model.latencyP50Ms, specifier: "%.1f")/\(model.latencyP95Ms, specifier: "%.1f") ms p50/p95"
-                    + (model.latencySkewCorrected ? "" : " (same-host)"))
+                Text("capture→client \(model.latencyP50Ms, specifier: "%.1f")/\(model.latencyP95Ms, specifier: "%.1f") ms p50/p95\(model.latencySkewCorrected ? "" : " (same-host)")")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
@@ -526,11 +651,18 @@ struct ContentView: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             #endif
+            #if os(tvOS)
+            // No focusable control during play: a focusable button steals the controller's
+            // A press (the focus engine consumes it before the host sees it). Disconnect is
+            // the Siri Remote's Menu button (.onExitCommand on the stream) — just hint it.
+            Text("Press Menu to disconnect")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            #else
             Button("Disconnect (⌘D)") { model.disconnect() }
                 .font(.caption)
-                #if !os(tvOS)
                 .keyboardShortcut("d", modifiers: .command)
-                #endif
+            #endif
         }
         .padding(10)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
@@ -572,12 +704,18 @@ struct ContentView: View {
            let g = PunktfunkConnection.GamepadType(name: name) {
             pad = g
         }
+        var bitrate = UInt32(clamping: bitrateKbps)
+        if let kbps = ProcessInfo.processInfo.environment["PUNKTFUNK_BITRATE_KBPS"],
+           let v = UInt32(kbps) {
+            bitrate = v
+        }
         model.connect(
             to: host,
             width: UInt32(clamping: width), height: UInt32(clamping: height),
             hz: UInt32(clamping: hz),
             compositor: pref,
             gamepad: pad,
+            bitrateKbps: bitrate,
             autoTrust: true)
     }
 }

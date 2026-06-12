@@ -98,6 +98,15 @@ public final class InputCapture {
     /// window, clicking the HUD) and nothing is forwarded. Main-queue only.
     public private(set) var forwarding = false
 
+    /// iPad pointer routing (the StreamViewController mirrors the scene's live pointer-lock
+    /// state into this). GCMouse only delivers relative deltas + buttons while the scene is
+    /// LOCKED, so this is true then and the GCMouse handlers forward. When the scene can't
+    /// lock (Stage Manager, not frontmost, iPhone) the iPad routes the mouse through UIKit's
+    /// pointer path as ABSOLUTE moves (`sendMouseAbs`) instead — so this goes false, gating
+    /// GCMouse off and enabling the absolute path, the two never double-sending. Moot on
+    /// macOS (no GCMouse handlers installed; `sendMouseAbs` is never called there). Main-queue.
+    public var gcMouseForwarding = false
+
     /// Fired on ⌘⎋ (the capture toggle — detected here so it works in both states; the
     /// event itself is swallowed). Main queue.
     public var onToggleCapture: (() -> Void)?
@@ -257,6 +266,17 @@ public final class InputCapture {
         #endif
     }
 
+    /// Release any held MOUSE buttons host-side, leaving keyboard state untouched. Used when
+    /// the iPad pointer lock drops while a GCMouse button is held: by then the GCMouse release
+    /// handler is gated off (`gcMouseForwarding` is false), so it can't deliver the release
+    /// itself and the button would otherwise stick until the next `releaseAll` (blur / stop).
+    public func releaseMouseButtons() {
+        for button in pressedButtons {
+            connection.send(.mouseButton(button, down: false))
+        }
+        pressedButtons.removeAll()
+    }
+
     private func sendButton(_ button: UInt32, pressed: Bool) {
         guard forwarding else { return }
         if button == suppressedButton {
@@ -365,7 +385,7 @@ public final class InputCapture {
         // pointer lock). See the file header.
         #if !os(macOS)
         input.mouseMovedHandler = { [weak self] _, dx, dy in
-            guard let self, self.forwarding else { return }
+            guard let self, self.forwarding, self.gcMouseForwarding else { return }
             // GC gives +y up; the host expects screen-space (+y down).
             let fx = dx + self.residualX
             let fy = -dy + self.residualY
@@ -387,28 +407,40 @@ public final class InputCapture {
                 }
             }
         }
+        // Buttons take the GCMouse path only while the scene is pointer-locked; when it
+        // isn't, the UIKit indirect-pointer path carries them (gcMouseForwarding gates here
+        // so the two can't double-send).
         input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
-            self?.sendButton(1, pressed: pressed)
+            guard let self, self.gcMouseForwarding else { return }
+            self.sendButton(1, pressed: pressed)
         }
         input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in
-            self?.sendButton(3, pressed: pressed)
+            guard let self, self.gcMouseForwarding else { return }
+            self.sendButton(3, pressed: pressed)
         }
         input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in
-            self?.sendButton(2, pressed: pressed)
+            guard let self, self.gcMouseForwarding else { return }
+            self.sendButton(2, pressed: pressed)
         }
         // First two side buttons → GameStream X1/X2.
         if let aux = input.auxiliaryButtons {
             for (i, button) in aux.prefix(2).enumerated() {
                 button.pressedChangedHandler = { [weak self] _, _, pressed in
-                    self?.sendButton(UInt32(4 + i), pressed: pressed)
+                    guard let self, self.gcMouseForwarding else { return }
+                    self.sendButton(UInt32(4 + i), pressed: pressed)
                 }
             }
         }
+        // Scroll WHEEL (plain HID mice) while pointer-locked: GCMouse's scroll dpad reports
+        // wheel deltas here, +y up / +x right — already the host's WHEEL convention, one unit
+        // per notch → ×120 (WHEEL_DELTA), residual-accumulated by sendScroll. (Trackpad
+        // two-finger scrolling is gesture-based and does NOT reach GameController — that
+        // arrives via the stream view's scroll pan recognizer; on macOS, via scrollWheel.)
+        input.scroll.valueChangedHandler = { [weak self] _, dx, dy in
+            guard let self, self.forwarding, self.gcMouseForwarding else { return }
+            self.sendScroll(dx: dx * 120, dy: dy * 120)
+        }
         #endif
-        // NOTE: no scroll handler here. GCMouse's scroll dpad only fires for plain HID
-        // wheel deltas — trackpad/Magic Mouse scrolling is gesture-based and never
-        // reaches GameController. Scroll arrives via the stream view's scrollWheel
-        // override (NSEvent covers wheels too) → sendScroll().
     }
 
     /// Forward relative mouse motion (macOS). Fed by StreamLayerView's NSEvent monitor —
@@ -438,6 +470,18 @@ public final class InputCapture {
                 motionDebugTick = now
             }
         }
+    }
+
+    /// Forward an ABSOLUTE cursor position (iPad pointer fallback). Fed by the iOS stream
+    /// view's hover / indirect-pointer path when the scene can't pointer-lock: the host
+    /// places its cursor at this client-surface pixel — the same letterbox mapping the touch
+    /// path uses. Gated by `forwarding` AND `!gcMouseForwarding` (the relative GCMouse path
+    /// owns motion while locked), so absolute and relative motion never both fire. No residual
+    /// accumulation — the value is absolute, not a delta.
+    public func sendMouseAbs(x: Int32, y: Int32, surfaceWidth: UInt32, surfaceHeight: UInt32) {
+        guard forwarding, !gcMouseForwarding else { return }
+        connection.send(.mouseMoveAbs(
+            x: x, y: y, surfaceWidth: surfaceWidth, surfaceHeight: surfaceHeight))
     }
 
     /// Forward a scroll gesture, WHEEL_DELTA(120)-scaled (positive = up / right,

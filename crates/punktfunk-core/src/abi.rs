@@ -1406,7 +1406,7 @@ pub struct PunktfunkProbeResult {
 }
 
 /// Start a bandwidth speed test: ask the host to burst filler over the data plane at
-/// `target_kbps` of goodput for `duration_ms` (each clamped host-side to ≤ 1 Gbps / ≤ 5 s),
+/// `target_kbps` of goodput for `duration_ms` (each clamped host-side to ≤ 3 Gbps / ≤ 5 s),
 /// *briefly pausing video*. Non-blocking — poll [`punktfunk_connection_probe_result`] until its
 /// `done` field is 1. Starting a probe resets any prior measurement.
 ///

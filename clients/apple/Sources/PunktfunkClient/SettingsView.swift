@@ -16,6 +16,7 @@ struct SettingsView: View {
     @AppStorage("punktfunk.hz") private var hz = 60
     @AppStorage("punktfunk.compositor") private var compositor = 0
     @AppStorage("punktfunk.gamepadType") private var gamepadType = 0
+    @AppStorage("punktfunk.bitrateKbps") private var bitrateKbps = 0
     @AppStorage("punktfunk.micEnabled") private var micEnabled = true
     @ObservedObject private var gamepads = GamepadManager.shared
     #if os(macOS)
@@ -78,10 +79,18 @@ struct SettingsView: View {
             VStack(spacing: 16) {
                 TVSelectionRow(title: "Stream mode", options: options, selection: modeTag)
                 TVSelectionRow(
+                    title: "Bitrate", options: bitrateOptions, selection: $bitrateKbps)
+                if bitrateKbps > 1_000_000 {
+                    Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                }
+                TVSelectionRow(
                     title: "Compositor", options: compositors, selection: $compositor)
                 Text("The host creates a virtual output at exactly this mode — native "
-                    + "resolution, no scaling. A specific compositor is honored only if "
-                    + "available on the host.")
+                    + "resolution, no scaling. \(Self.bitrateFooter) A specific compositor "
+                    + "is honored only if available on the host.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -111,6 +120,77 @@ struct SettingsView: View {
             gamepads.startDiscovery()
         }
         .onDisappear { gamepads.stopDiscovery() }
+    }
+    #endif
+
+    // MARK: - Bitrate
+
+    /// Slider domain, log-scale: the useful range spans three orders of magnitude
+    /// (a few Mbps … 3 Gbps) — linear would cram everything below 100 Mbps into the
+    /// first pixels.
+    private static let minSliderKbps = 2_000.0
+    private static let maxSliderKbps = 3_000_000.0
+
+    private static let bitrateFooter =
+        "Automatic uses the host's default bitrate (20 Mbps); the host clamps any choice "
+        + "to its supported range. Run a speed test from a host card's context menu to "
+        + "pick an informed value. Applies from the next session."
+
+    private static let gigabitWarning =
+        "Above 1 Gbps — test the network speed first (a host card's context menu → "
+        + "Test Network Speed…). A bitrate beyond what the link sustains causes loss "
+        + "and stutter."
+
+    /// `bitrateKbps == 0` is Automatic; switching to manual lands on the host default.
+    private var automaticBitrate: Binding<Bool> {
+        Binding(
+            get: { bitrateKbps == 0 },
+            set: { bitrateKbps = $0 ? 0 : 20_000 })
+    }
+
+    /// Slider position 0...1 ↔ kbps on the log scale, snapped to two significant figures
+    /// so the readout shows round numbers instead of 47_322.
+    private var bitrateSlider: Binding<Double> {
+        Binding(
+            get: {
+                let v = Double(bitrateKbps).clamped(Self.minSliderKbps, Self.maxSliderKbps)
+                return log(v / Self.minSliderKbps)
+                    / log(Self.maxSliderKbps / Self.minSliderKbps)
+            },
+            set: { pos in
+                let raw = Self.minSliderKbps
+                    * pow(Self.maxSliderKbps / Self.minSliderKbps, pos)
+                let mag = pow(10, floor(log10(raw)) - 1)
+                bitrateKbps = Int((raw / mag).rounded() * mag)
+            })
+    }
+
+    #if os(tvOS)
+    /// tvOS has no Slider — the focus-native control is the pushed picker (the same
+    /// pattern as the stream mode), so the rates are presets here, up to the same 3 Gbps
+    /// ceiling, plus a custom entry so a non-preset stored value stays visible.
+    private static let bitratePresets: [(label: String, tag: Int)] = [
+        ("Automatic", 0),
+        ("10 Mbps", 10_000),
+        ("20 Mbps", 20_000),
+        ("40 Mbps", 40_000),
+        ("80 Mbps", 80_000),
+        ("150 Mbps", 150_000),
+        ("300 Mbps", 300_000),
+        ("500 Mbps", 500_000),
+        ("1 Gbps", 1_000_000),
+        ("1.5 Gbps", 1_500_000),
+        ("2 Gbps", 2_000_000),
+        ("3 Gbps", 3_000_000),
+    ]
+
+    private var bitrateOptions: [(label: String, tag: Int)] {
+        var options = Self.bitratePresets
+        if !options.contains(where: { $0.tag == bitrateKbps }) {
+            options.insert(
+                (SpeedTestSheet.mbpsLabel(kbps: bitrateKbps) + " (custom)", bitrateKbps), at: 1)
+        }
+        return options
     }
     #endif
 
@@ -200,11 +280,32 @@ struct SettingsView: View {
                 LabeledContent("") {
                     Button("Use this display's mode") { fillFromMainScreen() }
                 }
+                // (sharedBody is unused on tvOS — its body still compiles there, and
+                // Slider doesn't exist on tvOS; the tv path has its own preset picker.)
+                #if !os(tvOS)
+                Toggle("Automatic bitrate", isOn: automaticBitrate)
+                if bitrateKbps != 0 {
+                    HStack(spacing: 12) {
+                        Slider(value: bitrateSlider, in: 0...1) {
+                            Text("Bitrate")
+                        }
+                        Text(SpeedTestSheet.mbpsLabel(kbps: bitrateKbps))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 76, alignment: .trailing)
+                    }
+                    if bitrateKbps > 1_000_000 {
+                        Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+                #endif
             } header: {
                 Text("Stream mode")
             } footer: {
                 Text("The host creates a virtual output at exactly this mode — "
-                    + "native resolution, no scaling.")
+                    + "native resolution, no scaling. \(Self.bitrateFooter)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -322,5 +423,12 @@ struct SettingsView: View {
         height = Int(min(bounds.width, bounds.height))
         hz = UIScreen.main.maximumFramesPerSecond
         #endif
+    }
+}
+
+extension Double {
+    /// The log-scale slider mapping needs a bounded input (Automatic stores 0).
+    fileprivate func clamped(_ lo: Double, _ hi: Double) -> Double {
+        Swift.min(Swift.max(self, lo), hi)
     }
 }

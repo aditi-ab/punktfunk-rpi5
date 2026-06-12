@@ -175,20 +175,20 @@ client) is built and live. Two changes harden it from "works" to "secure by defa
 
   PIN pairing (§8a) stays the bootstrap — the first device, or when no approver is online.
 
-## 9. Client→host network speed test + settable bitrate *(host side done — client UI remaining)*
+## 9. Client→host network speed test + settable bitrate *(host + Apple client done — web console remaining)*
 
 Measure what the network actually sustains so the bitrate picker is informed (suggest/cap a safe
 value) instead of guesswork that ends in a stuttering stream.
 
 **Done & live (host + protocol + connector + C ABI, `74819b1`):**
 - **Bitrate negotiation**: `bitrate_kbps` rides Hello/Welcome (trailing-byte back-compat). The
-  client requests a rate; the host clamps to [500 kbps, 500 Mbps] (or its 20 Mbps default on 0),
+  client requests a rate; the host clamps to [500 kbps, 2 Gbps] (or its 20 Mbps default on 0),
   applies it to NVENC (replacing the old hardcoded 20 Mbps) on the initial mode + every reconfigure,
   and echoes the resolved value. C ABI: `punktfunk_connect_ex3(…, bitrate_kbps, …)` +
   `punktfunk_connection_bitrate()`.
 - **Bandwidth probe over the punktfunk/1 data path**: `ProbeRequest{target_kbps,duration_ms}` /
   `ProbeResult{bytes_sent,…}` control messages + a `FLAG_PROBE` packet flag. The host bursts
-  zero-filled FEC-encoded AUs at the target goodput for the duration (clamped ≤ 1 Gbps / ≤ 5 s,
+  zero-filled FEC-encoded AUs at the target goodput for the duration (clamped ≤ 3 Gbps / ≤ 5 s,
   video paused), reports what it sent; the connector measures received bytes/window → goodput + loss
   and exposes it (`punktfunk_connection_speed_test()` + `punktfunk_connection_probe_result()` →
   `PunktfunkProbeResult{throughput_kbps, loss_pct, …}`). Probe filler is diverted from the decoder.
@@ -196,9 +196,17 @@ value) instead of guesswork that ends in a stuttering stream.
   interleaved probe AUs excluded from frame verification. `punktfunk-client-rs` gains `--bitrate` +
   `--speed-test KBPS:MS` as the reference/loopback driver.
 
-**Remaining (client UI):** wire the C ABI into the Apple client — a "Test network" action
-(`speed_test` → poll `probe_result` → "~XXX Mbps · recommended bitrate YYY") feeding a bitrate
-control (`connect_ex3`), and surface both in the web console.
+**Done (Apple client UI):** Settings grows a Bitrate control (Automatic = host default; manual is
+a log-scale slider up to 3 Gbps with an above-1-Gbps "test the speed first" warning — tvOS keeps
+a focus-native preset picker; rides `connect_ex3` on every connect, `PUNKTFUNK_BITRATE_KBPS` dev
+override), and each host card's context menu gets
+"Test Network Speed…" — a sheet that connects, runs `speed_test` (up to the host's 3 Gbps
+probe ceiling for 2 s), polls `probe_result` with a live readout, and shows measured
+goodput · loss · recommended bitrate (≈70% of measured, capped at the 2 Gbps session
+ceiling) with a one-tap "Use N Mbps" writing the setting. Loopback-tested through the
+xcframework: bitrate echo (50 000 → 50 000) + a 20 Mbps/500 ms probe completing with real numbers.
+
+**Remaining:** surface both in the web console.
 
 ## 10. HDR + 10-bit color *(parked — blocked upstream at the compositor producer)*
 

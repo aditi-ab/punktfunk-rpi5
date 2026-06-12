@@ -366,7 +366,7 @@ impl NativeClient {
     /// `target_kbps` of goodput for `duration_ms`, *briefly pausing video*. Non-blocking — the
     /// measurement accumulates in the background; poll [`NativeClient::probe_result`] until its
     /// `done` flag is set. Starting a probe resets any prior measurement. The host clamps both
-    /// fields (≤ 1 Gbps, ≤ 5 s).
+    /// fields (≤ 3 Gbps, ≤ 5 s).
     pub fn request_probe(&self, target_kbps: u32, duration_ms: u32) -> Result<()> {
         // Reset the accumulator so a fresh run doesn't blend into the previous one.
         *self.probe.lock().unwrap() = ProbeState {

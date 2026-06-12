@@ -38,16 +38,21 @@ private let streamInputDebug =
 private final class CursorCapture {
     private var captured = false
 
-    func capture(in view: NSView) {
-        guard !captured, let window = view.window, view.bounds.width > 0 else { return }
+    /// Returns whether capture actually engaged. It can fail mid app-activation — the click
+    /// that reactivates the app delivers `mouseDown` before the app is frontmost, and
+    /// `CGAssociateMouseAndMouseCursorPosition` is refused then — so the caller must stay
+    /// released and let the NEXT click retry, never latching a half-captured state.
+    func capture(in view: NSView) -> Bool {
+        guard !captured, let window = view.window, view.bounds.width > 0 else { return false }
         // Park the cursor mid-view so a click can't land in (and activate) another app.
         let rectOnScreen = window.convertToScreen(view.convert(view.bounds, to: nil))
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
         CGWarpMouseCursorPosition(
             CGPoint(x: rectOnScreen.midX, y: primaryHeight - rectOnScreen.midY))
-        CGAssociateMouseAndMouseCursorPosition(0)
+        guard CGAssociateMouseAndMouseCursorPosition(0) == .success else { return false }
         NSCursor.hide()
         captured = true
+        return true
     }
 
     func release() {
@@ -194,6 +199,10 @@ public final class StreamLayerView: NSView {
     /// InputCapture suppresses its press/release toward the host. Clicks while captured
     /// are the host's (GC forwards them) — nothing to do here.
     public override func mouseDown(with event: NSEvent) {
+        if streamInputDebug {
+            streamInputLog.debug(
+                "mouseDown: captureEnabled=\(self.captureEnabled, privacy: .public) captured=\(self.captured, privacy: .public)")
+        }
         if captureEnabled, !captured {
             engageCapture(fromClick: true)
             return
@@ -239,6 +248,11 @@ public final class StreamLayerView: NSView {
     // here as a send; ⌘-combos still arrive via performKeyEquivalent and stay functional (⌘D).
     // Modifier keys never fire keyDown/keyUp — they come through flagsChanged below.
     public override var acceptsFirstResponder: Bool { true }
+    // A click after the app was inactive (Cmd-Tab away and back) must reach mouseDown so the
+    // user can re-capture — the deliberate design is that becoming active does NOT auto-grab;
+    // you click into the video. Default NSViews aren't key-view candidates, which can drop
+    // that first click; opting in keeps the view a valid click/responder target.
+    public override var canBecomeKeyView: Bool { true }
     public override func keyDown(with event: NSEvent) {
         if captured {
             if let ic = inputCapture, let vk = InputCapture.keyCodeToVK[event.keyCode] {
@@ -285,7 +299,10 @@ public final class StreamLayerView: NSView {
         guard captureEnabled, !captured, pump != nil, window != nil,
               fromClick || (NSApp.isActive && window?.isKeyWindow == true)
         else { return }
-        cursorCapture.capture(in: self)
+        // If the cursor grab is refused (e.g. the reactivating click arrives before the app is
+        // frontmost), stay released so the NEXT click retries — never latch captured=true over
+        // a free cursor, which would make mouseDown's `!captured` guard reject every later click.
+        guard cursorCapture.capture(in: self) else { return }
         inputCapture?.setForwarding(true, suppressClick: fromClick)
         // Install AFTER the warp + setForwarding: the engage warp generates no forwarded
         // delta (the monitor isn't up yet), and the engage click's suppression latch is
