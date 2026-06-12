@@ -243,18 +243,21 @@ async fn connect(mode: Mode) -> Result<MutterSession> {
     )
     .await?;
 
-    // 3. The virtual monitor, pinned to the client's exact mode via RecordVirtual's "modes"
-    // (explicit size + refresh-rate; Mutter ≥ 47). WITHOUT it Mutter derives the virtual monitor's
-    // refresh from the PipeWire stream framerate and defaults to **60 Hz** — so a >60 Hz client
-    // mode (e.g. 240) renders at 60 and only the encoder pads to 240 (duplicate frames). Older
-    // Mutter that doesn't know the key just ignores it and falls back to the 60 Hz default.
-    let mut vmode: HashMap<&str, Value> = HashMap::new();
-    vmode.insert("size", Value::from((mode.width, mode.height)));
-    vmode.insert("refresh-rate", Value::from(mode.refresh_hz as f64));
-    vmode.insert("is-preferred", Value::from(true));
+    // 3. The virtual monitor. By DEFAULT we let Mutter derive the refresh from the PipeWire
+    // framerate (it defaults the virtual monitor to **60 Hz**) — stable. PUNKTFUNK_MUTTER_VIRTUAL_REFRESH=1
+    // pins the client's exact WxH@Hz via RecordVirtual's "modes" (explicit size + refresh-rate;
+    // Mutter ≥ 47) for true >60 Hz — BUT a high-refresh virtual CRTC has been observed to SIGSEGV
+    // gnome-shell on teardown (large modes, e.g. 5120×1440@240), so it is OFF by default until that
+    // teardown crash is resolved.
     let mut rec: HashMap<&str, Value> = HashMap::new();
     rec.insert("cursor-mode", Value::from(CURSOR_EMBEDDED));
-    rec.insert("modes", Value::from(vec![vmode]));
+    if virtual_refresh_enabled() && mode.refresh_hz > 60 {
+        let mut vmode: HashMap<&str, Value> = HashMap::new();
+        vmode.insert("size", Value::from((mode.width, mode.height)));
+        vmode.insert("refresh-rate", Value::from(mode.refresh_hz as f64));
+        vmode.insert("is-preferred", Value::from(true));
+        rec.insert("modes", Value::from(vec![vmode]));
+    }
     let stream_path: OwnedObjectPath = sc_session
         .call("RecordVirtual", &(rec,))
         .await
@@ -339,6 +342,20 @@ type ApplyLogical = (i32, i32, f64, u32, bool, Vec<ApplyMon>);
 
 fn virtual_primary_enabled() -> bool {
     std::env::var("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Opt-in: pin the virtual output to the client's exact refresh via RecordVirtual "modes" (true
+/// above-60 Hz). OFF by default — a high-refresh virtual CRTC currently SIGSEGVs gnome-shell on
+/// session teardown (large modes), so don't risk the host's GNOME session until that's fixed.
+fn virtual_refresh_enabled() -> bool {
+    std::env::var("PUNKTFUNK_MUTTER_VIRTUAL_REFRESH")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
