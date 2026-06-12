@@ -29,6 +29,13 @@ All three appliances advertise over mDNS (`_punktfunk._udp`) and require PIN pai
 ## Progress log
 
 ### 2026-06-12
+- **Delegated pairing approval (§8b-1)** — an unpaired device that tries to connect to a
+  pairing-required host now shows up as a **pending request** in the web console's Pairing page;
+  one click approves it (optionally relabeling) and pairs its certificate fingerprint — no PIN
+  fetched out of band. New mgmt endpoints (`/native/pending` + approve/deny), an in-memory pending
+  queue in `NativePairing` (fp-deduped, capped, 10-min expiry), and an optional **device name** in
+  the `Hello` (back-compat trailing field; `client-rs --name` sends it). End-to-end tested.
+  §8b-2 (approve from a paired device's own app) is the client-side follow-up.
 - **CI + deployment landed** (see the [CI & Docker](/docs/ci) guide). Gitea Actions, three
   workflows: Rust workspace checks inside the new `punktfunk-rust-ci` builder image (Ubuntu 26.04,
   full link-dep stack incl. a libcuda stub — 141/141 tests green in-container), web + docs-site

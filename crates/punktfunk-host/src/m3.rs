@@ -454,13 +454,34 @@ async fn serve_session(
             punktfunk_core::ABI_VERSION
         );
         if opts.require_pairing {
-            let known = endpoint::peer_fingerprint(&conn)
-                .map(|fp| np.is_paired(&fingerprint_hex(&fp)))
+            let fp = endpoint::peer_fingerprint(&conn);
+            let known = fp
+                .as_ref()
+                .map(|fp| np.is_paired(&fingerprint_hex(fp)))
                 .unwrap_or(false);
-            anyhow::ensure!(
-                known,
-                "unpaired client rejected (this host requires pairing — run the PIN ceremony first)"
-            );
+            if !known {
+                // Delegated approval (§8b-1): an identified-but-unpaired knock becomes a pending
+                // request the operator can approve from the console — no PIN fetched out of band.
+                // The label is the client's Hello name, else fingerprint-derived. An anonymous
+                // client (no certificate) has no identity to approve, so nothing is recorded.
+                if let Some(fp) = &fp {
+                    let fp_hex = fingerprint_hex(fp);
+                    // Sanitize the wire-supplied name before it reaches the log (untrusted: an
+                    // unpaired device could embed terminal escapes / bidi overrides); note_pending
+                    // stores the same sanitized form and derives a fingerprint label when empty.
+                    let label = crate::native_pairing::sanitize_device_name(
+                        hello.name.as_deref().unwrap_or(""),
+                        &fp_hex,
+                    );
+                    tracing::info!(name = %label, fingerprint = %fp_hex,
+                        "unpaired device knocked — held for approval in the console");
+                    np.note_pending(&label, &fp_hex);
+                }
+                anyhow::bail!(
+                    "unpaired client rejected (this host requires pairing — approve the device \
+                     in the console, or run the PIN ceremony)"
+                );
+            }
         }
         crate::encode::validate_dimensions(
             crate::encode::Codec::H265,
@@ -2204,6 +2225,100 @@ mod tests {
 
     fn test_paired_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("punktfunk-paired-test-{}.json", std::process::id()))
+    }
+
+    /// Delegated approval (§8b-1) end to end in-process: an identified-but-unpaired client's
+    /// knock on a pairing-required host is held as a pending request (fingerprint-derived label —
+    /// the connector sends no Hello name); approving it pairs the fingerprint, and the same
+    /// identity then gets a session with no PIN ceremony.
+    #[test]
+    fn delegated_approval_admits_after_knock() {
+        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::quic::endpoint;
+
+        let store =
+            std::env::temp_dir().join(format!("pf-approval-test-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&store);
+        let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
+        let np_host = np.clone();
+        let host = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(serve(
+                M3Options {
+                    port: 19779,
+                    source: M3Source::Synthetic,
+                    seconds: 0,
+                    frames: 25,
+                    max_sessions: 2, // the knock + the post-approval session
+                    max_concurrent: 1,
+                    require_pairing: true,
+                    allow_pairing: false,
+                    pairing_pin: None,
+                    paired_store: None, // unused: the shared `np` IS the store handle
+                },
+                np_host,
+            ))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let timeout = std::time::Duration::from_secs(10);
+        let (cert, key) = endpoint::generate_identity().unwrap();
+        let mode = punktfunk_core::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+
+        // 1: the knock — an identified-but-unpaired connect is rejected, but lands in pending.
+        assert!(
+            NativeClient::connect(
+                "127.0.0.1",
+                19779,
+                mode,
+                CompositorPref::Auto,
+                GamepadPref::Auto,
+                0,
+                None,
+                Some((cert.clone(), key.clone())),
+                timeout
+            )
+            .is_err(),
+            "unpaired knock must still be rejected"
+        );
+        let expected_fp = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let pend = np.pending();
+        assert_eq!(pend.len(), 1, "the knock must be held for approval");
+        assert_eq!(pend[0].fingerprint, expected_fp);
+        assert!(
+            pend[0].name.starts_with("device "),
+            "no Hello name → fingerprint-derived label, got {:?}",
+            pend[0].name
+        );
+
+        // 2: approve (with an operator label) → the same identity now gets a session, no PIN.
+        let approved = np
+            .approve_pending(pend[0].id, Some("Approved Device"))
+            .unwrap()
+            .expect("pending id must approve");
+        assert_eq!(approved.fingerprint, expected_fp);
+        let client = NativeClient::connect(
+            "127.0.0.1",
+            19779,
+            mode,
+            CompositorPref::Auto,
+            GamepadPref::Auto,
+            0,
+            None,
+            Some((cert, key)),
+            timeout,
+        )
+        .expect("approved identity gets a session");
+        drop(client);
+        let _ = std::fs::remove_file(&store);
+        host.join().unwrap().unwrap();
     }
 
     /// The PIN pairing ceremony + the --require-pairing gate, end to end in-process:

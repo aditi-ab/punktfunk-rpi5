@@ -3,9 +3,10 @@ title: Pairing & Trust
 description: How a client and host establish trust — PIN pairing once, pinned reconnects after.
 ---
 
-punktfunk has no accounts and no cloud. Trust is established directly between a client and a host, on
-your network, with a one-time **PIN pairing**. After that, the device reconnects automatically on a
-pinned cryptographic identity.
+punktfunk has no accounts and no cloud. Trust is established directly between a client and a host,
+on your network, with a one-time pairing — either an **approval click in the host's console** or a
+**PIN ceremony**. After that, the device reconnects automatically on a pinned cryptographic
+identity.
 
 ## How it works
 
@@ -17,7 +18,24 @@ pinned cryptographic identity.
 - After pairing, the host stores the client's identity in its allow-list, and the client stores the
   host's fingerprint. Reconnects are automatic — no PIN.
 
-## Arming pairing on the host
+## Approving a device from the console (no PIN)
+
+The fastest way to admit a new device: just **try to connect** from it. On a pairing-required host,
+the attempt shows up in the web console's Pairing page under **Waiting for approval** — with the
+device's name and identity fingerprint. Click **Approve** (and optionally give it a label like
+"Living Room TV"), and the device is paired on the spot: its next connect goes straight through. No
+PIN to read or type.
+
+**Deny** just dismisses the request (the device can knock again later — it's "not now", not a
+blocklist). Requests expire on their own after a few minutes.
+
+This works because approval happens on the host's authenticated management surface — only someone
+with console access can admit a device.
+
+## Pairing with a PIN
+
+The PIN ceremony is the other path — useful for the *first* device (before the console has admitted
+anything) or when you're at the client and the console isn't handy.
 
 Pairing has to be **armed** on the host before a client can pair (so a random device can't pair
 itself). Two ways:

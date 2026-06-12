@@ -145,6 +145,9 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(disarm_native_pairing))
                 .routes(routes!(list_native_clients))
                 .routes(routes!(unpair_native_client))
+                .routes(routes!(list_pending_devices))
+                .routes(routes!(approve_pending_device))
+                .routes(routes!(deny_pending_device))
                 .routes(routes!(stop_session))
                 .routes(routes!(request_idr)),
         )
@@ -377,6 +380,29 @@ struct NativeClient {
     name: String,
     /// Hex SHA-256 of the client certificate — its stable id here.
     fingerprint: String,
+}
+
+/// An unpaired device that tried to connect while the host requires pairing — awaiting
+/// **delegated approval** (approve it here instead of fetching the host PIN out of band).
+#[derive(Serialize, ToSchema)]
+struct PendingDevice {
+    /// Id to address approve/deny (per-process; entries expire after ~10 minutes).
+    id: u32,
+    /// Best-effort device label (the client's own name, else fingerprint-derived).
+    #[schema(example = "Enrico's MacBook")]
+    name: String,
+    /// Hex SHA-256 of the device's certificate — what approval pins.
+    fingerprint: String,
+    /// Seconds since the device last knocked.
+    age_secs: u64,
+}
+
+/// Approve-pending-device request body. Send `{}` to keep the device's own name.
+#[derive(Deserialize, ToSchema)]
+struct ApprovePending {
+    /// Operator-chosen label for the device (defaults to the name it knocked with).
+    #[schema(example = "Living Room TV")]
+    name: Option<String>,
 }
 
 /// Error envelope for every non-2xx response.
@@ -885,6 +911,116 @@ async fn unpair_native_client(
     }
 }
 
+/// List devices awaiting pairing approval
+///
+/// Unpaired devices that tried to connect while the host requires pairing. Approve one to pair
+/// it without a PIN (delegated approval); entries expire after ~10 minutes.
+#[utoipa::path(
+    get,
+    path = "/native/pending",
+    tag = "native",
+    operation_id = "listPendingDevices",
+    responses(
+        (status = OK, description = "Devices awaiting approval (empty when none, or when the \
+                                     native host is not enabled)", body = Vec<PendingDevice>),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn list_pending_devices(State(st): State<Arc<MgmtState>>) -> Json<Vec<PendingDevice>> {
+    let pending = st
+        .native
+        .as_ref()
+        .map(|np| np.pending())
+        .unwrap_or_default();
+    Json(
+        pending
+            .into_iter()
+            .map(|p| PendingDevice {
+                id: p.id,
+                name: p.name,
+                fingerprint: p.fingerprint,
+                age_secs: p.age_secs,
+            })
+            .collect(),
+    )
+}
+
+/// Approve a pending device
+///
+/// Pairs the device's certificate fingerprint — it can connect immediately (no PIN). Optionally
+/// relabel it via the body; send `{}` to keep the name it knocked with.
+#[utoipa::path(
+    post,
+    path = "/native/pending/{id}/approve",
+    tag = "native",
+    operation_id = "approvePendingDevice",
+    params(("id" = u32, Path, description = "Pending-request id from the pending list")),
+    request_body = ApprovePending,
+    responses(
+        (status = OK, description = "Device paired", body = NativeClient),
+        (status = NOT_FOUND, description = "No pending request with that id (expired?)", body = ApiError),
+        (status = SERVICE_UNAVAILABLE, description = "Native host not enabled", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the trust store", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn approve_pending_device(
+    State(st): State<Arc<MgmtState>>,
+    Path(id): Path<u32>,
+    ApiJson(req): ApiJson<ApprovePending>,
+) -> Response {
+    let Some(np) = &st.native else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "native host not enabled");
+    };
+    match np.approve_pending(id, req.name.as_deref()) {
+        Ok(Some(client)) => {
+            tracing::info!(name = %client.name, fingerprint = %client.fingerprint,
+                "management API: pending device approved (delegated pairing)");
+            Json(NativeClient {
+                name: client.name,
+                fingerprint: client.fingerprint,
+            })
+            .into_response()
+        }
+        Ok(None) => api_error(
+            StatusCode::NOT_FOUND,
+            "no pending request with that id (it may have expired — have the device retry)",
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not persist trust store: {e}"),
+        ),
+    }
+}
+
+/// Deny a pending device
+///
+/// Drops the request. Not a blocklist — the device's next attempt knocks again.
+#[utoipa::path(
+    post,
+    path = "/native/pending/{id}/deny",
+    tag = "native",
+    operation_id = "denyPendingDevice",
+    params(("id" = u32, Path, description = "Pending-request id from the pending list")),
+    responses(
+        (status = NO_CONTENT, description = "Request dropped"),
+        (status = NOT_FOUND, description = "No pending request with that id", body = ApiError),
+        (status = SERVICE_UNAVAILABLE, description = "Native host not enabled", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn deny_pending_device(State(st): State<Arc<MgmtState>>, Path(id): Path<u32>) -> Response {
+    let Some(np) = &st.native else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "native host not enabled");
+    };
+    if np.deny_pending(id) {
+        tracing::info!(id, "management API: pending device denied");
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        api_error(StatusCode::NOT_FOUND, "no pending request with that id")
+    }
+}
+
 /// Stop the active session
 ///
 /// Kicks the connected client: stops the video/audio stream threads and clears the launch
@@ -1345,6 +1481,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_devices_approve_and_deny() {
+        let np = Arc::new(
+            crate::native_pairing::NativePairing::load_with(
+                Some(
+                    std::env::temp_dir()
+                        .join(format!("pf-mgmt-pending-{}.json", std::process::id())),
+                ),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let app = test_app_native(test_state(), np.clone());
+
+        // Empty queue.
+        let (s, b) = send(&app, get_req("/api/v1/native/pending")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b.as_array().unwrap().len(), 0);
+
+        // Two devices knock (what the QUIC gate records); they appear in the list.
+        np.note_pending("Enrico's MacBook", "aa11");
+        np.note_pending("device bb22cc33", "bb22");
+        let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
+        assert_eq!(b.as_array().unwrap().len(), 2);
+        assert_eq!(b[0]["name"], "Enrico's MacBook");
+        let approve_id = b[0]["id"].as_u64().unwrap();
+        let deny_id = b[1]["id"].as_u64().unwrap();
+
+        // Approve the first with an operator label → paired under that name, gone from pending.
+        let (s, b) = send(
+            &app,
+            post_json(
+                &format!("/api/v1/native/pending/{approve_id}/approve"),
+                serde_json::json!({"name": "Office MacBook"}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b["name"], "Office MacBook");
+        assert_eq!(b["fingerprint"], "aa11");
+        assert!(np.is_paired("AA11"), "approval pins the fingerprint");
+
+        // Deny the second → dropped, not paired; a re-deny is 404.
+        let deny = post_json(
+            &format!("/api/v1/native/pending/{deny_id}/deny"),
+            serde_json::json!({}),
+        );
+        assert_eq!(send(&app, deny).await.0, StatusCode::NO_CONTENT);
+        assert!(!np.is_paired("bb22"));
+        let (s, _) = send(
+            &app,
+            post_json(
+                &format!("/api/v1/native/pending/{deny_id}/deny"),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        // Queue is empty again; approving a stale id is 404 (keep `{}` = device's own name).
+        let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
+        assert_eq!(b.as_array().unwrap().len(), 0);
+        let (s, _) = send(
+            &app,
+            post_json("/api/v1/native/pending/123/approve", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn native_endpoints_report_disabled_without_native_host() {
         let app = test_app(test_state(), None);
         let (s, b) = send(&app, get_req("/api/v1/native/pair")).await;
@@ -1354,6 +1561,23 @@ mod tests {
         let (s, _) = send(
             &app,
             post_json("/api/v1/native/pair/arm", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        // Pending list reads as an empty array (like /native/clients), not a 503.
+        let (s, b) = send(&app, get_req("/api/v1/native/pending")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b.as_array().unwrap().len(), 0);
+        // Approve/deny without a native host are 503.
+        let (s, _) = send(
+            &app,
+            post_json("/api/v1/native/pending/0/approve", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        let (s, _) = send(
+            &app,
+            post_json("/api/v1/native/pending/0/deny", serde_json::json!({})),
         )
         .await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);

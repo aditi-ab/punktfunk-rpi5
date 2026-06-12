@@ -108,11 +108,15 @@ pub struct AudioPacket {
 }
 
 pub struct NativeClient {
-    frames: Receiver<Frame>,
-    audio: Receiver<AudioPacket>,
-    rumble: Receiver<(u16, u16, u16)>,
+    // Each plane's receiver sits behind its own mutex so `NativeClient` is `Sync` and Rust
+    // embedders can share one `Arc<NativeClient>` across their plane threads (the same
+    // one-thread-per-plane contract the C ABI documents — the lock is uncontended there,
+    // and two threads racing one plane now serialize instead of being undefined).
+    frames: Mutex<Receiver<Frame>>,
+    audio: Mutex<Receiver<AudioPacket>>,
+    rumble: Mutex<Receiver<(u16, u16, u16)>>,
     /// Inbound DualSense feedback (lightbar / player LEDs / adaptive triggers) — 0xCD datagrams.
-    hidout: Receiver<HidOutput>,
+    hidout: Mutex<Receiver<HidOutput>>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     /// Outbound mic frames `(seq, pts_ns, opus)` → encoded as 0xCB datagrams by the worker.
     mic_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64, Vec<u8>)>,
@@ -234,10 +238,10 @@ impl NativeClient {
             };
         *mode_slot.lock().unwrap() = negotiated;
         Ok(NativeClient {
-            frames: frame_rx,
-            audio: audio_rx,
-            rumble: rumble_rx,
-            hidout: hidout_rx,
+            frames: Mutex::new(frame_rx),
+            audio: Mutex::new(audio_rx),
+            rumble: Mutex::new(rumble_rx),
+            hidout: Mutex::new(hidout_rx),
             input_tx,
             mic_tx,
             rich_input_tx,
@@ -419,7 +423,7 @@ impl NativeClient {
     /// (`&self` here supports the cross-plane sharing; a plane's queue is still
     /// single-consumer by contract).
     pub fn next_frame(&self, timeout: Duration) -> Result<Frame> {
-        match self.frames.recv_timeout(timeout) {
+        match self.frames.lock().unwrap().recv_timeout(timeout) {
             Ok(f) => Ok(f),
             Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
             Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
@@ -430,7 +434,7 @@ impl NativeClient {
     /// [`PunktfunkError::Closed`] once the session ended. Drain on a dedicated audio thread —
     /// packets arrive every 5 ms.
     pub fn next_audio(&self, timeout: Duration) -> Result<AudioPacket> {
-        match self.audio.recv_timeout(timeout) {
+        match self.audio.lock().unwrap().recv_timeout(timeout) {
             Ok(p) => Ok(p),
             Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
             Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
@@ -440,7 +444,7 @@ impl NativeClient {
     /// Pull the next rumble update `(pad, low, high)`; same semantics as
     /// [`NativeClient::next_audio`]. Amplitudes are 0..0xFFFF, `(0, 0)` = stop.
     pub fn next_rumble(&self, timeout: Duration) -> Result<(u16, u16, u16)> {
-        match self.rumble.recv_timeout(timeout) {
+        match self.rumble.lock().unwrap().recv_timeout(timeout) {
             Ok(r) => Ok(r),
             Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
             Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
@@ -452,7 +456,7 @@ impl NativeClient {
     /// [`NativeClient::next_rumble`]. Replay it on a real DualSense (e.g. via the platform's
     /// `GCDualSenseAdaptiveTrigger` API). Only the DualSense host backend emits these.
     pub fn next_hidout(&self, timeout: Duration) -> Result<HidOutput> {
-        match self.hidout.recv_timeout(timeout) {
+        match self.hidout.lock().unwrap().recv_timeout(timeout) {
             Ok(h) => Ok(h),
             Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
             Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
@@ -579,6 +583,9 @@ async fn worker_main(args: WorkerArgs) {
                 compositor,
                 gamepad,
                 bitrate_kbps,
+                // No device name yet: the connect ABI has no name parameter (pairing does). The
+                // host falls back to a fingerprint-derived label in its pending-approval list.
+                name: None,
             }
             .encode(),
         )

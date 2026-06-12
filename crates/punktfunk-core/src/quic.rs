@@ -38,7 +38,7 @@ pub const CTL_MAGIC: &[u8; 4] = b"PKFc";
 
 /// `client → host`: open the session, requesting a display mode (the host creates its
 /// virtual output at exactly this size/refresh — native resolution end to end).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hello {
     pub abi_version: u32,
     pub mode: Mode,
@@ -57,7 +57,16 @@ pub struct Hello {
     /// the value it actually configured in [`Welcome::bitrate_kbps`]. Appended to the wire form —
     /// omitted by older clients (decodes to `0`, i.e. host default).
     pub bitrate_kbps: u32,
+    /// Human-readable device name ("Enrico's MacBook"), shown by the host when this device knocks
+    /// on a pairing-required host (the delegated-approval pending list) and stored on approval.
+    /// Appended to the wire form as `len u8 || UTF-8` (≤ [`HELLO_NAME_MAX`] bytes) — omitted by
+    /// older clients (decodes to `None`; the host falls back to a fingerprint-derived label).
+    pub name: Option<String>,
 }
+
+/// Longest device name carried in a [`Hello`] (bytes of UTF-8; longer names are truncated on
+/// encode, rejected on decode — a one-byte length prefix caps it at 255 anyway).
+pub const HELLO_NAME_MAX: usize = 64;
 
 /// `host → client`: the complete session offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -463,6 +472,22 @@ impl Hello {
         b.push(self.compositor.to_u8()); // appended at offset 20 — older hosts read [0..20] and skip it
         b.push(self.gamepad.to_u8()); // appended at offset 21 — same back-compat discipline
         b.extend_from_slice(&self.bitrate_kbps.to_le_bytes()); // appended at offset 22..26
+        if let Some(name) = &self.name {
+            // Appended at offset 26: len u8 || UTF-8. This is the LAST trailing field — `None`
+            // emits nothing (so a no-name Hello is byte-identical to the bitrate-era form), which
+            // means a *future* field can't simply follow `name` at a fixed offset; it would need
+            // its own presence flag. Truncate to a char boundary within HELLO_NAME_MAX.
+            let mut n = name.as_str();
+            while n.len() > HELLO_NAME_MAX {
+                let mut cut = HELLO_NAME_MAX;
+                while !n.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                n = &n[..cut];
+            }
+            b.push(n.len() as u8);
+            b.extend_from_slice(n.as_bytes());
+        }
         b
     }
 
@@ -492,6 +517,17 @@ impl Hello {
                 .get(22..26)
                 .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
                 .unwrap_or(0),
+            // Optional trailing device name: len u8 || UTF-8. Absent / oversized / non-UTF-8 →
+            // `None` (never fail the handshake over a label).
+            name: b.get(26).and_then(|&len| {
+                let len = len as usize;
+                if len == 0 || len > HELLO_NAME_MAX {
+                    return None;
+                }
+                b.get(27..27 + len)
+                    .and_then(|s| std::str::from_utf8(s).ok())
+                    .map(String::from)
+            }),
         })
     }
 }
@@ -1406,6 +1442,7 @@ mod tests {
             compositor: CompositorPref::Kwin,
             gamepad: GamepadPref::DualSense,
             bitrate_kbps: 25_000,
+            name: Some("Test Device".into()),
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -1470,6 +1507,7 @@ mod tests {
             compositor: CompositorPref::Mutter,
             gamepad: GamepadPref::DualSense,
             bitrate_kbps: 80_000,
+            name: None,
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -1524,6 +1562,51 @@ mod tests {
         assert_eq!(pre_bitrate_w.gamepad, GamepadPref::Xbox360);
         assert_eq!(pre_bitrate_w.bitrate_kbps, 0);
         assert_eq!(Welcome::decode(&wenc).unwrap().bitrate_kbps, 120_000);
+    }
+
+    #[test]
+    fn hello_name_roundtrip_and_back_compat() {
+        let base = Hello {
+            abi_version: 2,
+            mode: Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+            },
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: Some("Enrico's MacBook".into()),
+        };
+        let enc = base.encode();
+        assert_eq!(
+            Hello::decode(&enc).unwrap().name.as_deref(),
+            Some("Enrico's MacBook")
+        );
+        // A bitrate-era (26-byte) peer reading a named Hello ignores the trailing name; a named
+        // host reading a bitrate-era Hello decodes name = None.
+        assert_eq!(Hello::decode(&enc[..26]).unwrap().name, None);
+        // No name → wire form is byte-identical to the bitrate-era message (26 bytes).
+        let unnamed = Hello {
+            name: None,
+            ..base.clone()
+        };
+        assert_eq!(unnamed.encode().len(), 26);
+        // Over-long names truncate to a char boundary within HELLO_NAME_MAX on encode.
+        let long = Hello {
+            name: Some(format!("{}ü", "x".repeat(HELLO_NAME_MAX - 1))), // ü straddles the cap
+            ..base.clone()
+        };
+        let dec = Hello::decode(&long.encode()).unwrap();
+        let n = dec.name.expect("truncated name still present");
+        assert!(n.len() <= HELLO_NAME_MAX && n.starts_with('x'));
+        // A corrupt length byte (longer than the buffer) or bad UTF-8 degrades to None, never Err.
+        let mut bad_len = unnamed.encode();
+        bad_len.push(40); // claims 40 name bytes, none follow
+        assert_eq!(Hello::decode(&bad_len).unwrap().name, None);
+        let mut bad_utf8 = unnamed.encode();
+        bad_utf8.extend_from_slice(&[2, 0xFF, 0xFE]);
+        assert_eq!(Hello::decode(&bad_utf8).unwrap().name, None);
     }
 
     #[test]
@@ -1632,6 +1715,7 @@ mod tests {
                 compositor: CompositorPref::Auto,
                 gamepad: GamepadPref::Auto,
                 bitrate_kbps: 0,
+                name: None,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");

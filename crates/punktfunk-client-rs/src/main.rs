@@ -371,6 +371,9 @@ async fn session(args: Args) -> Result<()> {
             compositor: args.compositor,
             gamepad: args.gamepad,
             bitrate_kbps: args.bitrate_kbps,
+            // `--name` (also the pairing label) — shown in the host's pending-approval list when
+            // this client knocks on a pairing-required host.
+            name: Some(args.name.clone()),
         }
         .encode(),
     )

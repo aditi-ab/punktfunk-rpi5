@@ -144,7 +144,7 @@ mostly-mechanical port. Recommended start: **Phase 0** — capture an existing m
 stack end to end; **Phase 1** wires SudoVDA for the native-resolution output. Deferred only because
 it's unbuildable on the Linux dev box; the trait boundaries are already in the right places.
 
-## 8. Pairing & trust hardening *(next)*
+## 8. Pairing & trust hardening *(§8a + §8b-1 done; §8b-2 next)*
 
 The unified host + web-console pairing (arm a window → display the host PIN → user enters it on the
 client) is built and live. Two changes harden it from "works" to "secure by default":
@@ -154,24 +154,23 @@ client) is built and live. Two changes harden it from "works" to "secure by defa
   is via the SPAKE2 PIN ceremony (one online guess, no offline attack) armed from the web console.
   Validated live: unpaired → "this host requires pairing", then web-armed PIN → "client trusted".
   Deployed to the dev box + Bazzite.
-- **Delegated pairing approval** *(next — the ergonomic enabler for "mandatory": pair a device
-  without fetching the host PIN out of band).* Target flow:
-  1. Device A is already paired (authenticated) to Host X.
-  2. The user tries to connect Device B to Host X.
-  3. Host X surfaces a request: *"Allow Device B to pair with Host X?"*
-  4. The user approves/denies; on approve, Host X admits Device B — binding B's certificate
-     fingerprint — with no PIN typed.
-
-  Two buildable layers:
-  - **§8b-1 (host + web — achievable now):** an unpaired B that connects to an approval-enabled host
-    is held as a **pending request** `{id, name, fingerprint, requested_at}` in `NativePairing`
-    instead of a flat reject; mgmt gains `GET /native/pending` + `POST /native/pending/{id}/{approve,
-    deny}`; the web console lists pending requests with Approve/Deny. The **operator approves from
-    the console** — delegated approval via the management surface.
-  - **§8b-2 (peer push — needs the client):** the host also pushes the pending request over a paired
-    **Device A**'s live QUIC connection (a new control-plane message); A's app renders the prompt and
-    replies approve/deny — the user's exact "Device A gets a notification" flow. The native/Apple UI
-    is a client-agent task.
+- ✅ **§8b-1 Delegated approval via the console — done (2026-06-12)** *(the ergonomic enabler for
+  "mandatory": pair a device without fetching the host PIN out of band).* An identified-but-unpaired
+  device that knocks on a pairing-required host is held as a **pending request** in `NativePairing`
+  (in-memory, deduped by fingerprint, 32-entry cap, 10-min expiry — a LAN scanner can't grow it,
+  and an anonymous client with no certificate records nothing). The mgmt API gains
+  `GET /native/pending` + `POST /native/pending/{id}/approve` (optional `{name}` to relabel) +
+  `POST /native/pending/{id}/deny`; the web console's Pairing page shows a **Waiting for approval**
+  section (live-polling) with Approve/Deny — approve pins the fingerprint on the spot, no PIN.
+  The `Hello` carries an optional trailing **device name** (same back-compat pattern as
+  compositor/gamepad/bitrate; `client-rs --name` sends it, fingerprint-derived label otherwise) so
+  the pending list is human-readable. End-to-end tested (knock → pending → approve → same identity
+  streams) + unit/mgmt tests.
+- **§8b-2 (peer push — needs the client):** the host also pushes the pending request over a paired
+  **Device A**'s live QUIC connection (a new control-plane message); A's app renders the prompt and
+  replies approve/deny — the user's exact "Device A gets a notification" flow. The native/Apple UI
+  is a client-agent task. The Apple connector should also start sending the `Hello` device name
+  (needs a connect-ABI name parameter; the wire field is already live).
 
   PIN pairing (§8a) stays the bootstrap — the first device, or when no approver is online.
 

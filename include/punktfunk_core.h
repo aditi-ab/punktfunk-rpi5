@@ -147,6 +147,12 @@
 #define MAX_DATAGRAM_BYTES 2048
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Longest device name carried in a [`Hello`] (bytes of UTF-8; longer names are truncated on
+// encode, rejected on decode — a one-byte length prefix caps it at 255 anyway).
+#define HELLO_NAME_MAX 64
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`Reconfigure`] (first byte after the magic).
 #define MSG_RECONFIGURE 1
 #endif
