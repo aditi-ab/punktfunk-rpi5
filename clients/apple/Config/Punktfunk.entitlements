@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Keychain Sharing: a team-scoped access group so the punktfunk/1 client identity in
+	     the data-protection keychain is gated by the app's entitlement (team + bundle id),
+	     not a per-binary ACL. That is what makes Keychain access persist across rebuilds
+	     with NO prompt — see ClientIdentityStore. $(AppIdentifierPrefix) expands to the
+	     team prefix at signing time. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)io.unom.punktfunk</string>
+	</array>
+</dict>
+</plist>

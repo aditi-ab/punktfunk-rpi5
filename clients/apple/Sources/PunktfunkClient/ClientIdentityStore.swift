@@ -1,5 +1,6 @@
 // This client's persistent punktfunk/1 identity: a self-signed certificate + key (PEM),
-// generated once and stored in the login Keychain. The certificate's fingerprint is how
+// generated once and stored in the data-protection Keychain (with a legacy file-keychain
+// fallback for unsigned builds — see `query(dataProtection:)`). The certificate's fingerprint is how
 // hosts recognize this client after PIN pairing — losing the key un-pairs this Mac from
 // every host, so the pair is presented on every connect but never regenerated once
 // stored. That invariant drives the error handling below: a Keychain that *refuses
@@ -42,8 +43,9 @@ final class ClientIdentityStore: @unchecked Sendable {
             break // genuine first run — mint below
         case .corrupt:
             // Our own item, undecodable: the pairings it backed are unusable either
-            // way, so deliberately self-heal by replacing it.
-            SecItemDelete(Self.query as CFDictionary)
+            // way, so deliberately self-heal by replacing it (both keychains, best-effort).
+            SecItemDelete(Self.query(dataProtection: true) as CFDictionary)
+            SecItemDelete(Self.query(dataProtection: false) as CFDictionary)
         case .denied(let status):
             throw IdentityError.keychain(status)
         }
@@ -89,14 +91,35 @@ final class ClientIdentityStore: @unchecked Sendable {
         case denied(OSStatus)
     }
 
-    private static let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "io.unom.punktfunk",
-        kSecAttrAccount as String: "client-identity",
-    ]
+    /// Item coordinates. We prefer the DATA-PROTECTION keychain: with the app's
+    /// `keychain-access-groups` entitlement, items there are gated by the app's identity
+    /// (team + bundle id) instead of a per-binary ACL — so a SIGNED build reads them across
+    /// rebuilds with NO Keychain prompt (a per-binary ACL re-prompts on every resign, which
+    /// is why an ad-hoc-signed app asked every launch). An ad-hoc / unsigned build (e.g.
+    /// `swift run`) has no such entitlement — `SecItem*` returns `errSecMissingEntitlement`
+    /// there, and we fall back to the legacy file keychain (still works, with the old prompt).
+    private static func query(dataProtection: Bool) -> [String: Any] {
+        var q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "io.unom.punktfunk",
+            kSecAttrAccount as String: "client-identity",
+        ]
+        if dataProtection { q[kSecUseDataProtectionKeychain as String] = true }
+        return q
+    }
 
     private func copyStored() -> ReadResult {
-        var query = Self.query
+        let result = read(dataProtection: true)
+        // No entitlement (ad-hoc / unsigned build): the data-protection keychain is
+        // unavailable — read the legacy file keychain instead.
+        if case .denied(errSecMissingEntitlement) = result {
+            return read(dataProtection: false)
+        }
+        return result
+    }
+
+    private func read(dataProtection: Bool) -> ReadResult {
+        var query = Self.query(dataProtection: dataProtection)
         query[kSecReturnData as String] = true
         var out: CFTypeRef?
         switch SecItemCopyMatching(query as CFDictionary, &out) {
@@ -116,8 +139,16 @@ final class ClientIdentityStore: @unchecked Sendable {
         guard let data = try? JSONEncoder().encode(
             Stored(certPEM: identity.certPEM, keyPEM: identity.keyPEM))
         else { return errSecParam }
-        var add = Self.query
+        var add = Self.query(dataProtection: true)
         add[kSecValueData as String] = data
-        return SecItemAdd(add as CFDictionary, nil)
+        // After-first-unlock so a background reconnect can still read it; the access-group
+        // entitlement (not a per-binary ACL) gates it, so it survives rebuilds prompt-free.
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        let status = SecItemAdd(add as CFDictionary, nil)
+        guard status == errSecMissingEntitlement else { return status }
+        // Ad-hoc / unsigned build: persist to the legacy file keychain instead.
+        var legacy = Self.query(dataProtection: false)
+        legacy[kSecValueData as String] = data
+        return SecItemAdd(legacy as CFDictionary, nil)
     }
 }
