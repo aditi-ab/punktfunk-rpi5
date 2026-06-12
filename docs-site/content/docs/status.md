@@ -14,7 +14,7 @@ and the design in the [Implementation Plan](/docs/implementation-plan); this pag
 | **M1** — `punktfunk-core` + C ABI (protocol · FEC · crypto) | ✅ complete & hardened |
 | **M2** — GameStream host (Moonlight-compatible) | ✅ working end-to-end; HDR/surround-audio polish open |
 | **M3** — `punktfunk/1` native protocol (QUIC control + UDP data) | ✅ full session planes, validated live |
-| **M4** — native client decode + present (Apple first) | 🟡 stage 1 live; stage-2 presenter built + decode-tested (opt-in, present needs live validation) |
+| **M4** — native client decode + present (Apple first) | 🟡 macOS stage 1 live; stage-2 presenter built + decode-tested (opt-in, present needs live validation). **Linux GTK client stage 1 live** (2026-06-12) |
 
 ## Live on the boxes
 
@@ -29,6 +29,21 @@ All three appliances advertise over mDNS (`_punktfunk._udp`) and require PIN pai
 ## Progress log
 
 ### 2026-06-12
+- **Native Linux client — stage 1, first light** (`crates/punktfunk-client-linux`, binary
+  `punktfunk-client`). GTK4/libadwaita app on the **Option A** architecture picked after a
+  six-angle research pass (toolkits / hw decode / Wayland presentation / input capture /
+  prior art / codebase): links `punktfunk-core` directly as a crate (no C ABI;
+  `NativeClient` is `Sync` now), mDNS host list, TOFU + SPAKE2 PIN pairing dialogs
+  (identity shared with `client-rs`), FFmpeg software HEVC decode (`LOW_DELAY` + slice
+  threads) into a `GtkGraphicsOffload`-wrapped picture, PipeWire playback with the host
+  mic-player's jitter ring inverted, SDL3 gamepad capture + rumble/lightbar feedback,
+  layout-independent keyboard (exact inverse of the host's VK table), absolute mouse +
+  WHEEL_DELTA scroll, compositor-shortcut inhibition, fullscreen, stats overlay.
+  **Validated live** against this box's `serve --native`: 1080p60 at a locked 60 fps,
+  capture→decoded **p50 ≈ 6.4 ms** (software decode, debug build). Next: VAAPI dmabuf →
+  `GdkDmabufTexture` (Tier-1 zero-copy on Intel/AMD clients), DualSense
+  touchpad/motion/trigger replay over SDL3, then the stage-2 raw-Wayland presenter
+  (wp_presentation feedback, tearing-control, Vulkan Video for NVIDIA clients).
 - **Delegated pairing approval (§8b-1)** — an unpaired device that tries to connect to a
   pairing-required host now shows up as a **pending request** in the web console's Pairing page;
   one click approves it (optionally relabeling) and pairs its certificate fingerprint — no PIN

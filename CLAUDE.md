@@ -86,8 +86,20 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    `RemoteFirstLightTests` (full pipeline over the LAN). See
    [`clients/apple/README.md`](clients/apple/README.md). Next: stage 2 presenter
    (`VTDecompressionSession` + `CAMetalLayer` frame pacing), glass-to-glass numbers via
-   `tools/latency-probe` (scaffold), iOS variant. The Linux reference client
-   (`punktfunk-client-rs`) gets VAAPI + wgpu on the same connector later.
+   `tools/latency-probe` (scaffold), iOS variant.
+   **Linux stage 1 done, first light 2026-06-12** (`crates/punktfunk-client-linux`, binary
+   `punktfunk-client`): GTK4/libadwaita shell linking `punktfunk-core` directly (no C ABI;
+   `NativeClient` is now `Sync` — mutexed plane receivers), mDNS host list, TOFU + SPAKE2
+   PIN dialogs (identity shared with client-rs), FFmpeg software HEVC decode (LOW_DELAY,
+   slice threads) → `GtkGraphicsOffload`-wrapped picture, PipeWire playback (mic-player
+   jitter ring inverted), SDL3 gamepad capture + rumble/lightbar feedback, keyboard via
+   exact inverse of the host VK table, absolute mouse + 120-unit scroll. Validated live
+   against `serve --native` on this box: 1080p60, steady 60 fps, capture→decoded p50
+   ≈6.4 ms (debug build). `--connect host[:port]` for scripting. Next (per the 2026-06-12
+   research, memory `linux-client-option-a`): VAAPI dmabuf → `GdkDmabufTexture` (Tier-1
+   zero-copy on Intel/AMD), then the stage-2 raw-Wayland presenter (wp_presentation
+   feedback, tearing-control, Vulkan Video on NVIDIA) — **wgpu/winit rejected** (no dmabuf
+   import / presentation feedback / shortcuts-inhibit).
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).
@@ -141,7 +153,8 @@ crates/punktfunk-host/
   zerocopy/{egl,cuda,vulkan}.rs         dmabuf → CUDA → NVENC (tiled via EGL/GL, LINEAR via Vulkan)
   inject/{libei,wlr,gamepad,dualsense}.rs   input backends (uinput xpad + UHID DualSense)
   capture.rs · encode.rs · audio.rs · m0.rs · m3.rs · mgmt.rs · native_pairing.rs
-crates/punktfunk-client-rs/   punktfunk/1 reference client (M3 headless; M4 adds decode+present)
+crates/punktfunk-client-rs/   punktfunk/1 reference client (M3 headless test/measurement tool)
+crates/punktfunk-client-linux/  native Linux client (GTK4/libadwaita · FFmpeg · PipeWire · SDL3)
 web/                          TanStack web console over the mgmt API (status · devices · pairing)
 packaging/                    Fedora/Bazzite RPM · bootc · COPR (packaging/bazzite/README.md)
 tools/{loss-harness,latency-probe}/     measurement (plan §10)

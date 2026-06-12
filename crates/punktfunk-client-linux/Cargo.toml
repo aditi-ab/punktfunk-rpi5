@@ -1,0 +1,39 @@
+[package]
+name = "punktfunk-client-linux"
+description = "Native Linux punktfunk/1 client — GTK4/libadwaita shell, FFmpeg decode, PipeWire audio, SDL3 gamepads"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "punktfunk-client"
+path = "src/main.rs"
+
+# Everything is Linux-gated so `cargo build --workspace` stays green on macOS (the Mac
+# client lives in clients/apple); on other platforms this builds as a stub binary.
+[target.'cfg(target_os = "linux")'.dependencies]
+punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+
+# UI shell. GraphicsOffload needs GTK ≥ 4.14; black-background ≥ 4.16. AlertDialog/
+# PreferencesDialog need libadwaita ≥ 1.5.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+async-channel = "2"
+
+# Video decode (same FFmpeg pin as the host) and audio.
+ffmpeg-next = "8"
+opus = "0.3"
+pipewire = "0.9"
+
+# Gamepads: capture + rumble/lightbar feedback (full DualSense fidelity lives here).
+sdl3 = "0.18"
+
+mdns-sd = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
