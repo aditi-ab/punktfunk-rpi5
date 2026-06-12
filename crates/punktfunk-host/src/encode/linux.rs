@@ -160,6 +160,24 @@ impl NvencEncoder {
         video.set_frame_rate(Some(Rational(fps as i32, 1)));
         video.set_bit_rate(bitrate_bps as usize);
         video.set_max_bit_rate(bitrate_bps as usize);
+        // VBV/HRD buffer — bound the SIZE of any single frame. Under CBR with no buffer set, NVENC
+        // uses a loose default VBV, so a high-motion P-frame is allowed to balloon to many times the
+        // average; those extra packets overflow the bounded send queue + kernel socket buffer and
+        // get dropped, which the client sees as framedrops/jitter (and, on the infinite-GOP path, as
+        // old/stale frames flashing until the next RFI). A tight ~1-frame buffer makes the encoder
+        // hold frame size roughly constant and absorb motion as a momentary QP (quality) dip instead
+        // — the trade we want. Default = 1 frame of bits (bitrate/fps); PUNKTFUNK_VBV_FRAMES tunes it
+        // (larger = better motion quality but bigger per-frame bursts).
+        let vbv_frames = std::env::var("PUNKTFUNK_VBV_FRAMES")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0);
+        let vbv_bits =
+            ((bitrate_bps as f64 / fps.max(1) as f64) * vbv_frames as f64).clamp(1.0, i32::MAX as f64);
+        unsafe {
+            (*video.as_mut_ptr()).rc_buffer_size = vbv_bits as i32;
+        }
         video.set_max_b_frames(0);
         // Infinite GOP — NO periodic IDR. A keyframe at 5120x1440 is ~20-40x a P-frame, so a
         // periodic IDR is a recurring multi-millisecond encode+packetize+send spike — the ~2s
