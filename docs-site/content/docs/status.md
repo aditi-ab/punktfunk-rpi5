@@ -29,6 +29,14 @@ All three appliances advertise over mDNS (`_punktfunk._udp`) and require PIN pai
 ## Progress log
 
 ### 2026-06-12
+- **Concurrent sessions** — the host no longer serves one client at a time. The accept loop spawns
+  each session (`JoinSet`), bounded by `--max-concurrent` (default 4, a NVENC bound; overflow waits
+  in the accept queue). Each session keeps its own virtual output + encoder; they share the
+  host-lifetime input/audio/mic services — i.e. **multiple devices viewing/controlling the same
+  desktop** on kwin/mutter/wlroots. Validated live on the GNOME box: two clients connected at once
+  → **two independent Mutter virtual outputs (1280×720 + 1920×1080) streaming simultaneously**
+  (39 MB + 48 MB). gamescope's *independent-desktops* (multi-user) isolation — per-session
+  input/audio — is a follow-up.
 - **Apple client latency HUD** — `PunktfunkConnection.clockOffsetNs` (from the C-ABI getter) +
   `LatencyMeter` surface a skew-corrected **capture→client-receipt** p50/p95 in the macOS HUD: the
   first cross-machine latency the real Apple client reports. (Stage-1 `AVSampleBufferDisplayLayer`
@@ -59,5 +67,7 @@ All three appliances advertise over mDNS (`_punktfunk._udp`) and require PIN pai
 See the [Roadmap](/docs/roadmap) for the ordered list. Near-term:
 - **True glass-to-glass**: Apple client present-stamp (decode→present) + host render→capture term.
 - **Apple stage-2 presenter** (`VTDecompressionSession` → `CAMetalLayer`).
-- **Mandatory PIN pairing + delegated pairing approval**; concurrent sessions.
+- **Mandatory PIN pairing + delegated pairing approval** (an already-paired device approves a new one).
+- **gamescope multi-user isolation** — per-session input/audio so concurrent sessions are independent
+  desktops (the shared-desktop multi-view case landed).
 - **bazzite** kept up to date (currently offline; one rebuild behind).
