@@ -197,6 +197,17 @@ public final class StreamLayerView: NSView {
                 self?.releaseCapture()
             })
         }
+        // Becoming key RETRIES a still-pending session-start auto-capture — the case where a
+        // session began (reconnect) while this window wasn't key yet, so engageCapture(fromClick:
+        // false) was refused by its key-window guard and, with no retry, capture stayed off and
+        // input dead. This is a no-op once capture engaged (pendingAutoCapture is cleared) and
+        // after a manual ⌘⎋/focus-loss release (the flag is already false), so it does NOT
+        // resurrect the deliberately-rejected "auto-grab on every activation" behavior.
+        windowObservers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            self?.attemptPendingCapture()
+        })
         attemptPendingCapture()
     }
 
@@ -301,8 +312,13 @@ public final class StreamLayerView: NSView {
 
     private func attemptPendingCapture() {
         guard pendingAutoCapture, window != nil, bounds.width > 0 else { return }
-        pendingAutoCapture = false // one shot, even if the engage below is refused
         engageCapture(fromClick: false)
+        // Clear the one-shot only once it ACTUALLY engaged. If the engage was refused — the
+        // app/window isn't key yet (common right after a reconnect), or the cursor grab raced
+        // app activation — leave it armed so didBecomeKey (or the next layout pass) retries.
+        // This stays scoped to session start: a later manual release (⌘⎋, focus loss) doesn't
+        // re-arm it, so it never resurrects auto-grab-on-activation.
+        if captured { pendingAutoCapture = false }
     }
 
     private func engageCapture(fromClick: Bool) {

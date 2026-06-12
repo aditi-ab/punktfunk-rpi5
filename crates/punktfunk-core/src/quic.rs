@@ -1100,6 +1100,26 @@ pub async fn clock_sync(
 pub mod endpoint {
     use std::sync::{Arc, Mutex};
 
+    /// Shared QUIC transport tuning for BOTH the host and client endpoints. Keep-alive is the
+    /// load-bearing setting: with quinn's defaults it is OFF, so any quiet stretch on the
+    /// connection (no input, audio muted or stalled, a capture hiccup, a mode change) lets the
+    /// idle timer run out and quinn closes the session — surfacing to the embedder as
+    /// `next_au` → Closed. The native equivalent of Moonlight's ENet keepalive: a small PING
+    /// every `KEEP_ALIVE` keeps the path warm. The interval sits well under `MAX_IDLE` so
+    /// several keepalives can be lost back-to-back (a wifi roam, a brief blip) without a false
+    /// close, while a genuinely dead peer is still detected within `MAX_IDLE`.
+    fn stream_transport() -> Arc<quinn::TransportConfig> {
+        use std::time::Duration;
+        const MAX_IDLE: Duration = Duration::from_secs(20);
+        const KEEP_ALIVE: Duration = Duration::from_secs(4);
+        let mut t = quinn::TransportConfig::default();
+        t.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(MAX_IDLE).expect("20s is a valid QUIC idle timeout"),
+        ));
+        t.keep_alive_interval(Some(KEEP_ALIVE));
+        Arc::new(t)
+    }
+
     /// Server endpoint with a fresh self-signed certificate (tests/dev — production hosts
     /// persist an identity and use [`server_with_identity`] so clients can pin it).
     pub fn server(addr: std::net::SocketAddr) -> anyhow_result::Result<quinn::Endpoint> {
@@ -1142,7 +1162,8 @@ pub mod endpoint {
             .map_err(|e| anyhow_result::Error::msg(format!("server config: {e}")))?;
         let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
             .map_err(|e| anyhow_result::Error::msg(format!("quic server config: {e}")))?;
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
+        server_config.transport_config(stream_transport()); // keep-alive — see stream_transport
         Ok(quinn::Endpoint::server(server_config, addr)?)
     }
 
@@ -1233,8 +1254,10 @@ pub mod endpoint {
             };
             let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
                 .map_err(|e| anyhow_result::Error::msg(format!("quic client config: {e}")))?;
+            let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
+            client_cfg.transport_config(stream_transport()); // keep-alive — see stream_transport
             let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
-            ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_cfg)));
+            ep.set_default_client_config(client_cfg);
             Ok(ep)
         })();
         (ep, observed)
