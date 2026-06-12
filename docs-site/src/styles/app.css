@@ -1,0 +1,6 @@
+@import 'tailwindcss';
+@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/preset.css';
+
+/* Pull Fumadocs UI's own classes into the Tailwind 4 scan so they aren't purged. */
+@source '../../node_modules/fumadocs-ui/dist/**/*.js';

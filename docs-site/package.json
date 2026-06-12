@@ -1,0 +1,34 @@
+{
+  "name": "punktfunk-docs",
+  "private": true,
+  "type": "module",
+  "description": "punktfunk documentation site — Fumadocs on TanStack Start (Vite + Nitro/bun)",
+  "scripts": {
+    "dev": "vite dev --port 3001",
+    "build": "vite build",
+    "start": "bun run .output/server/index.mjs",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tanstack/react-router": "^1.121.0",
+    "@tanstack/react-start": "^1.121.0",
+    "fumadocs-core": "^16.10.1",
+    "fumadocs-ui": "^16.10.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@tanstack/nitro-v2-vite-plugin": "^1.155.0",
+    "@types/mdx": "^2.0.14",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5",
+    "fumadocs-mdx": "^15.0.12",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^7.3.5",
+    "vite-tsconfig-paths": "^5.1.0"
+  }
+}

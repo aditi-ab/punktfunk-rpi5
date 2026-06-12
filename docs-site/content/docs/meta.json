@@ -1,0 +1,14 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "overview",
+    "implementation-plan",
+    "roadmap",
+    "m2-plan",
+    "---Setup---",
+    "linux-setup",
+    "windows-host",
+    "dualsense-haptics"
+  ]
+}
