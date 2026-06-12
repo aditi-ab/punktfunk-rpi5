@@ -19,6 +19,8 @@ RUN dnf -y install \
       # ffmpeg (NVENC), capture/audio/display link deps
       ffmpeg-devel pipewire-devel wayland-devel libxkbcommon-devel opus-devel \
       mesa-libGL-devel mesa-libgbm-devel \
+      # punktfunk-client link deps (GTK4 shell + SDL3 gamepads)
+      gtk4-devel libadwaita-devel SDL3-devel \
   && dnf clean all
 
 # libcuda link stub — the zerocopy path links a fixed set of cuXxx driver symbols, but CI has

@@ -33,8 +33,13 @@ jobs:
       - uses: actions/checkout@v4
 
       # rpmbuild + git archive need the checkout trusted; cache the crates download.
+      # The client link deps are also baked into the fedora-rpm image, but this job runs
+      # against the image from the PREVIOUS push (docker.yml bootstrap note) — keep it
+      # green across image changes; a no-op once the image has them.
       - name: Prep
-        run: git config --global --add safe.directory "$PWD"
+        run: |
+          git config --global --add safe.directory "$PWD"
+          dnf -y install gtk4-devel libadwaita-devel SDL3-devel
       - uses: actions/cache@v4
         with:
           path: /usr/local/cargo/registry

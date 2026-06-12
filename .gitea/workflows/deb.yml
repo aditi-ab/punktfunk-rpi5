@@ -1,7 +1,8 @@
-# Build the punktfunk-host .deb and publish it to Gitea's Debian package registry, so the
-# Ubuntu hosts get new builds via `apt update && apt upgrade`. Runs inside the same Ubuntu
-# 26.04 rust-ci builder image as ci.yml, so dpkg-shlibdeps pins the runtime lib package names
-# (libavcodec62, libpipewire-0.3-0t64, …) to exactly what the target boxes run.
+# Build the punktfunk-host and punktfunk-client .debs and publish them to Gitea's Debian
+# package registry, so Ubuntu boxes get new builds via `apt update && apt upgrade`. Runs
+# inside the same Ubuntu 26.04 rust-ci builder image as ci.yml, so dpkg-shlibdeps pins the
+# runtime lib package names (libavcodec62, libpipewire-0.3-0t64, …) to exactly what the
+# target boxes run.
 #
 # Registry (public, unom org): https://git.unom.io/unom/-/packages
 # Box setup (once):  see packaging/debian/README.md
@@ -30,9 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # dpkg-shlibdeps (Depends resolution) + dpkg-deb live in dpkg-dev.
-      - name: dpkg-dev
-        run: apt-get update && apt-get install -y --no-install-recommends dpkg-dev
+      # dpkg-shlibdeps (Depends resolution) + dpkg-deb live in dpkg-dev. The client's link
+      # deps are also baked into the rust-ci image, but this job runs against the image
+      # from the PREVIOUS push (docker.yml bootstrap note) — keep it green across image
+      # changes; a no-op once the image has them.
+      - name: dpkg-dev + client link deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends dpkg-dev \
+            libgtk-4-dev libadwaita-1-dev libsdl3-dev
 
       # Share ci.yml's cache keys so the release build reuses its registry + target artifacts.
       - name: Cache keys
@@ -50,10 +57,10 @@ jobs:
           key: cargo-target-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-target-${{ env.rustc }}-
 
-      - name: Build release host
+      - name: Build release host + client
         run: |
           git config --global --add safe.directory "$PWD"
-          cargo build --release -p punktfunk-host --locked
+          cargo build --release -p punktfunk-host -p punktfunk-client-linux --locked
 
       - name: Version
         # Tag v1.2.3 -> 1.2.3 (a real release); a main push -> 0.0.1~ciN.g<sha>, which sorts
@@ -68,16 +75,19 @@ jobs:
           echo "VERSION=$V" >> "$GITHUB_ENV"
           echo "package version $V"
 
-      - name: Build .deb
-        run: VERSION="$VERSION" bash packaging/debian/build-deb.sh
+      - name: Build .debs
+        run: |
+          VERSION="$VERSION" bash packaging/debian/build-deb.sh
+          VERSION="$VERSION" bash packaging/debian/build-client-deb.sh
 
       - name: Publish to the Gitea apt registry
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
-          DEB="$(ls dist/*.deb)"
-          echo "uploading $DEB"
-          # PAT owner (enricobuehler), not the push actor — matches docker.yml's registry login.
-          curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
-            "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
-          echo "published $DEB to $OWNER/debian $DISTRIBUTION/$COMPONENT"
+          for DEB in dist/*.deb; do
+            echo "uploading $DEB"
+            # PAT owner (enricobuehler), not the push actor — matches docker.yml's registry login.
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
+          done
+          echo "published to $OWNER/debian $DISTRIBUTION/$COMPONENT"

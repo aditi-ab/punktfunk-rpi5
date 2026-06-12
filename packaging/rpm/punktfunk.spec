@@ -65,6 +65,10 @@ BuildRequires:  pkgconfig(libavutil)
 # Zero-copy GPU path: src/zerocopy/ links libGL + libgbm (mesa) via hand-rolled FFI.
 BuildRequires:  pkgconfig(gl)
 BuildRequires:  pkgconfig(gbm)
+# The client subpackage (GTK4 shell + SDL3 gamepads).
+BuildRequires:  pkgconfig(gtk4)
+BuildRequires:  pkgconfig(libadwaita-1)
+BuildRequires:  pkgconfig(sdl3)
 # It ALSO links the NVIDIA CUDA driver lib (-lcuda) via FFI, so libcuda.so must be present
 # at LINK time. A normal NVIDIA host (or Bazzite -nvidia) has it; a headless COPR/koji builder
 # without a GPU does NOT — point %build at the CUDA toolkit stub (…/stubs/libcuda.so) there,
@@ -96,14 +100,28 @@ exact resolution and refresh via a per-compositor backend (KWin, gamescope, Mutt
 Sway/wlroots), captured zero-copy (dmabuf -> CUDA -> NVENC) and split-encoded above
 ~1 Gpix/s. Input (mouse/keyboard/gamepads) is injected back into the session.
 
+%package client
+Summary:        Low-latency desktop/game streaming client (punktfunk/1, GTK4)
+# Audio playback / mic capture want the PipeWire daemon; degrade gracefully without it.
+Recommends:     pipewire
+Recommends:     wireplumber
+
+%description client
+The native Linux client for punktfunk. Discovers hosts on the LAN (mDNS), trusts
+them via certificate pinning with a SPAKE2 PIN pairing ceremony, and streams HEVC
+video (GF(2^16) Leopard FEC + AES-GCM over UDP, QUIC control plane) with Opus
+audio, microphone passthrough, and full gamepad support including DualSense
+touchpad, motion, adaptive triggers and lightbar through SDL3. The host creates a
+virtual output at exactly this client's resolution and refresh rate — no scaling.
+
 %prep
 %autosetup -n %{name}-%{version}
 
 %build
-# Release build of the host binary only (the workspace also has the core lib + clients).
+# Release build of the host + client binaries (the workspace also has the core lib).
 # cargo fetches crates over the network; COPR build hosts allow this.
 export RUSTFLAGS="%{?build_rustflags}"
-cargo build --release -p punktfunk-host
+cargo build --release -p punktfunk-host -p punktfunk-client-linux
 
 %install
 # Binary
@@ -118,6 +136,14 @@ install -Dm0644 scripts/99-punktfunk-net.conf %{buildroot}%{_prefix}/lib/sysctl.
 
 # systemd *user* unit (the host runs in the graphical session, not as root).
 install -Dm0644 scripts/punktfunk-host.service %{buildroot}%{_userunitdir}/punktfunk-host.service
+
+# --- client subpackage ---
+install -Dm0755 target/release/punktfunk-client %{buildroot}%{_bindir}/punktfunk-client
+install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
+                %{buildroot}%{_datadir}/applications/io.unom.Punktfunk.desktop
+# DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).
+install -Dm0644 scripts/70-punktfunk-client.rules \
+                %{buildroot}%{_udevrulesdir}/70-punktfunk-client.rules
 
 # Headless session helpers + example config + OpenAPI doc (reference material).
 install -d %{buildroot}%{_datadir}/%{name}/headless
@@ -136,6 +162,18 @@ install -Dm0644 docs/api/openapi.json                  %{buildroot}%{_datadir}/%
 %{_userunitdir}/punktfunk-host.service
 %dir %{_datadir}/%{name}
 %{_datadir}/%{name}/*
+
+%files client
+%license LICENSE-MIT LICENSE-APACHE
+%{_bindir}/punktfunk-client
+%{_datadir}/applications/io.unom.Punktfunk.desktop
+%{_udevrulesdir}/70-punktfunk-client.rules
+
+%post client
+# Pick up the DualSense hidraw rule without a reboot (best-effort; on rpm-ostree it
+# applies on the next boot into the layered deployment).
+udevadm control --reload-rules 2>/dev/null || :
+udevadm trigger --subsystem-match=hidraw 2>/dev/null || :
 
 %post
 # Reload udev so /dev/uinput picks up the new rule without a reboot (best-effort).
