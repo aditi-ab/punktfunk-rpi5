@@ -313,7 +313,11 @@ const DEFAULT_BITRATE_KBPS: u32 = 20_000;
 /// clean 1 Gbps with zero send-buffer drops; sustained overruns are still counted as
 /// `packets_send_dropped`.
 const MIN_BITRATE_KBPS: u32 = 500;
-const MAX_BITRATE_KBPS: u32 = 2_000_000;
+// 8 Gbps ceiling — headroom for a 2.5 Gbps link and the 5 Gbps path (home-worker-3 → Mac Studio,
+// Mac is 10G). The encoder is pixel-rate bound, not bitrate bound (NVENC emits multi-Gbps trivially;
+// ~1 Gpix/s per engine, ~2 with the auto 2-way split), so the real ceiling is the transport send
+// path (UDP GSO + per-packet alloc removal), not this number.
+const MAX_BITRATE_KBPS: u32 = 8_000_000;
 
 /// Resolve a client's [`Hello::bitrate_kbps`] request to the rate the host will configure:
 /// `0` → host default; anything else clamped into `[MIN, MAX]`.
@@ -323,6 +327,17 @@ fn resolve_bitrate_kbps(requested: u32) -> u32 {
     } else {
         requested.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)
     }
+}
+
+/// FEC recovery percent for the session's Welcome. Default 20% (Sunshine's default too); a clean
+/// wired LAN can lower it (every recovery shard is wire bytes + packets), so `PUNKTFUNK_FEC_PCT`
+/// overrides it — e.g. `0` disables FEC entirely, `10` halves the overhead. Clamped to ≤ 90.
+fn fec_percent_from_env() -> u8 {
+    std::env::var("PUNKTFUNK_FEC_PCT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u8>().ok())
+        .map(|p| p.min(90))
+        .unwrap_or(20)
 }
 
 /// Persistent audio-capturer slot, reused across sessions (same pattern as the GameStream
@@ -531,10 +546,14 @@ async fn serve_session(
             // The post-GameStream point of punktfunk/1: Leopard GF(2¹⁶) FEC + real encryption.
             fec: FecConfig {
                 scheme: FecScheme::Gf16,
-                fec_percent: 20,
+                fec_percent: fec_percent_from_env(),
                 max_data_per_block: 4096,
             },
-            shard_payload: 1200,
+            // ~1452-byte payload keeps the IP datagram within a 1500 MTU (1452 + 40 header + 24
+            // crypto + 8 IP/UDP ≈ 1500), vs the old 1200 — ~17% fewer packets for free, and an even
+            // size (FEC requires even shards). Negotiated, so the client follows. Jumbo (≈8900) is a
+            // future negotiated bump (needs MAX_DATAGRAM_BYTES raised + end-to-end 9000 MTU).
+            shard_payload: 1452,
             encrypt: true,
             key,
             salt: *b"pkf1",
@@ -1419,7 +1438,7 @@ fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Composito
 /// bitrate cap ([`MAX_BITRATE_KBPS`], 2 Gbps) on purpose — a probe should be able to demonstrate
 /// headroom past the rate a session will actually be configured to use, so the client can pick a
 /// confident 1 Gbps+ bitrate. GF(2¹⁶) FEC makes multi-Gbps reachable on a LAN.
-const MAX_PROBE_KBPS: u32 = 3_000_000;
+const MAX_PROBE_KBPS: u32 = 10_000_000;
 const MAX_PROBE_MS: u32 = 5_000;
 
 /// Run a bandwidth probe over `session`: burst zero-filled access units flagged [`FLAG_PROBE`] at
