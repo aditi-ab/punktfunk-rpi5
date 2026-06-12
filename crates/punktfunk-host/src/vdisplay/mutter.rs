@@ -22,16 +22,20 @@ use super::{Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
 use ashpd::zbus;
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
-use zbus::zvariant::{OwnedObjectPath, Value};
+use std::time::{Duration, Instant};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 const BUS_RD: &str = "org.gnome.Mutter.RemoteDesktop";
 const BUS_SC: &str = "org.gnome.Mutter.ScreenCast";
+const BUS_DC: &str = "org.gnome.Mutter.DisplayConfig";
+/// `ApplyMonitorsConfig` method: 1 = temporary (auto-reverts on the next monitor change —
+/// e.g. when our virtual output is torn down — so we never persist a layout to monitors.xml).
+const APPLY_TEMPORARY: u32 = 1;
 
 /// Mutter cursor mode: render the cursor into the stream (matches the KWin/gamescope backends).
 const CURSOR_EMBEDDED: u32 = 1;
@@ -66,7 +70,7 @@ impl VirtualDisplay for MutterDisplay {
         let stop_thread = stop.clone();
         thread::Builder::new()
             .name("punktfunk-mutter-vout".into())
-            .spawn(move || session_thread(setup_tx, stop_thread))
+            .spawn(move || session_thread(setup_tx, stop_thread, mode))
             .context("spawn Mutter virtual-output thread")?;
 
         let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
@@ -101,7 +105,7 @@ impl Drop for StopGuard {
 
 /// Keepalive thread: run the D-Bus handshake on a private tokio runtime, report the PipeWire
 /// node id, then hold the connection until stopped.
-fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>) {
+fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>, mode: Mode) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -114,6 +118,26 @@ fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>) 
         }
     };
     rt.block_on(async move {
+        // Opt-in: snapshot the monitor layout BEFORE the virtual output exists, so we can tell the
+        // new (virtual) connector apart and restore the layout on teardown. Best-effort.
+        let dc_pre = if virtual_primary_enabled() {
+            match display_config().await {
+                Ok(dc) => match get_state(&dc).await {
+                    Ok(state) => Some((dc, state)),
+                    Err(e) => {
+                        tracing::warn!("mutter: GetCurrentState (pre) failed ({e:#}); leaving displays as-is");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("mutter: DisplayConfig unavailable ({e:#}); leaving displays as-is");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let session = match connect().await {
             Ok(s) => s,
             Err(e) => {
@@ -122,9 +146,35 @@ fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>) 
             }
         };
         let _ = setup_tx.send(Ok(session.node_id));
+
+        // Make the freshly-created virtual output the PRIMARY monitor so the GNOME shell + new
+        // windows land on the surface we stream. Without this, on a host that also has a physical
+        // monitor attached, the virtual output is an empty extended desktop — you stream only the
+        // wallpaper. Best-effort: any failure just logs and streaming continues unchanged.
+        let mut restore: Option<(zbus::Proxy<'static>, Vec<ApplyLogical>)> = None;
+        if let Some((dc, pre)) = &dc_pre {
+            match make_virtual_primary(dc, mode, pre).await {
+                Ok(()) => {
+                    restore = Some((dc.clone(), to_apply_logicals(pre)));
+                    tracing::info!("mutter: virtual output set as the primary monitor");
+                }
+                Err(e) => tracing::warn!(
+                    "mutter: could not set the virtual output primary ({e:#}); streaming continues — the desktop may render on the physical monitor"
+                ),
+            }
+        }
+
         // Park, keeping `session` (and its zbus connection) alive until told to stop.
         while !stop.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Restore the original monitor layout (physical primary) before tearing the session down.
+        // (Mutter also auto-reverts the temporary config when the virtual output disappears.)
+        if let Some((dc, original)) = restore {
+            if let Err(e) = apply_config(&dc, &original).await {
+                tracing::warn!("mutter: monitor-layout restore failed ({e:#}); Mutter reverts the temporary config on teardown");
+            }
         }
         // Best-effort explicit teardown before the connection drops.
         let _ = session.rd_session.call_method("Stop", &()).await;
@@ -232,4 +282,232 @@ async fn connect() -> Result<MutterSession> {
         _conn: conn,
         node_id,
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Optional: make the per-session virtual output the PRIMARY monitor (PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY).
+//
+// `RecordVirtual` adds the virtual monitor as an *extended* desktop. On a headless host that's the
+// only display, so the shell + windows live there. But when a physical monitor is attached, GNOME
+// keeps it primary and the virtual output is an empty extension — the stream shows only the
+// wallpaper. We fix that by promoting the virtual output to primary (physical kept on, secondary)
+// via `org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig`, and restore on teardown.
+// ---------------------------------------------------------------------------------------------
+
+/// `org.gnome.Mutter.DisplayConfig.GetCurrentState` reply shapes (see the interface XML):
+///   monitors:         `a((ssss)a(siiddada{sv})a{sv})`
+///   logical_monitors: `a(iiduba(ssss)a{sv})`
+type MonitorSpec = (String, String, String, String); // connector, vendor, product, serial
+type DbusMode = (
+    String,
+    i32,
+    i32,
+    f64,
+    f64,
+    Vec<f64>,
+    HashMap<String, OwnedValue>,
+);
+type MonitorInfo = (MonitorSpec, Vec<DbusMode>, HashMap<String, OwnedValue>);
+type LogicalMonitor = (
+    i32,
+    i32,
+    f64,
+    u32,
+    bool,
+    Vec<MonitorSpec>,
+    HashMap<String, OwnedValue>,
+);
+type CurrentState = (
+    u32,
+    Vec<MonitorInfo>,
+    Vec<LogicalMonitor>,
+    HashMap<String, OwnedValue>,
+);
+
+/// `ApplyMonitorsConfig` logical-monitor shape: `(iiduba(ssa{sv}))`, monitor = `(ssa{sv})`.
+type ApplyMon = (String, String, HashMap<String, Value<'static>>); // connector, mode_id, props
+type ApplyLogical = (i32, i32, f64, u32, bool, Vec<ApplyMon>);
+
+fn virtual_primary_enabled() -> bool {
+    std::env::var("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// A DisplayConfig proxy on its own session-bus connection (owned, so it stays alive for the
+/// session — independent of the RemoteDesktop/ScreenCast connection).
+async fn display_config() -> Result<zbus::Proxy<'static>> {
+    let conn = zbus::Connection::session()
+        .await
+        .context("connect session D-Bus (DisplayConfig)")?;
+    zbus::Proxy::new(
+        &conn,
+        BUS_DC,
+        "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig",
+    )
+    .await
+    .context("DisplayConfig proxy")
+}
+
+async fn get_state(dc: &zbus::Proxy<'_>) -> Result<CurrentState> {
+    dc.call("GetCurrentState", &())
+        .await
+        .context("DisplayConfig.GetCurrentState")
+}
+
+fn connectors(state: &CurrentState) -> HashSet<String> {
+    state.1.iter().map(|m| m.0 .0.clone()).collect()
+}
+
+fn mode_flag(md: &DbusMode, key: &str) -> bool {
+    matches!(md.6.get(key).map(|v| &**v), Some(&Value::Bool(true)))
+}
+
+/// The current (else preferred, else first) mode of `connector` → (mode_id, width, height).
+fn current_mode(state: &CurrentState, connector: &str) -> Option<(String, i32, i32)> {
+    let mon = state.1.iter().find(|m| m.0 .0 == connector)?;
+    let pick = mon
+        .1
+        .iter()
+        .find(|md| mode_flag(md, "is-current"))
+        .or_else(|| mon.1.iter().find(|md| mode_flag(md, "is-preferred")))
+        .or_else(|| mon.1.first())?;
+    Some((pick.0.clone(), pick.1, pick.2))
+}
+
+/// Wait for the virtual output to appear in DisplayConfig (its size follows PipeWire negotiation,
+/// which lands shortly after the node id), then promote it to primary with the physicals kept on.
+async fn make_virtual_primary(dc: &zbus::Proxy<'_>, mode: Mode, pre: &CurrentState) -> Result<()> {
+    let pre_conns = connectors(pre);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let state = get_state(dc).await?;
+        // The virtual connector = present now, absent in the pre-snapshot.
+        let virt = state
+            .1
+            .iter()
+            .map(|m| m.0 .0.clone())
+            .find(|c| !pre_conns.contains(c));
+        if let Some(vconn) = virt {
+            // Prefer the mode matching the client's WxH; fall back to whatever is current.
+            let vmode = state
+                .1
+                .iter()
+                .find(|m| m.0 .0 == vconn)
+                .and_then(|m| {
+                    m.1.iter()
+                        .find(|md| md.1 == mode.width as i32 && md.2 == mode.height as i32)
+                        .map(|md| md.0.clone())
+                })
+                .or_else(|| current_mode(&state, &vconn).map(|(id, _, _)| id));
+            let Some(vmode) = vmode else {
+                bail!("virtual monitor {vconn} has no usable mode yet");
+            };
+            let config = build_primary_config(&state, &vconn, &vmode, mode.width as i32);
+            let _: () = dc
+                .call(
+                    "ApplyMonitorsConfig",
+                    &(
+                        state.0,
+                        APPLY_TEMPORARY,
+                        config,
+                        HashMap::<String, Value<'static>>::new(),
+                    ),
+                )
+                .await
+                .context("DisplayConfig.ApplyMonitorsConfig (set virtual primary)")?;
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("the virtual monitor did not appear in DisplayConfig within 6s");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Virtual output = primary at the top-left; physical monitors kept enabled but secondary, laid
+/// out adjacently to its right (so the local screen never blanks).
+fn build_primary_config(
+    state: &CurrentState,
+    vconn: &str,
+    vmode: &str,
+    virt_width: i32,
+) -> Vec<ApplyLogical> {
+    let mut logicals: Vec<ApplyLogical> = Vec::new();
+    logicals.push((
+        0,
+        0,
+        1.0,
+        0,
+        true,
+        vec![(vconn.to_string(), vmode.to_string(), HashMap::new())],
+    ));
+    let mut x = virt_width;
+    for lm in &state.2 {
+        if lm.5.iter().any(|s| s.0 == vconn) {
+            continue; // skip the virtual output's own logical monitor
+        }
+        let mons: Vec<ApplyMon> =
+            lm.5.iter()
+                .filter_map(|s| {
+                    current_mode(state, &s.0).map(|(id, _, _)| (s.0.clone(), id, HashMap::new()))
+                })
+                .collect();
+        if mons.is_empty() {
+            continue;
+        }
+        let width =
+            lm.5.first()
+                .and_then(|s| current_mode(state, &s.0))
+                .map(|(_, w, _)| w)
+                .unwrap_or(1920);
+        logicals.push((x, 0, lm.2, lm.3, false, mons));
+        x += width;
+    }
+    logicals
+}
+
+/// Convert a captured `GetCurrentState` layout back into an `ApplyMonitorsConfig` argument (used
+/// to restore the physical-primary layout on teardown).
+fn to_apply_logicals(state: &CurrentState) -> Vec<ApplyLogical> {
+    state
+        .2
+        .iter()
+        .filter_map(|lm| {
+            let mons: Vec<ApplyMon> = lm
+                .5
+                .iter()
+                .filter_map(|s| {
+                    current_mode(state, &s.0).map(|(id, _, _)| (s.0.clone(), id, HashMap::new()))
+                })
+                .collect();
+            if mons.is_empty() {
+                return None;
+            }
+            Some((lm.0, lm.1, lm.2, lm.3, lm.4, mons))
+        })
+        .collect()
+}
+
+async fn apply_config(dc: &zbus::Proxy<'_>, logicals: &[ApplyLogical]) -> Result<()> {
+    let state = get_state(dc).await?;
+    let _: () = dc
+        .call(
+            "ApplyMonitorsConfig",
+            &(
+                state.0,
+                APPLY_TEMPORARY,
+                logicals.to_vec(),
+                HashMap::<String, Value<'static>>::new(),
+            ),
+        )
+        .await
+        .context("DisplayConfig.ApplyMonitorsConfig (restore)")?;
+    Ok(())
 }
