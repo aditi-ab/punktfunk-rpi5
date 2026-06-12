@@ -631,8 +631,7 @@ struct ContentView: View {
             if model.latencyValid {
                 // Capture→client-receipt (skew-corrected); excludes the layer's decode+present —
                 // see LatencyMeter. "(same-host)" when the host didn't answer the skew handshake.
-                Text("capture→client \(model.latencyP50Ms, specifier: "%.1f")/\(model.latencyP95Ms, specifier: "%.1f") ms p50/p95"
-                    + (model.latencySkewCorrected ? "" : " (same-host)"))
+                Text("capture→client \(model.latencyP50Ms, specifier: "%.1f")/\(model.latencyP95Ms, specifier: "%.1f") ms p50/p95\(model.latencySkewCorrected ? "" : " (same-host)")")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
