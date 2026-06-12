@@ -11,5 +11,10 @@
 	<array>
 		<string>_punktfunk._udp</string>
 	</array>
+	<!-- Standard-algorithm crypto only (AES-GCM via the Rust core) — exempt from export
+	     compliance, but the key must be declared or every TestFlight build stalls on the
+	     compliance question. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 </dict>
 </plist>

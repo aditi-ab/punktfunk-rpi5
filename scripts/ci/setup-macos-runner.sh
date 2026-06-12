@@ -91,20 +91,10 @@ fi
 # runner ships as a root LaunchDaemon; installing it needs sudo once. Without sudo this
 # script still leaves a working (but reboot-volatile) nohup daemon behind.
 # PATH must carry the CLT tools, cargo, node and act_runner itself; jobs inherit it.
-# If the system developer dir is CLT-only but a full Xcode is installed, hand jobs a
-# DEVELOPER_DIR override — the per-process equivalent of `xcode-select -s`, no sudo needed.
-DEVELOPER_DIR_XML=""
-DEV_DIR=""
-if ! /usr/bin/xcodebuild -version >/dev/null 2>&1; then
-    for app in /Applications/Xcode.app /Applications/Xcode*.app; do
-        if DEVELOPER_DIR="$app/Contents/Developer" /usr/bin/xcodebuild -version >/dev/null 2>&1; then
-            DEV_DIR="$app/Contents/Developer"
-            DEVELOPER_DIR_XML="<key>DEVELOPER_DIR</key><string>$DEV_DIR</string>"
-            echo "==> using full Xcode at $app via DEVELOPER_DIR"
-            break
-        fi
-    done
-fi
+# Deliberately NO DEVELOPER_DIR here: cargo (rust ld) must stay on the system default —
+# a newer-than-OS Xcode's ld emits dylibs the running dyld rejects ("mis-aligned
+# LINKEDIT string pool"), breaking every proc-macro build. Steps that need a full Xcode
+# (xcodebuild) resolve it themselves (build-xcframework.sh, release.yml).
 
 PLIST_STAGE="$RUNNER_HOME/io.gitea.act_runner.plist"
 PLIST_SYSTEM="/Library/LaunchDaemons/io.gitea.act_runner.plist"
@@ -128,7 +118,6 @@ cat > "$PLIST_STAGE" <<EOF
         <key>PATH</key>
         <string>$HOME/.cargo/bin:$BIN_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key><string>$HOME</string>
-        $DEVELOPER_DIR_XML
     </dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
@@ -150,7 +139,6 @@ else
         echo "==> no sudo: starting an interim daemon (dies on reboot)"
         (cd "$RUNNER_HOME" && \
             PATH="$HOME/.cargo/bin:$BIN_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-            ${DEV_DIR:+DEVELOPER_DIR="$DEV_DIR"} \
             nohup "$BIN_DIR/act_runner" daemon --config config.yaml >> runner.log 2>&1 &)
     fi
     echo "==> for the permanent (reboot-safe) runner, run once on the Mac:"
@@ -161,9 +149,8 @@ fi
 sleep 2
 tail -5 "$RUNNER_HOME/runner.log" 2>/dev/null || true
 
-if ! /usr/bin/xcodebuild -version >/dev/null 2>&1 && [ -z "$DEVELOPER_DIR_XML" ]; then
-    echo "WARNING: xcodebuild not usable (Command Line Tools only, no full Xcode found) —"
-    echo "         apple.yml's xcframework step needs a full Xcode in /Applications, with"
-    echo "         its license accepted once: sudo xcodebuild -license accept"
+if ! /usr/bin/xcodebuild -version >/dev/null 2>&1 && ! ls -d /Applications/Xcode*.app >/dev/null 2>&1; then
+    echo "WARNING: no full Xcode found — the xcframework/release steps need one in"
+    echo "         /Applications, with its license accepted once: sudo xcodebuild -license accept"
 fi
 echo "OK: runner '$RUNNER_NAME' labels=$LABELS instance=$INSTANCE"

@@ -13,6 +13,7 @@ CI runs on **Gitea Actions** (`git.unom.io`, org `unom`). Three workflows in
 | `ci.yml` | push to `main`, PRs | `ubuntu-24.04` | Rust workspace (fmt · clippy `-D warnings` · build · test · C-ABI harness · generated-header drift) inside the `punktfunk-rust-ci` image; `web/` and `docs-site/` build + typecheck in `oven/bun:1` |
 | `docker.yml` | push to `main`, `v*` tags, manual | `ubuntu-24.04` | Builds + pushes the three images below (`latest` + `sha-<short>` tags) |
 | `apple.yml` | push to `main`, PRs, manual | `macos-arm64` | Rust core → `PunktfunkCore.xcframework` → `swift build` + `swift test` in `clients/apple` |
+| `release.yml` | `v*` tags, manual | `macos-arm64` | Production Apple builds: Developer-ID-signed, notarized, stapled macOS `.dmg` attached to the Gitea release + iOS archive uploaded to TestFlight |
 
 ## Dockerized pieces
 
@@ -54,6 +55,33 @@ Re-provisioning (idempotent) or first-time registration from a dev box:
 ssh enricobuehler@192.168.1.135 GITEA_RUNNER_TOKEN=<token> bash -s \
     < scripts/ci/setup-macos-runner.sh
 ```
+
+## Apple releases
+
+`release.yml` produces the production client builds on the Mac runner. All three app
+targets share the bundle ID **`io.unom.punktfunk`** (one App Store listing, universal
+purchase — effectively unchangeable after first submission). Secrets:
+`DEVID_CERT_P12_B64`/`DEVID_CERT_PASSWORD` (Developer ID Application certificate, only
+creatable by the account holder) and `ASC_API_KEY_P8`/`ASC_API_KEY_ID`/`ASC_API_ISSUER_ID`
+(App Store Connect API key — notarization, TestFlight upload, automatic-signing profile
+fetch). Signing uses a per-run throwaway keychain; nothing persists on the runner.
+Per-platform state:
+
+- **macOS** — Developer ID export → `notarytool` → stapled `.dmg` on the Gitea release.
+  The Mac **App Store** lane is deferred: it requires App Sandbox entitlements
+  (network client + Bonjour) the app doesn't declare yet.
+- **iOS** — archive + upload to TestFlight (`method: app-store-connect`,
+  `destination: upload`). Crypto is declared exempt (`ITSAppUsesNonExemptEncryption`,
+  `Config/Info.plist`) so builds don't stall on the compliance question.
+- **tvOS** — not built: the Rust core needs tier-3 targets (nightly `-Zbuild-std`).
+
+The runner needs a **release (non-beta) Xcode** — App Store processing rejects beta-SDK
+builds, and a beta is unusable for the Rust side too: a newer-than-OS ld emits dylibs the
+running dyld rejects ("mis-aligned LINKEDIT string pool"), killing every proc-macro build
+with a misleading `E0463 can't find crate`. `build-xcframework.sh` therefore resolves
+toolchains itself: non-beta Xcode for everything; with only CLT + a beta present it
+builds macOS slices against CLT (packaging via any Xcode — `-create-xcframework` does no
+linking) and **refuses iOS/tvOS slices** (CLT has no iOS SDK).
 
 ## Deployment
 

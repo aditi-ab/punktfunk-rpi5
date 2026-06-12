@@ -1,0 +1,214 @@
+# Production Apple client builds — runs on the macos-arm64 runner (home-mac-mini-1).
+#
+#   Tag v* (or workflow_dispatch):
+#     macOS  -> Developer ID signed + notarized + stapled .dmg, attached to a Gitea
+#               release on tag pushes
+#     iOS    -> archive + upload straight to TestFlight (App Store Connect)
+#     tvOS   -> not built: the Rust core needs tier-3 targets (nightly -Zbuild-std)
+#     macOS App Store/TestFlight -> deferred: needs App Sandbox entitlements first
+#               (network client + Bonjour); the Developer ID build covers macOS today.
+#
+# One App Store listing for all platforms (universal purchase): every target shares the
+# bundle ID io.unom.punktfunk.
+#
+# Secrets: DEVID_CERT_P12_B64 / DEVID_CERT_PASSWORD (Developer ID Application cert),
+# ASC_API_KEY_P8 / ASC_API_KEY_ID / ASC_API_ISSUER_ID (App Store Connect API key —
+# notarization, TestFlight upload, and automatic-signing profile fetch).
+#
+# Needs a RELEASE Xcode on the runner (App Store rejects beta-SDK builds); the workflow
+# picks the first non-beta /Applications/Xcode*.app and only falls back to a beta with a
+# loud warning.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      testflight:
+        description: "Upload the iOS build to TestFlight (true/false)"
+        required: false
+        default: "true"
+
+jobs:
+  apple:
+    runs-on: macos-arm64
+    timeout-minutes: 120
+    env:
+      TEAM_ID: F4H37KF6WC
+      PROJECT: clients/apple/Punktfunk.xcodeproj
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select release Xcode
+        run: |
+          DEV_DIR=""
+          for app in /Applications/Xcode.app /Applications/Xcode_*.app /Applications/Xcode-*.app; do
+            case "$app" in *beta*|*Beta*) continue;; esac
+            [ -x "$app/Contents/Developer/usr/bin/xcodebuild" ] && DEV_DIR="$app/Contents/Developer" && break
+          done
+          if [ -z "$DEV_DIR" ]; then
+            for app in /Applications/Xcode*.app; do
+              [ -x "$app/Contents/Developer/usr/bin/xcodebuild" ] && DEV_DIR="$app/Contents/Developer" && break
+            done
+            echo "::warning::No release Xcode found — using $DEV_DIR. TestFlight/App Store REJECTS beta-SDK builds."
+          fi
+          [ -n "$DEV_DIR" ] || { echo "no usable Xcode found" >&2; exit 1; }
+          # Scoped to xcodebuild steps only (XCODE_DEV_DIR, not DEVELOPER_DIR): cargo must
+          # keep the system-default linker — a newer-than-OS Xcode's ld produces dylibs the
+          # running dyld rejects, killing proc-macro loads (see build-xcframework.sh).
+          echo "XCODE_DEV_DIR=$DEV_DIR" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$DEV_DIR" xcodebuild -version
+
+      - name: Version from tag
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}" ;;
+            *)            V="0.0.${GITHUB_RUN_NUMBER}" ;;
+          esac
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "BUILD_NUM=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          echo "version $V build $GITHUB_RUN_NUMBER"
+
+      - name: Rust toolchain (mac + iOS slices)
+        run: |
+          RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
+          dirname "$RUSTUP" >> "$GITHUB_PATH"
+          "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin \
+            aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
+      - name: Build PunktfunkCore.xcframework (mac + iOS)
+        run: BUILD_IOS=1 bash scripts/build-xcframework.sh
+
+      - name: Import Developer ID certificate (throwaway keychain)
+        env:
+          P12_B64: ${{ secrets.DEVID_CERT_P12_B64 }}
+          P12_PASSWORD: ${{ secrets.DEVID_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/punktfunk-ci.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          printf '%s' "$P12_B64" | base64 -d > "$RUNNER_TEMP/devid.p12"
+          security import "$RUNNER_TEMP/devid.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/devid.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Stage App Store Connect API key
+        env:
+          ASC_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          printf '%s' "$ASC_P8" > "$RUNNER_TEMP/asc.p8"
+          chmod 600 "$RUNNER_TEMP/asc.p8"
+
+      - name: Archive macOS
+        run: |
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
+            -project "$PROJECT" -scheme Punktfunk \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/Punktfunk-macos.xcarchive" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
+
+      - name: Export macOS (Developer ID)
+        run: |
+          cat > "$RUNNER_TEMP/export-devid.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>developer-id</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>destination</key><string>export</string>
+          </dict>
+          </plist>
+          EOF
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Punktfunk-macos.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/export-devid.plist" \
+            -exportPath "$RUNNER_TEMP/export-devid" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
+
+      - name: Notarized DMG
+        run: |
+          STAGE="$RUNNER_TEMP/dmg-stage"
+          mkdir -p "$STAGE"
+          cp -R "$RUNNER_TEMP/export-devid/Punktfunk.app" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          DMG="$RUNNER_TEMP/Punktfunk-$VERSION.dmg"
+          hdiutil create -volname "Punktfunk" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcrun notarytool submit "$DMG" --wait \
+            --key "$RUNNER_TEMP/asc.p8" \
+            --key-id "${{ secrets.ASC_API_KEY_ID }}" \
+            --issuer "${{ secrets.ASC_API_ISSUER_ID }}"
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcrun stapler staple "$DMG"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+      - name: Attach DMG to Gitea release
+        if: startsWith(gitea.ref, 'refs/tags/')
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          API="${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}"
+          # Create the release (409 -> already exists, fetch it instead).
+          ID=$(curl -sf -X POST "$API/releases" \
+                 -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+                 -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"$GITHUB_REF_NAME\"}" \
+               | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' \
+               || curl -sf "$API/releases/tags/$GITHUB_REF_NAME" -H "Authorization: token $TOKEN" \
+               | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+          curl -sf -X POST "$API/releases/$ID/assets?name=Punktfunk-$VERSION.dmg" \
+            -H "Authorization: token $TOKEN" \
+            -F "attachment=@$DMG" >/dev/null
+          echo "attached Punktfunk-$VERSION.dmg to release $GITHUB_REF_NAME"
+
+      - name: Archive iOS + upload to TestFlight
+        if: gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true'
+        run: |
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
+            -project "$PROJECT" -scheme Punktfunk-iOS \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
+          cat > "$RUNNER_TEMP/export-appstore.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+          </dict>
+          </plist>
+          EOF
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/export-appstore.plist" \
+            -exportPath "$RUNNER_TEMP/export-appstore" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
+
+      - name: Clean up keychain + API key
+        if: always()
+        run: |
+          [ -n "${KEYCHAIN:-}" ] && security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+          security list-keychains -d user -s login.keychain-db
+          rm -f "$RUNNER_TEMP/asc.p8"
