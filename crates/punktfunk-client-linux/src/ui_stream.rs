@@ -1,12 +1,18 @@
 //! The stream page: decoded frames into a `GtkGraphicsOffload`-wrapped picture, local
 //! input captured and forwarded on the wire contract.
 //!
-//! Input mapping: keys are hardware keycodes (evdev + 8 on Wayland) → VK via `keymap`,
-//! layout-independent. Mouse is absolute (`MouseMoveAbs` scaled into the negotiated mode
-//! through the letterbox transform) — relative/pointer-lock capture is the stage-2
-//! presenter's job. While streaming, compositor shortcuts are inhibited (configurable);
-//! Ctrl+Alt+Shift+Q ends the session, F11 toggles fullscreen — everything else goes to
-//! the host.
+//! Input capture is a deliberate, reversible STATE (Moonlight-style, mirroring the Swift
+//! client): engaged when the stream starts and when the user clicks into the video (that
+//! click is suppressed toward the host); released by Ctrl+Alt+Shift+Q (toggles) or focus
+//! loss — held keys/buttons are flushed host-side on release so nothing sticks down.
+//! While captured the local cursor is hidden (the host renders its own) and compositor
+//! shortcuts are inhibited (configurable); while released nothing is forwarded and the
+//! HUD says how to recapture.
+//!
+//! Keys are hardware keycodes (evdev + 8 on Wayland) → VK via `keymap`, layout-
+//! independent. Mouse is absolute (`MouseMoveAbs` scaled into the negotiated mode through
+//! the letterbox transform, surface size packed in `flags`) — pointer-lock relative
+//! capture is the stage-2 presenter's job. F11 toggles fullscreen locally.
 
 use crate::keymap;
 use crate::session::Stats;
@@ -15,6 +21,9 @@ use adw::prelude::*;
 use gtk::{gdk, glib};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::input::{InputEvent, InputKind};
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -60,6 +69,61 @@ fn send_abs(widget: &impl IsA<gtk::Widget>, connector: &NativeClient, x: f64, y:
     send(connector, InputKind::MouseMoveAbs, 0, px, py, flags);
 }
 
+/// The capture state shared by every input controller on the page.
+struct Capture {
+    connector: Arc<NativeClient>,
+    window: adw::ApplicationWindow,
+    overlay: gtk::Overlay,
+    hint: gtk::Label,
+    inhibit_shortcuts: bool,
+    captured: Cell<bool>,
+    /// VKs / GameStream button ids currently held — flushed up on release.
+    held_keys: RefCell<HashSet<u8>>,
+    held_buttons: RefCell<HashSet<u32>>,
+}
+
+impl Capture {
+    fn engage(&self) {
+        if self.captured.replace(true) {
+            return;
+        }
+        self.overlay
+            .set_cursor(gdk::Cursor::from_name("none", None).as_ref());
+        self.hint.set_visible(false);
+        if self.inhibit_shortcuts {
+            if let Some(tl) = self
+                .window
+                .surface()
+                .and_then(|s| s.downcast::<gdk::Toplevel>().ok())
+            {
+                tl.inhibit_system_shortcuts(None::<&gdk::Event>);
+            }
+        }
+    }
+
+    fn release(&self) {
+        if !self.captured.replace(false) {
+            return;
+        }
+        self.overlay.set_cursor(None);
+        self.hint.set_visible(true);
+        if let Some(tl) = self
+            .window
+            .surface()
+            .and_then(|s| s.downcast::<gdk::Toplevel>().ok())
+        {
+            tl.restore_system_shortcuts();
+        }
+        // Flush everything held so nothing sticks down on the host.
+        for vk in self.held_keys.borrow_mut().drain() {
+            send(&self.connector, InputKind::KeyUp, vk as u32, 0, 0, 0);
+        }
+        for b in self.held_buttons.borrow_mut().drain() {
+            send(&self.connector, InputKind::MouseButtonUp, b, 0, 0, 0);
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn new(
     window: &adw::ApplicationWindow,
@@ -86,12 +150,31 @@ pub fn new(
     stats_label.set_margin_start(12);
     stats_label.set_margin_top(12);
 
+    let hint = gtk::Label::new(Some(
+        "Click the stream to capture input · Ctrl+Alt+Shift+Q releases",
+    ));
+    hint.add_css_class("osd");
+    hint.set_halign(gtk::Align::Center);
+    hint.set_valign(gtk::Align::End);
+    hint.set_margin_bottom(24);
+    hint.set_visible(false);
+
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&offload));
     overlay.add_overlay(&stats_label);
+    overlay.add_overlay(&hint);
     overlay.set_focusable(true);
-    // The remote cursor is in the video — hide the local one over the stream.
-    overlay.set_cursor(gdk::Cursor::from_name("none", None).as_ref());
+
+    let capture = Rc::new(Capture {
+        connector: connector.clone(),
+        window: window.clone(),
+        overlay: overlay.clone(),
+        hint: hint.clone(),
+        inhibit_shortcuts,
+        captured: Cell::new(false),
+        held_keys: RefCell::new(HashSet::new()),
+        held_buttons: RefCell::new(HashSet::new()),
+    });
 
     let header = adw::HeaderBar::new();
     let fullscreen_btn = gtk::Button::from_icon_name("view-fullscreen-symbolic");
@@ -111,13 +194,14 @@ pub fn new(
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&overlay));
-    // Fullscreen = the stream and nothing else.
-    {
+    // Fullscreen = the stream and nothing else. (Window handlers are disconnected when
+    // the page dies — the window outlives every session.)
+    let fs_handler = {
         let toolbar = toolbar.clone();
         window.connect_fullscreened_notify(move |w| {
             toolbar.set_reveal_top_bars(!w.is_fullscreen());
-        });
-    }
+        })
+    };
 
     let page = adw::NavigationPage::builder()
         .title(title)
@@ -150,15 +234,18 @@ pub fn new(
     {
         let key = gtk::EventControllerKey::new();
         key.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let conn = connector.clone();
-        let stop_k = stop.clone();
+        let cap = capture.clone();
         let window_k = window.clone();
         key.connect_key_pressed(move |_, keyval, keycode, state| {
             let chord = gdk::ModifierType::CONTROL_MASK
                 | gdk::ModifierType::ALT_MASK
                 | gdk::ModifierType::SHIFT_MASK;
             if state.contains(chord) && keyval.to_lower() == gdk::Key::q {
-                stop_k.store(true, Ordering::SeqCst); // ends the session → page pops
+                if cap.captured.get() {
+                    cap.release();
+                } else {
+                    cap.engage();
+                }
                 return glib::Propagation::Stop;
             }
             if keyval == gdk::Key::F11 {
@@ -169,113 +256,126 @@ pub fn new(
                 }
                 return glib::Propagation::Stop;
             }
+            if !cap.captured.get() {
+                return glib::Propagation::Proceed;
+            }
             if let Some(vk) = keycode
                 .checked_sub(8)
                 .and_then(|c| keymap::evdev_to_vk(c as u16))
             {
-                send(&conn, InputKind::KeyDown, vk as u32, 0, 0, 0);
+                cap.held_keys.borrow_mut().insert(vk);
+                send(&cap.connector, InputKind::KeyDown, vk as u32, 0, 0, 0);
             }
             glib::Propagation::Stop
         });
-        let conn = connector.clone();
+        let cap = capture.clone();
         key.connect_key_released(move |_, _keyval, keycode, _state| {
             if let Some(vk) = keycode
                 .checked_sub(8)
                 .and_then(|c| keymap::evdev_to_vk(c as u16))
             {
-                send(&conn, InputKind::KeyUp, vk as u32, 0, 0, 0);
+                // Flush-on-release may have beaten us to it — only forward if still held.
+                if cap.held_keys.borrow_mut().remove(&vk) {
+                    send(&cap.connector, InputKind::KeyUp, vk as u32, 0, 0, 0);
+                }
             }
         });
         overlay.add_controller(key);
     }
 
-    // --- Mouse: absolute motion, buttons, wheel ---
+    // --- Mouse: absolute motion, buttons, wheel — forwarded only while captured ---
     {
         let motion = gtk::EventControllerMotion::new();
-        let conn = connector.clone();
-        let target = overlay.downgrade();
+        let cap = capture.clone();
         motion.connect_motion(move |_, x, y| {
-            if let Some(w) = target.upgrade() {
-                send_abs(&w, &conn, x, y);
+            if cap.captured.get() {
+                send_abs(&cap.overlay, &cap.connector, x, y);
             }
         });
         overlay.add_controller(motion);
     }
     {
         let click = gtk::GestureClick::builder().button(0).build();
-        let conn = connector.clone();
-        let target = overlay.downgrade();
+        let cap = capture.clone();
         click.connect_pressed(move |g, _n, x, y| {
-            if let Some(w) = target.upgrade() {
-                w.grab_focus();
-                send_abs(&w, &conn, x, y);
+            cap.overlay.grab_focus();
+            if !cap.captured.get() {
+                cap.engage(); // the engaging click is suppressed toward the host
+                return;
             }
+            send_abs(&cap.overlay, &cap.connector, x, y);
             if let Some(gs) = keymap::gdk_button_to_gs(g.current_button()) {
-                send(&conn, InputKind::MouseButtonDown, gs, 0, 0, 0);
+                cap.held_buttons.borrow_mut().insert(gs);
+                send(&cap.connector, InputKind::MouseButtonDown, gs, 0, 0, 0);
             }
         });
-        let conn = connector.clone();
+        let cap = capture.clone();
         click.connect_released(move |g, _n, _x, _y| {
             if let Some(gs) = keymap::gdk_button_to_gs(g.current_button()) {
-                send(&conn, InputKind::MouseButtonUp, gs, 0, 0, 0);
+                if cap.held_buttons.borrow_mut().remove(&gs) {
+                    send(&cap.connector, InputKind::MouseButtonUp, gs, 0, 0, 0);
+                }
             }
         });
         overlay.add_controller(click);
     }
     {
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
-        let conn = connector.clone();
+        let cap = capture.clone();
         scroll.connect_scroll(move |_, dx, dy| {
+            if !cap.captured.get() {
+                return glib::Propagation::Proceed;
+            }
             // The wire carries WHEEL_DELTA(120) units, positive = up / right; GTK's dy is
             // positive = down. Smooth fractions survive — libei's discrete scroll is
             // 120-based too.
             let vy = (-dy * 120.0) as i32;
             if vy != 0 {
-                send(&conn, InputKind::MouseScroll, 0, vy, 0, 0);
+                send(&cap.connector, InputKind::MouseScroll, 0, vy, 0, 0);
             }
             let vx = (dx * 120.0) as i32;
             if vx != 0 {
-                send(&conn, InputKind::MouseScroll, 1, vx, 0, 0);
+                send(&cap.connector, InputKind::MouseScroll, 1, vx, 0, 0);
             }
             glib::Propagation::Stop
         });
         overlay.add_controller(scroll);
     }
 
-    // --- Capture lifecycle: grab focus + compositor shortcuts while mapped. ---
+    // --- Capture lifecycle ---
     {
-        let window = window.clone();
+        // Engaged when the stream starts (trust is already confirmed by then).
+        let cap = capture.clone();
         overlay.connect_map(move |w| {
-            tracing::debug!("stream overlay mapped");
             w.grab_focus();
-            if inhibit_shortcuts {
-                if let Some(tl) = window
-                    .surface()
-                    .and_then(|s| s.downcast::<gdk::Toplevel>().ok())
-                {
-                    tl.inhibit_system_shortcuts(None::<&gdk::Event>);
-                }
-            }
+            cap.engage();
         });
     }
-    {
-        let window = window.clone();
-        overlay.connect_unmap(move |_| {
-            if let Some(tl) = window
-                .surface()
-                .and_then(|s| s.downcast::<gdk::Toplevel>().ok())
-            {
-                tl.restore_system_shortcuts();
+    // Focus loss releases (Alt-Tab away, another window) — Swift does the same.
+    let active_handler = {
+        let cap = capture.clone();
+        window.connect_is_active_notify(move |w| {
+            if !w.is_active() {
+                cap.release();
             }
-        });
+        })
+    };
+    {
+        let cap = capture.clone();
+        overlay.connect_unmap(move |_| cap.release());
     }
     // The page's `hidden` fires once navigation away completes (back button, pop on
     // session end) — NOT on the transient unmap/map cycle a NavigationView push performs.
     {
         let window = window.clone();
         let stop_h = stop.clone();
+        let handlers = RefCell::new(Some((fs_handler, active_handler)));
         page.connect_hidden(move |_| {
             tracing::debug!("stream page hidden — ending session");
+            if let Some((fs, active)) = handlers.borrow_mut().take() {
+                window.disconnect(fs);
+                window.disconnect(active);
+            }
             if window.is_fullscreen() {
                 window.unfullscreen();
             }

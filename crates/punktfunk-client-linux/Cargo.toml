@@ -28,8 +28,9 @@ ffmpeg-next = "8"
 opus = "0.3"
 pipewire = "0.9"
 
-# Gamepads: capture + rumble/lightbar feedback (full DualSense fidelity lives here).
-sdl3 = "0.18"
+# Gamepads: capture + feedback (full DualSense fidelity — touchpad/motion/triggers/LEDs
+# need the hidapi driver).
+sdl3 = { version = "0.18", features = ["hidapi"] }
 
 mdns-sd = "0.20"
 serde = { version = "1", features = ["derive"] }

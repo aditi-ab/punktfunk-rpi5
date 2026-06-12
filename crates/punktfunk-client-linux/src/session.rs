@@ -4,8 +4,8 @@
 //! the input path) — `NativeClient` is `Sync`, planes stay one-consumer-per-thread:
 //! video+audio here, rumble+hidout on the gamepad thread.
 
+use crate::audio;
 use crate::video::{DecodedFrame, Decoder};
-use crate::{audio, gamepad};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use punktfunk_core::PunktfunkError;
@@ -17,8 +17,11 @@ pub struct SessionParams {
     pub host: String,
     pub port: u16,
     pub mode: Mode,
+    pub compositor: CompositorPref,
     pub gamepad: GamepadPref,
     pub bitrate_kbps: u32,
+    /// Stream the default microphone to the host's virtual mic source.
+    pub mic_enabled: bool,
     /// Pinned host fingerprint; `None` = trust on first use (caller persists the observed one).
     pub pin: Option<[u8; 32]>,
     pub identity: (String, String),
@@ -84,7 +87,7 @@ fn pump(
         &params.host,
         params.port,
         params.mode,
-        CompositorPref::Auto,
+        params.compositor,
         params.gamepad,
         params.bitrate_kbps,
         params.pin,
@@ -118,14 +121,22 @@ fn pump(
             return;
         }
     };
-    // Audio and gamepads are best-effort: a session without them still streams.
+    // Audio is best-effort: a session without it still streams. Gamepads are the
+    // app-lifetime service's job (the UI attaches it on Connected).
     let player = audio::AudioPlayer::spawn()
         .map_err(|e| tracing::warn!(error = %e, "audio disabled"))
         .ok();
     let mut opus_dec = opus::Decoder::new(48_000, opus::Channels::Stereo)
         .map_err(|e| tracing::warn!(error = %e, "opus decoder failed — audio disabled"))
         .ok();
-    let gamepad_thread = gamepad::spawn(connector.clone(), stop.clone());
+    let _mic = params
+        .mic_enabled
+        .then(|| {
+            audio::MicStreamer::spawn(connector.clone())
+                .map_err(|e| tracing::warn!(error = %e, "mic uplink disabled"))
+                .ok()
+        })
+        .flatten();
 
     let clock_offset = connector.clock_offset_ns;
     let mut total_frames = 0u64;
@@ -218,9 +229,6 @@ fn pump(
         reason = end.as_deref().unwrap_or("user"),
         "session ended"
     );
-    stop.store(true, Ordering::SeqCst); // take the gamepad thread down with us
-    if let Some(t) = gamepad_thread {
-        let _ = t.join();
-    }
+    stop.store(true, Ordering::SeqCst);
     let _ = ev_tx.send_blocking(SessionEvent::Ended(end));
 }

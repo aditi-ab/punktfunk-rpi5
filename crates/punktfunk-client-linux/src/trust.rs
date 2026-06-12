@@ -104,29 +104,39 @@ impl KnownHosts {
     }
 }
 
-/// App settings, persisted as JSON. Stringly-typed gamepad pref so the file stays
-/// readable; parsed with `GamepadPref::from_name` at connect time.
+/// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file
+/// stays readable; parsed with `*Pref::from_name` at connect time.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
+    /// Stream mode; `0` = the native size/refresh of the monitor the window is on,
+    /// resolved at connect time.
     pub width: u32,
     pub height: u32,
     pub refresh_hz: u32,
     /// Requested encoder bitrate (kbps); 0 = host default.
     pub bitrate_kbps: u32,
     pub gamepad: String,
-    /// Grab compositor shortcuts (Alt+Tab, Super…) while streaming.
+    /// Which host compositor backend to request (advisory; the host falls back to
+    /// auto-detect when unavailable).
+    pub compositor: String,
+    /// Grab compositor shortcuts (Alt+Tab, Super…) while input is captured.
     pub inhibit_shortcuts: bool,
+    /// Stream the default microphone to the host's virtual mic source.
+    pub mic_enabled: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            width: 1920,
-            height: 1080,
-            refresh_hz: 60,
+            width: 0,
+            height: 0,
+            refresh_hz: 0,
             bitrate_kbps: 0,
             gamepad: "auto".into(),
+            compositor: "auto".into(),
             inhibit_shortcuts: true,
+            mic_enabled: false,
         }
     }
 }

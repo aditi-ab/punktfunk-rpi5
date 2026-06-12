@@ -173,8 +173,8 @@ impl NvencEncoder {
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
             .unwrap_or(1.0);
-        let vbv_bits =
-            ((bitrate_bps as f64 / fps.max(1) as f64) * vbv_frames as f64).clamp(1.0, i32::MAX as f64);
+        let vbv_bits = ((bitrate_bps as f64 / fps.max(1) as f64) * vbv_frames as f64)
+            .clamp(1.0, i32::MAX as f64);
         unsafe {
             (*video.as_mut_ptr()).rc_buffer_size = vbv_bits as i32;
         }

@@ -4,9 +4,9 @@ use crate::session::{SessionEvent, SessionParams};
 use crate::trust::{KnownHost, KnownHosts, Settings};
 use crate::ui_hosts::ConnectRequest;
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, glib};
 use punktfunk_core::client::NativeClient;
-use punktfunk_core::config::GamepadPref;
+use punktfunk_core::config::{CompositorPref, GamepadPref};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -18,6 +18,8 @@ struct App {
     toasts: adw::ToastOverlay,
     settings: Rc<RefCell<Settings>>,
     identity: (String, String),
+    /// App-lifetime SDL gamepad service: Settings list + per-session capture/feedback.
+    gamepad: crate::gamepad::GamepadService,
     /// One session at a time — ignore connects while one is starting/running.
     busy: std::cell::Cell<bool>,
 }
@@ -89,6 +91,7 @@ fn build_ui(gtk_app: &adw::Application) {
         toasts,
         settings: Rc::new(RefCell::new(Settings::load())),
         identity,
+        gamepad: crate::gamepad::GamepadService::start(),
         busy: std::cell::Cell::new(false),
     });
 
@@ -99,7 +102,13 @@ fn build_ui(gtk_app: &adw::Application) {
         },
         {
             let app = app.clone();
-            Rc::new(move || crate::ui_settings::show(&app.window, app.settings.clone()))
+            Rc::new(move || {
+                crate::ui_settings::show(&app.window, app.settings.clone(), &app.gamepad)
+            })
+        },
+        {
+            let app = app.clone();
+            Rc::new(move |req| speed_test(app.clone(), req))
         },
     );
     nav.add(&hosts_page);
@@ -244,21 +253,151 @@ fn pin_dialog(app: Rc<App>, req: ConnectRequest) {
     dialog.present(Some(&parent));
 }
 
+/// Measure the path to a host over the real data plane (Swift's "Test Network Speed…"):
+/// connect, have the host burst probe filler for 2 s up to its 3 Gbps ceiling, report
+/// goodput · loss · a recommended bitrate (≈70 % of measured), and apply it in one tap.
+fn speed_test(app: Rc<App>, req: ConnectRequest) {
+    if app.busy.replace(true) {
+        return;
+    }
+    let pin = req.fp_hex.as_deref().and_then(crate::trust::parse_hex32);
+    let status = gtk::Label::new(Some("Connecting…"));
+    let dialog = adw::AlertDialog::new(Some("Network Speed Test"), Some(&req.name));
+    dialog.set_extra_child(Some(&status));
+    dialog.add_responses(&[("close", "Close"), ("apply", "Apply")]);
+    dialog.set_response_enabled("apply", false);
+    dialog.set_close_response("close");
+    dialog.present(Some(&app.window));
+
+    let (tx, rx) =
+        async_channel::bounded::<Result<punktfunk_core::client::ProbeOutcome, String>>(1);
+    let identity = app.identity.clone();
+    let (host, port) = (req.addr.clone(), req.port);
+    std::thread::spawn(move || {
+        let result = (|| {
+            let c = NativeClient::connect(
+                &host,
+                port,
+                punktfunk_core::config::Mode {
+                    width: 1280,
+                    height: 720,
+                    refresh_hz: 60,
+                },
+                CompositorPref::Auto,
+                GamepadPref::Auto,
+                0,
+                pin,
+                Some(identity),
+                std::time::Duration::from_secs(15),
+            )
+            .map_err(|e| format!("connect: {e:?}"))?;
+            c.request_probe(3_000_000, 2_000)
+                .map_err(|e| format!("probe: {e:?}"))?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let r = c.probe_result();
+                if r.done {
+                    // Let the last UDP shards land before tearing down.
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    return Ok(c.probe_result());
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err("probe timed out".to_string());
+                }
+            }
+        })();
+        let _ = tx.send_blocking(result);
+    });
+
+    glib::spawn_future_local(async move {
+        let outcome = rx.recv().await;
+        app.busy.set(false);
+        match outcome {
+            Ok(Ok(r)) => {
+                let mbps = f64::from(r.throughput_kbps) / 1000.0;
+                let recommended_kbps = r.throughput_kbps / 10 * 7;
+                status.set_text(&format!(
+                    "{mbps:.0} Mbit/s measured · {:.1} % loss\nRecommended bitrate: {:.0} Mbit/s",
+                    r.loss_pct,
+                    f64::from(recommended_kbps) / 1000.0,
+                ));
+                dialog.set_response_enabled("apply", true);
+                dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+                let settings = app.settings.clone();
+                let toasts = app.toasts.clone();
+                dialog.connect_response(Some("apply"), move |_, _| {
+                    let mut s = settings.borrow_mut();
+                    s.bitrate_kbps = recommended_kbps;
+                    s.save();
+                    toasts.add_toast(adw::Toast::new(&format!(
+                        "Bitrate set to {:.0} Mbit/s",
+                        f64::from(recommended_kbps) / 1000.0
+                    )));
+                });
+            }
+            Ok(Err(msg)) => status.set_text(&msg),
+            Err(_) => {}
+        }
+    });
+}
+
+/// The mode to request: explicit settings, with `0` fields resolved to the native
+/// size/refresh of the monitor the window currently occupies (mirrors the Swift client's
+/// native-display default).
+fn resolve_mode(app: &App) -> punktfunk_core::config::Mode {
+    let s = app.settings.borrow();
+    let mut mode = punktfunk_core::config::Mode {
+        width: s.width,
+        height: s.height,
+        refresh_hz: s.refresh_hz,
+    };
+    if mode.width == 0 || mode.refresh_hz == 0 {
+        let monitor = app
+            .window
+            .surface()
+            .zip(gdk::Display::default())
+            .and_then(|(surf, d)| d.monitor_at_surface(&surf));
+        if let Some(m) = monitor {
+            let geo = m.geometry();
+            let scale = m.scale_factor().max(1);
+            if mode.width == 0 {
+                mode.width = (geo.width() * scale) as u32;
+                mode.height = (geo.height() * scale) as u32;
+            }
+            if mode.refresh_hz == 0 {
+                mode.refresh_hz = ((m.refresh_rate() + 500) / 1000).max(30) as u32;
+            }
+        }
+    }
+    // No monitor info (early call, odd compositor) — a sane floor.
+    if mode.width == 0 {
+        (mode.width, mode.height) = (1920, 1080);
+    }
+    if mode.refresh_hz == 0 {
+        mode.refresh_hz = 60;
+    }
+    mode
+}
+
 fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
     if app.busy.replace(true) {
         return;
     }
+    let mode = resolve_mode(&app);
     let s = app.settings.borrow();
     let params = SessionParams {
         host: req.addr.clone(),
         port: req.port,
-        mode: punktfunk_core::config::Mode {
-            width: s.width,
-            height: s.height,
-            refresh_hz: s.refresh_hz,
+        mode,
+        compositor: CompositorPref::from_name(&s.compositor).unwrap_or(CompositorPref::Auto),
+        // "Automatic" matches the physical pad (Swift parity); an explicit choice wins.
+        gamepad: match GamepadPref::from_name(&s.gamepad) {
+            Some(GamepadPref::Auto) | None => app.gamepad.auto_pref(),
+            Some(explicit) => explicit,
         },
-        gamepad: GamepadPref::from_name(&s.gamepad).unwrap_or(GamepadPref::Auto),
         bitrate_kbps: s.bitrate_kbps,
+        mic_enabled: s.mic_enabled,
         pin,
         identity: app.identity.clone(),
     };
@@ -300,6 +439,7 @@ fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
                         "{} · {}×{}@{}",
                         req.name, mode.width, mode.height, mode.refresh_hz
                     );
+                    app.gamepad.attach(connector.clone());
                     let p = crate::ui_stream::new(
                         &app.window,
                         connector,
@@ -317,11 +457,13 @@ fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
                     }
                 }
                 SessionEvent::Failed(msg) => {
+                    tracing::warn!(%msg, "connect failed");
                     app.toast(&msg);
                     app.busy.set(false);
                     break;
                 }
                 SessionEvent::Ended(err) => {
+                    app.gamepad.detach();
                     app.nav.pop_to_tag("hosts");
                     if let Some(e) = err {
                         app.toast(&e);

@@ -1,6 +1,7 @@
-//! The hosts page: live mDNS discovery list + manual connect entry.
+//! The hosts page: saved (trusted) hosts, live mDNS discovery, manual connect entry.
 
 use crate::discovery::{self, DiscoveredHost};
+use crate::trust::KnownHosts;
 use adw::prelude::*;
 use gtk::glib;
 use std::cell::RefCell;
@@ -22,6 +23,7 @@ pub struct ConnectRequest {
 pub fn new(
     on_connect: Rc<dyn Fn(ConnectRequest)>,
     on_settings: Rc<dyn Fn()>,
+    on_speed_test: Rc<dyn Fn(ConnectRequest)>,
 ) -> adw::NavigationPage {
     let list = gtk::ListBox::new();
     list.add_css_class("boxed-list");
@@ -132,11 +134,72 @@ pub fn new(
     manual_list.set_selection_mode(gtk::SelectionMode::None);
     manual_list.append(&manual);
 
+    // Saved (trusted/paired) hosts — reachable even when mDNS isn't. Rebuilt every time
+    // the page is shown, so fresh TOFU/pairing entries appear on return.
+    let saved_label = gtk::Label::new(Some("Saved hosts"));
+    saved_label.add_css_class("heading");
+    saved_label.set_halign(gtk::Align::Start);
+    let saved_list = gtk::ListBox::new();
+    saved_list.add_css_class("boxed-list");
+    saved_list.set_selection_mode(gtk::SelectionMode::None);
+    let rebuild_saved = {
+        let saved_list = saved_list.clone();
+        let saved_label = saved_label.clone();
+        let on_connect = on_connect.clone();
+        let on_speed_test = on_speed_test.clone();
+        move || {
+            saved_list.remove_all();
+            let known = KnownHosts::load();
+            saved_label.set_visible(!known.hosts.is_empty());
+            saved_list.set_visible(!known.hosts.is_empty());
+            for k in &known.hosts {
+                let row = adw::ActionRow::builder()
+                    .title(&k.name)
+                    .subtitle(format!(
+                        "{}:{}{}",
+                        k.addr,
+                        k.port,
+                        if k.paired {
+                            " · paired"
+                        } else {
+                            " · trusted"
+                        }
+                    ))
+                    .activatable(true)
+                    .build();
+                let req = ConnectRequest {
+                    name: k.name.clone(),
+                    addr: k.addr.clone(),
+                    port: k.port,
+                    fp_hex: Some(k.fp_hex.clone()),
+                    pair_required: false,
+                };
+                let speed_btn = gtk::Button::from_icon_name("network-transmit-receive-symbolic");
+                speed_btn.set_tooltip_text(Some("Test network speed"));
+                speed_btn.set_valign(gtk::Align::Center);
+                speed_btn.add_css_class("flat");
+                {
+                    let on_speed_test = on_speed_test.clone();
+                    let req = req.clone();
+                    speed_btn.connect_clicked(move |_| on_speed_test(req.clone()));
+                }
+                row.add_suffix(&speed_btn);
+                row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+                let on_connect = on_connect.clone();
+                row.connect_activated(move |_| on_connect(req.clone()));
+                saved_list.append(&row);
+            }
+        }
+    };
+    rebuild_saved();
+
     let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
     content.set_margin_top(24);
     content.set_margin_bottom(24);
     content.set_margin_start(12);
     content.set_margin_end(12);
+    content.append(&saved_label);
+    content.append(&saved_list);
     let discovered_label = gtk::Label::new(Some("Hosts on this network"));
     discovered_label.add_css_class("heading");
     discovered_label.set_halign(gtk::Align::Start);
@@ -167,9 +230,11 @@ pub fn new(
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&scrolled));
 
-    adw::NavigationPage::builder()
+    let page = adw::NavigationPage::builder()
         .title("Punktfunk")
         .tag("hosts")
         .child(&toolbar)
-        .build()
+        .build();
+    page.connect_shown(move |_| rebuild_saved());
+    page
 }
