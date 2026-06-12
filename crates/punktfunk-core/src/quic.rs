@@ -126,6 +126,16 @@ pub struct Reconfigured {
     pub mode: Mode,
 }
 
+/// `client → host`, any time after [`Start`]: ask the host's encoder to emit a fresh IDR
+/// keyframe NOW. The infinite-GOP stream opens with one IDR then sends P-frames only, so a
+/// decoder that wedges (a lost/corrupt opening IDR, a bad early P-frame — most likely on the
+/// cold first session) would otherwise stay frozen until the next loss-triggered recovery
+/// keyframe, which may be far off. The client sends this when it detects a stalled decode;
+/// the host forces the next frame to be an IDR with in-band parameter sets, recovering the
+/// picture in ~one frame. Fire-and-forget — no reply (the recovered IDR is the ack).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestKeyframe;
+
 /// `client → host`, any time after [`Start`]: run a bandwidth speed test. The host bursts
 /// filler access units (flagged [`crate::packet::FLAG_PROBE`]) over the data plane at
 /// `target_kbps` of application goodput for `duration_ms`, *pausing video for the duration*, then
@@ -195,6 +205,8 @@ pub fn clock_offset_ns(samples: &[(u64, u64, u64, u64)]) -> Option<(i64, u64)> {
 pub const MSG_RECONFIGURE: u8 = 0x01;
 /// Type byte of [`Reconfigured`].
 pub const MSG_RECONFIGURED: u8 = 0x02;
+/// Type byte of [`RequestKeyframe`].
+pub const MSG_REQUEST_KEYFRAME: u8 = 0x03;
 /// Type byte of [`ProbeRequest`].
 pub const MSG_PROBE_REQUEST: u8 = 0x20;
 /// Type byte of [`ProbeResult`].
@@ -696,6 +708,23 @@ impl Reconfigured {
                 refresh_hz: u32at(14),
             },
         })
+    }
+}
+
+impl RequestKeyframe {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] — no payload
+        let mut b = Vec::with_capacity(5);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_REQUEST_KEYFRAME);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<RequestKeyframe> {
+        if b.len() != 5 || &b[0..4] != CTL_MAGIC || b[4] != MSG_REQUEST_KEYFRAME {
+            return Err(PunktfunkError::InvalidArg("bad RequestKeyframe"));
+        }
+        Ok(RequestKeyframe)
     }
 }
 
@@ -1658,6 +1687,22 @@ mod tests {
             .encode()
         )
         .is_err());
+    }
+
+    #[test]
+    fn request_keyframe_roundtrip() {
+        let bytes = RequestKeyframe.encode();
+        assert!(RequestKeyframe::decode(&bytes).is_ok());
+        // Distinct from the other control messages — its type byte must not collide.
+        let mode = Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        assert!(RequestKeyframe::decode(&Reconfigure { mode }.encode()).is_err());
+        assert!(Reconfigure::decode(&bytes).is_err());
+        // Length is exact (no trailing bytes accepted).
+        assert!(RequestKeyframe::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
     }
 
     #[test]

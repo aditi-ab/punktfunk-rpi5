@@ -17,7 +17,7 @@ use crate::input::InputEvent;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
     endpoint, io, Hello, HidOutput, ProbeRequest, ProbeResult, Reconfigure, Reconfigured,
-    RichInput, Start, Welcome,
+    RequestKeyframe, RichInput, Start, Welcome,
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 enum CtrlRequest {
     Mode(Mode),
     Probe(ProbeRequest),
+    Keyframe,
 }
 
 /// What the worker reports to [`NativeClient::connect`] once the handshake lands: the negotiated
@@ -362,6 +363,16 @@ impl NativeClient {
     pub fn request_mode(&self, mode: Mode) -> Result<()> {
         self.ctrl_tx
             .send(CtrlRequest::Mode(mode))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Ask the host's encoder to emit a fresh IDR keyframe now (client recovery on a stalled
+    /// decode). Non-blocking, fire-and-forget — the recovered keyframe is the only ack. The
+    /// caller should throttle (the decode stays wedged across several frames until the IDR
+    /// lands, so requesting on every frame would flood the control stream).
+    pub fn request_keyframe(&self) -> Result<()> {
+        self.ctrl_tx
+            .send(CtrlRequest::Keyframe)
             .map_err(|_| PunktfunkError::Closed)
     }
 
@@ -716,6 +727,7 @@ async fn worker_main(args: WorkerArgs) {
                         let bytes = match req {
                             CtrlRequest::Mode(m) => Reconfigure { mode: m }.encode(),
                             CtrlRequest::Probe(p) => p.encode(),
+                            CtrlRequest::Keyframe => RequestKeyframe.encode(),
                         };
                         if io::write_msg(&mut ctrl_send, &bytes).await.is_err() {
                             break;

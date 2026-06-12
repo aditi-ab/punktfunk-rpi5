@@ -44,11 +44,36 @@ private final class PumpToken: @unchecked Sendable {
     func cancel() { lock.lock(); live = false; lock.unlock() }
 }
 
+/// Throttled host keyframe requests for decode recovery. The decoder's async error callback
+/// (a VT thread) and the pump thread (a submit failure) both signal a wedge; this coalesces
+/// them so the control stream isn't flooded while the decode stays stalled for several frames
+/// until the requested IDR lands. Bound to the live connection in `start`, unbound in `stop`.
+private final class KeyframeRecovery: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connection: PunktfunkConnection?
+    private var lastNs: UInt64 = 0
+
+    func bind(_ c: PunktfunkConnection?) {
+        lock.lock(); connection = c; lastNs = 0; lock.unlock()
+    }
+
+    func request() {
+        lock.lock()
+        let now = DispatchTime.now().uptimeNanoseconds
+        let due = lastNs == 0 || now &- lastNs > 250_000_000 // ≥ 250 ms since the last request
+        if due { lastNs = now }
+        let conn = due ? connection : nil
+        lock.unlock()
+        conn?.requestKeyframe()
+    }
+}
+
 public final class Stage2Pipeline {
     private let ring = ReadyRing()
     private let presenter: MetalVideoPresenter
     private let decoder: VideoDecoder
     private let presentMeter: LatencyMeter
+    private let recovery = KeyframeRecovery()
     private var token = PumpToken()
     private var offsetNs: Int64 = 0
 
@@ -63,9 +88,13 @@ public final class Stage2Pipeline {
         self.presenter = presenter
         self.presentMeter = presentMeter
         let ring = ring
+        let recovery = recovery
         self.decoder = VideoDecoder(
             onDecoded: { ring.submit($0) },
-            onDecodeError: { _ in /* the pump resets the session via reset() on the next IDR */ })
+            // Async decode failure (a bad P-frame referencing a lost/corrupt IDR): the pump
+            // resets to re-gate on the next IDR, and we ask the host to send one now (infinite
+            // GOP — it wouldn't otherwise come soon). Throttled in KeyframeRecovery.
+            onDecodeError: { _ in recovery.request() })
     }
 
     /// Start pulling AUs into the decoder. `onFrame` fires per AU at receipt (capture→client
@@ -77,9 +106,11 @@ public final class Stage2Pipeline {
         onSessionEnd: (@Sendable () -> Void)?
     ) {
         offsetNs = connection.clockOffsetNs
+        recovery.bind(connection) // arm host-keyframe recovery for this session
         token = PumpToken() // fresh token per start — cancel is permanent (like StreamPump)
         let token = token
         let decoder = decoder
+        let recovery = recovery
         let thread = Thread {
             var format: CMVideoFormatDescription?
             while token.isLive {
@@ -92,8 +123,10 @@ public final class Stage2Pipeline {
                     guard let f = format, token.isLive else { continue }
                     if !decoder.decode(au: au, format: f) {
                         // Submit/decoder error: drop the session and re-gate on the next IDR's
-                        // in-band parameter sets (a delta frame can't recover) — stage-1's policy.
+                        // in-band parameter sets (a delta frame can't recover) — stage-1's policy
+                        // — and ask the host for that IDR now (infinite GOP; throttled).
                         decoder.reset()
+                        recovery.request()
                     }
                 } catch {
                     if token.isLive { onSessionEnd?() }
@@ -125,6 +158,7 @@ public final class Stage2Pipeline {
     public func stop() {
         token.cancel()
         decoder.reset()
+        recovery.bind(nil) // stop requesting keyframes once the session is torn down
     }
 
     deinit { token.cancel() }

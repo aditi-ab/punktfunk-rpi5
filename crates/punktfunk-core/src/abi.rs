@@ -1383,6 +1383,32 @@ pub unsafe extern "C" fn punktfunk_connection_request_mode(
     })
 }
 
+/// Ask the host's encoder to emit a fresh IDR keyframe now — client recovery when the
+/// decoder has stalled (the infinite-GOP stream sends one opening IDR then P-frames only, so
+/// a wedged decoder would otherwise freeze until the next loss-triggered recovery keyframe).
+/// Non-blocking, fire-and-forget; the recovered keyframe is the only ack. The caller should
+/// THROTTLE — the decode stays wedged for several frames until the IDR lands, so requesting
+/// every frame would flood the control stream.
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_request_keyframe(
+    c: *const PunktfunkConnection,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        match c.inner.request_keyframe() {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
+        }
+    })
+}
+
 /// A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
 /// the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
 /// measured goodput to drive a bitrate choice from; `loss_pct` is the delivery loss at that rate.

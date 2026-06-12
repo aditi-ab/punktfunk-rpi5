@@ -332,6 +332,21 @@ public final class PunktfunkConnection {
         _ = punktfunk_connection_request_mode(h, width, height, refreshHz)
     }
 
+    /// Ask the host's encoder to emit a fresh IDR keyframe now — recovery when the local
+    /// decoder has wedged. The host opens the infinite-GOP stream with one IDR and then sends
+    /// P-frames only, so a stalled decode (a lost/corrupt opening IDR, a bad early P-frame —
+    /// most likely on the cold first connect) would otherwise stay frozen until the next
+    /// loss-triggered recovery keyframe, which may be far off. Fire-and-forget; the recovered
+    /// keyframe is the only ack. THROTTLE at the call site — the decode stays wedged for
+    /// several frames until the IDR lands, so requesting every frame would flood the control
+    /// stream. Silently dropped after close.
+    public func requestKeyframe() {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        _ = punktfunk_connection_request_keyframe(h)
+    }
+
     /// The currently active session mode (updated by accepted `requestMode` switches).
     public func currentMode() -> (width: UInt32, height: UInt32, refreshHz: UInt32) {
         abiLock.lock()

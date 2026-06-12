@@ -163,6 +163,11 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`RequestKeyframe`].
+#define MSG_REQUEST_KEYFRAME 3
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ProbeRequest`].
 #define MSG_PROBE_REQUEST 32
 #endif
@@ -835,6 +840,19 @@ PunktfunkStatus punktfunk_connection_request_mode(const PunktfunkConnection *c,
                                                   uint32_t width,
                                                   uint32_t height,
                                                   uint32_t refresh_hz);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Ask the host's encoder to emit a fresh IDR keyframe now — client recovery when the
+// decoder has stalled (the infinite-GOP stream sends one opening IDR then P-frames only, so
+// a wedged decoder would otherwise freeze until the next loss-triggered recovery keyframe).
+// Non-blocking, fire-and-forget; the recovered keyframe is the only ack. The caller should
+// THROTTLE — the decode stays wedged for several frames until the IDR lands, so requesting
+// every frame would flood the control stream.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_request_keyframe(const PunktfunkConnection *c);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

@@ -41,6 +41,7 @@ final class StreamPump {
 
         let thread = Thread {
             var format: CMVideoFormatDescription?
+            var lastKeyframeRequest = Date.distantPast
             while token.isLive {
                 do {
                     guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
@@ -49,13 +50,19 @@ final class StreamPump {
                         format = f // refreshed on every IDR (mode changes included)
                     }
                     if layer.status == .failed {
-                        // Decode wedged: flush and re-gate on the next in-band parameter
-                        // sets — resuming with a delta frame can't recover. (A
-                        // request-IDR channel on punktfunk/1 is a host-side TODO; with the
-                        // host's infinite GOP this may otherwise stay black until the
-                        // next recovery keyframe.)
+                        // Decode wedged: flush and re-gate on the next in-band parameter sets
+                        // (resuming with a delta frame can't recover), AND ask the host for a
+                        // fresh IDR. With the host's infinite GOP the next keyframe could be
+                        // far off, so without the request the picture stays frozen — the
+                        // intermittent first-connect freeze. Throttled: the layer stays .failed
+                        // across several polls until the IDR lands, and one request suffices.
                         layer.flush()
                         format = AnnexB.formatDescription(fromIDR: au.data)
+                        let now = Date()
+                        if now.timeIntervalSince(lastKeyframeRequest) > 0.25 {
+                            connection.requestKeyframe()
+                            lastKeyframeRequest = now
+                        }
                     }
                     guard let f = format,
                           let sample = AnnexB.sampleBuffer(au: au, format: f),

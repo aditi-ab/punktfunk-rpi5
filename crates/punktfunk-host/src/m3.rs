@@ -28,7 +28,7 @@ use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
     endpoint, io, ClockEcho, ClockProbe, Hello, PairChallenge, PairProof, PairRequest, PairResult,
-    ProbeRequest, ProbeResult, Reconfigure, Reconfigured, Start, Welcome,
+    ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, Start, Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
@@ -578,6 +578,7 @@ async fn serve_session(
     // hands back a ProbeResult that this task writes to the client. The two control directions
     // (inbound requests, outbound probe results) are multiplexed with `select!`.
     let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<punktfunk_core::Mode>();
+    let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel::<()>();
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
     let (probe_result_tx, mut probe_result_rx) =
         tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
@@ -606,6 +607,14 @@ async fn serve_session(
                             break;
                         }
                         if ok && reconfig_tx.send(req.mode).is_err() {
+                            break; // data plane gone
+                        }
+                    } else if RequestKeyframe::decode(&msg).is_ok() {
+                        // Client recovery: its decoder wedged — force the next encoded frame to
+                        // be an IDR. Coalesced in the encode loop (a wedge fires several before
+                        // the IDR lands); a send error just means the data plane is gone.
+                        tracing::debug!("client requested keyframe (decode recovery)");
+                        if keyframe_tx.send(()).is_err() {
                             break; // data plane gone
                         }
                     } else if let Ok(req) = ProbeRequest::decode(&msg) {
@@ -782,6 +791,7 @@ async fn serve_session(
                         seconds,
                         stop_stream,
                         &reconfig_rx,
+                        &keyframe_rx,
                         compositor,
                         bitrate_kbps,
                         probe_rx,
@@ -1688,6 +1698,7 @@ fn virtual_stream(
     seconds: u32,
     stop: Arc<AtomicBool>,
     reconfig: &std::sync::mpsc::Receiver<punktfunk_core::Mode>,
+    keyframe: &std::sync::mpsc::Receiver<()>,
     compositor: crate::vdisplay::Compositor,
     bitrate_kbps: u32,
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
@@ -1761,6 +1772,18 @@ fn virtual_stream(
                         "mode-switch rebuild failed — staying on the current mode");
                 }
             }
+        }
+        // Client recovery: it asked for a fresh IDR (its decoder wedged on the cold opening
+        // GOP). Coalesce the backlog — several requests fire before the IDR lands — and force
+        // the next encoded frame to be a keyframe. (A reconfig rebuild above already opens with
+        // an IDR, so this is for the steady-state wedge, not mode switches.)
+        let mut want_kf = false;
+        while keyframe.try_recv().is_ok() {
+            want_kf = true;
+        }
+        if want_kf {
+            tracing::debug!("forcing keyframe (client decode recovery)");
+            enc.request_keyframe();
         }
         if let Some(f) = capturer.try_latest().context("capture")? {
             frame = f;
