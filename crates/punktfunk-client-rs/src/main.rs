@@ -45,8 +45,7 @@ use punktfunk_core::config::Role;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::FLAG_PROBE;
 use punktfunk_core::quic::{
-    endpoint, io, ClockEcho, ClockProbe, Hello, ProbeRequest, ProbeResult, Reconfigure,
-    Reconfigured, Start, Welcome,
+    endpoint, io, Hello, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, Start, Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::{CompositorPref, Mode, PunktfunkError, Session};
@@ -332,40 +331,6 @@ fn discover(secs: u64) -> Result<()> {
     Ok(())
 }
 
-/// Run the wall-clock skew handshake: `ROUNDS` `ClockProbe`/`ClockEcho` round-trips on the control
-/// stream, returning the host−client clock offset (ns) from the minimum-RTT sample, or `None` if the
-/// host never answers (an old host — the caller then assumes a shared clock). Each read is bounded so
-/// a silent old host can't wedge session start.
-async fn clock_sync(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) -> Option<i64> {
-    const ROUNDS: usize = 8;
-    let read_timeout = std::time::Duration::from_secs(2);
-    let mut samples: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        let t1 = now_ns();
-        let probe = ClockProbe { t1_ns: t1 }.encode();
-        if io::write_msg(send, &probe).await.is_err() {
-            break;
-        }
-        let read = tokio::time::timeout(read_timeout, io::read_msg(recv)).await;
-        let echo = match read {
-            Ok(Ok(b)) => match ClockEcho::decode(&b) {
-                Ok(e) => e,
-                Err(_) => break, // not a ClockEcho -> give up on skew
-            },
-            _ => break, // timeout or stream error -> old host / no skew support
-        };
-        samples.push((echo.t1_ns, echo.t2_ns, echo.t3_ns, now_ns()));
-    }
-    let (offset, rtt) = punktfunk_core::quic::clock_offset_ns(&samples)?;
-    tracing::info!(
-        offset_ns = offset,
-        rtt_us = rtt / 1000,
-        rounds = samples.len(),
-        "clock skew estimated (host-client); latency now cross-machine valid"
-    );
-    Some(offset)
-}
-
 async fn session(args: Args) -> Result<()> {
     let remote: std::net::SocketAddr = args.connect.parse().context("--connect host:port")?;
     let identity = load_or_create_identity()?;
@@ -430,7 +395,18 @@ async fn session(args: Args) -> Result<()> {
     // Wall-clock skew handshake on the still-private control stream (before --remode/--speed-test
     // take it): align our clock to the host's so the per-frame capture→reassembled latency is valid
     // across machines. `None` ⇒ an old host that doesn't answer — fall back to a shared clock (0).
-    let clock_offset_ns = clock_sync(&mut send, &mut recv).await;
+    let clock_offset_ns = match punktfunk_core::quic::clock_sync(&mut send, &mut recv).await {
+        Some(skew) => {
+            tracing::info!(
+                offset_ns = skew.offset_ns,
+                rtt_us = skew.rtt_ns / 1000,
+                rounds = skew.rounds,
+                "clock skew estimated (host-client); latency now cross-machine valid"
+            );
+            Some(skew.offset_ns)
+        }
+        None => None,
+    };
 
     // Speed-test accumulators: the data-plane loop folds each FLAG_PROBE filler AU in here; the
     // --speed-test reporter below reads them once the host's ProbeResult lands. first/last hold

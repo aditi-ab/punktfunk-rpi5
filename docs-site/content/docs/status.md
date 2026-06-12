@@ -29,6 +29,10 @@ All three appliances advertise over mDNS (`_punktfunk._udp`) and require PIN pai
 ## Progress log
 
 ### 2026-06-12
+- **Skew handshake in the connector + C ABI** — `quic::clock_sync` is now a shared core helper used
+  by both the reference client and `NativeClient`; the connector runs it at connect and exposes the
+  host clock offset over the C ABI (`punktfunk_connection_clock_offset_ns`). This is the substrate
+  the Apple client needs for the decode→present (glass-to-glass) term.
 - **Wall-clock skew handshake** (`ClockProbe`/`ClockEcho`, 8 NTP rounds after `Start`) — makes the
   client's capture→reassembled latency valid **cross-machine**. Validated GNOME box → dev box:
   offset −1.57 ms removed, **p50 1.30 ms** skew-corrected. (`05bc9ab`)

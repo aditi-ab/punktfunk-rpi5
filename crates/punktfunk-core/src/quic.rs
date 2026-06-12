@@ -1005,6 +1005,59 @@ pub mod io {
     }
 }
 
+/// One wall-clock skew-handshake outcome (see [`clock_sync`]).
+pub struct ClockSkew {
+    /// Host clock minus client clock, ns: add it to a client timestamp to express it in host time.
+    pub offset_ns: i64,
+    /// Round-trip time of the minimum-RTT sample, ns.
+    pub rtt_ns: u64,
+    /// How many probe rounds the host answered.
+    pub rounds: usize,
+}
+
+/// Run the wall-clock skew handshake from the client side over the (already-open) control stream:
+/// `ROUNDS` [`ClockProbe`]/[`ClockEcho`] round-trips, returning the host↔client offset from the
+/// minimum-RTT sample. `None` if the host never answers (an old host) — the caller then assumes a
+/// shared clock. Each read is bounded so a silent host can't wedge session start. Shared by the
+/// reference client and the embeddable connector; uses the realtime clock the host stamps `pts_ns`
+/// with, so the offset aligns a client receive instant to the host's capture clock.
+pub async fn clock_sync(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+) -> Option<ClockSkew> {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    fn now_ns() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+    const ROUNDS: usize = 8;
+    let read_timeout = Duration::from_secs(2);
+    let mut samples: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let t1 = now_ns();
+        let probe = ClockProbe { t1_ns: t1 }.encode();
+        if io::write_msg(send, &probe).await.is_err() {
+            break;
+        }
+        let read = tokio::time::timeout(read_timeout, io::read_msg(recv)).await;
+        let echo = match read {
+            Ok(Ok(b)) => match ClockEcho::decode(&b) {
+                Ok(e) => e,
+                Err(_) => break,
+            },
+            _ => break, // timeout or stream error -> old host / no skew support
+        };
+        samples.push((echo.t1_ns, echo.t2_ns, echo.t3_ns, now_ns()));
+    }
+    clock_offset_ns(&samples).map(|(offset_ns, rtt_ns)| ClockSkew {
+        offset_ns,
+        rtt_ns,
+        rounds: samples.len(),
+    })
+}
+
 /// quinn endpoint constructors. Host: self-signed identity (fresh, or persisted PEMs via
 /// [`endpoint::server_with_identity`]). Client: fingerprint pinning / TOFU via
 /// [`endpoint::client_pinned`] ([`endpoint::client_insecure`] is the no-pin special case).

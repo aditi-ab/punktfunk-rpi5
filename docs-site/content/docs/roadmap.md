@@ -306,11 +306,14 @@ buffer; `sendmmsg`/`recvmmsg` batching; the capture-timestamp anchor placement.
   **across machines** (reported `skew_corrected=true`), not just same-host. Back-compat: an old host
   that doesn't answer times out → `skew_corrected=false` (shared-clock assumption, as before).
   Validated cross-LAN (GNOME box → dev box): offset ≈ −1.57 ms (reproducible), rtt ~140 µs, **p50
-  1.30 ms** skew-corrected capture→reassembled. **Remaining for true glass-to-glass**: the **client
-  present-stamp** (decode→present term) — only the Apple client presents today, so it needs the
-  connector to expose the offset + an Apple present-time probe; and the **render→capture** term
-  (PipeWire buffer presentation timestamp vs our capture stamp). `tools/latency-probe` is still the
-  cross-machine orchestrator.
+  1.30 ms** skew-corrected capture→reassembled. The skew handshake is now a shared core helper
+  (`quic::clock_sync` → `ClockSkew`) used by both the reference client and the **embeddable
+  connector** — `NativeClient` runs it at connect and exposes the offset over the C ABI
+  (`punktfunk_connection_clock_offset_ns`), so the Apple client can convert a present instant to the
+  host clock. **Remaining for true glass-to-glass**: (1) the **Apple client present-stamp**
+  (decode→present) — Swift: stamp `AVSampleBufferDisplayLayer`/presenter time, add the C-ABI offset,
+  subtract the AU `pts_ns`; (2) the host **render→capture** term (PipeWire buffer presentation
+  timestamp vs our capture stamp). `tools/latency-probe` is still the cross-machine orchestrator.
 - **Bigger bets (ordered, deferred — need real-NIC/GPU/Mac validation):**
   1. **CUDA stream+event** to drop one of two redundant `cuCtxSynchronize` in `submit_cuda` (keep the
      copy) — ~0.1–0.4 ms@720p, ~1 ms@5K; only if per-stage timing proves the sync is on the path.

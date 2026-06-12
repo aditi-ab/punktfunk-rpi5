@@ -798,6 +798,21 @@ PunktfunkStatus punktfunk_connection_bitrate(const PunktfunkConnection *c, uint3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// The host↔client wall-clock offset (nanoseconds, **host minus client**) measured by the
+// connect-time skew handshake. Add it to a local receive/present timestamp (same realtime clock,
+// `CLOCK_REALTIME` / `gettimeofday`-epoch nanoseconds) to express that instant in the host's
+// capture clock — the clock the per-access-unit `pts_ns` is stamped in — so glass-to-glass latency
+// (e.g. present-time minus `pts_ns`) is valid across machines. `0` = no correction: either an older
+// host that didn't answer the handshake, or genuinely synchronized clocks. Safe any time after
+// connect.
+//
+// # Safety
+// `c` is a valid connection handle; `offset_ns` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_clock_offset_ns(const PunktfunkConnection *c,
+                                                     int64_t *offset_ns);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Ask the host to switch the live session to `width`x`height`@`refresh_hz` without
 // reconnecting (window resized, refresh changed). Non-blocking enqueue: on acceptance the
 // stream continues at the new mode — the first new-mode access unit is an IDR with

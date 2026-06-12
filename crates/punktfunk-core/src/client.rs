@@ -35,9 +35,10 @@ enum CtrlRequest {
 }
 
 /// What the worker reports to [`NativeClient::connect`] once the handshake lands: the negotiated
-/// mode, the host-resolved gamepad backend, the host's certificate fingerprint, and the resolved
-/// encoder bitrate (kbps).
-type Negotiated = (Mode, GamepadPref, [u8; 32], u32);
+/// mode, the host-resolved gamepad backend, the host's certificate fingerprint, the resolved
+/// encoder bitrate (kbps), and the host↔client clock offset (ns, host minus client; 0 = no skew
+/// correction / an old host that didn't answer the handshake).
+type Negotiated = (Mode, GamepadPref, [u8; 32], u32, i64);
 
 /// Accumulated state of an in-flight / finished speed test. The data-plane pump folds each
 /// received [`FLAG_PROBE`] access unit in; the control task records the host's [`ProbeResult`]
@@ -136,6 +137,11 @@ pub struct NativeClient {
     /// requested rate clamped to the host's range, or its default if we requested `0`. `0` = an
     /// older host that didn't report it.
     pub resolved_bitrate_kbps: u32,
+    /// Host clock minus client clock (ns), from the connect-time skew handshake. Add it to a local
+    /// receive/present timestamp to express it in the host's capture clock (the AU `pts_ns`), making
+    /// glass-to-glass latency valid across machines. `0` = no correction (an old host that didn't
+    /// answer, or genuinely synced clocks).
+    pub clock_offset_ns: i64,
 }
 
 impl NativeClient {
@@ -218,7 +224,7 @@ impl NativeClient {
             })
             .map_err(PunktfunkError::Io)?;
 
-        let (negotiated, resolved_gamepad, fingerprint, resolved_bitrate_kbps) =
+        let (negotiated, resolved_gamepad, fingerprint, resolved_bitrate_kbps, clock_offset_ns) =
             match ready_rx.recv_timeout(timeout) {
                 Ok(Ok(t)) => t,
                 Ok(Err(e)) => return Err(e),
@@ -244,6 +250,7 @@ impl NativeClient {
             host_fingerprint: fingerprint,
             resolved_gamepad,
             resolved_bitrate_kbps,
+            clock_offset_ns,
         })
     }
 
@@ -604,6 +611,23 @@ async fn worker_main(args: WorkerArgs) {
         )
         .await?;
 
+        // Wall-clock skew handshake on the control stream (before the session's control task takes
+        // it): align our clock to the host's so the embedder can express receive/present instants in
+        // the host's capture clock (the AU `pts_ns`). 0 ⇒ an old host that didn't answer (shared-clock
+        // assumption, as before). This is the substrate for glass-to-glass present-time measurement.
+        let clock_offset_ns = match crate::quic::clock_sync(&mut send, &mut recv).await {
+            Some(skew) => {
+                tracing::info!(
+                    offset_ns = skew.offset_ns,
+                    rtt_us = skew.rtt_ns / 1000,
+                    rounds = skew.rounds,
+                    "clock skew estimated (host-client)"
+                );
+                skew.offset_ns
+            }
+            None => 0,
+        };
+
         let host_udp = std::net::SocketAddr::new(remote.ip(), welcome.udp_port);
         let transport =
             UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())?;
@@ -617,6 +641,7 @@ async fn worker_main(args: WorkerArgs) {
             welcome.gamepad,
             fingerprint,
             welcome.bitrate_kbps,
+            clock_offset_ns,
         ))
     };
 
@@ -629,6 +654,7 @@ async fn worker_main(args: WorkerArgs) {
         resolved_gamepad,
         fingerprint,
         resolved_bitrate_kbps,
+        clock_offset_ns,
     ) = match setup.await {
         Ok(t) => t,
         Err(e) => {
@@ -641,6 +667,7 @@ async fn worker_main(args: WorkerArgs) {
         resolved_gamepad,
         fingerprint,
         resolved_bitrate_kbps,
+        clock_offset_ns,
     )));
 
     // Input task: embedder events → QUIC datagrams.
