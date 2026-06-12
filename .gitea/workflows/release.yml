@@ -139,17 +139,19 @@ jobs:
             <key>method</key><string>developer-id</string>
             <key>teamID</key><string>$TEAM_ID</string>
             <key>destination</key><string>export</string>
+            <!-- Manual + explicit cert: with -allowProvisioningUpdates Xcode prefers
+                 CLOUD-managed Developer ID signing, which the App-Manager-role API key
+                 can't do ("Cloud signing permission error") and it never falls back to
+                 the perfectly valid local identity. -->
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Developer ID Application</string>
           </dict>
           </plist>
           EOF
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/Punktfunk-macos.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/export-devid.plist" \
-            -exportPath "$RUNNER_TEMP/export-devid" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
-            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
-            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
+            -exportPath "$RUNNER_TEMP/export-devid"
 
       - name: Notarized DMG
         run: |
