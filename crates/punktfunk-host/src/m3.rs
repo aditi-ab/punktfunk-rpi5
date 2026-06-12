@@ -27,8 +27,8 @@ use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, 
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
-    endpoint, io, Hello, PairChallenge, PairProof, PairRequest, PairResult, ProbeRequest,
-    ProbeResult, Reconfigure, Reconfigured, Start, Welcome,
+    endpoint, io, ClockEcho, ClockProbe, Hello, PairChallenge, PairProof, PairRequest, PairResult,
+    ProbeRequest, ProbeResult, Reconfigure, Reconfigured, Start, Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
@@ -544,6 +544,19 @@ async fn serve_session(
                         );
                         if probe_tx.send(req).is_err() {
                             break; // data plane gone
+                        }
+                    } else if let Ok(probe) = ClockProbe::decode(&msg) {
+                        // Wall-clock skew handshake: echo the client's t1 with our receive (t2) and
+                        // send (t3) stamps, both in the host clock the AU pts_ns uses. Answered
+                        // inline on the control stream — cheap, no data-plane involvement.
+                        let t2_ns = now_ns();
+                        let echo = ClockEcho {
+                            t1_ns: probe.t1_ns,
+                            t2_ns,
+                            t3_ns: now_ns(),
+                        };
+                        if io::write_msg(&mut ctrl_send, &echo.encode()).await.is_err() {
+                            break;
                         }
                     } else {
                         tracing::warn!("unknown control message — ignoring");

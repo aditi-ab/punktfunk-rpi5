@@ -50,7 +50,11 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   **Mid-stream mode renegotiation**: `Reconfigure` on the still-open control stream — the
   host rebuilds output+encoder at the new mode in ~90 ms while the data plane runs on
   (validated live: one .h265 with 720p and 1080p segments). Measured on-box at 720p120: 1680/1680 frames, **p50 0.83 ms**
-  capture→…→reassembled; audio measured live (~200 pkts/s). `punktfunk-client-rs` is the
+  capture→…→reassembled; audio measured live (~200 pkts/s). A **wall-clock skew handshake**
+  (`ClockProbe`/`ClockEcho`, 8 NTP rounds after `Start`, `clock_offset_ns`) aligns the client to the
+  host clock, so that latency is now valid **cross-machine** (`skew_corrected=true`) — measured GNOME
+  box → dev box over the LAN: **p50 1.30 ms** (the −1.57 ms inter-box clock offset removed).
+  `punktfunk-client-rs` is the
   working reference client (`--pin`, datagram counters, `--input-test` incl. gamepad).
   The embeddable connector (`NativeClient`) exposes it all over the C ABI: `punktfunk_connect`
   (pin/TOFU) + `next_au`/`next_audio`/`next_rumble`/`next_hidout`/`send_input`/

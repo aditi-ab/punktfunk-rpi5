@@ -144,6 +144,44 @@ pub struct ProbeResult {
     pub duration_ms: u32,
 }
 
+/// `client → host`, right after [`Start`]: one round of the wall-clock skew handshake. The client
+/// stamps `t1_ns` (its monotonic-since-epoch clock) and sends; the host echoes it in [`ClockEcho`]
+/// with its own receive/send stamps. A few rounds let the client estimate the host↔client clock
+/// offset, so the per-frame `capture→reassembled` latency (the AU `pts_ns` is the host's capture
+/// clock) is meaningful across machines, not just same-host. An old host ignores it (the client
+/// times out and assumes a shared clock).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClockProbe {
+    pub t1_ns: u64,
+}
+
+/// `host → client`: answer to [`ClockProbe`]. `t2_ns` is when the host received the probe and
+/// `t3_ns` when it sent this echo (both the host clock); `t1_ns` is the client's send stamp echoed
+/// back. With the client's receive time `t4`, offset = ((t2−t1)+(t3−t4))/2 (host minus client) and
+/// RTT = (t4−t1)−(t3−t2). See [`clock_offset_ns`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClockEcho {
+    pub t1_ns: u64,
+    pub t2_ns: u64,
+    pub t3_ns: u64,
+}
+
+/// Estimate the host↔client clock offset (**host minus client**, ns) and RTT (ns) from skew-handshake
+/// samples `(t1, t2, t3, t4)` — NTP's formula, taking the **minimum-RTT** sample (least queuing
+/// noise; also discards the first round's host-setup latency). Offset is positive when the host
+/// clock is ahead of the client's; add it to a client timestamp to express it in the host clock.
+/// Returns `None` for an empty sample set.
+pub fn clock_offset_ns(samples: &[(u64, u64, u64, u64)]) -> Option<(i64, u64)> {
+    samples
+        .iter()
+        .map(|&(t1, t2, t3, t4)| {
+            let rtt = ((t4 as i128 - t1 as i128) - (t3 as i128 - t2 as i128)).max(0) as u64;
+            let offset = (((t2 as i128 - t1 as i128) + (t3 as i128 - t4 as i128)) / 2) as i64;
+            (offset, rtt)
+        })
+        .min_by_key(|&(_, rtt)| rtt)
+}
+
 /// Type byte of [`Reconfigure`] (first byte after the magic).
 pub const MSG_RECONFIGURE: u8 = 0x01;
 /// Type byte of [`Reconfigured`].
@@ -152,6 +190,10 @@ pub const MSG_RECONFIGURED: u8 = 0x02;
 pub const MSG_PROBE_REQUEST: u8 = 0x20;
 /// Type byte of [`ProbeResult`].
 pub const MSG_PROBE_RESULT: u8 = 0x21;
+/// Type byte of [`ClockProbe`].
+pub const MSG_CLOCK_PROBE: u8 = 0x30;
+/// Type byte of [`ClockEcho`].
+pub const MSG_CLOCK_ECHO: u8 = 0x31;
 
 // ---------------------------------------------------------------------------------------------
 // Pairing ceremony (typed control messages): instead of a session Hello, a client may open
@@ -664,6 +706,50 @@ impl ProbeResult {
             bytes_sent: u64::from_le_bytes(b[5..13].try_into().unwrap()),
             packets_sent: u32::from_le_bytes(b[13..17].try_into().unwrap()),
             duration_ms: u32::from_le_bytes(b[17..21].try_into().unwrap()),
+        })
+    }
+}
+
+impl ClockProbe {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] t1[5..13]
+        let mut b = Vec::with_capacity(13);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_CLOCK_PROBE);
+        b.extend_from_slice(&self.t1_ns.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ClockProbe> {
+        if b.len() != 13 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLOCK_PROBE {
+            return Err(PunktfunkError::InvalidArg("bad ClockProbe"));
+        }
+        Ok(ClockProbe {
+            t1_ns: u64::from_le_bytes(b[5..13].try_into().unwrap()),
+        })
+    }
+}
+
+impl ClockEcho {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] t1[5..13] t2[13..21] t3[21..29]
+        let mut b = Vec::with_capacity(29);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_CLOCK_ECHO);
+        b.extend_from_slice(&self.t1_ns.to_le_bytes());
+        b.extend_from_slice(&self.t2_ns.to_le_bytes());
+        b.extend_from_slice(&self.t3_ns.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ClockEcho> {
+        if b.len() != 29 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLOCK_ECHO {
+            return Err(PunktfunkError::InvalidArg("bad ClockEcho"));
+        }
+        Ok(ClockEcho {
+            t1_ns: u64::from_le_bytes(b[5..13].try_into().unwrap()),
+            t2_ns: u64::from_le_bytes(b[13..21].try_into().unwrap()),
+            t3_ns: u64::from_le_bytes(b[21..29].try_into().unwrap()),
         })
     }
 }
@@ -1432,6 +1518,48 @@ mod tests {
         assert!(ProbeRequest::decode(&res.encode()).is_err());
         assert!(Reconfigure::decode(&req.encode()).is_err());
         assert!(ProbeResult::decode(&req.encode()).is_err());
+    }
+
+    #[test]
+    fn clock_messages_roundtrip() {
+        let probe = ClockProbe {
+            t1_ns: 1_700_000_000_123,
+        };
+        assert_eq!(ClockProbe::decode(&probe.encode()).unwrap(), probe);
+        let echo = ClockEcho {
+            t1_ns: 1_700_000_000_123,
+            t2_ns: 1_700_000_050_456,
+            t3_ns: 1_700_000_050_789,
+        };
+        assert_eq!(ClockEcho::decode(&echo.encode()).unwrap(), echo);
+        // Disjoint from the other control messages (distinct type bytes).
+        assert!(ClockProbe::decode(&echo.encode()).is_err());
+        assert!(ProbeRequest::decode(&probe.encode()).is_err());
+        assert!(ClockEcho::decode(&probe.encode()).is_err());
+    }
+
+    #[test]
+    fn clock_offset_picks_min_rtt_and_recovers_offset() {
+        // Host clock is +1_000_000 ns ahead of the client. Construct samples where a symmetric
+        // round-trip recovers exactly that offset, and a noisy (asymmetric, high-RTT) sample is
+        // present but must be ignored by the min-RTT selection.
+        const OFF: i64 = 1_000_000;
+        // Clean sample: client t1=0, one-way=200µs each way → t2 = t1 + 200_000 + OFF (host clock),
+        // t3 = t2 + 50_000 (host processing), t4 = t3 - OFF + 200_000 (back in client clock).
+        let t1 = 0u64;
+        let t2 = (t1 as i64 + 200_000 + OFF) as u64;
+        let t3 = t2 + 50_000;
+        let t4 = (t3 as i64 - OFF + 200_000) as u64;
+        // Noisy sample: same offset but a fat, asymmetric RTT (slow return path) — higher RTT.
+        let n1 = 1_000_000u64;
+        let n2 = (n1 as i64 + 200_000 + OFF) as u64;
+        let n3 = n2 + 50_000;
+        let n4 = (n3 as i64 - OFF + 5_000_000) as u64; // 5 ms return → big RTT
+        let (offset, rtt) =
+            clock_offset_ns(&[(n1, n2, n3, n4), (t1, t2, t3, t4)]).expect("non-empty");
+        assert_eq!(offset, OFF, "min-RTT sample recovers the offset exactly");
+        assert_eq!(rtt, 400_000, "min-RTT sample's RTT (2x200us), not the noisy 5ms one");
+        assert!(clock_offset_ns(&[]).is_none());
     }
 
     #[test]

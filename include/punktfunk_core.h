@@ -167,6 +167,16 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ClockProbe`].
+#define MSG_CLOCK_PROBE 48
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`ClockEcho`].
+#define MSG_CLOCK_ECHO 49
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`PairRequest`].
 #define MSG_PAIR_REQUEST 16
 #endif
