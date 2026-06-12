@@ -48,7 +48,9 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
         Backend::Libei => {
             #[cfg(target_os = "linux")]
             {
-                Ok(Box::new(libei::LibeiInjector::open()?))
+                Ok(Box::new(
+                    libei::LibeiInjector::open_with(libei_ei_source())?,
+                ))
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -102,6 +104,25 @@ pub fn default_backend() -> Backend {
         Backend::Libei
     } else {
         Backend::WlrVirtual
+    }
+}
+
+/// How the libei backend reaches its EIS server. KWin goes through the `RemoteDesktop` *portal*
+/// (with a pre-seeded grant), but GNOME's portal `Start()` needs an interactive approval a
+/// headless host can't answer — so GNOME goes straight to Mutter's *direct* RemoteDesktop EIS
+/// (`org.gnome.Mutter.RemoteDesktop`), the same direct API the Mutter video backend uses.
+#[cfg(target_os = "linux")]
+fn libei_ei_source() -> libei::EiSource {
+    let gnome = std::env::var("PUNKTFUNK_COMPOSITOR")
+        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("mutter"))
+        || std::env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .to_ascii_uppercase()
+            .contains("GNOME");
+    if gnome {
+        libei::EiSource::MutterEis
+    } else {
+        libei::EiSource::Portal
     }
 }
 

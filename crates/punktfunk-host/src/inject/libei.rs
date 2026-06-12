@@ -27,10 +27,12 @@ use ashpd::desktop::{
     },
     CreateSessionOptions, PersistMode,
 };
+use ashpd::zbus;
 use futures_util::StreamExt;
 use punktfunk_core::input::{InputEvent, InputKind};
 use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
+use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -41,8 +43,14 @@ const SCROLL_HORIZONTAL: u32 = 1;
 /// Where to find the EIS server.
 #[derive(Clone, Debug)]
 pub enum EiSource {
-    /// `org.freedesktop.portal.RemoteDesktop` (KWin, GNOME/Mutter).
+    /// `org.freedesktop.portal.RemoteDesktop` via `ashpd` (KWin — a pre-seeded grant avoids the
+    /// approval dialog).
     Portal,
+    /// Mutter's *direct* `org.gnome.Mutter.RemoteDesktop` EIS (GNOME). Unlike the xdg portal, this
+    /// needs no interactive "Allow remote control?" approval — which a headless host can't answer,
+    /// so the portal's `Start()` would just time out. Mirrors how the Mutter *video* backend uses
+    /// the same direct API.
+    MutterEis,
     /// A file containing the EIS socket path/name (gamescope's relayed `LIBEI_SOCKET`); polled
     /// until it appears, since the compositor may still be starting.
     SocketPathFile(std::path::PathBuf),
@@ -101,7 +109,7 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     // Keep `_rd`/`_session` bound for the whole loop — dropping the portal session closes the
     // EIS connection. Bound the setup so a headless approval dialog (un-bypassed grant) can't
     // hang the worker forever.
-    let (_portal, context, mut events) = match tokio::time::timeout(
+    let (_keepalive, context, mut events) = match tokio::time::timeout(
         Duration::from_secs(30),
         connect(source),
     )
@@ -157,22 +165,27 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     }
 }
 
-/// Tie down the verbose tuple the connect step returns. The portal pair must stay alive for
-/// the whole session (dropping it closes the EIS connection); `None` for the direct-socket path.
+/// Tie down the verbose tuple the connect step returns. The keep-alive must stay alive for the
+/// whole session — dropping the portal/Mutter session closes the EIS connection; for the
+/// direct-socket path it's `Box::new(())`.
 type Connected = (
-    Option<(RemoteDesktop, ashpd::desktop::Session<RemoteDesktop>)>,
+    Box<dyn Send>,
     ei::Context,
     reis::tokio::EiConvertEventStream,
 );
 
 /// Reach an EIS server per `source` and run the EI sender handshake.
 async fn connect(source: EiSource) -> Result<Connected> {
-    let (portal, stream) = match source {
+    let (keepalive, stream): (Box<dyn Send>, UnixStream) = match source {
         EiSource::Portal => {
             let (rd, session, fd) = connect_portal().await?;
-            (Some((rd, session)), UnixStream::from(fd))
+            (Box::new((rd, session)), UnixStream::from(fd))
         }
-        EiSource::SocketPathFile(file) => (None, connect_socket_file(&file).await?),
+        EiSource::MutterEis => {
+            let (keepalive, fd) = connect_mutter().await?;
+            (keepalive, UnixStream::from(fd))
+        }
+        EiSource::SocketPathFile(file) => (Box::new(()), connect_socket_file(&file).await?),
     };
     let context = ei::Context::new(stream).map_err(|e| anyhow!("reis EI context: {e}"))?;
     // Bound the handshake. `UnixStream::connect` to a socket *file* succeeds the moment the path
@@ -188,7 +201,7 @@ async fn connect(source: EiSource) -> Result<Connected> {
         anyhow!("EI handshake timed out (EIS server not responding — stale/half-ready socket?)")
     })?
     .map_err(|e| anyhow!("EI handshake: {e}"))?;
-    Ok((portal, context, events))
+    Ok((keepalive, context, events))
 }
 
 /// Open a RemoteDesktop portal session (pointer + keyboard) and obtain the EIS socket fd.
@@ -228,6 +241,50 @@ async fn connect_portal() -> Result<(
         .await
         .map_err(|e| anyhow!("connect_to_eis (RemoteDesktop portal version < 2?): {e}"))?;
     Ok((rd, session, fd))
+}
+
+/// GNOME path: get the EIS socket fd from Mutter's *direct* `org.gnome.Mutter.RemoteDesktop` API
+/// (`CreateSession` → `Start` → `ConnectToEIS`). No xdg portal is involved, so there is no
+/// interactive "Allow remote control?" approval to satisfy — exactly why [`connect_portal`] times
+/// out on a headless GNOME host. (Same direct API the Mutter *video* backend uses.) The returned
+/// keep-alive owns the D-Bus connection + session; dropping it tears the Mutter session down and
+/// closes the EIS connection (Mutter sessions die with their D-Bus connection).
+async fn connect_mutter() -> Result<(Box<dyn Send>, std::os::fd::OwnedFd)> {
+    use zbus::zvariant::{OwnedObjectPath, Value};
+    let conn = zbus::Connection::session()
+        .await
+        .map_err(|e| anyhow!("connect session D-Bus (Mutter RemoteDesktop): {e}"))?;
+    let rd = zbus::Proxy::new(
+        &conn,
+        "org.gnome.Mutter.RemoteDesktop",
+        "/org/gnome/Mutter/RemoteDesktop",
+        "org.gnome.Mutter.RemoteDesktop",
+    )
+    .await
+    .map_err(|e| anyhow!("Mutter RemoteDesktop proxy (is gnome-shell running?): {e}"))?;
+    let session_path: OwnedObjectPath = rd
+        .call("CreateSession", &())
+        .await
+        .map_err(|e| anyhow!("Mutter RemoteDesktop.CreateSession: {e}"))?;
+    let session = zbus::Proxy::new(
+        &conn,
+        "org.gnome.Mutter.RemoteDesktop",
+        session_path,
+        "org.gnome.Mutter.RemoteDesktop.Session",
+    )
+    .await
+    .map_err(|e| anyhow!("Mutter RemoteDesktop.Session proxy: {e}"))?;
+    session
+        .call_method("Start", &())
+        .await
+        .map_err(|e| anyhow!("Mutter RemoteDesktop.Session.Start: {e}"))?;
+    let options: HashMap<&str, Value> = HashMap::new();
+    let fd: zbus::zvariant::OwnedFd = session
+        .call("ConnectToEIS", &(options,))
+        .await
+        .map_err(|e| anyhow!("Mutter RemoteDesktop.Session.ConnectToEIS: {e}"))?;
+    tracing::info!("libei: connected to Mutter's direct RemoteDesktop EIS (no portal approval)");
+    Ok((Box::new((conn, session)), std::os::fd::OwnedFd::from(fd)))
 }
 
 /// Poll `file` for the EIS socket path (the gamescope backend relays `LIBEI_SOCKET` there once
