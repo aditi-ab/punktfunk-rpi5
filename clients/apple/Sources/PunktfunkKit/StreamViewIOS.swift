@@ -45,25 +45,29 @@ public struct StreamView: UIViewControllerRepresentable {
     private let onCaptureChange: ((Bool) -> Void)?
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
     private let onSessionEnd: (@Sendable () -> Void)?
+    private let presentMeter: LatencyMeter?
 
     public init(
         connection: PunktfunkConnection,
         captureEnabled: Bool = true,
         onCaptureChange: ((Bool) -> Void)? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
-        onSessionEnd: (@Sendable () -> Void)? = nil
+        onSessionEnd: (@Sendable () -> Void)? = nil,
+        presentMeter: LatencyMeter? = nil
     ) {
         self.connection = connection
         self.captureEnabled = captureEnabled
         self.onCaptureChange = onCaptureChange
         self.onFrame = onFrame
         self.onSessionEnd = onSessionEnd
+        self.presentMeter = presentMeter
     }
 
     public func makeUIViewController(context: Context) -> StreamViewController {
         let controller = StreamViewController()
         controller.onCaptureChange = onCaptureChange
         controller.captureEnabled = captureEnabled
+        controller.presentMeter = presentMeter
         controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         return controller
     }
@@ -71,6 +75,7 @@ public struct StreamView: UIViewControllerRepresentable {
     public func updateUIViewController(_ controller: StreamViewController, context: Context) {
         controller.onCaptureChange = onCaptureChange
         controller.captureEnabled = captureEnabled
+        controller.presentMeter = presentMeter
         if controller.connection !== connection {
             controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         }
@@ -87,6 +92,12 @@ public final class StreamViewController: UIViewController {
     public private(set) var connection: PunktfunkConnection?
     private var pump: StreamPump?
     private var observers: [NSObjectProtocol] = []
+    /// Stage-2 presenter (opt-in via `punktfunk.presenter`): a CAMetalLayer sublayer driven by a
+    /// CADisplayLink instead of the StreamPump → displayLayer path. nil = stage-1 (default).
+    var presentMeter: LatencyMeter?
+    private var stage2: Stage2Pipeline?
+    private var stage2Link: CADisplayLink?
+    private var metalLayer: CAMetalLayer?
     #if os(iOS)
     private var inputCapture: InputCapture?
     fileprivate var captured = false
@@ -204,11 +215,20 @@ public final class StreamViewController: UIViewController {
         inputCapture = capture
         #endif
 
-        let pump = StreamPump()
-        pump.start(
-            connection: connection, layer: streamView.displayLayer,
-            onFrame: onFrame, onSessionEnd: onSessionEnd)
-        self.pump = pump
+        // Presenter choice — default stage-1 (the known-good AVSampleBufferDisplayLayer). Stage-2
+        // (`punktfunk.presenter == "stage2"`) takes VTDecompressionSession decode + a
+        // CAMetalLayer/display-link present; falls back here if Metal can't be set up.
+        if UserDefaults.standard.string(forKey: "punktfunk.presenter") == "stage2",
+           let meter = presentMeter,
+           let pipeline = Stage2Pipeline(presentMeter: meter) {
+            startStage2(pipeline, connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
+        } else {
+            let pump = StreamPump()
+            pump.start(
+                connection: connection, layer: streamView.displayLayer,
+                onFrame: onFrame, onSessionEnd: onSessionEnd)
+            self.pump = pump
+        }
 
         #if os(iOS)
         // GC only delivers while active; everything held is flushed by InputCapture's
@@ -227,7 +247,7 @@ public final class StreamViewController: UIViewController {
         observers.append(NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self, self.wasCapturedOnResign, self.captureEnabled, self.pump != nil
+            guard let self, self.wasCapturedOnResign, self.captureEnabled, self.connection != nil
             else { return }
             self.setCaptured(true)
         })
@@ -262,13 +282,74 @@ public final class StreamViewController: UIViewController {
         #endif
         pump?.stop()
         pump = nil
+        teardownStage2()
         connection = nil
+    }
+
+    // MARK: - Stage-2 presenter (VTDecompressionSession → CAMetalLayer + display link)
+
+    private func startStage2(
+        _ pipeline: Stage2Pipeline, connection: PunktfunkConnection,
+        onFrame: (@Sendable (AccessUnit) -> Void)?, onSessionEnd: (@Sendable () -> Void)?
+    ) {
+        let metal = pipeline.layer
+        metal.contentsScale = streamView.contentScaleFactor
+        streamView.layer.addSublayer(metal)
+        metalLayer = metal
+        stage2 = pipeline
+        layoutMetalLayer()
+        let link = CADisplayLink(target: self, selector: #selector(stage2Tick(_:)))
+        link.add(to: .main, forMode: .common)
+        stage2Link = link
+        pipeline.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
+    }
+
+    @objc private func stage2Tick(_ link: CADisplayLink) {
+        stage2?.renderTick(
+            targetPresentNs: Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: link.targetTimestamp))
+    }
+
+    public override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        layoutMetalLayer()
+    }
+
+    /// Aspect-fit the metal sublayer in the view (the host streams at the client's native mode,
+    /// so this is usually the full bounds). drawableSize is the layer's pixel size; the shader's
+    /// fullscreen triangle scales the decoded texture to fill it.
+    private func layoutMetalLayer() {
+        guard let metalLayer, let connection else { return }
+        let mode = connection.currentMode()
+        let bounds = streamView.bounds
+        let fit: CGRect = (mode.width > 0 && mode.height > 0)
+            ? AVMakeRect(
+                aspectRatio: CGSize(width: Int(mode.width), height: Int(mode.height)),
+                insideRect: bounds)
+            : bounds
+        let scale = streamView.contentScaleFactor
+        CATransaction.begin()
+        CATransaction.setDisableActions(true) // don't animate the resize
+        metalLayer.contentsScale = scale
+        metalLayer.frame = fit
+        CATransaction.commit()
+        stage2?.setDrawableSize(CGSize(width: fit.width * scale, height: fit.height * scale))
+    }
+
+    private func teardownStage2() {
+        stage2Link?.invalidate()
+        stage2Link = nil
+        stage2?.stop()
+        stage2 = nil
+        metalLayer?.removeFromSuperlayer()
+        metalLayer = nil
     }
 
     #if os(iOS)
     private func setCaptured(_ on: Bool) {
         if on {
-            guard captureEnabled, !captured, pump != nil else { return }
+            // `connection != nil` (not `pump`) is the session-active gate — the stage-2 presenter
+            // runs without a StreamPump.
+            guard captureEnabled, !captured, connection != nil else { return }
             inputCapture?.setForwarding(true)
             captured = true
         } else {

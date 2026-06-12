@@ -17,6 +17,7 @@ struct SettingsView: View {
     @AppStorage("punktfunk.compositor") private var compositor = 0
     @AppStorage("punktfunk.gamepadType") private var gamepadType = 0
     @AppStorage("punktfunk.bitrateKbps") private var bitrateKbps = 0
+    @AppStorage("punktfunk.presenter") private var presenter = "stage1"
     @AppStorage("punktfunk.micEnabled") private var micEnabled = true
     @ObservedObject private var gamepads = GamepadManager.shared
     #if os(macOS)
@@ -88,6 +89,10 @@ struct SettingsView: View {
                 }
                 TVSelectionRow(
                     title: "Compositor", options: compositors, selection: $compositor)
+                TVSelectionRow(
+                    title: "Presenter",
+                    options: [("Stage 1 (default)", "stage1"), ("Stage 2 (experimental)", "stage2")],
+                    selection: $presenter)
                 Text("The host creates a virtual output at exactly this mode — native "
                     + "resolution, no scaling. \(Self.bitrateFooter) A specific compositor "
                     + "is honored only if available on the host.")
@@ -363,6 +368,21 @@ struct SettingsView: View {
                 Text("Which compositor drives the virtual output on the host. A specific "
                     + "choice is honored only if that backend is available there — "
                     + "otherwise the host falls back to auto-detection.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                Picker("Presenter", selection: $presenter) {
+                    Text("Stage 1 (default)").tag("stage1")
+                    Text("Stage 2 (experimental)").tag("stage2")
+                }
+            } header: {
+                Text("Video presenter")
+            } footer: {
+                Text("Stage 1 feeds compressed video to the system display layer (known-good). "
+                    + "Stage 2 decodes explicitly and presents through Metal with a display "
+                    + "link — it adds a capture→present (glass-to-glass) latency line in the HUD "
+                    + "and shortens the present tail. Applies from the next session.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

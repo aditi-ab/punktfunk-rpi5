@@ -61,12 +61,21 @@ final class SessionModel: ObservableObject {
     @Published var latencyP95Ms = 0.0
     @Published var latencyValid = false
     @Published var latencySkewCorrected = false
+    /// Capture→present (glass-to-glass, modulo the host render→capture term) — only the stage-2
+    /// presenter can stamp this (it owns decode + a CAMetalLayer/display-link present). Stays
+    /// invalid under stage-1, where the layer presents internally with no per-frame callback.
+    @Published var presentLatencyP50Ms = 0.0
+    @Published var presentLatencyP95Ms = 0.0
+    @Published var presentLatencyValid = false
+    @Published var presentLatencySkewCorrected = false
     /// Mirrors StreamView's capture state (it owns the input capture; this drives the
     /// HUD's "click to capture" / "⌘⎋ releases" hint).
     @Published var mouseCaptured = false
 
     let meter = FrameMeter()
     let latency = LatencyMeter()
+    /// Fed by the stage-2 presenter's display link (capture→present). Passed to StreamView.
+    let presentLatency = LatencyMeter()
     private var statsTimer: Timer?
     private var audio: SessionAudio?
     private var gamepadCapture: GamepadCapture?
@@ -229,6 +238,14 @@ final class SessionModel: ObservableObject {
                     self.latencyValid = true
                 } else {
                     self.latencyValid = false
+                }
+                if let p = self.presentLatency.drain() {
+                    self.presentLatencyP50Ms = p.p50Ms
+                    self.presentLatencyP95Ms = p.p95Ms
+                    self.presentLatencySkewCorrected = p.skewCorrected
+                    self.presentLatencyValid = true
+                } else {
+                    self.presentLatencyValid = false
                 }
             }
         }

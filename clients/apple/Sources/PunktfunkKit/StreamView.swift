@@ -69,30 +69,35 @@ public struct StreamView: NSViewRepresentable {
     private let onCaptureChange: ((Bool) -> Void)?
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
     private let onSessionEnd: (@Sendable () -> Void)?
+    private let presentMeter: LatencyMeter?
 
     /// `onFrame`/`onSessionEnd` fire on the pump thread — hop to the main actor for UI.
     /// `captureEnabled: false` disables input capture entirely while UI (e.g. a trust
     /// prompt) is layered over the stream; flipping it to true auto-engages capture
     /// once. `onCaptureChange` (main thread) reports engage/release — drive the HUD's
-    /// "click to capture" / "⌘⎋ releases" hint with it.
+    /// "click to capture" / "⌘⎋ releases" hint with it. `presentMeter` records capture→present
+    /// when the stage-2 presenter is active (`punktfunk.presenter == "stage2"`).
     public init(
         connection: PunktfunkConnection,
         captureEnabled: Bool = true,
         onCaptureChange: ((Bool) -> Void)? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
-        onSessionEnd: (@Sendable () -> Void)? = nil
+        onSessionEnd: (@Sendable () -> Void)? = nil,
+        presentMeter: LatencyMeter? = nil
     ) {
         self.connection = connection
         self.captureEnabled = captureEnabled
         self.onCaptureChange = onCaptureChange
         self.onFrame = onFrame
         self.onSessionEnd = onSessionEnd
+        self.presentMeter = presentMeter
     }
 
     public func makeNSView(context: Context) -> StreamLayerView {
         let view = StreamLayerView()
         view.onCaptureChange = onCaptureChange
         view.captureEnabled = captureEnabled
+        view.presentMeter = presentMeter
         view.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         return view
     }
@@ -100,6 +105,7 @@ public struct StreamView: NSViewRepresentable {
     public func updateNSView(_ view: StreamLayerView, context: Context) {
         view.onCaptureChange = onCaptureChange
         view.captureEnabled = captureEnabled
+        view.presentMeter = presentMeter
         // SwiftUI reuses the NSView across state changes — repoint the pump only when the
         // connection identity actually changed.
         if view.connection !== connection {
@@ -115,6 +121,12 @@ public struct StreamView: NSViewRepresentable {
 public final class StreamLayerView: NSView {
     private let displayLayer = AVSampleBufferDisplayLayer()
     private var pump: StreamPump?
+    /// Stage-2 presenter (opt-in via `punktfunk.presenter`): a CAMetalLayer sublayer driven by a
+    /// display link instead of the StreamPump → displayLayer path. nil = stage-1 (default).
+    var presentMeter: LatencyMeter?
+    private var stage2: Stage2Pipeline?
+    private var stage2Link: CADisplayLink?
+    private var metalLayer: CAMetalLayer?
     public private(set) var connection: PunktfunkConnection?
     private let cursorCapture = CursorCapture()
     private var inputCapture: InputCapture?
@@ -191,6 +203,7 @@ public final class StreamLayerView: NSView {
     public override func layout() {
         super.layout()
         attemptPendingCapture() // bounds become real here on first presentation
+        layoutMetalLayer() // keep the stage-2 sublayer aspect-fit to the view
     }
 
     // MARK: - Capture state machine
@@ -296,7 +309,9 @@ public final class StreamLayerView: NSView {
         // A click is explicit intent AND may arrive mid-activation (acceptsFirstMouse:
         // NSApp.isActive / isKeyWindow are still false for the click coming in from
         // another app) — only the auto-engage paths require already-held key status.
-        guard captureEnabled, !captured, pump != nil, window != nil,
+        // `connection != nil` (not `pump`) is the session-active gate — the stage-2 presenter
+        // runs without a StreamPump, and capture must still engage there.
+        guard captureEnabled, !captured, connection != nil, window != nil,
               fromClick || (NSApp.isActive && window?.isKeyWindow == true)
         else { return }
         // If the cursor grab is refused (e.g. the reactivating click arrives before the app is
@@ -416,12 +431,78 @@ public final class StreamLayerView: NSView {
         capture.start()
         inputCapture = capture
 
-        let pump = StreamPump()
-        pump.start(
-            connection: connection, layer: displayLayer,
-            onFrame: onFrame, onSessionEnd: onSessionEnd)
-        self.pump = pump
+        // Presenter choice — default stage-1 (the known-good AVSampleBufferDisplayLayer). Stage-2
+        // (`punktfunk.presenter == "stage2"`) takes explicit VTDecompressionSession decode + a
+        // CAMetalLayer/display-link present; it falls back here if Metal can't be set up.
+        if UserDefaults.standard.string(forKey: "punktfunk.presenter") == "stage2",
+           let meter = presentMeter,
+           let pipeline = Stage2Pipeline(presentMeter: meter) {
+            startStage2(pipeline, connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
+        } else {
+            let pump = StreamPump()
+            pump.start(
+                connection: connection, layer: displayLayer,
+                onFrame: onFrame, onSessionEnd: onSessionEnd)
+            self.pump = pump
+        }
         requestAutoCapture() // entering a session is the deliberate "capture me" moment
+    }
+
+    // MARK: - Stage-2 presenter (VTDecompressionSession → CAMetalLayer + display link)
+
+    private func startStage2(
+        _ pipeline: Stage2Pipeline, connection: PunktfunkConnection,
+        onFrame: (@Sendable (AccessUnit) -> Void)?, onSessionEnd: (@Sendable () -> Void)?
+    ) {
+        let metal = pipeline.layer
+        displayLayer.addSublayer(metal) // contentsScale + frame set in layoutMetalLayer()
+        metalLayer = metal
+        stage2 = pipeline
+        layoutMetalLayer()
+        let link = displayLink(target: self, selector: #selector(stage2Tick(_:)))
+        link.add(to: .main, forMode: .common)
+        stage2Link = link
+        pipeline.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
+    }
+
+    @objc private func stage2Tick(_ link: CADisplayLink) {
+        stage2?.renderTick(
+            targetPresentNs: Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: link.targetTimestamp))
+    }
+
+    /// Aspect-fit the metal sublayer in the view (the host streams at the client's native mode,
+    /// so this is usually the full bounds; it letterboxes a resized window). drawableSize is the
+    /// layer's pixel size — the fullscreen-triangle shader scales the decoded texture to fill it.
+    private func layoutMetalLayer() {
+        guard let metalLayer, let connection else { return }
+        let mode = connection.currentMode()
+        let fit: NSRect = (mode.width > 0 && mode.height > 0)
+            ? AVMakeRect(
+                aspectRatio: CGSize(width: Int(mode.width), height: Int(mode.height)),
+                insideRect: bounds)
+            : bounds
+        let scale = window?.backingScaleFactor ?? 1
+        // No implicit resize animation; refresh contentsScale on a retina↔non-retina move.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        metalLayer.contentsScale = scale
+        metalLayer.frame = fit
+        CATransaction.commit()
+        stage2?.setDrawableSize(CGSize(width: fit.width * scale, height: fit.height * scale))
+    }
+
+    public override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        layoutMetalLayer() // backing scale changed (e.g. moved to a non-retina display)
+    }
+
+    private func teardownStage2() {
+        stage2Link?.invalidate()
+        stage2Link = nil
+        stage2?.stop()
+        stage2 = nil
+        metalLayer?.removeFromSuperlayer()
+        metalLayer = nil
     }
 
     /// Stop pumping (≤ one poll timeout). Does not close the connection — that stays with
@@ -433,6 +514,7 @@ public final class StreamLayerView: NSView {
         inputCapture = nil
         pump?.stop()
         pump = nil
+        teardownStage2()
         connection = nil
     }
 

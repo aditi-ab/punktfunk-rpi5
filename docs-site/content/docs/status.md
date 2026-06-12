@@ -14,7 +14,7 @@ and the design in the [Implementation Plan](/docs/implementation-plan); this pag
 | **M1** — `punktfunk-core` + C ABI (protocol · FEC · crypto) | ✅ complete & hardened |
 | **M2** — GameStream host (Moonlight-compatible) | ✅ working end-to-end; HDR/surround-audio polish open |
 | **M3** — `punktfunk/1` native protocol (QUIC control + UDP data) | ✅ full session planes, validated live |
-| **M4** — native client decode + present (Apple first) | 🟡 stage 1 done (first light); stage-2 presenter next |
+| **M4** — native client decode + present (Apple first) | 🟡 stage 1 live; stage-2 presenter built + decode-tested (opt-in, present needs live validation) |
 
 ## Live on the boxes
 
@@ -75,7 +75,7 @@ All three appliances advertise over mDNS (`_punktfunk._udp`) and require PIN pai
 
 See the [Roadmap](/docs/roadmap) for the ordered list. Near-term:
 - **True glass-to-glass**: Apple client present-stamp (decode→present) + host render→capture term.
-- **Apple stage-2 presenter** (`VTDecompressionSession` → `CAMetalLayer`).
+- **Apple stage-2 presenter** (`VTDecompressionSession` → `CAMetalLayer`) — built + decode-unit-tested + live-validated on glass behind the `punktfunk.presenter` flag (capture→present ~11 ms p50); make it the default after a few resolution/HDR checks.
 - **Mandatory PIN pairing + delegated pairing approval** (an already-paired device approves a new one).
 - **gamescope multi-user isolation** — per-session input/audio so concurrent sessions are independent
   desktops (the shared-desktop multi-view case landed).

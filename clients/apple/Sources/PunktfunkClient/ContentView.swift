@@ -610,7 +610,8 @@ struct ContentView: View {
                     },
                     onSessionEnd: { [weak model] in
                         Task { @MainActor in model?.sessionEnded() }
-                    }
+                    },
+                    presentMeter: model.presentLatency
                 )
                 .overlay(alignment: .topTrailing) {
                     if captureEnabled { hud(conn) }
@@ -632,6 +633,13 @@ struct ContentView: View {
                 // Capture→client-receipt (skew-corrected); excludes the layer's decode+present —
                 // see LatencyMeter. "(same-host)" when the host didn't answer the skew handshake.
                 Text("capture→client \(model.latencyP50Ms, specifier: "%.1f")/\(model.latencyP95Ms, specifier: "%.1f") ms p50/p95\(model.latencySkewCorrected ? "" : " (same-host)")")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            if model.presentLatencyValid {
+                // Capture→present (glass-to-glass, modulo host render→capture) — stage-2 presenter
+                // only; stage-1's layer presents internally with no per-frame stamp.
+                Text("capture→present \(model.presentLatencyP50Ms, specifier: "%.1f")/\(model.presentLatencyP95Ms, specifier: "%.1f") ms p50/p95\(model.presentLatencySkewCorrected ? "" : " (same-host)")")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
             }

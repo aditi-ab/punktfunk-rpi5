@@ -9,6 +9,13 @@ import VideoToolbox
 import XCTest
 @testable import PunktfunkKit
 
+/// Sendable holder for the values the (background-thread) decode callback writes.
+private final class FrameBox: @unchecked Sendable {
+    let lock = NSLock()
+    var frame: ReadyFrame?
+    var error: OSStatus?
+}
+
 final class VideoToolboxRoundTripTests: XCTestCase {
     private let width = 320
     private let height = 240
@@ -57,6 +64,43 @@ final class VideoToolboxRoundTripTests: XCTestCase {
         let pixels = try XCTUnwrap(decoded) // CVImageBuffer and CVPixelBuffer are the same CF type
         XCTAssertEqual(CVPixelBufferGetWidth(pixels), width)
         XCTAssertEqual(CVPixelBufferGetHeight(pixels), height)
+    }
+
+    /// Stage-2 decode half: the same known IDR through `VideoDecoder` — assert its async output
+    /// callback fires with a CVPixelBuffer of the right dimensions, the pts round-trips, and
+    /// decode-completion is stamped.
+    func testVideoDecoderAsyncCallbackDeliversPixels() throws {
+        let (formatDesc, avccSample) = try encodeOneHEVCKeyframe()
+        let annexB = try annexBAU(formatDesc: formatDesc, avccSample: avccSample)
+        let format = try XCTUnwrap(AnnexB.formatDescription(fromIDR: annexB))
+        let au = AccessUnit(data: annexB, ptsNs: 42_000_000, frameIndex: 0, flags: 0)
+
+        let box = FrameBox()
+        let done = DispatchSemaphore(value: 0)
+        let decoder = VideoDecoder(
+            onDecoded: { frame in
+                box.lock.lock(); box.frame = frame; box.lock.unlock()
+                done.signal()
+            },
+            onDecodeError: { status in
+                box.lock.lock(); box.error = status; box.lock.unlock()
+                done.signal()
+            })
+
+        XCTAssertTrue(decoder.decode(au: au, format: format), "frame submit should succeed")
+        XCTAssertEqual(done.wait(timeout: .now() + 10), .success, "the decode callback must fire")
+        decoder.reset()
+
+        box.lock.lock()
+        let frame = box.frame
+        let error = box.error
+        box.lock.unlock()
+        XCTAssertNil(error.map { "decode error \($0)" })
+        let ready = try XCTUnwrap(frame, "the async output callback must deliver a ReadyFrame")
+        XCTAssertEqual(CVPixelBufferGetWidth(ready.pixelBuffer), width)
+        XCTAssertEqual(CVPixelBufferGetHeight(ready.pixelBuffer), height)
+        XCTAssertEqual(ready.ptsNs, 42_000_000, "pts round-trips through the decoder")
+        XCTAssertGreaterThan(ready.decodedNs, 0, "decode-completion is stamped")
     }
 
     // MARK: - encode helpers
