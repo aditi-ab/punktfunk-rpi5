@@ -325,7 +325,13 @@ buffer; `sendmmsg`/`recvmmsg` batching; the capture-timestamp anchor placement.
   compressed samples internally with no per-frame callback, so it needs the **stage-2 presenter**
   (`VTDecompressionSession` decode-completion timestamp + `CAMetalLayer`/display-link present) to
   stamp on-glass present time; (2) the host **render→capture** term (PipeWire buffer presentation
-  timestamp vs our capture stamp). `tools/latency-probe` is still the cross-machine orchestrator.
+  timestamp vs our capture stamp). **render→capture is parked (low priority):** pipewire-rs 0.9.2
+  exposes no per-buffer meta accessor, no raw buffer pointer (`pub(crate)`), and no stream-timing
+  API, so reading `SPA_META_Header.pts` would require introducing raw `spa_sys`/`pw_sys` FFI into the
+  working, perf-critical capture buffer-acquisition — a risky rewrite for the *smallest* g2g term,
+  with KWin/Mutter `Header.pts` support unconfirmed. Glass-to-glass is effectively complete as
+  **capture→present** (the stage-2 presenter measures it). `tools/latency-probe` is still the
+  cross-machine orchestrator.
 - **Bigger bets (ordered, deferred — need real-NIC/GPU/Mac validation):**
   1. **CUDA stream+event** to drop one of two redundant `cuCtxSynchronize` in `submit_cuda` (keep the
      copy) — ~0.1–0.4 ms@720p, ~1 ms@5K; only if per-stage timing proves the sync is on the path.
@@ -356,3 +362,23 @@ GameStream already auto-discovered via mDNS (`_nvstream._tcp`). Now both the uni
   (`pair=optional`); fingerprint + pairing state correct in both.
 - **Next** (not done): wire NWBrowser discovery into the Apple client UI (host picker); the
   host-side contract above is all it needs.
+
+## 14. Concurrent sessions *(shared-desktop multi-view ✅ done; multi-user deferred)*
+
+The host no longer serves one client at a time. The accept loop spawns each session (`JoinSet`),
+bounded by `--max-concurrent` (default 4 — a NVENC bound; overflow waits in the accept queue). Each
+session keeps its own virtual output + NVENC encoder; the host-lifetime input/audio/mic services stay
+shared.
+
+- **Done & live (shared-desktop multi-view):** multiple devices viewing/controlling the **same**
+  desktop on the shared-desktop backends (kwin/mutter/wlroots) — e.g. stream *your* desktop to a
+  laptop + a TV at once; shared input/audio is the correct semantics there. Validated live on the
+  GNOME box: two clients → **two independent Mutter virtual outputs (1280×720 + 1920×1080) streaming
+  simultaneously**. The QUIC handshake stays in the accept loop so a failed handshake doesn't consume
+  a slot or block the next client.
+- **Deferred — gamescope multi-user (independent desktops):** the *other* model — each client its own
+  gamescope instance, with **per-session input + audio + mic** (the multi-user / cloud-gaming case).
+  Researched 2026-06-12 and **parked**: it's a large multi-file refactor (per-instance EIS sockets +
+  a per-session injector + per-session **null-sink audio routing** + per-session mic) for a niche
+  use case, while the common multi-device case is already covered by the multi-view model above. Full
+  research + the plumbing list: [gamescope Multi-User Isolation](/docs/gamescope-multiuser).
