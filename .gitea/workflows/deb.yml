@@ -1,0 +1,82 @@
+# Build the punktfunk-host .deb and publish it to Gitea's Debian package registry, so the
+# Ubuntu hosts get new builds via `apt update && apt upgrade`. Runs inside the same Ubuntu
+# 26.04 rust-ci builder image as ci.yml, so dpkg-shlibdeps pins the runtime lib package names
+# (libavcodec62, libpipewire-0.3-0t64, …) to exactly what the target boxes run.
+#
+# Registry (public, unom org): https://git.unom.io/unom/-/packages
+# Box setup (once):  see packaging/debian/README.md
+#
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (shared with docker.yml).
+name: deb
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  DISTRIBUTION: stable
+  COMPONENT: main
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04
+    container:
+      image: git.unom.io/unom/punktfunk-rust-ci:latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # dpkg-shlibdeps (Depends resolution) + dpkg-deb live in dpkg-dev.
+      - name: dpkg-dev
+        run: apt-get update && apt-get install -y --no-install-recommends dpkg-dev
+
+      # Share ci.yml's cache keys so the release build reuses its registry + target artifacts.
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-target-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-${{ env.rustc }}-
+
+      - name: Build release host
+        run: |
+          git config --global --add safe.directory "$PWD"
+          cargo build --release -p punktfunk-host --locked
+
+      - name: Version
+        # Tag v1.2.3 -> 1.2.3 (a real release); a main push -> 0.0.1~ciN.g<sha>, which sorts
+        # BEFORE 0.0.1 (the '~') yet monotonically increases by run number, so `apt upgrade`
+        # always moves the boxes to the newest main build.
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}" ;;
+            *)            V="0.0.1~ci${GITHUB_RUN_NUMBER}.g${GITHUB_SHA::8}" ;;
+          esac
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "package version $V"
+
+      - name: Build .deb
+        run: VERSION="$VERSION" bash packaging/debian/build-deb.sh
+
+      - name: Publish to the Gitea apt registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          DEB="$(ls dist/*.deb)"
+          echo "uploading $DEB"
+          # PAT owner (enricobuehler), not the push actor — matches docker.yml's registry login.
+          curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
+            "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
+          echo "published $DEB to $OWNER/debian $DISTRIBUTION/$COMPONENT"

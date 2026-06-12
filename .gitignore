@@ -13,3 +13,6 @@ clients/apple/PunktfunkCore.xcframework/
 clients/apple/.swiftpm/
 # Xcode per-user state
 xcuserdata/
+
+# Debian package build output
+/dist/

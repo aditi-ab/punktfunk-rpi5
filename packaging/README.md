@@ -4,6 +4,9 @@ The punktfunk host is Linux-only and links system FFmpeg (NVENC), PipeWire, Opus
 the NVIDIA driver. This directory packages it for the **Fedora Atomic / Bazzite** world
 (rpm-ostree + bootc), where most of those deps are already present.
 
+> 👉 **Ubuntu/Debian hosts** install via `apt` from Gitea's package registry — see
+> [`debian/README.md`](debian/README.md) (`apt update && apt upgrade` for new builds).
+
 > 👉 **End-to-end Bazzite setup walkthrough** (install → udev/group → `host.env` → service →
 > firewall → verify → troubleshooting): [`bazzite/README.md`](bazzite/README.md). This file is the
 > higher-level packaging rationale.
