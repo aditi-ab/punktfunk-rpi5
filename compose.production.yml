@@ -1,0 +1,11 @@
+# Production compose for the deployed punktfunk pieces — runs on home-main-2 under
+# ~/punktfunk-docs (synced there by .gitea/workflows/docker.yml's deploy job; pattern
+# follows unom/website + unom/cms). Caddy on home-reverse-proxy-1 serves
+# docs.punktfunk.unom.io -> home-main-2:3220 (vhost in unom/reverse-proxy).
+name: punktfunk-docs-prod
+services:
+  docs:
+    image: git.unom.io/unom/punktfunk-docs:latest
+    restart: unless-stopped
+    ports:
+      - "3220:3000"

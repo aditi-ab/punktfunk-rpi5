@@ -55,6 +55,17 @@ ssh enricobuehler@192.168.1.135 GITEA_RUNNER_TOKEN=<token> bash -s \
     < scripts/ci/setup-macos-runner.sh
 ```
 
+## Deployment
+
+`docker.yml`'s `deploy-docs` job ships this docs site after every image push: it syncs
+`compose.production.yml` to `~/punktfunk-docs` on **home-main-2** and runs
+`docker compose pull && up -d` there over SSH (same pattern and secret set as
+`unom/website`: `DEPLOY_HOST` / `DEPLOY_USER` / `DEPLOY_PORT` / `DEPLOY_SSH_KEY`, the
+`unom-ci-deploy` key). The container binds host port **3220**; Caddy on
+`home-reverse-proxy-1` serves it as <https://docs.punktfunk.unom.io> (vhost tracked in
+`unom/reverse-proxy`). The host and the web console are NOT deployed — the console
+fronts a punktfunk host's management API on whatever box runs the host.
+
 ## Troubleshooting
 
 - **Mac runner offline** — `ssh <mac> tail -50 '~/ci/act-runner/runner.log'`; restart with

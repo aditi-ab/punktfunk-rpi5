@@ -59,3 +59,42 @@ jobs:
         run: |
           docker push "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}"
           docker push "$REGISTRY/$OWNER/${{ matrix.image }}:latest"
+
+  # Deploy the docs site to home-main-2 (docs.punktfunk.unom.io via Caddy on
+  # home-reverse-proxy-1 -> :3220). Same secret set as unom/website's deploy:
+  # DEPLOY_HOST/DEPLOY_USER/DEPLOY_PORT/DEPLOY_SSH_KEY (the unom-ci-deploy key).
+  deploy-docs:
+    runs-on: ubuntu-24.04
+    needs: build-push
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync compose file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "compose.production.yml"
+          target: "~/punktfunk-docs"
+          overwrite: true
+
+      - name: Pull and start docs
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Token enters via env, never the script text (keeps it out of run logs).
+          envs: REGISTRY_TOKEN
+          script: |
+            set -euo pipefail
+            printf '%s' "$REGISTRY_TOKEN" | docker login git.unom.io -u enricobuehler --password-stdin
+            cd ~/punktfunk-docs
+            docker compose -f compose.production.yml pull docs
+            docker compose -f compose.production.yml up -d --no-build docs
