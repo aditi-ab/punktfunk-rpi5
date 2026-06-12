@@ -172,6 +172,10 @@ public final class StreamViewController: UIViewController {
         self.connection = connection
         loadViewIfNeeded()
         #if os(iOS)
+        // Fresh session: drop any resign/foreground capture-restore state left over from a
+        // prior session (stop() doesn't clear it). Otherwise a stale `true` could later
+        // re-engage capture on a foreground that the new session never asked for.
+        wasCapturedOnResign = false
         // Read the LIVE mode per touch batch — an accepted requestMode() mid-stream
         // changes the letterbox, and touches must follow it.
         streamView.currentHostMode = { [weak connection] in
@@ -247,7 +251,10 @@ public final class StreamViewController: UIViewController {
         observers.append(NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self, self.wasCapturedOnResign, self.captureEnabled, self.connection != nil
+            // inputCapture != nil: don't try to restore before this session's capture is wired
+            // up — setForwarding would silently no-op on the nil handlers and leave input dead.
+            guard let self, self.wasCapturedOnResign, self.captureEnabled,
+                  self.connection != nil, self.inputCapture != nil
             else { return }
             self.setCaptured(true)
         })
