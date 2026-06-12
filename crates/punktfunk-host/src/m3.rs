@@ -159,6 +159,27 @@ pub(crate) async fn serve(opts: M3Options, np: Arc<NativePairing>) -> Result<()>
         "punktfunk/1 host listening (QUIC) — clients pin this fingerprint"
     );
 
+    // mDNS: advertise the native service so clients auto-discover this host (the analogue of the
+    // GameStream _nvstream advert; both run in the unified host). Held for the host's lifetime —
+    // dropping `_advert` unregisters. Best-effort: a discovery failure must not stop streaming
+    // (manual `--connect HOST:PORT` always works), so we log and continue.
+    let _advert = match crate::gamestream::Host::detect() {
+        Ok(h) => crate::discovery::advertise_native(
+            &h.hostname,
+            h.local_ip,
+            opts.port,
+            &fingerprint_hex(&fingerprint),
+            opts.require_pairing,
+            &h.uniqueid,
+        )
+        .map_err(|e| tracing::warn!(error = %format!("{e:#}"), "native mDNS advertise failed (continuing)"))
+        .ok(),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "host detect for mDNS failed (continuing)");
+            None
+        }
+    };
+
     // One audio capturer for the whole host lifetime, handed from session to session
     // (avoids a PipeWire stream setup per session — see AudioCapSlot).
     let audio_cap: AudioCapSlot = Arc::new(std::sync::Mutex::new(None));
@@ -236,10 +257,10 @@ const DEFAULT_BITRATE_KBPS: u32 = 20_000;
 /// above unusable, and a **2 Gbps** ceiling is generous headroom over the 1 Gbps+ target that
 /// GF(2¹⁶) Leopard FEC was built to reach — it lifts the GF(2⁸)/~1 Gbps wall, and at 1 Gbps a frame
 /// is only a few-hundred shards in one block (far under the 65535 limit). Enough for 5K@240 with
-/// margin. Resolved value is echoed in `Welcome::bitrate_kbps`. CAVEAT: the native data plane still
-/// does one `send()` syscall per packet (no `sendmmsg` batching / paced send thread yet), so
-/// sustained multi-hundred-Mbps can show send-buffer drops (counted as `packets_send_dropped`)
-/// until that lands — see the 1 Gbps work in the roadmap.
+/// margin. Resolved value is echoed in `Welcome::bitrate_kbps`. The native data plane batches sends
+/// (`sendmmsg`) and paces each frame on a dedicated send thread (microburst cap), validated to a
+/// clean 1 Gbps with zero send-buffer drops; sustained overruns are still counted as
+/// `packets_send_dropped`.
 const MIN_BITRATE_KBPS: u32 = 500;
 const MAX_BITRATE_KBPS: u32 = 2_000_000;
 

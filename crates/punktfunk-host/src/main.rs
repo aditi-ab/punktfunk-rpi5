@@ -15,6 +15,7 @@
 
 mod audio;
 mod capture;
+mod discovery;
 mod encode;
 mod gamestream;
 mod inject;
@@ -437,6 +438,8 @@ NOTES:
     'portal' needs headless Sway + xdg-desktop-portal-wlr running in this session
     (see docs/linux-setup.md). 'synthetic' needs no capture session and always runs.
     Encoded AUs are written to a playable file AND (unless --no-loopback) fed through a
-    punktfunk_core host→client loopback that reassembles and byte-verifies each one."
+    punktfunk_core host→client loopback that reassembles and byte-verifies each one.
+    Both 'serve --native' and 'm3-host' advertise the native service over mDNS
+    (_punktfunk._udp) for client auto-discovery — 'punktfunk-client-rs --discover' lists them."
     );
 }

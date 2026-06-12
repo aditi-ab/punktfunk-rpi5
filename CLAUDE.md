@@ -43,6 +43,10 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   no offline dictionary attack) establishes mutual trust:
   clients present persistent identities via QUIC client auth, the host stores paired
   fingerprints (`punktfunk1-paired.json`) and can gate sessions with `--require-pairing`.
+  **LAN auto-discovery**: both `serve --native` and `m3-host` advertise the native service over
+  mDNS (`_punktfunk._udp`, `crate::discovery`) with TXT `proto`/`fp`(cert fingerprint to
+  pin)/`pair`(required|optional)/`id`; `punktfunk-client-rs --discover` lists hosts, Apple clients
+  browse the same service via NWBrowser (validated cross-LAN 2026-06-12).
   **Mid-stream mode renegotiation**: `Reconfigure` on the still-open control stream — the
   host rebuilds output+encoder at the new mode in ~90 ms while the data plane runs on
   (validated live: one .h265 with 720p and 1080p segments). Measured on-box at 720p120: 1680/1680 frames, **p50 0.83 ms**

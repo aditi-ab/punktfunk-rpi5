@@ -15,6 +15,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"]
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# LAN host discovery (`--discover`): browse the native `_punktfunk._udp` mDNS service the host
+# advertises (same crate/version the host advertises with).
+mdns-sd = "0.20"
 
 # Linux-only: --mic-test's Opus encoder (libopus). The mic UPLINK itself is portable —
 # only this synthetic-tone test rig needs the encoder.

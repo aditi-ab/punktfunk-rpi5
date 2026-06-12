@@ -1953,6 +1953,7 @@ name = "punktfunk-client-rs"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "mdns-sd",
  "opus",
  "punktfunk-core",
  "quinn",

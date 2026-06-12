@@ -31,8 +31,12 @@
 //! host honors it where available (DualSense needs Linux UHID), else falls back to X-Box 360,
 //! and reports the resolved choice in its Welcome (logged as `session offer … gamepad=…`).
 //!
+//! `--discover [SECS]` browses the LAN for native (`_punktfunk._udp`) hosts the host advertises
+//! over mDNS, prints each (name, addr:port, pairing requirement, cert fingerprint to pin), and
+//! exits without connecting.
+//!
 //! Usage: `punktfunk-client-rs [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE] [--input-test]
-//!         [--pin HEX] [--compositor NAME] [--gamepad NAME]`
+//!         [--pin HEX] [--compositor NAME] [--gamepad NAME] | --discover [SECS]`
 //! (M4 adds VAAPI decode + wgpu present on this skeleton.)
 
 use anyhow::{anyhow, Context, Result};
@@ -75,6 +79,9 @@ struct Args {
     /// `--speed-test KBPS:MS` — after the stream starts, ask the host for a `MS`-millisecond
     /// bandwidth probe burst at `KBPS`, then report measured throughput + loss.
     speed_test: Option<(u32, u32)>,
+    /// `--discover [SECS]` — browse the LAN for native (`_punktfunk._udp`) hosts for `SECS`
+    /// seconds (default 4), print what's found, and exit. No connection is made.
+    discover: Option<u64>,
 }
 
 fn parse_mode(m: &str) -> Option<Mode> {
@@ -191,6 +198,12 @@ fn parse_args() -> Args {
             let (kbps, ms) = s.split_once(':')?;
             Some((kbps.parse().ok()?, ms.parse().ok()?))
         }),
+        // `--discover` may be a bare flag or carry a seconds value (`--discover 8`); only treat
+        // the following token as a count when it parses as a number (else it's the next flag).
+        discover: argv
+            .iter()
+            .any(|a| a == "--discover")
+            .then(|| get("--discover").and_then(|s| s.parse().ok()).unwrap_or(4)),
     }
 }
 
@@ -215,6 +228,10 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<()> {
+    // Discovery mode: browse the LAN for native hosts, print them, and exit (no connection).
+    if let Some(secs) = args.discover {
+        return discover(secs);
+    }
     // Pairing mode: run the PIN ceremony and print the fingerprint to pin, then exit.
     if let Some(pin) = &args.pair {
         let (host, port) = args
@@ -243,6 +260,75 @@ fn run(args: Args) -> Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(session(args))
+}
+
+/// Browse the LAN for native (`_punktfunk._udp`) hosts for `secs` seconds and print them, then
+/// exit — the discovery side of the host's mDNS advert (host crate `discovery.rs`). TXT keys:
+/// `fp` (host cert fingerprint to pin), `pair` (required|optional), `id` (stable host id).
+fn discover(secs: u64) -> Result<()> {
+    use mdns_sd::{ServiceDaemon, ServiceEvent};
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    let daemon = ServiceDaemon::new().context("create mDNS daemon")?;
+    let receiver = daemon
+        .browse("_punktfunk._udp.local.")
+        .context("browse _punktfunk._udp")?;
+    tracing::info!(secs, "browsing for native punktfunk/1 hosts (_punktfunk._udp)…");
+    // One row per host, keyed by the stable uniqueid (falls back to the fullname) so the same
+    // host re-advertising or answering on several interfaces collapses to a single entry.
+    let mut hosts: BTreeMap<String, String> = BTreeMap::new();
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // Timeout == time left to the deadline: an event returns immediately, otherwise the recv
+        // returns Err exactly at the deadline (or if the daemon channel closes) and we stop.
+        match receiver.recv_timeout(remaining) {
+            Ok(ServiceEvent::ServiceResolved(info)) => {
+                let props = info.get_properties();
+                let val = |k: &str| props.get_property_val_str(k).unwrap_or("").to_string();
+                let addr = info
+                    .get_addresses()
+                    .iter()
+                    .next()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let fp = val("fp");
+                let fp_short = fp.get(..16).unwrap_or(fp.as_str());
+                let name = info.get_fullname().split('.').next().unwrap_or("?").to_string();
+                let id = val("id");
+                let key = if id.is_empty() {
+                    info.get_fullname().to_string()
+                } else {
+                    id
+                };
+                let row = format!(
+                    "  {name:<24} {addr}:{:<6} pair={:<9} fp={fp_short}…",
+                    info.get_port(),
+                    val("pair"),
+                );
+                hosts.insert(key, row);
+            }
+            Ok(_) => {} // SearchStarted / ServiceFound / removals — ignore
+            Err(_) => break,
+        }
+    }
+    let _ = daemon.shutdown();
+    if hosts.is_empty() {
+        println!("no native punktfunk/1 hosts found on the LAN ({secs}s)");
+    } else {
+        println!("native punktfunk/1 hosts ({}):", hosts.len());
+        for row in hosts.values() {
+            println!("{row}");
+        }
+        println!(
+            "\nconnect with: punktfunk-client-rs --connect <addr:port> [--pin <fp> | --pair <PIN>]"
+        );
+    }
+    Ok(())
 }
 
 async fn session(args: Args) -> Result<()> {
