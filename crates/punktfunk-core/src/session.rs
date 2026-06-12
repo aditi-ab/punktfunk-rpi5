@@ -158,7 +158,8 @@ impl Session {
     /// batched `sendmmsg`, returning how many the kernel accepted. The rest (`packets.len() - n`)
     /// are counted as send-buffer drops. Call once for the whole frame, or per paced chunk.
     pub fn send_sealed(&self, packets: &[&[u8]]) -> Result<usize> {
-        let sent = self.transport.send_batch(packets)?;
+        // GSO when enabled (UdpTransport/Linux), else sendmmsg — same short-count drop contract.
+        let sent = self.transport.send_gso(packets)?;
         if sent < packets.len() {
             StatsCounters::add(
                 &self.stats.packets_send_dropped,

@@ -33,6 +33,18 @@ pub trait Transport: Send + Sync {
         Ok(sent)
     }
 
+    /// Send a frame's equal-size packets using UDP Generic Segmentation Offload where available:
+    /// one `sendmsg` hands the kernel a big buffer it splits into `gso_size` UDP datagrams, building
+    /// ~1 GSO skb per ≤64 segments instead of one skb per packet. This is the multi-Gbps lever —
+    /// research shows ~2.4× throughput at equal CPU and ~40× fewer syscalls, and that `sendmmsg`
+    /// batching alone is insufficient (it still builds one skb per datagram). The
+    /// [`UdpTransport`](super::UdpTransport) Linux override implements it (opt-in via `PUNKTFUNK_GSO`,
+    /// auto-fallback on any GSO error); the default just delegates to [`send_batch`](Self::send_batch),
+    /// correct for loopback and non-Linux. Same lossy, FEC-protected short-count contract as `send_batch`.
+    fn send_gso(&self, packets: &[&[u8]]) -> std::io::Result<usize> {
+        self.send_batch(packets)
+    }
+
     fn recv(&self) -> std::io::Result<Option<Vec<u8>>>;
 
     /// Receive up to `out.len()` datagrams in as few syscalls as possible, writing each into its
