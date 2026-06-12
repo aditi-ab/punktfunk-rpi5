@@ -382,7 +382,9 @@ fn current_mode(state: &CurrentState, connector: &str) -> Option<(String, i32, i
 }
 
 /// Wait for the virtual output to appear in DisplayConfig (its size follows PipeWire negotiation,
-/// which lands shortly after the node id), then promote it to primary with the physicals kept on.
+/// which lands shortly after the node id), then make it the SOLE primary output (physicals
+/// disabled for the session) so the cursor, windows, and keyboard focus stay on the streamed
+/// surface. Restored on teardown.
 async fn make_virtual_primary(dc: &zbus::Proxy<'_>, mode: Mode, pre: &CurrentState) -> Result<()> {
     let pre_conns = connectors(pre);
     let deadline = Instant::now() + Duration::from_secs(6);
@@ -409,7 +411,7 @@ async fn make_virtual_primary(dc: &zbus::Proxy<'_>, mode: Mode, pre: &CurrentSta
             let Some(vmode) = vmode else {
                 bail!("virtual monitor {vconn} has no usable mode yet");
             };
-            let config = build_primary_config(&state, &vconn, &vmode, mode.width as i32);
+            let config = build_primary_config(&vconn, &vmode);
             let _: () = dc
                 .call(
                     "ApplyMonitorsConfig",
@@ -431,46 +433,20 @@ async fn make_virtual_primary(dc: &zbus::Proxy<'_>, mode: Mode, pre: &CurrentSta
     }
 }
 
-/// Virtual output = primary at the top-left; physical monitors kept enabled but secondary, laid
-/// out adjacently to its right (so the local screen never blanks).
-fn build_primary_config(
-    state: &CurrentState,
-    vconn: &str,
-    vmode: &str,
-    virt_width: i32,
-) -> Vec<ApplyLogical> {
-    let mut logicals: Vec<ApplyLogical> = Vec::new();
-    logicals.push((
+/// The virtual output as the SOLE, primary monitor — physical outputs are omitted, so Mutter
+/// disables them for the session. This confines the cursor, windows, and keyboard focus to the
+/// streamed surface; keeping the physical enabled as a *secondary* monitor instead lets relative
+/// pointer motion and window focus wander onto it (invisible to the client — the cursor seems to
+/// vanish). The physical layout is restored on teardown.
+fn build_primary_config(vconn: &str, vmode: &str) -> Vec<ApplyLogical> {
+    vec![(
         0,
         0,
         1.0,
         0,
         true,
         vec![(vconn.to_string(), vmode.to_string(), HashMap::new())],
-    ));
-    let mut x = virt_width;
-    for lm in &state.2 {
-        if lm.5.iter().any(|s| s.0 == vconn) {
-            continue; // skip the virtual output's own logical monitor
-        }
-        let mons: Vec<ApplyMon> =
-            lm.5.iter()
-                .filter_map(|s| {
-                    current_mode(state, &s.0).map(|(id, _, _)| (s.0.clone(), id, HashMap::new()))
-                })
-                .collect();
-        if mons.is_empty() {
-            continue;
-        }
-        let width =
-            lm.5.first()
-                .and_then(|s| current_mode(state, &s.0))
-                .map(|(_, w, _)| w)
-                .unwrap_or(1920);
-        logicals.push((x, 0, lm.2, lm.3, false, mons));
-        x += width;
-    }
-    logicals
+    )]
 }
 
 /// Convert a captured `GetCurrentState` layout back into an `ApplyMonitorsConfig` argument (used
