@@ -176,6 +176,10 @@ jobs:
 
       - name: Archive iOS + upload to TestFlight
         if: gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true'
+        # Best-effort until the App Store Connect app record for io.unom.punktfunk
+        # exists — the upload errors without one. Drop this once TestFlight onboarding
+        # is done so real upload failures fail the run.
+        continue-on-error: true
         run: |
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk-iOS \
