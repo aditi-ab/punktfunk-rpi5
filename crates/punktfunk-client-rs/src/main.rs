@@ -528,6 +528,7 @@ async fn session(args: Args) -> Result<()> {
     // low-latency input path without a real input device.
     if args.input_test {
         let conn2 = conn.clone();
+        let (mw, mh) = (args.mode.width, args.mode.height);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             tracing::info!("input-test: sending scripted datagrams for ~6s");
@@ -547,6 +548,17 @@ async fn session(args: Args) -> Result<()> {
                     flags: 0,
                 };
                 let _ = conn2.send_datagram(mv.encode().to_vec().into());
+                // Absolute motion too (the GTK client's path): a diagonal sweep, with the
+                // coordinate-space size packed in `flags` — the contract injectors require.
+                let abs = InputEvent {
+                    kind: InputKind::MouseMoveAbs,
+                    _pad: [0; 3],
+                    code: 0,
+                    x: ((i * mw) / 160) as i32,
+                    y: ((i * mh) / 160) as i32,
+                    flags: (mw << 16) | (mh & 0xffff),
+                };
+                let _ = conn2.send_datagram(abs.encode().to_vec().into());
                 if i % 20 == 0 {
                     for kind in [InputKind::KeyDown, InputKind::KeyUp] {
                         let key = InputEvent {

@@ -43,18 +43,21 @@ fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, fl
     });
 }
 
-/// Widget coordinates → video pixel coordinates through the Contain-fit letterbox.
-fn map_xy(widget: &impl IsA<gtk::Widget>, connector: &NativeClient, x: f64, y: f64) -> (i32, i32) {
+/// Forward an absolute pointer position: widget coordinates → video pixels through the
+/// Contain-fit letterbox. `flags` packs the coordinate-space size (`(w << 16) | h`, the
+/// same contract as touch) — the host normalizes against it before mapping into the EIS
+/// region; without it the event is dropped.
+fn send_abs(widget: &impl IsA<gtk::Widget>, connector: &NativeClient, x: f64, y: f64) {
     let w = widget.as_ref();
     let mode = connector.mode();
     let (ww, wh) = (w.width().max(1) as f64, w.height().max(1) as f64);
     let (vw, vh) = (mode.width.max(1) as f64, mode.height.max(1) as f64);
     let scale = (ww / vw).min(wh / vh);
     let (ox, oy) = ((ww - vw * scale) / 2.0, (wh - vh * scale) / 2.0);
-    (
-        (((x - ox) / scale).round()).clamp(0.0, vw - 1.0) as i32,
-        (((y - oy) / scale).round()).clamp(0.0, vh - 1.0) as i32,
-    )
+    let px = (((x - ox) / scale).round()).clamp(0.0, vw - 1.0) as i32;
+    let py = (((y - oy) / scale).round()).clamp(0.0, vh - 1.0) as i32;
+    let flags = (mode.width << 16) | (mode.height & 0xffff);
+    send(connector, InputKind::MouseMoveAbs, 0, px, py, flags);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -193,8 +196,7 @@ pub fn new(
         let target = overlay.downgrade();
         motion.connect_motion(move |_, x, y| {
             if let Some(w) = target.upgrade() {
-                let (px, py) = map_xy(&w, &conn, x, y);
-                send(&conn, InputKind::MouseMoveAbs, 0, px, py, 0);
+                send_abs(&w, &conn, x, y);
             }
         });
         overlay.add_controller(motion);
@@ -206,8 +208,7 @@ pub fn new(
         click.connect_pressed(move |g, _n, x, y| {
             if let Some(w) = target.upgrade() {
                 w.grab_focus();
-                let (px, py) = map_xy(&w, &conn, x, y);
-                send(&conn, InputKind::MouseMoveAbs, 0, px, py, 0);
+                send_abs(&w, &conn, x, y);
             }
             if let Some(gs) = keymap::gdk_button_to_gs(g.current_button()) {
                 send(&conn, InputKind::MouseButtonDown, gs, 0, 0, 0);

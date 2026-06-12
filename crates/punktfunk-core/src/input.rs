@@ -17,7 +17,10 @@ pub enum InputKind {
     KeyUp = 1,
     /// Relative motion: `x`/`y` carry `dx`/`dy`.
     MouseMove = 2,
-    /// Absolute motion: `x`/`y` carry pixel coordinates.
+    /// Absolute motion: `x`/`y` carry pixel coordinates and `flags` packs the client's
+    /// coordinate-space size as `(width << 16) | height` (the same contract as
+    /// [`TouchDown`](Self::TouchDown)) — injectors normalize against it before mapping
+    /// into the output region and **drop the event when it is zero**.
     MouseMoveAbs = 3,
     MouseButtonDown = 4,
     MouseButtonUp = 5,

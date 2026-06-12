@@ -273,7 +273,10 @@ enum PunktfunkInputKind
     PUNKTFUNK_INPUT_KIND_KEY_UP = 1,
     // Relative motion: `x`/`y` carry `dx`/`dy`.
     PUNKTFUNK_INPUT_KIND_MOUSE_MOVE = 2,
-    // Absolute motion: `x`/`y` carry pixel coordinates.
+    // Absolute motion: `x`/`y` carry pixel coordinates and `flags` packs the client's
+    // coordinate-space size as `(width << 16) | height` (the same contract as
+    // [`TouchDown`](Self::TouchDown)) — injectors normalize against it before mapping
+    // into the output region and **drop the event when it is zero**.
     PUNKTFUNK_INPUT_KIND_MOUSE_MOVE_ABS = 3,
     PUNKTFUNK_INPUT_KIND_MOUSE_BUTTON_DOWN = 4,
     PUNKTFUNK_INPUT_KIND_MOUSE_BUTTON_UP = 5,
