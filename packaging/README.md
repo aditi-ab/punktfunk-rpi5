@@ -33,7 +33,20 @@ On **Bazzite** the only genuinely new runtime bits are `ffmpeg-libs` (RPM Fusion
 `libei` — the rest of the stack is already there. The default backend is **gamescope**
 (`packaging/bazzite/host.env`), which the host spawns headless per session — no desktop login.
 
-## Option A — COPR (per-host, `rpm-ostree install`)
+## Option A — Gitea RPM registry (recommended; per-host, `rpm-ostree`)
+
+The host's RPM is published to **unom's self-hosted Gitea RPM registry** (CI builds it on every
+push), mirroring the [Debian/apt](debian/README.md) setup. Add one repo file, install, and track
+updates with `rpm-ostree upgrade` — no COPR account needed. Full guide: [`rpm/README.md`](rpm/README.md).
+
+```sh
+curl -fsSL https://git.unom.io/api/packages/unom/rpm/bazzite.repo \
+  | sudo tee /etc/yum.repos.d/punktfunk.repo
+rpm-ostree install punktfunk && systemctl reboot
+# updates:  rpm-ostree upgrade && systemctl reboot
+```
+
+## Option B — COPR (per-host, `rpm-ostree install`)
 
 1. Create a COPR project, enable **build-from-SCM** pointing at this repo, spec path
    `packaging/rpm/punktfunk.spec` (see `copr/README.md`). Under *External Repositories* add

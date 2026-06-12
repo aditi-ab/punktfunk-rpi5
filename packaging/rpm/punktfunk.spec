@@ -17,8 +17,12 @@
 ################################################################################
 
 Name:           punktfunk
-Version:        0.0.1
-Release:        1%{?dist}
+# Version/Release are overridable so CI can stamp a rolling snapshot: a main build passes
+#   --define "pf_version 0.0.1" --define "pf_release 0.ci42.gdeadbee"
+# (Release starting "0." sorts BEFORE the eventual "1" release), a v* tag passes the clean
+# version with "pf_release 1". A plain `rpmbuild` (or COPR) with no defines builds 0.0.1-1.
+Version:        %{?pf_version}%{!?pf_version:0.0.1}
+Release:        %{?pf_release}%{!?pf_release:1}%{?dist}
 Summary:        Low-latency desktop/game streaming host (Moonlight-compatible + punktfunk/1)
 
 License:        MIT OR Apache-2.0
@@ -28,6 +32,12 @@ Source0:        %{name}-%{version}.tar.gz
 
 # punktfunk-host is Linux-only and links system FFmpeg/PipeWire/Opus.
 ExclusiveArch:  x86_64 aarch64
+
+# The zerocopy FFI links the NVIDIA driver's libcuda.so.1; rpm's auto-dep generator would turn
+# that into a hard Requires on libcuda.so.1 (and we never want to pin the driver — NVENC/EGL come
+# from whatever NVIDIA stack the host runs, expressed below as the weak xorg-x11-drv-nvidia-cuda
+# Recommends). Drop it from the auto-Requires, mirroring the Debian package's NVIDIA filter.
+%global __requires_exclude ^libcuda\\.so.*$
 
 # --- Build toolchain ---------------------------------------------------------
 BuildRequires:  cargo
@@ -131,5 +141,5 @@ echo "then enable the host: systemctl --user enable --now punktfunk-host"
 echo "Config: cp %{_datadir}/%{name}/host.env.bazzite ~/.config/punktfunk/host.env"
 
 %changelog
-* Tue Jun 10 2026 punktfunk <noreply@anthropic.com> - 0.0.1-1
+* Wed Jun 10 2026 punktfunk <noreply@anthropic.com> - 0.0.1-1
 - Initial RPM: punktfunk-host + udev rule + systemd user unit + headless helpers.

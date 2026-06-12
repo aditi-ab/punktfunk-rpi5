@@ -1,0 +1,50 @@
+# CI builder for the punktfunk RPM — Fedora 43 to match Bazzite's base (so the RPM's
+# auto-generated library Requires, e.g. libavcodec.so.NN, pin to exactly what the target
+# runs). Used by .gitea/workflows/rpm.yml; built+pushed by .gitea/workflows/docker.yml.
+#
+#   docker build -f ci/fedora-rpm.Dockerfile -t punktfunk-fedora-rpm ci
+#
+# Mirrors ci/rust-ci.Dockerfile (the Ubuntu workspace builder) for the rpmbuild side.
+FROM fedora:43
+
+# RPM Fusion (free + nonfree) provides the NVENC-capable ffmpeg-devel the host links against.
+RUN dnf -y install \
+      "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
+      "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm" \
+  && dnf -y install \
+      # rpmbuild + source-tarball tooling; nodejs runs the Gitea Actions JS (checkout/cache)
+      rpm-build rpmdevtools systemd-rpm-macros git tar gzip nodejs \
+      # build toolchain + bindgen
+      gcc gcc-c++ clang clang-devel cmake nasm pkgconf-pkg-config curl ca-certificates \
+      # ffmpeg (NVENC), capture/audio/display link deps
+      ffmpeg-devel pipewire-devel wayland-devel libxkbcommon-devel opus-devel \
+      mesa-libGL-devel mesa-libgbm-devel \
+  && dnf clean all
+
+# libcuda link stub — the zerocopy path links a fixed set of cuXxx driver symbols, but CI has
+# no GPU and never RUNS CUDA. Rather than drag in the NVIDIA userspace stack, synthesize a stub
+# libcuda.so.1 that just defines those symbols (the SAME approach the Ubuntu image takes with the
+# real driver lib, minus the driver). On Bazzite the real driver provides libcuda.so.1 at runtime.
+# The symbol list is `nm -D --undefined-only` of the built host binary; a new cu* call would fail
+# the link with a clear "undefined reference", flagging this list to update.
+RUN set -eux; : > /tmp/cuda_stub.c; \
+    for s in cuCtxCreate_v2 cuCtxSetCurrent cuCtxSynchronize cuDestroyExternalMemory \
+             cuDeviceGet cuExternalMemoryGetMappedBuffer cuGraphicsGLRegisterImage \
+             cuGraphicsMapResources cuGraphicsSubResourceGetMappedArray cuGraphicsUnmapResources \
+             cuGraphicsUnregisterResource cuImportExternalMemory cuInit cuMemAllocPitch_v2 \
+             cuMemcpy2D_v2 cuMemFree_v2; do \
+      echo "int $s(void){return 0;}" >> /tmp/cuda_stub.c; \
+    done; \
+    gcc -shared -fPIC -Wl,-soname,libcuda.so.1 -o /usr/lib64/libcuda.so.1 /tmp/cuda_stub.c; \
+    ln -sf libcuda.so.1 /usr/lib64/libcuda.so; \
+    rm -f /tmp/cuda_stub.c; ldconfig; test -e /usr/lib64/libcuda.so
+
+# Rustup (not Fedora's packaged rust) so rust-toolchain.toml's pinned channel resolves, matching
+# the Ubuntu builder. Shared location so jobs running as any uid can use it.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal \
+    && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME" \
+    && rustc --version && cargo --version

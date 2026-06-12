@@ -2,6 +2,7 @@
 #   punktfunk-web      — management console (web/Dockerfile, repo-root context)
 #   punktfunk-docs     — documentation site (docs-site/Dockerfile)
 #   punktfunk-rust-ci  — Rust CI builder image consumed by ci.yml
+#   punktfunk-fedora-rpm — Fedora 43 builder image consumed by rpm.yml (Bazzite RPM)
 # Host and clients are intentionally NOT containerized (see CLAUDE.md "What's left").
 #
 # REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope.
@@ -37,6 +38,9 @@ jobs:
             context: docs-site
           - image: punktfunk-rust-ci
             dockerfile: ci/rust-ci.Dockerfile
+            context: ci
+          - image: punktfunk-fedora-rpm
+            dockerfile: ci/fedora-rpm.Dockerfile
             context: ci
     steps:
       - uses: actions/checkout@v4

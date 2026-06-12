@@ -1,0 +1,71 @@
+# Build the punktfunk-host RPM and publish it to Gitea's RPM package registry, so Bazzite /
+# Fedora Atomic hosts layer + update it with rpm-ostree. Counterpart to deb.yml (apt). Runs in
+# the Fedora 43 builder image (ci/fedora-rpm.Dockerfile) so the RPM's auto library Requires
+# (libavcodec.so.NN, …) match the target's sonames.
+#
+# Registry (public, unom org), group "bazzite":
+#   repo file  https://git.unom.io/api/packages/unom/rpm/bazzite.repo
+# Box setup (once): see packaging/rpm/README.md
+#
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (shared with docker.yml).
+name: rpm
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  RPM_GROUP: bazzite
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04
+    container:
+      image: git.unom.io/unom/punktfunk-fedora-rpm:latest
+    timeout-minutes: 90
+    env:
+      CARGO_HOME: /usr/local/cargo
+    steps:
+      - uses: actions/checkout@v4
+
+      # rpmbuild + git archive need the checkout trusted; cache the crates download.
+      - name: Prep
+        run: git config --global --add safe.directory "$PWD"
+      - uses: actions/cache@v4
+        with:
+          path: /usr/local/cargo/registry
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+
+      - name: Version
+        # Tag v1.2.3 -> 1.2.3-1 (release); main push -> 0.0.1-0.ciN.g<sha>, whose release "0."
+        # sorts BEFORE the eventual "1" yet increases by run number, so `rpm-ostree upgrade`
+        # always moves to the newest main build.
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; R="1" ;;
+            *)            V="0.0.1"; R="0.ci${GITHUB_RUN_NUMBER}.g${GITHUB_SHA::8}" ;;
+          esac
+          echo "PF_VERSION=$V" >> "$GITHUB_ENV"
+          echo "PF_RELEASE=$R" >> "$GITHUB_ENV"
+          echo "rpm $V-$R"
+
+      - name: Build RPM
+        run: PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" bash packaging/rpm/build-rpm.sh
+
+      - name: Publish to the Gitea RPM registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          # Publish only the main package (skip -debuginfo/-debugsource subpackages).
+          for rpm in dist/*.rpm; do
+            case "$rpm" in *debuginfo*|*debugsource*) echo "skip $rpm"; continue;; esac
+            echo "uploading $rpm"
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$rpm" \
+              "https://$REGISTRY/api/packages/$OWNER/rpm/$RPM_GROUP/upload"
+          done
+          echo "published to $OWNER/rpm/$RPM_GROUP"
