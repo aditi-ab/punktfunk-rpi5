@@ -7,12 +7,14 @@
     "implementation-plan",
     "roadmap",
     "m2-plan",
+    "apple-stage2-presenter",
     "---Setup---",
     "linux-setup",
     "headless-box",
     "gnome-box",
     "bazzite",
     "windows-host",
-    "dualsense-haptics"
+    "dualsense-haptics",
+    "ci"
   ]
 }

@@ -1,0 +1,39 @@
+# Apple client CI — runs on the self-hosted macOS runner (home-mac-mini-1, host mode;
+# see scripts/ci/setup-macos-runner.sh). Builds the Rust core into
+# PunktfunkCore.xcframework, then builds + tests the Swift package. Network-dependent
+# tests (RemoteFirstLightTests) self-skip without PUNKTFUNK_REMOTE_HOST.
+name: apple
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  swift:
+    runs-on: macos-arm64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (self-healing on a fresh runner)
+        run: |
+          if ! command -v rustup >/dev/null && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --profile minimal
+          fi
+          RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
+          dirname "$RUSTUP" >> "$GITHUB_PATH"
+          "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build PunktfunkCore.xcframework
+        run: bash scripts/build-xcframework.sh
+
+      - name: Build (PunktfunkKit + PunktfunkClient app shell)
+        working-directory: clients/apple
+        run: swift build
+
+      - name: Test (unit + real-codec round trip; remote tests self-skip)
+        working-directory: clients/apple
+        run: swift test

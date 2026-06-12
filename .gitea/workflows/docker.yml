@@ -1,0 +1,61 @@
+# Build + push the dockerized pieces to the Gitea container registry:
+#   punktfunk-web      — management console (web/Dockerfile, repo-root context)
+#   punktfunk-docs     — documentation site (docs-site/Dockerfile)
+#   punktfunk-rust-ci  — Rust CI builder image consumed by ci.yml
+# Host and clients are intentionally NOT containerized (see CLAUDE.md "What's left").
+#
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope.
+#
+# Bootstrap note: ci.yml's rust job pulls punktfunk-rust-ci:latest from the registry, so
+# this workflow (or a manual push) must have succeeded once before that job can run; on
+# the same push, ci.yml builds against the PREVIOUS image. All three were seeded manually
+# on 2026-06-12.
+name: docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        include:
+          - image: punktfunk-web
+            dockerfile: web/Dockerfile
+            context: .
+          - image: punktfunk-docs
+            dockerfile: docs-site/Dockerfile
+            context: docs-site
+          - image: punktfunk-rust-ci
+            dockerfile: ci/rust-ci.Dockerfile
+            context: ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to registry
+        # Username must be the owner of the REGISTRY_TOKEN PAT, not the push actor.
+        run: |
+          echo "${{ secrets.REGISTRY_TOKEN }}" \
+            | docker login "$REGISTRY" -u enricobuehler --password-stdin
+
+      - name: Build
+        run: |
+          docker build --pull \
+            -f "${{ matrix.dockerfile }}" \
+            -t "$REGISTRY/$OWNER/${{ matrix.image }}:latest" \
+            -t "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}" \
+            "${{ matrix.context }}"
+
+      - name: Push
+        run: |
+          docker push "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}"
+          docker push "$REGISTRY/$OWNER/${{ matrix.image }}:latest"

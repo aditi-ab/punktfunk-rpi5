@@ -1,5 +1,7 @@
-# CI for punktfunk (Gitea Actions, GitHub-Actions-compatible syntax).
-# Adjust `runs-on` to match your runner labels if not using the default ubuntu image.
+# CI for punktfunk (Gitea Actions). Linux jobs run on the `ubuntu-latest` runner; the Rust
+# job runs inside the prebuilt builder image (ci/rust-ci.Dockerfile — system FFmpeg 8,
+# PipeWire, GL/GBM, libcuda link stub, pinned-channel rustup) so the workspace links the
+# same libs as the dev boxes. Apple client CI lives in apple.yml (macOS runner).
 name: ci
 
 on:
@@ -10,22 +12,36 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    container:
+      image: git.unom.io/unom/punktfunk-rust-ci:latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: |
-          if ! command -v cargo >/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          fi
-          rustup component add rustfmt clippy
+      # Best-effort caches (act_runner's built-in cache server). Keyed on Cargo.lock:
+      # registry/git are download caches, target/ the incremental build. The target key
+      # carries the rustc version — rust-toolchain.toml pins the floating "stable"
+      # channel, so the file alone wouldn't invalidate stale incremental state.
+      - name: Cache keys
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-home-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-target-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-${{ env.rustc }}-
 
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build
         run: cargo build --workspace --locked
@@ -38,6 +54,52 @@ jobs:
 
       - name: Verify generated header is committed & up to date
         run: |
-          cargo build -p punktfunk-core
+          cargo build -p punktfunk-core --locked
+          git config --global --add safe.directory "$PWD"
           git diff --exit-code include/punktfunk_core.h \
             || (echo "include/punktfunk_core.h is stale — commit the regenerated header" && exit 1)
+
+  web:
+    runs-on: ubuntu-latest
+    container:
+      image: oven/bun:1
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      # oven/bun ships neither git nor a real node (only a bun shim) — actions/checkout
+      # needs both.
+      - name: Install git + node
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends git nodejs
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      # Build first: it generates the orval API client + paraglide messages that
+      # typechecking imports.
+      - name: Build
+        run: bun run build
+      - name: Typecheck
+        run: bun run lint
+
+  docs-site:
+    runs-on: ubuntu-latest
+    container:
+      image: oven/bun:1
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: docs-site
+    steps:
+      - name: Install git
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends git
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      # Build first: fumadocs-mdx emits the .source typegen the typecheck imports.
+      - name: Build
+        run: bun run build
+      - name: Typecheck
+        run: bun run lint
