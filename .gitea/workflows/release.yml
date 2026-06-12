@@ -91,6 +91,16 @@ jobs:
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
           security set-keychain-settings -lut 7200 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          # Apple's intermediates — without the issuing CA in the chain the identity is
+          # "invalid" and xcodebuild reports "No signing certificate ... found" even
+          # though the cert imported fine (fresh boxes don't ship all WWDR/Developer ID
+          # intermediates).
+          for ca in DeveloperIDG2CA AppleWWDRCAG3 AppleWWDRCAG4; do
+            curl -sf "https://www.apple.com/certificateauthority/$ca.cer" \
+              -o "$RUNNER_TEMP/$ca.cer" \
+              && security import "$RUNNER_TEMP/$ca.cer" -k "$KEYCHAIN" -t cert >/dev/null \
+              || echo "::warning::could not stage intermediate $ca"
+          done
           printf '%s' "$P12_B64" | base64 -d > "$RUNNER_TEMP/devid.p12"
           security import "$RUNNER_TEMP/devid.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" \
             -T /usr/bin/codesign -T /usr/bin/security
