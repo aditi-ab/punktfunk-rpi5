@@ -60,9 +60,10 @@ jobs:
           docker push "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}"
           docker push "$REGISTRY/$OWNER/${{ matrix.image }}:latest"
 
-  # Deploy the docs site to home-main-2 (docs.punktfunk.unom.io via Caddy on
-  # home-reverse-proxy-1 -> :3220). Same secret set as unom/website's deploy:
-  # DEPLOY_HOST/DEPLOY_USER/DEPLOY_PORT/DEPLOY_SSH_KEY (the unom-ci-deploy key).
+  # Deploy the docs site to unom-1, the DMZ services VM website/cms also deploy to
+  # (docs.punktfunk.unom.io via Caddy on home-reverse-proxy-1 -> :3220). Same secret set
+  # as unom/website's deploy: DEPLOY_HOST/DEPLOY_USER/DEPLOY_PORT/DEPLOY_SSH_KEY (the
+  # unom-ci-deploy key).
   deploy-docs:
     runs-on: ubuntu-24.04
     needs: build-push

@@ -1,7 +1,7 @@
-# Production compose for the deployed punktfunk pieces — runs on home-main-2 under
+# Production compose for the deployed punktfunk pieces — runs on unom-1 (the DMZ services VM, 192.168.50.50) under
 # ~/punktfunk-docs (synced there by .gitea/workflows/docker.yml's deploy job; pattern
 # follows unom/website + unom/cms). Caddy on home-reverse-proxy-1 serves
-# docs.punktfunk.unom.io -> home-main-2:3220 (vhost in unom/reverse-proxy).
+# docs.punktfunk.unom.io -> unom-1:3220 (vhost in unom/reverse-proxy).
 name: punktfunk-docs-prod
 services:
   docs:
