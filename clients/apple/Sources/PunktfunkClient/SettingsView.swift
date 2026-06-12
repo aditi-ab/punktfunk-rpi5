@@ -11,18 +11,18 @@ import SwiftUI
 @MainActor
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("punktfunk.width") private var width = 1920
-    @AppStorage("punktfunk.height") private var height = 1080
-    @AppStorage("punktfunk.hz") private var hz = 60
-    @AppStorage("punktfunk.compositor") private var compositor = 0
-    @AppStorage("punktfunk.gamepadType") private var gamepadType = 0
-    @AppStorage("punktfunk.bitrateKbps") private var bitrateKbps = 0
-    @AppStorage("punktfunk.presenter") private var presenter = "stage1"
-    @AppStorage("punktfunk.micEnabled") private var micEnabled = true
+    @AppStorage(DefaultsKey.streamWidth) private var width = 1920
+    @AppStorage(DefaultsKey.streamHeight) private var height = 1080
+    @AppStorage(DefaultsKey.streamHz) private var hz = 60
+    @AppStorage(DefaultsKey.compositor) private var compositor = 0
+    @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
+    @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
+    @AppStorage(DefaultsKey.presenter) private var presenter = "stage1"
+    @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
     @ObservedObject private var gamepads = GamepadManager.shared
     #if os(macOS)
-    @AppStorage("punktfunk.speakerUID") private var speakerUID = ""
-    @AppStorage("punktfunk.micUID") private var micUID = ""
+    @AppStorage(DefaultsKey.speakerUID) private var speakerUID = ""
+    @AppStorage(DefaultsKey.micUID) private var micUID = ""
     @State private var outputDevices: [AudioDevice] = []
     @State private var inputDevices: [AudioDevice] = []
     #endif

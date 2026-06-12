@@ -4,7 +4,7 @@
 // follow `active` — exactly ONE physical controller is forwarded to the host, as pad 0.
 //
 // Selection: the user can pin a controller in Settings (persisted under
-// "punktfunk.gamepadID"); with no pin — or the pinned one absent — the most recently
+// DefaultsKey.gamepadID); with no pin — or the pinned one absent — the most recently
 // connected extended gamepad wins. GCController has no stable hardware serial, so the pin
 // is a fingerprint of vendorName|productCategory (+ a connect-order suffix for twins);
 // identical twin controllers may swap a pin across reconnects, which the Settings footer
@@ -61,7 +61,7 @@ public final class GamepadManager: ObservableObject {
         }
     }
 
-    private static let preferredKey = "punktfunk.gamepadID"
+    private static let preferredKey = DefaultsKey.gamepadID
     /// Connect order (identity-keyed) — drives both twin de-dup suffixes and auto-pick.
     private var connectOrder: [ObjectIdentifier] = []
     private var observers: [NSObjectProtocol] = []

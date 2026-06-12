@@ -43,6 +43,9 @@ private final class FeedbackStopFlag: @unchecked Sendable {
 /// amplitude and torn down on retarget; players run only while their motor is on, so an
 /// idle controller costs no radio traffic. Failures (pads without haptics, engine resets)
 /// downgrade to silence — rumble is best-effort by design.
+///
+/// `@unchecked Sendable` is sound because every property (`controller`/`low`/`high`/`broken`) is
+/// read and written only inside `queue` closures — the serial queue is the synchronization.
 private final class RumbleRenderer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "io.unom.punktfunk.haptics", qos: .userInteractive)
 
@@ -176,6 +179,11 @@ public final class GamepadFeedback {
             }
         }
     }
+
+    /// Safety net: the drain thread captures `connection` strongly and only `self` weakly, so if
+    /// this is dropped without `stop()` (an abrupt teardown) the thread would poll forever and
+    /// leak the connection — signal it to exit. (`stop()` is the normal path and also joins it.)
+    deinit { flag.stop() }
 
     /// Map the DualSense player-LED bit patterns (5 LEDs, hid-playstation's player
     /// conventions) onto GCControllerPlayerIndex. Unknown patterns fall back to the lit

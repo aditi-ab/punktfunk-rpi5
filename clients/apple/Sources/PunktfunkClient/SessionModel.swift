@@ -207,9 +207,9 @@ final class SessionModel: ObservableObject {
         let defaults = UserDefaults.standard
         let audio = SessionAudio(connection: conn)
         audio.start(
-            speakerUID: defaults.string(forKey: "punktfunk.speakerUID") ?? "",
-            micUID: defaults.string(forKey: "punktfunk.micUID") ?? "",
-            micEnabled: defaults.object(forKey: "punktfunk.micEnabled") as? Bool ?? true)
+            speakerUID: defaults.string(forKey: DefaultsKey.speakerUID) ?? "",
+            micUID: defaults.string(forKey: DefaultsKey.micUID) ?? "",
+            micEnabled: defaults.object(forKey: DefaultsKey.micEnabled) as? Bool ?? true)
         self.audio = audio
         // Gamepads: forward GamepadManager's active controller as pad 0 and render the
         // host's feedback (rumble always; lightbar/player-LEDs/adaptive-triggers when the

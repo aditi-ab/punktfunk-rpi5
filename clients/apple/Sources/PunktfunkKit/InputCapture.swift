@@ -557,7 +557,8 @@ public final class InputCapture {
         var m: [Int: UInt32] = [:]
         // a–z: HID 0x04..0x1D → VK 'A'..'Z'.
         for i in 0..<26 { m[0x04 + i] = UInt32(0x41 + i) }
-        // 1–9, 0: HID 0x1E..0x27 → VK '1'..'9','0'.
+        // 1–9: HID 0x1E..0x26 → VK '1'..'9'; then 0: HID 0x27 → VK '0' (set separately —
+        // the '0' key sits AFTER '9' in HID but its VK 0x30 sits BEFORE '1' (0x31)).
         for i in 0..<9 { m[0x1E + i] = UInt32(0x31 + i) }
         m[0x27] = 0x30
         m[0x28] = 0x0D // return
