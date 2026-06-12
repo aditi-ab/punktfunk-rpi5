@@ -61,7 +61,12 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
   trust-on-first-use fingerprint prompt over the live-but-blurred stream, and SPAKE2 PIN
   pairing (`PairSheet`, from a host card's context menu or the trust prompt;
   `ClientIdentityStore` keeps the client identity in the Keychain and presents it on
-  every connect) — then pinned reconnects, fps/Mb-s HUD. Settings also picks the HOST
+  every connect) — then pinned reconnects, fps/Mb-s HUD + a **capture→client-receipt latency**
+  line (`LatencyMeter`, p50/p95): the AU `pts_ns` (host capture clock) to the instant the client
+  received it, **skew-corrected** across machines via `PunktfunkConnection.clockOffsetNs` (the
+  connect-time wall-clock handshake, `punktfunk_connection_clock_offset_ns`). It excludes the
+  layer's decode+present (stage-1 `AVSampleBufferDisplayLayer` has no per-frame present callback);
+  true decode→present awaits the stage-2 presenter. Settings also picks the HOST
   compositor (KWin/wlroots/Mutter/gamescope, default automatic — the host honors it
   only if that backend is available there) and has a **Controllers** section: every
   detected controller (capability glyphs, battery, "In use" badge), which one to forward

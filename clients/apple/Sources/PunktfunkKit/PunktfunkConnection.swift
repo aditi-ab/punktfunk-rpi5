@@ -195,6 +195,13 @@ public final class PunktfunkConnection {
     /// DualSense feedback.
     public private(set) var resolvedGamepad: GamepadType = .auto
 
+    /// Host clock minus client clock (nanoseconds), from the connect-time wall-clock skew handshake
+    /// (`punktfunk_connection_clock_offset_ns`). Add it to a local `CLOCK_REALTIME` instant to
+    /// express that instant in the host's capture clock — the clock each `AccessUnit.ptsNs` is
+    /// stamped in — so a glass-to-glass latency (present/enqueue time minus `ptsNs`) is valid across
+    /// machines. `0` = no correction (an older host that didn't answer, or synchronized clocks).
+    public private(set) var clockOffsetNs: Int64 = 0
+
     /// Connect and start a session at the requested mode (the host creates a native virtual
     /// output at exactly this size/refresh). Blocks up to `timeoutMs`.
     ///
@@ -251,6 +258,9 @@ public final class PunktfunkConnection {
         var gp: UInt32 = 0
         _ = punktfunk_connection_gamepad(handle, &gp)
         resolvedGamepad = GamepadType(rawValue: gp) ?? .auto
+        var offset: Int64 = 0
+        _ = punktfunk_connection_clock_offset_ns(handle, &offset)
+        clockOffsetNs = offset
     }
 
     /// Ask the host to switch the live session to a new mode (window resized) — no

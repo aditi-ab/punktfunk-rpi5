@@ -29,6 +29,11 @@ All three appliances advertise over mDNS (`_punktfunk._udp`) and require PIN pai
 ## Progress log
 
 ### 2026-06-12
+- **Apple client latency HUD** — `PunktfunkConnection.clockOffsetNs` (from the C-ABI getter) +
+  `LatencyMeter` surface a skew-corrected **capture→client-receipt** p50/p95 in the macOS HUD: the
+  first cross-machine latency the real Apple client reports. (Stage-1 `AVSampleBufferDisplayLayer`
+  has no present callback, so decode→present is excluded — that needs the stage-2 presenter.)
+  Needs an `xcframework` rebuild + `swift test` on the Mac to validate.
 - **Skew handshake in the connector + C ABI** — `quic::clock_sync` is now a shared core helper used
   by both the reference client and `NativeClient`; the connector runs it at connect and exposes the
   host clock offset over the C ABI (`punktfunk_connection_clock_offset_ns`). This is the substrate

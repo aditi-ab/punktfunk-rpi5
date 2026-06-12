@@ -478,7 +478,10 @@ struct ContentView: View {
                     onCaptureChange: { [weak model] captured in
                         model?.mouseCaptured = captured
                     },
-                    onFrame: { [meter = model.meter] au in meter.note(byteCount: au.data.count) },
+                    onFrame: { [meter = model.meter, latency = model.latency, offset = conn.clockOffsetNs] au in
+                        meter.note(byteCount: au.data.count)
+                        latency.record(ptsNs: au.ptsNs, offsetNs: offset)
+                    },
                     onSessionEnd: { [weak model] in
                         Task { @MainActor in model?.sessionEnded() }
                     }
@@ -498,6 +501,14 @@ struct ContentView: View {
                     .frame(width: 7, height: 7)
                 Text("\(conn.width)×\(conn.height)@\(conn.refreshHz)  \(model.fps) fps  \(model.mbps, specifier: "%.1f") Mb/s")
                     .font(.system(.caption, design: .monospaced))
+            }
+            if model.latencyValid {
+                // Capture→client-receipt (skew-corrected); excludes the layer's decode+present —
+                // see LatencyMeter. "(same-host)" when the host didn't answer the skew handshake.
+                Text("capture→client \(model.latencyP50Ms, specifier: "%.1f")/\(model.latencyP95Ms, specifier: "%.1f") ms p50/p95"
+                    + (model.latencySkewCorrected ? "" : " (same-host)"))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
             }
             // While captured the cursor is hidden+frozen, so the button is keyboard-only
             // (⌘⎋ or Cmd+Tab release the cursor; released, it's clickable again).

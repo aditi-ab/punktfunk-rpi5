@@ -53,11 +53,20 @@ final class SessionModel: ObservableObject {
     @Published var fps = 0
     @Published var mbps = 0.0
     @Published var totalFrames = 0
+    /// Capture→client-receipt latency (ms), skew-corrected across machines via the connect-time
+    /// clock offset — p50/p95 for the HUD. `latencyValid` is false until the first sample drains
+    /// (and whenever no host frames arrived in the last interval). `latencySkewCorrected` = the host
+    /// answered the skew handshake (the number is cross-machine valid, not just same-host).
+    @Published var latencyP50Ms = 0.0
+    @Published var latencyP95Ms = 0.0
+    @Published var latencyValid = false
+    @Published var latencySkewCorrected = false
     /// Mirrors StreamView's capture state (it owns the input capture; this drives the
     /// HUD's "click to capture" / "⌘⎋ releases" hint).
     @Published var mouseCaptured = false
 
     let meter = FrameMeter()
+    let latency = LatencyMeter()
     private var statsTimer: Timer?
     private var audio: SessionAudio?
     private var gamepadCapture: GamepadCapture?
@@ -165,6 +174,7 @@ final class SessionModel: ObservableObject {
         phase = .idle
         fps = 0
         mbps = 0
+        latencyValid = false
         mouseCaptured = false
     }
 
@@ -211,6 +221,14 @@ final class SessionModel: ObservableObject {
                 self.fps = frames
                 self.mbps = Double(bytes) * 8 / 1_000_000
                 self.totalFrames = total
+                if let lat = self.latency.drain() {
+                    self.latencyP50Ms = lat.p50Ms
+                    self.latencyP95Ms = lat.p95Ms
+                    self.latencySkewCorrected = lat.skewCorrected
+                    self.latencyValid = true
+                } else {
+                    self.latencyValid = false
+                }
             }
         }
         // .common so the HUD keeps updating during window drags / menu tracking.

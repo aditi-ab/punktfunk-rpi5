@@ -310,9 +310,13 @@ buffer; `sendmmsg`/`recvmmsg` batching; the capture-timestamp anchor placement.
   (`quic::clock_sync` → `ClockSkew`) used by both the reference client and the **embeddable
   connector** — `NativeClient` runs it at connect and exposes the offset over the C ABI
   (`punktfunk_connection_clock_offset_ns`), so the Apple client can convert a present instant to the
-  host clock. **Remaining for true glass-to-glass**: (1) the **Apple client present-stamp**
-  (decode→present) — Swift: stamp `AVSampleBufferDisplayLayer`/presenter time, add the C-ABI offset,
-  subtract the AU `pts_ns`; (2) the host **render→capture** term (PipeWire buffer presentation
+  host clock. The Apple client now consumes that offset: `PunktfunkConnection.clockOffsetNs` +
+  `LatencyMeter` surface a **capture→client-receipt** (skew-corrected) p50/p95 in the HUD — the first
+  cross-machine latency the real Apple client reports. **Remaining for *true* glass-to-glass**:
+  (1) the **decode→present** tail — the stage-1 `AVSampleBufferDisplayLayer` decodes+presents
+  compressed samples internally with no per-frame callback, so it needs the **stage-2 presenter**
+  (`VTDecompressionSession` decode-completion timestamp + `CAMetalLayer`/display-link present) to
+  stamp on-glass present time; (2) the host **render→capture** term (PipeWire buffer presentation
   timestamp vs our capture stamp). `tools/latency-probe` is still the cross-machine orchestrator.
 - **Bigger bets (ordered, deferred — need real-NIC/GPU/Mac validation):**
   1. **CUDA stream+event** to drop one of two redundant `cuCtxSynchronize` in `submit_cuda` (keep the
