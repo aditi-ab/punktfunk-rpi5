@@ -167,9 +167,12 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    and recovery keyframes re-send them — "refresh the format description on every IDR"
    (what `StreamView` does) is sufficient; there is no out-of-band extradata, ever.
 4. **Stage 2 (next)**: explicit `VTDecompressionSession` + `CAMetalLayer` for frame-pacing
-   control (ProMotion/120 Hz), glass-to-glass measurement via `tools/latency-probe` (the
-   host stamps `pts_ns` with its capture wall clock; across machines you need a clock
-   offset estimate from the QUIC RTT).
+   control (ProMotion/120 Hz) and true decode→present / glass-to-glass measurement. The
+   cross-machine clock offset is **already wired** — `PunktfunkConnection.clockOffsetNs` (from
+   the connect-time skew handshake); add it to a `CLOCK_REALTIME` present instant and subtract
+   the AU `pts_ns`. **Full pickup-ready implementation plan** (decode + present + measurement
+   wiring, integration points, gotchas): `docs-site/content/docs/apple-stage2-presenter.md`
+   (rendered in the docs site under "Apple Stage-2 Presenter").
 5. **Audio — wired, both directions.** Playback: `SessionAudio` drains `nextAudio()`
    on its own thread, decodes through CoreAudio's built-in Opus codec (`OpusCodec.swift`
    — kAudioFormatOpus, no bundled libopus; round-trip unit-tested) into a priming
