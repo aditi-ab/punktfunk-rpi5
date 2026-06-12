@@ -112,6 +112,10 @@ install -Dm0755 target/release/punktfunk-host %{buildroot}%{_bindir}/punktfunk-h
 # udev rule — /dev/uinput access for virtual gamepads (input group).
 install -Dm0644 scripts/60-punktfunk.rules %{buildroot}%{_udevrulesdir}/60-punktfunk.rules
 
+# UDP socket-buffer tuning (32 MB) — without it the kernel clamps the host's SO_SNDBUF to ~416 KB
+# and high-bitrate frames overflow it (send-side loss). systemd-sysctl applies it at boot.
+install -Dm0644 scripts/99-punktfunk-net.conf %{buildroot}%{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
+
 # systemd *user* unit (the host runs in the graphical session, not as root).
 install -Dm0644 scripts/punktfunk-host.service %{buildroot}%{_userunitdir}/punktfunk-host.service
 
@@ -128,6 +132,7 @@ install -Dm0644 docs/api/openapi.json                  %{buildroot}%{_datadir}/%
 %doc README.md docs/implementation-plan.md packaging/README.md
 %{_bindir}/punktfunk-host
 %{_udevrulesdir}/60-punktfunk.rules
+%{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
 %{_userunitdir}/punktfunk-host.service
 %dir %{_datadir}/%{name}
 %{_datadir}/%{name}/*
@@ -136,6 +141,9 @@ install -Dm0644 docs/api/openapi.json                  %{buildroot}%{_datadir}/%
 # Reload udev so /dev/uinput picks up the new rule without a reboot (best-effort).
 udevadm control --reload-rules 2>/dev/null || :
 udevadm trigger --subsystem-match=misc 2>/dev/null || :
+# Apply the UDP socket-buffer tuning (also auto-applied at boot by systemd-sysctl; on rpm-ostree
+# it takes effect on the next boot into the layered deployment).
+sysctl -p %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || :
 echo "punktfunk installed. Add yourself to the 'input' group (sudo usermod -aG input \$USER)"
 echo "then enable the host: systemctl --user enable --now punktfunk-host"
 echo "Config: cp %{_datadir}/%{name}/host.env.bazzite ~/.config/punktfunk/host.env"
