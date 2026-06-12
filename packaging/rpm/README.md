@@ -15,14 +15,28 @@ paths — same spec (`punktfunk.spec`) — just self-hosted in Gitea instead of 
 ## Install on a Bazzite host (one-time)
 
 ```sh
-# Trust + add the repo (rpm-ostree reads /etc/yum.repos.d). Public registry, no auth.
-curl -fsSL https://git.unom.io/api/packages/unom/rpm/bazzite.repo \
-  | sudo tee /etc/yum.repos.d/punktfunk.repo
+# Add the repo. Our RPMs are unsigned, but Gitea GPG-signs the repo METADATA — so verify that
+# (repo_gpgcheck=1) and skip the per-package signature check (gpgcheck=0). The signed metadata
+# carries each package's SHA256, so authenticity still holds. (Don't just curl Gitea's served
+# bazzite.repo — it sets gpgcheck=1, which fails on unsigned packages.)
+sudo tee /etc/yum.repos.d/punktfunk.repo >/dev/null <<'REPO'
+[gitea-unom-bazzite]
+name=punktfunk (unom, Bazzite)
+baseurl=https://git.unom.io/api/packages/unom/rpm/bazzite
+enabled=1
+gpgcheck=0
+repo_gpgcheck=1
+gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key
+REPO
 
 # Layer the package, then reboot into the new deployment.
 rpm-ostree install punktfunk
 systemctl reboot
 ```
+
+> If `rpm-ostree` can't complete the metadata GPG check non-interactively, set `repo_gpgcheck=0`
+> (TLS-only trust to the self-hosted registry). Proper per-package signing (`gpgcheck=1`) would
+> need a CI signing key + `rpm --addsign` — future hardening, not wired up.
 
 After reboot, as the desktop user:
 
