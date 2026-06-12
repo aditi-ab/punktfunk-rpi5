@@ -91,6 +91,9 @@ jobs:
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
           security set-keychain-settings -lut 7200 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          # xcodebuild's signing lookup consults the DEFAULT keychain — being on the
+          # search list alone isn't enough (find-identity sees the cert, export doesn't).
+          security default-keychain -d user -s "$KEYCHAIN"
           # Apple's intermediates — without the issuing CA in the chain the identity is
           # "invalid" and xcodebuild reports "No signing certificate ... found" even
           # though the cert imported fine (fresh boxes don't ship all WWDR/Developer ID
@@ -225,6 +228,7 @@ jobs:
       - name: Clean up keychain + API key
         if: always()
         run: |
+          security default-keychain -d user -s login.keychain-db 2>/dev/null || true
           [ -n "${KEYCHAIN:-}" ] && security delete-keychain "$KEYCHAIN" 2>/dev/null || true
           security list-keychains -d user -s login.keychain-db
           rm -f "$RUNNER_TEMP/asc.p8"
