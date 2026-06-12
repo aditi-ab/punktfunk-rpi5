@@ -103,7 +103,7 @@ same-host-only, as today.
   `VideoToolboxRoundTripTests` → assert a `CVPixelBuffer` of the right dimensions + the
   decode callback fires). Present is display-bound — validate it **live** via the HUD number.
 - Live: connect to a Linux host (`m3-host --source virtual` on the GNOME box; see
-  [GNOME Box Setup](/docs/gnome-box)), confirm `capture→present` is a few ms over `capture→client`
+  [Ubuntu — GNOME](/docs/ubuntu-gnome)), confirm `capture→present` is a few ms over `capture→client`
   and that `decode→present` shrank vs. an `AVSampleBufferDisplayLayer` baseline.
 - Compare against the headless reference number: `punktfunk-client-rs` reports skew-corrected
   capture→reassembled (~1.3 ms p50 GNOME box → dev box); capture→present should be that **+ decode +

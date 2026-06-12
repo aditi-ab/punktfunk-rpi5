@@ -1,21 +1,42 @@
 ---
 title: Introduction
-description: Low-latency desktop and game streaming, Linux-first.
+description: Low-latency desktop and game streaming from a Linux host to any of your devices.
 ---
 
 import { Cards, Card } from 'fumadocs-ui/components/card'
 
-**punktfunk** is a ground-up low-latency desktop and game streaming stack, built Linux-first,
-with a shared Rust protocol core (`punktfunk-core`) exposed over a C ABI and native clients per
-platform. It speaks two protocols: GameStream (so a stock Moonlight client just works) and the
-native `punktfunk/1` (QUIC control plane + a hardened UDP data plane with GF(2¹⁶) Leopard FEC and
-AES-GCM).
+**punktfunk** streams your Linux desktop or games to your other devices — a laptop, a Mac, a tablet,
+a TV — at low latency and at **each device's own resolution and refresh rate**. Run the host on a
+Linux machine with an NVIDIA GPU, connect a client, and you're streaming.
 
-## Start here
+It's built for the things that make streaming feel native:
+
+- **Your device's exact mode.** The host spins up a virtual display sized to the client that's
+  connecting — 1080p60 to your laptop, 1440p120 to your desktop, 4K to your TV — at the same time.
+  No letterboxing, no scaling, no juggling your real monitors.
+- **Low latency, GPU end to end.** Frames go straight from the compositor to the GPU encoder
+  (NVENC) with zero CPU copies, and over a transport tuned for responsiveness rather than throughput.
+- **Works with the apps you already have.** punktfunk speaks the GameStream protocol, so any
+  **Moonlight** client connects out of the box — and a faster **native protocol** with a dedicated
+  app for Apple devices.
+- **Secure by default.** Hosts require a one-time PIN pairing; after that, devices reconnect on a
+  pinned identity. No accounts, no cloud.
+
+## Pick your path
 
 <Cards>
-  <Card title="Status & Progress" href="/docs/status" description="Where the work stands, what's live on each box, and a dated progress log." />
-  <Card title="Implementation Plan" href="/docs/implementation-plan" description="The full design: protocol core, milestones, and architecture." />
-  <Card title="Roadmap" href="/docs/roadmap" description="Decided next goals and the longer-term bets." />
-  <Card title="Host Setup" href="/docs/linux-setup" description="Build env + bring-up: Linux, headless KDE, GNOME/Mutter, Bazzite." />
+  <Card title="How It Works" href="/docs/how-it-works" description="The ideas behind punktfunk in a few minutes — virtual displays, the two protocols, pairing." />
+  <Card title="Quick Start" href="/docs/quickstart" description="From nothing to streaming: set up a host and connect your first client." />
+  <Card title="Host Setup" href="/docs/requirements" description="Install the host on Ubuntu (GNOME or KDE), Fedora (KDE), or Bazzite." />
+  <Card title="Connect a Client" href="/docs/clients" description="Stream with the Apple app, Moonlight, or the Linux client." />
 </Cards>
+
+## What you need
+
+- A **Linux host** with an **NVIDIA GPU** (for the NVENC hardware encoder) running one of the
+  [supported setups](/docs/requirements): **Ubuntu** (GNOME or KDE), **Fedora** (KDE), or **Bazzite**.
+- A **client device** to stream to — a Mac/iPhone/iPad/Apple TV (native app), or anything that runs
+  **Moonlight**.
+- Both on the **same network** (LAN or VPN). punktfunk is designed for a trusted local network.
+
+Ready? Head to the [Quick Start](/docs/quickstart).

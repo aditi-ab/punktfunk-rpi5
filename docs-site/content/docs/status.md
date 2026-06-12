@@ -21,7 +21,7 @@ and the design in the [Implementation Plan](/docs/implementation-plan); this pag
 | Box | Role | Compositor | Notes |
 |---|---|---|---|
 | **home-worker-2** (dev) | KDE/KWin appliance | kwin (headless Plasma) | QEMU VM, passthrough RTX 5070 Ti; `serve --native` user unit |
-| **home-worker-3** (GNOME) | GNOME/Mutter appliance | mutter (RecordVirtual) | RTX 4090; autologin GNOME Wayland; `serve --native` user unit. See [GNOME Box Setup](/docs/gnome-box) |
+| **home-worker-3** (GNOME) | GNOME/Mutter appliance | mutter (RecordVirtual) | RTX 4090; autologin GNOME Wayland; `serve --native` user unit. See [Ubuntu — GNOME](/docs/ubuntu-gnome) |
 | **home-bazzite-1** | SteamOS-like host | gamescope | host-managed Steam session at client mode. See [Bazzite Setup](/docs/bazzite) |
 
 All three appliances advertise over mDNS (`_punktfunk._udp`) and require PIN pairing by default.
@@ -62,7 +62,7 @@ All three appliances advertise over mDNS (`_punktfunk._udp`) and require PIN pai
   proto); `punktfunk-client-rs --discover` lists hosts. Validated cross-LAN. (`4fff464`)
 - **Third test box stood up** — home-worker-3 (Ubuntu 26.04, RTX 4090, GNOME 50): first GNOME/Mutter
   zero-copy streaming on a real desktop; **1 Gbps probe clean** (625 MB/5 s, `send_dropped=0`).
-  Two physical-NVIDIA gotchas documented in [GNOME Box Setup](/docs/gnome-box).
+  Two physical-NVIDIA gotchas documented in [Ubuntu — GNOME](/docs/ubuntu-gnome).
 - **Encode|send thread split** validated on real NIC (`send_dropped=0` at 720p60 / 1080p120). (`b295a5b`)
 
 ### Earlier (see roadmap + git log)
