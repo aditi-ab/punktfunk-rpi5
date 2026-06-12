@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Custom keys merged into the auto-generated Info.plist (GENERATE_INFOPLIST_FILE=YES
+	     supplies the rest). NSBonjourServices is required for NWBrowser to browse this
+	     service type on iOS/tvOS — without it the system blocks the browse and discovery
+	     returns nothing. Kept OUT of the synchronized App/ + Sources/ groups so it isn't
+	     auto-added as a bundle resource (which collides with Info.plist processing). -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_punktfunk._udp</string>
+	</array>
+</dict>
+</plist>

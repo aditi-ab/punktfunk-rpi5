@@ -5,12 +5,21 @@
 // fullscreen-and-frontmost, so in Stage Manager it degrades to Mac-style "both cursors
 // visible" forwarding).
 //
-// Touch is the primary input and is always forwarded (touching the video IS explicit
-// intent): every finger maps to a wire touch id, coordinates are mapped through the
-// aspect-fit letterbox into host-mode pixels, so surface == host mode and the host's
-// rescale is the identity. Hardware keyboard/mouse forwarding shares InputCapture with
-// macOS — auto-engaged when streaming starts, ⌘⎋ toggles (detected from the HID stream;
-// there is no NSEvent monitor here).
+// FINGER touch and INDIRECT POINTER (mouse/trackpad) are routed apart by UITouch.type.
+// Direct fingers (and Pencil) always forward as wire touches — every finger maps to a touch
+// id, coordinates mapped through the aspect-fit letterbox into host-mode pixels (surface ==
+// host mode, so the host's rescale is the identity).
+//
+// A hardware mouse/trackpad is a pointer, not a finger. When the scene is pointer-LOCKED
+// (full-screen + frontmost iPad) GCMouse delivers raw relative deltas and the system hides
+// the cursor — the gaming-grade path. When it CAN'T lock (Stage Manager, not frontmost,
+// iPhone) the system shows its own cursor and routes the mouse through UIKit's pointer path:
+// hover + indirect-pointer touches, which we forward as ABSOLUTE cursor position (+ buttons)
+// so the host cursor tracks the visible local one. We never forward an indirect pointer as a
+// touch — doing so hid the cursor and made the host see taps instead of a moving mouse.
+// GCMouse is gated off whenever the lock isn't held so the two paths can't double-send.
+// Hardware keyboard forwarding shares InputCapture with macOS — auto-engaged when streaming
+// starts, ⌘⎋ toggles (detected from the HID stream; there is no NSEvent monitor here).
 //
 // The public type is named StreamView like its macOS twin (each is platform-gated), so
 // the SwiftUI app layer is identical on both platforms.
@@ -82,6 +91,9 @@ public final class StreamViewController: UIViewController {
     private var inputCapture: InputCapture?
     fileprivate var captured = false
     private var pointerInteraction: UIPointerInteraction?
+    /// Capture state at the last resign, restored on the next foreground — otherwise the
+    /// mouse/keyboard stay released after navigating out and nothing re-grabs them.
+    private var wasCapturedOnResign = false
     #endif
 
     /// Reads whether the scene's pointer is actually locked right now; nil = state
@@ -156,8 +168,28 @@ public final class StreamViewController: UIViewController {
             let mode = connection.currentMode()
             return CGSize(width: Double(mode.width), height: Double(mode.height))
         }
-        streamView.onTouchEvent = { [weak connection] event in
+        streamView.onTouchEvent = { [weak self, weak connection] event in
+            // Touch IS the intent during a trusted session, but must not leak to the host
+            // while a trust prompt is up (captureEnabled == false) — gate it on that. The
+            // ⌘⎋ mouse/keyboard toggle (captured) deliberately does NOT gate touch.
+            guard self?.captureEnabled == true else { return }
             connection?.send(event)
+        }
+        // Indirect pointer (mouse/trackpad with no lock) → absolute cursor + buttons, routed
+        // through InputCapture so the forwarding gate and release-on-blur apply uniformly.
+        streamView.onPointerMoveAbs = { [weak self] p in
+            self?.inputCapture?.sendMouseAbs(
+                x: p.x, y: p.y, surfaceWidth: p.w, surfaceHeight: p.h)
+        }
+        streamView.onPointerButton = { [weak self] button, down in
+            self?.inputCapture?.sendMouseButton(button, pressed: down)
+        }
+        // Trackpad two-finger / wheel scroll → host scroll. The pan recognizer is the
+        // UNLOCKED regime; while locked, GCMouse's scroll handler owns it — mirror the
+        // sendMouseAbs !gcMouseForwarding gate so the two can't double-send.
+        streamView.onScroll = { [weak self] dx, dy in
+            guard let self, self.inputCapture?.gcMouseForwarding == false else { return }
+            self.inputCapture?.sendScroll(dx: dx, dy: dy)
         }
 
         let capture = InputCapture(connection: connection)
@@ -185,17 +217,28 @@ public final class StreamViewController: UIViewController {
         observers.append(NotificationCenter.default.addObserver(
             forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.setCaptured(false)
+            guard let self else { return }
+            self.wasCapturedOnResign = self.captured
+            self.setCaptured(false)
         })
-        // The system can drop the lock without us asking (Slide Over, Stage Manager, leaving
-        // foregroundActive). Surface it so the user sees, in PUNKTFUNK_INPUT_DEBUG, when
-        // GCMouse delivery has silently stopped and we've fallen back to touch.
+        // Returning to the foreground restores the capture the user had before leaving —
+        // without this the mouse/keyboard stay released and nothing re-grabs them (touch
+        // always plays regardless). The macOS twin re-engages on a click into the video.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.wasCapturedOnResign, self.captureEnabled, self.pump != nil
+            else { return }
+            self.setCaptured(true)
+        })
+        // The system can grant or drop the lock without us asking (Slide Over, Stage Manager,
+        // entering/leaving foregroundActive). Re-resolve the mouse routing on every change:
+        // GCMouse (locked) vs the absolute UIKit pointer path (unlocked), and the
+        // hidden-vs-visible local cursor.
         observers.append(NotificationCenter.default.addObserver(
             forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self, iosInputDebug else { return }
-            let locked = self.pointerLockEngaged().map(String.init(describing:)) ?? "unavailable"
-            iosInputLog.debug("pointer lock changed: isLocked=\(locked, privacy: .public)")
+            self?.syncPointerLock()
         })
 
         if captureEnabled {
@@ -212,6 +255,9 @@ public final class StreamViewController: UIViewController {
         inputCapture?.stop()
         inputCapture = nil
         streamView.onTouchEvent = nil
+        streamView.onPointerMoveAbs = nil
+        streamView.onPointerButton = nil
+        streamView.onScroll = nil
         streamView.currentHostMode = nil
         #endif
         pump?.stop()
@@ -231,18 +277,35 @@ public final class StreamViewController: UIViewController {
             captured = false
         }
         setNeedsUpdateOfPrefersPointerLocked()
-        pointerInteraction?.invalidate() // re-resolve the hidden/visible pointer style
+        syncPointerLock() // resolve cursor + GCMouse/absolute routing for the current state
         let onCaptureChange = onCaptureChange
         let captured = captured
         DispatchQueue.main.async { [weak self] in
             onCaptureChange?(captured)
-            // The lock request is async — read the resolved state next turn. If it didn't
-            // engage, GCMouse won't deliver and the always-on touch path carries input.
-            if iosInputDebug, let self {
-                let locked = self.pointerLockEngaged().map(String.init(describing:)) ?? "unavailable"
-                iosInputLog.debug(
-                    "setCaptured(\(captured, privacy: .public)) → pointer lock isLocked=\(locked, privacy: .public)")
-            }
+            // The lock request is async — the resolved state can land a runloop later, and the
+            // initial grant may precede our didChange observer, so re-resolve the routing here.
+            self?.syncPointerLock()
+        }
+    }
+
+    /// Resolve the mouse routing for the scene's CURRENT pointer-lock state: GCMouse (relative
+    /// deltas + buttons) while locked, the absolute UIKit pointer path while not, and the
+    /// hidden-vs-visible local cursor to match. Idempotent — safe to call on every lock-state
+    /// change and capture toggle. Main queue.
+    private func syncPointerLock() {
+        let locked = pointerLockEngaged() == true
+        let useGCMouse = captured && locked
+        // Lock dropped (or capture ended) while the GCMouse path held a button down: once
+        // gcMouseForwarding flips false its release handler is gated off, so flush any held
+        // mouse button here before the switch — otherwise it sticks down on the host.
+        if inputCapture?.gcMouseForwarding == true, !useGCMouse {
+            inputCapture?.releaseMouseButtons()
+        }
+        inputCapture?.gcMouseForwarding = useGCMouse
+        pointerInteraction?.invalidate() // re-resolve the hidden/visible cursor for the state
+        if iosInputDebug {
+            iosInputLog.debug(
+                "pointer lock isLocked=\(locked, privacy: .public) captured=\(self.captured, privacy: .public)")
         }
     }
     #endif
@@ -258,7 +321,11 @@ extension StreamViewController: UIPointerInteractionDelegate {
     public func pointerInteraction(
         _ interaction: UIPointerInteraction, styleFor region: UIPointerRegion
     ) -> UIPointerStyle? {
-        captured ? .hidden() : nil
+        // Hide the local cursor only when the scene is actually pointer-LOCKED — then the
+        // host renders its own cursor from GCMouse deltas and a visible local one would just
+        // diverge. When the lock isn't held the cursor stays VISIBLE so the user can aim; the
+        // pointer is forwarded as an absolute position, both cursors tracking together.
+        captured && pointerLockEngaged() == true ? .hidden() : nil
     }
 }
 #endif
@@ -274,12 +341,26 @@ final class StreamLayerUIView: UIView {
     }
 
     #if os(iOS)
-    /// Reads the LIVE negotiated mode in pixels (the touch coordinate space).
-    var currentHostMode: (() -> CGSize)?
-    var onTouchEvent: ((PunktfunkInputEvent) -> Void)?
+    /// A position already mapped into host-mode pixels, with the surface dims the host
+    /// rescales against (== host mode, so its rescale is the identity).
+    struct HostPoint { let x: Int32; let y: Int32; let w: UInt32; let h: UInt32 }
 
-    /// Wire touch ids per active UITouch; ids are reused after the touch ends.
+    /// Reads the LIVE negotiated mode in pixels (the touch/pointer coordinate space).
+    var currentHostMode: (() -> CGSize)?
+    /// Direct fingers / Pencil → wire touch events.
+    var onTouchEvent: ((PunktfunkInputEvent) -> Void)?
+    /// Indirect pointer (mouse/trackpad with no lock) → absolute cursor moves.
+    var onPointerMoveAbs: ((HostPoint) -> Void)?
+    /// Indirect-pointer buttons (GameStream ids: 1=left 3=right); `down` = press.
+    var onPointerButton: ((_ button: UInt32, _ down: Bool) -> Void)?
+    /// Trackpad two-finger / wheel scroll (no lock) → host scroll deltas, WHEEL(120)-scaled.
+    var onScroll: ((_ dx: Float, _ dy: Float) -> Void)?
+
+    /// Wire touch ids per active direct UITouch; ids are reused after the touch ends.
     private var touchIDs: [ObjectIdentifier: UInt32] = [:]
+    /// GameStream button held per active indirect-pointer touch (one click/drag session);
+    /// released when that touch ends.
+    private var pointerButtons: [ObjectIdentifier: UInt32] = [:]
     #endif
 
     override init(frame: CGRect) {
@@ -287,6 +368,17 @@ final class StreamLayerUIView: UIView {
         displayLayer.videoGravity = .resizeAspect
         #if os(iOS)
         isMultipleTouchEnabled = true
+        // Button-less mouse/trackpad movement (no lock) arrives as hover, not touches —
+        // forward it as absolute cursor moves so the host cursor tracks without a click held.
+        addGestureRecognizer(
+            UIHoverGestureRecognizer(target: self, action: #selector(handleHover)))
+        // Trackpad two-finger / wheel scroll → a scroll-ONLY pan: allowedTouchTypes = []
+        // rejects finger drags (those stay host touches), allowedScrollTypesMask accepts the
+        // indirect scroll devices. Forwarded as host scroll deltas.
+        let scrollPan = UIPanGestureRecognizer(target: self, action: #selector(handleScroll))
+        scrollPan.allowedScrollTypesMask = .all
+        scrollPan.allowedTouchTypes = []
+        addGestureRecognizer(scrollPan)
         #endif
         backgroundColor = .black
     }
@@ -296,26 +388,58 @@ final class StreamLayerUIView: UIView {
 
     #if os(iOS)
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        forward(touches, kind: .down)
+        route(touches, event: event, kind: .down)
     }
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        forward(touches, kind: .move)
+        route(touches, event: event, kind: .move)
     }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        forward(touches, kind: .up)
+        route(touches, event: event, kind: .up)
     }
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        forward(touches, kind: .up)
+        route(touches, event: event, kind: .up)
     }
 
     private enum TouchKind { case down, move, up }
 
-    private func forward(_ touches: Set<UITouch>, kind: TouchKind) {
-        guard let hostMode = currentHostMode?(),
-              hostMode.width > 0, hostMode.height > 0, onTouchEvent != nil
-        else { return }
-        let video = AVMakeRect(aspectRatio: hostMode, insideRect: bounds)
-        guard video.width > 0, video.height > 0 else { return }
+    /// Split a touch batch by kind: an INDIRECT POINTER (mouse/trackpad with no lock) drives
+    /// the host cursor as an absolute mouse; everything else (direct finger, Pencil) is a host
+    /// touch. Mixed batches are possible, so partition rather than branch on the first touch.
+    private func route(_ touches: Set<UITouch>, event: UIEvent?, kind: TouchKind) {
+        var fingers: Set<UITouch> = []
+        for touch in touches {
+            if touch.type == .indirectPointer {
+                handleIndirectPointer(touch, event: event, kind: kind)
+            } else {
+                fingers.insert(touch)
+            }
+        }
+        if !fingers.isEmpty { forwardTouches(fingers, kind: kind) }
+    }
+
+    /// An indirect-pointer touch is a button-held click/drag session: forward its position as
+    /// an absolute cursor move and its button as a mouse button (down on begin, up on end).
+    private func handleIndirectPointer(_ touch: UITouch, event: UIEvent?, kind: TouchKind) {
+        let key = ObjectIdentifier(touch)
+        let host = hostPoint(from: touch.location(in: self))
+        switch kind {
+        case .down:
+            let button = Self.gsButton(for: event?.buttonMask ?? .primary)
+            pointerButtons[key] = button
+            if let host { onPointerMoveAbs?(host) } // place the cursor, then press
+            onPointerButton?(button, true)
+        case .move:
+            if let host { onPointerMoveAbs?(host) }
+        case .up:
+            if let host { onPointerMoveAbs?(host) }
+            if let button = pointerButtons.removeValue(forKey: key) {
+                onPointerButton?(button, false)
+            }
+        }
+    }
+
+    private func forwardTouches(_ touches: Set<UITouch>, kind: TouchKind) {
+        guard onTouchEvent != nil else { return }
         for touch in touches {
             let key = ObjectIdentifier(touch)
             let id: UInt32
@@ -332,18 +456,51 @@ final class StreamLayerUIView: UIView {
                 onTouchEvent?(.touchUp(id: id))
                 continue
             }
-            let p = touch.location(in: self)
-            let x = Int32(((p.x - video.minX) / video.width * hostMode.width)
-                .rounded().clamped(to: 0...(hostMode.width - 1)))
-            let y = Int32(((p.y - video.minY) / video.height * hostMode.height)
-                .rounded().clamped(to: 0...(hostMode.height - 1)))
-            let w = UInt32(hostMode.width)
-            let h = UInt32(hostMode.height)
+            guard let h = hostPoint(from: touch.location(in: self)) else { continue }
             onTouchEvent?(
                 kind == .down
-                    ? .touchDown(id: id, x: x, y: y, surfaceWidth: w, surfaceHeight: h)
-                    : .touchMove(id: id, x: x, y: y, surfaceWidth: w, surfaceHeight: h))
+                    ? .touchDown(id: id, x: h.x, y: h.y, surfaceWidth: h.w, surfaceHeight: h.h)
+                    : .touchMove(id: id, x: h.x, y: h.y, surfaceWidth: h.w, surfaceHeight: h.h))
         }
+    }
+
+    /// Button-less mouse/trackpad movement (no lock) → absolute cursor move.
+    @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+        switch recognizer.state {
+        case .began, .changed:
+            if let h = hostPoint(from: recognizer.location(in: self)) { onPointerMoveAbs?(h) }
+        default:
+            break
+        }
+    }
+
+    /// Trackpad / wheel scroll (no lock) → host scroll deltas. The translation is consumed
+    /// each callback so the next is a fresh delta. Sign/scale are tunable (≈ one notch per
+    /// ~10 pt): finger up scrolls up (host +y), x passes through — the host WHEEL convention.
+    @objc private func handleScroll(_ g: UIPanGestureRecognizer) {
+        guard g.state == .began || g.state == .changed else { return }
+        let t = g.translation(in: self)
+        g.setTranslation(.zero, in: self)
+        onScroll?(Float(t.x) * 12, Float(-t.y) * 12)
+    }
+
+    /// Map a view-space point through the aspect-fit letterbox into host-mode pixels; points
+    /// outside the video area clamp onto its edge. nil until a mode is negotiated.
+    private func hostPoint(from p: CGPoint) -> HostPoint? {
+        guard let hostMode = currentHostMode?(), hostMode.width > 0, hostMode.height > 0
+        else { return nil }
+        let video = AVMakeRect(aspectRatio: hostMode, insideRect: bounds)
+        guard video.width > 0, video.height > 0 else { return nil }
+        let x = Int32(((p.x - video.minX) / video.width * hostMode.width)
+            .rounded().clamped(to: 0...(hostMode.width - 1)))
+        let y = Int32(((p.y - video.minY) / video.height * hostMode.height)
+            .rounded().clamped(to: 0...(hostMode.height - 1)))
+        return HostPoint(x: x, y: y, w: UInt32(hostMode.width), h: UInt32(hostMode.height))
+    }
+
+    /// `.secondary` (right button / two-finger click) → GameStream right (3); else left (1).
+    private static func gsButton(for mask: UIEvent.ButtonMask) -> UInt32 {
+        mask.contains(.secondary) ? 3 : 1
     }
 
     private func nextFreeID() -> UInt32 {

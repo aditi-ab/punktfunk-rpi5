@@ -39,9 +39,10 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
     thread per view, token-cancelled so reconnects can't double-pump.
   - `InputCapture.swift` — `GCMouse` raw deltas + `GCKeyboard` HID→VK mapping (the host's
     `vk_to_evdev` consumes Windows VKs), with fractional-delta accumulation so sub-pixel
-    motion isn't truncated away. Buttons use GameStream ids (1=left … 5=X2). Scroll
-    arrives via the stream view's `scrollWheel` override instead of GC (trackpad/Magic
-    Mouse gestures never reach GCMouse's scroll dpad), WHEEL_DELTA(120)-scaled.
+    motion isn't truncated away. Buttons use GameStream ids (1=left … 5=X2). Scroll is
+    WHEEL_DELTA(120)-scaled: macOS via the stream view's `scrollWheel` override, iPad via
+    GCMouse's scroll dpad when pointer-locked and a scroll-only `UIPanGestureRecognizer`
+    otherwise (trackpad gestures never reach GC's scroll dpad).
   - `GamepadManager.swift` — app-lifetime controller discovery + selection (`.shared`):
     watches `GCController` connect/disconnect, fingerprints each pad for the Settings UI
     (name, capabilities, battery), and selects the ONE controller forwarded to the host
@@ -56,8 +57,15 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
     locality) and `nextHidOutput()` (lightbar → `GCDeviceLight`, player LEDs →
     `playerIndex`, adaptive-trigger effect blocks → a total, table-driven parser →
     `GCDualSenseAdaptiveTrigger`, exact for the 10-zone positional modes).
-- **`PunktfunkClient`** (the app): hosts grid (saved in UserDefaults), "+" toolbar
-  sheet to add hosts, stream mode in Settings (⌘,), two trust flows — the
+  - `HostDiscovery.swift` — LAN auto-discovery: an `NWBrowser` over `_punktfunk._udp`
+    (the host's `crate::discovery` mDNS advert), resolving each service to an IP:port via a
+    throwaway `NWConnection` and parsing the TXT (`fp` advisory cert fingerprint, `pair`,
+    stable `id`). iOS/tvOS need `NSBonjourServices` (`Config/Info.plist`) or the system
+    blocks the browse.
+- **`PunktfunkClient`** (the app): hosts grid (saved in UserDefaults) with an **On this
+  network** section listing mDNS-discovered hosts (tap to save + connect, or pair if the
+  host requires it), "+" toolbar sheet to add hosts manually, stream mode in Settings (⌘,),
+  two trust flows — the
   trust-on-first-use fingerprint prompt over the live-but-blurred stream, and SPAKE2 PIN
   pairing (`PairSheet`, from a host card's context menu or the trust prompt;
   `ClientIdentityStore` keeps the client identity in the Keychain and presents it on
@@ -74,16 +82,25 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
   ("Controller type": Automatic / Xbox 360 / DualSense — Automatic matches the physical
   pad; resolved at connect time, the host pad is fixed per session). Gamepad capture +
   feedback run with streaming (`SessionModel` owns them, same trust gate as audio).
+  Settings also sets the **Bitrate** (Automatic toggle = host default; manual is a
+  log-scale slider, 2 Mbps – 3 Gbps, snapped to two significant figures — above 1 Gbps
+  an inline warning says to run a speed test first; tvOS uses a preset picker instead,
+  Slider doesn't exist there; negotiated via the Hello on every connect), and a host
+  card's context menu offers **"Test Network Speed…"** (`SpeedTestSheet`): connects, has
+  the host burst probe filler over the real data plane (up to the host's 3 Gbps probe
+  ceiling for 2 s, roadmap §9),
+  shows measured goodput · loss · a recommended bitrate (≈70% of measured), and applies
+  it in one tap.
 - **Tests** (`swift test`): byte-level Annex-B units; a real-codec round trip
   (VTCompressionSession-encoded HEVC rebuilt as the host's wire shape → `AnnexB` →
   VTDecompressionSession → pixels); table-driven DualSense trigger-effect parsing
   (`DualSenseTriggerEffectTests`) and the gamepad wire conversions
   (`GamepadWireTests`); loopback integration against real local hosts
-  (`test-loopback.sh` — stream round trip incl. gamepad/touchpad/motion sends and a
+  (`test-loopback.sh` — stream round trip incl. gamepad/touchpad/motion sends, a
   host-scripted feedback burst asserted on the rumble + HID-output planes
-  (`PUNKTFUNK_TEST_FEEDBACK=1`), plus the PIN pairing ceremony and the
-  `--require-pairing` gate against a second, armed host); the remote first-light test
-  above.
+  (`PUNKTFUNK_TEST_FEEDBACK=1`), the bitrate-negotiation echo and a real 20 Mbps
+  bandwidth probe, plus the PIN pairing ceremony and the `--require-pairing` gate
+  against a second, armed host); the remote first-light test above.
 
 ## Build / run / test (on a Mac)
 
@@ -224,23 +241,31 @@ signing, bundle id `io.unom.punktfunk`. Notes:
    as the macOS one, so the SwiftUI shell is identical) hosts the shared `StreamPump` in
    a view controller for `prefersPointerLocked`: with a hardware mouse/trackpad that is
    the iPadOS cursor capture (system honors it fullscreen-and-frontmost; in Stage
-   Manager it degrades to both-cursors forwarding). Touch is always forwarded — every
-   finger gets a wire touch id and coordinates map through the aspect-fit letterbox
-   into host-mode pixels (surface == host mode, so the host rescale is the identity).
+   Manager it degrades to absolute-mouse forwarding). Input is routed by kind: DIRECT
+   fingers / Pencil are touches (each gets a wire touch id, coordinates mapped through the
+   aspect-fit letterbox into host-mode pixels — surface == host mode, so the host rescale is
+   the identity), while a mouse/trackpad is a MOUSE — pointer-LOCKED it is GCMouse relative
+   deltas; unlocked it is absolute moves + buttons + scroll over the UIKit pointer path
+   (hover + `.indirectPointer` touches), the local cursor staying visible so you can aim. An
+   indirect pointer is never sent as a touch. Touch is gated on trust (not forwarded under
+   the TOFU prompt), and returning to the foreground restores the capture you had on leaving.
    `InputCapture` is cross-platform (GC works the same on iPadOS; ⌘⎋ is detected from
    the HID stream there); audio routes via `AVAudioSession` (the Settings device
    pickers are macOS-only). For the iPad-with-external-display setup: the target
    enables multiple scenes + indirect input events — on Stage Manager iPads, drag the
    punktfunk window onto the external screen and the stream runs there with full
    keyboard/mouse/touch. While streaming the session is immersive (edge-to-edge,
-   status bar + home indicator hidden) and the iPadOS cursor is hidden over the video
-   (`UIPointerInteraction` `.hidden()` — visible again when ⌘⎋ releases capture); on
+   status bar + home indicator hidden) and the iPadOS cursor is hidden over the video only
+   while the scene is actually pointer-LOCKED (`UIPointerInteraction` `.hidden()`); when the
+   lock isn't held it stays visible and the mouse forwards as an absolute cursor instead; on
    iOS first run the stream mode defaults to the device's native screen so the video
    fills the display. **tvOS** runs the same app (target **Punktfunk-tvOS**, first-lit
    in the Apple TV simulator at 720p60): playback-only audio (no mic on tvOS),
    focus-driven UI (`.card` host tiles), no kb/mouse capture yet — input lands with
-   gamepad support, the natural tvOS input anyway; core slices are tier-3 Rust targets
-   (see Build above). Known gaps: true pointer LOCK (`prefersPointerLocked`) isn't
+   gamepad support, the natural tvOS input anyway. While streaming there is NO focusable
+   control (a focusable Disconnect button would let the focus engine eat the controller's A
+   before the host sees it); the Siri Remote's **Menu** button disconnects (`.onExitCommand`).
+   Core slices are tier-3 Rust targets (see Build above). Known gaps: true pointer LOCK (`prefersPointerLocked`) isn't
    consulted through UIHostingController, so the hidden cursor can still drift onto a
    second screen (fixing it means putting the controller into the UIKit presentation
    chain); and
