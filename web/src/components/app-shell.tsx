@@ -18,6 +18,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   useLocale()
   return (
     <div className="flex min-h-screen">
+      {/* Desktop sidebar (≥ sm). */}
       <aside className="hidden w-60 shrink-0 flex-col border-r bg-card/40 p-4 sm:flex">
         <div className="mb-6 flex items-center gap-2 px-2">
           <Radio className="size-5 text-[var(--success)]" />
@@ -44,9 +45,41 @@ export function AppShell({ children }: { children: ReactNode }) {
           <LanguageSwitcher />
         </div>
       </aside>
-      <main className="flex-1 overflow-x-hidden">
-        <div className="mx-auto max-w-5xl p-6 sm:p-10">{children}</div>
-      </main>
+
+      <div className="flex flex-1 flex-col overflow-x-hidden">
+        {/* Mobile top bar (< sm): brand + language. The sidebar is hidden here. */}
+        <header className="flex items-center gap-2 border-b bg-card/40 px-4 py-3 sm:hidden">
+          <Radio className="size-5 text-[var(--success)]" />
+          <div className="font-semibold leading-tight">{m.app_name()}</div>
+          <div className="ml-auto">
+            <LanguageSwitcher />
+          </div>
+        </header>
+
+        <main className="flex-1">
+          {/* pb-24 leaves room for the fixed bottom nav on mobile. */}
+          <div className="mx-auto max-w-5xl p-6 pb-24 sm:p-10 sm:pb-10">{children}</div>
+        </main>
+      </div>
+
+      {/* Mobile bottom tab bar (< sm): the primary navigation on phones. */}
+      <nav
+        className="fixed inset-x-0 bottom-0 z-40 flex border-t bg-card/95 backdrop-blur sm:hidden"
+        style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
+      >
+        {NAV.map(({ to, icon: Icon, label }) => (
+          <Link
+            key={to}
+            to={to}
+            activeOptions={{ exact: to === '/' }}
+            className="flex flex-1 flex-col items-center gap-1 py-2 text-[10px] text-muted-foreground transition-colors"
+            activeProps={{ className: 'text-foreground' }}
+          >
+            <Icon className="size-5" />
+            <span className="leading-none">{label()}</span>
+          </Link>
+        ))}
+      </nav>
     </div>
   )
 }
