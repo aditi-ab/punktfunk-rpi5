@@ -138,7 +138,7 @@ fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>, 
             None
         };
 
-        let session = match connect().await {
+        let session = match connect(mode).await {
             Ok(s) => s,
             Err(e) => {
                 let _ = setup_tx.send(Err(format!("{e:#}")));
@@ -190,7 +190,7 @@ struct MutterSession {
 }
 
 /// Run the four-step handshake (see module docs).
-async fn connect() -> Result<MutterSession> {
+async fn connect(mode: Mode) -> Result<MutterSession> {
     let conn = zbus::Connection::session()
         .await
         .context("connect session D-Bus")?;
@@ -243,9 +243,18 @@ async fn connect() -> Result<MutterSession> {
     )
     .await?;
 
-    // 3. The virtual monitor. Size/refresh follow the PipeWire format negotiation.
+    // 3. The virtual monitor, pinned to the client's exact mode via RecordVirtual's "modes"
+    // (explicit size + refresh-rate; Mutter ≥ 47). WITHOUT it Mutter derives the virtual monitor's
+    // refresh from the PipeWire stream framerate and defaults to **60 Hz** — so a >60 Hz client
+    // mode (e.g. 240) renders at 60 and only the encoder pads to 240 (duplicate frames). Older
+    // Mutter that doesn't know the key just ignores it and falls back to the 60 Hz default.
+    let mut vmode: HashMap<&str, Value> = HashMap::new();
+    vmode.insert("size", Value::from((mode.width, mode.height)));
+    vmode.insert("refresh-rate", Value::from(mode.refresh_hz as f64));
+    vmode.insert("is-preferred", Value::from(true));
     let mut rec: HashMap<&str, Value> = HashMap::new();
     rec.insert("cursor-mode", Value::from(CURSOR_EMBEDDED));
+    rec.insert("modes", Value::from(vec![vmode]));
     let stream_path: OwnedObjectPath = sc_session
         .call("RecordVirtual", &(rec,))
         .await
