@@ -3,11 +3,15 @@
   "pages": [
     "index",
     "overview",
+    "status",
     "implementation-plan",
     "roadmap",
     "m2-plan",
     "---Setup---",
     "linux-setup",
+    "headless-box",
+    "gnome-box",
+    "bazzite",
     "windows-host",
     "dualsense-haptics"
   ]

@@ -299,15 +299,24 @@ buffer; `sendmmsg`/`recvmmsg` batching; the capture-timestamp anchor placement.
   `sync_channel(3)` with backpressure. Removes the serialization (~2–8 ms @60–120 fps) and is the
   substrate the slice wrapper needs. Real-NIC soak (host on the Ubuntu/GNOME box, client over the
   LAN): `send_dropped=0` at 720p60 / 1080p120, and a 1 Gbps probe pushed 625 MB in 5 s clean.
+- **Done & live (skew handshake landed 2026-06-12):** **wall-clock skew handshake** — `ClockProbe`/
+  `ClockEcho` on the control stream (8 NTP-style rounds right after `Start`; min-RTT sample →
+  host−client offset; `clock_offset_ns`). The client adds the offset to its receive instant before
+  differencing against the AU `pts_ns`, so the `capture→reassembled` percentiles are now valid
+  **across machines** (reported `skew_corrected=true`), not just same-host. Back-compat: an old host
+  that doesn't answer times out → `skew_corrected=false` (shared-clock assumption, as before).
+  Validated cross-LAN (GNOME box → dev box): offset ≈ −1.57 ms (reproducible), rtt ~140 µs, **p50
+  1.30 ms** skew-corrected capture→reassembled. **Remaining for true glass-to-glass**: the **client
+  present-stamp** (decode→present term) — only the Apple client presents today, so it needs the
+  connector to expose the offset + an Apple present-time probe; and the **render→capture** term
+  (PipeWire buffer presentation timestamp vs our capture stamp). `tools/latency-probe` is still the
+  cross-machine orchestrator.
 - **Bigger bets (ordered, deferred — need real-NIC/GPU/Mac validation):**
-  1. **Wall-clock skew handshake + glass-to-glass probe** (`tools/latency-probe`) — measures the two
-     biggest unmeasured terms (render→capture, decode→present); client present-stamp vs the AU's
-     `pts_ns` (already attached).
-  2. **CUDA stream+event** to drop one of two redundant `cuCtxSynchronize` in `submit_cuda` (keep the
+  1. **CUDA stream+event** to drop one of two redundant `cuCtxSynchronize` in `submit_cuda` (keep the
      copy) — ~0.1–0.4 ms@720p, ~1 ms@5K; only if per-stage timing proves the sync is on the path.
-  3. **Stage-2 Apple presenter** (`VTDecompressionSession` → `CAMetalLayer`, hand-paced) — ~0.5 refresh
+  2. **Stage-2 Apple presenter** (`VTDecompressionSession` → `CAMetalLayer`, hand-paced) — ~0.5 refresh
      off the present tail (biggest client win at 60 Hz); gate on the probe proving present is real.
-  4. **NVENC slice-mode wrapper** (roadmap §2 sub-frame pipelining) — per-slice transmit overlaps
+  3. **NVENC slice-mode wrapper** (roadmap §2 sub-frame pipelining) — per-slice transmit overlaps
      encode+send within a frame (~3–6 ms at 4K/5K/IDR); large + driver-ABI-fragile, on top of the
      thread split, only after measurement justifies it.
 

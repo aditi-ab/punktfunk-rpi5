@@ -27,7 +27,9 @@ per-session virtual output (KWin, gamescope, Mutter, Sway backends), encoded wit
 plane (p50 ~0.8 ms capture→reassembled at 720p120), with a SPAKE2 PIN pairing ceremony. Both
 run from **one process** (`serve --native`), managed through a REST API + web console. Builds
 against FFmpeg 7 or 8; deployed live on Bazzite. Full status: [`CLAUDE.md`](CLAUDE.md);
-roadmap: [`docs/roadmap.md`](docs/roadmap.md).
+roadmap, setup guides & progress: the docs site ([`docs-site/`](docs-site) — Fumadocs;
+`bun run dev`), with the canonical [roadmap](docs-site/content/docs/roadmap.md) and
+[status](docs-site/content/docs/status.md) there. Design notes stay in [`docs/`](docs).
 
 ## Layout
 
