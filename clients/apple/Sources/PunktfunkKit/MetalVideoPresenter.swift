@@ -80,6 +80,19 @@ public final class MetalVideoPresenter {
         layer.pixelFormat = .bgra8Unorm
         layer.framebufferOnly = true
         layer.isOpaque = true
+        // Triple-buffer: more in-flight drawables before `nextDrawable()` (called on the
+        // display-link / MAIN thread) has to block waiting for one to free.
+        layer.maximumDrawableCount = 3
+        #if os(macOS)
+        // The display link already paces exactly one present per vsync. Leaving the layer's
+        // own vsync wait on means `commandBuffer.present` ALSO blocks for the hardware vsync,
+        // so `nextDrawable()` stalls the MAIN thread until a drawable frees — windowed, the
+        // WindowServer's looser compositing hides it; FULLSCREEN's tighter, more-direct path
+        // serializes the main thread to the display and the stall surfaces as bad judder.
+        // Disabling the layer-level sync lets present return promptly (the display link is the
+        // pacing source), which is what fixes the fullscreen stutter. macOS-only property.
+        layer.displaySyncEnabled = false
+        #endif
         self.layer = layer
     }
 
