@@ -436,9 +436,9 @@ fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
     }
     let flag0 = data[1]; // BIT0 compat vibration, BIT1 haptics select, BIT2 R2, BIT3 L2
     let flag1 = data[2]; // BIT2 lightbar, BIT4 player indicators
-    // Motor rumble: high-frequency (small/right) motor at data[3], low-frequency (big/left) at
-    // data[4]. Scale 0..255 → 0..0xFFFF, same (low, high) convention as the uinput pad's mixer,
-    // and route to the universal rumble plane (0xCA).
+                         // Motor rumble: high-frequency (small/right) motor at data[3], low-frequency (big/left) at
+                         // data[4]. Scale 0..255 → 0..0xFFFF, same (low, high) convention as the uinput pad's mixer,
+                         // and route to the universal rumble plane (0xCA).
     if flag0 & 0x03 != 0 {
         let high = (data[3] as u16) << 8;
         let low = (data[4] as u16) << 8;
@@ -607,7 +607,10 @@ impl DualSenseManager {
         }
         match DualSensePad::open(idx as u8) {
             Ok(p) => {
-                tracing::info!(index = idx, "virtual DualSense created (UHID hid-playstation)");
+                tracing::info!(
+                    index = idx,
+                    "virtual DualSense created (UHID hid-playstation)"
+                );
                 self.pads[idx] = Some(p);
                 self.state[idx] = DsState::neutral();
                 self.last_rumble[idx] = (0, 0);
@@ -744,8 +747,8 @@ mod tests {
         assert_eq!(&r[16..22], &[0x22, 0x11, 0x44, 0x33, 0x66, 0x55]); // gyro LE
         assert_eq!(&r[22..28], &[0x78, 0x07, 0x9A, 0x09, 0xBC, 0x0B]); // accel LE
         assert_eq!(&r[28..32], &[0xDD, 0xCC, 0xBB, 0xAA]); // sensor_timestamp LE
-        // Touch point 1 at struct off 32 = r[33..37]: contact byte (active → bit7 clear),
-        // then 12-bit x / 12-bit y packed.
+                                                           // Touch point 1 at struct off 32 = r[33..37]: contact byte (active → bit7 clear),
+                                                           // then 12-bit x / 12-bit y packed.
         assert_eq!(r[33], 5);
         assert_eq!(r[34], 0x23);
         assert_eq!(r[35], 0x61); // x_hi nibble 0x1 | (y & 0xF) << 4 (y=0x356 → 0x6 << 4)

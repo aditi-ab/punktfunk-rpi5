@@ -46,7 +46,12 @@ pub fn advertise_native(
     props.insert("fp".into(), fingerprint.to_string());
     props.insert(
         "pair".into(),
-        if require_pairing { "required" } else { "optional" }.into(),
+        if require_pairing {
+            "required"
+        } else {
+            "optional"
+        }
+        .into(),
     );
     props.insert("id".into(), uniqueid.to_string());
     let service = ServiceInfo::new(NATIVE_SERVICE, hostname, &host_name, ip, port, props)

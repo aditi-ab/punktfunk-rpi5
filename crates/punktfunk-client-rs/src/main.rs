@@ -274,7 +274,10 @@ fn discover(secs: u64) -> Result<()> {
     let receiver = daemon
         .browse("_punktfunk._udp.local.")
         .context("browse _punktfunk._udp")?;
-    tracing::info!(secs, "browsing for native punktfunk/1 hosts (_punktfunk._udp)…");
+    tracing::info!(
+        secs,
+        "browsing for native punktfunk/1 hosts (_punktfunk._udp)…"
+    );
     // One row per host, keyed by the stable uniqueid (falls back to the fullname) so the same
     // host re-advertising or answering on several interfaces collapses to a single entry.
     let mut hosts: BTreeMap<String, String> = BTreeMap::new();
@@ -298,7 +301,12 @@ fn discover(secs: u64) -> Result<()> {
                     .unwrap_or_else(|| "?".into());
                 let fp = val("fp");
                 let fp_short = fp.get(..16).unwrap_or(fp.as_str());
-                let name = info.get_fullname().split('.').next().unwrap_or("?").to_string();
+                let name = info
+                    .get_fullname()
+                    .split('.')
+                    .next()
+                    .unwrap_or("?")
+                    .to_string();
                 let id = val("id");
                 let key = if id.is_empty() {
                     info.get_fullname().to_string()
@@ -490,7 +498,10 @@ async fn session(args: Args) -> Result<()> {
             } else {
                 0
             };
-            let throughput_kbps = recv_bytes.saturating_mul(8).checked_div(window_ms).unwrap_or(0);
+            let throughput_kbps = recv_bytes
+                .saturating_mul(8)
+                .checked_div(window_ms)
+                .unwrap_or(0);
             let loss_pct = if res.bytes_sent > 0 {
                 res.bytes_sent.saturating_sub(recv_bytes) as f64 / res.bytes_sent as f64 * 100.0
             } else {

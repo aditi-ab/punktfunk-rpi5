@@ -175,8 +175,7 @@ impl NativeClient {
         let (mic_tx, mic_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u64, Vec<u8>)>();
         let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<RichInput>();
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<CtrlRequest>();
-        let (ready_tx, ready_rx) =
-            std::sync::mpsc::channel::<Result<Negotiated>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mode_slot = Arc::new(std::sync::Mutex::new(mode));
         let probe = Arc::new(Mutex::new(ProbeState::default()));
