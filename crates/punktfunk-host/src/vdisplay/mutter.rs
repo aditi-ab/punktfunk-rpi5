@@ -169,15 +169,19 @@ fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>, 
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
-        // Restore the original monitor layout (physical primary) before tearing the session down.
-        // (Mutter also auto-reverts the temporary config when the virtual output disappears.)
+        // Tear down: STOP the screencast FIRST so Mutter removes the virtual output and auto-reverts
+        // the temporary monitor config (physical → primary). Reconfiguring an *actively-captured*
+        // high-refresh virtual output via ApplyMonitorsConfig was SIGSEGVing gnome-shell on teardown,
+        // so we never touch the layout while the virtual output is still live.
+        let _ = session.rd_session.call_method("Stop", &()).await;
         if let Some((dc, original)) = restore {
+            // Let Mutter drop the virtual output, then re-assert the physical layout deterministically
+            // (a no-op if the temporary config already auto-reverted) — safe now: no live virtual.
+            tokio::time::sleep(Duration::from_millis(300)).await;
             if let Err(e) = apply_config(&dc, &original).await {
-                tracing::warn!("mutter: monitor-layout restore failed ({e:#}); Mutter reverts the temporary config on teardown");
+                tracing::warn!("mutter: monitor-layout restore after stop failed ({e:#}); Mutter auto-reverts the temporary config on teardown");
             }
         }
-        // Best-effort explicit teardown before the connection drops.
-        let _ = session.rd_session.call_method("Stop", &()).await;
     });
 }
 
@@ -244,11 +248,11 @@ async fn connect(mode: Mode) -> Result<MutterSession> {
     .await?;
 
     // 3. The virtual monitor. By DEFAULT we let Mutter derive the refresh from the PipeWire
-    // framerate (it defaults the virtual monitor to **60 Hz**) — stable. PUNKTFUNK_MUTTER_VIRTUAL_REFRESH=1
-    // pins the client's exact WxH@Hz via RecordVirtual's "modes" (explicit size + refresh-rate;
-    // Mutter ≥ 47) for true >60 Hz — BUT a high-refresh virtual CRTC has been observed to SIGSEGV
-    // gnome-shell on teardown (large modes, e.g. 5120×1440@240), so it is OFF by default until that
-    // teardown crash is resolved.
+    // framerate (it defaults the virtual monitor to 60 Hz) — universally safe.
+    // PUNKTFUNK_MUTTER_VIRTUAL_REFRESH=1 pins the client's exact WxH@Hz via RecordVirtual's "modes"
+    // (explicit size + refresh-rate; Mutter ≥ 47) for true >60 Hz — validated at 5120×1440@240 on
+    // Mutter 50 + NVIDIA. (A high-refresh virtual CRTC used to SIGSEGV gnome-shell on teardown; the
+    // stop-screencast-before-any-monitor-reconfig teardown below avoids that.)
     let mut rec: HashMap<&str, Value> = HashMap::new();
     rec.insert("cursor-mode", Value::from(CURSOR_EMBEDDED));
     if virtual_refresh_enabled() && mode.refresh_hz > 60 {
@@ -352,8 +356,10 @@ fn virtual_primary_enabled() -> bool {
 }
 
 /// Opt-in: pin the virtual output to the client's exact refresh via RecordVirtual "modes" (true
-/// above-60 Hz). OFF by default — a high-refresh virtual CRTC currently SIGSEGVs gnome-shell on
-/// session teardown (large modes), so don't risk the host's GNOME session until that's fixed.
+/// above-60 Hz). Off by default — Mutter-derived 60 Hz is safe on every host; high-refresh virtual
+/// CRTCs are validated on Mutter 50 + NVIDIA but behaviour can vary, so it stays opt-in. (The
+/// teardown SIGSEGV that first motivated this gate is fixed by stopping the screencast before any
+/// monitor-config change.)
 fn virtual_refresh_enabled() -> bool {
     std::env::var("PUNKTFUNK_MUTTER_VIRTUAL_REFRESH")
         .map(|v| {
