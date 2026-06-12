@@ -74,7 +74,8 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
   received it, **skew-corrected** across machines via `PunktfunkConnection.clockOffsetNs` (the
   connect-time wall-clock handshake, `punktfunk_connection_clock_offset_ns`). It excludes the
   layer's decode+present (stage-1 `AVSampleBufferDisplayLayer` has no per-frame present callback);
-  true decode→present awaits the stage-2 presenter. Settings also picks the HOST
+  the opt-in **stage-2 presenter** (Settings → Presenter) adds a **capture→present**
+  (glass-to-glass) line via explicit decode + a Metal/display-link present. Settings also picks the HOST
   compositor (KWin/wlroots/Mutter/gamescope, default automatic — the host honors it
   only if that backend is available there) and has a **Controllers** section: every
   detected controller (capability glyphs, battery, "In use" badge), which one to forward
@@ -166,13 +167,15 @@ signing, bundle id `io.unom.punktfunk`. Notes:
 3. **Decode flow**: the host opens every stream with an IDR carrying VPS/SPS/PPS in-band
    and recovery keyframes re-send them — "refresh the format description on every IDR"
    (what `StreamView` does) is sufficient; there is no out-of-band extradata, ever.
-4. **Stage 2 (next)**: explicit `VTDecompressionSession` + `CAMetalLayer` for frame-pacing
-   control (ProMotion/120 Hz) and true decode→present / glass-to-glass measurement. The
-   cross-machine clock offset is **already wired** — `PunktfunkConnection.clockOffsetNs` (from
-   the connect-time skew handshake); add it to a `CLOCK_REALTIME` present instant and subtract
-   the AU `pts_ns`. **Full pickup-ready implementation plan** (decode + present + measurement
-   wiring, integration points, gotchas): `docs-site/content/docs/apple-stage2-presenter.md`
-   (rendered in the docs site under "Apple Stage-2 Presenter").
+4. **Stage 2 — built, opt-in (`punktfunk.presenter == "stage2"`, default stage 1).** Explicit
+   `VTDecompressionSession` decode (`VideoDecoder`) → a `CAMetalLayer` + display-link present
+   (`MetalVideoPresenter`/`Stage2Pipeline`), hosted as a sublayer by the same `StreamView`s with
+   input capture + HUD unchanged. It adds a **capture→present** (glass-to-glass, modulo the host
+   render→capture term) HUD line, skew-corrected via `PunktfunkConnection.clockOffsetNs`. The
+   decode half is unit-tested (`testVideoDecoderAsyncCallbackDeliversPixels`); the Metal present
+   is display-bound — **validate live** (flip the Settings "Presenter" picker, watch the HUD
+   number and that the image looks right) before making it the default. 10-bit/HDR + a smoothing
+   pacer are later. Plan: `docs-site/content/docs/apple-stage2-presenter.md`.
 5. **Audio — wired, both directions.** Playback: `SessionAudio` drains `nextAudio()`
    on its own thread, decodes through CoreAudio's built-in Opus codec (`OpusCodec.swift`
    — kAudioFormatOpus, no bundled libopus; round-trip unit-tested) into a priming
