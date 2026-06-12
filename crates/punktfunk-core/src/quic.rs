@@ -1610,8 +1610,10 @@ mod tests {
         let n4 = (n3 as i64 - OFF + 5_000_000) as u64; // 5 ms return → big RTT
         let (offset, rtt) =
             clock_offset_ns(&[(n1, n2, n3, n4), (t1, t2, t3, t4)]).expect("non-empty");
-        assert_eq!(offset, OFF, "min-RTT sample recovers the offset exactly");
-        assert_eq!(rtt, 400_000, "min-RTT sample's RTT (2x200us), not the noisy 5ms one");
+        // The min-RTT sample recovers the offset exactly; its RTT is 2x200us, and the noisy
+        // (asymmetric, 5 ms return) sample is ignored by the min-RTT selection.
+        assert_eq!(offset, OFF);
+        assert_eq!(rtt, 400_000);
         assert!(clock_offset_ns(&[]).is_none());
     }
 
