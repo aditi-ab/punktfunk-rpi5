@@ -10,8 +10,8 @@ CI runs on **Gitea Actions** (`git.unom.io`, org `unom`). Three workflows in
 
 | Workflow | Trigger | Runner | What it does |
 |---|---|---|---|
-| `ci.yml` | push to `main`, PRs | `ubuntu-latest` | Rust workspace (fmt · clippy `-D warnings` · build · test · C-ABI harness · generated-header drift) inside the `punktfunk-rust-ci` image; `web/` and `docs-site/` build + typecheck in `oven/bun:1` |
-| `docker.yml` | push to `main`, `v*` tags, manual | `ubuntu-latest` | Builds + pushes the three images below (`latest` + `sha-<short>` tags) |
+| `ci.yml` | push to `main`, PRs | `ubuntu-24.04` | Rust workspace (fmt · clippy `-D warnings` · build · test · C-ABI harness · generated-header drift) inside the `punktfunk-rust-ci` image; `web/` and `docs-site/` build + typecheck in `oven/bun:1` |
+| `docker.yml` | push to `main`, `v*` tags, manual | `ubuntu-24.04` | Builds + pushes the three images below (`latest` + `sha-<short>` tags) |
 | `apple.yml` | push to `main`, PRs, manual | `macos-arm64` | Rust core → `PunktfunkCore.xcframework` → `swift build` + `swift test` in `clients/apple` |
 
 ## Dockerized pieces
@@ -31,7 +31,7 @@ push actor).
 
 ## Runners
 
-- **`ubuntu-latest`** — the pre-existing Linux runner; runs the Rust/web/docs jobs (as
+- **`ubuntu-24.04`** — the pre-existing Linux runner; runs the Rust/web/docs jobs (as
   docker containers) and the image build+push jobs.
 - **`macos-arm64`** — `home-mac-mini-1` (M-series, macOS 26), a **host-mode**
   `act_runner` (upstream now ships it as `gitea-runner`) provisioned by
@@ -39,10 +39,13 @@ push actor).
   rustup (+ both darwin targets for the universal xcframework), Node.js (host-mode runners
   execute JS actions via `node` from PATH — nothing auto-provisions it), the runner binary
   in `~/.local/bin`, state in `~/ci/act-runner/` (config, `.runner` registration,
-  `runner.log`), kept alive by the `io.gitea.act_runner` LaunchAgent. Needs full **Xcode**
-  for `xcodebuild -create-xcframework` (CLT alone only covers `swift build/test`); if
-  `xcode-select` still points at CLT, the script auto-detects `/Applications/Xcode*.app`
-  and bakes a `DEVELOPER_DIR` override into the LaunchAgent — no sudo required.
+  `runner.log`), kept alive by the `io.gitea.act_runner` **root LaunchDaemon** — it cannot
+  be a user LaunchAgent: macOS Local Network privacy silently blocks LAN dials
+  ("no route to host") from unbundled CLI binaries in gui/user launchd domains, while
+  system daemons are exempt. Needs full **Xcode** for `xcodebuild -create-xcframework`
+  (CLT alone only covers `swift build/test`); if `xcode-select` still points at CLT, the
+  script auto-detects `/Applications/Xcode*.app` and bakes a `DEVELOPER_DIR` override into
+  the daemon environment — no `xcode-select -s` required.
 
 Re-provisioning (idempotent) or first-time registration from a dev box:
 
@@ -55,9 +58,9 @@ ssh enricobuehler@192.168.1.135 GITEA_RUNNER_TOKEN=<token> bash -s \
 ## Troubleshooting
 
 - **Mac runner offline** — `ssh <mac> tail -50 '~/ci/act-runner/runner.log'`; restart with
-  `launchctl kickstart -k gui/$(id -u)/io.gitea.act_runner`. After a reboot with nobody
-  logged in, the LaunchAgent only starts once auto-login is enabled (or promote the plist
-  to a LaunchDaemon).
+  `sudo launchctl kickstart -k system/io.gitea.act_runner`. "no route to host" in the log
+  means the daemon is running in a gui/user domain again — see the Local Network note
+  above.
 - **`apple.yml` fails at the xcframework step** — Xcode missing or unselected:
   `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer` and accept the license
   (`sudo xcodebuild -license accept`), then re-run.

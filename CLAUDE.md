@@ -124,6 +124,13 @@ Generated artifacts are **checked in** and CI fails on drift: `include/punktfunk
 (cbindgen from `punktfunk-core/src/abi.rs`) and `docs/api/openapi.json` (regenerate with
 `cargo run -p punktfunk-host -- openapi > docs/api/openapi.json`; spec lives in `mgmt.rs`).
 
+CI is Gitea Actions (`.gitea/workflows/`, guide: docs-site `ci.md`): `ci.yml` runs the
+workspace checks inside the `git.unom.io/unom/punktfunk-rust-ci` image plus web/docs-site
+build+typecheck; `docker.yml` builds+pushes the web/docs/rust-ci images (host and native
+clients are deliberately NOT containerized); `apple.yml` builds the xcframework and runs
+`swift build`/`swift test` on the `macos-arm64` host-mode runner (home-mac-mini-1,
+provisioned by `scripts/ci/setup-macos-runner.sh`).
+
 ## Layout
 
 ```

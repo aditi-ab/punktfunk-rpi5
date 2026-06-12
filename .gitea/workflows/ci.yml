@@ -11,7 +11,7 @@ on:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: git.unom.io/unom/punktfunk-rust-ci:latest
     timeout-minutes: 90
@@ -60,7 +60,7 @@ jobs:
             || (echo "include/punktfunk_core.h is stale — commit the regenerated header" && exit 1)
 
   web:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: oven/bun:1
     timeout-minutes: 30
@@ -84,7 +84,7 @@ jobs:
         run: bun run lint
 
   docs-site:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: oven/bun:1
     timeout-minutes: 30

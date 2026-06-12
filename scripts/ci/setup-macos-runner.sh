@@ -8,8 +8,9 @@
 # Installs: rustup (+ both darwin targets for the universal xcframework), Node.js (the
 # runner executes JS actions like actions/checkout via `node` from PATH — host mode does
 # not auto-provision it), the act_runner binary (host mode — jobs run directly on macOS,
-# no containers), and a LaunchAgent that keeps the runner daemon alive. Registration only
-# happens once (.runner file); the token is NOT persisted by this script.
+# no containers), and a root LaunchDaemon that keeps the runner daemon alive (see the
+# launchd section for why it can't be a user LaunchAgent). Registration only happens once
+# (.runner file); the token is NOT persisted by this script.
 #
 # Env knobs: GITEA_INSTANCE (default https://git.unom.io), GITEA_RUNNER_TOKEN (required
 # for first-time registration only), RUNNER_NAME (default: LocalHostName), RUNNER_LABELS
@@ -26,7 +27,6 @@ RUNNER_NAME="${RUNNER_NAME:-$(scutil --get LocalHostName)}"
 LABELS="${RUNNER_LABELS:-macos-arm64:host}"
 RUNNER_HOME="$HOME/ci/act-runner"
 BIN_DIR="$HOME/.local/bin"
-PLIST="$HOME/Library/LaunchAgents/io.gitea.act_runner.plist"
 
 # --- Rust toolchain (the xcframework is built from the Rust core) -----------------------
 if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
@@ -65,6 +65,11 @@ fi
 # --- config + one-time registration ------------------------------------------------------
 cd "$RUNNER_HOME"
 [ -f config.yaml ] || "$BIN_DIR/act_runner" generate-config > config.yaml
+# generate-config seeds runner.labels with docker:// defaults, which (a) override the
+# host-mode labels registered in .runner and (b) make the daemon demand a Docker engine
+# ("Docker Engine socket not found"). Empty them so .runner's labels rule.
+sed -i '' -e '/docker.gitea.com\/runner-images/d' \
+    -e 's|^\([[:space:]]*\)labels:$|\1labels: []|' config.yaml
 if [ ! -f .runner ]; then
     if [ -z "${GITEA_RUNNER_TOKEN:-}" ]; then
         echo "ERROR: not registered yet — re-run with GITEA_RUNNER_TOKEN=<token>" >&2
@@ -78,28 +83,38 @@ if [ ! -f .runner ]; then
         --labels "$LABELS"
 fi
 
-# --- LaunchAgent: keep the daemon alive across crashes and (GUI) logins ------------------
-# PATH must carry the CLT tools, cargo and act_runner itself; jobs inherit it.
+# --- launchd service ---------------------------------------------------------------------
+# macOS Local Network privacy (15+) silently denies LAN connections ("no route to host")
+# to unbundled CLI binaries in gui/user launchd domains — a user LaunchAgent can NOT reach
+# a Gitea instance on the LAN (curl over ssh works, the same dial from the agent fails).
+# System-domain daemons are exempt and survive reboots with nobody logged in, so the
+# runner ships as a root LaunchDaemon; installing it needs sudo once. Without sudo this
+# script still leaves a working (but reboot-volatile) nohup daemon behind.
+# PATH must carry the CLT tools, cargo, node and act_runner itself; jobs inherit it.
 # If the system developer dir is CLT-only but a full Xcode is installed, hand jobs a
 # DEVELOPER_DIR override — the per-process equivalent of `xcode-select -s`, no sudo needed.
 DEVELOPER_DIR_XML=""
+DEV_DIR=""
 if ! /usr/bin/xcodebuild -version >/dev/null 2>&1; then
     for app in /Applications/Xcode.app /Applications/Xcode*.app; do
         if DEVELOPER_DIR="$app/Contents/Developer" /usr/bin/xcodebuild -version >/dev/null 2>&1; then
-            DEVELOPER_DIR_XML="<key>DEVELOPER_DIR</key><string>$app/Contents/Developer</string>"
+            DEV_DIR="$app/Contents/Developer"
+            DEVELOPER_DIR_XML="<key>DEVELOPER_DIR</key><string>$DEV_DIR</string>"
             echo "==> using full Xcode at $app via DEVELOPER_DIR"
             break
         fi
     done
 fi
 
-mkdir -p "$(dirname "$PLIST")"
-cat > "$PLIST" <<EOF
+PLIST_STAGE="$RUNNER_HOME/io.gitea.act_runner.plist"
+PLIST_SYSTEM="/Library/LaunchDaemons/io.gitea.act_runner.plist"
+cat > "$PLIST_STAGE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key><string>io.gitea.act_runner</string>
+    <key>UserName</key><string>$USER</string>
     <key>ProgramArguments</key>
     <array>
         <string>$BIN_DIR/act_runner</string>
@@ -123,19 +138,24 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 
-UID_NUM="$(id -u)"
-launchctl bootout "gui/$UID_NUM/io.gitea.act_runner" 2>/dev/null || true
-if launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null; then
-    echo "==> runner LaunchAgent bootstrapped (gui/$UID_NUM)"
+launchctl bootout "gui/$(id -u)/io.gitea.act_runner" 2>/dev/null || true
+if sudo -n true 2>/dev/null; then
+    sudo install -m 644 -o root -g wheel "$PLIST_STAGE" "$PLIST_SYSTEM"
+    pkill -x act_runner 2>/dev/null || true
+    sudo launchctl bootout system/io.gitea.act_runner 2>/dev/null || true
+    sudo launchctl bootstrap system "$PLIST_SYSTEM"
+    echo "==> runner LaunchDaemon bootstrapped (system domain)"
 else
-    # No GUI session (pure-SSH box, nobody logged in): land it in the user domain for now.
-    # For boot persistence without a GUI login, either enable auto-login for this user or
-    # promote the plist to a root-owned LaunchDaemon in /Library/LaunchDaemons (sudo).
-    launchctl bootout "user/$UID_NUM/io.gitea.act_runner" 2>/dev/null || true
-    launchctl bootstrap "user/$UID_NUM" "$PLIST"
-    echo "==> runner LaunchAgent bootstrapped (user/$UID_NUM — no GUI session)"
-    echo "    NOTE: won't auto-start after reboot until auto-login is enabled or the"
-    echo "    plist is promoted to a LaunchDaemon."
+    if ! pgrep -x act_runner >/dev/null; then
+        echo "==> no sudo: starting an interim daemon (dies on reboot)"
+        (cd "$RUNNER_HOME" && \
+            PATH="$HOME/.cargo/bin:$BIN_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+            ${DEV_DIR:+DEVELOPER_DIR="$DEV_DIR"} \
+            nohup "$BIN_DIR/act_runner" daemon --config config.yaml >> runner.log 2>&1 &)
+    fi
+    echo "==> for the permanent (reboot-safe) runner, run once on the Mac:"
+    echo "    sudo install -m 644 -o root -g wheel $PLIST_STAGE $PLIST_SYSTEM"
+    echo "    sudo launchctl bootstrap system $PLIST_SYSTEM"
 fi
 
 sleep 2
