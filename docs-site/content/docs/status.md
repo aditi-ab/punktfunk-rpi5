@@ -29,6 +29,15 @@ All three appliances advertise over mDNS (`_punktfunk._udp`) and require PIN pai
 ## Progress log
 
 ### 2026-06-12
+- **CI + deployment landed** (see the [CI & Docker](/docs/ci) guide). Gitea Actions, three
+  workflows: Rust workspace checks inside the new `punktfunk-rust-ci` builder image (Ubuntu 26.04,
+  full link-dep stack incl. a libcuda stub — 141/141 tests green in-container), web + docs-site
+  build/typecheck, `docker.yml` building+pushing `punktfunk-web`/`punktfunk-docs`/`punktfunk-rust-ci`
+  to the registry, and `apple.yml` (xcframework → `swift build`/`swift test`) on a new **host-mode
+  macOS runner** (`home-mac-mini-1`, provisioned by `scripts/ci/setup-macos-runner.sh`; macOS
+  Local-Network privacy forces it to run as a root LaunchDaemon). Host and native clients stay
+  un-dockerized by design. **This site now deploys automatically**: `deploy-docs` ships it to
+  unom-1:3220, Caddy serves <https://docs.punktfunk.unom.io> — live and verified.
 - **Concurrent sessions** — the host no longer serves one client at a time. The accept loop spawns
   each session (`JoinSet`), bounded by `--max-concurrent` (default 4, a NVENC bound; overflow waits
   in the accept queue). Each session keeps its own virtual output + encoder; they share the
