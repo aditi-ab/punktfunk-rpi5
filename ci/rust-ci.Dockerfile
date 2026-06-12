@@ -20,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpipewire-0.3-dev libopus-dev libwayland-dev libxkbcommon-dev \
     # zerocopy link deps (GL via libglvnd, EGL, GBM)
     libgl-dev libegl-dev libgbm-dev \
+    # punktfunk-client-linux (GTK4/libadwaita shell, SDL3 gamepads)
+    libgtk-4-dev libadwaita-1-dev libsdl3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # libcuda link stub: the NVIDIA userspace library (no kernel module needed) provides

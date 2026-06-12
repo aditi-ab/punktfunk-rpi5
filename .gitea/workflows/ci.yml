@@ -18,6 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # punktfunk-client-linux link deps. Also baked into rust-ci.Dockerfile — but ci.yml
+      # runs against the image from the PREVIOUS push (docker.yml bootstrap note), so this
+      # keeps the job green across image-content changes; a no-op once the image has them.
+      - name: GTK4/libadwaita/SDL3 dev packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev libsdl3-dev
+
       # Best-effort caches (act_runner's built-in cache server). Keyed on Cargo.lock:
       # registry/git are download caches, target/ the incremental build. The target key
       # carries the rustc version — rust-toolchain.toml pins the floating "stable"
