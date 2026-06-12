@@ -15,10 +15,14 @@ final class LoopbackIntegrationTests: XCTestCase {
         }
 
         let conn = try PunktfunkConnection(
-            host: "127.0.0.1", port: port, width: 1280, height: 720, refreshHz: 60)
+            host: "127.0.0.1", port: port, width: 1280, height: 720, refreshHz: 60,
+            bitrateKbps: 50_000)
         XCTAssertEqual(conn.width, 1280)
         XCTAssertEqual(conn.height, 720)
         XCTAssertEqual(conn.refreshHz, 60)
+        // The Welcome echoes the negotiated encoder bitrate (50 Mbps is within the
+        // host's accepted range, so it comes back unclamped).
+        XCTAssertEqual(conn.resolvedBitrateKbps, 50_000)
 
         // Pull 25 synthetic frames and byte-verify the documented pattern:
         // u32 LE frame index, then data[i] = (idx as u8) &+ (i as u8).
@@ -88,12 +92,34 @@ final class LoopbackIntegrationTests: XCTestCase {
                 "missing the scripted trigger event: \(hidout)")
         }
 
+        // Speed test against the synthetic host: a short 20 Mbps burst over the real
+        // data plane. Probe filler is diverted from the frame queue (the 25-frame
+        // verification above stays byte-exact), the host's end-of-burst report flips
+        // `done`, and the measurement carries real numbers.
+        conn.startSpeedTest(targetKbps: 20_000, durationMs: 500)
+        var probe: PunktfunkConnection.ProbeResult?
+        let probeDeadline = Date().addingTimeInterval(10)
+        while Date() < probeDeadline {
+            if let r = conn.probeResult(), r.done {
+                probe = r
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        let result = try XCTUnwrap(probe, "the probe never completed")
+        XCTAssertGreaterThan(result.recvBytes, 0)
+        XCTAssertGreaterThan(result.hostBytes, 0)
+        XCTAssertGreaterThan(result.throughputKbps, 0)
+        XCTAssertGreaterThan(result.elapsedMs, 0)
+        XCTAssertGreaterThanOrEqual(result.lossPct, 0)
+
         conn.close()
         XCTAssertThrowsError(try conn.nextAU(timeoutMs: 10)) { error in
             guard case PunktfunkClientError.closed = error else {
                 return XCTFail("expected .closed, got \(error)")
             }
         }
+        XCTAssertNil(conn.probeResult())
     }
 
     func testConnectFailureThrows() {

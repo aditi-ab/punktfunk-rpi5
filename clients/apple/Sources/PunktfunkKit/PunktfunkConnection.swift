@@ -202,6 +202,11 @@ public final class PunktfunkConnection {
     /// machines. `0` = no correction (an older host that didn't answer, or synchronized clocks).
     public private(set) var clockOffsetNs: Int64 = 0
 
+    /// The video encoder bitrate (kbps) the host actually configured — the requested
+    /// `bitrateKbps` clamped to the host's range ([500, 2 000 000] kbps), or its default
+    /// (20 000) when 0 was requested. `0` = an older host that didn't report it.
+    public private(set) var resolvedBitrateKbps: UInt32 = 0
+
     /// Connect and start a session at the requested mode (the host creates a native virtual
     /// output at exactly this size/refresh). Blocks up to `timeoutMs`.
     ///
@@ -218,6 +223,10 @@ public final class PunktfunkConnection {
     ///
     /// `gamepad`: which virtual pad the host creates for this session's controllers (see
     /// `GamepadType`; `.auto` = host decides). Check `resolvedGamepad` afterwards.
+    ///
+    /// `bitrateKbps`: requested video encoder bitrate (0 = host default; the host clamps
+    /// to its supported range). Check `resolvedBitrateKbps` afterwards — a speed test
+    /// (`startSpeedTest`) is how a client picks an informed value.
     public init(
         host: String, port: UInt16 = 9777,
         width: UInt32, height: UInt32, refreshHz: UInt32,
@@ -225,6 +234,7 @@ public final class PunktfunkConnection {
         identity: ClientIdentity? = nil,
         compositor: Compositor = .auto,
         gamepad: GamepadType = .auto,
+        bitrateKbps: UInt32 = 0,
         timeoutMs: UInt32 = 10_000
     ) throws {
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
@@ -234,16 +244,16 @@ public final class PunktfunkConnection {
                 withOptionalCString(identity?.keyPEM) { key in
                     if let pin = pinSHA256 {
                         return pin.withUnsafeBytes { p in
-                            punktfunk_connect_ex2(
+                            punktfunk_connect_ex3(
                                 cs, port, width, height, refreshHz, compositor.rawValue,
-                                gamepad.rawValue,
+                                gamepad.rawValue, bitrateKbps,
                                 p.bindMemory(to: UInt8.self).baseAddress, &observed,
                                 cert, key, timeoutMs)
                         }
                     }
-                    return punktfunk_connect_ex2(
+                    return punktfunk_connect_ex3(
                         cs, port, width, height, refreshHz, compositor.rawValue,
-                        gamepad.rawValue,
+                        gamepad.rawValue, bitrateKbps,
                         nil, &observed, cert, key, timeoutMs)
                 }
             }
@@ -261,6 +271,54 @@ public final class PunktfunkConnection {
         var offset: Int64 = 0
         _ = punktfunk_connection_clock_offset_ns(handle, &offset)
         clockOffsetNs = offset
+        var br: UInt32 = 0
+        _ = punktfunk_connection_bitrate(handle, &br)
+        resolvedBitrateKbps = br
+    }
+
+    /// A bandwidth speed-test measurement (see `startSpeedTest`). Partial until `done`.
+    public struct ProbeResult: Sendable, Equatable {
+        /// The host's end-of-burst report arrived — the numbers are final.
+        public let done: Bool
+        /// Probe payload bytes / packets the client received.
+        public let recvBytes: UInt64
+        public let recvPackets: UInt32
+        /// Probe payload bytes / packets the host reported sending.
+        public let hostBytes: UInt64
+        public let hostPackets: UInt32
+        /// Client-measured receive window (first→last probe AU), milliseconds.
+        public let elapsedMs: UInt32
+        /// Measured goodput, kilobits per second.
+        public let throughputKbps: UInt32
+        /// Delivery loss `(hostBytes − recvBytes) / hostBytes`, percent (0 if unknown).
+        public let lossPct: Float
+    }
+
+    /// Start a bandwidth speed test: the host bursts filler over the data plane at
+    /// `targetKbps` of goodput for `durationMs` (clamped host-side to ≤ 3 Gbps / ≤ 5 s),
+    /// briefly pausing video. Non-blocking — poll `probeResult()` until `done`. Starting
+    /// a probe resets any prior measurement. Silently dropped after close.
+    public func startSpeedTest(targetKbps: UInt32, durationMs: UInt32) {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        _ = punktfunk_connection_speed_test(h, targetKbps, durationMs)
+    }
+
+    /// The current speed-test measurement (zeros before any probe; partial until `done`).
+    /// Safe to poll from any thread; nil after close.
+    public func probeResult() -> ProbeResult? {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return nil }
+        var out = PunktfunkProbeResult()
+        guard punktfunk_connection_probe_result(h, &out) == statusOK else { return nil }
+        return ProbeResult(
+            done: out.done != 0,
+            recvBytes: out.recv_bytes, recvPackets: out.recv_packets,
+            hostBytes: out.host_bytes, hostPackets: out.host_packets,
+            elapsedMs: out.elapsed_ms, throughputKbps: out.throughput_kbps,
+            lossPct: out.loss_pct)
     }
 
     /// Ask the host to switch the live session to a new mode (window resized) — no
@@ -508,6 +566,17 @@ public extension PunktfunkInputEvent {
     }
     static func mouseMove(dx: Int32, dy: Int32) -> PunktfunkInputEvent {
         make(PUNKTFUNK_INPUT_KIND_MOUSE_MOVE.rawValue, code: 0, x: dx, y: dy)
+    }
+    /// Absolute cursor position in client-surface pixels — the host places its cursor
+    /// there (same letterbox mapping and `flags` surface-dims packing as the touch events).
+    /// Used by the iPad pointer fallback when the scene can't pointer-lock and GCMouse's
+    /// relative deltas aren't available; the surface dimensions must each fit in 16 bits.
+    static func mouseMoveAbs(
+        x: Int32, y: Int32, surfaceWidth: UInt32, surfaceHeight: UInt32
+    ) -> PunktfunkInputEvent {
+        make(
+            PUNKTFUNK_INPUT_KIND_MOUSE_MOVE_ABS.rawValue, code: 0, x: x, y: y,
+            flags: ((surfaceWidth & 0xFFFF) << 16) | (surfaceHeight & 0xFFFF))
     }
     /// GameStream button ids: 1=left 2=middle 3=right 4=X1 5=X2 (host maps to evdev BTN_*).
     static func mouseButton(_ button: UInt32, down: Bool) -> PunktfunkInputEvent {
