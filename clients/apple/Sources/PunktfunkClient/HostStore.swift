@@ -9,6 +9,7 @@
 // --require-pairing only admit paired clients, so for them pairing is the only way in.
 
 import Foundation
+import PunktfunkKit
 import SwiftUI
 
 struct StoredHost: Identifiable, Codable, Hashable {
@@ -26,7 +27,7 @@ struct StoredHost: Identifiable, Codable, Hashable {
 
 @MainActor
 final class HostStore: ObservableObject {
-    private static let key = "punktfunk.hosts"
+    private static let key = DefaultsKey.hosts
 
     @Published var hosts: [StoredHost] {
         didSet { persist() }

@@ -218,7 +218,7 @@ public final class StreamViewController: UIViewController {
         // Presenter choice — default stage-1 (the known-good AVSampleBufferDisplayLayer). Stage-2
         // (`punktfunk.presenter == "stage2"`) takes VTDecompressionSession decode + a
         // CAMetalLayer/display-link present; falls back here if Metal can't be set up.
-        if UserDefaults.standard.string(forKey: "punktfunk.presenter") == "stage2",
+        if UserDefaults.standard.string(forKey: DefaultsKey.presenter) == "stage2",
            let meter = presentMeter,
            let pipeline = Stage2Pipeline(presentMeter: meter) {
             startStage2(pipeline, connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
@@ -294,17 +294,21 @@ public final class StreamViewController: UIViewController {
     ) {
         let metal = pipeline.layer
         metal.contentsScale = streamView.contentScaleFactor
+        // Composites OVER the idle (un-enqueued in stage-2) AVSampleBufferDisplayLayer base.
         streamView.layer.addSublayer(metal)
         metalLayer = metal
         stage2 = pipeline
         layoutMetalLayer()
-        let link = CADisplayLink(target: self, selector: #selector(stage2Tick(_:)))
+        // Weak-proxy target so the link doesn't retain-cycle with the controller (see
+        // DisplayLinkProxy) — the link retains the proxy; the proxy holds self weakly.
+        let proxy = DisplayLinkProxy { [weak self] link in self?.stage2Tick(link) }
+        let link = CADisplayLink(target: proxy, selector: #selector(DisplayLinkProxy.tick(_:)))
         link.add(to: .main, forMode: .common)
         stage2Link = link
         pipeline.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
     }
 
-    @objc private func stage2Tick(_ link: CADisplayLink) {
+    private func stage2Tick(_ link: CADisplayLink) {
         stage2?.renderTick(
             targetPresentNs: Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: link.targetTimestamp))
     }
@@ -394,6 +398,7 @@ public final class StreamViewController: UIViewController {
     deinit {
         observers.forEach(NotificationCenter.default.removeObserver(_:))
         pump?.stop()
+        teardownStage2() // invalidate the display link + stop the pipeline if stop() was missed
     }
 }
 

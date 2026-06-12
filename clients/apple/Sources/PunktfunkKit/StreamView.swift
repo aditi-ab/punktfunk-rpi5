@@ -434,7 +434,7 @@ public final class StreamLayerView: NSView {
         // Presenter choice — default stage-1 (the known-good AVSampleBufferDisplayLayer). Stage-2
         // (`punktfunk.presenter == "stage2"`) takes explicit VTDecompressionSession decode + a
         // CAMetalLayer/display-link present; it falls back here if Metal can't be set up.
-        if UserDefaults.standard.string(forKey: "punktfunk.presenter") == "stage2",
+        if UserDefaults.standard.string(forKey: DefaultsKey.presenter) == "stage2",
            let meter = presentMeter,
            let pipeline = Stage2Pipeline(presentMeter: meter) {
             startStage2(pipeline, connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
@@ -455,17 +455,22 @@ public final class StreamLayerView: NSView {
         onFrame: (@Sendable (AccessUnit) -> Void)?, onSessionEnd: (@Sendable () -> Void)?
     ) {
         let metal = pipeline.layer
-        displayLayer.addSublayer(metal) // contentsScale + frame set in layoutMetalLayer()
+        // The opaque metal layer composites OVER the AVSampleBufferDisplayLayer base, which sits
+        // idle (un-enqueued) in stage-2. contentsScale + frame are set in layoutMetalLayer().
+        displayLayer.addSublayer(metal)
         metalLayer = metal
         stage2 = pipeline
         layoutMetalLayer()
-        let link = displayLink(target: self, selector: #selector(stage2Tick(_:)))
+        // Weak-proxy target so the link doesn't form a retain cycle with the view (see
+        // DisplayLinkProxy) — the link retains the proxy; the proxy holds the view weakly.
+        let proxy = DisplayLinkProxy { [weak self] link in self?.stage2Tick(link) }
+        let link = displayLink(target: proxy, selector: #selector(DisplayLinkProxy.tick(_:)))
         link.add(to: .main, forMode: .common)
         stage2Link = link
         pipeline.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
     }
 
-    @objc private func stage2Tick(_ link: CADisplayLink) {
+    private func stage2Tick(_ link: CADisplayLink) {
         stage2?.renderTick(
             targetPresentNs: Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: link.targetTimestamp))
     }
@@ -523,6 +528,7 @@ public final class StreamLayerView: NSView {
         appObservers.forEach(NotificationCenter.default.removeObserver(_:))
         windowObservers.forEach(NotificationCenter.default.removeObserver(_:))
         pump?.stop()
+        teardownStage2() // invalidate the display link + stop the pipeline if stop() was missed
     }
 }
 #endif

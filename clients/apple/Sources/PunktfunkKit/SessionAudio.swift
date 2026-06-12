@@ -47,6 +47,10 @@ final class AudioRing: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let capacity = buf.count
+        // A single write larger than the whole ring would push readIdx PAST writeIdx below
+        // (inverting the valid range — corruption). It never happens (one decoded packet is far
+        // under capacity), but guard rather than corrupt.
+        guard count <= capacity else { return }
         if writeIdx + count - readIdx > capacity {
             readIdx = writeIdx + count - capacity // overflow: drop oldest
         }

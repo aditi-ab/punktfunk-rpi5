@@ -12,6 +12,16 @@ import AVFoundation
 import Foundation
 import QuartzCore
 
+/// Weak-target wrapper for CADisplayLink. The link retains its target, so targeting a view
+/// directly makes a `view → link → view` cycle that only `invalidate()` breaks — if a teardown
+/// is ever missed the view leaks and keeps ticking. This proxy holds the handler weakly, so the
+/// view can deallocate and its `deinit` invalidate the link.
+public final class DisplayLinkProxy: NSObject {
+    private let onTick: (CADisplayLink) -> Void
+    public init(_ onTick: @escaping (CADisplayLink) -> Void) { self.onTick = onTick }
+    @objc public func tick(_ link: CADisplayLink) { onTick(link) }
+}
+
 /// Newest-ready 1-slot ring: the decoder overwrites (drops the older undisplayed frame — lowest
 /// latency, no smoothing buffer), the display link takes-and-clears. Sendable; lock-guarded.
 private final class ReadyRing: @unchecked Sendable {
