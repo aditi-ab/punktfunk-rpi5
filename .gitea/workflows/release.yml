@@ -5,15 +5,22 @@
 #               release on tag pushes
 #     iOS    -> archive + upload straight to TestFlight (App Store Connect)
 #     tvOS   -> not built: the Rust core needs tier-3 targets (nightly -Zbuild-std)
-#     macOS App Store/TestFlight -> deferred: needs App Sandbox entitlements first
-#               (network client + Bonjour); the Developer ID build covers macOS today.
+#     macOS App Store/TestFlight -> deferred: needs App Sandbox entitlements first.
 #
 # One App Store listing for all platforms (universal purchase): every target shares the
 # bundle ID io.unom.punktfunk.
 #
-# Secrets: DEVID_CERT_P12_B64 / DEVID_CERT_PASSWORD (Developer ID Application cert),
-# ASC_API_KEY_P8 / ASC_API_KEY_ID / ASC_API_ISSUER_ID (App Store Connect API key —
-# notarization, TestFlight upload, and automatic-signing profile fetch).
+# Signing setup (NOT secret-based anymore): the runner is a LaunchAgent in the user's
+# logged-in Aqua session, so it uses the **login keychain** directly. Install the signing
+# identities there once via Xcode (Settings -> Accounts -> Manage Certificates): Developer
+# ID Application + Apple Distribution, with the WWDR intermediate present (so they show as
+# *valid*). xcodebuild/codesign then sign exactly like a local build — no throwaway keychain.
+# One-time, to avoid headless "codesign wants to use the key" prompts, grant codesign access:
+#   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <login-pw> \
+#     ~/Library/Keychains/login.keychain-db
+#
+# Secrets: only ASC_API_KEY_P8 / ASC_API_KEY_ID / ASC_API_ISSUER_ID (App Store Connect API
+# key — notarization, TestFlight upload, automatic-signing profile fetch).
 #
 # Needs a RELEASE Xcode on the runner (App Store rejects beta-SDK builds); the workflow
 # picks the first non-beta /Applications/Xcode*.app and only falls back to a beta with a
@@ -80,86 +87,6 @@ jobs:
       - name: Build PunktfunkCore.xcframework (mac + iOS)
         run: BUILD_IOS=1 bash scripts/build-xcframework.sh
 
-      - name: Import signing certificates (throwaway keychain)
-        env:
-          P12_B64: ${{ secrets.DEVID_CERT_P12_B64 }}
-          P12_PASSWORD: ${{ secrets.DEVID_CERT_PASSWORD }}
-          IOS_P12_B64: ${{ secrets.IOS_DIST_CERT_P12_B64 }}
-          IOS_P12_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
-        run: |
-          KEYCHAIN="$RUNNER_TEMP/punktfunk-ci.keychain-db"
-          KEYCHAIN_PASS="$(uuidgen)"
-          echo "::add-mask::$KEYCHAIN_PASS"
-          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
-          echo "KEYCHAIN_PASS=$KEYCHAIN_PASS" >> "$GITHUB_ENV"
-          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security set-keychain-settings -lut 7200 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          # xcodebuild's signing lookup consults the DEFAULT keychain — being on the
-          # search list alone isn't enough (find-identity sees the cert, export doesn't).
-          security default-keychain -d user -s "$KEYCHAIN"
-          # Apple's intermediates — without the issuing CA in the chain the leaf is "invalid"
-          # and dropped from find-identity -v (cert imports fine, just isn't a *valid*
-          # identity). Fresh boxes don't ship all WWDR/Developer ID intermediates. RETRY: a
-          # single transient miss here is exactly what silently broke iOS — Apple Distribution
-          # chains through WWDR G3, while Developer ID (-> DeveloperIDG2CA) kept working.
-          for ca in DeveloperIDG2CA AppleWWDRCAG3 AppleWWDRCAG4; do
-            for attempt in 1 2 3; do
-              curl -fsS "https://www.apple.com/certificateauthority/$ca.cer" \
-                -o "$RUNNER_TEMP/$ca.cer" \
-                && security import "$RUNNER_TEMP/$ca.cer" -k "$KEYCHAIN" -t cert >/dev/null 2>&1 \
-                && break
-              [ "$attempt" = 3 ] && echo "::warning::could not stage intermediate $ca after 3 tries"
-              sleep 2
-            done
-          done
-          # Chain-vs-clock diagnostic: is the WWDR intermediate (Apple Distribution's issuer)
-          # actually present, and is the runner's clock past the cert's notBefore?
-          echo "runner date (UTC): $(date -u)"
-          security find-certificate -c "Apple Worldwide Developer Relations Certification Authority" \
-            "$KEYCHAIN" >/dev/null 2>&1 \
-            && echo "WWDR intermediate (Apple Distribution issuer): present in keychain" \
-            || echo "::warning::WWDR intermediate MISSING — Apple Distribution leaf will be invalid"
-          printf '%s' "$P12_B64" | base64 -d > "$RUNNER_TEMP/devid.p12"
-          security import "$RUNNER_TEMP/devid.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" \
-            -T /usr/bin/codesign -T /usr/bin/security
-          rm -f "$RUNNER_TEMP/devid.p12"
-          # iOS App Store distribution identity (optional — imported only when the secret is
-          # set; the iOS/TestFlight job stays best-effort). Self-diagnosing: prints secret
-          # byte-lengths + decoded p12 size + import rc (never the secret value) so a bad iOS
-          # cert is explained in-log. Does NOT fail this shared step on an iOS-cert problem —
-          # that would also block the macOS release; the gate below only warns. Apple
-          # Distribution chains through WWDR G3, fetched above (G6 is not used for it).
-          echo "cert-secret lengths: ios_b64=${#IOS_P12_B64} devid_b64=${#P12_B64}"
-          if [ -n "$IOS_P12_B64" ]; then
-            printf '%s' "$IOS_P12_B64" | tr -d '\r\n ' | base64 -d > "$RUNNER_TEMP/ios-dist.p12" \
-              || echo "::warning::IOS_DIST_CERT_P12_B64 is not valid base64"
-            echo "ios_p12_bytes=$(wc -c < "$RUNNER_TEMP/ios-dist.p12" 2>/dev/null || echo 0)"
-            set +e
-            security import "$RUNNER_TEMP/ios-dist.p12" -k "$KEYCHAIN" -P "$IOS_P12_PASSWORD" \
-              -T /usr/bin/codesign -T /usr/bin/security
-            echo "ios_import_rc=$?"
-            set -e
-            rm -f "$RUNNER_TEMP/ios-dist.p12"
-          fi
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          security find-identity -v -p codesigning "$KEYCHAIN"
-          # Non-fatal explainer: if the iOS secret was set but produced no VALID Apple
-          # Distribution identity, name the likely reason and list ALL (incl. invalid)
-          # identities — WITHOUT failing this step, so the macOS release still proceeds.
-          if [ -n "$IOS_P12_B64" ] \
-             && ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution"; then
-            echo "::warning::IOS_DIST_CERT_P12_B64 set but no VALID 'Apple Distribution' identity — but it may still be usable (see trust verdict below); codesign is less strict than find-identity -v."
-            echo "all codesigning identities (incl. invalid):"
-            security find-identity -p codesigning "$KEYCHAIN" || true
-            echo "--- trust verdict for the Apple Distribution leaf (codeSign policy) ---"
-            security find-certificate -c "Apple Distribution" -p "$KEYCHAIN" > "$RUNNER_TEMP/appledist.pem" 2>/dev/null || true
-            security verify-cert -p codeSign -c "$RUNNER_TEMP/appledist.pem" -k "$KEYCHAIN" 2>&1 || true
-            rm -f "$RUNNER_TEMP/appledist.pem"
-          fi
-
       - name: Stage App Store Connect API key
         env:
           ASC_P8: ${{ secrets.ASC_API_KEY_P8 }}
@@ -167,69 +94,31 @@ jobs:
           printf '%s' "$ASC_P8" > "$RUNNER_TEMP/asc.p8"
           chmod 600 "$RUNNER_TEMP/asc.p8"
 
-      - name: Archive macOS (unsigned — signed by codesign below)
+      - name: macOS — archive, codesign Developer ID, notarize, DMG
         run: |
-          # Archive WITHOUT signing, then codesign with Developer ID in the next step. We do
-          # NOT let xcodebuild sign during archive because the app's keychain-access-groups
-          # entitlement is the "Keychain Sharing" capability, and Xcode's archive gate demands
-          # a provisioning profile for it under BOTH automatic and manual signing — even
-          # though a Developer ID app honours that team-prefixed entitlement at RUNTIME with
-          # no profile (the gate is an Xcode build-phase check, not a real requirement). Raw
-          # codesign has no such gate. Safe because the bundle is a single statically-linked
-          # binary: static PunktfunkCore.xcframework, SPM static products, macOS 14 target (no
-          # embedded Swift dylibs), and no Embed-Frameworks phase — so nothing nested to sign.
+          # Archive UNSIGNED, then codesign with the Developer ID Application identity from the
+          # login keychain. Unsigned archive sidesteps Xcode's keychain-access-groups
+          # provisioning-profile gate; codesign just needs the (now valid) identity + the
+          # team-prefixed entitlement, no profile. Bundle is a single static binary.
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk \
             -destination 'generic/platform=macOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-macos.xcarchive" \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             CODE_SIGNING_ALLOWED=NO
-
-      - name: Sign macOS app (Developer ID, hardened runtime)
-        run: |
           APP="$RUNNER_TEMP/Punktfunk-macos.xcarchive/Products/Applications/Punktfunk.app"
-          # codesign does NOT expand $(AppIdentifierPrefix) (an Xcode build-setting var), so
-          # resolve it to the real team prefix — otherwise keychain-access-groups would be the
-          # literal string instead of the team-scoped group.
-          RESOLVED="$RUNNER_TEMP/Punktfunk.entitlements"
+          # codesign won't expand $(AppIdentifierPrefix) — resolve it to the team prefix.
+          RESOLVED="$RUNNER_TEMP/macos.entitlements"
           sed "s/\$(AppIdentifierPrefix)/${TEAM_ID}./g" \
             clients/apple/Config/Punktfunk.entitlements > "$RESOLVED"
-          # codesign must be pointed at the throwaway keychain explicitly: on this runner the
-          # default keychain search list does not reliably carry across steps, so a bare
-          # --sign "Developer ID Application" reports "no identity found" even though the
-          # import step found it there. Re-assert the search list + default keychain in THIS
-          # step's context (no password needed — it stays unlocked with a codesign-allowed
-          # partition list from the import step) AND scope codesign to it with --keychain.
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          security default-keychain -d user -s "$KEYCHAIN"
-          echo "signing identity keychain: $KEYCHAIN"
-          security find-identity -v -p codesigning "$KEYCHAIN"
-          # Inside-out: sign any nested Mach-O first (defensive — the static build normally
-          # has none), then the app bundle with the resolved entitlements + hardened runtime +
-          # secure timestamp, which is what notarization requires.
-          if [ -d "$APP/Contents/Frameworks" ]; then
-            find "$APP/Contents/Frameworks" -depth \( -name '*.framework' -o -name '*.dylib' \) \
-              -print0 | while IFS= read -r -d '' f; do
-                codesign --force --options runtime --timestamp \
-                  --keychain "$KEYCHAIN" \
-                  --sign "Developer ID Application" "$f"
-              done
-          fi
           codesign --force --options runtime --timestamp \
-            --keychain "$KEYCHAIN" \
             --entitlements "$RESOLVED" \
             --sign "Developer ID Application" "$APP"
           codesign --verify --strict --verbose=2 "$APP"
-          # Stage where the DMG step expects it ($RUNNER_TEMP/export-devid/Punktfunk.app).
-          mkdir -p "$RUNNER_TEMP/export-devid"
-          rm -rf "$RUNNER_TEMP/export-devid/Punktfunk.app"
-          cp -R "$APP" "$RUNNER_TEMP/export-devid/Punktfunk.app"
-
-      - name: Notarized DMG
-        run: |
+          # Notarized DMG.
           STAGE="$RUNNER_TEMP/dmg-stage"
           mkdir -p "$STAGE"
-          cp -R "$RUNNER_TEMP/export-devid/Punktfunk.app" "$STAGE/"
+          cp -R "$APP" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
           DMG="$RUNNER_TEMP/Punktfunk-$VERSION.dmg"
           hdiutil create -volname "Punktfunk" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
@@ -258,120 +147,40 @@ jobs:
             -F "attachment=@$DMG" >/dev/null
           echo "attached Punktfunk-$VERSION.dmg to release $GITHUB_REF_NAME"
 
-      - name: Archive iOS + upload to TestFlight
+      - name: iOS — archive + upload to TestFlight
         if: gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true'
-        # Best-effort until the App Store Connect app record for io.unom.punktfunk
-        # exists — the upload errors without one. Drop this once TestFlight onboarding
-        # is done so real upload failures fail the run.
+        # Best-effort until the App Store Connect app record for io.unom.punktfunk exists.
         continue-on-error: true
-        env:
-          IOS_PROFILE_B64: ${{ secrets.IOS_PROFILE_B64 }}
         run: |
-          # The iOS platform SDK is a separate Xcode component and isn't installed on every
-          # runner; without it `archive` dies with "iOS 26.5 is not installed". Skip cleanly
-          # (this is best-effort anyway) instead of a red step — install it on the runner with
-          # `xcodebuild -downloadPlatform iOS` when iOS/TestFlight is ready to go live.
-          if ! DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -showsdks 2>/dev/null | grep -q iphoneos; then
-            echo "::warning::iOS platform SDK not installed on this runner — skipping iOS/TestFlight."
-            exit 0
-          fi
-          # App Store signing: archive UNSIGNED, then raw `codesign` with the Apple Distribution
-          # identity + the profile's entitlements — exactly like the macOS DMG. NOT xcodebuild
-          # manual signing: its signing-identity selection enforces an online revocation/OCSP
-          # check that drops a freshly-minted cert (find-identity -v excludes it) even though the
-          # cert is genuinely valid (verify-cert passes) and codesign signs with it fine. This
-          # also means no provisioning-profile discovery, so no Xcode-pruning / profile-dir dance.
-          # Gate on the MATCHING identity list.
-          if ! security find-identity -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution"; then
-            echo "::warning::no Apple Distribution identity present — set IOS_DIST_CERT_P12_B64. Skipping iOS/TestFlight."
-            exit 0
-          fi
-          if [ -z "$IOS_PROFILE_B64" ]; then
-            echo "::warning::IOS_PROFILE_B64 not set — need an App Store provisioning profile for io.unom.punktfunk. Skipping iOS/TestFlight."
-            exit 0
-          fi
-          # Decode the App Store provisioning profile + its embedded entitlements. A
-          # .mobileprovision is a CMS-signed plist; security cms is flaky on this runner, so
-          # openssl smime is the fallback that actually works.
-          printf '%s' "$IOS_PROFILE_B64" | tr -d '\r\n ' | base64 -d > "$RUNNER_TEMP/appstore.mobileprovision" \
-            || { echo "::warning::IOS_PROFILE_B64 is not valid base64 — skipping iOS"; exit 0; }
-          security cms -D -i "$RUNNER_TEMP/appstore.mobileprovision" \
-            -o "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null \
-          || openssl smime -inform DER -verify -noverify \
-               -in "$RUNNER_TEMP/appstore.mobileprovision" \
-               -out "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null || true
-          if [ ! -s "$RUNNER_TEMP/appstore-profile.plist" ]; then
-            echo "::warning::could not extract the profile plist — is IOS_PROFILE_B64 the base64 of the .mobileprovision FILE? Skipping iOS."
-            exit 0
-          fi
-          plutil -extract Entitlements xml1 -o "$RUNNER_TEMP/ios-entitlements.plist" \
-            "$RUNNER_TEMP/appstore-profile.plist" \
-            || { echo "::warning::profile has no Entitlements — skipping iOS"; exit 0; }
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          security default-keychain -d user -s "$KEYCHAIN"
-          # Archive UNSIGNED — no xcodebuild signing/provisioning at all.
+          # Standard App Store flow: automatic signing now works because the runner is in the
+          # logged-in session with the login keychain (Apple Distribution valid) and Xcode is
+          # signed into the team — so -allowProvisioningUpdates manages the cert + App Store
+          # profile, exactly like a local Archive.
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk-iOS \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
-            CODE_SIGNING_ALLOWED=NO
-          APP=$(ls -d "$RUNNER_TEMP/Punktfunk-ios.xcarchive/Products/Applications/"*.app | head -1)
-          echo "iOS app bundle: $APP"
-          cp "$RUNNER_TEMP/appstore.mobileprovision" "$APP/embedded.mobileprovision"
-          # Re-assert the keychain RIGHT BEFORE signing: the xcodebuild archive above resets the
-          # user keychain search list, so codesign would otherwise fail to find the WWDR
-          # intermediate (it lives only in the throwaway keychain) and report "unable to build
-          # chain to self-signed root / errSecInternalComponent". The macOS sign step avoids
-          # this by signing in a separate step; the iOS archive+sign share one step. Unlock too.
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN" 2>/dev/null || true
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          security default-keychain -d user -s "$KEYCHAIN"
-          # Re-establish codesign's access to the private key (errSecInternalComponent at
-          # sign time is classically a key-ACL problem) + stage the WWDR intermediate and
-          # Apple Root so the whole chain is in the identity's keychain for the chain build.
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null 2>&1 || true
-          curl -fsS "https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer" -o "$RUNNER_TEMP/w.cer" \
-            && security import "$RUNNER_TEMP/w.cer" -k "$KEYCHAIN" -t cert >/dev/null 2>&1 || true
-          curl -fsS "https://www.apple.com/appleca/AppleIncRootCertificate.cer" -o "$RUNNER_TEMP/r.cer" \
-            && security import "$RUNNER_TEMP/r.cer" -k "$KEYCHAIN" -t cert >/dev/null 2>&1 || true
-          # Sign by the identity's SHA-1 HASH (not the name) — name matching is a known cause
-          # of "unable to build chain / errSecInternalComponent". Diagnostics: show valid vs
-          # matching identities at sign time, and run codesign at max verbosity.
-          IOS_ID=$(security find-identity -p codesigning "$KEYCHAIN" | awk '/Apple Distribution/{print $2; exit}')
-          echo "iOS signing identity hash: ${IOS_ID:-NONE}"
-          echo "--- valid identities ---"; security find-identity -v -p codesigning "$KEYCHAIN" || true
-          # Inside-out: sign any nested Mach-O first (the static build usually has none), then
-          # the app with the profile's entitlements + the Apple Distribution identity.
-          if [ -d "$APP/Frameworks" ]; then
-            find "$APP/Frameworks" -depth \( -name '*.framework' -o -name '*.dylib' \) -print0 \
-              | while IFS= read -r -d '' f; do
-                  codesign --force --keychain "$KEYCHAIN" --sign "$IOS_ID" "$f"
-                done
-          fi
-          codesign --force --keychain "$KEYCHAIN" \
-            --entitlements "$RUNNER_TEMP/ios-entitlements.plist" \
-            --sign "$IOS_ID" --verbose=4 "$APP"
-          codesign --verify --strict --verbose=2 "$APP"
-          # Package the .ipa.
-          rm -rf "$RUNNER_TEMP/Payload" "$RUNNER_TEMP/Punktfunk.ipa"
-          mkdir -p "$RUNNER_TEMP/Payload"
-          cp -R "$APP" "$RUNNER_TEMP/Payload/"
-          ( cd "$RUNNER_TEMP" && zip -qry Punktfunk.ipa Payload )
-          # Upload to App Store Connect (TestFlight). altool reads the key from
-          # ~/.appstoreconnect/private_keys/AuthKey_<id>.p8.
-          ASC_KEY_ID="${{ secrets.ASC_API_KEY_ID }}"
-          mkdir -p "$HOME/.appstoreconnect/private_keys"
-          cp "$RUNNER_TEMP/asc.p8" "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
-          DEVELOPER_DIR="$XCODE_DEV_DIR" xcrun altool --upload-app -f "$RUNNER_TEMP/Punktfunk.ipa" \
-            -t ios --apiKey "$ASC_KEY_ID" --apiIssuer "${{ secrets.ASC_API_ISSUER_ID }}"
-          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
-
-      - name: Clean up keychain + API key
-        if: always()
-        run: |
-          security default-keychain -d user -s login.keychain-db 2>/dev/null || true
-          [ -n "${KEYCHAIN:-}" ] && security delete-keychain "$KEYCHAIN" 2>/dev/null || true
-          security list-keychains -d user -s login.keychain-db
-          rm -f "$RUNNER_TEMP/asc.p8"
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
+          cat > "$RUNNER_TEMP/export-appstore.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+          </dict>
+          </plist>
+          EOF
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/export-appstore.plist" \
+            -exportPath "$RUNNER_TEMP/export-appstore" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
