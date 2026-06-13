@@ -122,15 +122,24 @@ jobs:
 
       - name: Archive macOS
         run: |
+          # Manual Developer ID signing — same reasoning as the export step below. With
+          # -allowProvisioningUpdates the archive runs AUTOMATIC signing, which tries to mint
+          # an Apple Development cert + a "Mac App Development" profile for io.unom.punktfunk:
+          # installing that cert into the CI keychain fails (DVTSecErrorDomain -61 "Write
+          # permissions error") and no such profile exists — a Developer ID DMG needs
+          # neither. Pin the Developer ID identity and no profile: the app is non-sandboxed
+          # and its lone entitlement (keychain-access-groups, team-prefixed) is authorized by
+          # the Developer ID team itself, so no provisioning profile is required. The ASC key
+          # is still staged above for notarytool + the iOS App Store archive.
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk \
             -destination 'generic/platform=macOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-macos.xcarchive" \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
-            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
-            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER=""
 
       - name: Export macOS (Developer ID)
         run: |
