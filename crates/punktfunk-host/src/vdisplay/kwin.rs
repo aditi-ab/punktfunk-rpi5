@@ -225,7 +225,10 @@ fn virtual_primary_enabled() -> bool {
 /// (same source as [`read_active_refresh`]).
 fn other_enabled_outputs() -> Vec<String> {
     let ours = format!("Virtual-{VOUT_NAME}");
-    let out = match std::process::Command::new("kscreen-doctor").arg("-j").output() {
+    let out = match std::process::Command::new("kscreen-doctor")
+        .arg("-j")
+        .output()
+    {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };
@@ -264,12 +267,17 @@ fn apply_virtual_primary() -> Vec<String> {
     // own. Let that settle, then belt-and-suspenders: disable anything still enabled besides ours so
     // the streamed output is unambiguously the sole desktop regardless of KWin's implicit behaviour.
     if !kscreen(&[format!("output.{ours}.primary")]) {
-        tracing::warn!("KWin: could not set the virtual output primary; client may see only the wallpaper");
+        tracing::warn!(
+            "KWin: could not set the virtual output primary; client may see only the wallpaper"
+        );
     }
     std::thread::sleep(Duration::from_millis(200));
     let others = other_enabled_outputs();
     if !others.is_empty() {
-        let args: Vec<String> = others.iter().map(|o| format!("output.{o}.disable")).collect();
+        let args: Vec<String> = others
+            .iter()
+            .map(|o| format!("output.{o}.disable"))
+            .collect();
         let _ = kscreen(&args);
     }
     tracing::info!(also_disabled = ?others, "KWin: streamed output set as the sole desktop");
