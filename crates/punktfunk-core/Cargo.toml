@@ -56,6 +56,13 @@ libc = "0.2"
 
 [dev-dependencies]
 proptest = "1"
+# Tier-1 microbenchmarks (benches/pipeline.rs). default-features off → no plotters/HTML (headless
+# CI just needs the measurement + target/criterion/**/estimates.json for the regression compare).
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "pipeline"
+harness = false
 
 [build-dependencies]
 cbindgen = "0.29"
