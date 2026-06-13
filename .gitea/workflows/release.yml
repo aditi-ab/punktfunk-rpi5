@@ -288,6 +288,14 @@ jobs:
             echo "::warning::IOS_PROFILE_B64 not set — need an App Store provisioning profile for io.unom.punktfunk. Skipping iOS/TestFlight."
             exit 0
           fi
+          # A running Xcode.app actively MANAGES ~/Library/Developer/Xcode/UserData/Provisioning
+          # Profiles — it prunes manually-installed profiles it doesn't recognise from its
+          # account, deleting ours from the very dir xcodebuild reads right before signing
+          # (hence 'No profile matching ...' even though the file was installed). Quit it;
+          # headless CI doesn't need the GUI Xcode and xcodebuild runs independently.
+          osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
+          pkill -x Xcode 2>/dev/null || true
+          sleep 2
           # Stage the App Store provisioning profile + read its Name/UUID (the archive +
           # export reference it by name; Xcode finds it by UUID under the profiles dirs).
           printf '%s' "$IOS_PROFILE_B64" | tr -d '\r\n ' | base64 -d > "$RUNNER_TEMP/appstore.mobileprovision" \
