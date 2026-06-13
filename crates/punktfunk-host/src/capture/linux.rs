@@ -466,6 +466,15 @@ mod pipewire {
         negotiated: Arc<AtomicBool>,
         /// Present when zero-copy is enabled: imports a dmabuf → CUDA device buffer.
         importer: Option<crate::zerocopy::EglImporter>,
+        /// GNOME stale-frame filter state. Mutter re-delivers complete OLD pool buffers on the SHM
+        /// download path (no GPU sync prevents it on NVIDIA); a captured frame whose content equals
+        /// an EARLIER distinct frame (not the immediately-previous one — that's a normal duplicate) is
+        /// such a stale re-delivery and gets DROPPED so the encoder never emits the flash. `stale_seen`
+        /// counts drops; `keep_stale` (PUNKTFUNK_KEEP_STALE=1) turns the filter off for A/B testing.
+        stale_recent: std::collections::VecDeque<u64>,
+        stale_last: u64,
+        stale_seen: u64,
+        keep_stale: bool,
     }
 
     /// Log a frame-drop reason once per process (the process callback runs per frame; a stuck
@@ -786,6 +795,10 @@ mod pipewire {
             active,
             negotiated,
             importer,
+            stale_recent: std::collections::VecDeque::new(),
+            stale_last: 0,
+            stale_seen: 0,
+            keep_stale: std::env::var_os("PUNKTFUNK_KEEP_STALE").is_some(),
         };
 
         let stream = pw::stream::StreamBox::new(
@@ -1021,6 +1034,44 @@ mod pipewire {
                 for y in 0..h {
                     tight[y * row..y * row + row]
                         .copy_from_slice(&region[y * stride..y * stride + row]);
+                }
+                // GNOME stale-frame filter: Mutter re-delivers complete OLD pool buffers on the SHM
+                // download path (no NVIDIA fence prevents it). A frame whose sampled content equals an
+                // EARLIER distinct frame is a stale re-delivery — DROP it so the encoder never emits
+                // the flash (try_latest then re-sends the last good frame). Hashes a spatial sample;
+                // a real return-to-prior-state is rare and dropping it is harmless. KEEP_STALE=1 = off.
+                {
+                    let s: &[u8] = &tight;
+                    let step = (s.len() / 1024).max(1);
+                    let mut hh: u64 = 0xcbf2_9ce4_8422_2325;
+                    let mut i = 0;
+                    while i < s.len() {
+                        hh = (hh ^ s[i] as u64).wrapping_mul(0x0100_0000_01b3);
+                        i += step;
+                    }
+                    // `stale_last` = the current (newest) frame's hash. A frame equal to it is a normal
+                    // duplicate (deliver). A frame equal to an OLDER distinct frame in `stale_recent`
+                    // is a stale re-delivery (drop). Anything else is new forward content (deliver).
+                    if hh == ud.stale_last {
+                        // duplicate of the current frame — deliver as usual
+                    } else if ud.stale_recent.contains(&hh) {
+                        ud.stale_seen += 1;
+                        if ud.stale_seen.is_power_of_two() {
+                            tracing::warn!(
+                                dropped = ud.stale_seen,
+                                "GNOME stale-frame dropped (capture reverted to an earlier frame)"
+                            );
+                        }
+                        if !ud.keep_stale {
+                            return; // drop the stale re-delivery — don't advance `stale_last`
+                        }
+                    } else {
+                        ud.stale_recent.push_back(hh);
+                        if ud.stale_recent.len() > 24 {
+                            ud.stale_recent.pop_front();
+                        }
+                        ud.stale_last = hh;
+                    }
                 }
                 let pts_ns = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
