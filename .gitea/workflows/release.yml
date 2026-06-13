@@ -147,6 +147,16 @@ jobs:
           RESOLVED="$RUNNER_TEMP/Punktfunk.entitlements"
           sed "s/\$(AppIdentifierPrefix)/${TEAM_ID}./g" \
             clients/apple/Config/Punktfunk.entitlements > "$RESOLVED"
+          # codesign must be pointed at the throwaway keychain explicitly: on this runner the
+          # default keychain search list does not reliably carry across steps, so a bare
+          # --sign "Developer ID Application" reports "no identity found" even though the
+          # import step found it there. Re-assert the search list + default keychain in THIS
+          # step's context (no password needed — it stays unlocked with a codesign-allowed
+          # partition list from the import step) AND scope codesign to it with --keychain.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security default-keychain -d user -s "$KEYCHAIN"
+          echo "signing identity keychain: $KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN"
           # Inside-out: sign any nested Mach-O first (defensive — the static build normally
           # has none), then the app bundle with the resolved entitlements + hardened runtime +
           # secure timestamp, which is what notarization requires.
@@ -154,10 +164,12 @@ jobs:
             find "$APP/Contents/Frameworks" -depth \( -name '*.framework' -o -name '*.dylib' \) \
               -print0 | while IFS= read -r -d '' f; do
                 codesign --force --options runtime --timestamp \
+                  --keychain "$KEYCHAIN" \
                   --sign "Developer ID Application" "$f"
               done
           fi
           codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN" \
             --entitlements "$RESOLVED" \
             --sign "Developer ID Application" "$APP"
           codesign --verify --strict --verbose=2 "$APP"
