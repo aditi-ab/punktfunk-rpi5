@@ -336,17 +336,23 @@ jobs:
             && security import "$RUNNER_TEMP/w.cer" -k "$KEYCHAIN" -t cert >/dev/null 2>&1 || true
           curl -fsS "https://www.apple.com/appleca/AppleIncRootCertificate.cer" -o "$RUNNER_TEMP/r.cer" \
             && security import "$RUNNER_TEMP/r.cer" -k "$KEYCHAIN" -t cert >/dev/null 2>&1 || true
+          # Sign by the identity's SHA-1 HASH (not the name) — name matching is a known cause
+          # of "unable to build chain / errSecInternalComponent". Diagnostics: show valid vs
+          # matching identities at sign time, and run codesign at max verbosity.
+          IOS_ID=$(security find-identity -p codesigning "$KEYCHAIN" | awk '/Apple Distribution/{print $2; exit}')
+          echo "iOS signing identity hash: ${IOS_ID:-NONE}"
+          echo "--- valid identities ---"; security find-identity -v -p codesigning "$KEYCHAIN" || true
           # Inside-out: sign any nested Mach-O first (the static build usually has none), then
           # the app with the profile's entitlements + the Apple Distribution identity.
           if [ -d "$APP/Frameworks" ]; then
             find "$APP/Frameworks" -depth \( -name '*.framework' -o -name '*.dylib' \) -print0 \
               | while IFS= read -r -d '' f; do
-                  codesign --force --keychain "$KEYCHAIN" --sign "Apple Distribution" "$f"
+                  codesign --force --keychain "$KEYCHAIN" --sign "$IOS_ID" "$f"
                 done
           fi
           codesign --force --keychain "$KEYCHAIN" \
             --entitlements "$RUNNER_TEMP/ios-entitlements.plist" \
-            --sign "Apple Distribution" "$APP"
+            --sign "$IOS_ID" --verbose=4 "$APP"
           codesign --verify --strict --verbose=2 "$APP"
           # Package the .ipa.
           rm -rf "$RUNNER_TEMP/Payload" "$RUNNER_TEMP/Punktfunk.ipa"
