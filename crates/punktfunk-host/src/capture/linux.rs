@@ -1106,28 +1106,23 @@ mod pipewire {
                     let corrupted = (hdr_flags & spa::sys::SPA_META_HEADER_FLAG_CORRUPTED) != 0
                         || (chunk_flags & spa::sys::SPA_CHUNK_FLAG_CORRUPTED as i32) != 0;
 
-                    // Rate-limited diagnostic (~once/sec): drain depth + chunk size/flags + header
-                    // flags. Tells us whether buffers queue up (latest-frame-only helps) and whether
-                    // stale buffers are flagged CORRUPTED or report size 0.
-                    if drained > 1 || chunk_flags != 0 || hdr_flags != 0 {
+                    // THE GNOME FLASH FIX: skip Mutter's CORRUPTED / size-0 cursor-update buffers.
+                    // When the pointer moves (e.g. dragging a window) Mutter sends metadata-only
+                    // buffers flagged CORRUPTED (chunk size 0) that still reference a RECYCLED old
+                    // frame; consuming them encodes "the window at its old position" — the flash.
+                    // Confirmed live on worker-3 (chunk_flags=CORRUPTED, size 0) for both the zero-copy
+                    // and SHM paths. The size-0 half is SHM-only (a real dmabuf legitimately reports
+                    // chunk size 0). `drained` is the latest-frame-only depth — a cheap extra defense
+                    // against bursty delivery, though here Mutter sends one buffer per callback.
+                    if corrupted || (chunk_size == 0 && !is_dmabuf) {
                         ud.dbg_log_n += 1;
-                        if ud.dbg_log_n.is_power_of_two() || ud.dbg_log_n % 60 == 0 {
-                            tracing::info!(
+                        if ud.dbg_log_n.is_power_of_two() {
+                            tracing::debug!(
+                                skipped = ud.dbg_log_n,
                                 drained,
-                                chunk_size,
-                                chunk_flags,
-                                hdr_flags,
-                                corrupted,
-                                n = ud.dbg_log_n,
-                                "capture: latest-frame-only drain (diagnostic)"
+                                "capture: skipped a stale CORRUPTED/cursor buffer (GNOME)"
                             );
                         }
-                    }
-
-                    // Skip a CORRUPTED stale buffer (or a size-0 SHM buffer — a dmabuf legitimately
-                    // reports size 0) — requeue it and wait for the next.
-                    if corrupted || (chunk_size == 0 && !is_dmabuf) {
-                        warn_once("capture: skipped a CORRUPTED/size-0 buffer (stale frame)");
                         unsafe { stream.queue_raw_buffer(newest) };
                         return;
                     }
