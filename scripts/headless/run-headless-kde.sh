@@ -48,8 +48,12 @@ else
 fi
 
 # kwin to its own log (so its EGL/GPU-init errors are captured, not lost to the terminal).
+# `--xwayland`: enable Xwayland so X11 apps (Discord/Electron, Steam, many launchers) work. Without
+# it `kwin_wayland --virtual` brings up NO X server at all (no display reserved), and those apps die
+# with "Missing X Server or $DISPLAY". KWin starts Xwayland on demand but reserves + logs the X11
+# display up front, which the detection below reads.
 KWIN_LOG="${TMPDIR:-/tmp}/punktfunk-kwin.log"
-kwin_wayland --virtual --width "$W" --height "$H" --no-lockscreen \
+kwin_wayland --virtual --xwayland --width "$W" --height "$H" --no-lockscreen \
     --socket "$WAYLAND_DISPLAY" >"$KWIN_LOG" 2>&1 &
 KWIN_PID=$!
 
@@ -78,13 +82,24 @@ echo "KWin ready."
 # is running — KWin sets DISPLAY only for its own children, not for apps launched via the
 # plasma menu / D-Bus activation. KWin brings Xwayland up a moment after itself; poll for it.
 DISPLAY_NUM=""
-for _ in $(seq 1 20); do
-    # `|| true`: under `set -euo pipefail`, pgrep/grep exit non-zero when Xwayland isn't up yet
+for _ in $(seq 1 40); do
+    # `|| true`: under `set -euo pipefail`, grep/pgrep exit non-zero when nothing's there yet
     # (common a few seconds into a systemd-launched boot), which would abort the WHOLE script —
     # killing KWin — on the first iteration instead of retrying. Tolerate it so the loop polls,
     # and so a session with no Xwayland at all still proceeds (DISPLAY just stays unset → warn).
+    # Primary: KWin reserves + logs the X11 display ("Using public X11 display :N") up front, even
+    # with Xwayland-on-demand (no Xwayland *process* until the first X client connects) — so the
+    # old pgrep-the-process check found nothing and never set DISPLAY. Read the log; fall back to a
+    # live Xwayland process for older KWin.
+    d=$(grep -oE 'Using public X11 display :[0-9]+' "$KWIN_LOG" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)
+    if [[ -n "$d" ]]; then DISPLAY_NUM="$d"; break; fi
     d=$(pgrep -a Xwayland 2>/dev/null | grep -oE ' :[0-9]+' | tr -d ' :' | head -1 || true)
     if [[ -n "$d" && -S "/tmp/.X11-unix/X$d" ]]; then DISPLAY_NUM="$d"; break; fi
+    # Most reliable here: KWin --xwayland reserves the /tmp/.X11-unix/X<N> socket up front (Xwayland
+    # starts on demand on first connect) and on this KWin neither logs the display nor runs a process
+    # until then. The socket IS the signal — take it. (Fresh boot has a tmpfs /tmp, so no stale one.)
+    s=$(ls /tmp/.X11-unix/X[0-9]* 2>/dev/null | head -1 || true)
+    if [[ -n "$s" && -S "$s" ]]; then DISPLAY_NUM="${s##*/X}"; break; fi
     sleep 0.25
 done
 if [[ -n "$DISPLAY_NUM" ]]; then
