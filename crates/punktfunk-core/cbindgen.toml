@@ -12,6 +12,12 @@ documentation_style = "c99"
 [parse]
 parse_deps = false
 
+[export]
+# Internal Apple-only FFI (transport/udp.rs `recvmsg_x` batched recv + its `MsghdrX`) — NOT part of
+# the C ABI. cbindgen otherwise sweeps the foreign import and its #[repr(C)] struct into the header,
+# where socklen_t/ssize_t/iovec are undefined and the C harness fails to compile.
+exclude = ["MsghdrX", "recvmsg_x"]
+
 [export.rename]
 "InputEvent" = "PunktfunkInputEvent"
 "InputKind" = "PunktfunkInputKind"
