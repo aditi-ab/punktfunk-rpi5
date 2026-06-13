@@ -239,7 +239,9 @@ impl UdpTransport {
         let mut observed: Option<std::net::SocketAddr> = None;
         loop {
             match socket.recv_from(&mut buf) {
-                Ok((n, src)) if n >= PUNCH_MAGIC.len() && &buf[..PUNCH_MAGIC.len()] == PUNCH_MAGIC => {
+                Ok((n, src))
+                    if n >= PUNCH_MAGIC.len() && &buf[..PUNCH_MAGIC.len()] == PUNCH_MAGIC =>
+                {
                     observed = Some(src);
                     break;
                 }
