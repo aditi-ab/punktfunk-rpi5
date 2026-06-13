@@ -123,7 +123,6 @@ impl VirtualDisplay for WlrootsDisplay {
             "sway headless output ready"
         );
         Ok(VirtualOutput {
-            mutter: false,
             node_id,
             remote_fd: Some(fd),
             preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),

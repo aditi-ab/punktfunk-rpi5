@@ -83,7 +83,6 @@ impl VirtualDisplay for GamescopeDisplay {
             point_injector_at_eis();
             tracing::info!(node_id, "gamescope: attaching to existing PipeWire node");
             return Ok(VirtualOutput {
-                mutter: false,
                 node_id,
                 remote_fd: None,
                 preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
@@ -108,7 +107,6 @@ impl VirtualDisplay for GamescopeDisplay {
             "gamescope virtual output ready"
         );
         Ok(VirtualOutput {
-            mutter: false,
             node_id,
             remote_fd: None,
             preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
@@ -138,7 +136,6 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
                 "gamescope session: reusing the running session (same mode — no Steam restart)"
             );
             return Ok(VirtualOutput {
-                mutter: false,
                 node_id,
                 remote_fd: None,
                 preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
@@ -165,7 +162,6 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
         "gamescope session: launched gamescope-session-plus at the client's mode"
     );
     Ok(VirtualOutput {
-        mutter: false,
         node_id,
         remote_fd: None,
         preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),

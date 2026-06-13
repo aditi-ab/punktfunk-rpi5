@@ -16,6 +16,7 @@
 mod audio;
 mod capture;
 mod discovery;
+mod dmabuf_fence;
 mod drm_sync;
 mod encode;
 mod gamestream;

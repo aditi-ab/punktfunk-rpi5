@@ -1,6 +1,14 @@
 //! Minimal DRM timeline-syncobj operations — the consumer side of PipeWire explicit sync
 //! (`SPA_META_SyncTimeline`).
 //!
+//! RETAINED BUT CURRENTLY UNUSED: producer-driven explicit sync is the "right" fix, but no
+//! compositor we target produces a usable sync_fd today — Mutter+NVIDIA fails buffer allocation
+//! (`error alloc buffers`, no cogl sync_fd), KWin/gamescope blit so they don't race at all. We sync
+//! zero-copy from the consumer side instead (see [`crate::dmabuf_fence`]). This module is kept,
+//! verified (ioctl numbers + a live signal→wait round trip), ready to wire in the moment a producer
+//! gains working `SPA_META_SyncTimeline`.
+#![allow(dead_code)]
+//!
 //! Compositors that render directly into the PipeWire buffer pool (Mutter's virtual
 //! monitors) hand buffers over at GPU-submit time; on drivers without implicit dmabuf
 //! fencing (NVIDIA) reading immediately races the render and shows the buffer's
