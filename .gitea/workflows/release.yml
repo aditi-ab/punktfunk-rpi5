@@ -218,6 +218,14 @@ jobs:
         # is done so real upload failures fail the run.
         continue-on-error: true
         run: |
+          # The iOS platform SDK is a separate Xcode component and isn't installed on every
+          # runner; without it `archive` dies with "iOS 26.5 is not installed". Skip cleanly
+          # (this is best-effort anyway) instead of a red step — install it on the runner with
+          # `xcodebuild -downloadPlatform iOS` when iOS/TestFlight is ready to go live.
+          if ! DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -showsdks 2>/dev/null | grep -q iphoneos; then
+            echo "::warning::iOS platform SDK not installed on this runner — skipping iOS/TestFlight."
+            exit 0
+          fi
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk-iOS \
             -destination 'generic/platform=iOS' \
