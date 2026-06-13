@@ -474,4 +474,3 @@ fn build_primary_config(vconn: &str, vmode: &str) -> Vec<ApplyLogical> {
         vec![(vconn.to_string(), vmode.to_string(), HashMap::new())],
     )]
 }
-
