@@ -120,50 +120,51 @@ jobs:
           printf '%s' "$ASC_P8" > "$RUNNER_TEMP/asc.p8"
           chmod 600 "$RUNNER_TEMP/asc.p8"
 
-      - name: Archive macOS
+      - name: Archive macOS (unsigned — signed by codesign below)
         run: |
-          # Manual Developer ID signing — same reasoning as the export step below. With
-          # -allowProvisioningUpdates the archive runs AUTOMATIC signing, which tries to mint
-          # an Apple Development cert + a "Mac App Development" profile for io.unom.punktfunk:
-          # installing that cert into the CI keychain fails (DVTSecErrorDomain -61 "Write
-          # permissions error") and no such profile exists — a Developer ID DMG needs
-          # neither. Pin the Developer ID identity and no profile: the app is non-sandboxed
-          # and its lone entitlement (keychain-access-groups, team-prefixed) is authorized by
-          # the Developer ID team itself, so no provisioning profile is required. The ASC key
-          # is still staged above for notarytool + the iOS App Store archive.
+          # Archive WITHOUT signing, then codesign with Developer ID in the next step. We do
+          # NOT let xcodebuild sign during archive because the app's keychain-access-groups
+          # entitlement is the "Keychain Sharing" capability, and Xcode's archive gate demands
+          # a provisioning profile for it under BOTH automatic and manual signing — even
+          # though a Developer ID app honours that team-prefixed entitlement at RUNTIME with
+          # no profile (the gate is an Xcode build-phase check, not a real requirement). Raw
+          # codesign has no such gate. Safe because the bundle is a single statically-linked
+          # binary: static PunktfunkCore.xcframework, SPM static products, macOS 14 target (no
+          # embedded Swift dylibs), and no Embed-Frameworks phase — so nothing nested to sign.
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk \
             -destination 'generic/platform=macOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-macos.xcarchive" \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="Developer ID Application" \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            PROVISIONING_PROFILE_SPECIFIER=""
+            CODE_SIGNING_ALLOWED=NO
 
-      - name: Export macOS (Developer ID)
+      - name: Sign macOS app (Developer ID, hardened runtime)
         run: |
-          cat > "$RUNNER_TEMP/export-devid.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key><string>developer-id</string>
-            <key>teamID</key><string>$TEAM_ID</string>
-            <key>destination</key><string>export</string>
-            <!-- Manual + explicit cert: with -allowProvisioningUpdates Xcode prefers
-                 CLOUD-managed Developer ID signing, which the App-Manager-role API key
-                 can't do ("Cloud signing permission error") and it never falls back to
-                 the perfectly valid local identity. -->
-            <key>signingStyle</key><string>manual</string>
-            <key>signingCertificate</key><string>Developer ID Application</string>
-          </dict>
-          </plist>
-          EOF
-          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/Punktfunk-macos.xcarchive" \
-            -exportOptionsPlist "$RUNNER_TEMP/export-devid.plist" \
-            -exportPath "$RUNNER_TEMP/export-devid"
+          APP="$RUNNER_TEMP/Punktfunk-macos.xcarchive/Products/Applications/Punktfunk.app"
+          # codesign does NOT expand $(AppIdentifierPrefix) (an Xcode build-setting var), so
+          # resolve it to the real team prefix — otherwise keychain-access-groups would be the
+          # literal string instead of the team-scoped group.
+          RESOLVED="$RUNNER_TEMP/Punktfunk.entitlements"
+          sed "s/\$(AppIdentifierPrefix)/${TEAM_ID}./g" \
+            clients/apple/Config/Punktfunk.entitlements > "$RESOLVED"
+          # Inside-out: sign any nested Mach-O first (defensive — the static build normally
+          # has none), then the app bundle with the resolved entitlements + hardened runtime +
+          # secure timestamp, which is what notarization requires.
+          if [ -d "$APP/Contents/Frameworks" ]; then
+            find "$APP/Contents/Frameworks" -depth \( -name '*.framework' -o -name '*.dylib' \) \
+              -print0 | while IFS= read -r -d '' f; do
+                codesign --force --options runtime --timestamp \
+                  --sign "Developer ID Application" "$f"
+              done
+          fi
+          codesign --force --options runtime --timestamp \
+            --entitlements "$RESOLVED" \
+            --sign "Developer ID Application" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+          # Stage where the DMG step expects it ($RUNNER_TEMP/export-devid/Punktfunk.app).
+          mkdir -p "$RUNNER_TEMP/export-devid"
+          rm -rf "$RUNNER_TEMP/export-devid/Punktfunk.app"
+          cp -R "$APP" "$RUNNER_TEMP/export-devid/Punktfunk.app"
 
       - name: Notarized DMG
         run: |
