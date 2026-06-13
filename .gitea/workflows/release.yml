@@ -292,12 +292,24 @@ jobs:
           # export reference it by name; Xcode finds it by UUID under the profiles dirs).
           printf '%s' "$IOS_PROFILE_B64" | tr -d '\r\n ' | base64 -d > "$RUNNER_TEMP/appstore.mobileprovision" \
             || { echo "::warning::IOS_PROFILE_B64 is not valid base64 — skipping iOS"; exit 0; }
-          security cms -D -i "$RUNNER_TEMP/appstore.mobileprovision" > "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null || true
-          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null || true)
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null || true)
-          if [ -z "$PROFILE_NAME" ] || [ -z "$PROFILE_UUID" ]; then
-            echo "::warning::could not read provisioning profile Name/UUID — skipping iOS"; exit 0
+          echo "profile bytes: $(wc -c < "$RUNNER_TEMP/appstore.mobileprovision")"
+          # A .mobileprovision is a CMS-signed plist — extract it (security, openssl fallback).
+          security cms -D -i "$RUNNER_TEMP/appstore.mobileprovision" \
+            -o "$RUNNER_TEMP/appstore-profile.plist" 2>"$RUNNER_TEMP/cms.err" \
+          || openssl smime -inform DER -verify -noverify \
+               -in "$RUNNER_TEMP/appstore.mobileprovision" \
+               -out "$RUNNER_TEMP/appstore-profile.plist" 2>>"$RUNNER_TEMP/cms.err" || true
+          if [ ! -s "$RUNNER_TEMP/appstore-profile.plist" ]; then
+            echo "::warning::could not extract the plist from the profile — is IOS_PROFILE_B64 the base64 of the .mobileprovision FILE?"
+            cat "$RUNNER_TEMP/cms.err" 2>/dev/null || true
+            echo "first bytes of decoded profile:"; head -c 64 "$RUNNER_TEMP/appstore.mobileprovision" | xxd | head -2 || true
+            exit 0
           fi
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null)
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null)
+          case "$PROFILE_UUID" in
+            ""|*[!A-Fa-f0-9-]*) echo "::warning::profile UUID not readable (got: '$PROFILE_UUID') — skipping iOS"; exit 0;;
+          esac
           for d in "$HOME/Library/MobileDevice/Provisioning Profiles" \
                    "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
             mkdir -p "$d"
