@@ -42,6 +42,11 @@ jobs:
           - image: punktfunk-fedora-rpm
             dockerfile: ci/fedora-rpm.Dockerfile
             context: ci
+          # Fedora 44 builder (Fedora KDE spin): same Dockerfile, newer base → libavcodec.so.62.
+          - image: punktfunk-fedora44-rpm
+            dockerfile: ci/fedora-rpm.Dockerfile
+            context: ci
+            buildargs: --build-arg FEDORA_VERSION=44
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +58,7 @@ jobs:
 
       - name: Build
         run: |
-          docker build --pull \
+          docker build --pull ${{ matrix.buildargs }} \
             -f "${{ matrix.dockerfile }}" \
             -t "$REGISTRY/$OWNER/${{ matrix.image }}:latest" \
             -t "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}" \

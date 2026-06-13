@@ -19,13 +19,23 @@ on:
 env:
   REGISTRY: git.unom.io
   OWNER: unom
-  RPM_GROUP: bazzite
 
 jobs:
   build-publish:
     runs-on: ubuntu-24.04
+    # One RPM per target whose ffmpeg soname must match (a binary RPM is soname-coupled to its
+    # base): Fedora 43 == Bazzite (libavcodec.so.61), Fedora 44 == the Fedora KDE spin (.so.62).
+    # Each builds in its matching builder image and publishes to its own registry group.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: punktfunk-fedora-rpm     # Fedora 43 == Bazzite base
+            group: bazzite
+          - image: punktfunk-fedora44-rpm   # Fedora 44 == Fedora KDE spin
+            group: fedora-44
     container:
-      image: git.unom.io/unom/punktfunk-fedora-rpm:latest
+      image: git.unom.io/unom/${{ matrix.image }}:latest
     timeout-minutes: 90
     env:
       CARGO_HOME: /usr/local/cargo
@@ -72,6 +82,6 @@ jobs:
             case "$rpm" in *debuginfo*|*debugsource*) echo "skip $rpm"; continue;; esac
             echo "uploading $rpm"
             curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$rpm" \
-              "https://$REGISTRY/api/packages/$OWNER/rpm/$RPM_GROUP/upload"
+              "https://$REGISTRY/api/packages/$OWNER/rpm/${{ matrix.group }}/upload"
           done
-          echo "published to $OWNER/rpm/$RPM_GROUP"
+          echo "published to $OWNER/rpm/${{ matrix.group }}"
