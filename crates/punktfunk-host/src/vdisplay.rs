@@ -35,6 +35,11 @@ pub struct VirtualOutput {
     pub preferred_mode: Option<(u32, u32, u32)>,
     /// Keeps the output — and whatever connection/thread backs it — alive; dropped on teardown.
     pub keepalive: Box<dyn Send>,
+    /// This is a Mutter virtual monitor: the compositor renders DIRECTLY into the
+    /// PipeWire buffer pool, so consuming its dmabufs needs explicit sync (SyncTimeline)
+    /// — without it, NVIDIA's missing implicit fencing shows stale frames. The capture
+    /// layer keys its sync negotiation / shm fallback on this.
+    pub mutter: bool,
 }
 
 /// Pluggable virtual-output creation, per compositor.

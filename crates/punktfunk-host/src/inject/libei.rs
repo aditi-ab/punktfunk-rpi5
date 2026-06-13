@@ -163,6 +163,11 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
             }
         }
     }
+    // A client that vanished mid-press must not leave keys/buttons latched in the
+    // compositor — Mutter keeps the implicit grab of a destroyed device's button and the
+    // focused app stops taking clicks until it is restarted. Release everything still
+    // held before the EIS connection (and its devices) go away.
+    state.release_all(&context);
 }
 
 /// Tie down the verbose tuple the connect step returns. The keep-alive must stay alive for the
@@ -360,6 +365,14 @@ struct EiState {
     /// kind a client sends + whether it emitted, so an unexpected client — e.g. a touch-only
     /// tablet hitting a compositor without ei_touchscreen — is immediately diagnosable).
     seen_kinds: u32,
+    /// Wire codes currently held down (keys = VK, buttons = GameStream ids, touches = ids)
+    /// — synthesized back up at session end ([`EiState::release_all`]). A client that
+    /// vanishes mid-press must not leave the compositor with a latched key or an implicit
+    /// pointer grab: observed on Mutter, a button held by a destroyed EIS device wedges
+    /// click delivery to the focused app until that app is restarted.
+    held_keys: Vec<u32>,
+    held_buttons: Vec<u32>,
+    held_touches: Vec<u32>,
 }
 
 /// Stable small index per [`InputKind`] for the `seen_kinds` bitmask.
@@ -390,6 +403,47 @@ impl EiState {
             start: Instant::now(),
             injected: 0,
             seen_kinds: 0,
+            held_keys: Vec::new(),
+            held_buttons: Vec::new(),
+            held_touches: Vec::new(),
+        }
+    }
+
+    /// Release everything the remote client still holds — called when the session ends
+    /// (client gone, EIS closing). Synthesizes wire-level release events through the
+    /// normal [`EiState::inject`] path so the compositor sees proper key-up / button-up /
+    /// touch-up frames before the devices disappear.
+    fn release_all(&mut self, ctx: &ei::Context) {
+        let (keys, buttons, touches) = (
+            std::mem::take(&mut self.held_keys),
+            std::mem::take(&mut self.held_buttons),
+            std::mem::take(&mut self.held_touches),
+        );
+        if keys.is_empty() && buttons.is_empty() && touches.is_empty() {
+            return;
+        }
+        tracing::info!(
+            keys = keys.len(),
+            buttons = buttons.len(),
+            touches = touches.len(),
+            "libei: releasing input still held at session end"
+        );
+        let release = |kind: InputKind, code: u32| InputEvent {
+            kind,
+            _pad: [0; 3],
+            code,
+            x: 0,
+            y: 0,
+            flags: 0,
+        };
+        for code in buttons {
+            self.inject(&release(InputKind::MouseButtonUp, code), ctx);
+        }
+        for code in keys {
+            self.inject(&release(InputKind::KeyUp, code), ctx);
+        }
+        for id in touches {
+            self.inject(&release(InputKind::TouchUp, id), ctx);
         }
     }
 
@@ -620,6 +674,23 @@ impl EiState {
         }
 
         if emitted {
+            // Track held state on the wire codes so `release_all` can undo it at
+            // session end (vanished clients must not leave anything latched).
+            match ev.kind {
+                InputKind::KeyDown if !self.held_keys.contains(&ev.code) => {
+                    self.held_keys.push(ev.code);
+                }
+                InputKind::KeyUp => self.held_keys.retain(|&c| c != ev.code),
+                InputKind::MouseButtonDown if !self.held_buttons.contains(&ev.code) => {
+                    self.held_buttons.push(ev.code);
+                }
+                InputKind::MouseButtonUp => self.held_buttons.retain(|&c| c != ev.code),
+                InputKind::TouchDown if !self.held_touches.contains(&ev.code) => {
+                    self.held_touches.push(ev.code);
+                }
+                InputKind::TouchUp => self.held_touches.retain(|&c| c != ev.code),
+                _ => {}
+            }
             dev.frame(self.last_serial, self.now_us());
         }
         if let Err(e) = ctx.flush() {

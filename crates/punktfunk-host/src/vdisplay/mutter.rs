@@ -85,6 +85,7 @@ impl VirtualDisplay for MutterDisplay {
             "Mutter virtual monitor ready"
         );
         Ok(VirtualOutput {
+            mutter: true,
             node_id,
             remote_fd: None,
             preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),

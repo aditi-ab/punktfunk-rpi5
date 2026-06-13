@@ -104,6 +104,7 @@ impl VirtualDisplay for KwinDisplay {
             mode.refresh_hz
         };
         Ok(VirtualOutput {
+            mutter: false,
             node_id,
             remote_fd: None,
             preferred_mode: Some((mode.width, mode.height, achieved_hz)),

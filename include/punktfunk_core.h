@@ -470,6 +470,18 @@ typedef struct {
     float loss_pct;
 } PunktfunkProbeResult;
 
+// `struct msghdr_x` from Darwin `<sys/socket.h>` (the batched-I/O variant — not in the `libc` crate).
+typedef struct {
+    void *msg_name;
+    socklen_t msg_namelen;
+    iovec *msg_iov;
+    int msg_iovlen;
+    void *msg_control;
+    socklen_t msg_controllen;
+    int msg_flags;
+    size_t msg_datalen;
+} MsghdrX;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -886,6 +898,10 @@ PunktfunkStatus punktfunk_connection_probe_result(const PunktfunkConnection *c,
 // `c` was returned by [`punktfunk_connect`] and is not used after this call.
 void punktfunk_connection_close(PunktfunkConnection *c);
 #endif
+
+// Darwin batched receive: up to `cnt` datagrams in one syscall; returns the count received and
+// sets each `msg_datalen` to its byte length. Present in libSystem on all macOS/iOS.
+extern ssize_t recvmsg_x(int s, MsghdrX *msgp, unsigned int cnt, int flags);
 
 #ifdef __cplusplus
 }  // extern "C"
