@@ -108,6 +108,7 @@ jobs:
             -project "$PROJECT" -scheme Punktfunk \
             -destination 'generic/platform=macOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-macos.xcarchive" \
+            -skipMacroValidation -skipPackagePluginValidation \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             CODE_SIGNING_ALLOWED=NO
           APP="$RUNNER_TEMP/Punktfunk-macos.xcarchive/Products/Applications/Punktfunk.app"
@@ -171,6 +172,7 @@ jobs:
             -project "$PROJECT" -scheme Punktfunk-iOS \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
+            -skipMacroValidation -skipPackagePluginValidation \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Apple Distribution" \
@@ -213,6 +215,7 @@ jobs:
             -project "$PROJECT" -scheme Punktfunk-tvOS \
             -destination 'generic/platform=tvOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-tvos.xcarchive" \
+            -skipMacroValidation -skipPackagePluginValidation \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Apple Distribution" \
