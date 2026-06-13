@@ -111,18 +111,36 @@ jobs:
             -T /usr/bin/codesign -T /usr/bin/security
           rm -f "$RUNNER_TEMP/devid.p12"
           # iOS App Store distribution identity (optional — imported only when the secret is
-          # set; the iOS/TestFlight job stays best-effort until it is). The WWDR intermediates
-          # fetched above also chain this Apple Distribution cert.
+          # set; the iOS/TestFlight job stays best-effort). Self-diagnosing: prints secret
+          # byte-lengths + decoded p12 size + import rc (never the secret value) so a bad iOS
+          # cert is explained in-log. Does NOT fail this shared step on an iOS-cert problem —
+          # that would also block the macOS release; the gate below only warns. Apple
+          # Distribution chains through WWDR G3, fetched above (G6 is not used for it).
+          echo "cert-secret lengths: ios_b64=${#IOS_P12_B64} devid_b64=${#P12_B64}"
           if [ -n "$IOS_P12_B64" ]; then
-            printf '%s' "$IOS_P12_B64" | base64 -d > "$RUNNER_TEMP/ios-dist.p12"
+            printf '%s' "$IOS_P12_B64" | tr -d '\r\n ' | base64 -d > "$RUNNER_TEMP/ios-dist.p12" \
+              || echo "::warning::IOS_DIST_CERT_P12_B64 is not valid base64"
+            echo "ios_p12_bytes=$(wc -c < "$RUNNER_TEMP/ios-dist.p12" 2>/dev/null || echo 0)"
+            set +e
             security import "$RUNNER_TEMP/ios-dist.p12" -k "$KEYCHAIN" -P "$IOS_P12_PASSWORD" \
               -T /usr/bin/codesign -T /usr/bin/security
+            echo "ios_import_rc=$?"
+            set -e
             rm -f "$RUNNER_TEMP/ios-dist.p12"
           fi
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           security find-identity -v -p codesigning "$KEYCHAIN"
+          # Non-fatal explainer: if the iOS secret was set but produced no VALID Apple
+          # Distribution identity, name the likely reason and list ALL (incl. invalid)
+          # identities — WITHOUT failing this step, so the macOS release still proceeds.
+          if [ -n "$IOS_P12_B64" ] \
+             && ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution"; then
+            echo "::warning::IOS_DIST_CERT_P12_B64 set but no VALID 'Apple Distribution' identity — likely the .p12 has no private key (export the IDENTITY, key included), or an untrusted/expired chain."
+            echo "all codesigning identities (incl. invalid):"
+            security find-identity -p codesigning "$KEYCHAIN" || true
+          fi
 
       - name: Stage App Store Connect API key
         env:
