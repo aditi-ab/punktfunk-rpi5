@@ -24,6 +24,9 @@ private struct CardMetrics {
 /// pairs / speed-tests / forgets / removes. Disabled while a session is busy.
 struct HostCardView: View {
     let host: StoredHost
+    /// Currently advertising on the LAN (matched against live mDNS discovery). False means
+    /// "not seen on this network" — off, or a remote/cross-subnet host we can't observe.
+    let isOnline: Bool
     let isConnecting: Bool
     let isMostRecent: Bool
     let isBusy: Bool
@@ -48,9 +51,16 @@ struct HostCardView: View {
                 }
                 .frame(height: m.iconBox)
                 VStack(spacing: 2) {
-                    Text(host.displayName)
-                        .font(m.nameFont)
-                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        // Presence dot: green = advertising on the LAN now; grey = not seen.
+                        Circle()
+                            .fill(isOnline ? Color.green : Color.secondary.opacity(0.35))
+                            .frame(width: 7, height: 7)
+                            .accessibilityLabel(isOnline ? "Online" : "Offline")
+                        Text(host.displayName)
+                            .font(m.nameFont)
+                            .lineLimit(1)
+                    }
                     HStack(spacing: 4) {
                         if host.pinnedSHA256 != nil {
                             Image(systemName: "lock.fill")

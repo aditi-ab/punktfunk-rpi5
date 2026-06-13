@@ -148,6 +148,7 @@ struct HomeView: View {
     private func hostCard(_ host: StoredHost) -> some View {
         HostCardView(
             host: host,
+            isOnline: isOnline(host),
             isConnecting: model.phase == .connecting && model.activeHost?.id == host.id,
             isMostRecent: host.id == mostRecentHostID,
             isBusy: model.isBusy,
@@ -176,12 +177,18 @@ struct HomeView: View {
         .padding(.top, store.hosts.isEmpty ? 0 : 8)
     }
 
-    /// Discovered hosts not already saved (matched by address+port) — the saved grid shows the
-    /// rest, so this section only surfaces genuinely-new hosts on the network.
+    /// A saved host is "online" iff a live mDNS advert currently matches it (see
+    /// `StoredHost.matches`). Recomputed on every discovery change (the @Published set), so the
+    /// dot tracks hosts appearing/leaving the network live.
+    private func isOnline(_ host: StoredHost) -> Bool {
+        discovery.hosts.contains { host.matches($0) }
+    }
+
+    /// Discovered hosts not already saved — the saved grid shows the rest, so this section only
+    /// surfaces genuinely-new hosts on the network. Same match as the online dot, so a saved host
+    /// whose IP changed (still fingerprint-matched) doesn't also appear here as a stranger.
     private var discoveredUnsaved: [DiscoveredHost] {
-        discovery.hosts.filter { d in
-            !store.hosts.contains { $0.address == d.host && $0.port == d.port }
-        }
+        discovery.hosts.filter { d in !store.hosts.contains { $0.matches(d) } }
     }
 
     /// The host of the most recent session — its card carries the accent ring.

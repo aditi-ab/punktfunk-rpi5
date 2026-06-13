@@ -25,6 +25,26 @@ struct StoredHost: Identifiable, Codable, Hashable {
     var displayName: String { name.isEmpty ? address : name }
 }
 
+extension StoredHost {
+    /// True when a live mDNS advert (`DiscoveredHost`) describes THIS saved host — drives the
+    /// "online" indicator and de-dupes the discovered section. Matched by certificate
+    /// fingerprint when both sides carry it (so it survives a DHCP address change), otherwise
+    /// by address:port. Online detection is LAN-scoped: a host not advertising on this network
+    /// (off, or a remote/cross-subnet address) simply won't match — "not seen", not proven off.
+    func matches(_ discovered: DiscoveredHost) -> Bool {
+        if let pin = pinnedSHA256, let fp = discovered.fingerprintHex,
+           pin.hexLower == fp.lowercased() {
+            return true
+        }
+        return address == discovered.host && port == discovered.port
+    }
+}
+
+private extension Data {
+    /// Lowercase hex, no separators — to compare a pinned fingerprint against the mDNS `fp`.
+    var hexLower: String { map { String(format: "%02x", $0) }.joined() }
+}
+
 @MainActor
 final class HostStore: ObservableObject {
     private static let key = DefaultsKey.hosts
