@@ -262,6 +262,8 @@ jobs:
         # exists — the upload errors without one. Drop this once TestFlight onboarding
         # is done so real upload failures fail the run.
         continue-on-error: true
+        env:
+          IOS_PROFILE_B64: ${{ secrets.IOS_PROFILE_B64 }}
         run: |
           # The iOS platform SDK is a separate Xcode component and isn't installed on every
           # runner; without it `archive` dies with "iOS 26.5 is not installed". Skip cleanly
@@ -271,16 +273,37 @@ jobs:
             echo "::warning::iOS platform SDK not installed on this runner — skipping iOS/TestFlight."
             exit 0
           fi
-          # App Store signing uses the Apple Distribution identity imported above from
-          # IOS_DIST_CERT_P12_B64. Gate on the MATCHING list (find-identity without -v), NOT
-          # the valid-only list: a freshly-minted cert with its key + intermediate present can
-          # be excluded from -v by a pending online revocation/trust check that codesign does
-          # NOT enforce — so -v would skip a perfectly signable identity. Re-assert the
-          # throwaway keychain (search list + default) so automatic signing finds it.
+          # App Store signing: MANUAL with the Apple Distribution identity + an App Store
+          # provisioning profile (IOS_PROFILE_B64). Automatic signing during `archive` resolves
+          # to iOS App *Development* — it wants an Apple Development cert (and tries to revoke
+          # the account's orphaned one) plus a dev profile, neither of which we have or want.
+          # Manual distribution signing skips all of that. Gate on the MATCHING identity list
+          # (find-identity without -v): a fresh cert can be dropped from -v by a pending
+          # revocation check that codesign does NOT enforce.
           if ! security find-identity -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution"; then
             echo "::warning::no Apple Distribution identity present — set IOS_DIST_CERT_P12_B64. Skipping iOS/TestFlight."
             exit 0
           fi
+          if [ -z "$IOS_PROFILE_B64" ]; then
+            echo "::warning::IOS_PROFILE_B64 not set — need an App Store provisioning profile for io.unom.punktfunk. Skipping iOS/TestFlight."
+            exit 0
+          fi
+          # Stage the App Store provisioning profile + read its Name/UUID (the archive +
+          # export reference it by name; Xcode finds it by UUID under the profiles dirs).
+          printf '%s' "$IOS_PROFILE_B64" | tr -d '\r\n ' | base64 -d > "$RUNNER_TEMP/appstore.mobileprovision" \
+            || { echo "::warning::IOS_PROFILE_B64 is not valid base64 — skipping iOS"; exit 0; }
+          security cms -D -i "$RUNNER_TEMP/appstore.mobileprovision" > "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null || true
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null || true)
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null || true)
+          if [ -z "$PROFILE_NAME" ] || [ -z "$PROFILE_UUID" ]; then
+            echo "::warning::could not read provisioning profile Name/UUID — skipping iOS"; exit 0
+          fi
+          for d in "$HOME/Library/MobileDevice/Provisioning Profiles" \
+                   "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$d"
+            cp "$RUNNER_TEMP/appstore.mobileprovision" "$d/$PROFILE_UUID.mobileprovision"
+          done
+          echo "iOS App Store profile: '$PROFILE_NAME' ($PROFILE_UUID)"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           security default-keychain -d user -s "$KEYCHAIN"
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
@@ -288,10 +311,10 @@ jobs:
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
-            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
-            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
           cat > "$RUNNER_TEMP/export-appstore.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -300,6 +323,10 @@ jobs:
             <key>method</key><string>app-store-connect</string>
             <key>destination</key><string>upload</string>
             <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict><key>io.unom.punktfunk</key><string>$PROFILE_NAME</string></dict>
           </dict>
           </plist>
           EOF
@@ -307,7 +334,6 @@ jobs:
             -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/export-appstore.plist" \
             -exportPath "$RUNNER_TEMP/export-appstore" \
-            -allowProvisioningUpdates \
             -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
             -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
             -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
