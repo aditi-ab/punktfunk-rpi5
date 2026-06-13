@@ -1,0 +1,32 @@
+# Tier-3 real-world GPU benchmark — the actual capture → zero-copy → NVENC → punktfunk/1 → reassemble
+# pipeline, measuring encode time / throughput / end-to-end latency. The GPU-less CI containers
+# (ci.yml `bench` job) can only run the Tier-1/2 GPU-free benchmarks; this runs on a SELF-HOSTED GPU
+# runner — a dev box with an NVIDIA GPU + a KWin session.
+#
+# Runner setup (one-time, on the GPU box): register a Gitea act_runner with the labels below, e.g.
+#   act_runner register --instance https://git.unom.io --token <REPO_RUNNER_TOKEN> \
+#     --labels gpu:host --name <box>-gpu
+# It runs jobs directly on the host (no container) so it can reach the GPU, PipeWire and the
+# compositor. A persistent KWin session helps (else the script brings up a headless one).
+#
+# Report-only: the script flags regressions vs scripts/bench/gpu-baseline.json but never fails the
+# job. Refresh the baseline on the runner with `scripts/bench/gpu-stream.sh <mode> <secs> --update`.
+name: bench-gpu
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "stream mode WxHxHz"
+        default: "1920x1080x120"
+  schedule:
+    - cron: "0 6 * * *" # nightly
+
+jobs:
+  gpu-stream:
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tier-3 GPU stream benchmark
+        run: bash scripts/bench/gpu-stream.sh "${{ inputs.mode || '1920x1080x120' }}" 12

@@ -115,3 +115,25 @@ jobs:
         run: bun run build
       - name: Typecheck
         run: bun run lint
+
+  bench:
+    # Tier-1 (criterion microbenchmarks) + Tier-2 (FEC loss recovery) — GPU-free, so they run here.
+    # Report-only: prints the numbers + a diff vs the committed baseline to the job summary and never
+    # fails the build (shared CI hardware is too noisy to gate on). The tight regression gate + the
+    # real encode/stream path live on the self-hosted GPU runner (Tier 3, bench-gpu.yml).
+    runs-on: ubuntu-24.04
+    container:
+      image: git.unom.io/unom/punktfunk-rust-ci:latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prep
+        run: |
+          git config --global --add safe.directory "$PWD"
+          command -v python3 >/dev/null || { apt-get update && apt-get install -y --no-install-recommends python3; }
+      - name: Tier-1 microbenchmarks (criterion)
+        run: cargo bench -p punktfunk-core --bench pipeline -- --warm-up-time 1 --measurement-time 3
+      - name: Tier-2 FEC loss recovery (loss-harness)
+        run: cargo run -q -p loss-harness
+      - name: Compare vs baseline (report-only)
+        run: python3 scripts/bench/compare.py --threshold 0.5
