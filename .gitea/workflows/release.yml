@@ -155,8 +155,13 @@ jobs:
           # MANUAL App Store signing: the local (valid) Apple Distribution identity + the App
           # Store provisioning profile. NOT -allowProvisioningUpdates — with an App-Manager-role
           # ASC key that forces Xcode's CLOUD-managed signing, which the role can't do ("Cloud
-          # signing permission error"). The profile must be installed on the runner: Xcode ->
-          # Settings -> Accounts -> Download Manual Profiles.
+          # signing permission error"). The profile must be installed on the runner under
+          # ~/Library/Developer/Xcode/UserData/Provisioning Profiles/ (install it once with
+          # Xcode.app quit, or it prunes the manually-dropped distribution profile).
+          # A running Xcode.app prunes unrecognized profiles from that dir — quit it so the App
+          # Store profile survives this build; headless xcodebuild doesn't need the GUI app.
+          osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
+          pkill -x Xcode 2>/dev/null || true
           PROFILE="Punktfunk App Store Distribution"
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk-iOS \
