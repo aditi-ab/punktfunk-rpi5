@@ -77,15 +77,19 @@ jobs:
           echo "BUILD_NUM=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
           echo "version $V build $GITHUB_RUN_NUMBER"
 
-      - name: Rust toolchain (mac + iOS slices)
+      - name: Rust toolchain (mac + iOS + tvOS slices)
         run: |
           RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
           dirname "$RUSTUP" >> "$GITHUB_PATH"
           "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin \
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          # tvOS targets are tier-3 (no prebuilt std) — build-xcframework.sh compiles them with
+          # nightly + -Zbuild-std, so ensure nightly + rust-src are present.
+          "$RUSTUP" toolchain install nightly --profile minimal
+          "$RUSTUP" component add rust-src --toolchain nightly
 
-      - name: Build PunktfunkCore.xcframework (mac + iOS)
-        run: BUILD_IOS=1 bash scripts/build-xcframework.sh
+      - name: Build PunktfunkCore.xcframework (mac + iOS + tvOS)
+        run: BUILD_IOS=1 BUILD_TVOS=1 bash scripts/build-xcframework.sh
 
       - name: Stage App Store Connect API key
         env:
@@ -162,7 +166,7 @@ jobs:
           # Store profile survives this build; headless xcodebuild doesn't need the GUI app.
           osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
           pkill -x Xcode 2>/dev/null || true
-          PROFILE="Punktfunk App Store Distribution"
+          PROFILE="Punktfunk iOS App Store Distribution"
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk-iOS \
             -destination 'generic/platform=iOS' \
@@ -191,6 +195,48 @@ jobs:
             -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/export-appstore.plist" \
             -exportPath "$RUNNER_TEMP/export-appstore" \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
+
+      - name: tvOS — archive + upload to TestFlight
+        if: gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true'
+        # Needs tvOS added to the App Store Connect app record + the tvOS platform installed
+        # on the runner (xcodebuild -downloadPlatform tvOS).
+        continue-on-error: true
+        run: |
+          # Same manual App Store signing as iOS (the App-Manager ASC key can't cloud-sign).
+          osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
+          pkill -x Xcode 2>/dev/null || true
+          PROFILE="Punktfunk tvOS App Store Distribution"
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
+            -project "$PROJECT" -scheme Punktfunk-tvOS \
+            -destination 'generic/platform=tvOS' \
+            -archivePath "$RUNNER_TEMP/Punktfunk-tvos.xcarchive" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE"
+          cat > "$RUNNER_TEMP/export-tvos.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict><key>io.unom.punktfunk</key><string>$PROFILE</string></dict>
+          </dict>
+          </plist>
+          EOF
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Punktfunk-tvos.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/export-tvos.plist" \
+            -exportPath "$RUNNER_TEMP/export-tvos" \
             -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
             -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
             -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
