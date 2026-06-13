@@ -1167,6 +1167,14 @@ fn input_thread(
     let mut rumble_state = [(0u16, 0u16); MAX_WIRE_PADS];
     let mut rumble_seen = [false; MAX_WIRE_PADS];
     let mut last_refresh = std::time::Instant::now();
+    // Pointer buttons / keys the client currently holds down. The injector is host-lifetime, so a
+    // press left dangling by an abrupt client disconnect stays latched in the compositor across the
+    // reconnect (Mutter keeps the implicit pointer grab of the still-pressed button — a stuck
+    // left-button-down then turns every later click into a drag: windows move, but clicking buttons
+    // and text inputs does nothing). We synthesize the matching up-events when this session ends —
+    // see the release loop after the `break`.
+    let mut held_buttons: Vec<u32> = Vec::new();
+    let mut held_keys: Vec<u32> = Vec::new();
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(4)) {
             Ok(ev) => match ev.kind {
@@ -1182,6 +1190,18 @@ fn input_thread(
                     }
                 }
                 _ => {
+                    // Track press/release so a mid-press disconnect can be undone below.
+                    match ev.kind {
+                        InputKind::MouseButtonDown if !held_buttons.contains(&ev.code) => {
+                            held_buttons.push(ev.code)
+                        }
+                        InputKind::MouseButtonUp => held_buttons.retain(|&c| c != ev.code),
+                        InputKind::KeyDown if !held_keys.contains(&ev.code) => {
+                            held_keys.push(ev.code)
+                        }
+                        InputKind::KeyUp => held_keys.retain(|&c| c != ev.code),
+                        _ => {}
+                    }
                     // Pointer/keyboard → the host-lifetime injector service (one persistent
                     // portal session for every punktfunk/1 session). A send error only means the
                     // service thread is gone (host shutting down) — dropping the event is fine,
@@ -1221,6 +1241,38 @@ fn input_thread(
                 }
             }
         }
+    }
+    // Session ended (client gone). Release anything still held through the host-lifetime injector —
+    // its EIS connection (and any implicit grab Mutter holds for our pressed button) outlives this
+    // session, so without this a button pressed at disconnect stays latched and breaks clicks for
+    // the next session. Mirror of the injector's own release_all, but keyed off the session, which
+    // is where a client actually vanishes mid-press.
+    if !held_buttons.is_empty() || !held_keys.is_empty() {
+        tracing::debug!(
+            buttons = held_buttons.len(),
+            keys = held_keys.len(),
+            "input: releasing held buttons/keys at session end"
+        );
+    }
+    for code in held_buttons {
+        let _ = inj_tx.send(InputEvent {
+            kind: InputKind::MouseButtonUp,
+            _pad: [0; 3],
+            code,
+            x: 0,
+            y: 0,
+            flags: 0,
+        });
+    }
+    for code in held_keys {
+        let _ = inj_tx.send(InputEvent {
+            kind: InputKind::KeyUp,
+            _pad: [0; 3],
+            code,
+            x: 0,
+            y: 0,
+            flags: 0,
+        });
     }
 }
 
