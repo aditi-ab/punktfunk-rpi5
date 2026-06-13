@@ -151,13 +151,9 @@ fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>, 
         // windows land on the surface we stream. Without this, on a host that also has a physical
         // monitor attached, the virtual output is an empty extended desktop — you stream only the
         // wallpaper. Best-effort: any failure just logs and streaming continues unchanged.
-        let mut restore: Option<(zbus::Proxy<'static>, Vec<ApplyLogical>)> = None;
         if let Some((dc, pre)) = &dc_pre {
             match make_virtual_primary(dc, mode, pre).await {
-                Ok(()) => {
-                    restore = Some((dc.clone(), to_apply_logicals(pre)));
-                    tracing::info!("mutter: virtual output set as the primary monitor");
-                }
+                Ok(()) => tracing::info!("mutter: virtual output set as the primary monitor"),
                 Err(e) => tracing::warn!(
                     "mutter: could not set the virtual output primary ({e:#}); streaming continues — the desktop may render on the physical monitor"
                 ),
@@ -169,19 +165,17 @@ fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>, 
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
-        // Tear down: STOP the screencast FIRST so Mutter removes the virtual output and auto-reverts
-        // the temporary monitor config (physical → primary). Reconfiguring an *actively-captured*
-        // high-refresh virtual output via ApplyMonitorsConfig was SIGSEGVing gnome-shell on teardown,
-        // so we never touch the layout while the virtual output is still live.
+        // Tear down: STOP the screencast so Mutter removes the virtual output. We deliberately do NOT
+        // re-assert the physical layout with our own ApplyMonitorsConfig. Issuing a monitor reconfig
+        // while the just-removed high-refresh virtual output is still tearing down SIGSEGVs gnome-shell
+        // on Mutter 50 + NVIDIA — observed live on home-worker-3: the teardown ApplyMonitorsConfig
+        // returned "recipient disconnected from message bus" because the shell crashed mid-call, after
+        // which GDM's crash-loop guard dropped to the greeter and wedged EVERY subsequent reconnect.
+        // make_virtual_primary applied an APPLY_TEMPORARY config; Mutter reverts that on its own once
+        // the virtual output disappears and our DisplayConfig connection (`dc_pre`) closes — so we just
+        // drop it here and let the revert happen Mutter-side, never touching the layout ourselves.
         let _ = session.rd_session.call_method("Stop", &()).await;
-        if let Some((dc, original)) = restore {
-            // Let Mutter drop the virtual output, then re-assert the physical layout deterministically
-            // (a no-op if the temporary config already auto-reverted) — safe now: no live virtual.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if let Err(e) = apply_config(&dc, &original).await {
-                tracing::warn!("mutter: monitor-layout restore after stop failed ({e:#}); Mutter auto-reverts the temporary config on teardown");
-            }
-        }
+        drop(dc_pre);
     });
 }
 
@@ -481,41 +475,3 @@ fn build_primary_config(vconn: &str, vmode: &str) -> Vec<ApplyLogical> {
     )]
 }
 
-/// Convert a captured `GetCurrentState` layout back into an `ApplyMonitorsConfig` argument (used
-/// to restore the physical-primary layout on teardown).
-fn to_apply_logicals(state: &CurrentState) -> Vec<ApplyLogical> {
-    state
-        .2
-        .iter()
-        .filter_map(|lm| {
-            let mons: Vec<ApplyMon> = lm
-                .5
-                .iter()
-                .filter_map(|s| {
-                    current_mode(state, &s.0).map(|(id, _, _)| (s.0.clone(), id, HashMap::new()))
-                })
-                .collect();
-            if mons.is_empty() {
-                return None;
-            }
-            Some((lm.0, lm.1, lm.2, lm.3, lm.4, mons))
-        })
-        .collect()
-}
-
-async fn apply_config(dc: &zbus::Proxy<'_>, logicals: &[ApplyLogical]) -> Result<()> {
-    let state = get_state(dc).await?;
-    let _: () = dc
-        .call(
-            "ApplyMonitorsConfig",
-            &(
-                state.0,
-                APPLY_TEMPORARY,
-                logicals.to_vec(),
-                HashMap::<String, Value<'static>>::new(),
-            ),
-        )
-        .await
-        .context("DisplayConfig.ApplyMonitorsConfig (restore)")?;
-    Ok(())
-}
