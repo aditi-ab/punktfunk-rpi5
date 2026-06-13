@@ -130,6 +130,19 @@ if [[ ! -s "$DB" && -s "$SELF_DIR/kde-authorized" ]]; then
     echo "seeded RemoteDesktop grant: $DB"
 fi
 
+# Virtual "Punktfunk" speaker: a null sink (shipped next to this script) that the host captures +
+# streams, set default so desktop audio goes there instead of a real/AirPlay device — a headless
+# host has no speakers, and on a LAN with AirPlay gear PipeWire otherwise picks a random HomePod.
+# pipewire reads its own config at start, so on FIRST install (config not yet present) restart it
+# once to load the sink; later boots already have it. (Also disable AirPlay discovery out of band:
+# `sudo dnf remove pipewire-config-raop`.)
+PWSINK="$HOME/.config/pipewire/pipewire.conf.d/50-punktfunk-sink.conf"
+if [[ ! -s "$PWSINK" && -s "$SELF_DIR/punktfunk-sink.conf" ]]; then
+    mkdir -p "$(dirname "$PWSINK")" && cp "$SELF_DIR/punktfunk-sink.conf" "$PWSINK"
+    echo "installed Punktfunk virtual speaker → restarting pipewire to load it"
+    systemctl --user restart pipewire 2>/dev/null || true
+fi
+
 # Reach graphical-session.target so xdg-desktop-portal (which is ordered After / fails its start
 # job without it) can come up — a headless linger session never gets there on its own, and Fedora's
 # target carries RefuseManualStart=yes, so drop that in once. Without the portal, libei input fails.

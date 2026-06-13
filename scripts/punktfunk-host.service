@@ -20,6 +20,12 @@
 [Unit]
 Description=punktfunk GameStream + punktfunk/1 host
 After=pipewire.service punktfunk-kde-session.service
+# PartOf the kwin session (when present): the host's libei input uses the RemoteDesktop portal,
+# whose D-Bus connection goes stale if the compositor session restarts the portal under it — the
+# in-process reopen loop can't recover that, but a full restart re-establishes it. So restart the
+# host whenever the kde-session restarts. Ignored when punktfunk-kde-session isn't installed
+# (gamescope / other backends).
+PartOf=punktfunk-kde-session.service
 
 [Service]
 EnvironmentFile=%h/.config/punktfunk/host.env

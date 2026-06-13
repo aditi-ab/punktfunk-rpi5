@@ -161,6 +161,8 @@ install -Dm0755 scripts/headless/run-headless-kde.sh   %{buildroot}%{_datadir}/%
 install -Dm0755 scripts/headless/run-headless-sway.sh  %{buildroot}%{_datadir}/%{name}/headless/run-headless-sway.sh
 # RemoteDesktop grant pre-seed for headless libei input (run-headless-kde.sh copies it in).
 install -Dm0644 scripts/headless/kde-authorized        %{buildroot}%{_datadir}/%{name}/headless/kde-authorized
+# Virtual "Punktfunk" speaker (null sink the host captures/streams; run-headless-kde.sh installs it).
+install -Dm0644 scripts/headless/punktfunk-sink.conf   %{buildroot}%{_datadir}/%{name}/headless/punktfunk-sink.conf
 install -Dm0644 scripts/host.env.example               %{buildroot}%{_datadir}/%{name}/host.env.example
 install -Dm0644 packaging/bazzite/host.env             %{buildroot}%{_datadir}/%{name}/host.env.bazzite
 install -Dm0644 packaging/kde/host.env                 %{buildroot}%{_datadir}/%{name}/host.env.kde
