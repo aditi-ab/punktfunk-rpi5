@@ -327,6 +327,15 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN" 2>/dev/null || true
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           security default-keychain -d user -s "$KEYCHAIN"
+          # Re-establish codesign's access to the private key (errSecInternalComponent at
+          # sign time is classically a key-ACL problem) + stage the WWDR intermediate and
+          # Apple Root so the whole chain is in the identity's keychain for the chain build.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null 2>&1 || true
+          curl -fsS "https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer" -o "$RUNNER_TEMP/w.cer" \
+            && security import "$RUNNER_TEMP/w.cer" -k "$KEYCHAIN" -t cert >/dev/null 2>&1 || true
+          curl -fsS "https://www.apple.com/appleca/AppleIncRootCertificate.cer" -o "$RUNNER_TEMP/r.cer" \
+            && security import "$RUNNER_TEMP/r.cer" -k "$KEYCHAIN" -t cert >/dev/null 2>&1 || true
           # Inside-out: sign any nested Mach-O first (the static build usually has none), then
           # the app with the profile's entitlements + the Apple Distribution identity.
           if [ -d "$APP/Frameworks" ]; then
