@@ -102,11 +102,36 @@ fi
 # D-Bus-activated X11 apps inherit it — then restart.
 systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR ${DISPLAY:+DISPLAY} 2>/dev/null || true
 dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS ${DISPLAY:+DISPLAY} 2>/dev/null || true
-# --no-block: queue the restart and return immediately. A synchronous try-restart of the
-# portal chain blocks bring-up ~30s (xdg-desktop-portal is Type=dbus and waits for its bus
-# name); the portal only needs to be ready before the FIRST client streams (seconds later,
-# user-driven), not before plasmashell starts.
-systemctl --user --no-block try-restart plasma-xdg-desktop-portal-kde.service xdg-desktop-portal-kde.service xdg-desktop-portal.service 2>/dev/null || true
+
+# Pre-seed the RemoteDesktop grant for headless input injection (libei). KWin's xdg portal would
+# otherwise pop an "Allow remote control?" dialog on every session Start() — which a headless host
+# can't answer, so EIS setup times out and input silently fails. The `kde-authorized` permission-
+# store table (this tiny GVariant DB, shipped next to this script) pre-authorizes it. Copy it in if
+# the user has none yet; never clobber an existing one.
+DB="$HOME/.local/share/flatpak/db/kde-authorized"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ ! -s "$DB" && -s "$SELF_DIR/kde-authorized" ]]; then
+    mkdir -p "$(dirname "$DB")" && cp "$SELF_DIR/kde-authorized" "$DB"
+    echo "seeded RemoteDesktop grant: $DB"
+fi
+
+# Reach graphical-session.target so xdg-desktop-portal (which is ordered After / fails its start
+# job without it) can come up — a headless linger session never gets there on its own, and Fedora's
+# target carries RefuseManualStart=yes, so drop that in once. Without the portal, libei input fails.
+GST_DROPIN="$HOME/.config/systemd/user/graphical-session.target.d"
+if [[ ! -f "$GST_DROPIN/10-punktfunk-headless.conf" ]]; then
+    mkdir -p "$GST_DROPIN"
+    printf '[Unit]\nRefuseManualStart=no\n' > "$GST_DROPIN/10-punktfunk-headless.conf"
+    systemctl --user daemon-reload 2>/dev/null || true
+fi
+systemctl --user start graphical-session.target 2>/dev/null || true
+
+# Bring the portal up against the env imported above. `start` (not the old `try-restart`, a no-op
+# when inactive — the headless first-boot case) so it actually comes up; `--no-block` since
+# xdg-desktop-portal is Type=dbus and blocks ~30s waiting for its bus name, and it only needs to be
+# ready before the FIRST client streams (seconds later), not before plasmashell.
+systemctl --user --no-block restart plasma-xdg-desktop-portal-kde.service 2>/dev/null || true
+systemctl --user --no-block start xdg-desktop-portal.service 2>/dev/null || true
 
 # Polkit authentication agent: without it, Discover / PackageKit can't get authorization to
 # install packages (polkitd is the policy engine; the *agent* is the GUI prompt). A full Plasma

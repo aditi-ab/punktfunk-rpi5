@@ -159,6 +159,8 @@ install -Dm0644 scripts/70-punktfunk-client.rules \
 install -d %{buildroot}%{_datadir}/%{name}/headless
 install -Dm0755 scripts/headless/run-headless-kde.sh   %{buildroot}%{_datadir}/%{name}/headless/run-headless-kde.sh
 install -Dm0755 scripts/headless/run-headless-sway.sh  %{buildroot}%{_datadir}/%{name}/headless/run-headless-sway.sh
+# RemoteDesktop grant pre-seed for headless libei input (run-headless-kde.sh copies it in).
+install -Dm0644 scripts/headless/kde-authorized        %{buildroot}%{_datadir}/%{name}/headless/kde-authorized
 install -Dm0644 scripts/host.env.example               %{buildroot}%{_datadir}/%{name}/host.env.example
 install -Dm0644 packaging/bazzite/host.env             %{buildroot}%{_datadir}/%{name}/host.env.bazzite
 install -Dm0644 packaging/kde/host.env                 %{buildroot}%{_datadir}/%{name}/host.env.kde

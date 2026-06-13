@@ -47,6 +47,7 @@ sed -i 's#%h/punktfunk/target/release/punktfunk-host#/usr/bin/punktfunk-host#' \
     "$STAGE/usr/lib/systemd/user/punktfunk-host.service"
 install -Dm0755 scripts/headless/run-headless-kde.sh   "$SHAREDIR/headless/run-headless-kde.sh"
 install -Dm0755 scripts/headless/run-headless-sway.sh  "$SHAREDIR/headless/run-headless-sway.sh"
+install -Dm0644 scripts/headless/kde-authorized        "$SHAREDIR/headless/kde-authorized"
 install -Dm0644 scripts/host.env.example           "$SHAREDIR/host.env.example"
 install -Dm0644 packaging/bazzite/host.env         "$SHAREDIR/host.env.bazzite"
 install -Dm0644 docs/api/openapi.json              "$SHAREDIR/openapi.json"
