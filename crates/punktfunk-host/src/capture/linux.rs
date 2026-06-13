@@ -665,6 +665,29 @@ mod pipewire {
         })
     }
 
+    /// Build a Buffers param for a TRUE SHM path: MemPtr + MemFd only, NO DmaBuf. Forces the
+    /// producer to download into mappable memory (Mutter's `glReadPixels`), which orders against its
+    /// render — so the frame is complete and current by construction. This is the only race-free
+    /// capture of Mutter's virtual monitor on NVIDIA: the compositor renders straight into the buffer
+    /// pool, NVIDIA attaches no implicit dmabuf fence (verified: `EXPORT_SYNC_FILE` waited=false) and
+    /// can't produce an explicit sync_fd, so any dmabuf read (zero-copy OR mmap) races the render and
+    /// flashes the buffer's previous frame. Excluding DmaBuf is what makes the difference vs.
+    /// `build_mappable_buffers` (which still let Mutter hand dmabufs).
+    fn build_shm_only_buffers() -> Result<Vec<u8>> {
+        serialize_pod(pw::spa::pod::Object {
+            type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+            id: pw::spa::param::ParamType::Buffers.as_raw(),
+            properties: vec![pw::spa::pod::Property {
+                key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: pw::spa::pod::Value::Int(
+                    (1i32 << pw::spa::sys::SPA_DATA_MemPtr)
+                        | (1i32 << pw::spa::sys::SPA_DATA_MemFd),
+                ),
+            }],
+        })
+    }
+
     /// Build a Buffers param requesting dmabuf-only buffers.
     fn build_dmabuf_buffers() -> Result<Vec<u8>> {
         serialize_pod(pw::spa::pod::Object {
@@ -736,8 +759,16 @@ mod pipewire {
         if importer.is_some() && !modifiers.contains(&0) {
             modifiers.push(0); // DRM_FORMAT_MOD_LINEAR
         }
-        let want_dmabuf = importer.is_some() && !modifiers.is_empty();
-        if zerocopy && !want_dmabuf {
+        // PUNKTFUNK_FORCE_SHM=1 forces the race-free download path (SHM, no dmabuf) — required on
+        // Mutter+NVIDIA where dmabuf capture has no working sync and shows stale frames. KWin/
+        // gamescope don't need it (they blit into the buffer, so no read-before-render race).
+        let force_shm = std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() == Ok("1");
+        let want_dmabuf = importer.is_some() && !modifiers.is_empty() && !force_shm;
+        if force_shm {
+            tracing::info!(
+                "capture: PUNKTFUNK_FORCE_SHM — race-free SHM download path (no dmabuf, no zero-copy)"
+            );
+        } else if zerocopy && !want_dmabuf {
             tracing::warn!("zero-copy: no EGL-importable dmabuf modifiers — using CPU path");
         } else if want_dmabuf {
             tracing::info!(
@@ -1069,6 +1100,9 @@ mod pipewire {
                 Some(build_dmabuf_format(&modifiers, preferred)?),
                 Some(build_dmabuf_buffers()?),
             )
+        } else if force_shm {
+            // True SHM: exclude DmaBuf so Mutter MUST download (glReadPixels orders against render).
+            (None, Some(build_shm_only_buffers()?))
         } else {
             // CPU path still accepts mappable dmabufs (gamescope offers only those once its
             // modifier-bearing format pod wins the intersection).
