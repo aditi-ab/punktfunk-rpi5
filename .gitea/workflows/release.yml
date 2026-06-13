@@ -89,7 +89,9 @@ jobs:
         run: |
           KEYCHAIN="$RUNNER_TEMP/punktfunk-ci.keychain-db"
           KEYCHAIN_PASS="$(uuidgen)"
+          echo "::add-mask::$KEYCHAIN_PASS"
           echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASS=$KEYCHAIN_PASS" >> "$GITHUB_ENV"
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
           security set-keychain-settings -lut 7200 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
@@ -317,6 +319,14 @@ jobs:
           APP=$(ls -d "$RUNNER_TEMP/Punktfunk-ios.xcarchive/Products/Applications/"*.app | head -1)
           echo "iOS app bundle: $APP"
           cp "$RUNNER_TEMP/appstore.mobileprovision" "$APP/embedded.mobileprovision"
+          # Re-assert the keychain RIGHT BEFORE signing: the xcodebuild archive above resets the
+          # user keychain search list, so codesign would otherwise fail to find the WWDR
+          # intermediate (it lives only in the throwaway keychain) and report "unable to build
+          # chain to self-signed root / errSecInternalComponent". The macOS sign step avoids
+          # this by signing in a separate step; the iOS archive+sign share one step. Unlock too.
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN" 2>/dev/null || true
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security default-keychain -d user -s "$KEYCHAIN"
           # Inside-out: sign any nested Mach-O first (the static build usually has none), then
           # the app with the profile's entitlements + the Apple Distribution identity.
           if [ -d "$APP/Frameworks" ]; then
