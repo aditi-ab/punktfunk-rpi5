@@ -316,6 +316,13 @@ jobs:
             cp "$RUNNER_TEMP/appstore.mobileprovision" "$d/$PROFILE_UUID.mobileprovision"
           done
           echo "iOS App Store profile: '$PROFILE_NAME' ($PROFILE_UUID)"
+          # Where did it land, and where does xcodebuild look? (manual-signing profile lookup
+          # reads ~/Library/MobileDevice + ~/Library/Developer/Xcode/UserData; confirm HOME.)
+          echo "HOME=$HOME whoami=$(whoami)"
+          echo "--- MobileDevice profiles ---"; ls -la "$HOME/Library/MobileDevice/Provisioning Profiles/" 2>&1 | tail -4
+          echo "--- UserData profiles ---"; ls -la "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/" 2>&1 | tail -4
+          echo "--- profile team(s) (want F4H37KF6WC) + name ---"
+          /usr/libexec/PlistBuddy -c 'Print :TeamIdentifier' "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null | head -4
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           security default-keychain -d user -s "$KEYCHAIN"
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
@@ -326,7 +333,11 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Apple Distribution" \
             DEVELOPMENT_TEAM="$TEAM_ID" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+          || { echo "=== archive failed — profile dirs AT FAILURE TIME ==="; \
+               ls -la "$HOME/Library/MobileDevice/Provisioning Profiles/" 2>&1 | tail -4; \
+               ls -la "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/" 2>&1 | tail -4; \
+               exit 1; }
           cat > "$RUNNER_TEMP/export-appstore.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
