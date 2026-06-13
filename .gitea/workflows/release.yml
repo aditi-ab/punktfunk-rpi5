@@ -149,9 +149,13 @@ jobs:
           # identities — WITHOUT failing this step, so the macOS release still proceeds.
           if [ -n "$IOS_P12_B64" ] \
              && ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution"; then
-            echo "::warning::IOS_DIST_CERT_P12_B64 set but no VALID 'Apple Distribution' identity — likely the .p12 has no private key (export the IDENTITY, key included), or an untrusted/expired chain."
+            echo "::warning::IOS_DIST_CERT_P12_B64 set but no VALID 'Apple Distribution' identity — but it may still be usable (see trust verdict below); codesign is less strict than find-identity -v."
             echo "all codesigning identities (incl. invalid):"
             security find-identity -p codesigning "$KEYCHAIN" || true
+            echo "--- trust verdict for the Apple Distribution leaf (codeSign policy) ---"
+            security find-certificate -c "Apple Distribution" -p "$KEYCHAIN" > "$RUNNER_TEMP/appledist.pem" 2>/dev/null || true
+            security verify-cert -p codeSign -c "$RUNNER_TEMP/appledist.pem" -k "$KEYCHAIN" 2>&1 || true
+            rm -f "$RUNNER_TEMP/appledist.pem"
           fi
 
       - name: Stage App Store Connect API key
@@ -268,10 +272,12 @@ jobs:
             exit 0
           fi
           # App Store signing uses the Apple Distribution identity imported above from
-          # IOS_DIST_CERT_P12_B64. Skip cleanly until that secret exists; re-assert the
-          # throwaway keychain on the search list + as default so automatic signing finds it
-          # (the search list doesn't reliably carry across steps on this runner).
-          if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution"; then
+          # IOS_DIST_CERT_P12_B64. Gate on the MATCHING list (find-identity without -v), NOT
+          # the valid-only list: a freshly-minted cert with its key + intermediate present can
+          # be excluded from -v by a pending online revocation/trust check that codesign does
+          # NOT enforce — so -v would skip a perfectly signable identity. Re-assert the
+          # throwaway keychain (search list + default) so automatic signing finds it.
+          if ! security find-identity -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution"; then
             echo "::warning::no Apple Distribution identity present — set IOS_DIST_CERT_P12_B64. Skipping iOS/TestFlight."
             exit 0
           fi
