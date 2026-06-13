@@ -77,10 +77,12 @@ jobs:
         working-directory: web
     steps:
       # oven/bun ships neither git nor a real node (only a bun shim) — actions/checkout
-      # needs both.
-      - name: Install git + node
+      # needs both. The slim Debian base also lacks ca-certificates, so without it git's
+      # HTTPS fetch of the repo dies with "Problem with the SSL CA cert (path? access
+      # rights?)" — no CA bundle to validate git.unom.io's (public) Let's Encrypt cert.
+      - name: Install git + node + CA certs
         working-directory: /
-        run: apt-get update && apt-get install -y --no-install-recommends git nodejs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: bun install --frozen-lockfile --ignore-scripts
@@ -100,9 +102,11 @@ jobs:
       run:
         working-directory: docs-site
     steps:
-      - name: Install git
+      # ca-certificates: the slim Debian base lacks a CA bundle, so actions/checkout's
+      # HTTPS fetch otherwise fails with "Problem with the SSL CA cert" (see web job).
+      - name: Install git + CA certs
         working-directory: /
-        run: apt-get update && apt-get install -y --no-install-recommends git
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: bun install --frozen-lockfile --ignore-scripts
