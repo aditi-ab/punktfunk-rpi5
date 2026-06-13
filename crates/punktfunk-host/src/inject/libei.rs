@@ -615,15 +615,24 @@ impl EiState {
             }
             InputKind::MouseScroll => match slot.interface::<ei::Scroll>() {
                 Some(s) => {
-                    // GameStream sends WHEEL_DELTA(120)-scaled deltas in `x`; ei scroll_discrete
-                    // uses the same 120-per-detent unit. Positive GameStream = up (vertical),
-                    // which is negative on the ei axis, but = RIGHT (horizontal), which is
-                    // already positive there (moonlight-qt/Sunshine pass horizontal through
-                    // unnegated) — only the vertical axis flips.
+                    // Wire deltas are WHEEL_DELTA(120)-scaled in `x`. Emit BOTH ei scroll axes
+                    // from it: `scroll_discrete` (120-per-detent — drives line/page scrolling)
+                    // AND the continuous `scroll` axis in logical px (≈15 px/detent). Without
+                    // the continuous axis Mutter floors a sub-detent delta (trackpad / precise
+                    // wheel / fractional smooth scroll) to zero whole clicks, so small scrolls
+                    // never register and you have to spin the wheel a lot — emitting the pixel
+                    // axis too makes every delta move proportionally (matches the wlr backend's
+                    // 15 px/notch). Positive wire = up (vertical, negated on the ei axis) /
+                    // RIGHT (horizontal, already positive — moonlight-qt/Sunshine pass it
+                    // through unnegated); only the vertical axis flips.
+                    const PX_PER_DETENT: f32 = 15.0;
+                    let px = ev.x as f32 / 120.0 * PX_PER_DETENT;
                     if ev.code == SCROLL_HORIZONTAL {
                         s.scroll_discrete(ev.x, 0);
+                        s.scroll(px, 0.0);
                     } else {
                         s.scroll_discrete(0, -ev.x);
+                        s.scroll(0.0, -px);
                     }
                 }
                 None => emitted = false,
