@@ -32,12 +32,17 @@ export WAYLAND_DISPLAY=wayland-kde
 export KWIN_WAYLAND_NO_PERMISSION_CHECKS=1
 
 # The probe binary (gates readiness on KWin actually exposing zkde_screencast — not merely
-# the socket existing). Use a release build if present, else fall back to `cargo run`.
+# the socket existing). Prefer a source-tree build (dev box), then a packaged install on PATH
+# (the RPM/.deb put it at /usr/bin — there is no $ROOT/target there, and the old cargo-run
+# fallback has no Cargo.toml either, so without this the probe never succeeds and the session
+# restart-loops), then `cargo run` as a last resort.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 if [[ -x "$ROOT/target/release/punktfunk-host" ]]; then
     PROBE=("$ROOT/target/release/punktfunk-host" probe-compositor)
 elif [[ -x "$ROOT/target/debug/punktfunk-host" ]]; then
     PROBE=("$ROOT/target/debug/punktfunk-host" probe-compositor)
+elif command -v punktfunk-host >/dev/null 2>&1; then
+    PROBE=(punktfunk-host probe-compositor)
 else
     PROBE=(cargo run -q --manifest-path "$ROOT/Cargo.toml" -p punktfunk-host -- probe-compositor)
 fi
