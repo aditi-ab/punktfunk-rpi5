@@ -273,13 +273,13 @@ jobs:
             echo "::warning::iOS platform SDK not installed on this runner — skipping iOS/TestFlight."
             exit 0
           fi
-          # App Store signing: MANUAL with the Apple Distribution identity + an App Store
-          # provisioning profile (IOS_PROFILE_B64). Automatic signing during `archive` resolves
-          # to iOS App *Development* — it wants an Apple Development cert (and tries to revoke
-          # the account's orphaned one) plus a dev profile, neither of which we have or want.
-          # Manual distribution signing skips all of that. Gate on the MATCHING identity list
-          # (find-identity without -v): a fresh cert can be dropped from -v by a pending
-          # revocation check that codesign does NOT enforce.
+          # App Store signing: archive UNSIGNED, then raw `codesign` with the Apple Distribution
+          # identity + the profile's entitlements — exactly like the macOS DMG. NOT xcodebuild
+          # manual signing: its signing-identity selection enforces an online revocation/OCSP
+          # check that drops a freshly-minted cert (find-identity -v excludes it) even though the
+          # cert is genuinely valid (verify-cert passes) and codesign signs with it fine. This
+          # also means no provisioning-profile discovery, so no Xcode-pruning / profile-dir dance.
+          # Gate on the MATCHING identity list.
           if ! security find-identity -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution"; then
             echo "::warning::no Apple Distribution identity present — set IOS_DIST_CERT_P12_B64. Skipping iOS/TestFlight."
             exit 0
@@ -288,86 +288,60 @@ jobs:
             echo "::warning::IOS_PROFILE_B64 not set — need an App Store provisioning profile for io.unom.punktfunk. Skipping iOS/TestFlight."
             exit 0
           fi
-          # A running Xcode.app actively MANAGES ~/Library/Developer/Xcode/UserData/Provisioning
-          # Profiles — it prunes manually-installed profiles it doesn't recognise from its
-          # account, deleting ours from the very dir xcodebuild reads right before signing
-          # (hence 'No profile matching ...' even though the file was installed). Quit it;
-          # headless CI doesn't need the GUI Xcode and xcodebuild runs independently.
-          osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
-          pkill -x Xcode 2>/dev/null || true
-          sleep 2
-          # Stage the App Store provisioning profile + read its Name/UUID (the archive +
-          # export reference it by name; Xcode finds it by UUID under the profiles dirs).
+          # Decode the App Store provisioning profile + its embedded entitlements. A
+          # .mobileprovision is a CMS-signed plist; security cms is flaky on this runner, so
+          # openssl smime is the fallback that actually works.
           printf '%s' "$IOS_PROFILE_B64" | tr -d '\r\n ' | base64 -d > "$RUNNER_TEMP/appstore.mobileprovision" \
             || { echo "::warning::IOS_PROFILE_B64 is not valid base64 — skipping iOS"; exit 0; }
-          echo "profile bytes: $(wc -c < "$RUNNER_TEMP/appstore.mobileprovision")"
-          # A .mobileprovision is a CMS-signed plist — extract it (security, openssl fallback).
           security cms -D -i "$RUNNER_TEMP/appstore.mobileprovision" \
-            -o "$RUNNER_TEMP/appstore-profile.plist" 2>"$RUNNER_TEMP/cms.err" \
+            -o "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null \
           || openssl smime -inform DER -verify -noverify \
                -in "$RUNNER_TEMP/appstore.mobileprovision" \
-               -out "$RUNNER_TEMP/appstore-profile.plist" 2>>"$RUNNER_TEMP/cms.err" || true
+               -out "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null || true
           if [ ! -s "$RUNNER_TEMP/appstore-profile.plist" ]; then
-            echo "::warning::could not extract the plist from the profile — is IOS_PROFILE_B64 the base64 of the .mobileprovision FILE?"
-            cat "$RUNNER_TEMP/cms.err" 2>/dev/null || true
-            echo "first bytes of decoded profile:"; head -c 64 "$RUNNER_TEMP/appstore.mobileprovision" | xxd | head -2 || true
+            echo "::warning::could not extract the profile plist — is IOS_PROFILE_B64 the base64 of the .mobileprovision FILE? Skipping iOS."
             exit 0
           fi
-          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null)
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null)
-          case "$PROFILE_UUID" in
-            ""|*[!A-Fa-f0-9-]*) echo "::warning::profile UUID not readable (got: '$PROFILE_UUID') — skipping iOS"; exit 0;;
-          esac
-          for d in "$HOME/Library/MobileDevice/Provisioning Profiles" \
-                   "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
-            mkdir -p "$d"
-            cp "$RUNNER_TEMP/appstore.mobileprovision" "$d/$PROFILE_UUID.mobileprovision"
-          done
-          echo "iOS App Store profile: '$PROFILE_NAME' ($PROFILE_UUID)"
-          # Where did it land, and where does xcodebuild look? (manual-signing profile lookup
-          # reads ~/Library/MobileDevice + ~/Library/Developer/Xcode/UserData; confirm HOME.)
-          echo "HOME=$HOME whoami=$(whoami)"
-          echo "--- MobileDevice profiles ---"; ls -la "$HOME/Library/MobileDevice/Provisioning Profiles/" 2>&1 | tail -4
-          echo "--- UserData profiles ---"; ls -la "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/" 2>&1 | tail -4
-          echo "--- profile team(s) (want F4H37KF6WC) + name ---"
-          /usr/libexec/PlistBuddy -c 'Print :TeamIdentifier' "$RUNNER_TEMP/appstore-profile.plist" 2>/dev/null | head -4
+          plutil -extract Entitlements xml1 -o "$RUNNER_TEMP/ios-entitlements.plist" \
+            "$RUNNER_TEMP/appstore-profile.plist" \
+            || { echo "::warning::profile has no Entitlements — skipping iOS"; exit 0; }
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           security default-keychain -d user -s "$KEYCHAIN"
+          # Archive UNSIGNED — no xcodebuild signing/provisioning at all.
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk-iOS \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
-          || { echo "=== archive failed — profile dirs AT FAILURE TIME ==="; \
-               ls -la "$HOME/Library/MobileDevice/Provisioning Profiles/" 2>&1 | tail -4; \
-               ls -la "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/" 2>&1 | tail -4; \
-               exit 1; }
-          cat > "$RUNNER_TEMP/export-appstore.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key><string>app-store-connect</string>
-            <key>destination</key><string>upload</string>
-            <key>teamID</key><string>$TEAM_ID</string>
-            <key>signingStyle</key><string>manual</string>
-            <key>signingCertificate</key><string>Apple Distribution</string>
-            <key>provisioningProfiles</key>
-            <dict><key>io.unom.punktfunk</key><string>$PROFILE_NAME</string></dict>
-          </dict>
-          </plist>
-          EOF
-          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
-            -exportOptionsPlist "$RUNNER_TEMP/export-appstore.plist" \
-            -exportPath "$RUNNER_TEMP/export-appstore" \
-            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
-            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
-            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
+            CODE_SIGNING_ALLOWED=NO
+          APP=$(ls -d "$RUNNER_TEMP/Punktfunk-ios.xcarchive/Products/Applications/"*.app | head -1)
+          echo "iOS app bundle: $APP"
+          cp "$RUNNER_TEMP/appstore.mobileprovision" "$APP/embedded.mobileprovision"
+          # Inside-out: sign any nested Mach-O first (the static build usually has none), then
+          # the app with the profile's entitlements + the Apple Distribution identity.
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -depth \( -name '*.framework' -o -name '*.dylib' \) -print0 \
+              | while IFS= read -r -d '' f; do
+                  codesign --force --keychain "$KEYCHAIN" --sign "Apple Distribution" "$f"
+                done
+          fi
+          codesign --force --keychain "$KEYCHAIN" \
+            --entitlements "$RUNNER_TEMP/ios-entitlements.plist" \
+            --sign "Apple Distribution" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+          # Package the .ipa.
+          rm -rf "$RUNNER_TEMP/Payload" "$RUNNER_TEMP/Punktfunk.ipa"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          ( cd "$RUNNER_TEMP" && zip -qry Punktfunk.ipa Payload )
+          # Upload to App Store Connect (TestFlight). altool reads the key from
+          # ~/.appstoreconnect/private_keys/AuthKey_<id>.p8.
+          ASC_KEY_ID="${{ secrets.ASC_API_KEY_ID }}"
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          cp "$RUNNER_TEMP/asc.p8" "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcrun altool --upload-app -f "$RUNNER_TEMP/Punktfunk.ipa" \
+            -t ios --apiKey "$ASC_KEY_ID" --apiIssuer "${{ secrets.ASC_API_ISSUER_ID }}"
+          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
 
       - name: Clean up keychain + API key
         if: always()
