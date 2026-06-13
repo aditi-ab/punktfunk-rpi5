@@ -136,6 +136,9 @@ install -Dm0644 scripts/99-punktfunk-net.conf %{buildroot}%{_prefix}/lib/sysctl.
 
 # systemd *user* unit (the host runs in the graphical session, not as root).
 install -Dm0644 scripts/punktfunk-host.service %{buildroot}%{_userunitdir}/punktfunk-host.service
+# The source unit's ExecStart points at the dev source tree; a packaged install has the binary at
+# %{_bindir}. Rewrite it so a fresh install (no hand-rolled unit) starts the installed binary.
+sed -i 's#%h/punktfunk/target/release/punktfunk-host#%{_bindir}/punktfunk-host#' %{buildroot}%{_userunitdir}/punktfunk-host.service
 
 # --- client subpackage ---
 install -Dm0755 target/release/punktfunk-client %{buildroot}%{_bindir}/punktfunk-client

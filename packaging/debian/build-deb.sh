@@ -41,6 +41,10 @@ install -Dm0644 scripts/60-punktfunk.rules         "$STAGE/usr/lib/udev/rules.d/
 # and high-bitrate frames overflow it (send-side packet loss). systemd-sysctl applies it at boot.
 install -Dm0644 scripts/99-punktfunk-net.conf      "$STAGE/usr/lib/sysctl.d/99-punktfunk-net.conf"
 install -Dm0644 scripts/punktfunk-host.service     "$STAGE/usr/lib/systemd/user/punktfunk-host.service"
+# The source unit's ExecStart points at the dev source tree; a packaged install has the binary at
+# /usr/bin. Rewrite it so a fresh apt install (no hand-rolled unit) starts the installed binary.
+sed -i 's#%h/punktfunk/target/release/punktfunk-host#/usr/bin/punktfunk-host#' \
+    "$STAGE/usr/lib/systemd/user/punktfunk-host.service"
 install -Dm0755 scripts/headless/run-headless-kde.sh   "$SHAREDIR/headless/run-headless-kde.sh"
 install -Dm0755 scripts/headless/run-headless-sway.sh  "$SHAREDIR/headless/run-headless-sway.sh"
 install -Dm0644 scripts/host.env.example           "$SHAREDIR/host.env.example"
