@@ -159,6 +159,38 @@ extern "C" {
     ) -> libc::ssize_t;
 }
 
+/// Data-plane NAT/firewall hole-punch marker. The video data plane is a raw UDP socket distinct
+/// from the QUIC control connection; on a flat LAN the host can send straight to the client, but
+/// across a NAT or a stateful inter-VLAN firewall the unsolicited host→client video is rejected
+/// (ICMP port-unreachable). So the client sends these tiny datagrams FROM its data socket TO the
+/// host's data port: that opens the firewall/NAT return path and lets the host learn the client's
+/// *observed* source (the NAT-translated address, not the client's reported private one). It's the
+/// only thing a client ever sends on the data plane (video is host→client), so the host treats any
+/// punch-magic datagram purely as a source-address probe and never as stream data.
+pub const PUNCH_MAGIC: &[u8] = b"PFpunch1";
+
+/// Spawn the client-side data-plane hole-punch keepalive. `sock` is a clone of the data socket
+/// (already `connect`ed to the host's data port — see [`UdpTransport::try_clone_socket`]). Bursts
+/// fast at first to open the NAT/firewall path before the host's punch-wait expires, then steady
+/// keepalive so a stateful firewall's idle timeout can't close the path during a static, low-bitrate
+/// scene. Stops when `stop` is set (session teardown) or the socket closes. No-op cost on a flat LAN.
+pub fn spawn_data_punch(sock: UdpSocket, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    std::thread::Builder::new()
+        .name("punktfunk-data-punch".into())
+        .spawn(move || {
+            let mut i = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if sock.send(PUNCH_MAGIC).is_err() {
+                    break;
+                }
+                let delay_ms = if i < 15 { 200 } else { 2000 };
+                i = i.saturating_add(1);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+        })
+        .ok();
+}
+
 pub struct UdpTransport {
     socket: UdpSocket,
 }
@@ -186,6 +218,60 @@ impl UdpTransport {
         Self::grow_buffers(&socket);
         socket.set_nonblocking(true)?;
         Ok(UdpTransport { socket })
+    }
+
+    /// Host side of the data plane for clients that may sit behind NAT / a stateful inter-VLAN
+    /// firewall. Bind `local`, then block up to `punch_timeout` for the client's first
+    /// [`PUNCH_MAGIC`] datagram and `connect` to its *observed* source — so video flows back
+    /// through the path the client just opened, to the address+port the host actually sees (the
+    /// NAT-translated one, which can differ from the client-reported `fallback_peer`). If no punch
+    /// arrives (a client that doesn't hole-punch), fall back to `fallback_peer` — the same flat-LAN
+    /// behaviour as [`connect`](Self::connect). Returns `(transport, punched)`.
+    pub fn connect_via_punch(
+        local: &str,
+        fallback_peer: &str,
+        punch_timeout: std::time::Duration,
+    ) -> std::io::Result<(Self, bool)> {
+        let socket = UdpSocket::bind(local)?;
+        socket.set_read_timeout(Some(punch_timeout))?;
+        let deadline = std::time::Instant::now() + punch_timeout;
+        let mut buf = [0u8; 64];
+        let mut observed: Option<std::net::SocketAddr> = None;
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((n, src)) if n >= PUNCH_MAGIC.len() && &buf[..PUNCH_MAGIC.len()] == PUNCH_MAGIC => {
+                    observed = Some(src);
+                    break;
+                }
+                Ok(_) => {} // stray datagram — keep waiting for a real punch
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break
+                }
+                Err(e) => return Err(e),
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        let punched = observed.is_some();
+        let target = observed.map(|s| s.to_string());
+        socket.connect(target.as_deref().unwrap_or(fallback_peer))?;
+        socket.set_read_timeout(None)?;
+        Self::grow_buffers(&socket);
+        socket.set_nonblocking(true)?;
+        Ok((UdpTransport { socket }, punched))
+    }
+
+    /// A second handle to the data socket, for sending hole-punch keepalives ([`PUNCH_MAGIC`])
+    /// while the [`Session`](crate::Session) owns the transport. The socket is already `connect`ed
+    /// to the host's data port, so `clone.send(PUNCH_MAGIC)` reaches it with no address.
+    pub fn try_clone_socket(&self) -> std::io::Result<UdpSocket> {
+        self.socket.try_clone()
     }
 
     /// The bound local address (e.g. to learn the OS-assigned ephemeral port).

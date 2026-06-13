@@ -788,9 +788,23 @@ async fn serve_session(
     let stop_stream = stop.clone();
     let result: Result<()> = async {
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let transport =
-                UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &client_udp.to_string())
-                    .context("bind data plane")?;
+            // Wait briefly for the client to hole-punch our data port, then stream to its OBSERVED
+            // source — so video traverses a NAT / stateful inter-VLAN firewall (the client and host
+            // can be on different subnets; control + side planes ride the client-initiated QUIC, but
+            // the raw video UDP needs the client to open the path first). Falls back to the
+            // client-reported address for clients that don't punch (flat-LAN, unchanged).
+            let (transport, punched) = UdpTransport::connect_via_punch(
+                &format!("0.0.0.0:{udp_port}"),
+                &client_udp.to_string(),
+                std::time::Duration::from_millis(2500),
+            )
+            .context("bind data plane")?;
+            tracing::info!(
+                %client_udp,
+                punched,
+                "data plane bound (punched=true → streaming to the client's observed source; \
+                 false → no hole-punch seen, using the reported address)"
+            );
             let mut session = Session::new(cfg, Box::new(transport))
                 .map_err(|e| anyhow!("host session: {e:?}"))?;
             match source {

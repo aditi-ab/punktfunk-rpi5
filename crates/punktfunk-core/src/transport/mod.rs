@@ -5,7 +5,7 @@ mod loopback;
 mod udp;
 
 pub use loopback::{loopback_pair, LoopbackTransport};
-pub use udp::UdpTransport;
+pub use udp::{spawn_data_punch, UdpTransport, PUNCH_MAGIC};
 
 /// A datagram transport. `recv` is non-blocking: it returns `Ok(None)` when no packet
 /// is currently available, so the caller (decode/present thread) never blocks here.

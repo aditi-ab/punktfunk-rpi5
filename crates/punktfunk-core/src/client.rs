@@ -648,6 +648,12 @@ async fn worker_main(args: WorkerArgs) {
         let host_udp = std::net::SocketAddr::new(remote.ip(), welcome.udp_port);
         let transport =
             UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())?;
+        // Hole-punch the host's data port so video traverses a NAT / stateful inter-VLAN firewall
+        // (control + side planes ride the client-initiated QUIC; the raw video UDP needs the client
+        // to open the path first). Stops with the session via the shared shutdown flag.
+        if let Ok(sock) = transport.try_clone_socket() {
+            crate::transport::spawn_data_punch(sock, shutdown.clone());
+        }
         let session = Session::new(welcome.session_config(Role::Client), Box::new(transport))?;
         Ok::<_, PunktfunkError>((
             conn,

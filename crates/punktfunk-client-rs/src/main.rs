@@ -814,6 +814,13 @@ async fn session(args: Args) -> Result<()> {
         let transport =
             UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())
                 .context("bind data plane")?;
+        // Hole-punch the host's data port so video traverses a NAT / inter-VLAN firewall. This
+        // tool runs one session then exits, so the keepalive thread dies with the process — no
+        // explicit stop needed (the flag is never set).
+        if let Ok(sock) = transport.try_clone_socket() {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            punktfunk_core::transport::spawn_data_punch(sock, stop);
+        }
         let mut session =
             Session::new(cfg, Box::new(transport)).map_err(|e| anyhow!("client session: {e:?}"))?;
         let mut sink = match &out_path {
