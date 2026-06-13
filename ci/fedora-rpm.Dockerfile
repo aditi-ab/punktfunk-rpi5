@@ -1,11 +1,15 @@
-# CI builder for the punktfunk RPM — Fedora 43 to match Bazzite's base (so the RPM's
-# auto-generated library Requires, e.g. libavcodec.so.NN, pin to exactly what the target
-# runs). Used by .gitea/workflows/rpm.yml; built+pushed by .gitea/workflows/docker.yml.
+# CI builder for the punktfunk RPM. The Fedora version is parameterized so one Dockerfile
+# serves every target whose ffmpeg soname must match: Fedora 43 == Bazzite's base (group
+# "bazzite"), Fedora 44 == the Fedora KDE spin (group "fedora-44"). The RPM's auto-generated
+# library Requires (e.g. libavcodec.so.NN) pin to exactly what the chosen base — and thus the
+# target — ships. Used by .gitea/workflows/rpm.yml; built+pushed by .gitea/workflows/docker.yml.
 #
-#   docker build -f ci/fedora-rpm.Dockerfile -t punktfunk-fedora-rpm ci
+#   docker build --build-arg FEDORA_VERSION=43 -f ci/fedora-rpm.Dockerfile -t punktfunk-fedora-rpm ci
+#   docker build --build-arg FEDORA_VERSION=44 -f ci/fedora-rpm.Dockerfile -t punktfunk-fedora44-rpm ci
 #
 # Mirrors ci/rust-ci.Dockerfile (the Ubuntu workspace builder) for the rpmbuild side.
-FROM fedora:43
+ARG FEDORA_VERSION=43
+FROM fedora:${FEDORA_VERSION}
 
 # RPM Fusion (free + nonfree) provides the NVENC-capable ffmpeg-devel the host links against.
 RUN dnf -y install \

@@ -140,6 +140,13 @@ install -Dm0644 scripts/punktfunk-host.service %{buildroot}%{_userunitdir}/punkt
 # %{_bindir}. Rewrite it so a fresh install (no hand-rolled unit) starts the installed binary.
 sed -i 's#%h/punktfunk/target/release/punktfunk-host#%{_bindir}/punktfunk-host#' %{buildroot}%{_userunitdir}/punktfunk-host.service
 
+# Optional headless KDE session unit (the kwin streaming appliance): brings up `kwin --virtual` on
+# wayland-kde via the packaged run-headless-kde.sh, so the host's kwin backend has a session whose
+# privileged screencast protocol it can bind. Repoint its ExecStart from the dev source tree to the
+# installed script. NOT enabled by default — only kwin-backend hosts (e.g. Fedora/Ubuntu KDE) need it.
+install -Dm0644 scripts/punktfunk-kde-session.service %{buildroot}%{_userunitdir}/punktfunk-kde-session.service
+sed -i 's#%h/punktfunk/scripts/headless/run-headless-kde.sh#%{_datadir}/%{name}/headless/run-headless-kde.sh#' %{buildroot}%{_userunitdir}/punktfunk-kde-session.service
+
 # --- client subpackage ---
 install -Dm0755 target/release/punktfunk-client %{buildroot}%{_bindir}/punktfunk-client
 install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
@@ -154,6 +161,7 @@ install -Dm0755 scripts/headless/run-headless-kde.sh   %{buildroot}%{_datadir}/%
 install -Dm0755 scripts/headless/run-headless-sway.sh  %{buildroot}%{_datadir}/%{name}/headless/run-headless-sway.sh
 install -Dm0644 scripts/host.env.example               %{buildroot}%{_datadir}/%{name}/host.env.example
 install -Dm0644 packaging/bazzite/host.env             %{buildroot}%{_datadir}/%{name}/host.env.bazzite
+install -Dm0644 packaging/kde/host.env                 %{buildroot}%{_datadir}/%{name}/host.env.kde
 install -Dm0644 docs/api/openapi.json                  %{buildroot}%{_datadir}/%{name}/openapi.json
 
 %files
@@ -163,6 +171,7 @@ install -Dm0644 docs/api/openapi.json                  %{buildroot}%{_datadir}/%
 %{_udevrulesdir}/60-punktfunk.rules
 %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
 %{_userunitdir}/punktfunk-host.service
+%{_userunitdir}/punktfunk-kde-session.service
 %dir %{_datadir}/%{name}
 %{_datadir}/%{name}/*
 
