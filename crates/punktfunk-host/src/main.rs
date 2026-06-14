@@ -16,7 +16,9 @@
 mod audio;
 mod capture;
 mod discovery;
+#[cfg(target_os = "linux")]
 mod dmabuf_fence;
+#[cfg(target_os = "linux")]
 mod drm_sync;
 mod encode;
 mod gamestream;

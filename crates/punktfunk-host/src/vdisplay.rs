@@ -15,6 +15,7 @@
 
 use anyhow::Result;
 pub use punktfunk_core::Mode;
+#[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 
 /// A created virtual output: a PipeWire source to capture, plus an owned keepalive whose drop
@@ -28,6 +29,7 @@ pub struct VirtualOutput {
     /// Portal/remote PipeWire fd when the node lives on a sandboxed remote (e.g. Mutter's
     /// RemoteDesktop+ScreenCast). `None` means the node is on the user's default PipeWire daemon
     /// (KWin `zkde_screencast`), captured by connecting to that daemon directly.
+    #[cfg(target_os = "linux")]
     pub remote_fd: Option<OwnedFd>,
     /// `(width, height, refresh_hz)` to prefer in the PipeWire format negotiation. KWin and
     /// gamescope outputs are created at the exact size, so this just confirms it; **Mutter sizes
