@@ -24,4 +24,6 @@ public enum DefaultsKey {
     public static let cursorMode = "punktfunk.cursorMode"
     /// Experimental: show the host's game library (browsed over the management API). Off by default.
     public static let libraryEnabled = "punktfunk.libraryEnabled"
+    /// macOS: take the window fullscreen while streaming and restore it on the host list. On by default.
+    public static let fullscreenWhileStreaming = "punktfunk.fullscreenWhileStreaming"
 }

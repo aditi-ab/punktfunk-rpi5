@@ -20,6 +20,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.presenter) private var presenter = "stage1"
     @AppStorage(DefaultsKey.cursorMode) private var cursorMode = "auto"
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
+    @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
     @ObservedObject private var gamepads = GamepadManager.shared
     #if os(macOS)
@@ -374,6 +375,16 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             #if os(macOS)
+            Section {
+                Toggle("Fullscreen while streaming", isOn: $fullscreenWhileStreaming)
+            } header: {
+                Text("Window")
+            } footer: {
+                Text("Take the window fullscreen when a session starts and restore it on the host "
+                    + "list, so only the stream is fullscreen — not the picker.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section {
                 Picker("Cursor in stream", selection: $cursorMode) {
                     Text("Auto (gamescope)").tag("auto")

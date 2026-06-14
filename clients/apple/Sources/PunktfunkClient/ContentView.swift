@@ -25,6 +25,7 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.compositor) private var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
+    @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @State private var showAddHost = false
     @State private var pairingTarget: StoredHost?
     @State private var speedTestTarget: StoredHost?
@@ -58,6 +59,11 @@ struct ContentView: View {
             }
         }
         .onDisappear { model.disconnect() } // window closed mid-session (Cmd+N spawns more)
+        #if os(macOS)
+        // Fullscreen only while a session is up (incl. the trust prompt over the blurred stream),
+        // windowed on the host list — so the picker isn't forced fullscreen. Opt-out in Settings.
+        .background(FullscreenController(active: fullscreenWhileStreaming && model.connection != nil))
+        #endif
         // On the outer Group so the sheet survives the trust-prompt → home transition
         // (the "Pair with PIN instead" path disconnects first — the host's accept loop
         // is sequential, a pairing connection would queue behind the live session).
@@ -287,3 +293,24 @@ struct ContentView: View {
             autoTrust: true)
     }
 }
+
+#if os(macOS)
+/// Drives the hosting window in/out of native fullscreen from SwiftUI state. Mounted invisibly in
+/// the view tree; on each `active` change it captures the window and toggles fullscreen only when
+/// the current state differs (so it never fights a toggle already in flight, and never touches a
+/// window the user fullscreened manually unless `active` says otherwise).
+private struct FullscreenController: NSViewRepresentable {
+    let active: Bool
+
+    func makeNSView(context: Context) -> NSView { NSView() }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        let want = active
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            let isFull = window.styleMask.contains(.fullScreen)
+            if want != isFull { window.toggleFullScreen(nil) }
+        }
+    }
+}
+#endif

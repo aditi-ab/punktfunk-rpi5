@@ -169,6 +169,15 @@ public final class GamepadCapture {
         ext.valueChangedHandler = { [weak self] g, _ in
             MainActor.assumeIsolated { self?.sync(g) }
         }
+        // The Home/PS button (→ guide; the host maps it to the DualSense PS / Xbox guide bit) does
+        // NOT reliably fire the gamepad's valueChangedHandler on macOS, so its presses were dropped.
+        // A dedicated handler re-syncs on every Home transition.
+        ext.buttonHome?.pressedChangedHandler = { [weak self] _, _, _ in
+            MainActor.assumeIsolated {
+                guard let self, let g = self.bound?.extendedGamepad else { return }
+                self.sync(g)
+            }
+        }
         // Wake the host pad immediately (pads are created lazily from the first event;
         // a DualSense's UHID handshake + initial lightbar write only start then).
         connection.send(.gamepadAxis(GamepadWire.axisLSX, value: 0, pad: 0))
