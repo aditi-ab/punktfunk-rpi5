@@ -111,6 +111,12 @@ public final class InputCapture {
     /// event itself is swallowed). Main queue.
     public var onToggleCapture: (() -> Void)?
 
+    /// Fired on ⌘⇧C (the client-side-cursor toggle — flips between the captured/disassociated
+    /// relative path and the visible-cursor absolute path; detected here, like ⌘⎋, so it works
+    /// regardless of the current capture state and the event itself is swallowed). macOS only;
+    /// the absolute-vs-relative forwarding lives entirely in StreamLayerView. Main queue.
+    public var onToggleCursor: (() -> Void)?
+
     /// Fired when a newer InputCapture takes the process-global GC handler slots (the
     /// singletons hold ONE handler each): the preempted owner must drop its capture
     /// state — its handlers are gone, so it would otherwise sit "captured" with dead
@@ -201,6 +207,15 @@ public final class InputCapture {
             if event.keyCode == 53 /* Esc */, flags == .command {
                 self.suppressedVK = 0x1B // the same physical Esc is en route via GC
                 self.onToggleCapture?()
+                return nil
+            }
+            // ⌘⇧C toggles the client-side cursor (visible-cursor absolute path vs the
+            // captured relative path). keyCode 8 = kVK_ANSI_C; layout-independent so it
+            // fires the same on any keyboard. Suppress the C (latched like ⌘⎋'s Esc) so it
+            // doesn't type into the host, and swallow the event so it doesn't beep.
+            if event.keyCode == 8 /* C */, flags == [.command, .shift] {
+                self.suppressedVK = 0x43 // VK_C — the same physical C is en route via GC
+                self.onToggleCursor?()
                 return nil
             }
             return event

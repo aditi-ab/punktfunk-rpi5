@@ -195,6 +195,13 @@ public final class PunktfunkConnection {
     /// DualSense feedback.
     public private(set) var resolvedGamepad: GamepadType = .auto
 
+    /// The compositor the host actually resolved for this session's virtual output (the
+    /// Welcome's echo of the requested `compositor`, with `.auto` resolved to a concrete
+    /// backend). `.auto` = an older host that didn't say. Clients use it to decide
+    /// client-side cursor behavior: `.gamescope`'s PipeWire capture carries no cursor, so
+    /// the client draws its own (a visible system cursor over the stream).
+    public private(set) var resolvedCompositor: Compositor = .auto
+
     /// Host clock minus client clock (nanoseconds), from the connect-time wall-clock skew handshake
     /// (`punktfunk_connection_clock_offset_ns`). Add it to a local `CLOCK_REALTIME` instant to
     /// express that instant in the host's capture clock — the clock each `AccessUnit.ptsNs` is
@@ -268,6 +275,9 @@ public final class PunktfunkConnection {
         var gp: UInt32 = 0
         _ = punktfunk_connection_gamepad(handle, &gp)
         resolvedGamepad = GamepadType(rawValue: gp) ?? .auto
+        var comp: UInt32 = 0
+        _ = punktfunk_connection_compositor(handle, &comp)
+        resolvedCompositor = Compositor(rawValue: comp) ?? .auto
         var offset: Int64 = 0
         _ = punktfunk_connection_clock_offset_ns(handle, &offset)
         clockOffsetNs = offset

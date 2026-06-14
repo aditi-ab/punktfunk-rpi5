@@ -39,6 +39,11 @@ struct StreamHUDView: View {
                 : "Click the stream to capture input")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+            // The client-side cursor (⌘⇧C) draws the local cursor over the stream instead of
+            // capturing it — the only accurate cursor for gamescope, whose capture has none.
+            Text("⌘⇧C toggles the on-screen cursor")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             #elseif os(iOS)
             // Touch always plays directly; ⌘⎋ (hardware keyboard) toggles kb/mouse.
             Text(model.mouseCaptured

@@ -20,4 +20,6 @@ public enum DefaultsKey {
     public static let micUID = "punktfunk.micUID"
     public static let presenter = "punktfunk.presenter"
     public static let hosts = "punktfunk.hosts"
+    /// Client-side cursor mode: "auto" (shown only in gamescope sessions), "always", "never".
+    public static let cursorMode = "punktfunk.cursorMode"
 }

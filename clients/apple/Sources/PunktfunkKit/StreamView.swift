@@ -35,31 +35,47 @@ private let streamInputDebug =
 /// (`CGAssociateMouseAndMouseCursorPosition(false)` — under which NSEvent mouseMoved/
 /// dragged deltas become the relative motion StreamLayerView forwards), and hide it.
 /// hide/unhide and associate are balanced via `captured`.
+///
+/// In CLIENT-SIDE-CURSOR mode (gamescope, whose capture carries no host cursor) this is a
+/// no-op: the local cursor stays visible and free, and StreamLayerView forwards ABSOLUTE
+/// positions instead — the visible system cursor IS the on-screen cursor. `disassociate`
+/// selects between the two; `release()` only undoes what `capture` actually did.
 private final class CursorCapture {
     private var captured = false
+    /// Whether the engaged capture actually disassociated+hid (false in cursor-visible mode),
+    /// so `release()` only restores when it must.
+    private var disassociated = false
 
     /// Returns whether capture actually engaged. It can fail mid app-activation — the click
     /// that reactivates the app delivers `mouseDown` before the app is frontmost, and
     /// `CGAssociateMouseAndMouseCursorPosition` is refused then — so the caller must stay
-    /// released and let the NEXT click retry, never latching a half-captured state.
-    func capture(in view: NSView) -> Bool {
+    /// released and let the NEXT click retry, never latching a half-captured state. With
+    /// `disassociate: false` (cursor-visible mode) it always engages — there is no grab to
+    /// be refused, the cursor stays free and visible.
+    func capture(in view: NSView, disassociate: Bool) -> Bool {
         guard !captured, let window = view.window, view.bounds.width > 0 else { return false }
-        // Park the cursor mid-view so a click can't land in (and activate) another app.
-        let rectOnScreen = window.convertToScreen(view.convert(view.bounds, to: nil))
-        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
-        CGWarpMouseCursorPosition(
-            CGPoint(x: rectOnScreen.midX, y: primaryHeight - rectOnScreen.midY))
-        guard CGAssociateMouseAndMouseCursorPosition(0) == .success else { return false }
-        NSCursor.hide()
+        if disassociate {
+            // Park the cursor mid-view so a click can't land in (and activate) another app.
+            let rectOnScreen = window.convertToScreen(view.convert(view.bounds, to: nil))
+            let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+            CGWarpMouseCursorPosition(
+                CGPoint(x: rectOnScreen.midX, y: primaryHeight - rectOnScreen.midY))
+            guard CGAssociateMouseAndMouseCursorPosition(0) == .success else { return false }
+            NSCursor.hide()
+        }
         captured = true
+        disassociated = disassociate
         return true
     }
 
     func release() {
         guard captured else { return }
-        CGAssociateMouseAndMouseCursorPosition(1)
-        NSCursor.unhide()
+        if disassociated {
+            CGAssociateMouseAndMouseCursorPosition(1)
+            NSCursor.unhide()
+        }
         captured = false
+        disassociated = false
     }
 }
 
@@ -136,10 +152,22 @@ public final class StreamLayerView: NSView {
     /// captured (GCMouse's own delivery proved unreliable on macOS — see InputCapture).
     /// Installed on engage, removed on release; nil while not captured.
     private var mouseEventMonitor: Any?
+    /// The window's `acceptsMouseMovedEvents` value before client-side-cursor capture raised
+    /// it (nil = not raised by us); restored on release so we leave the window as we found it.
+    private var savedAcceptsMouseMoved: Bool?
 
     /// Whether input capture is currently engaged (cursor hidden+frozen, mouse/keyboard
     /// forwarded). Main-thread only.
     public private(set) var captured = false
+
+    /// Client-side-cursor mode: when true the local system cursor stays VISIBLE over the
+    /// stream and the mouse monitor forwards ABSOLUTE positions (the visible cursor is the
+    /// on-screen cursor — gamescope draws none, so no double cursor); when false the existing
+    /// captured/disassociated relative path runs unchanged. Initialized at session start from
+    /// the `cursorMode` setting + the host's resolved compositor, toggled live by ⌘⇧C. A live
+    /// flip re-engages capture in the new mode so disassociation + the abs/rel choice swap
+    /// atomically. Main-thread only.
+    private var cursorVisible = false
     /// One-shot auto-engage request (stream start, trust confirmed) — attempted as soon
     /// as the view is in a window with real bounds, then dropped, so it can never fire
     /// surprisingly later (e.g. on a resize).
@@ -333,7 +361,9 @@ public final class StreamLayerView: NSView {
         // If the cursor grab is refused (e.g. the reactivating click arrives before the app is
         // frontmost), stay released so the NEXT click retries — never latch captured=true over
         // a free cursor, which would make mouseDown's `!captured` guard reject every later click.
-        guard cursorCapture.capture(in: self) else { return }
+        // In client-side-cursor mode there is no grab (the cursor stays visible) — capture
+        // always engages and the monitor forwards absolute positions instead.
+        guard cursorCapture.capture(in: self, disassociate: !cursorVisible) else { return }
         inputCapture?.setForwarding(true, suppressClick: fromClick)
         // Install AFTER the warp + setForwarding: the engage warp generates no forwarded
         // delta (the monitor isn't up yet), and the engage click's suppression latch is
@@ -363,8 +393,16 @@ public final class StreamLayerView: NSView {
     /// host re-accelerates there's mild double-acceleration, acceptable and fixable later
     /// via IOHID. Events are returned (not swallowed): the cursor is frozen, so they're
     /// inert locally.
+    ///
+    /// In client-side-cursor mode the cursor is NOT frozen, so bare `.mouseMoved` events are
+    /// only generated while `window.acceptsMouseMovedEvents` is true — we enable it here and
+    /// restore it on removal so absolute hover-motion keeps flowing without a click held.
     private func installMouseMonitor() {
         guard mouseEventMonitor == nil else { return }
+        if cursorVisible {
+            savedAcceptsMouseMoved = window?.acceptsMouseMovedEvents
+            window?.acceptsMouseMovedEvents = true
+        }
         mouseEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [
             .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
             .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
@@ -373,7 +411,16 @@ public final class StreamLayerView: NSView {
             guard let self, self.captured, let ic = self.inputCapture else { return event }
             switch event.type {
             case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-                ic.sendMotion(dx: Float(event.deltaX), dy: Float(event.deltaY)) // no y-negation
+                if self.cursorVisible {
+                    // Client-side cursor: forward the ABSOLUTE position (mapped through the
+                    // aspect-fit letterbox into host pixels), the same path the iPad pointer
+                    // fallback uses. Events in the letterbox bars are dropped (nil host point).
+                    if let p = self.hostPoint(from: event) {
+                        ic.sendMouseAbs(x: p.x, y: p.y, surfaceWidth: p.w, surfaceHeight: p.h)
+                    }
+                } else {
+                    ic.sendMotion(dx: Float(event.deltaX), dy: Float(event.deltaY)) // no y-negation
+                }
             case .leftMouseDown: ic.sendMouseButton(1, pressed: true)
             case .leftMouseUp: ic.sendMouseButton(1, pressed: false)
             case .rightMouseDown: ic.sendMouseButton(3, pressed: true)
@@ -393,6 +440,43 @@ public final class StreamLayerView: NSView {
             mouseEventMonitor = nil
             if streamInputDebug { streamInputLog.debug("mouse NSEvent monitor removed (capture released)") }
         }
+        // Restore the window's prior mouse-moved-events setting if we raised it (cursor mode).
+        if let saved = savedAcceptsMouseMoved {
+            window?.acceptsMouseMovedEvents = saved
+            savedAcceptsMouseMoved = nil
+        }
+    }
+
+    /// One host-pixel point on the negotiated output, with the surface dimensions the host
+    /// rescales against (surface == host mode, so the host applies no extra scaling).
+    private struct HostPoint { let x: Int32; let y: Int32; let w: UInt32; let h: UInt32 }
+
+    /// Map an NSEvent's cursor location into host-mode pixels for the client-side-cursor
+    /// (absolute) path. NSEvent.locationInWindow is window space, origin BOTTOM-left (+y up);
+    /// we convert to this view's space, FLIP y to the host's top-left (+y down) convention,
+    /// then aspect-fit-letterbox into the host mode exactly like the iOS touch/pointer path.
+    /// Returns nil for events in the letterbox bars (outside the video rect) so the host's
+    /// cursor isn't dragged onto a black edge, and until a mode is negotiated.
+    private func hostPoint(from event: NSEvent) -> HostPoint? {
+        guard let connection else { return nil }
+        let mode = connection.currentMode()
+        guard mode.width > 0, mode.height > 0 else { return nil }
+        // Window → view coords (non-flipped: origin bottom-left), then flip y into view-top-left.
+        let inView = convert(event.locationInWindow, from: nil)
+        let p = CGPoint(x: inView.x, y: bounds.height - inView.y)
+        // The video occupies the aspect-fit rect inside the (non-flipped) bounds; AVMakeRect's
+        // origin is bottom-left, so flip its minY too to match p's top-left space.
+        let fit = AVMakeRect(
+            aspectRatio: CGSize(width: Int(mode.width), height: Int(mode.height)),
+            insideRect: bounds)
+        guard fit.width > 0, fit.height > 0 else { return nil }
+        let videoMinYTop = bounds.height - fit.maxY
+        let u = (p.x - fit.minX) / fit.width
+        let v = (p.y - videoMinYTop) / fit.height
+        guard u >= 0, u <= 1, v >= 0, v <= 1 else { return nil } // letterbox bars
+        let hx = Int32((u * CGFloat(mode.width)).rounded().clamped(0, CGFloat(mode.width - 1)))
+        let hy = Int32((v * CGFloat(mode.height)).rounded().clamped(0, CGFloat(mode.height - 1)))
+        return HostPoint(x: hx, y: hy, w: mode.width, h: mode.height)
     }
 
     /// NSEvent `buttonNumber` → GameStream wire id for the "other" buttons: 2 = middle,
@@ -444,8 +528,27 @@ public final class StreamLayerView: NSView {
             // be a cursor trap with dead input.
             self?.releaseCapture()
         }
+        // ⌘⇧C flips the client-side cursor live. Only the key window's stream owns it (same
+        // guard as the ⌘⎋ capture toggle). Re-engage capture in the new mode so disassociation
+        // and the absolute/relative forwarding choice swap atomically — releaseCapture restores
+        // the old mode's grab (if any), engageCapture installs the new one.
+        capture.onToggleCursor = { [weak self] in
+            guard let self, self.window?.isKeyWindow == true else { return }
+            self.cursorVisible.toggle()
+            let wasCaptured = self.captured
+            self.releaseCapture()
+            if wasCaptured { self.engageCapture(fromClick: false) }
+        }
         capture.start()
         inputCapture = capture
+
+        // Resolve the client-side-cursor mode for this session: Auto → on iff the host
+        // resolved gamescope (whose capture carries no cursor); Always → on; Never → off.
+        switch UserDefaults.standard.string(forKey: DefaultsKey.cursorMode) ?? "auto" {
+        case "always": cursorVisible = true
+        case "never": cursorVisible = false
+        default: cursorVisible = connection.resolvedCompositor == .gamescope
+        }
 
         // Presenter choice — default stage-1 (the known-good AVSampleBufferDisplayLayer). Stage-2
         // (`punktfunk.presenter == "stage2"`) takes explicit VTDecompressionSession decode + a
@@ -545,6 +648,14 @@ public final class StreamLayerView: NSView {
         windowObservers.forEach(NotificationCenter.default.removeObserver(_:))
         pump?.stop()
         teardownStage2() // invalidate the display link + stop the pipeline if stop() was missed
+    }
+}
+
+extension CGFloat {
+    /// Clamp into a [lo, hi] range — keeps the absolute-cursor mapping inside the host's
+    /// pixel bounds even if a stray event reports a point a hair past the video rect.
+    fileprivate func clamped(_ lo: CGFloat, _ hi: CGFloat) -> CGFloat {
+        Swift.min(Swift.max(self, lo), hi)
     }
 }
 #endif

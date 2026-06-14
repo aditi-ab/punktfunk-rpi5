@@ -18,6 +18,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.presenter) private var presenter = "stage1"
+    @AppStorage(DefaultsKey.cursorMode) private var cursorMode = "auto"
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
     @ObservedObject private var gamepads = GamepadManager.shared
     #if os(macOS)
@@ -371,6 +372,24 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            #if os(macOS)
+            Section {
+                Picker("Cursor in stream", selection: $cursorMode) {
+                    Text("Auto (gamescope)").tag("auto")
+                    Text("Always").tag("always")
+                    Text("Never").tag("never")
+                }
+            } header: {
+                Text("Cursor")
+            } footer: {
+                Text("Show the local system cursor over the stream instead of capturing it. "
+                    + "gamescope's capture carries no cursor, so the client draws its own — "
+                    + "Auto turns this on only for gamescope sessions. ⌘⇧C toggles it live "
+                    + "during a session.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            #endif
             Section {
                 Picker("Presenter", selection: $presenter) {
                     Text("Stage 1 (default)").tag("stage1")
