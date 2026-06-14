@@ -13,7 +13,7 @@ CI runs on **Gitea Actions** (`git.unom.io`, org `unom`). Three workflows in
 | `ci.yml` | push to `main`, PRs | `ubuntu-24.04` | Rust workspace (fmt · clippy `-D warnings` · build · test · C-ABI harness · generated-header drift) inside the `punktfunk-rust-ci` image; `web/` and `docs-site/` build + typecheck in `oven/bun:1` |
 | `docker.yml` | push to `main`, `v*` tags, manual | `ubuntu-24.04` | Builds + pushes the three images below (`latest` + `sha-<short>` tags) |
 | `apple.yml` | push to `main`, PRs, manual | `macos-arm64` | Rust core → `PunktfunkCore.xcframework` → `swift build` + `swift test` in `clients/apple` |
-| `release.yml` | `v*` tags, manual | `macos-arm64` | Production Apple builds: Developer-ID-signed, notarized, stapled macOS `.dmg` attached to the Gitea release + iOS archive uploaded to TestFlight |
+| `release.yml` | `v*` tags, manual | `macos-arm64` | Production Apple builds: sandboxed macOS `.dmg` (Developer ID, notarized, stapled) attached to the Gitea release + macOS/iOS/tvOS archives uploaded to TestFlight |
 
 ## Dockerized pieces
 
@@ -60,20 +60,31 @@ ssh enricobuehler@192.168.1.135 GITEA_RUNNER_TOKEN=<token> bash -s \
 
 `release.yml` produces the production client builds on the Mac runner. All three app
 targets share the bundle ID **`io.unom.punktfunk`** (one App Store listing, universal
-purchase — effectively unchangeable after first submission). Secrets:
-`DEVID_CERT_P12_B64`/`DEVID_CERT_PASSWORD` (Developer ID Application certificate, only
-creatable by the account holder) and `ASC_API_KEY_P8`/`ASC_API_KEY_ID`/`ASC_API_ISSUER_ID`
-(App Store Connect API key — notarization, TestFlight upload, automatic-signing profile
-fetch). Signing uses a per-run throwaway keychain; nothing persists on the runner.
-Per-platform state:
+purchase — effectively unchangeable after first submission). Signing is **not** secret-based:
+the runner uses its **login keychain** directly, so install the **Developer ID Application**,
+**Apple Distribution**, and (for the Mac App Store `.pkg`) **3rd Party Mac Developer
+Installer** identities once via Xcode, with the WWDR intermediate present so they show as
+valid. The only secrets are `ASC_API_KEY_P8`/`ASC_API_KEY_ID`/`ASC_API_ISSUER_ID` (App Store
+Connect API key — notarization + TestFlight upload). Per-platform state:
 
-- **macOS** — Developer ID export → `notarytool` → stapled `.dmg` on the Gitea release.
-  The Mac **App Store** lane is deferred: it requires App Sandbox entitlements
-  (network client + Bonjour) the app doesn't declare yet.
+- **macOS (Developer ID)** — sandboxed app (`Config/Punktfunk-macOS.entitlements`) → export
+  → `notarytool` → stapled `.dmg` on the Gitea release.
+- **macOS (App Store)** — manual-signed archive (Apple Distribution + the *Punktfunk macOS
+  App Store Distribution* profile) → upload to TestFlight. App Sandbox is **mandatory** here
+  and is now declared (app-sandbox + network client/server + audio-input + bluetooth/usb).
+  Prereqs (one-time, Apple portal): add the **macOS platform** to the App Store Connect app
+  record (universal purchase), install the Mac App Store distribution profile + the installer
+  cert above. `continue-on-error` until those exist.
 - **iOS** — archive + upload to TestFlight (`method: app-store-connect`,
   `destination: upload`). Crypto is declared exempt (`ITSAppUsesNonExemptEncryption`,
   `Config/Info.plist`) so builds don't stall on the compliance question.
-- **tvOS** — not built: the Rust core needs tier-3 targets (nightly `-Zbuild-std`).
+- **tvOS** — archive + upload to TestFlight (Rust core built from tier-3 targets, nightly
+  `-Zbuild-std` via `build-xcframework.sh`).
+
+Each macOS target uses its own entitlements: `Config/Punktfunk-macOS.entitlements` (App
+Sandbox is macOS-only) for the macOS app, and the shared `Config/Punktfunk.entitlements`
+(keychain-access-groups only) for iOS/tvOS — `com.apple.security.app-sandbox` is invalid on
+iOS/tvOS and would fail upload validation.
 
 The runner needs a **release (non-beta) Xcode** — App Store processing rejects beta-SDK
 builds, and a beta is unusable for the Rust side too: a newer-than-OS ld emits dylibs the

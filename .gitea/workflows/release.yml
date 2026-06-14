@@ -1,14 +1,31 @@
 # Production Apple client builds — runs on the macos-arm64 runner (home-mac-mini-1).
 #
 #   Tag v* (or workflow_dispatch):
-#     macOS  -> Developer ID signed + notarized + stapled .dmg, attached to a Gitea
-#               release on tag pushes
+#     macOS (Developer ID) -> sandboxed, signed, notarized + stapled .dmg, attached to a
+#               Gitea release on tag pushes
+#     macOS (App Store)    -> archive + upload to TestFlight (App Store Connect)
 #     iOS    -> archive + upload straight to TestFlight (App Store Connect)
-#     tvOS   -> not built: the Rust core needs tier-3 targets (nightly -Zbuild-std)
-#     macOS App Store/TestFlight -> deferred: needs App Sandbox entitlements first.
+#     tvOS   -> archive + upload to TestFlight (Rust core built from tier-3 targets,
+#               nightly -Zbuild-std, in build-xcframework.sh)
 #
 # One App Store listing for all platforms (universal purchase): every target shares the
 # bundle ID io.unom.punktfunk.
+#
+# The macOS app is App-SANDBOXED for both channels (Config/Punktfunk-macOS.entitlements —
+# app-sandbox + network client/server + audio-input + bluetooth/usb device access; the
+# shared Config/Punktfunk.entitlements stays iOS/tvOS-only, where app-sandbox is invalid).
+# The Developer ID DMG is codesigned with the SAME macOS entitlements, so what we test
+# locally equals what App Store users get.
+#
+# macOS App Store prerequisites (one-time, Apple portal — NOT done by this workflow; the
+# step is continue-on-error until they exist):
+#   * App Store Connect: add the macOS platform to the io.unom.punktfunk app record
+#     (universal purchase).
+#   * A "Punktfunk macOS App Store Distribution" provisioning profile installed on the
+#     runner (under ~/Library/Developer/Xcode/UserData/Provisioning Profiles/).
+#   * The "3rd Party Mac Developer Installer" (Mac Installer Distribution) certificate in
+#     the runner's login keychain, in addition to "Apple Distribution" — the App Store
+#     .pkg is installer-signed with it.
 #
 # Signing setup (NOT secret-based anymore): the runner is a LaunchAgent in the user's
 # logged-in Aqua session, so it uses the **login keychain** directly. Install the signing
@@ -103,7 +120,9 @@ jobs:
           # Archive UNSIGNED, then codesign with the Developer ID Application identity from the
           # login keychain. Unsigned archive sidesteps Xcode's keychain-access-groups
           # provisioning-profile gate; codesign just needs the (now valid) identity + the
-          # team-prefixed entitlement, no profile. Bundle is a single static binary.
+          # team-prefixed entitlements, no profile (App Sandbox + the network/device
+          # capabilities are self-asserted for Developer ID — no profile entry needed).
+          # Bundle is a single static binary.
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk \
             -destination 'generic/platform=macOS' \
@@ -112,10 +131,11 @@ jobs:
             MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             CODE_SIGNING_ALLOWED=NO
           APP="$RUNNER_TEMP/Punktfunk-macos.xcarchive/Products/Applications/Punktfunk.app"
-          # codesign won't expand $(AppIdentifierPrefix) — resolve it to the team prefix.
+          # Sandboxed Developer ID: sign with the SAME macOS entitlements the App Store build
+          # uses. codesign won't expand $(AppIdentifierPrefix) — resolve it to the team prefix.
           RESOLVED="$RUNNER_TEMP/macos.entitlements"
           sed "s/\$(AppIdentifierPrefix)/${TEAM_ID}./g" \
-            clients/apple/Config/Punktfunk.entitlements > "$RESOLVED"
+            clients/apple/Config/Punktfunk-macOS.entitlements > "$RESOLVED"
           codesign --force --options runtime --timestamp \
             --entitlements "$RESOLVED" \
             --sign "Developer ID Application" "$APP"
@@ -151,6 +171,54 @@ jobs:
             -H "Authorization: token $TOKEN" \
             -F "attachment=@$DMG" >/dev/null
           echo "attached Punktfunk-$VERSION.dmg to release $GITHUB_REF_NAME"
+
+      - name: macOS App Store — archive + upload to TestFlight
+        if: gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true'
+        # Best-effort until the App Store Connect record has the macOS platform + the
+        # "Punktfunk macOS App Store Distribution" profile and the "3rd Party Mac Developer
+        # Installer" cert are on the runner (see the header). The macOS app is sandboxed
+        # (Config/Punktfunk-macOS.entitlements) — mandatory for the Mac App Store.
+        continue-on-error: true
+        run: |
+          # Separate archive from the Developer ID one above: App Store needs a profile-signed
+          # archive (manual signing), not the unsigned-then-codesign DMG path. Same App-Manager
+          # ASC-key constraint as iOS/tvOS — MANUAL signing, NOT -allowProvisioningUpdates
+          # (cloud signing the key can't do). Quit Xcode so it can't prune the dropped profile.
+          osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
+          pkill -x Xcode 2>/dev/null || true
+          PROFILE="Punktfunk macOS App Store Distribution"
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
+            -project "$PROJECT" -scheme Punktfunk \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/Punktfunk-macos-appstore.xcarchive" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE"
+          cat > "$RUNNER_TEMP/export-macos-appstore.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>installerSigningCertificate</key><string>3rd Party Mac Developer Installer</string>
+            <key>provisioningProfiles</key>
+            <dict><key>io.unom.punktfunk</key><string>$PROFILE</string></dict>
+          </dict>
+          </plist>
+          EOF
+          DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Punktfunk-macos-appstore.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/export-macos-appstore.plist" \
+            -exportPath "$RUNNER_TEMP/export-macos-appstore" \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "${{ secrets.ASC_API_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
 
       - name: iOS — archive + upload to TestFlight
         if: gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true'

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- macOS-ONLY entitlements. App Sandbox is a macOS concept (iOS/tvOS are always
+	     sandboxed and REJECT this key at upload), so the macOS target points here while
+	     iOS/tvOS keep the shared Config/Punktfunk.entitlements. The single macOS app is
+	     sandboxed for BOTH channels — the Developer ID DMG is codesigned with this same
+	     file (App Sandbox is allowed, not just required, for Developer ID), so what we
+	     test locally (⌘R / DMG) is exactly what Mac App Store / TestFlight users get. -->
+
+	<!-- Required for Mac App Store / TestFlight distribution. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+
+	<!-- Outbound QUIC control plane + raw-UDP data plane to the host, and NWBrowser mDNS
+	     discovery / NWConnection resolve. Every outbound socket (incl. the linked Rust
+	     core's UDP binds) needs this under the sandbox. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+
+	<!-- NOT optional, despite the client being "outbound only": the App Sandbox gates the
+	     bind() syscall itself as a network-bind ("server") operation. quinn binds its QUIC
+	     endpoint socket (quic.rs Endpoint::client 0.0.0.0:0) and the raw-UDP data plane
+	     binds a local socket to receive host→client datagrams (transport/udp.rs); both fail
+	     with deny(1) network-bind / EPERM without this, so NO video/audio/rumble ever
+	     arrives. (The classic QUIC-on-quinn-under-sandbox trap.) -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+
+	<!-- Microphone uplink: SessionAudio installs an AVAudioEngine input tap → Opus → host
+	     virtual mic. TCC blocks AVAudioEngine input under the sandbox without this even with
+	     NSMicrophoneUsageDescription present. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+
+	<!-- Game controllers over Bluetooth via the GameController framework
+	     (GCController.startWirelessControllerDiscovery — Xbox/DualSense). No CoreBluetooth in
+	     the app, so no NSBluetoothAlwaysUsageDescription is required, but the sandbox still
+	     gates GameController's BT HID access on this key. -->
+	<key>com.apple.security.device.bluetooth</key>
+	<true/>
+
+	<!-- Game controllers over USB + USB HID mouse/keyboard via the GameController framework.
+	     device.usb gates the IOHIDLibUserClient path the framework uses for wired devices
+	     (per Apple DTS); without it, plugged-in controllers deliver no input. Justify in App
+	     Review notes ("reads input from USB game controllers"). -->
+	<key>com.apple.security.device.usb</key>
+	<true/>
+
+	<!-- Keychain Sharing (unchanged from the shared file): a team-scoped access group so the
+	     punktfunk/1 client identity in the data-protection keychain is gated by the app's
+	     entitlement (team + bundle id), persisting across rebuilds with NO prompt — see
+	     ClientIdentityStore. $(AppIdentifierPrefix) expands to the team prefix at signing
+	     time (the Developer ID codesign step in release.yml resolves it via sed). -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)io.unom.punktfunk</string>
+	</array>
+</dict>
+</plist>

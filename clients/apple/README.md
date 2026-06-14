@@ -137,6 +137,17 @@ The app target **Punktfunk** wraps the same sources as the `swift run` shell
 catalog) and links `PunktfunkKit` from the local package. Generated Info.plist, ad-hoc
 signing, bundle id `io.unom.punktfunk`. Notes:
 
+- **Entitlements (sandbox)**: the macOS target uses
+  `Config/Punktfunk-macOS.entitlements`; iOS/tvOS use the shared
+  `Config/Punktfunk.entitlements`. The macOS app is **App-Sandboxed** (mandatory for the Mac
+  App Store/TestFlight, and used for the Developer ID DMG too so the local build matches what
+  ships): `com.apple.security.app-sandbox`, `network.client` + **`network.server`** (the
+  sandbox gates `bind()`; quinn + the raw-UDP plane both bind, so receive breaks without it),
+  `device.audio-input` (mic), `device.bluetooth` + `device.usb` (GameController over BT/USB),
+  and the existing `keychain-access-groups`. `app-sandbox` is macOS-only — keep it OUT of the
+  shared iOS/tvOS file (it fails upload validation there). Verify a build is sandboxed with
+  `codesign -d --entitlements :- <built .app>`. Heads-up: `device.usb` draws some App Review
+  scrutiny — justify it in the review notes ("reads input from USB game controllers").
 - **App icon**: `App/Assets.xcassets` ships an empty `AppIcon` slot. For an Icon Composer
   `.icon`: add the file to the project (target Punktfunk), set it as the App Icon in the
   target's General tab, and delete the placeholder `AppIcon.appiconset`. Heads-up: CLI
