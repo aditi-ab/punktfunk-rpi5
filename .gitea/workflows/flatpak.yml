@@ -1,0 +1,129 @@
+# Build the native punktfunk Linux CLIENT as a single-file Flatpak bundle and publish it to
+# Gitea's GENERIC package registry, so the Steam Deck (and any flatpak distro) installs it
+# the SteamOS-native, update-survivable way: `flatpak install --user <downloaded>.flatpak`.
+# (The HOST stays an RPM/deb — it needs unsandboxed /dev/uinput + zero-copy NVENC; only the
+# CLIENT is sandbox-friendly. See packaging/README.md and packaging/flatpak/README.md.)
+#
+# Gitea has NO flatpak/ostree registry, so the bundle lives in the generic registry:
+#   PUT  https://git.unom.io/api/packages/unom/generic/punktfunk-client-flatpak/<version>/<file>
+#   GET  https://git.unom.io/api/packages/unom/generic/punktfunk-client-flatpak/<version>/<file>
+# On tags the bundle is ALSO attached to the Gitea release (mirrors release.yml's DMG).
+#
+# PRIVILEGED-BUILD CONSTRAINT: flatpak-builder runs bubblewrap, which needs user namespaces.
+# In a Gitea/act_runner Docker executor that means the job container must be --privileged
+# (the same runner already runs `docker build` in docker.yml, so its Docker daemon allows it).
+# If your runner CANNOT grant --privileged, this job will fail at `flatpak-builder` with
+# "Creating new namespace failed: Operation not permitted" — see the fallback in
+# packaging/flatpak/README.md (build on the Deck via org.flatpak.Builder, or on a Linux box,
+# then upload with the curl line below).
+#
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (shared with deb/rpm/docker).
+name: flatpak
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  APP_ID: io.unom.Punktfunk
+  MANIFEST: packaging/flatpak/io.unom.Punktfunk.yml
+  PACKAGE: punktfunk-client-flatpak     # generic-registry package name
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      # Fedora ships a recent flatpak + flatpak-builder + the kernel userns support.
+      # --privileged is required for bubblewrap inside the Docker executor (see header).
+      image: fedora:43
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tooling
+        run: |
+          dnf -y install flatpak flatpak-builder git python3 python3-aiohttp python3-toml curl jq
+          # Flathub provides the GNOME runtime/SDK + the rust-stable + ffmpeg-full extensions.
+          flatpak remote-add --user --if-not-exists flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+          git config --global --add safe.directory "$PWD"
+
+      - name: Version
+        # Tag v1.2.3 -> 1.2.3; a main push -> 0.0.1-ciN.g<sha> (sorts before a real release,
+        # increases by run number — newest main build always wins). The generic registry
+        # version string allows letters/dots/hyphens.
+        run: |
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
+          case "$GITHUB_REF" in
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}" ;;
+            *)            V="0.0.1-ci${GITHUB_RUN_NUMBER}.g${SHORT}" ;;
+          esac
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "BUNDLE=punktfunk-client-${V}.flatpak" >> "$GITHUB_ENV"
+          echo "flatpak version $V"
+
+      - name: Generate offline cargo sources
+        # flatpak builds with no network; vendor every crate from Cargo.lock into
+        # cargo-sources.json next to the manifest (referenced by the manifest's
+        # punktfunk-client module).
+        run: |
+          curl -fsSL -o /tmp/flatpak-cargo-generator.py \
+            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+          python3 /tmp/flatpak-cargo-generator.py Cargo.lock \
+            -o packaging/flatpak/cargo-sources.json
+
+      - name: Build the flatpak (install deps from Flathub, offline build)
+        run: |
+          # --install-deps-from=flathub pulls everything the manifest declares: the GNOME 50
+          # runtime/SDK + the rust-stable (//25.08, rustc 1.96) and llvm20 SDK extensions, plus
+          # the runtime's auto codecs-extra (HEVC libavcodec). --disable-rofiles-fuse is the
+          # container-safe path (no FUSE).
+          flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --install-deps-from=flathub \
+            --repo="$PWD/repo" \
+            "$PWD/build-dir" "$MANIFEST"
+
+      - name: Export single-file bundle
+        run: |
+          flatpak build-bundle "$PWD/repo" "$BUNDLE" "$APP_ID"
+          ls -lh "$BUNDLE"
+
+      - name: Publish to the Gitea generic registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          BASE="https://$REGISTRY/api/packages/$OWNER/generic/$PACKAGE"
+          # 1) Immutable, versioned URL.
+          curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$BUNDLE" \
+            "$BASE/$VERSION/$BUNDLE"
+          echo "published $BASE/$VERSION/$BUNDLE"
+          # 2) Stable `latest/punktfunk-client.flatpak` alias for the Decky fallback + scripts.
+          #    The generic registry rejects re-uploading an existing version/file (409), so
+          #    delete the prior `latest` file first (ignore 404 on the first ever run).
+          curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+            "$BASE/latest/punktfunk-client.flatpak" || true
+          curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$BUNDLE" \
+            "$BASE/latest/punktfunk-client.flatpak"
+          echo "published $BASE/latest/punktfunk-client.flatpak"
+
+      - name: Attach bundle to the Gitea release (tags only)
+        if: startsWith(gitea.ref, 'refs/tags/')
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          API="${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}"
+          ID=$(curl -sf -X POST "$API/releases" \
+                 -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+                 -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"$GITHUB_REF_NAME\"}" \
+               | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' \
+               || curl -sf "$API/releases/tags/$GITHUB_REF_NAME" -H "Authorization: token $TOKEN" \
+               | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+          curl -sf -X POST "$API/releases/$ID/assets?name=$BUNDLE" \
+            -H "Authorization: token $TOKEN" \
+            -F "attachment=@$BUNDLE" >/dev/null
+          echo "attached $BUNDLE to release $GITHUB_REF_NAME"

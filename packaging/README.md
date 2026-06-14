@@ -95,11 +95,16 @@ systemctl --user enable --now punktfunk-host
 
 Pair a stock Moonlight client (mDNS-discovered), or connect the native punktfunk/1 client.
 
-## Why not Flatpak?
+## Why not Flatpak (for the HOST)?
 
 The host needs unsandboxed access the zero-copy NVENC path, `/dev/uinput`, the PipeWire
 graph and the compositor's privileged protocols — a Flatpak sandbox fights all of these.
 An RPM (or the bootc layer) installs into the host system where those just work.
+
+> 👉 The **client** is a different story — it IS shipped as a Flatpak (the only viable
+> Steam Deck install path: SteamOS `/usr` is read-only and lacks `libadwaita`/`libSDL3`). See
+> [`flatpak/README.md`](flatpak/README.md). The client sandbox only needs the GPU render node,
+> Wayland, PipeWire audio, the network and hidraw — all expressible as finish-args.
 
 ## Building the SRPM/RPM locally (Fedora only)
 

@@ -28,8 +28,9 @@ import decky
 # name and let the spawn fail loudly — install the client on the Deck (.deb / RPM / flatpak)
 # or symlink it into ~/.local/bin.
 #
-# TODO: once a Steam Deck / SteamOS install path for punktfunk-client is settled (likely a
-# flatpak, since SteamOS is image-based and /usr is read-only), pin the canonical path here.
+# On SteamOS (read-only /usr, image-based) the settled install path is the flatpak
+# ``io.unom.Punktfunk`` (packaging/flatpak/), launched via ``flatpak run`` — see the flatpak
+# fallback in :func:`_resolve_client`.
 CLIENT_BINARY = "punktfunk-client"
 
 # Service type advertised by punktfunk/1 hosts (matches NATIVE_SERVICE in the Rust host).
@@ -59,12 +60,14 @@ def _resolve_client() -> list[str]:
         if Path(candidate).exists():
             return [candidate]
 
-    # Flatpak fallback. The app id is a guess until a flatpak is actually published;
-    # `flatpak run <id>` is a no-op-ish failure if it is not installed, which surfaces as a
-    # spawn error the user can act on.
+    # Flatpak fallback — the canonical install path on the Steam Deck (SteamOS /usr is
+    # read-only; the flatpak bundles the libadwaita + SDL3 the system lacks). The app id is
+    # the one the flatpak manifest publishes (packaging/flatpak/io.unom.Punktfunk.yml). If it
+    # is not installed, `flatpak run <id>` fails and surfaces as a spawn error the user can
+    # act on (install the bundle: `flatpak install --user punktfunk-client-*.flatpak`).
     flatpak = shutil.which("flatpak")
     if flatpak:
-        return [flatpak, "run", "earth.buehler.punktfunk.Client"]
+        return [flatpak, "run", "io.unom.Punktfunk"]
 
     decky.logger.warning(
         "punktfunk-client not found on PATH or in %s; falling back to bare name",

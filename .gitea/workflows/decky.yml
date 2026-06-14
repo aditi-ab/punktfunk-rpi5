@@ -1,0 +1,126 @@
+# Build the punktfunk Decky Loader plugin (Gaming-Mode QAM launcher) into a distribution zip
+# and publish it to Gitea's GENERIC package registry, giving Decky's "install from URL" a
+# stable link. On tags the zip is ALSO attached to the Gitea release.
+#
+#   PUT/GET  https://git.unom.io/api/packages/unom/generic/punktfunk-decky/<version>/punktfunk.zip
+#
+# The plugin backend is PURE PYTHON (clients/decky/main.py — no compiled binary), so we do NOT
+# need the Decky CLI (which requires Docker + rust-nightly only to compile native backends).
+# We build the frontend with pnpm and assemble the store-layout zip by hand:
+#
+#   punktfunk.zip
+#     punktfunk/                  <- single top-level dir == plugin.json "name"
+#       plugin.json   [required]
+#       package.json  [required]
+#       main.py       [required: python backend]
+#       dist/index.js [required: rollup output]
+#       README.md     (recommended)
+#       LICENSE       [required by the plugin store]
+#
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (shared with deb/rpm/docker).
+name: decky
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  PACKAGE: punktfunk-decky        # generic-registry package name
+  PLUGIN: punktfunk               # plugin.json "name" == zip top-level dir
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: node:22-bookworm     # node + corepack(pnpm); matches the @decky toolchain
+    defaults:
+      run:
+        working-directory: clients/decky
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: pnpm
+        run: |
+          corepack enable
+          # The repo's pnpm-lock.yaml + package.json devDeps target pnpm 9 (the version the
+          # @decky toolchain and the local build use). Pin it so --frozen-lockfile holds.
+          corepack prepare pnpm@9 --activate
+
+      - name: Build frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build          # rollup -> clients/decky/dist/index.js
+
+      - name: Version
+        # Tag v1.2.3 -> 1.2.3; main push -> 0.0.1-ciN.g<sha>. Used only for the registry
+        # version path + the zip name (the plugin.json version is the source of truth Decky
+        # reads after install).
+        working-directory: ${{ gitea.workspace }}
+        run: |
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
+          case "$GITHUB_REF" in
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}" ;;
+            *)            V="0.0.1-ci${GITHUB_RUN_NUMBER}.g${SHORT}" ;;
+          esac
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "decky version $V"
+
+      - name: Assemble store-layout zip
+        working-directory: ${{ gitea.workspace }}
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends zip >/dev/null
+          STAGE="$RUNNER_TEMP/decky"
+          DEST="$STAGE/$PLUGIN"
+          rm -rf "$STAGE"; mkdir -p "$DEST/dist"
+          cp clients/decky/plugin.json   "$DEST/"
+          cp clients/decky/package.json  "$DEST/"
+          cp clients/decky/main.py       "$DEST/"
+          cp clients/decky/dist/index.js "$DEST/dist/"
+          cp clients/decky/README.md     "$DEST/"
+          # Store requires a LICENSE in the plugin root; the project is MIT OR Apache-2.0.
+          cp LICENSE-MIT                 "$DEST/LICENSE"
+          ( cd "$STAGE" && zip -r "$RUNNER_TEMP/punktfunk.zip" "$PLUGIN" )
+          ls -lh "$RUNNER_TEMP/punktfunk.zip"
+          unzip -l "$RUNNER_TEMP/punktfunk.zip"
+
+      - name: Publish to the Gitea generic registry
+        working-directory: ${{ gitea.workspace }}
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          BASE="https://$REGISTRY/api/packages/$OWNER/generic/$PACKAGE"
+          # 1) Immutable, versioned URL.
+          curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/punktfunk.zip" \
+            "$BASE/$VERSION/punktfunk.zip"
+          echo "published $BASE/$VERSION/punktfunk.zip"
+          # 2) Stable `latest/punktfunk.zip` — this is the link to paste into Decky's
+          #    "install from URL". The generic registry rejects re-uploading an existing
+          #    version/file (409), so delete the prior `latest` first (ignore 404 on run #1).
+          curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+            "$BASE/latest/punktfunk.zip" || true
+          curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/punktfunk.zip" \
+            "$BASE/latest/punktfunk.zip"
+          echo "install-from-URL link: $BASE/latest/punktfunk.zip"
+
+      - name: Attach zip to the Gitea release (tags only)
+        if: startsWith(gitea.ref, 'refs/tags/')
+        working-directory: ${{ gitea.workspace }}
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          API="${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}"
+          ID=$(curl -sf -X POST "$API/releases" \
+                 -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+                 -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"$GITHUB_REF_NAME\"}" \
+               | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' \
+               || curl -sf "$API/releases/tags/$GITHUB_REF_NAME" -H "Authorization: token $TOKEN" \
+               | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+          curl -sf -X POST "$API/releases/$ID/assets?name=punktfunk-${VERSION}.zip" \
+            -H "Authorization: token $TOKEN" \
+            -F "attachment=@$RUNNER_TEMP/punktfunk.zip" >/dev/null
+          echo "attached punktfunk-${VERSION}.zip to release $GITHUB_REF_NAME"

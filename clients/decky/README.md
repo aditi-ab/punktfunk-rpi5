@@ -49,12 +49,14 @@ Shells out to **`avahi-browse -rpt _punktfunk._udp`** (SteamOS and Bazzite ship
 ### Client launch (`connect()`)
 
 The client binary `punktfunk-client` is resolved in order: `PATH` → `/usr/bin` →
-`/usr/local/bin` → `~/.local/bin` → a `flatpak run earth.buehler.punktfunk.Client`
-fallback. The resolved argv and a clear `client-not-found` error surface to the UI. The
-child PID is tracked so `disconnect()` (and plugin `_unload`) can terminate it.
+`/usr/local/bin` → `~/.local/bin` → a `flatpak run io.unom.Punktfunk` fallback. The resolved
+argv and a clear `client-not-found` error surface to the UI. The child PID is tracked so
+`disconnect()` (and plugin `_unload`) can terminate it.
 
-> **TODO:** pin the canonical SteamOS install path once a Deck packaging story for
-> `punktfunk-client` is settled (likely a flatpak, since SteamOS `/usr` is read-only).
+> On the **Steam Deck** the client install is the flatpak `io.unom.Punktfunk`
+> (`packaging/flatpak/`) — SteamOS `/usr` is read-only and lacks `libadwaita`/`libSDL3`, so
+> the flatpak (which bundles them) is the canonical path; the resolver's flatpak fallback
+> launches exactly that.
 
 ## Prerequisites
 
@@ -76,15 +78,51 @@ pnpm build      # rollup → dist/index.js
 
 ## Install on the Deck
 
-Copy the built plugin directory to the Deck and restart Decky:
+### Option A — Decky "install from URL" (recommended; published by CI)
 
-```sh
-# the dir must contain: dist/, main.py, plugin.json, package.json
-rsync -a --exclude node_modules clients/decky/ deck@<deck-ip>:~/homebrew/plugins/punktfunk/
-# then, on the Deck, restart Decky Loader (Settings → Developer → "Restart" / reboot)
+CI (`.gitea/workflows/decky.yml`) builds the plugin into a store-layout zip and publishes it to
+Gitea's **generic package registry** on every push to `main` and on `v*` tags, exposing a stable
+URL. In Decky's settings → **Developer Mode** → **Install Plugin from URL**, paste:
+
+```
+https://git.unom.io/api/packages/unom/generic/punktfunk-decky/latest/punktfunk.zip
 ```
 
-The **punktfunk** panel then appears in the Quick Access Menu.
+(or a pinned version: `.../punktfunk-decky/<version>/punktfunk.zip`). On tags the same zip is
+also attached to the Gitea release. The zip's layout is the store-required one — a single
+top-level `punktfunk/` dir holding `plugin.json`, `package.json`, `main.py`, `dist/index.js`,
+`README.md`, and `LICENSE`.
+
+### Option B — manual dev copy (sideload)
+
+Decky's `~/homebrew/plugins/` is **root-owned** (PluginLoader runs as root and manages it), so a
+plain `rsync` into it fails — stage to a writable temp dir, then `sudo`-install and restart the
+loader. The two helper scripts do exactly this:
+
+```sh
+cd clients/decky
+pnpm install
+pnpm run package                       # → out/punktfunk/ + out/punktfunk-v<ver>.zip
+DECK=deck@<deck-ip> pnpm run deploy    # rsync → /tmp, sudo cp into plugins/, chown root, restart
+```
+
+`deploy.sh` prompts for the Deck's sudo password interactively (via `ssh -t`); set `DECKPASS=…`
+to run it non-interactively. Equivalent by hand:
+
+```sh
+cd clients/decky && pnpm build && bash scripts/package.sh
+rsync -azp --delete out/punktfunk/ deck@<deck-ip>:/tmp/punktfunk/
+ssh -t deck@<deck-ip> 'sudo sh -c "rm -rf ~deck/homebrew/plugins/punktfunk && \
+  cp -r /tmp/punktfunk ~deck/homebrew/plugins/punktfunk && \
+  chown -R root:root ~deck/homebrew/plugins/punktfunk && systemctl restart plugin_loader"'
+```
+
+A loader restart is required for an out-of-band install to appear. The **punktfunk** panel then
+shows up in the Quick Access Menu.
+
+> The plugin launches the client via the flatpak `io.unom.Punktfunk` (see
+> [`../../packaging/flatpak/README.md`](../../packaging/flatpak/README.md)) — install that on
+> the Deck too, or the panel's Connect surfaces a `client-not-found` error.
 
 ## Limitations / next steps
 

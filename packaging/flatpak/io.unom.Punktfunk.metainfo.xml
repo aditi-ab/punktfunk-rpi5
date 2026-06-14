@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metainfo for the punktfunk Linux client flatpak. Validate with:
+       appstreamcli validate packaging/flatpak/io.unom.Punktfunk.metainfo.xml
+     The component id MUST equal the flatpak app-id; the <launchable> MUST name the installed
+     desktop file (io.unom.Punktfunk.desktop). -->
+<component type="desktop-application">
+  <id>io.unom.Punktfunk</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Punktfunk</name>
+  <summary>Low-latency desktop and game streaming client</summary>
+
+  <description>
+    <p>
+      Punktfunk is the native Linux client for the punktfunk low-latency desktop and game
+      streaming stack. It discovers hosts on the LAN over mDNS, trusts them via certificate
+      pinning with a SPAKE2 PIN pairing ceremony, and streams HEVC video (GF(2^16) Leopard
+      FEC plus AES-GCM over UDP, with a QUIC control plane) at exactly the requested
+      resolution and refresh rate — no scaling.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Hardware-accelerated HEVC decode (VAAPI zero-copy on AMD and Intel, software fallback)</li>
+      <li>PipeWire audio playback and microphone uplink</li>
+      <li>Full gamepad support including DualSense touchpad, motion, adaptive triggers and lightbar (SDL3)</li>
+      <li>LAN host discovery, TOFU fingerprint pinning and PIN pairing</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.unom.Punktfunk.desktop</launchable>
+
+  <categories>
+    <category>Network</category>
+    <category>Game</category>
+    <category>RemoteAccess</category>
+  </categories>
+
+  <keywords>
+    <keyword>streaming</keyword>
+    <keyword>remote</keyword>
+    <keyword>game</keyword>
+    <keyword>moonlight</keyword>
+  </keywords>
+
+  <url type="homepage">https://git.unom.io/unom/punktfunk</url>
+  <url type="bugtracker">https://git.unom.io/unom/punktfunk/issues</url>
+  <url type="vcs-browser">https://git.unom.io/unom/punktfunk</url>
+
+  <developer id="io.unom">
+    <name>unom</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#a79ff8</color>
+    <color type="primary" scheme_preference="dark">#6c5bf3</color>
+  </branding>
+
+  <!-- Bump on each release; the version/date should track the published bundle. -->
+  <releases>
+    <release version="0.0.1" date="2026-06-15">
+      <description>
+        <p>Initial flatpak packaging of the native Linux client for the Steam Deck and Wayland desktops.</p>
+      </description>
+    </release>
+  </releases>
+</component>

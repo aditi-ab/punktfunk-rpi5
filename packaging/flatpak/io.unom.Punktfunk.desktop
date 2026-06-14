@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Punktfunk
+Comment=Stream a remote punktfunk host
+Exec=punktfunk-client
+Icon=io.unom.Punktfunk
+Terminal=false
+Categories=Network;Game;
+Keywords=streaming;remote;game;moonlight;
+StartupNotify=true
