@@ -47,7 +47,8 @@ jobs:
 
       - name: Tooling
         run: |
-          dnf -y install flatpak flatpak-builder git python3 python3-aiohttp python3-toml curl jq
+          # flatpak-cargo-generator.py (master) needs aiohttp + tomlkit (NOT the old `toml`).
+          dnf -y install flatpak flatpak-builder git python3 python3-aiohttp python3-tomlkit curl jq
           # Flathub provides the GNOME runtime/SDK + the rust-stable + ffmpeg-full extensions.
           flatpak remote-add --user --if-not-exists flathub \
             https://dl.flathub.org/repo/flathub.flatpakrepo

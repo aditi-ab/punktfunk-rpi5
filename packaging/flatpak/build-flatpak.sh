@@ -63,7 +63,7 @@ else
     curl -fsSL -o "$GEN" \
       https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
   fi
-  # Needs python3 + aiohttp + toml. On a host that lacks them (e.g. the Deck), generate on the
+  # Needs python3 + aiohttp + tomlkit. On a host that lacks them (e.g. the Deck), generate on the
   # Mac / a dev box instead and rsync the result next to the manifest (reused by the branch above).
   python3 "$GEN" Cargo.lock -o packaging/flatpak/cargo-sources.json
 fi
