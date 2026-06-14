@@ -236,16 +236,24 @@ jobs:
           osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
           pkill -x Xcode 2>/dev/null || true
           PROFILE="Punktfunk iOS App Store Distribution"
+          # Scope signing to the iOS device SDK via an xcconfig — see the tvOS step below for the
+          # full rationale. A global (CLI) profile specifier would also be forced onto the shared
+          # macOS-host SwiftPM macro plugins, which reject it and fail the archive; [sdk=iphoneos*]
+          # in an xcconfig lands it on the app/framework slices only.
+          SIGN_XCCONFIG="$RUNNER_TEMP/sign-ios.xcconfig"
+          cat > "$SIGN_XCCONFIG" <<XCCONF
+          CODE_SIGN_STYLE = Manual
+          DEVELOPMENT_TEAM = $TEAM_ID
+          CODE_SIGN_IDENTITY[sdk=iphoneos*] = Apple Distribution
+          PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*] = $PROFILE
+          XCCONF
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk-iOS \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-ios.xcarchive" \
             -skipMacroValidation -skipPackagePluginValidation \
-            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE"
+            -xcconfig "$SIGN_XCCONFIG" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM"
           cat > "$RUNNER_TEMP/export-appstore.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -279,16 +287,29 @@ jobs:
           osascript -e 'tell application "Xcode" to quit' >/dev/null 2>&1 || true
           pkill -x Xcode 2>/dev/null || true
           PROFILE="Punktfunk tvOS App Store Distribution"
+          # Scope signing to the tvOS device SDK via an xcconfig. A global (CLI) profile specifier
+          # hits EVERY target, including the shared SwiftPM macro plugins (OnceMacro/SwizzlingMacro/
+          # AssociationMacro) which build for the macOS host and reject a provisioning profile
+          # ("<macro> does not support provisioning profiles"), failing the archive. Conditionals
+          # work only in an xcconfig (xcodebuild mis-parses a CLI "SETTING[sdk=..]=val"), and a
+          # command-line -xcconfig outranks target settings, so [sdk=appletvos*] puts the profile on
+          # the app/framework slices only — the macosx-host macros get nothing. (The macOS archive
+          # above is immune: its host-SDK macros are CODE_SIGNING_ALLOWED=NO, so a global specifier
+          # is ignored there.)
+          SIGN_XCCONFIG="$RUNNER_TEMP/sign-tvos.xcconfig"
+          cat > "$SIGN_XCCONFIG" <<XCCONF
+          CODE_SIGN_STYLE = Manual
+          DEVELOPMENT_TEAM = $TEAM_ID
+          CODE_SIGN_IDENTITY[sdk=appletvos*] = Apple Distribution
+          PROVISIONING_PROFILE_SPECIFIER[sdk=appletvos*] = $PROFILE
+          XCCONF
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk-tvOS \
             -destination 'generic/platform=tvOS' \
             -archivePath "$RUNNER_TEMP/Punktfunk-tvos.xcarchive" \
             -skipMacroValidation -skipPackagePluginValidation \
-            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM" \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE"
+            -xcconfig "$SIGN_XCCONFIG" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUM"
           cat > "$RUNNER_TEMP/export-tvos.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
