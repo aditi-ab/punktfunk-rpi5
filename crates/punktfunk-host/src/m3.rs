@@ -875,6 +875,10 @@ async fn serve_session(
         let _ = input_handle.join();
     })
     .await;
+    // The capture (and our gamescope session's VirtualOutput) are gone by here. If this was the
+    // host-managed gamescope path on a box that autologs into gaming mode (Bazzite default), put the
+    // TV's gaming session back so it's the default when no one is streaming.
+    crate::vdisplay::restore_managed_session();
     result
 }
 

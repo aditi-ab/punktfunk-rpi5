@@ -227,6 +227,16 @@ pub fn gamescope_ei_socket_file() -> &'static str {
     gamescope::EI_SOCKET_FILE
 }
 
+/// Call when a client session ends: if the host-managed gamescope path took over a box's autologin
+/// gaming session (stopped its single-instance Steam to stream at the client's mode), restart that
+/// session so the TV returns to gaming mode. No-op on other compositors / when nothing was taken.
+#[cfg(target_os = "linux")]
+pub fn restore_managed_session() {
+    gamescope::restore_tv_session();
+}
+#[cfg(not(target_os = "linux"))]
+pub fn restore_managed_session() {}
+
 #[cfg(target_os = "linux")]
 mod gamescope;
 #[cfg(target_os = "linux")]

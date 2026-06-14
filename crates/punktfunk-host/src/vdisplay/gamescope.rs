@@ -41,6 +41,10 @@ struct SessionState {
 /// connections; on host restart the next launch stops the leftover unit by name and starts fresh.
 static MANAGED_SESSION: std::sync::Mutex<Option<SessionState>> = std::sync::Mutex::new(None);
 
+/// Autologin gaming-mode `gamescope-session-plus@*` units we stopped on connect to free Steam
+/// (single-instance), so [`restore_tv_session`] can restart them when the client disconnects.
+static STOPPED_AUTOLOGIN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// systemd --user transient unit name for the host-managed gamescope-session-plus session.
 const SESSION_UNIT: &str = "punktfunk-gamescope";
 /// The gamescope-session-plus launcher script (Bazzite / SteamOS-like hosts).
@@ -121,6 +125,11 @@ impl VirtualDisplay for GamescopeDisplay {
 /// otherwise stop the old transient unit and RELAUNCH at the new mode (gamescope can't change output
 /// mode live). Then discover the node + point the injector, exactly as the attach path does.
 fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
+    // Steam is single-instance: if the box autologged into gaming mode on a physical display (the
+    // Bazzite default — `gamescope-session-plus@ogui-steam` on the TV), that session holds Steam and
+    // renders to the TV's native mode, which we'd capture instead of the client's. Free Steam by
+    // stopping it; [`restore_tv_session`] (called when the client disconnects) brings it back.
+    stop_autologin_sessions();
     let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let same_mode = guard.as_ref().is_some_and(|s| {
         s.width == mode.width && s.height == mode.height && s.refresh_hz == mode.refresh_hz
@@ -167,6 +176,69 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
         preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
         keepalive: Box::new(()),
     })
+}
+
+/// Stop every running autologin gaming-mode session (`gamescope-session-plus@*.service`) so its
+/// single-instance Steam is free for our own host-managed session. Records the units so
+/// [`restore_tv_session`] can restart them on disconnect. Our own session is the transient
+/// `punktfunk-gamescope` unit (not a `@`-instance), so it's never matched here. No-op when nothing
+/// is autologged in (e.g. a box that boots headless).
+fn stop_autologin_sessions() {
+    let Ok(out) = Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--type=service",
+            "--state=running",
+            "--no-legend",
+            "--plain",
+            "gamescope-session-plus@*.service",
+        ])
+        .output()
+    else {
+        return;
+    };
+    let mut stopped = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(unit) = line.split_whitespace().next() {
+            if unit.starts_with("gamescope-session-plus@") && unit.ends_with(".service") {
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", unit])
+                    .status();
+                tracing::info!(
+                    unit,
+                    "freed Steam: stopped the autologin gaming session for this stream"
+                );
+                stopped.push(unit.to_string());
+            }
+        }
+    }
+    if !stopped.is_empty() {
+        *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = stopped;
+    }
+}
+
+/// Client disconnected: tear down our host-managed session (freeing Steam) and restart the
+/// autologin gaming session(s) we stopped on connect — so the TV returns to gaming mode when no one
+/// is streaming. Idempotent / safe to call on every session end (no-op when we stopped nothing,
+/// e.g. a non-gamescope or headless box). The brief Steam restart is the cost of "TV by default,
+/// client mode while streaming" given Steam's single-instance limit.
+pub fn restore_tv_session() {
+    let units = std::mem::take(&mut *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()));
+    if units.is_empty() {
+        return; // nothing was stolen → nothing to restore (also the non-Bazzite path)
+    }
+    stop_session(SESSION_UNIT); // our gamescope/Steam session, so Steam is free for the autologin
+    *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    for unit in units {
+        let _ = Command::new("systemctl")
+            .args(["--user", "start", &unit])
+            .status();
+        tracing::info!(
+            unit,
+            "restored the TV's autologin gaming session (client gone)"
+        );
+    }
 }
 
 /// Point the libei injector at the running gamescope's EIS socket (it reads the relay file
