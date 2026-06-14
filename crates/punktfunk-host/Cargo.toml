@@ -30,6 +30,13 @@ x509-parser = "0.16"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = "0.23"
 rustls-pemfile = "2"
+# Manual HTTPS+mTLS serve loop for the mgmt API (axum-server can't surface the peer cert): a
+# tokio-rustls handshake exposes the client cert, then hyper serves the axum Router with the
+# verified fingerprint injected as a request extension. Versions match the workspace lock.
+tokio-rustls = "0.26"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
+tower = { version = "0.5", features = ["util"] }
 rusty_enet = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

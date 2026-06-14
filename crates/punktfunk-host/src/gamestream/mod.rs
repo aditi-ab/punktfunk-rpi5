@@ -21,7 +21,7 @@ mod pairing;
 mod rtsp;
 mod serverinfo;
 mod stream;
-mod tls;
+pub(crate) mod tls;
 mod video;
 
 use anyhow::{Context, Result};

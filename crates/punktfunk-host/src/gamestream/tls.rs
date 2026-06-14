@@ -17,6 +17,9 @@ use std::sync::Arc;
 #[derive(Debug)]
 struct AcceptAnyClientCert {
     provider: Arc<CryptoProvider>,
+    /// nvhttp/pairing REQUIRES the client cert (mandatory); the mgmt API REQUESTS it but lets a
+    /// certless peer (a browser, falling back to a bearer token) through (optional).
+    mandatory: bool,
 }
 
 impl ClientCertVerifier for AcceptAnyClientCert {
@@ -25,7 +28,7 @@ impl ClientCertVerifier for AcceptAnyClientCert {
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        true
+        self.mandatory
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
@@ -76,8 +79,24 @@ impl ClientCertVerifier for AcceptAnyClientCert {
     }
 }
 
-/// Build a mutual-TLS `ServerConfig` presenting the host cert/key.
+/// Build a mutual-TLS `ServerConfig` presenting the host cert/key. nvhttp/pairing path: the
+/// client cert is **mandatory**.
 pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>> {
+    build_server_config(cert_pem, key_pem, true)
+}
+
+/// Like [`server_config`] but the client cert is **optional** — a certless peer (a browser using a
+/// bearer token) still completes the handshake. Used by the management API's mTLS auth: a paired
+/// client presents its cert (authorized by fingerprint), everyone else falls back to the token.
+pub fn server_config_optional_client(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>> {
+    build_server_config(cert_pem, key_pem, false)
+}
+
+fn build_server_config(
+    cert_pem: &str,
+    key_pem: &str,
+    mandatory: bool,
+) -> Result<Arc<ServerConfig>> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -88,6 +107,7 @@ pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>>
 
     let verifier = Arc::new(AcceptAnyClientCert {
         provider: provider.clone(),
+        mandatory,
     });
     let config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

@@ -86,16 +86,83 @@ pub async fn run(
             opts.bind
         );
     }
+    // Serve over HTTPS with the host's persistent identity (the cert clients already pin) and
+    // OPTIONAL client-cert auth: a paired native client presents its cert (authorized by
+    // fingerprint, no token), a browser presents none and uses the bearer token. See `require_auth`.
+    let identity = crate::gamestream::cert::ServerIdentity::load_or_create()
+        .context("load host identity for the management API TLS")?;
+    let tls = crate::gamestream::tls::server_config_optional_client(
+        &identity.cert_pem,
+        &identity.key_pem,
+    )
+    .context("management API TLS config")?;
     tracing::info!(
         addr = %opts.bind,
-        auth = if token.is_some() { "bearer" } else { "none (loopback)" },
-        "management API listening (docs at /api/docs, spec at /api/v1/openapi.json)"
+        auth = if token.is_some() { "mTLS (paired cert) or bearer" } else { "mTLS (paired cert); bearer disabled (loopback)" },
+        "management API listening over HTTPS (docs at /api/docs, spec at /api/v1/openapi.json)"
     );
     let app = app(state, token, opts.bind.port(), native);
-    axum_server::bind(opts.bind)
-        .serve(app.into_make_service())
+    serve_https(opts.bind, app, tls).await
+}
+
+/// SHA-256 of the peer's client certificate (hex), injected per-connection into each request's
+/// extensions by [`serve_https`]; `None` when the peer presented no client cert. `require_auth`
+/// authorizes a request whose fingerprint is in the paired store.
+#[derive(Clone)]
+struct PeerCertFingerprint(Option<String>);
+
+/// HTTPS server for the mgmt API. axum-server can't surface the client cert to a handler, so this
+/// runs the rustls handshake itself (via tokio-rustls), reads the verified peer certificate, and
+/// serves the axum `Router` over hyper with the peer's fingerprint attached to every request.
+async fn serve_https(bind: SocketAddr, app: Router, tls: Arc<rustls::ServerConfig>) -> Result<()> {
+    use tower::ServiceExt;
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let listener = tokio::net::TcpListener::bind(bind)
         .await
-        .context("management API server")
+        .with_context(|| format!("bind management API {bind}"))?;
+    loop {
+        let (tcp, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "management API accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                // A failed handshake is routine (port scan, a browser bailing on the self-signed
+                // cert, a client cert we'd still accept but the peer hung up) — not fatal.
+                Err(_) => return,
+            };
+            // The verified peer cert (the verifier accepts any well-formed one; we authorize by
+            // fingerprint in the auth layer) → its SHA-256, matched against the paired store.
+            let fp = tls_stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|c| c.first())
+                .map(|c| hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(c.as_ref())));
+            let peer = PeerCertFingerprint(fp);
+            let svc =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let app = app.clone();
+                    let peer = peer.clone();
+                    async move {
+                        let mut req = req.map(axum::body::Body::new);
+                        req.extensions_mut().insert(peer);
+                        app.oneshot(req).await // Router error is Infallible
+                    }
+                });
+            let io = hyper_util::rt::TokioIo::new(tls_stream);
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, svc)
+                    .await;
+        });
+    }
 }
 
 /// Compose the full management router (also used directly by the handler tests).
@@ -451,12 +518,22 @@ where
 /// Bearer-token gate on the `/api/v1` routes. No token configured ⇒ open (loopback-only,
 /// enforced in [`run`]); `/api/v1/health` stays open for monitoring probes either way.
 async fn require_auth(State(st): State<Arc<MgmtState>>, req: Request, next: Next) -> Response {
+    if req.uri().path() == "/api/v1/health" {
+        return next.run(req).await; // liveness probe is always open
+    }
+    // A paired native client authenticates by its mTLS certificate — the same identity + trust the
+    // QUIC data plane uses — so it never needs a bearer token. The fingerprint is attached by
+    // `serve_https` from the verified peer cert; we authorize it iff it's in the paired store.
+    if let Some(PeerCertFingerprint(Some(fp))) = req.extensions().get::<PeerCertFingerprint>() {
+        if st.native.as_ref().is_some_and(|n| n.is_paired(fp)) {
+            return next.run(req).await;
+        }
+    }
+    // Otherwise fall back to the bearer token (the web console / admin). No token configured ⇒
+    // open, which `run` only permits on a loopback bind.
     let Some(expected) = st.token.as_deref() else {
         return next.run(req).await;
     };
-    if req.uri().path() == "/api/v1/health" {
-        return next.run(req).await;
-    }
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -464,7 +541,10 @@ async fn require_auth(State(st): State<Arc<MgmtState>>, req: Request, next: Next
         .and_then(|v| v.strip_prefix("Bearer "));
     match presented {
         Some(token) if token_eq(token, expected) => next.run(req).await,
-        _ => api_error(StatusCode::UNAUTHORIZED, "missing or invalid bearer token"),
+        _ => api_error(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid credentials (a paired client cert, or a bearer token)",
+        ),
     }
 }
 
