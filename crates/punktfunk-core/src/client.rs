@@ -172,6 +172,7 @@ impl NativeClient {
         compositor: CompositorPref,
         gamepad: GamepadPref,
         bitrate_kbps: u32,
+        launch: Option<String>,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
         timeout: Duration,
@@ -214,6 +215,7 @@ impl NativeClient {
                     compositor,
                     gamepad,
                     bitrate_kbps,
+                    launch,
                     pin,
                     identity,
                     frame_tx,
@@ -526,6 +528,7 @@ struct WorkerArgs {
     compositor: CompositorPref,
     gamepad: GamepadPref,
     bitrate_kbps: u32,
+    launch: Option<String>,
     pin: Option<[u8; 32]>,
     identity: Option<(String, String)>,
     frame_tx: SyncSender<Frame>,
@@ -552,6 +555,7 @@ async fn worker_main(args: WorkerArgs) {
         compositor,
         gamepad,
         bitrate_kbps,
+        launch,
         pin,
         identity,
         frame_tx,
@@ -608,6 +612,8 @@ async fn worker_main(args: WorkerArgs) {
                 // No device name yet: the connect ABI has no name parameter (pairing does). The
                 // host falls back to a fingerprint-derived label in its pending-approval list.
                 name: None,
+                // Library id to launch this session, if the embedder asked for one.
+                launch: launch.clone(),
             }
             .encode(),
         )

@@ -153,6 +153,12 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Longest library id carried in a [`Hello::launch`] (bytes of UTF-8). Ids are short
+// (`steam:<appid>` / `custom:<12 hex>`); the cap just bounds an attacker-controlled field.
+#define HELLO_LAUNCH_MAX 128
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`Reconfigure`] (first byte after the magic).
 #define MSG_RECONFIGURE 1
 #endif
@@ -641,6 +647,31 @@ PunktfunkConnection *punktfunk_connect_ex3(const char *host,
                                            uint32_t compositor,
                                            uint32_t gamepad,
                                            uint32_t bitrate_kbps,
+                                           const uint8_t *pin_sha256,
+                                           uint8_t *observed_sha256_out,
+                                           const char *client_cert_pem,
+                                           const char *client_key_pem,
+                                           uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect_ex3`], but additionally asks the host to launch a library title in
+// this session. `launch_id` is a store-qualified [`crate::library`-style] id as returned by the
+// host's `GET /api/v1/library` (`steam:<appid>` / `custom:<id>`); the host resolves it against
+// its OWN library and runs the matching recipe — the client never sends a raw command. `NULL`
+// (or an empty / unknown id) ⇒ the host's default session, no game launched.
+//
+// # Safety
+// Same as [`punktfunk_connect`]; `launch_id`, when non-NULL, must be a NUL-terminated C string.
+PunktfunkConnection *punktfunk_connect_ex4(const char *host,
+                                           uint16_t port,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t refresh_hz,
+                                           uint32_t compositor,
+                                           uint32_t gamepad,
+                                           uint32_t bitrate_kbps,
+                                           const char *launch_id,
                                            const uint8_t *pin_sha256,
                                            uint8_t *observed_sha256_out,
                                            const char *client_cert_pem,

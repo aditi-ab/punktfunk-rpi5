@@ -797,6 +797,53 @@ pub unsafe extern "C" fn punktfunk_connect_ex3(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
+    // Delegate to the launch-aware variant with no game requested (the host's default session).
+    unsafe {
+        punktfunk_connect_ex4(
+            host,
+            port,
+            width,
+            height,
+            refresh_hz,
+            compositor,
+            gamepad,
+            bitrate_kbps,
+            std::ptr::null(),
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            timeout_ms,
+        )
+    }
+}
+
+/// Like [`punktfunk_connect_ex3`], but additionally asks the host to launch a library title in
+/// this session. `launch_id` is a store-qualified [`crate::library`-style] id as returned by the
+/// host's `GET /api/v1/library` (`steam:<appid>` / `custom:<id>`); the host resolves it against
+/// its OWN library and runs the matching recipe — the client never sends a raw command. `NULL`
+/// (or an empty / unknown id) ⇒ the host's default session, no game launched.
+///
+/// # Safety
+/// Same as [`punktfunk_connect`]; `launch_id`, when non-NULL, must be a NUL-terminated C string.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connect_ex4(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    gamepad: u32,
+    bitrate_kbps: u32,
+    launch_id: *const std::os::raw::c_char,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    timeout_ms: u32,
+) -> *mut PunktfunkConnection {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if host.is_null() {
             return std::ptr::null_mut();
@@ -804,6 +851,11 @@ pub unsafe extern "C" fn punktfunk_connect_ex3(
         let host = match unsafe { std::ffi::CStr::from_ptr(host) }.to_str() {
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
+        };
+        // A bad-UTF-8 launch id is non-fatal — treat it as "no game" rather than failing connect.
+        let launch = match unsafe { opt_cstr(launch_id) } {
+            Ok(Some(s)) if !s.is_empty() => Some(s.to_string()),
+            _ => None,
         };
         let mode = crate::config::Mode {
             width,
@@ -839,6 +891,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex3(
             pref,
             gamepad,
             bitrate_kbps,
+            launch,
             pin,
             identity,
             std::time::Duration::from_millis(timeout_ms as u64),

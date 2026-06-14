@@ -520,6 +520,24 @@ async fn serve_session(
             M3Source::Synthetic => None,
         };
 
+        // Resolve a requested library launch (the client sends only the store-qualified id;
+        // we look it up in OUR library so a client can't inject a command). Set the gamescope
+        // backend's app env var, exactly as the GameStream /launch path does — safe per-session
+        // (one session at a time). Only the bare-spawn gamescope path reads it; on a shared
+        // desktop (kwin/mutter/wlroots) or an attach-to-existing session it's a harmless no-op.
+        if let Some(id) = hello.launch.as_deref() {
+            match crate::library::launch_command(id) {
+                Some(cmd) => {
+                    tracing::info!(launch_id = id, command = %cmd, "launching library title");
+                    std::env::set_var("PUNKTFUNK_GAMESCOPE_APP", &cmd);
+                }
+                None => tracing::warn!(
+                    launch_id = id,
+                    "client requested a launch id not in this host's library — ignoring"
+                ),
+            }
+        }
+
         // Resolve the client's gamepad-backend preference (pure env/cfg check — no probing
         // needed; the actual pads are created lazily by the input thread).
         let gamepad = resolve_gamepad(hello.gamepad);
@@ -2389,6 +2407,7 @@ mod tests {
                 CompositorPref::Auto,
                 GamepadPref::Auto,
                 0,
+                None, // launch
                 None,
                 Some((cert.clone(), key.clone())),
                 timeout
@@ -2419,6 +2438,7 @@ mod tests {
             CompositorPref::Auto,
             GamepadPref::Auto,
             0,
+            None, // launch
             None,
             Some((cert, key)),
             timeout,
@@ -2478,6 +2498,7 @@ mod tests {
                 CompositorPref::Auto,
                 GamepadPref::Auto,
                 0,
+                None, // launch
                 None,
                 None,
                 timeout
@@ -2503,6 +2524,7 @@ mod tests {
             CompositorPref::Auto,
             GamepadPref::Auto,
             0,
+            None, // launch
             Some(host_fp),
             Some((cert.clone(), key.clone())),
             timeout,

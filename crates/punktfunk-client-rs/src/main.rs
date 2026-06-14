@@ -76,6 +76,9 @@ struct Args {
     gamepad: GamepadPref,
     /// `--bitrate KBPS` — request this encoder bitrate (kilobits/s); 0 = host default.
     bitrate_kbps: u32,
+    /// `--launch ID` — ask the host to launch a library title in this session (a store-qualified
+    /// id from the host's `GET /api/v1/library`, e.g. `steam:570`). Host resolves it; `None` = none.
+    launch: Option<String>,
     /// `--speed-test KBPS:MS` — after the stream starts, ask the host for a `MS`-millisecond
     /// bandwidth probe burst at `KBPS`, then report measured throughput + loss.
     speed_test: Option<(u32, u32)>,
@@ -194,6 +197,7 @@ fn parse_args() -> Args {
         compositor,
         gamepad,
         bitrate_kbps: get("--bitrate").and_then(|s| s.parse().ok()).unwrap_or(0),
+        launch: get("--launch").map(str::to_string),
         speed_test: get("--speed-test").and_then(|s| {
             let (kbps, ms) = s.split_once(':')?;
             Some((kbps.parse().ok()?, ms.parse().ok()?))
@@ -374,6 +378,8 @@ async fn session(args: Args) -> Result<()> {
             // `--name` (also the pairing label) — shown in the host's pending-approval list when
             // this client knocks on a pairing-required host.
             name: Some(args.name.clone()),
+            // `--launch ID` — host resolves it against its own library and runs it this session.
+            launch: args.launch.clone(),
         }
         .encode(),
     )

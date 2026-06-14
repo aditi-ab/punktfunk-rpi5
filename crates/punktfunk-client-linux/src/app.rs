@@ -286,6 +286,7 @@ fn speed_test(app: Rc<App>, req: ConnectRequest) {
                 CompositorPref::Auto,
                 GamepadPref::Auto,
                 0,
+                None, // launch: speed-test probe connect, no game
                 pin,
                 Some(identity),
                 std::time::Duration::from_secs(15),

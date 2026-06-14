@@ -353,6 +353,35 @@ pub fn delete_custom(id: &str) -> Result<bool> {
 // Unified library
 // ---------------------------------------------------------------------------------------
 
+/// Resolve a store-qualified library id (as sent by a client in `Hello::launch`) to the shell
+/// command the host should run for it — looked up in the host's OWN library so a client can only
+/// pick an existing title, never inject a command. `None` = unknown id, no launch recipe, or a
+/// malformed Steam appid.
+///
+/// - `steam_appid` → `steam steam://rungameid/<appid>` (appid validated as digits, so the only
+///   client-controlled part of the command is a number).
+/// - `command` → the stored command verbatim. This string comes from the host's own custom store
+///   (added by the host operator via the admin UI), never from the client, so it is trusted.
+pub fn launch_command(id: &str) -> Option<String> {
+    let spec = all_games().into_iter().find(|g| g.id == id)?.launch?;
+    command_for(&spec)
+}
+
+/// Map a resolved [`LaunchSpec`] to its shell command (pure — the unit-testable core of
+/// [`launch_command`], split out so the appid-validation can be tested without a Steam install).
+fn command_for(spec: &LaunchSpec) -> Option<String> {
+    match spec.kind.as_str() {
+        "steam_appid" => {
+            // Only digits — the appid is the sole client-influenced part of the command.
+            (!spec.value.is_empty() && spec.value.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| format!("steam steam://rungameid/{}", spec.value))
+        }
+        // Trusted: the command comes from the host's own custom store, never the client.
+        "command" => (!spec.value.trim().is_empty()).then(|| spec.value.clone()),
+        _ => None,
+    }
+}
+
 /// The full library: every store's titles merged + the custom entries, sorted by title.
 pub fn all_games() -> Vec<GameEntry> {
     let mut games = SteamProvider.list();
@@ -418,6 +447,45 @@ mod tests {
             Some("https://cdn.cloudflare.steamstatic.com/steam/apps/570/library_600x900.jpg")
         );
         assert!(art.header.unwrap().ends_with("/570/header.jpg"));
+    }
+
+    #[test]
+    fn launch_command_resolves_and_guards() {
+        let steam = LaunchSpec {
+            kind: "steam_appid".into(),
+            value: "570".into(),
+        };
+        assert_eq!(
+            command_for(&steam).as_deref(),
+            Some("steam steam://rungameid/570")
+        );
+        // A non-numeric "appid" (e.g. a client trying to inject) is rejected, never interpolated.
+        let evil = LaunchSpec {
+            kind: "steam_appid".into(),
+            value: "570; rm -rf ~".into(),
+        };
+        assert_eq!(command_for(&evil), None);
+        // Custom commands (from the host's own store) pass through verbatim.
+        let custom = LaunchSpec {
+            kind: "command".into(),
+            value: "dolphin-emu --batch".into(),
+        };
+        assert_eq!(command_for(&custom).as_deref(), Some("dolphin-emu --batch"));
+        // Empty / unknown kinds → no command.
+        assert_eq!(
+            command_for(&LaunchSpec {
+                kind: "command".into(),
+                value: "  ".into()
+            }),
+            None
+        );
+        assert_eq!(
+            command_for(&LaunchSpec {
+                kind: "wat".into(),
+                value: "x".into()
+            }),
+            None
+        );
     }
 
     #[test]

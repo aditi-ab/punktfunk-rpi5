@@ -62,11 +62,23 @@ pub struct Hello {
     /// Appended to the wire form as `len u8 || UTF-8` (≤ [`HELLO_NAME_MAX`] bytes) — omitted by
     /// older clients (decodes to `None`; the host falls back to a fingerprint-derived label).
     pub name: Option<String>,
+    /// Library entry the client wants this session to launch (the store-qualified `GameEntry.id`,
+    /// e.g. `steam:570` / `custom:abc123`). The host resolves it against ITS OWN library and runs
+    /// the matching launch recipe in the session — the client never sends a raw command, so a
+    /// remote peer can't inject one. `None` = no game requested (the host's default session).
+    /// Appended after `name` as `len u8 || UTF-8` (≤ [`HELLO_LAUNCH_MAX`] bytes); when present but
+    /// `name` is absent, a zero-length name placeholder precedes it so the offset stays
+    /// deterministic. Omitted by older clients (decodes to `None`).
+    pub launch: Option<String>,
 }
 
 /// Longest device name carried in a [`Hello`] (bytes of UTF-8; longer names are truncated on
 /// encode, rejected on decode — a one-byte length prefix caps it at 255 anyway).
 pub const HELLO_NAME_MAX: usize = 64;
+
+/// Longest library id carried in a [`Hello::launch`] (bytes of UTF-8). Ids are short
+/// (`steam:<appid>` / `custom:<12 hex>`); the cap just bounds an attacker-controlled field.
+pub const HELLO_LAUNCH_MAX: usize = 128;
 
 /// `host → client`: the complete session offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,6 +485,19 @@ pub mod pake {
     }
 }
 
+/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary (so a multi-byte char straddling
+/// the cap is dropped whole, never split). Shared by Hello's length-prefixed name/launch fields.
+fn truncate_to(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(22);
@@ -484,21 +509,23 @@ impl Hello {
         b.push(self.compositor.to_u8()); // appended at offset 20 — older hosts read [0..20] and skip it
         b.push(self.gamepad.to_u8()); // appended at offset 21 — same back-compat discipline
         b.extend_from_slice(&self.bitrate_kbps.to_le_bytes()); // appended at offset 22..26
-        if let Some(name) = &self.name {
-            // Appended at offset 26: len u8 || UTF-8. This is the LAST trailing field — `None`
-            // emits nothing (so a no-name Hello is byte-identical to the bitrate-era form), which
-            // means a *future* field can't simply follow `name` at a fixed offset; it would need
-            // its own presence flag. Truncate to a char boundary within HELLO_NAME_MAX.
-            let mut n = name.as_str();
-            while n.len() > HELLO_NAME_MAX {
-                let mut cut = HELLO_NAME_MAX;
-                while !n.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                n = &n[..cut];
+                                                               // name at offset 26: len u8 || UTF-8. Omitted when `None` *and* there is no later field —
+                                                               // so a Hello with neither name nor launch stays byte-identical to the bitrate-era form
+                                                               // (26 bytes). When `launch` is present we must still emit name's length byte (0 for None)
+                                                               // so `launch` lands at a deterministic offset.
+        match (&self.name, &self.launch) {
+            (None, None) => {}
+            (name, _) => {
+                let n = truncate_to(name.as_deref().unwrap_or(""), HELLO_NAME_MAX);
+                b.push(n.len() as u8);
+                b.extend_from_slice(n.as_bytes());
             }
-            b.push(n.len() as u8);
-            b.extend_from_slice(n.as_bytes());
+        }
+        // launch after name: len u8 || UTF-8. Last trailing field.
+        if let Some(launch) = &self.launch {
+            let l = truncate_to(launch, HELLO_LAUNCH_MAX);
+            b.push(l.len() as u8);
+            b.extend_from_slice(l.as_bytes());
         }
         b
     }
@@ -537,6 +564,19 @@ impl Hello {
                     return None;
                 }
                 b.get(27..27 + len)
+                    .and_then(|s| std::str::from_utf8(s).ok())
+                    .map(String::from)
+            }),
+            // Optional trailing launch id, positioned right after name's `len u8 || UTF-8` block.
+            // The raw name-length byte (even when oversized/zero) determines where launch starts,
+            // so a corrupt name never panics — it just pushes the launch offset out of range → None.
+            launch: b.get(26).and_then(|&name_len| {
+                let off = 27 + name_len as usize; // start of launch's length byte
+                let len = *b.get(off)? as usize;
+                if len == 0 || len > HELLO_LAUNCH_MAX {
+                    return None;
+                }
+                b.get(off + 1..off + 1 + len)
                     .and_then(|s| std::str::from_utf8(s).ok())
                     .map(String::from)
             }),
@@ -1495,6 +1535,7 @@ mod tests {
             gamepad: GamepadPref::DualSense,
             bitrate_kbps: 25_000,
             name: Some("Test Device".into()),
+            launch: Some("steam:570".into()),
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -1560,6 +1601,7 @@ mod tests {
             gamepad: GamepadPref::DualSense,
             bitrate_kbps: 80_000,
             name: None,
+            launch: None,
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -1629,6 +1671,7 @@ mod tests {
             gamepad: GamepadPref::Auto,
             bitrate_kbps: 0,
             name: Some("Enrico's MacBook".into()),
+            launch: None,
         };
         let enc = base.encode();
         assert_eq!(
@@ -1659,6 +1702,60 @@ mod tests {
         let mut bad_utf8 = unnamed.encode();
         bad_utf8.extend_from_slice(&[2, 0xFF, 0xFE]);
         assert_eq!(Hello::decode(&bad_utf8).unwrap().name, None);
+    }
+
+    #[test]
+    fn hello_launch_roundtrip_and_back_compat() {
+        let base = Hello {
+            abi_version: 2,
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: None,
+            launch: None,
+        };
+        // launch alone (no name): a zero-length name placeholder keeps the offset deterministic.
+        let with_launch = Hello {
+            launch: Some("steam:570".into()),
+            ..base.clone()
+        };
+        assert_eq!(Hello::decode(&with_launch.encode()).unwrap(), with_launch);
+        // launch + name together.
+        let both = Hello {
+            name: Some("Enrico's Mac".into()),
+            launch: Some("custom:abc123".into()),
+            ..base.clone()
+        };
+        assert_eq!(Hello::decode(&both.encode()).unwrap(), both);
+        // name but no launch (a name-era client): launch decodes None.
+        let name_only = Hello {
+            name: Some("Enrico's Mac".into()),
+            ..base.clone()
+        };
+        assert_eq!(Hello::decode(&name_only.encode()).unwrap().launch, None);
+        // Neither field → still the 26-byte bitrate-era form (no launch placeholder emitted).
+        assert_eq!(base.encode().len(), 26);
+        assert_eq!(Hello::decode(&base.encode()).unwrap().launch, None);
+        // A bitrate-era (26-byte) peer reading a launch-bearing Hello ignores it.
+        assert_eq!(
+            Hello::decode(&with_launch.encode()[..26]).unwrap().launch,
+            None
+        );
+        // Over-long ids truncate on a char boundary within HELLO_LAUNCH_MAX.
+        let long = Hello {
+            launch: Some(format!("{}ü", "x".repeat(HELLO_LAUNCH_MAX - 1))),
+            ..base.clone()
+        };
+        let dec = Hello::decode(&long.encode())
+            .unwrap()
+            .launch
+            .expect("present");
+        assert!(dec.len() <= HELLO_LAUNCH_MAX && dec.starts_with('x'));
     }
 
     #[test]
@@ -1784,6 +1881,7 @@ mod tests {
                 gamepad: GamepadPref::Auto,
                 bitrate_kbps: 0,
                 name: None,
+                launch: None,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");

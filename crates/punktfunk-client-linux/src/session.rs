@@ -90,6 +90,7 @@ fn pump(
         params.compositor,
         params.gamepad,
         params.bitrate_kbps,
+        None, // launch: the Linux client has no library picker yet
         params.pin,
         Some(params.identity),
         Duration::from_secs(15),
