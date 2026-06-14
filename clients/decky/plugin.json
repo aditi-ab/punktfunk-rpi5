@@ -1,0 +1,11 @@
+{
+  "name": "punktfunk",
+  "author": "enrico",
+  "flags": ["debug"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["streaming", "game-streaming", "remote-play"],
+    "description": "Launch the punktfunk low-latency streaming client from Gaming Mode: discover hosts on the LAN over mDNS and connect to one.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}

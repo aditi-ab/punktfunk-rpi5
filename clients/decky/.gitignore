@@ -1,0 +1,30 @@
+# Dependency directory
+node_modules
+.pnpm-store
+
+# Built TS files
+dist/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors
+.idea
+*.iml
+.vscode/settings.json
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Logs / scratch
+*.log
+tmp
+
+# decky CLI build artifacts
+out
+out/*
+cli/
+.yalc
+yalc.lock
