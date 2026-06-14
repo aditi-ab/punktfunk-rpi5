@@ -35,6 +35,11 @@ install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
 # DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).
 install -Dm0644 scripts/70-punktfunk-client.rules \
                 "$STAGE/usr/lib/udev/rules.d/70-punktfunk-client.rules"
+# UDP receive-buffer tuning (32 MB) — without it the kernel clamps the client's SO_RCVBUF and
+# high-bitrate streams overflow it at the receiver (measured: 4 MB cap = 31.6% loss at 2 Gbps,
+# 32 MB = 0%). systemd-sysctl applies it at boot; the postinst applies it on install.
+install -Dm0644 scripts/99-punktfunk-client-net.conf \
+                "$STAGE/usr/lib/sysctl.d/99-punktfunk-client-net.conf"
 install -Dm0644 LICENSE-MIT                              "$DOCDIR/LICENSE-MIT"
 install -Dm0644 LICENSE-APACHE                           "$DOCDIR/LICENSE-APACHE"
 install -Dm0644 README.md                                "$DOCDIR/README.md"
@@ -107,6 +112,8 @@ if [ "$1" = "configure" ]; then
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=hidraw 2>/dev/null || true
     update-desktop-database /usr/share/applications 2>/dev/null || true
+    # Apply the UDP recv-buffer tuning now (also auto-applied at boot by systemd-sysctl).
+    sysctl -p /usr/lib/sysctl.d/99-punktfunk-client-net.conf >/dev/null 2>&1 || true
 fi
 exit 0
 EOF

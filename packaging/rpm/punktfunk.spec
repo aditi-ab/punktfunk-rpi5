@@ -154,6 +154,12 @@ install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
 # DualSense hidraw access (full pad fidelity through SDL's HIDAPI driver).
 install -Dm0644 scripts/70-punktfunk-client.rules \
                 %{buildroot}%{_udevrulesdir}/70-punktfunk-client.rules
+# UDP receive-buffer tuning (32 MB) — the client asks for a 32 MB SO_RCVBUF; without raising
+# net.core.rmem_max the kernel clamps it and high-bitrate streams overflow at the receiver
+# (measured: 4 MB cap = 31.6% loss at 2 Gbps, 32 MB = 0%). Distinct filename from the host's so
+# both can be installed on one box.
+install -Dm0644 scripts/99-punktfunk-client-net.conf \
+                %{buildroot}%{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf
 
 # Headless session helpers + example config + OpenAPI doc (reference material).
 install -d %{buildroot}%{_datadir}/%{name}/headless
@@ -184,12 +190,16 @@ install -Dm0644 docs/api/openapi.json                  %{buildroot}%{_datadir}/%
 %{_bindir}/punktfunk-client
 %{_datadir}/applications/io.unom.Punktfunk.desktop
 %{_udevrulesdir}/70-punktfunk-client.rules
+%{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf
 
 %post client
 # Pick up the DualSense hidraw rule without a reboot (best-effort; on rpm-ostree it
 # applies on the next boot into the layered deployment).
 udevadm control --reload-rules 2>/dev/null || :
 udevadm trigger --subsystem-match=hidraw 2>/dev/null || :
+# Apply the UDP recv-buffer tuning now (also auto-applied at boot by systemd-sysctl; on
+# rpm-ostree it takes effect on the next boot into the layered deployment).
+sysctl -p %{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf >/dev/null 2>&1 || :
 
 %post
 # Reload udev so /dev/uinput picks up the new rule without a reboot (best-effort).
