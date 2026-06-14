@@ -247,7 +247,8 @@ pub fn schedule_restore_tv_session() {
     {
         return; // nothing was stolen → nothing to restore (also the non-Bazzite path)
     }
-    *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + RESTORE_DEBOUNCE);
+    *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(Instant::now() + RESTORE_DEBOUNCE);
     tracing::info!(
         secs = RESTORE_DEBOUNCE.as_secs(),
         "gamescope: scheduled debounced TV-session restore (cancelled if a client reconnects)"
