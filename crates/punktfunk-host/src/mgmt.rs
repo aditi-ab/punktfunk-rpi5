@@ -149,7 +149,10 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(approve_pending_device))
                 .routes(routes!(deny_pending_device))
                 .routes(routes!(stop_session))
-                .routes(routes!(request_idr)),
+                .routes(routes!(request_idr))
+                .routes(routes!(get_library))
+                .routes(routes!(create_custom_game))
+                .routes(routes!(update_custom_game, delete_custom_game)),
         )
         .split_for_parts()
 }
@@ -180,6 +183,7 @@ pub fn openapi_json() -> String {
         (name = "pairing", description = "Pairing PIN delivery (the out-of-band half of the GameStream pairing handshake)"),
         (name = "native", description = "Native punktfunk/1 pairing: arm a window, display the host PIN, manage paired devices"),
         (name = "session", description = "Active streaming session control"),
+        (name = "library", description = "Game library: installed-store titles (Steam) plus user-curated custom entries"),
     )
 )]
 struct ApiDoc;
@@ -1065,6 +1069,108 @@ async fn request_idr(State(st): State<Arc<MgmtState>>) -> Response {
     }
     st.app.force_idr.store(true, Ordering::SeqCst);
     StatusCode::ACCEPTED.into_response()
+}
+
+// ---------------------------------------------------------------------------------------
+// Library
+// ---------------------------------------------------------------------------------------
+
+/// List the game library
+///
+/// Every installed-store title (Steam, read from the host's local files — no Steam API key)
+/// merged with the user's custom entries, sorted by title. Artwork fields are URLs the client
+/// fetches directly (the public Steam CDN for Steam titles).
+#[utoipa::path(
+    get,
+    path = "/library",
+    tag = "library",
+    operation_id = "getLibrary",
+    responses(
+        (status = OK, description = "Unified library across all stores", body = [crate::library::GameEntry]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn get_library() -> Json<Vec<crate::library::GameEntry>> {
+    Json(crate::library::all_games())
+}
+
+/// Add a custom library entry
+///
+/// Creates a user-curated title (e.g. a non-Steam game, an emulator, a ROM) with caller-supplied
+/// artwork URLs. The host assigns a stable id, returned in the body.
+#[utoipa::path(
+    post,
+    path = "/library/custom",
+    tag = "library",
+    operation_id = "createCustomGame",
+    request_body = crate::library::CustomInput,
+    responses(
+        (status = CREATED, description = "Entry created", body = crate::library::CustomEntry),
+        (status = BAD_REQUEST, description = "Empty title", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the catalog", body = ApiError),
+    )
+)]
+async fn create_custom_game(ApiJson(input): ApiJson<crate::library::CustomInput>) -> Response {
+    if input.title.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
+    }
+    match crate::library::add_custom(input) {
+        Ok(entry) => (StatusCode::CREATED, Json(entry)).into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Update a custom library entry
+#[utoipa::path(
+    put,
+    path = "/library/custom/{id}",
+    tag = "library",
+    operation_id = "updateCustomGame",
+    params(("id" = String, Path, description = "The custom entry id (without the `custom:` prefix)")),
+    request_body = crate::library::CustomInput,
+    responses(
+        (status = OK, description = "Entry updated", body = crate::library::CustomEntry),
+        (status = BAD_REQUEST, description = "Empty title", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = NOT_FOUND, description = "No custom entry with that id", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the catalog", body = ApiError),
+    )
+)]
+async fn update_custom_game(
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<crate::library::CustomInput>,
+) -> Response {
+    if input.title.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "title must not be empty");
+    }
+    match crate::library::update_custom(&id, input) {
+        Ok(Some(entry)) => Json(entry).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "no custom entry with that id"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Delete a custom library entry
+#[utoipa::path(
+    delete,
+    path = "/library/custom/{id}",
+    tag = "library",
+    operation_id = "deleteCustomGame",
+    params(("id" = String, Path, description = "The custom entry id (without the `custom:` prefix)")),
+    responses(
+        (status = NO_CONTENT, description = "Entry deleted"),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = NOT_FOUND, description = "No custom entry with that id", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the catalog", body = ApiError),
+    )
+)]
+async fn delete_custom_game(Path(id): Path<String>) -> Response {
+    match crate::library::delete_custom(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "no custom entry with that id"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------------------

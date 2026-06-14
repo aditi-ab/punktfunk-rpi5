@@ -21,6 +21,7 @@ mod drm_sync;
 mod encode;
 mod gamestream;
 mod inject;
+mod library;
 mod m0;
 mod m3;
 mod mgmt;
@@ -68,6 +69,12 @@ fn real_main() -> Result<()> {
         // Print the management API's OpenAPI document (for client codegen).
         Some("openapi") => {
             print!("{}", mgmt::openapi_json());
+            Ok(())
+        }
+        // Dump the resolved game library (installed stores + custom entries) as JSON — the same
+        // payload `GET /api/v1/library` serves. A diagnostic for "does the host see my games?".
+        Some("library") => {
+            println!("{}", serde_json::to_string_pretty(&library::all_games())?);
             Ok(())
         }
         // Standalone input-injection smoke test (no client needed): open the session's input
