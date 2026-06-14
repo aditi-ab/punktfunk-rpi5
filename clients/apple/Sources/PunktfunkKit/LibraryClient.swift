@@ -42,7 +42,7 @@ public struct GameEntry: Codable, Hashable, Identifiable, Sendable {
     public var isCustom: Bool { store == "custom" }
 }
 
-/// Errors surfaced to the UI so it can guide setup (the common case is "needs a token").
+/// Errors surfaced to the UI so it can guide setup (the common case is "not paired yet").
 public enum LibraryError: LocalizedError {
     case unauthorized
     case http(Int)
@@ -51,13 +51,13 @@ public enum LibraryError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .unauthorized:
-            return "The host's management API rejected the token. Start the host with "
-                + "--mgmt-token and enter the same token here."
+            return "The host didn't recognize this device. Pair with the host first — it "
+                + "authorizes paired clients by their certificate (no token needed)."
         case .http(let code):
             return "The management API returned HTTP \(code)."
         case .unreachable(let why):
-            return "Couldn't reach the management API: \(why). The host must expose it on the "
-                + "LAN (serve --mgmt-bind 0.0.0.0 --mgmt-token …)."
+            return "Couldn't reach the host's management API: \(why). The host must expose it on "
+                + "the LAN (serve --mgmt-bind 0.0.0.0)."
         }
     }
 }
@@ -68,20 +68,36 @@ public let punktfunkDefaultMgmtPort: UInt16 = 47990
 
 /// Stateless fetcher for a host's library.
 public enum LibraryClient {
-    /// `GET http://<address>:<port>/api/v1/library` with an optional bearer token.
+    /// `GET https://<address>:<port>/api/v1/library`, authenticated by **mTLS**: the client
+    /// presents `identity` (its persistent cert/key PEM — the same identity the host paired over
+    /// QUIC), and the host's self-signed cert is pinned by `hostFingerprint` (SHA-256 of its DER,
+    /// the value the client already trusts). No bearer token — a paired client is authorized by
+    /// its certificate. `hostFingerprint == nil` ⇒ TOFU (accept the presented host cert).
     public static func fetch(
-        address: String, port: UInt16 = punktfunkDefaultMgmtPort, token: String? = nil
+        address: String,
+        port: UInt16 = punktfunkDefaultMgmtPort,
+        certPEM: String,
+        keyPEM: String,
+        hostFingerprint: Data?
     ) async throws -> [GameEntry] {
-        guard let url = URL(string: "http://\(address):\(port)/api/v1/library") else {
+        guard let url = URL(string: "https://\(address):\(port)/api/v1/library") else {
             throw LibraryError.unreachable("invalid host address")
         }
-        var req = URLRequest(url: url, timeoutInterval: 10)
-        if let token, !token.isEmpty {
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let identity: SecIdentity
+        do {
+            identity = try ClientTLS.makeIdentity(certPEM: certPEM, keyPEM: keyPEM)
+        } catch {
+            throw LibraryError.unreachable(
+                (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
         }
+        let delegate = LibraryTLSDelegate(identity: identity, pinnedHostFingerprint: hostFingerprint)
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+
+        let req = URLRequest(url: url, timeoutInterval: 10)
         let (data, response): (Data, URLResponse)
         do {
-            (data, response) = try await URLSession.shared.data(for: req)
+            (data, response) = try await session.data(for: req)
         } catch {
             throw LibraryError.unreachable(error.localizedDescription)
         }

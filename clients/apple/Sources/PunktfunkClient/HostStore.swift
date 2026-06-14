@@ -21,14 +21,11 @@ struct StoredHost: Identifiable, Codable, Hashable {
     var pinnedSHA256: Data?
     /// Last time a streaming session actually started (nil until the first one).
     var lastConnected: Date?
-    /// Management-API port for the experimental library browser (distinct from the data-plane
-    /// `port`). Optional (NOT a defaulted non-optional) so older saved hosts — whose JSON lacks
-    /// this key — still decode: synthesized Decodable ignores property defaults but treats a
-    /// missing Optional as nil. Resolve via `effectiveMgmtPort`.
+    /// Management-API port for the library browser (distinct from the data-plane `port`). Optional
+    /// (NOT a defaulted non-optional) so older saved hosts — whose JSON lacks this key — still
+    /// decode: synthesized Decodable ignores property defaults but treats a missing Optional as
+    /// nil. Resolve via `effectiveMgmtPort`. (Auth is mTLS by the pinned identity — no token.)
     var mgmtPort: UInt16?
-    /// Bearer token for the management API (the host's `--mgmt-token`). Required for any
-    /// non-loopback mgmt bind; nil until the user enters it.
-    var mgmtToken: String?
 
     var displayName: String { name.isEmpty ? address : name }
     var effectiveMgmtPort: UInt16 { mgmtPort ?? punktfunkDefaultMgmtPort }
@@ -96,14 +93,6 @@ final class HostStore: ObservableObject {
         hosts[i].pinnedSHA256 = nil
     }
 
-    /// Persist the management-API endpoint for the (experimental) library browser. An empty
-    /// token is stored as nil (no credential).
-    func setMgmt(_ hostID: UUID, port: UInt16, token: String) {
-        guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
-        hosts[i].mgmtPort = port
-        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        hosts[i].mgmtToken = trimmed.isEmpty ? nil : trimmed
-    }
 
     private func persist() {
         if let data = try? JSONEncoder().encode(hosts) {

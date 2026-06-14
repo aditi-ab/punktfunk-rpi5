@@ -16,10 +16,6 @@ struct LibraryView: View {
     @State private var games: [GameEntry] = []
     @State private var loading = false
     @State private var errorText: String?
-    @State private var showConfig = false
-    // Connection form state, seeded from the saved host.
-    @State private var portText: String = ""
-    @State private var tokenText: String = ""
 
     var body: some View {
         content
@@ -29,20 +25,12 @@ struct LibraryView: View {
             #endif
             .toolbar {
                 #if os(macOS)
-                ToolbarItemGroup {
-                    connectionButton
-                    reloadButton
-                }
+                ToolbarItemGroup { reloadButton }
                 #else
                 ToolbarItem(placement: .primaryAction) { reloadButton }
-                ToolbarItem(placement: .cancellationAction) { connectionButton }
                 #endif
             }
-            .sheet(isPresented: $showConfig) { connectionSheet }
-            .task {
-                seedForm()
-                await load()
-            }
+            .task { await load() }
     }
 
     @ViewBuilder private var content: some View {
@@ -92,7 +80,7 @@ struct LibraryView: View {
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420)
-            Button("Connection Settings…") { showConfig = true }
+            Button("Retry") { Task { await load() } }
                 .buttonStyle(.borderedProminent)
         }
         .padding()
@@ -117,81 +105,29 @@ struct LibraryView: View {
         .disabled(loading)
     }
 
-    private var connectionButton: some View {
-        Button { showConfig = true } label: {
-            Label("Connection", systemImage: "network")
-        }
-    }
-
-    private var connectionSheet: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    LabeledContent("Host") { Text(host.address) }
-                    TextField("Management port", text: $portText)
-                        #if !os(macOS)
-                        .keyboardType(.numberPad)
-                        #endif
-                    TextField("Management token", text: $tokenText)
-                        .autocorrectionDisabled(true)
-                        #if !os(macOS)
-                        .textInputAutocapitalization(.never)
-                        #endif
-                } header: {
-                    Text("Management API")
-                } footer: {
-                    Text("The host must expose its management API on the LAN: "
-                        + "`serve --mgmt-bind 0.0.0.0 --mgmt-token <token>`. The default port "
-                        + "is \(punktfunkDefaultMgmtPort). Enter the same token here.")
-                }
-            }
-            .navigationTitle("Library Connection")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
-                        let port = UInt16(portText) ?? punktfunkDefaultMgmtPort
-                        store.setMgmt(host.id, port: port, token: tokenText)
-                        showConfig = false
-                        Task { await load() }
-                    }
-                }
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { showConfig = false }
-                }
-            }
-        }
-    }
-
-    private func seedForm() {
-        // Always reflect the latest saved values (the host snapshot may predate a setMgmt).
-        let current = store.hosts.first { $0.id == host.id } ?? host
-        portText = String(current.effectiveMgmtPort)
-        tokenText = current.mgmtToken ?? ""
-    }
-
     private func load() async {
         loading = true
         errorText = nil
         let current = store.hosts.first { $0.id == host.id } ?? host
+        // mTLS uses this client's persistent identity (the host paired it over QUIC). No identity
+        // yet → the user hasn't connected/paired, which is also when there's nothing to browse.
+        guard let identity = (try? ClientIdentityStore.shared.load())?.identity else {
+            games = []
+            errorText = "Connect to this host once first — the library uses the identity created "
+                + "on pairing to authenticate."
+            loading = false
+            return
+        }
         do {
             games = try await LibraryClient.fetch(
                 address: current.address,
                 port: current.effectiveMgmtPort,
-                token: current.mgmtToken)
+                certPEM: identity.certPEM,
+                keyPEM: identity.keyPEM,
+                hostFingerprint: current.pinnedSHA256)
         } catch {
             games = []
-            if let libError = error as? LibraryError {
-                errorText = libError.errorDescription
-                // Token rejected — drop the user straight into the connection form.
-                if case .unauthorized = libError { showConfig = true }
-            } else {
-                errorText = error.localizedDescription
-            }
-            // No credential entered yet → also straight to setup.
-            if current.mgmtToken == nil { showConfig = true }
+            errorText = (error as? LibraryError)?.errorDescription ?? error.localizedDescription
         }
         loading = false
     }
