@@ -23,10 +23,12 @@ private final class ProbeToken: @unchecked Sendable {
 /// What the host is asked to burst: the host's full probe ceiling (it clamps to ≤ 3 Gbps),
 /// so the measurement surfaces the link's real ceiling instead of an artificial cap —
 /// bursting ABOVE what the link can carry is how the probe finds where delivery falls off.
-/// Two seconds rides out scheduler jitter. File-scope so the detached probe task reads them
-/// without crossing into the view's main actor.
+/// Five seconds (was 2 s) averages out the scheduler/recv jitter that made a short probe swing
+/// wildly (50 vs 900 Mbps on the same link) — long enough for the host's steady-state send and
+/// the client's recv drain to settle. File-scope so the detached probe task reads them without
+/// crossing into the view's main actor.
 private let probeTargetKbps: UInt32 = 3_000_000
-private let probeDurationMs: UInt32 = 2_000
+private let probeDurationMs: UInt32 = 5_000
 
 struct SpeedTestSheet: View {
     @Environment(\.dismiss) private var dismiss

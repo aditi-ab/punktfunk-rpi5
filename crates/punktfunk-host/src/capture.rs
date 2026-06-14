@@ -165,6 +165,12 @@ pub struct FastSyntheticCapturer {
     height: u32,
     frame_idx: u64,
     buf: Vec<u8>,
+    /// PUNKTFUNK_SYNTH_NOISE: every frame is fresh high-entropy noise NVENC can't compress or
+    /// predict, so the encoder hits its (CBR) bitrate target — a throughput test of the real
+    /// encode→FEC→send→recv path. The default flat/band content compresses to ~nothing, so it
+    /// can't generate real Mbps (the encoder is content-driven). xorshift over u64 chunks.
+    noise: bool,
+    rng: u64,
 }
 
 impl FastSyntheticCapturer {
@@ -175,20 +181,38 @@ impl FastSyntheticCapturer {
             height,
             frame_idx: 0,
             buf: vec![0u8; width as usize * height as usize * 4],
+            noise: std::env::var_os("PUNKTFUNK_SYNTH_NOISE").is_some(),
+            rng: 0x9e3779b97f4a7c15,
         }
     }
 }
 
 impl Capturer for FastSyntheticCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
-        let (w, h) = (self.width as usize, self.height as usize);
-        let row = w * 4;
-        let shade = (self.frame_idx % 256) as u8;
-        self.buf.fill(shade);
-        let band_h = (h / 20).max(1);
-        let band_y = (self.frame_idx as usize * 6) % h;
-        for y in band_y..(band_y + band_h).min(h) {
-            self.buf[y * row..(y + 1) * row].fill(0xff);
+        if self.noise {
+            // Fresh, every-frame-decorrelated noise: reseed from the frame index so consecutive
+            // frames share no structure (forces large P-frames too, not just the keyframe).
+            let mut s = self
+                .rng
+                .wrapping_add(self.frame_idx.wrapping_mul(0x2545F491_4F6CDD1D))
+                | 1;
+            for c in self.buf.chunks_exact_mut(8) {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                c.copy_from_slice(&s.to_le_bytes());
+            }
+            self.rng = s;
+        } else {
+            let (w, h) = (self.width as usize, self.height as usize);
+            let row = w * 4;
+            let shade = (self.frame_idx % 256) as u8;
+            self.buf.fill(shade);
+            let band_h = (h / 20).max(1);
+            let band_y = (self.frame_idx as usize * 6) % h;
+            for y in band_y..(band_y + band_h).min(h) {
+                self.buf[y * row..(y + 1) * row].fill(0xff);
+            }
         }
         self.frame_idx += 1;
         Ok(CapturedFrame {

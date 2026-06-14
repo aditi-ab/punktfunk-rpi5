@@ -108,10 +108,14 @@ fn send_one_gso(fd: libc::c_int, buf: &[u8], gso_size: u16) -> std::io::Result<(
     Ok(())
 }
 
-/// Apple (macOS/iOS) batched-receive enable state. Darwin has no `recvmmsg(2)`, so our macOS client
-/// does one `recv` per packet (non-allocating, but a syscall each); `recvmsg_x(2)` is the batched
-/// equivalent. Opt-in via `PUNKTFUNK_RECVMSG_X` (it's FFI we can't exercise off-Apple — the scalar
-/// recv-loop is the tested default), with auto-fallback if the syscall ever errors unexpectedly.
+/// Apple (macOS/iOS) batched-receive enable state. Darwin has no `recvmmsg(2)`, so without this our
+/// macOS client does one `recv` syscall per packet — at a few hundred Mbps that's ~40-90k syscalls/s
+/// on one core, and when the recv loop can't drain fast enough the kernel socket buffer backs up and
+/// drops, which the client sees as a sustained stream stalling/freezing around 300-400 Mbps.
+/// `recvmsg_x(2)` is the batched equivalent (the recv counterpart of Linux `recvmmsg`), cutting the
+/// syscall rate ~30x. **Default ON** (the multi-Gbps Mac path); the `swift test` loopback on the
+/// Apple CI runner exercises it, and it auto-falls-back to the scalar loop if the syscall ever errors
+/// unexpectedly. Set `PUNKTFUNK_RECVMSG_X=0` to force the scalar fallback.
 #[cfg(target_vendor = "apple")]
 mod recvx {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -122,7 +126,10 @@ mod recvx {
             1 => true,
             2 => false,
             _ => {
-                let on = std::env::var_os("PUNKTFUNK_RECVMSG_X").is_some();
+                // On unless explicitly disabled with PUNKTFUNK_RECVMSG_X=0.
+                let on = std::env::var("PUNKTFUNK_RECVMSG_X")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
                 STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }
