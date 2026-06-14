@@ -36,10 +36,10 @@ enum CtrlRequest {
 }
 
 /// What the worker reports to [`NativeClient::connect`] once the handshake lands: the negotiated
-/// mode, the host-resolved gamepad backend, the host's certificate fingerprint, the resolved
-/// encoder bitrate (kbps), and the host↔client clock offset (ns, host minus client; 0 = no skew
-/// correction / an old host that didn't answer the handshake).
-type Negotiated = (Mode, GamepadPref, [u8; 32], u32, i64);
+/// mode, the host-resolved compositor backend, the host-resolved gamepad backend, the host's
+/// certificate fingerprint, the resolved encoder bitrate (kbps), and the host↔client clock offset
+/// (ns, host minus client; 0 = no skew correction / an old host that didn't answer the handshake).
+type Negotiated = (Mode, CompositorPref, GamepadPref, [u8; 32], u32, i64);
 
 /// Accumulated state of an in-flight / finished speed test. The data-plane pump folds each
 /// received [`FLAG_PROBE`] access unit in; the control task records the host's [`ProbeResult`]
@@ -135,6 +135,10 @@ pub struct NativeClient {
     /// SHA-256 fingerprint of the certificate the host actually presented. A TOFU caller
     /// (`pin = None`) persists this and passes it as the pin from then on.
     pub host_fingerprint: [u8; 32],
+    /// The compositor backend the host actually resolved for this session ([`Welcome::compositor`]).
+    /// `Auto` = an older host that didn't say. Clients use it for compositor-specific behavior (e.g.
+    /// drawing a client-side cursor by default on gamescope, whose capture carries no cursor).
+    pub resolved_compositor: CompositorPref,
     /// The virtual gamepad backend the host actually resolved ([`Welcome::gamepad`]).
     /// `Auto` = an older host that didn't say (assume X-Box 360, no DualSense feedback).
     pub resolved_gamepad: GamepadPref,
@@ -228,15 +232,21 @@ impl NativeClient {
             })
             .map_err(PunktfunkError::Io)?;
 
-        let (negotiated, resolved_gamepad, fingerprint, resolved_bitrate_kbps, clock_offset_ns) =
-            match ready_rx.recv_timeout(timeout) {
-                Ok(Ok(t)) => t,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    shutdown.store(true, Ordering::SeqCst);
-                    return Err(PunktfunkError::Timeout);
-                }
-            };
+        let (
+            negotiated,
+            resolved_compositor,
+            resolved_gamepad,
+            fingerprint,
+            resolved_bitrate_kbps,
+            clock_offset_ns,
+        ) = match ready_rx.recv_timeout(timeout) {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                shutdown.store(true, Ordering::SeqCst);
+                return Err(PunktfunkError::Timeout);
+            }
+        };
         *mode_slot.lock().unwrap() = negotiated;
         Ok(NativeClient {
             frames: Mutex::new(frame_rx),
@@ -252,6 +262,7 @@ impl NativeClient {
             worker: Some(worker),
             mode: mode_slot,
             host_fingerprint: fingerprint,
+            resolved_compositor,
             resolved_gamepad,
             resolved_bitrate_kbps,
             clock_offset_ns,
@@ -661,6 +672,7 @@ async fn worker_main(args: WorkerArgs) {
             send,
             recv,
             welcome.mode,
+            welcome.compositor,
             welcome.gamepad,
             fingerprint,
             welcome.bitrate_kbps,
@@ -674,6 +686,7 @@ async fn worker_main(args: WorkerArgs) {
         mut ctrl_send,
         mut ctrl_recv,
         negotiated,
+        resolved_compositor,
         resolved_gamepad,
         fingerprint,
         resolved_bitrate_kbps,
@@ -687,6 +700,7 @@ async fn worker_main(args: WorkerArgs) {
     };
     let _ = ready_tx.send(Ok((
         negotiated,
+        resolved_compositor,
         resolved_gamepad,
         fingerprint,
         resolved_bitrate_kbps,

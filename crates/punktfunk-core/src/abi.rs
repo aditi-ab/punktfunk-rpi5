@@ -1294,6 +1294,35 @@ pub unsafe extern "C" fn punktfunk_connection_gamepad(
     })
 }
 
+/// The compositor backend the host actually resolved for this session (one of the
+/// `PUNKTFUNK_COMPOSITOR_*` values; the `Welcome`'s echo of the [`punktfunk_connect_ex`]
+/// preference). `PUNKTFUNK_COMPOSITOR_AUTO` = an older host that didn't say. Clients use it for
+/// compositor-specific behavior — e.g. a client-side cursor by default on
+/// `PUNKTFUNK_COMPOSITOR_GAMESCOPE`, whose PipeWire capture carries no cursor. Safe any time after
+/// connect.
+///
+/// # Safety
+/// `c` is a valid connection handle; `compositor` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_compositor(
+    c: *const PunktfunkConnection,
+    compositor: *mut u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        unsafe {
+            if !compositor.is_null() {
+                *compositor = c.inner.resolved_compositor.to_u8() as u32;
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// The video encoder bitrate (kilobits per second) the host actually configured for this session
 /// — the [`punktfunk_connect_ex3`] request clamped to the host's range, or its default when `0`
 /// was requested. `0` = an older host that didn't report it. Safe any time after connect.

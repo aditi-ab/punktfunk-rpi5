@@ -802,6 +802,19 @@ PunktfunkStatus punktfunk_connection_gamepad(const PunktfunkConnection *c, uint3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// The compositor backend the host actually resolved for this session (one of the
+// `PUNKTFUNK_COMPOSITOR_*` values; the `Welcome`'s echo of the [`punktfunk_connect_ex`]
+// preference). `PUNKTFUNK_COMPOSITOR_AUTO` = an older host that didn't say. Clients use it for
+// compositor-specific behavior — e.g. a client-side cursor by default on
+// `PUNKTFUNK_COMPOSITOR_GAMESCOPE`, whose PipeWire capture carries no cursor. Safe any time after
+// connect.
+//
+// # Safety
+// `c` is a valid connection handle; `compositor` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_compositor(const PunktfunkConnection *c, uint32_t *compositor);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // The video encoder bitrate (kilobits per second) the host actually configured for this session
 // — the [`punktfunk_connect_ex3`] request clamped to the host's range, or its default when `0`
 // was requested. `0` = an older host that didn't report it. Safe any time after connect.
