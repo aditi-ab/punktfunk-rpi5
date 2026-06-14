@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
-import { Activity, Server, Users, KeyRound, Settings, Radio } from 'lucide-react'
+import { Activity, Server, Users, KeyRound, LibraryBig, Settings, Radio } from 'lucide-react'
 import { m } from '@/paraglide/messages'
 import { useLocale, changeLocale, locales, type Locale } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils'
 const NAV = [
   { to: '/', icon: Activity, label: () => m.nav_dashboard() },
   { to: '/host', icon: Server, label: () => m.nav_host() },
+  { to: '/library', icon: LibraryBig, label: () => m.nav_library() },
   { to: '/clients', icon: Users, label: () => m.nav_clients() },
   { to: '/pairing', icon: KeyRound, label: () => m.nav_pairing() },
   { to: '/settings', icon: Settings, label: () => m.nav_settings() },
