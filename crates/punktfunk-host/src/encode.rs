@@ -60,6 +60,20 @@ impl Codec {
             Codec::H265 | Codec::Av1 => 8192,
         }
     }
+
+    /// The codec's *spec* top level/tier bitrate (bits/s) — the usual boundary at which NVENC
+    /// starts rejecting `avcodec_open2` with EINVAL. NOT a hard cap: [`open_video`](crate::encode::
+    /// open_video) probes the actual GPU ceiling by stepping DOWN from the requested bitrate only on
+    /// EINVAL, and uses this purely as the first step-down candidate (so a card that accepts more —
+    /// an RTX 5070 Ti does >1 Gbps HEVC where a 4090 caps at ~800 Mbps — is never clamped to it).
+    /// HEVC Level 6.2 High tier = 800 Mbps; H.264 High level 6.2 ≈ 480 Mbps; AV1's levels allow more.
+    pub fn max_bitrate_bps(self) -> u64 {
+        match self {
+            Codec::H264 => 480_000_000,
+            Codec::H265 => 800_000_000,
+            Codec::Av1 => 1_200_000_000,
+        }
+    }
 }
 
 /// Validate a requested encode resolution before we allocate buffers or open NVENC. Rejects
@@ -100,8 +114,46 @@ pub fn open_video(
     validate_dimensions(codec, width, height)?;
     #[cfg(target_os = "linux")]
     {
-        let enc = linux::NvencEncoder::open(codec, format, width, height, fps, bitrate_bps, cuda)?;
-        Ok(Box::new(enc) as Box<dyn Encoder>)
+        // Identify THIS GPU's real max encode bitrate by probing instead of hard-capping every
+        // build. NVENC rejects `avcodec_open2` with EINVAL when the bitrate exceeds what any codec
+        // level can express, and that ceiling is GPU/driver-specific (an RTX 4090 caps HEVC at
+        // ~800 Mbps; an RTX 5070 Ti accepts >1 Gbps). So open at the requested rate first and step
+        // down ONLY if this GPU refuses it — each GPU then runs at its own actual maximum, and a
+        // capable card is never clamped to a conservative guess. The codec's theoretical level
+        // ceiling is just the first step-down candidate (the usual boundary), not a blind cap.
+        const MIN_PROBE_BPS: u64 = 50_000_000;
+        let mut candidates = vec![bitrate_bps];
+        let cap = codec.max_bitrate_bps();
+        if cap < bitrate_bps {
+            candidates.push(cap);
+        }
+        let mut b = bitrate_bps.min(cap);
+        while b > MIN_PROBE_BPS {
+            b = b * 3 / 4;
+            candidates.push(b);
+        }
+        let mut last: Option<anyhow::Error> = None;
+        for (i, &b) in candidates.iter().enumerate() {
+            match linux::NvencEncoder::open(codec, format, width, height, fps, b, cuda) {
+                Ok(enc) => {
+                    if i > 0 {
+                        tracing::warn!(
+                            requested_mbps = bitrate_bps / 1_000_000,
+                            opened_mbps = b / 1_000_000,
+                            codec = codec.nvenc_name(),
+                            "this GPU's NVENC refused the requested bitrate (EINVAL) — opened at the \
+                             highest rate it accepts; request AV1 or a lower bitrate for more"
+                        );
+                    }
+                    return Ok(Box::new(enc) as Box<dyn Encoder>);
+                }
+                // EINVAL = above this GPU's level ceiling → step down. Any other failure (no GPU,
+                // bad mode, OOM) is real — surface it rather than masking it with bitrate retries.
+                Err(e) if format!("{e:#}").contains("Invalid argument") => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("encoder open failed at every probed bitrate")))
     }
     #[cfg(not(target_os = "linux"))]
     {
