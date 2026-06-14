@@ -1,0 +1,98 @@
+# Maintainer: unom <noreply@anthropic.com>
+#
+# Arch Linux / SteamOS package for the punktfunk streaming HOST. Mirrors the artifact
+# set of packaging/rpm/punktfunk.spec and packaging/debian/build-deb.sh exactly.
+#
+# Two build modes:
+#   - AUR / standalone:  makepkg in this dir (fetches the git tag below).
+#   - In-tree / CI:       PF_SRCDIR=$(git rev-parse --show-toplevel) makepkg --holdver
+#                         (builds the working tree instead of the tagged source — see build()).
+#
+# IMPORTANT: encode is NVENC-only (crates/punktfunk-host/src/encode/linux.rs). This package is
+# functional on NVIDIA hosts (nvidia-utils + Arch's NVENC-enabled ffmpeg). On an AMD Steam Deck
+# it installs but CANNOT encode until a VAAPI (hevc_vaapi) backend exists — see packaging/arch/README.md.
+pkgname=punktfunk-host
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="Low-latency desktop/game streaming host (Moonlight-compatible + punktfunk/1)"
+arch=('x86_64')
+url="https://git.unom.io/unom/punktfunk"
+license=('MIT OR Apache-2.0')
+
+# Runtime libs the binary links or drives. NVENC + GPU EGL/CUDA come from the NVIDIA driver
+# (nvidia-utils) — kept an optdepend, never a hard dep, exactly as the RPM (__requires_exclude
+# libcuda) and deb (shlibdeps grep-filter) do: the driver is installed out of band.
+depends=(
+  'ffmpeg'          # libavcodec/format/util — Arch's ffmpeg ships hevc_nvenc/av1_nvenc
+  'pipewire'        # capture + audio transport
+  'pipewire-pulse'  # desktop audio bridge
+  'wireplumber'     # PipeWire session manager
+  'opus'            # GameStream/punktfunk Opus audio
+  'libei'           # input injection (RemoteDesktop portal / EIS)
+  'mesa'            # libgbm (+ EGL on non-NVIDIA)
+  'libglvnd'        # libGL/libEGL loader
+  'libxkbcommon'    # virtual keyboard keymap
+  'wayland'         # wayland-client (vdisplay backends)
+)
+optdepends=(
+  'nvidia-utils: NVENC hardware encode + GPU EGL/CUDA zero-copy (REQUIRED to encode on NVIDIA)'
+  'gamescope: per-session nested compositor backend (no desktop login needed) — needs >=3.16.22'
+  'kwin: stream a KDE Plasma desktop (kwin VirtualDisplay backend)'
+  'mutter: stream a GNOME desktop (Mutter RecordVirtual backend)'
+  'sway: stream a wlroots desktop (Sway VirtualDisplay backend)'
+  'xdg-desktop-portal-kde: portal for the headless KDE session helper'
+  'xdg-desktop-portal-wlr: portal for the headless Sway session helper'
+)
+makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pkgconf' 'git')
+
+# AUR source (a tagged release). For an in-tree CI build, set PF_SRCDIR to the repo root and
+# build() uses it instead; see the README.
+source=("git+https://git.unom.io/unom/punktfunk.git#tag=v${pkgver}")
+sha256sums=('SKIP')
+install="${pkgname}.install"
+
+_repo() { printf '%s' "${PF_SRCDIR:-$srcdir/punktfunk}"; }
+
+build() {
+  cd "$(_repo)"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR="$srcdir/target"
+  # The zero-copy FFI link-needs libcuda at build time; nvidia-utils provides it on an NVIDIA
+  # builder. On a GPU-less builder, symlink the CUDA stub into the link path first (same caveat
+  # the RPM documents): ln -s "$(find / -name libcuda.so -path '*stubs*' | head -1)" /usr/lib/
+  cargo build --release --locked -p punktfunk-host
+}
+
+package() {
+  local R; R="$(_repo)"; local T="$srcdir/target/release"
+
+  install -Dm0755 "$T/punktfunk-host"                 "$pkgdir/usr/bin/punktfunk-host"
+
+  # /dev/uinput + /dev/uhid -> input group (virtual gamepads + DualSense UHID)
+  install -Dm0644 "$R/scripts/60-punktfunk.rules"     "$pkgdir/usr/lib/udev/rules.d/60-punktfunk.rules"
+  # 32 MB UDP socket buffers (send-side headroom at high bitrate)
+  install -Dm0644 "$R/scripts/99-punktfunk-net.conf"  "$pkgdir/usr/lib/sysctl.d/99-punktfunk-net.conf"
+
+  # systemd USER units (the host runs in the graphical session, not as root); the source units
+  # point at the dev tree — repoint ExecStart at the installed paths (mirrors rpm/deb).
+  install -Dm0644 "$R/scripts/punktfunk-host.service" "$pkgdir/usr/lib/systemd/user/punktfunk-host.service"
+  sed -i 's#%h/punktfunk/target/release/punktfunk-host#/usr/bin/punktfunk-host#' \
+    "$pkgdir/usr/lib/systemd/user/punktfunk-host.service"
+  install -Dm0644 "$R/scripts/punktfunk-kde-session.service" "$pkgdir/usr/lib/systemd/user/punktfunk-kde-session.service" 2>/dev/null || true
+  [ -f "$pkgdir/usr/lib/systemd/user/punktfunk-kde-session.service" ] && \
+    sed -i 's#%h/punktfunk/scripts/headless/run-headless-kde.sh#/usr/share/punktfunk/headless/run-headless-kde.sh#' \
+      "$pkgdir/usr/lib/systemd/user/punktfunk-kde-session.service"
+
+  # headless session helpers + env templates + OpenAPI doc
+  install -Dm0755 "$R/scripts/headless/run-headless-kde.sh"  "$pkgdir/usr/share/punktfunk/headless/run-headless-kde.sh"
+  install -Dm0755 "$R/scripts/headless/run-headless-sway.sh" "$pkgdir/usr/share/punktfunk/headless/run-headless-sway.sh"
+  install -Dm0644 "$R/scripts/headless/kde-authorized"       "$pkgdir/usr/share/punktfunk/headless/kde-authorized"
+  install -Dm0644 "$R/scripts/headless/punktfunk-sink.conf"  "$pkgdir/usr/share/punktfunk/headless/punktfunk-sink.conf"
+  install -Dm0644 "$R/scripts/host.env.example"              "$pkgdir/usr/share/punktfunk/host.env.example"
+  install -Dm0644 "$R/packaging/bazzite/host.env"            "$pkgdir/usr/share/punktfunk/host.env.bazzite"
+  install -Dm0644 "$R/packaging/kde/host.env"                "$pkgdir/usr/share/punktfunk/host.env.kde"
+  install -Dm0644 "$R/docs/api/openapi.json"                 "$pkgdir/usr/share/punktfunk/openapi.json"
+
+  install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+  install -Dm0644 "$R/README.md"      "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

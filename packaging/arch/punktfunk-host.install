@@ -1,0 +1,25 @@
+# pacman install scriptlet — mirrors the RPM %post / deb postinst.
+post_install() {
+  udevadm control --reload-rules 2>/dev/null || true
+  udevadm trigger --subsystem-match=misc 2>/dev/null || true
+  # Apply the UDP socket-buffer tuning now (also auto-applied at boot by systemd-sysctl).
+  sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
+  cat <<'MSG'
+punktfunk-host installed.
+  1. Add yourself to the 'input' group for virtual gamepads:
+       sudo usermod -aG input "$USER"     # then re-login
+  2. Pick a backend config (gamescope is the no-desktop default on SteamOS/Deck):
+       mkdir -p ~/.config/punktfunk
+       cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env
+  3. Enable the host:
+       systemctl --user enable --now punktfunk-host
+
+NOTE: encode is NVENC-only. Install 'nvidia-utils' on an NVIDIA host. An AMD Steam Deck is NOT
+      yet supported — it needs a VAAPI (hevc_vaapi) encoder backend (see packaging/arch/README.md).
+MSG
+}
+
+post_upgrade() {
+  udevadm control --reload-rules 2>/dev/null || true
+  sysctl -p /usr/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || true
+}
