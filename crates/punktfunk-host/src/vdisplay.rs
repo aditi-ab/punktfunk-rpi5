@@ -144,7 +144,262 @@ pub fn available() -> Vec<Compositor> {
     }
 }
 
-/// Detect the compositor to drive: `PUNKTFUNK_COMPOSITOR` override, else `XDG_CURRENT_DESKTOP`.
+/// The kind of graphical session live for our uid *right now* — the basis for per-connect backend
+/// selection on a box that flips between Steam Gaming Mode and a KDE/GNOME desktop (Bazzite,
+/// SteamOS). Detected by probing which compositor process is actually running, not by a static
+/// env var, so the host follows the box as the user switches sessions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveKind {
+    /// A `gamescope` session is live (Steam Gaming Mode / `gamescope-session-plus`).
+    Gaming,
+    /// A KWin / Plasma desktop is live.
+    DesktopKde,
+    /// A GNOME / Mutter desktop is live.
+    DesktopGnome,
+    /// A wlroots (Sway / Hyprland) desktop is live.
+    DesktopWlroots,
+    /// No recognized graphical session is running for our uid.
+    None,
+}
+
+/// The session environment that points a backend at the [detected](detect_active_session) active
+/// session: the Wayland socket (for the Wayland-protocol backends), the runtime dir + session bus
+/// (for PipeWire capture + D-Bus / portal input), and the desktop name (for portal routing). The
+/// host serves one session at a time, so [`apply_session_env`] writes these into the process env
+/// per connect and every backend that reads them then opens against the live session.
+#[derive(Clone, Debug, Default)]
+pub struct SessionEnv {
+    /// `WAYLAND_DISPLAY` of the live compositor (`None` for Gaming-attach / Mutter, which are
+    /// PipeWire-node / D-Bus driven and don't talk Wayland to us).
+    pub wayland_display: Option<String>,
+    /// `/run/user/<uid>` — the trustworthy anchor (the default PipeWire daemon + bus live here).
+    pub xdg_runtime_dir: String,
+    /// `DBUS_SESSION_BUS_ADDRESS` (defaults to `unix:path=<runtime>/bus`).
+    pub dbus_session_bus_address: String,
+    /// `XDG_CURRENT_DESKTOP` to advertise (KDE/GNOME/sway/gamescope) — drives portal/EIS routing.
+    pub xdg_current_desktop: Option<String>,
+}
+
+/// The live session: its [`ActiveKind`] plus the [`SessionEnv`] to target it.
+pub struct ActiveSession {
+    pub kind: ActiveKind,
+    pub env: SessionEnv,
+}
+
+impl ActiveSession {
+    /// A "nothing live" result carrying just the runtime-dir anchor.
+    fn none() -> ActiveSession {
+        ActiveSession {
+            kind: ActiveKind::None,
+            env: SessionEnv {
+                xdg_runtime_dir: default_runtime_dir(),
+                dbus_session_bus_address: default_bus(&default_runtime_dir()),
+                ..Default::default()
+            },
+        }
+    }
+}
+
+/// The concrete backend that drives a given live-session kind. `None` for [`ActiveKind::None`].
+pub fn compositor_for_kind(kind: ActiveKind) -> Option<Compositor> {
+    match kind {
+        ActiveKind::Gaming => Some(Compositor::Gamescope),
+        ActiveKind::DesktopKde => Some(Compositor::Kwin),
+        ActiveKind::DesktopGnome => Some(Compositor::Mutter),
+        ActiveKind::DesktopWlroots => Some(Compositor::Wlroots),
+        ActiveKind::None => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn default_runtime_dir() -> String {
+    std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+        let uid = unsafe { libc::getuid() };
+        format!("/run/user/{uid}")
+    })
+}
+#[cfg(not(target_os = "linux"))]
+fn default_runtime_dir() -> String {
+    std::env::var("XDG_RUNTIME_DIR").unwrap_or_default()
+}
+
+fn default_bus(runtime: &str) -> String {
+    std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_else(|_| format!("unix:path={runtime}/bus"))
+}
+
+/// Detect the graphical session live for our uid right now (cheap, side-effect-free: a `/proc`
+/// scan plus a runtime-dir socket scan — well under the handshake timeout). The authority is the
+/// running compositor process; a desktop compositor outranks a lingering gamescope. Used to route
+/// each connect to the correct backend, and to derive the [`SessionEnv`] that targets it.
+#[cfg(target_os = "linux")]
+pub fn detect_active_session() -> ActiveSession {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::getuid() };
+    let xdg_runtime_dir = default_runtime_dir();
+    let dbus = default_bus(&xdg_runtime_dir);
+
+    // Process probe: the running graphical compositor of THIS uid decides the kind. Priority lets
+    // a real desktop (kwin/gnome/sway) win over a leftover gamescope child. comm names mirror the
+    // `pkill -x` discipline (exact, ≤15 chars so untruncated).
+    let mut kind = ActiveKind::None;
+    let mut best = 0u8;
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let pid_path = e.path();
+            let Ok(md) = std::fs::metadata(&pid_path) else {
+                continue;
+            };
+            if md.uid() != uid {
+                continue;
+            }
+            let Ok(comm) = std::fs::read_to_string(pid_path.join("comm")) else {
+                continue;
+            };
+            let (k, prio) = match comm.trim() {
+                "gamescope" | "gamescope-wl" => (ActiveKind::Gaming, 1),
+                "kwin_wayland" => (ActiveKind::DesktopKde, 4),
+                "gnome-shell" => (ActiveKind::DesktopGnome, 4),
+                "sway" | "Hyprland" | "hyprland" | "river" => (ActiveKind::DesktopWlroots, 4),
+                _ => continue,
+            };
+            if prio > best {
+                best = prio;
+                kind = k;
+            }
+        }
+    }
+
+    // Wayland-protocol backends (KWin, wlroots) need the live socket; Gaming-attach and Mutter are
+    // node/D-Bus driven and don't.
+    let wayland_display = match kind {
+        ActiveKind::DesktopKde | ActiveKind::DesktopWlroots => {
+            find_wayland_socket(&xdg_runtime_dir, uid)
+        }
+        _ => None,
+    };
+    let xdg_current_desktop = match kind {
+        ActiveKind::DesktopKde => Some("KDE".to_string()),
+        ActiveKind::DesktopGnome => Some("GNOME".to_string()),
+        ActiveKind::DesktopWlroots => Some("sway".to_string()),
+        ActiveKind::Gaming => Some("gamescope".to_string()),
+        ActiveKind::None => None,
+    };
+    ActiveSession {
+        kind,
+        env: SessionEnv {
+            wayland_display,
+            xdg_runtime_dir,
+            dbus_session_bus_address: dbus,
+            xdg_current_desktop,
+        },
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn detect_active_session() -> ActiveSession {
+    ActiveSession::none()
+}
+
+/// Find the live `wayland-*` socket in `runtime` for our uid (skipping `.lock` sidecars). Trust a
+/// valid inherited `WAYLAND_DISPLAY` first; otherwise take the newest-mtime socket we own (a
+/// desktop session normally exposes exactly one).
+#[cfg(target_os = "linux")]
+fn find_wayland_socket(runtime: &str, uid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(w) = std::env::var("WAYLAND_DISPLAY") {
+        if !w.is_empty() {
+            let p = if w.starts_with('/') {
+                std::path::PathBuf::from(&w)
+            } else {
+                std::path::Path::new(runtime).join(&w)
+            };
+            if p.exists() {
+                return Some(w);
+            }
+        }
+    }
+    let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for e in std::fs::read_dir(runtime).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("wayland-") || name.ends_with(".lock") {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        if md.uid() != uid {
+            continue;
+        }
+        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+        cands.push((mtime, name));
+    }
+    cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
+    cands.into_iter().next().map(|(_, n)| n)
+}
+
+/// Write a detected session's [`SessionEnv`] into the process env so every backend (video capture
+/// and input alike) that reads `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` /
+/// `XDG_CURRENT_DESKTOP` at open time targets the live session. The host serves one session at a
+/// time, so a process-global write is sound; the next connect re-detects and re-applies. Same
+/// `set_var` discipline already used for `PUNKTFUNK_GAMESCOPE_APP` on the launch path.
+#[cfg(target_os = "linux")]
+pub fn apply_session_env(active: &ActiveSession) {
+    let e = &active.env;
+    std::env::set_var("XDG_RUNTIME_DIR", &e.xdg_runtime_dir);
+    std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &e.dbus_session_bus_address);
+    if let Some(w) = &e.wayland_display {
+        std::env::set_var("WAYLAND_DISPLAY", w);
+    }
+    if let Some(d) = &e.xdg_current_desktop {
+        std::env::set_var("XDG_CURRENT_DESKTOP", d);
+    }
+    // Mutter on NVIDIA has no working dmabuf capture sync — force SHM there; the KWin/gamescope
+    // tiled/LINEAR paths keep zero-copy.
+    if active.kind == ActiveKind::DesktopGnome {
+        std::env::set_var("PUNKTFUNK_FORCE_SHM", "1");
+    }
+}
+#[cfg(not(target_os = "linux"))]
+pub fn apply_session_env(_active: &ActiveSession) {}
+
+/// Route input to match the chosen video backend (they must not diverge), via the highest-priority
+/// `PUNKTFUNK_INPUT_BACKEND` knob the injector honors. For gamescope, also select **attach** (no
+/// churny host-managed restart) unless the operator explicitly opted into the managed session with
+/// `PUNKTFUNK_GAMESCOPE_MANAGED` — attaching to the running session avoids the per-connect
+/// stop/relaunch that leaked GPU context (the reconnect-black-screen on Bazzite F44).
+#[cfg(target_os = "linux")]
+pub fn apply_input_env(chosen: Compositor) {
+    let backend = match chosen {
+        Compositor::Gamescope => "gamescope",
+        Compositor::Kwin | Compositor::Mutter => "libei",
+        Compositor::Wlroots => "wlr",
+    };
+    std::env::set_var("PUNKTFUNK_INPUT_BACKEND", backend);
+    if chosen == Compositor::Gamescope {
+        // Managed = the operator opted in (new `PUNKTFUNK_GAMESCOPE_MANAGED`, or legacy
+        // `PUNKTFUNK_GAMESCOPE_SESSION` set explicitly). Otherwise ATTACH to the running session.
+        let managed = std::env::var_os("PUNKTFUNK_GAMESCOPE_MANAGED").is_some()
+            || std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_some();
+        if managed {
+            if std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_none() {
+                std::env::set_var("PUNKTFUNK_GAMESCOPE_SESSION", "steam");
+            }
+            std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE");
+        } else {
+            std::env::remove_var("PUNKTFUNK_GAMESCOPE_SESSION");
+            std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto");
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+pub fn apply_input_env(_chosen: Compositor) {}
+
+/// Detect the compositor to drive: explicit `PUNKTFUNK_COMPOSITOR` override (legacy / CI / forcing
+/// a backend for a test), else the **live session** ([`detect_active_session`] — so a Bazzite box
+/// follows Gaming↔Desktop switches), else a last-resort `XDG_CURRENT_DESKTOP` read.
 pub fn detect() -> Result<Compositor> {
     if let Ok(v) = std::env::var("PUNKTFUNK_COMPOSITOR") {
         return match v.trim().to_ascii_lowercase().as_str() {
@@ -158,6 +413,10 @@ pub fn detect() -> Result<Compositor> {
                 )
             }
         };
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(c) = compositor_for_kind(detect_active_session().kind) {
+        return Ok(c);
     }
     let desktop = std::env::var("XDG_CURRENT_DESKTOP")
         .unwrap_or_default()
@@ -173,7 +432,8 @@ pub fn detect() -> Result<Compositor> {
         Ok(Compositor::Wlroots)
     } else {
         anyhow::bail!(
-            "could not detect compositor from XDG_CURRENT_DESKTOP='{desktop}'; set PUNKTFUNK_COMPOSITOR"
+            "could not detect compositor: no live graphical session for this uid and \
+             XDG_CURRENT_DESKTOP='{desktop}'; set PUNKTFUNK_COMPOSITOR"
         )
     }
 }
@@ -245,3 +505,45 @@ mod kwin;
 mod mutter;
 #[cfg(target_os = "linux")]
 mod wlroots;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_kind_maps_to_its_backend() {
+        assert_eq!(
+            compositor_for_kind(ActiveKind::Gaming),
+            Some(Compositor::Gamescope)
+        );
+        assert_eq!(
+            compositor_for_kind(ActiveKind::DesktopKde),
+            Some(Compositor::Kwin)
+        );
+        assert_eq!(
+            compositor_for_kind(ActiveKind::DesktopGnome),
+            Some(Compositor::Mutter)
+        );
+        assert_eq!(
+            compositor_for_kind(ActiveKind::DesktopWlroots),
+            Some(Compositor::Wlroots)
+        );
+        // No live session → no backend; the caller turns this into a handshake error / fallback.
+        assert_eq!(compositor_for_kind(ActiveKind::None), None);
+    }
+
+    #[test]
+    fn detect_active_session_is_side_effect_free_and_terminates() {
+        // A pure probe of /proc + the runtime dir: it must not panic and must return promptly on
+        // any box (CI has no graphical session → ActiveKind::None, with the runtime-dir anchor).
+        let a = detect_active_session();
+        assert!(!a.env.xdg_runtime_dir.is_empty());
+        // Wayland sockets are only resolved for the Wayland-protocol desktops.
+        if matches!(
+            a.kind,
+            ActiveKind::Gaming | ActiveKind::DesktopGnome | ActiveKind::None
+        ) {
+            assert!(a.env.wayland_display.is_none());
+        }
+    }
+}

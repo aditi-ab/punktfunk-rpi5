@@ -1499,11 +1499,32 @@ fn pick_compositor(
 /// async reactor (`spawn_blocking`).
 fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Compositor> {
     use crate::vdisplay::Compositor;
+    // Explicit operator override (legacy / CI / forcing a backend for a test) wins and is assumed
+    // to come with a hand-set env — don't retarget the process env in that case.
+    let overridden = std::env::var_os("PUNKTFUNK_COMPOSITOR").is_some();
+    let detected = if overridden {
+        crate::vdisplay::detect().ok()
+    } else {
+        // Auto: detect the LIVE session (Gaming vs Desktop) and retarget the process env at it so
+        // every backend (video capture + input) this connect opens against the active session —
+        // this is the state machine that lets one host follow a Bazzite box across Gaming↔Desktop.
+        let active = crate::vdisplay::detect_active_session();
+        crate::vdisplay::apply_session_env(&active);
+        tracing::info!(
+            active = ?active.kind,
+            wayland = active.env.wayland_display.as_deref().unwrap_or("-"),
+            "detected active graphical session"
+        );
+        crate::vdisplay::compositor_for_kind(active.kind)
+    };
     let available = crate::vdisplay::available();
-    let detected = crate::vdisplay::detect().ok();
     let chosen = pick_compositor(pref, &available, detected).ok_or_else(|| {
-        anyhow!("no usable compositor (set PUNKTFUNK_COMPOSITOR or run inside a supported desktop)")
+        anyhow!("no usable compositor (no live graphical session for this uid; set PUNKTFUNK_COMPOSITOR or start a desktop/gaming session)")
     })?;
+    if !overridden {
+        // Point input at the same backend and select gamescope ATTACH (no churny managed restart).
+        crate::vdisplay::apply_input_env(chosen);
+    }
     let avail_ids: Vec<&str> = available.iter().map(|c| c.id()).collect();
     match Compositor::from_pref(pref) {
         Some(want) if want == chosen => {
