@@ -988,21 +988,36 @@ const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_s
 /// sender have dropped (host shutdown), which drops the injector and closes its portal session.
 fn injector_service_thread(rx: std::sync::mpsc::Receiver<InputEvent>) {
     let mut injector: Option<Box<dyn crate::inject::InputInjector>> = None;
+    let mut open_backend: Option<crate::inject::Backend> = None;
     let mut last_failed: Option<std::time::Instant> = None;
     for ev in rx {
+        // The resolved input backend (PUNKTFUNK_INPUT_BACKEND, set per connect by apply_input_env,
+        // also on a mid-stream session switch) may have changed since we opened. Reopen against it
+        // so input FOLLOWS the active session instead of injecting into a stale, still-warm backend
+        // (e.g. the managed gamescope's EIS socket after the user switched to the KDE desktop).
+        let want = crate::inject::default_backend();
+        if injector.is_some() && open_backend != Some(want) {
+            tracing::info!(
+                ?open_backend,
+                ?want,
+                "input: backend changed — reopening injector for the active session"
+            );
+            injector = None;
+            last_failed = None; // re-resolve immediately
+        }
         if injector.is_none() {
             // Open on the first event; after a failure wait out the backoff before retrying (a
             // few events drop during setup — acceptable, input is lossy).
             let ready = last_failed.is_none_or(|t| t.elapsed() >= INJECTOR_REOPEN_BACKOFF);
             if ready {
-                let backend = crate::inject::default_backend();
-                match crate::inject::open(backend) {
+                match crate::inject::open(want) {
                     Ok(i) => {
                         tracing::info!(
-                            ?backend,
+                            backend = ?want,
                             "punktfunk/1 input injector ready (host-lifetime)"
                         );
                         injector = Some(i);
+                        open_backend = Some(want);
                         last_failed = None;
                     }
                     Err(e) => {
@@ -1018,6 +1033,7 @@ fn injector_service_thread(rx: std::sync::mpsc::Receiver<InputEvent>) {
                 // a later event (covers a gamescope EIS socket that respawns with its session).
                 tracing::warn!(error = %format!("{e:#}"), "inject failed — reopening injector");
                 injector = None;
+                open_backend = None;
                 last_failed = Some(std::time::Instant::now());
             }
         }

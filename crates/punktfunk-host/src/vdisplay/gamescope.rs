@@ -266,6 +266,19 @@ fn do_restore_tv_session() {
     }
     stop_session(SESSION_UNIT); // our gamescope/Steam session, so Steam is free for the autologin
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // Only bring the gaming autologin BACK if the box is still meant to be in gaming mode. If the
+    // user switched to a desktop session (KDE/GNOME/wlroots) in the meantime, don't yank them back
+    // to gaming — leave the desktop alone. (We still stopped our idle managed session above.)
+    use super::ActiveKind;
+    if matches!(
+        super::detect_active_session().kind,
+        ActiveKind::DesktopKde | ActiveKind::DesktopGnome | ActiveKind::DesktopWlroots
+    ) {
+        tracing::info!(
+            "gamescope: a desktop session is active — not restoring the TV gaming session"
+        );
+        return;
+    }
     for unit in units {
         let _ = Command::new("systemctl")
             .args(["--user", "start", &unit])
