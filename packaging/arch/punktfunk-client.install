@@ -1,0 +1,19 @@
+# pacman scriptlet for the GTK4 client — mirrors build-client-deb.sh's postinst.
+post_install() {
+  udevadm control --reload-rules 2>/dev/null || true
+  udevadm trigger --subsystem-match=hidraw 2>/dev/null || true
+  update-desktop-database /usr/share/applications 2>/dev/null || true
+  # Apply the 32 MB UDP recv-buffer tuning now (also auto-applied at boot by systemd-sysctl).
+  sysctl -p /usr/lib/sysctl.d/99-punktfunk-client-net.conf >/dev/null 2>&1 || true
+  cat <<'MSG'
+punktfunk-client installed.
+  punktfunk-client                         # GUI: discover hosts on the LAN + connect
+  punktfunk-client --connect HOST[:PORT]   # direct / scripted (this is what the Decky plugin runs)
+On a Steam Deck / AMD box, install 'libva-mesa-driver' for hardware (VAAPI) decode.
+MSG
+}
+
+post_upgrade() {
+  udevadm control --reload-rules 2>/dev/null || true
+  sysctl -p /usr/lib/sysctl.d/99-punktfunk-client-net.conf >/dev/null 2>&1 || true
+}

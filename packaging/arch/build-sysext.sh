@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Wrap a built punktfunk-host pacman package into a systemd-sysext image — the update-survivable
-# way to add the host to an immutable Arch-derived distro (SteamOS 3): the .raw overlays /usr
-# read-only from the writable /var/lib/extensions/, so it persists across A/B OS updates with no
-# `steamos-readonly disable`. Needs `bsdtar`/`tar`, `squashfs-tools` (mksquashfs).
+# Wrap a built punktfunk pacman package into a systemd-sysext image — the update-survivable way to
+# add it to an immutable Arch-derived distro (SteamOS 3): the .raw overlays /usr read-only from the
+# writable /var/lib/extensions/, so it persists across A/B OS updates with no `steamos-readonly
+# disable`. Works for either split package — on a Steam Deck you'd wrap the CLIENT. Needs
+# `bsdtar`/`tar`, `squashfs-tools` (mksquashfs).
 #
-# Usage:  bash build-sysext.sh <punktfunk-host-*.pkg.tar.zst>
-# Output: punktfunk-host.raw
+# Usage:  bash build-sysext.sh <punktfunk-{host,client}-*.pkg.tar.zst>
+# Output: <pkgname>.raw   (e.g. punktfunk-client.raw)
 set -euo pipefail
 
-PKG="${1:?usage: build-sysext.sh <punktfunk-host-*.pkg.tar.zst>}"
+PKG="${1:?usage: build-sysext.sh <punktfunk-{host,client}-*.pkg.tar.zst>}"
 [ -f "$PKG" ] || { echo "no such package: $PKG" >&2; exit 1; }
-NAME=punktfunk-host
+# Derive the package name from the file (pkgname is everything before the -<version>).
+NAME="$(basename "$PKG" | sed -E 's/-[0-9].*//')"
+[ -n "$NAME" ] || { echo "could not derive package name from $PKG" >&2; exit 1; }
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -36,4 +39,8 @@ rm -f "$OUT"
 mksquashfs "$STAGE" "$OUT" -all-root -noappend -quiet
 echo "built $OUT"
 echo "  install:  sudo cp $OUT /var/lib/extensions/ && sudo systemctl enable --now systemd-sysext"
-echo "  then:     systemctl --user enable --now $NAME"
+if [ "$NAME" = "punktfunk-host" ]; then
+  echo "  then:     systemctl --user enable --now punktfunk-host"
+else
+  echo "  then:     run 'punktfunk-client' (or let the Decky plugin launch it)"
+fi

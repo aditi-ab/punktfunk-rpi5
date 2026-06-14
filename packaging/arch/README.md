@@ -1,15 +1,18 @@
 # punktfunk on Arch Linux / SteamOS
 
-Packaging for the punktfunk streaming **host** on Arch and Arch-derived immutable distros
-(SteamOS 3, etc.). Mirrors the artifact set of `packaging/rpm/punktfunk.spec` and
-`packaging/debian/build-deb.sh`.
+Packaging for punktfunk on Arch and Arch-derived immutable distros (SteamOS 3, etc.). The
+`PKGBUILD` is a **split package** producing both **`punktfunk-host`** (the gaming-rig host) and
+**`punktfunk-client`** (the GTK4 couch/Deck client) — mirrors the rpm subpackages
+(`packaging/rpm/punktfunk.spec`) and the two deb build scripts. On a **Steam Deck you want
+`punktfunk-client`** (it's what the [Decky plugin](../../clients/decky/) launches); on a gaming
+rig, `punktfunk-host`.
 
-> ⚠️ **Encode is NVENC-only today.** `crates/punktfunk-host/src/encode/linux.rs` implements
-> `hevc_nvenc`/`av1_nvenc`/`h264_nvenc` and a CUDA zero-copy path — there is **no VAAPI backend**.
-> So this package is functional on **Arch + NVIDIA** (the realistic target). On an **AMD Steam
-> Deck it installs but cannot encode** until a `hevc_vaapi`/`av1_vaapi` encoder is added in
-> `src/encode/` — a code change, not a packaging one. (`bazzite-deck-nvidia`, i.e. SteamOS-style
-> images running on NVIDIA hardware, work fine — they're NVIDIA.)
+> ⚠️ **Host encode is NVENC-only today.** `crates/punktfunk-host/src/encode/linux.rs` implements
+> `hevc_nvenc`/`av1_nvenc`/`h264_nvenc` + a CUDA zero-copy path — there is **no VAAPI encoder**. So
+> `punktfunk-host` works on **Arch + NVIDIA** (incl. `bazzite-deck-nvidia`); an **AMD Deck-as-host**
+> can't encode until a `hevc_vaapi` backend is added (a code change, not packaging). The **client
+> is unaffected** — `punktfunk-client` decodes via **VAAPI on AMD/Intel** (the Deck) with a software
+> fallback, so streaming *to* a Deck works today.
 
 ## Arch Linux (mutable)
 
@@ -64,7 +67,28 @@ systemctl --user enable --now punktfunk-host     # the user unit is now under /u
 The udev rule, sysctl, and systemd **user** unit all live under `/usr/lib`, so the merged sysext
 exposes them. `systemd-sysext refresh` re-merges after a reboot.
 
+## Steam Deck — the client (what the Decky plugin launches)
+
+To stream *to* a Deck, you install **`punktfunk-client`** there — same sysext mechanism, but
+wrapping the client package instead. The split `makepkg` produces both `.pkg.tar.zst` files; on the
+Deck use the client one:
+```sh
+cd packaging/arch && PF_SRCDIR="$(git rev-parse --show-toplevel)" makepkg -f --holdver
+bash build-sysext.sh punktfunk-client-*.pkg.tar.zst        # → punktfunk-client.raw
+# on the Deck:
+sudo cp punktfunk-client.raw /var/lib/extensions/
+sudo systemctl enable --now systemd-sysext
+sudo pacman -S --needed libva-mesa-driver                  # VAAPI hw decode on the Deck's AMD APU
+```
+Now `punktfunk-client` is on `PATH`, so the **[Decky plugin](../../clients/decky/)** finds and
+launches it (`punktfunk-client --connect host:port`) — gamescope composites its video like a game.
+The client needs no `/dev/uinput` or compositor-spawning rights (it captures input and decodes),
+so it's a much lighter sysext than the host.
+
 ## Files
-- `PKGBUILD` — the package recipe (builds the working tree via `PF_SRCDIR`, or a git tag for AUR).
-- `punktfunk-host.install` — pacman scriptlet (udev reload + sysctl + first-run hint), mirrors RPM `%post`.
-- `build-sysext.sh` — wraps a built `.pkg.tar.zst` into a `systemd-sysext` `.raw` for SteamOS.
+- `PKGBUILD` — split package: `punktfunk-host` + `punktfunk-client` (builds the working tree via
+  `PF_SRCDIR`, or a git tag for AUR).
+- `punktfunk-host.install` / `punktfunk-client.install` — pacman scriptlets (udev reload + sysctl +
+  first-run hint), mirror the RPM `%post` / deb postinst.
+- `build-sysext.sh` — wraps either built `.pkg.tar.zst` into a `systemd-sysext` `.raw` for SteamOS
+  (derives the name from the package, so it works for host or client).
