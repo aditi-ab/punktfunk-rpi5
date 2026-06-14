@@ -9,6 +9,9 @@ import SwiftUI
 struct LibraryView: View {
     @ObservedObject var store: HostStore
     let host: StoredHost
+    /// Tapping a title starts a session that asks the host to launch it (the library id is passed
+    /// through). `nil` ⇒ browse-only (cards aren't tappable).
+    var onLaunch: ((String) -> Void)? = nil
 
     @State private var games: [GameEntry] = []
     @State private var loading = false
@@ -59,7 +62,12 @@ struct LibraryView: View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 18) {
                 ForEach(games) { game in
-                    GameCard(game: game)
+                    if let onLaunch {
+                        Button { onLaunch(game.id) } label: { GameCard(game: game) }
+                            .buttonStyle(.plain)
+                    } else {
+                        GameCard(game: game)
+                    }
                 }
             }
             .padding()

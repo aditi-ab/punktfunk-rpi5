@@ -412,9 +412,9 @@ struct SettingsView: View {
                 Text("Experimental")
             } footer: {
                 Text("Adds a “Browse Library…” action to each host that lists its games "
-                    + "(Steam + custom) via the host's management API. The host must expose that "
-                    + "API on the LAN with a token (serve --mgmt-bind 0.0.0.0 --mgmt-token …). "
-                    + "Browsing only for now — launching a title comes later.")
+                    + "(Steam + custom) via the host's management API; tap a title to launch it. "
+                    + "The host must expose that API on the LAN with a token "
+                    + "(serve --mgmt-bind 0.0.0.0 --mgmt-token …).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

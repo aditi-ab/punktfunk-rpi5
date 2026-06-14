@@ -24,6 +24,8 @@ struct HomeView: View {
     let connectDiscovered: (DiscoveredHost) -> Void
     /// Pairing succeeded (tvOS PairSheet route) — pin + connect (ContentView guards staleness).
     let onPaired: (StoredHost, Data) -> Void
+    /// Picked a title in the (experimental) library — start a session that launches it.
+    let onLaunchTitle: (StoredHost, String) -> Void
     /// Experimental game-library browser (gated) — the host-card "Browse Library…" action.
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
 
@@ -85,7 +87,7 @@ struct HomeView: View {
                 SpeedTestSheet(host: host)
             }
             .navigationDestination(item: $libraryTarget) { host in
-                LibraryView(store: store, host: host)
+                LibraryView(store: store, host: host, onLaunch: { onLaunchTitle(host, $0) })
             }
             #endif
             #if !os(tvOS)

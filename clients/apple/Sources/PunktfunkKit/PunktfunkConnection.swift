@@ -242,26 +242,31 @@ public final class PunktfunkConnection {
         compositor: Compositor = .auto,
         gamepad: GamepadType = .auto,
         bitrateKbps: UInt32 = 0,
+        launchID: String? = nil,
         timeoutMs: UInt32 = 10_000
     ) throws {
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
         var observed = [UInt8](repeating: 0, count: 32)
+        // `launchID` (a host library id like "steam:570") asks the host to launch that title in
+        // the session; the host resolves it against its own library — nil = the host's default.
         handle = host.withCString { cs in
             withOptionalCString(identity?.certPEM) { cert in
                 withOptionalCString(identity?.keyPEM) { key in
-                    if let pin = pinSHA256 {
-                        return pin.withUnsafeBytes { p in
-                            punktfunk_connect_ex3(
-                                cs, port, width, height, refreshHz, compositor.rawValue,
-                                gamepad.rawValue, bitrateKbps,
-                                p.bindMemory(to: UInt8.self).baseAddress, &observed,
-                                cert, key, timeoutMs)
+                    withOptionalCString(launchID) { launch in
+                        if let pin = pinSHA256 {
+                            return pin.withUnsafeBytes { p in
+                                punktfunk_connect_ex4(
+                                    cs, port, width, height, refreshHz, compositor.rawValue,
+                                    gamepad.rawValue, bitrateKbps, launch,
+                                    p.bindMemory(to: UInt8.self).baseAddress, &observed,
+                                    cert, key, timeoutMs)
+                            }
                         }
+                        return punktfunk_connect_ex4(
+                            cs, port, width, height, refreshHz, compositor.rawValue,
+                            gamepad.rawValue, bitrateKbps, launch,
+                            nil, &observed, cert, key, timeoutMs)
                     }
-                    return punktfunk_connect_ex3(
-                        cs, port, width, height, refreshHz, compositor.rawValue,
-                        gamepad.rawValue, bitrateKbps,
-                        nil, &observed, cert, key, timeoutMs)
                 }
             }
         }

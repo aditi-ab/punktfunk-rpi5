@@ -87,6 +87,7 @@ final class SessionModel: ObservableObject {
                  compositor: PunktfunkConnection.Compositor = .auto,
                  gamepad: PunktfunkConnection.GamepadType = .auto,
                  bitrateKbps: UInt32 = 0,
+                 launchID: String? = nil,
                  autoTrust: Bool = false) {
         guard phase == .idle else { return }
         phase = .connecting
@@ -103,7 +104,7 @@ final class SessionModel: ObservableObject {
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,
                 pinSHA256: pin, identity: identity, compositor: compositor,
-                gamepad: gamepad, bitrateKbps: bitrateKbps) }
+                gamepad: gamepad, bitrateKbps: bitrateKbps, launchID: launchID) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 // The user may have abandoned this attempt (window closed, another host

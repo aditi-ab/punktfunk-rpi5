@@ -69,7 +69,9 @@ struct ContentView: View {
             SpeedTestSheet(host: host)
         }
         .sheet(item: $libraryTarget) { host in
-            NavigationStack { LibraryView(store: store, host: host) }
+            NavigationStack {
+                LibraryView(store: store, host: host, onLaunch: { launchTitle(host, $0) })
+            }
         }
         #endif
     }
@@ -80,14 +82,16 @@ struct ContentView: View {
             store: store, model: model, discovery: discovery,
             showAddHost: $showAddHost, pairingTarget: $pairingTarget,
             speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
-            connect: connect, connectDiscovered: connectDiscovered, onPaired: handlePaired)
+            connect: { connect($0) }, connectDiscovered: connectDiscovered,
+            onPaired: handlePaired, onLaunchTitle: launchTitle)
         #else
         HomeView(
             store: store, model: model, discovery: discovery,
             showAddHost: $showAddHost, pairingTarget: $pairingTarget,
             speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
             showSettings: $showSettings,
-            connect: connect, connectDiscovered: connectDiscovered, onPaired: handlePaired)
+            connect: { connect($0) }, connectDiscovered: connectDiscovered,
+            onPaired: handlePaired, onLaunchTitle: launchTitle)
         #endif
     }
 
@@ -171,7 +175,7 @@ struct ContentView: View {
 
     // MARK: - Connect
 
-    private func connect(_ host: StoredHost) {
+    private func connect(_ host: StoredHost, launchID: String? = nil) {
         // The gamepad-type setting resolves NOW (Automatic → match the active physical
         // controller): the host's virtual pad backend is fixed per session.
         model.connect(
@@ -183,7 +187,15 @@ struct ContentView: View {
             gamepad: GamepadManager.shared.resolveType(
                 setting: PunktfunkConnection.GamepadType(
                     rawValue: UInt32(clamping: gamepadType)) ?? .auto),
-            bitrateKbps: UInt32(clamping: bitrateKbps))
+            bitrateKbps: UInt32(clamping: bitrateKbps),
+            launchID: launchID)
+    }
+
+    /// Picked a title in the (experimental) library: dismiss the browser and start a session that
+    /// asks the host to launch it.
+    private func launchTitle(_ host: StoredHost, _ id: String) {
+        libraryTarget = nil
+        connect(host, launchID: id)
     }
 
     /// Tap a discovered host: save it (so the session has a stored identity and the trust pin
