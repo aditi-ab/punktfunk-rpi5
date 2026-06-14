@@ -169,13 +169,16 @@ public final class GamepadCapture {
         ext.valueChangedHandler = { [weak self] g, _ in
             MainActor.assumeIsolated { self?.sync(g) }
         }
-        // The Home/PS button (→ guide; the host maps it to the DualSense PS / Xbox guide bit) does
-        // NOT reliably fire the gamepad's valueChangedHandler on macOS, so its presses were dropped.
-        // A dedicated handler re-syncs on every Home transition.
-        ext.buttonHome?.pressedChangedHandler = { [weak self] _, _, _ in
-            MainActor.assumeIsolated {
-                guard let self, let g = self.bound?.extendedGamepad else { return }
-                self.sync(g)
+        // The Home/PS button (→ guide; the host maps it to the DualSense PS / Xbox guide bit). On
+        // macOS the SYSTEM grabs it by default (opens Launchpad's Games folder), so it never reached
+        // the app — `preferredSystemGestureState = .disabled` on the element is what hands it to us.
+        // We drive `guide` DIRECTLY from this handler's pressed value (not via buttonMask), because
+        // the legacy `extendedGamepad.buttonHome` is unreliable/often nil even when the physical
+        // element exists. On tvOS the element is absent (reserved) → nil, the whole block no-ops.
+        if let home = c.physicalInputProfile.buttons[GCInputButtonHome] {
+            home.preferredSystemGestureState = .disabled
+            home.pressedChangedHandler = { [weak self] _, _, pressed in
+                MainActor.assumeIsolated { self?.sendGuide(down: pressed) }
             }
         }
         // Wake the host pad immediately (pads are created lazily from the first event;
@@ -224,6 +227,18 @@ public final class GamepadCapture {
         }
     }
 
+    /// Forward the guide (Home/PS) transition directly — it's kept out of `buttonMask` (the legacy
+    /// `buttonHome` element is unreliable). Folds into `buttons` so a held PS button is released by
+    /// `releaseAll` on focus loss just like the others.
+    private func sendGuide(down: Bool) {
+        guard !suspended else { return }
+        let bit = GamepadWire.guide
+        let now = down ? (buttons | bit) : (buttons & ~bit)
+        guard now != buttons else { return }
+        connection.send(.gamepadButton(bit, down: down, pad: 0))
+        buttons = now
+    }
+
     private static func buttonMask(_ g: GCExtendedGamepad) -> UInt32 {
         var b: UInt32 = 0
         if g.dpad.up.isPressed { b |= GamepadWire.dpadUp }
@@ -236,7 +251,8 @@ public final class GamepadCapture {
         if g.rightThumbstickButton?.isPressed == true { b |= GamepadWire.rightStickClick }
         if g.leftShoulder.isPressed { b |= GamepadWire.leftShoulder }
         if g.rightShoulder.isPressed { b |= GamepadWire.rightShoulder }
-        if g.buttonHome?.isPressed == true { b |= GamepadWire.guide }
+        // guide (Home/PS) is NOT read here — it's forwarded directly by the Home button's
+        // pressedChangedHandler (the legacy `buttonHome` element is unreliable). See `rebind`.
         if g.buttonA.isPressed { b |= GamepadWire.a }
         if g.buttonB.isPressed { b |= GamepadWire.b }
         if g.buttonX.isPressed { b |= GamepadWire.x }
