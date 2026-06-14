@@ -28,6 +28,7 @@ struct ContentView: View {
     @State private var showAddHost = false
     @State private var pairingTarget: StoredHost?
     @State private var speedTestTarget: StoredHost?
+    @State private var libraryTarget: StoredHost?
     #if !os(macOS)
     @State private var showSettings = false
     #endif
@@ -67,6 +68,9 @@ struct ContentView: View {
         .sheet(item: $speedTestTarget) { host in
             SpeedTestSheet(host: host)
         }
+        .sheet(item: $libraryTarget) { host in
+            NavigationStack { LibraryView(store: store, host: host) }
+        }
         #endif
     }
 
@@ -75,13 +79,14 @@ struct ContentView: View {
         HomeView(
             store: store, model: model, discovery: discovery,
             showAddHost: $showAddHost, pairingTarget: $pairingTarget,
-            speedTestTarget: $speedTestTarget,
+            speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
             connect: connect, connectDiscovered: connectDiscovered, onPaired: handlePaired)
         #else
         HomeView(
             store: store, model: model, discovery: discovery,
             showAddHost: $showAddHost, pairingTarget: $pairingTarget,
-            speedTestTarget: $speedTestTarget, showSettings: $showSettings,
+            speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
+            showSettings: $showSettings,
             connect: connect, connectDiscovered: connectDiscovered, onPaired: handlePaired)
         #endif
     }

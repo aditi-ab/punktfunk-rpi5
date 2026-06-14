@@ -22,4 +22,6 @@ public enum DefaultsKey {
     public static let hosts = "punktfunk.hosts"
     /// Client-side cursor mode: "auto" (shown only in gamescope sessions), "always", "never".
     public static let cursorMode = "punktfunk.cursorMode"
+    /// Experimental: show the host's game library (browsed over the management API). Off by default.
+    public static let libraryEnabled = "punktfunk.libraryEnabled"
 }

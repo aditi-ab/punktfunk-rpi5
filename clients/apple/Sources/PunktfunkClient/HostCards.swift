@@ -35,6 +35,8 @@ struct HostCardView: View {
     let onSpeedTest: () -> Void
     let onForget: () -> Void
     let onRemove: () -> Void
+    /// Open the experimental library browser — nil (no menu item) unless the feature flag is on.
+    var onBrowseLibrary: (() -> Void)? = nil
 
     var body: some View {
         let m = CardMetrics.current
@@ -104,6 +106,9 @@ struct HostCardView: View {
         .contextMenu {
             Button("Pair with PIN…", action: onPair)
             Button("Test Network Speed…", action: onSpeedTest)
+            if let onBrowseLibrary {
+                Button("Browse Library…", action: onBrowseLibrary)
+            }
             if host.pinnedSHA256 != nil {
                 Button("Forget Identity", action: onForget)
             }

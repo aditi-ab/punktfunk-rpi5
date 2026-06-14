@@ -16,6 +16,7 @@ struct HomeView: View {
     @Binding var showAddHost: Bool
     @Binding var pairingTarget: StoredHost?
     @Binding var speedTestTarget: StoredHost?
+    @Binding var libraryTarget: StoredHost?
     #if !os(macOS)
     @Binding var showSettings: Bool
     #endif
@@ -23,6 +24,8 @@ struct HomeView: View {
     let connectDiscovered: (DiscoveredHost) -> Void
     /// Pairing succeeded (tvOS PairSheet route) — pin + connect (ContentView guards staleness).
     let onPaired: (StoredHost, Data) -> Void
+    /// Experimental game-library browser (gated) — the host-card "Browse Library…" action.
+    @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
 
     var body: some View {
         NavigationStack {
@@ -80,6 +83,9 @@ struct HomeView: View {
             }
             .navigationDestination(item: $speedTestTarget) { host in
                 SpeedTestSheet(host: host)
+            }
+            .navigationDestination(item: $libraryTarget) { host in
+                LibraryView(store: store, host: host)
             }
             #endif
             #if !os(tvOS)
@@ -146,7 +152,8 @@ struct HomeView: View {
     // MARK: - Cards
 
     private func hostCard(_ host: StoredHost) -> some View {
-        HostCardView(
+        let onBrowseLibrary: (() -> Void)? = libraryEnabled ? { libraryTarget = host } : nil
+        return HostCardView(
             host: host,
             isOnline: isOnline(host),
             isConnecting: model.phase == .connecting && model.activeHost?.id == host.id,
@@ -156,7 +163,8 @@ struct HomeView: View {
             onPair: { if !model.isBusy { pairingTarget = host } },
             onSpeedTest: { if !model.isBusy { speedTestTarget = host } },
             onForget: { store.forgetIdentity(host) },
-            onRemove: { store.remove(host) })
+            onRemove: { store.remove(host) },
+            onBrowseLibrary: onBrowseLibrary)
     }
 
     private var discoveredSection: some View {

@@ -19,6 +19,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.presenter) private var presenter = "stage1"
     @AppStorage(DefaultsKey.cursorMode) private var cursorMode = "auto"
+    @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
     @ObservedObject private var gamepads = GamepadManager.shared
     #if os(macOS)
@@ -402,6 +403,18 @@ struct SettingsView: View {
                     + "Stage 2 decodes explicitly and presents through Metal with a display "
                     + "link — it adds a capture→present (glass-to-glass) latency line in the HUD "
                     + "and shortens the present tail. Applies from the next session.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                Toggle("Show game library", isOn: $libraryEnabled)
+            } header: {
+                Text("Experimental")
+            } footer: {
+                Text("Adds a “Browse Library…” action to each host that lists its games "
+                    + "(Steam + custom) via the host's management API. The host must expose that "
+                    + "API on the LAN with a token (serve --mgmt-bind 0.0.0.0 --mgmt-token …). "
+                    + "Browsing only for now — launching a title comes later.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
