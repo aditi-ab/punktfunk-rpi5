@@ -532,23 +532,22 @@ public final class StreamLayerView: NSView {
         // guard as the ⌘⎋ capture toggle). Re-engage capture in the new mode so disassociation
         // and the absolute/relative forwarding choice swap atomically — releaseCapture restores
         // the old mode's grab (if any), engageCapture installs the new one.
-        capture.onToggleCursor = { [weak self] in
-            guard let self, self.window?.isKeyWindow == true else { return }
-            self.cursorVisible.toggle()
-            let wasCaptured = self.captured
-            self.releaseCapture()
-            if wasCaptured { self.engageCapture(fromClick: false) }
-        }
+        // ⌘⇧C would flip the client-side cursor live — NEUTERED while the feature is disabled
+        // (see the cursorVisible resolution below): toggling it on under gamescope's relative-only
+        // input traps the pointer. Restore this body when absolute/synthetic-cursor support lands.
+        capture.onToggleCursor = {}
         capture.start()
         inputCapture = capture
 
-        // Resolve the client-side-cursor mode for this session: Auto → on iff the host
-        // resolved gamescope (whose capture carries no cursor); Always → on; Never → off.
-        switch UserDefaults.standard.string(forKey: DefaultsKey.cursorMode) ?? "auto" {
-        case "always": cursorVisible = true
-        case "never": cursorVisible = false
-        default: cursorVisible = connection.resolvedCompositor == .gamescope
-        }
+        // Client-side cursor is TEMPORARILY DISABLED. It positions the host cursor with ABSOLUTE
+        // events, but gamescope's input socket (EIS) grants only a relative pointer, so those are
+        // silently dropped — the pointer never moves and clicks/scroll land on the stuck position
+        // (looks like "all input dead"). gamescope is exactly the compositor Auto enabled it for.
+        // Forced off until per-compositor gating (KWin/GNOME/Sway have absolute) or a synthetic-
+        // cursor-over-relative path lands; the resolution logic below is kept for that. See the
+        // ⌘⇧C handler (also neutered) and the cursorMode setting (hidden).
+        cursorVisible = false
+        _ = connection.resolvedCompositor // (was: Auto → gamescope; kept to document intent)
 
         // Presenter choice — default stage-1 (the known-good AVSampleBufferDisplayLayer). Stage-2
         // (`punktfunk.presenter == "stage2"`) takes explicit VTDecompressionSession decode + a

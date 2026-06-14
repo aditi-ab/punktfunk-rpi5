@@ -18,7 +18,6 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.presenter) private var presenter = "stage1"
-    @AppStorage(DefaultsKey.cursorMode) private var cursorMode = "auto"
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
@@ -385,22 +384,9 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Section {
-                Picker("Cursor in stream", selection: $cursorMode) {
-                    Text("Auto (gamescope)").tag("auto")
-                    Text("Always").tag("always")
-                    Text("Never").tag("never")
-                }
-            } header: {
-                Text("Cursor")
-            } footer: {
-                Text("Show the local system cursor over the stream instead of capturing it. "
-                    + "gamescope's capture carries no cursor, so the client draws its own — "
-                    + "Auto turns this on only for gamescope sessions. ⌘⇧C toggles it live "
-                    + "during a session.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            // The client-side cursor picker is hidden while the feature is disabled (gamescope's
+            // input is relative-only, so absolute cursor positioning traps input — see StreamView).
+            // Restore this Section when per-compositor gating / a synthetic cursor lands.
             #endif
             Section {
                 Picker("Presenter", selection: $presenter) {
