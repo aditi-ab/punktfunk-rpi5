@@ -5,6 +5,7 @@ members = [
     "crates/punktfunk-host",
     "crates/punktfunk-client-rs",
     "crates/punktfunk-client-linux",
+    "crates/punktfunk-android",
     "tools/latency-probe",
     "tools/loss-harness",
 ]

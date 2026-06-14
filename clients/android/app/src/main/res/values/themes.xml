@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The Activity is pure Compose; this platform theme just provides a no-action-bar host.
+         Compose draws its own Material 3 surfaces over it. -->
+    <style name="Theme.PunktfunkAndroid" parent="android:Theme.Material.NoActionBar" />
+</resources>

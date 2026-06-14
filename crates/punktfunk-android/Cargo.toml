@@ -1,0 +1,27 @@
+[package]
+name = "punktfunk-android"
+description = "punktfunk Android client — JNI bridge ('nativecore') over punktfunk-core (Rust-heavy client model)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+# `libpunktfunk_android.so` — loaded by Kotlin via `System.loadLibrary("punktfunk_android")`.
+name = "punktfunk_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The whole protocol/transport/FEC/crypto + the embeddable NativeClient connector. `quic` pulls
+# the punktfunk/1 control plane (now ring-only — no aws-lc, see punktfunk-core/Cargo.toml).
+punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+jni = "0.21"
+log = "0.4"
+
+# Android-only deps. Gated so `cargo build --workspace` on the Linux/macOS dev boxes + CI still
+# compiles this crate (as a host cdylib) — the Android-framework glue (logging now; AMediaCodec via
+# `ndk` and Oboe/Opus audio later) is only pulled in for the real `*-linux-android` targets.
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"

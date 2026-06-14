@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- punktfunk/1 QUIC/UDP data plane. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- mDNS discovery of _punktfunk._udp on the LAN (NsdManager). -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
+    <!-- Enforced from Android 17 (SDK 37) for ALL local-network traffic incl. the QUIC socket.
+         Harmless to declare on earlier releases. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <!-- Mic uplink to the host's virtual microphone (requested at runtime). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Gamepad rumble feedback. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- We target phone + TV from day one: keep the app installable on TV (no touchscreen) and on
+         devices without a gamepad. -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PunktfunkAndroid">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|density|navigation"
+            android:theme="@style/Theme.PunktfunkAndroid">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- TV launcher entry. -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

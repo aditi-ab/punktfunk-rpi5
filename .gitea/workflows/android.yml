@@ -1,0 +1,64 @@
+# Android client CI (Gitea Actions). Builds the Rust JNI core (crates/punktfunk-android) via
+# cargo-ndk for both shipping ABIs and assembles the debug APK (clients/android). Mirrors apple.yml
+# but on a Linux runner — the NDK is cross-platform, so no self-hosted host is needed.
+#
+# Prereq: the runner needs ~6 GB free + internet (it pulls the Android SDK/NDK and the Gradle
+# distribution in-job). If android-actions/setup-android is not mirrored on this Gitea instance,
+# replace that step with a manual cmdline-tools download, or bake an `android-ci` image like
+# ci/rust-ci.Dockerfile. Emulator instrumentation tests are deferred until a KVM-capable runner
+# exists (they self-skip otherwise, like apple.yml's RemoteFirstLightTests).
+name: android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 21 (AGP 9.2 runs on JDK 17–21, not the host default)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Rust toolchain + Android targets (self-healing on a fresh runner)
+        run: |
+          if ! command -v rustup >/dev/null && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --profile minimal
+          fi
+          RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
+          dirname "$RUSTUP" >> "$GITHUB_PATH"
+          "$RUSTUP" target add aarch64-linux-android x86_64-linux-android
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: NDK r28 LTS + platform 36 + build-tools
+        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+
+      - name: Caches (cargo + gradle)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            target
+          key: android-${{ hashFiles('Cargo.lock', 'clients/android/**/*.gradle.kts') }}
+          restore-keys: android-
+
+      - name: cargo-ndk
+        run: command -v cargo-ndk >/dev/null || cargo install cargo-ndk
+
+      - name: assembleDebug (cargo-ndk → jniLibs → APK)
+        working-directory: clients/android
+        run: ./gradlew :app:assembleDebug --stacktrace

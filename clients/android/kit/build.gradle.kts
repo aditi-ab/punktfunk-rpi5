@@ -1,0 +1,80 @@
+import java.io.File
+import java.util.Properties
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+plugins {
+    // AGP 9 built-in Kotlin compiles this module's Kotlin (NativeBridge) — no kotlin.android plugin.
+    id("com.android.library")
+}
+
+val ndkVer = "28.2.13676358" // r28 LTS — matches the SDK NDK installed for cargo-ndk
+
+android {
+    namespace = "io.unom.punktfunk.kit"
+    compileSdk = 37 // Android 17 — align with :app (androidx.core 1.19.0 requires it)
+    ndkVersion = ndkVer
+
+    defaultConfig {
+        minSdk = 31
+        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+    packaging { jniLibs { useLegacyPackaging = false } } // 16 KB-page friendly
+}
+
+kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_21) } }
+
+// ------------------------------------------------------------------------------------------------
+// cargo-ndk: cross-compile crates/punktfunk-android into this module's jniLibs/<abi>/ so the
+// resulting libpunktfunk_android.so is packaged into the app (and any AAR this module produces).
+// NDK r28+ aligns to 16 KB pages by default — no extra linker flags. Prereqs (see clients/android
+// /README.md): `cargo install cargo-ndk` + `rustup target add aarch64-linux-android x86_64-linux-android`.
+// ------------------------------------------------------------------------------------------------
+val repoRoot = rootDir.parentFile.parentFile // clients/android -> clients -> repo root
+val cargoBin = "${System.getProperty("user.home")}/.cargo/bin"
+
+// SDK location without depending on AGP's DSL (sdkDirectory isn't in AGP 9's library extension):
+// env first (set by Android Studio and by our CLI shell), then local.properties, then the default.
+fun androidSdkDir(): String {
+    System.getenv("ANDROID_HOME")?.let { return it }
+    System.getenv("ANDROID_SDK_ROOT")?.let { return it }
+    val lp = rootProject.file("local.properties")
+    if (lp.exists()) {
+        val props = Properties()
+        lp.inputStream().use { props.load(it) }
+        props.getProperty("sdk.dir")?.let { return it }
+    }
+    return "${System.getProperty("user.home")}/Library/Android/sdk"
+}
+
+fun registerCargoNdk(taskName: String, release: Boolean) =
+    tasks.register<Exec>(taskName) {
+        group = "rust"
+        description = "cargo-ndk build of punktfunk-android (${if (release) "release" else "debug"})"
+        workingDir = repoRoot
+        val sdk = androidSdkDir()
+        // A GUI Android Studio launch does not source the login shell, so make cargo + the NDK
+        // discoverable explicitly (works the same from a bare CLI).
+        environment("PATH", cargoBin + File.pathSeparator + System.getenv("PATH"))
+        environment("ANDROID_HOME", sdk)
+        environment("ANDROID_NDK_HOME", "$sdk/ndk/$ndkVer")
+        val cmd = mutableListOf(
+            "cargo", "ndk",
+            "-t", "arm64-v8a", "-t", "x86_64",
+            "-o", file("src/main/jniLibs").absolutePath,
+            "build", "-p", "punktfunk-android",
+        )
+        if (release) cmd += "--release"
+        commandLine(cmd)
+    }
+
+val cargoNdkDebug = registerCargoNdk("cargoNdkDebug", release = false)
+val cargoNdkRelease = registerCargoNdk("cargoNdkRelease", release = true)
+
+afterEvaluate {
+    tasks.named("preDebugBuild").configure { dependsOn(cargoNdkDebug) }
+    tasks.named("preReleaseBuild").configure { dependsOn(cargoNdkRelease) }
+}
