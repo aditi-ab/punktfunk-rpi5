@@ -291,6 +291,28 @@ sudo firewall-cmd --permanent --add-port=9777/udp && sudo firewall-cmd --reload
 
 ---
 
+## 6.5 Desktop (KDE) mode — stream the desktop at the client's resolution (optional)
+
+The host **auto-detects** the live session per connect: in **Steam Gaming Mode** it attaches to the
+running gamescope (no setup); switch the box to the **KDE Desktop** and it drives a KWin *virtual
+output at the connecting client's exact resolution* (no TV-stretch, churn-free). The Desktop path
+needs one one-shot setup the first time, because a normal KDE login withholds two things the
+headless host needs — the privileged `zkde_screencast` virtual-output protocol, and an
+auto-approved RemoteDesktop input grant:
+
+```sh
+bash /usr/share/punktfunk/bazzite/kde-desktop-setup.sh
+# then log out + back into the KDE Desktop session once (or reboot) so KWin restarts with the flag
+```
+
+That writes `~/.config/environment.d/10-punktfunk-kwin.conf`
+(`KWIN_WAYLAND_NO_PERMISSION_CHECKS=1`) and seeds the `kde-authorized` RemoteDesktop grant into
+`~/.local/share/flatpak/db/`. Gaming Mode is unaffected. To connect from Desktop Mode, switch to it
+(Steam → Power → Switch to Desktop), then connect the client; switching **mid-stream** requires a
+reconnect (the host resolves the backend per connect).
+
+---
+
 ## 7. Verify it's working
 
 **1. Watch the startup log:**

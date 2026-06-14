@@ -172,6 +172,9 @@ install -Dm0644 scripts/headless/punktfunk-sink.conf   %{buildroot}%{_datadir}/%
 install -Dm0644 scripts/host.env.example               %{buildroot}%{_datadir}/%{name}/host.env.example
 install -Dm0644 packaging/bazzite/host.env             %{buildroot}%{_datadir}/%{name}/host.env.bazzite
 install -Dm0644 packaging/kde/host.env                 %{buildroot}%{_datadir}/%{name}/host.env.kde
+# Bazzite KDE Desktop-mode one-shot setup (KWIN_WAYLAND_NO_PERMISSION_CHECKS + RemoteDesktop grant).
+install -d %{buildroot}%{_datadir}/%{name}/bazzite
+install -Dm0755 packaging/bazzite/kde-desktop-setup.sh %{buildroot}%{_datadir}/%{name}/bazzite/kde-desktop-setup.sh
 install -Dm0644 docs/api/openapi.json                  %{buildroot}%{_datadir}/%{name}/openapi.json
 
 %files
