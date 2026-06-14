@@ -72,13 +72,21 @@ mod gso {
     }
 }
 
-/// True if the send error means UDP GSO isn't supported here (vs a transient/real failure) — so we
-/// latch GSO off and fall back to `sendmmsg` rather than tear the stream down.
+/// True if the send error means UDP GSO isn't usable on this kernel/NIC/path (vs a transient/real
+/// failure) — so we latch GSO off and fall back to `sendmmsg` rather than tear the stream down.
+/// `EMSGSIZE` is the important one in practice: a NIC/egress path whose effective MTU is below our
+/// segment size rejects the whole GSO super-buffer at send time (the kernel validates each segment
+/// against the device MTU, which plain `sendmmsg` does not) — observed live as a code-90
+/// "Message too long" that instantly killed the stream. Treat it as "no GSO here" and fall back.
 #[cfg(target_os = "linux")]
 fn gso_unsupported(e: &std::io::Error) -> bool {
     matches!(
         e.raw_os_error(),
-        Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) | Some(libc::EIO)
+        Some(libc::ENOPROTOOPT)
+            | Some(libc::EOPNOTSUPP)
+            | Some(libc::EINVAL)
+            | Some(libc::EIO)
+            | Some(libc::EMSGSIZE)
     )
 }
 
