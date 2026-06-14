@@ -275,6 +275,11 @@ fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8, ts:
     r[28..32].copy_from_slice(&ts.to_le_bytes()); // sensor_timestamp (struct off 27)
     pack_touch(&mut r[33..37], &st.touch[0]); // touch point 1 (struct off 32)
     pack_touch(&mut r[37..41], &st.touch[1]); // touch point 2
+                                              // status byte (struct off 52 → r[53]) — hid-playstation reads battery here: low nibble =
+                                              // capacity (×10+5 %), high nibble = charging state (0 = discharging). A virtual pad has no
+                                              // real cell, so report "discharging, full" (0x0A → 100 %); leaving it 0 makes SteamOS / the
+                                              // kernel see ~5 % and warn "low battery". (We don't forward the client pad's real charge yet.)
+    r[53] = 0x0A;
 }
 
 fn pack_touch(dst: &mut [u8], t: &Touch) {
@@ -754,6 +759,9 @@ mod tests {
         assert_eq!(r[35], 0x61); // x_hi nibble 0x1 | (y & 0xF) << 4 (y=0x356 → 0x6 << 4)
         assert_eq!(r[36], 0x35); // y >> 4
         assert_eq!(r[37] & 0x80, 0x80); // touch point 2 inactive
+                                        // status byte (struct off 52): discharging (high nibble 0) + full capacity (low nibble
+                                        // 0xA → 100 %), so SteamOS/hid-playstation never reports a false "low battery".
+        assert_eq!(r[53], 0x0A);
     }
 
     /// The wire touchpad-click bit (Moonlight's extended position) lands in `buttons[2]`.

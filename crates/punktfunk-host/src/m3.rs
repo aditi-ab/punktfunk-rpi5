@@ -1254,6 +1254,11 @@ fn input_thread(
         pads.pump(
             |pad, low, high| {
                 if let Some(s) = rumble_state.get_mut(pad as usize) {
+                    // Log the silent→active transition (once per buzz) so a live test can tell
+                    // "host never gets rumble from the game" apart from "client doesn't render it".
+                    if *s == (0, 0) && (low != 0 || high != 0) {
+                        tracing::info!(pad, low, high, "rumble: forwarding to client (0xCA)");
+                    }
                     *s = (low, high);
                     rumble_seen[pad as usize] = true;
                 }
