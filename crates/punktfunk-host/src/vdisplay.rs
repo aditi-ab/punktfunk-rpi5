@@ -366,10 +366,13 @@ pub fn apply_session_env(active: &ActiveSession) {
 pub fn apply_session_env(_active: &ActiveSession) {}
 
 /// Route input to match the chosen video backend (they must not diverge), via the highest-priority
-/// `PUNKTFUNK_INPUT_BACKEND` knob the injector honors. For gamescope, also select **attach** (no
-/// churny host-managed restart) unless the operator explicitly opted into the managed session with
-/// `PUNKTFUNK_GAMESCOPE_MANAGED` — attaching to the running session avoids the per-connect
-/// stop/relaunch that leaked GPU context (the reconnect-black-screen on Bazzite F44).
+/// `PUNKTFUNK_INPUT_BACKEND` knob the injector honors. For gamescope, the **default is a managed
+/// session at the client's mode** (tears the TV's autologin down on connect; restored on a debounced
+/// idle) — so the client gets ITS resolution (capture == encode == client mode), not the TV's, and a
+/// quick reconnect reuses the warm session (no churn). Opt out to **attach** (mirror the running TV
+/// session at its own mode, gaming stays live on the panel, no Steam restart) with
+/// `PUNKTFUNK_GAMESCOPE_ATTACH`; an explicit `PUNKTFUNK_GAMESCOPE_NODE` also implies attach, and
+/// `PUNKTFUNK_GAMESCOPE_MANAGED` forces managed over either.
 #[cfg(target_os = "linux")]
 pub fn apply_input_env(chosen: Compositor) {
     let backend = match chosen {
@@ -379,18 +382,20 @@ pub fn apply_input_env(chosen: Compositor) {
     };
     std::env::set_var("PUNKTFUNK_INPUT_BACKEND", backend);
     if chosen == Compositor::Gamescope {
-        // Managed = the operator opted in (new `PUNKTFUNK_GAMESCOPE_MANAGED`, or legacy
-        // `PUNKTFUNK_GAMESCOPE_SESSION` set explicitly). Otherwise ATTACH to the running session.
-        let managed = std::env::var_os("PUNKTFUNK_GAMESCOPE_MANAGED").is_some()
-            || std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_some();
-        if managed {
+        let force_managed = std::env::var_os("PUNKTFUNK_GAMESCOPE_MANAGED").is_some();
+        let attach = !force_managed
+            && (std::env::var_os("PUNKTFUNK_GAMESCOPE_ATTACH").is_some()
+                || std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_some());
+        if attach {
+            std::env::remove_var("PUNKTFUNK_GAMESCOPE_SESSION");
+            if std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_none() {
+                std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto");
+            }
+        } else {
             if std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_none() {
                 std::env::set_var("PUNKTFUNK_GAMESCOPE_SESSION", "steam");
             }
             std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE");
-        } else {
-            std::env::remove_var("PUNKTFUNK_GAMESCOPE_SESSION");
-            std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto");
         }
     }
 }
@@ -488,14 +493,29 @@ pub fn gamescope_ei_socket_file() -> &'static str {
 }
 
 /// Call when a client session ends: if the host-managed gamescope path took over a box's autologin
-/// gaming session (stopped its single-instance Steam to stream at the client's mode), restart that
-/// session so the TV returns to gaming mode. No-op on other compositors / when nothing was taken.
+/// gaming session (stopped its single-instance Steam to stream at the client's mode), **schedule** a
+/// debounced restore so the TV returns to gaming mode — unless a client reconnects within the window
+/// (which reuses the warm session, avoiding the per-connect gamescope stop/relaunch that leaked GPU
+/// context on F44). No-op on other compositors / when nothing was taken. Needs [`start_restore_worker`]
+/// running to actually fire.
 #[cfg(target_os = "linux")]
 pub fn restore_managed_session() {
-    gamescope::restore_tv_session();
+    gamescope::schedule_restore_tv_session();
 }
 #[cfg(not(target_os = "linux"))]
 pub fn restore_managed_session() {}
+
+/// Start the host-lifetime worker that fires debounced [`restore_managed_session`] restores once a
+/// client has been gone long enough. Hold the returned handle for the host's lifetime; dropping it
+/// stops the worker. Call once from `serve()`.
+#[cfg(target_os = "linux")]
+pub fn start_restore_worker() -> std::sync::Arc<()> {
+    gamescope::start_restore_worker()
+}
+#[cfg(not(target_os = "linux"))]
+pub fn start_restore_worker() -> std::sync::Arc<()> {
+    std::sync::Arc::new(())
+}
 
 #[cfg(target_os = "linux")]
 mod gamescope;

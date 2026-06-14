@@ -42,8 +42,20 @@ struct SessionState {
 static MANAGED_SESSION: std::sync::Mutex<Option<SessionState>> = std::sync::Mutex::new(None);
 
 /// Autologin gaming-mode `gamescope-session-plus@*` units we stopped on connect to free Steam
-/// (single-instance), so [`restore_tv_session`] can restart them when the client disconnects.
+/// (single-instance), so [`schedule_restore_tv_session`] can restart them when the client disconnects.
 static STOPPED_AUTOLOGIN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// A pending debounced TV-session restore: the instant [`do_restore_tv_session`] should fire after
+/// the last client disconnect. A reconnect inside the window clears it (and reuses the still-warm
+/// managed session), so we never stop+relaunch gamescope per connect — that per-connect teardown is
+/// what leaked NVIDIA GPU context on F44 (the black-screen reconnect). Driven by the host-lifetime
+/// [`start_restore_worker`] thread.
+static PENDING_RESTORE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// How long to wait after the last disconnect before restoring the TV's autologin gaming session —
+/// long enough that a quick reconnect (e.g. a controller hiccup) reuses the warm managed session
+/// instead of triggering a stop/relaunch.
+const RESTORE_DEBOUNCE: Duration = Duration::from_secs(5);
 
 /// systemd --user transient unit name for the host-managed gamescope-session-plus session.
 const SESSION_UNIT: &str = "punktfunk-gamescope";
@@ -125,10 +137,13 @@ impl VirtualDisplay for GamescopeDisplay {
 /// otherwise stop the old transient unit and RELAUNCH at the new mode (gamescope can't change output
 /// mode live). Then discover the node + point the injector, exactly as the attach path does.
 fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
+    // A (re)connect cancels any pending debounced TV-restore: we're about to (re)use the managed
+    // session, so the autologin must stay stopped and the warm session stays up (no stop/relaunch).
+    *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // Steam is single-instance: if the box autologged into gaming mode on a physical display (the
     // Bazzite default — `gamescope-session-plus@ogui-steam` on the TV), that session holds Steam and
     // renders to the TV's native mode, which we'd capture instead of the client's. Free Steam by
-    // stopping it; [`restore_tv_session`] (called when the client disconnects) brings it back.
+    // stopping it; [`schedule_restore_tv_session`] (on disconnect) brings it back after a debounce.
     stop_autologin_sessions();
     let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let same_mode = guard.as_ref().is_some_and(|s| {
@@ -180,7 +195,7 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
 
 /// Stop every running autologin gaming-mode session (`gamescope-session-plus@*.service`) so its
 /// single-instance Steam is free for our own host-managed session. Records the units so
-/// [`restore_tv_session`] can restart them on disconnect. Our own session is the transient
+/// [`schedule_restore_tv_session`] can restart them on disconnect. Our own session is the transient
 /// `punktfunk-gamescope` unit (not a `@`-instance), so it's never matched here. No-op when nothing
 /// is autologged in (e.g. a box that boots headless).
 fn stop_autologin_sessions() {
@@ -218,12 +233,32 @@ fn stop_autologin_sessions() {
     }
 }
 
-/// Client disconnected: tear down our host-managed session (freeing Steam) and restart the
-/// autologin gaming session(s) we stopped on connect — so the TV returns to gaming mode when no one
-/// is streaming. Idempotent / safe to call on every session end (no-op when we stopped nothing,
-/// e.g. a non-gamescope or headless box). The brief Steam restart is the cost of "TV by default,
-/// client mode while streaming" given Steam's single-instance limit.
-pub fn restore_tv_session() {
+/// Client disconnected: **schedule** a debounced restore of the TV's autologin gaming session(s) we
+/// stopped on connect — the actual restore fires [`RESTORE_DEBOUNCE`] later (via [`start_restore_worker`])
+/// unless a client reconnects first, which cancels it and reuses the warm managed session. Debouncing
+/// means at most one gamescope stop/relaunch per quiet period instead of one per disconnect — the
+/// per-connect churn is what leaked GPU context on F44. No-op when nothing was stolen (non-Bazzite /
+/// headless box). Idempotent / safe to call on every session end.
+pub fn schedule_restore_tv_session() {
+    if STOPPED_AUTOLOGIN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+    {
+        return; // nothing was stolen → nothing to restore (also the non-Bazzite path)
+    }
+    *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + RESTORE_DEBOUNCE);
+    tracing::info!(
+        secs = RESTORE_DEBOUNCE.as_secs(),
+        "gamescope: scheduled debounced TV-session restore (cancelled if a client reconnects)"
+    );
+}
+
+/// Tear down our host-managed session (freeing Steam) and restart the autologin gaming session(s)
+/// we stopped on connect — so the TV returns to gaming mode when no one is streaming. Invoked by
+/// [`start_restore_worker`] once the debounce deadline passes; takes the stopped-unit list so a
+/// cancelled+reconnected window keeps the list for a later real restore.
+fn do_restore_tv_session() {
     let units = std::mem::take(&mut *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()));
     if units.is_empty() {
         return; // nothing was stolen → nothing to restore (also the non-Bazzite path)
@@ -236,9 +271,41 @@ pub fn restore_tv_session() {
             .status();
         tracing::info!(
             unit,
-            "restored the TV's autologin gaming session (client gone)"
+            "restored the TV's autologin gaming session (debounce elapsed, no client)"
         );
     }
+}
+
+/// Host-lifetime worker that fires a pending [`schedule_restore_tv_session`] once its debounce
+/// deadline passes. Returns a keepalive handle — drop it (host shutdown) to stop the worker. Cheap:
+/// a 100 ms tick that does nothing until a restore is actually pending.
+pub fn start_restore_worker() -> std::sync::Arc<()> {
+    let handle = std::sync::Arc::new(());
+    let weak = std::sync::Arc::downgrade(&handle);
+    if let Err(e) = std::thread::Builder::new()
+        .name("punktfunk-restore-worker".into())
+        .spawn(move || {
+            while weak.upgrade().is_some() {
+                std::thread::sleep(Duration::from_millis(100));
+                let due = {
+                    let mut g = PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner());
+                    match *g {
+                        Some(deadline) if Instant::now() >= deadline => {
+                            *g = None;
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if due {
+                    do_restore_tv_session();
+                }
+            }
+        })
+    {
+        tracing::error!(error = %e, "restore-worker spawn failed — TV session won't auto-restore on idle");
+    }
+    handle
 }
 
 /// Point the libei injector at the running gamescope's EIS socket (it reads the relay file

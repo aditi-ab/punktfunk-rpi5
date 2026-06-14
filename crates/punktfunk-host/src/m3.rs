@@ -203,6 +203,10 @@ pub(crate) async fn serve(opts: M3Options, np: Arc<NativePairing>) -> Result<()>
     // One virtual microphone for the whole host lifetime (see MicService): the client's mic uplink
     // (0xCB) is Opus-decoded and fed into a persistent PipeWire Audio/Source host apps record from.
     let mic_service = MicService::start();
+    // Host-lifetime worker that fires debounced TV-session restores (the managed gamescope path
+    // restores the box's autologin gaming session on idle, not per-disconnect — see
+    // `vdisplay::restore_managed_session`). Held for serve()'s lifetime; dropping it stops it.
+    let _restore_worker = crate::vdisplay::start_restore_worker();
     // Pairing state (arming PIN + trust store) is shared with the management API. If it was armed
     // at startup (the CLI flags), surface the PIN the headless operator reads from the log; the
     // web console arms it on demand instead (a fresh, time-limited PIN).
