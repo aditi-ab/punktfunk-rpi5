@@ -21,6 +21,8 @@ mod audio;
 #[cfg(windows)]
 mod discovery;
 #[cfg(windows)]
+mod gamepad;
+#[cfg(windows)]
 mod keymap;
 #[cfg(windows)]
 mod present;
@@ -153,20 +155,31 @@ fn main() {
         }
     }
 
+    let headless = flag("--headless");
+    // The app-lifetime gamepad service runs only for the windowed client; it also resolves the
+    // "Automatic" pad type to whatever physical controller is attached (other-client parity).
+    let gamepad_service = (!headless).then(gamepad::GamepadService::start);
+    let gamepad_pref = match GamepadPref::from_name(&settings.gamepad) {
+        Some(GamepadPref::Auto) | None => gamepad_service
+            .as_ref()
+            .map_or(GamepadPref::Auto, |s| s.auto_pref()),
+        Some(explicit) => explicit,
+    };
+
     tracing::info!(%host, port, ?mode, tofu = pin.is_none(), "connecting");
     let handle = session::start(session::SessionParams {
         host: host.clone(),
         port,
         mode,
         compositor: CompositorPref::Auto,
-        gamepad: GamepadPref::Auto,
+        gamepad: gamepad_pref,
         bitrate_kbps,
         mic_enabled,
         pin,
         identity,
     });
 
-    if flag("--headless") {
+    if headless {
         run_headless(handle);
         return;
     }
@@ -177,7 +190,8 @@ fn main() {
         port,
         tofu: pin.is_none(),
     };
-    if let Err(e) = app::WinApp::new(handle, info, true).run() {
+    let gamepad_service = gamepad_service.expect("started for the windowed path");
+    if let Err(e) = app::WinApp::new(handle, info, gamepad_service).run() {
         tracing::error!(error = %e, "windowed app failed");
         std::process::exit(1);
     }

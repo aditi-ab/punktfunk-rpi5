@@ -54,6 +54,23 @@ connect straight away:
 punktfunk-client --connect <host>:9777   # skip the picker, start a session immediately
 ```
 
+## Windows desktop client (in development)
+
+`punktfunk-client` for Windows (`crates/punktfunk-client-windows`) is the native graphical client
+for Windows — pure Rust, the same `punktfunk/1` core as the Apple and Linux apps, with a winit +
+Direct3D11 present surface, WASAPI audio, FFmpeg decode, SDL3 controllers, network discovery, and
+PIN pairing. It builds on `x86_64-pc-windows-msvc` and runs the connect/decode/present/input path;
+hardware (D3D11VA) decode, 10-bit/HDR present, and a native host-list/settings window are in
+progress, so it is not yet packaged. For now it is driven from the command line:
+
+```sh
+punktfunk-client --discover                       # list hosts on the network
+punktfunk-client --connect <host>:9777            # stream (trust-on-first-use)
+punktfunk-client --connect <host>:9777 --pair 1234 # pair with the PIN the host shows
+```
+
+Until it ships, **Moonlight** remains the recommended way to stream to Windows (see below).
+
 ## Linux reference client (headless)
 
 `punktfunk-client-rs` (in the repo) is a command-line client for the native protocol, used for

@@ -51,6 +51,10 @@ opus = "0.3"
 # Audio render + mic capture (the WASAPI analogue of the Linux client's PipeWire backend).
 wasapi = "0.23"
 
+# Gamepads: capture + feedback (full DualSense fidelity needs hidapi). SDL3 is cross-platform;
+# built from source via the bundled CMake on Windows (no system SDL3).
+sdl3 = { version = "0.18", features = ["build-from-source", "hidapi"] }
+
 mdns-sd = "0.20"
 async-channel = "2"
 serde = { version = "1", features = ["derive"] }

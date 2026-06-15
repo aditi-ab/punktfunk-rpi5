@@ -112,6 +112,21 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    Intel/AMD client box to live-verify the hw path. Next: the stage-2 raw-Wayland
    presenter (wp_presentation feedback, tearing-control, Vulkan Video on NVIDIA) —
    **wgpu/winit rejected** (no dmabuf import / presentation feedback / shortcuts-inhibit).
+   **Windows stage 1 done 2026-06-15** (`crates/punktfunk-client-windows`, binary
+   `punktfunk-client`): pure-Rust **winit + Direct3D11 flip-model swapchain** present (WARP
+   fallback for the GPU-less dev box; runtime-compiled fullscreen-triangle shaders, Contain-fit
+   letterbox), **FFmpeg software HEVC decode** (D3D11VA hw decode is the follow-up), **WASAPI**
+   shared-mode render + mic capture, keyboard (physical-`KeyCode`→VK) + absolute mouse + wheel
+   capture (Moonlight-style click-to-capture, Ctrl+Alt+Shift+Q release), **SDL3** gamepads
+   (rumble/lightbar/DualSense, built from source), `mdns-sd` discovery, shared client identity
+   + TOFU + SPAKE2 PIN pairing (`--connect`/`--discover`/`--pair`/`--headless`). Builds + clippy
+   + fmt + tests green on `x86_64-pc-windows-msvc` (built on the dev VM). **UI = winit + raw
+   D3D11, NOT WinUI3/Reactor** — a research pass confirmed windows-rs Reactor ships no
+   `SwapChainPanel`/`SetSwapChain` escape hatch, so it can't host the presenter (the bootstrap
+   doc's sanctioned fallback). Gotcha: `CARGO_HOME` must be an ASCII path — the `ü` in the dev
+   box's username breaks SDL3's MSVC precompiled-header build. Next: live host validation
+   (no GPU on the dev box → glass-to-glass defers to the RTX box), D3D11VA hw decode + 10-bit/HDR
+   present, a native host-list/settings GUI, and RAWINPUT relative-mouse pointer-lock.
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).

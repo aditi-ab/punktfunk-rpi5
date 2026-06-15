@@ -23,7 +23,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use windows::Win32::Foundation::HWND;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -43,7 +43,8 @@ pub struct ConnectInfo {
 pub struct WinApp {
     handle: SessionHandle,
     info: ConnectInfo,
-    inhibit_shortcuts: bool,
+    /// App-lifetime SDL gamepad service: per-session capture + rumble/HID feedback.
+    gamepad: crate::gamepad::GamepadService,
 
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -60,11 +61,15 @@ pub struct WinApp {
 }
 
 impl WinApp {
-    pub fn new(handle: SessionHandle, info: ConnectInfo, inhibit_shortcuts: bool) -> WinApp {
+    pub fn new(
+        handle: SessionHandle,
+        info: ConnectInfo,
+        gamepad: crate::gamepad::GamepadService,
+    ) -> WinApp {
         WinApp {
             handle,
             info,
-            inhibit_shortcuts,
+            gamepad,
             window: None,
             renderer: None,
             swap: None,
@@ -191,6 +196,7 @@ impl WinApp {
                             self.info.name, mode.width, mode.height, mode.refresh_hz
                         ));
                     }
+                    self.gamepad.attach(connector.clone());
                     self.connector = Some(connector);
                     tracing::info!(?mode, "connected — streaming");
                 }
@@ -210,11 +216,13 @@ impl WinApp {
                             "host fingerprint changed or pairing required — re-pair with --pair PIN"
                         );
                     }
+                    self.gamepad.detach();
                     event_loop.exit();
                     return false;
                 }
                 SessionEvent::Ended(err) => {
                     tracing::info!(reason = err.as_deref().unwrap_or("done"), "session ended");
+                    self.gamepad.detach();
                     event_loop.exit();
                     return false;
                 }
@@ -324,6 +332,7 @@ impl ApplicationHandler for WinApp {
         match event {
             WindowEvent::CloseRequested => {
                 self.handle.stop.store(true, Ordering::SeqCst);
+                self.gamepad.detach();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -364,12 +373,10 @@ impl ApplicationHandler for WinApp {
                     return;
                 };
                 if event.state.is_pressed() {
-                    if self.held_keys.insert(vk) {
-                        self.send(InputKind::KeyDown, vk as u32, 0, 0, 0);
-                    } else {
-                        // Auto-repeat: re-send KeyDown (the host tolerates repeats).
-                        self.send(InputKind::KeyDown, vk as u32, 0, 0, 0);
-                    }
+                    // Track held state for flush-on-release; re-send on auto-repeat too (the
+                    // host treats KeyDown as a state set, so repeats are harmless).
+                    self.held_keys.insert(vk);
+                    self.send(InputKind::KeyDown, vk as u32, 0, 0, 0);
                 } else if self.held_keys.remove(&vk) {
                     self.send(InputKind::KeyUp, vk as u32, 0, 0, 0);
                 }
@@ -428,11 +435,6 @@ impl ApplicationHandler for WinApp {
         } else {
             // No frame this turn — yield briefly instead of spinning a core flat-out.
             std::thread::sleep(Duration::from_millis(1));
-        }
-        let _ = Instant::now();
-        // Auto-engage capture once the first frame is on screen and the window has focus.
-        if self.have_frame && !self.captured && self.inhibit_shortcuts {
-            // (inhibit_shortcuts gates nothing yet on Windows; capture auto-engages on click.)
         }
     }
 }
