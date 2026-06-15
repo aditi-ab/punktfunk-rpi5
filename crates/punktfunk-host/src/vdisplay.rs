@@ -367,9 +367,71 @@ pub fn apply_session_env(active: &ActiveSession) {
     if active.kind == ActiveKind::DesktopGnome {
         std::env::set_var("PUNKTFUNK_FORCE_SHM", "1");
     }
+    // Stream the desktop as the SOLE output: promote the per-session virtual output to PRIMARY so
+    // the panels + windows land on the streamed surface, not an unstreamed real output (the
+    // auto-detected desktop path *is* "stream this desktop"). Default-on for the auto path; an
+    // explicit `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` still wins.
+    match active.kind {
+        ActiveKind::DesktopKde if std::env::var_os("PUNKTFUNK_KWIN_VIRTUAL_PRIMARY").is_none() => {
+            std::env::set_var("PUNKTFUNK_KWIN_VIRTUAL_PRIMARY", "1");
+        }
+        ActiveKind::DesktopGnome
+            if std::env::var_os("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY").is_none() =>
+        {
+            std::env::set_var("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY", "1");
+        }
+        _ => {}
+    }
 }
 #[cfg(not(target_os = "linux"))]
 pub fn apply_session_env(_active: &ActiveSession) {}
+
+/// On a **mid-stream** switch to a desktop, the xdg-desktop-portal (D-Bus-activated) and the systemd
+/// `--user` environment can still point at the OLD session, so the host's RemoteDesktop portal opens
+/// against a half-stale env — it accepts events but they don't reach the compositor until a
+/// reconnect. Push the live session env into the systemd/D-Bus activation environment and (for KWin,
+/// whose input rides the xdg RemoteDesktop portal) restart the portal so it re-reads it — the same
+/// settling a fresh desktop login does. Best-effort; mirrors the wlroots portal restart. GNOME uses
+/// Mutter's *direct* EIS (no xdg portal), so it only needs the env push.
+#[cfg(target_os = "linux")]
+pub fn settle_desktop_portal(chosen: Compositor) {
+    const VARS: &[&str] = &[
+        "WAYLAND_DISPLAY",
+        "XDG_CURRENT_DESKTOP",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+    ];
+    // Push our (correct) env into the systemd --user manager + the D-Bus activation environment so a
+    // re-activated portal/backend inherits the live session.
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "import-environment"])
+        .args(VARS)
+        .status();
+    let _ = std::process::Command::new("dbus-update-activation-environment")
+        .arg("--systemd")
+        .args(VARS)
+        .status();
+    // KWin input goes through the xdg RemoteDesktop portal; the frontend routes RemoteDesktop to a
+    // backend by its OWN startup XDG_CURRENT_DESKTOP, so restart it (+ the KDE backend) to re-read
+    // the now-live session, then let it settle before the injector reopens against it.
+    if chosen == Compositor::Kwin {
+        let _ = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "try-restart",
+                "xdg-desktop-portal-kde.service",
+                "xdg-desktop-portal.service",
+            ])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+    }
+    tracing::info!(
+        compositor = chosen.id(),
+        "settled desktop portal env for the switched-to session"
+    );
+}
+#[cfg(not(target_os = "linux"))]
+pub fn settle_desktop_portal(_chosen: Compositor) {}
 
 /// Route input to match the chosen video backend (they must not diverge), via the highest-priority
 /// `PUNKTFUNK_INPUT_BACKEND` knob the injector honors. For gamescope, the **default is a managed

@@ -2014,6 +2014,15 @@ fn virtual_stream(
                     env: sw.env,
                 });
                 crate::vdisplay::apply_input_env(sw.compositor);
+                // Switching INTO a desktop mid-stream: the xdg portal / systemd-user env may still
+                // point at the old session, so input would silently not land until a reconnect.
+                // Settle it (env push + KWin portal restart) before the injector reopens against it.
+                if matches!(
+                    sw.compositor,
+                    crate::vdisplay::Compositor::Kwin | crate::vdisplay::Compositor::Mutter
+                ) {
+                    crate::vdisplay::settle_desktop_portal(sw.compositor);
+                }
                 // Build the new backend's pipeline BEFORE dropping the old one (retry absorbs the
                 // brief compositor-coexistence race during a switch); on failure keep the old.
                 let rebuilt =
