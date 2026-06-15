@@ -68,4 +68,19 @@ object NativeBridge {
 
     /** One gamepad axis update. axisId: [Gamepad].AXIS_* (0..5). value: stick i16 (+y=up) / trigger 0..255. */
     external fun nativeSendGamepadAxis(handle: Long, axisId: Int, value: Int)
+
+    // ---- Host→client gamepad feedback: Rust pulls block ~100ms, Kotlin renders (see GamepadFeedback) ----
+
+    /**
+     * Block up to ~100 ms for the next rumble update. Returns `(low shl 16) or high` (each
+     * 0..0xFFFF; 0 = stop), or -1 on timeout / session closed. Call from a dedicated poll thread.
+     */
+    external fun nativeNextRumble(handle: Long): Long
+
+    /**
+     * Block up to ~100 ms for the next DualSense HID-output event, written into [buf] (a direct
+     * ByteBuffer, capacity >= 64) as `[kind][fields…]`: Led=01 r g b, PlayerLeds=02 bits,
+     * Trigger=03 which effect…. Returns the byte count, or -1 on timeout / session closed.
+     */
+    external fun nativeNextHidout(handle: Long, buf: java.nio.ByteBuffer): Int
 }

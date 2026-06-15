@@ -25,6 +25,7 @@ use jni::JNIEnv;
 mod audio;
 #[cfg(target_os = "android")]
 mod decode;
+mod feedback;
 mod session;
 
 /// Initialize `android_logger` once when the JVM loads the library. Logs land in logcat under the

@@ -43,6 +43,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import io.unom.punktfunk.kit.Gamepad
+import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.Keymap
 import io.unom.punktfunk.kit.NativeBridge
 import kotlin.math.abs
@@ -205,7 +206,10 @@ private fun StreamScreen(handle: Long, onDisconnect: () -> Unit) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         activity?.streamHandle = handle // route hardware keys to this session
         activity?.axisMapper = Gamepad.AxisMapper(handle) // route joystick axes
+        // Host→client feedback (rumble + DualSense lightbar/LEDs); poll threads stopped before close.
+        val feedback = GamepadFeedback(handle).also { it.start() }
         onDispose {
+            feedback.stop() // stop + join the poll threads BEFORE nativeClose frees the handle
             activity?.axisMapper?.reset() // release-all so nothing sticks on the host
             activity?.axisMapper = null
             activity?.streamHandle = 0L
