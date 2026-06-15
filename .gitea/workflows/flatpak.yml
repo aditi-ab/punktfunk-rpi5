@@ -23,6 +23,14 @@ name: flatpak
 on:
   push:
     branches: [main]
+    # The flatpak is the CLIENT — only rebuild when the client/core/manifest change, not on every
+    # docs/host push (this is a heavy flatpak-builder run). Tags (v*, the client release) build too.
+    paths:
+      - 'crates/punktfunk-client-linux/**'
+      - 'crates/punktfunk-core/**'
+      - 'packaging/flatpak/**'
+      - 'Cargo.lock'
+      - '.gitea/workflows/flatpak.yml'
     tags: ['v*']
   workflow_dispatch:
 
@@ -43,6 +51,11 @@ jobs:
       image: fedora:43
       options: --privileged
     steps:
+      # fedora:43 has no node, but actions/checkout (a JS action) needs it. A plain `run:` step
+      # executes via the container shell (no node needed), so install node BEFORE checkout.
+      - name: node for the JS actions
+        run: dnf -y install nodejs
+
       - uses: actions/checkout@v4
 
       - name: Tooling
