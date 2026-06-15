@@ -1,8 +1,13 @@
 package io.unom.punktfunk
 
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -17,6 +22,7 @@ import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -24,9 +30,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 
 /**
  * Stream settings. Edits are persisted immediately via [onChange]; [onBack] returns to the connect
@@ -81,6 +89,31 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
             options = GAMEPAD_OPTIONS.mapIndexed { i, lbl -> i to lbl },
             selected = s.gamepad,
         ) { g -> update(s.copy(gamepad = g)) }
+
+        // Mic uplink — turning it on requests RECORD_AUDIO; if denied, the toggle stays off.
+        val micLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission(),
+        ) { granted -> update(s.copy(micEnabled = granted)) }
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Microphone", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    "Send your mic to the host's virtual microphone",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Switch(
+                checked = s.micEnabled,
+                onCheckedChange = { on ->
+                    when {
+                        !on -> update(s.copy(micEnabled = false))
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                            PackageManager.PERMISSION_GRANTED -> update(s.copy(micEnabled = true))
+                        else -> micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                },
+            )
+        }
 
         Spacer(Modifier.height(8.dp))
         TextButton(onClick = onBack) { Text("Done") }

@@ -1,5 +1,7 @@
 package io.unom.punktfunk
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.InputDevice
@@ -15,26 +17,23 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -62,6 +61,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.Keymap
@@ -178,7 +178,7 @@ private fun App() {
 
     if (streamHandle != 0L) {
         // Immersive: the stream takes the whole screen, no bottom bar.
-        StreamScreen(streamHandle, onDisconnect = { streamHandle = 0L })
+        StreamScreen(streamHandle, micEnabled = settings.micEnabled, onDisconnect = { streamHandle = 0L })
     } else {
         Scaffold(
             bottomBar = {
@@ -309,61 +309,59 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     }
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp, vertical = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
     ) {
-        Text("punktfunk", style = MaterialTheme.typography.headlineMedium)
-        Text("Android client", style = MaterialTheme.typography.bodyMedium)
-        Spacer(Modifier.height(24.dp))
+        Text("punktfunk", style = MaterialTheme.typography.headlineLarge)
+        Text(
+            "stream a remote desktop",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(28.dp))
 
         if (savedHosts.isNotEmpty()) {
-            Text("Saved hosts", style = MaterialTheme.typography.labelLarge)
-            Spacer(Modifier.height(8.dp))
-            LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp)) {
-                items(savedHosts, key = { "${it.address}:${it.port}" }) { kh ->
-                    SavedHostRow(
-                        kh,
-                        enabled = !connecting,
-                        onConnect = {
-                            host = kh.address
-                            port = kh.port.toString()
-                            connect(kh.address, kh.port)
-                        },
-                        onForget = {
-                            knownHostStore.remove(kh.address, kh.port)
-                            savedHosts = knownHostStore.all()
-                        },
-                    )
-                }
+            SectionLabel("Saved hosts")
+            savedHosts.forEach { kh ->
+                SavedHostRow(
+                    kh,
+                    enabled = !connecting,
+                    onConnect = {
+                        host = kh.address
+                        port = kh.port.toString()
+                        connect(kh.address, kh.port)
+                    },
+                    onForget = {
+                        knownHostStore.remove(kh.address, kh.port)
+                        savedHosts = knownHostStore.all()
+                    },
+                )
             }
-            Spacer(Modifier.height(16.dp))
-            HorizontalDivider()
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(20.dp))
         }
 
         if (discovered.isNotEmpty()) {
-            Text("Discovered hosts", style = MaterialTheme.typography.labelLarge)
-            Spacer(Modifier.height(8.dp))
-            LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp)) {
-                items(discovered, key = { it.key }) { dh ->
-                    DiscoveredHostRow(dh, enabled = !connecting) {
-                        host = dh.host
-                        port = dh.port.toString()
-                        connect(dh.host, dh.port, dh)
-                    }
+            SectionLabel("Discovered on the network")
+            discovered.forEach { dh ->
+                DiscoveredHostRow(dh, enabled = !connecting) {
+                    host = dh.host
+                    port = dh.port.toString()
+                    connect(dh.host, dh.port, dh)
                 }
             }
-            Spacer(Modifier.height(16.dp))
-            HorizontalDivider()
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(20.dp))
         }
 
+        SectionLabel("Connect manually")
         OutlinedTextField(
             value = host,
             onValueChange = { host = it },
             label = { Text("Host") },
             singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(8.dp))
         OutlinedTextField(
@@ -372,18 +370,28 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
             label = { Text("Port") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(16.dp))
         Button(
             enabled = !connecting && host.isNotBlank() && port.isNotBlank(),
             onClick = { connect(host.trim(), port.toInt()) },
+            modifier = Modifier.fillMaxWidth(),
         ) { Text(if (connecting) "Connecting…" else "Connect  ($w×$h@$hz)") }
         status?.let {
             Spacer(Modifier.height(12.dp))
-            Text(it, style = MaterialTheme.typography.bodySmall)
+            Text(
+                it,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
         }
-        Spacer(Modifier.height(24.dp))
-        Text("core ABI v$abi", style = MaterialTheme.typography.labelSmall)
+        Spacer(Modifier.height(28.dp))
+        Text(
+            "core ABI v$abi",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 
     pendingTrust?.let { pt ->
@@ -499,6 +507,17 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     }
 }
 
+/** Left-aligned section header above each block of the connect screen. */
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.titleSmall,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+    )
+}
+
 @Composable
 private fun DiscoveredHostRow(dh: DiscoveredHost, enabled: Boolean, onTap: () -> Unit) {
     Card(
@@ -547,10 +566,15 @@ private fun SavedHostRow(
 }
 
 @Composable
-private fun StreamScreen(handle: Long, onDisconnect: () -> Unit) {
+private fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     val context = LocalContext.current
     val activity = context as? MainActivity
     val window = activity?.window
+    // Start mic only if the user enabled it AND granted RECORD_AUDIO (else the AAudio input fails).
+    val micWanted = micEnabled && ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.RECORD_AUDIO,
+    ) == PackageManager.PERMISSION_GRANTED
 
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -564,7 +588,8 @@ private fun StreamScreen(handle: Long, onDisconnect: () -> Unit) {
             activity?.axisMapper = null
             activity?.streamHandle = 0L
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            // Leaving the stream: stop the audio + decode threads and tear down the session.
+            // Leaving the stream: stop the mic + audio + decode threads and tear down the session.
+            NativeBridge.nativeStopMic(handle)
             NativeBridge.nativeStopAudio(handle)
             NativeBridge.nativeStopVideo(handle)
             NativeBridge.nativeClose(handle)
@@ -582,11 +607,13 @@ private fun StreamScreen(handle: Long, onDisconnect: () -> Unit) {
                         override fun surfaceCreated(holder: SurfaceHolder) {
                             NativeBridge.nativeStartVideo(handle, holder.surface)
                             NativeBridge.nativeStartAudio(handle)
+                            if (micWanted) NativeBridge.nativeStartMic(handle)
                         }
 
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
 
                         override fun surfaceDestroyed(holder: SurfaceHolder) {
+                            NativeBridge.nativeStopMic(handle)
                             NativeBridge.nativeStopAudio(handle)
                             NativeBridge.nativeStopVideo(handle)
                         }

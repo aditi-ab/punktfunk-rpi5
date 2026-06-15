@@ -15,6 +15,7 @@ data class Settings(
     val bitrateKbps: Int = 0,
     val compositor: Int = 0,
     val gamepad: Int = 0,
+    val micEnabled: Boolean = false,
 )
 
 /** Loads/saves [Settings] in the app-private `punktfunk_settings` prefs. */
@@ -29,6 +30,7 @@ class SettingsStore(context: Context) {
         bitrateKbps = prefs.getInt(K_BITRATE, 0),
         compositor = prefs.getInt(K_COMPOSITOR, 0),
         gamepad = prefs.getInt(K_GAMEPAD, 0),
+        micEnabled = prefs.getBoolean(K_MIC, false),
     )
 
     fun save(s: Settings) {
@@ -39,6 +41,7 @@ class SettingsStore(context: Context) {
             .putInt(K_BITRATE, s.bitrateKbps)
             .putInt(K_COMPOSITOR, s.compositor)
             .putInt(K_GAMEPAD, s.gamepad)
+            .putBoolean(K_MIC, s.micEnabled)
             .apply()
     }
 
@@ -49,6 +52,7 @@ class SettingsStore(context: Context) {
         const val K_BITRATE = "bitrate_kbps"
         const val K_COMPOSITOR = "compositor"
         const val K_GAMEPAD = "gamepad"
+        const val K_MIC = "mic_enabled"
     }
 }
 

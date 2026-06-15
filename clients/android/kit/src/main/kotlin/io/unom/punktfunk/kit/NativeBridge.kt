@@ -84,6 +84,16 @@ object NativeBridge {
     /** Stop + join the audio thread and close AAudio, without closing the session. No-op on `0`. */
     external fun nativeStopAudio(handle: Long)
 
+    /**
+     * Start mic uplink: AAudio input → Opus (48 kHz stereo, 20 ms) → host (`send_mic` / 0xCB), all in
+     * Rust. No-op if already running. The caller MUST hold RECORD_AUDIO; otherwise the AAudio input
+     * stream fails to open and the rest of the session keeps streaming.
+     */
+    external fun nativeStartMic(handle: Long)
+
+    /** Stop + join the mic thread and close the AAudio input stream. No-op on `0`. */
+    external fun nativeStopMic(handle: Long)
+
     // ---- Input: Kotlin captures, Rust forwards to the host (send_input) ----
 
     /** Relative mouse move; dx/dy are device-pixel deltas (screen +y down). */

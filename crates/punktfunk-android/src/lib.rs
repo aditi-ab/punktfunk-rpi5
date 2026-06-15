@@ -26,6 +26,8 @@ mod audio;
 #[cfg(target_os = "android")]
 mod decode;
 mod feedback;
+#[cfg(target_os = "android")]
+mod mic;
 mod session;
 
 /// Initialize `android_logger` once when the JVM loads the library. Logs land in logcat under the

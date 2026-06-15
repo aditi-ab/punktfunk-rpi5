@@ -33,6 +33,8 @@ pub(crate) struct SessionHandle {
     video: Mutex<Option<VideoThread>>,
     #[cfg(target_os = "android")]
     audio: Mutex<Option<crate::audio::AudioPlayback>>,
+    #[cfg(target_os = "android")]
+    mic: Mutex<Option<crate::mic::MicCapture>>,
 }
 
 struct VideoThread {
@@ -57,6 +59,13 @@ impl SessionHandle {
     fn stop_audio(&self) {
         let _ = self.audio.lock().unwrap().take();
     }
+
+    /// Stop mic uplink. Dropping the [`crate::mic::MicCapture`] joins its encode thread and closes
+    /// the AAudio input stream. Idempotent.
+    #[cfg(target_os = "android")]
+    fn stop_mic(&self) {
+        let _ = self.mic.lock().unwrap().take();
+    }
 }
 
 impl Drop for SessionHandle {
@@ -64,6 +73,8 @@ impl Drop for SessionHandle {
         self.stop_video();
         #[cfg(target_os = "android")]
         self.stop_audio();
+        #[cfg(target_os = "android")]
+        self.stop_mic();
     }
 }
 
@@ -182,6 +193,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
                 video: Mutex::new(None),
                 #[cfg(target_os = "android")]
                 audio: Mutex::new(None),
+                #[cfg(target_os = "android")]
+                mic: Mutex::new(None),
             };
             Box::into_raw(Box::new(handle)) as jlong
         }
@@ -378,6 +391,47 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
         // SAFETY: live handle per the contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
         h.stop_audio();
+    }
+}
+
+/// `NativeBridge.nativeStartMic(handle)` — start mic capture (AAudio input → Opus → host `send_mic`).
+/// No-op if already running or on a `0` handle. Caller MUST hold RECORD_AUDIO; a failure (e.g. no
+/// permission) leaves the rest of the session streaming.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let mut guard = h.mic.lock().unwrap();
+    if guard.is_some() {
+        return; // already capturing
+    }
+    match crate::mic::MicCapture::start(h.client.clone()) {
+        Some(m) => *guard = Some(m),
+        None => log::error!("nativeStartMic: mic init failed (RECORD_AUDIO? — session unaffected)"),
+    }
+}
+
+/// `NativeBridge.nativeStopMic(handle)` — stop + join the mic thread and close the AAudio input
+/// stream (without closing the session). No-op on `0`.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    if handle != 0 {
+        // SAFETY: live handle per the contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        h.stop_mic();
     }
 }
 
