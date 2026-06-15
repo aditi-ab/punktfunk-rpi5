@@ -64,10 +64,11 @@ sudo tee /etc/yum.repos.d/punktfunk.repo >/dev/null <<'REPO'
 name=punktfunk
 baseurl=https://git.unom.io/api/packages/unom/rpm/fedora-44
 enabled=1
-# Packages are unsigned; the repo METADATA is Gitea-signed — verify that, skip per-package sig.
-gpgcheck=0
+# Packages are GPG-signed (gpgcheck=1) AND the repo metadata is Gitea-signed (repo_gpgcheck=1).
+gpgcheck=1
 repo_gpgcheck=1
 gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key
+       https://git.unom.io/api/packages/unom/generic/punktfunk-keys/1/RPM-GPG-KEY-punktfunk
 REPO
 
 sudo dnf install punktfunk

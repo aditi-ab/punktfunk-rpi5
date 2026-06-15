@@ -20,7 +20,7 @@ FROM ${BASE_IMAGE}
 # packaging/rpm/README). Use it rather than COPR specifically because it carries the
 # punktfunk-web management console subpackage, which COPR's mock chroot can't build (no `bun`).
 # Group "bazzite" == the Fedora 43 base; override for a different base. Gitea signs the repo
-# metadata (repo_gpgcheck=1); the packages themselves are unsigned (gpgcheck=0).
+# metadata (repo_gpgcheck=1) and the packages are GPG-signed (gpgcheck=1, the packages@unom.io key).
 ARG PUNKTFUNK_RPM_GROUP=bazzite
 
 # RPM Fusion nonfree provides the NVENC-capable ffmpeg-libs punktfunk records/encodes with.
@@ -35,8 +35,8 @@ RUN printf '%s\n' \
       '[gitea-unom-punktfunk]' \
       'name=punktfunk (unom)' \
       "baseurl=https://git.unom.io/api/packages/unom/rpm/${PUNKTFUNK_RPM_GROUP}" \
-      'enabled=1' 'gpgcheck=0' 'repo_gpgcheck=1' \
-      'gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key' \
+      'enabled=1' 'gpgcheck=1' 'repo_gpgcheck=1' \
+      'gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key https://git.unom.io/api/packages/unom/generic/punktfunk-keys/1/RPM-GPG-KEY-punktfunk' \
       > /etc/yum.repos.d/punktfunk.repo \
  && dnf5 -y install punktfunk punktfunk-web \
  && dnf5 clean all

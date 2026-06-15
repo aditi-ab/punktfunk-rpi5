@@ -40,15 +40,16 @@ push), mirroring the [Debian/apt](debian/README.md) setup. Add one repo file, in
 updates with `rpm-ostree upgrade` — no COPR account needed. Full guide: [`rpm/README.md`](rpm/README.md).
 
 ```sh
-# unsigned pkgs + Gitea-signed metadata → repo_gpgcheck=1, gpgcheck=0 (see rpm/README.md)
+# GPG-signed pkgs + Gitea-signed metadata → gpgcheck=1, repo_gpgcheck=1 (see rpm/README.md)
 sudo tee /etc/yum.repos.d/punktfunk.repo >/dev/null <<'REPO'
 [gitea-unom-bazzite]
 name=punktfunk (unom, Bazzite)
 baseurl=https://git.unom.io/api/packages/unom/rpm/bazzite
 enabled=1
-gpgcheck=0
+gpgcheck=1
 repo_gpgcheck=1
 gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key
+       https://git.unom.io/api/packages/unom/generic/punktfunk-keys/1/RPM-GPG-KEY-punktfunk
 REPO
 rpm-ostree install punktfunk && systemctl reboot
 # updates:  rpm-ostree upgrade && systemctl reboot
