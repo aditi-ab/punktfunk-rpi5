@@ -214,10 +214,10 @@ impl InputInjector for SendInputInjector {
                 let scan = (sc_ex & 0xff) as u16;
                 let mut flags = KEYEVENTF_SCANCODE;
                 if extended {
-                    flags = flags | KEYEVENTF_EXTENDEDKEY;
+                    flags |= KEYEVENTF_EXTENDEDKEY;
                 }
                 if !down {
-                    flags = flags | KEYEVENTF_KEYUP;
+                    flags |= KEYEVENTF_KEYUP;
                 }
                 let ki = KEYBDINPUT {
                     wVk: VIRTUAL_KEY(0),

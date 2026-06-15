@@ -1520,12 +1520,10 @@ fn pick_compositor(
     available: &[crate::vdisplay::Compositor],
     detected: Option<crate::vdisplay::Compositor>,
 ) -> Option<crate::vdisplay::Compositor> {
-    if let Some(want) = crate::vdisplay::Compositor::from_pref(pref) {
-        if available.contains(&want) {
-            return Some(want);
-        }
+    match crate::vdisplay::Compositor::from_pref(pref) {
+        Some(want) if available.contains(&want) => Some(want),
+        _ => detected,
     }
-    detected
 }
 
 /// Resolve the client's compositor preference to a concrete backend (the I/O shell around
@@ -1539,7 +1537,7 @@ fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Composito
     #[cfg(target_os = "windows")]
     {
         let _ = pref;
-        return Ok(Compositor::Kwin);
+        Ok(Compositor::Kwin)
     }
     #[cfg(not(target_os = "windows"))]
     {

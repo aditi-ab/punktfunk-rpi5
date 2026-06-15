@@ -152,11 +152,9 @@ impl DuplCapturer {
                 .filter(|&hz| hz > 0)
                 .unwrap_or_else(|| {
                     let r = dd.ModeDesc.RefreshRate;
-                    if r.Denominator > 0 {
-                        (r.Numerator / r.Denominator).max(1)
-                    } else {
-                        60
-                    }
+                    r.Numerator
+                        .checked_div(r.Denominator)
+                        .map_or(60, |hz| hz.max(1))
                 });
             let timeout_ms = std::env::var("PUNKTFUNK_CAPTURE_TIMEOUT_MS")
                 .ok()

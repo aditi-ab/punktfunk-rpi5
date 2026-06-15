@@ -78,8 +78,8 @@ struct RemoveParams {
 /// One `DeviceIoControl` round trip (METHOD_BUFFERED). `input`/`output` may be empty.
 unsafe fn ioctl(h: HANDLE, code: u32, input: &[u8], output: &mut [u8]) -> Result<u32> {
     let mut returned = 0u32;
-    let inp = (!input.is_empty()).then(|| input.as_ptr() as *const c_void);
-    let outp = (!output.is_empty()).then(|| output.as_mut_ptr() as *mut c_void);
+    let inp = (!input.is_empty()).then_some(input.as_ptr() as *const c_void);
+    let outp = (!output.is_empty()).then_some(output.as_mut_ptr() as *mut c_void);
     DeviceIoControl(
         h,
         code,
