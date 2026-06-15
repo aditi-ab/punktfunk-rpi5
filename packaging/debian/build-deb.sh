@@ -103,7 +103,10 @@ DEPENDS="$SHDEPS, libei1, pipewire, wireplumber"
 # ffmpeg: Ubuntu's ffmpeg ships the NVENC-enabled libav* the binary links AND is the encoder
 # runtime; the libav* sonames are already hard Depends via shlibdeps, so the ffmpeg metapackage
 # is a Recommends. gamescope = a ready compositor backend; pipewire-pulse = desktop audio.
-RECOMMENDS="ffmpeg, gamescope, pipewire-pulse"
+# punktfunk-web = the management web console (pairing + status) every user needs — a separate
+# Architecture:all .deb; Recommends so `apt install punktfunk-host` pulls it by default, while a
+# headless/encoding-only box can opt out with --no-install-recommends.
+RECOMMENDS="ffmpeg, gamescope, pipewire-pulse, punktfunk-web"
 SUGGESTS="kwin-wayland, mutter"
 
 INSTALLED_KB="$(du -k -s "$STAGE" | cut -f1)"

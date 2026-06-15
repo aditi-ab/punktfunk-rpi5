@@ -1,0 +1,17 @@
+# punktfunk web console first-run setup — systemd USER one-shot.
+#
+# Generates the console login password (PUNKTFUNK_UI_PASSWORD) in the streaming user's
+# ~/.config/punktfunk on first start, surfaced to the --user journal for retrieval. A .deb postinst
+# runs as root (wrong $HOME), so credential generation must happen as the user — hence this unit.
+# Pulled in by punktfunk-web.service (Wants=); also runnable directly.
+[Unit]
+Description=punktfunk web console first-run setup (login password)
+ConditionPathExists=!%h/.config/punktfunk/web-password
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/share/punktfunk-web/web-init.sh
+
+[Install]
+WantedBy=default.target

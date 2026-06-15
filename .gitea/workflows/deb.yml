@@ -62,6 +62,23 @@ jobs:
           git config --global --add safe.directory "$PWD"
           cargo build --release -p punktfunk-host -p punktfunk-client-linux --locked
 
+      - name: Build + smoke-boot web console (node-server preset)
+        # Gate the .deb on a real node boot: the punktfunk-web .deb runs `node .output/server`,
+        # so prove the node-server build exists, isn't a bun bundle, and actually serves /login.
+        run: |
+          cd web
+          bun install --frozen-lockfile
+          bun run build
+          if grep -q 'Bun\.serve' .output/server/index.mjs; then
+            echo "ERROR: web build is a bun bundle (Bun.serve) — need the node-server preset"; exit 1
+          fi
+          PORT=3009 HOST=127.0.0.1 PUNKTFUNK_UI_PASSWORD=ci node .output/server/index.mjs &
+          NP=$!; sleep 3
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3009/login || echo 000)
+          kill "$NP" 2>/dev/null || true
+          echo "web console smoke: /login -> $code"
+          [ "$code" = 200 ] || { echo "ERROR: web console failed to boot under node"; exit 1; }
+
       - name: Version
         # Tag v1.2.3 -> 1.2.3 (a real release); a main push -> 0.0.1~ciN.g<sha>, which sorts
         # BEFORE 0.0.1 (the '~') yet monotonically increases by run number, so `apt upgrade`
@@ -79,6 +96,7 @@ jobs:
         run: |
           VERSION="$VERSION" bash packaging/debian/build-deb.sh
           VERSION="$VERSION" bash packaging/debian/build-client-deb.sh
+          VERSION="$VERSION" bash packaging/debian/build-web-deb.sh
 
       - name: Publish to the Gitea apt registry
         env:

@@ -1,0 +1,30 @@
+# punktfunk management web console — systemd USER unit (Nitro/Node SSR, port 3000).
+#
+# Installed by the punktfunk-web .deb to /usr/lib/systemd/user/. AUTO-WIRED — no env editing:
+# it sources the host's mgmt token + the generated login password, and points at the host's
+# loopback HTTPS mgmt API (self-signed cert → NODE_TLS_REJECT_UNAUTHORIZED for the proxy's only
+# outbound hop, which is loopback). Enable per user:
+#   systemctl --user enable --now punktfunk-web
+[Unit]
+Description=punktfunk management web console
+# web-init generates the login password; the host writes the mgmt token. Order after both.
+After=punktfunk-web-init.service punktfunk-host.service
+Wants=punktfunk-web-init.service
+
+[Service]
+Type=simple
+# Both are KEY=VALUE files. mgmt-token is REQUIRED (written by the host's `serve`); if absent the
+# unit fails + Restart retries until the host has created it. web-password is '-' optional (web-init
+# creates it first, but a manual operator may inject PUNKTFUNK_UI_PASSWORD another way).
+EnvironmentFile=%h/.config/punktfunk/mgmt-token
+EnvironmentFile=-%h/.config/punktfunk/web-password
+Environment=PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990
+Environment=NODE_TLS_REJECT_UNAUTHORIZED=0
+Environment=PORT=3000
+Environment=HOST=0.0.0.0
+ExecStart=/usr/bin/punktfunk-web-server
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
