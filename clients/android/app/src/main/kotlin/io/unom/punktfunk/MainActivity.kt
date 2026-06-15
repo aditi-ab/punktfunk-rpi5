@@ -342,7 +342,7 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Spacer(Modifier.height(8.dp))
-            Text("punktfunk", style = MaterialTheme.typography.headlineLarge)
+            Text("Punktfunk", style = MaterialTheme.typography.headlineLarge)
             Text(
                 "stream a remote desktop",
                 style = MaterialTheme.typography.bodyMedium,
