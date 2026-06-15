@@ -155,15 +155,40 @@ pub fn open_video(
         }
         Err(last.unwrap_or_else(|| anyhow::anyhow!("encoder open failed at every probed bitrate")))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = cuda; // always false on Windows (no Cuda payload)
+        let pref = std::env::var("PUNKTFUNK_ENCODER")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(pref.as_str(), "nvenc" | "hw" | "nvidia") {
+            anyhow::bail!(
+                "NVENC hardware encode is not yet implemented on Windows — omit PUNKTFUNK_ENCODER \
+                 or set it to 'software' to use the openh264 encoder"
+            );
+        }
+        anyhow::ensure!(
+            codec == Codec::H264,
+            "the Windows software encoder supports H.264 only; client negotiated {codec:?} \
+             (request H264, or use a GPU host once NVENC lands)"
+        );
+        // Software H.264 realistically caps far below the negotiated hardware rates.
+        const SW_BITRATE_CEIL: u64 = 100_000_000;
+        let enc =
+            sw::OpenH264Encoder::open(format, width, height, fps, bitrate_bps.min(SW_BITRATE_CEIL))?;
+        Ok(Box::new(enc) as Box<dyn Encoder>)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = (codec, format, width, height, fps, bitrate_bps, cuda);
-        anyhow::bail!("NVENC encode requires Linux (FFmpeg + NVIDIA driver)")
+        anyhow::bail!("video encode requires Linux or Windows")
     }
 }
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+mod sw;
 
 #[cfg(test)]
 mod tests {

@@ -117,3 +117,6 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_StationsAndDesktops",
 ] }
+# Software H.264 encoder (GPU-less path + NVENC fallback). The default `source` feature statically
+# compiles OpenH264 (BSD-2) — no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.
+openh264 = "0.9"
