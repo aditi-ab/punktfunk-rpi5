@@ -139,8 +139,8 @@ impl DuplCapturer {
                 }
                 j += 1;
             }
-            let output = out1
-                .with_context(|| format!("adapter has no output named {}", target.gdi_name))?;
+            let output =
+                out1.with_context(|| format!("adapter has no output named {}", target.gdi_name))?;
             // 4) duplicate the output.
             let dupl = output
                 .DuplicateOutput(&device)
@@ -171,7 +171,11 @@ impl DuplCapturer {
                 height,
                 refresh_hz,
                 target.gdi_name,
-                if gpu_mode { "D3D11 zero-copy" } else { "CPU staging" }
+                if gpu_mode {
+                    "D3D11 zero-copy"
+                } else {
+                    "CPU staging"
+                }
             );
             Ok(Self {
                 device,
@@ -268,7 +272,10 @@ impl DuplCapturer {
         }
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
-        match self.dupl.AcquireNextFrame(self.timeout_ms, &mut info, &mut res) {
+        match self
+            .dupl
+            .AcquireNextFrame(self.timeout_ms, &mut info, &mut res)
+        {
             Ok(()) => {}
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {

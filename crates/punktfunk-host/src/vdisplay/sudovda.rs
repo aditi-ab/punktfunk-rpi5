@@ -229,11 +229,16 @@ impl VirtualDisplay for SudoVdaDisplay {
             device_name,
             serial: [0u8; 14],
         };
-        let add_bytes =
-            unsafe { std::slice::from_raw_parts(&add as *const _ as *const u8, size_of::<AddParams>()) };
+        let add_bytes = unsafe {
+            std::slice::from_raw_parts(&add as *const _ as *const u8, size_of::<AddParams>())
+        };
         let mut out = [0u8; size_of::<AddOut>()];
-        unsafe { ioctl(self.device, IOCTL_ADD, add_bytes, &mut out) }
-            .with_context(|| format!("SudoVDA ADD {}x{}@{}", mode.width, mode.height, mode.refresh_hz))?;
+        unsafe { ioctl(self.device, IOCTL_ADD, add_bytes, &mut out) }.with_context(|| {
+            format!(
+                "SudoVDA ADD {}x{}@{}",
+                mode.width, mode.height, mode.refresh_hz
+            )
+        })?;
         let ao = unsafe { *(out.as_ptr() as *const AddOut) };
         tracing::info!(
             "SudoVDA created {}x{}@{} (target_id={}, adapter_luid={:#x})",
@@ -281,10 +286,12 @@ impl VirtualDisplay for SudoVdaDisplay {
         Ok(VirtualOutput {
             node_id: 0, // unused on Windows; the capture target is the GDI name below
             preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
-            win_capture: gdi_name.clone().map(|n| crate::capture::dxgi::WinCaptureTarget {
-                adapter_luid: crate::capture::dxgi::pack_luid(ao.luid),
-                gdi_name: n,
-            }),
+            win_capture: gdi_name
+                .clone()
+                .map(|n| crate::capture::dxgi::WinCaptureTarget {
+                    adapter_luid: crate::capture::dxgi::pack_luid(ao.luid),
+                    gdi_name: n,
+                }),
             keepalive: Box::new(SudoVdaKeepalive {
                 device: device_raw,
                 guid: MONITOR_GUID,
@@ -314,8 +321,9 @@ impl Drop for SudoVdaKeepalive {
             let _ = j.join();
         }
         let rp = RemoveParams { guid: self.guid };
-        let rp_bytes =
-            unsafe { std::slice::from_raw_parts(&rp as *const _ as *const u8, size_of::<RemoveParams>()) };
+        let rp_bytes = unsafe {
+            std::slice::from_raw_parts(&rp as *const _ as *const u8, size_of::<RemoveParams>())
+        };
         let mut none: [u8; 0] = [];
         let h = HANDLE(self.device as *mut c_void);
         if let Err(e) = unsafe { ioctl(h, IOCTL_REMOVE, rp_bytes, &mut none) } {

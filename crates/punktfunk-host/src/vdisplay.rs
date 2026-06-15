@@ -540,10 +540,10 @@ mod gamescope;
 mod kwin;
 #[cfg(target_os = "linux")]
 mod mutter;
-#[cfg(target_os = "linux")]
-mod wlroots;
 #[cfg(target_os = "windows")]
 mod sudovda;
+#[cfg(target_os = "linux")]
+mod wlroots;
 
 #[cfg(test)]
 mod tests {

@@ -257,7 +257,9 @@ pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Bo
 #[cfg(target_os = "windows")]
 pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Box<dyn Capturer>> {
     let target = vout.win_capture.clone().ok_or_else(|| {
-        anyhow::anyhow!("SudoVDA target not yet an active display (needs a WDDM GPU to activate it)")
+        anyhow::anyhow!(
+            "SudoVDA target not yet an active display (needs a WDDM GPU to activate it)"
+        )
     })?;
     dxgi::DuplCapturer::open(target, vout.preferred_mode, vout.keepalive)
         .map(|c| Box::new(c) as Box<dyn Capturer>)
@@ -268,7 +270,7 @@ pub fn capture_virtual_output(_vout: crate::vdisplay::VirtualOutput) -> Result<B
     anyhow::bail!("virtual-output capture requires Linux or Windows")
 }
 
-#[cfg(target_os = "linux")]
-mod linux;
 #[cfg(target_os = "windows")]
 pub mod dxgi;
+#[cfg(target_os = "linux")]
+mod linux;

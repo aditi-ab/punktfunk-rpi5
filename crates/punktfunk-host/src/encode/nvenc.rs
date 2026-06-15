@@ -18,8 +18,8 @@ use std::ffi::c_void;
 use std::ptr;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
@@ -94,7 +94,11 @@ impl NvencD3d11Encoder {
     /// Lazily create the session on the first frame's D3D11 device (so capture + encode share it).
     fn init_session(&mut self, device: &ID3D11Device) -> Result<()> {
         unsafe {
-            self.ctx = Some(device.GetImmediateContext().context("D3D11 immediate context")?);
+            self.ctx = Some(
+                device
+                    .GetImmediateContext()
+                    .context("D3D11 immediate context")?,
+            );
 
             // 1. open the session bound to the D3D11 device.
             let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {

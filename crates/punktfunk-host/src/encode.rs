@@ -185,8 +185,13 @@ pub fn open_video(
         );
         // Software H.264 realistically caps far below the negotiated hardware rates.
         const SW_BITRATE_CEIL: u64 = 100_000_000;
-        let enc =
-            sw::OpenH264Encoder::open(format, width, height, fps, bitrate_bps.min(SW_BITRATE_CEIL))?;
+        let enc = sw::OpenH264Encoder::open(
+            format,
+            width,
+            height,
+            fps,
+            bitrate_bps.min(SW_BITRATE_CEIL),
+        )?;
         Ok(Box::new(enc) as Box<dyn Encoder>)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -198,10 +203,10 @@ pub fn open_video(
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "windows")]
-mod sw;
 #[cfg(all(target_os = "windows", feature = "nvenc"))]
 mod nvenc;
+#[cfg(target_os = "windows")]
+mod sw;
 
 #[cfg(test)]
 mod tests {

@@ -46,7 +46,9 @@ impl WasapiLoopbackCapturer {
             .context("spawn wasapi audio thread")?;
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => {
-                tracing::info!("WASAPI loopback capture: 48 kHz stereo f32 (default render endpoint)");
+                tracing::info!(
+                    "WASAPI loopback capture: 48 kHz stereo f32 (default render endpoint)"
+                );
                 Ok(WasapiLoopbackCapturer {
                     chunks: rx,
                     channels,
@@ -93,7 +95,10 @@ fn capture_thread(
     ready: SyncSender<Result<()>>,
 ) -> Result<()> {
     // COM must be initialized on THIS thread (MTA), before any device call.
-    if let Err(e) = wasapi::initialize_mta().ok().context("CoInitializeEx (MTA)") {
+    if let Err(e) = wasapi::initialize_mta()
+        .ok()
+        .context("CoInitializeEx (MTA)")
+    {
         let _ = ready.send(Err(e));
         return Ok(());
     }
@@ -122,7 +127,9 @@ fn capture_thread(
         let capture_client = audio_client
             .get_audiocaptureclient()
             .context("IAudioCaptureClient")?;
-        audio_client.start_stream().context("start loopback stream")?;
+        audio_client
+            .start_stream()
+            .context("start loopback stream")?;
         let _ = ready.send(Ok(()));
 
         let mut bytes: VecDeque<u8> = VecDeque::new();
@@ -182,7 +189,10 @@ mod tests {
         };
         assert_eq!(cap.channels(), 2);
         match cap.next_chunk() {
-            Ok(samples) => assert!(samples.len() % 2 == 0, "interleaved stereo => even sample count"),
+            Ok(samples) => assert!(
+                samples.len() % 2 == 0,
+                "interleaved stereo => even sample count"
+            ),
             Err(e) => eprintln!("no audio within timeout (silent system?): {e:#}"),
         }
     }

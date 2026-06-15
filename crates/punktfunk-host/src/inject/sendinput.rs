@@ -13,11 +13,11 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyExW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    VIRTUAL_KEY,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -73,7 +73,10 @@ impl SendInputInjector {
         if n as usize != inputs.len() {
             // 0 = blocked (different/secure desktop). Surface as Err so the host service drops +
             // reopens the injector (which reattaches the input desktop).
-            anyhow::bail!("SendInput injected {n}/{} events (blocked desktop?)", inputs.len());
+            anyhow::bail!(
+                "SendInput injected {n}/{} events (blocked desktop?)",
+                inputs.len()
+            );
         }
         Ok(())
     }
@@ -130,11 +133,46 @@ impl InputInjector for SendInputInjector {
             InputKind::MouseButtonDown | InputKind::MouseButtonUp => {
                 let down = event.kind == InputKind::MouseButtonDown;
                 let (flag, data) = match event.code {
-                    1 => (if down { MOUSEEVENTF_LEFTDOWN } else { MOUSEEVENTF_LEFTUP }, 0u32),
-                    2 => (if down { MOUSEEVENTF_MIDDLEDOWN } else { MOUSEEVENTF_MIDDLEUP }, 0),
-                    3 => (if down { MOUSEEVENTF_RIGHTDOWN } else { MOUSEEVENTF_RIGHTUP }, 0),
-                    4 => (if down { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP }, XBUTTON1),
-                    5 => (if down { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP }, XBUTTON2),
+                    1 => (
+                        if down {
+                            MOUSEEVENTF_LEFTDOWN
+                        } else {
+                            MOUSEEVENTF_LEFTUP
+                        },
+                        0u32,
+                    ),
+                    2 => (
+                        if down {
+                            MOUSEEVENTF_MIDDLEDOWN
+                        } else {
+                            MOUSEEVENTF_MIDDLEUP
+                        },
+                        0,
+                    ),
+                    3 => (
+                        if down {
+                            MOUSEEVENTF_RIGHTDOWN
+                        } else {
+                            MOUSEEVENTF_RIGHTUP
+                        },
+                        0,
+                    ),
+                    4 => (
+                        if down {
+                            MOUSEEVENTF_XDOWN
+                        } else {
+                            MOUSEEVENTF_XUP
+                        },
+                        XBUTTON1,
+                    ),
+                    5 => (
+                        if down {
+                            MOUSEEVENTF_XDOWN
+                        } else {
+                            MOUSEEVENTF_XUP
+                        },
+                        XBUTTON2,
+                    ),
                     _ => return Ok(()),
                 };
                 let mi = MOUSEINPUT {
@@ -155,7 +193,11 @@ impl InputInjector for SendInputInjector {
                     dx: 0,
                     dy: 0,
                     mouseData: event.x as u32, // signed wheel delta reinterpreted as DWORD
-                    dwFlags: if horizontal { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL },
+                    dwFlags: if horizontal {
+                        MOUSEEVENTF_HWHEEL
+                    } else {
+                        MOUSEEVENTF_WHEEL
+                    },
                     time: 0,
                     dwExtraInfo: 0,
                 };
@@ -226,5 +268,8 @@ fn virtual_desktop_rect() -> (i32, i32, i32, i32) {
 // RCtrl (0xA3), RAlt (0xA5), Pause (0x90). MAPVK_VK_TO_VSC_EX already encodes E0 for most; this is a
 // thin safety net.
 fn forced_extended(vk: u16) -> bool {
-    matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0xA3 | 0xA5 | 0x90)
+    matches!(
+        vk,
+        0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0xA3 | 0xA5 | 0x90
+    )
 }

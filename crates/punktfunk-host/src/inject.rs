@@ -317,7 +317,7 @@ pub mod gamepad {
 }
 #[cfg(target_os = "linux")]
 mod libei;
-#[cfg(target_os = "linux")]
-mod wlr;
 #[cfg(target_os = "windows")]
 mod sendinput;
+#[cfg(target_os = "linux")]
+mod wlr;

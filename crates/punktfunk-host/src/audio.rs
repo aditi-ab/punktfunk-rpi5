@@ -39,7 +39,8 @@ pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
 
 #[cfg(target_os = "windows")]
 pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
-    wasapi_cap::WasapiLoopbackCapturer::open(channels).map(|c| Box::new(c) as Box<dyn AudioCapturer>)
+    wasapi_cap::WasapiLoopbackCapturer::open(channels)
+        .map(|c| Box::new(c) as Box<dyn AudioCapturer>)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]

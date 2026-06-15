@@ -132,10 +132,12 @@ impl Encoder for OpenH264Encoder {
         );
 
         match self.src_format {
-            PixelFormat::Rgb => self.yuv.read_rgb(RgbSliceU8::new(&bytes[..w * h * 3], (w, h))),
-            PixelFormat::Bgra | PixelFormat::Bgrx => {
-                self.yuv.read_rgb(BgraSliceU8::new(&bytes[..w * h * 4], (w, h)))
-            }
+            PixelFormat::Rgb => self
+                .yuv
+                .read_rgb(RgbSliceU8::new(&bytes[..w * h * 3], (w, h))),
+            PixelFormat::Bgra | PixelFormat::Bgrx => self
+                .yuv
+                .read_rgb(BgraSliceU8::new(&bytes[..w * h * 4], (w, h))),
             PixelFormat::Rgba | PixelFormat::Rgbx => {
                 self.normalize_to_bgra(bytes, 4, true);
                 self.yuv.read_rgb(BgraSliceU8::new(&self.scratch, (w, h)));
