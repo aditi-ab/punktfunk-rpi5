@@ -2,26 +2,25 @@
 //!
 //! Drives the raw NVENC API via `nvidia_video_codec_sdk::{sys, ENCODE_API}` (the safe `Encoder`
 //! wrapper is CUDA-only). Opens an encode session bound to the **same** `ID3D11Device` as the DXGI
-//! capturer (the device is carried on `FramePayload::D3d11`), registers a small pool of encoder-owned
-//! BGRA textures once, and per frame `CopyResource`s the captured texture into a pooled one and
-//! `encode_picture`s it. Mirrors the Linux NVENC config: CBR + ultra-low-latency, infinite GOP,
-//! P-frames only, forced-IDR for RFI, in-band SPS/PPS each keyframe.
+//! capturer (the device is carried on `FramePayload::D3d11`), and **encodes the capturer's texture in
+//! place** — it registers each input texture with NVENC once (cached by pointer) and `encode_picture`s
+//! it directly, with NO per-frame `CopyResource`. (That's safe because the host encode loop is
+//! synchronous — capture → submit → poll, where `poll`/`lock_bitstream` blocks until the encode
+//! finishes — so the capturer never overwrites the texture mid-encode; if that loop ever becomes
+//! pipelined, the capturer must hand a ring of textures.) Mirrors the Linux NVENC config: CBR +
+//! ultra-low-latency, infinite GOP, P-frames only, forced-IDR for RFI, in-band SPS/PPS each keyframe.
 //!
 //! Needs a real NVIDIA GPU at runtime (session creation fails otherwise) — compiles GPU-less, but
 //! `open`/`submit` only succeed on a GPU box. The software encoder (`super::sw`) is the fallback.
 
 use super::{Codec, EncodedFrame, Encoder};
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
-use anyhow::{anyhow, bail, Context, Result};
-use std::collections::VecDeque;
+use anyhow::{anyhow, bail, Result};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-};
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
 use nvidia_video_codec_sdk::ENCODE_API as API;
@@ -36,14 +35,7 @@ fn codec_guid(codec: Codec) -> nv::GUID {
     }
 }
 
-struct PooledTex {
-    tex: ID3D11Texture2D,
-    reg: nv::NV_ENC_REGISTERED_PTR,
-    map: nv::NV_ENC_INPUT_PTR,
-}
-
 pub struct NvencD3d11Encoder {
-    ctx: Option<ID3D11DeviceContext>,
     encoder: *mut c_void,
     codec_guid: nv::GUID,
     width: u32,
@@ -51,10 +43,14 @@ pub struct NvencD3d11Encoder {
     fps: u32,
     bitrate_bps: u64,
     buffer_fmt: nv::NV_ENC_BUFFER_FORMAT,
-    pool: Vec<PooledTex>,
+    /// Registrations of the capturer's input textures, cached by texture raw pointer — NVENC encodes
+    /// them in place (no per-frame copy). The cloned `ID3D11Texture2D` keeps each alive until we
+    /// unregister it (the capturer may drop its copy on a device recreate before our teardown runs).
+    regs: HashMap<isize, (nv::NV_ENC_REGISTERED_PTR, ID3D11Texture2D)>,
     next: usize,
     bitstreams: Vec<nv::NV_ENC_OUTPUT_PTR>,
-    pending: VecDeque<(nv::NV_ENC_OUTPUT_PTR, usize, u64)>,
+    /// (bitstream, mapped input resource to unmap after retrieval, pts_ns) per in-flight encode.
+    pending: VecDeque<(nv::NV_ENC_OUTPUT_PTR, nv::NV_ENC_INPUT_PTR, u64)>,
     frame_idx: i64,
     force_kf: bool,
     inited: bool,
@@ -77,7 +73,6 @@ impl NvencD3d11Encoder {
         bitrate_bps: u64,
     ) -> Result<Self> {
         Ok(Self {
-            ctx: None,
             encoder: ptr::null_mut(),
             codec_guid: codec_guid(codec),
             width,
@@ -85,7 +80,7 @@ impl NvencD3d11Encoder {
             fps,
             bitrate_bps,
             buffer_fmt: nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
-            pool: Vec::new(),
+            regs: HashMap::new(),
             next: 0,
             bitstreams: Vec::new(),
             pending: VecDeque::new(),
@@ -102,21 +97,23 @@ impl NvencD3d11Encoder {
         if self.encoder.is_null() {
             return;
         }
-        for p in &self.pool {
-            if !p.map.is_null() {
-                let _ = (API.unmap_input_resource)(self.encoder, p.map);
+        // Unmap any in-flight inputs, then unregister every cached texture and destroy the bitstreams.
+        for (_, map, _) in &self.pending {
+            if !map.is_null() {
+                let _ = (API.unmap_input_resource)(self.encoder, *map);
             }
-            let _ = (API.unregister_resource)(self.encoder, p.reg);
+        }
+        for (reg, _tex) in self.regs.values() {
+            let _ = (API.unregister_resource)(self.encoder, *reg);
         }
         for &bs in &self.bitstreams {
             let _ = (API.destroy_bitstream_buffer)(self.encoder, bs);
         }
         let _ = (API.destroy_encoder)(self.encoder);
-        self.pool.clear();
+        self.regs.clear(); // drops the texture clones, releasing our refs
         self.bitstreams.clear();
         self.pending.clear();
         self.encoder = ptr::null_mut();
-        self.ctx = None;
         self.inited = false;
         self.next = 0;
     }
@@ -124,12 +121,6 @@ impl NvencD3d11Encoder {
     /// Lazily create the session on the first frame's D3D11 device (so capture + encode share it).
     fn init_session(&mut self, device: &ID3D11Device) -> Result<()> {
         unsafe {
-            self.ctx = Some(
-                device
-                    .GetImmediateContext()
-                    .context("D3D11 immediate context")?,
-            );
-
             // Probe-and-step-down on the bitrate. NVENC rejects `initialize_encoder` with InvalidParam
             // when `averageBitRate` exceeds what the GPU's max codec level can express (e.g. a 1.6 Gbps
             // request on HEVC). Mirror the Linux host's strategy: try the requested rate, and on
@@ -275,48 +266,9 @@ impl NvencD3d11Encoder {
                 );
             }
 
-            // 5. encoder-owned BGRA texture pool, registered once, + one bitstream per slot.
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: self.width,
-                Height: self.height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            };
+            // 5. one output bitstream per in-flight slot. There is NO encoder-owned input pool: the
+            // capturer's textures are registered on demand in `submit` and encoded in place.
             for _ in 0..POOL {
-                let mut tex: Option<ID3D11Texture2D> = None;
-                device
-                    .CreateTexture2D(&desc, None, Some(&mut tex))
-                    .context("CreateTexture2D(nvenc pool)")?;
-                let tex = tex.context("null pool texture")?;
-                let mut rr = nv::NV_ENC_REGISTER_RESOURCE {
-                    version: nv::NV_ENC_REGISTER_RESOURCE_VER,
-                    resourceType:
-                        nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX,
-                    width: self.width,
-                    height: self.height,
-                    pitch: 0,
-                    resourceToRegister: tex.as_raw(),
-                    bufferFormat: self.buffer_fmt,
-                    bufferUsage: nv::NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
-                    ..Default::default()
-                };
-                (API.register_resource)(enc, &mut rr)
-                    .result_without_string()
-                    .map_err(|e| anyhow!("register_resource: {e:?}"))?;
-                self.pool.push(PooledTex {
-                    tex,
-                    reg: rr.registeredResource,
-                    map: ptr::null_mut(),
-                });
                 let mut cb = nv::NV_ENC_CREATE_BITSTREAM_BUFFER {
                     version: nv::NV_ENC_CREATE_BITSTREAM_BUFFER_VER,
                     ..Default::default()
@@ -373,18 +325,38 @@ impl Encoder for NvencD3d11Encoder {
         let slot = self.next % POOL;
         self.next += 1;
         unsafe {
-            let ctx = self.ctx.as_ref().context("no D3D11 context")?;
-            ctx.CopyResource(&self.pool[slot].tex, &frame.texture);
+            // Register the capturer's texture with NVENC once (cached by raw pointer), then encode it
+            // IN PLACE — no `CopyResource` into an encoder-owned pool. This is the zero-copy win: the
+            // capturer already produced a stable GPU texture; we just register + map + encode it.
+            let key = frame.texture.as_raw() as isize;
+            if !self.regs.contains_key(&key) {
+                let mut rr = nv::NV_ENC_REGISTER_RESOURCE {
+                    version: nv::NV_ENC_REGISTER_RESOURCE_VER,
+                    resourceType: nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX,
+                    width: self.width,
+                    height: self.height,
+                    pitch: 0,
+                    resourceToRegister: frame.texture.as_raw(),
+                    bufferFormat: self.buffer_fmt,
+                    bufferUsage: nv::NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
+                    ..Default::default()
+                };
+                (API.register_resource)(self.encoder, &mut rr)
+                    .result_without_string()
+                    .map_err(|e| anyhow!("register_resource: {e:?}"))?;
+                self.regs
+                    .insert(key, (rr.registeredResource, frame.texture.clone()));
+            }
+            let reg = self.regs[&key].0;
 
             let mut mp = nv::NV_ENC_MAP_INPUT_RESOURCE {
                 version: nv::NV_ENC_MAP_INPUT_RESOURCE_VER,
-                registeredResource: self.pool[slot].reg,
+                registeredResource: reg,
                 ..Default::default()
             };
             (API.map_input_resource)(self.encoder, &mut mp)
                 .result_without_string()
                 .map_err(|e| anyhow!("map_input_resource: {e:?}"))?;
-            self.pool[slot].map = mp.mappedResource;
 
             let pts = self.frame_idx as u64;
             self.frame_idx += 1;
@@ -411,7 +383,7 @@ impl Encoder for NvencD3d11Encoder {
                 .result_without_string()
                 .map_err(|e| anyhow!("encode_picture: {e:?}"))?;
             self.pending
-                .push_back((self.bitstreams[slot], slot, captured.pts_ns));
+                .push_back((self.bitstreams[slot], mp.mappedResource, captured.pts_ns));
         }
         Ok(())
     }
@@ -421,7 +393,7 @@ impl Encoder for NvencD3d11Encoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        let Some((bs, slot, pts_ns)) = self.pending.pop_front() else {
+        let Some((bs, map, pts_ns)) = self.pending.pop_front() else {
             return Ok(None);
         };
         unsafe {
@@ -445,9 +417,8 @@ impl Encoder for NvencD3d11Encoder {
             (API.unlock_bitstream)(self.encoder, bs)
                 .result_without_string()
                 .map_err(|e| anyhow!("unlock_bitstream: {e:?}"))?;
-            if !self.pool[slot].map.is_null() {
-                let _ = (API.unmap_input_resource)(self.encoder, self.pool[slot].map);
-                self.pool[slot].map = ptr::null_mut();
+            if !map.is_null() {
+                let _ = (API.unmap_input_resource)(self.encoder, map);
             }
             Ok(Some(EncodedFrame {
                 data,
