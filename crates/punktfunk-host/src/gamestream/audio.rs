@@ -17,9 +17,9 @@
 //! data packets are consumed immediately and missing parity only costs loss recovery — so
 //! the validated stereo path stays byte-identical (data packets only, exactly as before).
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 use crate::audio::SAMPLE_RATE;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use {
     super::AUDIO_PORT,
     crate::audio::{self, AudioCapturer},
@@ -31,7 +31,7 @@ use {
     std::time::{Duration, Instant},
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
 /// RTP payload types (moonlight-common-c `RtpAudioQueue.c`: `RTP_PAYLOAD_TYPE_AUDIO  97`,
@@ -259,7 +259,7 @@ pub type AudioCapSlot =
 /// Spawn the audio stream thread (idempotent via `running`). Stops when `running` clears.
 /// `gcm_key`/`rikeyid` come from `/launch` and key the AES-CBC payload encryption;
 /// `params` is the negotiated [`AudioParams`] from the RTSP ANNOUNCE.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn start(
     running: Arc<AtomicBool>,
     gcm_key: [u8; 16],
@@ -279,10 +279,10 @@ pub fn start(
         });
 }
 
-/// Stub — the audio plane needs Linux (PipeWire capture + libopus); this keeps non-Linux
-/// dev builds compiling (crate doc: "the crate compiles everywhere"). Reports failure the
-/// same way the real stream thread does: by clearing `running`.
-#[cfg(not(target_os = "linux"))]
+/// Stub — the audio plane needs an audio-capture backend (PipeWire on Linux, WASAPI on Windows)
+/// + libopus; this keeps the remaining targets (e.g. macOS) compiling (crate doc: "the crate
+/// compiles everywhere"). Reports failure the same way the real stream thread does: clears `running`.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn start(
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _gcm_key: [u8; 16],
@@ -290,11 +290,11 @@ pub fn start(
     _params: AudioParams,
     _audio_cap: AudioCapSlot,
 ) {
-    tracing::error!("GameStream audio requires Linux (PipeWire + libopus)");
+    tracing::error!("GameStream audio requires Linux (PipeWire) or Windows (WASAPI) + libopus");
     running.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn run(
     running: &AtomicBool,
     gcm_key: &[u8; 16],
@@ -340,13 +340,15 @@ fn run(
 
 /// Opus encoder for one session: the plain stereo encoder (the live-validated path, byte
 /// identical) or a libopus multistream encoder for 5.1/7.1.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 enum SessionEncoder {
     Stereo(opus::Encoder),
+    // Surround needs the libopus *multistream* encoder via `audiopus_sys` (Linux-only dep).
+    #[cfg(target_os = "linux")]
     Surround(MsEncoder),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl SessionEncoder {
     fn new(layout: &'static OpusLayout) -> Result<SessionEncoder> {
         if layout.channels == 2 {
@@ -362,7 +364,18 @@ impl SessionEncoder {
             enc.set_vbr(false).ok();
             Ok(SessionEncoder::Stereo(enc))
         } else {
-            Ok(SessionEncoder::Surround(MsEncoder::new(layout)?))
+            #[cfg(target_os = "linux")]
+            {
+                Ok(SessionEncoder::Surround(MsEncoder::new(layout)?))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::bail!(
+                    "surround audio ({} ch) needs the libopus multistream encoder (Linux only) — \
+                     use a stereo session",
+                    layout.channels
+                )
+            }
         }
     }
 
@@ -374,8 +387,12 @@ impl SessionEncoder {
         samples_per_channel: usize,
         out: &mut [u8],
     ) -> Result<usize> {
+        // `samples_per_channel` only feeds the multistream (surround) encoder; stereo infers it.
+        #[cfg(not(target_os = "linux"))]
+        let _ = samples_per_channel;
         match self {
             SessionEncoder::Stereo(enc) => enc.encode_float(frame, out).context("opus encode"),
+            #[cfg(target_os = "linux")]
             SessionEncoder::Surround(enc) => enc.encode_float(frame, samples_per_channel, out),
         }
     }
@@ -454,7 +471,7 @@ impl Drop for MsEncoder {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn audio_body(
     cap: &mut dyn AudioCapturer,
     sock: &UdpSocket,
