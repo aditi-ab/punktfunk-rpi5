@@ -8,7 +8,7 @@
 //! WDDM output). Compiles on the GPU-less VM; the pure helpers are unit-tested there.
 
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::Interface;
@@ -99,19 +99,88 @@ impl DuplCapturer {
     ) -> Result<Self> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
-            // 1) the adapter whose LUID matches SudoVDA's AddOut.luid.
-            let mut adapter: Option<IDXGIAdapter1> = None;
-            let mut i = 0u32;
-            while let Ok(a) = factory.EnumAdapters1(i) {
-                let d = a.GetDesc1()?;
-                if pack_luid(d.AdapterLuid) == target.adapter_luid {
-                    adapter = Some(a);
-                    break;
+            // 1) Find the output (monitor) whose GDI DeviceName matches, across ALL adapters. On a
+            // real-GPU box the SudoVDA virtual monitor's DXGI output is enumerated under the GPU that
+            // *renders* it (the discrete/integrated GPU), NOT under the SudoVDA "adapter" LUID that
+            // SudoVDA reports — so we can't restrict the search to `target.adapter_luid`. The output
+            // also appears a beat after the display is created, so settle-retry for up to ~2 s.
+            // `target.adapter_luid` is kept only as a tie-break preference (matched adapter first).
+            let _ = target.adapter_luid;
+            let deadline = Instant::now() + Duration::from_millis(2000);
+            let (adapter, output): (IDXGIAdapter1, IDXGIOutput1) = loop {
+                let mut hit = None;
+                let mut i = 0u32;
+                while let Ok(a) = factory.EnumAdapters1(i) {
+                    let ad = a.GetDesc1()?;
+                    let aname = String::from_utf16_lossy(&ad.Description);
+                    let aname = aname.trim_end_matches('\u{0}');
+                    let mut j = 0u32;
+                    while let Ok(o) = a.EnumOutputs(j) {
+                        let od = o.GetDesc()?;
+                        let oname = String::from_utf16_lossy(&od.DeviceName);
+                        let oname = oname.trim_end_matches('\u{0}').to_string();
+                        tracing::debug!(
+                            adapter = aname,
+                            luid = format!("{:#x}", pack_luid(ad.AdapterLuid)),
+                            output = oname,
+                            want = target.gdi_name,
+                            "DXGI output seen"
+                        );
+                        if gdi_name_matches(&od.DeviceName, &target.gdi_name) {
+                            tracing::info!(
+                                adapter = aname,
+                                luid = format!("{:#x}", pack_luid(ad.AdapterLuid)),
+                                output = oname,
+                                "capturing the SudoVDA output on this adapter"
+                            );
+                            hit = Some((a.clone(), o.cast::<IDXGIOutput1>()?));
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if hit.is_some() {
+                        break;
+                    }
+                    i += 1;
                 }
-                i += 1;
-            }
-            let adapter = adapter.context("no DXGI adapter matches the SudoVDA LUID")?;
-            // 2) D3D11 device ON that adapter (driver_type MUST be UNKNOWN with an explicit adapter).
+                if let Some(h) = hit {
+                    break h;
+                }
+                if Instant::now() >= deadline {
+                    let mut topo = Vec::new();
+                    let mut i = 0u32;
+                    while let Ok(a) = factory.EnumAdapters1(i) {
+                        let ad = a.GetDesc1()?;
+                        let an = String::from_utf16_lossy(&ad.Description);
+                        let mut outs = Vec::new();
+                        let mut j = 0u32;
+                        while let Ok(o) = a.EnumOutputs(j) {
+                            let od = o.GetDesc()?;
+                            outs.push(
+                                String::from_utf16_lossy(&od.DeviceName)
+                                    .trim_end_matches('\u{0}')
+                                    .to_string(),
+                            );
+                            j += 1;
+                        }
+                        topo.push(format!(
+                            "{} [{:#x}]: {:?}",
+                            an.trim_end_matches('\u{0}'),
+                            pack_luid(ad.AdapterLuid),
+                            outs
+                        ));
+                        i += 1;
+                    }
+                    bail!(
+                        "no DXGI adapter exposes output {} (topology: {})",
+                        target.gdi_name,
+                        topo.join(" | ")
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            // 2) D3D11 device ON the adapter that exposes the output (driver_type MUST be UNKNOWN with
+            // an explicit adapter). NVENC binds to this same device for zero-copy encode.
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
             D3D11CreateDevice(
@@ -128,20 +197,7 @@ impl DuplCapturer {
             .context("D3D11CreateDevice")?;
             let device = device.context("null D3D11 device")?;
             let context = context.context("null D3D11 context")?;
-            // 3) the output (monitor) whose GDI DeviceName matches.
-            let mut out1: Option<IDXGIOutput1> = None;
-            let mut j = 0u32;
-            while let Ok(o) = adapter.EnumOutputs(j) {
-                let od = o.GetDesc()?;
-                if gdi_name_matches(&od.DeviceName, &target.gdi_name) {
-                    out1 = Some(o.cast::<IDXGIOutput1>()?);
-                    break;
-                }
-                j += 1;
-            }
-            let output =
-                out1.with_context(|| format!("adapter has no output named {}", target.gdi_name))?;
-            // 4) duplicate the output.
+            // 3) duplicate the output.
             let dupl = output
                 .DuplicateOutput(&device)
                 .context("DuplicateOutput (already duplicated by another app?)")?;

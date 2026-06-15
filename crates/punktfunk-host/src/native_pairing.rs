@@ -7,7 +7,7 @@
 //! enters it (the client needs it to build its first message). So the UI **displays** the PIN —
 //! armed on demand for a short window — rather than accepting one.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -101,8 +101,9 @@ pub struct NativePairingStatus {
 }
 
 fn default_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME unset")?;
-    Ok(PathBuf::from(home).join(".config/punktfunk/punktfunk1-paired.json"))
+    // `config_dir()` resolves XDG/HOME on Linux and falls back to %APPDATA% on Windows — so the
+    // native paired-store works without a HOME env var (which a Windows service/task doesn't set).
+    Ok(crate::gamestream::config_dir().join("punktfunk1-paired.json"))
 }
 
 fn load(path: &std::path::Path) -> PairedClients {
