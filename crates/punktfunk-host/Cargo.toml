@@ -101,3 +101,16 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 # GPU-copy into an exportable allocation, export OPAQUE_FD → cuImportExternalMemory (the
 # officially-supported CUDA pairing; raw dmabuf fds are rejected by the desktop driver).
 ash = "0.38"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows host backends. `windows` covers the Win32/CCD APIs the SudoVDA virtual-display backend
+# drives (SetupAPI device enumeration, DeviceIoControl IOCTLs, QueryDisplayConfig name resolution);
+# capture/encode/input/audio backends extend the feature set as they land.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Display",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }

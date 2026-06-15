@@ -456,10 +456,16 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
             Compositor::Wlroots => Ok(Box::new(wlroots::WlrootsDisplay::new()?)),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        // Windows has a single virtual-display backend (SudoVDA); the compositor arg is moot.
+        let _ = compositor;
+        Ok(Box::new(sudovda::SudoVdaDisplay::new()?))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = compositor;
-        anyhow::bail!("virtual displays require Linux (Wayland compositor)")
+        anyhow::bail!("virtual displays require Linux or Windows")
     }
 }
 
@@ -480,10 +486,15 @@ pub fn probe(compositor: Compositor) -> Result<()> {
             Compositor::Gamescope | Compositor::Mutter | Compositor::Wlroots => Ok(()),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
     {
         let _ = compositor;
-        anyhow::bail!("virtual displays require Linux (Wayland compositor)")
+        sudovda::probe()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = compositor;
+        anyhow::bail!("virtual displays require Linux or Windows")
     }
 }
 
@@ -527,6 +538,8 @@ mod kwin;
 mod mutter;
 #[cfg(target_os = "linux")]
 mod wlroots;
+#[cfg(target_os = "windows")]
+mod sudovda;
 
 #[cfg(test)]
 mod tests {
