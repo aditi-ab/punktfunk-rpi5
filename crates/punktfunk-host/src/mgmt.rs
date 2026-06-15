@@ -571,7 +571,7 @@ fn token_eq(presented: &str, expected: &str) -> bool {
 async fn get_health() -> Json<Health> {
     Json(Health {
         status: "ok".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: env!("PUNKTFUNK_VERSION").into(),
         abi_version: punktfunk_core::ABI_VERSION,
     })
 }
@@ -593,7 +593,7 @@ async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<HostInfo> {
         hostname: h.hostname.clone(),
         uniqueid: h.uniqueid.clone(),
         local_ip: h.local_ip.to_string(),
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: env!("PUNKTFUNK_VERSION").into(),
         abi_version: punktfunk_core::ABI_VERSION,
         app_version: APP_VERSION.into(),
         gfe_version: GFE_VERSION.into(),

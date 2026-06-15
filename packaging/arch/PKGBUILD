@@ -19,7 +19,7 @@ pkgbase=punktfunk
 # the RPM spec's `%bcond_with web` (off by default). Set PF_WITH_WEB=1 to also build punktfunk-web
 # (appended to pkgname + bun to makedepends below).
 pkgname=('punktfunk-host' 'punktfunk-client')
-pkgver=0.0.1
+pkgver=0.2.0
 pkgrel=1
 arch=('x86_64')
 url="https://git.unom.io/unom/punktfunk"
@@ -46,6 +46,7 @@ _repo() { printf '%s' "${PF_SRCDIR:-$srcdir/punktfunk}"; }
 build() {
   cd "$(_repo)"
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR="$srcdir/target"
+  export PUNKTFUNK_BUILD_VERSION="${pkgver}-${pkgrel}"   # stamp --version / mgmt /health (build.rs)
   # The host's zero-copy FFI link-needs libcuda at build time; nvidia-utils provides it on an
   # NVIDIA builder. On a GPU-less builder symlink the CUDA stub into the link path first (same
   # caveat the RPM documents): ln -s "$(find / -name libcuda.so -path '*stubs*'|head -1)" /usr/lib/

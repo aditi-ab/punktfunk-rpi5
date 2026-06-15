@@ -13,7 +13,9 @@ name: rpm
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    # HOST-scoped tags only — the Apple client's `v*` tags (release.yml) must NOT publish a host
+    # RPM (a `v0.1.1` client tag previously shipped a host 0.1.1 that shadowed every rolling build).
+    tags: ['host-v*']
   workflow_dispatch:
 
 env:
@@ -65,14 +67,15 @@ jobs:
           restore-keys: cargo-home-
 
       - name: Version
-        # Tag v1.2.3 -> 1.2.3-1 (release); main push -> 0.0.1-0.ciN.g<sha>, whose release "0."
-        # sorts BEFORE the eventual "1" yet increases by run number, so `rpm-ostree upgrade`
-        # always moves to the newest main build.
+        # host-vX.Y.Z tag -> X.Y.Z-1 (a real host release); main push -> 0.2.0-0.ciN.g<sha>, whose
+        # "0." release sorts BELOW the eventual 0.2.0-1 yet climbs by run number AND outranks the
+        # stray 0.1.1, so `rpm-ostree upgrade` truly moves to the newest build. The spec %build
+        # stamps PUNKTFUNK_BUILD_VERSION from these macros into the binary (--version provenance).
         run: |
           SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
           case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; R="1" ;;
-            *)            V="0.0.1"; R="0.ci${GITHUB_RUN_NUMBER}.g${SHORT}" ;;
+            refs/tags/host-v*) V="${GITHUB_REF_NAME#host-v}"; R="1" ;;
+            *)                 V="0.2.0"; R="0.ci${GITHUB_RUN_NUMBER}.g${SHORT}" ;;
           esac
           echo "PF_VERSION=$V" >> "$GITHUB_ENV"
           echo "PF_RELEASE=$R" >> "$GITHUB_ENV"

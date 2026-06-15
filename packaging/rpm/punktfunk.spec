@@ -18,10 +18,11 @@
 
 Name:           punktfunk
 # Version/Release are overridable so CI can stamp a rolling snapshot: a main build passes
-#   --define "pf_version 0.0.1" --define "pf_release 0.ci42.gdeadbee"
-# (Release starting "0." sorts BEFORE the eventual "1" release), a v* tag passes the clean
-# version with "pf_release 1". A plain `rpmbuild` (or COPR) with no defines builds 0.0.1-1.
-Version:        %{?pf_version}%{!?pf_version:0.0.1}
+#   --define "pf_version 0.2.0" --define "pf_release 0.ci42.gdeadbee"
+# (Release starting "0." sorts BEFORE the eventual "1" release; base 0.2.0 sits ABOVE the stray
+# 0.1.1), a host-v* tag passes the clean version with "pf_release 1". A plain `rpmbuild` (or COPR)
+# with no defines builds 0.2.0-1.
+Version:        %{?pf_version}%{!?pf_version:0.2.0}
 Release:        %{?pf_release}%{!?pf_release:1}%{?dist}
 Summary:        Low-latency desktop/game streaming host (Moonlight-compatible + punktfunk/1)
 
@@ -149,7 +150,10 @@ editing. Enable with `systemctl --user enable --now punktfunk-web`.
 # Release build of the host + client binaries (the workspace also has the core lib).
 # cargo fetches crates over the network; COPR build hosts allow this.
 export RUSTFLAGS="%{?build_rustflags}"
-cargo build --release -p punktfunk-host -p punktfunk-client-linux
+# Stamp the exact NVR into the binary for --version / mgmt /health provenance (build.rs reads it).
+export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
+# --locked: reproducible from (commit + Cargo.lock), matching the .deb build path.
+cargo build --release --locked -p punktfunk-host -p punktfunk-client-linux
 
 %if %{with web}
 # Management web console: build the Nitro/Node SSR bundle (node-server preset) with bun. The

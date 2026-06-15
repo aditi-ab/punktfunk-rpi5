@@ -56,12 +56,23 @@ fn main() {
 }
 
 fn real_main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `--version` prints the build-stamped version (build.rs) to stdout and exits — no logging.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--version") | Some("-V") | Some("version")
+    ) {
+        println!("punktfunk-host {}", env!("PUNKTFUNK_VERSION"));
+        return Ok(());
+    }
+
     tracing::info!(
-        "punktfunk-host (punktfunk_core ABI v{})",
+        "punktfunk-host {} (punktfunk_core ABI v{})",
+        env!("PUNKTFUNK_VERSION"),
         punktfunk_core::ABI_VERSION
     );
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         // GameStream host control plane (P1.1: mDNS + serverinfo) + management API, and (with
         // --native) the native punktfunk/1 host in the same process — the unified host.

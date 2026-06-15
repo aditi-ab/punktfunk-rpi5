@@ -26,7 +26,7 @@ cd "$ROOTDIR"
 BIN="target/release/$PKG"
 if [ ! -x "$BIN" ]; then
   echo "==> building $PKG (release)"
-  cargo build --release -p "$PKG" --locked
+  PUNKTFUNK_BUILD_VERSION="$VERSION" cargo build --release -p "$PKG" --locked   # stamp --version (build.rs)
 fi
 
 STAGE="$(mktemp -d)"
