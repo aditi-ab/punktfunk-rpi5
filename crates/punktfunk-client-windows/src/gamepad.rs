@@ -51,7 +51,9 @@ pub struct GamepadService {
     pads: Arc<Mutex<Vec<PadInfo>>>,
     active: Arc<Mutex<Option<PadInfo>>>,
     pinned: Arc<Mutex<Option<u32>>>,
-    ctl: Sender<Ctl>,
+    // `Arc<Mutex<…>>` (not a bare `Sender`, which is `!Sync`) so the service is `Sync` — the
+    // WinUI app shares it across the UI thread and the session-pump thread (attach/detach).
+    ctl: Arc<Mutex<Sender<Ctl>>>,
 }
 
 impl GamepadService {
@@ -75,7 +77,7 @@ impl GamepadService {
             pads,
             active,
             pinned,
-            ctl,
+            ctl: Arc::new(Mutex::new(ctl)),
         }
     }
 
@@ -95,15 +97,15 @@ impl GamepadService {
 
     #[allow(dead_code)] // consumed by the settings GUI (follow-up)
     pub fn set_pinned(&self, id: Option<u32>) {
-        let _ = self.ctl.send(Ctl::Pin(id));
+        let _ = self.ctl.lock().unwrap().send(Ctl::Pin(id));
     }
 
     pub fn attach(&self, connector: Arc<NativeClient>) {
-        let _ = self.ctl.send(Ctl::Attach(connector));
+        let _ = self.ctl.lock().unwrap().send(Ctl::Attach(connector));
     }
 
     pub fn detach(&self) {
-        let _ = self.ctl.send(Ctl::Detach);
+        let _ = self.ctl.lock().unwrap().send(Ctl::Detach);
     }
 
     /// What "Automatic" resolves to right now — the virtual pad matching the physical one

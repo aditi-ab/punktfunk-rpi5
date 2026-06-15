@@ -1,6 +1,6 @@
 [package]
 name = "punktfunk-client-windows"
-description = "Native Windows punktfunk/1 client — winit/D3D11 shell, FFmpeg decode, WASAPI audio, SDL3 gamepads"
+description = "Native Windows punktfunk/1 client — WinUI 3 (windows-reactor) shell, D3D11/SwapChainPanel present, FFmpeg decode, WASAPI audio, SDL3 gamepads"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,27 +21,22 @@ path = "src/main.rs"
 # is Sync (mutexed plane receivers), so it drops into a UI app cleanly.
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 
-# Win32 / Direct3D11 / DXGI surface for the present path + raw input. Software (WARP) device on
-# the GPU-less dev box; the same code drives a hardware adapter on a real GPU.
-windows = { version = "0.62", features = [
+# WinUI 3 UI via windows-reactor (a declarative React-like framework backed by WinUI). Its
+# `build.rs` downloads the Windows App SDK NuGets and stages the bootstrap DLL + resources.pri
+# next to the exe; it requires `CARGO_WORKSPACE_DIR` to be set in the build env. Unpublished
+# (version 0.0.0) and fast-moving, so pinned to a verified commit.
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "b4129fcc1ae81eec8bf1217539883db821bca3a1" }
+# Win32 / Direct3D11 / DXGI for the SwapChainPanel composition swapchain. Pulled from the SAME
+# windows-rs commit as windows-reactor so their `windows-core` unifies — the `IDXGISwapChain1`
+# we hand to `SwapChainPanelHandle::set_swap_chain` must satisfy reactor's `windows_core::Interface`.
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "b4129fcc1ae81eec8bf1217539883db821bca3a1", features = [
     "Win32_Foundation",
-    "Win32_System_Com",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D_Fxc",
-    "Win32_UI_Input",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_HiDpi",
 ] }
-
-# UI shell: a winit window + a raw DXGI flip-model swapchain on its HWND (the proven present
-# path; the WinUI3/Reactor option is a documented follow-up). raw-window-handle extracts the
-# HWND for swapchain creation.
-winit = "0.30"
-raw-window-handle = "0.6"
 
 # Video decode (same FFmpeg pin as the host/Linux client) — software HEVC on the GPU-less dev
 # box; D3D11VA hardware decode is a follow-up for the real-GPU box.

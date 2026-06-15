@@ -1,440 +1,602 @@
-//! The winit application shell: one window hosting a Direct3D11 swapchain, the decoded-frame
-//! present loop, and local keyboard/mouse capture forwarded on the wire contract.
+//! The WinUI 3 (windows-reactor) application shell — host list, settings, PIN/TOFU pairing, and
+//! the stream page (a `SwapChainPanel` bound to the D3D11 composition swapchain in
+//! [`crate::present`], driven by reactor's per-frame `on_rendering`).
 //!
-//! Input capture is a deliberate, reversible STATE (Moonlight-style, mirroring the other
-//! native clients): engaged when the user clicks into the window (that click is suppressed
-//! toward the host) or on first focus; released by Ctrl+Alt+Shift+Q (toggles) or focus loss —
-//! held keys/buttons are flushed host-side on release so nothing sticks down. While captured
-//! the cursor is hidden and confined; F11 toggles fullscreen.
-//!
-//! Keys are winit physical `KeyCode`s → VK via `keymap` (layout-independent). Mouse is
-//! absolute (`MouseMoveAbs` scaled into the negotiated mode through the letterbox transform,
-//! surface size packed in `flags`) — relative pointer-lock is a follow-up (RAWINPUT).
+//! Declarative React-like model: a single root component routes on a `Screen` value held in
+//! `use_async_state` so background threads (discovery, the session pump) can drive navigation.
+//! The present + decoded-frame handoff crosses to the UI thread through a `Mutex` side-channel
+//! and thread-locals (the windows-reactor SwapChainPanel sample's pattern), since the per-frame
+//! present must not go through state/rerender.
 
-use crate::keymap;
-use crate::present::{Renderer, SwapChain};
-use crate::session::{SessionEvent, SessionHandle};
-use crate::trust::{KnownHost, KnownHosts};
+use crate::discovery::{self, DiscoveredHost};
+use crate::gamepad::GamepadService;
+use crate::present::Presenter;
+use crate::session::{self, SessionEvent, SessionParams};
+use crate::trust::{self, KnownHost, KnownHosts, Settings};
 use crate::video::DecodedFrame;
 use punktfunk_core::client::NativeClient;
-use punktfunk_core::config::Mode;
-use punktfunk_core::input::{InputEvent, InputKind};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::collections::HashSet;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::Duration;
-use windows::Win32::Foundation::HWND;
-use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
+use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
+use windows_reactor::*;
 
-/// How we reached this host (for persisting a TOFU fingerprint after `Connected`).
-pub struct ConnectInfo {
-    pub name: String,
-    pub addr: String,
-    pub port: u16,
-    /// TOFU connect (no pin supplied) — persist the observed fingerprint on `Connected`.
-    pub tofu: bool,
+const RESOLUTIONS: &[(u32, u32)] = &[
+    (0, 0),
+    (1280, 720),
+    (1920, 1080),
+    (2560, 1440),
+    (3840, 2160),
+];
+const REFRESH: &[u32] = &[0, 30, 60, 90, 120, 144, 165, 240];
+
+#[derive(Clone, PartialEq)]
+enum Screen {
+    Hosts,
+    Connecting,
+    Stream,
+    Settings,
+    Pair,
 }
 
-pub struct WinApp {
-    handle: SessionHandle,
-    info: ConnectInfo,
-    /// App-lifetime SDL gamepad service: per-session capture + rumble/HID feedback.
-    gamepad: crate::gamepad::GamepadService,
-
-    window: Option<Arc<Window>>,
-    renderer: Option<Renderer>,
-    swap: Option<SwapChain>,
-
-    connector: Option<Arc<NativeClient>>,
-    mode: Mode,
-    have_frame: bool,
-
-    captured: bool,
-    modifiers: ModifiersState,
-    held_keys: HashSet<u8>,
-    held_buttons: HashSet<u32>,
+/// The host we're about to connect to / pair with (carried into the Pair screen).
+#[derive(Clone, Default)]
+struct Target {
+    name: String,
+    addr: String,
+    port: u16,
+    fp_hex: Option<String>,
+    pair_optional: bool,
 }
 
-impl WinApp {
-    pub fn new(
-        handle: SessionHandle,
-        info: ConnectInfo,
-        gamepad: crate::gamepad::GamepadService,
-    ) -> WinApp {
-        WinApp {
-            handle,
-            info,
-            gamepad,
-            window: None,
-            renderer: None,
-            swap: None,
-            connector: None,
-            mode: Mode {
-                width: 1280,
-                height: 720,
-                refresh_hz: 60,
-            },
-            have_frame: false,
-            captured: false,
-            modifiers: ModifiersState::empty(),
-            held_keys: HashSet::new(),
-            held_buttons: HashSet::new(),
-        }
-    }
-
-    pub fn run(self) -> anyhow::Result<()> {
-        let event_loop = EventLoop::new()?;
-        event_loop.set_control_flow(ControlFlow::Poll);
-        let mut app = self;
-        event_loop.run_app(&mut app)?;
-        Ok(())
-    }
-
-    fn send(&self, kind: InputKind, code: u32, x: i32, y: i32, flags: u32) {
-        if let Some(c) = &self.connector {
-            let _ = c.send_input(&InputEvent {
-                kind,
-                _pad: [0; 3],
-                code,
-                x,
-                y,
-                flags,
-            });
-        }
-    }
-
-    /// Forward an absolute pointer position: window pixels → video pixels through the
-    /// Contain-fit letterbox (`flags` packs the coordinate-space size, the host's contract).
-    fn send_abs(&self, x: f64, y: f64) {
-        let Some(window) = &self.window else { return };
-        let size = window.inner_size();
-        let (ww, wh) = (size.width.max(1) as f64, size.height.max(1) as f64);
-        let (vw, vh) = (
-            self.mode.width.max(1) as f64,
-            self.mode.height.max(1) as f64,
-        );
-        let scale = (ww / vw).min(wh / vh);
-        let (ox, oy) = ((ww - vw * scale) / 2.0, (wh - vh * scale) / 2.0);
-        let px = (((x - ox) / scale).round()).clamp(0.0, vw - 1.0) as i32;
-        let py = (((y - oy) / scale).round()).clamp(0.0, vh - 1.0) as i32;
-        let flags = (self.mode.width << 16) | (self.mode.height & 0xffff);
-        self.send(InputKind::MouseMoveAbs, 0, px, py, flags);
-    }
-
-    fn engage(&mut self) {
-        if self.captured {
-            return;
-        }
-        self.captured = true;
-        if let Some(w) = &self.window {
-            w.set_cursor_visible(false);
-            // Confined keeps absolute mapping working; Locked (relative) is the follow-up.
-            let _ = w.set_cursor_grab(CursorGrabMode::Confined);
-        }
-    }
-
-    fn release(&mut self) {
-        if !self.captured {
-            return;
-        }
-        self.captured = false;
-        if let Some(w) = &self.window {
-            w.set_cursor_visible(true);
-            let _ = w.set_cursor_grab(CursorGrabMode::None);
-        }
-        // Flush everything held so nothing sticks down on the host.
-        for vk in self.held_keys.drain().collect::<Vec<_>>() {
-            self.send(InputKind::KeyUp, vk as u32, 0, 0, 0);
-        }
-        for b in self.held_buttons.drain().collect::<Vec<_>>() {
-            self.send(InputKind::MouseButtonUp, b, 0, 0, 0);
-        }
-    }
-
-    fn toggle_fullscreen(&self) {
-        if let Some(w) = &self.window {
-            if w.fullscreen().is_some() {
-                w.set_fullscreen(None);
-            } else {
-                w.set_fullscreen(Some(Fullscreen::Borderless(None)));
-            }
-        }
-    }
-
-    /// Drain session events + the newest decoded frame; returns true if a frame is ready to
-    /// present. Called every loop turn.
-    fn pump(&mut self, event_loop: &ActiveEventLoop) -> bool {
-        while let Ok(ev) = self.handle.events.try_recv() {
-            match ev {
-                SessionEvent::Connected {
-                    connector,
-                    mode,
-                    fingerprint,
-                } => {
-                    self.mode = mode;
-                    if self.info.tofu {
-                        let fp_hex = crate::trust::hex(&fingerprint);
-                        let mut known = KnownHosts::load();
-                        known.upsert(KnownHost {
-                            name: self.info.name.clone(),
-                            addr: self.info.addr.clone(),
-                            port: self.info.port,
-                            fp_hex: fp_hex.clone(),
-                            paired: false,
-                        });
-                        let _ = known.save();
-                        tracing::info!(fp = %fp_hex, "trusted on first use — pinned");
-                    }
-                    if let Some(w) = &self.window {
-                        w.set_title(&format!(
-                            "Punktfunk — {} · {}×{}@{}",
-                            self.info.name, mode.width, mode.height, mode.refresh_hz
-                        ));
-                    }
-                    self.gamepad.attach(connector.clone());
-                    self.connector = Some(connector);
-                    tracing::info!(?mode, "connected — streaming");
-                }
-                SessionEvent::Stats(s) => tracing::debug!(
-                    fps = format!("{:.0}", s.fps),
-                    mbps = format!("{:.1}", s.mbps),
-                    lat_ms = format!("{:.2}", s.latency_ms),
-                    "stats"
-                ),
-                SessionEvent::Failed {
-                    msg,
-                    trust_rejected,
-                } => {
-                    tracing::error!(%msg, trust_rejected, "connect failed");
-                    if trust_rejected {
-                        tracing::error!(
-                            "host fingerprint changed or pairing required — re-pair with --pair PIN"
-                        );
-                    }
-                    self.gamepad.detach();
-                    event_loop.exit();
-                    return false;
-                }
-                SessionEvent::Ended(err) => {
-                    tracing::info!(reason = err.as_deref().unwrap_or("done"), "session ended");
-                    self.gamepad.detach();
-                    event_loop.exit();
-                    return false;
-                }
-            }
-        }
-        // Keep only the newest frame (freshness over completeness).
-        let mut newest = None;
-        while let Ok(f) = self.handle.frames.try_recv() {
-            newest = Some(f);
-        }
-        if let (Some(DecodedFrame::Cpu(c)), Some(r)) = (&newest, self.renderer.as_mut()) {
-            if let Err(e) = r.upload(c) {
-                tracing::warn!(error = %e, "frame upload failed");
-            } else {
-                self.have_frame = true;
-            }
-        }
-        newest.is_some()
-    }
-
-    fn render(&mut self) {
-        let (Some(swap), Some(renderer)) = (self.swap.as_mut(), self.renderer.as_ref()) else {
-            return;
-        };
-        if !self.have_frame {
-            return;
-        }
-        match swap.rtv() {
-            Ok(rtv) => {
-                renderer.draw(
-                    &rtv,
-                    swap.width,
-                    swap.height,
-                    self.mode.width,
-                    self.mode.height,
-                );
-                swap.present();
-            }
-            Err(e) => tracing::warn!(error = %e, "acquire back buffer"),
-        }
-    }
+/// UI-thread-only present context: the D3D11 presenter plus the decoded-frame receiver.
+struct PresentCtx {
+    presenter: Presenter,
+    frames: async_channel::Receiver<DecodedFrame>,
 }
 
-fn hwnd_of(window: &Window) -> Option<HWND> {
-    match window.window_handle().ok()?.as_raw() {
-        RawWindowHandle::Win32(h) => Some(HWND(h.hwnd.get() as *mut core::ffi::c_void)),
-        _ => None,
-    }
+thread_local! {
+    static PRESENT: RefCell<Option<PresentCtx>> = const { RefCell::new(None) };
+    static PENDING_FRAMES: RefCell<Option<async_channel::Receiver<DecodedFrame>>> =
+        const { RefCell::new(None) };
 }
 
-/// winit MouseButton → GameStream button id (1=left, 2=middle, 3=right, 4=X1, 5=X2).
-fn mouse_button_id(b: MouseButton) -> Option<u32> {
-    Some(match b {
-        MouseButton::Left => 1,
-        MouseButton::Middle => 2,
-        MouseButton::Right => 3,
-        MouseButton::Back => 4,
-        MouseButton::Forward => 5,
-        _ => return None,
-    })
+/// Cross-thread handoff from the session pump (off-thread) to the stream page (UI thread).
+#[derive(Default)]
+struct Shared {
+    handoff: Mutex<Option<(Arc<NativeClient>, async_channel::Receiver<DecodedFrame>)>>,
+    target: Mutex<Target>,
 }
 
-impl ApplicationHandler for WinApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let attrs = Window::default_attributes()
-            .with_title("Punktfunk")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
-                tracing::error!(error = %e, "create window");
-                event_loop.exit();
-                return;
-            }
-        };
-        let renderer = match Renderer::new() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(error = %e, "D3D11 renderer");
-                event_loop.exit();
-                return;
-            }
-        };
-        let size = window.inner_size();
-        let swap = hwnd_of(&window)
-            .ok_or_else(|| anyhow::anyhow!("no HWND"))
-            .and_then(|hwnd| {
-                SwapChain::new(renderer.device(), hwnd, size.width, size.height)
-                    .map_err(|e| anyhow::anyhow!(e))
-            });
-        match swap {
-            Ok(s) => self.swap = Some(s),
-            Err(e) => {
-                tracing::error!(error = %e, "swapchain");
-                event_loop.exit();
-                return;
-            }
-        }
-        self.renderer = Some(renderer);
-        self.window = Some(window);
-    }
+pub struct AppCtx {
+    identity: (String, String),
+    settings: Mutex<Settings>,
+    gamepad: GamepadService,
+    shared: Arc<Shared>,
+}
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => {
-                self.handle.stop.store(true, Ordering::SeqCst);
-                self.gamepad.detach();
-                event_loop.exit();
-            }
-            WindowEvent::Resized(size) => {
-                if let Some(swap) = self.swap.as_mut() {
-                    if let Err(e) = swap.resize(size.width, size.height) {
-                        tracing::warn!(error = %e, "swapchain resize");
-                    }
-                }
-            }
-            WindowEvent::Focused(false) => self.release(),
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
-            WindowEvent::KeyboardInput { event, .. } => {
-                let PhysicalKey::Code(code) = event.physical_key else {
-                    return;
-                };
-                // Local chords (intercepted, never forwarded): capture toggle + fullscreen.
-                if code == KeyCode::KeyQ
-                    && event.state.is_pressed()
-                    && self.modifiers.control_key()
-                    && self.modifiers.alt_key()
-                    && self.modifiers.shift_key()
-                {
-                    if self.captured {
-                        self.release();
+pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_reactor::Result<()> {
+    let ctx = Arc::new(AppCtx {
+        identity,
+        settings: Mutex::new(Settings::load()),
+        gamepad,
+        shared: Arc::new(Shared::default()),
+    });
+    App::new()
+        .title("Punktfunk")
+        .inner_size(1100.0, 720.0)
+        .render(move |cx| root(cx, &ctx))
+}
+
+fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
+    let (screen, set_screen) = cx.use_async_state(Screen::Hosts);
+    let (hosts, set_hosts) = cx.use_async_state(Vec::<DiscoveredHost>::new());
+    let (status, set_status) = cx.use_async_state(String::new());
+
+    // Continuous LAN discovery (spawned once).
+    cx.use_effect((), {
+        let set_hosts = set_hosts.clone();
+        move || {
+            let rx = discovery::browse();
+            std::thread::spawn(move || {
+                let mut acc: Vec<DiscoveredHost> = Vec::new();
+                while let Ok(h) = rx.recv_blocking() {
+                    if let Some(e) = acc.iter_mut().find(|e| e.key == h.key) {
+                        *e = h;
                     } else {
-                        self.engage();
+                        acc.push(h);
                     }
-                    return;
+                    set_hosts.call(acc.clone());
                 }
-                if code == KeyCode::F11 && event.state.is_pressed() {
-                    self.toggle_fullscreen();
-                    return;
-                }
-                if !self.captured {
-                    return;
-                }
-                let Some(vk) = keymap::keycode_to_vk(code) else {
-                    return;
-                };
-                if event.state.is_pressed() {
-                    // Track held state for flush-on-release; re-send on auto-repeat too (the
-                    // host treats KeyDown as a state set, so repeats are harmless).
-                    self.held_keys.insert(vk);
-                    self.send(InputKind::KeyDown, vk as u32, 0, 0, 0);
-                } else if self.held_keys.remove(&vk) {
-                    self.send(InputKind::KeyUp, vk as u32, 0, 0, 0);
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                if self.captured {
-                    self.send_abs(position.x, position.y);
-                }
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                if !self.captured {
-                    if state == ElementState::Pressed && button == MouseButton::Left {
-                        self.engage(); // the engaging click is suppressed toward the host
-                    }
-                    return;
-                }
-                let Some(id) = mouse_button_id(button) else {
-                    return;
-                };
-                if state == ElementState::Pressed {
-                    self.held_buttons.insert(id);
-                    self.send(InputKind::MouseButtonDown, id, 0, 0, 0);
-                } else if self.held_buttons.remove(&id) {
-                    self.send(InputKind::MouseButtonUp, id, 0, 0, 0);
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if !self.captured {
-                    return;
-                }
-                // The wire carries WHEEL_DELTA(120) units, positive = up / right.
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x, y),
-                    MouseScrollDelta::PixelDelta(p) => (p.x as f32 / 120.0, p.y as f32 / 120.0),
-                };
-                let vy = (dy * 120.0) as i32;
-                if vy != 0 {
-                    self.send(InputKind::MouseScroll, 0, vy, 0, 0);
-                }
-                let vx = (dx * 120.0) as i32;
-                if vx != 0 {
-                    self.send(InputKind::MouseScroll, 1, vx, 0, 0);
-                }
-            }
-            WindowEvent::RedrawRequested => self.render(),
-            _ => {}
+            });
+        }
+    });
+
+    match screen {
+        Screen::Hosts => hosts_page(cx, ctx, &hosts, &status, &set_screen, &set_status),
+        Screen::Connecting => vstack((
+            text_block("Connecting…").font_size(20.0),
+            text_block(status.clone()),
+        ))
+        .spacing(12.0)
+        .into(),
+        Screen::Settings => settings_page(ctx, &set_screen),
+        Screen::Pair => pair_page(cx, ctx, &set_screen, &set_status),
+        Screen::Stream => stream_page(cx, ctx),
+    }
+}
+
+fn hosts_page(
+    cx: &mut RenderCx,
+    ctx: &Arc<AppCtx>,
+    hosts: &[DiscoveredHost],
+    status: &str,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) -> Element {
+    let (manual, set_manual) = cx.use_state(String::new());
+    let known = KnownHosts::load();
+
+    let mut rows: Vec<Element> = Vec::new();
+    rows.push(text_block("Punktfunk").font_size(28.0).bold().into());
+
+    // Saved (trusted/paired) hosts.
+    if !known.hosts.is_empty() {
+        rows.push(text_block("Saved hosts").font_size(16.0).bold().into());
+        for k in &known.hosts {
+            let t = Target {
+                name: k.name.clone(),
+                addr: k.addr.clone(),
+                port: k.port,
+                fp_hex: Some(k.fp_hex.clone()),
+                pair_optional: false,
+            };
+            let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
+            rows.push(
+                button(format!(
+                    "{}  ·  {}:{}  ·  {}",
+                    k.name,
+                    k.addr,
+                    k.port,
+                    if k.paired { "paired" } else { "trusted" }
+                ))
+                .on_click(move || initiate(&ctx2, t.clone(), &ss, &st))
+                .into(),
+            );
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let new_frame = self.pump(event_loop);
-        if new_frame {
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
-        } else {
-            // No frame this turn — yield briefly instead of spinning a core flat-out.
-            std::thread::sleep(Duration::from_millis(1));
-        }
+    // Discovered hosts.
+    rows.push(
+        text_block("Hosts on this network")
+            .font_size(16.0)
+            .bold()
+            .into(),
+    );
+    if hosts.is_empty() {
+        rows.push(text_block("Searching the LAN…").into());
     }
+    for h in hosts {
+        let t = Target {
+            name: h.name.clone(),
+            addr: h.addr.clone(),
+            port: h.port,
+            fp_hex: (!h.fp_hex.is_empty()).then(|| h.fp_hex.clone()),
+            pair_optional: h.pair == "optional",
+        };
+        let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
+        rows.push(
+            button(format!(
+                "{}  ·  {}:{}  ·  pairing {}",
+                h.name,
+                h.addr,
+                h.port,
+                if h.pair.is_empty() {
+                    "optional"
+                } else {
+                    &h.pair
+                }
+            ))
+            .on_click(move || initiate(&ctx2, t.clone(), &ss, &st))
+            .into(),
+        );
+    }
+
+    // Manual connection.
+    rows.push(
+        text_block("Manual connection")
+            .font_size(16.0)
+            .bold()
+            .into(),
+    );
+    rows.push(
+        text_box(manual.clone())
+            .placeholder("host:port")
+            .on_changed(move |s| set_manual.call(s))
+            .into(),
+    );
+    {
+        let (ctx2, ss, st, text) = (ctx.clone(), set_screen.clone(), set_status.clone(), manual);
+        rows.push(
+            button("Connect")
+                .accent()
+                .on_click(move || {
+                    let text = text.trim();
+                    if text.is_empty() {
+                        return;
+                    }
+                    let (addr, port) = match text.rsplit_once(':') {
+                        Some((a, p)) => (a.to_string(), p.parse().unwrap_or(9777)),
+                        None => (text.to_string(), 9777),
+                    };
+                    initiate(
+                        &ctx2,
+                        Target {
+                            name: addr.clone(),
+                            addr,
+                            port,
+                            fp_hex: None,
+                            pair_optional: false,
+                        },
+                        &ss,
+                        &st,
+                    );
+                })
+                .into(),
+        );
+    }
+
+    {
+        let ss = set_screen.clone();
+        rows.push(
+            button("Settings")
+                .on_click(move || ss.call(Screen::Settings))
+                .into(),
+        );
+    }
+    if !status.is_empty() {
+        rows.push(text_block(status.to_string()).into());
+    }
+
+    vstack(rows).spacing(8.0).into()
+}
+
+/// The trust gate (mirrors the GTK client's `initiate_connect`): pinned fingerprint → silent
+/// connect; known address → stored pin; advertised `pair=optional` → TOFU; otherwise → PIN
+/// pairing.
+fn initiate(
+    ctx: &Arc<AppCtx>,
+    target: Target,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) {
+    let known = KnownHosts::load();
+    let pin = target
+        .fp_hex
+        .as_ref()
+        .and_then(|fp| known.find_by_fp(fp).map(|_| fp.clone()))
+        .or_else(|| {
+            known
+                .find_by_addr(&target.addr, target.port)
+                .map(|k| k.fp_hex.clone())
+        })
+        .and_then(|fp| trust::parse_hex32(&fp));
+
+    if let Some(pin) = pin {
+        connect(ctx, &target, Some(pin), set_screen, set_status);
+    } else if target.pair_optional {
+        connect(ctx, &target, None, set_screen, set_status); // TOFU
+    } else {
+        *ctx.shared.target.lock().unwrap() = target;
+        set_screen.call(Screen::Pair);
+    }
+}
+
+fn connect(
+    ctx: &Arc<AppCtx>,
+    target: &Target,
+    pin: Option<[u8; 32]>,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) {
+    let s = ctx.settings.lock().unwrap().clone();
+    let mode = if s.width != 0 && s.refresh_hz != 0 {
+        Mode {
+            width: s.width,
+            height: s.height,
+            refresh_hz: s.refresh_hz,
+        }
+    } else {
+        Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        }
+    };
+    let gamepad_pref = match GamepadPref::from_name(&s.gamepad) {
+        Some(GamepadPref::Auto) | None => ctx.gamepad.auto_pref(),
+        Some(explicit) => explicit,
+    };
+    let handle = session::start(SessionParams {
+        host: target.addr.clone(),
+        port: target.port,
+        mode,
+        compositor: CompositorPref::Auto,
+        gamepad: gamepad_pref,
+        bitrate_kbps: s.bitrate_kbps,
+        mic_enabled: s.mic_enabled,
+        pin,
+        identity: ctx.identity.clone(),
+    });
+    set_screen.call(Screen::Connecting);
+
+    let tofu = pin.is_none();
+    let (shared, gamepad) = (ctx.shared.clone(), ctx.gamepad.clone());
+    let (ss, st) = (set_screen.clone(), set_status.clone());
+    let target = target.clone();
+    std::thread::spawn(move || loop {
+        match handle.events.recv_blocking() {
+            Ok(SessionEvent::Connected {
+                connector,
+                fingerprint,
+                ..
+            }) => {
+                if tofu {
+                    let mut k = KnownHosts::load();
+                    k.upsert(KnownHost {
+                        name: target.name.clone(),
+                        addr: target.addr.clone(),
+                        port: target.port,
+                        fp_hex: trust::hex(&fingerprint),
+                        paired: false,
+                    });
+                    let _ = k.save();
+                }
+                gamepad.attach(connector.clone());
+                *shared.handoff.lock().unwrap() = Some((connector, handle.frames.clone()));
+                ss.call(Screen::Stream);
+            }
+            Ok(SessionEvent::Failed {
+                msg,
+                trust_rejected,
+            }) => {
+                st.call(msg);
+                gamepad.detach();
+                if trust_rejected {
+                    // Pinned-fingerprint mismatch / pairing required → re-pair via the PIN screen.
+                    *shared.target.lock().unwrap() = target.clone();
+                    ss.call(Screen::Pair);
+                } else {
+                    ss.call(Screen::Hosts);
+                }
+                break;
+            }
+            Ok(SessionEvent::Ended(err)) => {
+                st.call(err.unwrap_or_else(|| "Session ended".into()));
+                gamepad.detach();
+                ss.call(Screen::Hosts);
+                break;
+            }
+            Ok(SessionEvent::Stats(_)) => {}
+            Err(_) => {
+                gamepad.detach();
+                ss.call(Screen::Hosts);
+                break;
+            }
+        }
+    });
+}
+
+fn pair_page(
+    cx: &mut RenderCx,
+    ctx: &Arc<AppCtx>,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) -> Element {
+    let (code, set_code) = cx.use_state(String::new());
+    let target = ctx.shared.target.lock().unwrap().clone();
+
+    let (ctx2, ss, st, code2, target2) = (
+        ctx.clone(),
+        set_screen.clone(),
+        set_status.clone(),
+        code.clone(),
+        target.clone(),
+    );
+    let pair_btn = button("Pair & Connect").accent().on_click(move || {
+        let pin = code2.trim().to_string();
+        let (ctx3, ss, st, target3) = (ctx2.clone(), ss.clone(), st.clone(), target2.clone());
+        std::thread::spawn(move || {
+            let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-client".into());
+            match NativeClient::pair(
+                &target3.addr,
+                target3.port,
+                (&ctx3.identity.0, &ctx3.identity.1),
+                &pin,
+                &name,
+                std::time::Duration::from_secs(90),
+            ) {
+                Ok(fp) => {
+                    let mut k = KnownHosts::load();
+                    k.upsert(KnownHost {
+                        name: target3.name.clone(),
+                        addr: target3.addr.clone(),
+                        port: target3.port,
+                        fp_hex: trust::hex(&fp),
+                        paired: true,
+                    });
+                    let _ = k.save();
+                    connect(&ctx3, &target3, Some(fp), &ss, &st);
+                }
+                Err(e) => {
+                    st.call(format!("Pairing failed: {e:?} (wrong PIN, or not armed?)"));
+                    ss.call(Screen::Hosts);
+                }
+            }
+        });
+    });
+    let back = {
+        let ss = set_screen.clone();
+        button("Cancel").on_click(move || ss.call(Screen::Hosts))
+    };
+
+    vstack((
+        text_block(format!("Pair with {}", target.name))
+            .font_size(22.0)
+            .bold(),
+        text_block("Arm pairing on the host (console or web UI), then enter the 4-digit PIN."),
+        text_box(code)
+            .placeholder("PIN")
+            .on_changed(move |s| set_code.call(s)),
+        hstack((pair_btn, back)).spacing(8.0),
+    ))
+    .spacing(12.0)
+    .into()
+}
+
+fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Element {
+    let s = ctx.settings.lock().unwrap().clone();
+    let res_i = RESOLUTIONS
+        .iter()
+        .position(|&(w, h)| w == s.width && h == s.height)
+        .unwrap_or(0) as i32;
+    let hz_i = REFRESH.iter().position(|&r| r == s.refresh_hz).unwrap_or(0) as i32;
+
+    let res_names: Vec<String> = RESOLUTIONS
+        .iter()
+        .map(|&(w, h)| {
+            if w == 0 {
+                "Native display".into()
+            } else {
+                format!("{w} × {h}")
+            }
+        })
+        .collect();
+    let hz_names: Vec<String> = REFRESH
+        .iter()
+        .map(|&r| {
+            if r == 0 {
+                "Native".into()
+            } else {
+                format!("{r} Hz")
+            }
+        })
+        .collect();
+
+    let res_combo = {
+        let ctx = ctx.clone();
+        ComboBox::new(res_names)
+            .header("Resolution")
+            .selected_index(res_i)
+            .on_selection_changed(move |i: i32| {
+                let (w, h) = RESOLUTIONS[(i.max(0) as usize).min(RESOLUTIONS.len() - 1)];
+                let mut s = ctx.settings.lock().unwrap();
+                (s.width, s.height) = (w, h);
+                s.save();
+            })
+    };
+    let hz_combo = {
+        let ctx = ctx.clone();
+        ComboBox::new(hz_names)
+            .header("Refresh rate")
+            .selected_index(hz_i)
+            .on_selection_changed(move |i: i32| {
+                let mut s = ctx.settings.lock().unwrap();
+                s.refresh_hz = REFRESH[(i.max(0) as usize).min(REFRESH.len() - 1)];
+                s.save();
+            })
+    };
+    let mic_toggle = {
+        let ctx = ctx.clone();
+        check_box(s.mic_enabled)
+            .label("Stream microphone to the host")
+            .on_changed(move |on: bool| {
+                let mut s = ctx.settings.lock().unwrap();
+                s.mic_enabled = on;
+                s.save();
+            })
+    };
+    let back = {
+        let ss = set_screen.clone();
+        button("Back")
+            .accent()
+            .on_click(move || ss.call(Screen::Hosts))
+    };
+
+    vstack((
+        text_block("Settings").font_size(28.0).bold(),
+        res_combo,
+        hz_combo,
+        mic_toggle,
+        back,
+    ))
+    .spacing(12.0)
+    .into()
+}
+
+fn present_newest(ctx: &mut PresentCtx) {
+    let mut newest = None;
+    while let Ok(f) = ctx.frames.try_recv() {
+        newest = Some(f);
+    }
+    let cpu = newest.as_ref().map(|DecodedFrame::Cpu(c)| c);
+    ctx.presenter.present(cpu);
+}
+
+fn stream_page(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
+    // Take the connector + frames handoff once on mount; keep the connector alive (and for
+    // input once that lands) in a use_ref, stash frames for `on_ready`.
+    let connector_ref = cx.use_ref::<Option<Arc<NativeClient>>>(None);
+    cx.use_effect((), {
+        let shared = ctx.shared.clone();
+        let connector_ref = connector_ref.clone();
+        move || {
+            if let Some((connector, frames)) = shared.handoff.lock().unwrap().take() {
+                connector_ref.set(Some(connector));
+                PENDING_FRAMES.with(|c| *c.borrow_mut() = Some(frames));
+            }
+        }
+    });
+
+    let rendering = cx.use_ref::<Option<Rendering>>(None);
+    cx.use_effect((), {
+        let rendering = rendering.clone();
+        move || {
+            if let Ok(r) = on_rendering(|| {
+                PRESENT.with(|cell| {
+                    if let Some(ctx) = cell.borrow_mut().as_mut() {
+                        present_newest(ctx);
+                    }
+                });
+            }) {
+                rendering.set(Some(r));
+            }
+        }
+    });
+
+    swap_chain_panel()
+        .on_ready(|panel| match Presenter::new(1280, 720) {
+            Ok(p) => {
+                if let Err(e) = panel.set_swap_chain(p.swap_chain()) {
+                    tracing::error!(error = %e, "set_swap_chain");
+                }
+                if let Some(frames) = PENDING_FRAMES.with(|c| c.borrow_mut().take()) {
+                    PRESENT.with(|cell| {
+                        *cell.borrow_mut() = Some(PresentCtx {
+                            presenter: p,
+                            frames,
+                        });
+                    });
+                    tracing::info!("stream presenter bound to SwapChainPanel");
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "create presenter"),
+        })
+        .on_resize(|w, h| {
+            PRESENT.with(|cell| {
+                if let Some(ctx) = cell.borrow_mut().as_mut() {
+                    ctx.presenter.resize(w as u32, h as u32);
+                }
+            });
+        })
+        .into()
 }

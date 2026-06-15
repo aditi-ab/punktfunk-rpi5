@@ -1,18 +1,16 @@
 //! `punktfunk-client` — the native Windows punktfunk/1 client.
 //!
-//! Pure Rust: `NativeClient` linked as a crate (no C ABI, like the GTK Linux client) ·
-//! FFmpeg decode · WASAPI audio · SDL3 gamepads · a winit window + Direct3D11 flip-model
-//! swapchain present surface. The trust surface mirrors the other native clients: persistent
-//! identity, trust-on-first-use, SPAKE2 PIN pairing.
+//! Pure Rust: `NativeClient` linked as a crate (no C ABI, like the GTK Linux client) · FFmpeg
+//! decode · WASAPI audio · SDL3 gamepads · a **WinUI 3** shell (windows-reactor) with the video
+//! on a `SwapChainPanel` bound to a D3D11 composition swapchain. The trust surface mirrors the
+//! other native clients: persistent identity, trust-on-first-use, SPAKE2 PIN pairing — all in-app
+//! (host list, settings, pairing). `--headless` keeps a CLI connect path for tests/measurement.
 //!
 //! Usage:
-//!   punktfunk-client --connect host[:port] [--pin HEX] [--pair PIN] [--mode WxHxHz]
-//!                    [--bitrate MBPS] [--mic]
-//!   punktfunk-client --headless --connect …   (no window; count frames + print stats)
-//!
-//! Trust: an explicit `--pin HEX` (or a host already pinned in the known-hosts store) connects
-//! silently; `--pair PIN` runs the SPAKE2 ceremony first; otherwise the connect is
-//! trust-on-first-use (the observed fingerprint is pinned on success).
+//!   punktfunk-client                          (open the WinUI 3 window: host list, settings, pairing)
+//!   punktfunk-client --discover               (list punktfunk hosts on the LAN)
+//!   punktfunk-client --headless --connect host[:port] [--pin HEX] [--pair PIN] [--mode WxHxHz]
+//!                    [--bitrate MBPS] [--mic]  (no window; count frames + print stats)
 
 #[cfg(windows)]
 mod app;
@@ -22,8 +20,6 @@ mod audio;
 mod discovery;
 #[cfg(windows)]
 mod gamepad;
-#[cfg(windows)]
-mod keymap;
 #[cfg(windows)]
 mod present;
 #[cfg(windows)]
@@ -35,8 +31,6 @@ mod video;
 
 #[cfg(windows)]
 fn main() {
-    use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -44,69 +38,12 @@ fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
-    let arg = |name: &str| -> Option<String> {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-    };
     let flag = |name: &str| args.iter().any(|a| a == name);
 
     if flag("--discover") {
         discover_and_print();
         return;
     }
-
-    let Some(target) = arg("--connect") else {
-        eprintln!(
-            "punktfunk-client: --connect host[:port] [--pin HEX] [--pair PIN] [--mode WxHxHz] \
-             [--bitrate MBPS] [--mic] [--headless]\n\
-             punktfunk-client --discover                (list punktfunk hosts on the LAN)"
-        );
-        std::process::exit(2);
-    };
-
-    // Saved settings supply defaults when a CLI flag is absent (the GUI host-list/settings
-    // chrome is a follow-up; until then these are the persisted preferences). A CLI flag both
-    // overrides and is written back, so the next bare run reuses it.
-    let mut settings = trust::Settings::load();
-    let (host, port) = match target.rsplit_once(':') {
-        Some((a, p)) => (a.to_string(), p.parse().unwrap_or(9777)),
-        None => (target.clone(), 9777u16),
-    };
-    // CLI overrides fold into the persisted settings, then we derive the effective values.
-    if let Some(m) = arg("--mode").and_then(|m| {
-        let mut it = m.split(['x', 'X']);
-        Some((
-            it.next()?.parse::<u32>().ok()?,
-            it.next()?.parse::<u32>().ok()?,
-            it.next()?.parse::<u32>().ok()?,
-        ))
-    }) {
-        (settings.width, settings.height, settings.refresh_hz) = m;
-    }
-    if let Some(b) = arg("--bitrate").and_then(|b| b.parse::<u32>().ok()) {
-        settings.bitrate_kbps = b * 1000;
-    }
-    if flag("--mic") {
-        settings.mic_enabled = true;
-    }
-    settings.save();
-    let mode = if settings.width != 0 && settings.refresh_hz != 0 {
-        Mode {
-            width: settings.width,
-            height: settings.height,
-            refresh_hz: settings.refresh_hz,
-        }
-    } else {
-        Mode {
-            width: 1920,
-            height: 1080,
-            refresh_hz: 60,
-        }
-    };
-    let bitrate_kbps = settings.bitrate_kbps;
-    let mic_enabled = settings.mic_enabled;
 
     let identity = match trust::load_or_create_identity() {
         Ok(i) => i,
@@ -116,7 +53,61 @@ fn main() {
         }
     };
 
-    // Resolve trust: explicit pin > already-pinned host > pairing ceremony > TOFU.
+    if flag("--headless") {
+        run_headless_cli(&args, identity);
+        return;
+    }
+
+    // Windowed (default): the WinUI 3 app owns host selection, settings, and pairing.
+    let gamepad = gamepad::GamepadService::start();
+    if let Err(e) = app::run(identity, gamepad) {
+        tracing::error!(error = %e, "WinUI app failed");
+        std::process::exit(1);
+    }
+}
+
+/// `--headless --connect host[:port] …`: connect from the CLI, count frames, print stats — the
+/// Windows analogue of `punktfunk-client-rs`.
+#[cfg(windows)]
+fn run_headless_cli(args: &[String], identity: (String, String)) {
+    use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+    use std::time::{Duration, Instant};
+
+    let arg = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let flag = |name: &str| args.iter().any(|a| a == name);
+
+    let Some(target) = arg("--connect") else {
+        eprintln!("--headless requires --connect host[:port]");
+        std::process::exit(2);
+    };
+    let (host, port) = match target.rsplit_once(':') {
+        Some((a, p)) => (a.to_string(), p.parse().unwrap_or(9777)),
+        None => (target.clone(), 9777u16),
+    };
+    let mode = arg("--mode")
+        .and_then(|m| {
+            let mut it = m.split(['x', 'X']);
+            Some(Mode {
+                width: it.next()?.parse().ok()?,
+                height: it.next()?.parse().ok()?,
+                refresh_hz: it.next()?.parse().ok()?,
+            })
+        })
+        .unwrap_or(Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        });
+    let bitrate_kbps = arg("--bitrate")
+        .and_then(|b| b.parse::<u32>().ok())
+        .map(|m| m * 1000)
+        .unwrap_or(0);
+
     let known = trust::KnownHosts::load();
     let mut pin = arg("--pin")
         .and_then(|h| trust::parse_hex32(&h))
@@ -133,7 +124,7 @@ fn main() {
             (&identity.0, &identity.1),
             code.trim(),
             &name,
-            std::time::Duration::from_secs(90),
+            Duration::from_secs(90),
         ) {
             Ok(fp) => {
                 let mut k = trust::KnownHosts::load();
@@ -149,59 +140,25 @@ fn main() {
                 pin = Some(fp);
             }
             Err(e) => {
-                eprintln!("Pairing failed: {e:?} (wrong PIN, or pairing not armed on the host?)");
+                eprintln!("Pairing failed: {e:?}");
                 std::process::exit(1);
             }
         }
     }
 
-    let headless = flag("--headless");
-    // The app-lifetime gamepad service runs only for the windowed client; it also resolves the
-    // "Automatic" pad type to whatever physical controller is attached (other-client parity).
-    let gamepad_service = (!headless).then(gamepad::GamepadService::start);
-    let gamepad_pref = match GamepadPref::from_name(&settings.gamepad) {
-        Some(GamepadPref::Auto) | None => gamepad_service
-            .as_ref()
-            .map_or(GamepadPref::Auto, |s| s.auto_pref()),
-        Some(explicit) => explicit,
-    };
-
-    tracing::info!(%host, port, ?mode, tofu = pin.is_none(), "connecting");
+    tracing::info!(%host, port, ?mode, tofu = pin.is_none(), "connecting (headless)");
     let handle = session::start(session::SessionParams {
-        host: host.clone(),
+        host,
         port,
         mode,
         compositor: CompositorPref::Auto,
-        gamepad: gamepad_pref,
+        gamepad: GamepadPref::Auto,
         bitrate_kbps,
-        mic_enabled,
+        mic_enabled: flag("--mic"),
         pin,
         identity,
     });
 
-    if headless {
-        run_headless(handle);
-        return;
-    }
-
-    let info = app::ConnectInfo {
-        name: host.clone(),
-        addr: host,
-        port,
-        tofu: pin.is_none(),
-    };
-    let gamepad_service = gamepad_service.expect("started for the windowed path");
-    if let Err(e) = app::WinApp::new(handle, info, gamepad_service).run() {
-        tracing::error!(error = %e, "windowed app failed");
-        std::process::exit(1);
-    }
-}
-
-/// Headless runner (`--headless`): drain events + frames, print stats, exit when the host
-/// ends or the harness deadline elapses — the Windows analogue of `punktfunk-client-rs`.
-#[cfg(windows)]
-fn run_headless(handle: session::SessionHandle) {
-    use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut frames_seen = 0u64;
     loop {
@@ -218,16 +175,8 @@ fn run_headless(handle: session::SessionHandle) {
                     frames_seen,
                     "stats"
                 ),
-                session::SessionEvent::Failed {
-                    msg,
-                    trust_rejected,
-                } => {
-                    tracing::error!(%msg, trust_rejected, "connect failed");
-                    if trust_rejected {
-                        tracing::error!(
-                            "host fingerprint changed or pairing required — re-pair with --pair PIN"
-                        );
-                    }
+                session::SessionEvent::Failed { msg, .. } => {
+                    tracing::error!(%msg, "connect failed");
                     return;
                 }
                 session::SessionEvent::Ended(err) => {
@@ -248,8 +197,7 @@ fn run_headless(handle: session::SessionHandle) {
     }
 }
 
-/// `--discover`: browse the LAN for punktfunk hosts (mDNS) and print them, then exit — the
-/// CLI analogue of the GTK client's discovered-hosts list.
+/// `--discover`: browse the LAN for punktfunk hosts (mDNS) and print them, then exit.
 #[cfg(windows)]
 fn discover_and_print() {
     use std::time::{Duration, Instant};
@@ -281,9 +229,9 @@ fn discover_and_print() {
     }
 }
 
-/// Win32/Direct3D11/WASAPI/SDL3 are Windows turf; this stub keeps `cargo build --workspace`
-/// green on Linux/macOS (the other native clients live in crates/punktfunk-client-linux and
-/// clients/apple).
+/// WinUI 3 / Direct3D11 / WASAPI / SDL3 are Windows turf; this stub keeps `cargo build
+/// --workspace` green on Linux/macOS (the other native clients live in
+/// crates/punktfunk-client-linux and clients/apple).
 #[cfg(not(windows))]
 fn main() {
     eprintln!(

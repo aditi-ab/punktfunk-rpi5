@@ -4,7 +4,7 @@
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiscoveredHost {
     /// Stable row key: the advertised host id, falling back to the mDNS fullname.
     pub key: String,
