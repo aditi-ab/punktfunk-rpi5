@@ -281,6 +281,10 @@ impl VirtualDisplay for SudoVdaDisplay {
         Ok(VirtualOutput {
             node_id: 0, // unused on Windows; the capture target is the GDI name below
             preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
+            win_capture: gdi_name.clone().map(|n| crate::capture::dxgi::WinCaptureTarget {
+                adapter_luid: crate::capture::dxgi::pack_luid(ao.luid),
+                gdi_name: n,
+            }),
             keepalive: Box::new(SudoVdaKeepalive {
                 device: device_raw,
                 guid: MONITOR_GUID,

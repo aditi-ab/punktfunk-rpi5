@@ -53,6 +53,9 @@ pub enum FramePayload {
     /// dmabuf has already been imported + copied into this owned device buffer.
     #[cfg(target_os = "linux")]
     Cuda(crate::zerocopy::DeviceBuffer),
+    /// A GPU-resident D3D11 texture (Windows zero-copy path for NVENC). Owns the copied frame.
+    #[cfg(target_os = "windows")]
+    D3d11(dxgi::D3d11Frame),
 }
 
 impl CapturedFrame {
@@ -251,10 +254,21 @@ pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Bo
     linux::PortalCapturer::from_virtual_output(vout).map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Box<dyn Capturer>> {
+    let target = vout.win_capture.clone().ok_or_else(|| {
+        anyhow::anyhow!("SudoVDA target not yet an active display (needs a WDDM GPU to activate it)")
+    })?;
+    dxgi::DuplCapturer::open(target, vout.preferred_mode, vout.keepalive)
+        .map(|c| Box::new(c) as Box<dyn Capturer>)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn capture_virtual_output(_vout: crate::vdisplay::VirtualOutput) -> Result<Box<dyn Capturer>> {
-    anyhow::bail!("virtual-output capture requires Linux")
+    anyhow::bail!("virtual-output capture requires Linux or Windows")
 }
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+pub mod dxgi;
