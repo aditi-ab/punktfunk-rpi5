@@ -14,12 +14,13 @@ const serverDir = fileURLToPath(new URL('./server', import.meta.url))
 // The management API the console drives. The browser always talks same-origin (/api/...):
 // in `vite dev` the dev server proxies it (below); in the built Bun/Nitro server a Nitro
 // route-rule proxies it (below). Override the upstream with PUNKTFUNK_MGMT_URL.
-const MGMT_URL = process.env.PUNKTFUNK_MGMT_URL ?? 'http://127.0.0.1:47990'
+const MGMT_URL = process.env.PUNKTFUNK_MGMT_URL ?? 'https://127.0.0.1:47990'
 
 export default defineConfig({
   server: {
     proxy: {
-      '/api': { target: MGMT_URL, changeOrigin: true },
+      // `secure: false`: the host serves its own self-signed identity cert on loopback.
+      '/api': { target: MGMT_URL, changeOrigin: true, secure: false },
     },
   },
   plugins: [

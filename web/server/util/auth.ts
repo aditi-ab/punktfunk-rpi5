@@ -14,9 +14,11 @@ export function uiPassword(): string {
   return process.env.PUNKTFUNK_UI_PASSWORD ?? ''
 }
 
-/** The management API the proxy forwards to (loopback by default — never LAN-exposed). */
+/** The management API the proxy forwards to (loopback by default — never LAN-exposed). It serves
+ * HTTPS with the host's self-signed identity cert, so the deployment also sets
+ * NODE_TLS_REJECT_UNAUTHORIZED=0 for the (loopback-only) proxy fetch — see .env.example. */
 export function mgmtUrl(): string {
-  return process.env.PUNKTFUNK_MGMT_URL ?? 'http://127.0.0.1:47990'
+  return process.env.PUNKTFUNK_MGMT_URL ?? 'https://127.0.0.1:47990'
 }
 
 /** Bearer token for the management API, injected server-side. */

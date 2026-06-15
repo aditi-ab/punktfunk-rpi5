@@ -15,8 +15,9 @@ Query** through **orval** codegen from the OpenAPI spec · **shadcn/ui** (Tailwi
 bun install               # runs `prepare` → codegen (orval + paraglide)
 bun run dev               # http://localhost:3000
 
-# The dev server proxies /api → http://127.0.0.1:47990 (the host's management API).
-# Point it elsewhere: PUNKTFUNK_MGMT_URL=http://<host>:47990 bun run dev
+# The dev server proxies /api → https://127.0.0.1:47990 (the host's mgmt API; it serves HTTPS
+# with the host's self-signed identity cert — the dev proxy uses `secure: false`).
+# Point it elsewhere: PUNKTFUNK_MGMT_URL=https://<host>:47990 bun run dev
 ```
 
 Start a host with the management API up:
@@ -37,7 +38,10 @@ If the host runs with `--mgmt-token`, set it under **Settings → API token** (s
 bun run build             # → .output/  (Nitro server, `bun` preset, + .output/public assets)
 PORT=3000 HOST=0.0.0.0 \
   PUNKTFUNK_UI_PASSWORD=… PUNKTFUNK_MGMT_TOKEN=… \
+  PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990 NODE_TLS_REJECT_UNAUTHORIZED=0 \
   bun run start           # = bun run .output/server/index.mjs
+# (the mgmt API is HTTPS w/ the host's self-signed cert on loopback → the proxy's fetch needs
+#  NODE_TLS_REJECT_UNAUTHORIZED=0; it makes no other outbound TLS calls. See .env.example.)
 bun run lint              # tsc --noEmit
 ```
 
