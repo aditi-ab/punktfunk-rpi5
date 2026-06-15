@@ -103,6 +103,9 @@ fn nvenc_input(format: PixelFormat) -> (Pixel, bool) {
         PixelFormat::Rgba => (Pixel::RGBA, false),
         PixelFormat::Rgb => (Pixel::RGBZ, true), // RGB -> rgb0
         PixelFormat::Bgr => (Pixel::BGRZ, true), // BGR -> bgr0
+        // 10-bit HDR (R10G10B10A2) is produced only by the Windows DXGI HDR capture path; the Linux
+        // capturer never emits it. Map to BGRA so the match is exhaustive — unreachable here.
+        PixelFormat::Rgb10a2 => (Pixel::BGRA, false),
     }
 }
 
@@ -131,6 +134,7 @@ pub struct NvencEncoder {
 unsafe impl Send for NvencEncoder {}
 
 impl NvencEncoder {
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
         format: PixelFormat,
@@ -139,7 +143,18 @@ impl NvencEncoder {
         fps: u32,
         bitrate_bps: u64,
         cuda: bool,
+        bit_depth: u8,
     ) -> Result<Self> {
+        // TODO(hdr): Linux 10-bit parity. Unlike the Windows raw-SDK path (which upconverts 8-bit
+        // ARGB → Main10 via pixelBitDepthMinus8), libavcodec hevc_nvenc needs a 10-bit input pixel
+        // format (p010) for Main10, so it's a bigger change; deferred until a Linux GPU box is
+        // available to validate. The Linux host stays 8-bit for now.
+        if bit_depth != 8 {
+            tracing::warn!(
+                bit_depth,
+                "Linux NVENC 10-bit not yet wired — encoding 8-bit"
+            );
+        }
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {
             unsafe { ffi::av_log_set_level(48) }; // AV_LOG_DEBUG — surface NVENC hw-frame rejects

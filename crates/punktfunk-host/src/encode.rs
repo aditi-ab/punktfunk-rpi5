@@ -102,6 +102,7 @@ pub fn validate_dimensions(codec: Codec, width: u32, height: u32) -> Result<()> 
 /// encoder takes GPU frames (`AV_PIX_FMT_CUDA`) from the zero-copy path; otherwise it takes
 /// packed RGB/BGR CPU frames. `format`/`bitrate_bps`/`codec`/mode come from session
 /// negotiation; the caller derives `cuda` from the first captured frame's payload.
+#[allow(clippy::too_many_arguments)]
 pub fn open_video(
     codec: Codec,
     format: PixelFormat,
@@ -110,6 +111,7 @@ pub fn open_video(
     fps: u32,
     bitrate_bps: u64,
     cuda: bool,
+    bit_depth: u8,
 ) -> Result<Box<dyn Encoder>> {
     validate_dimensions(codec, width, height)?;
     #[cfg(target_os = "linux")]
@@ -134,7 +136,7 @@ pub fn open_video(
         }
         let mut last: Option<anyhow::Error> = None;
         for (i, &b) in candidates.iter().enumerate() {
-            match linux::NvencEncoder::open(codec, format, width, height, fps, b, cuda) {
+            match linux::NvencEncoder::open(codec, format, width, height, fps, b, cuda, bit_depth) {
                 Ok(enc) => {
                     if i > 0 {
                         tracing::warn!(
@@ -158,6 +160,7 @@ pub fn open_video(
     #[cfg(target_os = "windows")]
     {
         let _ = cuda; // always false on Windows (no Cuda payload)
+        let _ = bit_depth; // used by the NVENC path below; the software H.264 path is 8-bit only
         let pref = std::env::var("PUNKTFUNK_ENCODER")
             .unwrap_or_default()
             .to_ascii_lowercase();
@@ -166,8 +169,15 @@ pub fn open_video(
             // FramePayload::D3d11 output under the same env var so capture + encode share textures.
             #[cfg(feature = "nvenc")]
             {
-                let enc =
-                    nvenc::NvencD3d11Encoder::open(codec, format, width, height, fps, bitrate_bps)?;
+                let enc = nvenc::NvencD3d11Encoder::open(
+                    codec,
+                    format,
+                    width,
+                    height,
+                    fps,
+                    bitrate_bps,
+                    bit_depth,
+                )?;
                 return Ok(Box::new(enc) as Box<dyn Encoder>);
             }
             #[cfg(not(feature = "nvenc"))]
@@ -196,7 +206,16 @@ pub fn open_video(
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        let _ = (codec, format, width, height, fps, bitrate_bps, cuda);
+        let _ = (
+            codec,
+            format,
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            cuda,
+            bit_depth,
+        );
         anyhow::bail!("video encode requires Linux or Windows")
     }
 }

@@ -144,7 +144,7 @@ public final class Stage2Pipeline {
     /// converted to `CLOCK_REALTIME` (see `realtimeNs(forDisplayLinkTimestamp:)`).
     public func renderTick(targetPresentNs: Int64) {
         guard let frame = ring.take() else { return }
-        guard presenter.render(frame.pixelBuffer) else { return }
+        guard presenter.render(frame.pixelBuffer, isHDR: frame.isHDR) else { return }
         presentMeter.record(ptsNs: frame.ptsNs, atNs: targetPresentNs, offsetNs: offsetNs)
     }
 

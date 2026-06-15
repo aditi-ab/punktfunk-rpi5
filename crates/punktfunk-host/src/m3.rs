@@ -554,6 +554,25 @@ async fn serve_session(
             "encoder bitrate"
         );
 
+        // Resolve the encode bit depth: HEVC Main10 only when the client advertised it AND the host
+        // opted in (PUNKTFUNK_10BIT). A client that can't decode 10-bit (caps bit clear, or an older
+        // client) always gets the 8-bit stream. PUNKTFUNK_10BIT is the host policy gate until a
+        // mgmt/console toggle replaces it.
+        let host_wants_10bit = std::env::var_os("PUNKTFUNK_10BIT").is_some();
+        let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
+        let bit_depth: u8 = if host_wants_10bit && client_supports_10bit {
+            10
+        } else {
+            8
+        };
+        tracing::info!(
+            bit_depth,
+            host_wants_10bit,
+            client_supports_10bit,
+            client_video_caps = hello.video_caps,
+            "encode bit depth"
+        );
+
         // Reserve a UDP port for the data plane (bind, read it back, rebind in UdpTransport).
         let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
         let udp_port = probe.local_addr()?.port();
@@ -590,6 +609,7 @@ async fn serve_session(
                 .unwrap_or(CompositorPref::Auto),
             gamepad,
             bitrate_kbps,
+            bit_depth,
         };
         io::write_msg(&mut send, &welcome.encode()).await?;
 
@@ -807,6 +827,7 @@ async fn serve_session(
     let (seconds, frames) = (opts.seconds, opts.frames);
     let mode = hello.mode;
     let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
+    let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
     let stop_stream = stop.clone();
     let result: Result<()> = async {
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -849,6 +870,7 @@ async fn serve_session(
                         &keyframe_rx,
                         compositor,
                         bitrate_kbps,
+                        bit_depth,
                         probe_rx,
                         probe_result_tx,
                     )
@@ -1942,6 +1964,7 @@ fn virtual_stream(
     keyframe: &std::sync::mpsc::Receiver<()>,
     compositor: crate::vdisplay::Compositor,
     bitrate_kbps: u32,
+    bit_depth: u8,
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
 ) -> Result<()> {
@@ -1949,11 +1972,12 @@ fn virtual_stream(
         compositor = compositor.id(),
         ?mode,
         bitrate_kbps,
+        bit_depth,
         "punktfunk/1 virtual display"
     );
     let mut vd = crate::vdisplay::open(compositor)?;
     let (mut capturer, mut enc, mut frame, mut interval) =
-        build_pipeline_with_retry(&mut vd, mode, bitrate_kbps)?;
+        build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth)?;
 
     let perf = std::env::var("PUNKTFUNK_PERF").is_ok();
     // Microburst cap (applied in send_loop/paced_submit): a frame ≤ this bursts out immediately;
@@ -2041,7 +2065,8 @@ fn virtual_stream(
                 let rebuilt =
                     (|| -> Result<(Box<dyn crate::vdisplay::VirtualDisplay>, Pipeline)> {
                         let mut new_vd = crate::vdisplay::open(sw.compositor)?;
-                        let pipe = build_pipeline_with_retry(&mut new_vd, mode, bitrate_kbps)?;
+                        let pipe =
+                            build_pipeline_with_retry(&mut new_vd, mode, bitrate_kbps, bit_depth)?;
                         Ok((new_vd, pipe))
                     })();
                 match rebuilt {
@@ -2084,7 +2109,7 @@ fn virtual_stream(
             // Build the new pipeline BEFORE dropping the old one: the host already acked
             // the switch as accepted, so a rebuild failure must not kill an otherwise
             // healthy session — keep streaming the current mode and log instead.
-            match build_pipeline(&mut vd, new_mode, bitrate_kbps) {
+            match build_pipeline(&mut vd, new_mode, bitrate_kbps, bit_depth) {
                 Ok(next_pipe) => {
                     (capturer, enc, frame, interval) = next_pipe;
                     next = std::time::Instant::now();
@@ -2176,11 +2201,12 @@ fn build_pipeline_with_retry(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     mode: punktfunk_core::Mode,
     bitrate_kbps: u32,
+    bit_depth: u8,
 ) -> Result<Pipeline> {
     const MAX_ATTEMPTS: u32 = 4;
     let mut backoff = std::time::Duration::from_millis(500);
     for attempt in 1..=MAX_ATTEMPTS {
-        match build_pipeline(vd, mode, bitrate_kbps) {
+        match build_pipeline(vd, mode, bitrate_kbps, bit_depth) {
             Ok(pipe) => {
                 if attempt > 1 {
                     tracing::info!(attempt, "pipeline up after retry");
@@ -2238,6 +2264,7 @@ fn build_pipeline(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     mode: punktfunk_core::Mode,
     bitrate_kbps: u32,
+    bit_depth: u8,
 ) -> Result<Pipeline> {
     let vout = vd.create(mode).context("create virtual output")?;
     // The backend reports the refresh it actually achieved in `preferred_mode.2` (KWin may cap a
@@ -2260,6 +2287,8 @@ fn build_pipeline(
         crate::capture::capture_virtual_output(vout).context("capture virtual output")?;
     capturer.set_active(true);
     let frame = capturer.next_frame().context("first frame")?;
+    // `bit_depth` is the handshake-negotiated value (8, or 10 = HEVC Main10 when the client
+    // advertised VIDEO_CAP_10BIT and the host opted in). Threaded down from the Welcome.
     let enc = crate::encode::open_video(
         crate::encode::Codec::H265,
         frame.format,
@@ -2268,6 +2297,7 @@ fn build_pipeline(
         effective_hz,
         bitrate_kbps as u64 * 1000,
         frame.is_cuda(),
+        bit_depth,
     )
     .context("open NVENC")?;
     let interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);

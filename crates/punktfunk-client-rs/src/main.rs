@@ -380,6 +380,14 @@ async fn session(args: Args) -> Result<()> {
             name: Some(args.name.clone()),
             // `--launch ID` — host resolves it against its own library and runs it this session.
             launch: args.launch.clone(),
+            // This headless tool just dumps the bitstream (no decode), so it can always claim
+            // 10-bit support. Gated by env so latency runs stay on the 8-bit baseline:
+            // PUNKTFUNK_CLIENT_10BIT=1 advertises VIDEO_CAP_10BIT to exercise the host Main10 path.
+            video_caps: if std::env::var_os("PUNKTFUNK_CLIENT_10BIT").is_some() {
+                punktfunk_core::quic::VIDEO_CAP_10BIT
+            } else {
+                0
+            },
         }
         .encode(),
     )

@@ -36,7 +36,8 @@ pub fn drm_fourcc(format: crate::capture::PixelFormat) -> Option<u32> {
         Rgbx => fourcc(b"XB24"), // DRM_FORMAT_XBGR8888
         Rgba => fourcc(b"AB24"), // DRM_FORMAT_ABGR8888
         // 24-bit packed RGB/BGR have no straightforward dmabuf import here; use the CPU path.
-        Rgb | Bgr => return None,
+        // Rgb10a2 is the Windows HDR capture format — never produced by the Linux capturer.
+        Rgb | Bgr | Rgb10a2 => return None,
     })
 }
 

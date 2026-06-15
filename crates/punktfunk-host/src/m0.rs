@@ -104,6 +104,7 @@ pub fn run(opts: Options) -> Result<()> {
         opts.fps,
         opts.bitrate_bps,
         first.is_cuda(),
+        8, // m0 synthetic harness: 8-bit
     )
     .context("open encoder")?;
 

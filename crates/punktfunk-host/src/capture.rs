@@ -22,6 +22,10 @@ pub enum PixelFormat {
     Rgb,
     /// `[B,G,R]`, 3 bpp.
     Bgr,
+    /// 10-bit RGB packed as `R10G10B10A2` (DXGI `R10G10B10A2_UNORM`), 4 bpp. The HDR capture path
+    /// produces this: scRGB FP16 desktop pixels are converted to BT.2020 PQ and written here, then
+    /// handed to NVENC as `ABGR10` for an HEVC Main10 / HDR10 encode.
+    Rgb10a2,
 }
 
 impl PixelFormat {

@@ -16,24 +16,26 @@ use windows::core::{s, Interface, PCSTR};
 use windows::Win32::Foundation::{HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
-    ID3DBlob, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
+    ID3DBlob, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
     ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView,
     ID3D11Texture2D, ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_FLAG,
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BLEND_DESC, D3D11_BLEND_INV_DEST_COLOR,
-    D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_BLEND_SRC_ALPHA,
-    D3D11_BUFFER_DESC,
-    D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_READ,
-    D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_POINT,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_MAP_WRITE_DISCARD, D3D11_RENDER_TARGET_BLEND_DESC,
-    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
-    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_USAGE_STAGING,
-    D3D11_VIEWPORT,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BLEND_DESC,
+    D3D11_BLEND_INV_DEST_COLOR, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD,
+    D3D11_BLEND_SRC_ALPHA, D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_COMPARISON_NEVER,
+    D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_MAP_WRITE_DISCARD, D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
+    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_DYNAMIC, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
@@ -230,7 +232,8 @@ unsafe fn compile_shader(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u
             .as_ref()
             .map(|e| {
                 let p = e.GetBufferPointer() as *const u8;
-                String::from_utf8_lossy(std::slice::from_raw_parts(p, e.GetBufferSize())).to_string()
+                String::from_utf8_lossy(std::slice::from_raw_parts(p, e.GetBufferSize()))
+                    .to_string()
             })
             .unwrap_or_default();
         bail!("D3DCompile failed: {msg}");
@@ -326,7 +329,13 @@ impl CursorCompositor {
         })
     }
 
-    unsafe fn set_shape(&mut self, device: &ID3D11Device, bgra: &[u8], w: u32, h: u32) -> Result<()> {
+    unsafe fn set_shape(
+        &mut self,
+        device: &ID3D11Device,
+        bgra: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<()> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
@@ -394,7 +403,11 @@ impl CursorCompositor {
         };
         ctx.RSSetViewports(Some(&[vp]));
         ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-        let blend = if invert { &self.blend_invert } else { &self.blend };
+        let blend = if invert {
+            &self.blend_invert
+        } else {
+            &self.blend
+        };
         ctx.OMSetBlendState(blend, Some(&[0.0; 4]), 0xffff_ffff);
         ctx.VSSetShader(&self.vs, None);
         ctx.PSSetShader(&self.ps, None);
@@ -409,8 +422,122 @@ impl CursorCompositor {
     }
 }
 
+/// Fullscreen-triangle vertex shader for the HDR conversion pass (3 verts, no input layout).
+const HDR_VS: &str = r"
+struct VOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+VOut main(uint vid : SV_VertexID) {
+    float2 uv = float2((vid << 1) & 2, vid & 2);
+    VOut o;
+    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+";
+
+/// HDR conversion pixel shader: scRGB FP16 desktop (linear, Rec.709 primaries, 1.0 = 80 nits) →
+/// BT.2020 primaries → SMPTE ST 2084 (PQ) → written to a 10-bit R10G10B10A2 target for NVENC
+/// (HEVC Main10 / HDR10). This is the standard Windows-HDR capture conversion (matches OBS/Sunshine).
+const HDR_PS: &str = r"
+Texture2D<float4> tx : register(t0);
+SamplerState sm : register(s0);
+// Rec.709 → Rec.2020 primaries (linear). Column-major rows as written, used with mul(M, v).
+static const float3x3 BT709_TO_BT2020 = {
+    0.627403914, 0.329283038, 0.043313048,
+    0.069097292, 0.919540405, 0.011362303,
+    0.016391439, 0.088013308, 0.895595253
+};
+float3 pq_oetf(float3 L) {
+    // L normalized so 1.0 = 10000 nits. ST 2084.
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+    float3 Lp = pow(saturate(L), m1);
+    return pow((c1 + c2 * Lp) / (1.0 + c3 * Lp), m2);
+}
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float3 scrgb = max(tx.Sample(sm, uv).rgb, 0.0); // scRGB can be negative (wide gamut); clamp
+    float3 nits = scrgb * 80.0;                      // scRGB 1.0 = 80 nits → absolute luminance
+    float3 lin2020 = mul(BT709_TO_BT2020, nits);     // primaries conversion (linear)
+    float3 pq = pq_oetf(lin2020 / 10000.0);          // normalize to 10k nits, encode PQ
+    return float4(pq, 1.0);
+}
+";
+
+/// scRGB FP16 → BT.2020 PQ 10-bit conversion pass. One per capture device (rebuilt on device
+/// recreate, like [`CursorCompositor`]). A single fullscreen draw samples the FP16 source SRV and
+/// writes PQ-encoded BT.2020 to the bound R10G10B10A2 render target.
+struct HdrConverter {
+    vs: ID3D11VertexShader,
+    ps: ID3D11PixelShader,
+    sampler: ID3D11SamplerState,
+}
+
+impl HdrConverter {
+    unsafe fn new(device: &ID3D11Device) -> Result<Self> {
+        let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
+        let psb = compile_shader(HDR_PS, s!("main"), s!("ps_5_0"))?;
+        let mut vs = None;
+        device.CreateVertexShader(&vsb, None, Some(&mut vs))?;
+        let mut ps = None;
+        device.CreatePixelShader(&psb, None, Some(&mut ps))?;
+        let sd = D3D11_SAMPLER_DESC {
+            Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+            ComparisonFunc: D3D11_COMPARISON_NEVER,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        };
+        let mut sampler = None;
+        device.CreateSamplerState(&sd, Some(&mut sampler))?;
+        Ok(Self {
+            vs: vs.context("hdr vs")?,
+            ps: ps.context("hdr ps")?,
+            sampler: sampler.context("hdr sampler")?,
+        })
+    }
+
+    /// Convert `src_srv` (FP16 scRGB) into `dst_rtv` (R10G10B10A2 PQ BT.2020). Opaque pass, no blend.
+    unsafe fn convert(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        src_srv: &ID3D11ShaderResourceView,
+        dst_rtv: &ID3D11RenderTargetView,
+        w: u32,
+        h: u32,
+    ) {
+        let vp = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: w as f32,
+            Height: h as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        ctx.RSSetViewports(Some(&[vp]));
+        ctx.OMSetRenderTargets(Some(&[Some(dst_rtv.clone())]), None);
+        ctx.OMSetBlendState(None, None, 0xffff_ffff); // opaque overwrite
+        ctx.VSSetShader(&self.vs, None);
+        ctx.PSSetShader(&self.ps, None);
+        ctx.PSSetShaderResources(0, Some(&[Some(src_srv.clone())]));
+        ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+        ctx.IASetInputLayout(None);
+        ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx.Draw(3, 0);
+        // Unbind so the next frame can CopyResource into the source and re-RTV the destination.
+        ctx.OMSetRenderTargets(Some(&[None]), None);
+        ctx.PSSetShaderResources(0, Some(&[None]));
+    }
+}
+
 /// Convert a DXGI pointer shape (color / masked-color / monochrome) into top-down BGRA.
-fn convert_pointer_shape(buf: &[u8], si: &DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> Option<(Vec<u8>, u32, u32)> {
+fn convert_pointer_shape(
+    buf: &[u8],
+    si: &DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+) -> Option<(Vec<u8>, u32, u32)> {
     let w = si.Width as usize;
     let pitch = si.Pitch as usize;
     if w == 0 || pitch == 0 {
@@ -571,7 +698,34 @@ pub struct DuplCapturer {
     /// Reused owned texture the duplication frame is copied into for the D3D11 path (the duplication
     /// surface is transient and released each frame).
     gpu_copy: Option<ID3D11Texture2D>,
-    have_gpu_frame: bool,
+    /// The most recently produced presentable GPU texture + its pixel format, repeated by
+    /// `next_frame` when AcquireNextFrame reports no change (static desktop) or during a rebuild.
+    /// Format-tagged because the SDR path presents BGRA `gpu_copy` while the HDR path presents the
+    /// 10-bit `hdr10_out` — the encoder needs the right format on every frame.
+    last_present: Option<(ID3D11Texture2D, PixelFormat)>,
+    /// HDR (scRGB FP16) capture state. Set when the duplication surface is `R16G16B16A16_FLOAT`
+    /// (the desktop has HDR on). The frame can't be `CopyResource`d into a BGRA target, so the HDR
+    /// path copies it into an FP16 SRV texture, composites the cursor, then runs [`HdrConverter`] to
+    /// produce a BT.2020 PQ 10-bit (`R10G10B10A2`) frame for NVENC. Toggling HDR fires ACCESS_LOST →
+    /// `recreate_dupl` re-detects the format, so this tracks the *current* duplication.
+    hdr_fp16: bool,
+    /// FP16 copy of the duplication surface (RT|SRV): the cursor composites onto it and the converter
+    /// samples it. Reallocated on device/size change.
+    fp16_src: Option<ID3D11Texture2D>,
+    fp16_srv: Option<ID3D11ShaderResourceView>,
+    /// 10-bit `R10G10B10A2` PQ output of the HDR conversion — the texture handed to NVENC.
+    hdr10_out: Option<ID3D11Texture2D>,
+    /// scRGB→PQ conversion pass; rebuilt on device recreate.
+    hdr_conv: Option<HdrConverter>,
+    /// Last time a duplication rebuild was attempted, to throttle retries during an outage (e.g. a
+    /// secure-desktop dwell where the output is gone) so we don't block the encode loop or hammer
+    /// DuplicateOutput — between attempts the last good frame is repeated. `None` = never attempted.
+    last_rebuild: Option<Instant>,
+    /// True once at least one real frame has been produced. After that, a frame drought (e.g. a long
+    /// secure-desktop dwell with nothing rendering to the virtual output) must never fatally end the
+    /// session — `next_frame` keeps repeating the last/seeded frame instead of erroring on its
+    /// deadline. The deadline stays fatal only *before* the first frame (a genuine startup misconfig).
+    ever_got_frame: bool,
     /// GPU cursor overlay (rebuilt on device recreate). `None` until the first composite.
     cursor: Option<CursorCompositor>,
     /// Last cursor shape as BGRA (kept device-independent so it survives a device recreate).
@@ -721,7 +875,7 @@ impl DuplCapturer {
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "nvenc" | "hw" | "nvidia"))
                 .unwrap_or(false);
             tracing::info!(
-                "DXGI duplication: {}x{}@{} on {} ({})",
+                "DXGI duplication: {}x{}@{} on {} ({}) dxgi_format={} (87=BGRA8 24=R10G10B10A2 10=R16G16B16A16_FLOAT)",
                 width,
                 height,
                 refresh_hz,
@@ -730,7 +884,8 @@ impl DuplCapturer {
                     "D3D11 zero-copy"
                 } else {
                     "CPU staging"
-                }
+                },
+                dd.ModeDesc.Format.0,
             );
             Ok(Self {
                 device,
@@ -752,7 +907,14 @@ impl DuplCapturer {
                 last: None,
                 gpu_mode,
                 gpu_copy: None,
-                have_gpu_frame: false,
+                last_present: None,
+                hdr_fp16: dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT,
+                fp16_src: None,
+                fp16_srv: None,
+                hdr10_out: None,
+                hdr_conv: None,
+                last_rebuild: None,
+                ever_got_frame: false,
                 cursor: None,
                 cursor_shape: None,
                 cursor_pos: (0, 0),
@@ -819,10 +981,104 @@ impl DuplCapturer {
         Ok(())
     }
 
+    /// FP16 (`R16G16B16A16_FLOAT`) copy of the HDR duplication surface (RT for the cursor composite +
+    /// SRV for the converter). Reallocated when absent (device/size change drops it).
+    unsafe fn ensure_fp16_src(&mut self) -> Result<()> {
+        if self.fp16_src.is_some() {
+            return Ok(());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: self.width,
+            Height: self.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut t: Option<ID3D11Texture2D> = None;
+        self.device
+            .CreateTexture2D(&desc, None, Some(&mut t))
+            .context("CreateTexture2D(fp16 src)")?;
+        let t = t.context("fp16 src tex")?;
+        let mut srv = None;
+        self.device
+            .CreateShaderResourceView(&t, None, Some(&mut srv))?;
+        self.fp16_srv = Some(srv.context("fp16 srv")?);
+        self.fp16_src = Some(t);
+        Ok(())
+    }
+
+    /// 10-bit `R10G10B10A2_UNORM` PQ output of the HDR conversion — the texture NVENC encodes.
+    unsafe fn ensure_hdr10_out(&mut self) -> Result<()> {
+        if self.hdr10_out.is_some() {
+            return Ok(());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: self.width,
+            Height: self.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R10G10B10A2_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut t: Option<ID3D11Texture2D> = None;
+        self.device
+            .CreateTexture2D(&desc, None, Some(&mut t))
+            .context("CreateTexture2D(hdr10 out)")?;
+        self.hdr10_out = t;
+        Ok(())
+    }
+
+    /// Allocate a presentable GPU texture on the *current* device, clear it to black, and record it
+    /// as `last_present`. Called after a desktop-switch recovery so `next_frame` always has a D3D11
+    /// frame to repeat even while the (secure) desktop renders nothing to the virtual output — this
+    /// is what keeps the session alive across a lock/login/UAC transition instead of dropping it. In
+    /// HDR mode it seeds the 10-bit output (black = PQ 0); otherwise the BGRA copy. One-shot: the next
+    /// real frame overwrites the texture in place.
+    unsafe fn seed_black_gpu_frame(&mut self) -> Result<()> {
+        if self.hdr_fp16 {
+            self.ensure_hdr10_out()?;
+            let out = self.hdr10_out.clone().context("hdr10 out texture")?;
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            self.device
+                .CreateRenderTargetView(&out, None, Some(&mut rtv))?;
+            self.context
+                .ClearRenderTargetView(&rtv.context("null RTV (hdr seed)")?, &[0.0, 0.0, 0.0, 1.0]);
+            self.last_present = Some((out, PixelFormat::Rgb10a2));
+        } else {
+            self.ensure_gpu_copy()?;
+            let gpu = self.gpu_copy.clone().context("gpu copy texture")?;
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            self.device
+                .CreateRenderTargetView(&gpu, None, Some(&mut rtv))?;
+            self.context
+                .ClearRenderTargetView(&rtv.context("null RTV (sdr seed)")?, &[0.0, 0.0, 0.0, 1.0]);
+            self.last_present = Some((gpu, PixelFormat::Bgra));
+        }
+        Ok(())
+    }
+
     /// Pull cursor position/visibility/shape out of the frame info (the HW cursor is NOT in the frame).
     unsafe fn update_cursor(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO) {
         if info.LastMouseUpdateTime != 0 {
-            self.cursor_pos = (info.PointerPosition.Position.x, info.PointerPosition.Position.y);
+            self.cursor_pos = (
+                info.PointerPosition.Position.x,
+                info.PointerPosition.Position.y,
+            );
             self.cursor_visible = info.PointerPosition.Visible.as_bool();
         }
         if info.PointerShapeBufferSize > 0 {
@@ -856,12 +1112,21 @@ impl DuplCapturer {
 
     /// Composite the cursor onto the GPU frame texture (zero-copy path).
     unsafe fn composite_cursor_gpu(&mut self, gpu: &ID3D11Texture2D) -> Result<()> {
+        // Diagnostic kill-switch: skip the GPU cursor composite entirely (PUNKTFUNK_NO_CURSOR=1) to
+        // isolate its cost on the 3D engine. The per-frame render-target view + draw to the 5K target
+        // is the suspect for the high 3D usage under heavy desktop change.
+        if std::env::var_os("PUNKTFUNK_NO_CURSOR").is_some() {
+            return Ok(());
+        }
         self.dbg_cursor += 1;
         if self.dbg_cursor % 240 == 1 {
             tracing::debug!(
                 visible = self.cursor_visible,
                 pos = format!("{:?}", self.cursor_pos),
-                shape = self.cursor_shape.as_ref().map(|(_, w, h)| format!("{w}x{h}")),
+                shape = self
+                    .cursor_shape
+                    .as_ref()
+                    .map(|(_, w, h)| format!("{w}x{h}")),
                 "cursor state"
             );
         }
@@ -898,58 +1163,70 @@ impl DuplCapturer {
         Ok(())
     }
 
+    /// ONE rebuild attempt — deliberately non-blocking. ACCESS_LOST fires on desktop switches
+    /// (normal ↔ Winlogon secure: lock/login/UAC) and on the mode change we issue at create. We
+    /// re-attach to the now-current input desktop and recreate the D3D11 device + duplication on it
+    /// (a device made on the previous desktop can't sustain a duplication on the new one). CRUCIAL:
+    /// no internal multi-second retry loop — during a secure-desktop dwell the SudoVDA output is
+    /// *gone* (`no DXGI output named …`), and a blocking retry here would starve the encode/send
+    /// loop of frames for seconds, so the client times out and disconnects (the bug this fixes).
+    /// Instead a single attempt returns immediately; the caller ([`acquire`]) repeats the last good
+    /// frame and retries on a throttle, so the session survives an arbitrarily long secure visit.
     unsafe fn recreate_dupl(&mut self) -> Result<()> {
         if self.holding_frame {
             let _ = self.dupl.ReleaseFrame();
             self.holding_frame = false;
         }
-        // ACCESS_LOST fires on desktop switches (normal ↔ Winlogon secure: lock/login/UAC) and on the
-        // mode change we issue at create. Re-attach to the now-current input desktop AND recreate the
-        // D3D11 device on it: a device made on the previous desktop cannot sustain a duplication on the
-        // new one (perpetual ACCESS_LOST). The capturer hands the new device out on `FramePayload::D3d11`,
-        // so NVENC re-inits when it sees it. Retry while the desktop is mid-reconfigure.
-        let deadline = Instant::now() + Duration::from_millis(12000);
-        loop {
-            // The SudoVDA virtual output's GDI name can CHANGE across a secure-desktop topology
-            // rebuild — the observed failure was searching for the stale \\.\DISPLAYn until the
-            // deadline and dying ("no DXGI output named ..."). Re-resolve it from the STABLE target
-            // id each retry so recovery finds the output under its current name.
-            if let Some(n) = crate::vdisplay::sudovda::resolve_gdi_name(self.target_id) {
-                self.gdi_name = n;
-            }
-            attach_input_desktop();
-            match reopen_duplication(&self.gdi_name) {
-                Ok((dev, ctx, out, dupl)) => {
-                    // A desktop switch can come back at a different size (e.g. the user session applies
-                    // its own resolution on login). Adopt it: update dimensions and drop the staging/gpu
-                    // copies so they reallocate. NVENC re-inits at the new size when it sees the frame.
-                    let dd: DXGI_OUTDUPL_DESC = dupl.GetDesc();
-                    let (nw, nh) = (dd.ModeDesc.Width, dd.ModeDesc.Height);
-                    if nw != self.width || nh != self.height {
-                        tracing::info!(
-                            old = format!("{}x{}", self.width, self.height),
-                            new = format!("{nw}x{nh}"),
-                            "DXGI duplication size changed across switch"
-                        );
-                        self.width = nw;
-                        self.height = nh;
-                        self.staging = None;
-                    }
-                    self.device = dev;
-                    self.context = ctx;
-                    self.output = out;
-                    self.dupl = dupl;
-                    self.gpu_copy = None; // stale: belonged to the old device
-                    self.cursor = None; // shaders/textures belonged to the old device; rebuilt on demand
-                    self.have_gpu_frame = false;
-                    self.first_frame = true;
-                    nudge_cursor_onto(&self.output); // re-kick after recovery
-                    return Ok(());
-                }
-                Err(e) if Instant::now() >= deadline => return Err(e),
-                Err(_) => std::thread::sleep(Duration::from_millis(120)),
+        // The SudoVDA output's GDI name can CHANGE across a secure-desktop topology rebuild —
+        // re-resolve from the STABLE target id so we find it under its current name.
+        if let Some(n) = crate::vdisplay::sudovda::resolve_gdi_name(self.target_id) {
+            self.gdi_name = n;
+        }
+        attach_input_desktop();
+        let (dev, ctx, out, dupl) = reopen_duplication(&self.gdi_name)?; // Err → caller repeats + retries
+                                                                         // A desktop switch can come back at a different size (e.g. the user session applies its own
+                                                                         // resolution on login). Adopt it: update dimensions and drop the staging/gpu copies so they
+                                                                         // reallocate. NVENC re-inits at the new size when it sees the frame.
+        let dd: DXGI_OUTDUPL_DESC = dupl.GetDesc();
+        let (nw, nh) = (dd.ModeDesc.Width, dd.ModeDesc.Height);
+        tracing::info!(
+            dxgi_format = dd.ModeDesc.Format.0,
+            "DXGI duplication rebuilt (format: 87=BGRA8 24=R10G10B10A2 10=R16G16B16A16_FLOAT)"
+        );
+        if nw != self.width || nh != self.height {
+            tracing::info!(
+                old = format!("{}x{}", self.width, self.height),
+                new = format!("{nw}x{nh}"),
+                "DXGI duplication size changed across switch"
+            );
+            self.width = nw;
+            self.height = nh;
+            self.staging = None;
+        }
+        self.device = dev;
+        self.context = ctx;
+        self.output = out;
+        self.dupl = dupl;
+        self.gpu_copy = None; // stale: belonged to the old device
+        self.cursor = None; // shaders/textures belonged to the old device; rebuilt on demand
+        self.last_present = None; // belonged to the old device; reseeded below
+                                  // Re-detect HDR and drop the HDR textures/converter (old device). Toggling HDR on or
+                                  // off is exactly this path: the duplication comes back as FP16 (HDR) or BGRA8.
+        self.hdr_fp16 = dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        self.fp16_src = None;
+        self.fp16_srv = None;
+        self.hdr10_out = None;
+        self.hdr_conv = None;
+        self.first_frame = true;
+        // Seed a black frame on the NEW device so next_frame always has something to repeat (and the
+        // encoder re-inits) until real frames resume.
+        if self.gpu_mode {
+            if let Err(e) = self.seed_black_gpu_frame() {
+                tracing::warn!(error = %format!("{e:#}"), "seed black frame after recovery failed");
             }
         }
+        nudge_cursor_onto(&self.output); // re-kick after recovery
+        Ok(())
     }
 
     /// Acquire one frame: `Some` on a fresh image, `None` on timeout (no change → caller reuses last).
@@ -960,7 +1237,11 @@ impl DuplCapturer {
         }
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
-        let timeout = if self.first_frame { 2000 } else { self.timeout_ms };
+        let timeout = if self.first_frame {
+            2000
+        } else {
+            self.timeout_ms
+        };
         match self.dupl.AcquireNextFrame(timeout, &mut info, &mut res) {
             Ok(()) => {
                 if self.first_frame {
@@ -993,13 +1274,31 @@ impl DuplCapturer {
                     || e.code() == DXGI_ERROR_DEVICE_RESET =>
             {
                 self.dbg_lost += 1;
-                tracing::warn!(
-                    lost = self.dbg_lost,
-                    code = format!("{:#x}", e.code().0),
-                    "DXGI capture lost (desktop switch?) — recovering"
-                );
-                self.recreate_dupl()?;
-                self.first_frame = true;
+                // THROTTLED, NON-BLOCKING recovery. During a secure-desktop dwell the SudoVDA output
+                // is gone, so a rebuild fails for the whole visit. We must NOT block retrying (that
+                // starves the encode/send loop → the client times out → disconnect — the bug). Try a
+                // rebuild at most ~4×/s; between attempts return "no new frame" so next_frame repeats
+                // the last good frame, keeping the client fed (frozen) until the desktop returns. A
+                // brief sleep on the throttled path avoids busy-spinning on the dead duplication.
+                let now = Instant::now();
+                let due = self.last_rebuild.map_or(true, |t| {
+                    now.duration_since(t) >= Duration::from_millis(250)
+                });
+                if due {
+                    self.last_rebuild = Some(now);
+                    if self.dbg_lost % 8 == 1 {
+                        tracing::warn!(
+                            lost = self.dbg_lost,
+                            code = format!("{:#x}", e.code().0),
+                            "DXGI capture lost (desktop switch?) — repeating last frame, retrying rebuild"
+                        );
+                    }
+                    if self.recreate_dupl().is_ok() {
+                        self.first_frame = true;
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(8));
+                }
                 return Ok(None);
             }
             Err(e) => return Err(e).context("AcquireNextFrame"),
@@ -1007,6 +1306,47 @@ impl DuplCapturer {
         self.holding_frame = true;
         let res = res.context("AcquireNextFrame: null resource")?;
         let tex: ID3D11Texture2D = res.cast().context("resource -> Texture2D")?;
+        if self.gpu_mode && self.hdr_fp16 {
+            // HDR zero-copy path: the duplication surface is scRGB FP16 (R16G16B16A16_FLOAT) — it can't
+            // be CopyResource'd into a BGRA target (that was the freeze + cursor-trail bug). Copy it into
+            // an FP16 SRV texture (same format → valid), composite the cursor onto it (the cursor lands
+            // at ~SDR-white brightness, then goes through the PQ curve correctly), then convert scRGB →
+            // BT.2020 PQ 10-bit into hdr10_out and hand THAT to NVENC (HEVC Main10 / HDR10).
+            self.ensure_fp16_src()?;
+            let src = self.fp16_src.clone().context("fp16 src texture")?;
+            self.context.CopyResource(&src, &tex);
+            let _ = self.dupl.ReleaseFrame();
+            self.holding_frame = false;
+            self.composite_cursor_gpu(&src)?; // onto the FP16 surface (RTV works on FP16)
+            self.ensure_hdr10_out()?;
+            let out = self.hdr10_out.clone().context("hdr10 out texture")?;
+            if self.hdr_conv.is_none() {
+                self.hdr_conv = Some(HdrConverter::new(&self.device)?);
+            }
+            let srv = self.fp16_srv.clone().context("fp16 srv")?;
+            let mut rtv: Option<ID3D11RenderTargetView> = None;
+            self.device
+                .CreateRenderTargetView(&out, None, Some(&mut rtv))?;
+            let rtv = rtv.context("hdr10 rtv")?;
+            self.hdr_conv.as_ref().unwrap().convert(
+                &self.context,
+                &srv,
+                &rtv,
+                self.width,
+                self.height,
+            );
+            self.last_present = Some((out.clone(), PixelFormat::Rgb10a2));
+            return Ok(Some(CapturedFrame {
+                width: self.width,
+                height: self.height,
+                pts_ns: now_ns(),
+                format: PixelFormat::Rgb10a2,
+                payload: FramePayload::D3d11(D3d11Frame {
+                    texture: out,
+                    device: self.device.clone(),
+                }),
+            }));
+        }
         if self.gpu_mode {
             // Zero-copy path: keep the frame on the GPU for NVENC. Copy the transient duplication
             // surface into a reused owned texture, release the duplication frame, hand off the texture.
@@ -1015,8 +1355,8 @@ impl DuplCapturer {
             self.context.CopyResource(&gpu, &tex);
             let _ = self.dupl.ReleaseFrame();
             self.holding_frame = false;
-            self.have_gpu_frame = true;
             self.composite_cursor_gpu(&gpu)?;
+            self.last_present = Some((gpu.clone(), PixelFormat::Bgra));
             return Ok(Some(CapturedFrame {
                 width: self.width,
                 height: self.height,
@@ -1079,20 +1419,23 @@ impl Capturer for DuplCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
         // Generous: a secure-desktop switch can take several seconds to settle (re-resolve + recreate
         // the duplication up to 12 s). Better a few seconds of frozen-last-frame than dropping the stream.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(f) = unsafe { self.acquire() }? {
+                self.ever_got_frame = true;
                 return Ok(f);
             }
-            if self.gpu_mode && self.have_gpu_frame {
-                if let Some(gpu) = &self.gpu_copy {
+            if self.gpu_mode {
+                if let Some((tex, fmt)) = &self.last_present {
+                    // Repeat the last presented GPU frame (SDR BGRA or HDR 10-bit), keeping the encoder
+                    // on a matching format through a static desktop or a mid-rebuild gap.
                     return Ok(CapturedFrame {
                         width: self.width,
                         height: self.height,
                         pts_ns: now_ns(),
-                        format: PixelFormat::Bgra,
+                        format: *fmt,
                         payload: FramePayload::D3d11(D3d11Frame {
-                            texture: gpu.clone(),
+                            texture: tex.clone(),
                             device: self.device.clone(),
                         }),
                     });
@@ -1108,6 +1451,14 @@ impl Capturer for DuplCapturer {
                 });
             }
             if Instant::now() > deadline {
+                // After we've streamed at least once, never fatally drop on a frame drought: a long
+                // secure-desktop dwell (or a slow rebuild) just means no NEW frame yet. Reset the
+                // deadline and keep repeating the last/seeded frame so the session stays alive. The
+                // deadline stays fatal only before the first frame — a genuine "monitor never lit up".
+                if self.ever_got_frame {
+                    deadline = Instant::now() + Duration::from_secs(20);
+                    continue;
+                }
                 return Err(anyhow!(
                     "no DXGI frame within 20s (SudoVDA monitor not activated by a WDDM GPU?)"
                 ));

@@ -146,6 +146,11 @@ impl Encoder for OpenH264Encoder {
                 self.normalize_to_bgra(bytes, 3, false);
                 self.yuv.read_rgb(BgraSliceU8::new(&self.scratch, (w, h)));
             }
+            // 10-bit HDR comes only from the GPU NVENC path; the software 8-bit H.264 encoder
+            // can't represent it (and never receives it — the capturer pairs Rgb10a2 with NVENC).
+            PixelFormat::Rgb10a2 => {
+                anyhow::bail!("software H.264 encoder cannot encode 10-bit HDR (Rgb10a2)")
+            }
         }
 
         if self.force_kf {

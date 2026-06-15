@@ -147,6 +147,16 @@
 #define MAX_DATAGRAM_BYTES 2048
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
+#define VIDEO_CAP_10BIT 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
+#define VIDEO_CAP_HDR 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Longest device name carried in a [`Hello`] (bytes of UTF-8; longer names are truncated on
 // encode, rejected on decode — a one-byte length prefix caps it at 255 anyway).
 #define HELLO_NAME_MAX 64

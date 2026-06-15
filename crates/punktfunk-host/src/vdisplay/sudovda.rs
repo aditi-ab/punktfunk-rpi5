@@ -1,4 +1,4 @@
-﻿//! Windows virtual-display backend driving **SudoVDA** (the SudoMaker Virtual Display Adapter —
+//! Windows virtual-display backend driving **SudoVDA** (the SudoMaker Virtual Display Adapter —
 //! the Indirect Display Driver the Apollo Sunshine-fork ships). The Windows analogue of the
 //! Linux per-compositor backends: [`create`](VirtualDisplay::create) adds a virtual monitor at the
 //! client's exact `WxH@Hz` (the mode is baked into the ADD IOCTL — no EDID seeding), starts the
@@ -161,7 +161,11 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
             ..Default::default()
         };
         let ok = unsafe {
-            EnumDisplaySettingsW(PCWSTR(wname.as_ptr()), ENUM_DISPLAY_SETTINGS_MODE(i), &mut dm)
+            EnumDisplaySettingsW(
+                PCWSTR(wname.as_ptr()),
+                ENUM_DISPLAY_SETTINGS_MODE(i),
+                &mut dm,
+            )
         }
         .as_bool();
         if !ok {
@@ -175,7 +179,12 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
     }
     let chosen_hz = if at_res.contains(&mode.refresh_hz) {
         mode.refresh_hz
-    } else if let Some(hz) = at_res.iter().copied().filter(|&hz| hz <= mode.refresh_hz).max() {
+    } else if let Some(hz) = at_res
+        .iter()
+        .copied()
+        .filter(|&hz| hz <= mode.refresh_hz)
+        .max()
+    {
         hz
     } else if let Some(hz) = at_res.iter().copied().max() {
         hz
@@ -212,8 +221,9 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
         dmDisplayFrequency: chosen_hz,
         ..Default::default()
     };
-    let test =
-        unsafe { ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, CDS_TEST, None) };
+    let test = unsafe {
+        ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, CDS_TEST, None)
+    };
     if test != DISP_CHANGE_SUCCESSFUL {
         tracing::warn!(
             result = test.0,

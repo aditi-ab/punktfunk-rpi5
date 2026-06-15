@@ -43,6 +43,12 @@ pub struct NvencD3d11Encoder {
     fps: u32,
     bitrate_bps: u64,
     buffer_fmt: nv::NV_ENC_BUFFER_FORMAT,
+    /// Encoded bit depth (8 or 10). 10 → HEVC Main10 (NVENC upconverts the 8-bit ARGB input).
+    bit_depth: u8,
+    /// HDR: the capturer is delivering BT.2020 PQ 10-bit (`PixelFormat::Rgb10a2`) frames. Sets the
+    /// `ABGR10` input format + the BT.2020/PQ colour VUI. Derived per-frame from the capture format
+    /// (HDR can toggle mid-session); a change re-inits the session.
+    hdr: bool,
     /// Registrations of the capturer's input textures, cached by texture raw pointer — NVENC encodes
     /// them in place (no per-frame copy). The cloned `ID3D11Texture2D` keeps each alive until we
     /// unregister it (the capturer may drop its copy on a device recreate before our teardown runs).
@@ -71,6 +77,7 @@ impl NvencD3d11Encoder {
         height: u32,
         fps: u32,
         bitrate_bps: u64,
+        bit_depth: u8,
     ) -> Result<Self> {
         Ok(Self {
             encoder: ptr::null_mut(),
@@ -80,6 +87,8 @@ impl NvencD3d11Encoder {
             fps,
             bitrate_bps,
             buffer_fmt: nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+            bit_depth,
+            hdr: false,
             regs: HashMap::new(),
             next: 0,
             bitstreams: Vec::new(),
@@ -139,7 +148,8 @@ impl NvencD3d11Encoder {
             // it at low pixel rates). Env override PUNKTFUNK_SPLIT_ENCODE = 0/disable | 1/auto | 2 | 3.
             // HEVC/AV1 only; the init-failure fallback below disables it if a codec/config rejects it.
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let mut split_mode: u32 = match std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok().as_deref() {
+            let mut split_mode: u32 = match std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok().as_deref()
+            {
                 Some("0") | Some("disable") => {
                     nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32
                 }
@@ -202,6 +212,33 @@ impl NvencD3d11Encoder {
                 cfg.rcParams.vbvBufferSize = vbv;
                 cfg.rcParams.vbvInitialDelay = vbv;
 
+                // 3b. 10-bit HEVC Main10. The 8-bit ARGB capture input is upconverted by NVENC (the
+                // proven high-bit-depth-from-8-bit path); the encoded stream is 10-bit, which removes
+                // banding and is the foundation for HDR. Color stays BT.709 here (Phase 2 sets the
+                // BT.2020/PQ VUI + HDR10 metadata). 8-bit leaves the preset default (Main) untouched.
+                if self.bit_depth == 10 {
+                    cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_MAIN10_GUID;
+                    cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2);
+                    // 10 - 8
+                }
+
+                // 3c. HDR colour signaling: BT.2020 primaries + SMPTE ST 2084 (PQ) transfer in the
+                // HEVC VUI, so a decoder/display knows the 10-bit samples are PQ HDR (not SDR gamma).
+                // The capturer already produced PQ-encoded BT.2020 pixels; this just describes them.
+                // (HDR10 static metadata — mastering display + MaxCLL/MaxFALL — is added in a follow-up.)
+                if self.hdr {
+                    let vui = &mut cfg.encodeCodecConfig.hevcConfig.hevcVUIParameters;
+                    vui.videoSignalTypePresentFlag = 1;
+                    vui.videoFullRangeFlag = 0; // limited (studio) range — NVENC RGB→YUV default
+                    vui.colourDescriptionPresentFlag = 1;
+                    vui.colourPrimaries =
+                        nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
+                    vui.transferCharacteristics =
+                        nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
+                    vui.colourMatrix =
+                        nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+                }
+
                 // 4. initialize the encoder.
                 let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
                     version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
@@ -242,9 +279,11 @@ impl NvencD3d11Encoder {
                     // fails, the codec/config may not accept it (e.g. H264) — disable split and retry
                     // single-engine rather than fail the session.
                     Err(e)
-                        if split_mode != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE as u32
+                        if split_mode
+                            != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE as u32
                             && split_mode
-                                != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32 =>
+                                != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE
+                                    as u32 =>
                     {
                         let _ = (API.destroy_encoder)(enc);
                         tracing::warn!(error = ?e, "NVENC init rejected with split-encode forced — disabling split, retrying single-engine");
@@ -253,7 +292,10 @@ impl NvencD3d11Encoder {
                     }
                     Err(e) => {
                         let _ = (API.destroy_encoder)(enc);
-                        return Err(anyhow!("initialize_encoder: {e:?} (even at {} Mbps floor)", FLOOR_BPS / 1_000_000));
+                        return Err(anyhow!(
+                            "initialize_encoder: {e:?} (even at {} Mbps floor)",
+                            FLOOR_BPS / 1_000_000
+                        ));
                     }
                 }
             };
@@ -280,10 +322,12 @@ impl NvencD3d11Encoder {
             }
             self.inited = true;
             tracing::info!(
-                "NVENC D3D11 session: {}x{}@{} {} Mbps {:?}",
+                "NVENC D3D11 session: {}x{}@{} {}-bit{} {} Mbps {:?}",
                 self.width,
                 self.height,
                 self.fps,
+                self.bit_depth,
+                if self.hdr { " HDR(BT.2020 PQ)" } else { "" },
                 self.bitrate_bps / 1_000_000,
                 self.codec_guid
             );
@@ -303,21 +347,36 @@ impl Encoder for NvencD3d11Encoder {
         // The capturer recreates its D3D11 device on a desktop switch (secure/Winlogon) and may come
         // back at a different resolution (user session applies its own mode on login). Re-init when the
         // frame arrives on a different device OR at a different size than our session was built on.
+        // HDR (BT.2020 PQ 10-bit) when the capturer hands us a 10-bit R10G10B10A2 frame. This can flip
+        // mid-session when the user toggles HDR (which arrives as a capture device recreate anyway).
+        let hdr = matches!(captured.format, PixelFormat::Rgb10a2);
         let dev_raw = frame.device.as_raw();
-        let size_changed = self.inited && (self.width != captured.width || self.height != captured.height);
-        if self.inited && (self.init_device != dev_raw || size_changed) {
+        let size_changed =
+            self.inited && (self.width != captured.width || self.height != captured.height);
+        let hdr_changed = self.inited && self.hdr != hdr;
+        if self.inited && (self.init_device != dev_raw || size_changed || hdr_changed) {
             tracing::info!(
                 device_changed = self.init_device != dev_raw,
                 size_changed,
+                hdr_changed,
+                hdr,
                 new = format!("{}x{}", captured.width, captured.height),
-                "NVENC: capture device/size changed (desktop switch) — re-initializing session"
+                "NVENC: capture device/size/HDR changed — re-initializing session"
             );
             unsafe { self.teardown() };
         }
         if !self.inited {
-            // Adopt the current frame size so the encoder always matches what the capturer produces.
+            // Adopt the current frame size + colour so the encoder always matches the capturer output.
             self.width = captured.width;
             self.height = captured.height;
+            self.hdr = hdr;
+            if hdr {
+                // 10-bit BT.2020 PQ input; force Main10 regardless of the negotiated SDR bit depth.
+                self.bit_depth = 10;
+                self.buffer_fmt = nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10;
+            } else {
+                self.buffer_fmt = nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB;
+            }
             let device = frame.device.clone();
             self.init_session(&device)?;
             self.init_device = dev_raw;
@@ -332,7 +391,8 @@ impl Encoder for NvencD3d11Encoder {
             if !self.regs.contains_key(&key) {
                 let mut rr = nv::NV_ENC_REGISTER_RESOURCE {
                     version: nv::NV_ENC_REGISTER_RESOURCE_VER,
-                    resourceType: nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX,
+                    resourceType:
+                        nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX,
                     width: self.width,
                     height: self.height,
                     pitch: 0,

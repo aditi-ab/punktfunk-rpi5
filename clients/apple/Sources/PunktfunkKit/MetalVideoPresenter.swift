@@ -7,6 +7,7 @@
 // (which fires on the main runloop). The Metal objects + texture cache are touched only here.
 
 #if canImport(Metal) && canImport(QuartzCore)
+import CoreGraphics
 import CoreVideo
 import Metal
 import QuartzCore
@@ -44,6 +45,27 @@ fragment float4 pf_frag(VOut in [[stage_in]],
     float b = y + 1.8556 * u;
     return float4(saturate(float3(r, g, b)), 1.0);
 }
+
+// HDR: 10-bit P010 (BT.2020, limited range), Y'CbCr that is PQ-encoded. We apply the BT.2020
+// matrix to get PQ-encoded R'G'B' and output it as-is — the CAMetalLayer's itur_2100_PQ colour
+// space + EDR tells the compositor the samples are PQ, so it does the PQ→display mapping. No EOTF
+// here (matching the host, which emitted BT.2020 PQ). P010 stores the 10-bit code in the high bits
+// of each 16-bit sample, so an .r16Unorm sample reads ~code/1023 (the /1024 vs /1023 error is < 0.1%).
+fragment float4 pf_frag_hdr(VOut in [[stage_in]],
+                            texture2d<float> lumaTex [[texture(0)]],
+                            texture2d<float> chromaTex [[texture(1)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float y = lumaTex.sample(s, in.uv).r;
+    float2 c = chromaTex.sample(s, in.uv).rg;
+    // BT.2020 10-bit limited (video) range → full-range PQ R'G'B'.
+    y = (y - 64.0/1023.0) * (1023.0/876.0);
+    float u = (c.x - 512.0/1023.0) * (1023.0/896.0);
+    float v = (c.y - 512.0/1023.0) * (1023.0/896.0);
+    float r = y + 1.4746 * v;
+    float g = y - 0.16455 * u - 0.57135 * v;
+    float b = y + 1.8814 * u;
+    return float4(saturate(float3(r, g, b)), 1.0);
+}
 """
 
 public final class MetalVideoPresenter {
@@ -52,8 +74,13 @@ public final class MetalVideoPresenter {
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
-    private let pipeline: MTLRenderPipelineState
+    /// SDR (BT.709 8-bit NV12 → bgra8) and HDR (BT.2020 PQ 10-bit P010 → rgba16Float) pipelines.
+    /// Selected per frame by `render`; the layer is reconfigured when the mode flips (HDR toggle).
+    private let pipelineSDR: MTLRenderPipelineState
+    private let pipelineHDR: MTLRenderPipelineState
     private var textureCache: CVMetalTextureCache?
+    /// Current layer configuration — switched lazily in `configure(hdr:)` when a frame's mode differs.
+    private var hdrActive = false
 
     /// nil if Metal is unavailable (no GPU / a headless CI) — the caller falls back to stage-1.
     public init?() {
@@ -64,11 +91,17 @@ public final class MetalVideoPresenter {
         self.queue = queue
         do {
             let library = try device.makeLibrary(source: shaderSource, options: nil)
-            let desc = MTLRenderPipelineDescriptor()
-            desc.vertexFunction = library.makeFunction(name: "pf_vtx")
-            desc.fragmentFunction = library.makeFunction(name: "pf_frag")
-            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
-            pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            let vtx = library.makeFunction(name: "pf_vtx")
+            let sdr = MTLRenderPipelineDescriptor()
+            sdr.vertexFunction = vtx
+            sdr.fragmentFunction = library.makeFunction(name: "pf_frag")
+            sdr.colorAttachments[0].pixelFormat = .bgra8Unorm
+            pipelineSDR = try device.makeRenderPipelineState(descriptor: sdr)
+            let hdr = MTLRenderPipelineDescriptor()
+            hdr.vertexFunction = vtx
+            hdr.fragmentFunction = library.makeFunction(name: "pf_frag_hdr")
+            hdr.colorAttachments[0].pixelFormat = .rgba16Float // EDR-capable
+            pipelineHDR = try device.makeRenderPipelineState(descriptor: hdr)
         } catch {
             return nil
         }
@@ -102,14 +135,40 @@ public final class MetalVideoPresenter {
         if layer.drawableSize != size { layer.drawableSize = size }
     }
 
-    /// Draw one decoded frame to the next drawable and present it. Returns true on success;
+    /// Reconfigure the layer for SDR or HDR when the stream mode flips (HDR toggle). HDR uses an
+    /// rgba16Float drawable + a BT.2020 PQ colour space + EDR, so the compositor PQ-maps to the
+    /// display; SDR uses the plain 8-bit sRGB path. Main-thread only (called from `render`).
+    private func configure(hdr: Bool) {
+        guard hdr != hdrActive else { return }
+        hdrActive = hdr
+        if hdr {
+            layer.pixelFormat = .rgba16Float
+            layer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+            #if os(macOS)
+            layer.wantsExtendedDynamicRangeContent = true
+            #endif
+        } else {
+            layer.pixelFormat = .bgra8Unorm
+            layer.colorspace = nil
+            #if os(macOS)
+            layer.wantsExtendedDynamicRangeContent = false
+            #endif
+        }
+    }
+
+    /// Draw one decoded frame to the next drawable and present it. `isHDR` selects the 10-bit
+    /// BT.2020 PQ path (P010 input) vs the 8-bit BT.709 path (NV12 input). Returns true on success;
     /// false when there's no drawable yet, a texture couldn't be made, or Metal errored — the
     /// caller then doesn't stamp a present for this frame.
     @discardableResult
-    public func render(_ pixelBuffer: CVPixelBuffer) -> Bool {
+    public func render(_ pixelBuffer: CVPixelBuffer, isHDR: Bool = false) -> Bool {
+        configure(hdr: isHDR)
+        // P010 stores 10-bit luma/chroma in 16-bit samples → R16/RG16; NV12 is 8-bit → R8/RG8.
+        let lumaFmt: MTLPixelFormat = isHDR ? .r16Unorm : .r8Unorm
+        let chromaFmt: MTLPixelFormat = isHDR ? .rg16Unorm : .rg8Unorm
         guard let textureCache,
-              let luma = makeTexture(pixelBuffer, plane: 0, format: .r8Unorm, cache: textureCache),
-              let chroma = makeTexture(pixelBuffer, plane: 1, format: .rg8Unorm, cache: textureCache)
+              let luma = makeTexture(pixelBuffer, plane: 0, format: lumaFmt, cache: textureCache),
+              let chroma = makeTexture(pixelBuffer, plane: 1, format: chromaFmt, cache: textureCache)
         else { return false }
 
         // The hosting view owns drawableSize (aspect-fit to its bounds); skip until it's laid
@@ -127,7 +186,7 @@ public final class MetalVideoPresenter {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
             return false
         }
-        encoder.setRenderPipelineState(pipeline)
+        encoder.setRenderPipelineState(isHDR ? pipelineHDR : pipelineSDR)
         encoder.setFragmentTexture(CVMetalTextureGetTexture(luma), index: 0)
         encoder.setFragmentTexture(CVMetalTextureGetTexture(chroma), index: 1)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)

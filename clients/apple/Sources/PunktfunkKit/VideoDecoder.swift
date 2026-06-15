@@ -17,8 +17,11 @@ public struct ReadyFrame: @unchecked Sendable {
     public let ptsNs: UInt64
     /// Client `CLOCK_REALTIME` instant decode completed, in nanoseconds.
     public let decodedNs: Int64
-    /// The decoded image (NV12 biplanar, Metal-compatible).
+    /// The decoded image — 8-bit NV12 biplanar (SDR) or 10-bit P010 biplanar (HDR), Metal-compatible.
     public let pixelBuffer: CVPixelBuffer
+    /// True when the stream is HDR (BT.2020 PQ): the buffer is 10-bit P010 and the presenter must
+    /// configure EDR + BT.2020 PQ output. Derived from the decoded buffer's pixel format.
+    public let isHDR: Bool
 }
 
 /// The C output callback can't capture context, so VideoToolbox hands it the refcon we set at
@@ -116,8 +119,22 @@ public final class VideoDecoder: @unchecked Sendable {
         format = nil
     }
 
-    /// `lock` held. Replace the session with one for `newFormat`. NV12 video-range, Metal-
-    /// compatible output (10-bit/HDR is a later tie-in — see the plan).
+    /// True when `newFormat` carries a PQ (SMPTE ST 2084) or HLG transfer function — i.e. the host
+    /// is sending HDR (BT.2020). VideoToolbox populates the transfer-function extension from the
+    /// HEVC VUI, so this tracks the *stream*, switching dynamically when the user toggles HDR
+    /// (the host re-emits parameter sets with the new VUI → a new format desc → session rebuild).
+    static func isHDRFormat(_ format: CMVideoFormatDescription) -> Bool {
+        guard
+            let tf = CMFormatDescriptionGetExtension(
+                format, extensionKey: kCMFormatDescriptionExtension_TransferFunction)
+        else { return false }
+        let s = tf as? String
+        return s == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+            || s == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
+    }
+
+    /// `lock` held. Replace the session with one for `newFormat`. SDR streams decode to 8-bit NV12;
+    /// HDR streams (BT.2020 PQ) decode to 10-bit P010 so the presenter can drive EDR.
     private func createSessionLocked(format newFormat: CMVideoFormatDescription) -> Bool {
         if let session {
             VTDecompressionSessionWaitForAsynchronousFrames(session)
@@ -126,10 +143,14 @@ public final class VideoDecoder: @unchecked Sendable {
         session = nil
         format = nil
 
+        let hdr = Self.isHDRFormat(newFormat)
+        let pixelFormat =
+            hdr
+            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange // P010 (10-bit)
+            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange // NV12 (8-bit)
         let imageAttrs: [CFString: Any] = [
             kCVPixelBufferMetalCompatibilityKey: true,
-            kCVPixelBufferPixelFormatTypeKey:
-                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferPixelFormatTypeKey: pixelFormat,
         ]
         var callback = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: decoderOutputCallback,
@@ -160,6 +181,11 @@ public final class VideoDecoder: @unchecked Sendable {
         // pts was stamped at timescale 1e9 (AnnexB.sampleBuffer); normalize defensively.
         let p = CMTimeConvertScale(pts, timescale: 1_000_000_000, method: .default)
         let ptsNs = p.value > 0 ? UInt64(p.value) : 0
-        onDecoded(ReadyFrame(ptsNs: ptsNs, decodedNs: decodedNs, pixelBuffer: imageBuffer))
+        // HDR iff the decoder produced a 10-bit P010 buffer (we only request P010 for PQ streams).
+        let isHDR =
+            CVPixelBufferGetPixelFormatType(imageBuffer)
+            == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        onDecoded(
+            ReadyFrame(ptsNs: ptsNs, decodedNs: decodedNs, pixelBuffer: imageBuffer, isHDR: isHDR))
     }
 }

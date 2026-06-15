@@ -70,7 +70,20 @@ pub struct Hello {
     /// `name` is absent, a zero-length name placeholder precedes it so the offset stays
     /// deterministic. Omitted by older clients (decodes to `None`).
     pub launch: Option<String>,
+    /// Client video capabilities the host may use to upgrade the stream — a bitfield of
+    /// [`VIDEO_CAP_10BIT`] (the client can decode 10-bit Main10 HEVC) and [`VIDEO_CAP_HDR`]
+    /// (the client can present BT.2020 PQ HDR10). The host enables a 10-bit / HDR encode ONLY
+    /// when the matching bit is set, so an older client (decodes to `0`) always gets the 8-bit
+    /// BT.709 stream it understands. Appended after `launch` as a single trailing byte; a
+    /// zero-length name/launch placeholder precedes it when those are absent so the offset stays
+    /// deterministic. Omitted by older clients (decodes to `0`).
+    pub video_caps: u8,
 }
+
+/// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
+pub const VIDEO_CAP_10BIT: u8 = 0x01;
+/// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
+pub const VIDEO_CAP_HDR: u8 = 0x02;
 
 /// Longest device name carried in a [`Hello`] (bytes of UTF-8; longer names are truncated on
 /// encode, rejected on decode — a one-byte length prefix caps it at 255 anyway).
@@ -108,6 +121,12 @@ pub struct Welcome {
     /// default when the client requested `0`). Appended to the wire form — `0` when an older host
     /// omitted it (i.e. "unknown").
     pub bitrate_kbps: u32,
+    /// The luma/chroma bit depth the host actually encodes at — `8` (default / older host) or
+    /// `10` (Main10, enabled only when the client advertised [`VIDEO_CAP_10BIT`]). The client
+    /// configures its decoder for 10-bit (P010) when this is `10`. Appended to the wire form as a
+    /// single trailing byte; `8` when an older host omitted it. (Color space stays BT.709 in
+    /// Phase 1; BT.2020 PQ HDR signaling is added alongside HDR support.)
+    pub bit_depth: u8,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -513,19 +532,27 @@ impl Hello {
                                                                // so a Hello with neither name nor launch stays byte-identical to the bitrate-era form
                                                                // (26 bytes). When `launch` is present we must still emit name's length byte (0 for None)
                                                                // so `launch` lands at a deterministic offset.
+                                                               // `video_caps` is the last trailing field, after `launch`; when it's present (non-zero)
+                                                               // the name/launch length bytes must still be emitted (0 for absent) so it lands at a
+                                                               // deterministic offset — the same discipline `launch` already imposes on `name`.
+        let need_placeholders = self.video_caps != 0;
         match (&self.name, &self.launch) {
-            (None, None) => {}
+            (None, None) if !need_placeholders => {}
             (name, _) => {
                 let n = truncate_to(name.as_deref().unwrap_or(""), HELLO_NAME_MAX);
                 b.push(n.len() as u8);
                 b.extend_from_slice(n.as_bytes());
             }
         }
-        // launch after name: len u8 || UTF-8. Last trailing field.
-        if let Some(launch) = &self.launch {
-            let l = truncate_to(launch, HELLO_LAUNCH_MAX);
+        // launch after name: len u8 || UTF-8.
+        if self.launch.is_some() || need_placeholders {
+            let l = truncate_to(self.launch.as_deref().unwrap_or(""), HELLO_LAUNCH_MAX);
             b.push(l.len() as u8);
             b.extend_from_slice(l.as_bytes());
+        }
+        // video_caps: single trailing byte. Last field.
+        if self.video_caps != 0 {
+            b.push(self.video_caps);
         }
         b
     }
@@ -580,6 +607,15 @@ impl Hello {
                     .and_then(|s| std::str::from_utf8(s).ok())
                     .map(String::from)
             }),
+            // Optional trailing video-caps byte, positioned right after launch's `len u8 || bytes`
+            // block. Uses the raw (possibly zero/placeholder) name/launch length bytes to locate it,
+            // so it's robust to absent name/launch; absent entirely on an older client → `0`.
+            video_caps: {
+                let name_len = b.get(26).copied().unwrap_or(0) as usize;
+                let launch_off = 27 + name_len; // launch's length byte
+                let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
+                b.get(launch_off + 1 + launch_len).copied().unwrap_or(0)
+            },
         })
     }
 }
@@ -607,6 +643,7 @@ impl Welcome {
         b.push(self.compositor.to_u8()); // appended at offset 53 — older clients read [0..53] and skip it
         b.push(self.gamepad.to_u8()); // appended at offset 54 — same back-compat discipline
         b.extend_from_slice(&self.bitrate_kbps.to_le_bytes()); // appended at offset 55..59
+        b.push(self.bit_depth); // appended at offset 59 — older clients read [0..59] and skip it
         b
     }
 
@@ -614,7 +651,7 @@ impl Welcome {
         // Layout (LE): magic[0..4] abi[4..8] port[8..10] w[10..14] h[14..18] hz[18..22]
         // scheme[22] pct[23] max_data[24..26] shard[26..28] encrypt[28] key[29..45]
         // salt[45..49] frames[49..53] compositor[53] gamepad[54] bitrate_kbps[55..59]
-        // (compositor/gamepad/bitrate are optional trailing bytes).
+        // bit_depth[59] (compositor/gamepad/bitrate/bit_depth are optional trailing bytes).
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -661,6 +698,9 @@ impl Welcome {
                 .get(55..59)
                 .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
                 .unwrap_or(0),
+            // Optional trailing byte — absent on an older host → `8` (8-bit, the only depth they
+            // encode).
+            bit_depth: b.get(59).copied().unwrap_or(8),
         })
     }
 
@@ -1518,6 +1558,7 @@ mod tests {
             compositor: CompositorPref::Gamescope,
             gamepad: GamepadPref::DualSense,
             bitrate_kbps: 50_000,
+            bit_depth: 10,
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
     }
@@ -1536,6 +1577,7 @@ mod tests {
             bitrate_kbps: 25_000,
             name: Some("Test Device".into()),
             launch: Some("steam:570".into()),
+            video_caps: VIDEO_CAP_10BIT,
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -1602,6 +1644,7 @@ mod tests {
             bitrate_kbps: 80_000,
             name: None,
             launch: None,
+            video_caps: 0,
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -1639,9 +1682,10 @@ mod tests {
             compositor: CompositorPref::Kwin,
             gamepad: GamepadPref::Xbox360,
             bitrate_kbps: 120_000,
+            bit_depth: 10,
         };
         let wenc = w.encode();
-        assert_eq!(wenc.len(), 59);
+        assert_eq!(wenc.len(), 60);
         let legacy_w = Welcome::decode(&wenc[..53]).unwrap();
         assert_eq!(legacy_w.compositor, CompositorPref::Auto);
         assert_eq!(legacy_w.gamepad, GamepadPref::Auto);
@@ -1655,7 +1699,10 @@ mod tests {
         let pre_bitrate_w = Welcome::decode(&wenc[..55]).unwrap();
         assert_eq!(pre_bitrate_w.gamepad, GamepadPref::Xbox360);
         assert_eq!(pre_bitrate_w.bitrate_kbps, 0);
+        assert_eq!(pre_bitrate_w.bit_depth, 8); // older host (no trailing byte) → 8-bit assumed
+        assert_eq!(legacy_w.bit_depth, 8);
         assert_eq!(Welcome::decode(&wenc).unwrap().bitrate_kbps, 120_000);
+        assert_eq!(Welcome::decode(&wenc).unwrap().bit_depth, 10); // full form carries it
     }
 
     #[test]
@@ -1672,6 +1719,7 @@ mod tests {
             bitrate_kbps: 0,
             name: Some("Enrico's MacBook".into()),
             launch: None,
+            video_caps: 0,
         };
         let enc = base.encode();
         assert_eq!(
@@ -1718,6 +1766,7 @@ mod tests {
             bitrate_kbps: 0,
             name: None,
             launch: None,
+            video_caps: 0,
         };
         // launch alone (no name): a zero-length name placeholder keeps the offset deterministic.
         let with_launch = Hello {
@@ -1882,6 +1931,7 @@ mod tests {
                 bitrate_kbps: 0,
                 name: None,
                 launch: None,
+                video_caps: 0,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");

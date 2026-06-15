@@ -164,7 +164,9 @@ mod uso {
     /// Latch USO off for the process after a send that means it isn't usable on this OS/NIC/path.
     pub fn disable() {
         if STATE.swap(2, Ordering::Relaxed) != 2 {
-            tracing::warn!("Windows USO unsupported on this path — falling back to per-packet sends");
+            tracing::warn!(
+                "Windows USO unsupported on this path — falling back to per-packet sends"
+            );
         }
     }
 }

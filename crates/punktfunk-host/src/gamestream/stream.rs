@@ -274,6 +274,7 @@ fn stream_body(
         cfg.fps,
         cfg.bitrate_kbps as u64 * 1000,
         frame.is_cuda(),
+        8, // GameStream/Moonlight path: 8-bit (its own codec negotiation)
     )
     .context("open NVENC for stream")?;
     // FEC overhead percent (Sunshine default 20). Override with PUNKTFUNK_FEC_PCT (0 = data-only).

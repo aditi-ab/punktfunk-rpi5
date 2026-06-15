@@ -614,6 +614,10 @@ async fn worker_main(args: WorkerArgs) {
                 name: None,
                 // Library id to launch this session, if the embedder asked for one.
                 launch: launch.clone(),
+                // TODO(hdr): advertise the embedder's real decode caps once the ABI carries them
+                // and the Apple/Linux clients decode 10-bit. 0 = 8-bit only — the host then never
+                // upgrades this connector's session to a stream it can't yet present.
+                video_caps: 0,
             }
             .encode(),
         )
