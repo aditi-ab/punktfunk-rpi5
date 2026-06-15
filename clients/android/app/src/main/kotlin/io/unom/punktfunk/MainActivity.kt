@@ -11,6 +11,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
@@ -18,10 +19,16 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -46,6 +53,8 @@ import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.Keymap
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.discovery.DiscoveredHost
+import io.unom.punktfunk.kit.discovery.HostDiscovery
 import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -139,12 +148,44 @@ private fun App() {
 @Composable
 private fun ConnectScreen(onConnected: (Long) -> Unit) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     var host by remember { mutableStateOf("") }
     var port by remember { mutableStateOf("9777") }
     var connecting by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
     val abi = remember { runCatching { NativeBridge.abiVersion() }.getOrDefault(-1) }
     val (w, h, hz) = REQUEST_MODE
+
+    // mDNS discovery scoped to this screen; NsdManager callbacks arrive on the main thread, so the
+    // onChange callback can set Compose state directly. (Emulator SLIRP drops multicast → empty.)
+    val discovery = remember { HostDiscovery(context) }
+    var discovered by remember { mutableStateOf<List<DiscoveredHost>>(emptyList()) }
+    DisposableEffect(Unit) {
+        discovery.onChange = { discovered = it }
+        discovery.start()
+        onDispose {
+            discovery.onChange = null
+            discovery.stop()
+        }
+    }
+
+    fun connect(targetHost: String, targetPort: Int) {
+        connecting = true
+        status = "Connecting to $targetHost:$targetPort…"
+        discovery.stop() // free the Wi-Fi radio before the stream session
+        scope.launch {
+            val handle = withContext(Dispatchers.IO) {
+                NativeBridge.nativeConnect(targetHost, targetPort, w, h, hz)
+            }
+            connecting = false
+            if (handle != 0L) {
+                onConnected(handle)
+            } else {
+                status = "Connection failed — check host/port and logcat"
+                discovery.start()
+            }
+        }
+    }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
@@ -154,6 +195,24 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
         Text("punktfunk", style = MaterialTheme.typography.headlineMedium)
         Text("Android client", style = MaterialTheme.typography.bodyMedium)
         Spacer(Modifier.height(24.dp))
+
+        if (discovered.isNotEmpty()) {
+            Text("Discovered hosts", style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.height(8.dp))
+            LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp)) {
+                items(discovered, key = { it.key }) { dh ->
+                    DiscoveredHostRow(dh, enabled = !connecting) {
+                        host = dh.host
+                        port = dh.port.toString()
+                        connect(dh.host, dh.port)
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+        }
+
         OutlinedTextField(
             value = host,
             onValueChange = { host = it },
@@ -171,21 +230,7 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
         Spacer(Modifier.height(16.dp))
         Button(
             enabled = !connecting && host.isNotBlank() && port.isNotBlank(),
-            onClick = {
-                connecting = true
-                status = "Connecting to $host:$port…"
-                scope.launch {
-                    val handle = withContext(Dispatchers.IO) {
-                        NativeBridge.nativeConnect(host.trim(), port.toInt(), w, h, hz)
-                    }
-                    connecting = false
-                    if (handle != 0L) {
-                        onConnected(handle)
-                    } else {
-                        status = "Connection failed — check host/port and logcat"
-                    }
-                }
-            },
+            onClick = { connect(host.trim(), port.toInt()) },
         ) { Text(if (connecting) "Connecting…" else "Connect  ($w×$h@$hz)") }
         status?.let {
             Spacer(Modifier.height(12.dp))
@@ -193,6 +238,25 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
         }
         Spacer(Modifier.height(24.dp))
         Text("core ABI v$abi", style = MaterialTheme.typography.labelSmall)
+    }
+}
+
+@Composable
+private fun DiscoveredHostRow(dh: DiscoveredHost, enabled: Boolean, onTap: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp)
+            .clickable(enabled = enabled, onClick = onTap),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Text(dh.name, style = MaterialTheme.typography.bodyLarge)
+            val pairing = if (dh.pairingRequired) "pairing required" else "TOFU"
+            Text("${dh.host}:${dh.port} · $pairing", style = MaterialTheme.typography.bodySmall)
+            dh.fingerprint?.let { fp ->
+                Text("fp ${fp.take(16)}…", style = MaterialTheme.typography.labelSmall)
+            }
+        }
     }
 }
 

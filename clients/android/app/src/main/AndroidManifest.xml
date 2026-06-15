@@ -8,6 +8,9 @@
     <uses-permission
         android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
+    <!-- Hold a MulticastLock while NsdManager discovery runs (OEM Wi-Fi power-save hedge). -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- Enforced from Android 17 (SDK 37) for ALL local-network traffic incl. the QUIC socket.
          Harmless to declare on earlier releases. -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />

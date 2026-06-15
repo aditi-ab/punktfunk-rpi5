@@ -27,6 +27,10 @@ android {
 
 kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_21) } }
 
+dependencies {
+    testImplementation("junit:junit:4.13.2") // JVM unit test for the pure TXT parser
+}
+
 // ------------------------------------------------------------------------------------------------
 // cargo-ndk: cross-compile crates/punktfunk-android into this module's jniLibs/<abi>/ so the
 // resulting libpunktfunk_android.so is packaged into the app (and any AAR this module produces).
