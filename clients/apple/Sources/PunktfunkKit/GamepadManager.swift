@@ -107,6 +107,11 @@ public final class GamepadManager: ObservableObject {
         setting: PunktfunkConnection.GamepadType
     ) -> PunktfunkConnection.GamepadType {
         guard setting == .auto else { return setting }
+        // Refresh from the LIVE controller list first. `active` is otherwise only populated by the
+        // async `.GCControllerDidConnect` notification, so at connect time it can still be nil even
+        // with a DualSense attached — which would send `.auto` and the host would create an Xbox 360
+        // pad. `rebuild()` re-reads `GCController.controllers()` synchronously, closing that race.
+        rebuild()
         guard let active else { return .auto }
         return active.isDualSense ? .dualSense : .xbox360
     }
