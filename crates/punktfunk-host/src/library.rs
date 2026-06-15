@@ -127,6 +127,7 @@ fn steam_art(appid: u32) -> Artwork {
 }
 
 /// Candidate Steam roots (classic, Flatpak, Deck) that actually exist, canonicalized + deduped.
+#[cfg(not(target_os = "windows"))]
 fn steam_roots() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
@@ -137,6 +138,25 @@ fn steam_roots() -> Vec<PathBuf> {
         home.join(".steam/root"),
         home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"), // Flatpak Steam
     ];
+    steam_roots_existing(candidates)
+}
+
+/// Windows Steam roots: the default install dirs under Program Files. Games installed on other
+/// drives are still found via each root's `libraryfolders.vdf` (see [`steam_library_dirs`]). A
+/// non-default Steam install dir (registry `Valve\Steam\InstallPath`) isn't covered yet.
+#[cfg(target_os = "windows")]
+fn steam_roots() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for var in ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"] {
+        if let Some(pf) = std::env::var_os(var) {
+            candidates.push(PathBuf::from(pf).join("Steam"));
+        }
+    }
+    steam_roots_existing(candidates)
+}
+
+/// Keep only the candidate roots that exist (have a `steamapps` dir), canonicalized + deduped.
+fn steam_roots_existing(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut roots = Vec::new();
     for c in candidates {
@@ -174,12 +194,21 @@ fn steam_library_dirs() -> Vec<PathBuf> {
 }
 
 /// Pull every `"path"  "<dir>"` value out of a `libraryfolders.vdf`. We don't need a full VDF
-/// parser for the two flat fields we read — Linux library paths never contain the `"` or `\`
-/// that would require unescaping.
+/// parser for the two flat fields we read. On Windows the values are backslash-escaped
+/// (`D:\\SteamLibrary`), so unescape `\\` → `\`; Linux paths need no unescaping.
 fn vdf_paths(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|l| vdf_value(l.trim(), "path"))
-        .map(str::to_string)
+        .map(|p| {
+            #[cfg(target_os = "windows")]
+            {
+                p.replace("\\\\", "\\")
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                p.to_string()
+            }
+        })
         .collect()
 }
 
