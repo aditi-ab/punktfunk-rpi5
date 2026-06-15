@@ -638,6 +638,8 @@ mod tests {
         // A pure probe of /proc + the runtime dir: it must not panic and must return promptly on
         // any box (CI has no graphical session → ActiveKind::None, with the runtime-dir anchor).
         let a = detect_active_session();
+        // The runtime-dir anchor is a Linux (XDG) concept; Windows has no equivalent.
+        #[cfg(target_os = "linux")]
         assert!(!a.env.xdg_runtime_dir.is_empty());
         // Wayland sockets are only resolved for the Wayland-protocol desktops.
         if matches!(

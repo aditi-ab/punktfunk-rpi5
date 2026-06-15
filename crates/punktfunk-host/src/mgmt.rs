@@ -1588,9 +1588,11 @@ mod tests {
         );
 
         let checked_in = include_str!("../../../docs/api/openapi.json");
+        // Compare content, not line-ending style: the generated `json` is LF (serde_json), but git
+        // may check the file out CRLF on Windows.
         assert_eq!(
-            json.trim(),
-            checked_in.trim(),
+            json.trim().replace('\r', ""),
+            checked_in.trim().replace('\r', ""),
             "docs/api/openapi.json is stale — regenerate with: \
              cargo run -p punktfunk-host -- openapi > docs/api/openapi.json"
         );
