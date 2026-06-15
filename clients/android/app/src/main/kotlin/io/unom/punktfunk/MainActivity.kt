@@ -62,7 +62,8 @@ import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.discovery.HostDiscovery
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.IdentityStore
-import io.unom.punktfunk.kit.security.PinStore
+import io.unom.punktfunk.kit.security.KnownHost
+import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.kit.security.obtainIdentity
 import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
@@ -144,15 +145,15 @@ private sealed interface Screen {
 }
 
 /**
- * A trust decision awaiting the user before a connect proceeds. [hostId] is the PinStore key.
- * Trust-on-first-use ([Kind.TRUST_NEW]) is only ever offered when the host ADVERTISED pair=optional;
- * a pair=required host or a manually-typed/unknown-policy host goes straight to PIN pairing
- * ([Kind.PAIR]), and a changed fingerprint forces re-pairing — never a silent re-trust shortcut.
+ * A trust decision awaiting the user before a connect proceeds. [name] is the label to save the
+ * host under. Trust-on-first-use ([Kind.TRUST_NEW]) is only ever offered when the host ADVERTISED
+ * pair=optional; a pair=required host or a manually-typed/unknown-policy host goes straight to PIN
+ * pairing ([Kind.PAIR]), and a changed fingerprint forces re-pairing — never a silent re-trust.
  */
 private data class PendingTrust(
     val host: String,
     val port: Int,
-    val hostId: String,
+    val name: String,
     val advertisedFp: String?,
     val kind: Kind,
 ) {
@@ -206,7 +207,8 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit, onOpe
     }
 
     val identityStore = remember { IdentityStore(context) }
-    val pinStore = remember { PinStore(context) }
+    val knownHostStore = remember { KnownHostStore(context) }
+    var savedHosts by remember { mutableStateOf(knownHostStore.all()) }
     // Mint-once on genuine first run; an Unrecoverable store (decrypt failure) surfaces here and
     // refuses to connect — never silently shadow-minting a new identity (which would force re-pair).
     var identity by remember { mutableStateOf<ClientIdentity?>(null) }
@@ -218,11 +220,10 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit, onOpe
     // A trust decision awaiting the user (first-connect TOFU / fp changed / PIN pairing).
     var pendingTrust by remember { mutableStateOf<PendingTrust?>(null) }
 
-    fun hostIdFor(h2: String, p2: Int, dh: DiscoveredHost?) = dh?.key ?: "$h2:$p2"
-
     // Issue the actual connect with identity + (optional) pin. On a TOFU connect (pinHex null),
-    // persist the fingerprint the host presented so the next connect goes straight through.
-    fun doConnect(targetHost: String, targetPort: Int, hostId: String, pinHex: String?) {
+    // pin the fingerprint the host presented (as an unpaired known host) so the next connect goes
+    // straight through and it appears in the saved-hosts list.
+    fun doConnect(targetHost: String, targetPort: Int, name: String, pinHex: String?) {
         val id = identity
         if (id == null) {
             status = "Identity not ready yet — try again in a moment"
@@ -241,9 +242,11 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit, onOpe
             }
             connecting = false
             if (handle != 0L) {
-                if (pinHex == null) { // TOFU: pin what we observed
+                if (pinHex == null) { // TOFU: pin what we observed (unpaired)
                     val fp = NativeBridge.nativeHostFingerprint(handle)
-                    if (fp.isNotEmpty()) pinStore.pin(hostId, fp)
+                    if (fp.isNotEmpty()) {
+                        knownHostStore.save(KnownHost(targetHost, targetPort, name, fp, paired = false))
+                    }
                 }
                 onConnected(handle)
             } else {
@@ -253,28 +256,28 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit, onOpe
         }
     }
 
-    // Decide pinned-reconnect vs fp-changed vs TOFU vs PIN pairing before connecting. Trust-on-
-    // first-use is permitted ONLY when the host advertised pair=optional (dh.pairingRequired ==
-    // false); a pair=required host, or a manually-typed/unknown-policy host (dh == null), must pair
-    // by PIN — we never trust an unverified cert on faith.
+    // Decide pinned-reconnect vs fp-changed vs TOFU vs PIN pairing before connecting. Trust state is
+    // keyed by address:port, so a discovered and a manually-typed connection to the same host share
+    // one record. Trust-on-first-use is permitted ONLY when the host advertised pair=optional; a
+    // pair=required host, or a manual/unknown-policy host, must pair by PIN.
     fun connect(targetHost: String, targetPort: Int, dh: DiscoveredHost? = null) {
-        val hostId = hostIdFor(targetHost, targetPort, dh)
-        val stored = pinStore.get(hostId)
+        val known = knownHostStore.get(targetHost, targetPort)
         val adv = dh?.fingerprint?.lowercase()
+        val name = dh?.name ?: targetHost
         when {
             // Known host whose advertised fp still matches the pin → silent pinned reconnect.
-            stored != null && (adv == null || adv == stored) ->
-                doConnect(targetHost, targetPort, hostId, stored)
+            known != null && (adv == null || adv == known.fpHex) ->
+                doConnect(targetHost, targetPort, known.name, known.fpHex)
             // Known host whose fp changed → force re-pairing (no silent re-trust shortcut).
-            stored != null -> pendingTrust =
-                PendingTrust(targetHost, targetPort, hostId, adv, PendingTrust.Kind.FP_CHANGED)
+            known != null -> pendingTrust =
+                PendingTrust(targetHost, targetPort, known.name, adv, PendingTrust.Kind.FP_CHANGED)
             // Host explicitly advertised pair=optional → trust-on-first-use is permitted (offer it,
             // clearly labeled, alongside PIN pairing). Smart-cast: this branch ⇒ dh != null.
             dh?.pairingRequired == false -> pendingTrust =
-                PendingTrust(targetHost, targetPort, hostId, dh.fingerprint, PendingTrust.Kind.TRUST_NEW)
+                PendingTrust(targetHost, targetPort, name, dh.fingerprint, PendingTrust.Kind.TRUST_NEW)
             // pair=required, or a manual/unknown-policy host → PIN pairing is mandatory.
             else -> pendingTrust =
-                PendingTrust(targetHost, targetPort, hostId, adv, PendingTrust.Kind.PAIR)
+                PendingTrust(targetHost, targetPort, name, adv, PendingTrust.Kind.PAIR)
         }
     }
 
@@ -286,6 +289,31 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit, onOpe
         Text("punktfunk", style = MaterialTheme.typography.headlineMedium)
         Text("Android client", style = MaterialTheme.typography.bodyMedium)
         Spacer(Modifier.height(24.dp))
+
+        if (savedHosts.isNotEmpty()) {
+            Text("Saved hosts", style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.height(8.dp))
+            LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp)) {
+                items(savedHosts, key = { "${it.address}:${it.port}" }) { kh ->
+                    SavedHostRow(
+                        kh,
+                        enabled = !connecting,
+                        onConnect = {
+                            host = kh.address
+                            port = kh.port.toString()
+                            connect(kh.address, kh.port)
+                        },
+                        onForget = {
+                            knownHostStore.remove(kh.address, kh.port)
+                            savedHosts = knownHostStore.all()
+                        },
+                    )
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+        }
 
         if (discovered.isNotEmpty()) {
             Text("Discovered hosts", style = MaterialTheme.typography.labelLarge)
@@ -348,7 +376,7 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit, onOpe
                     }
                 },
                 confirmButton = {
-                    TextButton({ pendingTrust = null; doConnect(pt.host, pt.port, pt.hostId, null) }) {
+                    TextButton({ pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null) }) {
                         Text("Trust (TOFU)")
                     }
                 },
@@ -421,9 +449,13 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit, onOpe
                                         }
                                         pairing = false
                                         if (fp.isNotEmpty()) {
-                                            pinStore.pin(pt.hostId, fp) // verified host fp; paired
+                                            // Verified host fp — save as a paired known host.
+                                            knownHostStore.save(
+                                                KnownHost(pt.host, pt.port, pt.name, fp, paired = true),
+                                            )
+                                            savedHosts = knownHostStore.all()
                                             pendingTrust = null
-                                            doConnect(pt.host, pt.port, pt.hostId, fp)
+                                            doConnect(pt.host, pt.port, pt.name, fp)
                                         } else {
                                             err = "Pairing failed — wrong PIN, or the host isn't armed."
                                         }
@@ -456,6 +488,34 @@ private fun DiscoveredHostRow(dh: DiscoveredHost, enabled: Boolean, onTap: () ->
             dh.fingerprint?.let { fp ->
                 Text("fp ${fp.take(16)}…", style = MaterialTheme.typography.labelSmall)
             }
+        }
+    }
+}
+
+@Composable
+private fun SavedHostRow(
+    host: KnownHost,
+    enabled: Boolean,
+    onConnect: () -> Unit,
+    onForget: () -> Unit,
+) {
+    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(enabled = enabled, onClick = onConnect)
+                    .padding(vertical = 12.dp),
+            ) {
+                Text(host.name, style = MaterialTheme.typography.bodyLarge)
+                val trust = if (host.paired) "paired" else "trusted (TOFU)"
+                Text("${host.address}:${host.port} · $trust", style = MaterialTheme.typography.bodySmall)
+                Text("fp ${host.fpHex.take(16)}…", style = MaterialTheme.typography.labelSmall)
+            }
+            TextButton(enabled = enabled, onClick = onForget) { Text("Forget") }
         }
     }
 }
