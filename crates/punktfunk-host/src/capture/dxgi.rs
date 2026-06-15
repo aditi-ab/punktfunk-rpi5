@@ -1207,6 +1207,37 @@ impl DuplCapturer {
         Ok(())
     }
 
+    /// CHEAP recovery for the ACCESS_LOST *churn*: re-`DuplicateOutput` on the EXISTING device +
+    /// output. No new device/factory, so the encoder is NOT re-initialized and no black is seeded —
+    /// the existing `gpu_copy`/HDR textures/`last_present` are kept and frames resume immediately. This
+    /// is the right recovery for the HDR overlay-flip churn (the duplication is invalidated but the
+    /// output is still live). Returns false when the output can't be re-duplicated (desktop switch /
+    /// output gone) so the caller falls back to the full [`recreate_dupl`]. Probes the new duplication
+    /// (like recreate_dupl) so a born-lost one is rejected rather than adopted.
+    unsafe fn try_reduplicate(&mut self) -> bool {
+        if self.holding_frame {
+            let _ = self.dupl.ReleaseFrame();
+            self.holding_frame = false;
+        }
+        let dupl = match self.output.DuplicateOutput(&self.device) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        // Short probe (hot path): a born-lost duplication returns ACCESS_LOST immediately regardless
+        // of the timeout; only the alive-but-idle case waits the full 16ms, and idle = nothing moving.
+        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut res: Option<IDXGIResource> = None;
+        match dupl.AcquireNextFrame(16, &mut info, &mut res) {
+            Ok(()) => {
+                let _ = dupl.ReleaseFrame();
+            }
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {}
+            Err(_) => return false, // born-lost on the same output → need the full rebuild
+        }
+        self.dupl = dupl;
+        true
+    }
+
     /// ONE rebuild attempt — deliberately non-blocking. ACCESS_LOST fires on desktop switches
     /// (normal ↔ Winlogon secure: lock/login/UAC) and on the mode change we issue at create. We
     /// re-attach to the now-current input desktop and recreate the D3D11 device + duplication on it
@@ -1349,25 +1380,36 @@ impl DuplCapturer {
                     || e.code() == DXGI_ERROR_DEVICE_RESET =>
             {
                 self.dbg_lost += 1;
-                // THROTTLED, NON-BLOCKING recovery. During a secure-desktop dwell the SudoVDA output
-                // is gone, so a rebuild fails for the whole visit. We must NOT block retrying (that
-                // starves the encode/send loop → the client times out → disconnect — the bug). Try a
-                // rebuild at most ~4×/s; between attempts return "no new frame" so next_frame repeats
-                // the last good frame, keeping the client fed (frozen) until the desktop returns. A
-                // brief sleep on the throttled path avoids busy-spinning on the dead duplication.
+                // TIERED recovery. The HDR path produces a constant ACCESS_LOST *churn*: the
+                // duplication keeps getting invalidated (overlay/MPO flips that HDR makes aggressive)
+                // but the OUTPUT stays valid — a probe passes, the dup lives briefly, dies, repeats.
+                // For that, the cheap fix is a fresh DuplicateOutput on the SAME device+output: no new
+                // device/factory → NO encoder re-init, NO black seed → frames stay near-continuous
+                // (this is what makes HDR animations smooth). Only a genuine output loss (secure-desktop
+                // switch, where DISPLAY10 is gone) or a dead device needs the full rebuild — and THAT
+                // is throttled so a long secure dwell doesn't hammer DuplicateOutput / starve the
+                // client (between attempts we repeat the last frame).
+                let device_dead =
+                    e.code() == DXGI_ERROR_DEVICE_REMOVED || e.code() == DXGI_ERROR_DEVICE_RESET;
+                if self.dbg_lost % 64 == 1 {
+                    tracing::warn!(
+                        lost = self.dbg_lost,
+                        code = format!("{:#x}", e.code().0),
+                        "DXGI capture lost — recovering (cheap re-duplicate, full rebuild if output gone)"
+                    );
+                }
+                if !device_dead && self.try_reduplicate() {
+                    // Cheap recovery succeeded; the next acquire gets frames on the same device.
+                    self.first_frame = true;
+                    return Ok(None);
+                }
+                // Output gone / device dead → full rebuild (new device), throttled.
                 let now = Instant::now();
                 let due = self.last_rebuild.map_or(true, |t| {
                     now.duration_since(t) >= Duration::from_millis(250)
                 });
                 if due {
                     self.last_rebuild = Some(now);
-                    if self.dbg_lost % 8 == 1 {
-                        tracing::warn!(
-                            lost = self.dbg_lost,
-                            code = format!("{:#x}", e.code().0),
-                            "DXGI capture lost (desktop switch?) — repeating last frame, retrying rebuild"
-                        );
-                    }
                     if self.recreate_dupl().is_ok() {
                         self.first_frame = true;
                     }
