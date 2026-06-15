@@ -17,6 +17,7 @@ use punktfunk_core::quic::{HidOutput, RichInput};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::time::{Duration, Instant};
 
 // /dev/uhid event ABI (linux/uhid.h). `struct uhid_event` is __packed__: a u32 `type` then a
 // union whose largest member is uhid_create2_req (128+64+64 + 2+2 + 4*4 + rd_data[4096] = 4372).
@@ -496,6 +497,9 @@ pub struct DualSenseManager {
     state: Vec<DsState>,
     /// Last rumble forwarded per pad, so a report that only changes the LED doesn't re-send it.
     last_rumble: Vec<(u16, u16)>,
+    /// When each pad last wrote an input report — drives [`DualSenseManager::heartbeat`], which
+    /// re-emits the current state during input silence so the kernel never sees the device go quiet.
+    last_write: Vec<Instant>,
     /// Pad creation failed (e.g. /dev/uhid permissions) — warn once, drop events.
     broken: bool,
 }
@@ -512,6 +516,7 @@ impl DualSenseManager {
             pads: (0..MAX_PADS).map(|_| None).collect(),
             state: vec![DsState::neutral(); MAX_PADS],
             last_rumble: vec![(0, 0); MAX_PADS],
+            last_write: vec![Instant::now(); MAX_PADS],
             broken: false,
         }
     }
@@ -604,6 +609,24 @@ impl DualSenseManager {
         if let Some(pad) = self.pads[idx].as_mut() {
             let _ = pad.write_state(&st);
         }
+        // Reset the heartbeat timer on every write (real input or heartbeat), so an actively-used
+        // pad emits no extra reports — the heartbeat only fills genuine input-silence gaps.
+        self.last_write[idx] = Instant::now();
+    }
+
+    /// Re-emit each live pad's CURRENT report if it's been silent for `max_gap`. A real DualSense
+    /// streams report `0x01` continuously (~250 Hz); the kernel `hid-playstation` driver / Proton /
+    /// SDL treat a multi-second silence (a held-steady stick produces no wire events) as an
+    /// unplugged controller — the "controller disconnected every few seconds" symptom. Re-sending
+    /// the current state is idempotent (a stale-but-correct frame, never a phantom input);
+    /// `write_state` bumps the report's seq + timestamp, so each is a fresh, well-formed report.
+    pub fn heartbeat(&mut self, max_gap: Duration) {
+        let now = Instant::now();
+        for i in 0..self.pads.len() {
+            if self.pads[i].is_some() && now.duration_since(self.last_write[i]) >= max_gap {
+                self.write(i);
+            }
+        }
     }
 
     fn ensure(&mut self, idx: usize) {
@@ -619,6 +642,7 @@ impl DualSenseManager {
                 self.pads[idx] = Some(p);
                 self.state[idx] = DsState::neutral();
                 self.last_rumble[idx] = (0, 0);
+                self.last_write[idx] = Instant::now();
             }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — controller input disabled");

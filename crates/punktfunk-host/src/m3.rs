@@ -1198,6 +1198,19 @@ impl PadBackend {
             PadBackend::DualSense(m) => m.pump(rumble, hidout),
         }
     }
+
+    /// Keep a virtual DualSense alive during input silence: re-emit its current HID report if it's
+    /// gone quiet, so the kernel `hid-playstation` driver / SDL don't treat a held-steady pad as
+    /// unplugged ("controller disconnected every few seconds"). No-op for the X-Box pad (evdev
+    /// holds last-known state with no periodic-report requirement). Called every input-thread tick;
+    /// the per-pad gap timer (not the tick rate) governs the actual emit cadence.
+    fn heartbeat(&mut self) {
+        match self {
+            PadBackend::Xbox360(_) => {}
+            #[cfg(target_os = "linux")]
+            PadBackend::DualSense(m) => m.heartbeat(std::time::Duration::from_millis(8)),
+        }
+    }
 }
 
 /// The per-session input thread: route pointer/keyboard events to the host-lifetime injector
@@ -1293,6 +1306,10 @@ fn input_thread(
                 let _ = conn.send_datagram(h.encode().into());
             },
         );
+        // Keep the virtual DualSense from going silent during steady input (no-op for X-Box): a
+        // held-steady pad sends no wire events, so without a periodic re-emit the kernel/SDL drop
+        // it as unplugged. The 8 ms gap inside heartbeat() governs the rate, not this ≤4 ms tick.
+        pads.heartbeat();
         if last_refresh.elapsed() >= std::time::Duration::from_millis(500) {
             last_refresh = std::time::Instant::now();
             for (i, &(low, high)) in rumble_state.iter().enumerate() {
