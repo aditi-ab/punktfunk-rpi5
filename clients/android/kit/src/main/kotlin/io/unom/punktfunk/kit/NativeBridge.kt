@@ -28,4 +28,13 @@ object NativeBridge {
 
     /** Tear down a session handle returned by [nativeConnect]. No-op on `0`. */
     external fun nativeClose(handle: Long)
+
+    /**
+     * Start the HEVC decode thread rendering onto [surface] (a SurfaceView's surface). Decode runs
+     * entirely in Rust (NDK AMediaCodec → ANativeWindow) — no per-frame JNI. No-op if already started.
+     */
+    external fun nativeStartVideo(handle: Long, surface: android.view.Surface)
+
+    /** Stop + join the decode thread without closing the session. No-op on `0`. */
+    external fun nativeStopVideo(handle: Long)
 }
