@@ -162,15 +162,26 @@ pub fn open_video(
             .unwrap_or_default()
             .to_ascii_lowercase();
         if matches!(pref.as_str(), "nvenc" | "hw" | "nvidia") {
-            anyhow::bail!(
-                "NVENC hardware encode is not yet implemented on Windows — omit PUNKTFUNK_ENCODER \
-                 or set it to 'software' to use the openh264 encoder"
-            );
+            // Hardware path: NVENC over D3D11. The DXGI capturer switches to its zero-copy
+            // FramePayload::D3d11 output under the same env var so capture + encode share textures.
+            #[cfg(feature = "nvenc")]
+            {
+                let enc =
+                    nvenc::NvencD3d11Encoder::open(codec, format, width, height, fps, bitrate_bps)?;
+                return Ok(Box::new(enc) as Box<dyn Encoder>);
+            }
+            #[cfg(not(feature = "nvenc"))]
+            {
+                anyhow::bail!(
+                    "NVENC requested but this host was built without it — rebuild with \
+                     `--features nvenc` (needs the NVENC SDK's nvencodeapi.lib at link time)"
+                );
+            }
         }
         anyhow::ensure!(
             codec == Codec::H264,
             "the Windows software encoder supports H.264 only; client negotiated {codec:?} \
-             (request H264, or use a GPU host once NVENC lands)"
+             (set PUNKTFUNK_ENCODER=nvenc for a GPU host, or request H264)"
         );
         // Software H.264 realistically caps far below the negotiated hardware rates.
         const SW_BITRATE_CEIL: u64 = 100_000_000;
@@ -189,6 +200,8 @@ pub fn open_video(
 mod linux;
 #[cfg(target_os = "windows")]
 mod sw;
+#[cfg(all(target_os = "windows", feature = "nvenc"))]
+mod nvenc;
 
 #[cfg(test)]
 mod tests {

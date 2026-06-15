@@ -127,3 +127,16 @@ windows = { version = "0.62", features = [
 openh264 = "0.9"
 # WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
 wasapi = "0.23"
+# NVENC hardware encoder (NVENC SDK, D3D11 input). The SDK pins `cudarc` with
+# `cuda-version-from-build-system` (a build-time CUDA-toolkit probe); its `ci-check` feature switches
+# cudarc to `dynamic-loading` (loads nvcuda.dll at runtime — nothing needed at build), which is how
+# the crate builds on docs.rs/CI. We enable it so the GPU-less VM/CI compiles; the DirectX NVENC path
+# never calls CUDA at runtime, so the pinned CUDA bindings version is irrelevant.
+nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
+
+[features]
+# NVENC hardware encode (Windows). OFF by default: it pulls the NVENC SDK, and the host then needs
+# the NVENC entry points (NvEncodeAPICreateInstance / NvEncodeAPIGetMaxSupportedVersion) at link
+# time — i.e. `nvencodeapi.lib` from the NVIDIA Video Codec SDK (or an import lib generated from
+# nvEncodeAPI64.dll) on the linker path. Build the GPU host with `--features nvenc`.
+nvenc = ["dep:nvidia-video-codec-sdk"]
