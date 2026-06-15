@@ -59,6 +59,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-core") // bottom-bar tab icons
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     // Android TV components (we target phone + TV) land in the TV-UI milestone:

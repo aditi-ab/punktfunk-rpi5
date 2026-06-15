@@ -31,9 +31,16 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -48,6 +55,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalContext
@@ -138,10 +146,10 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private sealed interface Screen {
-    data object Connect : Screen
-    data object Settings : Screen
-    data class Stream(val handle: Long) : Screen
+/** Bottom-bar destinations (the immersive stream view is shown full-screen, outside the bar). */
+private enum class Tab(val label: String, val icon: ImageVector) {
+    Connect("Connect", Icons.Filled.Home),
+    Settings("Settings", Icons.Filled.Settings),
 }
 
 /**
@@ -165,24 +173,43 @@ private fun App() {
     val context = LocalContext.current
     val settingsStore = remember { SettingsStore(context) }
     var settings by remember { mutableStateOf(settingsStore.load()) }
-    var screen by remember { mutableStateOf<Screen>(Screen.Connect) }
-    when (val s = screen) {
-        Screen.Connect -> ConnectScreen(
-            settings = settings,
-            onConnected = { handle -> screen = Screen.Stream(handle) },
-            onOpenSettings = { screen = Screen.Settings },
-        )
-        Screen.Settings -> SettingsScreen(
-            initial = settings,
-            onChange = { settings = it; settingsStore.save(it) },
-            onBack = { screen = Screen.Connect },
-        )
-        is Screen.Stream -> StreamScreen(s.handle, onDisconnect = { screen = Screen.Connect })
+    var streamHandle by remember { mutableStateOf(0L) } // 0 = not streaming
+    var tab by remember { mutableStateOf(Tab.Connect) }
+
+    if (streamHandle != 0L) {
+        // Immersive: the stream takes the whole screen, no bottom bar.
+        StreamScreen(streamHandle, onDisconnect = { streamHandle = 0L })
+    } else {
+        Scaffold(
+            bottomBar = {
+                NavigationBar {
+                    Tab.entries.forEach { t ->
+                        NavigationBarItem(
+                            selected = tab == t,
+                            onClick = { tab = t },
+                            icon = { Icon(t.icon, contentDescription = t.label) },
+                            label = { Text(t.label) },
+                        )
+                    }
+                }
+            },
+        ) { innerPadding ->
+            Box(Modifier.fillMaxSize().padding(innerPadding)) {
+                when (tab) {
+                    Tab.Connect -> ConnectScreen(settings = settings, onConnected = { streamHandle = it })
+                    Tab.Settings -> SettingsScreen(
+                        initial = settings,
+                        onChange = { settings = it; settingsStore.save(it) },
+                        onBack = { tab = Tab.Connect },
+                    )
+                }
+            }
+        }
     }
 }
 
 @Composable
-private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit, onOpenSettings: () -> Unit) {
+private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var host by remember { mutableStateOf("") }
@@ -351,7 +378,6 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit, onOpe
             enabled = !connecting && host.isNotBlank() && port.isNotBlank(),
             onClick = { connect(host.trim(), port.toInt()) },
         ) { Text(if (connecting) "Connecting…" else "Connect  ($w×$h@$hz)") }
-        TextButton(enabled = !connecting, onClick = onOpenSettings) { Text("Settings") }
         status?.let {
             Spacer(Modifier.height(12.dp))
             Text(it, style = MaterialTheme.typography.bodySmall)
