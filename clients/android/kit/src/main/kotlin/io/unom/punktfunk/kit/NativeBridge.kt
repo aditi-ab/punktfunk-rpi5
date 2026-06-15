@@ -18,13 +18,44 @@ object NativeBridge {
     external fun coreVersion(): String
 
     /**
-     * Connect to a host (trust-on-first-use, anonymous) and return an opaque session handle, or
-     * `0` on failure. Pair the handle with exactly one [nativeClose].
-     *
-     * TODO(M4): pin/identity/pairing, plane pumps (video/audio/rumble/HID), input, mode
-     * renegotiation — see `crates/punktfunk-android/src/session.rs`.
+     * Mint a fresh persistent self-signed identity, returned as
+     * `"<certPem>\n-----PUNKTFUNK-KEY-----\n<keyPem>"`, or `""` on error. Kotlin persists it
+     * (Keystore-wrapped via `IdentityStore`) and only calls this again when the store is empty.
      */
-    external fun nativeConnect(host: String, port: Int, width: Int, height: Int, refreshHz: Int): Long
+    external fun nativeGenerateIdentity(): String
+
+    /**
+     * Connect, presenting [certPem]/[keyPem] (both empty = anonymous) and pinning [pinHex] (empty =
+     * trust-on-first-use — read [nativeHostFingerprint] after; else 64-hex host SHA-256, mismatch →
+     * `0`). Returns an opaque session handle, or `0` on failure. Pair with exactly one [nativeClose].
+     */
+    external fun nativeConnect(
+        host: String,
+        port: Int,
+        width: Int,
+        height: Int,
+        refreshHz: Int,
+        certPem: String,
+        keyPem: String,
+        pinHex: String,
+    ): Long
+
+    /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */
+    external fun nativeHostFingerprint(handle: Long): String
+
+    /**
+     * Run the SPAKE2 PIN ceremony, presenting [certPem]/[keyPem]. Returns the host's verified
+     * fingerprint (64-hex) to persist + pin, or `""` on failure (wrong PIN / MITM / unreachable).
+     * Blocking — call off the main thread.
+     */
+    external fun nativePair(
+        host: String,
+        port: Int,
+        certPem: String,
+        keyPem: String,
+        pin: String,
+        name: String,
+    ): String
 
     /** Tear down a session handle returned by [nativeConnect]. No-op on `0`. */
     external fun nativeClose(handle: Long)

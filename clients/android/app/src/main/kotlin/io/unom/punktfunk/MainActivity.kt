@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import android.os.Build
 import android.os.Bundle
 import android.view.InputDevice
 import android.view.KeyEvent
@@ -22,10 +23,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.HorizontalDivider
@@ -33,9 +36,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -55,6 +60,10 @@ import io.unom.punktfunk.kit.Keymap
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.discovery.HostDiscovery
+import io.unom.punktfunk.kit.security.ClientIdentity
+import io.unom.punktfunk.kit.security.IdentityStore
+import io.unom.punktfunk.kit.security.PinStore
+import io.unom.punktfunk.kit.security.obtainIdentity
 import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -136,6 +145,18 @@ private sealed interface Screen {
     data class Stream(val handle: Long) : Screen
 }
 
+/** A trust decision awaiting the user before a connect proceeds. [hostId] is the PinStore key. */
+private data class PendingTrust(
+    val host: String,
+    val port: Int,
+    val hostId: String,
+    val advertisedFp: String?,
+    val pairingRequired: Boolean,
+    val kind: Kind,
+) {
+    enum class Kind { TRUST_NEW, FP_CHANGED, PAIR }
+}
+
 @Composable
 private fun App() {
     var screen by remember { mutableStateOf<Screen>(Screen.Connect) }
@@ -169,21 +190,79 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
         }
     }
 
-    fun connect(targetHost: String, targetPort: Int) {
+    val identityStore = remember { IdentityStore(context) }
+    val pinStore = remember { PinStore(context) }
+    // Mint-once on genuine first run; an Unrecoverable store (decrypt failure) surfaces here and
+    // refuses to connect — never silently shadow-minting a new identity (which would force re-pair).
+    var identity by remember { mutableStateOf<ClientIdentity?>(null) }
+    LaunchedEffect(Unit) {
+        runCatching { withContext(Dispatchers.IO) { obtainIdentity(identityStore) } }
+            .onSuccess { identity = it }
+            .onFailure { status = "Identity unavailable: ${it.message} — re-pair may be required" }
+    }
+    // A trust decision awaiting the user (first-connect TOFU / fp changed / PIN pairing).
+    var pendingTrust by remember { mutableStateOf<PendingTrust?>(null) }
+
+    fun hostIdFor(h2: String, p2: Int, dh: DiscoveredHost?) = dh?.key ?: "$h2:$p2"
+
+    // Issue the actual connect with identity + (optional) pin. On a TOFU connect (pinHex null),
+    // persist the fingerprint the host presented so the next connect goes straight through.
+    fun doConnect(targetHost: String, targetPort: Int, hostId: String, pinHex: String?) {
+        val id = identity
+        if (id == null) {
+            status = "Identity not ready yet — try again in a moment"
+            return
+        }
         connecting = true
         status = "Connecting to $targetHost:$targetPort…"
         discovery.stop() // free the Wi-Fi radio before the stream session
         scope.launch {
             val handle = withContext(Dispatchers.IO) {
-                NativeBridge.nativeConnect(targetHost, targetPort, w, h, hz)
+                NativeBridge.nativeConnect(
+                    targetHost, targetPort, w, h, hz,
+                    id.certPem, id.privateKeyPem, pinHex ?: "",
+                )
             }
             connecting = false
             if (handle != 0L) {
+                if (pinHex == null) { // TOFU: pin what we observed
+                    val fp = NativeBridge.nativeHostFingerprint(handle)
+                    if (fp.isNotEmpty()) pinStore.pin(hostId, fp)
+                }
                 onConnected(handle)
             } else {
-                status = "Connection failed — check host/port and logcat"
+                status = "Connection failed — check host/port, PIN, and logcat"
                 discovery.start()
             }
+        }
+    }
+
+    // Decide TOFU vs pinned vs pairing before connecting.
+    fun connect(targetHost: String, targetPort: Int, dh: DiscoveredHost? = null) {
+        val hostId = hostIdFor(targetHost, targetPort, dh)
+        val stored = pinStore.get(hostId)
+        val pairingReq = dh?.pairingRequired ?: false
+        when {
+            stored != null -> {
+                val adv = dh?.fingerprint?.lowercase()
+                if (adv != null && adv != stored) {
+                    // Advertised fp no longer matches the pin — host reinstall, or an impostor.
+                    pendingTrust = PendingTrust(
+                        targetHost, targetPort, hostId, adv, pairingReq, PendingTrust.Kind.FP_CHANGED,
+                    )
+                } else {
+                    doConnect(targetHost, targetPort, hostId, stored)
+                }
+            }
+            // Never trusted + host requires pairing → TOFU can't pass the gate; go straight to PIN.
+            pairingReq -> pendingTrust = PendingTrust(
+                // pairingReq true ⇒ dh != null (smart-cast), so the fp is the advertised one.
+                targetHost, targetPort, hostId, dh.fingerprint, true, PendingTrust.Kind.PAIR,
+            )
+            // Never trusted, TOFU allowed → confirm trust first.
+            else -> pendingTrust = PendingTrust(
+                targetHost, targetPort, hostId, dh?.fingerprint, false, PendingTrust.Kind.TRUST_NEW,
+            )
         }
     }
 
@@ -204,7 +283,7 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
                     DiscoveredHostRow(dh, enabled = !connecting) {
                         host = dh.host
                         port = dh.port.toString()
-                        connect(dh.host, dh.port)
+                        connect(dh.host, dh.port, dh)
                     }
                 }
             }
@@ -238,6 +317,118 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
         }
         Spacer(Modifier.height(24.dp))
         Text("core ABI v$abi", style = MaterialTheme.typography.labelSmall)
+    }
+
+    pendingTrust?.let { pt ->
+        when (pt.kind) {
+            PendingTrust.Kind.TRUST_NEW -> AlertDialog(
+                onDismissRequest = { pendingTrust = null },
+                title = { Text("Trust this host?") },
+                text = {
+                    Column {
+                        Text("First connection to ${pt.host}:${pt.port}.")
+                        pt.advertisedFp?.let { Text("Fingerprint ${it.take(16)}…") }
+                        Text("Pairing with a PIN is stronger — it verifies both sides.")
+                    }
+                },
+                confirmButton = {
+                    TextButton({ pendingTrust = null; doConnect(pt.host, pt.port, pt.hostId, null) }) {
+                        Text("Trust (TOFU)")
+                    }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton({ pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) }) {
+                            Text("Pair with PIN…")
+                        }
+                        TextButton({ pendingTrust = null }) { Text("Cancel") }
+                    }
+                },
+            )
+            PendingTrust.Kind.FP_CHANGED -> AlertDialog(
+                onDismissRequest = { pendingTrust = null },
+                title = { Text("Host identity changed") },
+                text = {
+                    Text(
+                        "The pinned fingerprint for ${pt.host} no longer matches what it now " +
+                            "advertises. This can mean a host reinstall — or an impostor. Re-pair, " +
+                            "or forget the saved fingerprint to trust the new one.",
+                    )
+                },
+                confirmButton = {
+                    TextButton({ pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) }) { Text("Re-pair") }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton({
+                            pinStore.remove(pt.hostId)
+                            pendingTrust = null
+                            doConnect(pt.host, pt.port, pt.hostId, null)
+                        }) { Text("Forget & re-TOFU") }
+                        TextButton({ pendingTrust = null }) { Text("Cancel") }
+                    }
+                },
+            )
+            PendingTrust.Kind.PAIR -> {
+                var pin by remember(pt) { mutableStateOf("") }
+                var name by remember(pt) { mutableStateOf(Build.MODEL ?: "Android") }
+                var pairing by remember(pt) { mutableStateOf(false) }
+                var err by remember(pt) { mutableStateOf<String?>(null) }
+                AlertDialog(
+                    onDismissRequest = { if (!pairing) pendingTrust = null },
+                    title = { Text("Pair with PIN") },
+                    text = {
+                        Column {
+                            Text("Enter the 4-digit PIN shown on the host.")
+                            OutlinedTextField(
+                                value = pin,
+                                onValueChange = { v -> pin = v.filter { it.isDigit() }.take(4) },
+                                label = { Text("PIN") },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            )
+                            OutlinedTextField(
+                                value = name,
+                                onValueChange = { name = it },
+                                label = { Text("This device") },
+                                singleLine = true,
+                            )
+                            err?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(
+                            enabled = !pairing && pin.length == 4 && identity != null,
+                            onClick = {
+                                val id = identity
+                                if (id != null) {
+                                    pairing = true
+                                    err = null
+                                    scope.launch {
+                                        val fp = withContext(Dispatchers.IO) {
+                                            NativeBridge.nativePair(
+                                                pt.host, pt.port, id.certPem, id.privateKeyPem, pin, name,
+                                            )
+                                        }
+                                        pairing = false
+                                        if (fp.isNotEmpty()) {
+                                            pinStore.pin(pt.hostId, fp) // verified host fp; paired
+                                            pendingTrust = null
+                                            doConnect(pt.host, pt.port, pt.hostId, fp)
+                                        } else {
+                                            err = "Pairing failed — wrong PIN, or the host isn't armed."
+                                        }
+                                    }
+                                }
+                            },
+                        ) { Text(if (pairing) "Pairing…" else "Pair") }
+                    },
+                    dismissButton = {
+                        TextButton(enabled = !pairing, onClick = { pendingTrust = null }) { Text("Cancel") }
+                    },
+                )
+            }
+        }
     }
 }
 

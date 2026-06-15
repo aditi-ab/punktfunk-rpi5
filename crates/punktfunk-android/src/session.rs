@@ -4,12 +4,14 @@
 //! feeds — boxed and handed to Kotlin as an opaque `jlong`. The connector is `Sync`, so the decode
 //! thread pulls the video plane (`next_frame`) directly while Kotlin still holds the handle.
 //!
-//! Wired so far: connect/close + the video plane (HEVC `next_frame` → NDK AMediaCodec → the
-//! SurfaceView's `ANativeWindow`, see [`crate::decode`]).
+//! Wired: connect/close, the video plane (HEVC `next_frame` → NDK AMediaCodec → the SurfaceView's
+//! `ANativeWindow`, see [`crate::decode`]), host→client audio ([`crate::audio`]), input
+//! (`send_input` — mouse/keyboard/gamepad), rumble/DualSense HID feedback ([`crate::feedback`]),
+//! and the trust surface: `nativeGenerateIdentity` (persistent identity, Keystore-wrapped on the
+//! Kotlin side), `nativeConnect` with identity + pin (TOFU / pinned), and `nativePair` (SPAKE2 PIN).
 //!
-//! TODO(M4 Android stage 1): audio (`next_audio` → Opus → Oboe), input (`send_input` /
-//! `send_rich_input`), rumble/HID feedback, pairing/identity (Keystore). Port the orchestration
-//! from `crates/punktfunk-client-linux`.
+//! TODO(M4 Android stage 1): client→host DualSense rich input (`send_rich_input`), mode
+//! renegotiation. Port the remaining orchestration from `crates/punktfunk-client-linux`.
 
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
@@ -65,9 +67,54 @@ impl Drop for SessionHandle {
     }
 }
 
-/// `NativeBridge.nativeConnect(host, port, width, height, refreshHz): Long` — trust-on-first-use,
-/// anonymous. Returns an opaque session handle, or `0` on failure (logged to logcat).
+/// SHA-256 fingerprint → 64 lowercase hex chars (matches the host log + client-rs).
+fn hex32(fp: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    fp.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// 64-hex → [u8; 32]; `None` on bad length/char.
+fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// `NativeBridge.nativeGenerateIdentity(): String` — mint a fresh persistent self-signed identity.
+/// Returns `"<certPem>\n-----PUNKTFUNK-KEY-----\n<keyPem>"`, or `""` on failure (logged). Kotlin
+/// persists it (Keystore-wrapped) and only calls this again when the store is genuinely empty.
 #[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIdentity<'local>(
+    env: JNIEnv<'local>,
+    _this: JObject<'local>,
+) -> jni::sys::jstring {
+    let out = match punktfunk_core::quic::endpoint::generate_identity() {
+        Ok((cert, key)) => format!("{cert}\n-----PUNKTFUNK-KEY-----\n{key}"),
+        Err(e) => {
+            log::error!("nativeGenerateIdentity failed: {e}");
+            String::new()
+        }
+    };
+    match env.new_string(out) {
+        Ok(s) => s.into_raw(),
+        Err(_) => JObject::null().into_raw(),
+    }
+}
+
+/// `NativeBridge.nativeConnect(host, port, w, h, hz, certPem, keyPem, pinHex): Long`. `certPem`/
+/// `keyPem` empty = anonymous, else presented as the persistent identity. `pinHex` empty = TOFU
+/// (read `nativeHostFingerprint` after), else 64-hex SHA-256 to pin the host (mismatch → 0).
+/// Returns an opaque handle, or 0 on failure (logged).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'local>(
     mut env: JNIEnv<'local>,
     _this: JObject<'local>,
@@ -76,10 +123,36 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     width: jint,
     height: jint,
     refresh_hz: jint,
+    cert_pem: JString<'local>,
+    key_pem: JString<'local>,
+    pin_hex: JString<'local>,
 ) -> jlong {
     let host: String = match env.get_string(&host) {
         Ok(s) => s.into(),
         Err(_) => return 0,
+    };
+    let cert: String = env
+        .get_string(&cert_pem)
+        .map(Into::into)
+        .unwrap_or_default();
+    let key: String = env.get_string(&key_pem).map(Into::into).unwrap_or_default();
+    let pin_hex: String = env.get_string(&pin_hex).map(Into::into).unwrap_or_default();
+
+    let identity: Option<(String, String)> = if cert.is_empty() || key.is_empty() {
+        None
+    } else {
+        Some((cert, key))
+    };
+    let pin: Option<[u8; 32]> = if pin_hex.is_empty() {
+        None
+    } else {
+        match parse_hex32(&pin_hex) {
+            Some(fp) => Some(fp),
+            None => {
+                log::error!("nativeConnect: bad pin hex (len {})", pin_hex.len());
+                return 0;
+            }
+        }
     };
     let mode = Mode {
         width: width as u32,
@@ -92,10 +165,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         mode,
         CompositorPref::Auto,
         GamepadPref::Auto,
-        0,    // bitrate_kbps: host default
-        None, // launch: default app
-        None, // pin: trust on first use
-        None, // identity: anonymous (TODO: Keystore-backed identity + pairing)
+        0,        // bitrate_kbps: host default
+        None,     // launch: default app
+        pin,      // Some → Crypto on host-fp mismatch
+        identity, // owned (cert, key) PEM, or None (anonymous)
         Duration::from_secs(10),
     ) {
         Ok(client) => {
@@ -129,6 +202,79 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     if handle != 0 {
         // SAFETY: per the contract, `handle` is a live `Box<SessionHandle>` pointer.
         unsafe { drop(Box::from_raw(handle as *mut SessionHandle)) };
+    }
+}
+
+/// `NativeBridge.nativeHostFingerprint(handle): String` — the SHA-256 (64-hex) of the cert the host
+/// presented on this connection. Valid after a successful `nativeConnect`; Kotlin pins it on a TOFU
+/// connect. `""` on a `0` handle.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerprint<'local>(
+    env: JNIEnv<'local>,
+    _this: JObject<'local>,
+    handle: jlong,
+) -> jni::sys::jstring {
+    let out = if handle == 0 {
+        String::new()
+    } else {
+        // SAFETY: live handle per the nativeConnect/nativeClose contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        hex32(&h.client.host_fingerprint)
+    };
+    match env.new_string(out) {
+        Ok(s) => s.into_raw(),
+        Err(_) => JObject::null().into_raw(),
+    }
+}
+
+/// `NativeBridge.nativePair(host, port, certPem, keyPem, pin, name): String` — run the SPAKE2 PIN
+/// ceremony, presenting our persistent identity. On success returns the host's verified fingerprint
+/// (64-hex) to persist + pin; on any failure (wrong PIN / MITM / host reject / unreachable) returns
+/// `""` (logged). Blocking — Kotlin calls it off the UI thread.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePair<'local>(
+    mut env: JNIEnv<'local>,
+    _this: JObject<'local>,
+    host: JString<'local>,
+    port: jint,
+    cert_pem: JString<'local>,
+    key_pem: JString<'local>,
+    pin: JString<'local>,
+    name: JString<'local>,
+) -> jni::sys::jstring {
+    let g = |e: &mut JNIEnv<'local>, j: &JString<'local>| -> String {
+        e.get_string(j).map(Into::into).unwrap_or_default()
+    };
+    let host = g(&mut env, &host);
+    let cert = g(&mut env, &cert_pem);
+    let key = g(&mut env, &key_pem);
+    let pin = g(&mut env, &pin);
+    let name = g(&mut env, &name);
+
+    let out = if host.is_empty() || cert.is_empty() || key.is_empty() {
+        log::error!("nativePair: missing host/identity");
+        String::new()
+    } else {
+        match NativeClient::pair(
+            &host,
+            port as u16,
+            (&cert, &key), // borrowed identity
+            &pin,
+            &name,
+            Duration::from_secs(60),
+        ) {
+            Ok(host_fp) => hex32(&host_fp),
+            Err(e) => {
+                // Crypto error == wrong PIN / MITM; anything else == transport/host reject.
+                log::error!("nativePair to {host}:{port} failed: {e}");
+                String::new()
+            }
+        }
+    };
+    match env.new_string(out) {
+        Ok(s) => s.into_raw(),
+        Err(_) => JObject::null().into_raw(),
     }
 }
 
