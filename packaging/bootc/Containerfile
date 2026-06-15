@@ -15,8 +15,12 @@
 ARG BASE_IMAGE=ghcr.io/ublue-os/bazzite-nvidia:stable
 FROM ${BASE_IMAGE}
 
-# COPR project that hosts the punktfunk RPM (see packaging/copr/README). Override at build.
-ARG PUNKTFUNK_COPR=enricobuehler/punktfunk
+# punktfunk's RPMs come from unom's Gitea RPM registry (the recommended path — see
+# packaging/rpm/README). Use it rather than COPR specifically because it carries the
+# punktfunk-web management console subpackage, which COPR's mock chroot can't build (no `bun`).
+# Group "bazzite" == the Fedora 43 base; override for a different base. Gitea signs the repo
+# metadata (repo_gpgcheck=1); the packages themselves are unsigned (gpgcheck=0).
+ARG PUNKTFUNK_RPM_GROUP=bazzite
 
 # RPM Fusion nonfree provides the NVENC-capable ffmpeg-libs punktfunk records/encodes with.
 # (Bazzite usually has RPM Fusion enabled already; this is belt-and-suspenders.)
@@ -25,15 +29,20 @@ RUN dnf5 -y install \
         https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm \
     || true
 
-# Enable our COPR and install punktfunk.
-RUN dnf5 -y copr enable ${PUNKTFUNK_COPR} && \
-    dnf5 -y install punktfunk && \
-    dnf5 -y copr disable ${PUNKTFUNK_COPR} && \
-    dnf5 clean all
+# Add the Gitea RPM repo and install the host + the web console (punktfunk-web pulls nodejs).
+RUN printf '%s\n' \
+      '[gitea-unom-punktfunk]' \
+      'name=punktfunk (unom)' \
+      "baseurl=https://git.unom.io/api/packages/unom/rpm/${PUNKTFUNK_RPM_GROUP}" \
+      'enabled=1' 'gpgcheck=0' 'repo_gpgcheck=1' \
+      'gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key' \
+      > /etc/yum.repos.d/punktfunk.repo \
+ && dnf5 -y install punktfunk punktfunk-web \
+ && dnf5 clean all
 
-# The udev rule + systemd *user* unit ship in the RPM; nothing else to enable at image
-# build time (the host runs per-user in the graphical session, enabled with
-# `systemctl --user enable --now punktfunk-host` after first boot).
+# The udev rule + systemd *user* units ship in the RPMs; nothing else to enable at image build
+# time (host + console run per-user in the graphical session, enabled after first boot with
+# `systemctl --user enable --now punktfunk-host punktfunk-web`).
 
 # bootc image hygiene: the container build must leave a clean ostree commit.
 RUN ostree container commit

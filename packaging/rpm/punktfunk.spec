@@ -39,6 +39,13 @@ ExclusiveArch:  x86_64 aarch64
 # Recommends). Drop it from the auto-Requires, mirroring the Debian package's NVIDIA filter.
 %global __requires_exclude ^libcuda\\.so.*$
 
+# Management web console subpackage (punktfunk-web). OFF by default: building the Nitro/Node SSR
+# bundle needs `bun`, which a plain rpmbuild / COPR mock chroot does NOT have. CI's builder image
+# (ci/fedora-rpm.Dockerfile) DOES have bun and builds with `--with web`, so the Gitea RPM registry
+# carries punktfunk-web. COPR (no bun) builds host+client only — use the Gitea registry for the
+# console, or enable bun + `--with web` in the COPR project. Mirrors the Debian punktfunk-web .deb.
+%bcond_with web
+
 # --- Build toolchain ---------------------------------------------------------
 BuildRequires:  cargo
 BuildRequires:  rust
@@ -90,6 +97,10 @@ Suggests:       kwin
 Suggests:       mutter
 # NVENC + GPU EGL come from the NVIDIA driver; on Bazzite the -nvidia image has it.
 Recommends:     (xorg-x11-drv-nvidia-cuda if xorg-x11-drv-nvidia)
+# The management web console (pairing + status) every user needs — a separate noarch subpackage.
+# Weak-dep so `dnf install punktfunk` pulls it where it exists (the Gitea registry); harmless where
+# it doesn't (a COPR build without `--with web` simply has no punktfunk-web to satisfy).
+Recommends:     punktfunk-web
 
 %description
 punktfunk is a Linux-first, low-latency desktop and game streaming host. It speaks
@@ -114,6 +125,23 @@ audio, microphone passthrough, and full gamepad support including DualSense
 touchpad, motion, adaptive triggers and lightbar through SDL3. The host creates a
 virtual output at exactly this client's resolution and refresh rate — no scaling.
 
+%if %{with web}
+%package web
+Summary:        punktfunk management web console (Nitro/Node SSR + React)
+BuildArch:      noarch
+# Runtime is plain node (the .output is portable JS — bun is only the build tool). Fedora 41+
+# ships nodejs >= 20, which the node-server build needs.
+Requires:       nodejs
+
+%description web
+The browser console for a punktfunk streaming host: status, paired devices, and the SPAKE2
+PIN pairing flow every client needs. Runs as a systemd --user service on port 3000, login-gated
+(a password generated on first start), proxying the host's loopback HTTPS management API with a
+bearer token injected server-side (never sent to the browser). Auto-wired to the host on a
+packaged install — it sources the host's mgmt token and a generated login password, no env
+editing. Enable with `systemctl --user enable --now punktfunk-web`.
+%endif
+
 %prep
 %autosetup -n %{name}-%{version}
 
@@ -122,6 +150,16 @@ virtual output at exactly this client's resolution and refresh rate — no scali
 # cargo fetches crates over the network; COPR build hosts allow this.
 export RUSTFLAGS="%{?build_rustflags}"
 cargo build --release -p punktfunk-host -p punktfunk-client-linux
+
+%if %{with web}
+# Management web console: build the Nitro/Node SSR bundle (node-server preset) with bun. The
+# .output is portable JS run at runtime by plain node; bun is only the build tool (CI image).
+(cd web && bun install --frozen-lockfile && bun run build)
+if grep -q 'Bun\.serve' web/.output/server/index.mjs; then
+  echo "ERROR: web build is a bun bundle (Bun.serve) — need the node-server preset" >&2
+  exit 1
+fi
+%endif
 
 %install
 # Binary
@@ -177,6 +215,24 @@ install -d %{buildroot}%{_datadir}/%{name}/bazzite
 install -Dm0755 packaging/bazzite/kde-desktop-setup.sh %{buildroot}%{_datadir}/%{name}/bazzite/kde-desktop-setup.sh
 install -Dm0644 docs/api/openapi.json                  %{buildroot}%{_datadir}/%{name}/openapi.json
 
+%if %{with web}
+# --- web console subpackage (punktfunk-web) ---
+install -d %{buildroot}%{_datadir}/punktfunk-web/.output
+cp -r web/.output/server %{buildroot}%{_datadir}/punktfunk-web/.output/server
+cp -r web/.output/public %{buildroot}%{_datadir}/punktfunk-web/.output/public
+# PATH-stable launcher (matches the .deb's /usr/bin/punktfunk-web-server).
+cat > %{buildroot}%{_bindir}/punktfunk-web-server <<'WRAP'
+#!/bin/sh
+exec /usr/bin/node /usr/share/punktfunk-web/.output/server/index.mjs "$@"
+WRAP
+chmod 0755 %{buildroot}%{_bindir}/punktfunk-web-server
+# systemd --user units: the console runs per-user; web-init generates the login password.
+install -Dm0644 scripts/punktfunk-web.service      %{buildroot}%{_userunitdir}/punktfunk-web.service
+install -Dm0644 scripts/punktfunk-web-init.service %{buildroot}%{_userunitdir}/punktfunk-web-init.service
+install -Dm0755 scripts/web-init.sh                %{buildroot}%{_datadir}/punktfunk-web/web-init.sh
+install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punktfunk-web/web.env.example
+%endif
+
 %files
 %license LICENSE-MIT LICENSE-APACHE
 %doc README.md docs/implementation-plan.md packaging/README.md
@@ -194,6 +250,18 @@ install -Dm0644 docs/api/openapi.json                  %{buildroot}%{_datadir}/%
 %{_datadir}/applications/io.unom.Punktfunk.desktop
 %{_udevrulesdir}/70-punktfunk-client.rules
 %{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf
+
+%if %{with web}
+%files web
+%license LICENSE-MIT LICENSE-APACHE
+%{_bindir}/punktfunk-web-server
+%dir %{_datadir}/punktfunk-web
+%{_datadir}/punktfunk-web/.output
+%{_datadir}/punktfunk-web/web-init.sh
+%{_datadir}/punktfunk-web/web.env.example
+%{_userunitdir}/punktfunk-web.service
+%{_userunitdir}/punktfunk-web-init.service
+%endif
 
 %post client
 # Pick up the DualSense hidraw rule without a reboot (best-effort; on rpm-ostree it
@@ -215,6 +283,17 @@ echo "punktfunk installed. Add yourself to the 'input' group (sudo usermod -aG i
 echo "then enable the host: systemctl --user enable --now punktfunk-host"
 echo "Config: cp %{_datadir}/%{name}/host.env.bazzite ~/.config/punktfunk/host.env"
 
+%if %{with web}
+%post web
+echo "punktfunk-web installed. Enable the console for your user:"
+echo "    systemctl --user enable --now punktfunk-web"
+echo "A login password is generated on first start — read it with:"
+echo "    journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'"
+echo "Then open http://<host-ip>:3000"
+%endif
+
 %changelog
+* Sun Jun 15 2026 punktfunk <noreply@anthropic.com> - 0.0.1-2
+- Add punktfunk-web subpackage (management console, --with web; auto-wired to the host token).
 * Wed Jun 10 2026 punktfunk <noreply@anthropic.com> - 0.0.1-1
 - Initial RPM: punktfunk-host + udev rule + systemd user unit + headless helpers.

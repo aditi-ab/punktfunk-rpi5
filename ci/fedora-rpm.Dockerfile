@@ -17,7 +17,8 @@ RUN dnf -y install \
       "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm" \
   && dnf -y install \
       # rpmbuild + source-tarball tooling; nodejs runs the Gitea Actions JS (checkout/cache)
-      rpm-build rpmdevtools systemd-rpm-macros git tar gzip nodejs \
+      # AND the punktfunk-web .output at runtime; unzip is for the bun installer below.
+      rpm-build rpmdevtools systemd-rpm-macros git tar gzip nodejs unzip \
       # build toolchain + bindgen
       gcc gcc-c++ clang clang-devel cmake nasm pkgconf-pkg-config curl ca-certificates \
       # ffmpeg (NVENC), capture/audio/display link deps
@@ -26,6 +27,13 @@ RUN dnf -y install \
       # punktfunk-client link deps (GTK4 shell + SDL3 gamepads)
       gtk4-devel libadwaita-devel SDL3-devel \
   && dnf clean all
+
+# bun — the build tool for the punktfunk-web console (`bun run build` -> the node-server .output
+# the punktfunk-web RPM ships and runs with plain node). Not in Fedora repos; install the official
+# standalone binary to a system PATH dir so the rpmbuild `%build` (run as any uid) finds it.
+RUN curl -fsSL https://bun.sh/install | bash \
+    && install -m0755 /root/.bun/bin/bun /usr/local/bin/bun \
+    && bun --version
 
 # libcuda link stub — the zerocopy path links a fixed set of cuXxx driver symbols, but CI has
 # no GPU and never RUNS CUDA. Rather than drag in the NVIDIA userspace stack, synthesize a stub

@@ -50,6 +50,14 @@ jobs:
         run: |
           git config --global --add safe.directory "$PWD"
           dnf -y install gtk4-devel libadwaita-devel SDL3-devel
+          # bun builds the punktfunk-web console (--with web). Baked into the image; install it
+          # here too so the job stays green against the PREVIOUS image (docker.yml bootstrap note).
+          command -v bun >/dev/null || {
+            dnf -y install unzip
+            curl -fsSL https://bun.sh/install | bash
+            install -m0755 "$HOME/.bun/bin/bun" /usr/local/bin/bun
+          }
+          bun --version
       - uses: actions/cache@v4
         with:
           path: /usr/local/cargo/registry
@@ -71,7 +79,9 @@ jobs:
           echo "rpm $V-$R"
 
       - name: Build RPM
-        run: PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" bash packaging/rpm/build-rpm.sh
+        # PF_WITH_WEB=1 → also build the noarch punktfunk-web subpackage (the publish loop below
+        # globs it in; the host RPM Recommends it). Needs bun (ensured in Prep).
+        run: PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" PF_WITH_WEB=1 bash packaging/rpm/build-rpm.sh
 
       - name: Publish to the Gitea RPM registry
         env:

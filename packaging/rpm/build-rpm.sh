@@ -11,6 +11,10 @@ set -euo pipefail
 
 PF_VERSION="${PF_VERSION:-0.0.1}"
 PF_RELEASE="${PF_RELEASE:-1}"
+# PF_WITH_WEB=1 builds the punktfunk-web subpackage too (needs `bun` on PATH — present in the CI
+# builder image, not in a plain mock chroot). Default off so a bare `rpmbuild`/COPR still works.
+WEB_OPT=()
+[ "${PF_WITH_WEB:-0}" = "1" ] && WEB_OPT=(--with web)
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
@@ -28,7 +32,7 @@ git archive --format=tar.gz --prefix="punktfunk-${PF_VERSION}/" \
 # resolves them from RPMs. Our builder image provides the toolchain via rustup (so
 # rust-toolchain.toml's pinned channel works) and the -devel libs via dnf, neither of which
 # rpmbuild's RPM-level check sees — skip it; a genuinely missing dep fails the compile/link.
-rpmbuild -bb --nodeps \
+rpmbuild -bb --nodeps "${WEB_OPT[@]}" \
   --define "_topdir $TOP" \
   --define "pf_version ${PF_VERSION}" \
   --define "pf_release ${PF_RELEASE}" \

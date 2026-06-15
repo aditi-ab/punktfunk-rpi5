@@ -29,8 +29,10 @@ repo_gpgcheck=1
 gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key
 REPO
 
-# Layer the package, then reboot into the new deployment.
-rpm-ostree install punktfunk
+# Layer the host + the web console (pairing/status), then reboot into the new deployment.
+# (punktfunk Recommends punktfunk-web; list it explicitly so it's pulled regardless of weak-dep
+# settings. The registry carries punktfunk-web because CI builds the spec --with web; COPR can't.)
+rpm-ostree install punktfunk punktfunk-web
 systemctl reboot
 ```
 
@@ -46,6 +48,9 @@ ujust add-user-to-input-group           # virtual gamepads need /dev/uinput (re-
 mkdir -p ~/.config/punktfunk
 cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env   # gamescope defaults
 systemctl --user enable --now punktfunk-host
+# Web console — enable it and read the auto-generated login password (then open http://<host-ip>:3000):
+systemctl --user enable --now punktfunk-web
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
 ```
 
 (See [`../bazzite/README.md`](../bazzite/README.md) for the full appliance walkthrough —
@@ -65,7 +70,9 @@ tracking: `rpm-ostree override` / `rpm-ostree uninstall punktfunk`.
 ## Build an RPM locally
 
 ```sh
-PF_VERSION=0.0.1 bash packaging/rpm/build-rpm.sh   # -> dist/punktfunk-0.0.1-1.fcNN.x86_64.rpm
+PF_VERSION=0.0.1 bash packaging/rpm/build-rpm.sh                # host + client
+PF_VERSION=0.0.1 PF_WITH_WEB=1 bash packaging/rpm/build-rpm.sh  # + the noarch punktfunk-web (needs bun on PATH)
+# -> dist/punktfunk-0.0.1-1.fcNN.x86_64.rpm  (+ punktfunk-web-0.0.1-1.fcNN.noarch.rpm with PF_WITH_WEB=1)
 ```
 
 Run it inside the Fedora 43 builder image so the deps resolve and match Bazzite:

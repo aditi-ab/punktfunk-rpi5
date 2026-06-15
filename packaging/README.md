@@ -91,9 +91,20 @@ ujust add-user-to-input-group           # virtual gamepads need /dev/uinput (the
 mkdir -p ~/.config/punktfunk
 cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env   # edit (gamescope app, etc.)
 systemctl --user enable --now punktfunk-host
+
+# Management web console (pairing + status) — pulled in by default (the host RPM Recommends it;
+# `--no-install-recommends` / headless-only boxes can skip it). Enable it and read the login password:
+systemctl --user enable --now punktfunk-web
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # then open http://<host-ip>:3000
 ```
 
-Pair a stock Moonlight client (mDNS-discovered), or connect the native punktfunk/1 client.
+Pair a stock Moonlight client (mDNS-discovered), or connect the native punktfunk/1 client — via the
+web console at `http://<host-ip>:3000` or directly.
+
+> ⚠️ **COPR caveat:** COPR's mock chroot has no `bun`, so a COPR build produces only
+> `punktfunk` + `punktfunk-client` — **not** `punktfunk-web`. For the console on a COPR/bootc host,
+> install from the **Gitea RPM registry** (Option A — it carries `punktfunk-web`), which is also why
+> `bootc/Containerfile` installs from there rather than COPR.
 
 ## Why not Flatpak (for the HOST)?
 

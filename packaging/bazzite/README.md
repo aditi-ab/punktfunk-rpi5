@@ -32,10 +32,12 @@ There are two supported paths on Bazzite, driven by different files in `packagin
 | **B — bootc / OCI image** | `packaging/bootc/Containerfile` | Bakes punktfunk into a `FROM bazzite-nvidia` image once; you `bootc switch` any number of hosts onto it | Fleets, reproducible appliances, no per-host drift |
 
 **Trade-off:** Path A is a per-host package layer — simple, but each host accumulates its own
-layered-package state. Path B builds one image (RPM Fusion + COPR + the package + udev rule
-pre-installed) that you push to a registry and rebase hosts onto atomically — no per-host
-`rpm-ostree install` drift, at the cost of running a `podman build`/`push` pipeline. Both
-ultimately install the **same RPM** and require the **same first-run setup** (sections 3–6).
+layered-package state. Path B builds one image (RPM Fusion + the Gitea RPM repo + the host and
+**web console** + udev rule pre-installed) that you push to a registry and rebase hosts onto
+atomically — no per-host `rpm-ostree install` drift, at the cost of running a `podman build`/`push`
+pipeline. Both require the **same first-run setup** (sections 3–6); note Path B installs from the
+**Gitea RPM registry** (which carries `punktfunk-web`), whereas Path A's COPR builds host+client
+only — for the web console on Path A, layer from the Gitea registry instead (`../rpm/README.md`).
 
 ### Path A — rpm-ostree layering from the COPR
 
@@ -64,8 +66,10 @@ systemctl reboot
 
 The image is built **off-host** (on any machine with `podman`) from
 `packaging/bootc/Containerfile`, which bases on `ghcr.io/ublue-os/bazzite-nvidia:stable`
-(override with `--build-arg BASE_IMAGE=…`), enables RPM Fusion free + nonfree, enables the COPR
-(`--build-arg PUNKTFUNK_COPR=…`, default `enricobuehler/punktfunk`), and installs the package.
+(override with `--build-arg BASE_IMAGE=…`), enables RPM Fusion free + nonfree, adds the Gitea RPM
+repo (`--build-arg PUNKTFUNK_RPM_GROUP=…`, default `bazzite`), and installs the host **and the web
+console** (`punktfunk punktfunk-web`). It uses the Gitea registry rather than the COPR specifically
+because the registry carries `punktfunk-web` (COPR's mock chroot can't build it — no `bun`).
 
 ```sh
 # Build + push (run from the repo root, on your builder machine):
@@ -76,9 +80,10 @@ podman push  ghcr.io/<you>/bazzite-punktfunk
 sudo bootc switch ghcr.io/<you>/bazzite-punktfunk && systemctl reboot
 ```
 
-> ⚠️ The image build runs `dnf5 copr enable enricobuehler/punktfunk` — so **Path B also depends on
-> the COPR being published** (or on you pointing `PUNKTFUNK_COPR` at a COPR you've built yourself).
-> If the COPR doesn't exist, the `podman build` fails at the install step.
+> ⚠️ The image installs from the **Gitea RPM registry** (group `bazzite`), so **Path B depends on
+> that registry being populated** — CI (`.gitea/workflows/rpm.yml`) publishes `punktfunk` +
+> `punktfunk-web` on every push to `main`. Packages are unsigned with GPG-signed metadata
+> (`repo_gpgcheck=1`), matching `packaging/rpm/README.md`.
 
 ---
 
@@ -215,6 +220,10 @@ into the user unit directory.
 ```sh
 systemctl --user daemon-reload
 systemctl --user enable --now punktfunk-host
+# Management web console (pairing + status), if you installed punktfunk-web (it ships in the Gitea
+# RPM registry / bootc image — COPR can't build it; see ../rpm/README.md). Read the login password:
+systemctl --user enable --now punktfunk-web
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # then open http://<host-ip>:3000
 ```
 
 Check health and logs:
