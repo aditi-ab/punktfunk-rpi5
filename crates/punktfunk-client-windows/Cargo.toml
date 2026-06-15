@@ -21,6 +21,28 @@ path = "src/main.rs"
 # is Sync (mutexed plane receivers), so it drops into a UI app cleanly.
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 
+# Win32 / Direct3D11 / DXGI surface for the present path + raw input. Software (WARP) device on
+# the GPU-less dev box; the same code drives a hardware adapter on a real GPU.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+] }
+
+# UI shell: a winit window + a raw DXGI flip-model swapchain on its HWND (the proven present
+# path; the WinUI3/Reactor option is a documented follow-up). raw-window-handle extracts the
+# HWND for swapchain creation.
+winit = "0.30"
+raw-window-handle = "0.6"
+
 # Video decode (same FFmpeg pin as the host/Linux client) — software HEVC on the GPU-less dev
 # box; D3D11VA hardware decode is a follow-up for the real-GPU box.
 ffmpeg-next = "8"

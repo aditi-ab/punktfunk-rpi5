@@ -84,6 +84,10 @@ impl KnownHosts {
         Ok(())
     }
 
+    // Used by the GUI host-list's pinned-fingerprint trust decision (the silent-reconnect
+    // path); the current CLI trust flow keys on address. Kept for parity with the other
+    // clients' known-hosts API — wired when the discovered-hosts UI lands.
+    #[allow(dead_code)]
     pub fn find_by_fp(&self, fp_hex: &str) -> Option<&KnownHost> {
         self.hosts.iter().find(|h| h.fp_hex == fp_hex)
     }

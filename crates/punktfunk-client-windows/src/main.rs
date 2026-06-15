@@ -1,18 +1,29 @@
 //! `punktfunk-client` — the native Windows punktfunk/1 client.
 //!
 //! Pure Rust: `NativeClient` linked as a crate (no C ABI, like the GTK Linux client) ·
-//! FFmpeg decode · WASAPI audio · SDL3 gamepads · a winit + Direct3D11 present surface. The
-//! trust surface mirrors the other native clients: persistent identity, TOFU prompt with the
-//! host fingerprint, SPAKE2 PIN pairing.
+//! FFmpeg decode · WASAPI audio · SDL3 gamepads · a winit window + Direct3D11 flip-model
+//! swapchain present surface. The trust surface mirrors the other native clients: persistent
+//! identity, trust-on-first-use, SPAKE2 PIN pairing.
 //!
-//! Until the UI shell lands, the binary runs **headless** (`--connect host[:port]`): connect,
-//! decode, play audio, and print per-second stats — the Windows analogue of
-//! `punktfunk-client-rs`, for validating the protocol/decode path against a live host.
+//! Usage:
+//!   punktfunk-client --connect host[:port] [--pin HEX] [--pair PIN] [--mode WxHxHz]
+//!                    [--bitrate MBPS] [--mic]
+//!   punktfunk-client --headless --connect …   (no window; count frames + print stats)
+//!
+//! Trust: an explicit `--pin HEX` (or a host already pinned in the known-hosts store) connects
+//! silently; `--pair PIN` runs the SPAKE2 ceremony first; otherwise the connect is
+//! trust-on-first-use (the observed fingerprint is pinned on success).
 
+#[cfg(windows)]
+mod app;
 #[cfg(windows)]
 mod audio;
 #[cfg(windows)]
 mod discovery;
+#[cfg(windows)]
+mod keymap;
+#[cfg(windows)]
+mod present;
 #[cfg(windows)]
 mod session;
 #[cfg(windows)]
@@ -23,7 +34,6 @@ mod video;
 #[cfg(windows)]
 fn main() {
     use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
-    use std::time::{Duration, Instant};
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -38,39 +48,63 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    let flag = |name: &str| args.iter().any(|a| a == name);
+
+    if flag("--discover") {
+        discover_and_print();
+        return;
+    }
 
     let Some(target) = arg("--connect") else {
         eprintln!(
-            "punktfunk-client (headless): --connect host[:port] [--pin HEX] [--mode WxHxHz] \
-             [--bitrate MBPS] [--mic]\n\
-             The windowed UI is not wired yet; this runs the protocol/decode path headless."
+            "punktfunk-client: --connect host[:port] [--pin HEX] [--pair PIN] [--mode WxHxHz] \
+             [--bitrate MBPS] [--mic] [--headless]\n\
+             punktfunk-client --discover                (list punktfunk hosts on the LAN)"
         );
         std::process::exit(2);
     };
+
+    // Saved settings supply defaults when a CLI flag is absent (the GUI host-list/settings
+    // chrome is a follow-up; until then these are the persisted preferences). A CLI flag both
+    // overrides and is written back, so the next bare run reuses it.
+    let mut settings = trust::Settings::load();
     let (host, port) = match target.rsplit_once(':') {
         Some((a, p)) => (a.to_string(), p.parse().unwrap_or(9777)),
         None => (target.clone(), 9777u16),
     };
-    let mode = arg("--mode")
-        .and_then(|m| {
-            let mut it = m.split(['x', 'X']);
-            Some(Mode {
-                width: it.next()?.parse().ok()?,
-                height: it.next()?.parse().ok()?,
-                refresh_hz: it.next()?.parse().ok()?,
-            })
-        })
-        .unwrap_or(Mode {
-            width: 1280,
-            height: 720,
+    // CLI overrides fold into the persisted settings, then we derive the effective values.
+    if let Some(m) = arg("--mode").and_then(|m| {
+        let mut it = m.split(['x', 'X']);
+        Some((
+            it.next()?.parse::<u32>().ok()?,
+            it.next()?.parse::<u32>().ok()?,
+            it.next()?.parse::<u32>().ok()?,
+        ))
+    }) {
+        (settings.width, settings.height, settings.refresh_hz) = m;
+    }
+    if let Some(b) = arg("--bitrate").and_then(|b| b.parse::<u32>().ok()) {
+        settings.bitrate_kbps = b * 1000;
+    }
+    if flag("--mic") {
+        settings.mic_enabled = true;
+    }
+    settings.save();
+    let mode = if settings.width != 0 && settings.refresh_hz != 0 {
+        Mode {
+            width: settings.width,
+            height: settings.height,
+            refresh_hz: settings.refresh_hz,
+        }
+    } else {
+        Mode {
+            width: 1920,
+            height: 1080,
             refresh_hz: 60,
-        });
-    let pin = arg("--pin").and_then(|h| trust::parse_hex32(&h));
-    let bitrate_kbps = arg("--bitrate")
-        .and_then(|b| b.parse::<u32>().ok())
-        .map(|m| m * 1000)
-        .unwrap_or(0);
-    let mic_enabled = args.iter().any(|a| a == "--mic");
+        }
+    };
+    let bitrate_kbps = settings.bitrate_kbps;
+    let mic_enabled = settings.mic_enabled;
 
     let identity = match trust::load_or_create_identity() {
         Ok(i) => i,
@@ -80,9 +114,48 @@ fn main() {
         }
     };
 
-    tracing::info!(%host, port, ?mode, tofu = pin.is_none(), "connecting (headless)");
+    // Resolve trust: explicit pin > already-pinned host > pairing ceremony > TOFU.
+    let known = trust::KnownHosts::load();
+    let mut pin = arg("--pin")
+        .and_then(|h| trust::parse_hex32(&h))
+        .or_else(|| {
+            known
+                .find_by_addr(&host, port)
+                .and_then(|k| trust::parse_hex32(&k.fp_hex))
+        });
+    if let Some(code) = arg("--pair") {
+        let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-client".into());
+        match punktfunk_core::client::NativeClient::pair(
+            &host,
+            port,
+            (&identity.0, &identity.1),
+            code.trim(),
+            &name,
+            std::time::Duration::from_secs(90),
+        ) {
+            Ok(fp) => {
+                let mut k = trust::KnownHosts::load();
+                k.upsert(trust::KnownHost {
+                    name: host.clone(),
+                    addr: host.clone(),
+                    port,
+                    fp_hex: trust::hex(&fp),
+                    paired: true,
+                });
+                let _ = k.save();
+                tracing::info!(fp = %trust::hex(&fp), "paired");
+                pin = Some(fp);
+            }
+            Err(e) => {
+                eprintln!("Pairing failed: {e:?} (wrong PIN, or pairing not armed on the host?)");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    tracing::info!(%host, port, ?mode, tofu = pin.is_none(), "connecting");
     let handle = session::start(session::SessionParams {
-        host,
+        host: host.clone(),
         port,
         mode,
         compositor: CompositorPref::Auto,
@@ -93,8 +166,28 @@ fn main() {
         identity,
     });
 
-    // Headless consumer: drain events + frames, print stats, run until the host ends or
-    // ~60 s elapse (the harness bound). Frames are counted and dropped (no present yet).
+    if flag("--headless") {
+        run_headless(handle);
+        return;
+    }
+
+    let info = app::ConnectInfo {
+        name: host.clone(),
+        addr: host,
+        port,
+        tofu: pin.is_none(),
+    };
+    if let Err(e) = app::WinApp::new(handle, info, true).run() {
+        tracing::error!(error = %e, "windowed app failed");
+        std::process::exit(1);
+    }
+}
+
+/// Headless runner (`--headless`): drain events + frames, print stats, exit when the host
+/// ends or the harness deadline elapses — the Windows analogue of `punktfunk-client-rs`.
+#[cfg(windows)]
+fn run_headless(handle: session::SessionHandle) {
+    use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut frames_seen = 0u64;
     loop {
@@ -102,11 +195,7 @@ fn main() {
             match ev {
                 session::SessionEvent::Connected {
                     mode, fingerprint, ..
-                } => tracing::info!(
-                    ?mode,
-                    fp = %trust::hex(&fingerprint),
-                    "connected"
-                ),
+                } => tracing::info!(?mode, fp = %trust::hex(&fingerprint), "connected"),
                 session::SessionEvent::Stats(s) => tracing::info!(
                     fps = format!("{:.0}", s.fps),
                     mbps = format!("{:.1}", s.mbps),
@@ -115,8 +204,16 @@ fn main() {
                     frames_seen,
                     "stats"
                 ),
-                session::SessionEvent::Failed { msg, .. } => {
-                    tracing::error!(%msg, "connect failed");
+                session::SessionEvent::Failed {
+                    msg,
+                    trust_rejected,
+                } => {
+                    tracing::error!(%msg, trust_rejected, "connect failed");
+                    if trust_rejected {
+                        tracing::error!(
+                            "host fingerprint changed or pairing required — re-pair with --pair PIN"
+                        );
+                    }
                     return;
                 }
                 session::SessionEvent::Ended(err) => {
@@ -134,6 +231,39 @@ fn main() {
             return;
         }
         std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// `--discover`: browse the LAN for punktfunk hosts (mDNS) and print them, then exit — the
+/// CLI analogue of the GTK client's discovered-hosts list.
+#[cfg(windows)]
+fn discover_and_print() {
+    use std::time::{Duration, Instant};
+    println!("Browsing the LAN for punktfunk hosts (~5 s)…");
+    let rx = discovery::browse();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = std::collections::HashSet::new();
+    while Instant::now() < deadline {
+        while let Ok(h) = rx.try_recv() {
+            if seen.insert(h.key.clone()) {
+                println!(
+                    "  {}  {}:{}  pair={}  fp={}",
+                    h.name,
+                    h.addr,
+                    h.port,
+                    if h.pair.is_empty() {
+                        "optional"
+                    } else {
+                        &h.pair
+                    },
+                    if h.fp_hex.is_empty() { "-" } else { &h.fp_hex },
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if seen.is_empty() {
+        println!("  (none found — is a host running with --native / m3-host?)");
     }
 }
 

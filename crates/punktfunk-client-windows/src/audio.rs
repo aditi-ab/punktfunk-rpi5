@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
-use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
+use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
 
 const SAMPLE_RATE: usize = 48_000;
 const CHANNELS: usize = 2;
@@ -97,8 +97,10 @@ fn render_thread(
         return Ok(());
     }
     let res = (|| -> Result<()> {
-        let device =
-            wasapi::get_default_device(&Direction::Render).context("default render endpoint")?;
+        let device = DeviceEnumerator::new()
+            .context("DeviceEnumerator")?
+            .get_default_device(&Direction::Render)
+            .context("default render endpoint")?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
         let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, CHANNELS, None);
         let (default_period, _min_period) =
@@ -159,7 +161,7 @@ fn render_thread(
                 primed = false;
             }
             render_client
-                .write_to_device(avail_frames, BLOCK_ALIGN, &out, None)
+                .write_to_device(avail_frames, &out, None)
                 .context("write_to_device")?;
         }
         audio_client.stop_stream().ok();
@@ -219,7 +221,9 @@ fn mic_thread(connector: &Arc<NativeClient>, stop: Arc<AtomicBool>) -> Result<()
     .map_err(|e| anyhow!("opus encoder: {e}"))?;
     let _ = encoder.set_bitrate(opus::Bitrate::Bits(64_000));
 
-    let device = wasapi::get_default_device(&Direction::Capture)
+    let device = DeviceEnumerator::new()
+        .context("DeviceEnumerator")?
+        .get_default_device(&Direction::Capture)
         .context("default capture endpoint (no microphone?)")?;
     let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
     let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, CHANNELS, None);
