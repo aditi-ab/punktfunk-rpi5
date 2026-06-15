@@ -21,6 +21,8 @@ mod discovery;
 #[cfg(windows)]
 mod gamepad;
 #[cfg(windows)]
+mod input;
+#[cfg(windows)]
 mod present;
 #[cfg(windows)]
 mod session;

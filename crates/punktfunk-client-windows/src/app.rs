@@ -546,14 +546,17 @@ fn stream_page(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // Take the connector + frames handoff once on mount; keep the connector alive (and for
     // input once that lands) in a use_ref, stash frames for `on_ready`.
     let connector_ref = cx.use_ref::<Option<Arc<NativeClient>>>(None);
-    cx.use_effect((), {
+    cx.use_effect_with_cleanup((), {
         let shared = ctx.shared.clone();
         let connector_ref = connector_ref.clone();
         move || {
             if let Some((connector, frames)) = shared.handoff.lock().unwrap().take() {
-                connector_ref.set(Some(connector));
+                let mode = connector.mode();
+                connector_ref.set(Some(connector.clone()));
                 PENDING_FRAMES.with(|c| *c.borrow_mut() = Some(frames));
+                crate::input::install(connector, mode);
             }
+            Some(crate::input::uninstall)
         }
     });
 
