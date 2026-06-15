@@ -206,11 +206,20 @@ fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        // Windows: %APPDATA% (e.g. C:\Users\X\AppData\Roaming) — cert/key/paired/uniqueid persist there.
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("punktfunk")
 }
 
 fn hostname_string() -> String {
+    #[cfg(target_os = "windows")]
+    if let Some(n) = std::env::var_os("COMPUTERNAME") {
+        let s = n.to_string_lossy().trim().to_string();
+        if !s.is_empty() {
+            return s;
+        }
+    }
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|s| s.trim().to_string())
@@ -245,7 +254,8 @@ fn primary_local_ip() -> Option<IpAddr> {
 
 /// Where the paired-client allow-list persists (survives host restarts, like Sunshine).
 fn paired_path() -> Option<std::path::PathBuf> {
-    Some(std::path::Path::new(&std::env::var("HOME").ok()?).join(".config/punktfunk/paired.json"))
+    // Same dir as the host identity (HOME/.config/punktfunk on Linux, %APPDATA%\punktfunk on Windows).
+    Some(config_dir().join("paired.json"))
 }
 
 /// Load the persisted paired-client certificate DERs (empty on first run / parse failure).

@@ -1519,6 +1519,15 @@ fn pick_compositor(
 /// async reactor (`spawn_blocking`).
 fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Compositor> {
     use crate::vdisplay::Compositor;
+    // Windows has a single virtual-display backend (SudoVDA); vdisplay::open ignores the compositor
+    // arg there, so short-circuit the Linux session-detection state machine with a placeholder.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = pref;
+        return Ok(Compositor::Kwin);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
     // Explicit operator override (legacy / CI / forcing a backend for a test) wins and is assumed
     // to come with a hand-set env — don't retarget the process env in that case.
     let overridden = std::env::var_os("PUNKTFUNK_COMPOSITOR").is_some();
@@ -1565,6 +1574,7 @@ fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Composito
         ),
     }
     Ok(chosen)
+    }
 }
 
 /// Bounds a speed-test [`ProbeRequest`] before bursting: a 3 Gbps / 5 s ceiling keeps a probe from
