@@ -37,6 +37,10 @@ final class StreamPump {
         onSessionEnd: (@Sendable () -> Void)?
     ) {
         let token = token
+        // The layer is non-Sendable but its enqueue/flush are documented thread-safe, and after
+        // this point only the pump thread drives it — assert that so the @Sendable Thread closure
+        // may capture it.
+        nonisolated(unsafe) let layer = layer
         layer.flush() // drop any frames a previous connection left queued
 
         let thread = Thread {

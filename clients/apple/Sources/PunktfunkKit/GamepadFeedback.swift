@@ -173,7 +173,10 @@ public final class GamepadFeedback {
 
     public init(connection: PunktfunkConnection, manager: GamepadManager) {
         self.connection = connection
-        Task { @MainActor in
+        // Capture self weakly in the hop too, so the inner sink's weak capture isn't shadowing
+        // an implicit strong one — and the subscription (stored on self) never retain-cycles.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             self.activeSub = manager.$active.sink { [weak self] dc in
                 MainActor.assumeIsolated { self?.retarget(dc?.controller) }
             }
