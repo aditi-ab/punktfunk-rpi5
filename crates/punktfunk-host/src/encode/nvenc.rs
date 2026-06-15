@@ -140,6 +140,28 @@ impl NvencD3d11Encoder {
             const FLOOR_BPS: u64 = 10_000_000;
             let requested_bps = self.bitrate_bps;
             let mut bitrate = self.bitrate_bps;
+            // 2-way NVENC split-frame encoding (Ada dual-NVENC) — the high-pixel-rate throughput lever
+            // the Linux host enables via libavcodec `split_encode_mode`. A single Ada NVENC session tops
+            // out ~0.8 Gpix/s, so at high motion a 5K@240 (1.77 Gpix/s) frame takes ~8 ms to encode and
+            // the rate caps ~125 fps; splitting across both engines roughly halves that. Force 2-way
+            // above ~1 Gpix/s (matching encode/linux.rs), AUTO below (the ~2% BD-rate cost isn't worth
+            // it at low pixel rates). Env override PUNKTFUNK_SPLIT_ENCODE = 0/disable | 1/auto | 2 | 3.
+            // HEVC/AV1 only; the init-failure fallback below disables it if a codec/config rejects it.
+            let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
+            let mut split_mode: u32 = match std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok().as_deref() {
+                Some("0") | Some("disable") => {
+                    nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32
+                }
+                Some("1") | Some("auto") => {
+                    nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32
+                }
+                Some("3") => nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
+                Some("2") => nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+                _ if pixel_rate > 1_000_000_000 => {
+                    nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
+                }
+                _ => nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE as u32,
+            };
             let enc = loop {
                 // 1. open the session bound to the D3D11 device.
                 let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
@@ -205,6 +227,9 @@ impl NvencD3d11Encoder {
                     encodeConfig: &mut cfg,
                     ..Default::default()
                 };
+                // splitEncodeMode is a C bitfield — set via the generated accessor, not a struct field.
+                init.set_splitEncodeMode(split_mode);
+
                 match (API.initialize_encoder)(enc, &mut init).result_without_string() {
                     Ok(()) => {
                         self.bitrate_bps = bitrate;
@@ -220,6 +245,19 @@ impl NvencD3d11Encoder {
                             "NVENC initialize_encoder rejected bitrate — stepping down (GPU codec-level cap)"
                         );
                         bitrate = next;
+                        continue;
+                    }
+                    // Last resort at the floor bitrate: if split-encode was forced and init still
+                    // fails, the codec/config may not accept it (e.g. H264) — disable split and retry
+                    // single-engine rather than fail the session.
+                    Err(e)
+                        if split_mode != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE as u32
+                            && split_mode
+                                != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32 =>
+                    {
+                        let _ = (API.destroy_encoder)(enc);
+                        tracing::warn!(error = ?e, "NVENC init rejected with split-encode forced — disabling split, retrying single-engine");
+                        split_mode = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
                         continue;
                     }
                     Err(e) => {
