@@ -57,16 +57,17 @@ punktfunk-client --connect <host>:9777   # skip the picker, start a session imme
 ## Windows desktop client (in development)
 
 `punktfunk-client` for Windows (`crates/punktfunk-client-windows`) is the native graphical client
-for Windows — pure Rust, the same `punktfunk/1` core as the Apple and Linux apps, with a winit +
-Direct3D11 present surface, WASAPI audio, FFmpeg decode, SDL3 controllers, network discovery, and
-PIN pairing. It builds on `x86_64-pc-windows-msvc` and runs the connect/decode/present/input path;
-hardware (D3D11VA) decode, 10-bit/HDR present, and a native host-list/settings window are in
-progress, so it is not yet packaged. For now it is driven from the command line:
+for Windows — pure Rust, the same `punktfunk/1` core as the Apple and Linux apps, with a **WinUI 3**
+UI (host list, settings, PIN pairing) and the video on a `SwapChainPanel`, plus WASAPI audio, FFmpeg
+decode, SDL3 controllers, network discovery, and PIN pairing. Launch it and pick a host from the
+list, just like the Apple and Linux apps. It builds on `x86_64-pc-windows-msvc`; hardware (D3D11VA)
+decode, 10-bit/HDR present, and packaging are in progress, so it is not yet shipped. A headless CLI
+path exists for scripting/measurement:
 
 ```sh
-punktfunk-client --discover                       # list hosts on the network
-punktfunk-client --connect <host>:9777            # stream (trust-on-first-use)
-punktfunk-client --connect <host>:9777 --pair 1234 # pair with the PIN the host shows
+punktfunk-client                                   # open the WinUI 3 window (host list / settings)
+punktfunk-client --discover                        # list hosts on the network
+punktfunk-client --headless --connect <host>:9777  # no window: connect, count frames, print stats
 ```
 
 Until it ships, **Moonlight** remains the recommended way to stream to Windows (see below).

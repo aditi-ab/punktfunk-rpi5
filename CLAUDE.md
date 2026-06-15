@@ -113,20 +113,25 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    presenter (wp_presentation feedback, tearing-control, Vulkan Video on NVIDIA) —
    **wgpu/winit rejected** (no dmabuf import / presentation feedback / shortcuts-inhibit).
    **Windows stage 1 done 2026-06-15** (`crates/punktfunk-client-windows`, binary
-   `punktfunk-client`): pure-Rust **winit + Direct3D11 flip-model swapchain** present (WARP
-   fallback for the GPU-less dev box; runtime-compiled fullscreen-triangle shaders, Contain-fit
-   letterbox), **FFmpeg software HEVC decode** (D3D11VA hw decode is the follow-up), **WASAPI**
-   shared-mode render + mic capture, keyboard (physical-`KeyCode`→VK) + absolute mouse + wheel
-   capture (Moonlight-style click-to-capture, Ctrl+Alt+Shift+Q release), **SDL3** gamepads
-   (rumble/lightbar/DualSense, built from source), `mdns-sd` discovery, shared client identity
-   + TOFU + SPAKE2 PIN pairing (`--connect`/`--discover`/`--pair`/`--headless`). Builds + clippy
-   + fmt + tests green on `x86_64-pc-windows-msvc` (built on the dev VM). **UI = winit + raw
-   D3D11, NOT WinUI3/Reactor** — a research pass confirmed windows-rs Reactor ships no
-   `SwapChainPanel`/`SetSwapChain` escape hatch, so it can't host the presenter (the bootstrap
-   doc's sanctioned fallback). Gotcha: `CARGO_HOME` must be an ASCII path — the `ü` in the dev
-   box's username breaks SDL3's MSVC precompiled-header build. Next: live host validation
-   (no GPU on the dev box → glass-to-glass defers to the RTX box), D3D11VA hw decode + 10-bit/HDR
-   present, a native host-list/settings GUI, and RAWINPUT relative-mouse pointer-lock.
+   `punktfunk-client`): pure-Rust **WinUI 3** UI via **windows-reactor** (a declarative React-like
+   framework backed by WinUI; PR #4499 added the `SwapChainPanel` widget + `set_swap_chain`). The
+   video is a **`SwapChainPanel`** bound to a **D3D11 composition swapchain** (WARP fallback for
+   the GPU-less dev box; runtime-compiled fullscreen-triangle shaders, Contain-fit letterbox),
+   driven by reactor's per-frame `on_rendering`. **FFmpeg software HEVC decode** (D3D11VA hw decode
+   is the follow-up), **WASAPI** render + mic capture, **SDL3** gamepads (rumble/lightbar/DualSense),
+   `mdns-sd` discovery, and the full trust surface — all **in-app**: host list (live mDNS + saved +
+   manual), settings (resolution/refresh/mic), SPAKE2 PIN pairing screen, TOFU, pinned-fp-mismatch
+   re-pair. **Stream input** is Win32 low-level hooks (`WH_KEYBOARD_LL`/`WH_MOUSE_LL`) — reactor
+   exposes no raw key/pointer events; native Windows VK + absolute mouse (client-rect Contain-fit) +
+   wheel, Ctrl+Alt+Shift+Q capture toggle. `--headless`/`--discover` keep CLI paths. Builds + clippy
+   + fmt green on `x86_64-pc-windows-msvc` (on the dev VM). **windows-reactor is unpublished** (git
+   dep pinned to commit `b4129fcc`; `windows` pinned to the SAME commit so `IDXGISwapChain1` unifies
+   with `set_swap_chain`); its `build.rs` downloads the Win App SDK NuGets + needs `CARGO_WORKSPACE_DIR`
+   set (in the VM build env; `/temp`+`/winmd` gitignored). Gotcha: `CARGO_HOME` must be an ASCII path
+   — the `ü` in the dev box's username breaks SDL3's MSVC precompiled-header build. Next: **on-glass
+   validation** (the dev VM is headless/Session-0 → the WinUI window needs a display: RDP or the RTX
+   box), D3D11VA hw decode + 10-bit/HDR present, RAWINPUT relative-mouse pointer-lock, and a per-host
+   speed test in the UI.
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).
