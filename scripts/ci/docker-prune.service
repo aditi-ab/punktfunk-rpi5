@@ -2,11 +2,13 @@
 #
 # Why this exists: every CI push builds and sha-<commit>-tags a Docker image per pipeline
 # (rust-ci, web, docs, fedora-rpm, fedora44-rpm, ...). Those tags are never dangling, so a
-# plain `docker image prune` SKIPS them and they accumulate forever — that is what filled the
-# disk (589 images / ~85 GB, builds failing on ENOSPC). This trims everything older than 24h;
-# images IN USE by a running container are always protected regardless of age.
-#
+# plain `docker image prune` SKIPS them and they accumulate — that is what filled the disk.
 # Host-level, not per-repo CI, because the runner is shared (punktfunk + other orgs all benefit).
+#
+# Two tiers: trim anything older than 12h normally, AND — because a push-burst can fill 99 GB
+# WITHIN that 12h window (a fast iteration session hit 100% and poisoned the cargo cache with a
+# truncated, half-saved target/) — a burst guard that prunes ALL idle images + cache once the
+# disk is >85% full. Images IN USE by a running container are always protected.
 #
 # Install on the runner host (root):
 #   cp scripts/ci/docker-prune.{service,timer} /etc/systemd/system/
@@ -22,7 +24,10 @@ After=docker.service
 [Service]
 Type=oneshot
 # '-' prefix: each step is independent — a no-op/failure never blocks the others.
-ExecStart=-/usr/bin/docker image prune -af --filter until=24h
-ExecStart=-/usr/bin/docker builder prune -af --filter until=24h
-ExecStart=-/usr/bin/docker buildx prune -af --filter until=24h
-ExecStart=-/usr/bin/docker container prune -f --filter until=24h
+ExecStart=-/usr/bin/docker image prune -af --filter until=12h
+ExecStart=-/usr/bin/docker builder prune -af --filter until=12h
+ExecStart=-/usr/bin/docker buildx prune -af --filter until=12h
+ExecStart=-/usr/bin/docker container prune -f --filter until=12h
+# Burst guard: if STILL >85% full, prune every idle image + all build cache (in-use protected),
+# so a push-storm can't drive CI into ENOSPC (which truncates and poisons the actions/cargo cache).
+ExecStart=-/bin/sh -c 'P=$(df --output=pcent / | tr -dc 0-9); [ "$P" -ge 85 ] && { docker image prune -af; docker builder prune -af; docker buildx prune -af; } || true'

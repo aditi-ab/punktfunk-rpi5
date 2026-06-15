@@ -71,10 +71,10 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target
-          # -v2-: bypass a target cache poisoned by a disk-full build (see ci.yml). Shares the
+          # -v3-: bypass a target cache poisoned by a disk-full build (see ci.yml). Shares the
           # key with ci.yml so the release build reuses its clean artifacts.
-          key: cargo-target-v2-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-target-v2-${{ env.rustc }}-
+          key: cargo-target-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-v3-${{ env.rustc }}-
 
       - name: Build release host + client
         env:

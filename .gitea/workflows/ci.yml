@@ -42,12 +42,12 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target
-          # -v2-: the prior `cargo-target-<rustc>-*` cache was poisoned when the runner ran
+          # -v3-: the prior `cargo-target-<rustc>-*` cache was poisoned when the runner ran
           # out of disk mid-build and actions/cache saved a truncated target/ (a dep's .rmeta
           # went missing -> E0463 "can't find crate"). A suffix bump wouldn't help — restore-keys
           # would fall back to the poisoned prefix — so the prefix itself is versioned.
-          key: cargo-target-v2-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-target-v2-${{ env.rustc }}-
+          key: cargo-target-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-v3-${{ env.rustc }}-
 
       - name: Format
         run: cargo fmt --all --check

@@ -1,12 +1,12 @@
-# Runs docker-prune.service every 6h. Persistent=true catches up after downtime.
-# Install: see the header of docker-prune.service.
+# Runs docker-prune.service hourly (the burst guard needs to react within the hour, not every 6h).
+# Persistent=true catches up after downtime. Install: see the header of docker-prune.service.
 
 [Unit]
-Description=Run docker-prune every 6h (CI runner disk hygiene)
+Description=Run docker-prune hourly (CI runner disk hygiene + burst guard)
 
 [Timer]
-OnCalendar=*-*-* 00/6:00:00
-RandomizedDelaySec=600
+OnCalendar=hourly
+RandomizedDelaySec=300
 Persistent=true
 
 [Install]
