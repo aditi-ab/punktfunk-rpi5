@@ -1,0 +1,13 @@
+# Runs docker-prune.service every 6h. Persistent=true catches up after downtime.
+# Install: see the header of docker-prune.service.
+
+[Unit]
+Description=Run docker-prune every 6h (CI runner disk hygiene)
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

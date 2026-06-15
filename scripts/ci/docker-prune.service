@@ -1,0 +1,28 @@
+# Docker disk hygiene for the self-hosted Gitea Actions runner (home-runner-1, 192.168.1.52).
+#
+# Why this exists: every CI push builds and sha-<commit>-tags a Docker image per pipeline
+# (rust-ci, web, docs, fedora-rpm, fedora44-rpm, ...). Those tags are never dangling, so a
+# plain `docker image prune` SKIPS them and they accumulate forever — that is what filled the
+# disk (589 images / ~85 GB, builds failing on ENOSPC). This trims everything older than 24h;
+# images IN USE by a running container are always protected regardless of age.
+#
+# Host-level, not per-repo CI, because the runner is shared (punktfunk + other orgs all benefit).
+#
+# Install on the runner host (root):
+#   cp scripts/ci/docker-prune.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now docker-prune.timer
+# See also scripts/ci/setup-macos-runner.sh for the macOS runner.
+
+[Unit]
+Description=Prune aged Docker images / build cache (CI runner disk hygiene)
+Documentation=https://git.unom.io/unom/punktfunk
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# '-' prefix: each step is independent — a no-op/failure never blocks the others.
+ExecStart=-/usr/bin/docker image prune -af --filter until=24h
+ExecStart=-/usr/bin/docker builder prune -af --filter until=24h
+ExecStart=-/usr/bin/docker buildx prune -af --filter until=24h
+ExecStart=-/usr/bin/docker container prune -f --filter until=24h
