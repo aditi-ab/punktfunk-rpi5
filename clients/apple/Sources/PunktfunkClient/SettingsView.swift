@@ -1,6 +1,10 @@
-// App settings (⌘,): the stream mode, the host compositor, and controllers. The host
-// creates a native virtual output at exactly this size/refresh — there is no scaling
-// anywhere in the pipeline.
+// App settings. The host creates a native virtual output at exactly the chosen size/refresh —
+// there is no scaling anywhere in the pipeline.
+//
+// Navigation differs per platform: macOS uses a tabbed preferences window (the sections had
+// outgrown one scrolling pane); iOS uses a single grouped Form; tvOS uses a focus-native
+// pushed-picker layout. The individual sections (`streamModeSection`, `audioSection`, …) are
+// shared across all three so a setting is defined exactly once.
 
 #if os(macOS)
 import AppKit
@@ -21,6 +25,8 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
+    @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
+    @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @ObservedObject private var gamepads = GamepadManager.shared
     #if os(macOS)
     @AppStorage(DefaultsKey.speakerUID) private var speakerUID = ""
@@ -32,13 +38,90 @@ struct SettingsView: View {
     var body: some View {
         #if os(tvOS)
         // Native tv pattern: no inline text entry (typing numbers with a remote is
-        // miserable and the inline field chrome fights the focus system). The mode is
-        // a preset picker; pickers push selection lists like the system Settings app.
+        // miserable and the inline field chrome fights the focus system). Modes are
+        // preset pickers that push selection lists like the system Settings app.
         tvBody
+        #elseif os(macOS)
+        macBody
         #else
-        sharedBody
+        iosBody
         #endif
     }
+
+    // MARK: - macOS: tabbed preferences
+
+    #if os(macOS)
+    private var macBody: some View {
+        TabView {
+            Form {
+                streamModeSection
+                compositorSection
+            }
+            .formStyle(.grouped)
+            .tabItem { Label("General", systemImage: "gearshape") }
+
+            Form {
+                presenterSection
+                windowSection
+                statisticsSection
+            }
+            .formStyle(.grouped)
+            .tabItem { Label("Display", systemImage: "display") }
+
+            Form {
+                audioSection
+            }
+            .formStyle(.grouped)
+            .onAppear {
+                outputDevices = AudioDevices.outputs()
+                inputDevices = AudioDevices.inputs()
+            }
+            .tabItem { Label("Audio", systemImage: "speaker.wave.2") }
+
+            Form {
+                controllersSection
+            }
+            .formStyle(.grouped)
+            .onAppear {
+                gamepads.refresh()
+                gamepads.startDiscovery()
+            }
+            .onDisappear { gamepads.stopDiscovery() }
+            .tabItem { Label("Controllers", systemImage: "gamecontroller") }
+
+            Form {
+                experimentalSection
+            }
+            .formStyle(.grouped)
+            .tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }
+        }
+        .frame(width: 480, height: 460)
+    }
+    #endif
+
+    // MARK: - iOS: one grouped Form
+
+    #if os(iOS)
+    private var iosBody: some View {
+        Form {
+            streamModeSection
+            audioSection
+            compositorSection
+            presenterSection
+            statisticsSection
+            experimentalSection
+            controllersSection
+        }
+        .formStyle(.grouped)
+        .onAppear {
+            gamepads.refresh()
+            gamepads.startDiscovery()
+        }
+        .onDisappear { gamepads.stopDiscovery() }
+    }
+    #endif
+
+    // MARK: - tvOS
 
     #if os(tvOS)
     private static let presets: [(label: String, tag: String)] = [
@@ -57,6 +140,10 @@ struct SettingsView: View {
                 height = parts[1]
                 hz = parts[2]
             })
+    }
+
+    private var hudEnabledTag: Binding<String> {
+        Binding(get: { hudEnabled ? "on" : "off" }, set: { hudEnabled = $0 == "on" })
     }
 
     private var tvBody: some View {
@@ -102,6 +189,12 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.top, 8)
+                TVSelectionRow(
+                    title: "Statistics overlay",
+                    options: [("On", "on"), ("Off", "off")], selection: hudEnabledTag)
+                TVSelectionRow(
+                    title: "Statistics position", options: Self.placementOptions,
+                    selection: $hudPlacement)
                 ForEach(gamepads.controllers) { controller in
                     controllerRow(controller)
                         .padding(.horizontal, 24)
@@ -129,6 +222,203 @@ struct SettingsView: View {
         .onDisappear { gamepads.stopDiscovery() }
     }
     #endif
+
+    // MARK: - Sections (shared)
+
+    @ViewBuilder private var streamModeSection: some View {
+        Section {
+            HStack {
+                TextField("Resolution", value: $width, format: .number.grouping(.never))
+                Text("×")
+                TextField("", value: $height, format: .number.grouping(.never))
+                    .labelsHidden()
+            }
+            TextField("Refresh rate (Hz)", value: $hz, format: .number.grouping(.never))
+            LabeledContent("") {
+                Button("Use this display's mode") { fillFromMainScreen() }
+            }
+            #if !os(tvOS)
+            Toggle("Automatic bitrate", isOn: automaticBitrate)
+            if bitrateKbps != 0 {
+                HStack(spacing: 12) {
+                    Slider(value: bitrateSlider, in: 0...1) {
+                        Text("Bitrate")
+                    }
+                    Text(SpeedTestSheet.mbpsLabel(kbps: bitrateKbps))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .frame(minWidth: 76, alignment: .trailing)
+                }
+                if bitrateKbps > 1_000_000 {
+                    Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+            #endif
+        } header: {
+            Text("Stream mode")
+        } footer: {
+            Text("The host creates a virtual output at exactly this mode — "
+                + "native resolution, no scaling. \(Self.bitrateFooter)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var audioSection: some View {
+        Section {
+            #if os(macOS)
+            Picker("Speaker", selection: $speakerUID) {
+                Text("System default").tag("")
+                ForEach(outputDevices) { device in
+                    Text(device.name).tag(device.uid)
+                }
+                if !speakerUID.isEmpty,
+                   !outputDevices.contains(where: { $0.uid == speakerUID }) {
+                    Text("Unavailable device").tag(speakerUID)
+                }
+            }
+            #endif
+            Toggle("Send microphone to the host", isOn: $micEnabled)
+            #if os(macOS)
+            Picker("Microphone", selection: $micUID) {
+                Text("System default").tag("")
+                ForEach(inputDevices) { device in
+                    Text(device.name).tag(device.uid)
+                }
+                if !micUID.isEmpty,
+                   !inputDevices.contains(where: { $0.uid == micUID }) {
+                    Text("Unavailable device").tag(micUID)
+                }
+            }
+            .disabled(!micEnabled)
+            #endif
+        } header: {
+            Text("Audio")
+        } footer: {
+            Text("Host audio plays through the speaker; the microphone feeds the "
+                + "host's virtual mic. System default follows macOS device changes. "
+                + "Applies from the next session.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var compositorSection: some View {
+        Section {
+            Picker("Compositor", selection: $compositor) {
+                Text("Automatic").tag(0)
+                Text("KWin (KDE Plasma)").tag(1)
+                Text("wlroots (Sway / Hyprland)").tag(2)
+                Text("Mutter (GNOME)").tag(3)
+                Text("gamescope").tag(4)
+            }
+        } header: {
+            Text("Host compositor")
+        } footer: {
+            Text("Which compositor drives the virtual output on the host. A specific "
+                + "choice is honored only if that backend is available there — "
+                + "otherwise the host falls back to auto-detection.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var windowSection: some View {
+        #if os(macOS)
+        Section {
+            Toggle("Fullscreen while streaming", isOn: $fullscreenWhileStreaming)
+        } header: {
+            Text("Window")
+        } footer: {
+            Text("Take the window fullscreen when a session starts and restore it on the host "
+                + "list, so only the stream is fullscreen — not the picker.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        #endif
+    }
+
+    @ViewBuilder private var presenterSection: some View {
+        Section {
+            Picker("Presenter", selection: $presenter) {
+                Text("Stage 1 (default)").tag("stage1")
+                Text("Stage 2 (experimental)").tag("stage2")
+            }
+        } header: {
+            Text("Video presenter")
+        } footer: {
+            Text("Stage 1 feeds compressed video to the system display layer (known-good). "
+                + "Stage 2 decodes explicitly and presents through Metal with a display "
+                + "link — it adds a capture→present (glass-to-glass) latency line in the HUD "
+                + "and shortens the present tail. Applies from the next session.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var statisticsSection: some View {
+        Section {
+            Toggle("Show statistics overlay", isOn: $hudEnabled)
+            Picker("Position", selection: $hudPlacement) {
+                ForEach(HUDPlacement.allCases) { placement in
+                    Text(placement.label).tag(placement.rawValue)
+                }
+            }
+            .disabled(!hudEnabled)
+        } header: {
+            Text("Statistics")
+        } footer: {
+            Text(Self.statisticsFooter)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var experimentalSection: some View {
+        Section {
+            Toggle("Show game library", isOn: $libraryEnabled)
+        } header: {
+            Text("Experimental")
+        } footer: {
+            Text("Adds a “Browse Library…” action to each host that lists its games "
+                + "(Steam + custom) via the host's management API; tap a title to launch it. "
+                + "The host must expose that API on the LAN with a token "
+                + "(serve --mgmt-bind 0.0.0.0 --mgmt-token …).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var controllersSection: some View {
+        Section {
+            if gamepads.controllers.isEmpty {
+                Text("No controllers detected")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(gamepads.controllers) { controller in
+                    controllerRow(controller)
+                }
+            }
+            Picker("Use controller", selection: $gamepads.preferredID) {
+                ForEach(controllerOptions, id: \.tag) { option in
+                    Text(option.label).tag(option.tag)
+                }
+            }
+            Picker("Controller type", selection: $gamepadType) {
+                ForEach(Self.padTypes, id: \.tag) { option in
+                    Text(option.label).tag(option.tag)
+                }
+            }
+        } header: {
+            Text("Controllers")
+        } footer: {
+            Text(Self.controllersFooter)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
 
     // MARK: - Bitrate
 
@@ -199,7 +489,22 @@ struct SettingsView: View {
         }
         return options
     }
+
+    private static let placementOptions: [(label: String, tag: String)] =
+        HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
     #endif
+
+    // MARK: - Statistics
+
+    private static var statisticsFooter: String {
+        let base = "The overlay shows resolution, frame rate, throughput and latency while "
+            + "streaming, in the chosen corner."
+        #if os(macOS) || os(iOS)
+        return base + " Toggle it any time with ⌘⇧S."
+        #else
+        return base
+        #endif
+    }
 
     // MARK: - Controllers
 
@@ -272,190 +577,6 @@ struct SettingsView: View {
                     .foregroundStyle(.green)
             }
         }
-    }
-
-    private var sharedBody: some View {
-        Form {
-            Section {
-                HStack {
-                    TextField("Resolution", value: $width, format: .number.grouping(.never))
-                    Text("×")
-                    TextField("", value: $height, format: .number.grouping(.never))
-                        .labelsHidden()
-                }
-                TextField("Refresh rate (Hz)", value: $hz, format: .number.grouping(.never))
-                LabeledContent("") {
-                    Button("Use this display's mode") { fillFromMainScreen() }
-                }
-                // (sharedBody is unused on tvOS — its body still compiles there, and
-                // Slider doesn't exist on tvOS; the tv path has its own preset picker.)
-                #if !os(tvOS)
-                Toggle("Automatic bitrate", isOn: automaticBitrate)
-                if bitrateKbps != 0 {
-                    HStack(spacing: 12) {
-                        Slider(value: bitrateSlider, in: 0...1) {
-                            Text("Bitrate")
-                        }
-                        Text(SpeedTestSheet.mbpsLabel(kbps: bitrateKbps))
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                            .frame(minWidth: 76, alignment: .trailing)
-                    }
-                    if bitrateKbps > 1_000_000 {
-                        Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                }
-                #endif
-            } header: {
-                Text("Stream mode")
-            } footer: {
-                Text("The host creates a virtual output at exactly this mode — "
-                    + "native resolution, no scaling. \(Self.bitrateFooter)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            #if !os(tvOS)
-            Section {
-                #if os(macOS)
-                Picker("Speaker", selection: $speakerUID) {
-                    Text("System default").tag("")
-                    ForEach(outputDevices) { device in
-                        Text(device.name).tag(device.uid)
-                    }
-                    if !speakerUID.isEmpty,
-                       !outputDevices.contains(where: { $0.uid == speakerUID }) {
-                        Text("Unavailable device").tag(speakerUID)
-                    }
-                }
-                #endif
-                #if !os(tvOS)
-                Toggle("Send microphone to the host", isOn: $micEnabled)
-                #endif
-                #if os(macOS)
-                Picker("Microphone", selection: $micUID) {
-                    Text("System default").tag("")
-                    ForEach(inputDevices) { device in
-                        Text(device.name).tag(device.uid)
-                    }
-                    if !micUID.isEmpty,
-                       !inputDevices.contains(where: { $0.uid == micUID }) {
-                        Text("Unavailable device").tag(micUID)
-                    }
-                }
-                .disabled(!micEnabled)
-                #endif
-            } header: {
-                Text("Audio")
-            } footer: {
-                Text("Host audio plays through the speaker; the microphone feeds the "
-                    + "host's virtual mic. System default follows macOS device changes. "
-                    + "Applies from the next session.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            #endif
-            Section {
-                Picker("Compositor", selection: $compositor) {
-                    Text("Automatic").tag(0)
-                    Text("KWin (KDE Plasma)").tag(1)
-                    Text("wlroots (Sway / Hyprland)").tag(2)
-                    Text("Mutter (GNOME)").tag(3)
-                    Text("gamescope").tag(4)
-                }
-            } header: {
-                Text("Host compositor")
-            } footer: {
-                Text("Which compositor drives the virtual output on the host. A specific "
-                    + "choice is honored only if that backend is available there — "
-                    + "otherwise the host falls back to auto-detection.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            #if os(macOS)
-            Section {
-                Toggle("Fullscreen while streaming", isOn: $fullscreenWhileStreaming)
-            } header: {
-                Text("Window")
-            } footer: {
-                Text("Take the window fullscreen when a session starts and restore it on the host "
-                    + "list, so only the stream is fullscreen — not the picker.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            // The client-side cursor picker is hidden while the feature is disabled (gamescope's
-            // input is relative-only, so absolute cursor positioning traps input — see StreamView).
-            // Restore this Section when per-compositor gating / a synthetic cursor lands.
-            #endif
-            Section {
-                Picker("Presenter", selection: $presenter) {
-                    Text("Stage 1 (default)").tag("stage1")
-                    Text("Stage 2 (experimental)").tag("stage2")
-                }
-            } header: {
-                Text("Video presenter")
-            } footer: {
-                Text("Stage 1 feeds compressed video to the system display layer (known-good). "
-                    + "Stage 2 decodes explicitly and presents through Metal with a display "
-                    + "link — it adds a capture→present (glass-to-glass) latency line in the HUD "
-                    + "and shortens the present tail. Applies from the next session.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Section {
-                Toggle("Show game library", isOn: $libraryEnabled)
-            } header: {
-                Text("Experimental")
-            } footer: {
-                Text("Adds a “Browse Library…” action to each host that lists its games "
-                    + "(Steam + custom) via the host's management API; tap a title to launch it. "
-                    + "The host must expose that API on the LAN with a token "
-                    + "(serve --mgmt-bind 0.0.0.0 --mgmt-token …).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Section {
-                if gamepads.controllers.isEmpty {
-                    Text("No controllers detected")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(gamepads.controllers) { controller in
-                        controllerRow(controller)
-                    }
-                }
-                Picker("Use controller", selection: $gamepads.preferredID) {
-                    ForEach(controllerOptions, id: \.tag) { option in
-                        Text(option.label).tag(option.tag)
-                    }
-                }
-                Picker("Controller type", selection: $gamepadType) {
-                    ForEach(Self.padTypes, id: \.tag) { option in
-                        Text(option.label).tag(option.tag)
-                    }
-                }
-            } header: {
-                Text("Controllers")
-            } footer: {
-                Text(Self.controllersFooter)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .formStyle(.grouped)
-        .onAppear {
-            gamepads.refresh()
-            gamepads.startDiscovery()
-        }
-        .onDisappear { gamepads.stopDiscovery() }
-        #if os(macOS)
-        .frame(width: 380)
-        .fixedSize()
-        .onAppear {
-            outputDevices = AudioDevices.outputs()
-            inputDevices = AudioDevices.inputs()
-        }
-        #endif
     }
 
     private func fillFromMainScreen() {

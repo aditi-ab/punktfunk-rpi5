@@ -91,7 +91,14 @@ What's here, all compiled and tested on macOS (Xcode 26.5 / Swift 6.3):
   the host burst probe filler over the real data plane (up to the host's 3 Gbps probe
   ceiling for 2 s, roadmap §9),
   shows measured goodput · loss · a recommended bitrate (≈70% of measured), and applies
-  it in one tap.
+  it in one tap. The streaming **statistics overlay** can be turned off and moved to any
+  corner (Settings → Display → Statistics, `DefaultsKey.hudEnabled`/`hudPlacement`), and
+  toggled live with **⌘⇧S** — a Scene-level **"Stream" menu** (`StreamCommands`) that also
+  carries **Disconnect ⌘D**, so disconnect survives the HUD being hidden (on iOS a small
+  exit chip appears instead; on tvOS the Siri-Remote Menu button still disconnects). The
+  macOS Settings window is a **tabbed preferences pane** (General / Display / Audio /
+  Controllers / Advanced) — the sections are shared with the iOS single-Form layout and the
+  tvOS pushed-picker layout, defined once each.
 - **Tests** (`swift test`): byte-level Annex-B units; a real-codec round trip
   (VTCompressionSession-encoded HEVC rebuilt as the host's wire shape → `AnnexB` →
   VTDecompressionSession → pixels); table-driven DualSense trigger-effect parsing

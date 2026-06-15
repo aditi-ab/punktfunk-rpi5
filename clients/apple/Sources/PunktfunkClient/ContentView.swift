@@ -26,6 +26,8 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
+    @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
+    @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @State private var showAddHost = false
     @State private var pairingTarget: StoredHost?
     @State private var speedTestTarget: StoredHost?
@@ -59,6 +61,13 @@ struct ContentView: View {
             }
         }
         .onDisappear { model.disconnect() } // window closed mid-session (Cmd+N spawns more)
+        // Expose the session to the Scene-level Stream menu (Disconnect ⌘D works even when
+        // the HUD is hidden). tvOS has no such menu.
+        #if !os(tvOS)
+        .focusedSceneValue(\.sessionFocus, SessionFocus(
+            isStreaming: model.connection != nil,
+            disconnect: { model.disconnect() }))
+        #endif
         #if os(macOS)
         // Fullscreen only while a session is up (incl. the trust prompt over the blurred stream),
         // windowed on the host list — so the picker isn't forced fullscreen. Opt-out in Settings.
@@ -155,7 +164,8 @@ struct ContentView: View {
     }
 
     private func stream(captureEnabled: Bool) -> some View {
-        Group {
+        let placement = HUDPlacement(rawValue: hudPlacement) ?? .topTrailing
+        return Group {
             if let conn = model.connection {
                 StreamView(
                     connection: conn,
@@ -172,9 +182,30 @@ struct ContentView: View {
                     },
                     presentMeter: model.presentLatency
                 )
-                .overlay(alignment: .topTrailing) {
-                    if captureEnabled { StreamHUDView(model: model, connection: conn) }
+                .overlay(alignment: placement.alignment) {
+                    if captureEnabled && hudEnabled {
+                        StreamHUDView(model: model, connection: conn, placement: placement)
+                    }
                 }
+                #if os(iOS)
+                // Touch users have no menu / ⌘D, so when the HUD (and its Disconnect button)
+                // is hidden, keep a minimal always-reachable exit in a corner. It rides a
+                // material disc (like the HUD) so the glyph stays legible over a bright frame
+                // — this is the sole touch disconnect path when stats are off.
+                .overlay(alignment: .topLeading) {
+                    if captureEnabled && !hudEnabled {
+                        Button { model.disconnect() } label: {
+                            Image(systemName: "xmark")
+                                .font(.headline.weight(.semibold))
+                                .frame(width: 36, height: 36)
+                                .background(.regularMaterial, in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(12)
+                        .accessibilityLabel("Disconnect")
+                    }
+                }
+                #endif
             }
         }
     }

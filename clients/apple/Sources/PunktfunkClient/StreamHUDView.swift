@@ -4,12 +4,44 @@
 import PunktfunkKit
 import SwiftUI
 
+/// Which corner the HUD overlay occupies (persisted as `DefaultsKey.hudPlacement`). The raw
+/// values are stable on disk — rename the cases freely, never the strings.
+enum HUDPlacement: String, CaseIterable, Identifiable {
+    case topLeading, topTrailing, bottomLeading, bottomTrailing
+
+    var id: String { rawValue }
+
+    /// SwiftUI overlay alignment for `.overlay(alignment:)`.
+    var alignment: Alignment {
+        switch self {
+        case .topLeading: return .topLeading
+        case .topTrailing: return .topTrailing
+        case .bottomLeading: return .bottomLeading
+        case .bottomTrailing: return .bottomTrailing
+        }
+    }
+
+    /// The HUD's own stack hugs the screen edge it sits against, so its text aligns outward.
+    var isTrailing: Bool { self == .topTrailing || self == .bottomTrailing }
+
+    /// User-facing corner label.
+    var label: String {
+        switch self {
+        case .topLeading: return "Top Left"
+        case .topTrailing: return "Top Right"
+        case .bottomLeading: return "Bottom Left"
+        case .bottomTrailing: return "Bottom Right"
+        }
+    }
+}
+
 struct StreamHUDView: View {
     @ObservedObject var model: SessionModel
     let connection: PunktfunkConnection
+    var placement: HUDPlacement = .topTrailing
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 4) {
+        VStack(alignment: placement.isTrailing ? .trailing : .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Circle()
                     .fill(Color.accentColor)
@@ -60,9 +92,10 @@ struct StreamHUDView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             #else
+            // ⌘D lives on the app's Stream menu (so it still works when the HUD is hidden);
+            // this button is the in-overlay, click-to-disconnect affordance.
             Button("Disconnect (⌘D)") { model.disconnect() }
                 .font(.caption)
-                .keyboardShortcut("d", modifiers: .command)
             #endif
         }
         .padding(10)

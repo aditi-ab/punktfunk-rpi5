@@ -26,4 +26,10 @@ public enum DefaultsKey {
     public static let libraryEnabled = "punktfunk.libraryEnabled"
     /// macOS: take the window fullscreen while streaming and restore it on the host list. On by default.
     public static let fullscreenWhileStreaming = "punktfunk.fullscreenWhileStreaming"
+    /// Show the streaming statistics overlay (mode/fps/throughput/latency). On by default; toggle
+    /// while streaming with ⌘⇧S (macOS / hardware keyboard).
+    public static let hudEnabled = "punktfunk.hudEnabled"
+    /// Which corner the statistics overlay sits in — a `HUDPlacement` raw value
+    /// ("topLeading"/"topTrailing"/"bottomLeading"/"bottomTrailing"). Default top-trailing.
+    public static let hudPlacement = "punktfunk.hudPlacement"
 }

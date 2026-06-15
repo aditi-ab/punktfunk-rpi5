@@ -16,6 +16,11 @@ struct PunktfunkClientApp: App {
         WindowGroup("Punktfunkempfänger") {
             ContentView()
         }
+        // The Stream menu (Disconnect ⌘D, Show/Hide Statistics ⌘⇧S) — a real menu bar on
+        // macOS, hardware-keyboard shortcuts on iPad. tvOS has neither.
+        #if !os(tvOS)
+        .commands { StreamCommands() }
+        #endif
         #if os(macOS)
         Settings {
             SettingsView()
