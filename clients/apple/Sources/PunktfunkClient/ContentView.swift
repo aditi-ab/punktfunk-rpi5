@@ -145,6 +145,13 @@ struct ContentView: View {
         #if os(macOS)
         .frame(minWidth: 640, minHeight: 360)
         .background(Color.black)
+        // Fill the whole display in fullscreen, INCLUDING behind the camera housing (notch).
+        // Without this the stream is laid out in the safe area below the notch, so an
+        // aspect-fit video at the display's native mode scales down and leaves black borders.
+        // A fullscreen video behind the notch (a thin top-center strip occluded) is the
+        // expected behavior — same edge-to-edge intent as the iOS/tvOS branches below. Inert
+        // in windowed mode (no notch safe-area inset on a titled window).
+        .ignoresSafeArea()
         #elseif os(iOS)
         // Streaming is immersive: edge-to-edge under the status bar and home
         // indicator, both hidden for the session (they return with the hosts grid).
