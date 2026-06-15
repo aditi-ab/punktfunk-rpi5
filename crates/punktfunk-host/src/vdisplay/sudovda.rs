@@ -347,6 +347,20 @@ unsafe fn restore_displays(saved: &[(String, DEVMODEW)]) {
     }
 }
 
+/// Re-detach physical displays so the secure (Winlogon) desktop keeps rendering to the virtual
+/// output — for the in-session DXGI capture recovery (dxgi.rs `recreate_dupl`). The lock/UAC/login
+/// switch can re-attach a physical monitor (the secure desktop then lands on IT and our virtual
+/// output goes perpetually ACCESS_LOST — the "born-lost" storm); re-running the isolate routes the
+/// secure desktop back to the virtual output, mirroring what a fresh session's `create` does (the
+/// delta that makes a reconnect work where in-session recovery didn't). Idempotent + cheap: when
+/// nothing besides `gdi_name` is attached, [`isolate_displays`] finds nothing to detach and commits
+/// nothing — so this is safe to call on every throttled recovery tick (no display thrash).
+pub(crate) fn reassert_isolation(gdi_name: &str) {
+    unsafe {
+        let _ = isolate_displays(gdi_name);
+    }
+}
+
 unsafe fn open_device() -> Result<HANDLE> {
     let hdev = SetupDiGetClassDevsW(
         Some(&SUVDA_INTERFACE),

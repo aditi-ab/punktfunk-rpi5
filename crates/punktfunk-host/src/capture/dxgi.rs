@@ -206,8 +206,21 @@ VOut main(uint vid : SV_VertexID) {
 const CURSOR_PS: &str = r"
 Texture2D tx : register(t0);
 SamplerState sm : register(s0);
+// b0 is shared with the VS: float4 rect, then the HDR cursor params. For SDR white_mul=1 / decode=0
+// so this is a no-op (returns the raw sampled BGRA, blended in the display's native sRGB space). For
+// HDR the cursor is composited onto a LINEAR scRGB FP16 surface where 1.0 = 80 nits, so we sRGB→
+// linear decode (correct alpha blending + no dark edge fringe) and scale to HDR graphics white
+// (~203 nits → white_mul = 203/80) so the cursor isn't ~2.5x too dim vs the HDR desktop.
+cbuffer C : register(b0) { float4 rect; float white_mul; float decode; float2 pad; };
+float3 srgb_to_linear(float3 c) {
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
-    return tx.Sample(sm, uv);
+    float4 s = tx.Sample(sm, uv);
+    float3 rgb = s.rgb;
+    if (decode > 0.5) { rgb = srgb_to_linear(rgb); }
+    rgb *= white_mul;
+    return float4(rgb, s.a);
 }
 ";
 
@@ -267,7 +280,7 @@ impl CursorCompositor {
         device.CreatePixelShader(&psb, None, Some(&mut ps))?;
 
         let cbd = D3D11_BUFFER_DESC {
-            ByteWidth: 16,
+            ByteWidth: 32, // float4 rect + (white_mul, decode, pad, pad) for the HDR cursor PS
             Usage: D3D11_USAGE_DYNAMIC,
             BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
             CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
@@ -375,6 +388,13 @@ impl CursorCompositor {
         cx: i32,
         cy: i32,
         invert: bool,
+        // HDR (decode=true): sRGB→linear decode + scale the cursor to `white_mul` × 80 nits, so a
+        // white cursor hits HDR graphics white (~203 nits) not 80. SDR passes white_mul=1.0,
+        // decode=false → the PS returns the raw sample (blended in the display's native sRGB space).
+        // The inversion (masked-color / I-beam) blend operates on the framebuffer reference, so it is
+        // left unscaled/undecoded even in HDR.
+        white_mul: f32,
+        decode: bool,
     ) {
         let (srv, cw, ch) = match &self.tex {
             Some(t) => t,
@@ -384,13 +404,19 @@ impl CursorCompositor {
         let x1 = ((cx + *cw as i32) as f32 / fw as f32) * 2.0 - 1.0;
         let y0 = 1.0 - (cy as f32 / fh as f32) * 2.0;
         let y1 = 1.0 - ((cy + *ch as i32) as f32 / fh as f32) * 2.0;
-        let rect = [x0, y0, x1, y1];
+        let (mul, dec) = if invert {
+            (1.0_f32, 0.0_f32)
+        } else {
+            (white_mul, if decode { 1.0 } else { 0.0 })
+        };
+        // cbuf layout: [rect.x, rect.y, rect.z, rect.w, white_mul, decode, pad, pad] (32 bytes).
+        let cb = [x0, y0, x1, y1, mul, dec, 0.0, 0.0];
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         if ctx
             .Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
             .is_ok()
         {
-            std::ptr::copy_nonoverlapping(rect.as_ptr(), mapped.pData as *mut f32, 4);
+            std::ptr::copy_nonoverlapping(cb.as_ptr(), mapped.pData as *mut f32, cb.len());
             ctx.Unmap(&self.cbuf, 0);
         }
         let vp = D3D11_VIEWPORT {
@@ -412,6 +438,7 @@ impl CursorCompositor {
         ctx.VSSetShader(&self.vs, None);
         ctx.PSSetShader(&self.ps, None);
         ctx.VSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
+        ctx.PSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())])); // white_mul/decode for the PS
         ctx.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
         ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
         ctx.IASetInputLayout(None);
@@ -1110,8 +1137,11 @@ impl DuplCapturer {
         }
     }
 
-    /// Composite the cursor onto the GPU frame texture (zero-copy path).
-    unsafe fn composite_cursor_gpu(&mut self, gpu: &ID3D11Texture2D) -> Result<()> {
+    /// Composite the cursor onto the GPU frame texture (zero-copy path). `hdr` = the target is the
+    /// linear scRGB FP16 surface (HDR path) — the cursor is then sRGB→linear decoded and scaled to
+    /// HDR graphics white (PUNKTFUNK_HDR_CURSOR_NITS, default 203, per BT.2408) so it isn't ~2.5×
+    /// too dim; SDR composites the raw cursor in the display's native sRGB space.
+    unsafe fn composite_cursor_gpu(&mut self, gpu: &ID3D11Texture2D, hdr: bool) -> Result<()> {
         // Diagnostic kill-switch: skip the GPU cursor composite entirely (PUNKTFUNK_NO_CURSOR=1) to
         // isolate its cost on the 3D engine. The per-frame render-target view + draw to the 5K target
         // is the suspect for the high 3D usage under heavy desktop change.
@@ -1151,6 +1181,18 @@ impl DuplCapturer {
             .CreateRenderTargetView(gpu, None, Some(&mut rtv))?;
         let rtv = rtv.context("cursor rtv")?;
         let (cx, cy) = self.cursor_pos;
+        // HDR graphics-white target in nits → scRGB multiplier (scRGB 1.0 = 80 nits). Default 203
+        // (BT.2408); PUNKTFUNK_HDR_CURSOR_NITS overrides without a rebuild. SDR → 1.0, no decode.
+        let white_mul = if hdr {
+            let nits = std::env::var("PUNKTFUNK_HDR_CURSOR_NITS")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|n| n.is_finite() && *n > 0.0)
+                .unwrap_or(203.0);
+            nits / 80.0
+        } else {
+            1.0
+        };
         self.cursor.as_ref().unwrap().draw(
             &self.context,
             &rtv,
@@ -1159,6 +1201,8 @@ impl DuplCapturer {
             cx,
             cy,
             self.cursor_invert,
+            white_mul,
+            hdr, // decode sRGB→linear only on the HDR (linear FP16) target
         );
         Ok(())
     }
@@ -1183,10 +1227,41 @@ impl DuplCapturer {
             self.gdi_name = n;
         }
         attach_input_desktop();
+        // Re-route the secure (Winlogon) desktop back to the virtual output. The lock/UAC switch can
+        // re-attach a physical monitor so the secure desktop lands there and our virtual output goes
+        // perpetually ACCESS_LOST; re-isolating (as a fresh session's `create` does) is the delta that
+        // makes in-session recovery work like a reconnect. Idempotent/cheap when already isolated.
+        crate::vdisplay::sudovda::reassert_isolation(&self.gdi_name);
         let (dev, ctx, out, dupl) = reopen_duplication(&self.gdi_name)?; // Err → caller repeats + retries
-                                                                         // A desktop switch can come back at a different size (e.g. the user session applies its own
-                                                                         // resolution on login). Adopt it: update dimensions and drop the staging/gpu copies so they
-                                                                         // reallocate. NVENC re-inits at the new size when it sees the frame.
+
+        // PROBE before adopting. During the unsettled Winlogon switch DuplicateOutput SUCCEEDS but the
+        // duplication is "born-lost" — the first AcquireNextFrame immediately returns ACCESS_LOST.
+        // Adopting it (swapping into self + seeding black) is exactly what produced the perpetual
+        // rebuild→born-lost storm (lost=2097) where the secure desktop never appeared. So gate adoption
+        // on a probe: Ok (a frame) or WAIT_TIMEOUT (alive but idle) ⇒ live, adopt; any other error ⇒
+        // born-lost, drop the locals and bail so the caller repeats the last frame and retries on the
+        // 250ms throttle. Once the topology settles (and reassert_isolation has taken), a probe passes
+        // and we adopt a LIVE duplication of the secure desktop.
+        {
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut res: Option<IDXGIResource> = None;
+            match dupl.AcquireNextFrame(50, &mut info, &mut res) {
+                Ok(()) => {
+                    let _ = dupl.ReleaseFrame();
+                }
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {}
+                Err(e) => {
+                    return Err(anyhow!(
+                        "rebuilt duplication is born-lost (probe AcquireNextFrame: {:#x}) — \
+                         topology not settled yet",
+                        e.code().0
+                    ));
+                }
+            }
+        }
+        // A desktop switch can come back at a different size (e.g. the user session applies its own
+        // resolution on login). Adopt it: update dimensions and drop the staging/gpu copies so they
+        // reallocate. NVENC re-inits at the new size when it sees the frame.
         let dd: DXGI_OUTDUPL_DESC = dupl.GetDesc();
         let (nw, nh) = (dd.ModeDesc.Width, dd.ModeDesc.Height);
         tracing::info!(
@@ -1317,7 +1392,7 @@ impl DuplCapturer {
             self.context.CopyResource(&src, &tex);
             let _ = self.dupl.ReleaseFrame();
             self.holding_frame = false;
-            self.composite_cursor_gpu(&src)?; // onto the FP16 surface (RTV works on FP16)
+            self.composite_cursor_gpu(&src, true)?; // onto the FP16 surface (HDR: decode + nits scale)
             self.ensure_hdr10_out()?;
             let out = self.hdr10_out.clone().context("hdr10 out texture")?;
             if self.hdr_conv.is_none() {
@@ -1355,7 +1430,7 @@ impl DuplCapturer {
             self.context.CopyResource(&gpu, &tex);
             let _ = self.dupl.ReleaseFrame();
             self.holding_frame = false;
-            self.composite_cursor_gpu(&gpu)?;
+            self.composite_cursor_gpu(&gpu, false)?;
             self.last_present = Some((gpu.clone(), PixelFormat::Bgra));
             return Ok(Some(CapturedFrame {
                 width: self.width,
