@@ -46,4 +46,18 @@ object NativeBridge {
 
     /** Stop + join the audio thread and close AAudio, without closing the session. No-op on `0`. */
     external fun nativeStopAudio(handle: Long)
+
+    // ---- Input: Kotlin captures, Rust forwards to the host (send_input) ----
+
+    /** Relative mouse move; dx/dy are device-pixel deltas (screen +y down). */
+    external fun nativeSendPointerMove(handle: Long, dx: Int, dy: Int)
+
+    /** One mouse-button transition. button: 1=left 2=middle 3=right 4=X1 5=X2. */
+    external fun nativeSendPointerButton(handle: Long, button: Int, down: Boolean)
+
+    /** One scroll step. axis: 0=vertical 1=horizontal. delta: signed, 120-scaled, +=up/right. */
+    external fun nativeSendScroll(handle: Long, axis: Int, delta: Int)
+
+    /** One key transition. vk: Windows VK (0 = dropped by Rust). mods: VK modifier mask (0 for now). */
+    external fun nativeSendKey(handle: Long, vk: Int, down: Boolean, mods: Int)
 }

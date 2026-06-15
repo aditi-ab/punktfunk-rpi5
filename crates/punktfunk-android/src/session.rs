@@ -12,10 +12,11 @@
 //! from `crates/punktfunk-client-linux`.
 
 use jni::objects::{JObject, JString};
-use jni::sys::{jint, jlong};
+use jni::sys::{jboolean, jint, jlong};
 use jni::JNIEnv;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+use punktfunk_core::input::{InputEvent, InputKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -227,4 +228,120 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
         let h = unsafe { &*(handle as *const SessionHandle) };
         h.stop_audio();
     }
+}
+
+// ---- Input plane: Kotlin capture → NativeClient::send_input ----------------------------------
+// All four are `&self` on the `Sync` connector (send_input is a non-blocking datagram push), safe
+// from the Kotlin UI thread. NOT android-gated — send_input exists on the host build too, so these
+// compile everywhere (parity with nativeConnect/nativeClose). The wire codes are the GameStream
+// conventions: buttons 1=left/2=middle/3=right/4=X1/5=X2; scroll axis 0=vertical/1=horizontal,
+// signed 120-unit delta, +=up/right; keys are Windows VK (mapped from KEYCODE_* on the Kotlin side).
+
+/// `NativeBridge.nativeSendPointerMove(handle, dx, dy)` — relative mouse motion (screen +y down).
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointerMove(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    dx: jint,
+    dy: jint,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract; send_input is &self.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let _ = h.client.send_input(&InputEvent {
+        kind: InputKind::MouseMove,
+        _pad: [0; 3],
+        code: 0,
+        x: dx,
+        y: dy,
+        flags: 0,
+    });
+}
+
+/// `NativeBridge.nativeSendPointerButton(handle, button, down)` — one button transition.
+/// `button`: GameStream id (1=left, 2=middle, 3=right, 4=X1, 5=X2). `down`: 1=press, 0=release.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointerButton(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    button: jint,
+    down: jboolean,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: live handle per the contract.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let _ = h.client.send_input(&InputEvent {
+        kind: if down != 0 {
+            InputKind::MouseButtonDown
+        } else {
+            InputKind::MouseButtonUp
+        },
+        _pad: [0; 3],
+        code: button as u32,
+        x: 0,
+        y: 0,
+        flags: 0,
+    });
+}
+
+/// `NativeBridge.nativeSendScroll(handle, axis, delta)` — one scroll step. `axis`: 0=vertical,
+/// 1=horizontal. `delta`: signed, WHEEL_DELTA(120)-scaled, +=up/right.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendScroll(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    axis: jint,
+    delta: jint,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: live handle per the contract.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let _ = h.client.send_input(&InputEvent {
+        kind: InputKind::MouseScroll,
+        _pad: [0; 3],
+        code: axis as u32,
+        x: delta,
+        y: 0,
+        flags: 0,
+    });
+}
+
+/// `NativeBridge.nativeSendKey(handle, vk, down, mods)` — one key transition. `vk`: Windows
+/// Virtual-Key code (0 = unmapped → dropped). `down`: 1=press, 0=release. `mods`: VK modifier
+/// bitmask (0 for now — the host folds modifiers from the L/R modifier key events themselves).
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendKey(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    vk: jint,
+    down: jboolean,
+    mods: jint,
+) {
+    if handle == 0 || vk == 0 {
+        return;
+    }
+    // SAFETY: live handle per the contract.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let _ = h.client.send_input(&InputEvent {
+        kind: if down != 0 {
+            InputKind::KeyDown
+        } else {
+            InputKind::KeyUp
+        },
+        _pad: [0; 3],
+        code: vk as u32,
+        x: 0,
+        y: 0,
+        flags: mods as u32,
+    });
 }
