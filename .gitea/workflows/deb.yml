@@ -87,6 +87,13 @@ jobs:
         # Gate the .deb on a real node boot: the punktfunk-web .deb runs `node .output/server`,
         # so prove the node-server build exists, isn't a bun bundle, and actually serves /login.
         run: |
+          # bun builds the console. It's baked into the rust-ci image, but bootstrap it here too so
+          # the job stays green against the PREVIOUS image (docker.yml bootstrap lag).
+          command -v bun >/dev/null || {
+            apt-get install -y --no-install-recommends unzip
+            curl -fsSL https://bun.sh/install | bash
+          }
+          export PATH="$HOME/.bun/bin:$PATH"
           cd web
           bun install --frozen-lockfile
           bun run build

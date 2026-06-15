@@ -11,8 +11,8 @@
 FROM ubuntu:26.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # toolchain + bindgen; nodejs runs the JS actions (checkout/cache) inside this container
-    build-essential clang libclang-dev pkg-config cmake git curl ca-certificates nodejs \
+    # toolchain + bindgen; nodejs runs the JS actions (checkout/cache); unzip is for the bun installer
+    build-essential clang libclang-dev pkg-config cmake git curl ca-certificates nodejs unzip \
     # ffmpeg-next 8 (system FFmpeg 8 / libavcodec 62 on 26.04)
     libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev \
     libavdevice-dev \
@@ -23,6 +23,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # punktfunk-client-linux (GTK4/libadwaita shell, SDL3 gamepads)
     libgtk-4-dev libadwaita-1-dev libsdl3-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# bun — builds the punktfunk-web console in deb.yml (which runs the web build in THIS image).
+# ci.yml's web/docs jobs use the oven/bun image instead, so this is only for the deb job.
+RUN curl -fsSL https://bun.sh/install | bash \
+    && install -m0755 /root/.bun/bin/bun /usr/local/bin/bun \
+    && bun --version
 
 # libcuda link stub: the NVIDIA userspace library (no kernel module needed) provides
 # every cuXxx symbol. On 26.04 the package already ships the libcuda.so dev symlink;
