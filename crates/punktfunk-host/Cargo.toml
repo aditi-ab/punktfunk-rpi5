@@ -120,3 +120,5 @@ windows = { version = "0.62", features = [
 # Software H.264 encoder (GPU-less path + NVENC fallback). The default `source` feature statically
 # compiles OpenH264 (BSD-2) — no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.
 openh264 = "0.9"
+# WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
+wasapi = "0.23"

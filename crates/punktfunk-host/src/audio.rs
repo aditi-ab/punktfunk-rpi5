@@ -37,9 +37,14 @@ pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
     linux::PwAudioCapturer::open(channels).map(|c| Box::new(c) as Box<dyn AudioCapturer>)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
+    wasapi_cap::WasapiLoopbackCapturer::open(channels).map(|c| Box::new(c) as Box<dyn AudioCapturer>)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn open_audio_capture(_channels: u32) -> Result<Box<dyn AudioCapturer>> {
-    anyhow::bail!("audio capture requires Linux + PipeWire")
+    anyhow::bail!("audio capture requires Linux + PipeWire or Windows + WASAPI")
 }
 
 /// The inverse of [`AudioCapturer`]: a virtual microphone the host *produces*. It registers a
@@ -71,3 +76,5 @@ pub fn open_virtual_mic(_channels: u32) -> Result<Box<dyn VirtualMic>> {
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+mod wasapi_cap;
