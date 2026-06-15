@@ -26,9 +26,10 @@ printf '%s' "$RPM_GPG_PRIVATE_KEY" | gpg --batch --import
 KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')"
 [ -n "$KEYID" ] || { echo "no secret key imported from RPM_GPG_PRIVATE_KEY" >&2; exit 1; }
 
-# rpm v4 detached-signing macro. Force loopback pinentry (no TTY in CI); feed the passphrase, if
-# any, on stdin via --passphrase-fd 0.
-SIGN_CMD="%{__gpg} gpg --batch --no-verbose --no-armor --pinentry-mode loopback"
+# rpm v4 detached-signing macro. NOTE: %{__gpg} already IS the gpg binary path — do NOT add a
+# literal `gpg` after it (that becomes a spurious filename arg -> "no command supplied"). Force
+# loopback pinentry (no TTY in CI); feed the passphrase, if any, on stdin via --passphrase-fd 0.
+SIGN_CMD="%{__gpg} --batch --no-verbose --no-armor --pinentry-mode loopback"
 [ -n "${RPM_GPG_PASSPHRASE:-}" ] && SIGN_CMD="$SIGN_CMD --passphrase-fd 0"
 SIGN_CMD="$SIGN_CMD -u %{_gpg_name} --digest-algo sha256 -sbo %{__signature_filename} %{__plaintext_filename}"
 
