@@ -48,6 +48,22 @@
 	<key>com.apple.security.device.usb</key>
 	<true/>
 
+	<!-- Controller rumble via CoreHaptics: GCDeviceHaptics.createEngine → CHHapticEngine
+	     (GamepadFeedback's RumbleRenderer), and AVAudioEngine playback, reach the system
+	     audio-analytics daemon `com.apple.audioanalyticsd` over Mach. The sandbox denies that
+	     global-name lookup unless it's whitelisted here, and the framework's own precondition
+	     turns the denial into a HARD CRASH ("Process is sandboxed but
+	     com.apple.security.exception.mach-lookup.global-name doesn't contain
+	     com.apple.audioanalyticsd") the moment a controller's haptics engine starts. This
+	     temporary exception is the documented, App-Store-acceptable way to permit exactly that
+	     lookup — and ONLY that service (the key takes exact names, no wildcards). App Store:
+	     declare it in App Store Connect → App Sandbox Entitlement Usage Information ("CoreHaptics
+	     gamepad rumble contacts the system audio-analytics daemon"). -->
+	<key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+	<array>
+		<string>com.apple.audioanalyticsd</string>
+	</array>
+
 	<!-- Keychain Sharing (unchanged from the shared file): a team-scoped access group so the
 	     punktfunk/1 client identity in the data-protection keychain is gated by the app's
 	     entitlement (team + bundle id), persisting across rebuilds with NO prompt — see
