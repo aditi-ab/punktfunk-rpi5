@@ -58,6 +58,10 @@ pub struct NvencD3d11Encoder {
     frame_idx: i64,
     force_kf: bool,
     inited: bool,
+    /// Raw ptr of the D3D11 device this session was initialized with. The capturer recreates the
+    /// device on a desktop switch (normal ↔ Winlogon secure); when a frame carries a new device we
+    /// tear down and re-init NVENC against it.
+    init_device: *mut c_void,
 }
 
 // Raw NVENC handle + COM ptrs; confined to the single encode thread (like the Linux encoder).
@@ -88,7 +92,33 @@ impl NvencD3d11Encoder {
             frame_idx: 0,
             force_kf: false,
             inited: false,
+            init_device: ptr::null_mut(),
         })
+    }
+
+    /// Tear down the encode session + pooled resources. Reused on a capture-device change (desktop
+    /// switch) and at Drop.
+    unsafe fn teardown(&mut self) {
+        if self.encoder.is_null() {
+            return;
+        }
+        for p in &self.pool {
+            if !p.map.is_null() {
+                let _ = (API.unmap_input_resource)(self.encoder, p.map);
+            }
+            let _ = (API.unregister_resource)(self.encoder, p.reg);
+        }
+        for &bs in &self.bitstreams {
+            let _ = (API.destroy_bitstream_buffer)(self.encoder, bs);
+        }
+        let _ = (API.destroy_encoder)(self.encoder);
+        self.pool.clear();
+        self.bitstreams.clear();
+        self.pending.clear();
+        self.encoder = ptr::null_mut();
+        self.ctx = None;
+        self.inited = false;
+        self.next = 0;
     }
 
     /// Lazily create the session on the first frame's D3D11 device (so capture + encode share it).
@@ -100,70 +130,112 @@ impl NvencD3d11Encoder {
                     .context("D3D11 immediate context")?,
             );
 
-            // 1. open the session bound to the D3D11 device.
-            let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
-                version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
-                deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
-                device: device.as_raw(),
-                apiVersion: nv::NVENCAPI_VERSION,
-                ..Default::default()
-            };
-            let mut enc: *mut c_void = ptr::null_mut();
-            (API.open_encode_session_ex)(&mut params, &mut enc)
-                .result_without_string()
-                .map_err(|e| anyhow!("NVENC open_encode_session_ex: {e:?} (no NVIDIA GPU?)"))?;
-            self.encoder = enc;
-
-            // 2. seed the P1 + ultra-low-latency preset config.
-            let mut preset = nv::NV_ENC_PRESET_CONFIG {
-                version: nv::NV_ENC_PRESET_CONFIG_VER,
-                presetCfg: nv::NV_ENC_CONFIG {
-                    version: nv::NV_ENC_CONFIG_VER,
+            // Probe-and-step-down on the bitrate. NVENC rejects `initialize_encoder` with InvalidParam
+            // when `averageBitRate` exceeds what the GPU's max codec level can express (e.g. a 1.6 Gbps
+            // request on HEVC). Mirror the Linux host's strategy: try the requested rate, and on
+            // failure drop to 3/4 and retry, down to a floor — so the connection ALWAYS succeeds at the
+            // highest bitrate THIS GPU supports (a newer GPU that accepts the request keeps it
+            // untouched; only an over-asking client gets clamped). Each attempt re-opens a fresh
+            // session (NVENC has no re-init after a failed initialize).
+            const FLOOR_BPS: u64 = 10_000_000;
+            let requested_bps = self.bitrate_bps;
+            let mut bitrate = self.bitrate_bps;
+            let enc = loop {
+                // 1. open the session bound to the D3D11 device.
+                let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+                    version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+                    deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
+                    device: device.as_raw(),
+                    apiVersion: nv::NVENCAPI_VERSION,
                     ..Default::default()
-                },
-                ..Default::default()
-            };
-            (API.get_encode_preset_config_ex)(
-                enc,
-                self.codec_guid,
-                nv::NV_ENC_PRESET_P1_GUID,
-                nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
-                &mut preset,
-            )
-            .result_without_string()
-            .map_err(|e| anyhow!("get_encode_preset_config_ex: {e:?}"))?;
-            let mut cfg = preset.presetCfg;
+                };
+                let mut enc: *mut c_void = ptr::null_mut();
+                (API.open_encode_session_ex)(&mut params, &mut enc)
+                    .result_without_string()
+                    .map_err(|e| anyhow!("NVENC open_encode_session_ex: {e:?} (no NVIDIA GPU?)"))?;
 
-            // 3. mirror the Linux RC config: CBR, infinite GOP, P-only, ~1-frame VBV.
-            cfg.gopLength = nv::NVENC_INFINITE_GOPLENGTH;
-            cfg.frameIntervalP = 1;
-            cfg.rcParams.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
-            let bps = self.bitrate_bps.min(u32::MAX as u64) as u32;
-            cfg.rcParams.averageBitRate = bps;
-            cfg.rcParams.maxBitRate = bps;
-            let vbv = (self.bitrate_bps as f64 / self.fps.max(1) as f64) as u32;
-            cfg.rcParams.vbvBufferSize = vbv;
-            cfg.rcParams.vbvInitialDelay = vbv;
-
-            // 4. initialize the encoder.
-            let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
-                version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
-                encodeGUID: self.codec_guid,
-                presetGUID: nv::NV_ENC_PRESET_P1_GUID,
-                tuningInfo: nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
-                encodeWidth: self.width,
-                encodeHeight: self.height,
-                darWidth: self.width,
-                darHeight: self.height,
-                frameRateNum: self.fps,
-                frameRateDen: 1,
-                enablePTD: 1,
-                encodeConfig: &mut cfg,
-                ..Default::default()
-            };
-            (API.initialize_encoder)(enc, &mut init)
+                // 2. seed the P1 + ultra-low-latency preset config.
+                let mut preset = nv::NV_ENC_PRESET_CONFIG {
+                    version: nv::NV_ENC_PRESET_CONFIG_VER,
+                    presetCfg: nv::NV_ENC_CONFIG {
+                        version: nv::NV_ENC_CONFIG_VER,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                if let Err(e) = (API.get_encode_preset_config_ex)(
+                    enc,
+                    self.codec_guid,
+                    nv::NV_ENC_PRESET_P1_GUID,
+                    nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+                    &mut preset,
+                )
                 .result_without_string()
-                .map_err(|e| anyhow!("initialize_encoder: {e:?}"))?;
+                {
+                    let _ = (API.destroy_encoder)(enc);
+                    return Err(anyhow!("get_encode_preset_config_ex: {e:?}"));
+                }
+                let mut cfg = preset.presetCfg;
+
+                // 3. mirror the Linux RC config: CBR, infinite GOP, P-only, ~1-frame VBV.
+                cfg.gopLength = nv::NVENC_INFINITE_GOPLENGTH;
+                cfg.frameIntervalP = 1;
+                cfg.rcParams.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
+                let bps = bitrate.min(u32::MAX as u64) as u32;
+                cfg.rcParams.averageBitRate = bps;
+                cfg.rcParams.maxBitRate = bps;
+                // Shrink the VBV with the bitrate — NVENC validates it against the same level ceiling.
+                let vbv = (bitrate as f64 / self.fps.max(1) as f64) as u32;
+                cfg.rcParams.vbvBufferSize = vbv;
+                cfg.rcParams.vbvInitialDelay = vbv;
+
+                // 4. initialize the encoder.
+                let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
+                    version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
+                    encodeGUID: self.codec_guid,
+                    presetGUID: nv::NV_ENC_PRESET_P1_GUID,
+                    tuningInfo: nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+                    encodeWidth: self.width,
+                    encodeHeight: self.height,
+                    darWidth: self.width,
+                    darHeight: self.height,
+                    frameRateNum: self.fps,
+                    frameRateDen: 1,
+                    enablePTD: 1,
+                    encodeConfig: &mut cfg,
+                    ..Default::default()
+                };
+                match (API.initialize_encoder)(enc, &mut init).result_without_string() {
+                    Ok(()) => {
+                        self.bitrate_bps = bitrate;
+                        break enc;
+                    }
+                    Err(e) if bitrate > FLOOR_BPS => {
+                        let _ = (API.destroy_encoder)(enc);
+                        let next = (bitrate * 3 / 4).max(FLOOR_BPS);
+                        tracing::warn!(
+                            tried_mbps = bitrate / 1_000_000,
+                            next_mbps = next / 1_000_000,
+                            error = ?e,
+                            "NVENC initialize_encoder rejected bitrate — stepping down (GPU codec-level cap)"
+                        );
+                        bitrate = next;
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = (API.destroy_encoder)(enc);
+                        return Err(anyhow!("initialize_encoder: {e:?} (even at {} Mbps floor)", FLOOR_BPS / 1_000_000));
+                    }
+                }
+            };
+            self.encoder = enc;
+            if self.bitrate_bps < requested_bps {
+                tracing::info!(
+                    requested_mbps = requested_bps / 1_000_000,
+                    applied_mbps = self.bitrate_bps / 1_000_000,
+                    "NVENC bitrate capped to this GPU's max for the codec"
+                );
+            }
 
             // 5. encoder-owned BGRA texture pool, registered once, + one bitstream per slot.
             let desc = D3D11_TEXTURE2D_DESC {
@@ -222,7 +294,7 @@ impl NvencD3d11Encoder {
                 self.width,
                 self.height,
                 self.fps,
-                bps / 1_000_000,
+                self.bitrate_bps / 1_000_000,
                 self.codec_guid
             );
             Ok(())
@@ -238,9 +310,27 @@ impl Encoder for NvencD3d11Encoder {
                 bail!("NVENC D3D11 encoder needs a GPU texture frame (use the software encoder for CPU frames)")
             }
         };
+        // The capturer recreates its D3D11 device on a desktop switch (secure/Winlogon) and may come
+        // back at a different resolution (user session applies its own mode on login). Re-init when the
+        // frame arrives on a different device OR at a different size than our session was built on.
+        let dev_raw = frame.device.as_raw();
+        let size_changed = self.inited && (self.width != captured.width || self.height != captured.height);
+        if self.inited && (self.init_device != dev_raw || size_changed) {
+            tracing::info!(
+                device_changed = self.init_device != dev_raw,
+                size_changed,
+                new = format!("{}x{}", captured.width, captured.height),
+                "NVENC: capture device/size changed (desktop switch) — re-initializing session"
+            );
+            unsafe { self.teardown() };
+        }
         if !self.inited {
+            // Adopt the current frame size so the encoder always matches what the capturer produces.
+            self.width = captured.width;
+            self.height = captured.height;
             let device = frame.device.clone();
             self.init_session(&device)?;
+            self.init_device = dev_raw;
         }
         let slot = self.next % POOL;
         self.next += 1;
@@ -336,20 +426,6 @@ impl Encoder for NvencD3d11Encoder {
 
 impl Drop for NvencD3d11Encoder {
     fn drop(&mut self) {
-        if self.encoder.is_null() {
-            return;
-        }
-        unsafe {
-            for p in &self.pool {
-                if !p.map.is_null() {
-                    let _ = (API.unmap_input_resource)(self.encoder, p.map);
-                }
-                let _ = (API.unregister_resource)(self.encoder, p.reg);
-            }
-            for &bs in &self.bitstreams {
-                let _ = (API.destroy_bitstream_buffer)(self.encoder, bs);
-            }
-            let _ = (API.destroy_encoder)(self.encoder);
-        }
+        unsafe { self.teardown() };
     }
 }

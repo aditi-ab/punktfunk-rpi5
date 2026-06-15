@@ -603,7 +603,7 @@ mod kwin;
 #[cfg(target_os = "linux")]
 mod mutter;
 #[cfg(target_os = "windows")]
-mod sudovda;
+pub(crate) mod sudovda;
 #[cfg(target_os = "linux")]
 mod wlroots;
 
