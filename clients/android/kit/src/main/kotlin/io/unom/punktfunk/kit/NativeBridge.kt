@@ -27,7 +27,10 @@ object NativeBridge {
     /**
      * Connect, presenting [certPem]/[keyPem] (both empty = anonymous) and pinning [pinHex] (empty =
      * trust-on-first-use — read [nativeHostFingerprint] after; else 64-hex host SHA-256, mismatch →
-     * `0`). Returns an opaque session handle, or `0` on failure. Pair with exactly one [nativeClose].
+     * `0`). [width]/[height]/[refreshHz] are the requested virtual-output mode (the host streams at
+     * exactly this); [bitrateKbps] 0 = host default; [compositorPref]/[gamepadPref] are the
+     * `CompositorPref`/`GamepadPref` wire bytes (0 = Auto). Returns an opaque session handle, or `0`
+     * on failure. Pair with exactly one [nativeClose].
      */
     external fun nativeConnect(
         host: String,
@@ -38,6 +41,9 @@ object NativeBridge {
         certPem: String,
         keyPem: String,
         pinHex: String,
+        bitrateKbps: Int,
+        compositorPref: Int,
+        gamepadPref: Int,
     ): Long
 
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */

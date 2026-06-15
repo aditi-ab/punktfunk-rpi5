@@ -137,11 +137,9 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** Scaffold mode requested from the host (WxH@Hz). TODO: derive from the display. */
-private val REQUEST_MODE = Triple(1280, 720, 60)
-
 private sealed interface Screen {
     data object Connect : Screen
+    data object Settings : Screen
     data class Stream(val handle: Long) : Screen
 }
 
@@ -163,15 +161,27 @@ private data class PendingTrust(
 
 @Composable
 private fun App() {
+    val context = LocalContext.current
+    val settingsStore = remember { SettingsStore(context) }
+    var settings by remember { mutableStateOf(settingsStore.load()) }
     var screen by remember { mutableStateOf<Screen>(Screen.Connect) }
     when (val s = screen) {
-        Screen.Connect -> ConnectScreen(onConnected = { handle -> screen = Screen.Stream(handle) })
+        Screen.Connect -> ConnectScreen(
+            settings = settings,
+            onConnected = { handle -> screen = Screen.Stream(handle) },
+            onOpenSettings = { screen = Screen.Settings },
+        )
+        Screen.Settings -> SettingsScreen(
+            initial = settings,
+            onChange = { settings = it; settingsStore.save(it) },
+            onBack = { screen = Screen.Connect },
+        )
         is Screen.Stream -> StreamScreen(s.handle, onDisconnect = { screen = Screen.Connect })
     }
 }
 
 @Composable
-private fun ConnectScreen(onConnected: (Long) -> Unit) {
+private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit, onOpenSettings: () -> Unit) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var host by remember { mutableStateOf("") }
@@ -179,7 +189,8 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
     var connecting by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
     val abi = remember { runCatching { NativeBridge.abiVersion() }.getOrDefault(-1) }
-    val (w, h, hz) = REQUEST_MODE
+    // The host streams at exactly this mode; "Native" settings resolve from the device display.
+    val (w, h, hz) = settings.effectiveMode(context)
 
     // mDNS discovery scoped to this screen; NsdManager callbacks arrive on the main thread, so the
     // onChange callback can set Compose state directly. (Emulator SLIRP drops multicast → empty.)
@@ -225,6 +236,7 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
                 NativeBridge.nativeConnect(
                     targetHost, targetPort, w, h, hz,
                     id.certPem, id.privateKeyPem, pinHex ?: "",
+                    settings.bitrateKbps, settings.compositor, settings.gamepad,
                 )
             }
             connecting = false
@@ -311,6 +323,7 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
             enabled = !connecting && host.isNotBlank() && port.isNotBlank(),
             onClick = { connect(host.trim(), port.toInt()) },
         ) { Text(if (connecting) "Connecting…" else "Connect  ($w×$h@$hz)") }
+        TextButton(enabled = !connecting, onClick = onOpenSettings) { Text("Settings") }
         status?.let {
             Spacer(Modifier.height(12.dp))
             Text(it, style = MaterialTheme.typography.bodySmall)

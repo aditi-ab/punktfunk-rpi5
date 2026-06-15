@@ -109,9 +109,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIde
     }
 }
 
-/// `NativeBridge.nativeConnect(host, port, w, h, hz, certPem, keyPem, pinHex): Long`. `certPem`/
-/// `keyPem` empty = anonymous, else presented as the persistent identity. `pinHex` empty = TOFU
-/// (read `nativeHostFingerprint` after), else 64-hex SHA-256 to pin the host (mismatch → 0).
+/// `NativeBridge.nativeConnect(host, port, w, h, hz, certPem, keyPem, pinHex, bitrateKbps,
+/// compositorPref, gamepadPref): Long`. `certPem`/`keyPem` empty = anonymous, else presented as the
+/// persistent identity. `pinHex` empty = TOFU (read `nativeHostFingerprint` after), else 64-hex
+/// SHA-256 to pin the host (mismatch → 0). `bitrateKbps` 0 = host default. `compositorPref`/
+/// `gamepadPref` are `CompositorPref`/`GamepadPref` wire bytes (0 = Auto; unknown → Auto).
 /// Returns an opaque handle, or 0 on failure (logged).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
@@ -126,6 +128,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     cert_pem: JString<'local>,
     key_pem: JString<'local>,
     pin_hex: JString<'local>,
+    bitrate_kbps: jint,
+    compositor_pref: jint,
+    gamepad_pref: jint,
 ) -> jlong {
     let host: String = match env.get_string(&host) {
         Ok(s) => s.into(),
@@ -163,12 +168,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         &host,
         port as u16,
         mode,
-        CompositorPref::Auto,
-        GamepadPref::Auto,
-        0,        // bitrate_kbps: host default
-        None,     // launch: default app
-        pin,      // Some → Crypto on host-fp mismatch
-        identity, // owned (cert, key) PEM, or None (anonymous)
+        CompositorPref::from_u8(compositor_pref.clamp(0, u8::MAX as jint) as u8),
+        GamepadPref::from_u8(gamepad_pref.clamp(0, u8::MAX as jint) as u8),
+        bitrate_kbps.max(0) as u32, // 0 = host default
+        None,                       // launch: default app
+        pin,                        // Some → Crypto on host-fp mismatch
+        identity,                   // owned (cert, key) PEM, or None (anonymous)
         Duration::from_secs(10),
     ) {
         Ok(client) => {
