@@ -137,7 +137,8 @@ private fun StreamScreen(handle: Long, onDisconnect: () -> Unit) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onDispose {
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            // Leaving the stream: stop the decode thread and tear down the session.
+            // Leaving the stream: stop the audio + decode threads and tear down the session.
+            NativeBridge.nativeStopAudio(handle)
             NativeBridge.nativeStopVideo(handle)
             NativeBridge.nativeClose(handle)
         }
@@ -152,11 +153,13 @@ private fun StreamScreen(handle: Long, onDisconnect: () -> Unit) {
                 holder.addCallback(object : SurfaceHolder.Callback {
                     override fun surfaceCreated(holder: SurfaceHolder) {
                         NativeBridge.nativeStartVideo(handle, holder.surface)
+                        NativeBridge.nativeStartAudio(handle)
                     }
 
                     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
 
                     override fun surfaceDestroyed(holder: SurfaceHolder) {
+                        NativeBridge.nativeStopAudio(handle)
                         NativeBridge.nativeStopVideo(handle)
                     }
                 })

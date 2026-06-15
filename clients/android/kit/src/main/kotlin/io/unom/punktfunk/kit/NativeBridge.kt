@@ -37,4 +37,13 @@ object NativeBridge {
 
     /** Stop + join the decode thread without closing the session. No-op on `0`. */
     external fun nativeStopVideo(handle: Long)
+
+    /**
+     * Start host→client audio: Opus decode → jitter ring → AAudio (LowLatency), all in Rust. No-op
+     * if already started. Best-effort — a failure leaves video streaming.
+     */
+    external fun nativeStartAudio(handle: Long)
+
+    /** Stop + join the audio thread and close AAudio, without closing the session. No-op on `0`. */
+    external fun nativeStopAudio(handle: Long)
 }

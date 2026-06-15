@@ -56,14 +56,29 @@ fun registerCargoNdk(taskName: String, release: Boolean) =
         description = "cargo-ndk build of punktfunk-android (${if (release) "release" else "debug"})"
         workingDir = repoRoot
         val sdk = androidSdkDir()
-        // A GUI Android Studio launch does not source the login shell, so make cargo + the NDK
-        // discoverable explicitly (works the same from a bare CLI).
-        environment("PATH", cargoBin + File.pathSeparator + System.getenv("PATH"))
+        // A GUI Android Studio launch does not source the login shell, so make cargo, the NDK, and
+        // cmake (libopus builds via the cmake crate) discoverable explicitly — same as a bare CLI.
+        val cmakeBin = "$sdk/cmake/3.22.1/bin"
+        environment(
+            "PATH",
+            cargoBin + File.pathSeparator + cmakeBin + File.pathSeparator + System.getenv("PATH"),
+        )
         environment("ANDROID_HOME", sdk)
         environment("ANDROID_NDK_HOME", "$sdk/ndk/$ndkVer")
+        // CMake's built-in Android support (used by the cmake crate for libopus) finds the NDK via
+        // these, and uses Ninja (bundled next to the SDK cmake) since there's no `make`.
+        environment("ANDROID_NDK_ROOT", "$sdk/ndk/$ndkVer")
+        environment("ANDROID_NDK", "$sdk/ndk/$ndkVer")
+        environment("CMAKE_GENERATOR", "Ninja")
+        // audiopus_sys picks static-vs-dynamic by HOST not target — force the bundled static libopus
+        // (pure C) so the android .so links it instead of looking for the host's libopus.so.
+        environment("LIBOPUS_STATIC", "1")
+        environment("LIBOPUS_NO_PKG", "1")
         val cmd = mutableListOf(
             "cargo", "ndk",
             "-t", "arm64-v8a", "-t", "x86_64",
+            // Link against the minSdk-31 sysroot so libaaudio (API 26+) is found.
+            "--platform", "31",
             "-o", file("src/main/jniLibs").absolutePath,
             "build", "-p", "punktfunk-android",
         )

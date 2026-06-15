@@ -28,6 +28,8 @@ pub(crate) struct SessionHandle {
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub client: Arc<NativeClient>,
     video: Mutex<Option<VideoThread>>,
+    #[cfg(target_os = "android")]
+    audio: Mutex<Option<crate::audio::AudioPlayback>>,
 }
 
 struct VideoThread {
@@ -45,11 +47,20 @@ impl SessionHandle {
             }
         }
     }
+
+    /// Stop + close audio playback. Dropping the [`crate::audio::AudioPlayback`] joins its decode
+    /// thread and closes the AAudio stream. Idempotent.
+    #[cfg(target_os = "android")]
+    fn stop_audio(&self) {
+        let _ = self.audio.lock().unwrap().take();
+    }
 }
 
 impl Drop for SessionHandle {
     fn drop(&mut self) {
         self.stop_video();
+        #[cfg(target_os = "android")]
+        self.stop_audio();
     }
 }
 
@@ -90,6 +101,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
             let handle = SessionHandle {
                 client: Arc::new(client),
                 video: Mutex::new(None),
+                #[cfg(target_os = "android")]
+                audio: Mutex::new(None),
             };
             Box::into_raw(Box::new(handle)) as jlong
         }
@@ -173,5 +186,45 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
         // SAFETY: live handle per the contract.
         let h = unsafe { &*(handle as *const SessionHandle) };
         h.stop_video();
+    }
+}
+
+/// `NativeBridge.nativeStartAudio(handle)` — start the Opus→AAudio playback thread. No-op if already
+/// started or on a `0` handle. Best-effort: a failure leaves video streaming.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let mut guard = h.audio.lock().unwrap();
+    if guard.is_some() {
+        return; // already playing
+    }
+    match crate::audio::AudioPlayback::start(h.client.clone()) {
+        Some(p) => *guard = Some(p),
+        None => log::error!("nativeStartAudio: playback init failed (video unaffected)"),
+    }
+}
+
+/// `NativeBridge.nativeStopAudio(handle)` — stop + join the audio thread and close AAudio (without
+/// closing the session). No-op on `0`.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    if handle != 0 {
+        // SAFETY: live handle per the contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        h.stop_audio();
     }
 }

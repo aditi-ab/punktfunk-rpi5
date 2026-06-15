@@ -2547,6 +2547,7 @@ dependencies = [
  "jni",
  "log",
  "ndk",
+ "opus",
  "punktfunk-core",
 ]
 

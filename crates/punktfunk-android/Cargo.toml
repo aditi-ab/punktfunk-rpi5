@@ -25,7 +25,11 @@ log = "0.4"
 # `ndk` and Oboe/Opus audio later) is only pulled in for the real `*-linux-android` targets.
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.14"
-# NDK bindings for the per-frame video path: AMediaCodec (HEVC hardware decode) + ANativeWindow
-# (the SurfaceView surface). Links libmediandk/libnativewindow. Decode runs entirely in Rust — no
-# per-frame JNI crossing (the "no async / native threads on the hot path" invariant).
-ndk = { version = "0.9", features = ["media"] }
+# NDK bindings. "media" = AMediaCodec/ANativeWindow (video); "audio" = AAudio (audio playback).
+# Pure-Rust FFI to libmediandk/libnativewindow/libaaudio — no C++/libc++_shared to bundle. Decode +
+# audio run entirely in Rust on native threads (the "no async on the hot path" invariant).
+ndk = { version = "0.9", features = ["media", "audio"] }
+# Opus decode for the host→client audio plane (0xC9: 48 kHz stereo, 5 ms frames). Same crate the
+# host + Linux client use. audiopus_sys vendors libopus (pure C) and builds it static via cmake —
+# the cargo-ndk build sets LIBOPUS_STATIC=1/LIBOPUS_NO_PKG=1 so it links the bundled lib, not the host's.
+opus = "0.3"
