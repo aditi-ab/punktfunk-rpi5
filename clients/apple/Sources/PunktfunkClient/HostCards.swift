@@ -110,7 +110,9 @@ struct HostCardView: View {
                 Button("Browse Library…", action: onBrowseLibrary)
             }
             if host.pinnedSHA256 != nil {
-                Button("Forget Identity", action: onForget)
+                // Dropping the pin does NOT downgrade to TOFU: the next connect must re-pair via
+                // PIN (unless the host advertises pair=optional). Wording reflects that.
+                Button("Forget Identity (re-pair to reconnect)", action: onForget)
             }
             Button("Remove", role: .destructive, action: onRemove)
         }

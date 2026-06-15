@@ -145,13 +145,17 @@ private sealed interface Screen {
     data class Stream(val handle: Long) : Screen
 }
 
-/** A trust decision awaiting the user before a connect proceeds. [hostId] is the PinStore key. */
+/**
+ * A trust decision awaiting the user before a connect proceeds. [hostId] is the PinStore key.
+ * Trust-on-first-use ([Kind.TRUST_NEW]) is only ever offered when the host ADVERTISED pair=optional;
+ * a pair=required host or a manually-typed/unknown-policy host goes straight to PIN pairing
+ * ([Kind.PAIR]), and a changed fingerprint forces re-pairing — never a silent re-trust shortcut.
+ */
 private data class PendingTrust(
     val host: String,
     val port: Int,
     val hostId: String,
     val advertisedFp: String?,
-    val pairingRequired: Boolean,
     val kind: Kind,
 ) {
     enum class Kind { TRUST_NEW, FP_CHANGED, PAIR }
@@ -237,32 +241,28 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
         }
     }
 
-    // Decide TOFU vs pinned vs pairing before connecting.
+    // Decide pinned-reconnect vs fp-changed vs TOFU vs PIN pairing before connecting. Trust-on-
+    // first-use is permitted ONLY when the host advertised pair=optional (dh.pairingRequired ==
+    // false); a pair=required host, or a manually-typed/unknown-policy host (dh == null), must pair
+    // by PIN — we never trust an unverified cert on faith.
     fun connect(targetHost: String, targetPort: Int, dh: DiscoveredHost? = null) {
         val hostId = hostIdFor(targetHost, targetPort, dh)
         val stored = pinStore.get(hostId)
-        val pairingReq = dh?.pairingRequired ?: false
+        val adv = dh?.fingerprint?.lowercase()
         when {
-            stored != null -> {
-                val adv = dh?.fingerprint?.lowercase()
-                if (adv != null && adv != stored) {
-                    // Advertised fp no longer matches the pin — host reinstall, or an impostor.
-                    pendingTrust = PendingTrust(
-                        targetHost, targetPort, hostId, adv, pairingReq, PendingTrust.Kind.FP_CHANGED,
-                    )
-                } else {
-                    doConnect(targetHost, targetPort, hostId, stored)
-                }
-            }
-            // Never trusted + host requires pairing → TOFU can't pass the gate; go straight to PIN.
-            pairingReq -> pendingTrust = PendingTrust(
-                // pairingReq true ⇒ dh != null (smart-cast), so the fp is the advertised one.
-                targetHost, targetPort, hostId, dh.fingerprint, true, PendingTrust.Kind.PAIR,
-            )
-            // Never trusted, TOFU allowed → confirm trust first.
-            else -> pendingTrust = PendingTrust(
-                targetHost, targetPort, hostId, dh?.fingerprint, false, PendingTrust.Kind.TRUST_NEW,
-            )
+            // Known host whose advertised fp still matches the pin → silent pinned reconnect.
+            stored != null && (adv == null || adv == stored) ->
+                doConnect(targetHost, targetPort, hostId, stored)
+            // Known host whose fp changed → force re-pairing (no silent re-trust shortcut).
+            stored != null -> pendingTrust =
+                PendingTrust(targetHost, targetPort, hostId, adv, PendingTrust.Kind.FP_CHANGED)
+            // Host explicitly advertised pair=optional → trust-on-first-use is permitted (offer it,
+            // clearly labeled, alongside PIN pairing). Smart-cast: this branch ⇒ dh != null.
+            dh?.pairingRequired == false -> pendingTrust =
+                PendingTrust(targetHost, targetPort, hostId, dh.fingerprint, PendingTrust.Kind.TRUST_NEW)
+            // pair=required, or a manual/unknown-policy host → PIN pairing is mandatory.
+            else -> pendingTrust =
+                PendingTrust(targetHost, targetPort, hostId, adv, PendingTrust.Kind.PAIR)
         }
     }
 
@@ -328,7 +328,10 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
                     Column {
                         Text("First connection to ${pt.host}:${pt.port}.")
                         pt.advertisedFp?.let { Text("Fingerprint ${it.take(16)}…") }
-                        Text("Pairing with a PIN is stronger — it verifies both sides.")
+                        Text(
+                            "This host allows trust-on-first-use, but that can't tell an impostor " +
+                                "from the real host. Pairing with a PIN is stronger — it proves both sides.",
+                        )
                     }
                 },
                 confirmButton = {
@@ -351,22 +354,15 @@ private fun ConnectScreen(onConnected: (Long) -> Unit) {
                 text = {
                     Text(
                         "The pinned fingerprint for ${pt.host} no longer matches what it now " +
-                            "advertises. This can mean a host reinstall — or an impostor. Re-pair, " +
-                            "or forget the saved fingerprint to trust the new one.",
+                            "advertises. This can mean a host reinstall — or an impostor. Re-pair " +
+                            "with the host's PIN to continue.",
                     )
                 },
                 confirmButton = {
                     TextButton({ pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) }) { Text("Re-pair") }
                 },
                 dismissButton = {
-                    Row {
-                        TextButton({
-                            pinStore.remove(pt.hostId)
-                            pendingTrust = null
-                            doConnect(pt.host, pt.port, pt.hostId, null)
-                        }) { Text("Forget & re-TOFU") }
-                        TextButton({ pendingTrust = null }) { Text("Cancel") }
-                    }
+                    TextButton({ pendingTrust = null }) { Text("Cancel") }
                 },
             )
             PendingTrust.Kind.PAIR -> {
@@ -442,8 +438,8 @@ private fun DiscoveredHostRow(dh: DiscoveredHost, enabled: Boolean, onTap: () ->
     ) {
         Column(Modifier.padding(12.dp)) {
             Text(dh.name, style = MaterialTheme.typography.bodyLarge)
-            val pairing = if (dh.pairingRequired) "pairing required" else "TOFU"
-            Text("${dh.host}:${dh.port} · $pairing", style = MaterialTheme.typography.bodySmall)
+            val trust = if (dh.pairingRequired) "PIN pairing" else "PIN or trust-on-first-use"
+            Text("${dh.host}:${dh.port} · $trust", style = MaterialTheme.typography.bodySmall)
             dh.fingerprint?.let { fp ->
                 Text("fp ${fp.take(16)}…", style = MaterialTheme.typography.labelSmall)
             }

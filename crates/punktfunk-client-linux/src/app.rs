@@ -44,7 +44,10 @@ pub fn run() -> glib::ExitCode {
 }
 
 /// `--connect host[:port]` — skip the hosts page and start a session immediately
-/// (scripting + headless testing; trust follows the same known-hosts/TOFU rules).
+/// (scripting + headless testing). Trust follows the same rules as a manual entry: a host
+/// already pinned at this address connects silently on its stored pin; an unknown host is
+/// routed to the PIN ceremony (never a silent TOFU connect — `fp_hex`/`pair_optional` are
+/// unset, so `initiate_connect`'s manual arm mandates pairing).
 fn cli_connect_request() -> Option<ConnectRequest> {
     let args: Vec<String> = std::env::args().collect();
     let target = args
@@ -61,7 +64,7 @@ fn cli_connect_request() -> Option<ConnectRequest> {
         addr,
         port,
         fp_hex: None,
-        pair_required: false,
+        pair_optional: false,
     })
 }
 
@@ -119,10 +122,18 @@ fn build_ui(gtk_app: &adw::Application) {
     }
 }
 
-/// The trust gate in front of every connect. Discovered hosts carry their fingerprint in
-/// the mDNS advert, so trust is decided *before* any traffic: known → pinned connect;
-/// unknown → TOFU prompt (or straight to pairing when the host requires it). Manual
-/// entries have no advance fingerprint: trust on first use, pin from then on.
+/// The trust gate in front of every connect. The host is the policy authority (it
+/// advertises `pair=optional` only when it accepts unpaired clients); the client renders
+/// its trust UI from that:
+///   1. PINNED RECONNECT — a host already pinned to this exact fingerprint connects silently.
+///   2. FINGERPRINT CHANGED — a host we know at this address but whose fingerprint no longer
+///      matches is the impostor signal: force re-pairing via the PIN ceremony, regardless of
+///      the advertised policy.
+///   3. NEW host — TOFU is offered only when the host advertised `pair=optional` (rule 3a);
+///      otherwise (pair=required, unknown/empty policy, or a manual entry) PIN pairing is
+///      mandatory (rule 3b).
+///
+/// A new host is never auto-connected without a stored pin or an explicit trust decision.
 fn initiate_connect(app: Rc<App>, req: ConnectRequest) {
     if app.busy.get() {
         return;
@@ -131,19 +142,31 @@ fn initiate_connect(app: Rc<App>, req: ConnectRequest) {
     match &req.fp_hex {
         Some(fp_hex) => {
             if known.find_by_fp(fp_hex).is_some() {
+                // Rule 1: pinned fingerprint matches — silent connect.
                 start_session(app, req.clone(), crate::trust::parse_hex32(fp_hex));
-            } else if req.pair_required {
-                // TOFU alone won't pass the host's gate — go straight to the ceremony.
+            } else if known.find_by_addr(&req.addr, req.port).is_some() {
+                // Rule 2: we trust a host at this address but the fingerprint changed —
+                // the impostor signal. Re-pair via the PIN ceremony (no TOFU shortcut).
+                app.toast("Host fingerprint changed — re-pair with a PIN to continue");
                 pin_dialog(app, req);
-            } else {
+            } else if req.pair_optional {
+                // Rule 3a: the host opted into reduced-security TOFU; offer it alongside PIN.
                 tofu_dialog(app, req);
+            } else {
+                // Rule 3b: pair=required or unknown policy — PIN pairing is mandatory.
+                pin_dialog(app, req);
             }
         }
         None => {
-            let pin = known
+            // Manual entry (no advertised fingerprint). A known address connects silently
+            // on its stored pin (rule 1); an unknown one must pair — never silent TOFU.
+            match known
                 .find_by_addr(&req.addr, req.port)
-                .and_then(|k| crate::trust::parse_hex32(&k.fp_hex));
-            start_session(app, req, pin);
+                .and_then(|k| crate::trust::parse_hex32(&k.fp_hex))
+            {
+                Some(pin) => start_session(app, req, Some(pin)),
+                None => pin_dialog(app, req), // rule 3b
+            }
         }
     }
 }
@@ -457,10 +480,21 @@ fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
                         p.update_stats(s);
                     }
                 }
-                SessionEvent::Failed(msg) => {
-                    tracing::warn!(%msg, "connect failed");
-                    app.toast(&msg);
+                SessionEvent::Failed {
+                    msg,
+                    trust_rejected,
+                } => {
+                    tracing::warn!(%msg, trust_rejected, "connect failed");
                     app.busy.set(false);
+                    // A pinned connect rejected on trust grounds means the host's cert no
+                    // longer matches the stored pin (rotated cert or impostor) — route to
+                    // the PIN ceremony to re-establish trust rather than dead-ending.
+                    if trust_rejected && !tofu {
+                        app.toast("Host fingerprint changed — re-pair with a PIN to continue");
+                        pin_dialog(app.clone(), req.clone());
+                    } else {
+                        app.toast(&msg);
+                    }
                     break;
                 }
                 SessionEvent::Ended(err) => {

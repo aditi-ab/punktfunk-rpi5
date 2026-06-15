@@ -27,6 +27,10 @@ public struct DiscoveredHost: Identifiable, Sendable, Equatable {
     public let fingerprintHex: String?
     /// The host advertised `pair=required` — a client must pair before it can stream.
     public let requiresPairing: Bool
+    /// The host EXPLICITLY advertised `pair=optional` — only then may the client offer the
+    /// reduced-security TOFU "Trust" path. A missing/unknown `pair` field is NOT optional:
+    /// pairing is mandatory unless this is true (the policy authority is the host's advert).
+    public let allowsTofu: Bool
 }
 
 @MainActor
@@ -124,7 +128,8 @@ public final class HostDiscovery: ObservableObject {
                         self.resolved[key] = DiscoveredHost(
                             id: (id?.isEmpty == false) ? id! : name,
                             name: name, host: address, port: port.rawValue,
-                            fingerprintHex: fp, requiresPairing: pair == "required")
+                            fingerprintHex: fp, requiresPairing: pair == "required",
+                            allowsTofu: pair == "optional")
                         self.publish()
                     }
                     conn.cancel()

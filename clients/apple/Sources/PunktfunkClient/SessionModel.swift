@@ -83,11 +83,18 @@ final class SessionModel: ObservableObject {
 
     var isBusy: Bool { phase != .idle }
 
+    /// `allowTofu` gates the trust-on-first-use prompt for an unpinned host: it is only true
+    /// when the host EXPLICITLY advertised `pair=optional` (rule 3a). For any other unpinned host
+    /// — `pair=required`, a manually-typed host, or a discovered host with no/unknown `pair`
+    /// field — TOFU is forbidden (rule 3b): the connect refuses rather than offering trust, and
+    /// the user is routed to PIN pairing by the caller. (A pinned host connects regardless: its
+    /// stored fingerprint is the trust decision.)
     func connect(to host: StoredHost, width: UInt32, height: UInt32, hz: UInt32,
                  compositor: PunktfunkConnection.Compositor = .auto,
                  gamepad: PunktfunkConnection.GamepadType = .auto,
                  bitrateKbps: UInt32 = 0,
                  launchID: String? = nil,
+                 allowTofu: Bool = false,
                  autoTrust: Bool = false) {
         guard phase == .idle else { return }
         phase = .connecting
@@ -118,12 +125,24 @@ final class SessionModel: ObservableObject {
                 }
                 switch result {
                 case .success(let conn):
-                    self.connection = conn
-                    self.startStatsTimer()
                     if pin != nil || autoTrust {
+                        self.connection = conn
+                        self.startStatsTimer()
                         self.beginStreaming()
-                    } else {
+                    } else if allowTofu {
+                        // Host advertised pair=optional — offer the reduced-security TOFU prompt
+                        // over the live (blurred) stream (rule 3a).
+                        self.connection = conn
+                        self.startStatsTimer()
                         self.phase = .awaitingTrust(fingerprint: conn.hostFingerprint)
+                    } else {
+                        // Unpinned and TOFU not permitted (rule 3b): never let this silently
+                        // become trustable. Drop the connection; the caller routes to pairing.
+                        Task.detached { conn.close() } // joins Rust threads — off-main
+                        self.phase = .idle
+                        self.activeHost = nil
+                        self.errorMessage = "\(host.displayName) is not paired yet. "
+                            + "Pair with its PIN before streaming."
                     }
                 case .failure:
                     self.phase = .idle

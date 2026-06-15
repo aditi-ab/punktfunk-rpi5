@@ -86,8 +86,9 @@ final class HostStore: ObservableObject {
         hosts[i].pinnedSHA256 = fingerprint
     }
 
-    /// Drop the pinned identity (e.g. after a legitimate host reinstall) — the next
-    /// connect goes through the trust prompt again.
+    /// Drop the pinned identity (e.g. after a legitimate host reinstall). This does NOT downgrade
+    /// to TOFU: the next connect re-pairs via the PIN ceremony, unless the host advertises
+    /// `pair=optional` (the only case the connect path still offers the trust prompt).
     func forgetIdentity(_ host: StoredHost) {
         guard let i = hosts.firstIndex(where: { $0.id == host.id }) else { return }
         hosts[i].pinnedSHA256 = nil

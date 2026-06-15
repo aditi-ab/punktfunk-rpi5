@@ -184,8 +184,13 @@ fn real_main() -> Result<()> {
                 max_concurrent: get("--max-concurrent")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(m3::DEFAULT_MAX_CONCURRENT),
-                require_pairing: args.iter().any(|a| a == "--require-pairing"),
-                allow_pairing: args.iter().any(|a| a == "--allow-pairing"),
+                // Secure by default: REQUIRE PIN pairing (reject unpaired clients) unless
+                // --allow-tofu opts into trust-on-first-use — the host then accepts unpaired
+                // clients and advertises pair=optional. Pairing is always armed so a PIN is
+                // available (logged at startup); `--require-pairing`/`--allow-pairing` are now
+                // the default and accepted as no-ops for back-compat.
+                require_pairing: !args.iter().any(|a| a == "--allow-tofu"),
+                allow_pairing: true,
                 pairing_pin: None,
                 paired_store: None,
             })
@@ -446,9 +451,10 @@ M3-HOST OPTIONS:
     --max-sessions <N>           exit after N sessions; 0 = serve forever (default: 0)
     --max-concurrent <N>         stream at most N sessions at once (NVENC bound); overflow waits
                                  in the accept queue; 0 = unlimited (default: 4)
-    --allow-pairing              accept PIN pairing ceremonies (arm pairing mode)
-    --require-pairing            only serve PIN-paired clients (implies --allow-pairing;
-                                 the host logs a 4-digit PIN when a client starts pairing)
+    --allow-tofu                 also accept UNPAIRED clients (trust-on-first-use) and advertise
+                                 pair=optional. Default: pairing REQUIRED — the host rejects
+                                 unpaired clients and logs a 4-digit pairing PIN at startup;
+                                 TOFU without pairing is insecure on a LAN
 
 M0 OPTIONS:
     --source <synthetic|portal|kwin-virtual>

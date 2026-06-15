@@ -37,12 +37,16 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   0xC8 (incl. **gamepads** — incremental events accumulated into the uinput xpad), **Opus
   audio** 0xC9 (48 kHz stereo, 5 ms, host→client), **rumble** 0xCA (host→client). **Trust:**
   host serves its persistent identity (`~/.config/punktfunk/cert.pem`, shared with GameStream
-  pairing) and logs the SHA-256 fingerprint; clients pin it (TOFU on first connect —
-  `endpoint::client_pinned`), and a **SPAKE2 PIN pairing ceremony** (host arms pairing and displays a
-  4-digit PIN; a PAKE binds both cert fingerprints so an attacker gets one online guess,
-  no offline dictionary attack) establishes mutual trust:
-  clients present persistent identities via QUIC client auth, the host stores paired
-  fingerprints (`punktfunk1-paired.json`) and can gate sessions with `--require-pairing`.
+  pairing) and logs the SHA-256 fingerprint; clients pin it, established by a **SPAKE2 PIN pairing
+  ceremony** (host arms pairing and displays a 4-digit PIN; a PAKE binds both cert fingerprints so an
+  attacker gets one online guess, no offline dictionary attack) — PIN pairing is the default for new
+  hosts. **TOFU on first connect** (`endpoint::client_pinned`) stays as an explicit host opt-in
+  (`m3-host --allow-tofu` / `serve --open`, advertised as `pair=optional`) for fully trusted LANs;
+  clients only offer the TOFU "Trust" path for a host that advertised `pair=optional`, route every
+  other new host straight to the PIN ceremony, and on a pinned-fingerprint change force re-pairing
+  (no re-TOFU shortcut). Clients present persistent identities via QUIC client auth, the host stores
+  paired fingerprints (`punktfunk1-paired.json`) and gates sessions with `--require-pairing` (the
+  default; `--allow-tofu`/`--open` accept unpaired clients).
   **LAN auto-discovery**: both `serve --native` and `m3-host` advertise the native service over
   mDNS (`_punktfunk._udp`, `crate::discovery`) with TXT `proto`/`fp`(cert fingerprint to
   pin)/`pair`(required|optional)/`id`; `punktfunk-client-rs --discover` lists hosts, Apple clients
@@ -114,9 +118,12 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
 3. **punktfunk/1 protocol growth**: concurrent sessions (today: one at a time, extras wait
    in the accept queue). **Done:** unified host (`serve --native` runs GameStream + the
    punktfunk/1 QUIC host in one process) with native pairing driven over the mgmt API /
-   web console (`mod native_pairing`: arm-on-demand → display PIN, paired-device list). Next
-   (see roadmap): **mandatory PIN pairing by default** (TOFU-without-pairing is insecure on a
-   LAN) + **delegated pairing approval** (an already-paired device approves a new one).
+   web console (`mod native_pairing`: arm-on-demand → display PIN, paired-device list).
+   **Done:** PIN pairing is the default, host-gated — the host requires pairing and advertises
+   `pair=required` unless opted out with `--allow-tofu`/`--open` (then `pair=optional`, accepts
+   unpaired clients); clients render TOFU only for a `pair=optional` host and force re-pairing on a
+   fingerprint change. Next (see roadmap): **delegated pairing approval** (an already-paired device
+   approves a new one).
 4. **M2 polish**: HDR/10-bit (needs HDR capture + metadata plumbing; `av1_nvenc
    -highbitdepth 1` already encodes Main10 from 8-bit input on this box),
    reconnect-at-new-mode robustness. AV1 negotiation and surround audio are implemented

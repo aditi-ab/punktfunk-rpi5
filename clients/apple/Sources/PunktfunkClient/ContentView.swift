@@ -181,7 +181,21 @@ struct ContentView: View {
 
     // MARK: - Connect
 
-    private func connect(_ host: StoredHost, launchID: String? = nil) {
+    private func connect(_ host: StoredHost, launchID: String? = nil, allowTofu: Bool? = nil) {
+        // A pinned host connects on its stored fingerprint; an unpinned host may only TOFU when
+        // the host's LIVE advert says `pair=optional` (rule 3a). When the caller doesn't already
+        // know the policy (a saved-card tap / manual entry), resolve it from the current mDNS set:
+        // an unpinned host with no matching `pair=optional` advert routes to PIN pairing instead
+        // of silently entering the trust prompt (rules 3b + 4). A pinned host ignores all of this.
+        if host.pinnedSHA256 == nil {
+            let tofuOK = allowTofu ?? discovery.hosts.contains {
+                host.matches($0) && $0.allowsTofu
+            }
+            if !tofuOK {
+                pairingTarget = host
+                return
+            }
+        }
         // The gamepad-type setting resolves NOW (Automatic → match the active physical
         // controller): the host's virtual pad backend is fixed per session.
         model.connect(
@@ -194,7 +208,8 @@ struct ContentView: View {
                 setting: PunktfunkConnection.GamepadType(
                     rawValue: UInt32(clamping: gamepadType)) ?? .auto),
             bitrateKbps: UInt32(clamping: bitrateKbps),
-            launchID: launchID)
+            launchID: launchID,
+            allowTofu: host.pinnedSHA256 == nil)
     }
 
     /// Picked a title in the (experimental) library: dismiss the browser and start a session that
@@ -205,16 +220,18 @@ struct ContentView: View {
     }
 
     /// Tap a discovered host: save it (so the session has a stored identity and the trust pin
-    /// persists), then connect — TOFU shows the fingerprint, which should match the advertised
-    /// `fp`. A `pair=required` host goes straight to the pairing ceremony instead.
+    /// persists), then connect or pair per the host's advertised policy. The host is the policy
+    /// authority — TOFU is offered ONLY when it explicitly advertised `pair=optional` (rule 3a);
+    /// a `pair=required` host, or one with no/unknown `pair` field, goes straight to the PIN
+    /// pairing ceremony (rule 3b). (A pinned discovered host connects silently inside `connect`.)
     private func connectDiscovered(_ d: DiscoveredHost) {
         guard !model.isBusy else { return }
         let host = StoredHost(name: d.name, address: d.host, port: d.port)
         store.add(host)
-        if d.requiresPairing {
-            pairingTarget = host
+        if d.allowsTofu {
+            connect(host, allowTofu: true)
         } else {
-            connect(host)
+            pairingTarget = host
         }
     }
 

@@ -34,8 +34,10 @@ with console access can admit a device.
 
 ## Pairing with a PIN
 
-The PIN ceremony is the other path — useful for the *first* device (before the console has admitted
-anything) or when you're at the client and the console isn't handy.
+PIN pairing is the **default and required** path for any new host: unless the host has explicitly
+opted into trust-on-first-use (see below), a client connecting to an unknown host must complete the
+PIN ceremony before it can stream. It's the right path for the *first* device (before the console has
+admitted anything) or when you're at the client and the console isn't handy.
 
 Pairing has to be **armed** on the host before a client can pair (so a random device can't pair
 itself). On the production host (`serve --native`), this is done from the **web console**: open the
@@ -57,14 +59,30 @@ By default, the native host **requires** pairing — only devices that have pair
 the right setting on a shared network: a device has to complete the PIN ceremony once before it can
 connect.
 
-If you're on a fully trusted single-user network and want to skip pairing, start the host with
-`serve --native --open` — but requiring pairing is strongly recommended.
+If you're on a fully trusted single-user network and want to skip pairing, run the host open with
+`serve --native --open` (or `m3-host --allow-tofu` for the standalone host) — it then advertises
+`pair=optional` and accepts unpaired clients. Requiring pairing is strongly recommended.
 
-## Trust-on-first-use
+## Trust-on-first-use (host opt-in)
 
-If a host *isn't* requiring pairing, a client connecting for the first time will show the host's
-fingerprint and ask you to confirm it (trust-on-first-use), then pin it. Pairing is the stronger path
-and the default; trust-on-first-use is a convenience for trusted setups.
+Trust-on-first-use (TOFU) is **off by default** and is an explicit *host* opt-in for fully trusted
+networks. A host enables it by running open — `m3-host --allow-tofu` or `serve --open` — which makes
+it advertise `pair=optional` over mDNS and accept unpaired clients. Only then does a client offer the
+TOFU path: connecting to such a host for the first time shows the host's fingerprint and asks you to
+confirm it (compare it with the one the host logged at startup), then pins it. The client presents
+this clearly as the reduced-security option, alongside **Pair with PIN**.
+
+> **Warning:** TOFU cannot detect an impostor on the first connection — if someone is impersonating
+> the host the very first time you connect, you'll pin the attacker's fingerprint. PIN pairing closes
+> that gap (the SPAKE2 ceremony binds both identities), which is why it's the default. Use TOFU only
+> on a network you fully trust.
+
+For every other case — a host advertising `pair=required` (the default), a host you typed in by hand,
+or a discovered host whose pair policy is unknown — TOFU is not offered and the client routes straight
+to the PIN ceremony.
+
+Once a host is pinned, a fingerprint change is treated as the impostor signal: the client forces
+re-pairing through the PIN ceremony rather than offering to re-trust the new identity.
 
 ## Managing paired devices
 

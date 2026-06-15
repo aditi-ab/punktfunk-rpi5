@@ -24,7 +24,9 @@ catalog, RTSP/ENet/audio, and **video at the client's exact resolution and refre
 per-session virtual output (KWin, gamescope, Mutter, Sway backends), encoded with GPU
 **zero-copy** (dmabuf → CUDA/Vulkan → NVENC) at up to 5120×1440@240. The native
 **`punktfunk/1`** protocol adds a QUIC control plane and a GF(2¹⁶) Leopard-FEC + AES-GCM data
-plane (p50 ~0.8 ms capture→reassembled at 720p120), with a SPAKE2 PIN pairing ceremony. Both
+plane (p50 ~0.8 ms capture→reassembled at 720p120). Its trust model is **SPAKE2 PIN pairing by
+default** — a new host requires the PIN ceremony; trust-on-first-use is an explicit host opt-in
+(`m3-host --allow-tofu` / `serve --open`, advertised as `pair=optional`) for fully trusted LANs. Both
 run from **one process** (`serve --native`), managed through a REST API + web console. Builds
 against FFmpeg 7 or 8; deployed live on Bazzite. Full status: [`CLAUDE.md`](CLAUDE.md);
 roadmap, setup guides & progress: the docs site ([`docs-site/`](docs-site) — Fumadocs;

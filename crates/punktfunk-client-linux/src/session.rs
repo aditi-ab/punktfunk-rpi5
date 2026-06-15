@@ -42,7 +42,13 @@ pub enum SessionEvent {
         mode: Mode,
         fingerprint: [u8; 32],
     },
-    Failed(String),
+    /// `trust_rejected` is set when the connect failed the TLS trust check (a `Crypto`
+    /// error): for a pinned connect this is the fingerprint-changed signal, so the UI can
+    /// offer a re-pair (PIN) path rather than a dead-end error.
+    Failed {
+        msg: String,
+        trust_rejected: bool,
+    },
     Ended(Option<String>),
     Stats(Stats),
 }
@@ -97,6 +103,7 @@ fn pump(
     ) {
         Ok(c) => Arc::new(c),
         Err(e) => {
+            let trust_rejected = matches!(e, PunktfunkError::Crypto);
             let msg = match e {
                 PunktfunkError::Crypto => {
                     "Host identity rejected — wrong fingerprint, or the host requires pairing"
@@ -105,7 +112,10 @@ fn pump(
                 PunktfunkError::Timeout => "Connection timed out".to_string(),
                 other => format!("Connect failed: {other:?}"),
             };
-            let _ = ev_tx.send_blocking(SessionEvent::Failed(msg));
+            let _ = ev_tx.send_blocking(SessionEvent::Failed {
+                msg,
+                trust_rejected,
+            });
             return;
         }
     };

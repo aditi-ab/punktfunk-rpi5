@@ -9,15 +9,17 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 /// What the user asked to connect to. `fp_hex` comes from the mDNS TXT record when the
-/// host was discovered (drives the TOFU prompt *before* connecting); manual entries have
-/// none and trust on first use.
+/// host was discovered (drives the trust decision *before* connecting); manual entries have
+/// none. `pair_optional` is true ONLY when a discovered host advertised `pair=optional`,
+/// which is the sole case in which the reduced-security TOFU path may be offered — every
+/// other case (pair=required, unknown/empty policy, manual entry) mandates PIN pairing.
 #[derive(Clone, Debug)]
 pub struct ConnectRequest {
     pub name: String,
     pub addr: String,
     pub port: u16,
     pub fp_hex: Option<String>,
-    pub pair_required: bool,
+    pub pair_optional: bool,
 }
 
 pub fn new(
@@ -80,7 +82,9 @@ pub fn new(
                                     addr: h.addr.clone(),
                                     port: h.port,
                                     fp_hex: (!h.fp_hex.is_empty()).then(|| h.fp_hex.clone()),
-                                    pair_required: h.pair == "required",
+                                    // TOFU is offered only when the host explicitly opts in
+                                    // with pair=optional; required/empty means mandatory PIN.
+                                    pair_optional: h.pair == "optional",
                                 });
                             }
                         });
@@ -119,7 +123,8 @@ pub fn new(
                 addr,
                 port,
                 fp_hex: None,
-                pair_required: false,
+                // Manual entry carries no advertised policy — never eligible for TOFU.
+                pair_optional: false,
             });
         }
     };
@@ -172,7 +177,9 @@ pub fn new(
                     addr: k.addr.clone(),
                     port: k.port,
                     fp_hex: Some(k.fp_hex.clone()),
-                    pair_required: false,
+                    // Saved host: its fp is already pinned, so this routes to a silent
+                    // pinned connect; TOFU eligibility is irrelevant.
+                    pair_optional: false,
                 };
                 let speed_btn = gtk::Button::from_icon_name("network-transmit-receive-symbolic");
                 speed_btn.set_tooltip_text(Some("Test network speed"));
