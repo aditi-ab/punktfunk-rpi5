@@ -3,7 +3,9 @@
 `punktfunk-host` is published as an RPM to **Gitea's RPM package registry** in the public `unom`
 org (group `bazzite`), so Bazzite / Fedora Atomic hosts layer and update it with `rpm-ostree`.
 CI (`.gitea/workflows/rpm.yml`) builds and publishes on every push to `main` (a rolling
-`0.0.1-0.ciN.<sha>` build) and on `v*` tags (a clean `X.Y.Z-1`). The RPM is built in the
+`0.2.0-0.ciN.<sha>` build, which outranks the stray `0.1.1` so `rpm-ostree upgrade` always gets the
+latest — no version pin needed) and on **host-scoped** `host-v*` tags (a clean `X.Y.Z-1`; the Apple
+client's `v*` tags deliberately do **not** publish a host RPM). The RPM is built in the
 Fedora 43 image (`ci/fedora-rpm.Dockerfile`) so its auto-generated library Requires
 (`libavcodec.so.NN`, …) match Bazzite's sonames; the NVIDIA driver lib (`libcuda.so.1`) is
 excluded — NVENC/EGL come from whatever NVIDIA stack the host runs (a weak Recommends).
@@ -37,8 +39,42 @@ systemctl reboot
 ```
 
 > If `rpm-ostree` can't complete the metadata GPG check non-interactively, set `repo_gpgcheck=0`
-> (TLS-only trust to the self-hosted registry). Proper per-package signing (`gpgcheck=1`) would
-> need a CI signing key + `rpm --addsign` — future hardening, not wired up.
+> (TLS-only trust to the self-hosted registry).
+
+## Enabling per-package signing (`gpgcheck=1`)
+
+CI is wired to GPG-sign each RPM (`packaging/rpm/sign-rpms.sh`, run from `rpm.yml`), but it's
+**dormant** until you provide a signing key — until then packages publish unsigned and the repo
+above uses `gpgcheck=0`. This is a self-hosted registry served over HTTPS with GPG-signed metadata
+(`repo_gpgcheck=1`), so per-package signing is hardening, not a correctness fix. (Note: this is a
+GPG/OpenPGP key — a `step-ca`/X.509 cert can't sign RPMs; step-ca is for the registry/console TLS.)
+
+One-time setup:
+
+```sh
+# 1. Generate a DEDICATED, passphrase-less signing key (separate from the Gitea registry key).
+gpg --batch --gen-key <<EOF
+%no-protection
+Key-Type: eddsa
+Key-Curve: ed25519
+Name-Real: punktfunk packages
+Name-Email: packages@unom.io
+Expire-Date: 0
+%commit
+EOF
+gpg --armor --export-secret-keys packages@unom.io   # -> paste into the CI secret below
+gpg --armor --export             packages@unom.io > RPM-GPG-KEY-punktfunk   # the PUBLIC key
+
+# 2. In the repo's Gitea Actions secrets, add RPM_GPG_PRIVATE_KEY = the armored PRIVATE key
+#    (and RPM_GPG_PASSPHRASE only if the key has one). The next CI run signs + self-verifies.
+
+# 3. Publish RPM-GPG-KEY-punktfunk where clients can fetch it, then on each host import it and
+#    flip the repo to gpgcheck=1:
+sudo rpm --import https://git.unom.io/.../RPM-GPG-KEY-punktfunk
+sudo sed -i 's/^gpgcheck=0/gpgcheck=1/' /etc/yum.repos.d/punktfunk.repo
+```
+
+Do **not** flip `gpgcheck=1` before a signed build has published, or installs will fail.
 
 After reboot, as the desktop user:
 

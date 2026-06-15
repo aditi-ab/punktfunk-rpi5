@@ -86,6 +86,12 @@ jobs:
         # globs it in; the host RPM Recommends it). Needs bun (ensured in Prep).
         run: PF_VERSION="$PF_VERSION" PF_RELEASE="$PF_RELEASE" PF_WITH_WEB=1 bash packaging/rpm/build-rpm.sh
 
+      - name: Sign RPMs (dormant until RPM_GPG_PRIVATE_KEY is set — see packaging/rpm/README.md)
+        env:
+          RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+          RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
+        run: bash packaging/rpm/sign-rpms.sh
+
       - name: Publish to the Gitea RPM registry
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
