@@ -298,8 +298,12 @@ fn gs_button_to_evdev(b: u32) -> Option<u32> {
 pub mod dualsense;
 #[cfg(target_os = "linux")]
 pub mod gamepad;
-/// Stub — virtual gamepads need Linux uinput; events are dropped elsewhere.
-#[cfg(not(target_os = "linux"))]
+/// Windows: virtual Xbox 360 pads via ViGEmBus.
+#[cfg(target_os = "windows")]
+#[path = "inject/gamepad_windows.rs"]
+pub mod gamepad;
+/// Stub — virtual gamepads need Linux uinput or Windows ViGEmBus; events are dropped elsewhere.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod gamepad {
     #[derive(Default)]
     pub struct GamepadManager;
