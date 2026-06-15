@@ -1,0 +1,230 @@
+//! Windows input injection via `SendInput` (Win32 KeyboardAndMouse) — the Windows analogue of
+//! [`super::wlr`]: absolute mouse normalized to the virtual desktop, relative mouse for games,
+//! scancode keyboard, scroll, buttons. The client already sends Windows VK codes, so there is no
+//! keycode table. Survives UAC/lock desktop switches by reattaching the thread to the current
+//! input desktop before each event (`OpenInputDesktop`/`SetThreadDesktop`).
+
+use anyhow::Result;
+use punktfunk_core::input::{InputEvent, InputKind};
+use std::mem::size_of;
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
+    HDESK,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    MapVirtualKeyExW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    VIRTUAL_KEY,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
+
+use super::InputInjector;
+
+const ABS_MAX: f64 = 65535.0; // SendInput absolute coords are 0..65535 over the chosen surface.
+const GENERIC_ALL: u32 = 0x1000_0000;
+const XBUTTON1: u32 = 0x0001;
+const XBUTTON2: u32 = 0x0002;
+
+pub struct SendInputInjector {
+    desktop: Option<HDESK>,
+}
+
+// Only ever used from the host's single injector thread (like SudoVdaDisplay).
+unsafe impl Send for SendInputInjector {}
+
+impl SendInputInjector {
+    pub fn open() -> Result<Self> {
+        let mut me = Self { desktop: None };
+        me.reattach_input_desktop(); // best-effort
+        tracing::info!("SendInput injector ready (Win32 KeyboardAndMouse)");
+        Ok(me)
+    }
+
+    /// Bind this thread to the desktop currently receiving input. UAC / lock screen / Ctrl-Alt-Del
+    /// swap the input desktop; `SendInput` silently no-ops unless our thread is on it.
+    fn reattach_input_desktop(&mut self) {
+        unsafe {
+            match OpenInputDesktop(
+                DESKTOP_CONTROL_FLAGS(0),
+                false,
+                DESKTOP_ACCESS_FLAGS(GENERIC_ALL),
+            ) {
+                Ok(h) => {
+                    if SetThreadDesktop(h).is_ok() {
+                        if let Some(old) = self.desktop.replace(h) {
+                            let _ = CloseDesktop(old);
+                        }
+                    } else {
+                        let _ = CloseDesktop(h);
+                    }
+                }
+                Err(_) => { /* not privileged enough for the secure desktop; stay put */ }
+            }
+        }
+    }
+
+    fn send(inputs: &[INPUT]) -> Result<()> {
+        let n = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+        if n as usize != inputs.len() {
+            // 0 = blocked (different/secure desktop). Surface as Err so the host service drops +
+            // reopens the injector (which reattaches the input desktop).
+            anyhow::bail!("SendInput injected {n}/{} events (blocked desktop?)", inputs.len());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SendInputInjector {
+    fn drop(&mut self) {
+        if let Some(h) = self.desktop.take() {
+            unsafe {
+                let _ = CloseDesktop(h);
+            }
+        }
+    }
+}
+
+impl InputInjector for SendInputInjector {
+    fn inject(&mut self, event: &InputEvent) -> Result<()> {
+        self.reattach_input_desktop();
+        match event.kind {
+            InputKind::MouseMove => {
+                let mi = MOUSEINPUT {
+                    dx: event.x,
+                    dy: event.y,
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                };
+                Self::send(&[mouse(mi)])
+            }
+            InputKind::MouseMoveAbs => {
+                let w = (event.flags >> 16) & 0xffff;
+                let h = event.flags & 0xffff;
+                if w == 0 || h == 0 {
+                    return Ok(()); // contract: drop zero extent
+                }
+                let (_vx, _vy, vw, vh) = virtual_desktop_rect();
+                // One virtual output spanning the virtual desktop: map client (0..w,0..h) -> 0..65535.
+                let cx = (event.x.clamp(0, w as i32)) as f64 / w as f64;
+                let cy = (event.y.clamp(0, h as i32)) as f64 / h as f64;
+                let ax = (cx * ABS_MAX).round() as i32;
+                let ay = (cy * ABS_MAX).round() as i32;
+                let _ = (vw, vh); // virtual-desktop rect reserved for multi-output mapping
+                let mi = MOUSEINPUT {
+                    dx: ax,
+                    dy: ay,
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    time: 0,
+                    dwExtraInfo: 0,
+                };
+                Self::send(&[mouse(mi)])
+            }
+            InputKind::MouseButtonDown | InputKind::MouseButtonUp => {
+                let down = event.kind == InputKind::MouseButtonDown;
+                let (flag, data) = match event.code {
+                    1 => (if down { MOUSEEVENTF_LEFTDOWN } else { MOUSEEVENTF_LEFTUP }, 0u32),
+                    2 => (if down { MOUSEEVENTF_MIDDLEDOWN } else { MOUSEEVENTF_MIDDLEUP }, 0),
+                    3 => (if down { MOUSEEVENTF_RIGHTDOWN } else { MOUSEEVENTF_RIGHTUP }, 0),
+                    4 => (if down { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP }, XBUTTON1),
+                    5 => (if down { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP }, XBUTTON2),
+                    _ => return Ok(()),
+                };
+                let mi = MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: data,
+                    dwFlags: flag,
+                    time: 0,
+                    dwExtraInfo: 0,
+                };
+                Self::send(&[mouse(mi)])
+            }
+            InputKind::MouseScroll => {
+                // GameStream WHEEL_DELTA(120) units. Windows WHEEL positive=up (matches GameStream —
+                // no flip, unlike Wayland); HWHEEL positive=right (matches). x is 120-scaled already.
+                let horizontal = event.code == 1;
+                let mi = MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: event.x as u32, // signed wheel delta reinterpreted as DWORD
+                    dwFlags: if horizontal { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL },
+                    time: 0,
+                    dwExtraInfo: 0,
+                };
+                Self::send(&[mouse(mi)])
+            }
+            InputKind::KeyDown | InputKind::KeyUp => {
+                let down = event.kind == InputKind::KeyDown;
+                let vk = (event.code & 0xff) as u16; // client sends Windows VK
+                let sc_ex = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, None) };
+                if sc_ex == 0 {
+                    return Ok(()); // unmappable -> drop
+                }
+                let extended = (sc_ex & 0xe000) == 0xe000 || forced_extended(vk);
+                let scan = (sc_ex & 0xff) as u16;
+                let mut flags = KEYEVENTF_SCANCODE;
+                if extended {
+                    flags = flags | KEYEVENTF_EXTENDEDKEY;
+                }
+                if !down {
+                    flags = flags | KEYEVENTF_KEYUP;
+                }
+                let ki = KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: scan,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                };
+                Self::send(&[key(ki)])
+            }
+            // Gamepad goes through ViGEm (separate backend). Touch: no SendInput equivalent -> no-op.
+            InputKind::GamepadButton
+            | InputKind::GamepadAxis
+            | InputKind::TouchDown
+            | InputKind::TouchMove
+            | InputKind::TouchUp => Ok(()),
+        }
+    }
+}
+
+fn mouse(mi: MOUSEINPUT) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 { mi },
+    }
+}
+
+fn key(ki: KEYBDINPUT) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki },
+    }
+}
+
+fn virtual_desktop_rect() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
+}
+
+// VKs Windows wants flagged extended even when the scancode high bits aren't set: the editing
+// cluster (Ins/Del/Home/End/PgUp/PgDn = 0x21..0x28, 0x2D, 0x2E), the Win keys (0x5B/0x5C/0x5D),
+// RCtrl (0xA3), RAlt (0xA5), Pause (0x90). MAPVK_VK_TO_VSC_EX already encodes E0 for most; this is a
+// thin safety net.
+fn forced_extended(vk: u16) -> bool {
+    matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0xA3 | 0xA5 | 0x90)
+}

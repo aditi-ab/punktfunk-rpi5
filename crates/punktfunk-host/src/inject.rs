@@ -31,6 +31,8 @@ pub enum Backend {
     GamescopeEi,
     /// `/dev/uinput` — universal fallback (but invisible to `WLR_LIBINPUT_NO_DEVICES=1`).
     Uinput,
+    /// Windows `SendInput` (Win32 KeyboardAndMouse) — the Windows host path.
+    SendInput,
 }
 
 pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
@@ -71,6 +73,16 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
                 anyhow::bail!("gamescope EIS input requires Linux")
             }
         }
+        Backend::SendInput => {
+            #[cfg(target_os = "windows")]
+            {
+                Ok(Box::new(sendinput::SendInputInjector::open()?))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                anyhow::bail!("SendInput injection requires Windows")
+            }
+        }
         other => anyhow::bail!("injection backend {other:?} not implemented"),
     }
 }
@@ -87,23 +99,31 @@ pub fn default_backend() -> Backend {
             "libei" | "ei" | "portal" => return Backend::Libei,
             "gamescope" | "gamescope-ei" => return Backend::GamescopeEi,
             "uinput" => return Backend::Uinput,
+            "sendinput" | "win" | "windows" => return Backend::SendInput,
             other => tracing::warn!(
                 value = other,
                 "unknown PUNKTFUNK_INPUT_BACKEND — auto-detecting"
             ),
         }
     }
-    if std::env::var("PUNKTFUNK_COMPOSITOR")
-        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("gamescope"))
+    #[cfg(target_os = "windows")]
     {
-        return Backend::GamescopeEi;
+        Backend::SendInput
     }
-    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    let d = desktop.to_ascii_uppercase();
-    if d.contains("KDE") || d.contains("GNOME") {
-        Backend::Libei
-    } else {
-        Backend::WlrVirtual
+    #[cfg(not(target_os = "windows"))]
+    {
+        if std::env::var("PUNKTFUNK_COMPOSITOR")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("gamescope"))
+        {
+            return Backend::GamescopeEi;
+        }
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        let d = desktop.to_ascii_uppercase();
+        if d.contains("KDE") || d.contains("GNOME") {
+            Backend::Libei
+        } else {
+            Backend::WlrVirtual
+        }
     }
 }
 
@@ -295,3 +315,5 @@ pub mod gamepad {
 mod libei;
 #[cfg(target_os = "linux")]
 mod wlr;
+#[cfg(target_os = "windows")]
+mod sendinput;
