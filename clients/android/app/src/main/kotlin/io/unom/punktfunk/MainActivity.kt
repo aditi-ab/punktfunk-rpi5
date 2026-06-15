@@ -1,7 +1,9 @@
 package io.unom.punktfunk
 
 import android.os.Bundle
+import android.view.InputDevice
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
@@ -40,6 +42,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.Keymap
 import io.unom.punktfunk.kit.NativeBridge
 import kotlin.math.abs
@@ -55,6 +58,9 @@ class MainActivity : ComponentActivity() {
      */
     var streamHandle: Long = 0L
 
+    /** Joystick-axis state mapper for the active session (built/reset by StreamScreen). */
+    var axisMapper: Gamepad.AxisMapper? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -68,6 +74,20 @@ class MainActivity : ComponentActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val handle = streamHandle
         if (handle != 0L) {
+            // Gamepad buttons (incl. DPAD only when truly from a gamepad — else KEYCODE_DPAD_* are
+            // keyboard arrows and belong to the VK path below).
+            if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
+                val bit = Gamepad.buttonBit(event.keyCode)
+                if (bit != 0) {
+                    when (event.action) {
+                        // repeatCount guard: don't re-send a held button as auto-repeat.
+                        KeyEvent.ACTION_DOWN ->
+                            if (event.repeatCount == 0) NativeBridge.nativeSendGamepadButton(handle, bit, true)
+                        KeyEvent.ACTION_UP -> NativeBridge.nativeSendGamepadButton(handle, bit, false)
+                    }
+                    return true // consumed
+                }
+            }
             when (event.keyCode) {
                 // Leave these to the system even while streaming.
                 KeyEvent.KEYCODE_BACK, // → BackHandler leaves the stream
@@ -90,6 +110,11 @@ class MainActivity : ComponentActivity() {
             }
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (streamHandle != 0L && axisMapper?.onMotion(event) == true) return true
+        return super.dispatchGenericMotionEvent(event)
     }
 }
 
@@ -179,7 +204,10 @@ private fun StreamScreen(handle: Long, onDisconnect: () -> Unit) {
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         activity?.streamHandle = handle // route hardware keys to this session
+        activity?.axisMapper = Gamepad.AxisMapper(handle) // route joystick axes
         onDispose {
+            activity?.axisMapper?.reset() // release-all so nothing sticks on the host
+            activity?.axisMapper = null
             activity?.streamHandle = 0L
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             // Leaving the stream: stop the audio + decode threads and tear down the session.

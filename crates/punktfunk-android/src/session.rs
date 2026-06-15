@@ -345,3 +345,60 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendKey(
         flags: mods as u32,
     });
 }
+
+// ---- Gamepad: Kotlin captures (KeyEvent/MotionEvent) → NativeClient::send_input ---------------
+// Single-pad model: exactly one controller, forwarded as pad 0 (flags = 0). Buttons carry the
+// gamepad::BTN_* bit in `code` and pressed/released in `x` (1/0); axes carry the gamepad::AXIS_* id
+// in `code` and the value in `x` (sticks i16 −32768..32767, +y = up; triggers 0..255). The host
+// accumulates the incremental events into its virtual xpad. Wire contract: input.rs::gamepad.
+
+/// `NativeBridge.nativeSendGamepadButton(handle, bit, down)` — one gamepad button transition.
+/// `bit`: a `gamepad::BTN_*` bit (e.g. BTN_A = 0x1000). `down`: 1=press, 0=release.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadButton(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    bit: jint,
+    down: jboolean,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: live handle per the contract.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let _ = h.client.send_input(&InputEvent {
+        kind: InputKind::GamepadButton,
+        _pad: [0; 3],
+        code: bit as u32,
+        x: i32::from(down != 0),
+        y: 0,
+        flags: 0, // pad index 0 — single-pad model
+    });
+}
+
+/// `NativeBridge.nativeSendGamepadAxis(handle, axisId, value)` — one gamepad axis update.
+/// `axisId`: a `gamepad::AXIS_*` id (LS_X=0..RT=5). `value`: stick i16 (−32768..32767, +y=up) or
+/// trigger 0..255.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepadAxis(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    axis_id: jint,
+    value: jint,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: live handle per the contract.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let _ = h.client.send_input(&InputEvent {
+        kind: InputKind::GamepadAxis,
+        _pad: [0; 3],
+        code: axis_id as u32,
+        x: value,
+        y: 0,
+        flags: 0, // pad index 0 — single-pad model
+    });
+}

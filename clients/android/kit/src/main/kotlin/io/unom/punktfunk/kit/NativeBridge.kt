@@ -60,4 +60,12 @@ object NativeBridge {
 
     /** One key transition. vk: Windows VK (0 = dropped by Rust). mods: VK modifier mask (0 for now). */
     external fun nativeSendKey(handle: Long, vk: Int, down: Boolean, mods: Int)
+
+    // ---- Gamepad: one pad forwarded as pad 0 (Rust hardcodes flags=0) ----
+
+    /** One gamepad button transition. bit: a [Gamepad].BTN_* bit. down: press/release. */
+    external fun nativeSendGamepadButton(handle: Long, bit: Int, down: Boolean)
+
+    /** One gamepad axis update. axisId: [Gamepad].AXIS_* (0..5). value: stick i16 (+y=up) / trigger 0..255. */
+    external fun nativeSendGamepadAxis(handle: Long, axisId: Int, value: Int)
 }
