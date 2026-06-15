@@ -1,0 +1,38 @@
+[package]
+name = "punktfunk-client-windows"
+description = "Native Windows punktfunk/1 client — winit/D3D11 shell, FFmpeg decode, WASAPI audio, SDL3 gamepads"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "punktfunk-client"
+path = "src/main.rs"
+
+# Everything is Windows-gated so `cargo build --workspace` stays green on Linux/macOS (the
+# other native clients live in crates/punktfunk-client-linux and clients/apple); on other
+# platforms this builds as a stub binary. Mirrors the Linux client's cfg(target_os="linux")
+# gating exactly.
+[target.'cfg(windows)'.dependencies]
+# The protocol core, linked directly (no C ABI) — same as the GTK Linux client. NativeClient
+# is Sync (mutexed plane receivers), so it drops into a UI app cleanly.
+punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+
+# Video decode (same FFmpeg pin as the host/Linux client) — software HEVC on the GPU-less dev
+# box; D3D11VA hardware decode is a follow-up for the real-GPU box.
+ffmpeg-next = "8"
+opus = "0.3"
+
+# Audio render + mic capture (the WASAPI analogue of the Linux client's PipeWire backend).
+wasapi = "0.23"
+
+mdns-sd = "0.20"
+async-channel = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -2586,6 +2586,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "punktfunk-client-windows"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "ffmpeg-next",
+ "mdns-sd",
+ "opus",
+ "punktfunk-core",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "wasapi",
+]
+
+[[package]]
 name = "punktfunk-core"
 version = "0.0.1"
 dependencies = [

@@ -158,11 +158,25 @@ impl NvencD3d11Encoder {
                 }
                 Some("3") => nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_THREE_FORCED_MODE as u32,
                 Some("2") => nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_TWO_FORCED_MODE as u32,
+                // Main10 (10-bit / HDR): 2-way split is measurably SLOWER on Ada — at 5120x1440@240
+                // Main10, forced-2 took 7.6 ms/frame (~131 fps) vs 2.8 ms (~357 fps) single-engine
+                // (the split/merge overhead dominates for 10-bit). A single Ada NVENC engine already
+                // handles 5K@240 Main10 well under the 4.17 ms budget, so DON'T split — splitting was
+                // the "broken animations in HDR" (the stream capped at ~131 fps). Env still overrides.
+                _ if self.bit_depth >= 10 => {
+                    nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32
+                }
                 _ if pixel_rate > 1_000_000_000 => {
                     nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_TWO_FORCED_MODE as u32
                 }
                 _ => nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE as u32,
             };
+            tracing::info!(
+                split_mode,
+                bit_depth = self.bit_depth,
+                pixel_rate,
+                "NVENC split-encode mode (0=disable 1=auto-forced 2=two 3=three 4=auto)"
+            );
             let enc = loop {
                 // 1. open the session bound to the D3D11 device.
                 let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
