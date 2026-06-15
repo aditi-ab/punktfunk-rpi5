@@ -9,16 +9,17 @@
 //! and a copy is checked in at `docs/api/openapi.json` (a test fails if it drifts, like the
 //! cbindgen header).
 //!
-//! Security: binds loopback by default. A bearer token (`--mgmt-token` / `PUNKTFUNK_MGMT_TOKEN`)
-//! is enforced on every `/api/v1` route except `/api/v1/health`, and is mandatory for
-//! non-loopback binds. The OpenAPI document and docs UI are served unauthenticated (the
-//! spec is public knowledge — it lives in this repo).
+//! Security: binds loopback by default, serves HTTPS with the host's identity cert, and requires
+//! auth on every `/api/v1` route except `/api/v1/health` — **always**, even on loopback. A paired
+//! native client authenticates by its mTLS cert; everyone else by a bearer token (`--mgmt-token` /
+//! `PUNKTFUNK_MGMT_TOKEN`, else auto-generated + persisted to `~/.config/punktfunk/mgmt-token`). The
+//! OpenAPI document and docs UI are served unauthenticated (the spec is public — it lives in this repo).
 
 use crate::encode::Codec;
 use crate::gamestream::{
     AppState, APP_VERSION, AUDIO_PORT, CONTROL_PORT, GFE_VERSION, RTSP_PORT, VIDEO_PORT,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use axum::{
     extract::{Path, Request, State},
     http::{header, StatusCode},
@@ -76,16 +77,13 @@ pub async fn run(
     opts: Options,
     native: Option<Arc<crate::native_pairing::NativePairing>>,
 ) -> Result<()> {
-    // A blank token is no token: it must neither satisfy the non-loopback guard below nor
-    // become a credential an empty `Authorization: Bearer ` header would match.
-    let token = opts.token.filter(|t| !t.trim().is_empty());
-    if token.is_none() && !opts.bind.ip().is_loopback() {
-        bail!(
-            "management API bind {} is not loopback — set --mgmt-token (or PUNKTFUNK_MGMT_TOKEN) \
-             to expose it beyond this machine",
-            opts.bind
-        );
-    }
+    // The mgmt API is HTTPS + token-authenticated ALWAYS (even on loopback): `parse_serve`
+    // guarantees a token (CLI flag / env / persisted ~/.config/punktfunk/mgmt-token / generated).
+    // A blank token is treated as none — fail loudly rather than ever serve unauthenticated.
+    let token = opts
+        .token
+        .filter(|t| !t.trim().is_empty())
+        .context("management API has no token — internal error: parse_serve must provide one")?;
     // Serve over HTTPS with the host's persistent identity (the cert clients already pin) and
     // OPTIONAL client-cert auth: a paired native client presents its cert (authorized by
     // fingerprint, no token), a browser presents none and uses the bearer token. See `require_auth`.
@@ -98,10 +96,10 @@ pub async fn run(
     .context("management API TLS config")?;
     tracing::info!(
         addr = %opts.bind,
-        auth = if token.is_some() { "mTLS (paired cert) or bearer" } else { "mTLS (paired cert); bearer disabled (loopback)" },
+        auth = "mTLS (paired cert) or bearer (required)",
         "management API listening over HTTPS (docs at /api/docs, spec at /api/v1/openapi.json)"
     );
-    let app = app(state, token, opts.bind.port(), native);
+    let app = app(state, Some(token), opts.bind.port(), native);
     serve_https(opts.bind, app, tls).await
 }
 
@@ -515,8 +513,8 @@ where
 // Auth
 // ---------------------------------------------------------------------------------------
 
-/// Bearer-token gate on the `/api/v1` routes. No token configured ⇒ open (loopback-only,
-/// enforced in [`run`]); `/api/v1/health` stays open for monitoring probes either way.
+/// Auth gate on the `/api/v1` routes: a paired client cert (mTLS) or the bearer token — required
+/// always (the host runs with a token by construction). `/api/v1/health` stays open for probes.
 async fn require_auth(State(st): State<Arc<MgmtState>>, req: Request, next: Next) -> Response {
     if req.uri().path() == "/api/v1/health" {
         return next.run(req).await; // liveness probe is always open
@@ -529,10 +527,10 @@ async fn require_auth(State(st): State<Arc<MgmtState>>, req: Request, next: Next
             return next.run(req).await;
         }
     }
-    // Otherwise fall back to the bearer token (the web console / admin). No token configured ⇒
-    // open, which `run` only permits on a loopback bind.
+    // Otherwise require the bearer token (the web console / admin). `run` always passes a token, so
+    // no-token means a misconfigured caller (e.g. a test constructing `app` directly) — deny.
     let Some(expected) = st.token.as_deref() else {
-        return next.run(req).await;
+        return api_error(StatusCode::UNAUTHORIZED, "authentication required");
     };
     let presented = req
         .headers()
@@ -1278,18 +1276,48 @@ mod tests {
         Arc::new(AppState::new(host, identity))
     }
 
+    // The mgmt API now always requires auth, so the router always has a token. A test that passes
+    // `None` gets the default "test-secret" (and `send` auto-attaches the matching bearer); a test
+    // that passes an explicit token exercises a mismatch (e.g. `bearer_token_is_enforced`).
     fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
-        app(state, token.map(String::from), DEFAULT_PORT, None)
+        app(
+            state,
+            Some(token.unwrap_or("test-secret").to_string()),
+            DEFAULT_PORT,
+            None,
+        )
     }
 
     fn test_app_native(
         state: Arc<AppState>,
         np: Arc<crate::native_pairing::NativePairing>,
     ) -> Router {
-        app(state, None, DEFAULT_PORT, Some(np))
+        // Auth required always; the paired-cert tests inject a fingerprint (cert branch wins), the
+        // rest authenticate via the `send`-attached default bearer.
+        app(
+            state,
+            Some("test-secret".to_string()),
+            DEFAULT_PORT,
+            Some(np),
+        )
     }
 
-    async fn send(app: &Router, req: axum::http::Request<Body>) -> (StatusCode, serde_json::Value) {
+    async fn send(
+        app: &Router,
+        mut req: axum::http::Request<Body>,
+    ) -> (StatusCode, serde_json::Value) {
+        // Auto-attach the default bearer unless the test set its own Authorization (e.g. the
+        // mismatch cases in `bearer_token_is_enforced`). Open routes ignore it; authed routes
+        // accept it against the `test-secret` default token.
+        if !req
+            .headers()
+            .contains_key(axum::http::header::AUTHORIZATION)
+        {
+            req.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static("Bearer test-secret"),
+            );
+        }
         let resp = app.clone().oneshot(req).await.expect("infallible");
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -1497,15 +1525,16 @@ mod tests {
         assert!(body["error"].is_string(), "media type: {body}");
     }
 
-    /// A blank token must not satisfy the "non-loopback requires a token" guard.
+    /// A blank token is treated as no token: the mgmt API requires auth always (even on loopback),
+    /// so `run` refuses to start unauthenticated rather than serve open.
     #[tokio::test]
-    async fn blank_token_rejected_for_public_bind() {
+    async fn blank_token_rejected() {
         let opts = Options {
-            bind: "0.0.0.0:0".parse().unwrap(),
+            bind: "127.0.0.1:0".parse().unwrap(),
             token: Some("   ".into()),
         };
         let err = run(test_state(), opts, None).await.unwrap_err();
-        assert!(err.to_string().contains("not loopback"), "{err}");
+        assert!(err.to_string().contains("no token"), "{err}");
     }
 
     #[tokio::test]

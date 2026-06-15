@@ -27,6 +27,7 @@ mod library;
 mod m0;
 mod m3;
 mod mgmt;
+mod mgmt_token;
 mod native_pairing;
 mod pipeline;
 mod pwinit;
@@ -293,11 +294,12 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<m3::NativeServe
         }
         i += 1;
     }
-    // Flag wins over the environment so a unit file can set a default and a shell override it.
+    // The mgmt API is HTTPS + token-authenticated ALWAYS (even on loopback). Resolve the token:
+    // the --mgmt-token flag (above) wins, else PUNKTFUNK_MGMT_TOKEN env, else the persisted
+    // ~/.config/punktfunk/mgmt-token, else a freshly generated + persisted one — so a bare `serve`
+    // Just Works with auth on, no operator step, and the bundled web console reads the same file.
     if opts.token.is_none() {
-        opts.token = std::env::var("PUNKTFUNK_MGMT_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
+        opts.token = Some(crate::mgmt_token::load_or_generate()?);
     }
     let native = native_port.map(|port| m3::NativeServe {
         port,

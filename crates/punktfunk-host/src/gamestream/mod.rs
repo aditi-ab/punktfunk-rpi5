@@ -202,7 +202,7 @@ pub fn serve(mgmt: crate::mgmt::Options, native: Option<crate::m3::NativeServe>)
 }
 
 /// `~/.config/punktfunk`, created on demand — host identity + (later) pairing state live here.
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
