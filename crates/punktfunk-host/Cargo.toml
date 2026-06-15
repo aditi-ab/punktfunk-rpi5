@@ -53,6 +53,12 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
+# Opus stereo encode for the host->client audio plane. The `opus` crate vendors libopus via
+# `audiopus_sys` (cmake-built from source — no system lib, no vcpkg), so it builds on Windows MSVC
+# too (needs CMake + NASM, both on the box). Both platforms that have an audio-capture backend.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+opus = "0.3"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # `screencast` gates the ScreenCast portal module; `remote_desktop` adds the RemoteDesktop
 # portal we use for libei input on KWin/GNOME; `tokio` is the default runtime.
@@ -81,8 +87,6 @@ wayland-backend = "0.3"
 serde_json = "1"
 # Builds/validates the xkb keymap uploaded to the virtual keyboard + tracks modifier state.
 xkbcommon = "0.8"
-# Opus encode for the GameStream audio stream (links system libopus).
-opus = "0.3"
 # The safe `opus` crate is stereo-only; surround (5.1/7.1) needs the libopus *multistream*
 # encoder (`opus_multistream_encoder_*`). `audiopus_sys` is the sys layer `opus` already
 # vendors (same libopus link), so this adds bindings, not a second copy of the library.
