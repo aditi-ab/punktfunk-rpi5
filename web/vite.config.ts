@@ -41,7 +41,11 @@ export default defineConfig({
     // proxies to the management host injecting the bearer token server-side) — NOT a static
     // routeRule, so the proxy runs behind the login gate and reads env at runtime.
     nitroV2Plugin({
-      preset: 'bun',
+      // node-server (not bun): a STANDALONE node HTTP server (`node .output/server/index.mjs`
+      // listens — the plain `node` preset only exports a handler). Lets the bundled punktfunk-web
+      // .deb depend on apt-native `nodejs (>= 20)` instead of vendoring bun. CI still BUILDS with
+      // bun; only the runtime target changes. (dev `vite dev` is unaffected.)
+      preset: 'node-server',
       compatibilityDate: '2026-06-10',
       // Scan server/{middleware,routes} for the auth gate + the /api proxy.
       scanDirs: [serverDir],
