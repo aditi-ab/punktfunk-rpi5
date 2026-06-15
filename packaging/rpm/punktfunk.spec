@@ -31,8 +31,10 @@ URL:            https://git.unom.io/unom/punktfunk
 # COPR SCM builds provide the checkout; for a tarball build, drop a git archive here:
 Source0:        %{name}-%{version}.tar.gz
 
-# punktfunk-host is Linux-only and links system FFmpeg/PipeWire/Opus.
-ExclusiveArch:  x86_64 aarch64
+# punktfunk-host is Linux-only and links system FFmpeg/PipeWire/Opus. x86_64 only for now: encode
+# is NVENC (desktop NVIDIA) and no aarch64 build is produced/published by CI — claiming aarch64
+# here would advertise an arch we never ship. Re-add aarch64 once there's an arm64 build leg.
+ExclusiveArch:  x86_64
 
 # The zerocopy FFI links the NVIDIA driver's libcuda.so.1; rpm's auto-dep generator would turn
 # that into a hard Requires on libcuda.so.1 (and we never want to pin the driver — NVENC/EGL come

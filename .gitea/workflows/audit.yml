@@ -1,0 +1,33 @@
+# Supply-chain advisory scan for the (network-facing, crypto-heavy) Rust dependency tree.
+# Runs `cargo audit` against the RustSec advisory DB: weekly (catch newly-disclosed CVEs in
+# pinned deps), on every Cargo.lock change (catch a bad dep the moment it lands), and on demand.
+# To silence a known-unfixable advisory, add it to `.cargo/audit.toml` ([advisories] ignore = [...]).
+name: audit
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  push:
+    branches: [main]
+    paths: ['Cargo.lock', '.gitea/workflows/audit.yml']
+  workflow_dispatch:
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-24.04
+    container:
+      image: git.unom.io/unom/punktfunk-rust-ci:latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Cache /usr/local/cargo so the cargo-audit binary (and the advisory DB clone) persist.
+      - uses: actions/cache@v4
+        with:
+          path: /usr/local/cargo
+          key: cargo-audit-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-audit-
+      - name: cargo audit
+        run: |
+          git config --global --add safe.directory "$PWD"
+          command -v cargo-audit >/dev/null 2>&1 || cargo install --locked cargo-audit
+          cargo audit
