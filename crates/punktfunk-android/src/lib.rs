@@ -21,6 +21,8 @@ use jni::objects::JObject;
 use jni::sys::jint;
 use jni::JNIEnv;
 
+#[cfg(target_os = "android")]
+mod decode;
 mod session;
 
 /// Initialize `android_logger` once when the JVM loads the library. Logs land in logcat under the

@@ -25,3 +25,7 @@ log = "0.4"
 # `ndk` and Oboe/Opus audio later) is only pulled in for the real `*-linux-android` targets.
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.14"
+# NDK bindings for the per-frame video path: AMediaCodec (HEVC hardware decode) + ANativeWindow
+# (the SurfaceView surface). Links libmediandk/libnativewindow. Decode runs entirely in Rust — no
+# per-frame JNI crossing (the "no async / native threads on the hot path" invariant).
+ndk = { version = "0.9", features = ["media"] }

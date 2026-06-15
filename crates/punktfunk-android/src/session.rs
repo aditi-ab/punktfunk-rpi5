@@ -1,33 +1,60 @@
-//! Session handle lifecycle over JNI.
+//! Session lifecycle + plane wiring over JNI.
 //!
-//! A connected [`NativeClient`] is boxed and handed to Kotlin as an opaque `jlong`; [`nativeClose`]
-//! drops it, and the connector's `Drop` tears down the worker thread + QUIC connection (RAII). The
-//! client is `Sync`, so the Kotlin side is free to pull each plane from its own thread later.
+//! A connected session is a [`SessionHandle`] — an `Arc<NativeClient>` plus the decode thread it
+//! feeds — boxed and handed to Kotlin as an opaque `jlong`. The connector is `Sync`, so the decode
+//! thread pulls the video plane (`next_frame`) directly while Kotlin still holds the handle.
 //!
-//! TODO(M4 Android stage 1): build out the plane pumps + IO on top of this handle. Port the
-//! orchestration from `crates/punktfunk-client-linux`:
+//! Wired so far: connect/close + the video plane (HEVC `next_frame` → NDK AMediaCodec → the
+//! SurfaceView's `ANativeWindow`, see [`crate::decode`]).
 //!
-//! - video: `next_frame` → AnnexB access unit → `AMediaCodec` (NDK, async) → `SurfaceView`
-//! - audio: `next_audio` → Opus decode → jitter ring → Oboe (port `client-linux/src/audio.rs`)
-//! - input: Kotlin capture → `send_input` / `send_rich_input` (VK keymap from `keymap.rs`)
-//! - rumble/HID feedback: `next_rumble` / `next_hidout` → VibratorManager / LightsManager
-//! - trust: `generate_identity` + `pair` + pin (Keystore-wrapped), then pass `pin`/`identity` here
-//!
-//! The signatures below are deliberately minimal (TOFU, anonymous) so the scaffold can already
-//! stand up a session against a host that does not require pairing.
+//! TODO(M4 Android stage 1): audio (`next_audio` → Opus → Oboe), input (`send_input` /
+//! `send_rich_input`), rumble/HID feedback, pairing/identity (Keystore). Port the orchestration
+//! from `crates/punktfunk-client-linux`.
 
 use jni::objects::{JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// `NativeBridge.nativeConnect(host, port, width, height, refreshHz): Long`.
-///
-/// Trust-on-first-use (no pin) and anonymous (no client identity) — enough to bring up a stream
-/// against a host that does not require pairing. Returns an opaque session handle, or `0` on
-/// failure (the cause is logged to logcat).
+/// A live session behind the `jlong` handle: the connector + the decode thread it feeds.
+pub(crate) struct SessionHandle {
+    // Read only by the android decode path (`nativeStartVideo` → `crate::decode`); on the host
+    // build (CI's workspace clippy/build) those readers are cfg'd out, so it's intentionally unused.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub client: Arc<NativeClient>,
+    video: Mutex<Option<VideoThread>>,
+}
+
+struct VideoThread {
+    shutdown: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl SessionHandle {
+    /// Signal the decode thread to stop and join it. Idempotent.
+    fn stop_video(&self) {
+        if let Some(mut vt) = self.video.lock().unwrap().take() {
+            vt.shutdown.store(true, Ordering::SeqCst);
+            if let Some(j) = vt.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+}
+
+impl Drop for SessionHandle {
+    fn drop(&mut self) {
+        self.stop_video();
+    }
+}
+
+/// `NativeBridge.nativeConnect(host, port, width, height, refreshHz): Long` — trust-on-first-use,
+/// anonymous. Returns an opaque session handle, or `0` on failure (logged to logcat).
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'local>(
     mut env: JNIEnv<'local>,
@@ -53,13 +80,19 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         mode,
         CompositorPref::Auto,
         GamepadPref::Auto,
-        0,    // bitrate_kbps: let the host choose its default
+        0,    // bitrate_kbps: host default
         None, // launch: default app
         None, // pin: trust on first use
         None, // identity: anonymous (TODO: Keystore-backed identity + pairing)
         Duration::from_secs(10),
     ) {
-        Ok(client) => Box::into_raw(Box::new(client)) as jlong,
+        Ok(client) => {
+            let handle = SessionHandle {
+                client: Arc::new(client),
+                video: Mutex::new(None),
+            };
+            Box::into_raw(Box::new(handle)) as jlong
+        }
         Err(e) => {
             log::error!("nativeConnect to {host}:{port} failed: {e}");
             0
@@ -67,12 +100,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     }
 }
 
-/// `NativeBridge.nativeClose(handle)` — drop the boxed [`NativeClient`] (RAII shutdown of the
-/// worker thread + QUIC connection). No-op on a `0` handle.
+/// `NativeBridge.nativeClose(handle)` — drop the session (stops the decode thread, then RAII-tears
+/// down the connector). No-op on `0`.
 ///
 /// # Safety contract
-/// `handle` must be either `0` or a value previously returned by [`Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect`]
-/// and not already closed. Kotlin owns this invariant (one `nativeClose` per non-zero `nativeConnect`).
+/// `handle` must be `0` or a live handle from [`Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect`],
+/// closed exactly once and not concurrently with other calls on the same handle (Kotlin owns this).
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     _env: JNIEnv,
@@ -80,7 +113,65 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     handle: jlong,
 ) {
     if handle != 0 {
-        // SAFETY: per the contract above, `handle` is a live `Box<NativeClient>` pointer.
-        unsafe { drop(Box::from_raw(handle as *mut NativeClient)) };
+        // SAFETY: per the contract, `handle` is a live `Box<SessionHandle>` pointer.
+        unsafe { drop(Box::from_raw(handle as *mut SessionHandle)) };
+    }
+}
+
+/// `NativeBridge.nativeStartVideo(handle, surface)` — wrap the SurfaceView's `Surface` as an
+/// `ANativeWindow` and start the HEVC decode thread rendering onto it. No-op if already started.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
+    env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    surface: JObject,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let mut guard = h.video.lock().unwrap();
+    if guard.is_some() {
+        return; // already streaming
+    }
+    // SAFETY: `env`/`surface` are valid JNI pointers for this call. `as *mut _` bridges any
+    // jni-sys version skew between the `jni` and `ndk` crates (both are raw `*mut _` pointers).
+    let window = match unsafe {
+        ndk::native_window::NativeWindow::from_surface(
+            env.get_native_interface() as *mut _,
+            surface.as_raw() as *mut _,
+        )
+    } {
+        Some(w) => w,
+        None => {
+            log::error!("nativeStartVideo: no ANativeWindow from Surface");
+            return;
+        }
+    };
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let client = h.client.clone();
+    let sd = shutdown.clone();
+    let join = std::thread::Builder::new()
+        .name("pf-decode".into())
+        .spawn(move || crate::decode::run(client, window, sd))
+        .ok();
+    *guard = Some(VideoThread { shutdown, join });
+}
+
+/// `NativeBridge.nativeStopVideo(handle)` — stop + join the decode thread (without closing the
+/// session). No-op on `0`.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    if handle != 0 {
+        // SAFETY: live handle per the contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        h.stop_video();
     }
 }
