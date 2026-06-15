@@ -43,12 +43,13 @@ The client requests a bitrate; the host encodes to it. To find a good value for 
 
 ## Multiple devices at once
 
-A host can stream to several clients simultaneously — each gets its own virtual display at its own
-resolution. This is the natural way to put your desktop on a laptop *and* a TV at the same time (both
-see and control the same desktop).
+Today the native `punktfunk/1` host (`serve --native`) streams **one session at a time** — additional
+clients wait in the accept queue until the active session ends. Each session gets its own virtual
+display at the client's exact resolution; concurrent native sessions are on the roadmap.
 
-The number of simultaneous streams is bounded by your GPU's encoder. Cap it with
-`--max-concurrent N` on the host command line (default 4); extra clients wait until a slot frees.
+(`m3-host`, the standalone test host, has a `--max-concurrent N` knob, default 4, bounded by your
+GPU's encoder — see the [Host CLI](/docs/host-cli) reference — but `serve --native` does **not** take
+that flag.)
 
 ## Codec and FEC
 

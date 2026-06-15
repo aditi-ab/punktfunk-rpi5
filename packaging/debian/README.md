@@ -2,8 +2,16 @@
 
 `punktfunk-host` is published as a `.deb` to **Gitea's Debian package registry** in the public
 `unom` org, so the Ubuntu hosts update with plain `apt`. CI (`.gitea/workflows/deb.yml`) builds
-and publishes on every push to `main` (a rolling `0.0.1~ciN.<sha>` build) and on `v*` tags
-(a clean `X.Y.Z`).
+and publishes on every push to `main` (a rolling `0.2.0~ciN.g<sha>` build) and on `host-v*` tags
+(a clean `X.Y.Z`) — the rolling builds outrank the stray `0.1.1`, so plain `apt upgrade` always
+gets the latest (no version pin needed).
+
+The same workflow also publishes **`punktfunk-web`** (the browser management console — pairing +
+status) and **`punktfunk-client`** (the GTK4 couch/Deck client). `punktfunk-host` **Recommends**
+`punktfunk-web`, so a default `apt install punktfunk-host` pulls the console too (alongside the
+udev/sysctl bits) unless you've disabled weak deps; `punktfunk-client` is independent — install it
+on the box you stream *to*. (`punktfunk-client-rs` is the headless reference/test tool, not packaged
+here.)
 
 Package layout mirrors the Fedora RPM (`../rpm/punktfunk.spec`): the host binary, the `/dev/uinput`
 udev rule, the systemd **user** unit, headless session helpers, the example config, and the OpenAPI
@@ -35,6 +43,49 @@ sudo usermod -aG input "$USER"          # virtual gamepads (re-login to take eff
 mkdir -p ~/.config/punktfunk
 cp /usr/share/punktfunk-host/host.env.example ~/.config/punktfunk/host.env   # then edit
 systemctl --user enable --now punktfunk-host
+# Web console — enable it and read the auto-generated login password (then open http://<host-ip>:3000):
+systemctl --user enable --now punktfunk-web
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
+```
+
+## Firewall
+
+Open the ports the host listens on. The **native `punktfunk/1`** plane:
+
+- **QUIC control plane: UDP 9777** (`serve --native --native-port N` to change).
+- **Data plane: an *ephemeral* UDP port** — negotiated per session, so there is no fixed port to
+  open. For a restrictive firewall you'd need to allow a UDP range (the repo does not pin one).
+
+And the **GameStream / Moonlight** ports (fixed):
+
+| Port | Proto | Purpose |
+|---|---|---|
+| 47984 | TCP | HTTPS nvhttp (paired, mutual-TLS) |
+| 47989 | TCP | HTTP nvhttp (`/serverinfo`, `/pair` PIN flow) |
+| 48010 | TCP | RTSP handshake |
+| 47998–48010 | UDP | Video RTP (+ FEC), ENet control (47999), audio (48000) |
+| 5353 | UDP | mDNS auto-discovery |
+
+The mgmt API (TCP 47990) binds to loopback by default — leave it closed unless you move it off
+loopback with `--mgmt-bind IP:PORT` (which then requires `--mgmt-token`).
+
+With `ufw`:
+
+```sh
+sudo ufw allow 9777/udp                                 # punktfunk/1 control plane
+sudo ufw allow 47984/tcp && sudo ufw allow 47989/tcp && sudo ufw allow 48010/tcp
+sudo ufw allow 47998:48010/udp
+sudo ufw allow 5353/udp
+# plus the ephemeral punktfunk/1 data port — open a UDP range you reserve for it.
+```
+
+With raw `nftables` (add to your `inet filter input` chain):
+
+```
+udp dport 9777 accept                  # punktfunk/1 control plane
+tcp dport { 47984, 47989, 48010 } accept
+udp dport { 47998-48010, 5353 } accept
+# plus the ephemeral punktfunk/1 data port (a reserved UDP range).
 ```
 
 ## Updates

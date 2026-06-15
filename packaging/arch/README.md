@@ -95,6 +95,46 @@ launches it (`punktfunk-client --connect host:port`) — gamescope composites it
 The client needs no `/dev/uinput` or compositor-spawning rights (it captures input and decodes),
 so it's a much lighter sysext than the host.
 
+## Firewall
+
+If the host box runs a firewall, open the ports it listens on. The **native `punktfunk/1`** plane:
+
+- **QUIC control plane: UDP 9777** (`serve --native --native-port N` to change).
+- **Data plane: an *ephemeral* UDP port** — negotiated per session, so there is no fixed port to
+  open. For a restrictive firewall you'd need to allow a UDP range (the repo does not pin one).
+
+And the **GameStream / Moonlight** ports (fixed):
+
+| Port | Proto | Purpose |
+|---|---|---|
+| 47984 | TCP | HTTPS nvhttp (paired, mutual-TLS) |
+| 47989 | TCP | HTTP nvhttp (`/serverinfo`, `/pair` PIN flow) |
+| 48010 | TCP | RTSP handshake |
+| 47998–48010 | UDP | Video RTP (+ FEC), ENet control (47999), audio (48000) |
+| 5353 | UDP | mDNS auto-discovery |
+
+The mgmt API (TCP 47990) binds to loopback by default — leave it closed unless you move it off
+loopback with `--mgmt-bind IP:PORT` (which then requires `--mgmt-token`).
+
+With `ufw`:
+
+```sh
+sudo ufw allow 9777/udp                                 # punktfunk/1 control plane
+sudo ufw allow 47984/tcp && sudo ufw allow 47989/tcp && sudo ufw allow 48010/tcp
+sudo ufw allow 47998:48010/udp
+sudo ufw allow 5353/udp
+# plus the ephemeral punktfunk/1 data port — open a UDP range you reserve for it.
+```
+
+With raw `nftables` (add to your `inet filter input` chain):
+
+```
+udp dport 9777 accept                  # punktfunk/1 control plane
+tcp dport { 47984, 47989, 48010 } accept
+udp dport { 47998-48010, 5353 } accept
+# plus the ephemeral punktfunk/1 data port (a reserved UDP range).
+```
+
 ## Files
 - `PKGBUILD` — split package: `punktfunk-host` + `punktfunk-client` (builds the working tree via
   `PF_SRCDIR`, or a git tag for AUR).

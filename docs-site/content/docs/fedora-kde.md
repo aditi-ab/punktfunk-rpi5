@@ -113,9 +113,10 @@ mDNS. It requires **PIN pairing** by default (secure on a LAN); pair once from y
 ## 4. Connect a client
 
 From any [client](/docs/clients) — `punktfunk-client --discover` finds the host on the LAN. On
-first connect, complete the PIN pairing (arm it from the host's web console / mgmt API, or run the
-host with `--allow-pairing`). See [Clients](/docs/clients) and
-[Running as a Service](/docs/running-as-a-service).
+first connect, complete the PIN pairing — **arm it from the host's web console / mgmt API**, which
+makes the host display a 4-digit PIN to type into the client. (Pairing is required by default; pass
+`serve --native --open` only if you deliberately want to disable the requirement.) See
+[Clients](/docs/clients) and [Running as a Service](/docs/running-as-a-service).
 
 ## Appendix — build from source
 

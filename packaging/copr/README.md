@@ -11,7 +11,7 @@ once in the COPR web UI (or with `copr-cli`):
 - Source build method: `rpkg` (or `make_srpm`)
 
 **Project settings**
-- Chroots: `fedora-41-x86_64`, `fedora-42-x86_64` (match your Bazzite Fedora base;
+- Chroots: `fedora-43-x86_64`, `fedora-44-x86_64` (match your Bazzite Fedora base;
   `rpm -E %fedora` on the host tells you which). Add `aarch64` if needed.
 - External repositories (so `ffmpeg-devel` resolves at build time):
   `https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$releasever.noarch.rpm`
@@ -22,7 +22,7 @@ once in the COPR web UI (or with `copr-cli`):
 `copr-cli` equivalent:
 
 ```sh
-copr-cli create punktfunk --chroot fedora-42-x86_64 \
+copr-cli create punktfunk --chroot fedora-44-x86_64 \
   --repo 'https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$releasever.noarch.rpm' \
   --repo 'https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$releasever.noarch.rpm'
 copr-cli buildscm punktfunk \

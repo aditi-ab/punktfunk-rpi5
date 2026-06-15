@@ -37,9 +37,9 @@ On the device you want to stream to:
   network*. Tap it, and when prompted, **pair**.
 - **Anything with Moonlight:** add the host (it should be discovered automatically), then pair.
 
-To pair, the host needs to show a PIN. Arm pairing from the host's web console (or with
-`--allow-pairing` on the command line) — the host displays a 4-digit PIN, you type it into the client,
-and they trust each other from then on. Full details: [Pairing & Trust](/docs/pairing).
+To pair, the host needs to show a PIN. Arm pairing from the host's web console — the host displays a
+4-digit PIN, you type it into the client, and they trust each other from then on. Pairing is required
+by default. Full details: [Pairing & Trust](/docs/pairing).
 
 ## 4. Stream
 

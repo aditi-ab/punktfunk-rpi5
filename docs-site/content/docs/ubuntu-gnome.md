@@ -42,39 +42,35 @@ sudo update-initramfs -u && sudo reboot
 > `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der` (set a one-time password), reboot, and
 > choose **Enrol MOK** at the blue screen. Or disable Secure Boot in firmware.
 
-## 2. Dependencies
+## 2. Install the host (apt)
 
-Install the build toolchain and runtime libraries:
+`punktfunk-host` is published as a `.deb` to the public Gitea apt registry, so the box installs and
+updates with plain `apt`. The registry is public — no auth needed, just trust its signing key:
 
 ```sh
-sudo apt install build-essential pkg-config cmake clang libclang-dev nasm git curl \
-  pipewire pipewire-pulse wireplumber libpipewire-0.3-dev libspa-0.2-dev \
-  libwayland-dev wayland-protocols libxkbcommon-dev libopus-dev \
-  libdrm-dev libgbm-dev libegl-dev libgles-dev mesa-common-dev libva-dev \
-  ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev libavdevice-dev \
-  libnvidia-egl-wayland1 libnvidia-egl-gbm1 libei-dev
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://git.unom.io/api/packages/unom/debian/repository.key \
+  | sudo tee /etc/apt/keyrings/punktfunk.asc >/dev/null
+
+echo "deb [signed-by=/etc/apt/keyrings/punktfunk.asc] https://git.unom.io/api/packages/unom/debian stable main" \
+  | sudo tee /etc/apt/sources.list.d/punktfunk.list
+
+sudo apt update
+sudo apt install punktfunk-host
 ```
 
-Install Rust if you don't have it:
+`punktfunk-host` `Recommends` the browser console (`punktfunk-web`), so apt pulls it in by default.
+The desktop *client* (`punktfunk-client`) is a separate package for the machine you stream *to* — not
+installed on a host. The NVIDIA driver is **not** a dependency — you installed it out of band in
+step 1. Later updates are just `sudo apt update && sudo apt upgrade`.
+
+## 3. Configure
+
+The package ships the systemd **user** unit, the `/dev/uinput` udev rule, the socket-buffer sysctl
+tuning, and an example config. As the desktop user, grant gamepad access and write the GNOME config:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-## 3. Build
-
-```sh
-git clone https://git.unom.io/unom/punktfunk.git && cd punktfunk
-cargo build --release -p punktfunk-host
-```
-
-The host binary is at `target/release/punktfunk-host`.
-
-## 4. Configure
-
-The host reads its settings from `~/.config/punktfunk/host.env`. For GNOME:
-
-```sh
+sudo usermod -aG input "$USER"     # /dev/uinput for virtual gamepads (re-login to apply)
 mkdir -p ~/.config/punktfunk
 cat > ~/.config/punktfunk/host.env <<'ENV'
 WAYLAND_DISPLAY=wayland-0
@@ -88,18 +84,30 @@ ENV
 
 See the [Configuration reference](/docs/configuration) for every option.
 
-## 5. Run
+## 4. Run
 
-From a terminal **inside your GNOME session** (so the host can reach Mutter):
+Start the host as a user service from **inside your GNOME session** (so it can reach Mutter):
 
 ```sh
-cargo run --release -p punktfunk-host -- serve --native
+systemctl --user enable --now punktfunk-host
+journalctl --user -u punktfunk-host -f      # watch it come up + print its fingerprint
 ```
 
-The host starts listening, prints its fingerprint, and advertises itself on the network. Now
-[connect a client](/docs/clients).
+The host listens on UDP `9777` (native punktfunk/1) plus the GameStream ports, and advertises itself
+over mDNS. It requires **PIN pairing** by default (secure on a LAN) — arm pairing from the web
+console (next step) and pair once from your [client](/docs/clients).
 
-To run it automatically at boot — including on a **headless** machine with no monitor — see
+### Web console
+
+The console (status, paired devices, arm pairing) ships as `punktfunk-web`:
+
+```sh
+systemctl --user enable --now punktfunk-web
+# read the auto-generated login password, then open http://<host-ip>:3000
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
+```
+
+To run the host automatically at boot — including on a **headless** machine with no monitor — see
 [Running as a Service](/docs/running-as-a-service).
 
 ## Troubleshooting
@@ -111,3 +119,34 @@ To run it automatically at boot — including on a **headless** machine with no 
   capture. On a headless/always-on host, disable the lock — see
   [Running as a Service](/docs/running-as-a-service).
 - More in [Troubleshooting](/docs/troubleshooting).
+
+## Appendix — build from source
+
+If the apt registry doesn't have a build for your release, or you want to track `main` directly,
+compile the host yourself (no clean updates / no packaged units — you wire those up by hand).
+
+Install the build toolchain and runtime libraries:
+
+```sh
+sudo apt install build-essential pkg-config cmake clang libclang-dev nasm git curl \
+  pipewire pipewire-pulse wireplumber libpipewire-0.3-dev libspa-0.2-dev \
+  libwayland-dev wayland-protocols libxkbcommon-dev libopus-dev \
+  libdrm-dev libgbm-dev libegl-dev libgles-dev mesa-common-dev libva-dev \
+  ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev libavdevice-dev \
+  libnvidia-egl-wayland1 libnvidia-egl-gbm1 libei-dev
+```
+
+Install Rust if you don't have it, then build:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+git clone https://git.unom.io/unom/punktfunk.git && cd punktfunk
+cargo build --release -p punktfunk-host
+```
+
+The host binary lands at `target/release/punktfunk-host`. Write `~/.config/punktfunk/host.env` as in
+step 3, then run it inside your GNOME session:
+
+```sh
+cargo run --release -p punktfunk-host -- serve --native
+```

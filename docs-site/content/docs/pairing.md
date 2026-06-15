@@ -38,13 +38,13 @@ The PIN ceremony is the other path — useful for the *first* device (before the
 anything) or when you're at the client and the console isn't handy.
 
 Pairing has to be **armed** on the host before a client can pair (so a random device can't pair
-itself). Two ways:
+itself). On the production host (`serve --native`), this is done from the **web console**: open the
+host's management console, click to arm pairing, and the host displays a 4-digit PIN along with the
+list of paired devices. This works on a headless host over the network — there is no command-line flag
+to arm pairing on `serve`.
 
-- **Web console** *(recommended)* — open the host's management console, click to arm pairing, and it
-  shows the PIN and the list of paired devices. This is the easiest way and works on a headless host
-  over the network.
-- **Command line** — start the host with `--allow-pairing` (or `--require-pairing`); it prints a PIN
-  in its log when a client begins pairing.
+(The standalone headless test host, `m3-host`, takes `--allow-pairing`/`--require-pairing` on its
+command line instead; the production `serve --native` host arms pairing from the console.)
 
 Then, on the client:
 
@@ -57,8 +57,8 @@ By default, the native host **requires** pairing — only devices that have pair
 the right setting on a shared network: a device has to complete the PIN ceremony once before it can
 connect.
 
-If you're on a fully trusted single-user network and want to skip pairing, the host can be run open —
-but requiring pairing is strongly recommended.
+If you're on a fully trusted single-user network and want to skip pairing, start the host with
+`serve --native --open` — but requiring pairing is strongly recommended.
 
 ## Trust-on-first-use
 

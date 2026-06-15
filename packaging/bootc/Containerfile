@@ -1,8 +1,9 @@
 # bootc / OCI image layer that bakes punktfunk into a Bazzite-based atomic image.
 #
 # Bazzite is already a bootc image (Fedora Atomic + gamescope + PipeWire + the NVIDIA
-# stack), so we layer punktfunk on top: enable RPM Fusion (for the NVENC ffmpeg) and our
-# COPR, install the package, and pre-enable the udev rule. Build + push this image, then
+# stack), so we layer punktfunk on top: enable RPM Fusion (for the NVENC ffmpeg) and unom's
+# Gitea RPM registry (NOT COPR — only the registry carries the punktfunk-web subpackage),
+# install the packages, and pre-enable the udev rule. Build + push this image, then
 # `bootc switch` (or rebase) a Bazzite host onto it for an image-based, atomic install —
 # no per-host `rpm-ostree install` drift.
 #

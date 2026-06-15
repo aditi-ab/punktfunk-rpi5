@@ -13,10 +13,37 @@ the mode of the device you're streaming to, not the TV the box is plugged into.
 
 ## Install
 
-The host installs from the punktfunk COPR repository (see `packaging/bazzite/` in the repo for the
-exact COPR/RPM/bootc options). You can also build from source as on
-[Fedora KDE](/docs/fedora-kde) — Bazzite is Fedora Atomic underneath, and its FFmpeg builds the host
-fine.
+The host ships as an RPM in punktfunk's **Gitea RPM registry** (public), so a Bazzite / Fedora
+Atomic box layers and updates it with `rpm-ostree`. Add the repo, then layer the host plus the web
+console and reboot:
+
+```sh
+# Add the repo. Our RPMs are unsigned, but Gitea GPG-signs the repo METADATA — verify that
+# (repo_gpgcheck=1) and skip the per-package signature check (gpgcheck=0). The signed metadata
+# carries each package's SHA256, so authenticity still holds. (Don't curl Gitea's served
+# bazzite.repo verbatim — it sets gpgcheck=1, which fails on unsigned packages.)
+sudo tee /etc/yum.repos.d/punktfunk.repo >/dev/null <<'REPO'
+[gitea-unom-bazzite]
+name=punktfunk (unom, Bazzite)
+baseurl=https://git.unom.io/api/packages/unom/rpm/bazzite
+enabled=1
+gpgcheck=0
+repo_gpgcheck=1
+gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key
+REPO
+
+# Layer the host + the web console, then reboot into the new deployment.
+# (punktfunk Recommends punktfunk-web; list it explicitly so it's pulled regardless of weak-dep
+# settings — the Gitea registry carries punktfunk-web, which COPR can't build.)
+rpm-ostree install punktfunk punktfunk-web
+systemctl reboot
+```
+
+`rpm-ostree upgrade` then tracks new builds automatically (Bazzite's auto-update timer does this
+for you). For a fully baked appliance image there's also a **bootc** Containerfile that installs
+the same RPMs from this registry — see `packaging/bootc/` and `packaging/rpm/README.md` in the repo.
+Building from source works too (Bazzite is Fedora Atomic underneath, and its FFmpeg builds the host
+fine — same steps as [Fedora KDE](/docs/fedora-kde)), but the registry is the supported path.
 
 ## Allow controller input
 
@@ -32,7 +59,14 @@ permission, not a client problem.)
 
 ## Configure
 
-Point the host at the gamescope backend in `~/.config/punktfunk/host.env`:
+The RPM ships a gamescope-ready config you can copy as your starting point:
+
+```sh
+mkdir -p ~/.config/punktfunk
+cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env
+```
+
+The key settings in `~/.config/punktfunk/host.env` point the host at the gamescope backend:
 
 ```sh
 PUNKTFUNK_COMPOSITOR=gamescope
@@ -50,6 +84,14 @@ client's exact resolution and refresh, and relaunches it if the client changes m
 Bazzite hosts are typically headless. Enable the host service and linger so it starts at boot — see
 [Running as a Service](/docs/running-as-a-service). Because the host launches its own gamescope
 session per client, you don't need a separate desktop-session unit.
+
+```sh
+systemctl --user enable --now punktfunk-host
+# Web console (pairing + status) — enable it and read the auto-generated login password,
+# then open http://<host-ip>:3000:
+systemctl --user enable --now punktfunk-web
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
+```
 
 ## Good to know
 

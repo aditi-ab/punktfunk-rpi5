@@ -21,10 +21,18 @@ punktfunk-host serve --native
 | `--native-port <PORT>` | Native QUIC port (default `9777`). |
 | `--open` | Don't require pairing — serve any device on the network. Off by default; only for trusted single-user setups. |
 | `--mgmt-bind <IP:PORT>` | Management API address (default loopback `127.0.0.1:47990`). |
-| `--mgmt-token <TOKEN>` | Bearer token for the management API; required when `--mgmt-bind` isn't loopback. |
+| `--mgmt-token <TOKEN>` | Override the bearer token for the management API. |
 
-By default the host **requires pairing** — see [Pairing & Trust](/docs/pairing). Arm pairing from the
-web console (or the `m3-host` flags below for a quick test).
+These are the only flags `serve` accepts.
+
+The management API is **always HTTPS with bearer-token auth**. If you don't pass `--mgmt-token`, a token
+is auto-generated and persisted to `~/.config/punktfunk/mgmt-token`; `--mgmt-token` only overrides it. A
+token is **required** when you bind the API off loopback with `--mgmt-bind`.
+
+By default the host **requires pairing** — see [Pairing & Trust](/docs/pairing). On `serve --native` you
+**arm pairing from the web console** (or mgmt API); the host then displays a 4-digit PIN. Pass `--open` to
+turn off the mandatory-pairing default and serve any device on the network (trusted single-user setups
+only). The pairing flags below are `m3-host`-only and do **not** apply to `serve`.
 
 ## `m3-host`
 
@@ -38,11 +46,16 @@ punktfunk-host m3-host --source virtual
 | Flag | Meaning |
 |---|---|
 | `--port <N>` | QUIC listen port (default `9777`). |
-| `--source virtual` | Use a real virtual display + NVENC (vs. `synthetic` test frames). |
+| `--source synthetic` · `virtual` | `virtual` uses a real virtual display + NVENC; `synthetic` emits test frames. |
+| `--seconds <N>` / `--frames <N>` | Bound each session by wall-clock seconds or frame count. |
 | `--max-concurrent <N>` | Stream at most N sessions at once (default 4); overflow waits in the queue. |
 | `--max-sessions <N>` | Exit after N sessions (0 = serve forever). |
 | `--allow-pairing` | Accept PIN pairing; the host prints a PIN when a client pairs. |
 | `--require-pairing` | Only serve paired devices (implies `--allow-pairing`). |
+
+`--max-concurrent`, `--allow-pairing`, and `--require-pairing` are **`m3-host`-only** — `serve` does not
+accept them. On `serve --native` you arm pairing from the web console instead, and concurrency is not
+yet capped from the command line.
 
 Both `serve --native` and `m3-host` advertise the host on the network so clients can discover it. List
 hosts from another machine with `punktfunk-client-rs --discover`.

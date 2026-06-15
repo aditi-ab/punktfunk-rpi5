@@ -31,6 +31,23 @@ roadmap, setup guides & progress: the docs site ([`docs-site/`](docs-site) — F
 `bun run dev`), with the canonical [roadmap](docs-site/content/docs/roadmap.md) and
 [status](docs-site/content/docs/status.md) there. Design notes stay in [`docs/`](docs).
 
+## Install (host)
+
+The package registries are the real distribution channel — pick your distro and run one command.
+Per-distro setup (add the repo, first-run, web console) lives in the linked READMEs.
+
+| Distro | One-command happy path | Details |
+|--------|------------------------|---------|
+| **Ubuntu / Debian** (apt) | `sudo apt install punktfunk-host` *(after adding the repo)* | [`packaging/debian/README.md`](packaging/debian/README.md) |
+| **Fedora / Bazzite** (rpm-ostree) | `rpm-ostree install punktfunk punktfunk-web` *(after adding the repo; or the bootc image)* | [`packaging/rpm/README.md`](packaging/rpm/README.md) |
+| **Arch / Steam Deck** (PKGBUILD / sysext) | `makepkg -si` *(Arch)* · sysext `.raw` *(SteamOS/Deck)* | [`packaging/arch/README.md`](packaging/arch/README.md) |
+
+`punktfunk-host` is the streaming host; `punktfunk-web` is the browser console (pairing + status);
+`punktfunk-client` is the GTK4 desktop client (also shipped via apt/RPM/Arch/Flatpak). After install,
+run `punktfunk-host serve --native` inside your desktop session, then pair from the web console.
+
+Building from source (below) is a fallback.
+
 ## Layout
 
 ```
@@ -46,7 +63,9 @@ tools/{latency-probe,loss-harness}/   measurement (plan §10)
 docs/{implementation-plan,roadmap,windows-host,dualsense-haptics}.md
 ```
 
-## Build & test
+## Build & test (from source)
+
+For development, or as an install fallback where no package is available:
 
 ```sh
 cargo build --workspace          # green on Linux and macOS

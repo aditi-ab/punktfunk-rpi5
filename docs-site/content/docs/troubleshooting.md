@@ -10,8 +10,11 @@ description: Common problems setting up or using a punktfunk host, and how to fi
 - Host and client must be on the **same network/subnet**. Discovery uses mDNS, which doesn't cross
   routed subnets or most VPNs-without-multicast. As a fallback, add the host by **IP address** in your
   client.
-- A firewall on the host can block it. The native protocol uses UDP port **9777** (plus the data
-  port); GameStream/Moonlight uses its standard ports. Allow them on the host's firewall.
+- A firewall on the host can block it. The native protocol's control plane uses UDP port **9777**. The
+  per-session **data plane** uses an *ephemeral* UDP port negotiated at connect time (currently
+  random) — for a strict firewall, open a UDP range or move the data port. GameStream/Moonlight uses
+  TCP **47984/47989/48010** + UDP **47998–48010** + ENet UDP **47999**. Allow them on the host's
+  firewall.
 
 ## `nvidia-smi` says it can't communicate with the driver
 
@@ -56,8 +59,8 @@ Then log out and back in. On other distros this is `sudo usermod -aG input $USER
 
 ## Pairing is rejected / the client can't connect
 
-- The host **requires pairing** by default. Arm pairing (web console, or `--allow-pairing`), then
-  enter the PIN on the client. See [Pairing & Trust](/docs/pairing).
+- The host **requires pairing** by default. Arm pairing from the web console, then enter the PIN on
+  the client. See [Pairing & Trust](/docs/pairing).
 - If you re-installed the host, its identity changed — re-pair the client.
 
 ## Stutter, drops, or high latency
@@ -65,8 +68,9 @@ Then log out and back in. On other distros this is `sudo usermod -aG input $USER
 - Lower the **bitrate**. On a busy or Wi-Fi link, the requested bitrate may be too high — the Apple
   app's [speed test](/docs/configuration#bitrate) picks a safe value; with Moonlight, set it manually.
 - Prefer a **wired** connection or 5 GHz Wi-Fi between host and client.
-- Streaming to **many devices at once** shares the GPU encoder; cap concurrency with
-  `--max-concurrent`.
+- Streaming to **many devices at once** shares the GPU encoder. The production host
+  (`serve --native`) handles one native session at a time, with extra clients queued; heavy load is
+  usually bitrate-bound, so lower the bitrate first.
 
 ## Still stuck?
 
