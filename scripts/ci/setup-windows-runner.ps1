@@ -71,11 +71,18 @@ if (-not (Test-Path "$RunnerHome\.runner")) {
     & $Exe register --no-interactive --instance $Instance --token $Token --name $RunnerName --labels $Labels
 }
 
+# rustup toolchains under an ASCII path so nothing in the daemon env carries the non-ASCII
+# username (the same hazard that breaks SDL3's PCH; here it also keeps this script ASCII-clean).
+if (-not (Test-Path "C:\Users\Public\.rustup\settings.toml")) {
+    Write-Host "==> copying rustup toolchains to an ASCII path"
+    robocopy "$env:USERPROFILE\.rustup" "C:\Users\Public\.rustup" /E /NFL /NDL /NJH /NJS /MT:16 | Out-Null
+}
+
 # --- daemon env wrapper (the box's MSVC/WinUI/FFmpeg toolchain) ---
 $wrapper = "$RunnerHome\run-runner.ps1"
 @'
 $env:CARGO_HOME = "C:\Users\Public\.cargo"
-$env:RUSTUP_HOME = "C:\Users\Enrico Bühler\.rustup"
+$env:RUSTUP_HOME = "C:\Users\Public\.rustup"
 $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 $env:FFMPEG_DIR = "C:\Users\Public\ffmpeg"
@@ -104,4 +111,4 @@ Start-Sleep -Seconds 4
 Write-Host "==> runner '$RunnerName' labels=$Labels instance=$Instance"
 $p = Get-Process act_runner -ErrorAction SilentlyContinue
 if ($p) { Write-Host "daemon running (pid $($p.Id), session $($p.SessionId))" }
-else { Write-Warning "daemon not running yet — check $RunnerHome\runner task / logs" }
+else { Write-Warning "daemon not running yet - check the gitea-act-runner task" }
