@@ -45,7 +45,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
 };
 use windows::Win32::System::StationsAndDesktops::{
-    OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
+    CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
 
@@ -238,23 +238,26 @@ unsafe fn duplicate_output(
 /// frames until something changes; a pointer move IS a DDA "change", so this kicks the very first
 /// `AcquireNextFrame` loose — and lands the cursor on the display the client is viewing. Two moves
 /// to distinct points guarantee an actual move even if the cursor already sat at the center.
-/// Follow the current input desktop so duplication spans the normal ↔ Winlogon (secure: login/UAC)
-/// desktops. Opening the secure desktop requires SYSTEM; on a non-SYSTEM host this just fails on
-/// Winlogon (capture freezes there) — which is why the host relaunches itself as SYSTEM. The HDESK
-/// is intentionally leaked: it must stay open while it's the thread's desktop, and switches
-/// (lock/unlock/UAC) are rare, so a few handles per session is fine.
+/// Re-sync the calling (capture) thread to the CURRENT input desktop. MUST be called on EVERY recovery
+/// — symmetrically for ENTERING and LEAVING the Winlogon (secure: lock/login/UAC) desktop. Gating it on
+/// is_secure_desktop() (the old bug) re-attached only on the way IN, so on the way OUT the capture
+/// thread stayed stuck on the gone Winlogon desktop and every rebuild failed → no frames → client
+/// timeout → "display disconnected". Apollo calls its equivalent (syncThreadDesktop) before every
+/// duplicate. Opening the secure desktop requires SYSTEM (the host relaunches itself as SYSTEM).
+/// Matches Apollo by closing the handle right after SetThreadDesktop — the thread keeps the desktop via
+/// an internal reference, so this does NOT leak even when called on every recovery.
 unsafe fn attach_input_desktop() {
     match OpenInputDesktop(
         DESKTOP_CONTROL_FLAGS(0),
         false,
         DESKTOP_ACCESS_FLAGS(0x1000_0000), // GENERIC_ALL
     ) {
-        Ok(desk) => match SetThreadDesktop(desk) {
-            Ok(()) => tracing::info!("attach_input_desktop: SetThreadDesktop OK"),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:?}"), "attach_input_desktop: SetThreadDesktop FAILED")
+        Ok(desk) => {
+            if let Err(e) = SetThreadDesktop(desk) {
+                tracing::warn!(error = %format!("{e:?}"), "attach_input_desktop: SetThreadDesktop FAILED");
             }
-        },
+            let _ = CloseDesktop(desk);
+        }
         Err(e) => {
             tracing::warn!(error = %format!("{e:?}"), "attach_input_desktop: OpenInputDesktop FAILED")
         }
@@ -1645,8 +1648,14 @@ impl DuplCapturer {
         // freshly-rebuilt duplication → a self-feeding ACCESS_LOST storm (200 rebuilds/session observed).
         // Apollo isolates once at startup and its recovery just re-duplicates; match that off the secure
         // desktop. (The lock screen / post-login are NOT Winlogon, so they take this light path too.)
+        // Re-sync the capture thread to the CURRENT input desktop on EVERY rebuild — symmetric for
+        // ENTERING and LEAVING the secure (Winlogon) desktop. This is the fix for "UAC/lock appears
+        // fine but breaks the instant you click out of it": leaving secure used to skip this (it was
+        // gated on is_secure_desktop()), stranding the thread on the gone Winlogon desktop. Cheap +
+        // leak-free now (attach_input_desktop closes its handle). reassert_isolation stays secure-only
+        // (it's a CCD topology mutation that would self-feed a storm on the normal desktop).
+        attach_input_desktop();
         if crate::capture::desktop_watch::is_secure_desktop() {
-            attach_input_desktop();
             crate::vdisplay::sudovda::reassert_isolation(&self.gdi_name);
         }
         // RELEASE the old duplication FIRST (frees the output). reopen_duplication creates a NEW device
