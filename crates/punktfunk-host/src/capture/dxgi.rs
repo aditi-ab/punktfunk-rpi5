@@ -1419,13 +1419,16 @@ impl DuplCapturer {
             let mut si = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
             if self
                 .dupl
-                .GetFramePointerShape(
-                    info.PointerShapeBufferSize,
-                    buf.as_mut_ptr() as *mut c_void,
-                    &mut required,
-                    &mut si,
-                )
-                .is_ok()
+                .as_ref()
+                .is_some_and(|d| {
+                    d.GetFramePointerShape(
+                        info.PointerShapeBufferSize,
+                        buf.as_mut_ptr() as *mut c_void,
+                        &mut required,
+                        &mut si,
+                    )
+                    .is_ok()
+                })
             {
                 if let Some(shape) = convert_pointer_shape(&buf, &si) {
                     tracing::info!(
