@@ -83,6 +83,7 @@ if (-not (Test-Path "C:\Users\Public\.rustup\settings.toml")) {
 # --- daemon env wrapper (the box's MSVC/WinUI/FFmpeg toolchain) ---
 $wrapper = "$RunnerHome\run-runner.ps1"
 @'
+$env:NO_COLOR = "1"
 $env:CARGO_HOME = "C:\Users\Public\.cargo"
 $env:RUSTUP_HOME = "C:\Users\Public\.rustup"
 $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"
