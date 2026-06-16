@@ -12,6 +12,11 @@
 //!   punktfunk-client --headless --connect host[:port] [--pin HEX] [--pair PIN] [--mode WxHxHz]
 //!                    [--bitrate MBPS] [--mic]  (no window; count frames + print stats)
 
+// Link as a GUI (windows) subsystem binary so the default windowed launch (MSIX / double-click)
+// does NOT pop a console window. The CLI paths (--headless/--discover) reattach to the launching
+// terminal's console at startup (see main), so their output is still visible when run from a shell.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
@@ -33,6 +38,15 @@ mod video;
 
 #[cfg(windows)]
 fn main() {
+    // With #![windows_subsystem = "windows"] the process starts with no console, so the GUI/MSIX
+    // launch is window-free. AttachConsole only binds to an ALREADY-EXISTING parent console (it
+    // never creates one), so when launched from a terminal — `--headless`/`--discover` — stdout and
+    // the tracing writer below land in that terminal; from Explorer/MSIX it's a harmless no-op.
+    unsafe {
+        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
