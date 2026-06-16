@@ -10,7 +10,11 @@
 # daemon alive across reboots with nobody logged in. Registration happens once (.runner file); the
 # token is NOT persisted.
 #
-# Get the token from Gitea: org **unom** -> Settings -> Actions -> Runners -> "Create new runner".
+# Get a **GLOBAL** registration token: Gitea **Site Administration -> Actions -> Runners** (the
+# registration token shown there). The runner MUST be global/instance-scoped to pick up org-repo
+# jobs like unom/punktfunk — an org- or repo-scoped token leaves it registered but unmatchable
+# ("no fitting runner for windows-amd64", even though the runner shows idle). Mirrors the Linux
+# runner's scope.
 #
 # Env/param knobs: -Instance (default https://git.unom.io), -Token (GITEA_RUNNER_TOKEN; required
 # for first registration), -RunnerName (default COMPUTERNAME), -Labels (default windows-amd64:host
@@ -64,8 +68,8 @@ Pop-Location
 # --- one-time registration (from $RunnerHome: register writes .runner to the CWD) ---
 if (-not (Test-Path "$RunnerHome\.runner")) {
     if (-not $Token) {
-        Write-Warning "Not registered yet. Re-run with -Token <registration token>."
-        Write-Host "  (Gitea: org unom -> Settings -> Actions -> Runners -> Create new runner)"
+        Write-Warning "Not registered yet. Re-run with -Token <GLOBAL registration token>."
+        Write-Host "  (Gitea: Site Administration -> Actions -> Runners -> registration token; must be GLOBAL scope)"
         exit 1
     }
     Push-Location $RunnerHome

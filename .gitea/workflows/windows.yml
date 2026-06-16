@@ -12,7 +12,19 @@ name: windows
 on:
   push:
     branches: [main]
+    paths:
+      - 'crates/punktfunk-client-windows/**'
+      - 'crates/punktfunk-core/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.gitea/workflows/windows.yml'
   pull_request:
+    paths:
+      - 'crates/punktfunk-client-windows/**'
+      - 'crates/punktfunk-core/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.gitea/workflows/windows.yml'
   workflow_dispatch:
 
 jobs:
