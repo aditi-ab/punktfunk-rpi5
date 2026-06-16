@@ -2266,10 +2266,12 @@ fn virtual_stream(
 /// Should this host take the two-process (SYSTEM host + user-session WGC helper) path? Yes when it's
 /// running as SYSTEM — the only account that can capture the secure desktop + drive SendInput on it,
 /// and the account under which in-process WGC won't activate. `PUNKTFUNK_FORCE_HELPER` forces it on
-/// (for testing the relay as a normal user); `PUNKTFUNK_NO_HELPER` forces it off.
+/// (for testing the relay as a normal user); `PUNKTFUNK_NO_HELPER` forces it off. `PUNKTFUNK_NO_WGC`
+/// also forces it off — that mode runs pure single-process DDA (one capturer for the normal AND secure
+/// desktop, Apollo-style), which has no WGC helper to relay.
 #[cfg(target_os = "windows")]
 fn should_use_helper() -> bool {
-    if std::env::var_os("PUNKTFUNK_NO_HELPER").is_some() {
+    if std::env::var_os("PUNKTFUNK_NO_HELPER").is_some() || crate::capture::wgc_disabled() {
         return false;
     }
     std::env::var_os("PUNKTFUNK_FORCE_HELPER").is_some()
