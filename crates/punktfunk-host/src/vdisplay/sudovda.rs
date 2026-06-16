@@ -32,7 +32,7 @@ use windows::Win32::Devices::Display::{
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_GLOBAL, CDS_NORESET,
-    CDS_SET_PRIMARY, CDS_TEST, CDS_TYPE, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW,
+    CDS_TEST, CDS_TYPE, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW,
     DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY,
     DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
@@ -341,22 +341,15 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
         );
     }
 
-    // Default (multi-display, Apollo-parity): set ONLY this output's mode in place. Promoting the IDD
-    // to PRIMARY at the virtual-screen origin (DM_POSITION 0,0) + persisting it GLOBALly contests the
-    // box's baseline display (e.g. a 1024x768 basic "WinDisc") so the desktop topology never reaches a
-    // stable fixed point → a perpetual DXGI_ERROR_MODE_CHANGE_IN_PROGRESS storm (the freeze + audible
-    // PnP chime measured live on the RTX4090+iGPU box). Apollo with an EMPTY config never promotes
-    // primary and captures the same SudoVDA cleanly (verified live). So default to CDS_UPDATEREGISTRY
-    // only. ONLY when isolating to a SOLE display does the IDD genuinely need to be primary — a blank
-    // EXTENDED IDD may not be DWM-composited and would yield no duplication frames.
-    let isolating = std::env::var("PUNKTFUNK_ISOLATE_DISPLAYS").is_ok();
-    let mut dm_fields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_BITSPERPEL;
-    if isolating {
-        dm_fields |= DM_POSITION; // pin to origin, but only as the sole/primary display
-    }
+    // Set ONLY this output's mode in place (size/refresh/bpp; NO DM_POSITION). Do NOT promote it to
+    // PRIMARY here and do NOT write a GLOBAL topology: promoting the IDD to primary at (0,0) while the
+    // box's leftover basic display is still active contests the topology and storms
+    // DXGI_ERROR_MODE_CHANGE_IN_PROGRESS (measured live). The IDD is made the sole → primary →
+    // DWM-composited display by the CCD isolation in create() (which deactivates the other display
+    // first), so a sole display is already primary and needs no CDS_SET_PRIMARY here.
     let dm = DEVMODEW {
         dmSize: size_of::<DEVMODEW>() as u16,
-        dmFields: dm_fields,
+        dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_BITSPERPEL,
         dmBitsPerPel: 32,
         dmPelsWidth: mode.width,
         dmPelsHeight: mode.height,
@@ -376,16 +369,8 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
         );
         return;
     }
-    // Default: CDS_UPDATEREGISTRY only — set this output's mode WITHOUT promoting it to primary or
-    // rewriting the global topology (which storms MODE_CHANGE_IN_PROGRESS). Promote to primary only when
-    // isolating to a sole display.
-    let apply_flags = if isolating {
-        CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_SET_PRIMARY
-    } else {
-        CDS_UPDATEREGISTRY
-    };
     let apply = unsafe {
-        ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, apply_flags, None)
+        ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, CDS_UPDATEREGISTRY, None)
     };
     if apply == DISP_CHANGE_SUCCESSFUL {
         tracing::info!(
@@ -414,6 +399,11 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
 /// is attached" and the secure desktop has nowhere to render but the output we capture.
 ///
 /// Returns the displays we detached plus their saved modes so teardown can restore them.
+///
+/// Superseded by the atomic CCD [`isolate_displays_ccd`] (the legacy per-device GDI detach misses
+/// iGPU-attached monitors on a hybrid box and churns the topology). Retained for reference / a
+/// possible fallback.
+#[allow(dead_code)]
 unsafe fn isolate_displays(keep_gdi_name: &str) -> Vec<(String, DEVMODEW)> {
     let mut saved = Vec::new();
     let mut idx = 0u32;
@@ -766,32 +756,29 @@ impl VirtualDisplay for SudoVdaDisplay {
                 break;
             }
         }
-        let mut isolated: Vec<(String, DEVMODEW)> = Vec::new();
+        let isolated: Vec<(String, DEVMODEW)> = Vec::new(); // legacy GDI detach unused (CCD path below)
         let mut ccd_saved: Option<SavedConfig> = None;
         match &gdi_name {
             Some(n) => {
                 tracing::info!("SudoVDA target {} -> {n}", ao.target_id);
                 // ADD only advertises the mode; force it active so DXGI captures the requested size.
                 set_active_mode(n, mode);
-                // Display isolation (detach all other monitors → SudoVDA becomes the SOLE display) is
-                // OPT-IN now. On a hybrid GPU box a SOLE active display goes into fullscreen
-                // independent-flip / MPO, which Desktop Duplication CANNOT capture → the born-lost
-                // ACCESS_LOST + MODE_CHANGE_IN_PROGRESS storm measured live on the RTX4090+iGPU box
-                // (hook verified-firing, DPI=2, overlay running — yet still frozen). Apollo stays rock
-                // solid on this exact box precisely because it KEEPS the physical monitor active and just
-                // arranges the virtual display alongside it (multi-display is DWM-composited, so the
-                // output never independent-flips). So default to NOT isolating — match Apollo's topology.
-                // Set PUNKTFUNK_ISOLATE_DISPLAYS=1 to force the old sole-display behaviour (a truly
-                // headless box with no attached monitor, where the secure/Winlogon desktop would
-                // otherwise render on a detached physical output).
-                if std::env::var("PUNKTFUNK_ISOLATE_DISPLAYS").is_ok() {
-                    isolated = unsafe { isolate_displays(n) };
+                // Make the SudoVDA the SOLE active display (default). On this box an EXTENDED
+                // (non-primary) IDD is NOT DWM-composited → Desktop Duplication gets a born-lost
+                // ACCESS_LOST (measured live: MODE_CHANGE storm fixed, but the extended IDD then
+                // born-lost). Apollo reaches the same end state ("Virtual Desktop: WxH" — the IDD is the
+                // whole desktop, hence primary + composited) via Windows AUTO-promoting the real WDDM
+                // display over the box's leftover 1024x768 basic display; Windows does NOT auto-promote
+                // for us, so we deactivate the other display(s) explicitly via the clean atomic CCD path.
+                // Deactivating FIRST means set_active_mode's primary-promotion has nothing to contest →
+                // no MODE_CHANGE_IN_PROGRESS storm (that storm came from promoting primary WHILE the
+                // basic display stayed active). Opt out with PUNKTFUNK_NO_ISOLATE=1 (a box with a real
+                // second monitor to keep live). The legacy GDI detach is skipped — it misses
+                // iGPU-attached monitors on a hybrid box and churns per-device; CCD is atomic.
+                if std::env::var("PUNKTFUNK_NO_ISOLATE").is_err() {
                     ccd_saved = unsafe { isolate_displays_ccd(ao.target_id) };
                 } else {
-                    tracing::info!(
-                        "display isolation SKIPPED (Apollo-parity multi-display — avoids sole-display \
-                         independent-flip; set PUNKTFUNK_ISOLATE_DISPLAYS=1 to force sole-display)"
-                    );
+                    tracing::info!("display isolation skipped (PUNKTFUNK_NO_ISOLATE) — IDD stays extended");
                 }
                 thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture opens
             }
