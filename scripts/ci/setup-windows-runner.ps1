@@ -61,14 +61,16 @@ if (-not (Test-Path config.yaml)) { & $Exe generate-config | Set-Content -Encodi
     Set-Content -Encoding ASCII config.yaml
 Pop-Location
 
-# --- one-time registration ---
+# --- one-time registration (from $RunnerHome: register writes .runner to the CWD) ---
 if (-not (Test-Path "$RunnerHome\.runner")) {
     if (-not $Token) {
         Write-Warning "Not registered yet. Re-run with -Token <registration token>."
         Write-Host "  (Gitea: org unom -> Settings -> Actions -> Runners -> Create new runner)"
         exit 1
     }
+    Push-Location $RunnerHome
     & $Exe register --no-interactive --instance $Instance --token $Token --name $RunnerName --labels $Labels
+    Pop-Location
 }
 
 # rustup toolchains under an ASCII path so nothing in the daemon env carries the non-ASCII
@@ -88,7 +90,8 @@ $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 $env:FFMPEG_DIR = "C:\Users\Public\ffmpeg"
 $env:PATH = "C:\Users\Public\.cargo\bin;C:\nvm4w\nodejs;C:\Program Files\NASM;C:\Program Files\CMake\bin;C:\Program Files\LLVM\bin;C:\Users\Public\ffmpeg\bin;" + $env:PATH
 Set-Location "C:\Users\Public\act-runner"
-& "C:\Users\Public\act-runner\act_runner.exe" daemon --config config.yaml
+# cmd-level redirect (>>, 2>&1) keeps the daemon's native stderr out of PowerShell's error stream.
+& cmd /c "act_runner.exe daemon --config config.yaml >> runner.log 2>&1"
 '@ | Set-Content -Encoding UTF8 $wrapper
 
 # --- SYSTEM scheduled task: keep the daemon alive across reboots, no login needed ---
