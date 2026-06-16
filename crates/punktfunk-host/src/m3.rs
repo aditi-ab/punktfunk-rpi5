@@ -2541,17 +2541,20 @@ fn virtual_stream_relay(
                 "two-process: source switch"
             );
             if secure {
-                // SDR-while-secure: drop the SudoVDA out of HDR so the secure (Winlogon) desktop
-                // renders SDR/composed — the HDR fullscreen independent-flip is what made DDA storm
-                // ACCESS_LOST (black). Give the reconfig a moment to settle, then (re)open DDA fresh on
-                // the now-SDR output.
-                let toggled = unsafe {
-                    crate::vdisplay::sudovda::set_advanced_color(target.target_id, false)
-                };
-                if toggled {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
+                // SDR-while-secure (HDR sessions ONLY): drop the SudoVDA out of HDR so the secure
+                // (Winlogon) desktop renders SDR/composed — HDR fullscreen independent-flip is what made
+                // DDA storm ACCESS_LOST (black). For an SDR (8-bit) session the output is already SDR, so
+                // toggling is a needless topology change AND its matching restore on the way back would
+                // force the desktop into HDR the 8-bit encoder can't take (broken image).
+                if bit_depth >= 10 {
+                    let toggled = unsafe {
+                        crate::vdisplay::sudovda::set_advanced_color(target.target_id, false)
+                    };
+                    if toggled {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
                 }
-                dda = None; // reopen so we capture the post-toggle (SDR) output
+                dda = None; // reopen so we capture the (SDR) output
                 match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz) {
                     Ok(mut p) => {
                         p.enc.request_keyframe();
@@ -2564,10 +2567,14 @@ fn virtual_stream_relay(
                 }
                 next = std::time::Instant::now();
             } else {
-                // Returning to the normal desktop: restore HDR on the SudoVDA (WGC captures it HDR), then
-                // rebuild the helper fresh so its WGC re-detects the restored colorspace, and resume.
-                unsafe {
-                    crate::vdisplay::sudovda::set_advanced_color(target.target_id, true);
+                // Returning to the normal desktop: restore HDR on the SudoVDA (HDR sessions ONLY — WGC
+                // then captures it HDR). An SDR (8-bit) session must stay SDR; forcing HDR here is what
+                // made the rebuilt WGC helper capture HDR FP16 BT.2020 while the encoder is 8-bit SDR →
+                // format mismatch / broken image (the "HDR gets restored when flipping back" bug).
+                if bit_depth >= 10 {
+                    unsafe {
+                        crate::vdisplay::sudovda::set_advanced_color(target.target_id, true);
+                    }
                 }
                 dda = None; // free the secure DDA encoder
                 match build(&mut vd, cur_mode) {
