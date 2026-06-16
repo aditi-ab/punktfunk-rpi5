@@ -1829,36 +1829,47 @@ impl DuplCapturer {
                         "DXGI capture lost — recovering (cheap re-duplicate, full rebuild if output gone)"
                     );
                 }
-                // Back off: under aggressive HDR overlay/MPO invalidation the duplication dies
-                // continuously, and an unthrottled recovery would spin try_reduplicate (each a
-                // DuplicateOutput + up-to-16 ms Acquire) and starve the encode thread → freeze. Cap ALL
-                // recovery attempts to ~one per 5 ms; between attempts return None so the caller repeats
-                // the last frame, paced at the frame interval (no busy-spin, encode thread keeps running).
+                // GENTLE recovery. On the secure (Winlogon) desktop the duplication dies on EVERY
+                // independent-flip; a tight re-duplicate loop tears the duplication down + brings it up
+                // hundreds of times/sec — that release/recreate cycle is the real kernel stress (and it
+                // stalls the send thread long enough that the client times out → "display disconnected").
+                // So instead of fighting it: cap recovery HARD and just repeat the last frame in between
+                // (no busy-spin, no per-flip teardown). The session stays alive across a secure dwell; the
+                // lock/UAC screen is frozen/laggy, then capture resumes cleanly when the desktop returns.
+                // Tunable: PUNKTFUNK_RECOVER_MS (cheap re-duplicate cadence, default 250) and
+                // PUNKTFUNK_REBUILD_MS (heavy new-device rebuild cadence, default 1500).
+                let recover_ms = std::env::var("PUNKTFUNK_RECOVER_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(250u64);
                 let now = Instant::now();
                 if self
                     .last_recover
-                    .is_some_and(|t| now.duration_since(t) < Duration::from_millis(5))
+                    .is_some_and(|t| now.duration_since(t) < Duration::from_millis(recover_ms))
                 {
-                    return Ok(None);
+                    return Ok(None); // repeat the last frame; do NOT tear down/recreate yet
                 }
                 self.last_recover = Some(now);
                 if !device_dead && self.try_reduplicate() {
-                    // Cheap recovery succeeded; the next acquire gets frames on the same device.
+                    // Cheap recovery succeeded (same device, no teardown of the device/monitor).
                     self.first_frame = true;
                     return Ok(None);
                 }
-                // Output gone / device dead → full rebuild (new device), throttled.
+                // Heavy full rebuild (new device) — the costliest teardown/recreate, so throttle it the
+                // hardest. Only when the cheap re-duplicate keeps failing (genuine output/device loss).
+                let rebuild_ms = std::env::var("PUNKTFUNK_REBUILD_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1500u64);
                 let now = Instant::now();
-                let due = self.last_rebuild.map_or(true, |t| {
-                    now.duration_since(t) >= Duration::from_millis(250)
-                });
+                let due = self
+                    .last_rebuild
+                    .map_or(true, |t| now.duration_since(t) >= Duration::from_millis(rebuild_ms));
                 if due {
                     self.last_rebuild = Some(now);
                     if self.recreate_dupl().is_ok() {
                         self.first_frame = true;
                     }
-                } else {
-                    std::thread::sleep(Duration::from_millis(8));
                 }
                 // Born-lost rebuilds (created OK, instant ACCESS_LOST) used to escalate to a full pipeline
                 // cold-rebuild here — but that re-issued vd.create()→set_active_mode (an audible PnP
