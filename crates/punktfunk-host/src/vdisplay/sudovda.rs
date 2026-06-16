@@ -23,10 +23,11 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
-    QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+    QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
     DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_MODE_INFO,
-    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+    DISPLAYCONFIG_PATH_ACTIVE, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Graphics::Gdi::{
@@ -475,6 +476,85 @@ unsafe fn restore_displays(saved: &[(String, DEVMODEW)]) {
     }
 }
 
+/// Saved active display topology, for restoring on teardown.
+type SavedConfig = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
+
+/// Robust display isolation via the CCD API. The legacy [`isolate_displays`] (EnumDisplayDevices +
+/// ChangeDisplaySettings) MISSES displays on a hybrid box — an iGPU-attached physical monitor isn't
+/// flagged `ATTACHED_TO_DESKTOP` in the GDI enum, so it's never detached and the secure desktop /
+/// lock screen lands on IT while our virtual output freezes. `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)`
+/// sees every active path; we deactivate all of them EXCEPT the SudoVDA target's, leaving the virtual
+/// display as the sole desktop so ALL content (incl. Winlogon) renders to it. Apollo isolates the same
+/// way (CCD). Returns the original active config to restore on teardown.
+unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedConfig> {
+    let mut np = 0u32;
+    let mut nm = 0u32;
+    if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
+        return None;
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+    if QueryDisplayConfig(
+        QDC_ONLY_ACTIVE_PATHS,
+        &mut np,
+        paths.as_mut_ptr(),
+        &mut nm,
+        modes.as_mut_ptr(),
+        None,
+    )
+    .is_err()
+    {
+        return None;
+    }
+    paths.truncate(np as usize);
+    modes.truncate(nm as usize);
+    let saved = (paths.clone(), modes.clone());
+    let mut others = 0u32;
+    for p in paths.iter_mut() {
+        if p.targetInfo.id == keep_target_id {
+            continue;
+        }
+        if p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0 {
+            p.flags &= !DISPLAYCONFIG_PATH_ACTIVE; // mark this path inactive
+            others += 1;
+        }
+    }
+    if others == 0 {
+        tracing::info!("display isolate (CCD): SudoVDA target {keep_target_id} already the only active display");
+        return Some(saved);
+    }
+    let rc = SetDisplayConfig(
+        paths.len() as u32,
+        Some(paths.as_ptr()),
+        modes.len() as u32,
+        Some(modes.as_ptr()),
+        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
+    );
+    if rc == 0 {
+        tracing::info!("display isolate (CCD): deactivated {others} other display(s) — SudoVDA target {keep_target_id} is now the sole desktop");
+    } else {
+        tracing::warn!("display isolate (CCD): SetDisplayConfig failed rc={rc:#x} (tried to deactivate {others} path(s))");
+    }
+    Some(saved)
+}
+
+/// Restore the topology saved by [`isolate_displays_ccd`] (teardown, before the virtual output is
+/// removed), re-activating the displays we deactivated.
+unsafe fn restore_displays_ccd(saved: &SavedConfig) {
+    let (paths, modes) = saved;
+    if paths.is_empty() {
+        return;
+    }
+    let rc = SetDisplayConfig(
+        paths.len() as u32,
+        Some(paths.as_ptr()),
+        modes.len() as u32,
+        Some(modes.as_ptr()),
+        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
+    );
+    tracing::info!("display isolate (CCD): restored original topology rc={rc:#x}");
+}
+
 /// Re-detach physical displays so the secure (Winlogon) desktop keeps rendering to the virtual
 /// output — for the in-session DXGI capture recovery (dxgi.rs `recreate_dupl`). The lock/UAC/login
 /// switch can re-attach a physical monitor (the secure desktop then lands on IT and our virtual
@@ -659,13 +739,17 @@ impl VirtualDisplay for SudoVdaDisplay {
             }
         }
         let mut isolated: Vec<(String, DEVMODEW)> = Vec::new();
+        let mut ccd_saved: Option<SavedConfig> = None;
         match &gdi_name {
             Some(n) => {
                 tracing::info!("SudoVDA target {} -> {n}", ao.target_id);
                 // ADD only advertises the mode; force it active so DXGI captures the requested size.
                 set_active_mode(n, mode);
                 // Detach every other display so the secure desktop (Winlogon/UAC) renders here too.
+                // CCD isolation is the one that works on a hybrid box (the legacy GDI enum misses the
+                // iGPU-attached monitor); the legacy pass stays as a no-op fallback.
                 isolated = unsafe { isolate_displays(n) };
+                ccd_saved = unsafe { isolate_displays_ccd(ao.target_id) };
                 thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture opens
             }
             None => tracing::warn!(
@@ -693,6 +777,7 @@ impl VirtualDisplay for SudoVdaDisplay {
                 pinger: Some(pinger),
                 gdi_name,
                 isolated,
+                ccd_saved,
             }),
         })
     }
@@ -707,8 +792,11 @@ struct SudoVdaKeepalive {
     pinger: Option<JoinHandle<()>>,
     #[allow(dead_code)] // consumed by the Windows capture backend (not yet wired)
     gdi_name: Option<String>,
-    /// Displays detached by [`isolate_displays`], restored here on teardown.
+    /// Displays detached by [`isolate_displays`] (legacy), restored here on teardown.
     isolated: Vec<(String, DEVMODEW)>,
+    /// Active topology saved by [`isolate_displays_ccd`] (the one that works on hybrid boxes),
+    /// restored here on teardown.
+    ccd_saved: Option<SavedConfig>,
 }
 
 impl Drop for SudoVdaKeepalive {
@@ -718,7 +806,11 @@ impl Drop for SudoVdaKeepalive {
             let _ = j.join();
         }
         // Re-attach the physical display(s) we detached BEFORE removing the virtual output, so the
-        // box is never left with zero displays.
+        // box is never left with zero displays. Restore the CCD topology first (the one that actually
+        // detached on a hybrid box), then the legacy pass.
+        if let Some(saved) = &self.ccd_saved {
+            unsafe { restore_displays_ccd(saved) };
+        }
         unsafe { restore_displays(&self.isolated) };
         let rp = RemoveParams { guid: self.guid };
         let rp_bytes = unsafe {
