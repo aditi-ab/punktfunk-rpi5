@@ -2345,6 +2345,14 @@ fn virtual_stream_relay(
 
     // The authoritative Default↔Winlogon signal (requires SYSTEM to read the Winlogon desktop name).
     let watcher = crate::capture::desktop_watch::DesktopWatcher::start();
+    // Test hook: PUNKTFUNK_SECURE_TEST_PERIOD_MS=N drives a square-wave secure/normal toggle every N ms
+    // instead of the real watcher — exercises the mid-session helper↔DDA mux without a live UAC/lock
+    // (the real Winlogon DDA capture is already proven by the single-process secure path).
+    let secure_test_ms: Option<u128> = std::env::var("PUNKTFUNK_SECURE_TEST_PERIOD_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0);
+    let start = std::time::Instant::now();
 
     let mut interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64);
@@ -2420,7 +2428,10 @@ fn virtual_stream_relay(
         // Source mux: capture the secure (Winlogon) desktop via the host's DDA, the normal desktop via
         // the helper relay. On a switch, latch await_idr + force the now-active source to emit an IDR
         // so the client resumes cleanly.
-        let secure = watcher.is_secure();
+        let secure = match secure_test_ms {
+            Some(p) => (start.elapsed().as_millis() / p) % 2 == 1,
+            None => watcher.is_secure(),
+        };
         if secure != on_secure {
             on_secure = secure;
             await_idr = true;
