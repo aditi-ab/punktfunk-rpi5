@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX package manifest for the punktfunk Windows client (WinUI 3 via windows-reactor).
+
+  This is a TEMPLATE: packaging/pack-msix.ps1 substitutes {VERSION} (4-part numeric, e.g.
+  0.2.137.0) and {PUBLISHER} (must EXACTLY equal the signing cert's subject DN — default
+  `CN=unom` for the self-signed CI cert; a real code-signing cert just passes its own subject).
+
+  Why this packages cleanly even though the app was built "unpackaged": windows-reactor calls
+  MddBootstrapInitialize2 with OnPackageIdentity_NOOP (crates/libs/reactor/src/app.rs), so under
+  MSIX package identity the App SDK bootstrapper is a no-op and the runtime is resolved from the
+  <PackageDependency> below instead. The framework family + min version mirror what the runner has
+  installed and what reactor pins (WINDOWSAPPSDK_RELEASE_MAJORMINOR = 0x20000 = 2.0 ->
+  Microsoft.WindowsAppRuntime.2).
+
+  Full-trust Win32 app (EntryPoint Windows.FullTrustApplication + runFullTrust) — it owns raw D3D11,
+  Win32 low-level input hooks, WASAPI and SDL3, none of which fit the UWP app container.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="unom.Punktfunk"
+    Publisher="{PUBLISHER}"
+    Version="{VERSION}"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Punktfunk</DisplayName>
+    <PublisherDisplayName>unom</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+    <PackageDependency
+      Name="Microsoft.WindowsAppRuntime.2"
+      MinVersion="2.2.0.0"
+      Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="Punktfunk" Executable="punktfunk-client.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Punktfunk"
+        Description="Low-latency desktop and game streaming client"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Square71x71Logo="Assets\Square71x71Logo.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

@@ -1,0 +1,90 @@
+# Build the punktfunk Windows client as a signed MSIX and publish it to Gitea's generic package
+# registry, so Windows boxes can download + install a real package (Start tile, clean
+# install/uninstall) instead of a loose exe. Runs on the self-hosted Windows runner (host mode;
+# scripts/ci/setup-windows-runner.ps1) — the MSVC/WinUI/FFmpeg toolchain + the Windows SDK's
+# makeappx/signtool are baked into the runner's daemon env, same as windows.yml.
+#
+# Registry (public, unom org): https://git.unom.io/unom/-/packages  (generic group)
+# Packaging internals: crates/punktfunk-client-windows/packaging/README.md. BOM/MAX_PATH runner
+# gotchas baked into the daemon env + windows.yml: see that workflow.
+#
+# Versioning — MSIX requires a strictly 4-part numeric version (no ~/- suffixes), so:
+#   win-vX.Y.Z tag -> X.Y.Z.0  (a real Windows-client release; `win-v*` is its own tag namespace,
+#                               kept off the host's `host-v*` and the Apple `v*` to avoid the
+#                               version-shadow class of bug — see deb.yml).
+#   main push / dispatch -> 0.2.<run_number>.0  (rolling; climbs monotonically by run number).
+#
+# Signing (packaging/pack-msix.ps1): if the MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD Actions secrets
+# are set (a real or shared code-signing .pfx whose subject DN == Publisher), the package is signed
+# with them. Otherwise an ephemeral self-signed cert is generated and its public .cer is published
+# next to the .msix (users import it to Trusted People before install). Drop in a real cert later
+# with no workflow change — just add the secrets (+ pass -Publisher if its subject differs).
+name: windows-msix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/punktfunk-client-windows/**'
+      - 'crates/punktfunk-core/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.gitea/workflows/windows-msix.yml'
+    tags: ['win-v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  PKG: punktfunk-client-windows
+
+jobs:
+  package:
+    runs-on: windows-amd64
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure + version
+        shell: pwsh
+        run: |
+          # windows-reactor's build.rs unwraps CARGO_WORKSPACE_DIR; CARGO_TARGET_DIR=C:\t dodges the
+          # MAX_PATH wall in the CMake-from-source crates (see windows.yml). Both via GITHUB_ENV.
+          "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $parts = if ($env:GITHUB_REF -like 'refs/tags/win-v*') {
+            ($env:GITHUB_REF_NAME -replace '^win-v', '').Split('.')
+          } else {
+            @('0', '2', $env:GITHUB_RUN_NUMBER)
+          }
+          while ($parts.Count -lt 4) { $parts += '0' }
+          $v = ($parts[0..3] -join '.')
+          "MSIX_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "MSIX version $v"
+
+      - name: Build (release)
+        shell: pwsh
+        run: cargo build --release -p punktfunk-client-windows
+
+      - name: Pack + sign MSIX
+        shell: pwsh
+        env:
+          MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+        run: |
+          & crates/punktfunk-client-windows/packaging/pack-msix.ps1 `
+            -Version $env:MSIX_VERSION -TargetDir C:\t\release -OutDir C:\t\msix
+
+      - name: Publish to Gitea generic registry
+        shell: pwsh
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          $files = @($env:MSIX_PATH, $env:MSIX_CER_PATH) | Where-Object { $_ -and (Test-Path $_) }
+          if (-not $files) { throw "pack produced no artifacts to publish" }
+          foreach ($f in $files) {
+            $name = Split-Path $f -Leaf
+            $url = "https://$($env:REGISTRY)/api/packages/$($env:OWNER)/generic/$($env:PKG)/$($env:MSIX_VERSION)/$name"
+            curl.exe -fsS --user "enricobuehler:$($env:REGISTRY_TOKEN)" --upload-file "$f" "$url"
+            Write-Output "published $name -> $url"
+          }
