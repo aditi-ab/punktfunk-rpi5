@@ -564,6 +564,11 @@ unsafe fn restore_displays_ccd(saved: &SavedConfig) {
 /// nothing besides `gdi_name` is attached, [`isolate_displays`] finds nothing to detach and commits
 /// nothing — so this is safe to call on every throttled recovery tick (no display thrash).
 pub(crate) fn reassert_isolation(gdi_name: &str) {
+    // Only when sole-display isolation is explicitly opted into (see create()): otherwise re-isolating
+    // would itself trigger the independent-flip storm we're avoiding.
+    if std::env::var("PUNKTFUNK_ISOLATE_DISPLAYS").is_err() {
+        return;
+    }
     unsafe {
         let _ = isolate_displays(gdi_name);
     }
@@ -745,11 +750,26 @@ impl VirtualDisplay for SudoVdaDisplay {
                 tracing::info!("SudoVDA target {} -> {n}", ao.target_id);
                 // ADD only advertises the mode; force it active so DXGI captures the requested size.
                 set_active_mode(n, mode);
-                // Detach every other display so the secure desktop (Winlogon/UAC) renders here too.
-                // CCD isolation is the one that works on a hybrid box (the legacy GDI enum misses the
-                // iGPU-attached monitor); the legacy pass stays as a no-op fallback.
-                isolated = unsafe { isolate_displays(n) };
-                ccd_saved = unsafe { isolate_displays_ccd(ao.target_id) };
+                // Display isolation (detach all other monitors → SudoVDA becomes the SOLE display) is
+                // OPT-IN now. On a hybrid GPU box a SOLE active display goes into fullscreen
+                // independent-flip / MPO, which Desktop Duplication CANNOT capture → the born-lost
+                // ACCESS_LOST + MODE_CHANGE_IN_PROGRESS storm measured live on the RTX4090+iGPU box
+                // (hook verified-firing, DPI=2, overlay running — yet still frozen). Apollo stays rock
+                // solid on this exact box precisely because it KEEPS the physical monitor active and just
+                // arranges the virtual display alongside it (multi-display is DWM-composited, so the
+                // output never independent-flips). So default to NOT isolating — match Apollo's topology.
+                // Set PUNKTFUNK_ISOLATE_DISPLAYS=1 to force the old sole-display behaviour (a truly
+                // headless box with no attached monitor, where the secure/Winlogon desktop would
+                // otherwise render on a detached physical output).
+                if std::env::var("PUNKTFUNK_ISOLATE_DISPLAYS").is_ok() {
+                    isolated = unsafe { isolate_displays(n) };
+                    ccd_saved = unsafe { isolate_displays_ccd(ao.target_id) };
+                } else {
+                    tracing::info!(
+                        "display isolation SKIPPED (Apollo-parity multi-display — avoids sole-display \
+                         independent-flip; set PUNKTFUNK_ISOLATE_DISPLAYS=1 to force sole-display)"
+                    );
+                }
                 thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture opens
             }
             None => tracing::warn!(
