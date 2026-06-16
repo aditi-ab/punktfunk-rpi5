@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Themed-icon (Android 13+/Material You) layer: the Punktfunk silhouette in a single tone — the two
+  overlapping circles as one shape. The launcher recolors this to match the wallpaper, so the fill
+  colour here only needs to be opaque. Same geometry/centering as the foreground.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.105"
+        android:scaleY="0.105"
+        android:translateX="3.57"
+        android:translateY="-0.62">
+        <path
+            android:fillColor="#1B1B1F"
+            android:pathData="M403.037,791.672c107.586,0 194.41,-86.824 194.41,-194.41c0,-107.586 -86.824,-194.41 -194.41,-194.41c-107.586,0 -194.41,86.824 -194.41,194.41c0,107.586 86.824,194.41 194.41,194.41Z" />
+        <path
+            android:fillColor="#1B1B1F"
+            android:pathData="M735.276,540.321c76.075,-76.075 76.075,-198.862 0,-274.937c-76.075,-76.075 -198.862,-76.075 -274.937,0c-76.075,76.075 -76.075,198.862 0,274.937c76.075,76.075 198.862,76.075 274.937,0Z" />
+    </group>
+</vector>

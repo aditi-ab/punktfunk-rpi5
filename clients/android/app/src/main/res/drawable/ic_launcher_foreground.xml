@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Punktfunk mark: two overlapping violet circles (two "Punkte") with a lighter lens, from the
+  shared brand logo (clients/apple/.../punktfunk_Logo.icon). The source art lives in a 1001x1000
+  space; the group scales + centers it into the adaptive-icon 108dp safe zone (inner ~66dp circle).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.105"
+        android:scaleY="0.105"
+        android:translateX="3.57"
+        android:translateY="-0.62">
+        <path
+            android:fillColor="#A79FF8"
+            android:pathData="M403.037,791.672c107.586,0 194.41,-86.824 194.41,-194.41c0,-107.586 -86.824,-194.41 -194.41,-194.41c-107.586,0 -194.41,86.824 -194.41,194.41c0,107.586 86.824,194.41 194.41,194.41Z" />
+        <path
+            android:fillColor="#6C5BF3"
+            android:pathData="M735.276,540.321c76.075,-76.075 76.075,-198.862 0,-274.937c-76.075,-76.075 -198.862,-76.075 -274.937,0c-76.075,76.075 -76.075,198.862 0,274.937c76.075,76.075 198.862,76.075 274.937,0Z" />
+        <path
+            android:fillColor="#D2C9FB"
+            android:pathData="M647.84,590.737c-64.853,17.403 -136.871,0.597 -187.885,-50.416c-51.013,-51.013 -67.819,-123.032 -50.416,-187.885c64.853,-17.403 136.871,-0.597 187.885,50.416c51.013,51.013 67.819,123.032 50.416,187.885Z" />
+    </group>
+</vector>
