@@ -2364,6 +2364,12 @@ fn virtual_stream_relay(
     let mut on_secure = false;
     let mut next = std::time::Instant::now();
     let mut await_idr = false;
+    // Step 6 relaunch watchdog: how many times in a row the helper has died without producing a frame.
+    // A console disconnect/reconnect or a helper crash kills it; we respawn (the new helper picks up
+    // the now-active session via WTSGetActiveConsoleSessionId). Reset on the first relayed frame; only
+    // give up (end the stream) after a run of failures spanning a few seconds.
+    let mut helper_fails = 0u32;
+    const MAX_HELPER_FAILS: u32 = 20;
 
     // Build a FrameMsg + hand it to the send thread; returns false if the send thread is gone (caller
     // breaks the loop). Kept as a macro (not a closure) so each use borrows `frame_tx`/`sent`/`interval`
@@ -2513,15 +2519,49 @@ fn virtual_stream_relay(
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    tracing::error!("two-process: WGC helper exited — ending stream");
-                    break;
+                    // The helper exited (crash, or a console disconnect killed its session). REBUILD
+                    // the whole output + helper (not just respawn on the old target): an abruptly-killed
+                    // helper leaves the SudoVDA's DXGI output briefly unresolvable ("no DXGI output for
+                    // target N yet"), and a console reconnect needs a fresh output in the new session —
+                    // `build` recreates both. Back off so a hard-failing rebuild (e.g. no active session
+                    // yet) doesn't spin; give up only after a sustained run of failures.
+                    helper_fails += 1;
+                    if helper_fails > MAX_HELPER_FAILS {
+                        tracing::error!(
+                            fails = helper_fails,
+                            "two-process: WGC helper keeps dying — ending stream"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    match build(&mut vd, cur_mode) {
+                        Ok((ka, rl, tg, hz)) => {
+                            tracing::warn!(
+                                fails = helper_fails,
+                                "two-process: WGC helper exited — rebuilt output + helper"
+                            );
+                            relay = rl;
+                            _keepalive = ka;
+                            target = tg;
+                            effective_hz = hz;
+                            dda = None; // old-target DDA is stale
+                            interval = std::time::Duration::from_secs_f64(1.0 / hz.max(1) as f64);
+                            await_idr = true; // resume on the new helper's opening IDR
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"), fails = helper_fails,
+                                "two-process: helper rebuild failed — will retry");
+                        }
+                    }
+                    continue;
                 }
             };
             if await_idr && !au.keyframe {
                 continue; // skip stale deltas until the post-switch IDR
             }
             await_idr = false;
-            // The helper's pts_ns is on this machine's monotonic clock (same `now_ns()` source).
+            helper_fails = 0; // a frame flowed → the helper is healthy again
+                              // The helper's pts_ns is on this machine's monotonic clock (same `now_ns()` source).
             if !forward!(au.data, au.pts_ns, au.keyframe) {
                 break 'outer; // send thread gone
             }
