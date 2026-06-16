@@ -15,7 +15,7 @@
 
 use crate::capture::dxgi::WinCaptureTarget;
 use anyhow::{bail, Context, Result};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Mutex;
 use windows::core::PWSTR;

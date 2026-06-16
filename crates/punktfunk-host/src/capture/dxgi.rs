@@ -202,10 +202,15 @@ unsafe fn duplicate_output(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(200);
+        // Default 1 (no retry → immediate legacy fallback). On the secure desktop DuplicateOutput1
+        // ALWAYS refuses (only LOGON_UI may use it), so retrying there just blocks the capture thread;
+        // and on the normal desktop the release-before-reduplicate + gentle recovery already keep the
+        // legacy dup stable. Raise PUNKTFUNK_DUP_RETRY_N only on a box where DuplicateOutput1 can win
+        // the old-dup-teardown race (then PUNKTFUNK_DUP_RETRY_MS sets the per-wait, default 200).
         let attempts: u64 = std::env::var("PUNKTFUNK_DUP_RETRY_N")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(6)
+            .unwrap_or(1)
             .max(1);
         let mut last_err = None;
         for attempt in 0..attempts {
@@ -225,10 +230,16 @@ unsafe fn duplicate_output(
             }
         }
         if let Some(e) = last_err {
-            tracing::warn!(
-                error = %format!("{e:?}"),
-                "DuplicateOutput1 failed after retries — falling back to legacy DuplicateOutput (will churn)"
-            );
+            // Expected on the secure (Winlogon) desktop (DuplicateOutput1 is LOGON_UI-only) and fires
+            // once per gentle recovery there — throttle so a lock dwell doesn't flood the log. The
+            // legacy fallback below handles it; gentle recovery keeps it from churning.
+            static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+            if FALLBACKS.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+                tracing::warn!(
+                    error = %format!("{e:?}"),
+                    "DuplicateOutput1 unavailable — using legacy DuplicateOutput (expected on the secure desktop)"
+                );
+            }
         }
     }
     output.DuplicateOutput(device).context("DuplicateOutput")
