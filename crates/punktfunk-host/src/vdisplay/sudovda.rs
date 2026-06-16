@@ -60,7 +60,19 @@ const IOCTL_GET_VERSION: u32 = ctl(0x8FF);
 // A fixed monitor identity. One session at a time today; Windows persists this monitor's layout
 // across sessions by GUID, and REMOVE keys off it. (TODO: derive per-client when concurrent
 // sessions land.)
-const MONITOR_GUID: GUID = GUID::from_u128(0x70756E6B_7466_756E_6B30_000000000001);
+/// A UNIQUE-per-session SudoVDA monitor GUID. The monitor is keyed by GUID for IOCTL_ADD/REMOVE, so a
+/// FIXED GUID makes overlapping sessions (a client reconnecting after a freeze before the old session
+/// has torn down, or genuine concurrent sessions) all map to the SAME monitor — then one session's
+/// IOCTL_REMOVE on teardown tears the monitor down OUT FROM UNDER a still-live session ("display
+/// disconnected" sound + freeze, even with no context change — observed live). Make it unique per
+/// (process, session): base GUID with the low 48-bit node = (pid << 16 | session#).
+fn next_monitor_guid() -> GUID {
+    use std::sync::atomic::AtomicU32;
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) as u128;
+    let pid = std::process::id() as u128;
+    GUID::from_u128(0x70756E6B_7466_756E_6B30_000000000000u128 | (pid << 16) | (n & 0xFFFF))
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -664,11 +676,14 @@ impl VirtualDisplay for SudoVdaDisplay {
         let mut device_name = [0u8; 14];
         let nm = b"punktfunk";
         device_name[..nm.len()].copy_from_slice(nm);
+        // Unique GUID PER SESSION so overlapping sessions / client reconnects each own their own
+        // SudoVDA monitor — a stale session's REMOVE must never tear down a live session's monitor.
+        let session_guid = next_monitor_guid();
         let add = AddParams {
             width: mode.width,
             height: mode.height,
             refresh: mode.refresh_hz,
-            guid: MONITOR_GUID,
+            guid: session_guid,
             device_name,
             serial: [0u8; 14],
         };
@@ -802,7 +817,7 @@ impl VirtualDisplay for SudoVdaDisplay {
                 }),
             keepalive: Box::new(SudoVdaKeepalive {
                 device: device_raw,
-                guid: MONITOR_GUID,
+                guid: session_guid,
                 stop,
                 pinger: Some(pinger),
                 gdi_name,
