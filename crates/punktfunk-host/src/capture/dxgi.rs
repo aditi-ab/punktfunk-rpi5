@@ -205,6 +205,66 @@ pub(crate) unsafe fn nudge_cursor_onto(output: &IDXGIOutput1) {
     }
 }
 
+/// Replacement for `win32u.dll!NtGdiDdDDIGetCachedHybridQueryValue`: always report
+/// `D3DKMT_GPU_PREFERENCE_STATE_UNSPECIFIED` (3). We fully replace the function (never call the
+/// original), so no trampoline is needed. (Ported verbatim from Apollo's MinHook hook.)
+unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
+    if gpu_preference.is_null() {
+        return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
+    }
+    *gpu_preference = 3; // D3DKMT_GPU_PREFERENCE_STATE_UNSPECIFIED
+    0 // STATUS_SUCCESS
+}
+
+/// Apollo's win32u GPU-preference hook, ported. On a HYBRID-GPU box DXGI resolves a GPU preference
+/// (registry + power settings + the hybrid-adapter DDI) and REPARENTS outputs onto the chosen render
+/// GPU — which constantly invalidates Desktop Duplication (DXGI_ERROR_ACCESS_LOST 0x887A0026, the
+/// freeze/churn observed on the RTX 4090 + AMD iGPU box; `SET_RENDER_ADAPTER` is ignored there). Faking
+/// a cached preference of UNSPECIFIED makes DXGI skip the resolution, so the output is NOT reparented
+/// and DDA stays stable on one adapter (this is what makes Apollo's DDA work on this hardware).
+/// Installed once, before the first DXGI factory/enumeration; lasts the process lifetime (like Apollo).
+fn install_gpu_pref_hook() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| unsafe {
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+        use windows::Win32::System::Memory::{
+            VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS,
+        };
+        let Ok(lib) = LoadLibraryA(s!("win32u.dll")) else {
+            tracing::warn!("GPU-pref hook: win32u.dll not loadable — skipping (DDA may churn on hybrid GPUs)");
+            return;
+        };
+        let Some(target) = GetProcAddress(lib, s!("NtGdiDdDDIGetCachedHybridQueryValue")) else {
+            tracing::warn!("GPU-pref hook: NtGdiDdDDIGetCachedHybridQueryValue not exported — skipping");
+            return;
+        };
+        let target = target as usize as *mut u8;
+        // x64 absolute jump to our replacement: `mov rax, imm64 ; jmp rax` (12 bytes). We never call the
+        // original, so no trampoline/relocation (hence no detour crate / C length-disassembler dep).
+        let hook = hybrid_query_hook as usize;
+        let mut patch = [0u8; 12];
+        patch[0] = 0x48;
+        patch[1] = 0xB8; // mov rax, imm64
+        patch[2..10].copy_from_slice(&hook.to_le_bytes());
+        patch[10] = 0xFF;
+        patch[11] = 0xE0; // jmp rax
+        let mut old = PAGE_PROTECTION_FLAGS(0);
+        if VirtualProtect(target as *const c_void, 12, PAGE_EXECUTE_READWRITE, &mut old).is_err() {
+            tracing::warn!("GPU-pref hook: VirtualProtect failed — skipping");
+            return;
+        }
+        std::ptr::copy_nonoverlapping(patch.as_ptr(), target, 12);
+        let mut restore = PAGE_PROTECTION_FLAGS(0);
+        let _ = VirtualProtect(target as *const c_void, 12, old, &mut restore);
+        // No FlushInstructionCache: the patch lands before the first DXGI call on this same thread, so
+        // the i-cache is coherent (cross-modifying code would need a flush; this is same-thread setup).
+        tracing::info!(
+            "GPU-pref hook installed (win32u hybrid-query -> UNSPECIFIED): DXGI output reparenting disabled"
+        );
+    });
+}
+
 // DXGI Desktop Duplication deliberately EXCLUDES the hardware cursor from the captured surface (the
 // OS composites it separately). We capture the cursor shape/position from the frame info and blend it
 // back in — on the GPU for the zero-copy path (a CPU readback would stall the 240 fps pipeline).
@@ -873,6 +933,9 @@ impl DuplCapturer {
         keepalive: Box<dyn Send>,
     ) -> Result<Self> {
         unsafe {
+            // Stop DXGI hybrid-GPU output reparenting BEFORE we create the factory / enumerate outputs
+            // (the cause of the 0x887A0026 ACCESS_LOST churn on this hybrid box: RTX 4090 + AMD iGPU).
+            install_gpu_pref_hook();
             let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
             // 1) Find the output (monitor) whose GDI DeviceName matches, across ALL adapters. On a
             // real-GPU box the SudoVDA virtual monitor's DXGI output is enumerated under the GPU that
