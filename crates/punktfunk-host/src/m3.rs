@@ -2581,31 +2581,39 @@ fn virtual_stream_relay(
                 }
                 next = std::time::Instant::now();
             } else {
-                // Returning to the normal desktop: restore HDR on the SudoVDA (HDR sessions ONLY — WGC
-                // then captures it HDR). An SDR (8-bit) session must stay SDR; forcing HDR here is what
-                // made the rebuilt WGC helper capture HDR FP16 BT.2020 while the encoder is 8-bit SDR →
-                // format mismatch / broken image (the "HDR gets restored when flipping back" bug).
+                // Returning to the normal desktop: RESUME from the still-alive WGC helper. Do NOT
+                // recreate the SudoVDA monitor or respawn the helper — build()'s vd.create() is an
+                // IOCTL_REMOVE+ADD of the monitor (the audible disconnect/connect chime + the
+                // teardown/recreate kernel stress that broke DDA, now applied to the mux). The monitor +
+                // helper persist for the WHOLE session; only the host-DDA leg opens (secure) and closes
+                // (normal). Apply the DDA learning here: reuse, don't tear down.
+                dda = None; // free the secure DDA encoder; the relay (helper) is the source again
+                while relay.try_recv().is_ok() {} // drop secure-dwell backlog
+                relay.request_keyframe(); // client decoder resumes on the helper's next IDR
                 if bit_depth >= 10 {
+                    // HDR session ONLY: the secure switch dropped the SudoVDA to SDR for the DDA leg, so
+                    // here we must restore HDR AND rebuild the helper so WGC re-detects the HDR
+                    // colorspace. An SDR session never changed the colorspace → no rebuild, no recreate.
                     unsafe {
                         crate::vdisplay::sudovda::set_advanced_color(target.target_id, true);
                     }
-                }
-                dda = None; // free the secure DDA encoder
-                match build(&mut vd, cur_mode) {
-                    Ok((ka, rl, tg, hz)) => {
-                        relay = rl;
-                        _keepalive = ka;
-                        target = tg;
-                        effective_hz = hz;
-                        interval = std::time::Duration::from_secs_f64(1.0 / hz.max(1) as f64);
+                    match build(&mut vd, cur_mode) {
+                        Ok((ka, rl, tg, hz)) => {
+                            relay = rl;
+                            _keepalive = ka;
+                            target = tg;
+                            effective_hz = hz;
+                            interval = std::time::Duration::from_secs_f64(1.0 / hz.max(1) as f64);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %format!("{e:#}"),
+                                "two-process: helper rebuild on secure-exit failed");
+                            while relay.try_recv().is_ok() {}
+                            relay.request_keyframe();
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(error = %format!("{e:#}"),
-                            "two-process: helper rebuild on secure-exit failed");
-                        while relay.try_recv().is_ok() {}
-                        relay.request_keyframe();
-                    }
                 }
+                next = std::time::Instant::now();
             }
         }
         if want_kf {
