@@ -32,6 +32,8 @@ mod native_pairing;
 mod pipeline;
 mod pwinit;
 mod vdisplay;
+#[cfg(target_os = "windows")]
+mod wgc_helper;
 #[cfg(target_os = "linux")]
 mod zerocopy;
 
@@ -193,6 +195,34 @@ fn real_main() -> Result<()> {
                 allow_pairing: true,
                 pairing_pin: None,
                 paired_store: None,
+            })
+        }
+        // USER-session WGC helper (Windows two-process secure-desktop design): capture the EXISTING
+        // SudoVDA via WGC + NVENC, stream AUs on stdout to the SYSTEM host. Spawned by the host
+        // (CreateProcessAsUser), not run by hand. See docs/windows-secure-desktop.md.
+        #[cfg(target_os = "windows")]
+        Some("wgc-helper") => {
+            let get = |flag: &str| {
+                args.iter()
+                    .skip_while(|a| *a != flag)
+                    .nth(1)
+                    .map(String::as_str)
+            };
+            let (width, height, fps) = get("--mode")
+                .and_then(|m| {
+                    let p: Vec<u32> = m.split('x').filter_map(|s| s.parse().ok()).collect();
+                    (p.len() == 3).then(|| (p[0], p[1], p[2]))
+                })
+                .unwrap_or((1920, 1080, 60));
+            wgc_helper::run(wgc_helper::HelperOptions {
+                target_id: get("--target-id").and_then(|s| s.parse().ok()).unwrap_or(0),
+                gdi_name: get("--gdi").unwrap_or("").to_string(),
+                width,
+                height,
+                fps,
+                bitrate_kbps: get("--bitrate")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(20000),
             })
         }
         Some("-h") | Some("--help") | Some("help") | None => {
