@@ -5,6 +5,10 @@ mod loopback;
 mod udp;
 
 pub use loopback::{loopback_pair, LoopbackTransport};
+/// Windows-only: reusable USO (UDP Send Offload) batch send for callers that own their own connected
+/// socket (the GameStream video sender) rather than going through [`UdpTransport`].
+#[cfg(target_os = "windows")]
+pub use udp::send_uso_all;
 pub use udp::{spawn_data_punch, UdpTransport, PUNCH_MAGIC};
 
 /// A datagram transport. `recv` is non-blocking: it returns `Ok(None)` when no packet

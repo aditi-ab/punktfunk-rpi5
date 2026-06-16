@@ -180,9 +180,24 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Portable fallback (non-Linux dev builds — GameStream hosting never ships there): one
-/// syscall per packet.
-#[cfg(not(target_os = "linux"))]
+/// Windows: coalesce each paced burst's equal-size packets into `WSASendMsg(UDP_SEND_MSG_SIZE)`
+/// super-buffers (UDP Send Offload — the Windows analogue of Linux GSO), so a 16-packet burst is one
+/// syscall instead of 16. Reuses the proven core USO primitive; it returns how many leading packets
+/// it sent, and we send any remainder (USO off via `PUNKTFUNK_GSO=0`, a size-mixed burst, or a
+/// frame's short final packet) with a per-packet `send`. The socket is connected.
+#[cfg(target_os = "windows")]
+fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
+    let refs: Vec<&[u8]> = pkts.iter().map(|p| p.as_slice()).collect();
+    let n = punktfunk_core::transport::send_uso_all(sock, &refs)?;
+    for p in &pkts[n..] {
+        sock.send(p)?;
+    }
+    Ok(())
+}
+
+/// Portable fallback (other non-Linux dev builds, e.g. macOS — GameStream hosting never ships there):
+/// one syscall per packet.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     for p in pkts {
         sock.send(p)?;

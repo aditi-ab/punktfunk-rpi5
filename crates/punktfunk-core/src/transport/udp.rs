@@ -245,6 +245,53 @@ fn send_one_uso(socket: &std::net::UdpSocket, buf: &[u8], seg_size: u16) -> std:
     Ok(())
 }
 
+/// Reusable Windows USO batch send for callers that own their OWN connected `UdpSocket` and are not
+/// the [`UdpTransport`] data plane — specifically the GameStream video sender, whose paced bursts of
+/// equal-size RTP/FEC packets are otherwise sent one `send` syscall at a time on Windows. Coalesces
+/// the LEADING run of uniform-size packets into ≤512-segment `WSASendMsg(UDP_SEND_MSG_SIZE)`
+/// super-buffers and returns how many packets it sent that way; the caller sends any remainder with
+/// its own per-packet path. Returns `Ok(0)` (caller sends everything scalar) when USO is disabled
+/// (`PUNKTFUNK_GSO=0`) or the packets aren't uniform-size. On a USO-unsupported error it latches USO
+/// off process-wide and returns the count sent so far; a transient full-buffer also returns the
+/// count-so-far. Same uniform-size rule and `seg`/512 chunking as the [`UdpTransport`] `send_gso`
+/// Windows path, reusing its [`send_one_uso`] primitive.
+#[cfg(target_os = "windows")]
+pub fn send_uso_all(socket: &std::net::UdpSocket, packets: &[&[u8]]) -> std::io::Result<usize> {
+    if packets.is_empty() || !uso::active() {
+        return Ok(0);
+    }
+    // USO needs every segment but the last to be exactly `seg` bytes; bail to the scalar caller path
+    // otherwise (a frame's final/short packet or a size-mixed burst).
+    let seg = packets[0].len();
+    let last = packets.len() - 1;
+    if seg == 0 || packets[..last].iter().any(|p| p.len() != seg) || packets[last].len() > seg {
+        return Ok(0);
+    }
+    let max_seg = 512usize; // Win11 x64 accepts up to ~512 segments per WSASendMsg
+    let mut scratch: Vec<u8> = Vec::with_capacity(seg * packets.len().min(max_seg));
+    let mut sent = 0usize;
+    for chunk in packets.chunks(max_seg) {
+        scratch.clear();
+        for p in chunk {
+            scratch.extend_from_slice(p);
+        }
+        match send_one_uso(socket, &scratch, seg as u16) {
+            Ok(()) => sent += chunk.len(),
+            // Send buffer momentarily full — stop here; the caller sends the rest (and the pacing
+            // loop / blocking socket absorbs it). Never block or tear down here.
+            Err(e) if is_transient_io(&e) => break,
+            // USO unsupported on this OS/NIC/path — latch off; the caller sends the rest scalar and
+            // every later burst skips USO via `uso::active()`.
+            Err(e) if uso_unsupported(&e) => {
+                uso::disable();
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(sent)
+}
+
 /// Apple (macOS/iOS) batched-receive enable state. Darwin has no `recvmmsg(2)`, so without this our
 /// macOS client does one `recv` syscall per packet — at a few hundred Mbps that's ~40-90k syscalls/s
 /// on one core, and when the recv loop can't drain fast enough the kernel socket buffer backs up and
