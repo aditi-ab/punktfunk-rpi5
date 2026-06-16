@@ -3,9 +3,16 @@
 # (windows-reactor + D3D11/SwapChainPanel + WASAPI + SDL3) on x86_64-pc-windows-msvc.
 #
 # The MSVC/WinUI/FFmpeg toolchain (cargo/rustup on ASCII paths, NASM, CMake, LLVM, FFmpeg,
-# CARGO_HOME, CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. The one
-# per-checkout var is CARGO_WORKSPACE_DIR (windows-reactor's build.rs unwraps it + stages the
-# Windows App SDK NuGets/winmd under it) — set from GITHUB_WORKSPACE in a step.
+# CARGO_HOME, CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. Two
+# per-checkout vars are set in a step:
+#   - CARGO_WORKSPACE_DIR  windows-reactor's build.rs unwraps it + stages the Win App SDK
+#                          NuGets/winmd under it (from GITHUB_WORKSPACE).
+#   - CARGO_TARGET_DIR=C:\t  the runner's host workdir is buried deep under
+#                          C:\Windows\System32\config\systemprofile\.cache\act\<hash>\hostexecutor\,
+#                          so the default target\ path blows past Windows' MAX_PATH (260) inside the
+#                          CMake-from-source builds (audiopus_sys / SDL3) — MSBuild's tracker then
+#                          can't create its .tlog (DirectoryNotFoundException -> MSB6003). A short
+#                          root keeps every nested path well under the limit.
 #
 # Steps use `shell: pwsh` (PowerShell 7) deliberately: Windows PowerShell 5.1's
 # `Out-File -Encoding utf8` prepends a UTF-8 BOM that corrupts the first GITHUB_ENV line (the
@@ -42,6 +49,7 @@ jobs:
         shell: pwsh
         run: |
           "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           rustc --version
           cargo --version
           node --version
