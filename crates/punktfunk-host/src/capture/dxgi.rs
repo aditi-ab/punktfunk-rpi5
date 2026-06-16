@@ -39,7 +39,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED,
-    DXGI_ERROR_DEVICE_RESET,
+    DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_MODE_CHANGE_IN_PROGRESS,
     DXGI_ERROR_INVALID_CALL, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
@@ -1698,6 +1698,20 @@ impl DuplCapturer {
                 }
                 return Ok(None);
             }
+            // MODE_CHANGE_IN_PROGRESS (0x887A0025) is TRANSIENT by design ("the call may succeed at a
+            // later attempt") — the display topology is mid-settle (e.g. just after the IDD's mode is
+            // applied). Do NOT recover/rebuild: a rebuild re-issues create()→set_active_mode, re-touching
+            // the topology and PERPETUATING the change (the storm we measured). Just repeat the last frame
+            // and wait it out, like a timeout. Throttled log so a genuinely stuck change stays visible.
+            Err(e) if e.code() == DXGI_ERROR_MODE_CHANGE_IN_PROGRESS => {
+                self.dbg_timeouts += 1;
+                if self.dbg_timeouts % 120 == 1 {
+                    tracing::warn!(
+                        "DXGI mode change in progress (0x887A0025) — waiting for topology to settle"
+                    );
+                }
+                return Ok(None);
+            }
             // Recoverable losses, ALL handled by rebuilding the duplication (device + re-DuplicateOutput):
             //   ACCESS_LOST   — desktop switch (normal <-> Winlogon secure: lock/login/UAC) or mode change
             //   INVALID_CALL  — the secure->user-desktop switch (post-login) leaves the duplication in a
@@ -1760,24 +1774,18 @@ impl DuplCapturer {
                 } else {
                     std::thread::sleep(Duration::from_millis(8));
                 }
-                // Escape the born-lost storm on the NORMAL desktop. If rebuilds keep coming back
-                // born-lost (created OK, instant ACCESS_LOST), the cheap+heavy re-duplicate will never
-                // converge — this is the hybrid reparent/independent-flip wedge that froze the stream on
-                // its last frame forever. Surface an error so the m3 loop cold-rebuilds the WHOLE
-                // pipeline (fresh VirtualDisplay + device + output), bounded by MAX_CAPTURE_REBUILDS.
-                // NEVER on the secure (Winlogon) desktop: a long static lock/login/UAC dwell is
-                // legitimate and must not end the session.
-                const BORN_LOST_ESCAPE: u32 = 20; // ~5 s at the 250 ms rebuild throttle
-                if self.ever_got_frame
-                    && self.consecutive_born_lost >= BORN_LOST_ESCAPE
-                    && !crate::capture::desktop_watch::is_secure_desktop()
-                {
+                // Born-lost rebuilds (created OK, instant ACCESS_LOST) used to escalate to a full pipeline
+                // cold-rebuild here — but that re-issued vd.create()→set_active_mode (an audible PnP
+                // add/remove chime + a fresh topology mode change), which never converged and amplified
+                // the storm. With the topology fix (set_active_mode no longer promotes the IDD to PRIMARY
+                // by default) the born-lost storm is gone at its source; if one ever recurs, just keep
+                // repeating the last frame in-process — never tear the IDD down mid-session (Apollo never
+                // does). Throttled visibility only.
+                if self.consecutive_born_lost > 0 && self.consecutive_born_lost % 40 == 1 {
                     tracing::warn!(
                         consecutive = self.consecutive_born_lost,
-                        "DDA born-lost storm on normal desktop — escalating to full pipeline cold-rebuild"
+                        "DDA born-lost rebuilds — repeating last frame in-process (no teardown)"
                     );
-                    self.consecutive_born_lost = 0;
-                    return Err(anyhow!("DDA born-lost storm — cold-rebuilding capture pipeline"));
                 }
                 return Ok(None);
             }

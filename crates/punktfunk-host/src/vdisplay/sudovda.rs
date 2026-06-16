@@ -341,9 +341,22 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
         );
     }
 
+    // Default (multi-display, Apollo-parity): set ONLY this output's mode in place. Promoting the IDD
+    // to PRIMARY at the virtual-screen origin (DM_POSITION 0,0) + persisting it GLOBALly contests the
+    // box's baseline display (e.g. a 1024x768 basic "WinDisc") so the desktop topology never reaches a
+    // stable fixed point → a perpetual DXGI_ERROR_MODE_CHANGE_IN_PROGRESS storm (the freeze + audible
+    // PnP chime measured live on the RTX4090+iGPU box). Apollo with an EMPTY config never promotes
+    // primary and captures the same SudoVDA cleanly (verified live). So default to CDS_UPDATEREGISTRY
+    // only. ONLY when isolating to a SOLE display does the IDD genuinely need to be primary — a blank
+    // EXTENDED IDD may not be DWM-composited and would yield no duplication frames.
+    let isolating = std::env::var("PUNKTFUNK_ISOLATE_DISPLAYS").is_ok();
+    let mut dm_fields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_BITSPERPEL;
+    if isolating {
+        dm_fields |= DM_POSITION; // pin to origin, but only as the sole/primary display
+    }
     let dm = DEVMODEW {
         dmSize: size_of::<DEVMODEW>() as u16,
-        dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_BITSPERPEL | DM_POSITION,
+        dmFields: dm_fields,
         dmBitsPerPel: 32,
         dmPelsWidth: mode.width,
         dmPelsHeight: mode.height,
@@ -363,17 +376,16 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
         );
         return;
     }
+    // Default: CDS_UPDATEREGISTRY only — set this output's mode WITHOUT promoting it to primary or
+    // rewriting the global topology (which storms MODE_CHANGE_IN_PROGRESS). Promote to primary only when
+    // isolating to a sole display.
+    let apply_flags = if isolating {
+        CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_SET_PRIMARY
+    } else {
+        CDS_UPDATEREGISTRY
+    };
     let apply = unsafe {
-        ChangeDisplaySettingsExW(
-            PCWSTR(wname.as_ptr()),
-            Some(&dm),
-            None,
-            // Make it the PRIMARY display: a blank *extended* IDD output isn't composited by the DWM,
-            // so it produces no duplication frames. As primary it carries the shell/cursor → frames
-            // flow (this is what Apollo does). Position is (0,0) via DM_POSITION (zeroed by default).
-            CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_SET_PRIMARY,
-            None,
-        )
+        ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, apply_flags, None)
     };
     if apply == DISP_CHANGE_SUCCESSFUL {
         tracing::info!(
