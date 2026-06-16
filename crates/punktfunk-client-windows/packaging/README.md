@@ -37,24 +37,33 @@ MSIX requires a strictly 4-part numeric version. The workflow computes:
 
 ## Signing & install
 
-Signing precedence in `pack-msix.ps1`:
-1. **`MSIX_CERT_PFX_B64` / `MSIX_CERT_PASSWORD`** Actions secrets — a real (or shared) code-signing
-   `.pfx` whose **subject DN must equal `-Publisher`** (default `CN=unom`). Drop these in later to
-   move off self-signed with **no manifest change**; if the cert's subject differs, pass a matching
-   `-Publisher` (it's stamped into the manifest `Identity`).
-2. otherwise an **ephemeral self-signed** cert (subject = `-Publisher`) is generated and its public
-   `.cer` is published next to the `.msix`.
-
-To install a self-signed build, trust the cert once, then add the package:
+CI signs every build with a **stable self-signed code-signing cert** (`CN=unom`, SHA-1
+`CD1EFDEEEC9743AFC38F56C5AF30C5A3009BE941`, valid to 2036). Its public half is checked in as
+[`punktfunk-codesign.cer`](punktfunk-codesign.cer); the private `.pfx` + password live in the
+`MSIX_CERT_PFX_B64` / `MSIX_CERT_PASSWORD` Actions secrets. Because it's the *same* cert every build,
+trusting it is **one-time, per machine** — once imported, every future build and in-place upgrade is
+trusted with no further prompt:
 
 ```powershell
-Import-Certificate -FilePath .\punktfunk-client-windows_<ver>_x64.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+# once per machine (elevated): trust the publisher
+Import-Certificate -FilePath .\punktfunk-codesign.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+# then install (and re-run for each upgrade — no re-trust needed)
 Add-AppxPackage -Path .\punktfunk-client-windows_<ver>_x64.msix
 ```
+
+The matching `.cer` is also published next to each `.msix` in the registry, so it's always at hand.
 
 The MSIX declares a dependency on the Windows App SDK 2.x runtime; install
 [the App SDK runtime](https://aka.ms/windowsappsdk) if `Add-AppxPackage` reports a missing
 `Microsoft.WindowsAppRuntime.2` framework.
+
+`pack-msix.ps1` signing precedence: it uses the **`MSIX_CERT_PFX_B64` / `MSIX_CERT_PASSWORD`** secrets
+when present (the stable cert above), else generates an *ephemeral* self-signed cert (forks / local
+builds without the secrets). Either way it exports the signing cert's public `.cer` for the import.
+**To move to a publicly-trusted (no-import) cert** — Azure Artifact Signing or a public OV cert —
+replace the two secrets with the new `.pfx`; the cert's subject DN must equal the manifest
+`Publisher`, so pass a matching `-Publisher` (it's stamped into the package `Identity`, and changing
+it changes the package identity → a one-time reinstall).
 
 ## Building locally
 
