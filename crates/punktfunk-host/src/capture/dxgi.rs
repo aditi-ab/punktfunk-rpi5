@@ -1026,6 +1026,31 @@ impl DuplCapturer {
             // Stop DXGI hybrid-GPU output reparenting BEFORE we create the factory / enumerate outputs
             // (the cause of the 0x887A0026 ACCESS_LOST churn on this hybrid box: RTX 4090 + AMD iGPU).
             install_gpu_pref_hook();
+            // Force PER-MONITOR-AWARE-V2 on THIS (capture) thread. IDXGIOutput5::DuplicateOutput1
+            // REQUIRES V2 — without it the call returns E_ACCESSDENIED forever (the 4370x failures
+            // measured live), forcing the legacy DuplicateOutput fallback which yields a BORN-LOST
+            // duplication on this box → the ACCESS_LOST storm. SetProcessDpiAwarenessContext failed at
+            // startup ("already set" — a manifest/runtime locked the process to a LOWER awareness, and
+            // GetAwarenessFromDpiAwarenessContext can't tell V1 from V2: it reports 2 for both). The
+            // per-THREAD override works regardless of the process default, so DuplicateOutput1 can
+            // succeed (the working dup Apollo gets). Must run on the capture thread before any DXGI use.
+            {
+                use windows::Win32::UI::HiDpi::{
+                    AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext,
+                    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                };
+                let prev = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+                let is_v2 = AreDpiAwarenessContextsEqual(
+                    GetThreadDpiAwarenessContext(),
+                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                )
+                .as_bool();
+                tracing::info!(
+                    set_ok = !prev.0.is_null(),
+                    thread_is_v2 = is_v2,
+                    "capture thread DPI awareness -> PER_MONITOR_AWARE_V2 (required for DuplicateOutput1)"
+                );
+            }
             // Keep the IDD (SudoVDA) virtual display awake for the capture lifetime: an idle indirect
             // display can be power-gated, which invalidates the duplication (a contributor to the
             // "freezes randomly while streaming" loss). Restored to ES_CONTINUOUS on Drop. (Apollo does
