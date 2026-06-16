@@ -97,6 +97,12 @@ impl HelperRelay {
         self.rx.recv_timeout(dur)
     }
 
+    /// Non-blocking receive — used to drain stale buffered AUs (encoded while the secure desktop was
+    /// the live source) before resuming the relay. `Ok` while AUs remain, `Err` once empty.
+    pub fn try_recv(&self) -> Result<RelayAu, std::sync::mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+
     /// Ask the helper's encoder for an IDR on the next frame (client decode recovery). Best-effort:
     /// a write failure means the helper is gone — the caller's recv loop will see the disconnect.
     pub fn request_keyframe(&self) {
