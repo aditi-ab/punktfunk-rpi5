@@ -223,7 +223,7 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
 /// a cached preference of UNSPECIFIED makes DXGI skip the resolution, so the output is NOT reparented
 /// and DDA stays stable on one adapter (this is what makes Apollo's DDA work on this hardware).
 /// Installed once, before the first DXGI factory/enumeration; lasts the process lifetime (like Apollo).
-fn install_gpu_pref_hook() {
+pub(crate) fn install_gpu_pref_hook() {
     use std::sync::Once;
     static HOOK: Once = Once::new();
     HOOK.call_once(|| unsafe {
@@ -242,7 +242,7 @@ fn install_gpu_pref_hook() {
         let target = target as usize as *mut u8;
         // x64 absolute jump to our replacement: `mov rax, imm64 ; jmp rax` (12 bytes). We never call the
         // original, so no trampoline/relocation (hence no detour crate / C length-disassembler dep).
-        let hook = hybrid_query_hook as usize;
+        let hook = hybrid_query_hook as *const () as usize;
         let mut patch = [0u8; 12];
         patch[0] = 0x48;
         patch[1] = 0xB8; // mov rax, imm64

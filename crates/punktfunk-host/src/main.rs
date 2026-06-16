@@ -75,6 +75,13 @@ fn real_main() -> Result<()> {
         punktfunk_core::ABI_VERSION
     );
 
+    // Install Apollo's win32u GPU-preference hook BEFORE anything touches DXGI (the SudoVDA
+    // render-adapter selection creates a DXGI factory during virtual-display setup, well before
+    // capture). On a hybrid-GPU box this stops DXGI from reparenting the virtual output off the
+    // capture GPU — the ACCESS_LOST churn fix. Idempotent (Once); harmless on non-hybrid boxes.
+    #[cfg(target_os = "windows")]
+    crate::capture::dxgi::install_gpu_pref_hook();
+
     match args.first().map(String::as_str) {
         // GameStream host control plane (P1.1: mDNS + serverinfo) + management API, and (with
         // --native) the native punktfunk/1 host in the same process — the unified host.
