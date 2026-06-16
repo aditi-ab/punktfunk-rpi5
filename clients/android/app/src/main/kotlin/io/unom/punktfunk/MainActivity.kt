@@ -1,6 +1,7 @@
 package io.unom.punktfunk
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -13,8 +14,10 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -244,11 +247,22 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
 
     // mDNS discovery scoped to this screen; NsdManager callbacks arrive on the main thread, so the
     // onChange callback can set Compose state directly. (Emulator SLIRP drops multicast → empty.)
+    // NsdManager discovery needs NEARBY_WIFI_DEVICES on Android 13+ (a runtime permission) — without
+    // it discoverServices silently finds nothing. Request it once, then (re)start discovery on grant.
     val discovery = remember { HostDiscovery(context) }
     var discovered by remember { mutableStateOf<List<DiscoveredHost>>(emptyList()) }
-    DisposableEffect(Unit) {
+    var nearbyGranted by remember { mutableStateOf(hasNearbyPermission(context)) }
+    val nearbyLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> nearbyGranted = granted }
+    LaunchedEffect(Unit) {
+        if (!nearbyGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            nearbyLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+    }
+    DisposableEffect(nearbyGranted) {
         discovery.onChange = { discovered = it }
-        discovery.start()
+        if (nearbyGranted) discovery.start()
         onDispose {
             discovery.onChange = null
             discovery.stop()
@@ -575,6 +589,12 @@ private fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
         }
     }
 }
+
+/** NsdManager discovery needs NEARBY_WIFI_DEVICES on API 33+; below that it doesn't apply. */
+private fun hasNearbyPermission(context: Context): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+        ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) ==
+        PackageManager.PERMISSION_GRANTED
 
 /** Left-aligned section header above each block of the connect screen. */
 @Composable
