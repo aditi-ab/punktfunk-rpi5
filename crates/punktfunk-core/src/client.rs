@@ -21,7 +21,7 @@ use crate::quic::{
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -128,6 +128,11 @@ pub struct NativeClient {
     /// Speed-test accumulator, shared with the data-plane pump + control task.
     probe: Arc<Mutex<ProbeState>>,
     shutdown: Arc<AtomicBool>,
+    /// Cumulative count of access units the reassembler gave up on (FEC couldn't recover), mirrored
+    /// from the data-plane pump's `Session`. A client video loop watches this for increases to request
+    /// a recovery keyframe under infinite GOP — the correct loss trigger, since unrecoverable loss
+    /// yields reference-missing frames the decoder silently conceals (a decode-error trigger misses them).
+    frames_dropped: Arc<AtomicU64>,
     worker: Option<std::thread::JoinHandle<()>>,
     /// The currently active session mode (the Welcome's, then updated by every accepted
     /// [`NativeClient::request_mode`]).
@@ -208,11 +213,13 @@ impl NativeClient {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mode_slot = Arc::new(std::sync::Mutex::new(mode));
         let probe = Arc::new(Mutex::new(ProbeState::default()));
+        let frames_dropped = Arc::new(AtomicU64::new(0));
 
         let host = host.to_string();
         let shutdown_w = shutdown.clone();
         let mode_slot_w = mode_slot.clone();
         let probe_w = probe.clone();
+        let frames_dropped_w = frames_dropped.clone();
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
             .spawn(move || {
@@ -253,6 +260,7 @@ impl NativeClient {
                     shutdown: shutdown_w,
                     mode_slot: mode_slot_w,
                     probe: probe_w,
+                    frames_dropped: frames_dropped_w,
                 }));
             })
             .map_err(PunktfunkError::Io)?;
@@ -285,6 +293,7 @@ impl NativeClient {
             probe,
             shutdown,
             worker: Some(worker),
+            frames_dropped,
             mode: mode_slot,
             host_fingerprint: fingerprint,
             resolved_compositor,
@@ -410,6 +419,15 @@ impl NativeClient {
         self.ctrl_tx
             .send(CtrlRequest::Keyframe)
             .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
+    /// rebuild them). A video loop polls this and calls [`request_keyframe`](Self::request_keyframe)
+    /// when it increases — the correct loss trigger under infinite GOP, where unrecoverable loss
+    /// produces reference-missing delta frames the decoder silently conceals (so a decode-error
+    /// trigger would rarely fire). Monotonic for the session; compare against the last observed value.
+    pub fn frames_dropped(&self) -> u64 {
+        self.frames_dropped.load(Ordering::Relaxed)
     }
 
     /// Start a bandwidth speed test: ask the host to burst filler over the data plane at
@@ -566,6 +584,7 @@ struct WorkerArgs {
     shutdown: Arc<AtomicBool>,
     mode_slot: Arc<std::sync::Mutex<Mode>>,
     probe: Arc<Mutex<ProbeState>>,
+    frames_dropped: Arc<AtomicU64>,
 }
 
 /// The worker: QUIC handshake, then the input/datagram/control tasks + the blocking
@@ -593,6 +612,7 @@ async fn worker_main(args: WorkerArgs) {
         shutdown,
         mode_slot,
         probe,
+        frames_dropped,
     } = args;
     let setup = async {
         let remote: std::net::SocketAddr = format!("{host}:{port}")
@@ -864,6 +884,10 @@ async fn worker_main(args: WorkerArgs) {
     let _ = tokio::task::spawn_blocking(move || {
         pin_thread_user_interactive(); // feeds frame_tx → the client's user-interactive video pump
         while !pump_shutdown.load(Ordering::SeqCst) {
+            // Mirror the reassembler's unrecoverable-drop count for the client's keyframe-recovery
+            // loop. Updated every iteration (not just on a produced frame) so it stays current through
+            // a total-loss drought where no AU completes. Cheap: a few relaxed atomic loads.
+            frames_dropped.store(session.stats().frames_dropped, Ordering::Relaxed);
             match session.poll_frame() {
                 Ok(frame) => {
                     if frame.flags & FLAG_PROBE as u32 != 0 {

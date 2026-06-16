@@ -160,6 +160,9 @@ fn pump(
     let mut decode_us_sum = 0u64;
     let mut lat_us: Vec<u64> = Vec::with_capacity(256);
     let mut pcm = vec![0f32; 5760 * 2]; // decode scratch: max Opus frame (120 ms stereo)
+                                        // Loss recovery: watch the host→client unrecoverable-drop count and ask for an IDR when it climbs.
+    let mut last_dropped = connector.frames_dropped();
+    let mut last_kf_req: Option<Instant> = None;
 
     let end: Option<String> = loop {
         if stop.load(Ordering::SeqCst) {
@@ -200,6 +203,21 @@ fn pump(
             Err(PunktfunkError::NoFrame) => {}
             Err(PunktfunkError::Closed) => break Some("Host ended the session".to_string()),
             Err(e) => break Some(format!("session: {e:?}")),
+        }
+
+        // Loss recovery: under infinite GOP the only recovery keyframe is one we request. The
+        // reassembler drops unrecoverable AUs (frames_dropped); the decoder conceals the
+        // reference-missing delta frames that follow and returns Ok, so keying off a decode error
+        // rarely fires. Request an IDR when the drop count climbs, throttled.
+        let dropped = connector.frames_dropped();
+        if dropped > last_dropped {
+            last_dropped = dropped;
+            let now = Instant::now();
+            if last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
+                last_kf_req = Some(now);
+                let _ = connector.request_keyframe();
+                tracing::debug!(dropped, "requested keyframe (loss recovery)");
+            }
         }
 
         // Drain audio between frames (packets land every 5 ms; the queue holds 320 ms).
