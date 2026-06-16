@@ -2343,19 +2343,25 @@ fn virtual_stream_relay(
         })
         .context("spawn send thread")?;
 
-    // The authoritative Default↔Winlogon signal (requires SYSTEM to read the Winlogon desktop name).
-    let watcher = crate::capture::desktop_watch::DesktopWatcher::start();
-    // Keep a force-composed-flip overlay alive on the input desktop so the SECURE desktop (which
-    // otherwise presents via fullscreen independent-flip → DDA gets born-lost ACCESS_LOST / black) is
-    // forced into DWM composition and becomes capturable. Held for the stream's lifetime.
-    let _composed_flip = crate::capture::composed_flip::ForceComposedFlip::start();
     // Test hook: PUNKTFUNK_SECURE_TEST_PERIOD_MS=N drives a square-wave secure/normal toggle every N ms
-    // instead of the real watcher — exercises the mid-session helper↔DDA mux without a live UAC/lock
-    // (the real Winlogon DDA capture is already proven by the single-process secure path).
+    // instead of the real watcher — exercises the mid-session helper↔DDA mux without a live UAC/lock.
     let secure_test_ms: Option<u128> = std::env::var("PUNKTFUNK_SECURE_TEST_PERIOD_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0);
+    // Switching to the host DDA on the secure (Winlogon) desktop is OPT-IN: DDA can't reliably capture
+    // the secure desktop's HDR independent-flip (it storms ACCESS_LOST → black), whereas the WGC helper
+    // STAYS LIVE through a lock/UAC. So by default the mux keeps WGC the whole time (no DesktopWatcher
+    // switch, no overlay). Enable the experimental DDA-on-secure path with PUNKTFUNK_SECURE_DDA=1.
+    let dda_secure = std::env::var("PUNKTFUNK_SECURE_DDA").is_ok() || secure_test_ms.is_some();
+    // The authoritative Default↔Winlogon signal (requires SYSTEM to read the Winlogon desktop name);
+    // only needed when the DDA-on-secure path is enabled.
+    let watcher = dda_secure.then(crate::capture::desktop_watch::DesktopWatcher::start);
+    // Force-composed-flip overlay (only with DDA-on-secure): keeps the secure desktop out of fullscreen
+    // independent-flip so DDA can duplicate it. Off by default to avoid touching the normal desktop.
+    let _composed_flip = dda_secure
+        .then(crate::capture::composed_flip::ForceComposedFlip::start)
+        .flatten();
     let start = std::time::Instant::now();
 
     let mut interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
@@ -2438,10 +2444,11 @@ fn virtual_stream_relay(
         // Source mux: capture the secure (Winlogon) desktop via the host's DDA, the normal desktop via
         // the helper relay. On a switch, latch await_idr + force the now-active source to emit an IDR
         // so the client resumes cleanly.
-        let secure = match secure_test_ms {
-            Some(p) => (start.elapsed().as_millis() / p) % 2 == 1,
-            None => watcher.is_secure(),
-        };
+        let secure = dda_secure
+            && match secure_test_ms {
+                Some(p) => (start.elapsed().as_millis() / p) % 2 == 1,
+                None => watcher.as_ref().is_some_and(|w| w.is_secure()),
+            };
         if secure != on_secure {
             on_secure = secure;
             await_idr = true;
