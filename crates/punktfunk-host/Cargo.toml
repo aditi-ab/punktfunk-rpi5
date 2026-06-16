@@ -141,6 +141,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_System_Pipes",
     "Win32_System_Environment",
+    # Force-composed-flip overlay: a topmost layered window on the Winlogon desktop disqualifies the
+    # secure desktop's fullscreen independent-flip so Desktop Duplication can capture it.
+    "Win32_System_LibraryLoader",
 ] }
 # Software H.264 encoder (GPU-less path + NVENC fallback). The default `source` feature statically
 # compiles OpenH264 (BSD-2) — no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.

@@ -2345,6 +2345,10 @@ fn virtual_stream_relay(
 
     // The authoritative Default↔Winlogon signal (requires SYSTEM to read the Winlogon desktop name).
     let watcher = crate::capture::desktop_watch::DesktopWatcher::start();
+    // Keep a force-composed-flip overlay alive on the input desktop so the SECURE desktop (which
+    // otherwise presents via fullscreen independent-flip → DDA gets born-lost ACCESS_LOST / black) is
+    // forced into DWM composition and becomes capturable. Held for the stream's lifetime.
+    let _composed_flip = crate::capture::composed_flip::ForceComposedFlip::start();
     // Test hook: PUNKTFUNK_SECURE_TEST_PERIOD_MS=N drives a square-wave secure/normal toggle every N ms
     // instead of the real watcher — exercises the mid-session helper↔DDA mux without a live UAC/lock
     // (the real Winlogon DDA capture is already proven by the single-process secure path).

@@ -321,6 +321,8 @@ pub fn capture_virtual_output(_vout: crate::vdisplay::VirtualOutput) -> Result<B
 }
 
 #[cfg(target_os = "windows")]
+pub mod composed_flip;
+#[cfg(target_os = "windows")]
 pub mod desktop_watch;
 #[cfg(target_os = "windows")]
 pub mod dxgi;

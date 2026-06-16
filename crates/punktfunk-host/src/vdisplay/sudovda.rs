@@ -49,6 +49,7 @@ const fn ctl(func: u32) -> u32 {
 }
 const IOCTL_ADD: u32 = ctl(0x800);
 const IOCTL_REMOVE: u32 = ctl(0x801);
+const IOCTL_SET_RENDER_ADAPTER: u32 = ctl(0x802); // == 0x0022_2008
 const IOCTL_GET_WATCHDOG: u32 = ctl(0x803);
 const IOCTL_DRIVER_PING: u32 = ctl(0x888);
 const IOCTL_GET_VERSION: u32 = ctl(0x8FF);
@@ -74,6 +75,82 @@ struct AddParams {
 struct AddOut {
     luid: LUID,
     target_id: u32,
+}
+
+// SET_RENDER_ADAPTER input — byte-identical to SudoVDA's `{ LUID AdapterLuid; }` (8 bytes). The
+// windows `LUID` is `{ LowPart: u32, HighPart: i32 }` == the C `LUID`, so `#[repr(C)]` is exact.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SetRenderAdapterParams {
+    luid: LUID,
+}
+
+/// Pin the SudoVDA IDD's RENDER GPU to `luid` (Apollo's `SetRenderAdapter`). No output buffer. MUST be
+/// issued on the driver handle BEFORE `IOCTL_ADD` to steer which GPU the new target renders on — on a
+/// multi-adapter box (SudoVDA IDD + a discrete GPU) this stops DXGI from reparenting the virtual
+/// output onto a different adapter than the one we duplicate/encode on (the ACCESS_LOST storm).
+unsafe fn set_render_adapter(h: HANDLE, luid: LUID) -> Result<()> {
+    let p = SetRenderAdapterParams { luid };
+    let bytes = std::slice::from_raw_parts(
+        &p as *const _ as *const u8,
+        size_of::<SetRenderAdapterParams>(),
+    );
+    let mut none: [u8; 0] = [];
+    ioctl(h, IOCTL_SET_RENDER_ADAPTER, bytes, &mut none)
+        .map(|_| ())
+        .context("SudoVDA SET_RENDER_ADAPTER")
+}
+
+/// Resolve the LUID of the GPU that should RENDER the virtual display = the GPU that drives NVENC +
+/// Desktop Duplication (e.g. the RTX 4090). Default: the discrete adapter with the most
+/// `DedicatedVideoMemory`, skipping WARP / Basic-Render and the SudoVDA software adapter (≈0 VRAM).
+/// `PUNKTFUNK_RENDER_ADAPTER=<substring>` forces a match by Description (Apollo's `adapter_name`).
+unsafe fn resolve_render_adapter_luid() -> Option<LUID> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    let want = std::env::var("PUNKTFUNK_RENDER_ADAPTER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+    let mut best: Option<(LUID, u64, String)> = None;
+    let mut i = 0u32;
+    while let Ok(a) = factory.EnumAdapters1(i) {
+        i += 1;
+        let Ok(d) = a.GetDesc1() else { continue };
+        let name = String::from_utf16_lossy(&d.Description);
+        let name = name.trim_end_matches('\u{0}').to_string();
+        let lname = name.to_ascii_lowercase();
+        if lname.contains("basic render") || lname.contains("warp") {
+            continue; // never pin to the software rasterizer
+        }
+        if let Some(w) = &want {
+            if lname.contains(&w.to_ascii_lowercase()) {
+                tracing::info!(
+                    adapter = name,
+                    "render adapter chosen by PUNKTFUNK_RENDER_ADAPTER"
+                );
+                return Some(d.AdapterLuid);
+            }
+            continue;
+        }
+        let vram = d.DedicatedVideoMemory as u64; // SudoVDA software adapter ≈ 0 → loses to the dGPU
+        if best.as_ref().map_or(true, |(_, v, _)| vram > *v) {
+            best = Some((d.AdapterLuid, vram, name));
+        }
+    }
+    match best {
+        Some((luid, vram, name)) => {
+            tracing::info!(
+                adapter = name,
+                vram_mb = vram / (1024 * 1024),
+                "render adapter chosen (max VRAM)"
+            );
+            Some(luid)
+        }
+        None => {
+            tracing::warn!("no suitable render adapter found for SET_RENDER_ADAPTER");
+            None
+        }
+    }
 }
 
 #[repr(C)]
@@ -457,6 +534,22 @@ impl VirtualDisplay for SudoVdaDisplay {
             device_name,
             serial: [0u8; 14],
         };
+        // Pin the IDD's RENDER GPU to the NVENC/capture GPU (e.g. the 4090) BEFORE adding the target.
+        // On a multi-adapter box (SudoVDA IDD + discrete GPU) DXGI otherwise reparents the virtual
+        // output onto whichever GPU its hybrid-preference path resolves, which storms ACCESS_LOST
+        // (0x887A0026) on the secure/HDR desktop. Apollo's SET_RENDER_ADAPTER fixes this and MUST be
+        // issued before ADD. Best-effort: a driver that rejects it just keeps the default render GPU.
+        let pinned = unsafe { resolve_render_adapter_luid() };
+        if let Some(luid) = pinned {
+            match unsafe { set_render_adapter(self.device, luid) } {
+                Ok(()) => tracing::info!(
+                    luid = format!("{:08x}:{:08x}", luid.HighPart, luid.LowPart),
+                    "SudoVDA SET_RENDER_ADAPTER: pinned IDD render GPU"
+                ),
+                Err(e) => tracing::warn!("SudoVDA SET_RENDER_ADAPTER failed (continuing): {e:#}"),
+            }
+        }
+
         let add_bytes = unsafe {
             std::slice::from_raw_parts(&add as *const _ as *const u8, size_of::<AddParams>())
         };
@@ -476,6 +569,17 @@ impl VirtualDisplay for SudoVdaDisplay {
             ao.target_id,
             ao.luid.LowPart
         );
+        if let Some(luid) = pinned {
+            if ao.luid.LowPart == luid.LowPart && ao.luid.HighPart == luid.HighPart {
+                tracing::info!("SudoVDA ADD render adapter matches the pinned GPU (pin took)");
+            } else {
+                tracing::warn!(
+                    add = format!("{:08x}:{:08x}", ao.luid.HighPart, ao.luid.LowPart),
+                    pinned = format!("{:08x}:{:08x}", luid.HighPart, luid.LowPart),
+                    "SudoVDA ADD render adapter DIFFERS from pinned — driver ignored SET_RENDER_ADAPTER?"
+                );
+            }
+        }
 
         // Mandatory keepalive: ping inside the watchdog window or the driver tears all displays down.
         let stop = Arc::new(AtomicBool::new(false));
