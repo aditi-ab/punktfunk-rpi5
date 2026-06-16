@@ -93,7 +93,7 @@ $env:RUSTUP_HOME = "C:\Users\Public\.rustup"
 $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 $env:FFMPEG_DIR = "C:\Users\Public\ffmpeg"
-$env:PATH = "C:\Users\Public\.cargo\bin;C:\nvm4w\nodejs;C:\Program Files\NASM;C:\Program Files\CMake\bin;C:\Program Files\LLVM\bin;C:\Users\Public\ffmpeg\bin;" + $env:PATH
+$env:PATH = "C:\Program Files\PowerShell\7;C:\Users\Public\.cargo\bin;C:\nvm4w\nodejs;C:\Program Files\NASM;C:\Program Files\CMake\bin;C:\Program Files\LLVM\bin;C:\Users\Public\ffmpeg\bin;" + $env:PATH
 Set-Location "C:\Users\Public\act-runner"
 # cmd-level redirect (>>, 2>&1) keeps the daemon's native stderr out of PowerShell's error stream.
 & cmd /c "act_runner.exe daemon --config config.yaml >> runner.log 2>&1"

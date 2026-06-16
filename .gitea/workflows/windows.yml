@@ -5,8 +5,12 @@
 # The MSVC/WinUI/FFmpeg toolchain (cargo/rustup on ASCII paths, NASM, CMake, LLVM, FFmpeg,
 # CARGO_HOME, CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. The one
 # per-checkout var is CARGO_WORKSPACE_DIR (windows-reactor's build.rs unwraps it + stages the
-# Windows App SDK NuGets/winmd under it) — set from GITHUB_WORKSPACE in a step (not job-level
-# env, where Gitea can't yet resolve the workspace path).
+# Windows App SDK NuGets/winmd under it) — set from GITHUB_WORKSPACE in a step.
+#
+# Steps use `shell: pwsh` (PowerShell 7) deliberately: Windows PowerShell 5.1's
+# `Out-File -Encoding utf8` prepends a UTF-8 BOM that corrupts the first GITHUB_ENV line (the
+# CARGO_WORKSPACE_DIR var silently never gets set -> reactor build.rs panics). pwsh writes no BOM.
+# The runner's daemon wrapper puts C:\Program Files\PowerShell\7 on PATH so the job finds pwsh.
 name: windows
 
 on:
@@ -35,7 +39,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure + toolchain versions
-        shell: powershell
+        shell: pwsh
         run: |
           "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           rustc --version
@@ -44,17 +48,17 @@ jobs:
           Write-Output "workspace: $env:GITHUB_WORKSPACE"
 
       - name: Build
-        shell: powershell
+        shell: pwsh
         run: cargo build -p punktfunk-client-windows
 
       - name: Clippy (-D warnings)
-        shell: powershell
+        shell: pwsh
         run: cargo clippy -p punktfunk-client-windows --all-targets -- -D warnings
 
       - name: Rustfmt check
-        shell: powershell
+        shell: pwsh
         run: cargo fmt -p punktfunk-client-windows -- --check
 
       - name: Test
-        shell: powershell
+        shell: pwsh
         run: cargo test -p punktfunk-client-windows
