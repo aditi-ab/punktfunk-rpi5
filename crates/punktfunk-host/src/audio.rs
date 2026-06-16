@@ -16,7 +16,10 @@ pub const CHANNELS: usize = 2;
 /// falls behind).
 pub trait AudioCapturer: Send {
     /// Block until the next chunk of interleaved samples is available (variable size). The
-    /// caller reframes into fixed Opus frames.
+    /// caller reframes into fixed Opus frames. An **empty** chunk means "no samples right now"
+    /// (e.g. a quiet sink that hit the internal idle timeout) — NOT an error: the caller keeps the
+    /// capturer. `Err` is reserved for a genuinely dead capture thread, signalling the caller to
+    /// reopen.
     fn next_chunk(&mut self) -> Result<Vec<f32>>;
 
     /// The interleaved channel count this capturer delivers (what it was opened with).

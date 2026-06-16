@@ -65,7 +65,9 @@ impl AudioCapturer for PwAudioCapturer {
     fn next_chunk(&mut self) -> Result<Vec<f32>> {
         match self.chunks.recv_timeout(Duration::from_secs(5)) {
             Ok(c) => Ok(c),
-            Err(RecvTimeoutError::Timeout) => Err(anyhow!("no PipeWire audio within 5s")),
+            // A quiet sink (paused game, idle desktop) is NOT a failure — return an empty chunk so the
+            // caller keeps the capturer alive. Only a dead capture thread is an Err (→ caller reopens).
+            Err(RecvTimeoutError::Timeout) => Ok(Vec::new()),
             Err(RecvTimeoutError::Disconnected) => Err(anyhow!("pipewire audio thread ended")),
         }
     }
