@@ -2572,11 +2572,32 @@ fn virtual_stream_relay(
                 dropped_hdr_for_secure =
                     unsafe { crate::vdisplay::sudovda::advanced_color_enabled(target.target_id) };
                 if dropped_hdr_for_secure {
-                    let toggled = unsafe {
-                        crate::vdisplay::sudovda::set_advanced_color(target.target_id, false)
-                    };
-                    if toggled {
-                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    // The DDA path is SDR-only (BGRA8) — leaving the SudoVDA in HDR makes the secure
+                    // desktop capture black. Drop to SDR and VERIFY it actually took before opening DDA:
+                    // the CCD advanced-color toggle can transiently fail (rc=5) or lag, so retry until
+                    // advanced_color_enabled() reads false (or we give up and open DDA regardless).
+                    let mut off = false;
+                    for attempt in 0..6 {
+                        unsafe {
+                            crate::vdisplay::sudovda::set_advanced_color(target.target_id, false);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        if !unsafe {
+                            crate::vdisplay::sudovda::advanced_color_enabled(target.target_id)
+                        } {
+                            off = true;
+                            tracing::info!(
+                                attempt,
+                                "SudoVDA dropped to SDR for the secure DDA leg"
+                            );
+                            break;
+                        }
+                    }
+                    if !off {
+                        tracing::warn!(
+                            "could not drop the SudoVDA out of HDR for the secure desktop — DDA may \
+                             be black (display-config change likely denied on the Winlogon desktop)"
+                        );
                     }
                 }
                 dda = None; // reopen so we capture the (SDR) output
