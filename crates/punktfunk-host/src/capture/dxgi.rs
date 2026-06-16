@@ -194,21 +194,32 @@ unsafe fn duplicate_output(
         // which "succeeds" into a fragile dup that churns ACCESS_LOST/MODE_CHANGE every few ms on this
         // cross-GPU IDD. (This is why DuplicateOutput1 failed but the legacy call a beat later
         // succeeded — pure timing. Apollo retries DuplicateOutput1 2x/200ms for the same reason.)
+        // Apollo waits 200 ms between DuplicateOutput1 attempts — the kernel-side teardown of the
+        // just-released duplication takes that long, so short (ms) waits aren't enough. Env-tunable so
+        // we can dial it without a rebuild: PUNKTFUNK_DUP_RETRY_MS (per-wait, default 200) ×
+        // PUNKTFUNK_DUP_RETRY_N (attempts, default 6) → ~1 s worst case before the legacy fallback.
+        let retry_ms: u64 = std::env::var("PUNKTFUNK_DUP_RETRY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+        let attempts: u64 = std::env::var("PUNKTFUNK_DUP_RETRY_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6)
+            .max(1);
         let mut last_err = None;
-        for attempt in 0..5u64 {
+        for attempt in 0..attempts {
             match output5.DuplicateOutput1(device, 0, &formats) {
                 Ok(d) => {
                     if attempt > 0 {
-                        tracing::info!(attempt, "DuplicateOutput1 succeeded on retry (raced old-dup teardown)");
+                        tracing::info!(attempt, "DuplicateOutput1 succeeded on retry (rode out old-dup teardown race)");
                     }
                     return Ok(d);
                 }
                 Err(e) => {
                     last_err = Some(e);
-                    // Escalating brief waits: 2,4,8,16 ms (skip after the last attempt). Bounded so a
-                    // GENUINE failure still falls back to legacy quickly (~30 ms worst case).
-                    if attempt < 4 {
-                        std::thread::sleep(Duration::from_millis(2u64 << attempt));
+                    if attempt + 1 < attempts {
+                        std::thread::sleep(Duration::from_millis(retry_ms));
                     }
                 }
             }
