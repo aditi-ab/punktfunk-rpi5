@@ -842,6 +842,10 @@ pub struct DuplCapturer {
     /// secure-desktop dwell where the output is gone) so we don't block the encode loop or hammer
     /// DuplicateOutput — between attempts the last good frame is repeated. `None` = never attempted.
     last_rebuild: Option<Instant>,
+    /// Throttle for ALL ACCESS_LOST recovery attempts (cheap re-duplicate + full rebuild). A
+    /// constantly-invalidated duplication (HDR overlay/MPO churn) would otherwise spin recovery and
+    /// starve the encode thread; cap attempts to ~one per 5 ms and repeat the last frame between them.
+    last_recover: Option<Instant>,
     /// True once at least one real frame has been produced. After that, a frame drought (e.g. a long
     /// secure-desktop dwell with nothing rendering to the virtual output) must never fatally end the
     /// session — `next_frame` keeps repeating the last/seeded frame instead of erroring on its
@@ -1040,6 +1044,7 @@ impl DuplCapturer {
                 hdr10_out: None,
                 hdr_conv: None,
                 last_rebuild: None,
+                last_recover: None,
                 ever_got_frame: false,
                 cursor: None,
                 cursor_shape: None,
@@ -1547,6 +1552,19 @@ impl DuplCapturer {
                         "DXGI capture lost — recovering (cheap re-duplicate, full rebuild if output gone)"
                     );
                 }
+                // Back off: under aggressive HDR overlay/MPO invalidation the duplication dies
+                // continuously, and an unthrottled recovery would spin try_reduplicate (each a
+                // DuplicateOutput + up-to-16 ms Acquire) and starve the encode thread → freeze. Cap ALL
+                // recovery attempts to ~one per 5 ms; between attempts return None so the caller repeats
+                // the last frame, paced at the frame interval (no busy-spin, encode thread keeps running).
+                let now = Instant::now();
+                if self
+                    .last_recover
+                    .is_some_and(|t| now.duration_since(t) < Duration::from_millis(5))
+                {
+                    return Ok(None);
+                }
+                self.last_recover = Some(now);
                 if !device_dead && self.try_reduplicate() {
                     // Cheap recovery succeeded; the next acquire gets frames on the same device.
                     self.first_frame = true;
@@ -1581,12 +1599,17 @@ impl DuplCapturer {
         if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
             let mut d = D3D11_TEXTURE2D_DESC::default();
             tex.GetDesc(&mut d);
-            let now_hdr = d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
-            if d.Width != self.width || d.Height != self.height || now_hdr != self.hdr_fp16 {
+            // Only a real SIZE change is reliably detectable here. Format/HDR is NOT: legacy
+            // DuplicateOutput always hands back an 8-bit BGRA surface regardless of the output's FP16
+            // scanout mode, so comparing the acquired-texture format against `hdr_fp16` (derived from
+            // the OUTDUPL ModeDesc) self-fires every frame → a rebuild storm. A genuine resolution
+            // change is caught here; a real HDR↔SDR toggle arrives as ACCESS_LOST → recreate_dupl
+            // re-detects it. (Genuine FP16 capture is a separate change: DuplicateOutput1.)
+            if d.Width != self.width || d.Height != self.height {
                 tracing::info!(
-                    old = format!("{}x{} hdr={}", self.width, self.height, self.hdr_fp16),
-                    new = format!("{}x{} hdr={}", d.Width, d.Height, now_hdr),
-                    "DXGI capture format/size changed mid-stream — rebuilding"
+                    old = format!("{}x{}", self.width, self.height),
+                    new = format!("{}x{}", d.Width, d.Height),
+                    "DXGI capture size changed mid-stream — rebuilding"
                 );
                 let _ = self.dupl.ReleaseFrame();
                 let now = Instant::now();
