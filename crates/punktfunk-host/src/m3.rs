@@ -1968,6 +1968,26 @@ fn virtual_stream(
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
 ) -> Result<()> {
+    // Windows two-process secure-desktop path: when the host runs as SYSTEM (required for the secure
+    // desktop + SendInput), WGC can't activate in-process, so we capture the normal desktop via a
+    // helper spawned in the user session and relay its AUs. (Single-process WGC/DDA is used as the
+    // user, and stays the path on Linux.) See docs/windows-secure-desktop.md.
+    #[cfg(target_os = "windows")]
+    if should_use_helper() {
+        return virtual_stream_relay(
+            session,
+            mode,
+            seconds,
+            stop,
+            reconfig,
+            keyframe,
+            compositor,
+            bitrate_kbps,
+            bit_depth,
+            probe_rx,
+            probe_result_tx,
+        );
+    }
     tracing::info!(
         compositor = compositor.id(),
         ?mode,
@@ -2175,6 +2195,186 @@ fn virtual_stream(
     drop(frame_tx);
     let _ = send_thread.join();
     tracing::info!(sent, "punktfunk/1 virtual stream complete");
+    Ok(())
+}
+
+/// Should this host take the two-process (SYSTEM host + user-session WGC helper) path? Yes when it's
+/// running as SYSTEM — the only account that can capture the secure desktop + drive SendInput on it,
+/// and the account under which in-process WGC won't activate. `PUNKTFUNK_FORCE_HELPER` forces it on
+/// (for testing the relay as a normal user); `PUNKTFUNK_NO_HELPER` forces it off.
+#[cfg(target_os = "windows")]
+fn should_use_helper() -> bool {
+    if std::env::var_os("PUNKTFUNK_NO_HELPER").is_some() {
+        return false;
+    }
+    std::env::var_os("PUNKTFUNK_FORCE_HELPER").is_some()
+        || crate::capture::wgc_relay::running_as_system()
+}
+
+/// Windows two-process video stream: the SYSTEM host creates the SudoVDA virtual output (and holds
+/// its keepalive = the sole topology/isolation owner), spawns the WGC helper in the user session to
+/// capture+encode it, and relays the helper's AUs onto the QUIC data plane via the same send thread
+/// as the single-process path. Reconfigure rebuilds the output + re-spawns the helper at the new
+/// mode; keyframe requests are forwarded to the helper's encoder over its control channel.
+///
+/// Step 4 (this function): the normal-desktop relay. Step 5 adds the DesktopWatcher-driven mux that
+/// switches to the host's own DDA encoder on the secure (Winlogon) desktop.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn virtual_stream_relay(
+    session: Session,
+    mode: punktfunk_core::Mode,
+    seconds: u32,
+    stop: Arc<AtomicBool>,
+    reconfig: &std::sync::mpsc::Receiver<punktfunk_core::Mode>,
+    keyframe: &std::sync::mpsc::Receiver<()>,
+    compositor: crate::vdisplay::Compositor,
+    bitrate_kbps: u32,
+    bit_depth: u8,
+    probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
+    probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+) -> Result<()> {
+    use crate::capture::wgc_relay::HelperRelay;
+    tracing::info!(
+        ?mode,
+        bitrate_kbps,
+        bit_depth,
+        "punktfunk/1 two-process stream (SYSTEM host + user-session WGC helper)"
+    );
+
+    let mut vd = crate::vdisplay::open(compositor)?;
+
+    // Create the SudoVDA output + spawn a helper capturing it by GDI name. Returns the keepalive
+    // (held for the output's life — the sole isolation owner) and the running relay.
+    type Built = (Box<dyn Send>, HelperRelay);
+    let build = |vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
+                 mode: punktfunk_core::Mode|
+     -> Result<Built> {
+        let vout = vd.create(mode).context("create virtual output")?;
+        let effective_hz = vout
+            .preferred_mode
+            .map(|(_, _, hz)| hz)
+            .filter(|&hz| hz > 0)
+            .unwrap_or(mode.refresh_hz);
+        let target = vout.win_capture.clone().ok_or_else(|| {
+            anyhow!("SudoVDA target not yet an active display (needs a WDDM GPU to activate it)")
+        })?;
+        let relay = HelperRelay::spawn(
+            &target,
+            (mode.width, mode.height, effective_hz),
+            bitrate_kbps,
+            bit_depth,
+        )
+        .context("spawn WGC helper")?;
+        Ok((vout.keepalive, relay))
+    };
+
+    let (mut _keepalive, mut relay) = build(&mut vd, mode)?;
+
+    let perf = std::env::var("PUNKTFUNK_PERF").is_ok();
+    let burst_cap = std::env::var("PUNKTFUNK_PACE_BURST_KB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(128)
+        * 1024;
+
+    // Same encode|send split as the single-process path: this thread relays AUs, a dedicated send
+    // thread owns the Session and does FEC+seal+paced-send.
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<FrameMsg>(3);
+    let send_thread = std::thread::Builder::new()
+        .name("punktfunk-send".into())
+        .spawn({
+            let stop = stop.clone();
+            move || {
+                send_loop(
+                    session,
+                    frame_rx,
+                    probe_rx,
+                    probe_result_tx,
+                    stop,
+                    perf,
+                    burst_cap,
+                )
+            }
+        })
+        .context("spawn send thread")?;
+
+    let mut interval = std::time::Duration::from_secs_f64(1.0 / mode.refresh_hz.max(1) as f64);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64);
+    let mut sent: u64 = 0;
+    'outer: while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        // Mode switch: rebuild the output + re-spawn the helper at the new mode (drop the old relay +
+        // keepalive only after the new pair is up, so a failed rebuild keeps the current stream).
+        let mut want = None;
+        while let Ok(m) = reconfig.try_recv() {
+            want = Some(m);
+        }
+        if let Some(new_mode) = want {
+            tracing::info!(?new_mode, "two-process: rebuilding for mode switch");
+            match build(&mut vd, new_mode) {
+                Ok((ka, rl)) => {
+                    relay = rl; // drops the old relay (kills old helper) ...
+                    _keepalive = ka; // ... then releases the old output
+                    interval =
+                        std::time::Duration::from_secs_f64(1.0 / new_mode.refresh_hz.max(1) as f64);
+                }
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), ?new_mode,
+                        "two-process mode-switch rebuild failed — staying on the current mode");
+                }
+            }
+        }
+        // Forward client decode-recovery keyframe requests to the helper's encoder.
+        let mut want_kf = false;
+        while keyframe.try_recv().is_ok() {
+            want_kf = true;
+        }
+        if want_kf {
+            tracing::debug!("two-process: forwarding keyframe request to helper");
+            relay.request_keyframe();
+        }
+
+        // Pull the next relayed AU. A timeout means the helper stalled (or is mid-respawn); loop so
+        // reconfig/keyframe/stop still get serviced. Disconnected means the helper exited — end the
+        // stream (step 6 adds a relaunch watchdog; for now a dead helper ends the session).
+        let au = match relay.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(au) => au,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                tracing::warn!("two-process: no AU from helper within 500ms");
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!("two-process: WGC helper exited — ending stream");
+                break;
+            }
+        };
+        let flags = if au.keyframe {
+            (FLAG_PIC | FLAG_SOF) as u32
+        } else {
+            FLAG_PIC as u32
+        };
+        // The helper's pts_ns is on this machine's monotonic clock (same `now_ns()` source), so it is
+        // directly usable as the capture timestamp. encode_us = pipe-relay latency from capture.
+        let capture_ns = au.pts_ns;
+        let encode_us = (now_ns().saturating_sub(capture_ns) / 1000) as u32;
+        let msg = FrameMsg {
+            data: au.data,
+            capture_ns,
+            flags,
+            deadline: std::time::Instant::now() + interval,
+            encode_us,
+        };
+        if frame_tx.send(msg).is_err() {
+            break 'outer; // send thread gone
+        }
+        sent += 1;
+    }
+    drop(frame_tx);
+    let _ = send_thread.join();
+    tracing::info!(sent, "punktfunk/1 two-process stream complete");
     Ok(())
 }
 

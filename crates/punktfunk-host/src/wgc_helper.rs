@@ -15,7 +15,9 @@
 use crate::capture::{dxgi::WinCaptureTarget, wgc::WgcCapturer, Capturer};
 use crate::encode::{self, Codec};
 use anyhow::{Context, Result};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub struct HelperOptions {
     pub target_id: u32,
@@ -24,10 +26,17 @@ pub struct HelperOptions {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// Negotiated encode bit depth (8, or 10 = HEVC Main10). HDR auto-upgrades to 10 from the
+    /// captured frame's `Rgb10a2` format regardless.
+    pub bit_depth: u8,
 }
 
 /// AU framing magic + version, so the host can resync / detect a helper crash on its stdout stream.
 const AU_MAGIC: u32 = 0x5046_4155; // "PFAU"
+
+/// Control byte the host writes on our stdin to force the next frame to be an IDR. Must match
+/// `wgc_relay::CTL_KEYFRAME`.
+const CTL_KEYFRAME: u8 = 0x01;
 
 pub fn run(opts: HelperOptions) -> Result<()> {
     tracing::info!(
@@ -59,10 +68,33 @@ pub fn run(opts: HelperOptions) -> Result<()> {
         h,
         opts.fps,
         opts.bitrate_kbps as u64 * 1000,
-        false, // not cuda
-        8,     // bit depth: HDR auto-upgrades to Main10 from the Rgb10a2 frame
+        false,          // not cuda
+        opts.bit_depth, // 8, or 10 = Main10 (HDR auto-upgrades from the Rgb10a2 frame regardless)
     )
     .context("open NVENC")?;
+
+    // Control channel: the host writes a single byte on our stdin to force an IDR (client decode
+    // recovery), mirroring `enc.request_keyframe()` in the single-process path. A reader thread sets
+    // a flag the encode loop checks; stdin EOF (host gone) just stops the thread.
+    let kf = Arc::new(AtomicBool::new(false));
+    {
+        let kf = kf.clone();
+        std::thread::Builder::new()
+            .name("wgc-helper-ctl".into())
+            .spawn(move || {
+                let mut stdin = std::io::stdin();
+                let mut byte = [0u8; 1];
+                while let Ok(n) = stdin.read(&mut byte) {
+                    if n == 0 {
+                        break; // host closed our stdin
+                    }
+                    if byte[0] == CTL_KEYFRAME {
+                        kf.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+            .ok();
+    }
 
     // Binary stdout — lock it once + write framed AUs. A short write / broken pipe means the host
     // (parent) went away → exit cleanly so the host's relaunch watchdog can respawn us.
@@ -71,6 +103,9 @@ pub fn run(opts: HelperOptions) -> Result<()> {
 
     let mut frame = first;
     loop {
+        if kf.swap(false, Ordering::Relaxed) {
+            enc.request_keyframe();
+        }
         enc.submit(&frame).context("encoder submit")?;
         while let Some(au) = enc.poll().context("encoder poll")? {
             if write_au(&mut out, &au).is_err() {

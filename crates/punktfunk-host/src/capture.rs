@@ -328,3 +328,5 @@ pub mod dxgi;
 mod linux;
 #[cfg(target_os = "windows")]
 pub mod wgc;
+#[cfg(target_os = "windows")]
+pub mod wgc_relay;

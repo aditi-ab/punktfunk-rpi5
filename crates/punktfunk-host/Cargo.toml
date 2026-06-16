@@ -136,6 +136,11 @@ windows = { version = "0.62", features = [
     "Win32_System_WinRT_Graphics_Capture",
     # WGC runs under SYSTEM via interactive-user impersonation (WGC won't activate as SYSTEM).
     "Win32_System_RemoteDesktop",
+    # Two-process secure-desktop design: the SYSTEM host spawns the WGC helper in the interactive
+    # user session (CreateProcessAsUserW) with stdout/stdin redirected to anonymous pipes.
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_System_Environment",
 ] }
 # Software H.264 encoder (GPU-less path + NVENC fallback). The default `source` feature statically
 # compiles OpenH264 (BSD-2) — no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.

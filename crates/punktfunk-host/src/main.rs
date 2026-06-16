@@ -223,6 +223,7 @@ fn real_main() -> Result<()> {
                 bitrate_kbps: get("--bitrate")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(20000),
+                bit_depth: get("--bit-depth").and_then(|s| s.parse().ok()).unwrap_or(8),
             })
         }
         Some("-h") | Some("--help") | Some("help") | None => {
