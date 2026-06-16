@@ -2026,6 +2026,19 @@ fn virtual_stream(
     let (mut capturer, mut enc, mut frame, mut interval) =
         build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth)?;
 
+    // Windows single-process DDA path (PUNKTFUNK_NO_WGC=1): the SudoVDA virtual display, isolated as the
+    // SOLE active output, goes into fullscreen independent-flip (one plane on one display) which Desktop
+    // Duplication cannot capture → the born-lost ACCESS_LOST storm we measured on the RTX4090+iGPU box
+    // (hook verified-firing, DPI=2, yet 100% DuplicateOutput1 E_ACCESSDENIED + born-lost). A tiny topmost
+    // layered overlay disqualifies independent-flip and forces DWM composition, which DDA CAN capture.
+    // (Apollo never hits this because it runs WITH a physical monitor attached — multi-display is already
+    // DWM-composited; we isolate to sole-display, so we must force composition ourselves.) Unlike the WGC
+    // relay path — where WGC owns the normal desktop and the overlay is secure-only — here DDA owns the
+    // normal desktop too, so it must run unconditionally. Held for the session; Drop tears it down.
+    // Best-effort; disable with PUNKTFUNK_FORCE_COMPOSED=0.
+    #[cfg(target_os = "windows")]
+    let _composed_flip = crate::capture::composed_flip::ForceComposedFlip::start();
+
     let perf = std::env::var("PUNKTFUNK_PERF").is_ok();
     // Microburst cap (applied in send_loop/paced_submit): a frame ≤ this bursts out immediately;
     // only a bigger frame's overflow is spread. PUNKTFUNK_PACE_BURST_KB overrides the 128 KB default.
