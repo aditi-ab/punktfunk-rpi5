@@ -2344,6 +2344,20 @@ fn virtual_stream_relay(
         let target = vout.win_capture.clone().ok_or_else(|| {
             anyhow!("SudoVDA target not yet an active display (needs a WDDM GPU to activate it)")
         })?;
+        // Force the SudoVDA's advanced-color (HDR) state to MATCH the session bit depth BEFORE the WGC
+        // helper captures it. The advanced-color state PERSISTS on the monitor across sessions, so an
+        // 8-bit (SDR) session could otherwise inherit HDR left on by a prior 10-bit run (or our own
+        // earlier toggle) → the helper captures HDR FP16 while the encoder is 8-bit SDR → broken image.
+        // Runs on every build (initial + mode-switch + return-from-secure rebuild), keeping WGC's format
+        // consistent with the encoder. (HDR independent-flip on the secure desktop is handled separately
+        // by dropping to SDR for the DDA leg.)
+        #[cfg(target_os = "windows")]
+        unsafe {
+            if crate::vdisplay::sudovda::set_advanced_color(target.target_id, bit_depth >= 10) {
+                // Let the colorspace change settle before WGC creates its capture item / detects HDR.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
         let relay = HelperRelay::spawn(
             &target,
             (mode.width, mode.height, effective_hz),
