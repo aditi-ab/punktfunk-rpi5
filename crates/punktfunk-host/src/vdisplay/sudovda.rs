@@ -25,7 +25,7 @@ use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
     QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
     DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_MODE_INFO,
-    DISPLAYCONFIG_PATH_ACTIVE, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
+    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY,
     SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
@@ -479,6 +479,10 @@ unsafe fn restore_displays(saved: &[(String, DEVMODEW)]) {
 /// Saved active display topology, for restoring on teardown.
 type SavedConfig = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
 
+/// `DISPLAYCONFIG_PATH_ACTIVE` (wingdi.h) — the `flags` bit marking a path active. The `windows` crate
+/// doesn't export it, so define it here.
+const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
+
 /// Robust display isolation via the CCD API. The legacy [`isolate_displays`] (EnumDisplayDevices +
 /// ChangeDisplaySettings) MISSES displays on a hybrid box — an iGPU-attached physical monitor isn't
 /// flagged `ATTACHED_TO_DESKTOP` in the GDI enum, so it's never detached and the secure desktop /
@@ -524,10 +528,8 @@ unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedConfig> {
         return Some(saved);
     }
     let rc = SetDisplayConfig(
-        paths.len() as u32,
-        Some(paths.as_ptr()),
-        modes.len() as u32,
-        Some(modes.as_ptr()),
+        Some(paths.as_slice()),
+        Some(modes.as_slice()),
         SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
     );
     if rc == 0 {
@@ -546,10 +548,8 @@ unsafe fn restore_displays_ccd(saved: &SavedConfig) {
         return;
     }
     let rc = SetDisplayConfig(
-        paths.len() as u32,
-        Some(paths.as_ptr()),
-        modes.len() as u32,
-        Some(modes.as_ptr()),
+        Some(paths.as_slice()),
+        Some(modes.as_slice()),
         SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
     );
     tracing::info!("display isolate (CCD): restored original topology rc={rc:#x}");
