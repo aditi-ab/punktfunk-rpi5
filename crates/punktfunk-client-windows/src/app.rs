@@ -7,6 +7,9 @@
 //! The present + decoded-frame handoff crosses to the UI thread through a `Mutex` side-channel
 //! and thread-locals (the windows-reactor SwapChainPanel sample's pattern), since the per-frame
 //! present must not go through state/rerender.
+//!
+//! The chrome follows the windows-reactor gallery's look: Mica backdrop, a centred max-width
+//! column, theme brushes (`ThemeRef`), and rounded `border` cards.
 
 use crate::discovery::{self, DiscoveredHost};
 use crate::gamepad::GamepadService;
@@ -83,9 +86,88 @@ pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_react
     });
     App::new()
         .title("Punktfunk")
-        .inner_size(1100.0, 720.0)
+        .inner_size(1000.0, 720.0)
+        .backdrop(Backdrop::Mica)
         .render(move |cx| root(cx, &ctx))
 }
+
+// --- shared styling -----------------------------------------------------------------------
+
+fn uniform(v: f64) -> Thickness {
+    Thickness::uniform(v)
+}
+
+fn edges(left: f64, top: f64, right: f64, bottom: f64) -> Thickness {
+    Thickness {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
+
+/// A rounded, bordered surface in the theme's card colours.
+fn card(child: impl Into<Element>) -> Border {
+    border(child.into())
+        .background(ThemeRef::CardBackground)
+        .border_brush(ThemeRef::CardStroke)
+        .border_thickness(uniform(1.0))
+        .corner_radius(8.0)
+        .padding(uniform(16.0))
+}
+
+/// A small all-caps section label above a group of cards.
+fn section(label: &str) -> Element {
+    text_block(label)
+        .font_size(12.0)
+        .semibold()
+        .foreground(ThemeRef::SecondaryText)
+        .margin(edges(2.0, 10.0, 0.0, 0.0))
+        .into()
+}
+
+/// Wrap a screen's children in a scrollable, centred, max-width column.
+fn page(children: Vec<Element>) -> Element {
+    let col = vstack(children)
+        .spacing(10.0)
+        .max_width(640.0)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .margin(edges(24.0, 24.0, 24.0, 40.0));
+    scroll_view(col).into()
+}
+
+/// A clickable host row: name + address/badge + chevron.
+fn host_card(name: &str, sub: &str, badge: &str, on_tap: impl Fn() + 'static) -> Element {
+    card(
+        grid((
+            vstack((
+                text_block(name).font_size(15.0).semibold(),
+                text_block(sub)
+                    .font_size(12.0)
+                    .foreground(ThemeRef::SecondaryText),
+            ))
+            .spacing(2.0)
+            .grid_column(0)
+            .vertical_alignment(VerticalAlignment::Center),
+            text_block(badge)
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText)
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center)
+                .margin(edges(0.0, 0.0, 12.0, 0.0)),
+            text_block("\u{203A}")
+                .font_size(18.0)
+                .foreground(ThemeRef::SecondaryText)
+                .grid_column(2)
+                .vertical_alignment(VerticalAlignment::Center),
+        ))
+        .columns([GridLength::Star(1.0), GridLength::Auto, GridLength::Auto]),
+    )
+    .on_tapped(on_tap)
+    .into()
+}
+
+// --- screens ------------------------------------------------------------------------------
 
 fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (screen, set_screen) = cx.use_async_state(Screen::Hosts);
@@ -114,10 +196,20 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     match screen {
         Screen::Hosts => hosts_page(cx, ctx, &hosts, &status, &set_screen, &set_status),
         Screen::Connecting => vstack((
-            text_block("Connecting…").font_size(20.0),
-            text_block(status.clone()),
+            ProgressRing::indeterminate()
+                .width(48.0)
+                .height(48.0)
+                .horizontal_alignment(HorizontalAlignment::Center),
+            text_block("Connecting\u{2026}")
+                .font_size(16.0)
+                .horizontal_alignment(HorizontalAlignment::Center),
+            text_block(status.clone())
+                .foreground(ThemeRef::SecondaryText)
+                .horizontal_alignment(HorizontalAlignment::Center),
         ))
-        .spacing(12.0)
+        .spacing(16.0)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .vertical_alignment(VerticalAlignment::Center)
         .into(),
         Screen::Settings => settings_page(ctx, &set_screen),
         Screen::Pair => pair_page(cx, ctx, &set_screen, &set_status),
@@ -136,14 +228,41 @@ fn hosts_page(
     let (manual, set_manual) = cx.use_state(String::new());
     let known = KnownHosts::load();
 
-    let mut rows: Vec<Element> = Vec::new();
-    rows.push(text_block("Punktfunk").font_size(28.0).bold().into());
+    let mut body: Vec<Element> = Vec::new();
+
+    // Header: title block + Settings button.
+    body.push(
+        grid((
+            vstack((
+                text_block("Punktfunk").font_size(30.0).bold(),
+                text_block("Stream from a host on your network.")
+                    .foreground(ThemeRef::SecondaryText),
+            ))
+            .spacing(2.0)
+            .grid_column(0)
+            .vertical_alignment(VerticalAlignment::Center),
+            button("Settings")
+                .on_click({
+                    let ss = set_screen.clone();
+                    move || ss.call(Screen::Settings)
+                })
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center),
+        ))
+        .columns([GridLength::Star(1.0), GridLength::Auto])
+        .margin(edges(0.0, 0.0, 0.0, 6.0))
+        .into(),
+    );
+
+    if !status.is_empty() {
+        body.push(card(text_block(status.to_string()).foreground(ThemeRef::SystemCritical)).into());
+    }
 
     // Saved (trusted/paired) hosts.
     if !known.hosts.is_empty() {
-        rows.push(text_block("Saved hosts").font_size(16.0).bold().into());
+        body.push(section("SAVED HOSTS"));
         for k in &known.hosts {
-            let t = Target {
+            let target = Target {
                 name: k.name.clone(),
                 addr: k.addr.clone(),
                 port: k.port,
@@ -151,113 +270,100 @@ fn hosts_page(
                 pair_optional: false,
             };
             let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
-            rows.push(
-                button(format!(
-                    "{}  ·  {}:{}  ·  {}",
-                    k.name,
-                    k.addr,
-                    k.port,
-                    if k.paired { "paired" } else { "trusted" }
-                ))
-                .on_click(move || initiate(&ctx2, t.clone(), &ss, &st))
-                .into(),
-            );
+            body.push(host_card(
+                &k.name,
+                &format!("{}:{}", k.addr, k.port),
+                if k.paired { "Paired" } else { "Trusted" },
+                move || initiate(&ctx2, target.clone(), &ss, &st),
+            ));
         }
     }
 
     // Discovered hosts.
-    rows.push(
-        text_block("Hosts on this network")
-            .font_size(16.0)
-            .bold()
-            .into(),
-    );
+    body.push(section("ON YOUR NETWORK"));
     if hosts.is_empty() {
-        rows.push(text_block("Searching the LAN…").into());
-    }
-    for h in hosts {
-        let t = Target {
-            name: h.name.clone(),
-            addr: h.addr.clone(),
-            port: h.port,
-            fp_hex: (!h.fp_hex.is_empty()).then(|| h.fp_hex.clone()),
-            pair_optional: h.pair == "optional",
-        };
-        let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
-        rows.push(
-            button(format!(
-                "{}  ·  {}:{}  ·  pairing {}",
-                h.name,
-                h.addr,
-                h.port,
-                if h.pair.is_empty() {
-                    "optional"
-                } else {
-                    &h.pair
-                }
-            ))
-            .on_click(move || initiate(&ctx2, t.clone(), &ss, &st))
+        body.push(
+            card(
+                hstack((
+                    ProgressRing::indeterminate().width(18.0).height(18.0),
+                    text_block("Searching the LAN\u{2026}").foreground(ThemeRef::SecondaryText),
+                ))
+                .spacing(12.0),
+            )
             .into(),
         );
+    } else {
+        for h in hosts {
+            let target = Target {
+                name: h.name.clone(),
+                addr: h.addr.clone(),
+                port: h.port,
+                fp_hex: (!h.fp_hex.is_empty()).then(|| h.fp_hex.clone()),
+                pair_optional: h.pair == "optional",
+            };
+            let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
+            let badge = if h.pair == "required" { "PIN" } else { "Open" };
+            body.push(host_card(
+                &h.name,
+                &format!("{}:{}", h.addr, h.port),
+                badge,
+                move || initiate(&ctx2, target.clone(), &ss, &st),
+            ));
+        }
     }
 
     // Manual connection.
-    rows.push(
-        text_block("Manual connection")
-            .font_size(16.0)
-            .bold()
-            .into(),
-    );
-    rows.push(
-        text_box(manual.clone())
-            .placeholder("host:port")
-            .on_changed(move |s| set_manual.call(s))
-            .into(),
-    );
-    {
-        let (ctx2, ss, st, text) = (ctx.clone(), set_screen.clone(), set_status.clone(), manual);
-        rows.push(
-            button("Connect")
-                .accent()
-                .on_click(move || {
-                    let text = text.trim();
-                    if text.is_empty() {
-                        return;
-                    }
-                    let (addr, port) = match text.rsplit_once(':') {
-                        Some((a, p)) => (a.to_string(), p.parse().unwrap_or(9777)),
-                        None => (text.to_string(), 9777),
-                    };
-                    initiate(
-                        &ctx2,
-                        Target {
-                            name: addr.clone(),
-                            addr,
-                            port,
-                            fp_hex: None,
-                            pair_optional: false,
-                        },
-                        &ss,
-                        &st,
-                    );
-                })
-                .into(),
+    body.push(section("CONNECT MANUALLY"));
+    let connect_manual = {
+        let (ctx2, ss, st, text) = (
+            ctx.clone(),
+            set_screen.clone(),
+            set_status.clone(),
+            manual.clone(),
         );
-    }
+        move || {
+            let text = text.trim();
+            if text.is_empty() {
+                return;
+            }
+            let (addr, port) = match text.rsplit_once(':') {
+                Some((a, p)) => (a.to_string(), p.parse().unwrap_or(9777)),
+                None => (text.to_string(), 9777),
+            };
+            initiate(
+                &ctx2,
+                Target {
+                    name: addr.clone(),
+                    addr,
+                    port,
+                    fp_hex: None,
+                    pair_optional: false,
+                },
+                &ss,
+                &st,
+            );
+        }
+    };
+    body.push(
+        card(
+            grid((
+                text_box(manual)
+                    .placeholder("host or host:port")
+                    .on_changed(move |s| set_manual.call(s))
+                    .grid_column(0)
+                    .vertical_alignment(VerticalAlignment::Center),
+                button("Connect")
+                    .accent()
+                    .on_click(connect_manual)
+                    .grid_column(1)
+                    .margin(edges(8.0, 0.0, 0.0, 0.0)),
+            ))
+            .columns([GridLength::Star(1.0), GridLength::Auto]),
+        )
+        .into(),
+    );
 
-    {
-        let ss = set_screen.clone();
-        rows.push(
-            button("Settings")
-                .on_click(move || ss.call(Screen::Settings))
-                .into(),
-        );
-    }
-    if !status.is_empty() {
-        rows.push(text_block(status.to_string()).into());
-    }
-
-    vstack(rows).spacing(8.0).into()
+    page(body)
 }
 
 /// The trust gate (mirrors the GTK client's `initiate_connect`): pinned fingerprint → silent
@@ -327,6 +433,7 @@ fn connect(
         pin,
         identity: ctx.identity.clone(),
     });
+    set_status.call(String::new());
     set_screen.call(Screen::Connecting);
 
     let tofu = pin.is_none();
@@ -395,62 +502,74 @@ fn pair_page(
     let (code, set_code) = cx.use_state(String::new());
     let target = ctx.shared.target.lock().unwrap().clone();
 
-    let (ctx2, ss, st, code2, target2) = (
-        ctx.clone(),
-        set_screen.clone(),
-        set_status.clone(),
-        code.clone(),
-        target.clone(),
-    );
-    let pair_btn = button("Pair & Connect").accent().on_click(move || {
-        let pin = code2.trim().to_string();
-        let (ctx3, ss, st, target3) = (ctx2.clone(), ss.clone(), st.clone(), target2.clone());
-        std::thread::spawn(move || {
-            let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-client".into());
-            match NativeClient::pair(
-                &target3.addr,
-                target3.port,
-                (&ctx3.identity.0, &ctx3.identity.1),
-                &pin,
-                &name,
-                std::time::Duration::from_secs(90),
-            ) {
-                Ok(fp) => {
-                    let mut k = KnownHosts::load();
-                    k.upsert(KnownHost {
-                        name: target3.name.clone(),
-                        addr: target3.addr.clone(),
-                        port: target3.port,
-                        fp_hex: trust::hex(&fp),
-                        paired: true,
-                    });
-                    let _ = k.save();
-                    connect(&ctx3, &target3, Some(fp), &ss, &st);
+    let pair_btn = {
+        let (ctx2, ss, st, code2, target2) = (
+            ctx.clone(),
+            set_screen.clone(),
+            set_status.clone(),
+            code.clone(),
+            target.clone(),
+        );
+        button("Pair & Connect").accent().on_click(move || {
+            let pin = code2.trim().to_string();
+            let (ctx3, ss, st, target3) = (ctx2.clone(), ss.clone(), st.clone(), target2.clone());
+            std::thread::spawn(move || {
+                let name =
+                    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-client".into());
+                match NativeClient::pair(
+                    &target3.addr,
+                    target3.port,
+                    (&ctx3.identity.0, &ctx3.identity.1),
+                    &pin,
+                    &name,
+                    std::time::Duration::from_secs(90),
+                ) {
+                    Ok(fp) => {
+                        let mut k = KnownHosts::load();
+                        k.upsert(KnownHost {
+                            name: target3.name.clone(),
+                            addr: target3.addr.clone(),
+                            port: target3.port,
+                            fp_hex: trust::hex(&fp),
+                            paired: true,
+                        });
+                        let _ = k.save();
+                        connect(&ctx3, &target3, Some(fp), &ss, &st);
+                    }
+                    Err(e) => {
+                        st.call(format!("Pairing failed: {e:?} (wrong PIN, or not armed?)"));
+                        ss.call(Screen::Hosts);
+                    }
                 }
-                Err(e) => {
-                    st.call(format!("Pairing failed: {e:?} (wrong PIN, or not armed?)"));
-                    ss.call(Screen::Hosts);
-                }
-            }
-        });
-    });
-    let back = {
+            });
+        })
+    };
+    let cancel_btn = {
         let ss = set_screen.clone();
         button("Cancel").on_click(move || ss.call(Screen::Hosts))
     };
 
-    vstack((
+    let content = card(vstack((
         text_block(format!("Pair with {}", target.name))
-            .font_size(22.0)
-            .bold(),
-        text_block("Arm pairing on the host (console or web UI), then enter the 4-digit PIN."),
+            .font_size(20.0)
+            .semibold(),
+        text_block(
+            "Arm pairing on the host (its console or web console), then enter the 4-digit PIN it \
+             shows.",
+        )
+        .foreground(ThemeRef::SecondaryText)
+        .max_width(440.0),
         text_box(code)
             .placeholder("PIN")
             .on_changed(move |s| set_code.call(s)),
-        hstack((pair_btn, back)).spacing(8.0),
+        hstack((pair_btn, cancel_btn)).spacing(8.0),
     ))
-    .spacing(12.0)
-    .into()
+    .spacing(14.0))
+    .max_width(480.0)
+    .horizontal_alignment(HorizontalAlignment::Center)
+    .margin(edges(0.0, 80.0, 0.0, 0.0));
+
+    page(vec![content.into()])
 }
 
 fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Element {
@@ -467,7 +586,7 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
             if w == 0 {
                 "Native display".into()
             } else {
-                format!("{w} × {h}")
+                format!("{w} \u{00D7} {h}")
             }
         })
         .collect();
@@ -515,23 +634,50 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
                 s.save();
             })
     };
-    let back = {
-        let ss = set_screen.clone();
+
+    let header = grid((
+        text_block("Settings")
+            .font_size(30.0)
+            .bold()
+            .grid_column(0)
+            .vertical_alignment(VerticalAlignment::Center),
         button("Back")
             .accent()
-            .on_click(move || ss.call(Screen::Hosts))
-    };
-
-    vstack((
-        text_block("Settings").font_size(28.0).bold(),
-        res_combo,
-        hz_combo,
-        mic_toggle,
-        back,
+            .on_click({
+                let ss = set_screen.clone();
+                move || ss.call(Screen::Hosts)
+            })
+            .grid_column(1)
+            .vertical_alignment(VerticalAlignment::Center),
     ))
-    .spacing(12.0)
-    .into()
+    .columns([GridLength::Star(1.0), GridLength::Auto])
+    .margin(edges(0.0, 0.0, 0.0, 6.0));
+
+    let stream_card = card(
+        vstack((
+            text_block("Stream").font_size(15.0).semibold(),
+            text_block("The host creates a virtual display at exactly this mode.")
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText),
+            res_combo,
+            hz_combo,
+        ))
+        .spacing(10.0),
+    );
+
+    let audio_card =
+        card(vstack((text_block("Audio").font_size(15.0).semibold(), mic_toggle)).spacing(10.0));
+
+    page(vec![
+        header.into(),
+        section("STREAM"),
+        stream_card.into(),
+        section("AUDIO"),
+        audio_card.into(),
+    ])
 }
+
+// --- stream page --------------------------------------------------------------------------
 
 fn present_newest(ctx: &mut PresentCtx) {
     let mut newest = None;
@@ -543,8 +689,8 @@ fn present_newest(ctx: &mut PresentCtx) {
 }
 
 fn stream_page(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
-    // Take the connector + frames handoff once on mount; keep the connector alive (and for
-    // input once that lands) in a use_ref, stash frames for `on_ready`.
+    // Take the connector + frames handoff once on mount; keep the connector alive (and for input)
+    // in a use_ref, stash frames for `on_ready`, install the input hooks (and remove on unmount).
     let connector_ref = cx.use_ref::<Option<Arc<NativeClient>>>(None);
     cx.use_effect_with_cleanup((), {
         let shared = ctx.shared.clone();
