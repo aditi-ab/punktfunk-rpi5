@@ -186,12 +186,38 @@ unsafe fn duplicate_output(
         // wrongly tripping the HDR path. Real HDR capture (FP16 first + IDXGIOutput6 colorspace
         // detection to pick the path) is the follow-up once the churn is settled.
         let formats = [DXGI_FORMAT_B8G8R8A8_UNORM];
-        match output5.DuplicateOutput1(device, 0, &formats) {
-            Ok(d) => return Ok(d),
-            Err(e) => tracing::warn!(
+        // RETRY DuplicateOutput1. The caller releases the OLD duplication (self.dupl = None) immediately
+        // before calling us, and the kernel-side teardown of that duplication is ASYNC — the FIRST
+        // DuplicateOutput1 right after can race it and return E_ACCESSDENIED ("output still duplicated")
+        // even though we dropped our only reference. A few short retries let the teardown finish so the
+        // ROBUST DuplicateOutput1 dup succeeds, instead of falling through to legacy DuplicateOutput,
+        // which "succeeds" into a fragile dup that churns ACCESS_LOST/MODE_CHANGE every few ms on this
+        // cross-GPU IDD. (This is why DuplicateOutput1 failed but the legacy call a beat later
+        // succeeded — pure timing. Apollo retries DuplicateOutput1 2x/200ms for the same reason.)
+        let mut last_err = None;
+        for attempt in 0..5u64 {
+            match output5.DuplicateOutput1(device, 0, &formats) {
+                Ok(d) => {
+                    if attempt > 0 {
+                        tracing::info!(attempt, "DuplicateOutput1 succeeded on retry (raced old-dup teardown)");
+                    }
+                    return Ok(d);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    // Escalating brief waits: 2,4,8,16 ms (skip after the last attempt). Bounded so a
+                    // GENUINE failure still falls back to legacy quickly (~30 ms worst case).
+                    if attempt < 4 {
+                        std::thread::sleep(Duration::from_millis(2u64 << attempt));
+                    }
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            tracing::warn!(
                 error = %format!("{e:?}"),
-                "DuplicateOutput1 failed — falling back to legacy DuplicateOutput"
-            ),
+                "DuplicateOutput1 failed after retries — falling back to legacy DuplicateOutput (will churn)"
+            );
         }
     }
     output.DuplicateOutput(device).context("DuplicateOutput")
