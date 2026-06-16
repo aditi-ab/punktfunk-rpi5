@@ -22,8 +22,10 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
 };
 use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
+    QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_MODE_INFO,
+    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
@@ -214,6 +216,55 @@ pub(crate) unsafe fn resolve_gdi_name(target_id: u32) -> Option<String> {
         }
     }
     None
+}
+
+/// Toggle the SudoVDA target's advanced-color (HDR) state via the CCD API. Disabling HDR while on the
+/// secure (Winlogon) desktop makes it render SDR/composed so DXGI Desktop Duplication can capture it
+/// (the HDR fullscreen independent-flip otherwise storms `ACCESS_LOST` → black); re-enable on return so
+/// WGC keeps HDR on the normal desktop. Returns true on a successful `DisplayConfigSetDeviceInfo`.
+pub(crate) unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
+    let mut np = 0u32;
+    let mut nm = 0u32;
+    if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
+        return false;
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+    if QueryDisplayConfig(
+        QDC_ONLY_ACTIVE_PATHS,
+        &mut np,
+        paths.as_mut_ptr(),
+        &mut nm,
+        modes.as_mut_ptr(),
+        None,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    for p in paths.iter().take(np as usize) {
+        if p.targetInfo.id == target_id {
+            let mut s = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE::default();
+            s.header.r#type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+            s.header.size = size_of::<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>() as u32;
+            s.header.adapterId = p.targetInfo.adapterId;
+            s.header.id = p.targetInfo.id;
+            s.Anonymous.value = enable as u32; // bit 0 = enableAdvancedColor
+            let rc = DisplayConfigSetDeviceInfo(&mut s.header);
+            tracing::info!(
+                target_id,
+                enable,
+                rc,
+                "SudoVDA set advanced-color (HDR) state"
+            );
+            return rc == 0;
+        }
+    }
+    tracing::warn!(
+        target_id,
+        "set_advanced_color: target not found in active paths"
+    );
+    false
 }
 
 /// Force the freshly-added SudoVDA monitor to the client's exact `WxH@Hz`. The ADD IOCTL only

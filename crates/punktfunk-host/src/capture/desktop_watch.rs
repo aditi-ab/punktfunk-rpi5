@@ -45,24 +45,36 @@ impl DesktopWatcher {
         let _ = std::thread::Builder::new()
             .name("desktop-watch".into())
             .spawn(move || {
-                let mut last = initial;
+                // Debounce: only publish a change after the raw reading has been stable for several
+                // polls. The input desktop flaps Default↔Winlogon transiently during a lock/UAC
+                // transition; publishing every flap makes the capture mux thrash (rebuild storms).
+                const STABLE_POLLS: u32 = 4; // ~80ms
+                let mut published = initial;
+                let mut candidate = initial;
+                let mut stable = 0u32;
                 while !st.load(Ordering::Relaxed) {
                     let v = if unsafe { is_secure_desktop() } {
                         DESKTOP_SECURE
                     } else {
                         DESKTOP_NORMAL
                     };
-                    s.store(v, Ordering::Release);
-                    if v != last {
+                    if v == candidate {
+                        stable = stable.saturating_add(1);
+                    } else {
+                        candidate = v;
+                        stable = 1;
+                    }
+                    if stable >= STABLE_POLLS && candidate != published {
+                        s.store(candidate, Ordering::Release);
+                        published = candidate;
                         tracing::info!(
-                            desktop = if v == DESKTOP_SECURE {
+                            desktop = if candidate == DESKTOP_SECURE {
                                 "Winlogon(secure)"
                             } else {
                                 "Default"
                             },
-                            "input desktop changed"
+                            "input desktop changed (debounced)"
                         );
-                        last = v;
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }

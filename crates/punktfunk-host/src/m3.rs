@@ -2526,24 +2526,50 @@ fn virtual_stream_relay(
                 "two-process: source switch"
             );
             if secure {
-                if dda.is_none() {
-                    match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz) {
-                        Ok(p) => dda = Some(p),
-                        Err(e) => {
-                            tracing::error!(error = %format!("{e:#}"),
-                                "two-process: DDA open failed — secure desktop will freeze on last frame");
-                        }
-                    }
+                // SDR-while-secure: drop the SudoVDA out of HDR so the secure (Winlogon) desktop
+                // renders SDR/composed — the HDR fullscreen independent-flip is what made DDA storm
+                // ACCESS_LOST (black). Give the reconfig a moment to settle, then (re)open DDA fresh on
+                // the now-SDR output.
+                let toggled = unsafe {
+                    crate::vdisplay::sudovda::set_advanced_color(target.target_id, false)
+                };
+                if toggled {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
                 }
-                if let Some(d) = dda.as_mut() {
-                    d.enc.request_keyframe();
+                dda = None; // reopen so we capture the post-toggle (SDR) output
+                match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz) {
+                    Ok(mut p) => {
+                        p.enc.request_keyframe();
+                        dda = Some(p);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"),
+                            "two-process: DDA open failed — secure desktop will freeze on last frame");
+                    }
                 }
                 next = std::time::Instant::now();
             } else {
-                // Returning to the helper: drain stale buffered AUs (encoded while we ignored it) and
-                // force a fresh IDR; await_idr then skips the stale deltas until that IDR arrives.
-                while relay.try_recv().is_ok() {}
-                relay.request_keyframe();
+                // Returning to the normal desktop: restore HDR on the SudoVDA (WGC captures it HDR), then
+                // rebuild the helper fresh so its WGC re-detects the restored colorspace, and resume.
+                unsafe {
+                    crate::vdisplay::sudovda::set_advanced_color(target.target_id, true);
+                }
+                dda = None; // free the secure DDA encoder
+                match build(&mut vd, cur_mode) {
+                    Ok((ka, rl, tg, hz)) => {
+                        relay = rl;
+                        _keepalive = ka;
+                        target = tg;
+                        effective_hz = hz;
+                        interval = std::time::Duration::from_secs_f64(1.0 / hz.max(1) as f64);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"),
+                            "two-process: helper rebuild on secure-exit failed");
+                        while relay.try_recv().is_ok() {}
+                        relay.request_keyframe();
+                    }
+                }
             }
         }
         if want_kf {
