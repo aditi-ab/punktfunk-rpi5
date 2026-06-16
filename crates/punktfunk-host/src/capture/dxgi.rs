@@ -92,7 +92,7 @@ fn depad_bgra(src: &[u8], pitch: usize, w: usize, h: usize) -> Vec<u8> {
 /// Re-find the live `IDXGIOutput1` for a GDI name across all adapters (the SudoVDA monitor is
 /// enumerated under the rendering GPU). Used to recover after ACCESS_LOST, where the cached handle
 /// may be stale.
-unsafe fn find_output(gdi_name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1)> {
+pub(crate) unsafe fn find_output(gdi_name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1)> {
     let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
     let mut i = 0u32;
     while let Ok(a) = factory.EnumAdapters1(i) {
@@ -113,7 +113,9 @@ unsafe fn find_output(gdi_name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1)> {
 /// adapter). Used at open and on every ACCESS_LOST: a device created on one desktop cannot sustain a
 /// duplication on a *different* desktop (perpetual ACCESS_LOST), so the secure-desktop switch needs a
 /// device made while the thread is attached to that desktop.
-unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+pub(crate) unsafe fn make_device(
+    adapter: &IDXGIAdapter1,
+) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device: Option<ID3D11Device> = None;
     let mut context: Option<ID3D11DeviceContext> = None;
     D3D11CreateDevice(
@@ -179,7 +181,7 @@ unsafe fn attach_input_desktop() {
     }
 }
 
-unsafe fn nudge_cursor_onto(output: &IDXGIOutput1) {
+pub(crate) unsafe fn nudge_cursor_onto(output: &IDXGIOutput1) {
     if let Ok(od) = output.GetDesc() {
         let r = od.DesktopCoordinates;
         let _ = SetCursorPos(r.left + 8, r.top + 8);
@@ -495,14 +497,14 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 /// scRGB FP16 → BT.2020 PQ 10-bit conversion pass. One per capture device (rebuilt on device
 /// recreate, like [`CursorCompositor`]). A single fullscreen draw samples the FP16 source SRV and
 /// writes PQ-encoded BT.2020 to the bound R10G10B10A2 render target.
-struct HdrConverter {
+pub(crate) struct HdrConverter {
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
 }
 
 impl HdrConverter {
-    unsafe fn new(device: &ID3D11Device) -> Result<Self> {
+    pub(crate) unsafe fn new(device: &ID3D11Device) -> Result<Self> {
         let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
         let psb = compile_shader(HDR_PS, s!("main"), s!("ps_5_0"))?;
         let mut vs = None;
@@ -528,7 +530,7 @@ impl HdrConverter {
     }
 
     /// Convert `src_srv` (FP16 scRGB) into `dst_rtv` (R10G10B10A2 PQ BT.2020). Opaque pass, no blend.
-    unsafe fn convert(
+    pub(crate) unsafe fn convert(
         &self,
         ctx: &ID3D11DeviceContext,
         src_srv: &ID3D11ShaderResourceView,

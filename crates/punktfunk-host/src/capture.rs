@@ -265,8 +265,54 @@ pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Bo
             "SudoVDA target not yet an active display (needs a WDDM GPU to activate it)"
         )
     })?;
-    dxgi::DuplCapturer::open(target, vout.preferred_mode, vout.keepalive)
-        .map(|c| Box::new(c) as Box<dyn Capturer>)
+    let pref = vout.preferred_mode;
+    let keep = vout.keepalive;
+    // WGC (Windows.Graphics.Capture) is the default: it captures the COMPOSED desktop including the
+    // overlay/independent-flip planes DXGI Desktop Duplication misses (the frozen-HDR-animation bug),
+    // and has no ACCESS_LOST-on-overlay churn. DDA stays available via PUNKTFUNK_CAPTURE=dda and is
+    // the secure-desktop (lock/UAC) fallback (WGC can't capture those). `keep` is moved into the
+    // chosen backend (it owns the SudoVDA keepalive), so there's no open-time auto-fallback.
+    let backend = std::env::var("PUNKTFUNK_CAPTURE")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if backend == "dda" || backend == "dxgi" {
+        return dxgi::DuplCapturer::open(target, pref, keep)
+            .map(|c| Box::new(c) as Box<dyn Capturer>);
+    }
+    // WGC default, with a watchdog'd DDA fallback. WGC's Direct3D11CaptureFramePool::CreateFreeThreaded
+    // intermittently HANGS on the headless SudoVDA (IddCx) display — a blocking call we can't error out
+    // of in place. So run WGC open on a dedicated thread and bound it: if it doesn't finish in time
+    // (hang) or errors, fall back to the reliable DDA path so the session is NEVER left black. WGC,
+    // when it opens, captures the composed desktop (overlay/MPO-correct HDR — fixes frozen animations);
+    // DDA is the safety net (+ the secure-desktop path). The encode thread is set MTA so the WGC
+    // objects built on the watchdog thread (also MTA) are usable here; the keepalive is handed to WGC
+    // only on success, else to DDA. A hung watchdog thread is abandoned (holds no keepalive).
+    unsafe {
+        let _ = windows::Win32::System::WinRT::RoInitialize(
+            windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = target.clone();
+    let _ = std::thread::Builder::new()
+        .name("wgc-open".into())
+        .spawn(move || {
+            let _ = tx.send(wgc::WgcCapturer::open(t, pref));
+        });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(mut c)) => {
+            c.attach_keepalive(keep);
+            Ok(Box::new(c) as Box<dyn Capturer>)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %format!("{e:#}"), "WGC open failed — falling back to DDA");
+            dxgi::DuplCapturer::open(target, pref, keep).map(|c| Box::new(c) as Box<dyn Capturer>)
+        }
+        Err(_) => {
+            tracing::warn!("WGC open timed out (CreateFreeThreaded hang on the virtual display) — falling back to DDA");
+            dxgi::DuplCapturer::open(target, pref, keep).map(|c| Box::new(c) as Box<dyn Capturer>)
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -278,3 +324,5 @@ pub fn capture_virtual_output(_vout: crate::vdisplay::VirtualOutput) -> Result<B
 pub mod dxgi;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+pub mod wgc;
