@@ -3,9 +3,10 @@
 # (windows-reactor + D3D11/SwapChainPanel + WASAPI + SDL3) on x86_64-pc-windows-msvc.
 #
 # The MSVC/WinUI/FFmpeg toolchain (cargo/rustup on ASCII paths, NASM, CMake, LLVM, FFmpeg,
-# CARGO_HOME, CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env, so jobs
-# inherit it. The one per-checkout var is CARGO_WORKSPACE_DIR — windows-reactor's build.rs
-# unwraps it and stages the Windows App SDK NuGets + winmd under it.
+# CARGO_HOME, CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. The one
+# per-checkout var is CARGO_WORKSPACE_DIR (windows-reactor's build.rs unwraps it + stages the
+# Windows App SDK NuGets/winmd under it) — set from GITHUB_WORKSPACE in a step (not job-level
+# env, where Gitea can't yet resolve the workspace path).
 name: windows
 
 on:
@@ -18,30 +19,30 @@ jobs:
   build:
     runs-on: windows-amd64
     timeout-minutes: 60
-    env:
-      # windows-reactor's build.rs `.unwrap()`s this and writes /temp + /winmd under it.
-      CARGO_WORKSPACE_DIR: ${{ github.workspace }}
-    defaults:
-      run:
-        shell: powershell
     steps:
       - uses: actions/checkout@v4
 
-      - name: Toolchain + workspace path
+      - name: Configure + toolchain versions
+        shell: powershell
         run: |
+          "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           rustc --version
           cargo --version
           node --version
           Write-Output "workspace: $env:GITHUB_WORKSPACE"
 
       - name: Build
+        shell: powershell
         run: cargo build -p punktfunk-client-windows
 
       - name: Clippy (-D warnings)
+        shell: powershell
         run: cargo clippy -p punktfunk-client-windows --all-targets -- -D warnings
 
       - name: Rustfmt check
+        shell: powershell
         run: cargo fmt -p punktfunk-client-windows -- --check
 
       - name: Test
+        shell: powershell
         run: cargo test -p punktfunk-client-windows
