@@ -1570,6 +1570,38 @@ impl DuplCapturer {
             Err(e) => return Err(e).context("AcquireNextFrame"),
         }
         let res = res.context("AcquireNextFrame: null resource")?;
+        // Detect a mode/format change on the hot path. The desktop can flip HDR<->SDR (FP16<->BGRA —
+        // e.g. the SudoVDA output dropping out of HDR for the secure desktop) or change resolution
+        // WITHOUT raising ACCESS_LOST; `hdr_fp16`/`width`/`height` would then be stale and
+        // `present_acquired` would CopyResource into a mismatched-format/size target — corruption, or
+        // the secure-desktop "works once, then HDR breaks" bug. Re-read the acquired texture's desc
+        // every frame (Apollo does this) and rebuild on a real change instead of presenting a
+        // mismatched frame. Throttled like the ACCESS_LOST path so a flapping toggle can't hammer
+        // DuplicateOutput.
+        if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
+            let mut d = D3D11_TEXTURE2D_DESC::default();
+            tex.GetDesc(&mut d);
+            let now_hdr = d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            if d.Width != self.width || d.Height != self.height || now_hdr != self.hdr_fp16 {
+                tracing::info!(
+                    old = format!("{}x{} hdr={}", self.width, self.height, self.hdr_fp16),
+                    new = format!("{}x{} hdr={}", d.Width, d.Height, now_hdr),
+                    "DXGI capture format/size changed mid-stream — rebuilding"
+                );
+                let _ = self.dupl.ReleaseFrame();
+                let now = Instant::now();
+                let due = self
+                    .last_rebuild
+                    .map_or(true, |t| now.duration_since(t) >= Duration::from_millis(250));
+                if due {
+                    self.last_rebuild = Some(now);
+                    if self.recreate_dupl().is_ok() {
+                        self.first_frame = true;
+                    }
+                }
+                return Ok(None);
+            }
+        }
         Ok(Some(self.present_acquired(res)?))
     }
 
