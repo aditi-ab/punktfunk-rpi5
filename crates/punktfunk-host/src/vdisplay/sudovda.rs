@@ -10,9 +10,9 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use windows::core::{GUID, PCWSTR};
@@ -626,44 +626,65 @@ unsafe fn open_device() -> Result<HANDLE> {
     Ok(handle)
 }
 
-/// A live SudoVDA control handle. One per host; `create` adds/removes monitors on it.
-pub struct SudoVdaDisplay {
-    device: HANDLE,
-    watchdog_s: u32,
+// ── Host-level reference-counted SudoVDA monitor lifecycle ──────────────────────────────────────
+//
+// The virtual monitor is created on the first session and REUSED across sessions. When the last
+// session disconnects the monitor LINGERS for a grace window (PUNKTFUNK_MONITOR_LINGER_MS, default
+// 10 s): a reconnect within the window reuses it instantly (no new screen, no PnP connect/disconnect
+// chime, no teardown/recreate kernel churn); after the window a background timer REMOVEs it so a
+// physical-screen user gets their screen back. Overlapping sessions share one monitor via the
+// refcount (teardown only at refs==0 + expired grace), so a stale session can never REMOVE a live
+// session's monitor (the earlier collision). The control-device HANDLE is opened once and kept for
+// the host lifetime — it's a handle, not a screen, so it creates no phantom display.
+
+/// The resources backing one live SudoVDA monitor (owned by [`MGR`], not by any session).
+struct Monitor {
+    guid: GUID,
+    target_id: u32,
+    luid: LUID,
+    gdi_name: Option<String>,
+    mode: Mode,
+    stop: Arc<AtomicBool>,
+    pinger: Option<JoinHandle<()>>,
+    isolated: Vec<(String, DEVMODEW)>,
+    ccd_saved: Option<SavedConfig>,
 }
 
-// The HANDLE is a kernel object usable from any thread; we only ever issue serialized IOCTLs.
-unsafe impl Send for SudoVdaDisplay {}
+enum MgrState {
+    Idle,
+    Active { mon: Monitor, refs: u32 },
+    Lingering { mon: Monitor, until: Instant },
+}
+
+struct Mgr {
+    /// Control-device handle (raw isize; `HANDLE` isn't `Send`). Opened once, kept for the host life.
+    device: Option<isize>,
+    watchdog_s: u32,
+    state: MgrState,
+}
+
+static MGR: Mutex<Mgr> = Mutex::new(Mgr {
+    device: None,
+    watchdog_s: 3,
+    state: MgrState::Idle,
+});
+
+/// The Windows virtual-display backend. A marker — the monitor lifecycle lives in the global [`MGR`].
+pub struct SudoVdaDisplay;
 
 impl SudoVdaDisplay {
     pub fn new() -> Result<Self> {
-        let device = unsafe { open_device()? };
-        let mut ver = [0u8; 4];
-        if unsafe { ioctl(device, IOCTL_GET_VERSION, &[], &mut ver) }.is_ok() {
-            tracing::info!(
-                "SudoVDA protocol {}.{}.{} (test={})",
-                ver[0],
-                ver[1],
-                ver[2],
-                ver[3]
-            );
-        }
-        let mut wd = [0u8; 8];
-        let watchdog_s = if unsafe { ioctl(device, IOCTL_GET_WATCHDOG, &[], &mut wd) }.is_ok() {
-            u32::from_le_bytes([wd[0], wd[1], wd[2], wd[3]]).max(1)
-        } else {
-            3
-        };
-        tracing::info!("SudoVDA watchdog timeout {watchdog_s}s");
-        Ok(Self { device, watchdog_s })
+        // Open the control device once (validates the driver is present) + log version/watchdog.
+        let mut g = MGR.lock().unwrap();
+        mgr_ensure_device(&mut g)?;
+        Ok(Self)
     }
 }
 
 impl Drop for SudoVdaDisplay {
     fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.device);
-        }
+        // Nothing: the control device + monitor lifecycle are host-level (owned by MGR) and
+        // deliberately outlive any single session so a reconnect can reuse the monitor.
     }
 }
 
@@ -673,11 +694,24 @@ impl VirtualDisplay for SudoVdaDisplay {
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
+        // Delegate to the host-level manager: create the monitor, reuse a lingering one on reconnect,
+        // or join the live one — and hand back a lease whose Drop releases the refcount.
+        mgr_acquire(mode)
+    }
+}
+
+/// Create a fresh SudoVDA monitor at `mode` on the (host-level) control `device`. The old per-session
+/// `create()` body, now owned by the manager: ADD the target, start the watchdog ping, resolve the
+/// GDI name, force the client mode + (default) isolate to a sole composited display. Returns the
+/// [`Monitor`] resources; the manager tracks its lifecycle (refcount + linger).
+unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<Monitor> {
+    let dev = HANDLE(device as *mut c_void);
+    {
         let mut device_name = [0u8; 14];
         let nm = b"punktfunk";
         device_name[..nm.len()].copy_from_slice(nm);
-        // Unique GUID PER SESSION so overlapping sessions / client reconnects each own their own
-        // SudoVDA monitor — a stale session's REMOVE must never tear down a live session's monitor.
+        // Fresh GUID per created monitor (the manager refcount, not the GUID, prevents the
+        // cross-session REMOVE collision now).
         let session_guid = next_monitor_guid();
         let add = AddParams {
             width: mode.width,
@@ -705,7 +739,7 @@ impl VirtualDisplay for SudoVdaDisplay {
             None
         };
         if let Some(luid) = pinned {
-            match unsafe { set_render_adapter(self.device, luid) } {
+            match unsafe { set_render_adapter(dev, luid) } {
                 Ok(()) => tracing::info!(
                     luid = format!("{:08x}:{:08x}", luid.HighPart, luid.LowPart),
                     "SudoVDA SET_RENDER_ADAPTER: pinned IDD render GPU"
@@ -718,7 +752,7 @@ impl VirtualDisplay for SudoVdaDisplay {
             std::slice::from_raw_parts(&add as *const _ as *const u8, size_of::<AddParams>())
         };
         let mut out = [0u8; size_of::<AddOut>()];
-        unsafe { ioctl(self.device, IOCTL_ADD, add_bytes, &mut out) }.with_context(|| {
+        unsafe { ioctl(dev, IOCTL_ADD, add_bytes, &mut out) }.with_context(|| {
             format!(
                 "SudoVDA ADD {}x{}@{}",
                 mode.width, mode.height, mode.refresh_hz
@@ -747,8 +781,8 @@ impl VirtualDisplay for SudoVdaDisplay {
 
         // Mandatory keepalive: ping inside the watchdog window or the driver tears all displays down.
         let stop = Arc::new(AtomicBool::new(false));
-        let device_raw = self.device.0 as isize;
-        let interval = Duration::from_millis(self.watchdog_s as u64 * 1000 / 3);
+        let device_raw = device;
+        let interval = Duration::from_millis(watchdog_s as u64 * 1000 / 3);
         let stop_t = stop.clone();
         let pinger = thread::spawn(move || {
             let h = HANDLE(device_raw as *mut c_void);
@@ -803,71 +837,210 @@ impl VirtualDisplay for SudoVdaDisplay {
             ),
         }
 
-        Ok(VirtualOutput {
-            node_id: 0, // unused on Windows; the capture target is the GDI name below
-            preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
-            win_capture: gdi_name
-                .clone()
-                .map(|n| crate::capture::dxgi::WinCaptureTarget {
-                    adapter_luid: crate::capture::dxgi::pack_luid(ao.luid),
-                    gdi_name: n,
-                    // The SudoVDA target id is stable across secure-desktop topology rebuilds; the
-                    // GDI name is NOT, so capture re-resolves the name from this on every recovery.
-                    target_id: ao.target_id,
-                }),
-            keepalive: Box::new(SudoVdaKeepalive {
-                device: device_raw,
-                guid: session_guid,
-                stop,
-                pinger: Some(pinger),
-                gdi_name,
-                isolated,
-                ccd_saved,
-            }),
+        Ok(Monitor {
+            guid: session_guid,
+            target_id: ao.target_id,
+            luid: ao.luid,
+            gdi_name,
+            mode,
+            stop,
+            pinger: Some(pinger),
+            isolated,
+            ccd_saved,
         })
     }
 }
 
-/// RAII teardown: stop the ping thread, then REMOVE the monitor by its GUID. Does NOT close the
-/// device handle — that belongs to [`SudoVdaDisplay`], which outlives the output.
-struct SudoVdaKeepalive {
-    device: isize,
-    guid: GUID,
-    stop: Arc<AtomicBool>,
-    pinger: Option<JoinHandle<()>>,
-    #[allow(dead_code)] // consumed by the Windows capture backend (not yet wired)
-    gdi_name: Option<String>,
-    /// Displays detached by [`isolate_displays`] (legacy), restored here on teardown.
-    isolated: Vec<(String, DEVMODEW)>,
-    /// Active topology saved by [`isolate_displays_ccd`] (the one that works on hybrid boxes),
-    /// restored here on teardown.
-    ccd_saved: Option<SavedConfig>,
-}
+impl Monitor {
+    /// The capture target handed to a session (`None` until the GDI name resolves).
+    fn target(&self) -> Option<crate::capture::dxgi::WinCaptureTarget> {
+        self.gdi_name
+            .clone()
+            .map(|n| crate::capture::dxgi::WinCaptureTarget {
+                adapter_luid: crate::capture::dxgi::pack_luid(self.luid),
+                gdi_name: n,
+                // target_id is stable across secure-desktop topology rebuilds; the GDI name is NOT,
+                // so capture re-resolves the name from this on every recovery.
+                target_id: self.target_id,
+            })
+    }
 
-impl Drop for SudoVdaKeepalive {
-    fn drop(&mut self) {
+    /// Stop the watchdog ping, re-attach the displays we detached, then REMOVE the monitor (by GUID).
+    /// `device` is the host-level control handle. Consumes the monitor.
+    unsafe fn teardown(mut self, device: isize) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(j) = self.pinger.take() {
             let _ = j.join();
         }
-        // Re-attach the physical display(s) we detached BEFORE removing the virtual output, so the
-        // box is never left with zero displays. Restore the CCD topology first (the one that actually
-        // detached on a hybrid box), then the legacy pass.
+        // Re-attach detached display(s) BEFORE the REMOVE so the box is never left with zero displays.
         if let Some(saved) = &self.ccd_saved {
-            unsafe { restore_displays_ccd(saved) };
+            restore_displays_ccd(saved);
         }
-        unsafe { restore_displays(&self.isolated) };
+        restore_displays(&self.isolated);
         let rp = RemoveParams { guid: self.guid };
-        let rp_bytes = unsafe {
-            std::slice::from_raw_parts(&rp as *const _ as *const u8, size_of::<RemoveParams>())
-        };
+        let rp_bytes =
+            std::slice::from_raw_parts(&rp as *const _ as *const u8, size_of::<RemoveParams>());
         let mut none: [u8; 0] = [];
-        let h = HANDLE(self.device as *mut c_void);
-        if let Err(e) = unsafe { ioctl(h, IOCTL_REMOVE, rp_bytes, &mut none) } {
+        let h = HANDLE(device as *mut c_void);
+        if let Err(e) = ioctl(h, IOCTL_REMOVE, rp_bytes, &mut none) {
             tracing::warn!("SudoVDA REMOVE failed: {e:#}");
         } else {
             tracing::info!("SudoVDA monitor removed");
         }
+    }
+}
+
+/// Open the control device once + read version/watchdog; cache the handle (raw isize) in `g`.
+fn mgr_ensure_device(g: &mut Mgr) -> Result<isize> {
+    if let Some(d) = g.device {
+        return Ok(d);
+    }
+    let device = unsafe { open_device()? };
+    let mut ver = [0u8; 4];
+    if unsafe { ioctl(device, IOCTL_GET_VERSION, &[], &mut ver) }.is_ok() {
+        tracing::info!("SudoVDA protocol {}.{}.{} (test={})", ver[0], ver[1], ver[2], ver[3]);
+    }
+    let mut wd = [0u8; 8];
+    g.watchdog_s = if unsafe { ioctl(device, IOCTL_GET_WATCHDOG, &[], &mut wd) }.is_ok() {
+        u32::from_le_bytes([wd[0], wd[1], wd[2], wd[3]]).max(1)
+    } else {
+        3
+    };
+    tracing::info!("SudoVDA watchdog timeout {}s", g.watchdog_s);
+    let raw = device.0 as isize;
+    g.device = Some(raw);
+    Ok(raw)
+}
+
+/// Linger window before a session-less monitor is torn down. A reconnect within it reuses the
+/// monitor (no new screen / PnP chime); after it the monitor is REMOVEd so a physical screen returns.
+fn linger_ms() -> u64 {
+    std::env::var("PUNKTFUNK_MONITOR_LINGER_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000)
+}
+
+/// Acquire the shared monitor for a new session: join the live one (refcount++), reuse a lingering
+/// one (reconfiguring if the client mode changed), or create one. The returned [`MonitorLease`]
+/// releases the refcount on drop.
+fn mgr_acquire(mode: Mode) -> Result<VirtualOutput> {
+    ensure_linger_timer();
+    let mut g = MGR.lock().unwrap();
+    let device = mgr_ensure_device(&mut g)?;
+    let watchdog_s = g.watchdog_s;
+
+    // A live monitor already exists — join it (refcount++). This covers a concurrent session AND the
+    // build-then-drop overlap of a mid-stream Reconfigure / secure-return (the new lease is taken while
+    // the old is still held). If the requested mode differs, reconfigure the shared monitor to it so a
+    // Reconfigure actually applies (one shared monitor → sessions necessarily share a mode).
+    if let MgrState::Active { mon, refs } = &mut g.state {
+        *refs += 1;
+        let changed = mon.mode.width != mode.width
+            || mon.mode.height != mode.height
+            || mon.mode.refresh_hz != mode.refresh_hz;
+        if changed {
+            unsafe { mgr_reconfigure(mon, mode) };
+        }
+        tracing::info!(refs = *refs, "SudoVDA monitor reused (concurrent / reconfigure session)");
+        let pm = Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz));
+        let target = mon.target();
+        return Ok(VirtualOutput {
+            node_id: 0,
+            preferred_mode: pm,
+            win_capture: target,
+            keepalive: Box::new(MonitorLease),
+        });
+    }
+
+    // Idle or Lingering: repurpose/create a monitor → Active{refs:1}.
+    let mon = match std::mem::replace(&mut g.state, MgrState::Idle) {
+        MgrState::Lingering { mut mon, .. } => {
+            tracing::info!("SudoVDA monitor reused (reconnect within the linger window)");
+            let changed = mon.mode.width != mode.width
+                || mon.mode.height != mode.height
+                || mon.mode.refresh_hz != mode.refresh_hz;
+            if changed {
+                unsafe { mgr_reconfigure(&mut mon, mode) };
+            }
+            mon
+        }
+        MgrState::Idle => unsafe { create_monitor(device, mode, watchdog_s)? },
+        MgrState::Active { .. } => unreachable!("handled above"),
+    };
+    let pm = Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz));
+    let target = mon.target();
+    g.state = MgrState::Active { mon, refs: 1 };
+    Ok(VirtualOutput {
+        node_id: 0,
+        preferred_mode: pm,
+        win_capture: target,
+        keepalive: Box::new(MonitorLease),
+    })
+}
+
+/// Re-apply a (possibly new) mode to a reused monitor on reconnect, re-resolving its GDI name.
+unsafe fn mgr_reconfigure(mon: &mut Monitor, mode: Mode) {
+    tracing::info!(
+        old = format!("{}x{}@{}", mon.mode.width, mon.mode.height, mon.mode.refresh_hz),
+        new = format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
+        "SudoVDA: reconfiguring reused monitor to the new client mode"
+    );
+    if let Some(n) = resolve_gdi_name(mon.target_id) {
+        mon.gdi_name = Some(n);
+    }
+    if let Some(n) = &mon.gdi_name {
+        set_active_mode(n, mode);
+    }
+    mon.mode = mode;
+}
+
+/// Release a session's hold: refcount-- ; when the last session leaves, LINGER before teardown.
+fn mgr_release() {
+    let mut g = MGR.lock().unwrap();
+    g.state = match std::mem::replace(&mut g.state, MgrState::Idle) {
+        MgrState::Active { mon, refs } if refs > 1 => MgrState::Active { mon, refs: refs - 1 },
+        MgrState::Active { mon, .. } => {
+            let ms = linger_ms();
+            tracing::info!(linger_ms = ms, "SudoVDA: last session left — lingering before teardown");
+            MgrState::Lingering {
+                mon,
+                until: Instant::now() + Duration::from_millis(ms),
+            }
+        }
+        other => other,
+    };
+}
+
+/// Background timer (started once): tear down a monitor that has lingered past its deadline (→ Idle),
+/// so a physical-screen user gets their screen back after they stop streaming.
+fn ensure_linger_timer() {
+    static TIMER: Once = Once::new();
+    TIMER.call_once(|| {
+        let _ = thread::Builder::new()
+            .name("sudovda-linger".into())
+            .spawn(|| loop {
+                thread::sleep(Duration::from_millis(500));
+                let mut g = MGR.lock().unwrap();
+                let due = matches!(&g.state, MgrState::Lingering { until, .. } if Instant::now() >= *until);
+                if due {
+                    let device = g.device.unwrap_or(0);
+                    if let MgrState::Lingering { mon, .. } =
+                        std::mem::replace(&mut g.state, MgrState::Idle)
+                    {
+                        drop(g); // release the lock before the REMOVE IOCTL + display restore
+                        unsafe { mon.teardown(device) };
+                    }
+                }
+            });
+    });
+}
+
+/// A session's lease on the shared monitor. Drop releases the refcount (→ linger when it hits 0).
+struct MonitorLease;
+impl Drop for MonitorLease {
+    fn drop(&mut self) {
+        mgr_release();
     }
 }
 
