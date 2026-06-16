@@ -937,7 +937,12 @@ pub struct DuplCapturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     output: IDXGIOutput1,
-    dupl: IDXGIOutputDuplication,
+    /// The output duplication. `Option` so recovery can RELEASE it (set `None`) BEFORE re-duplicating:
+    /// DXGI permits only ONE `IDXGIOutputDuplication` per output, and a stale one (incl. an ACCESS_LOST
+    /// one) keeps holding the output, so a re-`DuplicateOutput1` returns E_ACCESSDENIED and legacy
+    /// `DuplicateOutput` returns a BORN-LOST dup — the storm. Apollo releases before re-duplicating; so
+    /// do we now. `None` only transiently during recovery (acquire routes None → recovery).
+    dupl: Option<IDXGIOutputDuplication>,
     /// The output's GDI name — re-resolved on ACCESS_LOST (a mode change can stale the cached handle).
     gdi_name: String,
     /// Stable SudoVDA target id, used to re-resolve `gdi_name` during recovery.
@@ -1206,7 +1211,7 @@ impl DuplCapturer {
                 device,
                 context,
                 output,
-                dupl,
+                dupl: Some(dupl),
                 target_id: target.target_id,
                 gdi_name: target.gdi_name,
                 width,
@@ -1542,9 +1547,13 @@ impl DuplCapturer {
     /// (like recreate_dupl) so a born-lost one is rejected rather than adopted.
     unsafe fn try_reduplicate(&mut self) -> bool {
         if self.holding_frame {
-            let _ = self.dupl.ReleaseFrame();
+            let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
             self.holding_frame = false;
         }
+        // RELEASE the old duplication FIRST (drop it → frees the output) before re-duplicating. DXGI
+        // allows one duplication per output; leaving the stale one alive is exactly why DuplicateOutput1
+        // returned E_ACCESSDENIED and the legacy fallback produced a born-lost dup.
+        self.dupl = None;
         let dupl = match duplicate_output(&self.output, &self.device) {
             Ok(d) => d,
             Err(_) => return false,
@@ -1553,10 +1562,10 @@ impl DuplCapturer {
         // + CAPTURE the frame: a born-lost duplication returns ACCESS_LOST immediately; alive-but-idle
         // waits the full 16ms. On a real frame we present it (so a static desktop keeps a real
         // last_present instead of the discarded one); idle keeps the existing last_present.
-        self.dupl = dupl;
+        self.dupl = Some(dupl);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
-        match self.dupl.AcquireNextFrame(16, &mut info, &mut res) {
+        match self.dupl.as_ref().unwrap().AcquireNextFrame(16, &mut info, &mut res) {
             Ok(()) => {
                 self.update_cursor(&info);
                 if let Some(r) = res {
@@ -1580,7 +1589,7 @@ impl DuplCapturer {
     /// frame and retries on a throttle, so the session survives an arbitrarily long secure visit.
     unsafe fn recreate_dupl(&mut self) -> Result<()> {
         if self.holding_frame {
-            let _ = self.dupl.ReleaseFrame();
+            let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
             self.holding_frame = false;
         }
         // The SudoVDA output's GDI name can CHANGE across a secure-desktop topology rebuild —
@@ -1600,6 +1609,11 @@ impl DuplCapturer {
             attach_input_desktop();
             crate::vdisplay::sudovda::reassert_isolation(&self.gdi_name);
         }
+        // RELEASE the old duplication FIRST (frees the output). reopen_duplication creates a NEW device
+        // and re-DuplicateOutputs the output; if the stale duplication is still alive it holds the output
+        // and the new one is born-lost / E_ACCESSDENIED. (On reopen failure self.dupl stays None and
+        // acquire's None-guard re-drives recovery.)
+        self.dupl = None;
         let (dev, ctx, out, dupl) = reopen_duplication(&self.gdi_name)?; // Err → caller repeats + retries
 
         // (The born-lost guard is now the capture-acquire at the end: we adopt, then grab the current
@@ -1626,7 +1640,7 @@ impl DuplCapturer {
         self.device = dev;
         self.context = ctx;
         self.output = out;
-        self.dupl = dupl;
+        self.dupl = Some(dupl);
         self.gpu_copy = None; // stale: belonged to the old device
         self.cursor = None; // shaders/textures belonged to the old device; rebuilt on demand
         self.last_present = None; // belonged to the old device; reseeded below
@@ -1648,7 +1662,7 @@ impl DuplCapturer {
         nudge_cursor_onto(&self.output); // kick a change so a static desktop yields its first frame
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
-        let captured = match self.dupl.AcquireNextFrame(120, &mut info, &mut res) {
+        let captured = match self.dupl.as_ref().unwrap().AcquireNextFrame(120, &mut info, &mut res) {
             Ok(()) => {
                 self.update_cursor(&info);
                 match res {
@@ -1693,7 +1707,7 @@ impl DuplCapturer {
     /// Acquire one frame: `Some` on a fresh image, `None` on timeout (no change → caller reuses last).
     unsafe fn acquire(&mut self) -> Result<Option<CapturedFrame>> {
         if self.holding_frame {
-            let _ = self.dupl.ReleaseFrame();
+            let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
             self.holding_frame = false;
         }
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -1703,7 +1717,14 @@ impl DuplCapturer {
         } else {
             self.timeout_ms
         };
-        match self.dupl.AcquireNextFrame(timeout, &mut info, &mut res) {
+        // If a prior recovery released the old duplication but couldn't create a new one yet (output
+        // gone during a secure dwell, etc.), self.dupl is None — synthesize ACCESS_LOST so we flow into
+        // the recovery path below instead of panicking.
+        let acq = match self.dupl.as_ref() {
+            Some(d) => d.AcquireNextFrame(timeout, &mut info, &mut res),
+            None => Err(windows::core::Error::from_hresult(DXGI_ERROR_ACCESS_LOST)),
+        };
+        match acq {
             Ok(()) => {
                 if self.first_frame {
                     tracing::info!(w = self.width, h = self.height, "DXGI first frame acquired");
@@ -1840,7 +1861,7 @@ impl DuplCapturer {
                     new = format!("{}x{}", d.Width, d.Height),
                     "DXGI capture size changed mid-stream — rebuilding"
                 );
-                let _ = self.dupl.ReleaseFrame();
+                let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
                 let now = Instant::now();
                 let due = self
                     .last_rebuild
@@ -1874,7 +1895,7 @@ impl DuplCapturer {
             self.ensure_fp16_src()?;
             let src = self.fp16_src.clone().context("fp16 src texture")?;
             self.context.CopyResource(&src, &tex);
-            let _ = self.dupl.ReleaseFrame();
+            let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
             self.holding_frame = false;
             self.composite_cursor_gpu(&src, true)?; // onto the FP16 surface (HDR: decode + nits scale)
             self.ensure_hdr10_out()?;
@@ -1912,7 +1933,7 @@ impl DuplCapturer {
             self.ensure_gpu_copy()?;
             let gpu = self.gpu_copy.clone().context("gpu copy texture")?;
             self.context.CopyResource(&gpu, &tex);
-            let _ = self.dupl.ReleaseFrame();
+            let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
             self.holding_frame = false;
             self.composite_cursor_gpu(&gpu, false)?;
             self.last_present = Some((gpu.clone(), PixelFormat::Bgra));
@@ -1939,7 +1960,7 @@ impl DuplCapturer {
         let src = std::slice::from_raw_parts(map.pData as *const u8, pitch * h);
         let mut tight = depad_bgra(src, pitch, w, h);
         self.context.Unmap(&staging, 0);
-        let _ = self.dupl.ReleaseFrame();
+        let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
         self.holding_frame = false;
         if self.cursor_visible {
             if let Some(shape) = &self.cursor_shape {
@@ -2054,7 +2075,7 @@ impl Drop for DuplCapturer {
     fn drop(&mut self) {
         if self.holding_frame {
             unsafe {
-                let _ = self.dupl.ReleaseFrame();
+                let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
             }
         }
         // Release the display/system-required execution state we took at open().
