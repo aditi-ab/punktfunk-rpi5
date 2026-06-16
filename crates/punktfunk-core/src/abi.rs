@@ -891,6 +891,9 @@ pub unsafe extern "C" fn punktfunk_connect_ex4(
             pref,
             gamepad,
             bitrate_kbps,
+            // 8-bit only over the C ABI for now — the ABI doesn't yet carry the embedder's video
+            // caps (Apple/Android decode 8-bit). The native Windows client advertises 10-bit/HDR.
+            0,
             launch,
             pin,
             identity,

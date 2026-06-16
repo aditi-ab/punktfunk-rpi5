@@ -96,6 +96,7 @@ fn pump(
         params.compositor,
         params.gamepad,
         params.bitrate_kbps,
+        0,    // video_caps: the Linux client has no 10-bit/HDR present path yet
         None, // launch: the Linux client has no library picker yet
         params.pin,
         Some(params.identity),

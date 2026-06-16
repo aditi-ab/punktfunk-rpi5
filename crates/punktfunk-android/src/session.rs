@@ -182,6 +182,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         CompositorPref::from_u8(compositor_pref.clamp(0, u8::MAX as jint) as u8),
         GamepadPref::from_u8(gamepad_pref.clamp(0, u8::MAX as jint) as u8),
         bitrate_kbps.max(0) as u32, // 0 = host default
+        0,                          // video_caps: 8-bit only on Android for now
         None,                       // launch: default app
         pin,                        // Some → Crypto on host-fp mismatch
         identity,                   // owned (cert, key) PEM, or None (anonymous)
