@@ -152,6 +152,43 @@ unsafe fn no_inherit(h: HANDLE) {
     let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
 }
 
+/// Build the helper's environment block: the user's block (so DLL/PATH/SystemRoot resolve) with this
+/// (host) process's `PUNKTFUNK_*` vars overlaid, so the helper encodes with the SAME settings the
+/// host runs with (`PUNKTFUNK_ENCODER=nvenc`, `PUNKTFUNK_ZEROCOPY`, …) instead of the user shell's.
+/// Returns a UTF-16, double-null-terminated block suitable for `CREATE_UNICODE_ENVIRONMENT`.
+unsafe fn merged_env_block(user_block: *const u16) -> Vec<u16> {
+    // Parse the user block ("VAR=VALUE\0" … "\0") into entries.
+    let mut entries: Vec<String> = Vec::new();
+    if !user_block.is_null() {
+        let mut p = user_block;
+        loop {
+            let mut len = 0isize;
+            while *p.offset(len) != 0 {
+                len += 1;
+            }
+            if len == 0 {
+                break; // the trailing empty string = end of block
+            }
+            let slice = std::slice::from_raw_parts(p, len as usize);
+            entries.push(String::from_utf16_lossy(slice));
+            p = p.offset(len + 1);
+        }
+    }
+    // Drop any PUNKTFUNK_* the user block carried, then overlay this process's PUNKTFUNK_* vars.
+    entries.retain(|e| !e.split('=').next().unwrap_or("").starts_with("PUNKTFUNK_"));
+    for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("PUNKTFUNK_")) {
+        entries.push(format!("{k}={v}"));
+    }
+    // Serialize back to a UTF-16 double-null-terminated block.
+    let mut block: Vec<u16> = Vec::new();
+    for e in entries {
+        block.extend(e.encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 unsafe fn spawn_inner(cmdline: &str, w: u32, h: u32, hz: u32) -> Result<HelperRelay> {
     // The user token of the active console session (requires the host to be SYSTEM).
     let session = WTSGetActiveConsoleSessionId();
@@ -175,9 +212,17 @@ unsafe fn spawn_inner(cmdline: &str, w: u32, h: u32, hz: u32) -> Result<HelperRe
     let _ = CloseHandle(user_token);
     dup.context("DuplicateTokenEx(TokenPrimary)")?;
 
-    // The user's environment block (PATH, USERPROFILE, …) so the helper resolves config + DLLs.
+    // The user's environment block (PATH, USERPROFILE, SystemRoot → DLL resolution), MERGED with the
+    // host's PUNKTFUNK_* vars. CreateProcessAsUserW would otherwise give the helper the *user's* env
+    // only, dropping PUNKTFUNK_ENCODER=nvenc / PUNKTFUNK_ZEROCOPY/… that the host runs with — so the
+    // helper would fall back to the software (H.264-only) encoder. We parse the user block, strip any
+    // PUNKTFUNK_* it has, append the host's, and pass the merged block.
     let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
     let _ = CreateEnvironmentBlock(&mut env_block, Some(primary), false);
+    let merged_env = merged_env_block(env_block as *const u16);
+    if !env_block.is_null() {
+        let _ = DestroyEnvironmentBlock(env_block);
+    }
 
     // Three pipes: stdout (helper→host AUs), stdin (host→helper control), stderr (helper→host logs).
     let (out_r, out_w) = make_pipe().context("stdout pipe")?;
@@ -211,7 +256,7 @@ unsafe fn spawn_inner(cmdline: &str, w: u32, h: u32, hz: u32) -> Result<HelperRe
         None,
         true, // inherit handles (the child's std ends)
         CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-        Some(env_block),
+        Some(merged_env.as_ptr() as *const core::ffi::c_void),
         None,
         &si,
         &mut pi,
@@ -221,9 +266,6 @@ unsafe fn spawn_inner(cmdline: &str, w: u32, h: u32, hz: u32) -> Result<HelperRe
     let _ = CloseHandle(out_w);
     let _ = CloseHandle(in_r);
     let _ = CloseHandle(err_w);
-    if !env_block.is_null() {
-        let _ = DestroyEnvironmentBlock(env_block);
-    }
     let _ = CloseHandle(primary);
 
     if let Err(e) = created {
