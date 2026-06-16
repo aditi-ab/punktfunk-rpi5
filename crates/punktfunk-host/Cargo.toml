@@ -149,6 +149,9 @@ windows = { version = "0.62", features = [
     # See capture/dxgi.rs `install_gpu_pref_hook`. No trampoline (we fully replace the fn) → no detour
     # crate / no C length-disassembler dep; a 12-byte absolute-jmp prologue patch suffices.
     "Win32_System_Memory",
+    # Per-monitor-v2 DPI awareness — IDXGIOutput5::DuplicateOutput1 (the modern capture path Apollo
+    # uses; FP16/format-list, robust to overlay/format churn) requires the process to be DPI-aware.
+    "Win32_UI_HiDpi",
 ] }
 # Software H.264 encoder (GPU-less path + NVENC fallback). The default `source` feature statically
 # compiles OpenH264 (BSD-2) — no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.

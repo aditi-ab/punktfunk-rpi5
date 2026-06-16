@@ -37,8 +37,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED,
+    DXGI_ERROR_DEVICE_RESET,
     DXGI_ERROR_INVALID_CALL, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
@@ -164,10 +165,36 @@ unsafe fn reopen_duplication(
 )> {
     let (adapter, out) = find_output(gdi_name)?;
     let (dev, ctx) = make_device(&adapter)?;
-    let dupl = out
-        .DuplicateOutput(&dev)
-        .context("re-DuplicateOutput after ACCESS_LOST")?;
+    let dupl = duplicate_output(&out, &dev).context("re-DuplicateOutput after ACCESS_LOST")?;
     Ok((dev, ctx, out, dupl))
+}
+
+/// Create the output duplication. Prefer `IDXGIOutput5::DuplicateOutput1` with an explicit
+/// encoder-format list (FP16 first, then BGRA8) — Apollo's path. It hands us the desktop's real
+/// scanout format (HDR FP16 or SDR BGRA8) and is far more robust to overlay/format changes than
+/// legacy `DuplicateOutput` (which always tone-maps to 8-bit BGRA — the source of much of the
+/// ACCESS_LOST churn). Requires the process be per-monitor-v2 DPI aware (set at startup in
+/// [`install_gpu_pref_hook`]). Falls back to legacy `DuplicateOutput` if Output5 is unavailable or
+/// `DuplicateOutput1` fails.
+unsafe fn duplicate_output(
+    output: &IDXGIOutput1,
+    device: &ID3D11Device,
+) -> Result<IDXGIOutputDuplication> {
+    if let Ok(output5) = output.cast::<IDXGIOutput5>() {
+        // BGRA8 only for now (SDR). NOTE: DuplicateOutput1 returns the FIRST format it can provide and
+        // DXGI will CONVERT to it — so listing FP16 first would hand back FP16 even on an SDR desktop,
+        // wrongly tripping the HDR path. Real HDR capture (FP16 first + IDXGIOutput6 colorspace
+        // detection to pick the path) is the follow-up once the churn is settled.
+        let formats = [DXGI_FORMAT_B8G8R8A8_UNORM];
+        match output5.DuplicateOutput1(device, 0, &formats) {
+            Ok(d) => return Ok(d),
+            Err(e) => tracing::warn!(
+                error = %format!("{e:?}"),
+                "DuplicateOutput1 failed — falling back to legacy DuplicateOutput"
+            ),
+        }
+    }
+    output.DuplicateOutput(device).context("DuplicateOutput")
 }
 
 /// Park the cursor on a duplicated output. A blank virtual display emits NO Desktop Duplication
@@ -231,6 +258,12 @@ pub(crate) fn install_gpu_pref_hook() {
         use windows::Win32::System::Memory::{
             VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS,
         };
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        // Per-monitor-v2 DPI awareness — required for IDXGIOutput5::DuplicateOutput1 and matches
+        // Apollo's startup. Best-effort (a no-op if already set by the manifest).
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let Ok(lib) = LoadLibraryA(s!("win32u.dll")) else {
             tracing::warn!("GPU-pref hook: win32u.dll not loadable — skipping (DDA may churn on hybrid GPUs)");
             return;
@@ -1043,8 +1076,7 @@ impl DuplCapturer {
             // + idempotent (a no-op when nothing else is attached).
             attach_input_desktop();
             crate::vdisplay::sudovda::reassert_isolation(&target.gdi_name);
-            let dupl = output
-                .DuplicateOutput(&device)
+            let dupl = duplicate_output(&output, &device)
                 .context("DuplicateOutput (already duplicated by another app?)")?;
             // Kick the first frame loose: a blank virtual display is otherwise change-less.
             nudge_cursor_onto(&output);
@@ -1421,7 +1453,7 @@ impl DuplCapturer {
             let _ = self.dupl.ReleaseFrame();
             self.holding_frame = false;
         }
-        let dupl = match self.output.DuplicateOutput(&self.device) {
+        let dupl = match duplicate_output(&self.output, &self.device) {
             Ok(d) => d,
             Err(_) => return false,
         };
