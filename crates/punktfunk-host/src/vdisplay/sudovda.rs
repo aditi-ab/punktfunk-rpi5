@@ -23,11 +23,11 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
-    QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-    DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_MODE_INFO,
-    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY,
-    SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+    QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Graphics::Gdi::{
@@ -273,6 +273,48 @@ pub(crate) unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
         target_id,
         "set_advanced_color: target not found in active paths"
     );
+    false
+}
+
+/// Read the SudoVDA target's CURRENT advanced-color (HDR) state via the CCD API — i.e. whether HDR is
+/// actually ON for the virtual display right now (e.g. because the user toggled it in Windows display
+/// settings). The capture/encode pipeline follows the monitor's real colorspace (WGC → FP16 → NVENC
+/// Main10 BT.2020 PQ), so this is the authoritative "is this an HDR session" signal — NOT the
+/// handshake-negotiated bit depth. Returns false if the target isn't found / the query fails.
+pub(crate) unsafe fn advanced_color_enabled(target_id: u32) -> bool {
+    let mut np = 0u32;
+    let mut nm = 0u32;
+    if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
+        return false;
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+    if QueryDisplayConfig(
+        QDC_ONLY_ACTIVE_PATHS,
+        &mut np,
+        paths.as_mut_ptr(),
+        &mut nm,
+        modes.as_mut_ptr(),
+        None,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    for p in paths.iter().take(np as usize) {
+        if p.targetInfo.id == target_id {
+            let mut info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
+            info.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+            info.header.size = size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
+            info.header.adapterId = p.targetInfo.adapterId;
+            info.header.id = p.targetInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut info.header) == 0 {
+                // value bit 1 = advancedColorEnabled (bit 0 = advancedColorSupported).
+                return (info.Anonymous.value & 0x2) != 0;
+            }
+            return false;
+        }
+    }
     false
 }
 

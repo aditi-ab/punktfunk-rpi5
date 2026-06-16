@@ -2344,18 +2344,22 @@ fn virtual_stream_relay(
         let target = vout.win_capture.clone().ok_or_else(|| {
             anyhow!("SudoVDA target not yet an active display (needs a WDDM GPU to activate it)")
         })?;
-        // Force the SudoVDA's advanced-color (HDR) state to MATCH the session bit depth BEFORE the WGC
-        // helper captures it. The advanced-color state PERSISTS on the monitor across sessions, so an
-        // 8-bit (SDR) session could otherwise inherit HDR left on by a prior 10-bit run (or our own
-        // earlier toggle) → the helper captures HDR FP16 while the encoder is 8-bit SDR → broken image.
-        // Runs on every build (initial + mode-switch + return-from-secure rebuild), keeping WGC's format
-        // consistent with the encoder. (HDR independent-flip on the secure desktop is handled separately
-        // by dropping to SDR for the DDA leg.)
+        // HDR is driven by the SudoVDA monitor's ACTUAL advanced-color state, not the handshake bit
+        // depth: the whole pipeline follows the monitor (WGC captures FP16 when HDR is on; NVENC forces
+        // Main10 + BT.2020 PQ from the 10-bit capture format regardless of the negotiated depth; the
+        // client auto-detects PQ from the HEVC VUI). So:
+        //   - a negotiated 10-bit session PROACTIVELY enables HDR on the monitor (below), but
+        //   - we must NEVER force HDR *off* here — that would wipe out a user's deliberate Windows HDR
+        //     toggle on the virtual display on every build (the "HDR doesn't persist" bug). Leaving the
+        //     monitor's state alone lets a user-enabled HDR session flow through end-to-end.
+        // The secure-desktop HDR drop (for the DDA leg) keys off the monitor's real state in the mux loop.
         #[cfg(target_os = "windows")]
-        unsafe {
-            if crate::vdisplay::sudovda::set_advanced_color(target.target_id, bit_depth >= 10) {
-                // Let the colorspace change settle before WGC creates its capture item / detects HDR.
-                std::thread::sleep(std::time::Duration::from_millis(250));
+        if bit_depth >= 10 {
+            unsafe {
+                if crate::vdisplay::sudovda::set_advanced_color(target.target_id, true) {
+                    // Let the colorspace change settle before WGC creates its capture item / detects HDR.
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
             }
         }
         let relay = HelperRelay::spawn(
@@ -2466,6 +2470,10 @@ fn virtual_stream_relay(
     // decoder must resume on a keyframe — the two encoders keep independent infinite-GOP state).
     let mut dda: Option<DdaPipe> = None;
     let mut on_secure = false;
+    // Whether we dropped the SudoVDA out of HDR for the secure (DDA) leg, so we know to restore it on
+    // the way back. Keyed off the monitor's REAL HDR state at the moment of the switch (a user can
+    // toggle Windows HDR mid-session), not the handshake bit depth.
+    let mut dropped_hdr_for_secure = false;
     let mut next = std::time::Instant::now();
     let mut await_idr = false;
     // Step 6 relaunch watchdog: how many times in a row the helper has died without producing a frame.
@@ -2557,10 +2565,13 @@ fn virtual_stream_relay(
             if secure {
                 // SDR-while-secure (HDR sessions ONLY): drop the SudoVDA out of HDR so the secure
                 // (Winlogon) desktop renders SDR/composed — HDR fullscreen independent-flip is what made
-                // DDA storm ACCESS_LOST (black). For an SDR (8-bit) session the output is already SDR, so
-                // toggling is a needless topology change AND its matching restore on the way back would
-                // force the desktop into HDR the 8-bit encoder can't take (broken image).
-                if bit_depth >= 10 {
+                // DDA storm ACCESS_LOST (black). Key off the monitor's REAL HDR state (a user may have
+                // toggled Windows HDR on the virtual display), not the negotiated bit depth — the pipeline
+                // streams HDR whenever the monitor is HDR regardless of the 8/10 handshake. For an SDR
+                // monitor this is a no-op (no needless topology change, nothing to restore).
+                dropped_hdr_for_secure =
+                    unsafe { crate::vdisplay::sudovda::advanced_color_enabled(target.target_id) };
+                if dropped_hdr_for_secure {
                     let toggled = unsafe {
                         crate::vdisplay::sudovda::set_advanced_color(target.target_id, false)
                     };
@@ -2590,10 +2601,11 @@ fn virtual_stream_relay(
                 dda = None; // free the secure DDA encoder; the relay (helper) is the source again
                 while relay.try_recv().is_ok() {} // drop secure-dwell backlog
                 relay.request_keyframe(); // client decoder resumes on the helper's next IDR
-                if bit_depth >= 10 {
-                    // HDR session ONLY: the secure switch dropped the SudoVDA to SDR for the DDA leg, so
-                    // here we must restore HDR AND rebuild the helper so WGC re-detects the HDR
-                    // colorspace. An SDR session never changed the colorspace → no rebuild, no recreate.
+                if dropped_hdr_for_secure {
+                    // We dropped the SudoVDA to SDR for the DDA leg → restore HDR AND rebuild the helper
+                    // so WGC re-detects the HDR colorspace. (An SDR session never changed the colorspace
+                    // → dropped_hdr_for_secure is false → no rebuild, no recreate.)
+                    dropped_hdr_for_secure = false;
                     unsafe {
                         crate::vdisplay::sudovda::set_advanced_color(target.target_id, true);
                     }
