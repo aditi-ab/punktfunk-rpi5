@@ -100,6 +100,22 @@ pub(crate) unsafe fn find_output(gdi_name: &str) -> Result<(IDXGIAdapter1, IDXGI
         while let Ok(o) = a.EnumOutputs(j) {
             let od = o.GetDesc()?;
             if gdi_name_matches(&od.DeviceName, gdi_name) {
+                // Diagnostic: which ADAPTER does this output sit under, and at what LUID? If this LUID
+                // BOUNCES across an ACCESS_LOST storm, the output is being reparented between adapters
+                // (the multi-GPU/IDD case Apollo's win32u hook + SET_RENDER_ADAPTER fix). If it's STABLE,
+                // the storm is something else (e.g. HDR independent-flip DDA can't capture).
+                if let Ok(ad) = a.GetDesc1() {
+                    let name = String::from_utf16_lossy(&ad.Description);
+                    tracing::info!(
+                        output = gdi_name,
+                        adapter = name.trim_end_matches('\u{0}'),
+                        luid = format!(
+                            "{:08x}:{:08x}",
+                            ad.AdapterLuid.HighPart, ad.AdapterLuid.LowPart
+                        ),
+                        "find_output: output resolved under adapter"
+                    );
+                }
                 return Ok((a.clone(), o.cast::<IDXGIOutput1>()?));
             }
             j += 1;
@@ -258,7 +274,23 @@ unsafe fn compile_shader(src: &str, entry: PCSTR, target: PCSTR) -> Result<Vec<u
     Ok(std::slice::from_raw_parts(p, blob.GetBufferSize()).to_vec())
 }
 
-/// GPU cursor overlay: a tiny shader pipeline that alpha-blends the cursor texture onto the captured
+/// A DXGI cursor shape decomposed into up to two BGRA layers. A single shape can require BOTH a
+/// normal alpha-blended layer AND a screen-inverting (XOR) layer at once — e.g. a masked-color text
+/// I-beam (opaque pixels + invert pixels) or a monochrome cursor mixing opaque and invert pixels.
+/// Each layer is composited with its own blend; a single image + single blend (the old approach)
+/// renders such mixed shapes wrong (wrong color, or a black box where the screen should invert).
+#[derive(Clone, Default)]
+struct CursorShape {
+    w: u32,
+    h: u32,
+    /// Layer composited with src-over alpha (transparent where a==0). `None` if it has no pixels.
+    alpha: Option<Vec<u8>>,
+    /// Layer composited with the inversion blend (white opaque → invert the screen underneath).
+    /// `None` if it has no pixels.
+    xor: Option<Vec<u8>>,
+}
+
+/// GPU cursor overlay: a tiny shader pipeline that blends the cursor texture(s) onto the captured
 /// frame. Tied to one D3D11 device; rebuilt when the capturer recreates its device on a desktop switch.
 struct CursorCompositor {
     vs: ID3D11VertexShader,
@@ -269,7 +301,10 @@ struct CursorCompositor {
     /// i.e. it inverts the screen under the cursor so it's visible on any background.
     blend_invert: ID3D11BlendState,
     sampler: ID3D11SamplerState,
-    tex: Option<(ID3D11ShaderResourceView, u32, u32)>, // srv + width + height
+    /// Alpha-blended layer (normal cursor pixels). srv + width + height.
+    tex_alpha: Option<(ID3D11ShaderResourceView, u32, u32)>,
+    /// Inversion-blended layer (screen-inverting pixels: masked-color I-beam bar, monochrome invert).
+    tex_xor: Option<(ID3D11ShaderResourceView, u32, u32)>,
 }
 
 impl CursorCompositor {
@@ -340,17 +375,18 @@ impl CursorCompositor {
             blend: blend.context("blend")?,
             blend_invert: blend_invert.context("blend_invert")?,
             sampler: sampler.context("sampler")?,
-            tex: None,
+            tex_alpha: None,
+            tex_xor: None,
         })
     }
 
-    unsafe fn set_shape(
-        &mut self,
+    /// Upload one BGRA layer as an immutable shader-resource texture and return its SRV.
+    unsafe fn upload_layer(
         device: &ID3D11Device,
         bgra: &[u8],
         w: u32,
         h: u32,
-    ) -> Result<()> {
+    ) -> Result<ID3D11ShaderResourceView> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
@@ -375,13 +411,35 @@ impl CursorCompositor {
         let tex = tex.context("cursor tex")?;
         let mut srv = None;
         device.CreateShaderResourceView(&tex, None, Some(&mut srv))?;
-        self.tex = Some((srv.context("cursor srv")?, w, h));
+        srv.context("cursor srv")
+    }
+
+    /// (Re)upload the decomposed cursor layers; either layer may be absent (→ that pass is skipped).
+    unsafe fn set_shapes(&mut self, device: &ID3D11Device, shape: &CursorShape) -> Result<()> {
+        self.tex_alpha = match &shape.alpha {
+            Some(b) => Some((
+                Self::upload_layer(device, b, shape.w, shape.h)?,
+                shape.w,
+                shape.h,
+            )),
+            None => None,
+        };
+        self.tex_xor = match &shape.xor {
+            Some(b) => Some((
+                Self::upload_layer(device, b, shape.w, shape.h)?,
+                shape.w,
+                shape.h,
+            )),
+            None => None,
+        };
         Ok(())
     }
 
-    /// Blend the cursor onto `rtv` (a render-target view of the captured frame) at frame pixel (cx,cy).
+    /// Blend ONE cursor layer onto `rtv` (a render-target view of the captured frame) at frame pixel
+    /// (cx,cy). `invert` selects the inversion blend (screen-inverting pixels); otherwise normal
+    /// src-over alpha. A shape with both an alpha and an XOR layer is drawn by calling this twice.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn draw(
+    unsafe fn draw_layer(
         &self,
         ctx: &ID3D11DeviceContext,
         rtv: &ID3D11RenderTargetView,
@@ -389,23 +447,22 @@ impl CursorCompositor {
         fh: u32,
         cx: i32,
         cy: i32,
+        srv: &ID3D11ShaderResourceView,
+        cw: u32,
+        ch: u32,
         invert: bool,
         // HDR (decode=true): sRGB→linear decode + scale the cursor to `white_mul` × 80 nits, so a
         // white cursor hits HDR graphics white (~203 nits) not 80. SDR passes white_mul=1.0,
         // decode=false → the PS returns the raw sample (blended in the display's native sRGB space).
-        // The inversion (masked-color / I-beam) blend operates on the framebuffer reference, so it is
-        // left unscaled/undecoded even in HDR.
+        // The inversion (masked-color / I-beam) blend operates on the framebuffer reference, so the
+        // caller passes white_mul=1.0/decode=false for the XOR layer even in HDR.
         white_mul: f32,
         decode: bool,
     ) {
-        let (srv, cw, ch) = match &self.tex {
-            Some(t) => t,
-            None => return,
-        };
         let x0 = (cx as f32 / fw as f32) * 2.0 - 1.0;
-        let x1 = ((cx + *cw as i32) as f32 / fw as f32) * 2.0 - 1.0;
+        let x1 = ((cx + cw as i32) as f32 / fw as f32) * 2.0 - 1.0;
         let y0 = 1.0 - (cy as f32 / fh as f32) * 2.0;
-        let y1 = 1.0 - ((cy + *ch as i32) as f32 / fh as f32) * 2.0;
+        let y1 = 1.0 - ((cy + ch as i32) as f32 / fh as f32) * 2.0;
         let (mul, dec) = if invert {
             (1.0_f32, 0.0_f32)
         } else {
@@ -563,10 +620,7 @@ impl HdrConverter {
 }
 
 /// Convert a DXGI pointer shape (color / masked-color / monochrome) into top-down BGRA.
-fn convert_pointer_shape(
-    buf: &[u8],
-    si: &DXGI_OUTDUPL_POINTER_SHAPE_INFO,
-) -> Option<(Vec<u8>, u32, u32)> {
+fn convert_pointer_shape(buf: &[u8], si: &DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> Option<CursorShape> {
     let w = si.Width as usize;
     let pitch = si.Pitch as usize;
     if w == 0 || pitch == 0 {
@@ -574,83 +628,120 @@ fn convert_pointer_shape(
     }
     // Type is a u32 (newtype constants compared via .0).
     if si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 {
-        // Straight 32bpp BGRA with a real alpha channel.
+        // Straight 32bpp BGRA with a real alpha channel → one alpha-blended layer, no XOR layer.
         let h = si.Height as usize;
         if buf.len() < pitch * h {
             return None;
         }
-        let mut out = vec![0u8; w * h * 4];
+        let mut alpha = vec![0u8; w * h * 4];
         for y in 0..h {
             for x in 0..w {
                 let s = y * pitch + x * 4;
                 let d = (y * w + x) * 4;
-                out[d] = buf[s];
-                out[d + 1] = buf[s + 1];
-                out[d + 2] = buf[s + 2];
-                out[d + 3] = buf[s + 3];
+                alpha[d] = buf[s];
+                alpha[d + 1] = buf[s + 1];
+                alpha[d + 2] = buf[s + 2];
+                alpha[d + 3] = buf[s + 3];
             }
         }
-        Some((out, w as u32, h as u32))
+        Some(CursorShape {
+            w: w as u32,
+            h: h as u32,
+            alpha: Some(alpha),
+            xor: None,
+        })
     } else if si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 {
-        // 32bpp where the alpha byte is a MASK, not an alpha: 0x00 = opaque (copy RGB), 0xFF = XOR
-        // with the screen. The text I-beam is this type — surround = XOR-with-black (a no-op, must be
-        // transparent), bar = XOR-with-white (inverts the screen so it shows on any background).
-        // Compositing uses the INVERSION blend (see CursorCompositor) when `cursor_invert` is set, so:
-        //   mask 0x00            -> opaque RGB         (rendered as a plain pixel — rare for I-beams)
-        //   mask 0xFF, RGB == 0  -> transparent        (XOR with black = unchanged)
-        //   mask 0xFF, RGB != 0  -> WHITE opaque       (the inversion blend turns this into 1-dest)
+        // 32bpp where the alpha byte is a MASK selector (0x00 or 0xFF), not an alpha. A single shape
+        // can mix opaque and screen-inverting pixels (the text I-beam: opaque hot-spot dot + an
+        // inverting bar), so we split it into BOTH layers:
+        //   mask 0x00            -> opaque RGB                 → ALPHA layer
+        //   mask 0xFF, RGB != 0  -> invert the screen (white)  → XOR layer
+        //   mask 0xFF, RGB == 0  -> XOR with black = no-op      → transparent in both
         let h = si.Height as usize;
         if buf.len() < pitch * h {
             return None;
         }
-        let mut out = vec![0u8; w * h * 4];
+        let mut alpha = vec![0u8; w * h * 4];
+        let mut xor = vec![0u8; w * h * 4];
+        let (mut any_alpha, mut any_xor) = (false, false);
         for y in 0..h {
             for x in 0..w {
                 let s = y * pitch + x * 4;
                 let d = (y * w + x) * 4;
                 let (b, g, r, mask) = (buf[s], buf[s + 1], buf[s + 2], buf[s + 3]);
                 if mask == 0 {
-                    out[d] = b;
-                    out[d + 1] = g;
-                    out[d + 2] = r;
-                    out[d + 3] = 255;
-                } else if b == 0 && g == 0 && r == 0 {
-                    out[d + 3] = 0; // XOR with black = no change → transparent
-                } else {
-                    out[d] = 255; // inverting pixel → white; inversion blend makes it 1-dest
-                    out[d + 1] = 255;
-                    out[d + 2] = 255;
-                    out[d + 3] = 255;
+                    alpha[d] = b;
+                    alpha[d + 1] = g;
+                    alpha[d + 2] = r;
+                    alpha[d + 3] = 255;
+                    any_alpha = true;
+                } else if b != 0 || g != 0 || r != 0 {
+                    // inverting pixel → white opaque; the inversion blend turns this into 1-dest
+                    xor[d] = 255;
+                    xor[d + 1] = 255;
+                    xor[d + 2] = 255;
+                    xor[d + 3] = 255;
+                    any_xor = true;
                 }
             }
         }
-        Some((out, w as u32, h as u32))
+        Some(CursorShape {
+            w: w as u32,
+            h: h as u32,
+            alpha: any_alpha.then_some(alpha),
+            xor: any_xor.then_some(xor),
+        })
     } else {
-        // Monochrome: top half = AND mask, bottom half = XOR mask, 1 bpp.
+        // Monochrome: top half = AND mask, bottom half = XOR mask, 1 bpp. Per-pixel (AND,XOR):
+        //   (0,0) opaque black      → ALPHA layer
+        //   (0,1) opaque white      → ALPHA layer
+        //   (1,0) transparent       → neither layer
+        //   (1,1) invert the screen → XOR layer (white opaque) — was previously approximated as
+        //                             solid black, which is the bug this split fixes.
         let h = (si.Height / 2) as usize;
         if buf.len() < pitch * h * 2 {
             return None;
         }
         let bit = |row: usize, x: usize| (buf[row * pitch + x / 8] >> (7 - (x % 8))) & 1;
-        let mut out = vec![0u8; w * h * 4];
+        let mut alpha = vec![0u8; w * h * 4];
+        let mut xor = vec![0u8; w * h * 4];
+        let (mut any_alpha, mut any_xor) = (false, false);
         for y in 0..h {
             for x in 0..w {
                 let and_bit = bit(y, x);
                 let xor_bit = bit(y + h, x);
-                let (b, g, r, a) = match (and_bit, xor_bit) {
-                    (0, 0) => (0, 0, 0, 255),       // opaque black
-                    (0, 1) => (255, 255, 255, 255), // opaque white
-                    (1, 0) => (0, 0, 0, 0),         // transparent
-                    _ => (0, 0, 0, 255),            // invert -> approximate as black
-                };
                 let d = (y * w + x) * 4;
-                out[d] = b;
-                out[d + 1] = g;
-                out[d + 2] = r;
-                out[d + 3] = a;
+                match (and_bit, xor_bit) {
+                    (0, 0) => {
+                        // opaque black: BGR already 0, just mark opaque
+                        alpha[d + 3] = 255;
+                        any_alpha = true;
+                    }
+                    (0, 1) => {
+                        alpha[d] = 255;
+                        alpha[d + 1] = 255;
+                        alpha[d + 2] = 255;
+                        alpha[d + 3] = 255;
+                        any_alpha = true;
+                    }
+                    (1, 0) => {} // transparent
+                    _ => {
+                        // (1,1) invert screen → white opaque into the XOR layer
+                        xor[d] = 255;
+                        xor[d + 1] = 255;
+                        xor[d + 2] = 255;
+                        xor[d + 3] = 255;
+                        any_xor = true;
+                    }
+                }
             }
         }
-        Some((out, w as u32, h as u32))
+        Some(CursorShape {
+            w: w as u32,
+            h: h as u32,
+            alpha: any_alpha.then_some(alpha),
+            xor: any_xor.then_some(xor),
+        })
     }
 }
 
@@ -758,14 +849,13 @@ pub struct DuplCapturer {
     ever_got_frame: bool,
     /// GPU cursor overlay (rebuilt on device recreate). `None` until the first composite.
     cursor: Option<CursorCompositor>,
-    /// Last cursor shape as BGRA (kept device-independent so it survives a device recreate).
-    cursor_shape: Option<(Vec<u8>, u32, u32)>,
+    /// Last cursor shape, decomposed into alpha + XOR layers (kept device-independent so it survives
+    /// a device recreate).
+    cursor_shape: Option<CursorShape>,
     cursor_pos: (i32, i32),
     cursor_visible: bool,
-    /// Cursor shape changed → re-upload to the GPU texture before the next composite.
+    /// Cursor shape changed → re-upload to the GPU texture(s) before the next composite.
     cursor_dirty: bool,
-    /// Current cursor is masked-color (XOR) → composite with the inversion blend.
-    cursor_invert: bool,
     dbg_cursor: u64,
     _keepalive: Box<dyn Send>,
 }
@@ -956,7 +1046,6 @@ impl DuplCapturer {
                 cursor_pos: (0, 0),
                 cursor_visible: false,
                 cursor_dirty: false,
-                cursor_invert: false,
                 dbg_cursor: 0,
                 _keepalive: keepalive,
             })
@@ -1144,11 +1233,11 @@ impl DuplCapturer {
                 if let Some(shape) = convert_pointer_shape(&buf, &si) {
                     tracing::info!(
                         shape_type = si.Type,
-                        size = format!("{}x{}", shape.1, shape.2),
+                        size = format!("{}x{}", shape.w, shape.h),
+                        alpha = shape.alpha.is_some(),
+                        xor = shape.xor.is_some(),
                         "cursor shape captured"
                     );
-                    self.cursor_invert =
-                        si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32;
                     self.cursor_shape = Some(shape);
                     self.cursor_dirty = true;
                 }
@@ -1175,7 +1264,7 @@ impl DuplCapturer {
                 shape = self
                     .cursor_shape
                     .as_ref()
-                    .map(|(_, w, h)| format!("{w}x{h}")),
+                    .map(|s| format!("{}x{}", s.w, s.h)),
                 "cursor state"
             );
         }
@@ -1187,11 +1276,11 @@ impl DuplCapturer {
             self.cursor_dirty = true; // fresh device → must (re)upload the shape texture
         }
         if self.cursor_dirty {
-            if let Some((bgra, w, h)) = &self.cursor_shape {
+            if let Some(shape) = &self.cursor_shape {
                 self.cursor
                     .as_mut()
                     .unwrap()
-                    .set_shape(&self.device, bgra, *w, *h)?;
+                    .set_shapes(&self.device, shape)?;
             }
             self.cursor_dirty = false;
         }
@@ -1212,17 +1301,43 @@ impl DuplCapturer {
         } else {
             1.0
         };
-        self.cursor.as_ref().unwrap().draw(
-            &self.context,
-            &rtv,
-            self.width,
-            self.height,
-            cx,
-            cy,
-            self.cursor_invert,
-            white_mul,
-            hdr, // decode sRGB→linear only on the HDR (linear FP16) target
-        );
+        let (w, h) = (self.width, self.height);
+        let comp = self.cursor.as_ref().unwrap();
+        // Alpha-blended layer (normal cursor pixels); HDR brightness scale applies here.
+        if let Some((srv, cw, ch)) = &comp.tex_alpha {
+            comp.draw_layer(
+                &self.context,
+                &rtv,
+                w,
+                h,
+                cx,
+                cy,
+                srv,
+                *cw,
+                *ch,
+                false,
+                white_mul,
+                hdr, // decode sRGB→linear only on the HDR (linear FP16) target
+            );
+        }
+        // Inversion layer (masked-color I-beam bar / monochrome invert): operates on the framebuffer
+        // reference, so it is never HDR-scaled or sRGB-decoded.
+        if let Some((srv, cw, ch)) = &comp.tex_xor {
+            comp.draw_layer(
+                &self.context,
+                &rtv,
+                w,
+                h,
+                cx,
+                cy,
+                srv,
+                *cw,
+                *ch,
+                true,
+                1.0,
+                false,
+            );
+        }
         Ok(())
     }
 
@@ -1543,18 +1658,34 @@ impl DuplCapturer {
         let _ = self.dupl.ReleaseFrame();
         self.holding_frame = false;
         if self.cursor_visible {
-            if let Some((bgra, cw, ch)) = &self.cursor_shape {
-                blend_cursor_cpu(
-                    &mut tight,
-                    self.width,
-                    self.height,
-                    bgra,
-                    *cw,
-                    *ch,
-                    self.cursor_pos.0,
-                    self.cursor_pos.1,
-                    self.cursor_invert,
-                );
+            if let Some(shape) = &self.cursor_shape {
+                let (cx, cy) = self.cursor_pos;
+                if let Some(bgra) = &shape.alpha {
+                    blend_cursor_cpu(
+                        &mut tight,
+                        self.width,
+                        self.height,
+                        bgra,
+                        shape.w,
+                        shape.h,
+                        cx,
+                        cy,
+                        false,
+                    );
+                }
+                if let Some(bgra) = &shape.xor {
+                    blend_cursor_cpu(
+                        &mut tight,
+                        self.width,
+                        self.height,
+                        bgra,
+                        shape.w,
+                        shape.h,
+                        cx,
+                        cy,
+                        true,
+                    );
+                }
             }
         }
         self.last = Some(tight.clone());
