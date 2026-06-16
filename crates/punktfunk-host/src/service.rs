@@ -1,0 +1,702 @@
+//! Windows service: a SYSTEM supervisor that launches the streaming host into the **active
+//! interactive console session** and keeps it tracking session switches — the end-user replacement
+//! for the ad-hoc PsExec / VBS / scheduled-task launch chain used during bring-up.
+//!
+//! Why a supervisor and not just "run the host as a service": the host must run **as SYSTEM in the
+//! interactive session** (session 1+). Desktop Duplication of the secure (Winlogon/UAC/lock) desktop
+//! and `SendInput` both need SYSTEM; capture and injection both need the *interactive* session, which
+//! a plain session-0 service is not in. So this service (itself in session 0) never captures — it
+//! duplicates its own LocalSystem token, retargets it to the active console session, and
+//! `CreateProcessAsUserW`s the host there. This is the Sunshine/Apollo model. The host in turn spawns
+//! the WGC helper into the *user* session (see `capture::wgc_relay`) — two nested launches.
+//!
+//! Subcommands (Windows only):
+//! ```text
+//!   punktfunk-host service run        SCM entry point (registered as binPath; not run by hand)
+//!   punktfunk-host service install    register an auto-start LocalSystem service + firewall rules
+//!   punktfunk-host service uninstall  stop + delete the service + remove firewall rules
+//!   punktfunk-host service start|stop|status   convenience wrappers over the SCM
+//! ```
+//! Config lives in `%ProgramData%\punktfunk\host.env` (the Windows analogue of `scripts/host.env`),
+//! loaded into the service's environment and carried to the host child. Logs land in
+//! `%ProgramData%\punktfunk\logs\`.
+
+use anyhow::{bail, Context, Result};
+use std::ffi::{c_void, OsString};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::time::Duration;
+
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Security::{
+    DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
+    SECURITY_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ALL_ACCESS,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_APPEND_DATA, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_WRITE_DATA, OPEN_ALWAYS,
+};
+use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent,
+    TerminateProcess, WaitForMultipleObjects, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+};
+
+/// SCM service name (the key under HKLM\SYSTEM\CurrentControlSet\Services). Stable identity.
+const SERVICE_NAME: &str = "PunktfunkHost";
+const SERVICE_DISPLAY: &str = "punktfunk streaming host";
+const SERVICE_DESCRIPTION: &str =
+    "Low-latency desktop/game streaming host. Launches the punktfunk host into the active session.";
+
+/// The host subcommand the service launches, overridable via `PUNKTFUNK_HOST_CMD` in host.env.
+/// `serve --native` runs the GameStream (Moonlight) host + the native punktfunk/1 QUIC host in one
+/// process — the unified host an end user wants.
+const DEFAULT_HOST_CMD: &str = "serve --native";
+
+/// Event handles shared between the SCM control handler (which signals them) and the supervision loop
+/// (which waits on them). Stored as raw `isize` so the `'static + Send` handler can reach them without
+/// a non-`Send` `HANDLE` capture. Set once in `run_service`.
+static STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
+static SESSION_EVENT: AtomicIsize = AtomicIsize::new(0);
+
+fn load_event(a: &AtomicIsize) -> HANDLE {
+    HANDLE(a.load(Ordering::Relaxed) as *mut c_void)
+}
+
+/// Dispatch `service <sub>`.
+pub fn main(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("run") => run(),
+        Some("install") => install(),
+        Some("uninstall") => uninstall(),
+        Some("start") => sc(&["start", SERVICE_NAME]),
+        Some("stop") => sc(&["stop", SERVICE_NAME]),
+        Some("status") => sc(&["query", SERVICE_NAME]),
+        _ => {
+            eprintln!(
+                "punktfunk-host service — Windows service control\n\n\
+                 USAGE:\n\
+                 \x20   punktfunk-host service install     register the auto-start service + firewall rules\n\
+                 \x20   punktfunk-host service uninstall   stop + remove the service + firewall rules\n\
+                 \x20   punktfunk-host service start       start the service now\n\
+                 \x20   punktfunk-host service stop        stop the service\n\
+                 \x20   punktfunk-host service status      query the service\n\n\
+                 Config: %ProgramData%\\punktfunk\\host.env   Logs: %ProgramData%\\punktfunk\\logs\\"
+            );
+            Ok(())
+        }
+    }
+}
+
+// ── Logging ─────────────────────────────────────────────────────────────────────────────────────
+
+/// `%ProgramData%\punktfunk\logs\service.log` — the service's own (supervision) log. The host child's
+/// stdout/stderr are redirected to `host.log` in the same dir.
+pub fn service_log_path() -> PathBuf {
+    let dir = crate::gamestream::config_dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("service.log")
+}
+
+fn host_log_path() -> PathBuf {
+    let dir = crate::gamestream::config_dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("host.log")
+}
+
+/// Initialise tracing to the service log file (the SCM gives the service no console/stderr). Falls
+/// back to stderr if the file can't be opened. Called from `main()` only for `service run`.
+pub fn init_file_logging(filter: tracing_subscriber::EnvFilter) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(service_log_path())
+    {
+        Ok(file) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(move || file.try_clone().expect("clone service log handle"))
+                .init();
+        }
+        Err(_) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
+        }
+    }
+}
+
+// ── host.env config ─────────────────────────────────────────────────────────────────────────────
+
+fn host_env_path() -> PathBuf {
+    crate::gamestream::config_dir().join("host.env")
+}
+
+/// Load `%ProgramData%\punktfunk\host.env` (KEY=VALUE lines, `#` comments) into this process's
+/// environment, so the host child inherits `PUNKTFUNK_*` / `RUST_LOG` via the merged env block.
+fn load_host_env() {
+    let path = host_env_path();
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        tracing::info!(path = %path.display(), "no host.env (using defaults)");
+        return;
+    };
+    let mut n = 0;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let (k, v) = (k.trim(), v.trim().trim_matches('"'));
+            if !k.is_empty() {
+                std::env::set_var(k, v);
+                n += 1;
+            }
+        }
+    }
+    tracing::info!(path = %path.display(), vars = n, "loaded host.env");
+}
+
+// ── service run (SCM entry point) ────────────────────────────────────────────────────────────────
+
+windows_service::define_windows_service!(ffi_service_main, service_main);
+
+fn run() -> Result<()> {
+    // Blocks until the service stops; the SCM then calls `service_main` on its own thread.
+    windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main).map_err(|e| {
+        anyhow::anyhow!(
+            "service_dispatcher failed ({e}). `service run` is launched by the Service Control \
+             Manager, not by hand — use `punktfunk-host service install` then `service start`."
+        )
+    })
+}
+
+fn service_main(_args: Vec<OsString>) {
+    if let Err(e) = run_service() {
+        tracing::error!("service exited with error: {e:#}");
+    }
+}
+
+fn run_service() -> Result<()> {
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+
+    // Two manual-reset events: STOP (set once, never reset) and SESSION (set on a console
+    // connect/disconnect, reset by the supervisor after it reacts).
+    let stop =
+        unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.context("CreateEvent stop")?;
+    let session = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+        .context("CreateEvent session")?;
+    STOP_EVENT.store(stop.0 as isize, Ordering::Relaxed);
+    SESSION_EVENT.store(session.0 as isize, Ordering::Relaxed);
+
+    // The control handler captures nothing — it reaches the events through the statics, so it stays
+    // `Fn + Send + 'static`. Session lock/unlock are handled inside the host (DesktopWatcher), so we
+    // only flag console connect/disconnect/logon — the events that change the active session.
+    let handler = move |control| -> ServiceControlHandlerResult {
+        match control {
+            ServiceControl::Stop | ServiceControl::Preshutdown | ServiceControl::Shutdown => {
+                unsafe { SetEvent(load_event(&STOP_EVENT)) }.ok();
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::SessionChange(param) => {
+                use windows_service::service::SessionChangeReason::*;
+                if matches!(
+                    param.reason,
+                    ConsoleConnect | ConsoleDisconnect | SessionLogon
+                ) {
+                    unsafe { SetEvent(load_event(&SESSION_EVENT)) }.ok();
+                }
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+    let status_handle = service_control_handler::register(SERVICE_NAME, handler)
+        .context("register service control handler")?;
+
+    let accepted = ServiceControlAccept::STOP
+        | ServiceControlAccept::PRESHUTDOWN
+        | ServiceControlAccept::SESSION_CHANGE;
+    let running = ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Running,
+        controls_accepted: accepted,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    };
+    status_handle
+        .set_service_status(running.clone())
+        .context("set RUNNING")?;
+    tracing::info!("punktfunk service started — supervising host in the active console session");
+
+    load_host_env();
+    let result = supervise(stop, session);
+
+    // Report STOPPED regardless of how supervise returned.
+    let _ = status_handle.set_service_status(ServiceStatus {
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
+        ..running
+    });
+    unsafe {
+        let _ = CloseHandle(stop);
+        let _ = CloseHandle(session);
+    }
+    result
+}
+
+/// The supervision loop: (re)launch the host into the active console session and wait on
+/// [stop, session-change, child-exit], relaunching on child exit and on a console-session switch.
+fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
+    let exe = std::env::current_exe().context("current_exe")?;
+    let host_cmd = std::env::var("PUNKTFUNK_HOST_CMD").unwrap_or_else(|_| DEFAULT_HOST_CMD.into());
+    let cmdline = format!("\"{}\" {host_cmd}", exe.to_string_lossy());
+    let workdir: Vec<u16> = exe
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // Kill-on-close job so a service crash never orphans the SYSTEM host; BREAKAWAY_OK lets the host
+    // still spawn the WGC helper.
+    let job = unsafe { make_job() }.context("create job object")?;
+
+    let mut restarts: u32 = 0;
+    loop {
+        if wait_one(stop, 0) {
+            break;
+        }
+        let session = unsafe { WTSGetActiveConsoleSessionId() };
+        if session == 0xFFFF_FFFF {
+            // No interactive session yet (boot / fully logged out). Wait, but wake on stop/session.
+            tracing::info!("no active console session — waiting");
+            if wait_any(&[stop, session_ev], 3000) == Some(0) {
+                break;
+            }
+            unsafe { ResetEvent(session_ev) }.ok();
+            continue;
+        }
+
+        let pi = match unsafe { spawn_host(session, &cmdline, &workdir, job) } {
+            Ok(pi) => pi,
+            Err(e) => {
+                tracing::error!("failed to launch host into session {session}: {e:#}");
+                if wait_one(stop, 3000) {
+                    break;
+                }
+                continue;
+            }
+        };
+        tracing::info!(pid = pi.dwProcessId, session, cmd = %host_cmd, "host launched");
+
+        // Wait on stop / session-change / child-exit.
+        let reason = wait_any(&[stop, session_ev, pi.hProcess], INFINITE);
+        match reason {
+            Some(0) => {
+                // Stop: terminate the child and exit.
+                unsafe {
+                    let _ = TerminateProcess(pi.hProcess, 0);
+                    let _ = CloseHandle(pi.hProcess);
+                    let _ = CloseHandle(pi.hThread);
+                }
+                break;
+            }
+            Some(1) => {
+                // Session change: relaunch only if the active console session actually moved.
+                unsafe { ResetEvent(session_ev) }.ok();
+                let now = unsafe { WTSGetActiveConsoleSessionId() };
+                if now != session {
+                    tracing::info!(
+                        old = session,
+                        new = now,
+                        "console session changed — relaunching host"
+                    );
+                    unsafe {
+                        let _ = TerminateProcess(pi.hProcess, 0);
+                        let _ = CloseHandle(pi.hProcess);
+                        let _ = CloseHandle(pi.hThread);
+                    }
+                    restarts = 0;
+                    continue;
+                }
+                // Same session (e.g. a stray notification) — keep waiting on the same child.
+                let r = wait_any(&[stop, pi.hProcess], INFINITE);
+                unsafe {
+                    let _ = TerminateProcess(pi.hProcess, 0);
+                    let _ = CloseHandle(pi.hProcess);
+                    let _ = CloseHandle(pi.hThread);
+                }
+                if r == Some(0) {
+                    break;
+                }
+                // child exited → fall through to relaunch
+            }
+            _ => {
+                // Child exited on its own — relaunch (with a small crash-loop backoff).
+                tracing::warn!("host process exited — relaunching");
+                unsafe {
+                    let _ = CloseHandle(pi.hProcess);
+                    let _ = CloseHandle(pi.hThread);
+                }
+            }
+        }
+
+        restarts += 1;
+        let backoff = restarts.min(10) * 500; // 0.5s..5s
+        if wait_one(stop, backoff) {
+            break;
+        }
+    }
+
+    unsafe {
+        // Dropping the job (KILL_ON_JOB_CLOSE) reaps any straggler in it.
+        let _ = CloseHandle(job);
+    }
+    tracing::info!("supervision loop ended");
+    Ok(())
+}
+
+/// `true` if `h` is signalled within `ms`.
+fn wait_one(h: HANDLE, ms: u32) -> bool {
+    unsafe { WaitForMultipleObjects(&[h], false, ms) == WAIT_OBJECT_0 }
+}
+
+/// Wait on several handles; returns the index of the first signalled, or `None` on timeout.
+fn wait_any(handles: &[HANDLE], ms: u32) -> Option<usize> {
+    let r = unsafe { WaitForMultipleObjects(handles, false, ms) };
+    let idx = r.0.wrapping_sub(WAIT_OBJECT_0.0);
+    (idx < handles.len() as u32).then_some(idx as usize)
+}
+
+/// A kill-on-close + breakaway-ok job object.
+unsafe fn make_job() -> Result<HANDLE> {
+    let job = CreateJobObjectW(None, PCWSTR::null()).context("CreateJobObjectW")?;
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    info.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    SetInformationJobObject(
+        job,
+        JobObjectExtendedLimitInformation,
+        &info as *const _ as *const c_void,
+        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+    )
+    .context("SetInformationJobObject")?;
+    Ok(job)
+}
+
+/// Launch the host as SYSTEM into `session_id`'s interactive desktop. Returns the child handles.
+unsafe fn spawn_host(
+    session_id: u32,
+    cmdline: &str,
+    workdir: &[u16],
+    job: HANDLE,
+) -> Result<PROCESS_INFORMATION> {
+    // 1) A primary SYSTEM token retargeted to the active console session: duplicate THIS process's
+    //    (LocalSystem) token, then set its session id. SYSTEM holds SE_TCB so SetTokenInformation
+    //    (TokenSessionId) is permitted.
+    let mut proc_token = HANDLE::default();
+    OpenProcessToken(
+        GetCurrentProcess(),
+        TOKEN_DUPLICATE
+            | TOKEN_QUERY
+            | TOKEN_ASSIGN_PRIMARY
+            | TOKEN_ADJUST_DEFAULT
+            | TOKEN_ADJUST_SESSIONID,
+        &mut proc_token,
+    )
+    .context("OpenProcessToken (service must run as SYSTEM)")?;
+
+    let mut primary = HANDLE::default();
+    let dup = DuplicateTokenEx(
+        proc_token,
+        TOKEN_ALL_ACCESS,
+        None,
+        SecurityImpersonation,
+        TokenPrimary,
+        &mut primary,
+    );
+    let _ = CloseHandle(proc_token);
+    dup.context("DuplicateTokenEx(TokenPrimary)")?;
+
+    SetTokenInformation(
+        primary,
+        TokenSessionId,
+        &session_id as *const u32 as *const c_void,
+        std::mem::size_of::<u32>() as u32,
+    )
+    .context("SetTokenInformation(TokenSessionId)")?;
+
+    // 2) The session's environment block, merged with this process's PUNKTFUNK_*/RUST_LOG (so the
+    //    host runs with host.env's settings, not a bare block). Same merge the WGC helper uses.
+    let mut env_block: *mut c_void = std::ptr::null_mut();
+    let _ = CreateEnvironmentBlock(&mut env_block, Some(primary), false);
+    let merged = crate::capture::wgc_relay::merged_env_block(env_block as *const u16);
+    if !env_block.is_null() {
+        let _ = DestroyEnvironmentBlock(env_block);
+    }
+
+    // 3) Redirect the host's stdout+stderr to host.log (inheritable handle).
+    let log = open_log_handle(&host_log_path())?;
+
+    let mut si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESTDHANDLES,
+        hStdOutput: log,
+        hStdError: log,
+        ..Default::default()
+    };
+    let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
+    si.lpDesktop = PWSTR(desktop.as_mut_ptr());
+
+    let mut cmd: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+    let cwd = (!workdir.is_empty()).then_some(PCWSTR(workdir.as_ptr()));
+    let mut pi = PROCESS_INFORMATION::default();
+
+    let created = CreateProcessAsUserW(
+        Some(primary),
+        None,
+        Some(PWSTR(cmd.as_mut_ptr())),
+        None,
+        None,
+        true, // inherit the log handle
+        CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+        Some(merged.as_ptr() as *const c_void),
+        cwd.unwrap_or(PCWSTR::null()),
+        &si,
+        &mut pi,
+    );
+
+    let _ = CloseHandle(log); // the child owns its inherited copy
+    let _ = CloseHandle(primary);
+    created.context("CreateProcessAsUserW(host)")?;
+
+    // Best-effort: keep the host inside the kill-on-close job.
+    let _ = AssignProcessToJobObject(job, pi.hProcess);
+    Ok(pi)
+}
+
+/// Open `path` for appending, as an INHERITABLE handle (so the child can use it as stdout/stderr).
+unsafe fn open_log_handle(path: &std::path::Path) -> Result<HANDLE> {
+    let wpath: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: true.into(),
+    };
+    // Append (no FILE_WRITE_DATA → all writes go to EOF), so each relaunch's OPEN_ALWAYS reopen
+    // accumulates instead of truncating from offset 0. This mirrors Rust's own `OpenOptions::append`
+    // access mask (FILE_GENERIC_WRITE minus WRITE_DATA, plus APPEND_DATA + SYNCHRONIZE/READ_CONTROL);
+    // bare FILE_APPEND_DATA alone produced a child handle that silently dropped writes.
+    let access = (FILE_GENERIC_WRITE.0 & !FILE_WRITE_DATA.0) | FILE_APPEND_DATA.0;
+    let h = CreateFileW(
+        PCWSTR(wpath.as_ptr()),
+        access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        Some(&sa),
+        OPEN_ALWAYS,
+        windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+        None,
+    )
+    .context("CreateFileW(host.log)")?;
+    Ok(h)
+}
+
+// ── install / uninstall ──────────────────────────────────────────────────────────────────────────
+
+fn install() -> Result<()> {
+    use windows_service::service::{
+        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+    };
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let exe = std::env::current_exe().context("current_exe")?;
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )
+    .context("open Service Control Manager (run from an elevated/Administrator prompt)")?;
+
+    let info = ServiceInfo {
+        name: OsString::from(SERVICE_NAME),
+        display_name: OsString::from(SERVICE_DISPLAY),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: exe.clone(),
+        launch_arguments: vec![OsString::from("service"), OsString::from("run")],
+        dependencies: vec![],
+        account_name: None, // None = LocalSystem
+        account_password: None,
+    };
+
+    // Create, or reconfigure if it already exists (idempotent install/upgrade).
+    match manager.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START) {
+        Ok(svc) => {
+            let _ = svc.set_description(SERVICE_DESCRIPTION);
+            println!("Created service '{SERVICE_NAME}' (auto-start, LocalSystem).");
+        }
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(1073 /* ERROR_SERVICE_EXISTS */) =>
+        {
+            let svc = manager
+                .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+                .context("open existing service to reconfigure")?;
+            svc.change_config(&info)
+                .context("reconfigure existing service")?;
+            let _ = svc.set_description(SERVICE_DESCRIPTION);
+            println!("Reconfigured existing service '{SERVICE_NAME}'.");
+        }
+        Err(e) => return Err(e).context("create service"),
+    }
+
+    ensure_default_host_env()?;
+    add_firewall_rules();
+
+    println!(
+        "\nInstalled. Config: {}\nLogs:   {}\n\nStart now with:  punktfunk-host service start",
+        host_env_path().display(),
+        crate::gamestream::config_dir().join("logs").display()
+    );
+    Ok(())
+}
+
+fn uninstall() -> Result<()> {
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let _ = sc(&["stop", SERVICE_NAME]); // best-effort stop first
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("open Service Control Manager (run elevated)")?;
+    let svc = manager
+        .open_service(SERVICE_NAME, ServiceAccess::DELETE)
+        .context("open service for delete")?;
+    svc.delete().context("delete service")?;
+    remove_firewall_rules();
+    println!("Removed service '{SERVICE_NAME}' and its firewall rules.");
+    Ok(())
+}
+
+/// Write a default `host.env` if none exists, so a fresh install streams with NVENC out of the box.
+fn ensure_default_host_env() -> Result<()> {
+    let path = host_env_path();
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let default = "# punktfunk host configuration (read by the Windows service).\n\
+        # KEY=VALUE per line; '#' comments. Restart the service after editing:\n\
+        #   punktfunk-host service stop && punktfunk-host service start\n\
+        \n\
+        PUNKTFUNK_ENCODER=nvenc\n\
+        PUNKTFUNK_VIDEO_SOURCE=virtual\n\
+        PUNKTFUNK_SECURE_DDA=1\n\
+        RUST_LOG=info\n\
+        \n\
+        # The host subcommand the service launches (default: serve --native).\n\
+        # PUNKTFUNK_HOST_CMD=serve --native\n\
+        \n\
+        # Force a specific NVENC render GPU by name substring (multi-GPU boxes only):\n\
+        # PUNKTFUNK_RENDER_ADAPTER=4090\n";
+    std::fs::write(&path, default).with_context(|| format!("write {}", path.display()))?;
+    println!("Wrote default config: {}", path.display());
+    Ok(())
+}
+
+// ── firewall + sc helpers ────────────────────────────────────────────────────────────────────────
+
+/// Inbound firewall rules for the streaming ports (best-effort; logs but never fails the install).
+fn add_firewall_rules() {
+    // (name suffix, protocol, ports)
+    let rules = [
+        ("TCP", "TCP", "47984,47989,48010,47990"),
+        ("UDP", "UDP", "47998-48010,9777,5353"),
+    ];
+    for (suffix, proto, ports) in rules {
+        let name = format!("punktfunk {suffix}");
+        let ok = run_quiet(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={name}"),
+                "dir=in",
+                "action=allow",
+                &format!("protocol={proto}"),
+                &format!("localport={ports}"),
+            ],
+        );
+        if ok {
+            println!("Firewall rule added: {name} ({ports})");
+        } else {
+            eprintln!("warning: could not add firewall rule '{name}' (add it manually if needed)");
+        }
+    }
+}
+
+fn remove_firewall_rules() {
+    for suffix in ["TCP", "UDP"] {
+        let name = format!("punktfunk {suffix}");
+        let _ = run_quiet(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                &format!("name={name}"),
+            ],
+        );
+    }
+}
+
+/// Run an `sc.exe` command, passing its output through (used by start/stop/status).
+fn sc(args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("sc")
+        .args(args)
+        .status()
+        .context("run sc.exe")?;
+    if !status.success() {
+        bail!("sc {} failed ({status})", args.join(" "));
+    }
+    Ok(())
+}
+
+/// Run a command discarding output; return whether it succeeded.
+fn run_quiet(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}

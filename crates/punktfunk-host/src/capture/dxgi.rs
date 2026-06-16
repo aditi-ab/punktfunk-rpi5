@@ -39,8 +39,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED,
-    DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_MODE_CHANGE_IN_PROGRESS,
-    DXGI_ERROR_INVALID_CALL, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_INVALID_CALL, DXGI_ERROR_MODE_CHANGE_IN_PROGRESS,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
 };
@@ -217,7 +217,10 @@ unsafe fn duplicate_output(
             match output5.DuplicateOutput1(device, 0, &formats) {
                 Ok(d) => {
                     if attempt > 0 {
-                        tracing::info!(attempt, "DuplicateOutput1 succeeded on retry (rode out old-dup teardown race)");
+                        tracing::debug!(
+                            attempt,
+                            "DuplicateOutput1 succeeded on retry (rode out old-dup teardown race)"
+                        );
                     }
                     return Ok(d);
                 }
@@ -235,7 +238,7 @@ unsafe fn duplicate_output(
             // legacy fallback below handles it; gentle recovery keeps it from churning.
             static FALLBACKS: AtomicU64 = AtomicU64::new(0);
             if FALLBACKS.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
-                tracing::warn!(
+                tracing::debug!(
                     error = %format!("{e:?}"),
                     "DuplicateOutput1 unavailable — using legacy DuplicateOutput (expected on the secure desktop)"
                 );
@@ -1212,19 +1215,20 @@ impl DuplCapturer {
             let device = device.context("null D3D11 device")?;
             let context = context.context("null D3D11 context")?;
             // 3) duplicate the output. Attach to the current input desktop first (as SYSTEM this can
-            // be the Winlogon secure desktop) so a session that starts at the lock/login screen works,
-            // and re-assert display isolation at OPEN time (not just in recovery): a lock/UAC switch can
-            // re-attach a physical monitor and route the secure desktop THERE, leaving our virtual
-            // output perpetually idle/lost — re-isolating forces the secure desktop back onto it. Cheap
-            // + idempotent (a no-op when nothing else is attached).
+            // be the Winlogon secure desktop) so a session that starts at the lock/login screen works.
+            // The SudoVDA is kept the sole desktop via the CCD isolation in sudovda::create_monitor
+            // (registry-persisted), so the secure desktop has nowhere to render but the output we
+            // capture — no per-open re-isolation needed.
             attach_input_desktop();
-            crate::vdisplay::sudovda::reassert_isolation(&target.gdi_name);
             let dupl = duplicate_output(&output, &device)
                 .context("DuplicateOutput (already duplicated by another app?)")?;
             // Did DXGI actually call our win32u GPU-pref hook during factory/device/dupl creation? hits==0
             // here means the hook is NOT on DXGI's reparenting path on this build → reparenting can't be
-            // the churn cause (look at independent-flip/composition instead).
-            tracing::info!(hook_hits = hybrid_hook_hits(), "win32u GPU-pref hook call count after open");
+            // the churn cause (look at independent-flip/composition instead). Diagnostic only.
+            tracing::debug!(
+                hook_hits = hybrid_hook_hits(),
+                "win32u GPU-pref hook call count after open"
+            );
             // Kick the first frame loose: a blank virtual display is otherwise change-less.
             nudge_cursor_onto(&output);
             let dd: DXGI_OUTDUPL_DESC = dupl.GetDesc();
@@ -1468,19 +1472,15 @@ impl DuplCapturer {
             let mut buf = vec![0u8; info.PointerShapeBufferSize as usize];
             let mut required = 0u32;
             let mut si = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
-            if self
-                .dupl
-                .as_ref()
-                .is_some_and(|d| {
-                    d.GetFramePointerShape(
-                        info.PointerShapeBufferSize,
-                        buf.as_mut_ptr() as *mut c_void,
-                        &mut required,
-                        &mut si,
-                    )
-                    .is_ok()
-                })
-            {
+            if self.dupl.as_ref().is_some_and(|d| {
+                d.GetFramePointerShape(
+                    info.PointerShapeBufferSize,
+                    buf.as_mut_ptr() as *mut c_void,
+                    &mut required,
+                    &mut si,
+                )
+                .is_ok()
+            }) {
                 if let Some(shape) = convert_pointer_shape(&buf, &si) {
                     tracing::info!(
                         shape_type = si.Type,
@@ -1501,12 +1501,6 @@ impl DuplCapturer {
     /// HDR graphics white (PUNKTFUNK_HDR_CURSOR_NITS, default 203, per BT.2408) so it isn't ~2.5×
     /// too dim; SDR composites the raw cursor in the display's native sRGB space.
     unsafe fn composite_cursor_gpu(&mut self, gpu: &ID3D11Texture2D, hdr: bool) -> Result<()> {
-        // Diagnostic kill-switch: skip the GPU cursor composite entirely (PUNKTFUNK_NO_CURSOR=1) to
-        // isolate its cost on the 3D engine. The per-frame render-target view + draw to the 5K target
-        // is the suspect for the high 3D usage under heavy desktop change.
-        if std::env::var_os("PUNKTFUNK_NO_CURSOR").is_some() {
-            return Ok(());
-        }
         self.dbg_cursor += 1;
         if self.dbg_cursor % 240 == 1 {
             tracing::debug!(
@@ -1619,7 +1613,12 @@ impl DuplCapturer {
         self.dupl = Some(dupl);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
-        match self.dupl.as_ref().unwrap().AcquireNextFrame(16, &mut info, &mut res) {
+        match self
+            .dupl
+            .as_ref()
+            .unwrap()
+            .AcquireNextFrame(16, &mut info, &mut res)
+        {
             Ok(()) => {
                 self.update_cursor(&info);
                 if let Some(r) = res {
@@ -1651,24 +1650,15 @@ impl DuplCapturer {
         if let Some(n) = crate::vdisplay::sudovda::resolve_gdi_name(self.target_id) {
             self.gdi_name = n;
         }
-        // Heavy topology work — re-attach the thread to the input desktop AND re-isolate the virtual
-        // output — ONLY on the actual secure (Winlogon) desktop. Entering it can re-attach a physical
-        // monitor and move the secure desktop off our virtual output, which re-isolation fixes. But on
-        // the NORMAL desktop this is just routine ACCESS_LOST churn (HDR overlay / MPO / periodic IddCx
-        // invalidation), and re-isolating there is a DISPLAY-TOPOLOGY CHANGE that itself invalidates the
-        // freshly-rebuilt duplication → a self-feeding ACCESS_LOST storm (200 rebuilds/session observed).
-        // Apollo isolates once at startup and its recovery just re-duplicates; match that off the secure
-        // desktop. (The lock screen / post-login are NOT Winlogon, so they take this light path too.)
         // Re-sync the capture thread to the CURRENT input desktop on EVERY rebuild — symmetric for
         // ENTERING and LEAVING the secure (Winlogon) desktop. This is the fix for "UAC/lock appears
         // fine but breaks the instant you click out of it": leaving secure used to skip this (it was
         // gated on is_secure_desktop()), stranding the thread on the gone Winlogon desktop. Cheap +
-        // leak-free now (attach_input_desktop closes its handle). reassert_isolation stays secure-only
-        // (it's a CCD topology mutation that would self-feed a storm on the normal desktop).
+        // leak-free (attach_input_desktop closes its handle). Apollo (syncThreadDesktop) does the same.
+        // We do NOT re-isolate the display on recovery: the CCD isolation from create_monitor is
+        // registry-persisted, and a CCD topology mutation here would itself invalidate the freshly-rebuilt
+        // duplication → a self-feeding ACCESS_LOST storm (200 rebuilds/session observed before this).
         attach_input_desktop();
-        if crate::capture::desktop_watch::is_secure_desktop() {
-            crate::vdisplay::sudovda::reassert_isolation(&self.gdi_name);
-        }
         // RELEASE the old duplication FIRST (frees the output). reopen_duplication creates a NEW device
         // and re-DuplicateOutputs the output; if the stale duplication is still alive it holds the output
         // and the new one is born-lost / E_ACCESSDENIED. (On reopen failure self.dupl stays None and
@@ -1722,7 +1712,12 @@ impl DuplCapturer {
         nudge_cursor_onto(&self.output); // kick a change so a static desktop yields its first frame
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
-        let captured = match self.dupl.as_ref().unwrap().AcquireNextFrame(120, &mut info, &mut res) {
+        let captured = match self
+            .dupl
+            .as_ref()
+            .unwrap()
+            .AcquireNextFrame(120, &mut info, &mut res)
+        {
             Ok(()) => {
                 self.update_cursor(&info);
                 match res {
@@ -1796,7 +1791,8 @@ impl DuplCapturer {
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 self.dbg_timeouts += 1;
                 if self.dbg_timeouts % 40 == 1 {
-                    tracing::warn!(
+                    // A static desktop produces no DDA frames, so timeouts are NORMAL idle, not an error.
+                    tracing::debug!(
                         timeouts = self.dbg_timeouts,
                         first_frame = self.first_frame,
                         "DXGI AcquireNextFrame timeout (no desktop change yet)"
@@ -1884,7 +1880,7 @@ impl DuplCapturer {
                 let now = Instant::now();
                 let due = self
                     .last_rebuild
-                    .map_or(true, |t| now.duration_since(t) >= Duration::from_millis(rebuild_ms));
+                    .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(rebuild_ms));
                 if due {
                     self.last_rebuild = Some(now);
                     if self.recreate_dupl().is_ok() {
@@ -1936,7 +1932,7 @@ impl DuplCapturer {
                 let now = Instant::now();
                 let due = self
                     .last_rebuild
-                    .map_or(true, |t| now.duration_since(t) >= Duration::from_millis(250));
+                    .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(250));
                 if due {
                     self.last_rebuild = Some(now);
                     if self.recreate_dupl().is_ok() {

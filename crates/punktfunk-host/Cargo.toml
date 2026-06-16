@@ -152,7 +152,14 @@ windows = { version = "0.62", features = [
     # Per-monitor-v2 DPI awareness — IDXGIOutput5::DuplicateOutput1 (the modern capture path Apollo
     # uses; FP16/format-list, robust to overlay/format churn) requires the process to be DPI-aware.
     "Win32_UI_HiDpi",
+    # Windows service supervisor (src/service.rs): a kill-on-close job object so a service crash never
+    # orphans the SYSTEM host it launched into the interactive session.
+    "Win32_System_JobObjects",
 ] }
+# The SCM plumbing for the `service` subcommand (define_windows_service! / dispatcher / control
+# handler / ServiceManager install). Wraps the Win32 service API; the supervision loop itself uses
+# the `windows` crate above.
+windows-service = "0.7"
 # Software H.264 encoder (GPU-less path + NVENC fallback). The default `source` feature statically
 # compiles OpenH264 (BSD-2) — no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.
 openh264 = "0.9"

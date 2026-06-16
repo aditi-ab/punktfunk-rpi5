@@ -152,11 +152,12 @@ unsafe fn no_inherit(h: HANDLE) {
     let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
 }
 
-/// Build the helper's environment block: the user's block (so DLL/PATH/SystemRoot resolve) with this
-/// (host) process's `PUNKTFUNK_*` vars overlaid, so the helper encodes with the SAME settings the
-/// host runs with (`PUNKTFUNK_ENCODER=nvenc`, `PUNKTFUNK_ZEROCOPY`, …) instead of the user shell's.
-/// Returns a UTF-16, double-null-terminated block suitable for `CREATE_UNICODE_ENVIRONMENT`.
-unsafe fn merged_env_block(user_block: *const u16) -> Vec<u16> {
+/// Build a child environment block: the target session's block (so DLL/PATH/SystemRoot resolve) with
+/// this process's `PUNKTFUNK_*` vars overlaid, so the child runs with the SAME settings this process
+/// has (`PUNKTFUNK_ENCODER=nvenc`, `PUNKTFUNK_ZEROCOPY`, …) instead of the target shell's. Returns a
+/// UTF-16, double-null-terminated block suitable for `CREATE_UNICODE_ENVIRONMENT`. Shared by the WGC
+/// helper spawn (here) and the Windows service launching the host into the active session.
+pub(crate) unsafe fn merged_env_block(user_block: *const u16) -> Vec<u16> {
     // Parse the user block ("VAR=VALUE\0" … "\0") into entries.
     let mut entries: Vec<String> = Vec::new();
     if !user_block.is_null() {
@@ -174,9 +175,10 @@ unsafe fn merged_env_block(user_block: *const u16) -> Vec<u16> {
             p = p.offset(len + 1);
         }
     }
-    // Drop any PUNKTFUNK_* the user block carried, then overlay this process's PUNKTFUNK_* vars.
-    entries.retain(|e| !e.split('=').next().unwrap_or("").starts_with("PUNKTFUNK_"));
-    for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("PUNKTFUNK_")) {
+    // Overlay "our" settings — PUNKTFUNK_* and RUST_LOG — dropping whatever the target block had.
+    let is_ours = |k: &str| k.starts_with("PUNKTFUNK_") || k == "RUST_LOG";
+    entries.retain(|e| !is_ours(e.split('=').next().unwrap_or("")));
+    for (k, v) in std::env::vars().filter(|(k, _)| is_ours(k)) {
         entries.push(format!("{k}={v}"));
     }
     // Serialize back to a UTF-16 double-null-terminated block.

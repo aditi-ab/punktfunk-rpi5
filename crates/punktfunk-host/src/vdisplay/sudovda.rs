@@ -31,10 +31,9 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Graphics::Gdi::{
-    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_GLOBAL, CDS_NORESET,
-    CDS_TEST, CDS_TYPE, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW,
-    DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY,
-    DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
+    ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_TEST, CDS_UPDATEREGISTRY, DEVMODEW,
+    DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
+    ENUM_DISPLAY_SETTINGS_MODE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -57,9 +56,6 @@ const IOCTL_GET_WATCHDOG: u32 = ctl(0x803);
 const IOCTL_DRIVER_PING: u32 = ctl(0x888);
 const IOCTL_GET_VERSION: u32 = ctl(0x8FF);
 
-// A fixed monitor identity. One session at a time today; Windows persists this monitor's layout
-// across sessions by GUID, and REMOVE keys off it. (TODO: derive per-client when concurrent
-// sessions land.)
 /// A UNIQUE-per-session SudoVDA monitor GUID. The monitor is keyed by GUID for IOCTL_ADD/REMOVE, so a
 /// FIXED GUID makes overlapping sessions (a client reconnecting after a freeze before the old session
 /// has torn down, or genuine concurrent sessions) all map to the SAME monitor — then one session's
@@ -148,7 +144,7 @@ unsafe fn resolve_render_adapter_luid() -> Option<LUID> {
             continue;
         }
         let vram = d.DedicatedVideoMemory as u64; // SudoVDA software adapter ≈ 0 → loses to the dGPU
-        if best.as_ref().map_or(true, |(_, v, _)| vram > *v) {
+        if best.as_ref().is_none_or(|(_, v, _)| vram > *v) {
             best = Some((d.AdapterLuid, vram, name));
         }
     }
@@ -263,7 +259,7 @@ pub(crate) unsafe fn set_advanced_color(target_id: u32, enable: bool) -> bool {
             s.header.adapterId = p.targetInfo.adapterId;
             s.header.id = p.targetInfo.id;
             s.Anonymous.value = enable as u32; // bit 0 = enableAdvancedColor
-            let rc = DisplayConfigSetDeviceInfo(&mut s.header);
+            let rc = DisplayConfigSetDeviceInfo(&s.header);
             tracing::info!(
                 target_id,
                 enable,
@@ -382,7 +378,13 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
         return;
     }
     let apply = unsafe {
-        ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, CDS_UPDATEREGISTRY, None)
+        ChangeDisplaySettingsExW(
+            PCWSTR(wname.as_ptr()),
+            Some(&dm),
+            None,
+            CDS_UPDATEREGISTRY,
+            None,
+        )
     };
     if apply == DISP_CHANGE_SUCCESSFUL {
         tracing::info!(
@@ -402,94 +404,6 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
     }
 }
 
-/// Detach every display except `keep_gdi_name`, leaving the SudoVDA virtual output as the ONLY
-/// display. This is the SudoVDA/Apollo "isolate the virtual display" move and the key to capturing
-/// the secure desktop: Windows renders the login / UAC (Winlogon) desktop on the physical/primary
-/// display and resets the topology when it switches there — with a physical monitor still attached
-/// (e.g. an LG TV), the login lands on it and our virtual output goes perpetually ACCESS_LOST. With
-/// the physical detached and the change PERSISTED to the registry, Winlogon reads "only the virtual
-/// is attached" and the secure desktop has nowhere to render but the output we capture.
-///
-/// Returns the displays we detached plus their saved modes so teardown can restore them.
-///
-/// Superseded by the atomic CCD [`isolate_displays_ccd`] (the legacy per-device GDI detach misses
-/// iGPU-attached monitors on a hybrid box and churns the topology). Retained for reference / a
-/// possible fallback.
-#[allow(dead_code)]
-unsafe fn isolate_displays(keep_gdi_name: &str) -> Vec<(String, DEVMODEW)> {
-    let mut saved = Vec::new();
-    let mut idx = 0u32;
-    loop {
-        let mut dd = DISPLAY_DEVICEW {
-            cb: size_of::<DISPLAY_DEVICEW>() as u32,
-            ..Default::default()
-        };
-        if !EnumDisplayDevicesW(PCWSTR::null(), idx, &mut dd, 0).as_bool() {
-            break;
-        }
-        idx += 1;
-        if (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP).0 == 0 {
-            continue; // not part of the desktop — nothing to detach
-        }
-        let name = String::from_utf16_lossy(&dd.DeviceName);
-        let name = name.trim_end_matches('\u{0}').to_string();
-        if name == keep_gdi_name {
-            continue; // the virtual output we want to keep
-        }
-        // Save the current mode so the teardown can re-attach this display where it was.
-        let mut cur = DEVMODEW {
-            dmSize: size_of::<DEVMODEW>() as u16,
-            ..Default::default()
-        };
-        let wname: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        if EnumDisplaySettingsW(PCWSTR(wname.as_ptr()), ENUM_CURRENT_SETTINGS, &mut cur).as_bool() {
-            saved.push((name.clone(), cur));
-        }
-        // A 0x0 mode removes the display from the desktop. NORESET batches; we commit once below.
-        let off = DEVMODEW {
-            dmSize: size_of::<DEVMODEW>() as u16,
-            dmFields: DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT,
-            ..Default::default()
-        };
-        let r = ChangeDisplaySettingsExW(
-            PCWSTR(wname.as_ptr()),
-            Some(&off),
-            None,
-            CDS_UPDATEREGISTRY | CDS_NORESET | CDS_GLOBAL,
-            None,
-        );
-        tracing::info!("display isolate: detaching {name} (result={})", r.0);
-    }
-    if !saved.is_empty() {
-        // Commit the batched detaches (NULL device + 0 flags applies the pending registry changes).
-        let _ = ChangeDisplaySettingsExW(PCWSTR::null(), None, None, CDS_TYPE(0), None);
-        tracing::info!(
-            "display isolate: {} display(s) detached — only {keep_gdi_name} remains",
-            saved.len()
-        );
-    }
-    saved
-}
-
-/// Re-attach the displays [`isolate_displays`] detached, restoring each to its saved mode. Called on
-/// teardown BEFORE the virtual output is removed, so there is always at least one display.
-unsafe fn restore_displays(saved: &[(String, DEVMODEW)]) {
-    for (name, dm) in saved {
-        let wname: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        let _ = ChangeDisplaySettingsExW(
-            PCWSTR(wname.as_ptr()),
-            Some(dm),
-            None,
-            CDS_UPDATEREGISTRY | CDS_NORESET | CDS_GLOBAL,
-            None,
-        );
-    }
-    if !saved.is_empty() {
-        let _ = ChangeDisplaySettingsExW(PCWSTR::null(), None, None, CDS_TYPE(0), None);
-        tracing::info!("display isolate: restored {} display(s)", saved.len());
-    }
-}
-
 /// Saved active display topology, for restoring on teardown.
 type SavedConfig = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
 
@@ -497,7 +411,7 @@ type SavedConfig = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
 /// doesn't export it, so define it here.
 const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
 
-/// Robust display isolation via the CCD API. The legacy [`isolate_displays`] (EnumDisplayDevices +
+/// Robust display isolation via the CCD API. The naive GDI approach (EnumDisplayDevices +
 /// ChangeDisplaySettings) MISSES displays on a hybrid box — an iGPU-attached physical monitor isn't
 /// flagged `ATTACHED_TO_DESKTOP` in the GDI enum, so it's never detached and the secure desktop /
 /// lock screen lands on IT while our virtual output freezes. `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)`
@@ -569,25 +483,6 @@ unsafe fn restore_displays_ccd(saved: &SavedConfig) {
     tracing::info!("display isolate (CCD): restored original topology rc={rc:#x}");
 }
 
-/// Re-detach physical displays so the secure (Winlogon) desktop keeps rendering to the virtual
-/// output — for the in-session DXGI capture recovery (dxgi.rs `recreate_dupl`). The lock/UAC/login
-/// switch can re-attach a physical monitor (the secure desktop then lands on IT and our virtual
-/// output goes perpetually ACCESS_LOST — the "born-lost" storm); re-running the isolate routes the
-/// secure desktop back to the virtual output, mirroring what a fresh session's `create` does (the
-/// delta that makes a reconnect work where in-session recovery didn't). Idempotent + cheap: when
-/// nothing besides `gdi_name` is attached, [`isolate_displays`] finds nothing to detach and commits
-/// nothing — so this is safe to call on every throttled recovery tick (no display thrash).
-pub(crate) fn reassert_isolation(gdi_name: &str) {
-    // Only when sole-display isolation is explicitly opted into (see create()): otherwise re-isolating
-    // would itself trigger the independent-flip storm we're avoiding.
-    if std::env::var("PUNKTFUNK_ISOLATE_DISPLAYS").is_err() {
-        return;
-    }
-    unsafe {
-        let _ = isolate_displays(gdi_name);
-    }
-}
-
 unsafe fn open_device() -> Result<HANDLE> {
     let hdev = SetupDiGetClassDevsW(
         Some(&SUVDA_INTERFACE),
@@ -646,7 +541,6 @@ struct Monitor {
     mode: Mode,
     stop: Arc<AtomicBool>,
     pinger: Option<JoinHandle<()>>,
-    isolated: Vec<(String, DEVMODEW)>,
     ccd_saved: Option<SavedConfig>,
 }
 
@@ -805,7 +699,6 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
                 break;
             }
         }
-        let isolated: Vec<(String, DEVMODEW)> = Vec::new(); // legacy GDI detach unused (CCD path below)
         let mut ccd_saved: Option<SavedConfig> = None;
         match &gdi_name {
             Some(n) => {
@@ -827,7 +720,9 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
                 if std::env::var("PUNKTFUNK_NO_ISOLATE").is_err() {
                     ccd_saved = unsafe { isolate_displays_ccd(ao.target_id) };
                 } else {
-                    tracing::info!("display isolation skipped (PUNKTFUNK_NO_ISOLATE) — IDD stays extended");
+                    tracing::info!(
+                        "display isolation skipped (PUNKTFUNK_NO_ISOLATE) — IDD stays extended"
+                    );
                 }
                 thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture opens
             }
@@ -845,7 +740,6 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
             mode,
             stop,
             pinger: Some(pinger),
-            isolated,
             ccd_saved,
         })
     }
@@ -876,7 +770,6 @@ impl Monitor {
         if let Some(saved) = &self.ccd_saved {
             restore_displays_ccd(saved);
         }
-        restore_displays(&self.isolated);
         let rp = RemoveParams { guid: self.guid };
         let rp_bytes =
             std::slice::from_raw_parts(&rp as *const _ as *const u8, size_of::<RemoveParams>());
@@ -898,7 +791,13 @@ fn mgr_ensure_device(g: &mut Mgr) -> Result<isize> {
     let device = unsafe { open_device()? };
     let mut ver = [0u8; 4];
     if unsafe { ioctl(device, IOCTL_GET_VERSION, &[], &mut ver) }.is_ok() {
-        tracing::info!("SudoVDA protocol {}.{}.{} (test={})", ver[0], ver[1], ver[2], ver[3]);
+        tracing::info!(
+            "SudoVDA protocol {}.{}.{} (test={})",
+            ver[0],
+            ver[1],
+            ver[2],
+            ver[3]
+        );
     }
     let mut wd = [0u8; 8];
     g.watchdog_s = if unsafe { ioctl(device, IOCTL_GET_WATCHDOG, &[], &mut wd) }.is_ok() {
@@ -942,7 +841,10 @@ fn mgr_acquire(mode: Mode) -> Result<VirtualOutput> {
         if changed {
             unsafe { mgr_reconfigure(mon, mode) };
         }
-        tracing::info!(refs = *refs, "SudoVDA monitor reused (concurrent / reconfigure session)");
+        tracing::info!(
+            refs = *refs,
+            "SudoVDA monitor reused (concurrent / reconfigure session)"
+        );
         let pm = Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz));
         let target = mon.target();
         return Ok(VirtualOutput {
@@ -982,7 +884,10 @@ fn mgr_acquire(mode: Mode) -> Result<VirtualOutput> {
 /// Re-apply a (possibly new) mode to a reused monitor on reconnect, re-resolving its GDI name.
 unsafe fn mgr_reconfigure(mon: &mut Monitor, mode: Mode) {
     tracing::info!(
-        old = format!("{}x{}@{}", mon.mode.width, mon.mode.height, mon.mode.refresh_hz),
+        old = format!(
+            "{}x{}@{}",
+            mon.mode.width, mon.mode.height, mon.mode.refresh_hz
+        ),
         new = format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
         "SudoVDA: reconfiguring reused monitor to the new client mode"
     );
@@ -999,10 +904,16 @@ unsafe fn mgr_reconfigure(mon: &mut Monitor, mode: Mode) {
 fn mgr_release() {
     let mut g = MGR.lock().unwrap();
     g.state = match std::mem::replace(&mut g.state, MgrState::Idle) {
-        MgrState::Active { mon, refs } if refs > 1 => MgrState::Active { mon, refs: refs - 1 },
+        MgrState::Active { mon, refs } if refs > 1 => MgrState::Active {
+            mon,
+            refs: refs - 1,
+        },
         MgrState::Active { mon, .. } => {
             let ms = linger_ms();
-            tracing::info!(linger_ms = ms, "SudoVDA: last session left — lingering before teardown");
+            tracing::info!(
+                linger_ms = ms,
+                "SudoVDA: last session left — lingering before teardown"
+            );
             MgrState::Lingering {
                 mon,
                 until: Instant::now() + Duration::from_millis(ms),
