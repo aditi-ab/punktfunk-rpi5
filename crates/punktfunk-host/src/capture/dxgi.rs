@@ -720,6 +720,7 @@ pub struct DuplCapturer {
     first_frame: bool,
     dbg_timeouts: u32,
     dbg_lost: u32,
+    dbg_black_seeds: u32,
     last: Option<Vec<u8>>,
     /// GPU-output mode (zero-copy → NVENC): produce `FramePayload::D3d11` instead of CPU BGRA.
     /// Selected by `PUNKTFUNK_ENCODER=nvenc` so the capturer's output matches the encoder's input.
@@ -878,8 +879,13 @@ impl DuplCapturer {
             let device = device.context("null D3D11 device")?;
             let context = context.context("null D3D11 context")?;
             // 3) duplicate the output. Attach to the current input desktop first (as SYSTEM this can
-            // be the Winlogon secure desktop) so a session that starts at the lock/login screen works.
+            // be the Winlogon secure desktop) so a session that starts at the lock/login screen works,
+            // and re-assert display isolation at OPEN time (not just in recovery): a lock/UAC switch can
+            // re-attach a physical monitor and route the secure desktop THERE, leaving our virtual
+            // output perpetually idle/lost — re-isolating forces the secure desktop back onto it. Cheap
+            // + idempotent (a no-op when nothing else is attached).
             attach_input_desktop();
+            crate::vdisplay::sudovda::reassert_isolation(&target.gdi_name);
             let dupl = output
                 .DuplicateOutput(&device)
                 .context("DuplicateOutput (already duplicated by another app?)")?;
@@ -933,6 +939,7 @@ impl DuplCapturer {
                 first_frame: true,
                 dbg_timeouts: 0,
                 dbg_lost: 0,
+                dbg_black_seeds: 0,
                 last: None,
                 gpu_mode,
                 gpu_copy: None,
@@ -1079,6 +1086,16 @@ impl DuplCapturer {
     /// HDR mode it seeds the 10-bit output (black = PQ 0); otherwise the BGRA copy. One-shot: the next
     /// real frame overwrites the texture in place.
     unsafe fn seed_black_gpu_frame(&mut self) -> Result<()> {
+        // Instrumentation: a BLACK seed means we have no real desktop frame to show — if the client
+        // streams black, this is why. On the secure (Winlogon) desktop this fires when the duplication
+        // came back born-lost / idle. Counted + logged (throttled) so a real-lock repro shows the mode.
+        self.dbg_black_seeds += 1;
+        if self.dbg_black_seeds % 32 == 1 {
+            tracing::warn!(
+                black_seeds = self.dbg_black_seeds,
+                "DDA: seeding BLACK frame — no real desktop frame available (secure desktop idle/born-lost?)"
+            );
+        }
         if self.hdr_fp16 {
             self.ensure_hdr10_out()?;
             let out = self.hdr10_out.clone().context("hdr10 out texture")?;
@@ -1225,18 +1242,23 @@ impl DuplCapturer {
             Ok(d) => d,
             Err(_) => return false,
         };
-        // Short probe (hot path): a born-lost duplication returns ACCESS_LOST immediately regardless
-        // of the timeout; only the alive-but-idle case waits the full 16ms, and idle = nothing moving.
+        // Adopt first (SAME device → existing gpu_copy/HDR textures/last_present stay valid), then probe
+        // + CAPTURE the frame: a born-lost duplication returns ACCESS_LOST immediately; alive-but-idle
+        // waits the full 16ms. On a real frame we present it (so a static desktop keeps a real
+        // last_present instead of the discarded one); idle keeps the existing last_present.
+        self.dupl = dupl;
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
-        match dupl.AcquireNextFrame(16, &mut info, &mut res) {
+        match self.dupl.AcquireNextFrame(16, &mut info, &mut res) {
             Ok(()) => {
-                let _ = dupl.ReleaseFrame();
+                self.update_cursor(&info);
+                if let Some(r) = res {
+                    let _ = self.present_acquired(r);
+                }
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {}
             Err(_) => return false, // born-lost on the same output → need the full rebuild
         }
-        self.dupl = dupl;
         true
     }
 
@@ -1267,31 +1289,8 @@ impl DuplCapturer {
         crate::vdisplay::sudovda::reassert_isolation(&self.gdi_name);
         let (dev, ctx, out, dupl) = reopen_duplication(&self.gdi_name)?; // Err → caller repeats + retries
 
-        // PROBE before adopting. During the unsettled Winlogon switch DuplicateOutput SUCCEEDS but the
-        // duplication is "born-lost" — the first AcquireNextFrame immediately returns ACCESS_LOST.
-        // Adopting it (swapping into self + seeding black) is exactly what produced the perpetual
-        // rebuild→born-lost storm (lost=2097) where the secure desktop never appeared. So gate adoption
-        // on a probe: Ok (a frame) or WAIT_TIMEOUT (alive but idle) ⇒ live, adopt; any other error ⇒
-        // born-lost, drop the locals and bail so the caller repeats the last frame and retries on the
-        // 250ms throttle. Once the topology settles (and reassert_isolation has taken), a probe passes
-        // and we adopt a LIVE duplication of the secure desktop.
-        {
-            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-            let mut res: Option<IDXGIResource> = None;
-            match dupl.AcquireNextFrame(50, &mut info, &mut res) {
-                Ok(()) => {
-                    let _ = dupl.ReleaseFrame();
-                }
-                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {}
-                Err(e) => {
-                    return Err(anyhow!(
-                        "rebuilt duplication is born-lost (probe AcquireNextFrame: {:#x}) — \
-                         topology not settled yet",
-                        e.code().0
-                    ));
-                }
-            }
-        }
+        // (The born-lost guard is now the capture-acquire at the end: we adopt, then grab the current
+        // frame; ACCESS_LOST there means born-lost, and we seed black + let the throttled caller retry.)
         // A desktop switch can come back at a different size (e.g. the user session applies its own
         // resolution on login). Adopt it: update dimensions and drop the staging/gpu copies so they
         // reallocate. NVENC re-inits at the new size when it sees the frame.
@@ -1326,14 +1325,47 @@ impl DuplCapturer {
         self.hdr10_out = None;
         self.hdr_conv = None;
         self.first_frame = true;
-        // Seed a black frame on the NEW device so next_frame always has something to repeat (and the
-        // encoder re-inits) until real frames resume.
-        if self.gpu_mode {
+        // Capture the CURRENT desktop frame as `last_present` (instead of seeding black). The secure
+        // (lock/login/UAC) desktop is STATIC, so DDA only emits a frame on change — if we seeded black
+        // we'd stream black until the user pressed a key (the reported bug). A freshly-created
+        // duplication's first AcquireNextFrame returns the full current desktop; grab it and present it,
+        // so the client shows the real (frozen-until-it-changes) secure desktop. Born-lost (ACCESS_LOST
+        // here) or no-initial-frame (timeout) → seed black as a fallback and let the throttled caller
+        // retry — a brief black flash during the unsettled switch, then real content.
+        nudge_cursor_onto(&self.output); // kick a change so a static desktop yields its first frame
+        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut res: Option<IDXGIResource> = None;
+        let captured = match self.dupl.AcquireNextFrame(120, &mut info, &mut res) {
+            Ok(()) => {
+                self.update_cursor(&info);
+                match res {
+                    Some(r) => match self.present_acquired(r) {
+                        Ok(_) => {
+                            self.first_frame = false;
+                            tracing::info!("DXGI recovery: captured real secure-desktop frame");
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"), "recovery: present_acquired failed");
+                            false
+                        }
+                    },
+                    None => false,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    code = format!("{:#x}", e.code().0),
+                    "DXGI recovery: no initial frame (born-lost/idle) — seeding black, will retry"
+                );
+                false
+            }
+        };
+        if !captured && self.gpu_mode {
             if let Err(e) = self.seed_black_gpu_frame() {
                 tracing::warn!(error = %format!("{e:#}"), "seed black frame after recovery failed");
             }
         }
-        nudge_cursor_onto(&self.output); // re-kick after recovery
         Ok(())
     }
 
@@ -1422,8 +1454,17 @@ impl DuplCapturer {
             }
             Err(e) => return Err(e).context("AcquireNextFrame"),
         }
-        self.holding_frame = true;
         let res = res.context("AcquireNextFrame: null resource")?;
+        Ok(Some(self.present_acquired(res)?))
+    }
+
+    /// Turn a freshly-acquired duplication resource into a `CapturedFrame` and record it as
+    /// `last_present`. Factored out of [`acquire`] so the recovery path ([`recreate_dupl`]) can grab
+    /// the CURRENT desktop frame instead of seeding black: the secure (lock/login/UAC) desktop is
+    /// static, so DDA emits no change-frame to replace a black seed — the cause of the black-screen-
+    /// until-you-press-a-key bug. The caller has already `AcquireNextFrame`d; this releases it.
+    unsafe fn present_acquired(&mut self, res: IDXGIResource) -> Result<CapturedFrame> {
+        self.holding_frame = true;
         let tex: ID3D11Texture2D = res.cast().context("resource -> Texture2D")?;
         if self.gpu_mode && self.hdr_fp16 {
             // HDR zero-copy path: the duplication surface is scRGB FP16 (R16G16B16A16_FLOAT) — it can't
@@ -1455,7 +1496,7 @@ impl DuplCapturer {
                 self.height,
             );
             self.last_present = Some((out.clone(), PixelFormat::Rgb10a2));
-            return Ok(Some(CapturedFrame {
+            return Ok(CapturedFrame {
                 width: self.width,
                 height: self.height,
                 pts_ns: now_ns(),
@@ -1464,7 +1505,7 @@ impl DuplCapturer {
                     texture: out,
                     device: self.device.clone(),
                 }),
-            }));
+            });
         }
         if self.gpu_mode {
             // Zero-copy path: keep the frame on the GPU for NVENC. Copy the transient duplication
@@ -1476,7 +1517,7 @@ impl DuplCapturer {
             self.holding_frame = false;
             self.composite_cursor_gpu(&gpu, false)?;
             self.last_present = Some((gpu.clone(), PixelFormat::Bgra));
-            return Ok(Some(CapturedFrame {
+            return Ok(CapturedFrame {
                 width: self.width,
                 height: self.height,
                 pts_ns: now_ns(),
@@ -1485,7 +1526,7 @@ impl DuplCapturer {
                     texture: gpu,
                     device: self.device.clone(),
                 }),
-            }));
+            });
         }
         self.ensure_staging()?;
         let staging = self.staging.clone().context("staging texture")?;
@@ -1517,13 +1558,13 @@ impl DuplCapturer {
             }
         }
         self.last = Some(tight.clone());
-        Ok(Some(CapturedFrame {
+        Ok(CapturedFrame {
             width: self.width,
             height: self.height,
             pts_ns: now_ns(),
             format: PixelFormat::Bgra,
             payload: FramePayload::Cpu(tight),
-        }))
+        })
     }
 }
 

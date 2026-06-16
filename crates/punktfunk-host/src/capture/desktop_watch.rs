@@ -29,14 +29,23 @@ pub struct DesktopWatcher {
 
 impl DesktopWatcher {
     pub fn start() -> Self {
-        let state = Arc::new(AtomicU8::new(DESKTOP_NORMAL));
+        // Compute the CURRENT desktop synchronously before returning, so the first reader (the capture
+        // mux) sees the real state immediately. Otherwise a session that begins already on the secure
+        // desktop (e.g. a reconnect to a locked box) would read DESKTOP_NORMAL for the first poll
+        // interval and relay one stale normal-desktop frame — the "flash of the login screen" bug.
+        let initial = if unsafe { is_secure_desktop() } {
+            DESKTOP_SECURE
+        } else {
+            DESKTOP_NORMAL
+        };
+        let state = Arc::new(AtomicU8::new(initial));
         let stop = Arc::new(AtomicBool::new(false));
         let s = state.clone();
         let st = stop.clone();
         let _ = std::thread::Builder::new()
             .name("desktop-watch".into())
             .spawn(move || {
-                let mut last = u8::MAX;
+                let mut last = initial;
                 while !st.load(Ordering::Relaxed) {
                     let v = if unsafe { is_secure_desktop() } {
                         DESKTOP_SECURE
