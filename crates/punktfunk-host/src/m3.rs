@@ -2385,33 +2385,37 @@ fn virtual_stream_relay(
     }
     // Note: takes the dimensions as args rather than capturing `cur_mode` — `cur_mode` is reassigned
     // on reconfig, and a closure holding a shared borrow of it for the whole fn would forbid that.
-    let open_dda = |target: &WinCaptureTarget, w: u32, h: u32, hz: u32| -> Result<DdaPipe> {
-        // The host already holds the real keepalive (sole isolation owner), so DDA gets a no-op one.
-        let mut cap = crate::capture::dxgi::DuplCapturer::open(
-            target.clone(),
-            Some((w, h, hz)),
-            Box::new(()),
-        )
-        .context("open DDA for secure desktop")?;
-        cap.set_active(true);
-        let frame = cap.next_frame().context("DDA first frame")?;
-        let enc = crate::encode::open_video(
-            crate::encode::Codec::H265,
-            frame.format,
-            frame.width,
-            frame.height,
-            hz,
-            bitrate_kbps as u64 * 1000,
-            frame.is_cuda(),
-            bit_depth,
-        )
-        .context("open NVENC for DDA")?;
-        Ok(DdaPipe {
-            cap: Box::new(cap),
-            enc,
-            frame,
-        })
-    };
+    let open_dda =
+        |target: &WinCaptureTarget, w: u32, h: u32, hz: u32, hdr: bool| -> Result<DdaPipe> {
+            // The host already holds the real keepalive (sole isolation owner), so DDA gets a no-op one.
+            // `hdr` requests an FP16 DuplicateOutput1 so the secure desktop is captured in HDR (→ BT.2020
+            // PQ Main10) instead of black — legacy DuplicateOutput can't capture an HDR/FP16 desktop.
+            let mut cap = crate::capture::dxgi::DuplCapturer::open(
+                target.clone(),
+                Some((w, h, hz)),
+                Box::new(()),
+                hdr,
+            )
+            .context("open DDA for secure desktop")?;
+            cap.set_active(true);
+            let frame = cap.next_frame().context("DDA first frame")?;
+            let enc = crate::encode::open_video(
+                crate::encode::Codec::H265,
+                frame.format,
+                frame.width,
+                frame.height,
+                hz,
+                bitrate_kbps as u64 * 1000,
+                frame.is_cuda(),
+                bit_depth,
+            )
+            .context("open NVENC for DDA")?;
+            Ok(DdaPipe {
+                cap: Box::new(cap),
+                enc,
+                frame,
+            })
+        };
 
     let perf = std::env::var("PUNKTFUNK_PERF").is_ok();
     let burst_cap = std::env::var("PUNKTFUNK_PACE_BURST_KB")
@@ -2470,10 +2474,6 @@ fn virtual_stream_relay(
     // decoder must resume on a keyframe — the two encoders keep independent infinite-GOP state).
     let mut dda: Option<DdaPipe> = None;
     let mut on_secure = false;
-    // Whether we dropped the SudoVDA out of HDR for the secure (DDA) leg, so we know to restore it on
-    // the way back. Keyed off the monitor's REAL HDR state at the moment of the switch (a user can
-    // toggle Windows HDR mid-session), not the handshake bit depth.
-    let mut dropped_hdr_for_secure = false;
     let mut next = std::time::Instant::now();
     let mut await_idr = false;
     // Step 6 relaunch watchdog: how many times in a row the helper has died without producing a frame.
@@ -2563,46 +2563,17 @@ fn virtual_stream_relay(
                 "two-process: source switch"
             );
             if secure {
-                // SDR-while-secure (HDR sessions ONLY): drop the SudoVDA out of HDR so the secure
-                // (Winlogon) desktop renders SDR/composed — HDR fullscreen independent-flip is what made
-                // DDA storm ACCESS_LOST (black). Key off the monitor's REAL HDR state (a user may have
-                // toggled Windows HDR on the virtual display), not the negotiated bit depth — the pipeline
-                // streams HDR whenever the monitor is HDR regardless of the 8/10 handshake. For an SDR
-                // monitor this is a no-op (no needless topology change, nothing to restore).
-                dropped_hdr_for_secure =
+                // Capture the secure (Winlogon) desktop in its NATIVE colorspace. Don't try to drop the
+                // SudoVDA out of HDR for the DDA leg — display-config changes are denied on the secure
+                // desktop (the drop just churned + still went black). Instead, if the monitor is in HDR,
+                // open DDA in HDR (FP16 DuplicateOutput1 → BT.2020 PQ Main10); the normal-desktop DDA
+                // overlay/flip issues that drove us to WGC don't apply to the composed Winlogon UI.
+                let hdr =
                     unsafe { crate::vdisplay::sudovda::advanced_color_enabled(target.target_id) };
-                if dropped_hdr_for_secure {
-                    // The DDA path is SDR-only (BGRA8) — leaving the SudoVDA in HDR makes the secure
-                    // desktop capture black. Drop to SDR and VERIFY it actually took before opening DDA:
-                    // the CCD advanced-color toggle can transiently fail (rc=5) or lag, so retry until
-                    // advanced_color_enabled() reads false (or we give up and open DDA regardless).
-                    let mut off = false;
-                    for attempt in 0..6 {
-                        unsafe {
-                            crate::vdisplay::sudovda::set_advanced_color(target.target_id, false);
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                        if !unsafe {
-                            crate::vdisplay::sudovda::advanced_color_enabled(target.target_id)
-                        } {
-                            off = true;
-                            tracing::info!(
-                                attempt,
-                                "SudoVDA dropped to SDR for the secure DDA leg"
-                            );
-                            break;
-                        }
-                    }
-                    if !off {
-                        tracing::warn!(
-                            "could not drop the SudoVDA out of HDR for the secure desktop — DDA may \
-                             be black (display-config change likely denied on the Winlogon desktop)"
-                        );
-                    }
-                }
-                dda = None; // reopen so we capture the (SDR) output
-                match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz) {
+                dda = None; // reopen to capture the secure desktop
+                match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz, hdr) {
                     Ok(mut p) => {
+                        tracing::info!(hdr, "two-process: opened DDA for the secure desktop");
                         p.enc.request_keyframe();
                         dda = Some(p);
                     }
@@ -2622,30 +2593,8 @@ fn virtual_stream_relay(
                 dda = None; // free the secure DDA encoder; the relay (helper) is the source again
                 while relay.try_recv().is_ok() {} // drop secure-dwell backlog
                 relay.request_keyframe(); // client decoder resumes on the helper's next IDR
-                if dropped_hdr_for_secure {
-                    // We dropped the SudoVDA to SDR for the DDA leg → restore HDR AND rebuild the helper
-                    // so WGC re-detects the HDR colorspace. (An SDR session never changed the colorspace
-                    // → dropped_hdr_for_secure is false → no rebuild, no recreate.)
-                    dropped_hdr_for_secure = false;
-                    unsafe {
-                        crate::vdisplay::sudovda::set_advanced_color(target.target_id, true);
-                    }
-                    match build(&mut vd, cur_mode) {
-                        Ok((ka, rl, tg, hz)) => {
-                            relay = rl;
-                            _keepalive = ka;
-                            target = tg;
-                            effective_hz = hz;
-                            interval = std::time::Duration::from_secs_f64(1.0 / hz.max(1) as f64);
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %format!("{e:#}"),
-                                "two-process: helper rebuild on secure-exit failed");
-                            while relay.try_recv().is_ok() {}
-                            relay.request_keyframe();
-                        }
-                    }
-                }
+                                          // Nothing to restore: we no longer toggle the SudoVDA's HDR state for the DDA leg, so the
+                                          // monitor's colorspace is unchanged and the still-alive WGC helper just resumes.
                 next = std::time::Instant::now();
             }
         }

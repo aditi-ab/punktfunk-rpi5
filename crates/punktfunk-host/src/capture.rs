@@ -286,7 +286,7 @@ pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Bo
         .unwrap_or_default()
         .to_ascii_lowercase();
     if backend == "dda" || backend == "dxgi" || wgc_disabled() {
-        return dxgi::DuplCapturer::open(target, pref, keep)
+        return dxgi::DuplCapturer::open(target, pref, keep, false)
             .map(|c| Box::new(c) as Box<dyn Capturer>);
     }
     // WGC default, with a watchdog'd DDA fallback. WGC's Direct3D11CaptureFramePool::CreateFreeThreaded
@@ -316,11 +316,13 @@ pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Bo
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %format!("{e:#}"), "WGC open failed — falling back to DDA");
-            dxgi::DuplCapturer::open(target, pref, keep).map(|c| Box::new(c) as Box<dyn Capturer>)
+            dxgi::DuplCapturer::open(target, pref, keep, false)
+                .map(|c| Box::new(c) as Box<dyn Capturer>)
         }
         Err(_) => {
             tracing::warn!("WGC open timed out (CreateFreeThreaded hang on the virtual display) — falling back to DDA");
-            dxgi::DuplCapturer::open(target, pref, keep).map(|c| Box::new(c) as Box<dyn Capturer>)
+            dxgi::DuplCapturer::open(target, pref, keep, false)
+                .map(|c| Box::new(c) as Box<dyn Capturer>)
         }
     }
 }

@@ -33,8 +33,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DYNAMIC, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5,
@@ -157,6 +157,7 @@ pub(crate) unsafe fn make_device(
 /// recovery to rebuild the whole capture on the current (possibly secure) input desktop.
 unsafe fn reopen_duplication(
     gdi_name: &str,
+    want_hdr: bool,
 ) -> Result<(
     ID3D11Device,
     ID3D11DeviceContext,
@@ -165,7 +166,8 @@ unsafe fn reopen_duplication(
 )> {
     let (adapter, out) = find_output(gdi_name)?;
     let (dev, ctx) = make_device(&adapter)?;
-    let dupl = duplicate_output(&out, &dev).context("re-DuplicateOutput after ACCESS_LOST")?;
+    let dupl =
+        duplicate_output(&out, &dev, want_hdr).context("re-DuplicateOutput after ACCESS_LOST")?;
     Ok((dev, ctx, out, dupl))
 }
 
@@ -179,13 +181,19 @@ unsafe fn reopen_duplication(
 unsafe fn duplicate_output(
     output: &IDXGIOutput1,
     device: &ID3D11Device,
+    want_hdr: bool,
 ) -> Result<IDXGIOutputDuplication> {
     if let Ok(output5) = output.cast::<IDXGIOutput5>() {
-        // BGRA8 only for now (SDR). NOTE: DuplicateOutput1 returns the FIRST format it can provide and
-        // DXGI will CONVERT to it — so listing FP16 first would hand back FP16 even on an SDR desktop,
-        // wrongly tripping the HDR path. Real HDR capture (FP16 first + IDXGIOutput6 colorspace
-        // detection to pick the path) is the follow-up once the churn is settled.
-        let formats = [DXGI_FORMAT_B8G8R8A8_UNORM];
+        // For an HDR session, request FP16 FIRST so DuplicateOutput1 hands back the desktop's real
+        // scRGB HDR surface → the `hdr_fp16` path converts it to BT.2020 PQ 10-bit for NVENC Main10.
+        // For SDR request BGRA8 only: listing FP16 first would make DXGI hand back FP16 even on an SDR
+        // desktop, wrongly tripping the HDR path. (HDR DDA is used for the secure desktop, where the
+        // SudoVDA may be in HDR and legacy DuplicateOutput — the SDR-era API — can't capture FP16.)
+        let formats: &[DXGI_FORMAT] = if want_hdr {
+            &[DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM]
+        } else {
+            &[DXGI_FORMAT_B8G8R8A8_UNORM]
+        };
         // RETRY DuplicateOutput1. The caller releases the OLD duplication (self.dupl = None) immediately
         // before calling us, and the kernel-side teardown of that duplication is ASYNC — the FIRST
         // DuplicateOutput1 right after can race it and return E_ACCESSDENIED ("output still duplicated")
@@ -207,14 +215,17 @@ unsafe fn duplicate_output(
         // and on the normal desktop the release-before-reduplicate + gentle recovery already keep the
         // legacy dup stable. Raise PUNKTFUNK_DUP_RETRY_N only on a box where DuplicateOutput1 can win
         // the old-dup-teardown race (then PUNKTFUNK_DUP_RETRY_MS sets the per-wait, default 200).
+        // HDR DDA genuinely NEEDS DuplicateOutput1 (legacy DuplicateOutput can't capture an FP16/HDR
+        // desktop — it returns E_INVALIDARG), so give it several attempts even on the secure desktop
+        // rather than bailing after one try to the useless legacy fallback. SDR keeps the default 1.
         let attempts: u64 = std::env::var("PUNKTFUNK_DUP_RETRY_N")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1)
+            .unwrap_or(if want_hdr { 5 } else { 1 })
             .max(1);
         let mut last_err = None;
         for attempt in 0..attempts {
-            match output5.DuplicateOutput1(device, 0, &formats) {
+            match output5.DuplicateOutput1(device, 0, formats) {
                 Ok(d) => {
                     if attempt > 0 {
                         tracing::debug!(
@@ -1026,6 +1037,10 @@ pub struct DuplCapturer {
     /// Format-tagged because the SDR path presents BGRA `gpu_copy` while the HDR path presents the
     /// 10-bit `hdr10_out` — the encoder needs the right format on every frame.
     last_present: Option<(ID3D11Texture2D, PixelFormat)>,
+    /// Whether this capturer should request an HDR (FP16) duplication — `DuplicateOutput1` with FP16
+    /// first, retried (legacy DuplicateOutput can't capture HDR). Set for the secure-desktop DDA leg
+    /// when the SudoVDA is in HDR; threaded into every (re)duplication incl. ACCESS_LOST recovery.
+    want_hdr: bool,
     /// HDR (scRGB FP16) capture state. Set when the duplication surface is `R16G16B16A16_FLOAT`
     /// (the desktop has HDR on). The frame can't be `CopyResource`d into a BGRA target, so the HDR
     /// path copies it into an FP16 SRV texture, composites the cursor, then runs [`HdrConverter`] to
@@ -1080,6 +1095,7 @@ impl DuplCapturer {
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
         keepalive: Box<dyn Send>,
+        want_hdr: bool,
     ) -> Result<Self> {
         unsafe {
             // Stop DXGI hybrid-GPU output reparenting BEFORE we create the factory / enumerate outputs
@@ -1220,7 +1236,7 @@ impl DuplCapturer {
             // (registry-persisted), so the secure desktop has nowhere to render but the output we
             // capture — no per-open re-isolation needed.
             attach_input_desktop();
-            let dupl = duplicate_output(&output, &device)
+            let dupl = duplicate_output(&output, &device, want_hdr)
                 .context("DuplicateOutput (already duplicated by another app?)")?;
             // Did DXGI actually call our win32u GPU-pref hook during factory/device/dupl creation? hits==0
             // here means the hook is NOT on DXGI's reparenting path on this build → reparenting can't be
@@ -1284,6 +1300,7 @@ impl DuplCapturer {
                 gpu_mode,
                 gpu_copy: None,
                 last_present: None,
+                want_hdr,
                 hdr_fp16: dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT,
                 fp16_src: None,
                 fp16_srv: None,
@@ -1602,7 +1619,7 @@ impl DuplCapturer {
         // allows one duplication per output; leaving the stale one alive is exactly why DuplicateOutput1
         // returned E_ACCESSDENIED and the legacy fallback produced a born-lost dup.
         self.dupl = None;
-        let dupl = match duplicate_output(&self.output, &self.device) {
+        let dupl = match duplicate_output(&self.output, &self.device, self.want_hdr) {
             Ok(d) => d,
             Err(_) => return false,
         };
@@ -1664,7 +1681,7 @@ impl DuplCapturer {
         // and the new one is born-lost / E_ACCESSDENIED. (On reopen failure self.dupl stays None and
         // acquire's None-guard re-drives recovery.)
         self.dupl = None;
-        let (dev, ctx, out, dupl) = reopen_duplication(&self.gdi_name)?; // Err → caller repeats + retries
+        let (dev, ctx, out, dupl) = reopen_duplication(&self.gdi_name, self.want_hdr)?; // Err → caller repeats + retries
 
         // (The born-lost guard is now the capture-acquire at the end: we adopt, then grab the current
         // frame; ACCESS_LOST there means born-lost, and we seed black + let the throttled caller retry.)
