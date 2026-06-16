@@ -134,6 +134,8 @@ windows = { version = "0.62", features = [
     "Graphics_DirectX_Direct3D11",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
+    # WGC runs under SYSTEM via interactive-user impersonation (WGC won't activate as SYSTEM).
+    "Win32_System_RemoteDesktop",
 ] }
 # Software H.264 encoder (GPU-less path + NVENC fallback). The default `source` feature statically
 # compiles OpenH264 (BSD-2) — no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.

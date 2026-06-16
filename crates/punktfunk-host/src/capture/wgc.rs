@@ -31,6 +31,7 @@ use windows::Graphics::Capture::{
 };
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11ShaderResourceView,
     ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
@@ -41,11 +42,46 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIOutput6};
+use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
+use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+
+/// The host runs as SYSTEM (so the DDA secure-desktop path works), but WGC will NOT activate under
+/// the SYSTEM account (`CreateForMonitor` → 0x80070424). Impersonate the interactive console user
+/// for the WGC activation. Returns the user token (the caller reverts + closes it after activation)
+/// or `None` (no active user, or the host already runs AS the user — WTSQueryUserToken then fails and
+/// WGC works without impersonation). SYSTEM-only; harmless under a user-token host.
+unsafe fn impersonate_active_user() -> Option<HANDLE> {
+    let session = WTSGetActiveConsoleSessionId();
+    if session == 0xFFFF_FFFF {
+        return None;
+    }
+    let mut token = HANDLE::default();
+    if WTSQueryUserToken(session, &mut token).is_ok() {
+        if ImpersonateLoggedOnUser(token).is_ok() {
+            return Some(token);
+        }
+        let _ = CloseHandle(token);
+    }
+    None
+}
+
+/// RAII: reverts the WGC-activation impersonation when it drops (covers every `?` early-return).
+struct Deimpersonate(Option<HANDLE>);
+impl Drop for Deimpersonate {
+    fn drop(&mut self) {
+        if let Some(tok) = self.0.take() {
+            unsafe {
+                let _ = RevertToSelf();
+                let _ = CloseHandle(tok);
+            }
+        }
+    }
+}
 
 /// Signal from the free-threaded FrameArrived callback to the encode thread: a monotonically
 /// increasing count of arrived frames + a condvar to wake `next_frame`. The encode thread tracks how
@@ -101,7 +137,12 @@ impl WgcCapturer {
             // activation factory (RoGetActivationFactory). Initialize MTA; ignore "already initialized"
             // / "changed mode" (another component on this thread may have init'd a compatible apartment).
             let ro = RoInitialize(RO_INIT_MULTITHREADED);
-            tracing::info!(ro_result = ?ro, "WGC: RoInitialize(MTA)");
+            // Impersonate the interactive user for the duration of WGC activation (host runs as
+            // SYSTEM; WGC won't activate under SYSTEM). Reverted by the guard's Drop on return. The
+            // WGC objects, once created, are accessed from the (SYSTEM) encode thread thereafter.
+            let imp = impersonate_active_user();
+            let _deimp = Deimpersonate(imp);
+            tracing::info!(ro_result = ?ro, impersonated = imp.is_some(), "WGC: RoInitialize(MTA)");
             // The SudoVDA output appears a beat after the display is created — settle-retry like DDA.
             let deadline = Instant::now() + Duration::from_millis(2000);
             let (adapter, output) = loop {
