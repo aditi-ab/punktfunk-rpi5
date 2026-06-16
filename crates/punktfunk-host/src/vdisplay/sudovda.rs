@@ -670,12 +670,23 @@ impl VirtualDisplay for SudoVdaDisplay {
             device_name,
             serial: [0u8; 14],
         };
-        // Pin the IDD's RENDER GPU to the NVENC/capture GPU (e.g. the 4090) BEFORE adding the target.
-        // On a multi-adapter box (SudoVDA IDD + discrete GPU) DXGI otherwise reparents the virtual
-        // output onto whichever GPU its hybrid-preference path resolves, which storms ACCESS_LOST
-        // (0x887A0026) on the secure/HDR desktop. Apollo's SET_RENDER_ADAPTER fixes this and MUST be
-        // issued before ADD. Best-effort: a driver that rejects it just keeps the default render GPU.
-        let pinned = unsafe { resolve_render_adapter_luid() };
+        // SET_RENDER_ADAPTER is OPT-IN. Apollo runs with an EMPTY config and NEVER pins the render
+        // adapter, yet captures the SudoVDA cleanly at the client mode on the 4090 (verified live on
+        // this exact box: no ACCESS_LOST, no MODE_CHANGE storm). On this box our pin is IGNORED by the
+        // driver AND the IDD lands on a DIFFERENT adapter (0x23664) than the one its DXGI output is
+        // enumerated under (the 4090, where we make the capture device) — a cross-GPU mismatch that is
+        // the real source of the perpetual ACCESS_LOST + MODE_CHANGE_IN_PROGRESS storm. So default to
+        // NOT pinning — let the IDD use its natural adapter like Apollo. Opt in with
+        // PUNKTFUNK_RENDER_ADAPTER=<name substring> only on a box that genuinely needs steering.
+        let pinned = if std::env::var("PUNKTFUNK_RENDER_ADAPTER").is_ok() {
+            unsafe { resolve_render_adapter_luid() }
+        } else {
+            tracing::info!(
+                "SudoVDA SET_RENDER_ADAPTER skipped (Apollo-parity: no render pin — avoids cross-GPU \
+                 mismatch; set PUNKTFUNK_RENDER_ADAPTER=<name> to force a specific render GPU)"
+            );
+            None
+        };
         if let Some(luid) = pinned {
             match unsafe { set_render_adapter(self.device, luid) } {
                 Ok(()) => tracing::info!(
