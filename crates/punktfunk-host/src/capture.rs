@@ -258,6 +258,16 @@ pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Bo
     linux::PortalCapturer::from_virtual_output(vout).map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
+/// `PUNKTFUNK_NO_WGC=1` forces the pure single-process DDA (Desktop Duplication) path everywhere: it
+/// skips WGC in [`capture_virtual_output`] AND bypasses the two-process secure-desktop relay (so even a
+/// SYSTEM host captures in-process via DDA, the way Apollo does — one capturer for the normal AND the
+/// secure desktop). For bringing DDA up to parity / validating it on its own; all the WGC code stays
+/// compiled and comes back the moment the flag is unset.
+#[cfg(target_os = "windows")]
+pub(crate) fn wgc_disabled() -> bool {
+    std::env::var_os("PUNKTFUNK_NO_WGC").is_some()
+}
+
 #[cfg(target_os = "windows")]
 pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Box<dyn Capturer>> {
     let target = vout.win_capture.clone().ok_or_else(|| {
@@ -275,7 +285,7 @@ pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Bo
     let backend = std::env::var("PUNKTFUNK_CAPTURE")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if backend == "dda" || backend == "dxgi" {
+    if backend == "dda" || backend == "dxgi" || wgc_disabled() {
         return dxgi::DuplCapturer::open(target, pref, keep)
             .map(|c| Box::new(c) as Box<dyn Capturer>);
     }

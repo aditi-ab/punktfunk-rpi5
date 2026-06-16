@@ -31,6 +31,8 @@ mod mgmt_token;
 mod native_pairing;
 mod pipeline;
 mod pwinit;
+#[cfg(target_os = "windows")]
+mod service;
 mod vdisplay;
 #[cfg(target_os = "windows")]
 mod wgc_helper;
@@ -43,13 +45,28 @@ use m0::{Options, Source};
 use std::path::PathBuf;
 
 fn main() {
-    // Logs go to stderr so stdout stays machine-readable (`punktfunk-host openapi > spec.json`).
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    // `service run` is launched by the SCM with no console — log to a file instead of stderr.
+    #[cfg(target_os = "windows")]
+    let service_run = {
+        let a: Vec<String> = std::env::args().skip(1).take(2).collect();
+        a.first().map(String::as_str) == Some("service")
+            && a.get(1).map(String::as_str) == Some("run")
+    };
+    #[cfg(not(target_os = "windows"))]
+    let service_run = false;
+
+    if service_run {
+        #[cfg(target_os = "windows")]
+        service::init_file_logging(filter);
+    } else {
+        // Logs go to stderr so stdout stays machine-readable (`punktfunk-host openapi > spec.json`).
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
     if let Err(e) = real_main() {
         tracing::error!("{e:#}");
@@ -74,6 +91,13 @@ fn real_main() -> Result<()> {
         env!("PUNKTFUNK_VERSION"),
         punktfunk_core::ABI_VERSION
     );
+
+    // Install Apollo's win32u GPU-preference hook BEFORE anything touches DXGI (the SudoVDA
+    // render-adapter selection creates a DXGI factory during virtual-display setup, well before
+    // capture). On a hybrid-GPU box this stops DXGI from reparenting the virtual output off the
+    // capture GPU — the ACCESS_LOST churn fix. Idempotent (Once); harmless on non-hybrid boxes.
+    #[cfg(target_os = "windows")]
+    crate::capture::dxgi::install_gpu_pref_hook();
 
     match args.first().map(String::as_str) {
         // GameStream host control plane (P1.1: mDNS + serverinfo) + management API, and (with
@@ -226,6 +250,11 @@ fn real_main() -> Result<()> {
                 bit_depth: get("--bit-depth").and_then(|s| s.parse().ok()).unwrap_or(8),
             })
         }
+        // Windows service control: install/uninstall/start/stop/status + the SCM `run` entry point.
+        // Replaces the ad-hoc launch chain — `service install` registers an auto-start SYSTEM service
+        // that launches the host into the active interactive session.
+        #[cfg(target_os = "windows")]
+        Some("service") => service::main(&args[1..]),
         Some("-h") | Some("--help") | Some("help") | None => {
             print_usage();
             Ok(())
@@ -507,5 +536,13 @@ NOTES:
     punktfunk_core host→client loopback that reassembles and byte-verifies each one.
     Both 'serve --native' and 'm3-host' advertise the native service over mDNS
     (_punktfunk._udp) for client auto-discovery — 'punktfunk-client-rs --discover' lists them."
+    );
+    #[cfg(target_os = "windows")]
+    eprintln!(
+        "\nWINDOWS SERVICE (end-user deployment — replaces a manual launch):\n\
+        \x20   punktfunk-host service install    register an auto-start SYSTEM service + firewall rules\n\
+        \x20   punktfunk-host service uninstall  remove the service + firewall rules\n\
+        \x20   punktfunk-host service start|stop|status\n\
+        \x20   config: %ProgramData%\\punktfunk\\host.env"
     );
 }

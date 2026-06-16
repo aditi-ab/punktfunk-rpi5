@@ -2026,6 +2026,19 @@ fn virtual_stream(
     let (mut capturer, mut enc, mut frame, mut interval) =
         build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth)?;
 
+    // Windows single-process DDA path (PUNKTFUNK_NO_WGC=1): the SudoVDA virtual display, isolated as the
+    // SOLE active output, goes into fullscreen independent-flip (one plane on one display) which Desktop
+    // Duplication cannot capture → the born-lost ACCESS_LOST storm we measured on the RTX4090+iGPU box
+    // (hook verified-firing, DPI=2, yet 100% DuplicateOutput1 E_ACCESSDENIED + born-lost). A tiny topmost
+    // layered overlay disqualifies independent-flip and forces DWM composition, which DDA CAN capture.
+    // (Apollo never hits this because it runs WITH a physical monitor attached — multi-display is already
+    // DWM-composited; we isolate to sole-display, so we must force composition ourselves.) Unlike the WGC
+    // relay path — where WGC owns the normal desktop and the overlay is secure-only — here DDA owns the
+    // normal desktop too, so it must run unconditionally. Held for the session; Drop tears it down.
+    // Best-effort; disable with PUNKTFUNK_FORCE_COMPOSED=0.
+    #[cfg(target_os = "windows")]
+    let _composed_flip = crate::capture::composed_flip::ForceComposedFlip::start();
+
     let perf = std::env::var("PUNKTFUNK_PERF").is_ok();
     // Microburst cap (applied in send_loop/paced_submit): a frame ≤ this bursts out immediately;
     // only a bigger frame's overflow is spread. PUNKTFUNK_PACE_BURST_KB overrides the 128 KB default.
@@ -2266,10 +2279,12 @@ fn virtual_stream(
 /// Should this host take the two-process (SYSTEM host + user-session WGC helper) path? Yes when it's
 /// running as SYSTEM — the only account that can capture the secure desktop + drive SendInput on it,
 /// and the account under which in-process WGC won't activate. `PUNKTFUNK_FORCE_HELPER` forces it on
-/// (for testing the relay as a normal user); `PUNKTFUNK_NO_HELPER` forces it off.
+/// (for testing the relay as a normal user); `PUNKTFUNK_NO_HELPER` forces it off. `PUNKTFUNK_NO_WGC`
+/// also forces it off — that mode runs pure single-process DDA (one capturer for the normal AND secure
+/// desktop, Apollo-style), which has no WGC helper to relay.
 #[cfg(target_os = "windows")]
 fn should_use_helper() -> bool {
-    if std::env::var_os("PUNKTFUNK_NO_HELPER").is_some() {
+    if std::env::var_os("PUNKTFUNK_NO_HELPER").is_some() || crate::capture::wgc_disabled() {
         return false;
     }
     std::env::var_os("PUNKTFUNK_FORCE_HELPER").is_some()
@@ -2329,6 +2344,20 @@ fn virtual_stream_relay(
         let target = vout.win_capture.clone().ok_or_else(|| {
             anyhow!("SudoVDA target not yet an active display (needs a WDDM GPU to activate it)")
         })?;
+        // Force the SudoVDA's advanced-color (HDR) state to MATCH the session bit depth BEFORE the WGC
+        // helper captures it. The advanced-color state PERSISTS on the monitor across sessions, so an
+        // 8-bit (SDR) session could otherwise inherit HDR left on by a prior 10-bit run (or our own
+        // earlier toggle) → the helper captures HDR FP16 while the encoder is 8-bit SDR → broken image.
+        // Runs on every build (initial + mode-switch + return-from-secure rebuild), keeping WGC's format
+        // consistent with the encoder. (HDR independent-flip on the secure desktop is handled separately
+        // by dropping to SDR for the DDA leg.)
+        #[cfg(target_os = "windows")]
+        unsafe {
+            if crate::vdisplay::sudovda::set_advanced_color(target.target_id, bit_depth >= 10) {
+                // Let the colorspace change settle before WGC creates its capture item / detects HDR.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
         let relay = HelperRelay::spawn(
             &target,
             (mode.width, mode.height, effective_hz),
@@ -2526,24 +2555,65 @@ fn virtual_stream_relay(
                 "two-process: source switch"
             );
             if secure {
-                if dda.is_none() {
-                    match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz) {
-                        Ok(p) => dda = Some(p),
-                        Err(e) => {
-                            tracing::error!(error = %format!("{e:#}"),
-                                "two-process: DDA open failed — secure desktop will freeze on last frame");
-                        }
+                // SDR-while-secure (HDR sessions ONLY): drop the SudoVDA out of HDR so the secure
+                // (Winlogon) desktop renders SDR/composed — HDR fullscreen independent-flip is what made
+                // DDA storm ACCESS_LOST (black). For an SDR (8-bit) session the output is already SDR, so
+                // toggling is a needless topology change AND its matching restore on the way back would
+                // force the desktop into HDR the 8-bit encoder can't take (broken image).
+                if bit_depth >= 10 {
+                    let toggled = unsafe {
+                        crate::vdisplay::sudovda::set_advanced_color(target.target_id, false)
+                    };
+                    if toggled {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
                     }
                 }
-                if let Some(d) = dda.as_mut() {
-                    d.enc.request_keyframe();
+                dda = None; // reopen so we capture the (SDR) output
+                match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz) {
+                    Ok(mut p) => {
+                        p.enc.request_keyframe();
+                        dda = Some(p);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"),
+                            "two-process: DDA open failed — secure desktop will freeze on last frame");
+                    }
                 }
                 next = std::time::Instant::now();
             } else {
-                // Returning to the helper: drain stale buffered AUs (encoded while we ignored it) and
-                // force a fresh IDR; await_idr then skips the stale deltas until that IDR arrives.
-                while relay.try_recv().is_ok() {}
-                relay.request_keyframe();
+                // Returning to the normal desktop: RESUME from the still-alive WGC helper. Do NOT
+                // recreate the SudoVDA monitor or respawn the helper — build()'s vd.create() is an
+                // IOCTL_REMOVE+ADD of the monitor (the audible disconnect/connect chime + the
+                // teardown/recreate kernel stress that broke DDA, now applied to the mux). The monitor +
+                // helper persist for the WHOLE session; only the host-DDA leg opens (secure) and closes
+                // (normal). Apply the DDA learning here: reuse, don't tear down.
+                dda = None; // free the secure DDA encoder; the relay (helper) is the source again
+                while relay.try_recv().is_ok() {} // drop secure-dwell backlog
+                relay.request_keyframe(); // client decoder resumes on the helper's next IDR
+                if bit_depth >= 10 {
+                    // HDR session ONLY: the secure switch dropped the SudoVDA to SDR for the DDA leg, so
+                    // here we must restore HDR AND rebuild the helper so WGC re-detects the HDR
+                    // colorspace. An SDR session never changed the colorspace → no rebuild, no recreate.
+                    unsafe {
+                        crate::vdisplay::sudovda::set_advanced_color(target.target_id, true);
+                    }
+                    match build(&mut vd, cur_mode) {
+                        Ok((ka, rl, tg, hz)) => {
+                            relay = rl;
+                            _keepalive = ka;
+                            target = tg;
+                            effective_hz = hz;
+                            interval = std::time::Duration::from_secs_f64(1.0 / hz.max(1) as f64);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %format!("{e:#}"),
+                                "two-process: helper rebuild on secure-exit failed");
+                            while relay.try_recv().is_ok() {}
+                            relay.request_keyframe();
+                        }
+                    }
+                }
+                next = std::time::Instant::now();
             }
         }
         if want_kf {

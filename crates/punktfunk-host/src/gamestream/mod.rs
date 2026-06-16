@@ -201,13 +201,25 @@ pub fn serve(mgmt: crate::mgmt::Options, native: Option<crate::m3::NativeServe>)
     })
 }
 
-/// `~/.config/punktfunk`, created on demand — host identity + (later) pairing state live here.
+/// The host config dir (host identity, pairing state, mgmt token, library) — created on demand.
+/// Linux: `$XDG_CONFIG_HOME/punktfunk` or `~/.config/punktfunk`. Windows: `%ProgramData%\punktfunk`
+/// (machine-wide — the SYSTEM service and the interactive user share ONE dir that survives logout).
+/// `PUNKTFUNK_CONFIG_DIR` overrides on both platforms (used by the Windows service config / tests).
 pub(crate) fn config_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("PUNKTFUNK_CONFIG_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    // Windows: %ProgramData% (e.g. C:\ProgramData\punktfunk) — machine-wide, SYSTEM-readable,
+    // persists across user logout, correct for a SYSTEM service. Falls back to %APPDATA% then CWD.
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("ProgramData")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(not(target_os = "windows"))]
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        // Windows: %APPDATA% (e.g. C:\Users\X\AppData\Roaming) — cert/key/paired/uniqueid persist there.
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("punktfunk")
 }

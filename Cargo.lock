@@ -2688,6 +2688,7 @@ dependencies = [
  "wayland-protocols-wlr",
  "wayland-scanner",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "windows-service",
  "x509-parser",
  "xkbcommon",
 ]
@@ -4326,6 +4327,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4555,6 +4562,17 @@ version = "0.4.1"
 source = "git+https://github.com/microsoft/windows-rs?rev=b4129fcc1ae81eec8bf1217539883db821bca3a1#b4129fcc1ae81eec8bf1217539883db821bca3a1"
 dependencies = [
  "windows-link 0.2.1 (git+https://github.com/microsoft/windows-rs?rev=b4129fcc1ae81eec8bf1217539883db821bca3a1)",
+]
+
+[[package]]
+name = "windows-service"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d24d6bcc7f734a4091ecf8d7a64c5f7d7066f45585c1861eba06449909609c8a"
+dependencies = [
+ "bitflags",
+ "widestring",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
