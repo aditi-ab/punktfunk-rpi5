@@ -1,8 +1,9 @@
 //! Windows input injection via `SendInput` (Win32 KeyboardAndMouse) — the Windows analogue of
 //! [`super::wlr`]: absolute mouse normalized to the virtual desktop, relative mouse for games,
 //! scancode keyboard, scroll, buttons. The client already sends Windows VK codes, so there is no
-//! keycode table. Survives UAC/lock desktop switches by reattaching the thread to the current
-//! input desktop before each event (`OpenInputDesktop`/`SetThreadDesktop`).
+//! keycode table. Survives UAC/lock desktop switches with Sunshine's retry-on-failure model: the
+//! thread stays bound to its desktop and only reattaches (`OpenInputDesktop`/`SetThreadDesktop`) when
+//! `SendInput` reports a short write (the input desktop switched) — no per-event reattach overhead.
 
 use anyhow::Result;
 use punktfunk_core::input::{InputEvent, InputKind};
@@ -68,11 +69,20 @@ impl SendInputInjector {
         }
     }
 
-    fn send(inputs: &[INPUT]) -> Result<()> {
+    /// Inject with Sunshine's retry-on-failure model: the thread stays bound to whatever desktop it
+    /// last attached to (no per-event `OpenInputDesktop`/`SetThreadDesktop` — two syscalls saved on
+    /// every mouse move), and only when `SendInput` reports a short write (0 = the input desktop
+    /// switched out from under us, e.g. into UAC/lock) do we reattach to the now-current input desktop
+    /// and retry once. This serves both the normal and secure desktops with no steady-state overhead.
+    fn send(&mut self, inputs: &[INPUT]) -> Result<()> {
+        let n = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+        if n as usize == inputs.len() {
+            return Ok(());
+        }
+        // Short write → the input desktop likely changed. Reattach + retry once.
+        self.reattach_input_desktop();
         let n = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
         if n as usize != inputs.len() {
-            // 0 = blocked (different/secure desktop). Surface as Err so the host service drops +
-            // reopens the injector (which reattaches the input desktop).
             anyhow::bail!(
                 "SendInput injected {n}/{} events (blocked desktop?)",
                 inputs.len()
@@ -94,7 +104,8 @@ impl Drop for SendInputInjector {
 
 impl InputInjector for SendInputInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<()> {
-        self.reattach_input_desktop();
+        // No per-event desktop reattach — `send` reattaches lazily only on a short write (desktop
+        // switch). The injector is bound to the input desktop at open() and follows switches on demand.
         match event.kind {
             InputKind::MouseMove => {
                 let mi = MOUSEINPUT {
@@ -105,7 +116,7 @@ impl InputInjector for SendInputInjector {
                     time: 0,
                     dwExtraInfo: 0,
                 };
-                Self::send(&[mouse(mi)])
+                self.send(&[mouse(mi)])
             }
             InputKind::MouseMoveAbs => {
                 let w = (event.flags >> 16) & 0xffff;
@@ -128,7 +139,7 @@ impl InputInjector for SendInputInjector {
                     time: 0,
                     dwExtraInfo: 0,
                 };
-                Self::send(&[mouse(mi)])
+                self.send(&[mouse(mi)])
             }
             InputKind::MouseButtonDown | InputKind::MouseButtonUp => {
                 let down = event.kind == InputKind::MouseButtonDown;
@@ -183,7 +194,7 @@ impl InputInjector for SendInputInjector {
                     time: 0,
                     dwExtraInfo: 0,
                 };
-                Self::send(&[mouse(mi)])
+                self.send(&[mouse(mi)])
             }
             InputKind::MouseScroll => {
                 // GameStream WHEEL_DELTA(120) units. Windows WHEEL positive=up (matches GameStream —
@@ -201,7 +212,7 @@ impl InputInjector for SendInputInjector {
                     time: 0,
                     dwExtraInfo: 0,
                 };
-                Self::send(&[mouse(mi)])
+                self.send(&[mouse(mi)])
             }
             InputKind::KeyDown | InputKind::KeyUp => {
                 let down = event.kind == InputKind::KeyDown;
@@ -226,7 +237,7 @@ impl InputInjector for SendInputInjector {
                     time: 0,
                     dwExtraInfo: 0,
                 };
-                Self::send(&[key(ki)])
+                self.send(&[key(ki)])
             }
             // Gamepad goes through ViGEm (separate backend). Touch: no SendInput equivalent -> no-op.
             InputKind::GamepadButton
