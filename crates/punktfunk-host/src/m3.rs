@@ -2453,26 +2453,40 @@ fn virtual_stream_relay(
                 },
                 "two-process: source switch"
             );
+            // Rebuild the SudoVDA output FRESH on every source switch — the key insight: a fresh
+            // reconnect captures the secure desktop but the live transition (which reused the
+            // session-start output, created while on the NORMAL desktop) does not. `build` does the
+            // exact reconnect setup: REMOVE + fresh ADD of the virtual monitor + re-isolate + a fresh
+            // capturer, so the new output is in the clean state that DDA can duplicate on the secure
+            // desktop. Drop the old DDA (it's bound to the old target); reopen on the new one.
+            match build(&mut vd, cur_mode) {
+                Ok((ka, rl, tg, hz)) => {
+                    relay = rl; // fresh helper (drops the old) ...
+                    _keepalive = ka; // ... then releases the old output
+                    target = tg;
+                    effective_hz = hz;
+                    interval = std::time::Duration::from_secs_f64(1.0 / hz.max(1) as f64);
+                }
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"),
+                        "two-process: source-switch rebuild failed — staying on the current source");
+                }
+            }
+            dda = None; // old DDA was on the old target
             if secure {
-                if dda.is_none() {
-                    match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz) {
-                        Ok(p) => dda = Some(p),
-                        Err(e) => {
-                            tracing::error!(error = %format!("{e:#}"),
-                                "two-process: DDA open failed — secure desktop will freeze on last frame");
-                        }
+                match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz) {
+                    Ok(mut p) => {
+                        p.enc.request_keyframe();
+                        dda = Some(p);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"),
+                            "two-process: DDA open failed — secure desktop will freeze on last frame");
                     }
                 }
-                if let Some(d) = dda.as_mut() {
-                    d.enc.request_keyframe();
-                }
                 next = std::time::Instant::now();
-            } else {
-                // Returning to the helper: drain stale buffered AUs (encoded while we ignored it) and
-                // force a fresh IDR; await_idr then skips the stale deltas until that IDR arrives.
-                while relay.try_recv().is_ok() {}
-                relay.request_keyframe();
             }
+            // (normal: the fresh helper's first frame is its opening IDR — await_idr clears on it.)
         }
         if want_kf {
             if secure {

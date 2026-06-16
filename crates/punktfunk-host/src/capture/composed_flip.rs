@@ -17,19 +17,21 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use windows::core::{w, PCWSTR};
+use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
     DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_NAME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassW,
-    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST,
-    LWA_ALPHA, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetSystemMetrics,
+    PeekMessageW, RegisterClassW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
+    TranslateMessage, HWND_TOPMOST, LWA_COLORKEY, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SW_SHOWNOACTIVATE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 /// A running force-composed-flip overlay. Drop signals the thread to tear down its window + exit.
@@ -105,6 +107,8 @@ unsafe fn make_overlay() -> Option<HWND> {
         lpfnWndProc: Some(wndproc),
         hInstance: hinst.into(),
         lpszClassName: class,
+        // Paint the window black so LWA_COLORKEY(black) keys it out → visually invisible.
+        hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
         ..Default::default()
     };
     let atom = RegisterClassW(&wc);
@@ -115,15 +119,24 @@ unsafe fn make_overlay() -> Option<HWND> {
             tracing::warn!(err = e.0, "force-composed-flip: RegisterClassW failed");
         }
     }
+    // Cover the WHOLE virtual screen (all outputs incl. the SudoVDA): a 1x1 corner window may not even
+    // sit on the captured output's rect, and independent-flip is per-output. A window overlapping the
+    // output is what disqualifies its flip.
+    let (vx, vy, vw, vh) = (
+        GetSystemMetrics(SM_XVIRTUALSCREEN),
+        GetSystemMetrics(SM_YVIRTUALSCREEN),
+        GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
+        GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
+    );
     let hwnd = match CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
         class,
         w!(""),
         WS_POPUP,
-        0,
-        0,
-        1,
-        1,
+        vx,
+        vy,
+        vw,
+        vh,
         None,
         None,
         Some(hinst.into()),
@@ -137,8 +150,16 @@ unsafe fn make_overlay() -> Option<HWND> {
             return None;
         }
     };
-    // alpha=1: technically visible (so it disqualifies independent-flip) but imperceptible.
-    let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 1, LWA_ALPHA);
+    // Color-key on black: the window is painted black (its WNDCLASS background brush) and black is keyed
+    // out, so it's visually invisible — but DWM counts it as a real opaque window covering the output,
+    // which is what disqualifies the fullscreen independent-flip (a near-zero ALPHA layered window is
+    // often ignored by the flip-eligibility check; a color-keyed one is not).
+    let _ = SetLayeredWindowAttributes(
+        hwnd,
+        windows::Win32::Foundation::COLORREF(0x0000_0000),
+        0,
+        LWA_COLORKEY,
+    );
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     let _ = SetWindowPos(
         hwnd,
