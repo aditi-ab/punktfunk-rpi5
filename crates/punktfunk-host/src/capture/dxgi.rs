@@ -10,7 +10,7 @@
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{s, Interface, PCSTR};
 use windows::Win32::Foundation::{HMODULE, LUID};
@@ -232,10 +232,35 @@ pub(crate) unsafe fn nudge_cursor_onto(output: &IDXGIOutput1) {
     }
 }
 
+/// How many times DXGI has actually called our hooked `NtGdiDdDDIGetCachedHybridQueryValue`. If this
+/// stays 0 while DDA churns with ACCESS_LOST, the hook is NOT on DXGI's GPU-preference path on this
+/// build (so reparenting can't be the cause — look at composition/independent-flip instead). >0 with
+/// continuing churn means the hook fires but reparenting isn't the trigger here.
+static HYBRID_HOOK_HITS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn hybrid_hook_hits() -> u64 {
+    HYBRID_HOOK_HITS.load(Ordering::Relaxed)
+}
+
+// kernel32 — declared directly so we don't pull the whole Win32_System_Diagnostics_Debug feature for
+// one call. FlushInstructionCache serializes the i-cache after the inline patch: the patch is written
+// on the main thread but DXGI runs the hooked export from the encode/worker thread (possibly a
+// different core), so the "same-thread, no flush needed" assumption was wrong.
+#[link(name = "kernel32")]
+extern "system" {
+    fn FlushInstructionCache(h: *mut c_void, base: *const c_void, size: usize) -> i32;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn SetThreadExecutionState(es_flags: u32) -> u32;
+}
+const ES_CONTINUOUS: u32 = 0x8000_0000;
+const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+
 /// Replacement for `win32u.dll!NtGdiDdDDIGetCachedHybridQueryValue`: always report
 /// `D3DKMT_GPU_PREFERENCE_STATE_UNSPECIFIED` (3). We fully replace the function (never call the
 /// original), so no trampoline is needed. (Ported verbatim from Apollo's MinHook hook.)
 unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
+    HYBRID_HOOK_HITS.fetch_add(1, Ordering::Relaxed);
     if gpu_preference.is_null() {
         return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
     }
@@ -259,11 +284,22 @@ pub(crate) fn install_gpu_pref_hook() {
             VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS,
         };
         use windows::Win32::UI::HiDpi::{
+            GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
             SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         };
-        // Per-monitor-v2 DPI awareness — required for IDXGIOutput5::DuplicateOutput1 and matches
-        // Apollo's startup. Best-effort (a no-op if already set by the manifest).
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // Per-monitor-v2 DPI awareness — REQUIRED for IDXGIOutput5::DuplicateOutput1 (without it the
+        // call returns E_ACCESSDENIED forever, forcing the legacy DuplicateOutput path). Matches
+        // Apollo's startup. SetProcessDpiAwarenessContext fails with E_ACCESS_DENIED if awareness was
+        // already set (manifest / earlier call) — log the outcome AND the effective awareness so a
+        // 100% DuplicateOutput1 E_ACCESSDENIED is diagnosable instead of silent.
+        match SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
+            Ok(()) => tracing::info!("DPI awareness set: PER_MONITOR_AWARE_V2"),
+            Err(e) => tracing::warn!(error = %format!("{e:?}"),
+                "SetProcessDpiAwarenessContext failed (already set?) — DuplicateOutput1 may E_ACCESSDENIED"),
+        }
+        // 0=UNAWARE 1=SYSTEM 2=PER_MONITOR(_V2). DuplicateOutput1 needs 2.
+        let awareness = GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()).0;
+        tracing::info!(awareness, "effective DPI awareness (need 2=PER_MONITOR for DuplicateOutput1)");
         let Ok(lib) = LoadLibraryA(s!("win32u.dll")) else {
             tracing::warn!("GPU-pref hook: win32u.dll not loadable — skipping (DDA may churn on hybrid GPUs)");
             return;
@@ -290,11 +326,25 @@ pub(crate) fn install_gpu_pref_hook() {
         std::ptr::copy_nonoverlapping(patch.as_ptr(), target, 12);
         let mut restore = PAGE_PROTECTION_FLAGS(0);
         let _ = VirtualProtect(target as *const c_void, 12, old, &mut restore);
-        // No FlushInstructionCache: the patch lands before the first DXGI call on this same thread, so
-        // the i-cache is coherent (cross-modifying code would need a flush; this is same-thread setup).
-        tracing::info!(
-            "GPU-pref hook installed (win32u hybrid-query -> UNSPECIFIED): DXGI output reparenting disabled"
-        );
+        // Serialize the i-cache: the patch is written here (main thread) but DXGI calls the export from
+        // the capture/encode worker thread — possibly a different core with a stale i-cache, in which
+        // case it would keep running the ORIGINAL function and DXGI would still reparent. (Apollo's
+        // MinHook does this flush internally; our hand-rolled patch must do it explicitly.)
+        let _ = FlushInstructionCache(GetCurrentProcess(), target as *const c_void, 12);
+        // VERIFY the patch actually landed (CFG/hotpatch/short-stub could silently reject it). Read it
+        // back; an error! (not a cheery "installed") makes a dead hook obvious in the logs.
+        let mut readback = [0u8; 12];
+        std::ptr::copy_nonoverlapping(target, readback.as_mut_ptr(), 12);
+        if readback == patch {
+            tracing::info!(
+                "GPU-pref hook installed + verified (win32u hybrid-query -> UNSPECIFIED): reparenting disabled"
+            );
+        } else {
+            tracing::error!(
+                want = %format!("{patch:02x?}"), got = %format!("{readback:02x?}"),
+                "GPU-pref hook patch did NOT land — hook is DEAD (DXGI will still reparent → ACCESS_LOST churn)"
+            );
+        }
     });
 }
 
@@ -944,6 +994,13 @@ pub struct DuplCapturer {
     /// session — `next_frame` keeps repeating the last/seeded frame instead of erroring on its
     /// deadline. The deadline stays fatal only *before* the first frame (a genuine startup misconfig).
     ever_got_frame: bool,
+    /// Consecutive rebuilds that produced a BORN-LOST duplication (created OK, but its first
+    /// AcquireNextFrame instantly returned ACCESS_LOST). On the NORMAL desktop this is the hybrid
+    /// reparent/flip storm — once it persists, `acquire` returns Err so the m3 loop cold-rebuilds the
+    /// whole pipeline (new device/output) instead of spinning on a dead dup forever (the bug where the
+    /// stream froze on the last frame). Reset to 0 by any real frame. NOT armed on the secure
+    /// (Winlogon) desktop, where a long static dwell is legitimate and must never end the session.
+    consecutive_born_lost: u32,
     /// GPU cursor overlay (rebuilt on device recreate). `None` until the first composite.
     cursor: Option<CursorCompositor>,
     /// Last cursor shape, decomposed into alpha + XOR layers (kept device-independent so it survives
@@ -969,6 +1026,11 @@ impl DuplCapturer {
             // Stop DXGI hybrid-GPU output reparenting BEFORE we create the factory / enumerate outputs
             // (the cause of the 0x887A0026 ACCESS_LOST churn on this hybrid box: RTX 4090 + AMD iGPU).
             install_gpu_pref_hook();
+            // Keep the IDD (SudoVDA) virtual display awake for the capture lifetime: an idle indirect
+            // display can be power-gated, which invalidates the duplication (a contributor to the
+            // "freezes randomly while streaming" loss). Restored to ES_CONTINUOUS on Drop. (Apollo does
+            // this too.) Must run on the capture thread (this one owns the capturer).
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
             let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
             // 1) Find the output (monitor) whose GDI DeviceName matches, across ALL adapters. On a
             // real-GPU box the SudoVDA virtual monitor's DXGI output is enumerated under the GPU that
@@ -1078,6 +1140,10 @@ impl DuplCapturer {
             crate::vdisplay::sudovda::reassert_isolation(&target.gdi_name);
             let dupl = duplicate_output(&output, &device)
                 .context("DuplicateOutput (already duplicated by another app?)")?;
+            // Did DXGI actually call our win32u GPU-pref hook during factory/device/dupl creation? hits==0
+            // here means the hook is NOT on DXGI's reparenting path on this build → reparenting can't be
+            // the churn cause (look at independent-flip/composition instead).
+            tracing::info!(hook_hits = hybrid_hook_hits(), "win32u GPU-pref hook call count after open");
             // Kick the first frame loose: a blank virtual display is otherwise change-less.
             nudge_cursor_onto(&output);
             let dd: DXGI_OUTDUPL_DESC = dupl.GetDesc();
@@ -1141,6 +1207,7 @@ impl DuplCapturer {
                 last_rebuild: None,
                 last_recover: None,
                 ever_got_frame: false,
+                consecutive_born_lost: 0,
                 cursor: None,
                 cursor_shape: None,
                 cursor_pos: (0, 0),
@@ -1587,6 +1654,14 @@ impl DuplCapturer {
                 tracing::warn!(error = %format!("{e:#}"), "seed black frame after recovery failed");
             }
         }
+        // Track the born-lost storm: a rebuild that grabbed a real frame clears it; one that came back
+        // born-lost (created OK, first AcquireNextFrame == ACCESS_LOST) advances it. `acquire` uses this
+        // to escape to a full pipeline cold-rebuild on the normal desktop instead of spinning forever.
+        if captured {
+            self.consecutive_born_lost = 0;
+        } else {
+            self.consecutive_born_lost = self.consecutive_born_lost.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -1609,6 +1684,7 @@ impl DuplCapturer {
                     tracing::info!(w = self.width, h = self.height, "DXGI first frame acquired");
                     self.first_frame = false;
                 }
+                self.consecutive_born_lost = 0; // a real frame breaks the born-lost storm
                 self.update_cursor(&info);
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
@@ -1683,6 +1759,25 @@ impl DuplCapturer {
                     }
                 } else {
                     std::thread::sleep(Duration::from_millis(8));
+                }
+                // Escape the born-lost storm on the NORMAL desktop. If rebuilds keep coming back
+                // born-lost (created OK, instant ACCESS_LOST), the cheap+heavy re-duplicate will never
+                // converge — this is the hybrid reparent/independent-flip wedge that froze the stream on
+                // its last frame forever. Surface an error so the m3 loop cold-rebuilds the WHOLE
+                // pipeline (fresh VirtualDisplay + device + output), bounded by MAX_CAPTURE_REBUILDS.
+                // NEVER on the secure (Winlogon) desktop: a long static lock/login/UAC dwell is
+                // legitimate and must not end the session.
+                const BORN_LOST_ESCAPE: u32 = 20; // ~5 s at the 250 ms rebuild throttle
+                if self.ever_got_frame
+                    && self.consecutive_born_lost >= BORN_LOST_ESCAPE
+                    && !crate::capture::desktop_watch::is_secure_desktop()
+                {
+                    tracing::warn!(
+                        consecutive = self.consecutive_born_lost,
+                        "DDA born-lost storm on normal desktop — escalating to full pipeline cold-rebuild"
+                    );
+                    self.consecutive_born_lost = 0;
+                    return Err(anyhow!("DDA born-lost storm — cold-rebuilding capture pipeline"));
                 }
                 return Ok(None);
             }
@@ -1928,6 +2023,10 @@ impl Drop for DuplCapturer {
             unsafe {
                 let _ = self.dupl.ReleaseFrame();
             }
+        }
+        // Release the display/system-required execution state we took at open().
+        unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS);
         }
         // _keepalive drops after, REMOVEing the SudoVDA monitor.
     }
