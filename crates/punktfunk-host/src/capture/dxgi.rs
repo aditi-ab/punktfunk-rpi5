@@ -1401,12 +1401,18 @@ impl DuplCapturer {
         if let Some(n) = crate::vdisplay::sudovda::resolve_gdi_name(self.target_id) {
             self.gdi_name = n;
         }
-        attach_input_desktop();
-        // Re-route the secure (Winlogon) desktop back to the virtual output. The lock/UAC switch can
-        // re-attach a physical monitor so the secure desktop lands there and our virtual output goes
-        // perpetually ACCESS_LOST; re-isolating (as a fresh session's `create` does) is the delta that
-        // makes in-session recovery work like a reconnect. Idempotent/cheap when already isolated.
-        crate::vdisplay::sudovda::reassert_isolation(&self.gdi_name);
+        // Heavy topology work — re-attach the thread to the input desktop AND re-isolate the virtual
+        // output — ONLY on the actual secure (Winlogon) desktop. Entering it can re-attach a physical
+        // monitor and move the secure desktop off our virtual output, which re-isolation fixes. But on
+        // the NORMAL desktop this is just routine ACCESS_LOST churn (HDR overlay / MPO / periodic IddCx
+        // invalidation), and re-isolating there is a DISPLAY-TOPOLOGY CHANGE that itself invalidates the
+        // freshly-rebuilt duplication → a self-feeding ACCESS_LOST storm (200 rebuilds/session observed).
+        // Apollo isolates once at startup and its recovery just re-duplicates; match that off the secure
+        // desktop. (The lock screen / post-login are NOT Winlogon, so they take this light path too.)
+        if crate::capture::desktop_watch::is_secure_desktop() {
+            attach_input_desktop();
+            crate::vdisplay::sudovda::reassert_isolation(&self.gdi_name);
+        }
         let (dev, ctx, out, dupl) = reopen_duplication(&self.gdi_name)?; // Err → caller repeats + retries
 
         // (The born-lost guard is now the capture-acquire at the end: we adopt, then grab the current

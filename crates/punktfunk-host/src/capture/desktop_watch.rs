@@ -101,7 +101,7 @@ impl Drop for DesktopWatcher {
 
 /// True if the current input desktop is "Winlogon" (the secure desktop). Best-effort: if the desktop
 /// can't be opened or named, report not-secure (the safe default — keep WGC/normal capture).
-unsafe fn is_secure_desktop() -> bool {
+pub(crate) unsafe fn is_secure_desktop() -> bool {
     let desk = match OpenInputDesktop(
         DESKTOP_CONTROL_FLAGS(0),
         false,
