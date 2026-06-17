@@ -147,6 +147,87 @@ fn find_device() -> Result<wasapi::Device> {
     })
 }
 
+/// Find the virtual-mic device, and if none exists, try to AUTO-INSTALL one so mic passthrough works
+/// out of the box (then re-find). Falls back to the guidance error if nothing can be installed.
+fn find_or_install_device() -> Result<wasapi::Device> {
+    match find_device() {
+        Ok(d) => Ok(d),
+        Err(e) => {
+            tracing::info!("no virtual mic device present — attempting auto-install");
+            if unsafe { try_install_virtual_mic() } {
+                find_device()
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Best-effort: install a virtual mic device so one exists without the user installing anything.
+/// Mirrors Apollo's Steam Streaming Speakers install — Steam Remote Play ships
+/// `SteamStreamingMicrophone.inf` next to the speakers INF, so install it via `DiInstallDriverW`
+/// (loaded from `newdev.dll`, like Apollo, to avoid an extra windows-crate feature). Needs admin (the
+/// host runs as SYSTEM). Returns true on success; false (no-op) if Steam isn't installed (INF absent),
+/// the install is denied, or `PUNKTFUNK_NO_MIC_INSTALL` is set.
+unsafe fn try_install_virtual_mic() -> bool {
+    use windows::core::{s, w, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+    use windows::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+
+    if std::env::var_os("PUNKTFUNK_NO_MIC_INSTALL").is_some() {
+        return false;
+    }
+    // Steam ships per-arch driver INFs under `Steam\drivers\Windows10\{arch}\`.
+    #[cfg(target_arch = "x86_64")]
+    let subdir = "x64";
+    #[cfg(target_arch = "aarch64")]
+    let subdir = "arm64";
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let subdir = "x86";
+    let template: Vec<u16> = format!(
+        "%CommonProgramFiles(x86)%\\Steam\\drivers\\Windows10\\{subdir}\\SteamStreamingMicrophone.inf"
+    )
+    .encode_utf16()
+    .chain(std::iter::once(0))
+    .collect();
+    let mut path = vec![0u16; 1024];
+    let n = ExpandEnvironmentStringsW(PCWSTR(template.as_ptr()), Some(path.as_mut_slice()));
+    if n == 0 || n as usize > path.len() {
+        return false;
+    }
+
+    let Ok(newdev) = LoadLibraryExW(w!("newdev.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) else {
+        tracing::warn!("could not load newdev.dll — virtual-mic auto-install unavailable");
+        return false;
+    };
+    let Some(addr) = GetProcAddress(newdev, s!("DiInstallDriverW")) else {
+        return false;
+    };
+    // BOOL DiInstallDriverW(HWND hwndParent, PCWSTR InfPath, DWORD Flags, PBOOL NeedReboot)
+    type DiInstall = unsafe extern "system" fn(HWND, PCWSTR, u32, *mut i32) -> i32;
+    let f: DiInstall = std::mem::transmute(addr);
+    let ok = f(
+        HWND(std::ptr::null_mut()),
+        PCWSTR(path.as_ptr()),
+        0,
+        std::ptr::null_mut(),
+    ) != 0;
+    if ok {
+        tracing::info!("installed the Steam Streaming Microphone virtual device");
+        std::thread::sleep(Duration::from_secs(5)); // let the audio subsystem register the endpoint
+    } else {
+        let err = windows::Win32::Foundation::GetLastError();
+        tracing::info!(
+            ?err,
+            "no virtual mic auto-installed (Steam absent / not admin) — see manual-install guidance"
+        );
+    }
+    ok
+}
+
 fn render_thread(
     queue: Arc<Mutex<VecDeque<u8>>>,
     stop: Arc<AtomicBool>,
@@ -162,7 +243,7 @@ fn render_thread(
     // Open + start the render stream. The WASAPI objects must outlive the loop, so build them here and
     // keep them (a closure that *returned* them would drop them); on any failure report Err and exit.
     let setup = (|| -> Result<(wasapi::AudioClient, wasapi::AudioRenderClient, wasapi::Handle, String)> {
-        let device = find_device()?;
+        let device = find_or_install_device()?;
         let name = device.get_friendlyname().unwrap_or_else(|_| "virtual mic".into());
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
         // 48 kHz stereo f32; autoconvert lets WASAPI shared-mode SRC match the device mix format.
