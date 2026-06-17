@@ -108,8 +108,14 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    default, saved-hosts list, .deb + RPM-subpackage CI (deb.yml/rpm.yml). **VAAPI decode
    → DRM-PRIME dmabuf → `GdkDmabufTexture`** (BT.709 color state; Tier-1 zero-copy on
    Intel/AMD, `PUNKTFUNK_DECODER=software|vaapi` override) with a proven fallback ladder —
-   no VAAPI device (NVIDIA) or mid-session VAAPI error → software decode; needs an
-   Intel/AMD client box to live-verify the hw path. Next: the stage-2 raw-Wayland
+   no VAAPI device (NVIDIA) or mid-session VAAPI error → software decode. **First AMD test
+   (Steam Deck) hit a green-screen bug, fixed:** FFmpeg's VAAPI export uses
+   `SEPARATE_LAYERS`, so NV12 arrives as two single-plane layers (R8 luma + GR88 chroma,
+   one shared fd); the mapper took `layers[0]` only → GTK got a luma-only R8 texture, chroma
+   read as 0 → green field / red whites. Fix derives the combined fourcc from the decoder
+   `sw_format` (→ `DRM_FORMAT_NV12`) and flattens all planes across all layers (mpv's
+   pattern); a first-frame descriptor dump logs the real layout. Awaiting Steam Deck
+   reconfirm. Next: the stage-2 raw-Wayland
    presenter (wp_presentation feedback, tearing-control, Vulkan Video on NVIDIA) —
    **wgpu/winit rejected** (no dmabuf import / presentation feedback / shortcuts-inhibit).
    **Windows stage 1 done 2026-06-15** (`crates/punktfunk-client-windows`, binary

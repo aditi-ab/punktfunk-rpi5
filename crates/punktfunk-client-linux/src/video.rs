@@ -43,7 +43,8 @@ pub struct CpuFrame {
 pub struct DmabufFrame {
     pub width: u32,
     pub height: u32,
-    /// DRM fourcc of the layer (NV12 for 8-bit VAAPI output).
+    /// Combined DRM fourcc of the whole surface (NV12 for 8-bit VAAPI output), derived
+    /// from the decoder's software format — NOT the per-plane component formats.
     pub fourcc: u32,
     pub modifier: u64,
     pub planes: Vec<DmabufPlane>,
@@ -292,12 +293,31 @@ impl VaapiDecoder {
 
     /// Map the VAAPI surface to DRM PRIME (zero copy) and lift the descriptor into a
     /// `DmabufFrame`. The mapped frame keeps the surface alive via its buffer refs.
+    ///
+    /// FFmpeg's VAAPI export uses `VA_EXPORT_SURFACE_SEPARATE_LAYERS`, so an NV12 surface
+    /// comes back as TWO layers (`R8` luma + `GR88` chroma), each one plane — NOT a single
+    /// `NV12` layer. The previous code took `layers[0]` only: GTK then saw an `R8`
+    /// single-plane texture with the chroma dropped, painting the screen green. The fix:
+    /// derive the COMBINED fourcc from the decoder's software pixel format (NV12 →
+    /// `DRM_FORMAT_NV12`) and flatten every plane across every layer in order (Y then UV).
     unsafe fn map_dmabuf(&mut self) -> Result<DmabufFrame> {
         use ffmpeg::ffi;
         unsafe {
             if (*self.frame).format != ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
                 bail!("decoder returned a software frame (no VAAPI surface)");
             }
+            // The real pixel layout lives on the hardware frames context, not the
+            // DRM-PRIME layer formats (those are the per-plane R8/GR88 component formats).
+            let sw_format = {
+                let hwfc = (*self.frame).hw_frames_ctx;
+                if hwfc.is_null() {
+                    bail!("VAAPI frame without a hardware frames context");
+                }
+                (*((*hwfc).data as *const ffi::AVHWFramesContext)).sw_format
+            };
+            let fourcc = drm_fourcc_for(sw_format)
+                .ok_or_else(|| anyhow!("unsupported VAAPI output format {sw_format:?}"))?;
+
             let drm = ffi::av_frame_alloc();
             (*drm).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
             let r = ffi::av_hwframe_map(drm, self.frame, ffi::AV_HWFRAME_MAP_READ as i32);
@@ -309,29 +329,84 @@ impl VaapiDecoder {
             let desc = (*drm).data[0] as *const ffi::AVDRMFrameDescriptor;
             let guard = DrmFrameGuard(drm);
             let d = &*desc;
-            if d.nb_layers < 1 {
-                bail!("DRM descriptor without layers");
+            if d.nb_layers < 1 || d.nb_objects < 1 {
+                bail!("DRM descriptor without layers/objects");
             }
-            let layer = &d.layers[0];
-            let mut planes = Vec::with_capacity(layer.nb_planes as usize);
-            for p in &layer.planes[..layer.nb_planes as usize] {
-                let obj = &d.objects[p.object_index as usize];
-                planes.push(DmabufPlane {
-                    fd: obj.fd,
-                    offset: p.offset as u32,
-                    stride: p.pitch as u32,
-                });
+
+            // Flatten planes across ALL layers, in declared order — the combined fourcc's
+            // plane order (Y, then UV for NV12) matches the layer order FFmpeg emits.
+            let mut planes = Vec::new();
+            for layer in &d.layers[..d.nb_layers as usize] {
+                for p in &layer.planes[..layer.nb_planes as usize] {
+                    let obj = &d.objects[p.object_index as usize];
+                    planes.push(DmabufPlane {
+                        fd: obj.fd,
+                        offset: p.offset as u32,
+                        stride: p.pitch as u32,
+                    });
+                }
             }
+
+            // The whole surface shares one tiling modifier (one BO on radeonsi); GTK takes
+            // a single modifier for the texture.
+            let modifier = d.objects[0].format_modifier;
+
+            log_descriptor_once(d, sw_format, fourcc, modifier);
+
             Ok(DmabufFrame {
                 width: (*self.frame).width as u32,
                 height: (*self.frame).height as u32,
-                fourcc: layer.format,
-                modifier: d.objects[0].format_modifier,
+                fourcc,
+                modifier,
                 planes,
                 guard,
             })
         }
     }
+}
+
+/// `fourcc(a,b,c,d)` — the DRM FourCC packing (little-endian, `a | b<<8 | c<<16 | d<<24`).
+const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+}
+
+/// The combined DRM FourCC for a decoder software pixel format. The host streams 8-bit
+/// 4:2:0 (NV12); P010 is here for the eventual 10-bit/HDR path.
+fn drm_fourcc_for(sw: ffmpeg_next::ffi::AVPixelFormat) -> Option<u32> {
+    use ffmpeg_next::ffi::AVPixelFormat::*;
+    Some(match sw {
+        AV_PIX_FMT_NV12 => fourcc(b'N', b'V', b'1', b'2'),
+        AV_PIX_FMT_P010LE => fourcc(b'P', b'0', b'1', b'0'),
+        _ => return None,
+    })
+}
+
+/// One-time dump of the DRM descriptor layout (objects, layers, planes, modifier) — so a
+/// new client/driver combination's real layout is visible in the logs without a debugger.
+fn log_descriptor_once(
+    d: &ffmpeg_next::ffi::AVDRMFrameDescriptor,
+    sw: ffmpeg_next::ffi::AVPixelFormat,
+    fourcc: u32,
+    modifier: u64,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(true);
+    if !ONCE.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let layers: Vec<(u32, i32)> = d.layers[..d.nb_layers.max(0) as usize]
+        .iter()
+        .map(|l| (l.format, l.nb_planes))
+        .collect();
+    tracing::info!(
+        sw_format = ?sw,
+        chosen_fourcc = format_args!("{:#010x}", fourcc),
+        nb_objects = d.nb_objects,
+        nb_layers = d.nb_layers,
+        ?layers,
+        modifier = format_args!("{:#018x}", modifier),
+        "VAAPI dmabuf descriptor layout (first frame)"
+    );
 }
 
 impl Drop for VaapiDecoder {
@@ -343,5 +418,26 @@ impl Drop for VaapiDecoder {
             ffi::avcodec_free_context(&mut self.ctx);
             ffi::av_buffer_unref(&mut self.hw_device);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lock the DRM FourCC magic numbers against typos — these are the exact values
+    /// `<drm_fourcc.h>` defines, and a wrong one is what painted the Steam Deck green.
+    #[test]
+    fn drm_fourcc_constants() {
+        assert_eq!(fourcc(b'N', b'V', b'1', b'2'), 0x3231_564e);
+        assert_eq!(fourcc(b'P', b'0', b'1', b'0'), 0x3031_3050);
+        assert_eq!(
+            drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12),
+            Some(0x3231_564e)
+        );
+        assert_eq!(
+            drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGBA),
+            None
+        );
     }
 }
