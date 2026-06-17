@@ -135,7 +135,18 @@ modules:
         CARGO_HOME: /run/build/punktfunk-client/cargo
         CARGO_NET_OFFLINE: 'true'
     build-commands:
-      - cargo --offline build --release --locked -p punktfunk-client-linux
+      # Drop the Windows client from the workspace before building. It pins windows-rs as a
+      # git dependency (cfg(windows)-gated, but cargo resolves it for the whole workspace
+      # regardless of target), and that git source is deliberately NOT vendored into
+      # cargo-sources.json — see packaging/flatpak/prune-windows-lock.py, which strips it so
+      # flatpak-builder doesn't full-clone the multi-GB windows-rs repo. Without removing the
+      # member, `cargo --offline` would try to load the un-vendored windows-rs source and fail
+      # ("can't checkout ... you are in the offline mode"). The flatpak never compiles the
+      # Windows client; this edits only the sandbox copy of Cargo.toml. (No --locked: the lock
+      # no longer matches the reduced member set; --offline still pins every crate to the
+      # vendored cargo-sources.json, so the build stays reproducible.)
+      - sed -i '\#"crates/punktfunk-client-windows",#d' Cargo.toml
+      - cargo --offline build --release -p punktfunk-client-linux
       - install -Dm0755 target/release/punktfunk-client ${FLATPAK_DEST}/bin/punktfunk-client
       # Desktop entry (renamed to the app id; Exec is the in-sandbox binary).
       - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.desktop
