@@ -15,7 +15,7 @@
 
 use super::{Codec, EncodedFrame, Encoder};
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
@@ -130,19 +130,124 @@ impl NvencD3d11Encoder {
         self.next = 0;
     }
 
+    /// Open + configure + initialize ONE NVENC session at `bitrate` (bps) and `split_mode`. Returns
+    /// the session handle, or destroys it and returns the error. NVENC has no re-init after a failed
+    /// `initialize_encoder`, so the bitrate-clamp search in `init_session` calls this once per probe.
+    unsafe fn try_open_session(
+        &self,
+        device: &ID3D11Device,
+        bitrate: u64,
+        split_mode: u32,
+    ) -> Result<*mut c_void> {
+        let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+            version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+            deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
+            device: device.as_raw(),
+            apiVersion: nv::NVENCAPI_VERSION,
+            ..Default::default()
+        };
+        let mut enc: *mut c_void = ptr::null_mut();
+        (API.open_encode_session_ex)(&mut params, &mut enc)
+            .result_without_string()
+            .map_err(|e| anyhow!("NVENC open_encode_session_ex: {e:?} (no NVIDIA GPU?)"))?;
+
+        // Seed the P1 + ultra-low-latency preset config.
+        let mut preset = nv::NV_ENC_PRESET_CONFIG {
+            version: nv::NV_ENC_PRESET_CONFIG_VER,
+            presetCfg: nv::NV_ENC_CONFIG {
+                version: nv::NV_ENC_CONFIG_VER,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if let Err(e) = (API.get_encode_preset_config_ex)(
+            enc,
+            self.codec_guid,
+            nv::NV_ENC_PRESET_P1_GUID,
+            nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+            &mut preset,
+        )
+        .result_without_string()
+        {
+            let _ = (API.destroy_encoder)(enc);
+            return Err(anyhow!("get_encode_preset_config_ex: {e:?}"));
+        }
+        let mut cfg = preset.presetCfg;
+
+        // Mirror the Linux RC config: CBR, infinite GOP, P-only, ~1-frame VBV.
+        cfg.gopLength = nv::NVENC_INFINITE_GOPLENGTH;
+        cfg.frameIntervalP = 1;
+        cfg.rcParams.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
+        let bps = bitrate.min(u32::MAX as u64) as u32;
+        cfg.rcParams.averageBitRate = bps;
+        cfg.rcParams.maxBitRate = bps;
+        // Shrink the VBV with the bitrate — NVENC validates it against the same level ceiling.
+        let vbv = (bitrate as f64 / self.fps.max(1) as f64) as u32;
+        cfg.rcParams.vbvBufferSize = vbv;
+        cfg.rcParams.vbvInitialDelay = vbv;
+
+        // HIGH tier + autoselect level. The codec's PER-LEVEL bitrate ceiling is otherwise the
+        // MAIN-tier cap — for HEVC at 5K that's Level 6.2 Main ≈ 240 Mbps. HIGH tier lifts the HEVC
+        // ceiling to ≈800 Mbps (AV1 higher still); autoselect lets NVENC pick the level for the
+        // tier+bitrate. `tier`/`level` are u32 (HIGH=1, AUTOSELECT=0); HEVC/AV1 share the union offset.
+        cfg.encodeCodecConfig.hevcConfig.tier = 1;
+        cfg.encodeCodecConfig.hevcConfig.level = 0;
+
+        // 10-bit HEVC Main10 (HDR foundation): NVENC upconverts the 8-bit input; 8-bit leaves the
+        // preset default (Main) untouched.
+        if self.bit_depth == 10 {
+            cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_MAIN10_GUID;
+            cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2); // 10 - 8
+        }
+
+        // HDR colour signaling: BT.2020 primaries + SMPTE ST 2084 (PQ) in the HEVC VUI.
+        if self.hdr {
+            let vui = &mut cfg.encodeCodecConfig.hevcConfig.hevcVUIParameters;
+            vui.videoSignalTypePresentFlag = 1;
+            vui.videoFullRangeFlag = 0; // limited (studio) range — NVENC RGB→YUV default
+            vui.colourDescriptionPresentFlag = 1;
+            vui.colourPrimaries = nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
+            vui.transferCharacteristics =
+                nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
+            vui.colourMatrix = nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+        }
+
+        let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
+            version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
+            encodeGUID: self.codec_guid,
+            presetGUID: nv::NV_ENC_PRESET_P1_GUID,
+            tuningInfo: nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+            encodeWidth: self.width,
+            encodeHeight: self.height,
+            darWidth: self.width,
+            darHeight: self.height,
+            frameRateNum: self.fps,
+            frameRateDen: 1,
+            enablePTD: 1,
+            encodeConfig: &mut cfg,
+            ..Default::default()
+        };
+        // splitEncodeMode is a C bitfield — set via the generated accessor, not a struct field.
+        init.set_splitEncodeMode(split_mode);
+
+        match (API.initialize_encoder)(enc, &mut init).result_without_string() {
+            Ok(()) => Ok(enc),
+            Err(e) => {
+                let _ = (API.destroy_encoder)(enc);
+                Err(anyhow!("initialize_encoder: {e:?}"))
+            }
+        }
+    }
+
     /// Lazily create the session on the first frame's D3D11 device (so capture + encode share it).
     fn init_session(&mut self, device: &ID3D11Device) -> Result<()> {
         unsafe {
-            // Probe-and-step-down on the bitrate. NVENC rejects `initialize_encoder` with InvalidParam
-            // when `averageBitRate` exceeds what the GPU's max codec level can express (e.g. a 1.6 Gbps
-            // request on HEVC). Mirror the Linux host's strategy: try the requested rate, and on
-            // failure drop to 3/4 and retry, down to a floor — so the connection ALWAYS succeeds at the
-            // highest bitrate THIS GPU supports (a newer GPU that accepts the request keeps it
-            // untouched; only an over-asking client gets clamped). Each attempt re-opens a fresh
-            // session (NVENC has no re-init after a failed initialize).
+            // Bitrate clamp (see the search below): NVENC rejects `initialize_encoder` when the bitrate
+            // exceeds the GPU's max codec level. We try the requested rate, then binary-search down to
+            // the MAX the level accepts and clamp to it — so an over-asking client (e.g. 1 Gbps on HEVC)
+            // gets the highest the GPU can actually do, not a coarse fraction of it.
             const FLOOR_BPS: u64 = 10_000_000;
             let requested_bps = self.bitrate_bps;
-            let mut bitrate = self.bitrate_bps;
             // 2-way NVENC split-frame encoding (Ada dual-NVENC) — the high-pixel-rate throughput lever
             // the Linux host enables via libavcodec `split_encode_mode`. A single Ada NVENC session tops
             // out ~0.8 Gpix/s, so at high motion a 5K@240 (1.77 Gpix/s) frame takes ~8 ms to encode and
@@ -180,150 +285,76 @@ impl NvencD3d11Encoder {
                 pixel_rate,
                 "NVENC split-encode mode (0=disable 1=auto-forced 2=two 3=three 4=auto)"
             );
-            let enc = loop {
-                // 1. open the session bound to the D3D11 device.
-                let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
-                    version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
-                    deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
-                    device: device.as_raw(),
-                    apiVersion: nv::NVENCAPI_VERSION,
-                    ..Default::default()
-                };
-                let mut enc: *mut c_void = ptr::null_mut();
-                (API.open_encode_session_ex)(&mut params, &mut enc)
-                    .result_without_string()
-                    .map_err(|e| anyhow!("NVENC open_encode_session_ex: {e:?} (no NVIDIA GPU?)"))?;
+            // Find the highest bitrate the GPU's codec LEVEL accepts and CLAMP to it. NVENC rejects
+            // `initialize_encoder` (InvalidParam) when the bitrate exceeds the level ceiling (e.g. a
+            // 1 Gbps request on HEVC). Strategy: try the requested rate; if the only problem is a forced
+            // split-encode mode the codec doesn't support, disable split and retry; if the bitrate
+            // itself is too high, binary-search [FLOOR, requested] for the MAX accepted rate and clamp
+            // to THAT (don't undershoot — the old ×¾ step-down landed well below the real ceiling).
+            const CLAMP_TOL_BPS: u64 = 20_000_000; // stop bisecting within ~20 Mbps of the ceiling
 
-                // 2. seed the P1 + ultra-low-latency preset config.
-                let mut preset = nv::NV_ENC_PRESET_CONFIG {
-                    version: nv::NV_ENC_PRESET_CONFIG_VER,
-                    presetCfg: nv::NV_ENC_CONFIG {
-                        version: nv::NV_ENC_CONFIG_VER,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                if let Err(e) = (API.get_encode_preset_config_ex)(
-                    enc,
-                    self.codec_guid,
-                    nv::NV_ENC_PRESET_P1_GUID,
-                    nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
-                    &mut preset,
-                )
-                .result_without_string()
-                {
-                    let _ = (API.destroy_encoder)(enc);
-                    return Err(anyhow!("get_encode_preset_config_ex: {e:?}"));
+            let mut probe = self.try_open_session(device, requested_bps, split_mode);
+            // Disambiguate a forced-split rejection from a bitrate-cap rejection: retry once at the
+            // requested rate with split disabled — if THAT succeeds, split was the problem, not bitrate.
+            let split_forced = split_mode
+                != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE as u32
+                && split_mode != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
+            if probe.is_err() && split_forced {
+                let no_split = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
+                if let Ok(e) = self.try_open_session(device, requested_bps, no_split) {
+                    tracing::warn!("NVENC: split-encode rejected by codec/config — disabled");
+                    split_mode = no_split;
+                    probe = Ok(e);
                 }
-                let mut cfg = preset.presetCfg;
+            }
 
-                // 3. mirror the Linux RC config: CBR, infinite GOP, P-only, ~1-frame VBV.
-                cfg.gopLength = nv::NVENC_INFINITE_GOPLENGTH;
-                cfg.frameIntervalP = 1;
-                cfg.rcParams.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
-                let bps = bitrate.min(u32::MAX as u64) as u32;
-                cfg.rcParams.averageBitRate = bps;
-                cfg.rcParams.maxBitRate = bps;
-                // Shrink the VBV with the bitrate — NVENC validates it against the same level ceiling.
-                let vbv = (bitrate as f64 / self.fps.max(1) as f64) as u32;
-                cfg.rcParams.vbvBufferSize = vbv;
-                cfg.rcParams.vbvInitialDelay = vbv;
-
-                // HIGH tier + autoselect level. The codec's PER-LEVEL bitrate ceiling is otherwise the
-                // MAIN-tier cap — for HEVC at 5K that's Level 6.2 Main ≈ 240 Mbps — so a high client
-                // bitrate (e.g. 1 Gbps) makes `initialize_encoder` reject it and the step-down loop below
-                // silently QUARTERS it to ~240-320 Mbps (visible color/motion compression). HIGH tier
-                // lifts the HEVC ceiling to ≈800 Mbps (AV1 higher still); autoselect lets NVENC pick the
-                // matching level for the tier+bitrate. `tier`/`level` are u32; HIGH = 1, AUTOSELECT = 0,
-                // and HEVC/AV1 share the union offset so this is correct for both codecs.
-                cfg.encodeCodecConfig.hevcConfig.tier = 1; // NV_ENC_TIER_*_HIGH
-                cfg.encodeCodecConfig.hevcConfig.level = 0; // NV_ENC_LEVEL_AUTOSELECT
-
-                // 3b. 10-bit HEVC Main10. The 8-bit ARGB capture input is upconverted by NVENC (the
-                // proven high-bit-depth-from-8-bit path); the encoded stream is 10-bit, which removes
-                // banding and is the foundation for HDR. Color stays BT.709 here (Phase 2 sets the
-                // BT.2020/PQ VUI + HDR10 metadata). 8-bit leaves the preset default (Main) untouched.
-                if self.bit_depth == 10 {
-                    cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_MAIN10_GUID;
-                    cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2);
-                    // 10 - 8
+            let enc = match probe {
+                Ok(enc) => {
+                    self.bitrate_bps = requested_bps;
+                    enc
                 }
-
-                // 3c. HDR colour signaling: BT.2020 primaries + SMPTE ST 2084 (PQ) transfer in the
-                // HEVC VUI, so a decoder/display knows the 10-bit samples are PQ HDR (not SDR gamma).
-                // The capturer already produced PQ-encoded BT.2020 pixels; this just describes them.
-                // (HDR10 static metadata — mastering display + MaxCLL/MaxFALL — is added in a follow-up.)
-                if self.hdr {
-                    let vui = &mut cfg.encodeCodecConfig.hevcConfig.hevcVUIParameters;
-                    vui.videoSignalTypePresentFlag = 1;
-                    vui.videoFullRangeFlag = 0; // limited (studio) range — NVENC RGB→YUV default
-                    vui.colourDescriptionPresentFlag = 1;
-                    vui.colourPrimaries =
-                        nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
-                    vui.transferCharacteristics =
-                        nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
-                    vui.colourMatrix =
-                        nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
-                }
-
-                // 4. initialize the encoder.
-                let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
-                    version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
-                    encodeGUID: self.codec_guid,
-                    presetGUID: nv::NV_ENC_PRESET_P1_GUID,
-                    tuningInfo: nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
-                    encodeWidth: self.width,
-                    encodeHeight: self.height,
-                    darWidth: self.width,
-                    darHeight: self.height,
-                    frameRateNum: self.fps,
-                    frameRateDen: 1,
-                    enablePTD: 1,
-                    encodeConfig: &mut cfg,
-                    ..Default::default()
-                };
-                // splitEncodeMode is a C bitfield — set via the generated accessor, not a struct field.
-                init.set_splitEncodeMode(split_mode);
-
-                match (API.initialize_encoder)(enc, &mut init).result_without_string() {
-                    Ok(()) => {
-                        self.bitrate_bps = bitrate;
-                        break enc;
+                Err(_) => {
+                    // Requested bitrate exceeds the codec-level ceiling — binary-search the max accepted.
+                    // `lo` is the highest known-good rate (FLOOR is assumed to fit), `hi` the lowest
+                    // rejected; `best` holds the live session at `lo` so we end up with the clamped one.
+                    let mut lo = FLOOR_BPS;
+                    let mut hi = requested_bps;
+                    let mut best: *mut c_void = ptr::null_mut();
+                    let mut best_bps = 0u64;
+                    while hi > lo + CLAMP_TOL_BPS {
+                        let mid = lo + (hi - lo) / 2;
+                        match self.try_open_session(device, mid, split_mode) {
+                            Ok(e) => {
+                                if !best.is_null() {
+                                    let _ = (API.destroy_encoder)(best);
+                                }
+                                best = e;
+                                best_bps = mid;
+                                lo = mid;
+                            }
+                            Err(_) => hi = mid,
+                        }
                     }
-                    Err(e) if bitrate > FLOOR_BPS => {
-                        let _ = (API.destroy_encoder)(enc);
-                        let next = (bitrate * 3 / 4).max(FLOOR_BPS);
-                        tracing::warn!(
-                            tried_mbps = bitrate / 1_000_000,
-                            next_mbps = next / 1_000_000,
-                            error = ?e,
-                            "NVENC initialize_encoder rejected bitrate — stepping down (GPU codec-level cap)"
-                        );
-                        bitrate = next;
-                        continue;
+                    if best.is_null() {
+                        // Nothing in (FLOOR, requested] accepted — fall back to the floor itself, also
+                        // trying split-disabled in case a forced split (not the bitrate) is the blocker.
+                        let no_split =
+                            nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
+                        best = self
+                            .try_open_session(device, FLOOR_BPS, split_mode)
+                            .or_else(|_| self.try_open_session(device, FLOOR_BPS, no_split))
+                            .context(
+                                "NVENC initialize_encoder rejected even at the floor bitrate",
+                            )?;
+                        best_bps = FLOOR_BPS;
                     }
-                    // Last resort at the floor bitrate: if split-encode was forced and init still
-                    // fails, the codec/config may not accept it (e.g. H264) — disable split and retry
-                    // single-engine rather than fail the session.
-                    Err(e)
-                        if split_mode
-                            != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE as u32
-                            && split_mode
-                                != nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE
-                                    as u32 =>
-                    {
-                        let _ = (API.destroy_encoder)(enc);
-                        tracing::warn!(error = ?e, "NVENC init rejected with split-encode forced — disabling split, retrying single-engine");
-                        split_mode = nv::NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_DISABLE_MODE as u32;
-                        continue;
-                    }
-                    Err(e) => {
-                        let _ = (API.destroy_encoder)(enc);
-                        return Err(anyhow!(
-                            "initialize_encoder: {e:?} (even at {} Mbps floor)",
-                            FLOOR_BPS / 1_000_000
-                        ));
-                    }
+                    tracing::warn!(
+                        requested_mbps = requested_bps / 1_000_000,
+                        clamped_mbps = best_bps / 1_000_000,
+                        "NVENC: requested bitrate above the GPU codec-level ceiling — clamped to the max accepted"
+                    );
+                    self.bitrate_bps = best_bps;
+                    best
                 }
             };
             self.encoder = enc;
