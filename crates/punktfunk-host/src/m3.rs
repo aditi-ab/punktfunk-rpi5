@@ -3180,7 +3180,7 @@ mod tests {
                 CompositorPref::Auto,
                 GamepadPref::Auto,
                 0,
-                0, // video_caps
+                0,    // video_caps
                 None, // launch
                 None,
                 Some((cert.clone(), key.clone())),
@@ -3212,7 +3212,7 @@ mod tests {
             CompositorPref::Auto,
             GamepadPref::Auto,
             0,
-            0, // video_caps
+            0,    // video_caps
             None, // launch
             None,
             Some((cert, key)),
@@ -3273,7 +3273,7 @@ mod tests {
                 CompositorPref::Auto,
                 GamepadPref::Auto,
                 0,
-                0, // video_caps
+                0,    // video_caps
                 None, // launch
                 None,
                 None,
@@ -3300,7 +3300,7 @@ mod tests {
             CompositorPref::Auto,
             GamepadPref::Auto,
             0,
-            0, // video_caps
+            0,    // video_caps
             None, // launch
             Some(host_fp),
             Some((cert.clone(), key.clone())),
