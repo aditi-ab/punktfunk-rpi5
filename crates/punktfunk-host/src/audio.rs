@@ -67,18 +67,27 @@ pub trait VirtualMic: Send {
     }
 }
 
-/// Open a virtual microphone PipeWire source with `channels` interleaved channels (1 or 2).
+/// Open a virtual microphone with `channels` interleaved channels (1 or 2). Linux: a PipeWire
+/// `Audio/Source`. Windows: writes into an existing virtual audio device's render endpoint (whose
+/// capture endpoint apps see as a mic) — see [`wasapi_mic`].
 #[cfg(target_os = "linux")]
 pub fn open_virtual_mic(channels: u32) -> Result<Box<dyn VirtualMic>> {
     linux::PwMicSource::open(channels).map(|m| Box::new(m) as Box<dyn VirtualMic>)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub fn open_virtual_mic(channels: u32) -> Result<Box<dyn VirtualMic>> {
+    wasapi_mic::WasapiVirtualMic::open(channels).map(|m| Box::new(m) as Box<dyn VirtualMic>)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn open_virtual_mic(_channels: u32) -> Result<Box<dyn VirtualMic>> {
-    anyhow::bail!("virtual mic requires Linux + PipeWire")
+    anyhow::bail!("virtual mic requires Linux + PipeWire or Windows + a virtual audio device")
 }
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "windows")]
 mod wasapi_cap;
+#[cfg(target_os = "windows")]
+mod wasapi_mic;

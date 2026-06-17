@@ -201,7 +201,8 @@ pub(crate) async fn serve(opts: M3Options, np: Arc<NativePairing>) -> Result<()>
     // wedged KWin's EIS setup ("EIS setup timed out"). Gamepads stay per-session (uinput).
     let injector = InjectorService::start();
     // One virtual microphone for the whole host lifetime (see MicService): the client's mic uplink
-    // (0xCB) is Opus-decoded and fed into a persistent PipeWire Audio/Source host apps record from.
+    // (0xCB) is Opus-decoded and fed into a persistent virtual mic host apps record from (Linux
+    // PipeWire Audio/Source; Windows a virtual audio device's render endpoint).
     let mic_service = MicService::start();
     // Host-lifetime worker that fires debounced TV-session restores (the managed gamescope path
     // restores the box's autologin gaming session on idle, not per-disconnect — see
@@ -1094,22 +1095,20 @@ impl MicService {
     }
 }
 
-/// Stub — mic passthrough needs Linux (PipeWire source + libopus); non-Linux dev builds
-/// drain and drop the frames (sessions still count the datagrams), same as when the
-/// source fails to open.
-#[cfg(not(target_os = "linux"))]
+/// Stub — mic passthrough needs a virtual-mic backend (Linux PipeWire source / Windows virtual audio
+/// device); other platforms drain and drop the frames (sessions still count the datagrams).
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
-    tracing::warn!(
-        "punktfunk/1 mic passthrough requires Linux (PipeWire + libopus) — frames dropped"
-    );
+    tracing::warn!("punktfunk/1 mic passthrough unsupported on this platform — frames dropped");
     for _ in rx {}
 }
 
 /// The host-lifetime mic worker: lazily open the virtual mic + decoder, then Opus-decode each
 /// forwarded frame and push the PCM into the source. Reopen (after [`INJECTOR_REOPEN_BACKOFF`])
 /// on open failure or a decode error. Exits when every session sender and the service's own
-/// sender drop (host shutdown), tearing the PipeWire source down.
-#[cfg(target_os = "linux")]
+/// sender drop (host shutdown), tearing the virtual mic down. Linux = PipeWire `Audio/Source`;
+/// Windows = a virtual audio device's render endpoint (see `audio::wasapi_mic`).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
     let mut mic: Option<Box<dyn crate::audio::VirtualMic>> = None;
     let mut decoder: Option<opus::Decoder> = None;
