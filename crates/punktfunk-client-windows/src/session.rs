@@ -30,7 +30,7 @@ pub struct SessionParams {
     pub identity: (String, String),
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 pub struct Stats {
     pub fps: f32,
     pub mbps: f32,
@@ -99,6 +99,10 @@ fn pump(
         params.compositor,
         params.gamepad,
         params.bitrate_kbps,
+        // Advertise 10-bit + HDR10: the presenter handles BT.2020 PQ (R10G10B10A2) frames, so the
+        // host may upgrade HDR content to a Main10/PQ stream (it still only does so for actual HDR
+        // content with its own 10-bit gate). 8-bit SDR is unaffected.
+        punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR,
         None, // launch: the Windows client has no library picker yet
         params.pin,
         Some(params.identity),

@@ -20,13 +20,17 @@ pub enum DecodedFrame {
     Cpu(CpuFrame),
 }
 
-/// RGBA pixels for a D3D11 `R8G8B8A8_UNORM` texture upload (which takes a row pitch).
+/// Packed 4-byte-per-pixel frame for a D3D11 texture upload (which takes a row pitch). The bytes
+/// are `R8G8B8A8` for SDR and `X2BGR10` (== DXGI `R10G10B10A2`, R in the low 10 bits) for HDR.
 pub struct CpuFrame {
     pub width: u32,
     pub height: u32,
-    /// RGBA row stride in bytes (≥ width*4 — swscale pads rows for SIMD).
+    /// Row stride in bytes (≥ width*4 — swscale pads rows for SIMD).
     pub stride: usize,
-    pub rgba: Vec<u8>,
+    pub pixels: Vec<u8>,
+    /// BT.2020 PQ HDR10 frame: `pixels` is `X2BGR10` and the presenter switches to a 10-bit
+    /// R10G10B10A2 + ST.2084 swapchain. `false` = ordinary 8-bit BT.709 SDR.
+    pub hdr: bool,
 }
 
 pub struct Decoder {
@@ -51,8 +55,9 @@ impl Decoder {
 
 struct SoftwareDecoder {
     decoder: ffmpeg::decoder::Video,
-    /// Rebuilt whenever the decoded format/size changes (mid-stream `Reconfigure`).
-    sws: Option<(scaling::Context, Pixel, u32, u32)>,
+    /// Rebuilt whenever the decoded format/size **or output format** changes (mid-stream
+    /// `Reconfigure`, or an SDR↔HDR flip): `(ctx, src_fmt, w, h, dst_fmt)`.
+    sws: Option<(scaling::Context, Pixel, u32, u32, Pixel)>,
 }
 
 impl SoftwareDecoder {
@@ -79,28 +84,53 @@ impl SoftwareDecoder {
         let mut frame = AvFrame::empty();
         let mut out = None;
         while self.decoder.receive_frame(&mut frame).is_ok() {
-            out = Some(self.convert_rgba(&frame)?);
+            out = Some(self.convert(&frame)?);
         }
         Ok(out)
     }
 
-    fn convert_rgba(&mut self, frame: &AvFrame) -> Result<CpuFrame> {
+    /// Convert the decoded YUV frame to a packed 4-byte format the presenter uploads directly:
+    /// SDR → `RGBA` (BT.709), HDR (SMPTE ST.2084 / PQ transfer) → `X2BGR10` (10-bit, == DXGI
+    /// R10G10B10A2) using the BT.2020 matrix. For HDR the PQ-encoded values pass through unchanged
+    /// (swscale only applies the YUV→RGB matrix + range, never the transfer) — exactly what an
+    /// HDR10/ST.2084 swapchain wants.
+    fn convert(&mut self, frame: &AvFrame) -> Result<CpuFrame> {
+        use ffmpeg::color::TransferCharacteristic;
         let (fmt, w, h) = (frame.format(), frame.width(), frame.height());
-        let rebuild =
-            !matches!(&self.sws, Some((_, f, sw, sh)) if *f == fmt && *sw == w && *sh == h);
+        let hdr = frame.color_transfer_characteristic() == TransferCharacteristic::SMPTE2084;
+        let dst = if hdr { Pixel::X2BGR10LE } else { Pixel::RGBA };
+        let rebuild = !matches!(&self.sws, Some((_, f, sw, sh, d)) if *f == fmt && *sw == w && *sh == h && *d == dst);
         if rebuild {
-            let ctx = scaling::Context::get(fmt, w, h, Pixel::RGBA, w, h, scaling::Flags::POINT)
+            let mut ctx = scaling::Context::get(fmt, w, h, dst, w, h, scaling::Flags::POINT)
                 .context("swscale context")?;
-            self.sws = Some((ctx, fmt, w, h));
+            if hdr {
+                // BT.2020 non-constant-luminance YUV (limited range) → full-range RGB. swscale
+                // applies only the matrix + range here, so the samples stay PQ-encoded.
+                unsafe {
+                    let coef = ffmpeg::ffi::sws_getCoefficients(ffmpeg::ffi::SWS_CS_BT2020);
+                    ffmpeg::ffi::sws_setColorspaceDetails(
+                        ctx.as_mut_ptr(),
+                        coef,
+                        0, // src range: limited (video)
+                        coef,
+                        1, // dst range: full
+                        0,
+                        1 << 16,
+                        1 << 16, // brightness / contrast / saturation defaults (16.16)
+                    );
+                }
+            }
+            self.sws = Some((ctx, fmt, w, h, dst));
         }
         let (sws, ..) = self.sws.as_mut().unwrap();
-        let mut rgba = AvFrame::empty();
-        sws.run(frame, &mut rgba).map_err(|e| anyhow!("sws: {e}"))?;
+        let mut conv = AvFrame::empty();
+        sws.run(frame, &mut conv).map_err(|e| anyhow!("sws: {e}"))?;
         Ok(CpuFrame {
             width: w,
             height: h,
-            stride: rgba.stride(0),
-            rgba: rgba.data(0).to_vec(),
+            stride: conv.stride(0),
+            pixels: conv.data(0).to_vec(),
+            hdr,
         })
     }
 }

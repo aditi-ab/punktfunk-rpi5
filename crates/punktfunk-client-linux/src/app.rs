@@ -308,7 +308,8 @@ fn speed_test(app: Rc<App>, req: ConnectRequest) {
                 },
                 CompositorPref::Auto,
                 GamepadPref::Auto,
-                0,
+                0,    // bitrate_kbps (host default)
+                0,    // video_caps: the Linux client has no 10-bit/HDR present path yet
                 None, // launch: speed-test probe connect, no game
                 pin,
                 Some(identity),

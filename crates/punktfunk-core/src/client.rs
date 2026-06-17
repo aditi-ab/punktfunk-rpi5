@@ -196,6 +196,10 @@ impl NativeClient {
         compositor: CompositorPref,
         gamepad: GamepadPref,
         bitrate_kbps: u32,
+        // Client video capabilities advertised to the host (bitfield of quic::VIDEO_CAP_10BIT /
+        // VIDEO_CAP_HDR) — the host upgrades to a 10-bit / HDR encode only when the matching bit is
+        // set. 0 = the 8-bit BT.709 stream every client understands.
+        video_caps: u8,
         launch: Option<String>,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
@@ -245,6 +249,7 @@ impl NativeClient {
                     compositor,
                     gamepad,
                     bitrate_kbps,
+                    video_caps,
                     launch,
                     pin,
                     identity,
@@ -569,6 +574,7 @@ struct WorkerArgs {
     compositor: CompositorPref,
     gamepad: GamepadPref,
     bitrate_kbps: u32,
+    video_caps: u8,
     launch: Option<String>,
     pin: Option<[u8; 32]>,
     identity: Option<(String, String)>,
@@ -597,6 +603,7 @@ async fn worker_main(args: WorkerArgs) {
         compositor,
         gamepad,
         bitrate_kbps,
+        video_caps,
         launch,
         pin,
         identity,
@@ -657,10 +664,10 @@ async fn worker_main(args: WorkerArgs) {
                 name: None,
                 // Library id to launch this session, if the embedder asked for one.
                 launch: launch.clone(),
-                // TODO(hdr): advertise the embedder's real decode caps once the ABI carries them
-                // and the Apple/Linux clients decode 10-bit. 0 = 8-bit only — the host then never
-                // upgrades this connector's session to a stream it can't yet present.
-                video_caps: 0,
+                // The embedder's decode/present caps (e.g. the Windows client advertises
+                // VIDEO_CAP_10BIT | VIDEO_CAP_HDR). The host only upgrades to a 10-bit / HDR encode
+                // when the matching bit is set, so `0` stays an 8-bit BT.709 stream.
+                video_caps,
             }
             .encode(),
         )

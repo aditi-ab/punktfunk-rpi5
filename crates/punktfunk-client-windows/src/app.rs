@@ -14,7 +14,7 @@
 use crate::discovery::{self, DiscoveredHost};
 use crate::gamepad::GamepadService;
 use crate::present::Presenter;
-use crate::session::{self, SessionEvent, SessionParams};
+use crate::session::{self, SessionEvent, SessionParams, Stats};
 use crate::trust::{self, KnownHost, KnownHosts, Settings};
 use crate::video::DecodedFrame;
 use punktfunk_core::client::NativeClient;
@@ -51,6 +51,56 @@ struct Target {
     pair_optional: bool,
 }
 
+/// Stable app services handed to the page components as props. Each routed screen that uses
+/// hooks (`hosts_page`/`pair_page`/`stream_page`) is mounted as its own `component(...)`, so
+/// its hooks live in an isolated slot list — calling them on the shared parent `cx` would
+/// change the hook order whenever the screen changes (reactor's Rules-of-Hooks guard aborts).
+///
+/// `Svc` compares equal by `ctx` identity (it never meaningfully changes across renders), so a
+/// page whose props are just `Svc` re-renders only via its own state hooks, never spuriously
+/// from the parent.
+#[derive(Clone)]
+struct Svc {
+    ctx: Arc<AppCtx>,
+    set_screen: AsyncSetState<Screen>,
+    set_status: AsyncSetState<String>,
+}
+
+impl PartialEq for Svc {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ctx, &other.ctx)
+    }
+}
+
+/// Props for the hosts page: the services plus the changing discovery/status data that must
+/// drive its re-render (compared by value, so a new host list or error refreshes the page).
+#[derive(Clone)]
+struct HostsProps {
+    svc: Svc,
+    hosts: Vec<DiscoveredHost>,
+    status: String,
+}
+
+impl PartialEq for HostsProps {
+    fn eq(&self, other: &Self) -> bool {
+        self.svc == other.svc && self.hosts == other.hosts && self.status == other.status
+    }
+}
+
+/// Props for the stream page: the services plus the live stats that drive the HUD overlay
+/// (compared by value, so each new sample re-renders the overlay).
+#[derive(Clone)]
+struct StreamProps {
+    svc: Svc,
+    stats: Stats,
+}
+
+impl PartialEq for StreamProps {
+    fn eq(&self, other: &Self) -> bool {
+        self.svc == other.svc && self.stats == other.stats
+    }
+}
+
 /// UI-thread-only present context: the D3D11 presenter plus the decoded-frame receiver.
 struct PresentCtx {
     presenter: Presenter,
@@ -68,6 +118,9 @@ thread_local! {
 struct Shared {
     handoff: Mutex<Option<(Arc<NativeClient>, async_channel::Receiver<DecodedFrame>)>>,
     target: Mutex<Target>,
+    /// Latest stream stats, written by the session's event loop and mirrored into reactor state
+    /// by the stream page's HUD poll thread to drive the overlay.
+    stats: Mutex<Stats>,
 }
 
 pub struct AppCtx {
@@ -173,6 +226,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (screen, set_screen) = cx.use_async_state(Screen::Hosts);
     let (hosts, set_hosts) = cx.use_async_state(Vec::<DiscoveredHost>::new());
     let (status, set_status) = cx.use_async_state(String::new());
+    let (stats, set_stats) = cx.use_async_state(Stats::default());
 
     // Continuous LAN discovery (spawned once).
     cx.use_effect((), {
@@ -193,8 +247,40 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         }
     });
 
+    // HUD stats: the session event loop writes `shared.stats`; this poll thread mirrors it into
+    // root state so the stream page gets it as a *prop*. (A child component's own async-state
+    // update is pruned when its props are unchanged — only a prop change re-renders it, exactly
+    // like discovery → hosts above.)
+    cx.use_effect((), {
+        let shared = ctx.shared.clone();
+        let set_stats = set_stats.clone();
+        move || {
+            std::thread::Builder::new()
+                .name("pf-hud".into())
+                .spawn(move || {
+                    let mut last = Stats::default();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        let s = *shared.stats.lock().unwrap();
+                        if s != last {
+                            last = s;
+                            set_stats.call(s);
+                        }
+                    }
+                })
+                .ok();
+        }
+    });
+
+    // Each hook-using screen is mounted as its own component so its hooks are isolated from
+    // root's (root's own hooks above stay a stable prefix regardless of which screen renders).
+    let svc = Svc {
+        ctx: ctx.clone(),
+        set_screen: set_screen.clone(),
+        set_status: set_status.clone(),
+    };
     match screen {
-        Screen::Hosts => hosts_page(cx, ctx, &hosts, &status, &set_screen, &set_status),
+        Screen::Hosts => component(hosts_page, HostsProps { svc, hosts, status }),
         Screen::Connecting => vstack((
             ProgressRing::indeterminate()
                 .width(48.0)
@@ -211,20 +297,19 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Center)
         .into(),
+        // settings_page uses no hooks (it never touches `cx`), so calling it inline is sound.
         Screen::Settings => settings_page(ctx, &set_screen),
-        Screen::Pair => pair_page(cx, ctx, &set_screen, &set_status),
-        Screen::Stream => stream_page(cx, ctx),
+        Screen::Pair => component(pair_page, svc),
+        Screen::Stream => component(stream_page, StreamProps { svc, stats }),
     }
 }
 
-fn hosts_page(
-    cx: &mut RenderCx,
-    ctx: &Arc<AppCtx>,
-    hosts: &[DiscoveredHost],
-    status: &str,
-    set_screen: &AsyncSetState<Screen>,
-    set_status: &AsyncSetState<String>,
-) -> Element {
+fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
+    let ctx = &props.svc.ctx;
+    let hosts = props.hosts.as_slice();
+    let status = props.status.as_str();
+    let set_screen = &props.svc.set_screen;
+    let set_status = &props.svc.set_status;
     let (manual, set_manual) = cx.use_state(String::new());
     let known = KnownHosts::load();
 
@@ -459,6 +544,7 @@ fn connect(
                     let _ = k.save();
                 }
                 gamepad.attach(connector.clone());
+                *shared.stats.lock().unwrap() = Stats::default(); // clear any prior session's numbers
                 *shared.handoff.lock().unwrap() = Some((connector, handle.frames.clone()));
                 ss.call(Screen::Stream);
             }
@@ -483,7 +569,7 @@ fn connect(
                 ss.call(Screen::Hosts);
                 break;
             }
-            Ok(SessionEvent::Stats(_)) => {}
+            Ok(SessionEvent::Stats(s)) => *shared.stats.lock().unwrap() = s,
             Err(_) => {
                 gamepad.detach();
                 ss.call(Screen::Hosts);
@@ -493,12 +579,10 @@ fn connect(
     });
 }
 
-fn pair_page(
-    cx: &mut RenderCx,
-    ctx: &Arc<AppCtx>,
-    set_screen: &AsyncSetState<Screen>,
-    set_status: &AsyncSetState<String>,
-) -> Element {
+fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
+    let ctx = &props.ctx;
+    let set_screen = &props.set_screen;
+    let set_status = &props.set_status;
     let (code, set_code) = cx.use_state(String::new());
     let target = ctx.shared.target.lock().unwrap().clone();
 
@@ -688,7 +772,8 @@ fn present_newest(ctx: &mut PresentCtx) {
     ctx.presenter.present(cpu);
 }
 
-fn stream_page(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
+fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
+    let ctx = &props.svc.ctx;
     // Take the connector + frames handoff once on mount; keep the connector alive (and for input)
     // in a use_ref, stash frames for `on_ready`, install the input hooks (and remove on unmount).
     let connector_ref = cx.use_ref::<Option<Arc<NativeClient>>>(None);
@@ -710,7 +795,7 @@ fn stream_page(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     cx.use_effect((), {
         let rendering = rendering.clone();
         move || {
-            if let Ok(r) = on_rendering(|| {
+            if let Ok(r) = on_rendering(move || {
                 PRESENT.with(|cell| {
                     if let Some(ctx) = cell.borrow_mut().as_mut() {
                         present_newest(ctx);
@@ -722,30 +807,70 @@ fn stream_page(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         }
     });
 
-    swap_chain_panel()
-        .on_ready(|panel| match Presenter::new(1280, 720) {
-            Ok(p) => {
-                if let Err(e) = panel.set_swap_chain(p.swap_chain()) {
-                    tracing::error!(error = %e, "set_swap_chain");
-                }
-                if let Some(frames) = PENDING_FRAMES.with(|c| c.borrow_mut().take()) {
-                    PRESENT.with(|cell| {
-                        *cell.borrow_mut() = Some(PresentCtx {
-                            presenter: p,
-                            frames,
+    let mode = connector_ref.borrow().as_ref().map(|c| c.mode());
+    grid((
+        swap_chain_panel()
+            .on_ready(|panel| match Presenter::new(1280, 720) {
+                Ok(p) => {
+                    if let Err(e) = panel.set_swap_chain(p.swap_chain()) {
+                        tracing::error!(error = %e, "set_swap_chain");
+                    }
+                    if let Some(frames) = PENDING_FRAMES.with(|c| c.borrow_mut().take()) {
+                        PRESENT.with(|cell| {
+                            *cell.borrow_mut() = Some(PresentCtx {
+                                presenter: p,
+                                frames,
+                            });
                         });
-                    });
-                    tracing::info!("stream presenter bound to SwapChainPanel");
+                        tracing::info!("stream presenter bound to SwapChainPanel");
+                    }
                 }
-            }
-            Err(e) => tracing::error!(error = %e, "create presenter"),
-        })
-        .on_resize(|w, h| {
-            PRESENT.with(|cell| {
-                if let Some(ctx) = cell.borrow_mut().as_mut() {
-                    ctx.presenter.resize(w as u32, h as u32);
-                }
-            });
-        })
-        .into()
+                Err(e) => tracing::error!(error = %e, "create presenter"),
+            })
+            .on_resize(|w, h| {
+                PRESENT.with(|cell| {
+                    if let Some(ctx) = cell.borrow_mut().as_mut() {
+                        ctx.presenter.resize(w as u32, h as u32);
+                    }
+                });
+            }),
+        hud_overlay(&props.stats, mode),
+    ))
+    .into()
+}
+
+/// The streaming HUD overlay (top-right), mirroring the Apple client: mode + fps/throughput, the
+/// capture→client latency + decode time, and the release-cursor hint. Layered over the
+/// `SwapChainPanel` in the same grid cell.
+fn hud_overlay(stats: &Stats, mode: Option<Mode>) -> Element {
+    let res = mode
+        .map(|m| format!("{}\u{00D7}{}@{}", m.width, m.height, m.refresh_hz))
+        .unwrap_or_else(|| "\u{2014}".into());
+    let line1 = format!("{res}   {:.0} fps   {:.1} Mb/s", stats.fps, stats.mbps);
+    let line2 = format!(
+        "capture\u{2192}client {:.1} ms p50 \u{00B7} decode {:.1} ms",
+        stats.latency_ms, stats.decode_ms
+    );
+    border(
+        vstack((
+            text_block(line1)
+                .font_size(12.0)
+                .foreground(Color::rgb(255, 255, 255)),
+            text_block(line2)
+                .font_size(11.0)
+                .foreground(Color::rgb(200, 200, 200)),
+            text_block("Ctrl+Alt+Shift+Q releases the mouse")
+                .font_size(11.0)
+                .foreground(Color::rgb(160, 160, 160)),
+        ))
+        .spacing(2.0),
+    )
+    .background(Color::rgb(0, 0, 0))
+    .corner_radius(8.0)
+    .padding(uniform(10.0))
+    .opacity(0.82)
+    .horizontal_alignment(HorizontalAlignment::Right)
+    .vertical_alignment(VerticalAlignment::Top)
+    .margin(uniform(12.0))
+    .into()
 }

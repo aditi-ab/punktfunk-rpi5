@@ -5,8 +5,12 @@
 //! The device prefers a hardware adapter and falls back to **WARP** (the GPU-less dev box runs
 //! the whole present path in software). The draw is a single full-screen triangle sampling the
 //! video texture; a letterbox is produced by clearing the back buffer black and setting the
-//! viewport to the Contain-fit rect (no per-frame vertex buffer). SDR 8-bit path; the
-//! 10-bit/HDR present (`R10G10B10A2` + `SetColorSpace1`) is a follow-up alongside P010 decode.
+//! viewport to the Contain-fit rect (no per-frame vertex buffer).
+//!
+//! **HDR10**: when a frame is BT.2020 PQ (`CpuFrame::hdr`), the swapchain flips to
+//! `R10G10B10A2` + `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` (+ HDR10 metadata) via
+//! `ResizeBuffers`/`SetColorSpace1`; the decoded samples are already PQ-encoded so the shader is a
+//! plain passthrough and the compositor maps PQ→display. SDR stays 8-bit B8G8R8A8.
 //!
 //! All `windows` types here come from the same windows-rs commit as `windows-reactor`, so the
 //! `IDXGISwapChain1` handed to `set_swap_chain` satisfies reactor's `windows_core::Interface`.
@@ -50,6 +54,9 @@ pub struct Presenter {
     /// Panel (swapchain) size in pixels, updated on resize.
     panel_w: u32,
     panel_h: u32,
+    /// Whether the swapchain is currently in 10-bit HDR10 (R10G10B10A2 + ST.2084) mode; flipped
+    /// to match each frame's `hdr` flag.
+    hdr: bool,
 }
 
 impl Presenter {
@@ -69,6 +76,7 @@ impl Presenter {
             tex: None,
             panel_w: width.max(1),
             panel_h: height.max(1),
+            hdr: false,
         })
     }
 
@@ -100,6 +108,9 @@ impl Presenter {
     /// last texture (or black). Called from the reactor `on_rendering` per-frame callback.
     pub fn present(&mut self, frame: Option<&CpuFrame>) {
         if let Some(f) = frame {
+            if f.hdr != self.hdr {
+                self.set_hdr(f.hdr);
+            }
             if let Err(e) = self.upload(f) {
                 tracing::warn!(error = %e, "frame upload failed");
             }
@@ -144,16 +155,74 @@ impl Presenter {
         }
     }
 
+    /// Switch the swapchain between 8-bit SDR (B8G8R8A8, sRGB/BT.709) and 10-bit HDR10
+    /// (R10G10B10A2, ST.2084 PQ BT.2020). `ResizeBuffers` can change the back-buffer format in
+    /// place, so the panel binding (`set_swap_chain`) stays valid — no rebind needed. The decoded
+    /// samples are already PQ-encoded BT.2020 (see `video::convert`), so the colour space is all the
+    /// compositor needs to map them to the display.
+    fn set_hdr(&mut self, on: bool) {
+        self.rtv = None; // release back-buffer refs before ResizeBuffers
+        self.tex = None; // texture format changes (R10G10B10A2 vs R8G8B8A8)
+        let format = if on {
+            DXGI_FORMAT_R10G10B10A2_UNORM
+        } else {
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        };
+        unsafe {
+            if let Err(e) = self.swap.ResizeBuffers(
+                0,
+                self.panel_w,
+                self.panel_h,
+                format,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            ) {
+                tracing::warn!(error = %e, "ResizeBuffers for HDR switch failed");
+                return;
+            }
+            let colorspace = if on {
+                DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+            } else {
+                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+            };
+            if let Ok(sc3) = self.swap.cast::<IDXGISwapChain3>() {
+                // Only set a colour space the swapchain accepts for present (on an SDR desktop the
+                // DWM still tone-maps HDR10 → SDR, so leaving the default there is fine).
+                if let Ok(support) = sc3.CheckColorSpaceSupport(colorspace) {
+                    if support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 != 0 {
+                        let _ = sc3.SetColorSpace1(colorspace);
+                    }
+                }
+            }
+            if on {
+                if let Ok(sc4) = self.swap.cast::<IDXGISwapChain4>() {
+                    let md = hdr10_metadata();
+                    let bytes = std::slice::from_raw_parts(
+                        &md as *const DXGI_HDR_METADATA_HDR10 as *const u8,
+                        std::mem::size_of::<DXGI_HDR_METADATA_HDR10>(),
+                    );
+                    let _ = sc4.SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, Some(bytes));
+                }
+            }
+        }
+        self.hdr = on;
+        tracing::info!(hdr = on, "swapchain colour mode switched");
+    }
+
     fn upload(&mut self, frame: &CpuFrame) -> Result<()> {
         let (w, h) = (frame.width, frame.height);
         let need_new = !matches!(&self.tex, Some((_, _, tw, th)) if *tw == w && *th == h);
         if need_new {
+            let format = if self.hdr {
+                DXGI_FORMAT_R10G10B10A2_UNORM
+            } else {
+                DXGI_FORMAT_R8G8B8A8_UNORM
+            };
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: w,
                 Height: h,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -191,7 +260,7 @@ impl Presenter {
             let row_bytes = (w as usize) * 4;
             for y in 0..h as usize {
                 std::ptr::copy_nonoverlapping(
-                    frame.rgba.as_ptr().add(y * src_pitch),
+                    frame.pixels.as_ptr().add(y * src_pitch),
                     dst.add(y * dst_pitch),
                     row_bytes.min(src_pitch),
                 );
@@ -273,7 +342,10 @@ fn create_composition_swapchain(
         BufferCount: 2,
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-        AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+        // IGNORE (opaque), not PREMULTIPLIED: the video fills the panel and the HDR `X2BGR10`
+        // upload leaves the 2 padding/alpha bits 0 — premultiplied alpha would then make HDR frames
+        // transparent. Opaque is correct for a full-frame video surface either way.
+        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
         Flags: 0,
     };
     unsafe {
@@ -352,5 +424,21 @@ fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
         let p = blob.GetBufferPointer() as *const u8;
         let n = blob.GetBufferSize();
         std::slice::from_raw_parts(p, n)
+    }
+}
+
+/// Generic HDR10 mastering metadata: BT.2020 primaries + D65 white (0.00002 units), a 1000-nit
+/// mastering display, MaxCLL 1000 / MaxFALL 400. The protocol doesn't carry the stream's real
+/// mastering metadata yet (host follow-up), so these are sane defaults the display tone-maps from.
+fn hdr10_metadata() -> DXGI_HDR_METADATA_HDR10 {
+    DXGI_HDR_METADATA_HDR10 {
+        RedPrimary: [35400, 14600],
+        GreenPrimary: [8500, 39850],
+        BluePrimary: [6550, 2300],
+        WhitePoint: [15635, 16450],
+        MaxMasteringLuminance: 1000,
+        MinMasteringLuminance: 1, // 0.0001-nit units → 0.0001 nits
+        MaxContentLightLevel: 1000,
+        MaxFrameAverageLightLevel: 400,
     }
 }
