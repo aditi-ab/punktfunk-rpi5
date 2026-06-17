@@ -1,0 +1,114 @@
+// Launch the stream as a Steam game so gamescope focuses + fullscreens it.
+//
+// THE LAUNCH MECHANISM (verified against MoonDeck): gamescope only gives focus/fullscreen to
+// the window tree Steam launched via `reaper` (it detects the "current app" by AppID — see
+// gamescope#484). So we cannot launch the flatpak from the plugin backend; we register ONE
+// hidden non-Steam shortcut that points at our wrapper script (bin/punktfunkrun.sh), pass the
+// per-session host as the shortcut's Steam launch options, and start it with RunGame. The
+// wrapper then execs `flatpak run io.unom.Punktfunk --connect <host>` as a reaper descendant.
+
+import { runnerInfo } from "./backend";
+
+// SteamClient is a Steam-internal global injected into the CEF context; it is not fully typed
+// by @decky/ui, so declare the surface we use. Signatures verified against MoonDeck + the
+// decky-frontend-lib SteamClient.Apps typings.
+declare const SteamClient: {
+  Apps: {
+    AddShortcut(
+      name: string,
+      exePath: string,
+      startDir: string,
+      launchOptions: string,
+    ): Promise<number>;
+    SetShortcutName(appId: number, name: string): void;
+    SetShortcutExe(appId: number, exe: string): void;
+    SetShortcutStartDir(appId: number, dir: string): void;
+    SetAppLaunchOptions(appId: number, options: string): void;
+    SetAppHidden(appId: number, hidden: boolean): void;
+    RunGame(gameId: string, _unused: string, _i: number, _j: number): void;
+    TerminateApp(gameId: string, _b: boolean): void;
+  };
+};
+
+const SHORTCUT_NAME = "punktfunk";
+
+// The 64-bit "gameid" RunGame wants, derived from a 32-bit non-Steam shortcut appId: the
+// standard non-Steam-game encoding (appid << 32 | 0x02000000). MoonDeck/decky tools use this.
+function gameIdFromAppId(appId: number): string {
+  return ((BigInt(appId) << 32n) | 0x02000000n).toString();
+}
+
+// Persist our shortcut appId across reloads so we reuse ONE shortcut instead of churning the
+// library (the appId is stable for the life of the shortcut).
+const STORAGE_KEY = "punktfunk:shortcutAppId";
+
+function rememberAppId(appId: number) {
+  try {
+    localStorage.setItem(STORAGE_KEY, String(appId));
+  } catch {
+    /* ignore */
+  }
+}
+function recallAppId(): number | null {
+  try {
+    const v = localStorage.getItem(STORAGE_KEY);
+    return v ? Number(v) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ensure exactly one hidden "punktfunk" shortcut exists pointing at the wrapper script, and
+ * return its appId. Reuses the remembered one when its exe still matches the current runner
+ * path (the plugin dir can change across reinstalls).
+ */
+async function ensureShortcut(): Promise<number> {
+  const info = await runnerInfo();
+  if (!info.exists) {
+    throw new Error(`launch wrapper missing at ${info.runner}`);
+  }
+
+  const remembered = recallAppId();
+  if (remembered != null) {
+    // Re-point the existing shortcut at the current runner path (cheap + idempotent).
+    SteamClient.Apps.SetShortcutExe(remembered, info.runner);
+    SteamClient.Apps.SetShortcutStartDir(
+      remembered,
+      info.runner.replace(/\/[^/]*$/, ""),
+    );
+    return remembered;
+  }
+
+  const appId = await SteamClient.Apps.AddShortcut(
+    SHORTCUT_NAME,
+    info.runner,
+    info.runner.replace(/\/[^/]*$/, ""), // start dir = the bin/ dir
+    "",
+  );
+  SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
+  // Hide it from the library — it's an implementation detail, launched programmatically.
+  SteamClient.Apps.SetAppHidden(appId, true);
+  rememberAppId(appId);
+  return appId;
+}
+
+/**
+ * Launch a stream to `host:port` fullscreen in Gaming Mode. Encodes the target into the
+ * shortcut's launch options (so one generic shortcut serves every host), then RunGame.
+ */
+export async function launchStream(host: string, port: number): Promise<void> {
+  const appId = await ensureShortcut();
+  const target = port && port !== 9777 ? `${host}:${port}` : host;
+  // KEY=value ... %command% — the wrapper reads PF_HOST from the environment.
+  SteamClient.Apps.SetAppLaunchOptions(appId, `PF_HOST=${target} %command%`);
+  SteamClient.Apps.RunGame(gameIdFromAppId(appId), "", -1, 100);
+}
+
+/** Stop the running stream shortcut (best-effort; the in-stream chord/back also works). */
+export function stopStream(): void {
+  const appId = recallAppId();
+  if (appId != null) {
+    SteamClient.Apps.TerminateApp(gameIdFromAppId(appId), false);
+  }
+}

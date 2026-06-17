@@ -36,11 +36,76 @@ pub fn run() -> glib::ExitCode {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // Headless pairing path (no GTK window): `--pair <PIN> --connect host[:port] [--name N]`.
+    // Used by the Decky plugin (a GTK dialog can't pop under gamescope) and for scripting.
+    if let Some(pin) = arg_value("--pair") {
+        return headless_pair(&pin);
+    }
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     // GTK doesn't see our argv (`--connect` is handled in `build_ui`); an empty argv also
     // keeps GApplication from rejecting unknown options.
     app.run_with_args(&[] as &[&str])
+}
+
+/// The value following `flag` in argv, if present (`--flag value`).
+fn arg_value(flag: &str) -> Option<String> {
+    std::env::args()
+        .skip_while(|a| a != flag)
+        .nth(1)
+        .filter(|v| !v.starts_with("--"))
+}
+
+/// Run the SPAKE2 PIN ceremony without a GTK window and persist the verified host to the
+/// known-hosts store as paired, so a later `--connect` connects silently. Same identity
+/// store the streaming path uses (same binary), so pairing here makes the stream work.
+/// Prints a one-line `paired <addr>:<port> fp=<hex>` on success; exits non-zero on failure.
+fn headless_pair(pin: &str) -> glib::ExitCode {
+    let Some(target) = arg_value("--connect") else {
+        eprintln!("--pair requires --connect host[:port]");
+        return glib::ExitCode::FAILURE;
+    };
+    let (addr, port) = match target.rsplit_once(':') {
+        Some((a, p)) => (a.to_string(), p.parse().unwrap_or(9777)),
+        None => (target.clone(), 9777),
+    };
+    // The label the HOST stores this client under (its paired-devices list).
+    let name = arg_value("--name").unwrap_or_else(|| "Steam Deck".to_string());
+
+    let identity = match crate::trust::load_or_create_identity() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("client identity: {e:#}");
+            return glib::ExitCode::FAILURE;
+        }
+    };
+    match NativeClient::pair(
+        &addr,
+        port,
+        (&identity.0, &identity.1),
+        pin.trim(),
+        &name,
+        std::time::Duration::from_secs(90),
+    ) {
+        Ok(fp) => {
+            let fp_hex = crate::trust::hex(&fp);
+            let mut known = KnownHosts::load();
+            known.upsert(KnownHost {
+                name: arg_value("--host-label").unwrap_or_else(|| addr.clone()),
+                addr: addr.clone(),
+                port,
+                fp_hex: fp_hex.clone(),
+                paired: true,
+            });
+            let _ = known.save();
+            println!("paired {addr}:{port} fp={fp_hex}");
+            glib::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("pairing failed: {e:?} (wrong PIN, or pairing not armed on the host?)");
+            glib::ExitCode::FAILURE
+        }
+    }
 }
 
 /// `--connect host[:port]` — skip the hosts page and start a session immediately

@@ -20,9 +20,12 @@ VER="$(python3 -c 'import json;print(json.load(open("package.json"))["version"])
 
 STAGE="$(mktemp -d)"
 DEST="$STAGE/$NAME"
-mkdir -p "$DEST/dist"
+mkdir -p "$DEST/dist" "$DEST/bin"
 cp dist/index.js "$DEST/dist/index.js"          # ship the bundle only, not the sourcemap
 cp main.py plugin.json package.json LICENSE "$DEST/"
+# The stream-launch wrapper (target of the Steam shortcut) — must stay executable.
+cp bin/punktfunkrun.sh "$DEST/bin/punktfunkrun.sh"
+chmod 0755 "$DEST/bin/punktfunkrun.sh"
 [ -f decky.pyi ]  && cp decky.pyi  "$DEST/"
 [ -f README.md ]  && cp README.md  "$DEST/"
 

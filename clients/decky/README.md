@@ -8,28 +8,44 @@ Because Decky plugins run inside Steam's CEF, the panel is built from real Steam
 primitives (`@decky/ui`: `PanelSection`, `PanelSectionRow`, `ButtonItem`, `Field`,
 `Spinner`) — so it looks and feels native to Gaming Mode.
 
-> **Spike / launcher only.** This is a minimal but functional first cut: discover hosts,
-> connect, disconnect. It launches the existing native GTK4 client
-> (`punktfunk-client`) over the top of Gaming Mode. An in-stream overlay (latency / bitrate
-> HUD, mid-session controls) and a fuller real-Steam-components UI are the next steps.
-> Runtime behavior on a real Deck is **untested** — only the build is verified here.
+> **Full Gaming-Mode client.** Discovery, a fullscreen page, in-UI SPAKE2 PIN pairing,
+> stream settings, and a stream that actually launches fullscreen under gamescope (via a
+> Steam shortcut, MoonDeck-style). The video itself is the existing GTK4 flatpak client
+> (`io.unom.Punktfunk`) — the plugin discovers, pairs, configures, and *launches it the
+> right way* so gamescope focuses it. The Steam-shortcut launch + pairing need a real Deck
+> in Gaming Mode to fully confirm.
 
 ## What it does
 
-1. **Refresh** — browses the LAN over mDNS for punktfunk/1 hosts (the `_punktfunk._udp`
-   service) via the backend `discover()`.
-2. **Lists discovered hosts** — name, `ip:port`, and a lock icon for whether pairing is
-   required (`pair=required` in the host's TXT record).
-3. **Connect** — selecting a host calls `connect(host, port)`, which launches
-   `punktfunk-client --connect host:port`; a toast and the status line reflect the result.
-4. **Disconnect** — `disconnect()` terminates the launched client.
+1. **Discover** — browses the LAN over mDNS for punktfunk/1 hosts (`_punktfunk._udp`,
+   backend `discover()` via `avahi-browse`). Shown in both the QAM panel and a **fullscreen
+   page** (Decky route `/punktfunk`, via `routerHook.addRoute`).
+2. **Pair** — for a `pair=required` host: a gamepad-navigable PIN keypad. The operator arms
+   pairing on the host (it shows a 4-digit PIN), the user enters it on the Deck, and the
+   backend runs the SPAKE2 ceremony headlessly via the flatpak client's `--pair` mode
+   (`pair()`), persisting the host as paired so the stream then connects silently.
+3. **Stream** — launches fullscreen in Gaming Mode. The plugin registers ONE hidden
+   non-Steam shortcut pointing at `bin/punktfunkrun.sh`, passes `PF_HOST` as the shortcut's
+   Steam launch options, and starts it with `SteamClient.Apps.RunGame` — so gamescope
+   focuses + fullscreens it. (A flatpak launched directly from the backend is invisible:
+   gamescope only focuses the process tree Steam launched via `reaper` — gamescope#484.)
+   The wrapper then execs `flatpak run io.unom.Punktfunk --connect <host>`.
+4. **Settings** — resolution / refresh / bitrate / gamepad / mic, written to the client's
+   `client-gtk-settings.json` (`get_settings`/`set_settings`), which the launched client reads.
+
+To leave the stream: the in-client controller chord (**L1+R1+Start+Select**) or close the
+"game" from the Steam overlay — exiting the client ends the Steam game and returns to
+Gaming Mode automatically.
 
 ## Architecture
 
 | File | Role |
 | --- | --- |
-| `src/index.tsx` | Frontend QAM panel (`@decky/ui` + `@decky/api`). |
-| `main.py` | Backend `Plugin` class: `discover` / `connect` / `disconnect` / `status` exposed over the Decky bridge. |
+| `src/index.tsx` | Frontend: QAM panel + the `/punktfunk` fullscreen page (host list, PIN keypad modal, settings). |
+| `src/steam.ts` | Steam-shortcut launch (`AddShortcut` / `SetAppLaunchOptions` / `RunGame`) — the focus-correct stream start. |
+| `src/backend.ts` | Typed `callable` bridges to `main.py`. |
+| `bin/punktfunkrun.sh` | The launch wrapper the Steam shortcut targets (so the window is focusable). |
+| `main.py` | Backend: `discover` / `pair` / `runner_info` / `get_settings` / `set_settings` / `kill_stream`. |
 | `plugin.json` | Decky plugin manifest. |
 | `decky.pyi` | Type stub for the injected `decky` module (vendored from the template). |
 
@@ -126,7 +142,13 @@ shows up in the Quick Access Menu.
 
 ## Limitations / next steps
 
-- Launcher only — no in-stream overlay yet; the client owns the full session once launched.
+- **Needs on-Deck validation in Gaming Mode**: the Steam-shortcut launch (`AddShortcut` /
+  `RunGame` / the `gameId` encoding) and the headless pairing env are coded to MoonDeck's
+  proven pattern but verified only at build time here.
 - mDNS discovery depends on `avahi-browse`; no manual "add host by IP" entry yet.
-- Pairing (PIN ceremony) is handled by the launched client, not the panel.
-- Not yet tested on real Deck hardware.
+- No in-stream overlay (latency/bitrate HUD) inside the plugin — the client owns the session
+  once launched; leave it with the L1+R1+Start+Select chord.
+- Pairing requires the operator to **arm pairing on the host** (so it shows the PIN); the
+  plugin can't arm it remotely (no host mgmt token on the Deck).
+- Settings are written to the flatpak's sandbox config path; if the client ever moves its
+  config location, that path mapping must follow.

@@ -76,12 +76,16 @@ jobs:
           apt-get update && apt-get install -y --no-install-recommends zip >/dev/null
           STAGE="$RUNNER_TEMP/decky"
           DEST="$STAGE/$PLUGIN"
-          rm -rf "$STAGE"; mkdir -p "$DEST/dist"
+          rm -rf "$STAGE"; mkdir -p "$DEST/dist" "$DEST/bin"
           cp clients/decky/plugin.json   "$DEST/"
           cp clients/decky/package.json  "$DEST/"
           cp clients/decky/main.py       "$DEST/"
           cp clients/decky/dist/index.js "$DEST/dist/"
           cp clients/decky/README.md     "$DEST/"
+          # The stream-launch wrapper (target of the Steam shortcut); keep it executable
+          # (runner_info() also re-chmods at runtime in case the zip/extract drops the bit).
+          cp clients/decky/bin/punktfunkrun.sh "$DEST/bin/"
+          chmod 0755 "$DEST/bin/punktfunkrun.sh"
           # Store requires a LICENSE in the plugin root; the project is MIT OR Apache-2.0.
           cp LICENSE-MIT                 "$DEST/LICENSE"
           ( cd "$STAGE" && zip -r "$RUNNER_TEMP/punktfunk.zip" "$PLUGIN" )
