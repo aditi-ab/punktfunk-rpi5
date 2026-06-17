@@ -85,10 +85,17 @@ jobs:
         # flatpak builds with no network; vendor every crate from Cargo.lock into
         # cargo-sources.json next to the manifest (referenced by the manifest's
         # punktfunk-client module).
+        #
+        # Prune the microsoft/windows-rs git crates first: they belong to
+        # punktfunk-client-windows, which the flatpak never builds, and leaving them in makes
+        # flatpak-builder full-clone that multi-GB repo at build time → "No space left on
+        # device" (see packaging/flatpak/prune-windows-lock.py). The committed Cargo.lock is
+        # untouched; cargo --offline only needs sources for the crates it compiles.
         run: |
           curl -fsSL -o /tmp/flatpak-cargo-generator.py \
             https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
-          python3 /tmp/flatpak-cargo-generator.py Cargo.lock \
+          python3 packaging/flatpak/prune-windows-lock.py Cargo.lock /tmp/Cargo.flatpak.lock
+          python3 /tmp/flatpak-cargo-generator.py /tmp/Cargo.flatpak.lock \
             -o packaging/flatpak/cargo-sources.json
 
       - name: Build the flatpak (install deps from Flathub, offline build)

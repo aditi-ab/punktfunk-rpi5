@@ -65,7 +65,10 @@ else
   fi
   # Needs python3 + aiohttp + tomlkit. On a host that lacks them (e.g. the Deck), generate on the
   # Mac / a dev box instead and rsync the result next to the manifest (reused by the branch above).
-  python3 "$GEN" Cargo.lock -o packaging/flatpak/cargo-sources.json
+  # Prune the microsoft/windows-rs git crates first (punktfunk-client-windows only) — otherwise
+  # flatpak-builder full-clones that multi-GB repo and fills the disk. See prune-windows-lock.py.
+  python3 packaging/flatpak/prune-windows-lock.py Cargo.lock /tmp/Cargo.flatpak.lock
+  python3 "$GEN" /tmp/Cargo.flatpak.lock -o packaging/flatpak/cargo-sources.json
 fi
 
 # --- build into a local ostree repo, then export a single-file bundle --------------------
