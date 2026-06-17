@@ -25,7 +25,10 @@ use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
 use nvidia_video_codec_sdk::ENCODE_API as API;
 
-const POOL: usize = 4;
+// Output bitstream buffers = max in-flight encodes. The helper deep-pipelines (submits several frames
+// before locking the oldest) so per-frame GPU-scheduling waits OVERLAP instead of serializing under a
+// GPU-saturating game; this must be ≥ the helper's `PUNKTFUNK_ENCODE_DEPTH` (default 4, clamped ≤ 6).
+const POOL: usize = 8;
 
 fn codec_guid(codec: Codec) -> nv::GUID {
     match codec {
@@ -363,7 +366,9 @@ impl Encoder for NvencD3d11Encoder {
         // frame arrives on a different device OR at a different size than our session was built on.
         // HDR (BT.2020 PQ 10-bit) when the capturer hands us a 10-bit R10G10B10A2 frame. This can flip
         // mid-session when the user toggles HDR (which arrives as a capture device recreate anyway).
-        let hdr = matches!(captured.format, PixelFormat::Rgb10a2);
+        // HDR (BT.2020 PQ) when the capturer hands a 10-bit frame — either R10G10B10A2 (the legacy
+        // shader path) or P010 (the video-processor path). 8-bit NV12/ARGB → SDR.
+        let hdr = matches!(captured.format, PixelFormat::Rgb10a2 | PixelFormat::P010);
         let dev_raw = frame.device.as_raw();
         let size_changed =
             self.inited && (self.width != captured.width || self.height != captured.height);
@@ -384,13 +389,22 @@ impl Encoder for NvencD3d11Encoder {
             self.width = captured.width;
             self.height = captured.height;
             self.hdr = hdr;
-            if hdr {
-                // 10-bit BT.2020 PQ input; force Main10 regardless of the negotiated SDR bit depth.
-                self.bit_depth = 10;
-                self.buffer_fmt = nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10;
-            } else {
-                self.buffer_fmt = nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB;
-            }
+            // Pick the NVENC input format from the captured pixel format. YUV (NV12/P010) is the
+            // video-processor path — NVENC encodes it natively (no internal RGB→YUV, which is a hidden
+            // 3D/compute step that would fight a GPU-saturating game). RGB (ARGB/ABGR10) is the legacy
+            // shader path. 10-bit (P010/ABGR10) forces HEVC Main10 + the BT.2020 PQ VUI.
+            self.buffer_fmt = match captured.format {
+                PixelFormat::P010 => {
+                    self.bit_depth = 10;
+                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT
+                }
+                PixelFormat::Rgb10a2 => {
+                    self.bit_depth = 10;
+                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10
+                }
+                PixelFormat::Nv12 => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
+                _ => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+            };
             let device = frame.device.clone();
             self.init_session(&device)?;
             self.init_device = dev_raw;

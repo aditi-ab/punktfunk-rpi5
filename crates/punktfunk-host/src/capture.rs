@@ -26,6 +26,13 @@ pub enum PixelFormat {
     /// produces this: scRGB FP16 desktop pixels are converted to BT.2020 PQ and written here, then
     /// handed to NVENC as `ABGR10` for an HEVC Main10 / HDR10 encode.
     Rgb10a2,
+    /// `NV12` (DXGI `NV12`): 8-bit BT.709 limited-range YUV 4:2:0. Produced by the D3D11 **video
+    /// processor** (video engine, not the 3D engine) so the per-frame colour conversion doesn't fight a
+    /// GPU-saturating game; handed to NVENC as `NV12` (it encodes YUV natively — no internal RGB→YUV).
+    Nv12,
+    /// `P010` (DXGI `P010`): 10-bit BT.2020 PQ limited-range YUV 4:2:0. HDR analogue of [`Nv12`]:
+    /// video-processor output for HEVC Main10 / HDR10, handed to NVENC as `YUV420_10BIT`.
+    P010,
 }
 
 impl PixelFormat {

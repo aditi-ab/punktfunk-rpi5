@@ -103,9 +103,10 @@ fn nvenc_input(format: PixelFormat) -> (Pixel, bool) {
         PixelFormat::Rgba => (Pixel::RGBA, false),
         PixelFormat::Rgb => (Pixel::RGBZ, true), // RGB -> rgb0
         PixelFormat::Bgr => (Pixel::BGRZ, true), // BGR -> bgr0
-        // 10-bit HDR (R10G10B10A2) is produced only by the Windows DXGI HDR capture path; the Linux
-        // capturer never emits it. Map to BGRA so the match is exhaustive — unreachable here.
-        PixelFormat::Rgb10a2 => (Pixel::BGRA, false),
+        // Rgb10a2 (HDR) and NV12/P010 (the Windows video-processor YUV outputs) are produced only by
+        // the Windows capture/encode paths; the Linux capturer never emits them. Map to BGRA so the
+        // match is exhaustive — unreachable here.
+        PixelFormat::Rgb10a2 | PixelFormat::Nv12 | PixelFormat::P010 => (Pixel::BGRA, false),
     }
 }
 

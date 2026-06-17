@@ -37,12 +37,12 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5,
-    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED,
-    DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_INVALID_CALL, DXGI_ERROR_MODE_CHANGE_IN_PROGRESS,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
-    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIDevice1, IDXGIFactory1, IDXGIOutput1,
+    IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
+    DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_INVALID_CALL,
+    DXGI_ERROR_MODE_CHANGE_IN_PROGRESS, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
 };
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
@@ -147,10 +147,119 @@ pub(crate) unsafe fn make_device(
         Some(&mut context),
     )
     .context("D3D11CreateDevice")?;
-    Ok((
-        device.context("null D3D11 device")?,
-        context.context("null D3D11 context")?,
-    ))
+    let device = device.context("null D3D11 device")?;
+    let context = context.context("null D3D11 context")?;
+
+    // Apollo-style GPU scheduling hardening (Sunshine display_base.cpp:599-709). Our capture+encode
+    // shares the GPU with the streamed game; when the game saturates the GPU our process is starved of
+    // GPU time slices, so NVENC sits near-idle yet `lock_bitstream` waits ~20 ms for our context to be
+    // scheduled — capping the stream (~47 fps measured at 5K@240) and stuttering. Per-frame copy/convert
+    // is NOT the cause (zero-copy + thread-priority alone didn't move it); the PROCESS-level GPU
+    // scheduling priority class is the decisive cross-process lever. Secondary: the absolute per-device
+    // GPU thread priority and a 1-frame latency cap.
+    elevate_process_gpu_priority();
+    if let Ok(dxgi_dev) = device.cast::<IDXGIDevice>() {
+        // Apollo's absolute max GPU thread priority (0x4000001E); fall back to relative +7.
+        if dxgi_dev.SetGPUThreadPriority(0x4000_001E).is_err()
+            && dxgi_dev.SetGPUThreadPriority(7).is_err()
+        {
+            tracing::warn!("SetGPUThreadPriority failed (run as admin/SYSTEM for GPU priority)");
+        }
+    }
+    if let Ok(dxgi1) = device.cast::<IDXGIDevice1>() {
+        let _ = dxgi1.SetMaximumFrameLatency(1);
+    }
+    Ok((device, context))
+}
+
+/// Apollo-style GPU scheduling-priority hardening (Sunshine `display_base.cpp:599-709`). On a
+/// GPU-saturated game our capture+encode process is starved of GPU time slices — NVENC sits ~idle but
+/// `lock_bitstream` waits ~20 ms for our context to be scheduled. Elevating the PROCESS GPU scheduling
+/// priority class (the strong cross-process lever — far more effective than `SetGPUThreadPriority`
+/// alone, which we measured as no help) lets our brief encode preempt the game. Uses HIGH, NOT
+/// realtime: realtime on NVIDIA + HAGS can freeze/crash NVENC (Apollo downgrades it for exactly this).
+/// Runs once per process; best-effort. `PUNKTFUNK_GPU_PRIORITY_CLASS = off|normal|high|realtime`
+/// (default high).
+fn elevate_process_gpu_priority() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        use windows::core::{s, PCWSTR};
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+        use windows::Win32::Security::{
+            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
+            SE_INC_BASE_PRIORITY_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
+            TOKEN_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        // D3DKMT_SCHEDULINGPRIORITYCLASS: IDLE 0, BELOW_NORMAL 1, NORMAL 2, ABOVE_NORMAL 3, HIGH 4,
+        // REALTIME 5.
+        let prio: i32 = match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS").ok().as_deref() {
+            Some("off") => {
+                tracing::info!("GPU process scheduling priority class left at default (off)");
+                return;
+            }
+            Some("normal") => 2,
+            Some("realtime") => 5,
+            _ => 4, // HIGH — safe on NVIDIA+HAGS (realtime can freeze NVENC)
+        };
+
+        // 1. Enable SE_INC_BASE_PRIORITY so the kernel permits the GPU priority bump.
+        let mut token = HANDLE::default();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .is_ok()
+        {
+            let mut luid = LUID::default();
+            if LookupPrivilegeValueW(PCWSTR::null(), SE_INC_BASE_PRIORITY_NAME, &mut luid).is_ok() {
+                let tp = TOKEN_PRIVILEGES {
+                    PrivilegeCount: 1,
+                    Privileges: [LUID_AND_ATTRIBUTES {
+                        Luid: luid,
+                        Attributes: SE_PRIVILEGE_ENABLED,
+                    }],
+                };
+                if AdjustTokenPrivileges(
+                    token,
+                    false,
+                    Some(&tp as *const TOKEN_PRIVILEGES),
+                    0,
+                    None,
+                    None,
+                )
+                .is_err()
+                {
+                    tracing::warn!("could not enable SE_INC_BASE_PRIORITY for GPU priority");
+                }
+            }
+            let _ = CloseHandle(token);
+        }
+
+        // 2. D3DKMTSetProcessSchedulingPriorityClass via gdi32 (no stable windows-rs binding).
+        if let Ok(gdi32) = LoadLibraryA(s!("gdi32.dll")) {
+            if let Some(p) = GetProcAddress(gdi32, s!("D3DKMTSetProcessSchedulingPriorityClass")) {
+                type SetPrio = unsafe extern "system" fn(HANDLE, i32) -> i32;
+                let f: SetPrio = std::mem::transmute(p);
+                let st = f(GetCurrentProcess(), prio);
+                if st == 0 {
+                    tracing::info!(
+                        priority_class = prio,
+                        "GPU process scheduling priority class set (2=normal 4=high 5=realtime)"
+                    );
+                } else {
+                    tracing::warn!(
+                        status = format!("0x{st:08X}"),
+                        "D3DKMTSetProcessSchedulingPriorityClass failed (run as admin/SYSTEM for GPU priority)"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Re-find the output, make a fresh device on its adapter, and duplicate it. Used by the ACCESS_LOST
@@ -827,6 +936,135 @@ impl HdrConverter {
     }
 }
 
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_TEX2D_VPIV,
+    D3D11_TEX2D_VPOV, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+    DXGI_RATIONAL,
+};
+
+/// D3D11 **Video Processor** colour/format converter — runs on the GPU's dedicated VIDEO engine, NOT
+/// the 3D engine, so the per-frame RGB→YUV conversion does not contend with a GPU-saturating game (the
+/// HDR pixel-shader path and NVENC's internal RGB→YUV both use the 3D/compute engine, which an AAA
+/// title pins at ~100%). Output is NV12 (SDR, BT.709 studio-range) or P010 (HDR, BT.2020 PQ
+/// studio-range) — NVENC's native YUV inputs, so it encodes them with no further conversion.
+pub(crate) struct VideoConverter {
+    vdev: ID3D11VideoDevice,
+    vctx: ID3D11VideoContext1,
+    enumr: ID3D11VideoProcessorEnumerator,
+    vp: ID3D11VideoProcessor,
+}
+
+impl VideoConverter {
+    pub(crate) unsafe fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+        hdr: bool,
+    ) -> Result<Self> {
+        let vdev: ID3D11VideoDevice = device.cast().context("device -> ID3D11VideoDevice")?;
+        let vctx: ID3D11VideoContext1 = context.cast().context("context -> ID3D11VideoContext1")?;
+        let rate = DXGI_RATIONAL {
+            Numerator: 240,
+            Denominator: 1,
+        };
+        let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            InputFrameRate: rate,
+            InputWidth: width,
+            InputHeight: height,
+            OutputFrameRate: rate,
+            OutputWidth: width,
+            OutputHeight: height,
+            Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        };
+        let enumr = vdev
+            .CreateVideoProcessorEnumerator(&desc)
+            .context("CreateVideoProcessorEnumerator")?;
+        let vp = vdev
+            .CreateVideoProcessor(&enumr, 0)
+            .context("CreateVideoProcessor")?;
+
+        // Full-range RGB in → studio-range YUV out. HDR: scRGB linear (G10) → BT.2020 PQ (G2084).
+        // SDR: sRGB (G22) → BT.709 (G22).
+        let (in_cs, out_cs) = if hdr {
+            (
+                DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+                DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+            )
+        } else {
+            (
+                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+            )
+        };
+        vctx.VideoProcessorSetStreamColorSpace1(&vp, 0, in_cs);
+        vctx.VideoProcessorSetOutputColorSpace1(&vp, out_cs);
+        // One frame in, one frame out — no interpolation/auto-processing.
+        vctx.VideoProcessorSetStreamFrameFormat(&vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+
+        Ok(Self {
+            vdev,
+            vctx,
+            enumr,
+            vp,
+        })
+    }
+
+    /// Convert `input` (BGRA or scRGB FP16) → `output` (NV12 or P010) on the video engine. Views are
+    /// created per call (cheap relative to the Blt) so the input texture can vary frame to frame.
+    pub(crate) unsafe fn convert(
+        &self,
+        input: &ID3D11Texture2D,
+        output: &ID3D11Texture2D,
+    ) -> Result<()> {
+        let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+            FourCC: 0,
+            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPIV {
+                    MipSlice: 0,
+                    ArraySlice: 0,
+                },
+            },
+        };
+        let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
+        self.vdev
+            .CreateVideoProcessorInputView(input, &self.enumr, &in_desc, Some(&mut in_view))
+            .context("CreateVideoProcessorInputView")?;
+
+        let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+            },
+        };
+        let mut out_view: Option<ID3D11VideoProcessorOutputView> = None;
+        self.vdev
+            .CreateVideoProcessorOutputView(output, &self.enumr, &out_desc, Some(&mut out_view))
+            .context("CreateVideoProcessorOutputView")?;
+        let out_view = out_view.context("null output view")?;
+
+        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: true.into(),
+            pInputSurface: std::mem::ManuallyDrop::new(in_view),
+            ..Default::default()
+        };
+        self.vctx
+            .VideoProcessorBlt(&self.vp, &out_view, 0, &[stream])
+            .context("VideoProcessorBlt")
+    }
+}
+
 /// Convert a DXGI pointer shape (color / masked-color / monochrome) into top-down BGRA.
 fn convert_pointer_shape(buf: &[u8], si: &DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> Option<CursorShape> {
     let w = si.Width as usize;
@@ -1055,6 +1293,17 @@ pub struct DuplCapturer {
     hdr10_out: Option<ID3D11Texture2D>,
     /// scRGB→PQ conversion pass; rebuilt on device recreate.
     hdr_conv: Option<HdrConverter>,
+    /// Video-processor RGB→YUV converter (runs on the VIDEO engine, not the 3D engine) + its NV12
+    /// (SDR) / P010 (HDR) output texture. This is the zero-3D path: the per-frame colour conversion and
+    /// NVENC's RGB→YUV both move off the 3D engine so capture+encode don't fight a GPU-saturating game.
+    /// Lazily built for the current size+HDR; rebuilt on change. `None`/error → falls back to the
+    /// legacy RGB path. Disabled with `PUNKTFUNK_NO_VIDEO_PROCESSOR=1`.
+    video_conv: Option<VideoConverter>,
+    yuv_out: Option<ID3D11Texture2D>,
+    /// HDR-ness the current `video_conv`/`yuv_out` were built for, so an HDR toggle rebuilds them.
+    yuv_is_hdr: bool,
+    /// Latched off after a VideoConverter failure so we don't retry it every frame (fall back to RGB).
+    vp_disabled: bool,
     /// Last time a duplication rebuild was attempted, to throttle retries during an outage (e.g. a
     /// secure-desktop dwell where the output is gone) so we don't block the encode loop or hammer
     /// DuplicateOutput — between attempts the last good frame is repeated. `None` = never attempted.
@@ -1306,6 +1555,10 @@ impl DuplCapturer {
                 fp16_srv: None,
                 hdr10_out: None,
                 hdr_conv: None,
+                video_conv: None,
+                yuv_out: None,
+                yuv_is_hdr: false,
+                vp_disabled: std::env::var_os("PUNKTFUNK_NO_VIDEO_PROCESSOR").is_some(),
                 last_rebuild: None,
                 last_recover: None,
                 ever_got_frame: false,
@@ -1373,6 +1626,85 @@ impl DuplCapturer {
             .context("CreateTexture2D(gpu copy)")?;
         self.gpu_copy = t;
         Ok(())
+    }
+
+    /// Convert `input` (BGRA for SDR, scRGB FP16 for HDR) to NVENC's native YUV (NV12 / P010) via the
+    /// D3D11 **video processor** (video engine) — keeping the per-frame colour conversion AND NVENC's
+    /// RGB→YUV off the 3D engine so capture+encode don't fight a GPU-saturating game. Returns the YUV
+    /// texture, or `None` to fall back to the legacy RGB path (processor disabled/unavailable). Lazily
+    /// builds + caches the processor + output texture for the current size + HDR-ness.
+    unsafe fn convert_to_yuv(
+        &mut self,
+        input: &ID3D11Texture2D,
+        hdr: bool,
+    ) -> Option<ID3D11Texture2D> {
+        if self.vp_disabled {
+            return None;
+        }
+        if self.video_conv.is_none() || self.yuv_out.is_none() || self.yuv_is_hdr != hdr {
+            self.video_conv = None;
+            self.yuv_out = None;
+            let vc = match VideoConverter::new(
+                &self.device,
+                &self.context,
+                self.width,
+                self.height,
+                hdr,
+            ) {
+                Ok(vc) => vc,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"),
+                            "video processor unavailable — falling back to RGB encode path");
+                    self.vp_disabled = true;
+                    return None;
+                }
+            };
+            let fmt = if hdr {
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P010
+            } else {
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12
+            };
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: self.width,
+                Height: self.height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: fmt,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut t: Option<ID3D11Texture2D> = None;
+            if let Err(e) = self.device.CreateTexture2D(&desc, None, Some(&mut t)) {
+                tracing::warn!(error = %format!("{e:?}"),
+                    "CreateTexture2D(YUV out) failed — falling back to RGB encode path");
+                self.vp_disabled = true;
+                return None;
+            }
+            self.video_conv = Some(vc);
+            self.yuv_out = t;
+            self.yuv_is_hdr = hdr;
+            tracing::info!(
+                hdr,
+                "video-processor YUV path active ({} on the video engine, 0% 3D)",
+                if hdr { "P010" } else { "NV12" }
+            );
+        }
+        let out = self.yuv_out.clone()?;
+        if let Err(e) = self.video_conv.as_ref()?.convert(input, &out) {
+            tracing::warn!(error = %format!("{e:#}"),
+                "VideoProcessorBlt failed — falling back to RGB encode path");
+            self.vp_disabled = true;
+            self.video_conv = None;
+            self.yuv_out = None;
+            return None;
+        }
+        Some(out)
     }
 
     /// FP16 (`R16G16B16A16_FLOAT`) copy of the HDR duplication surface (RT for the cursor composite +
@@ -1718,6 +2050,9 @@ impl DuplCapturer {
         self.fp16_srv = None;
         self.hdr10_out = None;
         self.hdr_conv = None;
+        // Video processor + its YUV output belonged to the old device / size / HDR-ness — rebuild lazily.
+        self.video_conv = None;
+        self.yuv_out = None;
         self.first_frame = true;
         // Capture the CURRENT desktop frame as `last_present` (instead of seeding black). The secure
         // (lock/login/UAC) desktop is STATIC, so DDA only emits a frame on change — if we seeded black
@@ -1982,6 +2317,22 @@ impl DuplCapturer {
             let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
             self.holding_frame = false;
             self.composite_cursor_gpu(&src, true)?; // onto the FP16 surface (HDR: decode + nits scale)
+                                                    // Video-engine path: scRGB FP16 → BT.2020 PQ P010 on the VIDEO engine (no 3D shader, and
+                                                    // NVENC encodes P010 natively). Fall back to the HdrConverter pixel shader (3D) only if the
+                                                    // video processor is unavailable.
+            if let Some(p010) = self.convert_to_yuv(&src, true) {
+                self.last_present = Some((p010.clone(), PixelFormat::P010));
+                return Ok(CapturedFrame {
+                    width: self.width,
+                    height: self.height,
+                    pts_ns: now_ns(),
+                    format: PixelFormat::P010,
+                    payload: FramePayload::D3d11(D3d11Frame {
+                        texture: p010,
+                        device: self.device.clone(),
+                    }),
+                });
+            }
             self.ensure_hdr10_out()?;
             let out = self.hdr10_out.clone().context("hdr10 out texture")?;
             if self.hdr_conv.is_none() {
@@ -2014,12 +2365,34 @@ impl DuplCapturer {
         if self.gpu_mode {
             // Zero-copy path: keep the frame on the GPU for NVENC. Copy the transient duplication
             // surface into a reused owned texture, release the duplication frame, hand off the texture.
+            // NOTE: do NOT convert the duplication surface directly on the video processor to skip this
+            // copy — the VP colour-convert (3D/compute on NVIDIA) holds the DDA surface until it
+            // completes, blocking ReleaseFrame/AcquireNextFrame and SERIALIZING capture+convert (~60 fps,
+            // encode_us 15-20 ms measured). The fast same-format CopyResource decouples them: it releases
+            // the DDA frame immediately so the convert runs independently (40-200 fps). Worth ~5% 3D.
             self.ensure_gpu_copy()?;
             let gpu = self.gpu_copy.clone().context("gpu copy texture")?;
             self.context.CopyResource(&gpu, &tex);
             let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
             self.holding_frame = false;
             self.composite_cursor_gpu(&gpu, false)?;
+            // Prefer the video-engine YUV path (BGRA → NV12 on the video engine) so the colour
+            // conversion AND NVENC's encode stay OFF the 3D engine — the only way to keep up when a
+            // game pins the 3D engine at ~100%. Fall back to handing NVENC the BGRA texture (it then
+            // does RGB→YUV internally on the 3D/compute engine).
+            if let Some(nv12) = self.convert_to_yuv(&gpu, false) {
+                self.last_present = Some((nv12.clone(), PixelFormat::Nv12));
+                return Ok(CapturedFrame {
+                    width: self.width,
+                    height: self.height,
+                    pts_ns: now_ns(),
+                    format: PixelFormat::Nv12,
+                    payload: FramePayload::D3d11(D3d11Frame {
+                        texture: nv12,
+                        device: self.device.clone(),
+                    }),
+                });
+            }
             self.last_present = Some((gpu.clone(), PixelFormat::Bgra));
             return Ok(CapturedFrame {
                 width: self.width,

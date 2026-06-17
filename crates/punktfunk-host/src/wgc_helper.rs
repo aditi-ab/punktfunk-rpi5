@@ -101,19 +101,85 @@ pub fn run(opts: HelperOptions) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
-    let mut frame = first;
+    // Encode pipeline depth. The loop keeps DEPTH frames in flight so per-frame GPU-scheduling waits
+    // can overlap. NOTE: depth > 1 was measured to REGRESS under a GPU-saturating game — the encodes
+    // serialize on the contended GPU anyway, so a deeper queue just stacks latency (≈ depth × frame
+    // time) without raising throughput. Default 1 (the validated-best); `PUNKTFUNK_ENCODE_DEPTH` (1..=6)
+    // can raise it if a future workload is genuinely encode-throughput-bound rather than scheduling-bound.
+    let depth: usize = std::env::var("PUNKTFUNK_ENCODE_DEPTH")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&d| (1..=6).contains(&d))
+        .unwrap_or(1);
+    tracing::info!(depth, "WGC helper: encode pipeline depth");
+
+    let perf = std::env::var_os("PUNKTFUNK_PERF").is_some();
+    let mut frames = 0u64;
+    let mut cap_wait_ns = 0u64;
+    let mut encode_ns = 0u64; // time blocked in lock_bitstream (the oldest in-flight encode)
+    let mut write_ns = 0u64; // time blocked writing the AU to the stdout pipe (relay backpressure)
+    let mut window = std::time::Instant::now();
+
+    // Prime: submit `depth` frames before the first poll so NVENC has that many encodes in flight.
+    // We don't hold the `CapturedFrame`s past `submit`: NVENC keeps its own registered texture clone
+    // and the capturer's ring/held-set own the canonical refs (sized for `depth`), so the in-flight
+    // inputs stay valid after our clones drop.
+    enc.submit(&first).context("first encoder submit")?;
+    drop(first);
+    for _ in 1..depth {
+        let f = cap.next_frame().context("WGC prime frame")?;
+        enc.submit(&f).context("prime encoder submit")?;
+    }
     loop {
         if kf.swap(false, Ordering::Relaxed) {
             enc.request_keyframe();
         }
-        enc.submit(&frame).context("encoder submit")?;
-        while let Some(au) = enc.poll().context("encoder poll")? {
-            if write_au(&mut out, &au).is_err() {
+        // Pop + forward the OLDEST in-flight frame (FIFO). With `depth` outstanding it has had
+        // depth-1 frames' worth of GPU slots to finish, so this rarely blocks under load.
+        let p0 = std::time::Instant::now();
+        let polled = enc.poll().context("encoder poll")?;
+        if perf {
+            encode_ns += p0.elapsed().as_nanos() as u64;
+        }
+        if let Some(au) = polled {
+            let w0 = std::time::Instant::now();
+            let wrote = write_au(&mut out, &au);
+            if perf {
+                write_ns += w0.elapsed().as_nanos() as u64;
+            }
+            if wrote.is_err() {
                 tracing::info!("WGC helper: stdout closed (host gone) — exiting");
                 return Ok(());
             }
         }
-        frame = cap.next_frame().context("WGC next frame")?;
+        // Refill: capture + submit to keep `depth` frames in flight.
+        let t0 = std::time::Instant::now();
+        let next = cap.next_frame().context("WGC next frame")?;
+        if perf {
+            cap_wait_ns += t0.elapsed().as_nanos() as u64;
+        }
+        enc.submit(&next).context("encoder submit")?;
+
+        if perf {
+            frames += 1;
+            let since = window.elapsed();
+            if since.as_secs() >= 2 {
+                let secs = since.as_secs_f64();
+                let per = |ns: u64| format!("{:.2}", ns as f64 / frames as f64 / 1e6);
+                tracing::info!(
+                    fps = format!("{:.1}", frames as f64 / secs),
+                    cap_wait_ms = per(cap_wait_ns),
+                    encode_ms = per(encode_ns),
+                    write_ms = per(write_ns),
+                    "WGC helper perf (depth-pipelined; encode_ms=lock_bitstream on the oldest)"
+                );
+                frames = 0;
+                cap_wait_ns = 0;
+                encode_ns = 0;
+                write_ns = 0;
+                window = std::time::Instant::now();
+            }
+        }
     }
 }
 

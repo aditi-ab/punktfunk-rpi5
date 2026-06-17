@@ -151,6 +151,13 @@ impl Encoder for OpenH264Encoder {
             PixelFormat::Rgb10a2 => {
                 anyhow::bail!("software H.264 encoder cannot encode 10-bit HDR (Rgb10a2)")
             }
+            // NV12/P010 are GPU-resident video-processor outputs for the NVENC path; the software
+            // encoder never receives them (it only gets CPU RGB frames).
+            PixelFormat::Nv12 | PixelFormat::P010 => {
+                anyhow::bail!(
+                    "software encoder cannot encode YUV GPU textures (NV12/P010 → NVENC only)"
+                )
+            }
         }
 
         if self.force_kf {
