@@ -1828,6 +1828,38 @@ struct FrameMsg {
 /// speed-test probe bursts (which also need the Session). Decoupling the paced send from encoding
 /// lets the encode of frame N+1 overlap the transmit of frame N instead of waiting behind its tail.
 /// Runs until the encode thread drops the frame channel (end of stream) or `stop` is set.
+/// Raise the current thread's OS scheduling priority so a CPU-heavy game can't deschedule our
+/// capture/encode/send threads. This matters even though our GPU work is already HIGH priority: the
+/// GPU scheduler can only favour commands we've actually SUBMITTED, so if a normal-priority thread is
+/// descheduled by the game it submits the convert/encode late and the GPU priority never bites. Apollo
+/// does the same (capture thread CRITICAL, encoder ABOVE_NORMAL). Windows-only — the Linux host caps
+/// the game via gamescope, so its threads aren't starved. `critical` → highest non-realtime class
+/// (the capture+encode loop); otherwise above-normal (the send/relay thread).
+pub(crate) fn boost_thread_priority(critical: bool) {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            THREAD_PRIORITY_HIGHEST,
+        };
+        let prio = if critical {
+            THREAD_PRIORITY_HIGHEST
+        } else {
+            THREAD_PRIORITY_ABOVE_NORMAL
+        };
+        match SetThreadPriority(GetCurrentThread(), prio) {
+            Ok(()) => tracing::debug!(critical, "thread priority raised"),
+            Err(e) => {
+                tracing::debug!(critical, error = %format!("{e:?}"), "SetThreadPriority failed")
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = critical;
+    }
+}
+
 fn send_loop(
     mut session: Session,
     frame_rx: std::sync::mpsc::Receiver<FrameMsg>,
@@ -1837,6 +1869,7 @@ fn send_loop(
     perf: bool,
     burst_cap: usize,
 ) {
+    boost_thread_priority(false); // transmit thread: above-normal (Apollo's encoder-thread level)
     let mut last_perf = std::time::Instant::now();
     let mut last_bytes = 0u64;
     let mut last_send_dropped = 0u64;
@@ -1995,6 +2028,9 @@ fn virtual_stream(
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
 ) -> Result<()> {
+    // This thread runs the capture+encode loop (single-process: Linux / synthetic / NO_WGC DDA) — or
+    // tail-calls the relay below. Elevate it so a CPU-heavy game can't deschedule our GPU submission.
+    boost_thread_priority(true);
     // Windows two-process secure-desktop path: when the host runs as SYSTEM (required for the secure
     // desktop + SendInput), WGC can't activate in-process, so we capture the normal desktop via a
     // helper spawned in the user session and relay its AUs. (Single-process WGC/DDA is used as the
