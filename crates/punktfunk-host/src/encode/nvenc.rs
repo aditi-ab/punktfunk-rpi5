@@ -229,6 +229,16 @@ impl NvencD3d11Encoder {
                 cfg.rcParams.vbvBufferSize = vbv;
                 cfg.rcParams.vbvInitialDelay = vbv;
 
+                // HIGH tier + autoselect level. The codec's PER-LEVEL bitrate ceiling is otherwise the
+                // MAIN-tier cap — for HEVC at 5K that's Level 6.2 Main ≈ 240 Mbps — so a high client
+                // bitrate (e.g. 1 Gbps) makes `initialize_encoder` reject it and the step-down loop below
+                // silently QUARTERS it to ~240-320 Mbps (visible color/motion compression). HIGH tier
+                // lifts the HEVC ceiling to ≈800 Mbps (AV1 higher still); autoselect lets NVENC pick the
+                // matching level for the tier+bitrate. `tier`/`level` are u32; HIGH = 1, AUTOSELECT = 0,
+                // and HEVC/AV1 share the union offset so this is correct for both codecs.
+                cfg.encodeCodecConfig.hevcConfig.tier = 1; // NV_ENC_TIER_*_HIGH
+                cfg.encodeCodecConfig.hevcConfig.level = 0; // NV_ENC_LEVEL_AUTOSELECT
+
                 // 3b. 10-bit HEVC Main10. The 8-bit ARGB capture input is upconverted by NVENC (the
                 // proven high-bit-depth-from-8-bit path); the encoded stream is 10-bit, which removes
                 // banding and is the foundation for HDR. Color stays BT.709 here (Phase 2 sets the
