@@ -129,6 +129,7 @@ pub fn new(
     window: &adw::ApplicationWindow,
     connector: Arc<NativeClient>,
     frames: async_channel::Receiver<DecodedFrame>,
+    escape_rx: async_channel::Receiver<()>,
     stop: Arc<AtomicBool>,
     inhibit_shortcuts: bool,
     title: &str,
@@ -159,10 +160,21 @@ pub fn new(
     hint.set_margin_bottom(24);
     hint.set_visible(false);
 
+    // Flashed when entering fullscreen — the only exit affordances once the header bar is
+    // hidden (F11 on a keyboard; the L1+R1+Start+Select chord on a controller, which is the
+    // only way out on a Steam Deck).
+    let fs_hint = gtk::Label::new(Some("F11  ·  L1 + R1 + Start + Select  —  exit fullscreen"));
+    fs_hint.add_css_class("osd");
+    fs_hint.set_halign(gtk::Align::Center);
+    fs_hint.set_valign(gtk::Align::Start);
+    fs_hint.set_margin_top(12);
+    fs_hint.set_visible(false);
+
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&offload));
     overlay.add_overlay(&stats_label);
     overlay.add_overlay(&hint);
+    overlay.add_overlay(&fs_hint);
     overlay.set_focusable(true);
 
     let capture = Rc::new(Capture {
@@ -198,8 +210,17 @@ pub fn new(
     // the page dies — the window outlives every session.)
     let fs_handler = {
         let toolbar = toolbar.clone();
+        let fs_hint = fs_hint.clone();
         window.connect_fullscreened_notify(move |w| {
-            toolbar.set_reveal_top_bars(!w.is_fullscreen());
+            let fs = w.is_fullscreen();
+            toolbar.set_reveal_top_bars(!fs);
+            if fs {
+                fs_hint.set_visible(true);
+                let fs_hint = fs_hint.clone();
+                glib::timeout_add_seconds_local_once(4, move || fs_hint.set_visible(false));
+            } else {
+                fs_hint.set_visible(false);
+            }
         })
     };
 
@@ -404,17 +425,38 @@ pub fn new(
         let cap = capture.clone();
         overlay.connect_unmap(move |_| cap.release());
     }
+
+    // Controller escape chord (gamepad service) → leave fullscreen + release capture. The
+    // chord is the only fullscreen exit a controller has (no F11 key; fullscreen hides the
+    // chrome). Aborted on page-hidden so a stale future can't act on the shared window.
+    let escape_future = {
+        let window = window.clone();
+        let cap = capture.clone();
+        glib::spawn_future_local(async move {
+            while escape_rx.recv().await.is_ok() {
+                if window.is_fullscreen() {
+                    window.unfullscreen();
+                }
+                cap.release();
+            }
+        })
+    };
+
     // The page's `hidden` fires once navigation away completes (back button, pop on
     // session end) — NOT on the transient unmap/map cycle a NavigationView push performs.
     {
         let window = window.clone();
         let stop_h = stop.clone();
         let handlers = RefCell::new(Some((fs_handler, active_handler)));
+        let escape_future = RefCell::new(Some(escape_future));
         page.connect_hidden(move |_| {
             tracing::debug!("stream page hidden — ending session");
             if let Some((fs, active)) = handlers.borrow_mut().take() {
                 window.disconnect(fs);
                 window.disconnect(active);
+            }
+            if let Some(f) = escape_future.borrow_mut().take() {
+                f.abort();
             }
             if window.is_fullscreen() {
                 window.unfullscreen();

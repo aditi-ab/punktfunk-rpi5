@@ -469,6 +469,7 @@ fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
                         &app.window,
                         connector,
                         frames.take().expect("Connected delivered once"),
+                        app.gamepad.escape_events(),
                         handle.stop.clone(),
                         inhibit,
                         &title,

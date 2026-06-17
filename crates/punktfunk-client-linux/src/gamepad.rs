@@ -27,6 +27,14 @@ const GYRO_LSB_PER_RAD_S: f32 = 20.0 * 180.0 / std::f32::consts::PI;
 const ACCEL_LSB_PER_G: f32 = 10_000.0;
 const G: f32 = 9.80665;
 
+/// The controller "escape" chord (Moonlight convention): L1 + R1 + Start + Select held
+/// together. Intercepted by the client to leave fullscreen + release input capture — the
+/// Deck has no F11 key and fullscreen hides the window chrome, so with a controller this
+/// is the only way out. Four simultaneous buttons that no game uses as a deliberate
+/// combo, so it can't be triggered by normal play. Still forwarded to the host (the user
+/// is leaving anyway); we only also raise the escape signal.
+const ESCAPE_CHORD: [u32; 4] = [wire::BTN_LB, wire::BTN_RB, wire::BTN_START, wire::BTN_BACK];
+
 #[derive(Clone, Debug)]
 pub struct PadInfo {
     pub id: u32,
@@ -46,6 +54,9 @@ pub struct GamepadService {
     active: Arc<Mutex<Option<PadInfo>>>,
     pinned: Arc<Mutex<Option<u32>>>,
     ctl: Sender<Ctl>,
+    /// Fires once per press of the [`ESCAPE_CHORD`]; the stream page consumes it to leave
+    /// fullscreen + release capture.
+    escape_rx: async_channel::Receiver<()>,
 }
 
 impl GamepadService {
@@ -54,11 +65,12 @@ impl GamepadService {
         let active = Arc::new(Mutex::new(None));
         let pinned = Arc::new(Mutex::new(None));
         let (ctl, ctl_rx) = std::sync::mpsc::channel();
+        let (escape_tx, escape_rx) = async_channel::unbounded();
         let (p, a, pin) = (pads.clone(), active.clone(), pinned.clone());
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-gamepad".into())
             .spawn(move || {
-                if let Err(e) = run(&p, &a, &pin, &ctl_rx) {
+                if let Err(e) = run(&p, &a, &pin, &ctl_rx, &escape_tx) {
                     tracing::warn!(error = %e, "gamepad service ended — pads disabled");
                 }
             })
@@ -70,7 +82,14 @@ impl GamepadService {
             active,
             pinned,
             ctl,
+            escape_rx,
         }
+    }
+
+    /// A receiver that yields one `()` each time the controller escape chord is pressed.
+    /// A fresh clone per call (shared mpmc channel); the stream page spawns a future on it.
+    pub fn escape_events(&self) -> async_channel::Receiver<()> {
+        self.escape_rx.clone()
     }
 
     pub fn pads(&self) -> Vec<PadInfo> {
@@ -210,6 +229,10 @@ struct Worker {
     last_axis: [i32; 6],
     held_buttons: Vec<u32>,
     last_accel: [i16; 3],
+    /// Raises the UI escape signal; the escape chord fires it once per press.
+    escape_tx: async_channel::Sender<()>,
+    /// The escape chord is fully held — latched so it fires once, not every poll.
+    chord_armed: bool,
 }
 
 impl Worker {
@@ -250,6 +273,26 @@ impl Worker {
         }
     }
 
+    /// Raise the UI escape signal when the [`ESCAPE_CHORD`] just completed (latched so it
+    /// fires once per press). Called after each button-down updates `held_buttons`.
+    fn maybe_fire_escape(&mut self) {
+        if self.chord_armed {
+            return;
+        }
+        if ESCAPE_CHORD.iter().all(|b| self.held_buttons.contains(b)) {
+            self.chord_armed = true;
+            let _ = self.escape_tx.try_send(());
+            tracing::info!("gamepad escape chord (L1+R1+Start+Select) — leaving fullscreen");
+        }
+    }
+
+    /// Re-arm once the chord is broken (any of its buttons released).
+    fn rearm_escape(&mut self) {
+        if self.chord_armed && !ESCAPE_CHORD.iter().all(|b| self.held_buttons.contains(b)) {
+            self.chord_armed = false;
+        }
+    }
+
     /// Sensors stream only while a session wants them (they cost USB/BT bandwidth).
     fn set_sensors(&mut self, enabled: bool) {
         let Some(id) = self.active_id() else { return };
@@ -270,6 +313,7 @@ fn run(
     active_out: &Mutex<Option<PadInfo>>,
     pinned_out: &Mutex<Option<u32>>,
     ctl: &Receiver<Ctl>,
+    escape_tx: &async_channel::Sender<()>,
 ) -> Result<(), String> {
     // Off-main-thread + no video subsystem: keep SDL away from signals, poll pads on its
     // own thread.
@@ -288,6 +332,8 @@ fn run(
         last_axis: [i32::MIN; 6],
         held_buttons: Vec::new(),
         last_accel: [0; 3],
+        escape_tx: escape_tx.clone(),
+        chord_armed: false,
     };
 
     let publish = |w: &Worker| {
@@ -372,6 +418,7 @@ fn run(
                             bit,
                             1,
                         );
+                        w.maybe_fire_escape();
                     }
                 }
                 Event::ControllerButtonUp { which, button, .. }
@@ -385,6 +432,7 @@ fn run(
                             bit,
                             0,
                         );
+                        w.rearm_escape();
                     }
                 }
                 Event::ControllerAxisMotion {
