@@ -15,14 +15,30 @@ android {
         applicationId = "io.unom.punktfunk"
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
+        versionCode = System.getenv("VERSION_CODE")?.toInt() ?: 1
         versionName = "0.0.1"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 
+    signingConfigs {
+        create("release") {
+            // These are provided by CI secrets as environment variables
+            val keystoreFile = System.getenv("RELEASE_KEYSTORE_FILE")
+            if (keystoreFile != null) {
+                storeFile = file(keystoreFile)
+                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false // scaffold; enable R8 + shrinkResources later
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
