@@ -159,6 +159,31 @@ fn ck(r: CUresult, what: &str) -> Result<()> {
     }
 }
 
+/// Copy a pitched device plane `(src_ptr, src_pitch)` down to a tightly-packed host buffer of
+/// `width_bytes`×`height` (no row padding). Synchronous on the priority stream. Used by the NV12
+/// self-test to read planes back for the colour comparison; not on the hot path.
+pub fn read_plane_to_host(
+    src_ptr: CUdeviceptr,
+    src_pitch: usize,
+    width_bytes: usize,
+    height: usize,
+) -> Result<Vec<u8>> {
+    let mut host = vec![0u8; width_bytes * height];
+    let copy = CUDA_MEMCPY2D {
+        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+        srcDevice: src_ptr,
+        srcPitch: src_pitch,
+        dstMemoryType: 1, // CU_MEMORYTYPE_HOST
+        dstHost: host.as_mut_ptr() as *mut c_void,
+        dstPitch: width_bytes,
+        WidthInBytes: width_bytes,
+        Height: height,
+        ..Default::default()
+    };
+    unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(dev->host)")? };
+    Ok(host)
+}
+
 /// The shared process-wide CUDA context (created once). Wrapped so it's `Send`/`Sync` to live
 /// in a `OnceLock`; the raw `CUcontext` is thread-safe to make current from any thread.
 #[derive(Clone, Copy)]
@@ -265,11 +290,52 @@ fn alloc_pitched(width: u32, height: u32) -> Result<(CUdeviceptr, usize)> {
     Ok((ptr, pitch))
 }
 
+/// Allocate the two pitched planes of an NV12 surface (8-bit BT.709 4:2:0): a `width`-byte Y plane
+/// (W×H, 1 byte/px) and an interleaved chroma plane (W/2 × H/2 samples, 2 bytes/sample → W bytes
+/// wide). Both planes share the driver's Y pitch (the wider request), so the encoder's two-plane
+/// surface and ours line up. Returns `((y_ptr, y_pitch), (uv_ptr, uv_pitch))`.
+fn alloc_pitched_nv12(
+    width: u32,
+    height: u32,
+) -> Result<((CUdeviceptr, usize), (CUdeviceptr, usize))> {
+    let mut y_ptr: CUdeviceptr = 0;
+    let mut y_pitch: usize = 0;
+    let mut uv_ptr: CUdeviceptr = 0;
+    let mut uv_pitch: usize = 0;
+    unsafe {
+        ck(
+            cuMemAllocPitch_v2(
+                &mut y_ptr,
+                &mut y_pitch,
+                width as usize,
+                height as usize,
+                16,
+            ),
+            "cuMemAllocPitch_v2(Y)",
+        )?;
+        // Chroma is W/2 samples wide at 2 bytes each = W bytes; H/2 rows.
+        ck(
+            cuMemAllocPitch_v2(
+                &mut uv_ptr,
+                &mut uv_pitch,
+                (width as usize / 2) * 2,
+                (height as usize / 2).max(1),
+                16,
+            ),
+            "cuMemAllocPitch_v2(UV)",
+        )?;
+    }
+    Ok(((y_ptr, y_pitch), (uv_ptr, uv_pitch)))
+}
+
 /// Free-list of recycled device allocations for one resolution. Shared (via `Arc`) between the
 /// capture thread that hands out buffers and the encode thread where a [`DeviceBuffer`] drops and
-/// returns its allocation here. Bulk-freed when the last reference drops.
+/// returns its allocation here. Bulk-freed when the last reference drops. For NV12 each free entry
+/// is the Y plane *and* its paired UV plane (allocated/recycled/freed together).
 struct PoolInner {
     free: Vec<CUdeviceptr>,
+    /// NV12 only: the UV plane paired with each Y plane in `free` (same index, same length).
+    free_uv: Vec<CUdeviceptr>,
 }
 
 impl Drop for PoolInner {
@@ -279,6 +345,9 @@ impl Drop for PoolInner {
                 let _ = cuCtxSetCurrent(c.0);
             }
             for &p in &self.free {
+                let _ = cuMemFree_v2(p);
+            }
+            for &p in &self.free_uv {
                 let _ = cuMemFree_v2(p);
             }
         }
@@ -294,6 +363,8 @@ pub struct BufferPool {
     width: u32,
     height: u32,
     pitch: usize,
+    /// NV12 pools carry a second (chroma) pitch; `Some` ⇒ buffers from this pool have a UV plane.
+    uv_pitch: Option<usize>,
 }
 
 impl BufferPool {
@@ -302,10 +373,30 @@ impl BufferPool {
     pub fn new(width: u32, height: u32) -> Result<BufferPool> {
         let (ptr, pitch) = alloc_pitched(width, height)?;
         Ok(BufferPool {
-            inner: Arc::new(Mutex::new(PoolInner { free: vec![ptr] })),
+            inner: Arc::new(Mutex::new(PoolInner {
+                free: vec![ptr],
+                free_uv: Vec::new(),
+            })),
             width,
             height,
             pitch,
+            uv_pitch: None,
+        })
+    }
+
+    /// Create a pool of NV12 two-plane surfaces (Y + interleaved UV) for `width`x`height`. Allocates
+    /// one pair up front to learn the driver's per-plane pitches (constant for a given width).
+    pub fn new_nv12(width: u32, height: u32) -> Result<BufferPool> {
+        let ((y_ptr, y_pitch), (uv_ptr, uv_pitch)) = alloc_pitched_nv12(width, height)?;
+        Ok(BufferPool {
+            inner: Arc::new(Mutex::new(PoolInner {
+                free: vec![y_ptr],
+                free_uv: vec![uv_ptr],
+            })),
+            width,
+            height,
+            pitch: y_pitch,
+            uv_pitch: Some(uv_pitch),
         })
     }
 
@@ -318,8 +409,31 @@ impl BufferPool {
     }
 
     /// Take a buffer — recycled if one is free, else freshly allocated. The buffer returns to this
-    /// pool when dropped (after the consumer has synchronized, so the GPU is done with it).
+    /// pool when dropped (after the consumer has synchronized, so the GPU is done with it). For an
+    /// NV12 pool the returned buffer carries both the Y and the paired UV plane.
     pub fn get(&self) -> Result<DeviceBuffer> {
+        if let Some(uv_pitch) = self.uv_pitch {
+            let reuse = {
+                let mut g = self.inner.lock().unwrap();
+                g.free.pop().map(|y| (y, g.free_uv.pop()))
+            };
+            let (ptr, uv_ptr) = match reuse {
+                // Y and UV are pushed/popped together, so a popped Y always has its UV.
+                Some((y, Some(uv))) => (y, uv),
+                _ => {
+                    let ((y, _), (uv, _)) = alloc_pitched_nv12(self.width, self.height)?;
+                    (y, uv)
+                }
+            };
+            return Ok(DeviceBuffer {
+                ptr,
+                pitch: self.pitch,
+                width: self.width,
+                height: self.height,
+                uv: Some((uv_ptr, uv_pitch)),
+                pool: Some(self.inner.clone()),
+            });
+        }
         let reuse = self.inner.lock().unwrap().free.pop();
         let ptr = match reuse {
             Some(p) => p,
@@ -330,6 +444,7 @@ impl BufferPool {
             pitch: self.pitch,
             width: self.width,
             height: self.height,
+            uv: None,
             pool: Some(self.inner.clone()),
         })
     }
@@ -343,6 +458,9 @@ pub struct DeviceBuffer {
     pub pitch: usize,
     pub width: u32,
     pub height: u32,
+    /// NV12 only: the interleaved chroma plane `(ptr, pitch)` paired with the Y plane in [`ptr`].
+    /// `None` for the default 4-byte RGB/BGRx path. When `Some`, [`ptr`] is the Y plane (1 byte/px).
+    pub uv: Option<(CUdeviceptr, usize)>,
     pool: Option<Arc<Mutex<PoolInner>>>,
 }
 
@@ -355,8 +473,28 @@ impl DeviceBuffer {
             pitch,
             width,
             height,
+            uv: None,
             pool: None,
         })
+    }
+
+    /// Allocate a standalone (un-pooled) NV12 two-plane buffer. Prefer [`BufferPool::new_nv12`] on
+    /// the hot path; used by the self-test.
+    pub fn alloc_nv12(width: u32, height: u32) -> Result<DeviceBuffer> {
+        let ((y_ptr, y_pitch), (uv_ptr, uv_pitch)) = alloc_pitched_nv12(width, height)?;
+        Ok(DeviceBuffer {
+            ptr: y_ptr,
+            pitch: y_pitch,
+            width,
+            height,
+            uv: Some((uv_ptr, uv_pitch)),
+            pool: None,
+        })
+    }
+
+    /// True if this buffer carries an NV12 chroma plane.
+    pub fn is_nv12(&self) -> bool {
+        self.uv.is_some()
     }
 }
 
@@ -366,8 +504,13 @@ impl Drop for DeviceBuffer {
             return;
         }
         if let Some(pool) = &self.pool {
-            // Recycle (the consumer synchronized before dropping, so the GPU is done with it).
-            pool.lock().unwrap().free.push(self.ptr);
+            // Recycle (the consumer synchronized before dropping, so the GPU is done with it). Y and
+            // its paired UV go back together so `get` can repair them as a unit.
+            let mut g = pool.lock().unwrap();
+            g.free.push(self.ptr);
+            if let Some((uv_ptr, _)) = self.uv {
+                g.free_uv.push(uv_ptr);
+            }
         } else {
             // The buffer may be freed on the encode thread; cuMemFree needs a current context.
             unsafe {
@@ -375,6 +518,9 @@ impl Drop for DeviceBuffer {
                     let _ = cuCtxSetCurrent(c.0);
                 }
                 let _ = cuMemFree_v2(self.ptr);
+                if let Some((uv_ptr, _)) = self.uv {
+                    let _ = cuMemFree_v2(uv_ptr);
+                }
             }
         }
     }
@@ -440,6 +586,62 @@ impl RegisteredTexture {
             res
         }
     }
+
+    /// Map this texture for the frame and copy its array into the device plane `(dst_ptr,
+    /// dst_pitch)`, taking `width_bytes`×`height` bytes (the GL internal format dictates
+    /// `width_bytes`: `width*1` for an `R8` luma target, `(width/2)*2` for an `RG8` chroma target).
+    /// Synchronized on our priority stream before unmap (so the source dmabuf is safe to recycle).
+    /// Always unmaps, even on copy error.
+    fn copy_mapped_plane(
+        &mut self,
+        dst_ptr: CUdeviceptr,
+        dst_pitch: usize,
+        width_bytes: usize,
+        height: usize,
+    ) -> Result<()> {
+        unsafe {
+            ck(
+                cuGraphicsMapResources(1, &mut self.resource, std::ptr::null_mut()),
+                "cuGraphicsMapResources",
+            )?;
+            let mut array: CUarray = std::ptr::null_mut();
+            if cuGraphicsSubResourceGetMappedArray(&mut array, self.resource, 0, 0) != 0 {
+                let _ = cuGraphicsUnmapResources(1, &mut self.resource, std::ptr::null_mut());
+                bail!("cuGraphicsSubResourceGetMappedArray failed");
+            }
+            let copy = CUDA_MEMCPY2D {
+                srcMemoryType: CU_MEMORYTYPE_ARRAY,
+                srcArray: array,
+                dstMemoryType: CU_MEMORYTYPE_DEVICE,
+                dstDevice: dst_ptr,
+                dstPitch: dst_pitch,
+                WidthInBytes: width_bytes,
+                Height: height,
+                ..Default::default()
+            };
+            let res = copy_blocking(&copy, "cuMemcpy2DAsync_v2(plane)");
+            let _ = cuGraphicsUnmapResources(1, &mut self.resource, std::ptr::null_mut());
+            res
+        }
+    }
+}
+
+/// Copy the two NV12 convert targets (registered `R8` luma + `RG8` chroma GL textures) into `dst`'s
+/// Y and UV planes. `dst` must be an NV12 buffer (`dst.uv` set). The luma plane is `width`×`height`
+/// bytes; the chroma plane is `(width/2)·2` bytes wide × `height/2` rows. Both copies sync on our
+/// priority stream before returning, so the dmabuf is safe to recycle once this returns.
+pub fn copy_mapped_nv12(
+    y_tex: &mut RegisteredTexture,
+    uv_tex: &mut RegisteredTexture,
+    dst: &DeviceBuffer,
+) -> Result<()> {
+    let (uv_ptr, uv_pitch) = dst
+        .uv
+        .ok_or_else(|| anyhow::anyhow!("copy_mapped_nv12 on a non-NV12 buffer"))?;
+    let w = dst.width as usize;
+    let h = dst.height as usize;
+    y_tex.copy_mapped_plane(dst.ptr, dst.pitch, w, h)?;
+    uv_tex.copy_mapped_plane(uv_ptr, uv_pitch, (w / 2) * 2, h / 2)
 }
 
 /// Copy a pitched device buffer into another device region (device→device), e.g. our imported
@@ -462,6 +664,50 @@ pub fn copy_device_to_device(
         ..Default::default()
     };
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(dev->dev)") }
+}
+
+/// Copy our imported NV12 [`DeviceBuffer`] (Y + UV planes) into NVENC's two-plane CUDA surface
+/// `(y_dst, y_pitch)` / `(uv_dst, uv_pitch)` (`av_hwframe_get_buffer`'s `data[0]`/`data[1]` +
+/// `linesize[0]`/`linesize[1]`). The Y plane is `width`×`height` bytes; the chroma plane is
+/// `(width/2)·2` bytes × `height/2` rows. The caller must have the shared context current.
+pub fn copy_nv12_to_device(
+    src: &DeviceBuffer,
+    y_dst: CUdeviceptr,
+    y_pitch: usize,
+    uv_dst: CUdeviceptr,
+    uv_pitch: usize,
+) -> Result<()> {
+    let (src_uv_ptr, src_uv_pitch) = src
+        .uv
+        .ok_or_else(|| anyhow::anyhow!("copy_nv12_to_device on a non-NV12 buffer"))?;
+    let w = src.width as usize;
+    let h = src.height as usize;
+    let y = CUDA_MEMCPY2D {
+        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+        srcDevice: src.ptr,
+        srcPitch: src.pitch,
+        dstMemoryType: CU_MEMORYTYPE_DEVICE,
+        dstDevice: y_dst,
+        dstPitch: y_pitch,
+        WidthInBytes: w, // 1 byte/px luma
+        Height: h,
+        ..Default::default()
+    };
+    let uv = CUDA_MEMCPY2D {
+        srcMemoryType: CU_MEMORYTYPE_DEVICE,
+        srcDevice: src_uv_ptr,
+        srcPitch: src_uv_pitch,
+        dstMemoryType: CU_MEMORYTYPE_DEVICE,
+        dstDevice: uv_dst,
+        dstPitch: uv_pitch,
+        WidthInBytes: (w / 2) * 2, // 2 bytes/sample interleaved U,V
+        Height: h / 2,
+        ..Default::default()
+    };
+    unsafe {
+        copy_blocking(&y, "cuMemcpy2DAsync_v2(nv12 Y dev->dev)")?;
+        copy_blocking(&uv, "cuMemcpy2DAsync_v2(nv12 UV dev->dev)")
+    }
 }
 
 impl Drop for RegisteredTexture {

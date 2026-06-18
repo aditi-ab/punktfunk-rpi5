@@ -466,6 +466,9 @@ mod pipewire {
         negotiated: Arc<AtomicBool>,
         /// Present when zero-copy is enabled: imports a dmabuf → CUDA device buffer.
         importer: Option<crate::zerocopy::EglImporter>,
+        /// `PUNKTFUNK_NV12`: on the tiled EGL/GL zero-copy path, convert to NV12 on the GPU and feed
+        /// NVENC native YUV (Tier 2A). Off ⇒ the BGRx path is unchanged.
+        nv12: bool,
         /// Rate-limit counter for the latest-frame-only diagnostic log (see `.process`).
         dbg_log_n: u64,
     }
@@ -780,8 +783,17 @@ mod pipewire {
                 // sample LINEAR).
                 let modifier = (ud.modifier != 0).then_some(ud.modifier);
                 if let Some(fourcc) = crate::zerocopy::drm_fourcc(fmt) {
-                    let imported = if modifier.is_some() {
-                        importer.import(&plane, w as u32, h as u32, fourcc, modifier)
+                    // NV12 convert (Tier 2A) only on the tiled EGL/GL path (`modifier.is_some()`):
+                    // produce native YUV so NVENC skips its internal RGB→YUV CSC. The LINEAR/Vulkan
+                    // (gamescope) path stays RGB — its convert isn't wired here. When NV12 is
+                    // produced the frame's format is reported as `Nv12` so the encoder opens native.
+                    let nv12 = ud.nv12 && modifier.is_some();
+                    let imported = if let Some(m) = modifier {
+                        if nv12 {
+                            importer.import_nv12(&plane, w as u32, h as u32, fourcc, Some(m))
+                        } else {
+                            importer.import(&plane, w as u32, h as u32, fourcc, Some(m))
+                        }
                     } else {
                         importer.import_linear(&plane, w as u32, h as u32)
                     };
@@ -794,6 +806,7 @@ mod pipewire {
                                     w,
                                     h,
                                     modifier = ud.modifier,
+                                    nv12,
                                     "zero-copy: dmabuf imported to CUDA (no CPU copy)"
                                 );
                             }
@@ -805,7 +818,7 @@ mod pipewire {
                                 width: w as u32,
                                 height: h as u32,
                                 pts_ns,
-                                format: fmt,
+                                format: if nv12 { PixelFormat::Nv12 } else { fmt },
                                 payload: FramePayload::Cuda(devbuf),
                             });
                             return;
@@ -978,6 +991,12 @@ mod pipewire {
                 "zero-copy: advertising EGL-importable dmabuf modifiers"
             );
         }
+        if want_dmabuf && crate::zerocopy::nv12_enabled() {
+            tracing::info!(
+                "PUNKTFUNK_NV12: tiled dmabufs convert to NV12 (BT.709 limited) on the GPU — NVENC \
+                 fed native YUV (no internal RGB→YUV CSC)"
+            );
+        }
 
         let data = UserData {
             info: VideoInfoRaw::default(),
@@ -987,6 +1006,7 @@ mod pipewire {
             active,
             negotiated,
             importer,
+            nv12: crate::zerocopy::nv12_enabled(),
             dbg_log_n: 0,
         };
 

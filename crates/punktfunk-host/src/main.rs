@@ -125,6 +125,11 @@ fn real_main() -> Result<()> {
         // Zero-copy FFI/GPU probe: init the EGL importer + CUDA context (no capture needed).
         #[cfg(target_os = "linux")]
         Some("zerocopy-probe") => zerocopy::probe(),
+        // NV12 colour self-test (no display/capture needed): convert a known RGBA pattern to NV12
+        // on the GPU and compare against a BT.709 limited-range reference. Validates the Tier 2A
+        // `PUNKTFUNK_NV12` convert is colour-correct. Prints PASS/FAIL + max Y/U/V error.
+        #[cfg(target_os = "linux")]
+        Some("nv12-selftest") => zerocopy::nv12_selftest(),
         // Compositor readiness probe: exit 0 iff the (detected or PUNKTFUNK_COMPOSITOR-forced)
         // compositor is up and able to create a virtual output *now*. A session-bringup
         // script polls this to gate on real readiness instead of a blind `sleep`.

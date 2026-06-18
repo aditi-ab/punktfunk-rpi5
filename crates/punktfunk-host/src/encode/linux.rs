@@ -103,10 +103,14 @@ fn nvenc_input(format: PixelFormat) -> (Pixel, bool) {
         PixelFormat::Rgba => (Pixel::RGBA, false),
         PixelFormat::Rgb => (Pixel::RGBZ, true), // RGB -> rgb0
         PixelFormat::Bgr => (Pixel::BGRZ, true), // BGR -> bgr0
-        // Rgb10a2 (HDR) and NV12/P010 (the Windows video-processor YUV outputs) are produced only by
-        // the Windows capture/encode paths; the Linux capturer never emits them. Map to BGRA so the
-        // match is exhaustive — unreachable here.
-        PixelFormat::Rgb10a2 | PixelFormat::Nv12 | PixelFormat::P010 => (Pixel::BGRA, false),
+        // NV12 is native YUV: NVENC encodes it with NO internal RGB→YUV CSC (the Tier 2A win). On
+        // Linux it's produced by the GPU convert on the zero-copy tiled path (`PUNKTFUNK_NV12`); on
+        // Windows by the D3D11 video processor.
+        PixelFormat::Nv12 => (Pixel::NV12, false),
+        // Rgb10a2 (HDR) and P010 (the Windows 10-bit video-processor output) are produced only by
+        // the Windows paths; the Linux capturer never emits them. Map to BGRA so the match is
+        // exhaustive — unreachable here.
+        PixelFormat::Rgb10a2 | PixelFormat::P010 => (Pixel::BGRA, false),
     }
 }
 
@@ -202,6 +206,21 @@ impl NvencEncoder {
         // This is the Moonlight/Sunshine low-latency model.
         unsafe {
             (*video.as_mut_ptr()).gop_size = -1;
+        }
+
+        // NV12 path: we did the RGB→YUV conversion ourselves as BT.709 *limited* range, so signal
+        // that in the bitstream VUI (colorspace/range/primaries/transfer) — otherwise the client
+        // decoder assumes a default and the picture comes out washed-out / wrong-contrast. The
+        // RGB-input paths leave these unset (NVENC's internal CSC writes its own VUI). Matches the
+        // Windows NV12 path's BT.709 limited-range signalling.
+        if matches!(format, PixelFormat::Nv12) {
+            unsafe {
+                let raw = video.as_mut_ptr();
+                (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
+                (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG; // limited/studio
+                (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+                (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+            }
         }
 
         // For the zero-copy path, take CUDA surfaces: wrap the shared CUcontext in CUDA
@@ -419,9 +438,20 @@ impl NvencEncoder {
                 ffi::av_frame_free(&mut f);
                 bail!("av_hwframe_get_buffer(CUDA) failed ({r})");
             }
-            let dst_ptr = (*f).data[0] as crate::zerocopy::cuda::CUdeviceptr;
-            let dst_pitch = (*f).linesize[0] as usize;
-            if let Err(e) = crate::zerocopy::cuda::copy_device_to_device(buf, dst_ptr, dst_pitch) {
+            // NV12 surfaces are two-plane (Y in data[0], interleaved UV in data[1]); the RGB
+            // surfaces are single-plane. Copy the matching layout into NVENC's pooled surface.
+            let copy_res = if buf.is_nv12() {
+                let y_ptr = (*f).data[0] as crate::zerocopy::cuda::CUdeviceptr;
+                let y_pitch = (*f).linesize[0] as usize;
+                let uv_ptr = (*f).data[1] as crate::zerocopy::cuda::CUdeviceptr;
+                let uv_pitch = (*f).linesize[1] as usize;
+                crate::zerocopy::cuda::copy_nv12_to_device(buf, y_ptr, y_pitch, uv_ptr, uv_pitch)
+            } else {
+                let dst_ptr = (*f).data[0] as crate::zerocopy::cuda::CUdeviceptr;
+                let dst_pitch = (*f).linesize[0] as usize;
+                crate::zerocopy::cuda::copy_device_to_device(buf, dst_ptr, dst_pitch)
+            };
+            if let Err(e) = copy_res {
                 ffi::av_frame_free(&mut f);
                 return Err(e).context("copy imported buffer into NVENC surface");
             }

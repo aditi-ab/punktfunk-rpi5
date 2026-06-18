@@ -34,6 +34,13 @@ const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_LINEAR: c_int = 0x2601;
 const GL_NEAREST: c_int = 0x2600;
 const GL_RGBA8: u32 = 0x8058;
+// Single/dual-channel 8-bit formats for the NV12 convert targets: R8 luma (full-res),
+// RG8 interleaved chroma (half-res). The `_RED`/`_RG` enums are the matching client formats.
+const GL_R8: u32 = 0x8229;
+const GL_RG8: u32 = 0x822B;
+// Client pixel format/type for texture uploads (self-test only): RGBA bytes.
+const GL_RGBA: u32 = 0x1908;
+const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_FRAMEBUFFER: u32 = 0x8D40;
 const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
 const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
@@ -54,6 +61,7 @@ extern "C" {
     fn glTexStorage2D(target: u32, levels: c_int, internalformat: u32, width: c_int, height: c_int);
     fn glGetError() -> u32;
     fn glGenFramebuffers(n: c_int, framebuffers: *mut u32);
+    fn glDeleteFramebuffers(n: c_int, framebuffers: *const u32);
     fn glBindFramebuffer(target: u32, framebuffer: u32);
     fn glFramebufferTexture2D(
         target: u32,
@@ -65,6 +73,7 @@ extern "C" {
     fn glCheckFramebufferStatus(target: u32) -> u32;
     fn glViewport(x: c_int, y: c_int, width: c_int, height: c_int);
     fn glGenVertexArrays(n: c_int, arrays: *mut u32);
+    fn glDeleteVertexArrays(n: c_int, arrays: *const u32);
     fn glBindVertexArray(array: u32);
     fn glDrawArrays(mode: u32, first: c_int, count: c_int);
     fn glActiveTexture(texture: u32);
@@ -81,6 +90,18 @@ extern "C" {
     fn glGetProgramiv(program: u32, pname: u32, params: *mut c_int);
     fn glGetUniformLocation(program: u32, name: *const i8) -> c_int;
     fn glUniform1i(location: c_int, v0: c_int);
+    fn glDeleteProgram(program: u32);
+    fn glTexSubImage2D(
+        target: u32,
+        level: c_int,
+        xoffset: c_int,
+        yoffset: c_int,
+        width: c_int,
+        height: c_int,
+        format: u32,
+        type_: u32,
+        pixels: *const c_void,
+    );
 }
 
 #[link(name = "gbm")]
@@ -96,6 +117,17 @@ type EglImageTargetFn = unsafe extern "system" fn(u32, *mut c_void);
 // to match the BGRx the encoder expects) into a normal GL_RGBA8 texture that CUDA *can* register.
 const VERT_SRC: &[u8] = b"#version 330 core\nout vec2 v_tex;\nvoid main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));v_tex=p;gl_Position=vec4(p*2.0-1.0,0.0,1.0);}\n";
 const FRAG_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){o_color=texture(image,v_tex).bgra;}\n";
+
+// NV12 BT.709 LIMITED-range convert from full-range RGB in [0,1]. Two passes share `VERT_SRC` and
+// the same source texture (the de-tiled dmabuf):
+//   Y pass  → GL_R8 luma, full-res:   Y = (16 + 219·(0.2126R+0.7152G+0.0722B))/255
+//   UV pass → GL_RG8 chroma, half-res (GL_LINEAR averages the 2×2 footprint):
+//     U = (128 + 224·(-0.1146R-0.3854G+0.5000B))/255  → R channel
+//     V = (128 + 224·( 0.5000R-0.4542G-0.0458B))/255  → G channel
+// RG8's (R=U, G=V) byte order matches NV12's interleaved [U,V]. All outputs clamped to [0,1].
+// Matches the Windows VideoConverter (BT.709, limited/studio range) so the two hosts look identical.
+const FRAG_Y_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){vec3 c=texture(image,v_tex).rgb;float Y=(16.0+219.0*(0.2126*c.r+0.7152*c.g+0.0722*c.b))/255.0;o_color=vec4(clamp(Y,0.0,1.0),0.0,0.0,1.0);}\n";
+const FRAG_UV_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){vec3 c=texture(image,v_tex).rgb;float U=(128.0+224.0*(-0.1146*c.r-0.3854*c.g+0.5000*c.b))/255.0;float V=(128.0+224.0*(0.5000*c.r-0.4542*c.g-0.0458*c.b))/255.0;o_color=vec4(clamp(U,0.0,1.0),clamp(V,0.0,1.0),0.0,1.0);}\n";
 
 unsafe fn compile_shader(kind: u32, src: &[u8]) -> Result<u32> {
     let sh = glCreateShader(kind);
@@ -113,9 +145,11 @@ unsafe fn compile_shader(kind: u32, src: &[u8]) -> Result<u32> {
     Ok(sh)
 }
 
-unsafe fn compile_program() -> Result<u32> {
+/// Compile+link the fullscreen-triangle program with fragment source `frag` and bind its `image`
+/// sampler to texture unit 0.
+unsafe fn compile_program_with(frag: &[u8]) -> Result<u32> {
     let vs = compile_shader(GL_VERTEX_SHADER, VERT_SRC)?;
-    let fs = compile_shader(GL_FRAGMENT_SHADER, FRAG_SRC)?;
+    let fs = compile_shader(GL_FRAGMENT_SHADER, frag)?;
     let prog = glCreateProgram();
     glAttachShader(prog, vs);
     glAttachShader(prog, fs);
@@ -132,6 +166,10 @@ unsafe fn compile_program() -> Result<u32> {
     }
     glUseProgram(0);
     Ok(prog)
+}
+
+unsafe fn compile_program() -> Result<u32> {
+    compile_program_with(FRAG_SRC)
 }
 
 /// Per-size GL machinery to blit a dmabuf EGLImage into a CUDA-registrable `GL_RGBA8` texture.
@@ -230,6 +268,165 @@ impl GlBlit {
     }
 }
 
+/// Per-size GL machinery to convert a dmabuf EGLImage into an NV12 (BT.709 limited-range) pair —
+/// the [`GlBlit`] analogue for the `PUNKTFUNK_NV12` path. Two passes share `src_tex`: a full-res Y
+/// pass into a CUDA-registrable `GL_R8` texture and a half-res UV pass into a `GL_RG8` texture.
+/// Feeding NVENC native NV12 deletes its internal RGB→YUV CSC (which otherwise runs on the SM that a
+/// saturating game pins at 100%); the convert here replaces the BGRx swizzle [`GlBlit`] did, at ~the
+/// same 3D cost.
+struct Nv12Blit {
+    y_program: u32,
+    uv_program: u32,
+    vao: u32,
+    y_fbo: u32,
+    uv_fbo: u32,
+    /// CUDA-registrable luma target (immutable `GL_R8`, W×H).
+    y_tex: u32,
+    /// CUDA-registrable chroma target (immutable `GL_RG8`, W/2 × H/2).
+    uv_tex: u32,
+    /// Source texture re-targeted to each frame's EGLImage. `GL_LINEAR` so the UV pass averages 2×2.
+    src_tex: u32,
+    width: u32,
+    height: u32,
+    y_registered: cuda::RegisteredTexture,
+    uv_registered: cuda::RegisteredTexture,
+    /// Recycled NV12 device buffers (two-plane) handed to the encoder.
+    pool: cuda::BufferPool,
+    /// Self-test only: whether `src_tex` has had immutable RGBA8 storage allocated for the upload
+    /// path (the live path retargets `src_tex` via EGLImage instead, never allocating storage).
+    test_src_storage: bool,
+}
+
+impl Nv12Blit {
+    unsafe fn new(width: u32, height: u32) -> Result<Nv12Blit> {
+        ensure!(
+            width % 2 == 0 && height % 2 == 0,
+            "NV12 convert needs even dimensions (got {width}x{height})"
+        );
+        let y_program = compile_program_with(FRAG_Y_SRC)?;
+        let uv_program = compile_program_with(FRAG_UV_SRC)?;
+        let mut vao = 0u32;
+        glGenVertexArrays(1, &mut vao);
+        let mut fbos = [0u32; 2];
+        glGenFramebuffers(2, fbos.as_mut_ptr());
+        let (y_fbo, uv_fbo) = (fbos[0], fbos[1]);
+
+        // Luma target: GL_R8 at full resolution.
+        let mut y_tex = 0u32;
+        glGenTextures(1, &mut y_tex);
+        glBindTexture(GL_TEXTURE_2D, y_tex);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, width as c_int, height as c_int);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+        // Chroma target: GL_RG8 at half resolution (R=U, G=V).
+        let mut uv_tex = 0u32;
+        glGenTextures(1, &mut uv_tex);
+        glBindTexture(GL_TEXTURE_2D, uv_tex);
+        glTexStorage2D(
+            GL_TEXTURE_2D,
+            1,
+            GL_RG8,
+            (width / 2) as c_int,
+            (height / 2) as c_int,
+        );
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+        // Source: GL_LINEAR so the half-res UV pass averages the 2×2 chroma footprint.
+        let mut src_tex = 0u32;
+        glGenTextures(1, &mut src_tex);
+        glBindTexture(GL_TEXTURE_2D, src_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        for (fbo, tex) in [(y_fbo, y_tex), (uv_fbo, uv_tex)] {
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+            let status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            ensure!(
+                status == GL_FRAMEBUFFER_COMPLETE,
+                "NV12 blit FBO incomplete ({status:#x}) — GL_R8/GL_RG8 not renderable?"
+            );
+        }
+        // Register both convert targets with CUDA once (per-resolution), + the NV12 two-plane pool.
+        let y_registered = cuda::RegisteredTexture::register_gl(y_tex)?;
+        let uv_registered = cuda::RegisteredTexture::register_gl(uv_tex)?;
+        let pool = cuda::BufferPool::new_nv12(width, height)?;
+        Ok(Nv12Blit {
+            y_program,
+            uv_program,
+            vao,
+            y_fbo,
+            uv_fbo,
+            y_tex,
+            uv_tex,
+            src_tex,
+            width,
+            height,
+            y_registered,
+            uv_registered,
+            pool,
+            test_src_storage: false,
+        })
+    }
+
+    /// Bind `image` to the source texture and run both convert passes into `y_tex`/`uv_tex`.
+    ///
+    /// # Safety: the GL context is current on this thread; `image` is a valid `EGLImage`.
+    unsafe fn run(&self, egl_image_target: EglImageTargetFn, image: *mut c_void) -> Result<()> {
+        glBindTexture(GL_TEXTURE_2D, self.src_tex);
+        let _ = glGetError();
+        egl_image_target(GL_TEXTURE_2D, image);
+        let e = glGetError();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        ensure!(e == 0, "glEGLImageTargetTexture2DOES failed ({e:#x})");
+        self.run_passes()
+    }
+
+    /// Run the two convert passes from whatever is currently in `src_tex` (caller populated it).
+    /// Shared by [`run`](Self::run) (EGLImage source) and the self-test (uploaded RGBA source).
+    ///
+    /// # Safety: the GL context is current on this thread.
+    unsafe fn run_passes(&self) -> Result<()> {
+        glActiveTexture(GL_TEXTURE0);
+        glBindVertexArray(self.vao);
+        // Y pass: full-res into the R8 target.
+        glBindFramebuffer(GL_FRAMEBUFFER, self.y_fbo);
+        glViewport(0, 0, self.width as c_int, self.height as c_int);
+        glUseProgram(self.y_program);
+        glBindTexture(GL_TEXTURE_2D, self.src_tex);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        // UV pass: half-res into the RG8 target (GL_LINEAR averages the 2×2).
+        glBindFramebuffer(GL_FRAMEBUFFER, self.uv_fbo);
+        glViewport(0, 0, (self.width / 2) as c_int, (self.height / 2) as c_int);
+        glUseProgram(self.uv_program);
+        glBindTexture(GL_TEXTURE_2D, self.src_tex);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glBindVertexArray(0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glFlush(); // submit GL work before CUDA maps the textures
+        Ok(())
+    }
+}
+
+impl Drop for Nv12Blit {
+    fn drop(&mut self) {
+        unsafe {
+            glDeleteTextures(1, &self.y_tex);
+            glDeleteTextures(1, &self.uv_tex);
+            glDeleteTextures(1, &self.src_tex);
+            glDeleteFramebuffers(2, [self.y_fbo, self.uv_fbo].as_ptr());
+            glDeleteVertexArrays(1, &self.vao);
+            glDeleteProgram(self.y_program);
+            glDeleteProgram(self.uv_program);
+        }
+    }
+}
+
 /// One dmabuf plane as delivered by PipeWire (single-plane for BGRx).
 #[derive(Clone, Copy, Debug)]
 pub struct DmabufPlane {
@@ -252,6 +449,8 @@ pub struct EglImporter {
     egl_image_target: EglImageTargetFn,
     /// Lazily-created GL blit machinery (recreated if the frame size changes).
     blit: Option<GlBlit>,
+    /// Lazily-created NV12 convert machinery (`PUNKTFUNK_NV12` path; recreated on size change).
+    nv12_blit: Option<Nv12Blit>,
     /// LINEAR-dmabuf path (gamescope): a Vulkan bridge (dmabuf → exportable OPAQUE_FD → CUDA),
     /// created lazily on the first LINEAR frame, + the destination pool.
     vk: Option<super::vulkan::VkBridge>,
@@ -355,6 +554,7 @@ impl EglImporter {
             _gl_ctx: gl_ctx,
             egl_image_target,
             blit: None,
+            nv12_blit: None,
             vk: None,
             linear_pool: None,
             gbm,
@@ -449,6 +649,33 @@ impl EglImporter {
         fourcc: u32,
         modifier: Option<u64>,
     ) -> Result<DeviceBuffer> {
+        self.import_inner(plane, width, height, fourcc, modifier, false)
+    }
+
+    /// Like [`import`](Self::import), but de-tiles **and converts** the dmabuf to NV12 (BT.709
+    /// limited range) on the GPU — the `PUNKTFUNK_NV12` path — so NVENC can encode native YUV with
+    /// no internal RGB→YUV CSC. The returned [`DeviceBuffer`] carries both NV12 planes
+    /// (`DeviceBuffer::is_nv12`). Only the tiled EGL/GL path supports this (LINEAR/Vulkan stays RGB).
+    pub fn import_nv12(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: Option<u64>,
+    ) -> Result<DeviceBuffer> {
+        self.import_inner(plane, width, height, fourcc, modifier, true)
+    }
+
+    fn import_inner(
+        &mut self,
+        plane: &DmabufPlane,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: Option<u64>,
+        nv12: bool,
+    ) -> Result<DeviceBuffer> {
         let mut attrs: Vec<egl::Attrib> = vec![
             egl::WIDTH as egl::Attrib,
             width as egl::Attrib,
@@ -484,10 +711,14 @@ impl EglImporter {
             )
             .context("eglCreateImage(EGL_LINUX_DMA_BUF_EXT) — modifier mismatch?")?;
 
-        // EGLImage → (sampled by a shader) → GL_RGBA8 texture → register *that* with CUDA → map
-        // → array → copy out. Registering the EGLImage texture directly fails (its layout isn't a
-        // CUDA-registrable format); the RGBA8 render target is.
-        let result = self.blit_and_copy(image.as_ptr(), width, height);
+        // EGLImage → (sampled by a shader) → GL_RGBA8 texture (or NV12 R8+RG8 pair) → register
+        // *that* with CUDA → map → array → copy out. Registering the EGLImage texture directly
+        // fails (its layout isn't a CUDA-registrable format); the render targets are.
+        let result = if nv12 {
+            self.blit_and_copy_nv12(image.as_ptr(), width, height)
+        } else {
+            self.blit_and_copy(image.as_ptr(), width, height)
+        };
         let _ = self.egl.destroy_image(self.display, image);
         result
     }
@@ -512,6 +743,80 @@ impl EglImporter {
         // cuGraphicsGLRegisterImage / cuMemAllocPitch.
         let dst = blit.pool.get()?;
         blit.registered.copy_mapped_to(&dst)?;
+        Ok(dst)
+    }
+
+    /// Convert the dmabuf `image` to NV12 (Y in an R8 texture, UV in an RG8 texture) and copy both
+    /// planes into a pooled NV12 [`DeviceBuffer`]. (Re)creates the per-size convert machinery as
+    /// needed. The `PUNKTFUNK_NV12` analogue of [`blit_and_copy`].
+    fn blit_and_copy_nv12(
+        &mut self,
+        image: *mut c_void,
+        width: u32,
+        height: u32,
+    ) -> Result<DeviceBuffer> {
+        cuda::make_current()?;
+        if self.nv12_blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
+            self.nv12_blit = Some(unsafe { Nv12Blit::new(width, height)? });
+        }
+        let egl_image_target = self.egl_image_target;
+        let blit = self.nv12_blit.as_mut().unwrap();
+        // SAFETY: GL + CUDA contexts current on this thread; `image` is a valid EGLImage.
+        unsafe { blit.run(egl_image_target, image)? };
+        let dst = blit.pool.get()?;
+        cuda::copy_mapped_nv12(&mut blit.y_registered, &mut blit.uv_registered, &dst)?;
+        Ok(dst)
+    }
+
+    /// Self-test entry: upload a packed `width`×`height` RGBA8 host pattern into a GL texture, run
+    /// the NV12 convert passes on the GPU, and copy both planes into a pooled NV12 [`DeviceBuffer`].
+    /// Exercises the exact shaders + CUDA copy the live path uses, but sourced from an uploaded
+    /// texture instead of a dmabuf EGLImage (no compositor needed). `rgba` is tightly packed, 4 B/px.
+    pub fn convert_rgba_for_test(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<DeviceBuffer> {
+        anyhow::ensure!(
+            rgba.len() == width as usize * height as usize * 4,
+            "test RGBA buffer {} bytes != {}x{}x4",
+            rgba.len(),
+            width,
+            height
+        );
+        cuda::make_current()?;
+        if self.nv12_blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
+            self.nv12_blit = Some(unsafe { Nv12Blit::new(width, height)? });
+        }
+        let blit = self.nv12_blit.as_mut().unwrap();
+        unsafe {
+            // Upload the host RGBA into `src_tex` (an immutable GL_RGBA8 backing must exist first;
+            // the live path never allocates it — it retargets `src_tex` via EGLImage instead).
+            glBindTexture(GL_TEXTURE_2D, blit.src_tex);
+            if !blit.test_src_storage {
+                glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width as c_int, height as c_int);
+                blit.test_src_storage = true;
+            }
+            let _ = glGetError();
+            glTexSubImage2D(
+                GL_TEXTURE_2D,
+                0,
+                0,
+                0,
+                width as c_int,
+                height as c_int,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                rgba.as_ptr() as *const c_void,
+            );
+            let e = glGetError();
+            glBindTexture(GL_TEXTURE_2D, 0);
+            ensure!(e == 0, "glTexSubImage2D(test source) failed ({e:#x})");
+            blit.run_passes()?;
+        }
+        let dst = blit.pool.get()?;
+        cuda::copy_mapped_nv12(&mut blit.y_registered, &mut blit.uv_registered, &dst)?;
         Ok(dst)
     }
 }
