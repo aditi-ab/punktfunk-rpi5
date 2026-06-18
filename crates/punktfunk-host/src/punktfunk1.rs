@@ -1831,10 +1831,15 @@ struct FrameMsg {
 /// capture/encode/send threads. This matters even though our GPU work is already HIGH priority: the
 /// GPU scheduler can only favour commands we've actually SUBMITTED, so if a normal-priority thread is
 /// descheduled by the game it submits the convert/encode late and the GPU priority never bites. Apollo
-/// does the same (capture thread CRITICAL, encoder ABOVE_NORMAL). Windows-only — the Linux host caps
-/// the game via gamescope, so its threads aren't starved. `critical` → highest non-realtime class
+/// does the same (capture thread CRITICAL, encoder ABOVE_NORMAL). The Linux host needs this too: an
+/// uncapped GPU-saturating title (e.g. CS2 direct on a virtual output, not capped by gamescope) is
+/// also a CPU hog and can deschedule our submit threads. `critical` → highest non-realtime class
 /// (the capture+encode loop); otherwise above-normal (the send/relay thread).
 pub(crate) fn boost_thread_priority(critical: bool) {
+    // Windows host-process/thread session tuning (timer 1ms, DWM MMCSS, HIGH class once; MMCSS +
+    // keep-display-awake per thread). No-op off Windows. Both stream threads call us, so this covers
+    // capture/encode (critical) and send (non-critical).
+    crate::session_tuning::on_hot_thread();
     #[cfg(target_os = "windows")]
     unsafe {
         use windows::Win32::System::Threading::{
@@ -1853,7 +1858,27 @@ pub(crate) fn boost_thread_priority(critical: bool) {
             }
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        // Best-effort nice of the CALLING thread. On Linux `setpriority(PRIO_PROCESS, 0, …)` acts on
+        // the calling thread (the kernel resolves who==0 to the current task/tid), and both call
+        // sites run inside their worker thread — so this nices exactly the capture/encode (critical)
+        // and send (non-critical) threads, nothing else. Silently no-ops without CAP_SYS_NICE / a
+        // raised RLIMIT_NICE, which is fine. We deliberately do NOT use SCHED_RR/FIFO by default: a
+        // realtime CPU class can preempt the compositor AND the game's own render thread, adding the
+        // very frame-time we refuse to add (opt-in only — see PUNKTFUNK_SCHED_RR).
+        let nice = if critical { -10 } else { -5 };
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
+        if rc == 0 {
+            tracing::debug!(critical, nice, "thread nice raised");
+        } else {
+            tracing::debug!(
+                critical,
+                "setpriority(nice) no-op (needs CAP_SYS_NICE / RLIMIT_NICE)"
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = critical;
     }

@@ -33,6 +33,7 @@ mod punktfunk1;
 mod pwinit;
 #[cfg(target_os = "windows")]
 mod service;
+mod session_tuning;
 mod spike;
 mod vdisplay;
 #[cfg(target_os = "windows")]

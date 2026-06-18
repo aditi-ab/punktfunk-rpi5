@@ -60,6 +60,8 @@ fn run(
     force_idr: &AtomicBool,
     video_cap: &std::sync::Mutex<Option<Box<dyn Capturer>>>,
 ) -> Result<()> {
+    // GameStream capture/encode thread: apply Windows session tuning (no-op off Windows).
+    crate::session_tuning::on_hot_thread();
     // Reject an out-of-range client mode before allocating capture/encode buffers.
     encode::validate_dimensions(cfg.codec, cfg.width, cfg.height)
         .context("client-requested video mode")?;
@@ -219,6 +221,8 @@ fn spawn_sender(
     std::thread::Builder::new()
         .name("punktfunk-send".into())
         .spawn(move || {
+            // GameStream send thread: Windows session tuning + MMCSS (no-op off Windows).
+            crate::session_tuning::on_hot_thread();
             // Chunk pacing: 16 packets per burst, bursts spread across the send budget.
             const PACE_CHUNK: usize = 16;
             let budget = frame_interval.mul_f32(0.75);

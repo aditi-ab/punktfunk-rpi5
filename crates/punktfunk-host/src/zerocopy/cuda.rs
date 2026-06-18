@@ -27,6 +27,15 @@ pub type CUexternalMemory = *mut c_void; // opaque CUextMemory_st*
 pub const CU_MEMORYTYPE_DEVICE: c_uint = 2;
 pub const CU_MEMORYTYPE_ARRAY: c_uint = 3;
 
+/// `CUctx_flags` (cuda.h): block the CPU on an OS primitive while waiting for the GPU instead of
+/// busy-spinning. On this shared box (compositor + send thread on the same cores) spinning a core
+/// to detect copy completion steals CPU from the very threads we want scheduled; BLOCKING_SYNC
+/// frees it. Default (`CU_CTX_SCHED_AUTO=0`) heuristically picks SPIN vs YIELD by core count.
+const CU_CTX_SCHED_BLOCKING_SYNC: c_uint = 0x04;
+
+/// `cuStreamCreateWithPriority` flag: don't implicitly synchronize with the legacy NULL stream.
+const CU_STREAM_NON_BLOCKING: c_uint = 0x01;
+
 /// `CUDA_MEMCPY2D` (cuda.h, `_v2` ABI). Field order is load-bearing.
 #[repr(C)]
 #[derive(Default)]
@@ -91,8 +100,15 @@ extern "C" {
         element_size: c_uint,
     ) -> CUresult;
     fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
-    fn cuMemcpy2D_v2(copy: *const CUDA_MEMCPY2D) -> CUresult;
-    fn cuCtxSynchronize() -> CUresult;
+    fn cuMemcpy2DAsync_v2(copy: *const CUDA_MEMCPY2D, stream: CUstream) -> CUresult;
+    fn cuStreamSynchronize(stream: CUstream) -> CUresult;
+    // Greatest/least stream priority the driver exposes (greatest = numerically lowest).
+    fn cuCtxGetStreamPriorityRange(least: *mut c_int, greatest: *mut c_int) -> CUresult;
+    fn cuStreamCreateWithPriority(
+        stream: *mut CUstream,
+        flags: c_uint,
+        priority: c_int,
+    ) -> CUresult;
 
     // GL interop (cudaGL.h) — these symbols have NO `_v2` suffix. `cuGraphicsEGLRegisterImage`
     // is Tegra-only on the desktop driver, so we go EGLImage → GL texture → register the texture.
@@ -162,7 +178,10 @@ pub fn context() -> Result<CUcontext> {
         let mut dev: CUdevice = 0;
         ck(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
         let mut ctx: CUcontext = std::ptr::null_mut();
-        ck(cuCtxCreate_v2(&mut ctx, 0, dev), "cuCtxCreate_v2")?;
+        ck(
+            cuCtxCreate_v2(&mut ctx, CU_CTX_SCHED_BLOCKING_SYNC, dev),
+            "cuCtxCreate_v2",
+        )?;
         ctx
     };
     // Racy first-init is fine: the winner's context is used; a loser leaks one context (rare,
@@ -174,6 +193,57 @@ pub fn context() -> Result<CUcontext> {
 pub fn make_current() -> Result<()> {
     let ctx = context()?;
     unsafe { ck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent") }
+}
+
+thread_local! {
+    /// Per-thread copy stream. `None` until first use; `Some(null)` means "creation failed, use the
+    /// default (NULL) stream". Per-thread (not shared) so each worker's `cuStreamSynchronize` waits
+    /// only on ITS OWN copies — the old per-frame `cuCtxSynchronize` was context-wide and also
+    /// blocked on the other worker thread's in-flight NULL-stream copies.
+    static COPY_STREAM: std::cell::Cell<Option<CUstream>> = const { std::cell::Cell::new(None) };
+}
+
+/// The calling thread's highest-priority copy stream (lazily created; context must be current).
+/// Carries the greatest stream priority the driver exposes — a scheduler hint that nudges our
+/// copies ahead of the game's queued compute. NOTE: stream priority is an intra-process hint and
+/// NVIDIA's Linux driver may ignore it / not preempt a saturating game's graphics context; this is
+/// "measure-then-keep", and it never regresses (falls back to the NULL stream). The greatest
+/// priority is the numerically-lowest value (`greatest` from `cuCtxGetStreamPriorityRange`).
+fn copy_stream() -> CUstream {
+    COPY_STREAM.with(|cell| {
+        if let Some(s) = cell.get() {
+            return s;
+        }
+        let stream = unsafe {
+            let (mut least, mut greatest) = (0i32, 0i32);
+            if cuCtxGetStreamPriorityRange(&mut least, &mut greatest) != 0 {
+                std::ptr::null_mut()
+            } else {
+                let mut s: CUstream = std::ptr::null_mut();
+                if cuStreamCreateWithPriority(&mut s, CU_STREAM_NON_BLOCKING, greatest) != 0 {
+                    std::ptr::null_mut()
+                } else {
+                    tracing::debug!(
+                        priority = greatest,
+                        "CUDA high-priority copy stream created"
+                    );
+                    s
+                }
+            }
+        };
+        cell.set(Some(stream));
+        stream
+    })
+}
+
+/// Issue `copy` on this thread's priority stream and block until it completes. Replaces the
+/// per-frame `cuMemcpy2D_v2` + context-wide `cuCtxSynchronize` pair: same completion guarantee
+/// (the source dmabuf is safe to recycle once this returns), but the wait is scoped to our own
+/// stream and the copy carries the high priority hint.
+unsafe fn copy_blocking(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
+    let stream = copy_stream();
+    ck(cuMemcpy2DAsync_v2(copy, stream), what)?;
+    ck(cuStreamSynchronize(stream), "cuStreamSynchronize")
 }
 
 /// Allocate one pitched device buffer for `width`x`height` 4-byte pixels; returns `(ptr, pitch)`.
@@ -342,7 +412,8 @@ impl RegisteredTexture {
     }
 
     /// Map the texture for this frame, copy its (already-linear RGBA8) array into `dst`, then
-    /// unmap. The `cuCtxSynchronize` ensures `dst` is ready before the source dmabuf is recycled.
+    /// unmap. The copy is synchronized (on our priority stream) before unmap so `dst` is ready
+    /// before the source dmabuf is recycled. Always unmaps, even if the copy errors.
     pub fn copy_mapped_to(&mut self, dst: &DeviceBuffer) -> Result<()> {
         unsafe {
             ck(
@@ -364,13 +435,10 @@ impl RegisteredTexture {
                 Height: dst.height as usize,
                 ..Default::default()
             };
-            let r = cuMemcpy2D_v2(&copy);
-            let s = cuCtxSynchronize();
+            let res = copy_blocking(&copy, "cuMemcpy2DAsync_v2");
             let _ = cuGraphicsUnmapResources(1, &mut self.resource, std::ptr::null_mut());
-            ck(r, "cuMemcpy2D_v2")?;
-            ck(s, "cuCtxSynchronize")?;
+            res
         }
-        Ok(())
     }
 }
 
@@ -393,11 +461,7 @@ pub fn copy_device_to_device(
         Height: src.height as usize,
         ..Default::default()
     };
-    unsafe {
-        ck(cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(dev->dev)")?;
-        ck(cuCtxSynchronize(), "cuCtxSynchronize")?;
-    }
-    Ok(())
+    unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(dev->dev)") }
 }
 
 impl Drop for RegisteredTexture {
@@ -500,10 +564,7 @@ pub fn copy_pitched_to_buffer(
         Height: dst.height as usize,
         ..Default::default()
     };
-    unsafe {
-        ck(cuMemcpy2D_v2(&copy), "cuMemcpy2D_v2(ext->dev)")?;
-        // The copy must finish before the dmabuf is requeued to the producer.
-        ck(cuCtxSynchronize(), "cuCtxSynchronize")?;
-    }
-    Ok(())
+    // copy_blocking syncs our priority stream before returning, so the copy is complete before the
+    // dmabuf is requeued to the producer.
+    unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(ext->dev)") }
 }
