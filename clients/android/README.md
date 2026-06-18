@@ -32,7 +32,7 @@ clients/android/                   Gradle project (this dir)
 
 ## Prerequisites (already set up on the dev Mac)
 
-- Android SDK + **NDK r28 LTS** (`28.2.13676358`), `platforms;android-37.0`, `build-tools;37.0.0`
+- Android SDK + **NDK r30** (`30.0.14904198`), `platforms;android-37.0`, `build-tools;37.0.0`
 - **JDK 21** for Gradle/AGP (the machine default JDK 25 is too new for AGP 9.2)
 - Rust + `rustup target add aarch64-linux-android x86_64-linux-android` + `cargo install cargo-ndk`
 

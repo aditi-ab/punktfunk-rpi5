@@ -7,7 +7,7 @@ plugins {
     id("com.android.library")
 }
 
-val ndkVer = "28.2.13676358" // r28 LTS — matches the SDK NDK installed for cargo-ndk
+val ndkVer = "30.0.14904198" // r30-beta1 — matches the SDK NDK installed for cargo-ndk
 
 android {
     namespace = "io.unom.punktfunk.kit"
