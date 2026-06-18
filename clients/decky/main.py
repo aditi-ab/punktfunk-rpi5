@@ -64,6 +64,17 @@ def _flatpak_env() -> dict:
     pairing). Reconstruct the user-session bits flatpak wants; the backend may not inherit
     them. Harmless if some are already set."""
     env = dict(os.environ)
+    # Decky Loader is a PyInstaller binary: it prepends its bundled libs (an older libssl) to
+    # LD_LIBRARY_PATH (its /tmp/_MEI* unpack dir), and that env leaks into our subprocess. The
+    # SYSTEM flatpak's libcurl needs OPENSSL_3.3.0 from the SYSTEM libssl, so the bundled libssl
+    # breaks it ("libssl.so.3: version OPENSSL_3.3.0 not found"). Restore the pre-bundle value
+    # PyInstaller saved as <VAR>_ORIG, or drop the var so the dynamic loader uses system libraries.
+    for var in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
+        orig = env.pop(f"{var}_ORIG", None)
+        if orig:
+            env[var] = orig
+        else:
+            env.pop(var, None)
     env.setdefault("HOME", decky.DECKY_USER_HOME)
     uid = os.environ.get("PF_UID") or "1000"
     env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
