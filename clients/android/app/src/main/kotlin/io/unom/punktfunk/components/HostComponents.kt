@@ -1,6 +1,7 @@
 package io.unom.punktfunk.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,6 +14,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
@@ -28,6 +30,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -57,12 +60,23 @@ fun HostCard(
     onConnect: () -> Unit,
     onForget: (() -> Unit)?,
 ) {
+    // D-pad / controller focus highlight: a clickable card is focusable, but the default state
+    // layer is too subtle on a TV across a room — draw a clear primary-colour border when focused.
+    var focused by remember { mutableStateOf(false) }
     ElevatedCard(
         onClick = onConnect,
         enabled = enabled,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(4.dp),
+            .padding(4.dp)
+            .onFocusChanged { focused = it.isFocused }
+            .then(
+                if (focused) {
+                    Modifier.border(2.dp, MaterialTheme.colorScheme.primary, CardDefaults.elevatedShape)
+                } else {
+                    Modifier
+                },
+            ),
     ) {
         Box(modifier = Modifier.fillMaxWidth()) {
             Column(
