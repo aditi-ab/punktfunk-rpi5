@@ -71,7 +71,7 @@ On the Windows runner / dev VM (MSVC + Windows SDK present), after a release bui
 
 ```powershell
 cargo build --release -p punktfunk-client-windows
-pwsh -File crates/punktfunk-client-windows/packaging/pack-msix.ps1 `
+pwsh -File clients/windows/packaging/pack-msix.ps1 `
   -Version 0.2.0.0 -TargetDir C:\t\release -OutDir C:\t\msix
 ```
 

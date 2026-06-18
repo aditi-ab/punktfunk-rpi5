@@ -236,9 +236,9 @@ journalctl --user -u punktfunk-host -f
 > **What `serve` actually starts.** The unit's `ExecStart` runs `punktfunk-host serve`, which is the
 > **GameStream / Moonlight-compatible** host (mDNS discovery, pairing, RTSP, the fixed GameStream
 > ports, **plus the management REST API on 47990**). The native `punktfunk/1` (QUIC) host is a
-> *separate* subcommand — `punktfunk-host m3-host` — and is **not** what the bundled systemd unit
+> *separate* subcommand — `punktfunk-host punktfunk1-host` — and is **not** what the bundled systemd unit
 > launches. So out of the box on Bazzite you get the **Moonlight-compatible** host.
-> (Source: `crates/punktfunk-host/src/main.rs` — `serve` → `gamestream::serve`; `m3-host` is its own
+> (Source: `crates/punktfunk-host/src/main.rs` — `serve` → `gamestream::serve`; `punktfunk1-host` is its own
 > path.)
 
 > **Unit caveat:** `scripts/punktfunk-host.service` declares only `After=pipewire.service` and (in
@@ -253,7 +253,7 @@ journalctl --user -u punktfunk-host -f
 
 > ⚠️ **There is no firewall script or firewall doc in the repo.** The ports below are derived
 > directly from the code constants (`crates/punktfunk-host/src/gamestream/mod.rs`, `mgmt.rs`) and
-> the M2 port-map (`docs/m2-plan.md`). Treat the `firewall-cmd` lines as recommended-but-verified,
+> the GameStream-host port-map (`docs/gamestream-host-plan.md`). Treat the `firewall-cmd` lines as recommended-but-verified,
 > not a checked-in script.
 
 **GameStream / Moonlight ports** (fixed; Moonlight derives them from the HTTP base):
@@ -285,16 +285,16 @@ sudo firewall-cmd --permanent --add-port=47998/udp \
 sudo firewall-cmd --reload
 ```
 
-**If you also run the native `punktfunk/1` host** (`punktfunk-host m3-host`, not started by the
+**If you also run the native `punktfunk/1` host** (`punktfunk-host punktfunk1-host`, not started by the
 default unit):
 
 - **QUIC control plane: UDP 9777** (default `--port`; change with `--port N`).
-- **Data plane: an *ephemeral* UDP port** — `m3-host` binds `0.0.0.0:0` and tells the client which
+- **Data plane: an *ephemeral* UDP port** — `punktfunk1-host` binds `0.0.0.0:0` and tells the client which
   port it got, so there is **no fixed data port to open**. For a restrictive firewall you'd need to
   allow the ephemeral UDP range; the repo does not pin one.
 
 ```sh
-# Only if you run `m3-host`:
+# Only if you run `punktfunk1-host`:
 sudo firewall-cmd --permanent --add-port=9777/udp && sudo firewall-cmd --reload
 ```
 
@@ -341,8 +341,8 @@ advertising`, and an RTSP listening line on port 48010. No NVENC/EGL errors on t
 - Launch the app — you should get video at your client's native resolution/refresh, with the nested
   `steam -gamepadui` (or whatever `PUNKTFUNK_GAMESCOPE_APP` you set) running inside gamescope.
 
-**3. (Optional) native punktfunk/1 client** — only if you're running the separate `m3-host`. The
-repo's reference client is `punktfunk-client-rs`, e.g. `punktfunk-client-rs --mode 1280x720x120 --out
+**3. (Optional) native punktfunk/1 client** — only if you're running the separate `punktfunk1-host`. The
+repo's reference client is `punktfunk-probe`, e.g. `punktfunk-probe --mode 1280x720x120 --out
 /tmp/a.h265` (add `--pin HEX` for PIN pairing). This is a headless/decode-to-file reference, not a
 desktop viewer.
 
@@ -414,5 +414,5 @@ matching your Bazzite Fedora base (`rpm -E %fedora`).
 1. The COPR is **operator-run / not assumed published** — both install paths depend on it.
 2. There is **no firewall script/doc in the repo** — the ports above are derived from the code.
 3. The bundled systemd unit runs the **GameStream/Moonlight** `serve` host, **not** the native
-   `punktfunk/1` QUIC host (`m3-host` is separate and unmanaged by the unit).
+   `punktfunk/1` QUIC host (`punktfunk1-host` is separate and unmanaged by the unit).
 4. The mgmt port (47990) is **loopback-only by default** — don't open it.

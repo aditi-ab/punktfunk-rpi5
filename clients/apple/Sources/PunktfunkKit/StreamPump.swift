@@ -46,27 +46,44 @@ final class StreamPump {
         let thread = Thread {
             var format: CMVideoFormatDescription?
             var lastKeyframeRequest = Date.distantPast
+            var lastFramesDropped = connection.framesDropped()
+            // Coalesced host keyframe request: the decode stays wedged for several frames until
+            // the IDR lands, so requesting on every frame would flood the control stream.
+            func requestKeyframeThrottled() {
+                let now = Date()
+                if now.timeIntervalSince(lastKeyframeRequest) > 0.25 {
+                    connection.requestKeyframe()
+                    lastKeyframeRequest = now
+                }
+            }
             while token.isLive {
                 do {
+                    // Loss recovery (the primary recovery path). Under the host's infinite GOP the
+                    // only recovery keyframe is one we request. The reassembler drops unrecoverable
+                    // AUs (framesDropped); the decoder then *conceals* the reference-missing delta
+                    // frames that follow — a frozen / garbage picture, WITHOUT flipping the layer to
+                    // .failed — so the .failed check below rarely fires after a real network blip.
+                    // Ask the host for a fresh IDR whenever the drop count climbs. Polled every
+                    // iteration (not just per AU) so a total-loss drought still recovers the moment
+                    // packets resume and the reassembler counts the gap.
+                    let dropped = connection.framesDropped()
+                    if dropped > lastFramesDropped {
+                        lastFramesDropped = dropped
+                        requestKeyframeThrottled()
+                    }
                     guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
                     onFrame?(au)
                     if let f = AnnexB.formatDescription(fromIDR: au.data) {
                         format = f // refreshed on every IDR (mode changes included)
                     }
                     if layer.status == .failed {
-                        // Decode wedged: flush and re-gate on the next in-band parameter sets
-                        // (resuming with a delta frame can't recover), AND ask the host for a
-                        // fresh IDR. With the host's infinite GOP the next keyframe could be
-                        // far off, so without the request the picture stays frozen — the
-                        // intermittent first-connect freeze. Throttled: the layer stays .failed
-                        // across several polls until the IDR lands, and one request suffices.
+                        // Decode wedged hard (the cold-first-connect case — a lost/corrupt opening
+                        // IDR): flush and re-gate on the next in-band parameter sets (resuming with
+                        // a delta frame can't recover), AND ask the host for a fresh IDR. Throttled:
+                        // the layer stays .failed across several polls until the IDR lands.
                         layer.flush()
                         format = AnnexB.formatDescription(fromIDR: au.data)
-                        let now = Date()
-                        if now.timeIntervalSince(lastKeyframeRequest) > 0.25 {
-                            connection.requestKeyframe()
-                            lastKeyframeRequest = now
-                        }
+                        requestKeyframeThrottled()
                     }
                     guard let f = format,
                           let sample = AnnexB.sampleBuffer(au: au, format: f),

@@ -40,7 +40,7 @@ fn chooser_file() -> String {
 }
 
 /// The managed xdpw config: per-session output selection with no GUI. The `|| echo` fallback
-/// keeps plain portal capture (`--source portal`, M0 flow) working when no session has written
+/// keeps plain portal capture (`--source portal` flow) working when no session has written
 /// the chooser file. xdpw runs `chooser_cmd` via `/bin/sh -c`, reads stdout.
 fn xdpw_config() -> String {
     format!(

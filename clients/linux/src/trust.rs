@@ -1,6 +1,6 @@
 //! Client identity, the known-hosts (pinned fingerprint) store, and app settings.
 //!
-//! The identity shares `~/.config/punktfunk/client-{cert,key}.pem` with `punktfunk-client-rs`
+//! The identity shares `~/.config/punktfunk/client-{cert,key}.pem` with `punktfunk-probe`
 //! so a box pairs once whichever client it uses.
 
 use anyhow::{anyhow, Context, Result};

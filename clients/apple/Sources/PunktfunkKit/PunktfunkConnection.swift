@@ -362,6 +362,21 @@ public final class PunktfunkConnection {
         _ = punktfunk_connection_request_keyframe(h)
     }
 
+    /// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
+    /// rebuild them). The video pump polls this and calls `requestKeyframe()` when it climbs — the
+    /// correct loss trigger under the host's infinite GOP, where unrecoverable loss yields
+    /// reference-missing delta frames the decoder *silently conceals* (a frozen / garbage picture,
+    /// no decode error and no `.failed` layer), so a decode-error trigger rarely fires. Monotonic
+    /// for the session; 0 after close. Cheap (an atomic load) — safe to poll every pump iteration.
+    public func framesDropped() -> UInt64 {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return 0 }
+        var out: UInt64 = 0
+        _ = punktfunk_connection_frames_dropped(h, &out)
+        return out
+    }
+
     /// The currently active session mode (updated by accepted `requestMode` switches).
     public func currentMode() -> (width: UInt32, height: UInt32, refreshHz: UInt32) {
         abiLock.lock()

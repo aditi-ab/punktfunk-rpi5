@@ -47,7 +47,7 @@ Today the native `punktfunk/1` host (`serve --native`) streams **one session at 
 clients wait in the accept queue until the active session ends. Each session gets its own virtual
 display at the client's exact resolution; concurrent native sessions are on the roadmap.
 
-(`m3-host`, the standalone test host, has a `--max-concurrent N` knob, default 4, bounded by your
+(`punktfunk1-host`, the standalone test host, has a `--max-concurrent N` knob, default 4, bounded by your
 GPU's encoder — see the [Host CLI](/docs/host-cli) reference — but `serve --native` does **not** take
 that flag.)
 

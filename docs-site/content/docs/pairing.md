@@ -45,7 +45,7 @@ host's management console, click to arm pairing, and the host displays a 4-digit
 list of paired devices. This works on a headless host over the network — there is no command-line flag
 to arm pairing on `serve`.
 
-(The standalone headless test host, `m3-host`, takes `--allow-pairing`/`--require-pairing` on its
+(The standalone headless test host, `punktfunk1-host`, takes `--allow-pairing`/`--require-pairing` on its
 command line instead; the production `serve --native` host arms pairing from the console.)
 
 Then, on the client:
@@ -60,13 +60,13 @@ the right setting on a shared network: a device has to complete the PIN ceremony
 connect.
 
 If you're on a fully trusted single-user network and want to skip pairing, run the host open with
-`serve --native --open` (or `m3-host --allow-tofu` for the standalone host) — it then advertises
+`serve --native --open` (or `punktfunk1-host --allow-tofu` for the standalone host) — it then advertises
 `pair=optional` and accepts unpaired clients. Requiring pairing is strongly recommended.
 
 ## Trust-on-first-use (host opt-in)
 
 Trust-on-first-use (TOFU) is **off by default** and is an explicit *host* opt-in for fully trusted
-networks. A host enables it by running open — `m3-host --allow-tofu` or `serve --open` — which makes
+networks. A host enables it by running open — `punktfunk1-host --allow-tofu` or `serve --open` — which makes
 it advertise `pair=optional` over mDNS and accept unpaired clients. Only then does a client offer the
 TOFU path: connecting to such a host for the first time shows the host's fingerprint and asks you to
 confirm it (compare it with the one the host logged at startup), then pins it. The client presents

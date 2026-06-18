@@ -26,7 +26,7 @@ on:
     # The flatpak is the CLIENT — only rebuild when the client/core/manifest change, not on every
     # docs/host push (this is a heavy flatpak-builder run). Tags (v*, the client release) build too.
     paths:
-      - 'crates/punktfunk-client-linux/**'
+      - 'clients/linux/**'
       - 'crates/punktfunk-core/**'
       - 'packaging/flatpak/**'
       - 'Cargo.lock'
@@ -40,6 +40,8 @@ env:
   APP_ID: io.unom.Punktfunk
   MANIFEST: packaging/flatpak/io.unom.Punktfunk.yml
   PACKAGE: punktfunk-client-flatpak     # generic-registry package name
+  REPO_URL: https://flatpak.unom.io   # shared unom OSTree repo (reusable across unom apps)
+  DEPLOY_DIR: unom-flatpak             # ~/<dir> on unom-1 (compose + ./site tree)
 
 jobs:
   build-publish:

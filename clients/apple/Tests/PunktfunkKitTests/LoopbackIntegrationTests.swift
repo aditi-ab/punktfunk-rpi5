@@ -1,7 +1,7 @@
 // Integration: the Swift wrapper against a real punktfunk/1 host over QUIC + UDP on loopback —
 // the Swift twin of punktfunk-host's m3.rs::c_abi_connection_roundtrip, this time through the
 // statically linked xcframework. Driven by clients/apple/test-loopback.sh, which builds and
-// starts `punktfunk-host m3-host --source synthetic` and sets PUNKTFUNK_LOOPBACK_PORT.
+// starts `punktfunk-host punktfunk1-host --source synthetic` and sets PUNKTFUNK_LOOPBACK_PORT.
 
 import XCTest
 @testable import PunktfunkKit
@@ -11,7 +11,7 @@ final class LoopbackIntegrationTests: XCTestCase {
         guard let portStr = ProcessInfo.processInfo.environment["PUNKTFUNK_LOOPBACK_PORT"],
               let port = UInt16(portStr)
         else {
-            throw XCTSkip("needs a running m3-host — use clients/apple/test-loopback.sh")
+            throw XCTSkip("needs a running punktfunk1-host — use clients/apple/test-loopback.sh")
         }
 
         let conn = try PunktfunkConnection(
@@ -139,7 +139,7 @@ final class LoopbackIntegrationTests: XCTestCase {
         guard let portStr = env["PUNKTFUNK_PAIRING_PORT"], let port = UInt16(portStr),
               let pin = env["PUNKTFUNK_PAIRING_PIN"]
         else {
-            throw XCTSkip("needs an armed m3-host — use clients/apple/test-loopback.sh")
+            throw XCTSkip("needs an armed punktfunk1-host — use clients/apple/test-loopback.sh")
         }
 
         let identity = try generateIdentity()

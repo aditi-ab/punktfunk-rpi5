@@ -3,7 +3,7 @@
 //! Send is batched via `sendmmsg` ([`Transport::send_batch`], ≤64/syscall) and recv via `recvmmsg`
 //! ([`Transport::recv_batch`], ≤32/syscall into a reused ring) — the 1 Gbps+ syscall lever
 //! (~125k → a few-k syscalls/sec at line rate). The host additionally paces each frame's send
-//! across the frame interval (see `m3.rs::paced_submit`) so a real NIC doesn't drop a line-rate
+//! across the frame interval (see `punktfunk1.rs::paced_submit`) so a real NIC doesn't drop a line-rate
 //! burst. All three layer on this same [`Transport`] seam (scalar fallbacks for loopback/non-Linux).
 
 use super::Transport;
@@ -397,7 +397,7 @@ impl UdpTransport {
     /// Sized for 1 Gbps+: at ~1.2 Gbps on the wire an 8 MB buffer is only ~49 ms of steady state,
     /// and a single multi-MB IDR keyframe (~4 MB ≈ 3300 packets) instantly fills most of it. 32 MB
     /// gives ~200 ms of headroom and absorbs a keyframe burst without EAGAIN drops. (Paced sending
-    /// — `m3.rs::paced_submit` — now spreads a big frame's overflow, so this buffer mostly absorbs
+    /// — `punktfunk1.rs::paced_submit` — now spreads a big frame's overflow, so this buffer mostly absorbs
     /// the immediate microburst rather than a whole unpaced frame.)
     const TARGET_SOCKBUF: usize = 32 * 1024 * 1024;
 

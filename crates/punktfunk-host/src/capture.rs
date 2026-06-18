@@ -1,4 +1,4 @@
-//! Frame capture (plan §7). On Linux: a PipeWire ScreenCast portal stream. M0 uses the
+//! Frame capture (plan §7). On Linux: a PipeWire ScreenCast portal stream. The spike uses the
 //! CPU-copy fallback (the portal delivers a CPU buffer; the encoder uploads it to the GPU
 //! internally). Zero-copy dmabuf→NVENC import is deferred (plan §9 risk).
 
@@ -45,7 +45,7 @@ impl PixelFormat {
 }
 
 /// A captured frame. [`format`](Self::format)/dimensions describe the pixels regardless of
-/// where they live — [`payload`](Self::payload) is either a CPU buffer (the M0/fallback path)
+/// where they live — [`payload`](Self::payload) is either a CPU buffer (the spike/fallback path)
 /// or a GPU buffer already on the device (the zero-copy path, plan §9).
 pub struct CapturedFrame {
     pub width: u32,
@@ -103,7 +103,7 @@ pub trait Capturer: Send {
     fn set_active(&self, _active: bool) {}
 }
 
-/// A deterministic moving test pattern (BGRx). Lets M0 exercise the encode → file →
+/// A deterministic moving test pattern (BGRx). Lets the spike exercise the encode → file →
 /// `punktfunk_core` path with no live capture session, and produces obviously non-static
 /// content (a sweeping bar + animated gradient) so the encoded output is verifiable.
 pub struct SyntheticCapturer {

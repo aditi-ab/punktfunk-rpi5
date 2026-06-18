@@ -25,7 +25,7 @@ punktfunk is cleanly layered. **~95% of the codebase is platform-agnostic and re
 | QUIC control plane (`quic.rs`, pairing, mode negotiation) | quinn + tokio are portable |
 | GameStream P1.1 (mDNS, serverinfo, pairing, RTSP, ENet) — *except* `stream.rs`/`audio.rs` | pure wire logic |
 | Management REST API (`mgmt.rs`) + OpenAPI | axum/tokio, portable |
-| Pipeline + `m3.rs` orchestration | trait-generic — calls `capturer.next_frame()`, `encoder.submit/poll()`; **needs zero changes** |
+| Pipeline + `punktfunk1.rs` orchestration | trait-generic — calls `capturer.next_frame()`, `encoder.submit/poll()`; **needs zero changes** |
 | The **trait boundaries** themselves: `Capturer`, `Encoder`, `VirtualDisplay`, `InputInjector`, `AudioCapturer`, `VirtualMic` | platform-neutral signatures; Linux deps are already isolated under `[target.'cfg(target_os="linux")'.dependencies]` |
 
 So a Windows host is **new `#[cfg(target_os = "windows")]` backend modules behind the existing

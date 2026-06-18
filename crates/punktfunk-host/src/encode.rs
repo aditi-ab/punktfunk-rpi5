@@ -1,5 +1,5 @@
 //! Hardware video encode (plan §7). Binds FFmpeg (NVENC); never rewrites codecs.
-//! Low-latency preset, B-frames off. M0 feeds BGRx CPU frames directly — `*_nvenc`
+//! Low-latency preset, B-frames off. The spike feeds BGRx CPU frames directly — `*_nvenc`
 //! accepts `bgr0` input and converts to YUV on the GPU, so no host-side swscale is
 //! needed (dmabuf zero-copy import is deferred; plan §9).
 

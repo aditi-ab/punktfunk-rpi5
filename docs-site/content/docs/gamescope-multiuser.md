@@ -29,7 +29,7 @@ Each gamescope **process is per-session** (`vdisplay/gamescope.rs::create()` spa
 - **EIS input socket — single global file.** gamescope exports `LIBEI_SOCKET` for its children; a
   shell wrapper relays it to the fixed path `/tmp/punktfunk-gamescope-ei` (`EI_SOCKET_FILE`).
   **Two concurrent instances overwrite each other's socket name** in that one file.
-- **Injector — one host-lifetime `!Send` service.** `m3.rs::InjectorService` opens **one**
+- **Injector — one host-lifetime `!Send` service.** `punktfunk1.rs::InjectorService` opens **one**
   `inject::open(backend)` for the whole run and forwards events over an mpsc channel. It was made
   shared deliberately (the portal `CreateSession` churn wedged KWin's EIS — "EIS setup timed out").
   For gamescope it reads the one global socket file, so all sessions' input lands in whichever

@@ -1,4 +1,4 @@
-//! `punktfunk-client-rs` — the reference client for `punktfunk/1` (M3): QUIC control plane, UDP data
+//! `punktfunk-probe` — the reference client for `punktfunk/1` (M3): QUIC control plane, UDP data
 //! plane, input over QUIC datagrams. Two modes, decided by the host's Welcome:
 //!
 //! * **verification** (`frames > 0`, synthetic host): byte-checks deterministic test frames;
@@ -35,7 +35,7 @@
 //! over mDNS, prints each (name, addr:port, pairing requirement, cert fingerprint to pin), and
 //! exits without connecting.
 //!
-//! Usage: `punktfunk-client-rs [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE] [--input-test]
+//! Usage: `punktfunk-probe [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE] [--input-test]
 //!         [--pin HEX] [--compositor NAME] [--gamepad NAME] | --discover [SECS]`
 //! (M4 adds VAAPI decode + wgpu present on this skeleton.)
 
@@ -193,7 +193,7 @@ fn parse_args() -> Args {
         pin,
         remode,
         pair: get("--pair").map(String::from),
-        name: get("--name").unwrap_or("punktfunk-client-rs").to_string(),
+        name: get("--name").unwrap_or("punktfunk-probe").to_string(),
         compositor,
         gamepad,
         bitrate_kbps: get("--bitrate").and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -337,7 +337,7 @@ fn discover(secs: u64) -> Result<()> {
             println!("{row}");
         }
         println!(
-            "\nconnect with: punktfunk-client-rs --connect <addr:port> [--pin <fp> | --pair <PIN>]"
+            "\nconnect with: punktfunk-probe --connect <addr:port> [--pin <fp> | --pair <PIN>]"
         );
     }
     Ok(())

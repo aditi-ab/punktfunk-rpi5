@@ -1494,6 +1494,35 @@ pub unsafe extern "C" fn punktfunk_connection_request_keyframe(
     })
 }
 
+/// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
+/// rebuild them). A video loop polls this and calls [`punktfunk_connection_request_keyframe`]
+/// when it climbs — the correct loss trigger under the host's infinite GOP, where unrecoverable
+/// loss yields reference-missing delta frames the decoder *silently conceals* (frozen / garbage
+/// picture, no decode error), so a decode-error trigger rarely fires. Monotonic for the session;
+/// compare against the last observed value. Writes 0 to `out` on a NULL connection.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_frames_dropped(
+    c: *const PunktfunkConnection,
+    out: *mut u64,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        unsafe {
+            if !out.is_null() {
+                *out = c.inner.frames_dropped();
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
 /// the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
 /// measured goodput to drive a bitrate choice from; `loss_pct` is the delivery loss at that rate.

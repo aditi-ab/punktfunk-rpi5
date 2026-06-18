@@ -276,7 +276,7 @@ punktfunk/
 │   │   ├── src/vdisplay/     # trait + kwin/wlroots/mutter impls
 │   │   ├── src/input/        # reis + uinput
 │   │   └── src/web/          # axum config/pairing API
-│   └── punktfunk-client-rs/      # reference Rust client (M4)
+│   └── punktfunk-probe/      # reference Rust client (M4)
 ├── clients/
 │   ├── apple/                # Swift package, imports punktfunk_core.h (M5)
 │   └── android/              # Kotlin + JNI (later)

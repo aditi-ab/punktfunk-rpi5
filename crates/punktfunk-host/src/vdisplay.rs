@@ -125,7 +125,7 @@ impl Compositor {
 /// installed (it spawns a nested session — independent of the running desktop), plus the live
 /// session's own compositor (KWin / Mutter / wlroots) when the host runs inside it. Cheap,
 /// side-effect-free probes — safe to call per management request. A concrete client preference
-/// is validated against this set before it's honored (see the m3 handshake's resolution).
+/// is validated against this set before it's honored (see the punktfunk/1 handshake's resolution).
 pub fn available() -> Vec<Compositor> {
     #[cfg(target_os = "linux")]
     {

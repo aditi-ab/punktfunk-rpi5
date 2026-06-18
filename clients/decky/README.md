@@ -81,7 +81,7 @@ argv and a clear `client-not-found` error surface to the UI. The child PID is tr
   installed and runnable on the Deck — via `.deb`/RPM/flatpak, or symlinked into
   `~/.local/bin`.
 - **avahi** (`avahi-daemon` + `avahi-browse`) for discovery — present on SteamOS/Bazzite.
-- A punktfunk/1 host on the LAN (`punktfunk-host serve --native` or `m3-host`).
+- A punktfunk/1 host on the LAN (`punktfunk-host serve --native` or `punktfunk1-host`).
 
 ## Build
 

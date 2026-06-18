@@ -1319,7 +1319,7 @@ pub struct DuplCapturer {
     ever_got_frame: bool,
     /// Consecutive rebuilds that produced a BORN-LOST duplication (created OK, but its first
     /// AcquireNextFrame instantly returned ACCESS_LOST). On the NORMAL desktop this is the hybrid
-    /// reparent/flip storm — once it persists, `acquire` returns Err so the m3 loop cold-rebuilds the
+    /// reparent/flip storm — once it persists, `acquire` returns Err so the punktfunk1 loop cold-rebuilds the
     /// whole pipeline (new device/output) instead of spinning on a dead dup forever (the bug where the
     /// stream froze on the last frame). Reset to 0 by any real frame. NOT armed on the secure
     /// (Winlogon) desktop, where a long static dwell is legitimate and must never end the session.

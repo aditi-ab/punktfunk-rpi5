@@ -910,6 +910,19 @@ PunktfunkStatus punktfunk_connection_request_keyframe(const PunktfunkConnection 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
+// rebuild them). A video loop polls this and calls [`punktfunk_connection_request_keyframe`]
+// when it climbs — the correct loss trigger under the host's infinite GOP, where unrecoverable
+// loss yields reference-missing delta frames the decoder *silently conceals* (frozen / garbage
+// picture, no decode error), so a decode-error trigger rarely fires. Monotonic for the session;
+// compare against the last observed value. Writes 0 to `out` on a NULL connection.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_frames_dropped(const PunktfunkConnection *c, uint64_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Start a bandwidth speed test: ask the host to burst filler over the data plane at
 // `target_kbps` of goodput for `duration_ms` (each clamped host-side to ≤ 3 Gbps / ≤ 5 s),
 // *briefly pausing video*. Non-blocking — poll [`punktfunk_connection_probe_result`] until its

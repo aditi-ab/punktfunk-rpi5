@@ -24,14 +24,14 @@ on:
   push:
     branches: [main]
     paths:
-      - 'crates/punktfunk-client-windows/**'
+      - 'clients/windows/**'
       - 'crates/punktfunk-core/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows.yml'
   pull_request:
     paths:
-      - 'crates/punktfunk-client-windows/**'
+      - 'clients/windows/**'
       - 'crates/punktfunk-core/**'
       - 'Cargo.lock'
       - 'Cargo.toml'

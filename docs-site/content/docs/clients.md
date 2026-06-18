@@ -56,7 +56,7 @@ punktfunk-client --connect <host>:9777   # skip the picker, start a session imme
 
 ## Windows desktop client (in development)
 
-`punktfunk-client` for Windows (`crates/punktfunk-client-windows`) is the native graphical client
+`punktfunk-client` for Windows (`clients/windows`) is the native graphical client
 for Windows — pure Rust, the same `punktfunk/1` core as the Apple and Linux apps, with a **WinUI 3**
 UI (host list, settings, PIN pairing) and the video on a `SwapChainPanel`, plus WASAPI audio, FFmpeg
 decode, SDL3 controllers, network discovery, and PIN pairing. Launch it and pick a host from the
@@ -74,13 +74,13 @@ Until it ships, **Moonlight** remains the recommended way to stream to Windows (
 
 ## Linux reference client (headless)
 
-`punktfunk-client-rs` (in the repo) is a command-line client for the native protocol, used for
+`punktfunk-probe` (in the repo) is a command-line client for the native protocol, used for
 testing, development, and latency measurement — not an everyday client. It connects, streams to a
 file, runs the speed test, and can discover hosts:
 
 ```sh
-punktfunk-client-rs --discover                        # list hosts on the network
-punktfunk-client-rs --connect <host>:9777 --pin <fp>  # connect to one
+punktfunk-probe --discover                        # list hosts on the network
+punktfunk-probe --connect <host>:9777 --pin <fp>  # connect to one
 ```
 
 ## Which should I use?
@@ -90,6 +90,6 @@ punktfunk-client-rs --connect <host>:9777 --pin <fp>  # connect to one
 | A Mac, iPhone, iPad, or Apple TV | The **Apple app** |
 | A Linux desktop or laptop, or a Steam Deck | **`punktfunk-client`** (GTK4) |
 | Windows, Android, a browser, a TV | **Moonlight** |
-| Automated tests / latency measurement | **`punktfunk-client-rs`** (headless) |
+| Automated tests / latency measurement | **`punktfunk-probe`** (headless) |
 
 Whichever you choose, the first connection needs a one-time [pairing](/docs/pairing).

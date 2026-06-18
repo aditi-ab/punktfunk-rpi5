@@ -1,6 +1,6 @@
 //! Shared native (`punktfunk/1`) pairing state — the on-demand arming PIN (with expiry) plus the
 //! persistent paired-clients store. One [`NativePairing`] handle is shared by the punktfunk/1 QUIC
-//! accept loop ([`crate::m3`]) and the management API ([`crate::mgmt`]), so an operator can **arm
+//! accept loop ([`crate::punktfunk1`]) and the management API ([`crate::mgmt`]), so an operator can **arm
 //! pairing and read the PIN from the web console** instead of the service log.
 //!
 //! The PIN direction is inherent to the SPAKE2 ceremony: the *host* mints the PIN and the *client*

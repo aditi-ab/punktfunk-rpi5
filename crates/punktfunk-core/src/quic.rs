@@ -1,4 +1,4 @@
-//! `punktfunk/1` — the native control plane (M3), gated behind the `quic` feature.
+//! `punktfunk/1` — the native control plane, gated behind the `quic` feature.
 //!
 //! GameStream is punktfunk's compatibility layer; this is the start of its own protocol. A QUIC
 //! connection (quinn, tokio — control plane only, never the per-frame path) carries a
@@ -12,9 +12,9 @@
 //!
 //! after which both sides bring up a [`crate::session::Session`] over a plain
 //! [`UdpTransport`](crate::transport::udp) (native threads, no async) and the host streams.
-//! The Welcome carries everything the M1 core negotiates — FEC scheme (including GF(2¹⁶)
+//! The Welcome carries everything the core negotiates — FEC scheme (including GF(2¹⁶)
 //! Leopard, which GameStream can't express), shard sizing, crypto key/salt — so the data
-//! plane is exactly the hardened M1 `Session`.
+//! plane is exactly the hardened core `Session`.
 //!
 //! Transport security: the host presents a long-lived self-signed certificate
 //! ([`endpoint::server_with_identity`]) and the client pins its SHA-256 fingerprint

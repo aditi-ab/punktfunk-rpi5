@@ -5,7 +5,7 @@
 # makeappx/signtool are baked into the runner's daemon env, same as windows.yml.
 #
 # Registry (public, unom org): https://git.unom.io/unom/-/packages  (generic group)
-# Packaging internals: crates/punktfunk-client-windows/packaging/README.md. BOM/MAX_PATH runner
+# Packaging internals: clients/windows/packaging/README.md. BOM/MAX_PATH runner
 # gotchas baked into the daemon env + windows.yml: see that workflow.
 #
 # Versioning — MSIX requires a strictly 4-part numeric version (no ~/- suffixes), so:
@@ -25,7 +25,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'crates/punktfunk-client-windows/**'
+      - 'clients/windows/**'
       - 'crates/punktfunk-core/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
@@ -72,7 +72,7 @@ jobs:
           MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
           MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
         run: |
-          & crates/punktfunk-client-windows/packaging/pack-msix.ps1 `
+          & clients/windows/packaging/pack-msix.ps1 `
             -Version $env:MSIX_VERSION -TargetDir C:\t\release -OutDir C:\t\msix
 
       - name: Publish to Gitea generic registry

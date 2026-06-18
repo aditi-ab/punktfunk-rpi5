@@ -1,9 +1,9 @@
-//! M0 — the pipeline spike (plan §8): capture → NVENC encode → playable file, with the
+//! The pipeline spike (plan §8): capture → NVENC encode → playable file, with the
 //! encoded access units also fed through a `punktfunk_core` host→client `Session` over an
 //! in-process loopback to prove the core's FEC + packetize + reassemble path on real
 //! encoder output.
 //!
-//! This is the spike runner, not the M2 hot path: it drives the stages on one thread (the
+//! This is the spike runner, not the production host path: it drives the stages on one thread (the
 //! per-stage-thread pipeline with bounded channels is [`crate::pipeline`]). Source is
 //! either a synthetic BGRx test pattern (no capture session needed) or the live xdg
 //! ScreenCast portal monitor.
@@ -52,12 +52,12 @@ pub fn run(opts: Options) -> Result<()> {
                 width = opts.width,
                 height = opts.height,
                 fps = opts.fps,
-                "M0 source: synthetic BGRx test pattern"
+                "spike source: synthetic BGRx test pattern"
             );
             Box::new(SyntheticCapturer::new(opts.width, opts.height, opts.fps))
         }
         Source::Portal => {
-            tracing::info!("M0 source: xdg ScreenCast portal (live monitor)");
+            tracing::info!("spike source: xdg ScreenCast portal (live monitor)");
             capture::open_portal_monitor().context("open portal capturer")?
         }
         Source::KwinVirtual => {
@@ -66,7 +66,7 @@ pub fn run(opts: Options) -> Result<()> {
                 width = opts.width,
                 height = opts.height,
                 ?compositor,
-                "M0 source: virtual output (PUNKTFUNK_COMPOSITOR)"
+                "spike source: virtual output (PUNKTFUNK_COMPOSITOR)"
             );
             let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
             let vout = vd
@@ -104,7 +104,7 @@ pub fn run(opts: Options) -> Result<()> {
         opts.fps,
         opts.bitrate_bps,
         first.is_cuda(),
-        8, // m0 synthetic harness: 8-bit
+        8, // spike synthetic harness: 8-bit
     )
     .context("open encoder")?;
 
@@ -147,7 +147,7 @@ pub fn run(opts: Options) -> Result<()> {
         out = %opts.out.display(),
         elapsed_s = format!("{elapsed:.2}"),
         encode_fps = format!("{:.1}", stats.encoded as f64 / elapsed.max(1e-9)),
-        "M0 capture→encode→file complete"
+        "spike capture→encode→file complete"
     );
 
     if let Some(lb) = lb {
@@ -194,7 +194,7 @@ fn drain_encoder(
 
 /// A host↔client `punktfunk_core` pair over a lossless in-process loopback. Each encoded AU is
 /// FEC-protected, packetized, sent, then reassembled on the client and byte-compared to the
-/// original — exercising the core on real encoder output (the M0 "feed into a Session" goal).
+/// original — exercising the core on real encoder output (the spike "feed into a Session" goal).
 struct Loopback {
     host: Session,
     client: Session,

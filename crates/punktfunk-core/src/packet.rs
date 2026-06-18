@@ -12,7 +12,7 @@
 //! `frame_index`↔`frameIndex`, `stream_seq`↔`streamPacketIndex`,
 //! (`block_index`,`block_count`)↔the `multiFecBlocks` nibbles, and
 //! (`data_shards`,`recovery_shards`,`shard_index`)↔the `fecInfo` bitfield. We carry them
-//! as explicit fields rather than bit-packing; full GameStream wire-exactness is an M2
+//! as explicit fields rather than bit-packing; full GameStream wire-exactness is a GameStream-host
 //! concern (it also needs RTP framing + RTSP), this is the coherent internal format.
 
 use crate::config::Config;

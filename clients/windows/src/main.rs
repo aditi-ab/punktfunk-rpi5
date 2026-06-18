@@ -83,7 +83,7 @@ fn main() {
 }
 
 /// `--headless --connect host[:port] …`: connect from the CLI, count frames, print stats — the
-/// Windows analogue of `punktfunk-client-rs`.
+/// Windows analogue of `punktfunk-probe`.
 #[cfg(windows)]
 fn run_headless_cli(args: &[String], identity: (String, String)) {
     use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
@@ -241,18 +241,18 @@ fn discover_and_print() {
         std::thread::sleep(Duration::from_millis(100));
     }
     if seen.is_empty() {
-        println!("  (none found — is a host running with --native / m3-host?)");
+        println!("  (none found — is a host running with --native / punktfunk1-host?)");
     }
 }
 
 /// WinUI 3 / Direct3D11 / WASAPI / SDL3 are Windows turf; this stub keeps `cargo build
 /// --workspace` green on Linux/macOS (the other native clients live in
-/// crates/punktfunk-client-linux and clients/apple).
+/// clients/linux and clients/apple).
 #[cfg(not(windows))]
 fn main() {
     eprintln!(
         "punktfunk-client-windows is Windows-only — the Linux client lives in \
-         crates/punktfunk-client-linux, the macOS client in clients/apple"
+         clients/linux, the macOS client in clients/apple"
     );
     std::process::exit(2);
 }

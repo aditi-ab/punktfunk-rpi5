@@ -3,7 +3,7 @@ package io.unom.punktfunk.kit
 /**
  * The single JNI seam to `libpunktfunk_android.so` (the Rust-heavy client core).
  *
- * Symbols are implemented in `crates/punktfunk-android`. This object is intentionally thin —
+ * Symbols are implemented in `clients/android/native`. This object is intentionally thin —
  * all protocol logic lives in Rust (`punktfunk-core` + the connector); Kotlin only marshals.
  */
 object NativeBridge {

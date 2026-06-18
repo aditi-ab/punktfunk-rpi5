@@ -1,6 +1,6 @@
 [package]
-name = "punktfunk-client-rs"
-description = "punktfunk reference client (M4): VAAPI decode + wgpu/Vulkan present"
+name = "punktfunk-probe"
+description = "punktfunk reference/probe client: headless punktfunk/1 client for testing + latency measurement"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 quinn = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
 anyhow = "1"

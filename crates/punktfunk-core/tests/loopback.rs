@@ -1,4 +1,4 @@
-//! M1 acceptance: round-trip access units through the full host→client path
+//! Core acceptance: round-trip access units through the full host→client path
 //! (packetize → FEC → loopback with simulated loss → recover → reassemble) and assert
 //! byte-exact recovery, for both FEC schemes, with and without encryption. Plus
 //! property tests over the FEC layer's loss patterns.

@@ -15,7 +15,7 @@ use punktfunk_core::client::NativeClient;
 use punktfunk_core::error::PunktfunkError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The decode loop. Runs on the `pf-decode` thread until `shutdown` is set or the session closes.
 pub fn run(client: Arc<NativeClient>, window: NativeWindow, shutdown: Arc<AtomicBool>) {
@@ -56,6 +56,10 @@ pub fn run(client: Arc<NativeClient>, window: NativeWindow, shutdown: Arc<Atomic
 
     let mut fed: u64 = 0;
     let mut rendered: u64 = 0;
+    // Loss recovery: watch the host→client unrecoverable-drop count and ask for an IDR when it
+    // climbs.
+    let mut last_dropped = client.frames_dropped();
+    let mut last_kf_req: Option<Instant> = None;
     while !shutdown.load(Ordering::Relaxed) {
         match client.next_frame(Duration::from_millis(5)) {
             Ok(frame) => {
@@ -74,6 +78,24 @@ pub fn run(client: Arc<NativeClient>, window: NativeWindow, shutdown: Arc<Atomic
             Err(_) => break,                   // session closed
         }
         rendered += drain(&codec);
+
+        // Loss recovery: under infinite GOP the only recovery keyframe is one we request. The
+        // reassembler drops unrecoverable AUs (frames_dropped); the decoder then conceals the
+        // reference-missing delta frames that follow and renders them without error, so keying off
+        // a decode error rarely fires. Request an IDR when the drop count climbs, throttled — the
+        // decode stays wedged for several frames until the IDR lands, so requesting every frame
+        // would flood the control stream.
+        let dropped = client.frames_dropped();
+        if dropped > last_dropped {
+            last_dropped = dropped;
+            let now = Instant::now();
+            if last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
+                last_kf_req = Some(now);
+                let _ = client.request_keyframe();
+                log::debug!("decode: requested keyframe (loss recovery, dropped={dropped})");
+            }
+        }
+
         if fed > 0 && fed % 300 == 0 {
             log::info!("decode: fed={fed} rendered={rendered}");
         }

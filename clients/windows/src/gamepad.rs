@@ -1,13 +1,15 @@
-//! App-lifetime gamepad service over SDL3 (mirrors the Swift client's `GamepadManager` +
-//! `GamepadCapture`/`GamepadFeedback`).
+//! App-lifetime gamepad service over SDL3 (mirrors the Swift/GTK clients' `GamepadManager` +
+//! capture/feedback). Ported near-verbatim from the GTK Linux client — SDL3 is cross-platform,
+//! so the only Windows change is the build (`sdl3` is compiled from source via the bundled
+//! CMake, since there is no system SDL3).
 //!
-//! One worker thread owns SDL for the process lifetime: it tracks connected pads for the
-//! Settings UI, selects the ONE controller forwarded as pad 0 (user pin, else the most
-//! recently connected), and — while a session is attached — forwards buttons/axes,
-//! DualSense touchpad contacts and motion samples (0xCC), and renders feedback: rumble on
-//! every pad, lightbar via SDL, and on a real DualSense the raw effects packet
-//! (adaptive-trigger blocks replayed verbatim, player LEDs). Held state is zeroed on the
-//! wire when the active pad switches or the session detaches, so nothing sticks down.
+//! One worker thread owns SDL for the process lifetime: it tracks connected pads, selects the
+//! ONE controller forwarded as pad 0 (user pin, else the most recently connected), and — while
+//! a session is attached — forwards buttons/axes, DualSense touchpad contacts and motion
+//! samples (0xCC), and renders feedback: rumble on every pad, lightbar via SDL, and on a real
+//! DualSense the raw effects packet (adaptive-trigger blocks replayed verbatim, player LEDs).
+//! Held state is zeroed on the wire when the active pad switches or the session detaches, so
+//! nothing sticks down.
 //!
 //! This thread is also the single consumer of the rumble and HID-output pull planes.
 
@@ -20,24 +22,20 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Motion scale constants, shared convention with the Swift client (`GamepadWire`):
-/// derived from hid-playstation's math over the host's fixed calibration blob. SDL hands
-/// us gyro in rad/s and accel in m/s²; the DualSense report wants raw LSBs.
+/// Motion scale constants, shared convention with the other clients (`GamepadWire`): derived
+/// from hid-playstation's math over the host's fixed calibration blob. SDL hands us gyro in
+/// rad/s and accel in m/s²; the DualSense report wants raw LSBs.
 const GYRO_LSB_PER_RAD_S: f32 = 20.0 * 180.0 / std::f32::consts::PI;
 const ACCEL_LSB_PER_G: f32 = 10_000.0;
 const G: f32 = 9.80665;
 
-/// The controller "escape" chord (Moonlight convention): L1 + R1 + Start + Select held
-/// together. Intercepted by the client to leave fullscreen + release input capture — the
-/// Deck has no F11 key and fullscreen hides the window chrome, so with a controller this
-/// is the only way out. Four simultaneous buttons that no game uses as a deliberate
-/// combo, so it can't be triggered by normal play. Still forwarded to the host (the user
-/// is leaving anyway); we only also raise the escape signal.
-const ESCAPE_CHORD: [u32; 4] = [wire::BTN_LB, wire::BTN_RB, wire::BTN_START, wire::BTN_BACK];
-
 #[derive(Clone, Debug)]
 pub struct PadInfo {
+    // `id`/`name` feed the settings GUI's pad list (a follow-up); the windowed client only
+    // reads `is_dualsense` (via `auto_pref`), so they're unused in reachable code for now.
+    #[allow(dead_code)]
     pub id: u32,
+    #[allow(dead_code)]
     pub name: String,
     pub is_dualsense: bool,
 }
@@ -53,10 +51,9 @@ pub struct GamepadService {
     pads: Arc<Mutex<Vec<PadInfo>>>,
     active: Arc<Mutex<Option<PadInfo>>>,
     pinned: Arc<Mutex<Option<u32>>>,
-    ctl: Sender<Ctl>,
-    /// Fires once per press of the [`ESCAPE_CHORD`]; the stream page consumes it to leave
-    /// fullscreen + release capture.
-    escape_rx: async_channel::Receiver<()>,
+    // `Arc<Mutex<…>>` (not a bare `Sender`, which is `!Sync`) so the service is `Sync` — the
+    // WinUI app shares it across the UI thread and the session-pump thread (attach/detach).
+    ctl: Arc<Mutex<Sender<Ctl>>>,
 }
 
 impl GamepadService {
@@ -65,12 +62,11 @@ impl GamepadService {
         let active = Arc::new(Mutex::new(None));
         let pinned = Arc::new(Mutex::new(None));
         let (ctl, ctl_rx) = std::sync::mpsc::channel();
-        let (escape_tx, escape_rx) = async_channel::unbounded();
         let (p, a, pin) = (pads.clone(), active.clone(), pinned.clone());
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-gamepad".into())
             .spawn(move || {
-                if let Err(e) = run(&p, &a, &pin, &ctl_rx, &escape_tx) {
+                if let Err(e) = run(&p, &a, &pin, &ctl_rx) {
                     tracing::warn!(error = %e, "gamepad service ended — pads disabled");
                 }
             })
@@ -81,17 +77,11 @@ impl GamepadService {
             pads,
             active,
             pinned,
-            ctl,
-            escape_rx,
+            ctl: Arc::new(Mutex::new(ctl)),
         }
     }
 
-    /// A receiver that yields one `()` each time the controller escape chord is pressed.
-    /// A fresh clone per call (shared mpmc channel); the stream page spawns a future on it.
-    pub fn escape_events(&self) -> async_channel::Receiver<()> {
-        self.escape_rx.clone()
-    }
-
+    #[allow(dead_code)] // consumed by the settings GUI (follow-up)
     pub fn pads(&self) -> Vec<PadInfo> {
         self.pads.lock().unwrap().clone()
     }
@@ -100,20 +90,22 @@ impl GamepadService {
         self.active.lock().unwrap().clone()
     }
 
+    #[allow(dead_code)] // consumed by the settings GUI (follow-up)
     pub fn pinned(&self) -> Option<u32> {
         *self.pinned.lock().unwrap()
     }
 
+    #[allow(dead_code)] // consumed by the settings GUI (follow-up)
     pub fn set_pinned(&self, id: Option<u32>) {
-        let _ = self.ctl.send(Ctl::Pin(id));
+        let _ = self.ctl.lock().unwrap().send(Ctl::Pin(id));
     }
 
     pub fn attach(&self, connector: Arc<NativeClient>) {
-        let _ = self.ctl.send(Ctl::Attach(connector));
+        let _ = self.ctl.lock().unwrap().send(Ctl::Attach(connector));
     }
 
     pub fn detach(&self) {
-        let _ = self.ctl.send(Ctl::Detach);
+        let _ = self.ctl.lock().unwrap().send(Ctl::Detach);
     }
 
     /// What "Automatic" resolves to right now — the virtual pad matching the physical one
@@ -175,10 +167,10 @@ fn axis_value(axis: sdl3::gamepad::Axis, v: i16) -> (u32, i32) {
     }
 }
 
-/// The DualSense effects packet (SDL `DS5EffectsState_t`, 47 bytes) — the same layout the
-/// host parses off its virtual pad; the wire's 11-byte trigger blocks drop in verbatim.
-/// Enable bits select only the fields each update touches, so rumble (driven separately
-/// through SDL) and untouched fields keep their state.
+/// The DualSense effects packet (SDL `DS5EffectsState_t`, 47 bytes) — the same layout the host
+/// parses off its virtual pad; the wire's 11-byte trigger blocks drop in verbatim. Enable bits
+/// select only the fields each update touches, so rumble (driven separately through SDL) and
+/// untouched fields keep their state.
 #[derive(Default)]
 struct Ds5Feedback;
 
@@ -229,10 +221,6 @@ struct Worker {
     last_axis: [i32; 6],
     held_buttons: Vec<u32>,
     last_accel: [i16; 3],
-    /// Raises the UI escape signal; the escape chord fires it once per press.
-    escape_tx: async_channel::Sender<()>,
-    /// The escape chord is fully held — latched so it fires once, not every poll.
-    chord_armed: bool,
 }
 
 impl Worker {
@@ -273,26 +261,6 @@ impl Worker {
         }
     }
 
-    /// Raise the UI escape signal when the [`ESCAPE_CHORD`] just completed (latched so it
-    /// fires once per press). Called after each button-down updates `held_buttons`.
-    fn maybe_fire_escape(&mut self) {
-        if self.chord_armed {
-            return;
-        }
-        if ESCAPE_CHORD.iter().all(|b| self.held_buttons.contains(b)) {
-            self.chord_armed = true;
-            let _ = self.escape_tx.try_send(());
-            tracing::info!("gamepad escape chord (L1+R1+Start+Select) — leaving fullscreen");
-        }
-    }
-
-    /// Re-arm once the chord is broken (any of its buttons released).
-    fn rearm_escape(&mut self) {
-        if self.chord_armed && !ESCAPE_CHORD.iter().all(|b| self.held_buttons.contains(b)) {
-            self.chord_armed = false;
-        }
-    }
-
     /// Sensors stream only while a session wants them (they cost USB/BT bandwidth).
     fn set_sensors(&mut self, enabled: bool) {
         let Some(id) = self.active_id() else { return };
@@ -313,10 +281,9 @@ fn run(
     active_out: &Mutex<Option<PadInfo>>,
     pinned_out: &Mutex<Option<u32>>,
     ctl: &Receiver<Ctl>,
-    escape_tx: &async_channel::Sender<()>,
 ) -> Result<(), String> {
-    // Off-main-thread + no video subsystem: keep SDL away from signals, poll pads on its
-    // own thread.
+    // Off-main-thread + no video subsystem: keep SDL away from signals, poll pads on its own
+    // thread.
     sdl3::hint::set("SDL_NO_SIGNAL_HANDLERS", "1");
     sdl3::hint::set("SDL_JOYSTICK_THREAD", "1");
     let sdl = sdl3::init().map_err(|e| e.to_string())?;
@@ -332,8 +299,6 @@ fn run(
         last_axis: [i32::MIN; 6],
         held_buttons: Vec::new(),
         last_accel: [0; 3],
-        escape_tx: escape_tx.clone(),
-        chord_armed: false,
     };
 
     let publish = |w: &Worker| {
@@ -418,7 +383,6 @@ fn run(
                             bit,
                             1,
                         );
-                        w.maybe_fire_escape();
                     }
                 }
                 Event::ControllerButtonUp { which, button, .. }
@@ -432,7 +396,6 @@ fn run(
                             bit,
                             0,
                         );
-                        w.rearm_escape();
                     }
                 }
                 Event::ControllerAxisMotion {
@@ -490,9 +453,9 @@ fn run(
                             y: (y.clamp(0.0, 1.0) * 65535.0) as u16,
                         });
                 }
-                // Motion: accel events update the cache; each gyro event ships a sample
-                // (the DualSense reports both at ~250 Hz). Scale convention shared with
-                // the Swift client — sign/scale derived, not yet live-verified.
+                // Motion: accel events update the cache; each gyro event ships a sample (the
+                // DualSense reports both at ~250 Hz). Scale convention shared with the other
+                // clients — sign/scale derived, not yet live-verified.
                 Event::ControllerSensorUpdated {
                     which,
                     sensor,
@@ -529,14 +492,24 @@ fn run(
             }
         }
 
-        // Feedback planes (this thread is their single consumer). The host re-sends
-        // rumble state periodically, so a generous duration with refresh-on-update is
-        // safe — a dropped stop heals within ~500 ms.
+        // Feedback planes (this thread is their single consumer). The host re-sends rumble state
+        // periodically, so a generous duration with refresh-on-update is safe — a dropped stop
+        // heals within ~500 ms.
         if let Some(connector) = w.attached.clone() {
             while let Ok((pad, low, high)) = connector.next_rumble(Duration::ZERO) {
                 if pad == 0 {
                     if let Some(p) = w.active_id().and_then(|id| w.opened.get_mut(&id)) {
-                        let _ = p.set_rumble(low, high, 5_000);
+                        // Surface a failed SDL rumble write: a swallowed error here (DualSense not in
+                        // the right HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The
+                        // host logs the send side on 0xCA, so the two together pinpoint host-game vs
+                        // client-render.
+                        if let Err(e) = p.set_rumble(low, high, 5_000) {
+                            tracing::warn!(low, high, error = %e, "rumble: SDL set_rumble failed");
+                        } else {
+                            tracing::debug!(low, high, "rumble: rendered");
+                        }
+                    } else {
+                        tracing::debug!(low, high, "rumble: received but no active pad to render");
                     }
                 }
             }

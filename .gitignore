@@ -20,3 +20,11 @@ xcuserdata/
 # Windows App SDK staging by windows-reactor build.rs
 /temp/
 /winmd/
+
+# Client crate build artifacts (clients moved out of crates/ -> clients/ 2026-06-18)
+/clients/*/target
+/clients/*/*/target
+
+# Python bytecode (e.g. clients/android/ci tooling)
+__pycache__/
+*.pyc

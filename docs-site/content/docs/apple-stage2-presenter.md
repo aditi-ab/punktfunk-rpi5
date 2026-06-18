@@ -102,10 +102,10 @@ same-host-only, as today.
 - `swift test`: add a decode-output test (decode a known IDR built like
   `VideoToolboxRoundTripTests` → assert a `CVPixelBuffer` of the right dimensions + the
   decode callback fires). Present is display-bound — validate it **live** via the HUD number.
-- Live: connect to a Linux host (`m3-host --source virtual` on the GNOME box; see
+- Live: connect to a Linux host (`punktfunk1-host --source virtual` on the GNOME box; see
   [Ubuntu — GNOME](/docs/ubuntu-gnome)), confirm `capture→present` is a few ms over `capture→client`
   and that `decode→present` shrank vs. an `AVSampleBufferDisplayLayer` baseline.
-- Compare against the headless reference number: `punktfunk-client-rs` reports skew-corrected
+- Compare against the headless reference number: `punktfunk-probe` reports skew-corrected
   capture→reassembled (~1.3 ms p50 GNOME box → dev box); capture→present should be that **+ decode +
   present**.
 

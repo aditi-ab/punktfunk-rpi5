@@ -11,7 +11,7 @@
 //! Kotlin side), `nativeConnect` with identity + pin (TOFU / pinned), and `nativePair` (SPAKE2 PIN).
 //!
 //! TODO(M4 Android stage 1): client→host DualSense rich input (`send_rich_input`), mode
-//! renegotiation. Port the remaining orchestration from `crates/punktfunk-client-linux`.
+//! renegotiation. Port the remaining orchestration from `clients/linux`.
 
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, jlong};

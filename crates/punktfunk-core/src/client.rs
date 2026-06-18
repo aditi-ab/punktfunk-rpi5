@@ -1,10 +1,10 @@
-//! The embeddable `punktfunk/1` client connector (M4 groundwork), behind the `quic` feature.
+//! The embeddable `punktfunk/1` client connector, behind the `quic` feature.
 //!
 //! [`NativeClient::connect`] runs the full client side of the protocol — QUIC handshake
 //! ([`crate::quic`]), UDP data plane ([`crate::session::Session`] on a native thread), input
 //! datagrams — and hands the embedder a dead-simple surface: *pull reassembled access units,
 //! push input events*. This is what the platform clients (SwiftUI/VideoToolbox, Android, …)
-//! link via the C ABI (`punktfunk_connect` & co. in [`crate::abi`]); `punktfunk-client-rs` is the
+//! link via the C ABI (`punktfunk_connect` & co. in [`crate::abi`]); `punktfunk-probe` is the
 //! Rust-native consumer of the same flow.
 //!
 //! Threading: one worker thread owns a tokio runtime (QUIC control plane only — design
@@ -166,7 +166,7 @@ pub struct NativeClient {
 /// kernel sees a high-QoS thread parked waiting on a lower-QoS one and the Thread Performance
 /// Checker flags a priority inversion. Matching the producers to the consumers' QoS removes
 /// the inversion without slowing the Swift side. No-op off Apple (the Linux client/host don't
-/// run a QoS scheduler, and `punktfunk-client-rs` doesn't care).
+/// run a QoS scheduler, and `punktfunk-probe` doesn't care).
 #[cfg(target_vendor = "apple")]
 fn pin_thread_user_interactive() {
     // SAFETY: sets only the current thread's QoS class — always valid to call.

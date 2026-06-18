@@ -1,5 +1,5 @@
 ---
-title: "M2 — Moonlight Host"
+title: "GameStream Host"
 description: "Stream to a stock Moonlight client on a client-sized virtual display."
 ---
 
@@ -72,13 +72,13 @@ Ground-truth protocol reference: [`research/gamestream-protocol-research.json`](
   handshake, negotiate `Config`, create a wlroots virtual output sized to the client.
   *Acceptance: Moonlight completes RTSP and the host stands up the UDP streams.*
 - **P1.3 — Video (punktfunk-core P1 codec), plaintext, clean-LAN.** RTP+NV framing + FEC shard
-  layout in punktfunk-core; wire M0's NVENC AUs → UDP 47998. *Acceptance: Moonlight DISPLAYS video.*
+  layout in punktfunk-core; wire the spike's NVENC AUs → UDP 47998. *Acceptance: Moonlight DISPLAYS video.*
 - **P1.4 — Control + input.** ENet (`rusty_enet`) control stream; decode input → `inject.rs`
   (uinput/reis); request-IDR → force NVENC keyframe. *Acceptance: mouse/keyboard work.*
 - **P1.5 — Robustness: FEC recovery + encryption.** nanors-exact FEC; per-shard AES-GCM.
   *Acceptance: stable under `tc netem` loss; encrypted streams.*
 - **P1.6 — Audio + polish.** Opus + audio RTP/FEC/CBC (UDP 47999); disconnect teardown; KWin
-  backend for the user's KDE box. *Acceptance: full game stream with sound — the M2 goal.*
+  backend for the user's KDE box. *Acceptance: full game stream with sound — the GameStream-host goal.*
 
 ## Crates (verified available)
 

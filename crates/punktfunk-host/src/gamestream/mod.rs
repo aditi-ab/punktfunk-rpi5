@@ -1,10 +1,10 @@
 //! GameStream (P1) control plane — what a stock Moonlight/Artemis client talks to around
 //! the media streams: mDNS discovery, the nvhttp serverinfo + pairing HTTP(S) API, RTSP,
 //! and the ENet control stream. `tokio`/`axum` live here (control plane, I/O-bound — never
-//! the per-frame hot path; that is `punktfunk_core`'s P1 wire codec). See `docs/m2-plan.md`.
+//! the per-frame hot path; that is `punktfunk_core`'s P1 wire codec). See `docs/gamestream-host-plan.md`.
 //!
 //! Status: P1.1 — mDNS `_nvstream._tcp` advertisement + `/serverinfo`. Pairing, RTSP, and
-//! the media streams follow (see the M2 task list / plan).
+//! the media streams follow (see the GameStream host task list / plan).
 
 pub mod apps;
 // Platform-neutral wire/negotiation logic + the Linux capture/encode pipeline (non-Linux
@@ -149,7 +149,10 @@ impl AppState {
 /// QUIC server on `cfg.port` in the same process, sharing one [`crate::native_pairing`] handle with
 /// the management API so the web console can arm pairing and show the PIN. `None` = GameStream only
 /// (the mgmt API's native endpoints report `enabled: false`).
-pub fn serve(mgmt: crate::mgmt::Options, native: Option<crate::m3::NativeServe>) -> Result<()> {
+pub fn serve(
+    mgmt: crate::mgmt::Options,
+    native: Option<crate::punktfunk1::NativeServe>,
+) -> Result<()> {
     let host = Host::detect()?;
     let identity = cert::ServerIdentity::load_or_create().context("host certificate")?;
     let state = Arc::new(AppState::new(host, identity));
@@ -187,7 +190,7 @@ pub fn serve(mgmt: crate::mgmt::Options, native: Option<crate::m3::NativeServe>)
                 tokio::try_join!(
                     nvhttp::run(state.clone()),
                     crate::mgmt::run(state.clone(), mgmt, Some(np.clone())),
-                    crate::m3::serve(crate::m3::native_serve_opts(&cfg), np),
+                    crate::punktfunk1::serve(crate::punktfunk1::native_serve_opts(&cfg), np),
                 )?;
             }
             _ => {

@@ -71,7 +71,7 @@ finish-args:
   - --socket=pulseaudio
   # --- network: QUIC control + UDP data plane + mDNS discovery (_punktfunk._udp) ---
   - --share=network
-  # --- persistent client identity / pairing store (shared with punktfunk-client-rs) ---
+  # --- persistent client identity / pairing store (shared with punktfunk-probe) ---
   - --filesystem=~/.config/punktfunk:create   # client-{cert,key}.pem, known-hosts, settings
 
 build-options:
@@ -145,7 +145,7 @@ modules:
       # Windows client; this edits only the sandbox copy of Cargo.toml. (No --locked: the lock
       # no longer matches the reduced member set; --offline still pins every crate to the
       # vendored cargo-sources.json, so the build stays reproducible.)
-      - sed -i '\#"crates/punktfunk-client-windows",#d' Cargo.toml
+      - sed -i '\#"clients/windows",#d' Cargo.toml
       - cargo --offline build --release -p punktfunk-client-linux
       - install -Dm0755 target/release/punktfunk-client ${FLATPAK_DEST}/bin/punktfunk-client
       # Desktop entry (renamed to the app id; Exec is the in-sandbox binary).

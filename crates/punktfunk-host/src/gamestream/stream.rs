@@ -1,6 +1,6 @@
 //! The video data plane: on RTSP PLAY, learn the client's UDP endpoint (it pings the video
 //! port), then run capture → NVENC encode → [`VideoPacketizer`] → UDP send. The source is
-//! either real portal desktop capture (`PUNKTFUNK_VIDEO_SOURCE=portal`, the M0 PipeWire path) or
+//! either real portal desktop capture (`PUNKTFUNK_VIDEO_SOURCE=portal`, the portal PipeWire path) or
 //! a synthetic test pattern (default). Runs on its own native thread.
 
 use super::video::{FrameType, VideoPacketizer};

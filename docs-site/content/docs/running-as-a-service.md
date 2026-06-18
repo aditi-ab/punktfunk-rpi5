@@ -82,7 +82,7 @@ session unit — see [Bazzite](/docs/bazzite).
 After a reboot, from another machine on the network:
 
 ```sh
-punktfunk-client-rs --discover     # or just look for the host in the Apple app / Moonlight
+punktfunk-probe --discover     # or just look for the host in the Apple app / Moonlight
 ```
 
 If the host is listed, it's up. If not, check `journalctl --user -u punktfunk-host` on the host.

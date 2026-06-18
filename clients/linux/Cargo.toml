@@ -15,7 +15,7 @@ path = "src/main.rs"
 # Everything is Linux-gated so `cargo build --workspace` stays green on macOS (the Mac
 # client lives in clients/apple); on other platforms this builds as a stub binary.
 [target.'cfg(target_os = "linux")'.dependencies]
-punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 
 # UI shell. GraphicsOffload needs GTK ≥ 4.14; black-background ≥ 4.16. AlertDialog/
 # PreferencesDialog need libadwaita ≥ 1.5.

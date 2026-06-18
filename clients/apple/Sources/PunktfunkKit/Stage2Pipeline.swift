@@ -113,8 +113,21 @@ public final class Stage2Pipeline {
         let recovery = recovery
         let thread = Thread {
             var format: CMVideoFormatDescription?
+            var lastFramesDropped = connection.framesDropped()
             while token.isLive {
                 do {
+                    // Loss recovery (the primary recovery path). The reassembler drops unrecoverable
+                    // AUs (framesDropped) and the decoder then conceals the reference-missing delta
+                    // frames that follow — often rendering them WITHOUT an error callback — so the
+                    // onDecodeError trigger rarely fires after a real network blip. Ask the host for
+                    // a fresh IDR whenever the drop count climbs (throttled in KeyframeRecovery).
+                    // Polled every iteration so a total-loss drought recovers the moment packets
+                    // resume and the reassembler counts the gap.
+                    let dropped = connection.framesDropped()
+                    if dropped > lastFramesDropped {
+                        lastFramesDropped = dropped
+                        recovery.request()
+                    }
                     guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
                     onFrame?(au)
                     if let f = AnnexB.formatDescription(fromIDR: au.data) {

@@ -1,4 +1,4 @@
-//! M3 — the `punktfunk/1` native host: QUIC control plane + the hardened M1 data plane over UDP.
+//! The `punktfunk/1` native host: QUIC control plane + the hardened core data plane over UDP.
 //! This is punktfunk's own protocol, past the GameStream compatibility layer:
 //!
 //! * the Welcome negotiates **GF(2¹⁶) Leopard FEC** (inexpressible in GameStream) + AES-GCM;
@@ -9,9 +9,9 @@
 //! * video frames carry a wall-clock `pts_ns`, so a same-host client measures the full
 //!   capture→encode→FEC→UDP→reassemble latency per frame.
 //!
-//! `punktfunk-host m3-host [--port 9777] [--source synthetic|virtual] [--seconds 30]
+//! `punktfunk-host punktfunk1-host [--port 9777] [--source synthetic|virtual] [--seconds 30]
 //!  [--frames 300]` serves sessions back to back (one at a time — the virtual output and
-//!  encoder are single-tenant); `punktfunk-client-rs --connect host:9777` is the counterpart.
+//!  encoder are single-tenant); `punktfunk-probe --connect host:9777` is the counterpart.
 //!  The data plane runs on native threads (no async on the frame path).
 //!
 //! Alongside video + input, a session carries **audio** (desktop Opus, 5 ms frames, host →
@@ -37,16 +37,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum M3Source {
+pub enum Punktfunk1Source {
     /// Deterministic test frames (protocol verification; the client byte-checks them).
     Synthetic,
     /// Real capture: virtual display at the client's requested mode → NVENC.
     Virtual,
 }
 
-pub struct M3Options {
+pub struct Punktfunk1Options {
     pub port: u16,
-    pub source: M3Source,
+    pub source: Punktfunk1Source,
     /// Virtual-source stream duration.
     pub seconds: u32,
     /// Synthetic-source frame count.
@@ -97,7 +97,7 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn run(opts: M3Options) -> Result<()> {
+pub fn run(opts: Punktfunk1Options) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -138,10 +138,10 @@ pub(crate) struct NativeServe {
 /// overflow clients wait in the accept queue. Override with `--max-concurrent`.
 pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 4;
 
-pub(crate) fn native_serve_opts(cfg: &NativeServe) -> M3Options {
-    M3Options {
+pub(crate) fn native_serve_opts(cfg: &NativeServe) -> Punktfunk1Options {
+    Punktfunk1Options {
         port: cfg.port,
-        source: M3Source::Virtual,
+        source: Punktfunk1Source::Virtual,
         seconds: 7 * 24 * 3600, // per-session cap; large enough not to cut a live stream
         frames: 0,
         max_sessions: 0,
@@ -153,7 +153,7 @@ pub(crate) fn native_serve_opts(cfg: &NativeServe) -> M3Options {
     }
 }
 
-pub(crate) async fn serve(opts: M3Options, np: Arc<NativePairing>) -> Result<()> {
+pub(crate) async fn serve(opts: Punktfunk1Options, np: Arc<NativePairing>) -> Result<()> {
     let identity = crate::gamestream::cert::ServerIdentity::load_or_create()
         .context("load host identity (~/.config/punktfunk)")?;
     let fingerprint = endpoint::fingerprint_of_pem(&identity.cert_pem)
@@ -427,7 +427,7 @@ async fn pair_ceremony(
 #[allow(clippy::too_many_arguments)]
 async fn serve_session(
     conn: quinn::Connection,
-    opts: &M3Options,
+    opts: &Punktfunk1Options,
     audio_cap: &AudioCapSlot,
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
     mic_tx: std::sync::mpsc::Sender<Vec<u8>>,
@@ -514,7 +514,7 @@ async fn serve_session(
         // can report what we'll actually drive. Only the Virtual source has a compositor; the
         // synthetic source has no virtual output. Blocking probes → spawn_blocking.
         let compositor = match source {
-            M3Source::Virtual => {
+            Punktfunk1Source::Virtual => {
                 let pref = hello.compositor;
                 Some(
                     tokio::task::spawn_blocking(move || resolve_compositor(pref))
@@ -522,7 +522,7 @@ async fn serve_session(
                         .context("resolve compositor task")??,
                 )
             }
-            M3Source::Synthetic => None,
+            Punktfunk1Source::Synthetic => None,
         };
 
         // Resolve a requested library launch (the client sends only the store-qualified id;
@@ -600,8 +600,8 @@ async fn serve_session(
             key,
             salt: *b"pkf1",
             frames: match source {
-                M3Source::Synthetic => frames,
-                M3Source::Virtual => 0, // unbounded — client streams until we close
+                Punktfunk1Source::Synthetic => frames,
+                Punktfunk1Source::Virtual => 0, // unbounded — client streams until we close
             },
             // Report the resolved backends back to the client (compositor: Auto for the
             // synthetic source).
@@ -726,7 +726,7 @@ async fn serve_session(
         let conn = conn.clone();
         let gamepad = welcome.gamepad;
         std::thread::Builder::new()
-            .name("punktfunk-m3-input".into())
+            .name("punktfunk1-input".into())
             .spawn(move || input_thread(input_rx, rich_rx, conn, inj_tx, gamepad))
             .context("spawn input thread")?
     };
@@ -778,12 +778,12 @@ async fn serve_session(
     // → host→client QUIC datagrams, on its own native thread. Best-effort on every failure
     // (no PipeWire audio, spawn error): the session continues without audio — and a spawn
     // error must NOT early-return here, the threads above are already running.
-    let audio_handle = if opts.source == M3Source::Virtual {
+    let audio_handle = if opts.source == Punktfunk1Source::Virtual {
         let conn = conn.clone();
         let stop = stop.clone();
         let cap = audio_cap.clone();
         std::thread::Builder::new()
-            .name("punktfunk-m3-audio".into())
+            .name("punktfunk1-audio".into())
             .spawn(move || audio_thread(conn, stop, cap))
             .map_err(|e| tracing::error!(error = %e, "audio thread spawn failed — session continues without audio"))
             .ok()
@@ -794,7 +794,7 @@ async fn serve_session(
     // Test hook (synthetic source only): a scripted feedback burst on the host→client
     // planes — rumble (0xCA) + DualSense HID-output (0xCD) — so loopback tests can assert
     // the client's feedback path without a real game writing output reports to a real pad.
-    if opts.source == M3Source::Synthetic
+    if opts.source == Punktfunk1Source::Synthetic
         && std::env::var("PUNKTFUNK_TEST_FEEDBACK").as_deref() == Ok("1")
     {
         use punktfunk_core::quic::HidOutput;
@@ -852,14 +852,14 @@ async fn serve_session(
             let mut session = Session::new(cfg, Box::new(transport))
                 .map_err(|e| anyhow!("host session: {e:?}"))?;
             match source {
-                M3Source::Synthetic => synthetic_stream(
+                Punktfunk1Source::Synthetic => synthetic_stream(
                     &mut session,
                     frames,
                     &stop_stream,
                     &probe_rx,
                     &probe_result_tx,
                 ),
-                M3Source::Virtual => {
+                Punktfunk1Source::Virtual => {
                     let compositor = compositor
                         .expect("the Virtual source resolves a compositor during the handshake");
                     virtual_stream(
@@ -986,7 +986,7 @@ impl InjectorService {
     fn start() -> InjectorService {
         let (tx, rx) = std::sync::mpsc::channel::<InputEvent>();
         if let Err(e) = std::thread::Builder::new()
-            .name("punktfunk-m3-injector".into())
+            .name("punktfunk1-injector".into())
             .spawn(move || injector_service_thread(rx))
         {
             tracing::error!(error = %e, "injector service thread spawn failed — pointer/keyboard input disabled");
@@ -1080,7 +1080,7 @@ impl MicService {
     fn start() -> MicService {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         if let Err(e) = std::thread::Builder::new()
-            .name("punktfunk-m3-mic".into())
+            .name("punktfunk1-mic".into())
             .spawn(move || mic_service_thread(rx))
         {
             tracing::error!(error = %e, "mic service thread spawn failed — mic passthrough disabled");
@@ -2117,7 +2117,7 @@ fn virtual_stream(
     let _watcher = if watch {
         let stop = stop.clone();
         std::thread::Builder::new()
-            .name("punktfunk-m3-watcher".into())
+            .name("punktfunk1-watcher".into())
             .spawn(move || session_watcher_loop(session_tx, stop))
             .ok()
     } else {
@@ -3014,9 +3014,9 @@ mod tests {
         use punktfunk_core::error::PunktfunkStatus;
 
         let host = std::thread::spawn(|| {
-            run(M3Options {
+            run(Punktfunk1Options {
                 port: 19777,
-                source: M3Source::Synthetic,
+                source: Punktfunk1Source::Synthetic,
                 seconds: 0,
                 frames: 25,
                 max_sessions: 3,
@@ -3182,9 +3182,9 @@ mod tests {
                 .build()
                 .unwrap();
             rt.block_on(serve(
-                M3Options {
+                Punktfunk1Options {
                     port: 19779,
-                    source: M3Source::Synthetic,
+                    source: Punktfunk1Source::Synthetic,
                     seconds: 0,
                     frames: 25,
                     max_sessions: 2, // the knock + the post-approval session
@@ -3268,9 +3268,9 @@ mod tests {
         use punktfunk_core::quic::endpoint;
 
         let host = std::thread::spawn(|| {
-            run(M3Options {
+            run(Punktfunk1Options {
                 port: 19778,
-                source: M3Source::Synthetic,
+                source: Punktfunk1Source::Synthetic,
                 seconds: 0,
                 frames: 25,
                 max_sessions: 4,

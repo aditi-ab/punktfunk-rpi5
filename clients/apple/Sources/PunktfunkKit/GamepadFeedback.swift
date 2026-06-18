@@ -58,7 +58,13 @@ private final class RumbleRenderer: @unchecked Sendable {
     private var controller: GCController?
     private var low: Motor?
     private var high: Motor?
+    // `broken` latches OFF only for a controller that genuinely has no haptics engine (an Xbox pad
+    // on an OS that doesn't expose rumble through GameController, a Siri Remote) — nothing to retry
+    // until the controller changes. A transient engine failure does NOT latch it; it tears down for
+    // a lazy rebuild instead, so a single hiccup can't kill rumble for the whole session.
     private var broken = false
+    /// Last logged active/silent state — for a one-line transition log, not per-event spam.
+    private var wasActive = false
 
     func retarget(_ c: GCController?) {
         queue.async {
@@ -70,8 +76,14 @@ private final class RumbleRenderer: @unchecked Sendable {
 
     func apply(low lowAmp: UInt16, high highAmp: UInt16) {
         queue.async {
+            let active = lowAmp != 0 || highAmp != 0
+            if active != self.wasActive {
+                self.wasActive = active
+                log.debug(
+                    "rumble: \(active ? "active" : "stop", privacy: .public) low=\(lowAmp, privacy: .public) high=\(highAmp, privacy: .public)")
+            }
             guard !self.broken else { return }
-            if (lowAmp != 0 || highAmp != 0), self.low == nil, self.high == nil {
+            if active, self.low == nil, self.high == nil {
                 self.setup()
             }
             if self.high != nil {
@@ -92,7 +104,15 @@ private final class RumbleRenderer: @unchecked Sendable {
     /// high = right/light — the Xbox/XInput convention the wire carries); one combined
     /// engine otherwise, driven by whichever amplitude is stronger.
     private func setup() {
-        guard let haptics = controller?.haptics else { return }
+        guard let haptics = controller?.haptics else {
+            // No haptics engine at all — an Xbox controller on an OS/firmware that doesn't expose
+            // rumble through GameController (works on Android via the standard Vibrator path, but
+            // Apple's support is controller/OS-dependent), or a Siri Remote. Nothing to retry until
+            // the controller changes; latch off (retarget clears it) and say so once.
+            log.info("rumble: active controller exposes no haptics engine — rumble unavailable")
+            broken = true
+            return
+        }
         let localities = haptics.supportedLocalities
         if localities.contains(.leftHandle), localities.contains(.rightHandle) {
             low = makeMotor(haptics, .leftHandle)
@@ -100,13 +120,28 @@ private final class RumbleRenderer: @unchecked Sendable {
         } else {
             low = makeMotor(haptics, .default)
         }
-        if low == nil && high == nil {
-            broken = true // no usable engine (e.g. Siri Remote) — stay silent
+        if low == nil, high == nil {
+            // Haptics present but no engine could be built right now (server busy / a transient
+            // error). Do NOT latch broken — the next nonzero amplitude retries setup().
+            log.warning("rumble: haptics present but engine setup failed — will retry on next rumble")
         }
     }
 
     private func makeMotor(_ haptics: GCDeviceHaptics, _ locality: GCHapticsLocality) -> Motor? {
         guard let engine = haptics.createEngine(withLocality: locality) else { return nil }
+        // The haptic server can stop or reset the engine out from under us — app backgrounding, an
+        // audio-session interruption (a call, Siri, another audio app), or a server crash. Left
+        // unhandled the players go dead and every later rumble throws, latching rumble off for the
+        // rest of the session (the "rumble worked, then went spotty" failure). Tear down on the
+        // serial queue so the next nonzero amplitude lazily rebuilds the engine, instead.
+        engine.stoppedHandler = { [weak self] reason in
+            log.info("rumble: haptic engine stopped (reason \(reason.rawValue, privacy: .public)) — will rebuild")
+            self?.queue.async { self?.teardown() }
+        }
+        engine.resetHandler = { [weak self] in
+            log.info("rumble: haptic engine reset — will rebuild")
+            self?.queue.async { self?.teardown() }
+        }
         do {
             try engine.start()
             let event = CHHapticEvent(
@@ -141,14 +176,19 @@ private final class RumbleRenderer: @unchecked Sendable {
             }
             motor = m
         } catch {
-            log.warning("haptic update failed — rumble disabled: \(error, privacy: .public)")
+            // A transient failure (the engine stopped/reset between its handler firing and now).
+            // Tear down so the next nonzero amplitude rebuilds — do NOT latch rumble off for the
+            // session (that was the old "spotty" behaviour).
+            log.warning("rumble: haptic update failed — rebuilding: \(error, privacy: .public)")
             teardown()
-            broken = true
         }
     }
 
     private func teardown() {
         for m in [low, high].compactMap({ $0 }) {
+            // Drop the handlers before stopping so stop() can't re-enter teardown via stoppedHandler.
+            m.engine.stoppedHandler = nil
+            m.engine.resetHandler = nil
             try? m.player.stop(atTime: CHHapticTimeImmediate)
             m.engine.stop()
         }

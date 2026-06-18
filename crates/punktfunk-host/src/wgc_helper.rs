@@ -50,7 +50,7 @@ pub fn run(opts: HelperOptions) -> Result<()> {
     // path. Elevate its OS priority so a CPU-heavy game can't deschedule it and delay submission (which
     // would leave our HIGH GPU priority with nothing queued to prioritise). Apollo's capture thread is
     // likewise CRITICAL.
-    crate::m3::boost_thread_priority(true);
+    crate::punktfunk1::boost_thread_priority(true);
 
     // Capture the EXISTING SudoVDA output by GDI name / target id — do NOT create one (the host owns
     // the virtual output + its isolate/restore; a second topology owner breaks DDA recovery).

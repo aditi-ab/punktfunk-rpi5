@@ -2,7 +2,7 @@
 //! docs/windows-secure-desktop.md — step 4).
 //!
 //! WGC won't activate under the SYSTEM account, so the SYSTEM host can't capture the normal desktop
-//! itself. Instead it spawns `m3-host wgc-helper` in the **interactive user session** (so WGC works)
+//! itself. Instead it spawns `punktfunk-host wgc-helper` in the **interactive user session** (so WGC works)
 //! via `CreateProcessAsUserW`, with the helper's **stdout** redirected to an anonymous pipe the host
 //! reads. The helper ships framed Annex-B access units; this module parses them back into AUs the
 //! host relays onto the live QUIC session (same `EncodedFrame` flow, just sourced over a pipe instead

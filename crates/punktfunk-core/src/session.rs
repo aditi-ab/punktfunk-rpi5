@@ -31,7 +31,7 @@ pub struct Frame {
 /// Note: the AEAD layer authenticates each datagram but does **not** provide anti-replay.
 /// Video replays are largely absorbed by the reassembler's per-frame dedup, but replayed
 /// input events are not yet filtered. A sliding-window replay filter keyed on the
-/// authenticated sequence belongs with the pairing/handshake layer (M2); until then,
+/// authenticated sequence belongs with the pairing/handshake layer (the GameStream host); until then,
 /// rely on the LAN/VPN transport assumption (plan §1).
 pub struct Session {
     config: Config,

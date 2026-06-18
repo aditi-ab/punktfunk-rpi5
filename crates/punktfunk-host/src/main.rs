@@ -6,9 +6,10 @@
 //! `#[cfg(target_os = "linux")]`; the crate compiles everywhere so the workspace builds
 //! on non-Linux dev machines — it just can't run the pipeline there.
 //!
-//! Status: M0. The `m0` subcommand runs the capture→encode→file pipeline spike and feeds
-//! the encoded AUs through a `punktfunk_core` loopback. M2 wires the full P1 host that a stock
-//! Moonlight client connects to.
+//! Subcommands: `serve` runs the GameStream-compatible host + management REST API (and, with
+//! `--native`, the native punktfunk/1 host in-process); `punktfunk1-host` runs the native
+//! punktfunk/1 host standalone; `spike` is a capture→encode→file pipeline dev tool that also
+//! round-trips the encoded AUs through a `punktfunk_core` loopback.
 
 // Scaffold: trait methods and config paths are defined ahead of their backends.
 #![allow(dead_code)]
@@ -24,15 +25,15 @@ mod encode;
 mod gamestream;
 mod inject;
 mod library;
-mod m0;
-mod m3;
 mod mgmt;
 mod mgmt_token;
 mod native_pairing;
 mod pipeline;
+mod punktfunk1;
 mod pwinit;
 #[cfg(target_os = "windows")]
 mod service;
+mod spike;
 mod vdisplay;
 #[cfg(target_os = "windows")]
 mod wgc_helper;
@@ -41,7 +42,7 @@ mod zerocopy;
 
 use anyhow::{bail, Context, Result};
 use encode::Codec;
-use m0::{Options, Source};
+use spike::{Options, Source};
 use std::path::PathBuf;
 
 fn main() {
@@ -185,10 +186,10 @@ fn real_main() -> Result<()> {
             println!("dualsense-test: done");
             Ok(())
         }
-        // M0 pipeline spike.
-        Some("m0") => m0::run(parse_m0(&args[1..])?),
-        // M3: native punktfunk/1 host (QUIC control plane + UDP data plane).
-        Some("m3-host") => {
+        // Capture→encode→file pipeline spike (dev tool).
+        Some("spike") => spike::run(parse_spike(&args[1..])?),
+        // Native punktfunk/1 host (QUIC control plane + UDP data plane).
+        Some("punktfunk1-host") => {
             let get = |flag: &str| {
                 args.iter()
                     .skip_while(|a| *a != flag)
@@ -196,10 +197,10 @@ fn real_main() -> Result<()> {
                     .map(String::as_str)
             };
             let source = match get("--source") {
-                Some("virtual") => m3::M3Source::Virtual,
-                _ => m3::M3Source::Synthetic,
+                Some("virtual") => punktfunk1::Punktfunk1Source::Virtual,
+                _ => punktfunk1::Punktfunk1Source::Synthetic,
             };
-            m3::run(m3::M3Options {
+            punktfunk1::run(punktfunk1::Punktfunk1Options {
                 port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(9777),
                 source,
                 seconds: get("--seconds").and_then(|s| s.parse().ok()).unwrap_or(30),
@@ -209,7 +210,7 @@ fn real_main() -> Result<()> {
                     .unwrap_or(0),
                 max_concurrent: get("--max-concurrent")
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(m3::DEFAULT_MAX_CONCURRENT),
+                    .unwrap_or(punktfunk1::DEFAULT_MAX_CONCURRENT),
                 // Secure by default: REQUIRE PIN pairing (reject unpaired clients) unless
                 // --allow-tofu opts into trust-on-first-use — the host then accepts unpaired
                 // clients and advertises pair=optional. Pairing is always armed so a PIN is
@@ -259,8 +260,9 @@ fn real_main() -> Result<()> {
             print_usage();
             Ok(())
         }
-        // Bare flags (no subcommand) default to the m0 spike for back-compat.
-        Some(_) => m0::run(parse_m0(&args)?),
+        // Unknown subcommand → usage. (No implicit default; a bare `punktfunk-host` with no
+        // args hits the None arm above and prints help.)
+        Some(other) => bail!("unknown command '{other}' (try --help)"),
     }
 }
 
@@ -320,7 +322,7 @@ fn input_test() -> Result<()> {
 /// the native punktfunk/1 host in-process (`--native`, the unified host). Returns the mgmt options
 /// and the native host config (`None` = GameStream only). Native pairing is **required by default**
 /// (an open host any LAN device can stream from is insecure); `--open` turns it off.
-fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<m3::NativeServe>)> {
+fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<punktfunk1::NativeServe>)> {
     let mut opts = mgmt::Options::default();
     let mut native_port: Option<u16> = None;
     let mut open = false;
@@ -377,14 +379,14 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<m3::NativeServe
     if opts.token.is_none() {
         opts.token = Some(crate::mgmt_token::load_or_generate()?);
     }
-    let native = native_port.map(|port| m3::NativeServe {
+    let native = native_port.map(|port| punktfunk1::NativeServe {
         port,
         require_pairing: !open,
     });
     Ok((opts, native))
 }
 
-fn parse_m0(args: &[String]) -> Result<Options> {
+fn parse_spike(args: &[String]) -> Result<Options> {
     let mut source = Source::Portal;
     let mut width = 1920u32;
     let mut height = 1080u32;
@@ -465,7 +467,7 @@ fn parse_m0(args: &[String]) -> Result<Options> {
             Codec::H265 => "h265",
             Codec::Av1 => "obu",
         };
-        PathBuf::from(format!("/tmp/punktfunk-m0.{ext}"))
+        PathBuf::from(format!("/tmp/punktfunk-spike.{ext}"))
     });
 
     Ok(Options {
@@ -486,12 +488,12 @@ fn print_usage() {
         "punktfunk-host — Linux streaming host
 
 USAGE:
-    punktfunk-host serve [OPTIONS]    GameStream host control plane (M2: mDNS + serverinfo …)
-                                  + the management REST API
-    punktfunk-host openapi            print the management API's OpenAPI document (codegen)
-    punktfunk-host m3-host [OPTIONS]  native punktfunk/1 host (QUIC control plane + UDP data plane)
-    punktfunk-host probe-compositor   exit 0 iff the compositor is up + ready (session-bringup gate)
-    punktfunk-host m0 [OPTIONS]       M0 capture→encode→file pipeline spike
+    punktfunk-host serve [OPTIONS]            GameStream host control plane (mDNS + serverinfo …)
+                                              + the management REST API
+    punktfunk-host openapi                    print the management API's OpenAPI document (codegen)
+    punktfunk-host punktfunk1-host [OPTIONS]  native punktfunk/1 host (QUIC control + UDP data plane)
+    punktfunk-host probe-compositor           exit 0 iff the compositor is up + ready (bringup gate)
+    punktfunk-host spike [OPTIONS]            capture→encode→file pipeline spike (dev tool)
 
 SERVE OPTIONS:
     --mgmt-bind <IP:PORT>        management API address (default: 127.0.0.1:47990)
@@ -503,7 +505,7 @@ SERVE OPTIONS:
     --open                       disable mandatory native pairing (default: pairing REQUIRED —
                                  an open host any LAN device can stream from is insecure)
 
-M3-HOST OPTIONS:
+PUNKTFUNK1-HOST OPTIONS:
     --port <N>                   QUIC listen port (default: 9777)
     --source <synthetic|virtual> test frames, or virtual display + NVENC (default: synthetic)
     --seconds <N>                per-session stream duration, virtual source (default: 30)
@@ -516,7 +518,7 @@ M3-HOST OPTIONS:
                                  unpaired clients and logs a 4-digit pairing PIN at startup;
                                  TOFU without pairing is insecure on a LAN
 
-M0 OPTIONS:
+SPIKE OPTIONS:
     --source <synthetic|portal|kwin-virtual>
                                  frame source (default: portal). 'kwin-virtual' creates a
                                  KWin virtual output at --width x --height and captures it
@@ -525,7 +527,7 @@ M0 OPTIONS:
     --codec <h264|h265|av1>      NVENC codec (default: h265)
     --bitrate <MBPS>             target bitrate in Mbps (default: 20)
     --width <W> --height <H>     synthetic source size (default: 1920x1080)
-    --out <PATH>                 raw Annex-B output (default: /tmp/punktfunk-m0.<ext>)
+    --out <PATH>                 raw Annex-B output (default: /tmp/punktfunk-spike.<ext>)
     --no-loopback                skip the punktfunk_core round-trip verification
     -h, --help                   this help
 
@@ -534,8 +536,8 @@ NOTES:
     (see docs/linux-setup.md). 'synthetic' needs no capture session and always runs.
     Encoded AUs are written to a playable file AND (unless --no-loopback) fed through a
     punktfunk_core host→client loopback that reassembles and byte-verifies each one.
-    Both 'serve --native' and 'm3-host' advertise the native service over mDNS
-    (_punktfunk._udp) for client auto-discovery — 'punktfunk-client-rs --discover' lists them."
+    Both 'serve --native' and 'punktfunk1-host' advertise the native service over mDNS
+    (_punktfunk._udp) for client auto-discovery — 'punktfunk-probe --discover' lists them."
     );
     #[cfg(target_os = "windows")]
     eprintln!(

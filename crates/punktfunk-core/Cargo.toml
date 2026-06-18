@@ -10,7 +10,7 @@ repository.workspace = true
 
 [lib]
 name = "punktfunk_core"
-# `lib`       — so punktfunk-host / punktfunk-client-rs / tools link it as a normal Rust crate.
+# `lib`       — so punktfunk-host / punktfunk-probe / tools link it as a normal Rust crate.
 # `staticlib` — `libpunktfunk_core.a` for the C test harness and static embedding.
 # `cdylib`    — `libpunktfunk_core.{so,dylib}` for Swift/Kotlin clients via the C ABI.
 crate-type = ["lib", "cdylib", "staticlib"]

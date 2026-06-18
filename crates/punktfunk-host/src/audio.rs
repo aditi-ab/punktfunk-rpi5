@@ -8,7 +8,7 @@ use anyhow::Result;
 
 /// Opus/GameStream audio is 48 kHz.
 pub const SAMPLE_RATE: u32 = 48_000;
-/// Stereo channel count — the default and the punktfunk/1 (M3) audio plane's fixed layout.
+/// Stereo channel count — the default and the punktfunk/1 audio plane's fixed layout.
 pub const CHANNELS: usize = 2;
 
 /// Produces interleaved `f32` PCM at [`SAMPLE_RATE`] in the channel count it was opened

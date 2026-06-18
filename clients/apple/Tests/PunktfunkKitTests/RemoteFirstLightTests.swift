@@ -5,7 +5,7 @@
 //
 // Run (host side, on the Linux box):
 //   PUNKTFUNK_COMPOSITOR=gamescope PUNKTFUNK_GAMESCOPE_APP=vkcube PUNKTFUNK_ZEROCOPY=1 \
-//   punktfunk-host m3-host --source virtual --seconds 120
+//   punktfunk-host punktfunk1-host --source virtual --seconds 120
 // Then here:
 //   PUNKTFUNK_REMOTE_HOST=192.168.1.70 swift test --filter RemoteFirstLightTests
 
@@ -54,7 +54,7 @@ final class RemoteFirstLightTests: XCTestCase {
     func testRemoteAudioBothDirections() throws {
         let env = ProcessInfo.processInfo.environment
         guard let host = env["PUNKTFUNK_REMOTE_HOST"] else {
-            throw XCTSkip("set PUNKTFUNK_REMOTE_HOST (and start m3-host --source virtual there)")
+            throw XCTSkip("set PUNKTFUNK_REMOTE_HOST (and start punktfunk1-host --source virtual there)")
         }
         let port = env["PUNKTFUNK_REMOTE_PORT"].flatMap(UInt16.init) ?? 9777
 
@@ -106,7 +106,7 @@ final class RemoteFirstLightTests: XCTestCase {
     func testRemoteStreamDecodesToPixels() throws {
         let env = ProcessInfo.processInfo.environment
         guard let host = env["PUNKTFUNK_REMOTE_HOST"] else {
-            throw XCTSkip("set PUNKTFUNK_REMOTE_HOST (and start m3-host --source virtual there)")
+            throw XCTSkip("set PUNKTFUNK_REMOTE_HOST (and start punktfunk1-host --source virtual there)")
         }
         let port = env["PUNKTFUNK_REMOTE_PORT"].flatMap(UInt16.init) ?? 9777
         // PUNKTFUNK_REMOTE_COMPOSITOR=kwin|gamescope|… asks the host for a specific

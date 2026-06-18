@@ -10,7 +10,7 @@ The same workflow also publishes **`punktfunk-web`** (the browser management con
 status) and **`punktfunk-client`** (the GTK4 couch/Deck client). `punktfunk-host` **Recommends**
 `punktfunk-web`, so a default `apt install punktfunk-host` pulls the console too (alongside the
 udev/sysctl bits) unless you've disabled weak deps; `punktfunk-client` is independent — install it
-on the box you stream *to*. (`punktfunk-client-rs` is the headless reference/test tool, not packaged
+on the box you stream *to*. (`punktfunk-probe` is the headless reference/test tool, not packaged
 here.)
 
 Package layout mirrors the Fedora RPM (`../rpm/punktfunk.spec`): the host binary, the `/dev/uinput`

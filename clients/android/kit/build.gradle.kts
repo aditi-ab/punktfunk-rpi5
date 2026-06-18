@@ -32,7 +32,7 @@ dependencies {
 }
 
 // ------------------------------------------------------------------------------------------------
-// cargo-ndk: cross-compile crates/punktfunk-android into this module's jniLibs/<abi>/ so the
+// cargo-ndk: cross-compile clients/android/native (punktfunk-client-android) into this module's jniLibs/<abi>/ so the
 // resulting libpunktfunk_android.so is packaged into the app (and any AAR this module produces).
 // NDK r28+ aligns to 16 KB pages by default — no extra linker flags. Prereqs (see clients/android
 // /README.md): `cargo install cargo-ndk` + `rustup target add aarch64-linux-android x86_64-linux-android`.
@@ -57,7 +57,7 @@ fun androidSdkDir(): String {
 fun registerCargoNdk(taskName: String, release: Boolean) =
     tasks.register<Exec>(taskName) {
         group = "rust"
-        description = "cargo-ndk build of punktfunk-android (${if (release) "release" else "debug"})"
+        description = "cargo-ndk build of punktfunk-client-android (${if (release) "release" else "debug"})"
         workingDir = repoRoot
         val sdk = androidSdkDir()
         // A GUI Android Studio launch does not source the login shell, so make cargo, the NDK, and
@@ -84,7 +84,7 @@ fun registerCargoNdk(taskName: String, release: Boolean) =
             // Link against the minSdk-31 sysroot so libaaudio (API 26+) is found.
             "--platform", "31",
             "-o", file("src/main/jniLibs").absolutePath,
-            "build", "-p", "punktfunk-android",
+            "build", "-p", "punktfunk-client-android",
         )
         if (release) cmd += "--release"
         commandLine(cmd)

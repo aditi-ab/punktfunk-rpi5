@@ -1,4 +1,4 @@
-# Android client CI (Gitea Actions). Builds the Rust JNI core (crates/punktfunk-android) via
+# Android client CI (Gitea Actions). Builds the Rust JNI core (clients/android/native) via
 # cargo-ndk for both shipping ABIs and assembles the debug APK (clients/android). Mirrors apple.yml
 # but on a Linux runner — the NDK is cross-platform, so no self-hosted host is needed.
 #

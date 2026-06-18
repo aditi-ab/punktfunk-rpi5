@@ -6,10 +6,10 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
 
 ## Where the work stands
 
-- **M1 (`punktfunk-core` + C ABI): complete and hardened.** FEC recovery, loopback-under-loss,
+- **Core (`punktfunk-core` + C ABI): complete and hardened.** FEC recovery, loopback-under-loss,
   proptests, C ABI harness all green; 13 adversarial-review findings fixed +
   regression-tested (`a913042`).
-- **M2 (GameStream host): working end-to-end with a stock Moonlight client.** Validated live
+- **GameStream host: working end-to-end with a stock Moonlight client.** Validated live
   on this box: pairing (persists across restarts), serverinfo/applist (app catalog from
   `~/.config/punktfunk/apps.json` → each entry picks a compositor + nested command), RTSP, ENet
   control, audio, and video at the **client's native resolution and refresh** — the host
@@ -28,11 +28,11 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   socket, wlr protocols on Sway) and **gamepads** (uinput X-Box-360 pads + rumble
   back-channel; validated live — pad created/destroyed with the session). Management REST API +
   checked-in OpenAPI doc (`mgmt.rs`).
-- **M3 (`punktfunk/1`, the native protocol): full session planes, validated live.** QUIC
+- **Native protocol (`punktfunk/1`): full session planes, validated live.** QUIC
   control plane (`punktfunk-core` `quic` feature: Hello{mode}/Welcome{full Config}/Start), data
-  plane = the hardened M1 `Session` over raw UDP with **GF(2¹⁶) Leopard FEC + AES-GCM**
+  plane = the hardened core `Session` over raw UDP with **GF(2¹⁶) Leopard FEC + AES-GCM**
   (inexpressible in GameStream), host creates the native virtual output at the client's
-  requested mode. `m3-host` is a **persistent listener** (sessions back to back;
+  requested mode. `punktfunk1-host` is a **persistent listener** (sessions back to back;
   `--max-sessions`). QUIC datagrams carry the side planes, demuxed by first byte: input
   0xC8 (incl. **gamepads** — incremental events accumulated into the uinput xpad), **Opus
   audio** 0xC9 (48 kHz stereo, 5 ms, host→client), **rumble** 0xCA (host→client). **Trust:**
@@ -41,15 +41,15 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   ceremony** (host arms pairing and displays a 4-digit PIN; a PAKE binds both cert fingerprints so an
   attacker gets one online guess, no offline dictionary attack) — PIN pairing is the default for new
   hosts. **TOFU on first connect** (`endpoint::client_pinned`) stays as an explicit host opt-in
-  (`m3-host --allow-tofu` / `serve --open`, advertised as `pair=optional`) for fully trusted LANs;
+  (`punktfunk1-host --allow-tofu` / `serve --open`, advertised as `pair=optional`) for fully trusted LANs;
   clients only offer the TOFU "Trust" path for a host that advertised `pair=optional`, route every
   other new host straight to the PIN ceremony, and on a pinned-fingerprint change force re-pairing
   (no re-TOFU shortcut). Clients present persistent identities via QUIC client auth, the host stores
   paired fingerprints (`punktfunk1-paired.json`) and gates sessions with `--require-pairing` (the
   default; `--allow-tofu`/`--open` accept unpaired clients).
-  **LAN auto-discovery**: both `serve --native` and `m3-host` advertise the native service over
+  **LAN auto-discovery**: both `serve --native` and `punktfunk1-host` advertise the native service over
   mDNS (`_punktfunk._udp`, `crate::discovery`) with TXT `proto`/`fp`(cert fingerprint to
-  pin)/`pair`(required|optional)/`id`; `punktfunk-client-rs --discover` lists hosts, Apple clients
+  pin)/`pair`(required|optional)/`id`; `punktfunk-probe --discover` lists hosts, Apple clients
   browse the same service via NWBrowser (validated cross-LAN 2026-06-12).
   **Mid-stream mode renegotiation**: `Reconfigure` on the still-open control stream — the
   host rebuilds output+encoder at the new mode in ~90 ms while the data plane runs on
@@ -58,7 +58,7 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   (`ClockProbe`/`ClockEcho`, 8 NTP rounds after `Start`, `clock_offset_ns`) aligns the client to the
   host clock, so that latency is now valid **cross-machine** (`skew_corrected=true`) — measured GNOME
   box → dev box over the LAN: **p50 1.30 ms** (the −1.57 ms inter-box clock offset removed).
-  `punktfunk-client-rs` is the
+  `punktfunk-probe` is the
   working reference client (`--pin`, datagram counters, `--input-test` incl. gamepad).
   The embeddable connector (`NativeClient`) exposes it all over the C ABI: `punktfunk_connect`
   (pin/TOFU) + `next_au`/`next_audio`/`next_rumble`/`next_hidout`/`send_input`/
@@ -69,7 +69,7 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
 
 ## What's left
 
-1. **M4 — client decode + present: macOS stage 1 done, first light achieved
+1. **Native clients — decode + present: macOS stage 1 done, first light achieved
    (2026-06-10).** PunktfunkKit compiles and is tested on macOS (AnnexB → VideoToolbox →
    `AVSampleBufferDisplayLayer`, GCMouse/GCKeyboard capture, `PunktfunkClient` app shell);
    validated live Mac ↔ this box at 720p60 — vkcube on glass, input injected via gamescope
@@ -85,13 +85,13 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    Loopback-tested end to end (`PUNKTFUNK_TEST_FEEDBACK=1` scripted burst); DualSense
    motion sign/scale derived, not yet live-verified. Tests: `swift test` in
    `clients/apple` (unit + real-codec round trip),
-   `test-loopback.sh` (Swift client vs synthetic m3-hosts on loopback — runs on macOS;
+   `test-loopback.sh` (Swift client vs synthetic punktfunk1-hosts on loopback — runs on macOS;
    includes the pairing ceremony + `--require-pairing` gate),
    `RemoteFirstLightTests` (full pipeline over the LAN). See
    [`clients/apple/README.md`](clients/apple/README.md). Next: stage 2 presenter
    (`VTDecompressionSession` + `CAMetalLayer` frame pacing), glass-to-glass numbers via
    `tools/latency-probe` (scaffold), iOS variant.
-   **Linux stage 1 done, first light 2026-06-12** (`crates/punktfunk-client-linux`, binary
+   **Linux stage 1 done, first light 2026-06-12** (`clients/linux`, binary
    `punktfunk-client`): GTK4/libadwaita shell linking `punktfunk-core` directly (no C ABI;
    `NativeClient` is now `Sync` — mutexed plane receivers), mDNS host list, TOFU + SPAKE2
    PIN dialogs (identity shared with client-rs), FFmpeg software HEVC decode (LOW_DELAY,
@@ -118,7 +118,7 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    reconfirm. Next: the stage-2 raw-Wayland
    presenter (wp_presentation feedback, tearing-control, Vulkan Video on NVIDIA) —
    **wgpu/winit rejected** (no dmabuf import / presentation feedback / shortcuts-inhibit).
-   **Windows stage 1 done 2026-06-15** (`crates/punktfunk-client-windows`, binary
+   **Windows stage 1 done 2026-06-15** (`clients/windows`, binary
    `punktfunk-client`): pure-Rust **WinUI 3** UI via **windows-reactor** (a declarative React-like
    framework backed by WinUI; PR #4499 added the `SwapChainPanel` widget + `set_swap_chain`). The
    video is a **`SwapChainPanel`** bound to a **D3D11 composition swapchain** (WARP fallback for
@@ -150,7 +150,7 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    unpaired clients); clients render TOFU only for a `pair=optional` host and force re-pairing on a
    fingerprint change. Next (see roadmap): **delegated pairing approval** (an already-paired device
    approves a new one).
-4. **M2 polish**: HDR/10-bit (needs HDR capture + metadata plumbing; `av1_nvenc
+4. **GameStream host polish**: HDR/10-bit (needs HDR capture + metadata plumbing; `av1_nvenc
    -highbitdepth 1` already encodes Main10 from 8-bit input on this box),
    reconnect-at-new-mode robustness. AV1 negotiation and surround audio are implemented
    and unit/live-capture tested — both still need a live Moonlight confirmation (select
@@ -193,9 +193,13 @@ crates/punktfunk-host/
   vdisplay/{kwin,gamescope,mutter,wlroots}.rs   per-compositor client-sized virtual outputs
   zerocopy/{egl,cuda,vulkan}.rs         dmabuf → CUDA → NVENC (tiled via EGL/GL, LINEAR via Vulkan)
   inject/{libei,wlr,gamepad,dualsense}.rs   input backends (uinput xpad + UHID DualSense)
-  capture.rs · encode.rs · audio.rs · m0.rs · m3.rs · mgmt.rs · native_pairing.rs
-crates/punktfunk-client-rs/   punktfunk/1 reference client (M3 headless test/measurement tool)
-crates/punktfunk-client-linux/  native Linux client (GTK4/libadwaita · FFmpeg · PipeWire · SDL3)
+  capture.rs · encode.rs · audio.rs · spike.rs · punktfunk1.rs · mgmt.rs · native_pairing.rs
+clients/probe/    punktfunk/1 reference/probe client (headless test/measurement tool)
+clients/linux/    native Linux client (GTK4/libadwaita · FFmpeg · PipeWire · SDL3)
+clients/windows/  native Windows client (WinUI 3 via windows-reactor · D3D11 · WASAPI · SDL3)
+clients/apple/    native macOS/iOS client (Swift · VideoToolbox · GameController)
+clients/android/  native Android client (Kotlin app + native/ Rust JNI core over punktfunk-core)
+clients/decky/    Steam Deck Decky plugin
 web/                          TanStack web console over the mgmt API (status · devices · pairing)
 packaging/                    Fedora/Bazzite RPM · bootc · COPR (packaging/bazzite/README.md)
 tools/{loss-harness,latency-probe}/     measurement (plan §10)
@@ -215,7 +219,7 @@ include/punktfunk_core.h      generated C header
 - **FEC is the wall-breaker.** GF(2⁸) (≤255 shards/block, Moonlight-compatible) and GF(2¹⁶)
   Leopard (≤65535 shards/block) — punktfunk/1 negotiates the latter, removing the ~1 Gbps
   ceiling.
-- **M1 security hardening stays intact**: reassembler bounds attacker-controlled fields
+- **Core security hardening stays intact**: reassembler bounds attacker-controlled fields
   before allocating (`ReassemblerLimits`); AES-GCM per-direction nonce salts + seq-as-AAD;
   ABI `struct_size` checks. Regression tests exist — keep them green.
 - **PipeWire consumer discipline**: our capture streams set `node.dont-reconnect` and tear
@@ -240,8 +244,8 @@ PUNKTFUNK_ZEROCOPY=1 cargo run -rp punktfunk-host -- serve
 
 # punktfunk/1 native loopback test (no Moonlight needed; same env as serve, listener persists
 # across sessions — bound it with --max-sessions):
-cargo run -rp punktfunk-host -- m3-host --source virtual --seconds 10 --max-sessions 1
-cargo run -rp punktfunk-client-rs -- --mode 1280x720x120 --out /tmp/a.h265 --input-test  # + --pin HEX
+cargo run -rp punktfunk-host -- punktfunk1-host --source virtual --seconds 10 --max-sessions 1
+cargo run -rp punktfunk-probe -- --mode 1280x720x120 --out /tmp/a.h265 --input-test  # + --pin HEX
 ```
 
 Pinned crate facts: `ashpd` 0.13 + `pipewire` 0.9 (must match ashpd's) + `ffmpeg-next` 8.x

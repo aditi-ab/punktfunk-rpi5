@@ -32,15 +32,15 @@ token is **required** when you bind the API off loopback with `--mgmt-bind`.
 By default the host **requires pairing** — see [Pairing & Trust](/docs/pairing). On `serve --native` you
 **arm pairing from the web console** (or mgmt API); the host then displays a 4-digit PIN. Pass `--open` to
 turn off the mandatory-pairing default and serve any device on the network (trusted single-user setups
-only). The pairing flags below are `m3-host`-only and do **not** apply to `serve`.
+only). The pairing flags below are `punktfunk1-host`-only and do **not** apply to `serve`.
 
-## `m3-host`
+## `punktfunk1-host`
 
 A standalone native-only host, mainly for testing the `punktfunk/1` path without the GameStream server
 or web console.
 
 ```sh
-punktfunk-host m3-host --source virtual
+punktfunk-host punktfunk1-host --source virtual
 ```
 
 | Flag | Meaning |
@@ -53,12 +53,12 @@ punktfunk-host m3-host --source virtual
 | `--allow-pairing` | Accept PIN pairing; the host prints a PIN when a client pairs. |
 | `--require-pairing` | Only serve paired devices (implies `--allow-pairing`). |
 
-`--max-concurrent`, `--allow-pairing`, and `--require-pairing` are **`m3-host`-only** — `serve` does not
+`--max-concurrent`, `--allow-pairing`, and `--require-pairing` are **`punktfunk1-host`-only** — `serve` does not
 accept them. On `serve --native` you arm pairing from the web console instead, and concurrency is not
 yet capped from the command line.
 
-Both `serve --native` and `m3-host` advertise the host on the network so clients can discover it. List
-hosts from another machine with `punktfunk-client-rs --discover`.
+Both `serve --native` and `punktfunk1-host` advertise the host on the network so clients can discover it. List
+hosts from another machine with `punktfunk-probe --discover`.
 
 ## Environment
 

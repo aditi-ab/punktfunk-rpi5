@@ -20,7 +20,7 @@ Steam session at the **client's exact resolution + refresh** — games see it (v
 change, reused (no Steam restart) on the same mode. Plus macOS/iPad input fixes (NSEvent motion +
 iPad pointer-lock) and a 4K/5K one-frame-freeze fix (grow the UDP socket buffers).
 
-**Next:** **§8 pairing & trust hardening** (mandatory PIN by default + delegated approval), the M4
+**Next:** **§8 pairing & trust hardening** (mandatory PIN by default + delegated approval), the native
 client presenter + iOS (§6), and a Windows host (§7 — now **de-risked via SudoVDA**, no custom
 signed driver needed). **§10 HDR/10-bit is parked — blocked upstream at the compositor** (no
 gamescope/KWin PipeWire 10-bit producer yet).
@@ -88,7 +88,7 @@ select = a `pw_stream` with `Direction::Output` + `media.class=Audio/Source`.
 - **Touch — implemented (host path), pending a backend that lands it.** `TouchDown/Move/Up`
   InputKinds (reuse the abs-pointer `flags=(w<<16)|h` mapping, `code`=touch id); host
   `inject/libei.rs` requests the `Touchscreen` device type + binds the `Touch` capability and
-  injects `ei_touchscreen` down/motion/up; `punktfunk-client-rs --touch-test` drags a finger.
+  injects `ei_touchscreen` down/motion/up; `punktfunk-probe --touch-test` drags a finger.
   **Validated:** KWin's RemoteDesktop portal *grants* the Touchscreen device type, but its EIS
   server creates **no touchscreen device** (headless KWin) — so touch currently no-ops on KWin
   (now logged once). The code is correct; it needs a backend that exposes `ei_touchscreen`
@@ -102,14 +102,14 @@ select = a `pw_stream` with `Direction::Output` + `media.class=Audio/Source`.
   trigger effects (L2/R2)**. Protocol carries new side-planes: rich-input `0xCC`
   (touchpad/motion) + HID-output `0xCD` (LED/triggers). `/dev/uhid` udev rule shipped.
 - **Rich DualSense — Phase C/D/E end-to-end, validated live.** `PUNKTFUNK_GAMEPAD=dualsense`
-  selects a per-session `DualSenseManager` (the `PadBackend` enum in `m3.rs`): client gamepad frames
+  selects a per-session `DualSenseManager` (the `PadBackend` enum in `punktfunk1.rs`): client gamepad frames
   build the DualSense report; the kernel's feedback comes back as `HidOutput` on the **0xCD** plane
   (lightbar / player LEDs / adaptive triggers) while **rumble stays on the universal 0xCA plane**
   (so non-DualSense clients still feel it); touchpad + motion ride the **0xCC** rich-input plane
   (`DualSenseManager::apply_rich`, merged with button state). The connector + C ABI gained
   `punktfunk_connection_next_hidout` (→ `PunktfunkHidOutput`) and `punktfunk_connection_send_rich_input`
-  (← `PunktfunkRichInput`); header regenerated. Validated on-box: a synthetic-source `m3-host` +
-  `punktfunk-client-rs --rich-input-test` created the real kernel DualSense, drove 0xCC, and decoded
+  (← `PunktfunkRichInput`); header regenerated. Validated on-box: a synthetic-source `punktfunk1-host` +
+  `punktfunk-probe --rich-input-test` created the real kernel DualSense, drove 0xCC, and decoded
   12 live 0xCD events (the kernel's actual lightbar/trigger init reports) — data plane unaffected
   (600/600 frames). *Remaining:* the Apple client renders adaptive triggers + rumble on a real
   DualSense (`GCDualSenseAdaptiveTrigger`) — handed off to the client agent for the real playtest.
@@ -192,7 +192,7 @@ value) instead of guesswork that ends in a stuttering stream.
   and exposes it (`punktfunk_connection_speed_test()` + `punktfunk_connection_probe_result()` →
   `PunktfunkProbeResult{throughput_kbps, loss_pct, …}`). Probe filler is diverted from the decoder.
   Validated on loopback (synthetic source): a 20 Mbps/2 s probe measured 20050 kbps at 0% loss,
-  interleaved probe AUs excluded from frame verification. `punktfunk-client-rs` gains `--bitrate` +
+  interleaved probe AUs excluded from frame verification. `punktfunk-probe` gains `--bitrate` +
   `--speed-test KBPS:MS` as the reference/loopback driver.
 
 **Done (Apple client UI):** Settings grows a Bitrate control (Automatic = host default; manual is
@@ -244,7 +244,7 @@ the GF(2⁸)/Moonlight ~1 Gbps wall). A 6-way subagent investigation (2026-06-11
 **Verdict: ~halfway, and it's mostly clamps + ONE real piece of work.** Already 1 Gbps-ready and
 untouched: the integer/type path (u32 kbps → u64 → int64_t, no truncation); FEC (a 1 Gbps frame is
 only ~434–874 data shards = a single GF(2¹⁶) block, two orders under the 65535 ceiling); AES-GCM
-(RustCrypto auto AES-NI, ~10–25× headroom on x86_64); the u64 sequence/nonce space; and the **M1
+(RustCrypto auto AES-NI, ~10–25× headroom on x86_64); the u64 sequence/nonce space; and the **core
 `ReassemblerLimits`** — fully *derived* from the negotiated `FecConfig`, so they already admit every
 legit high-bitrate frame with nothing to relax. Security invariant to keep: every allocation size
 must trace to a host-negotiated parameter clamped to a scheme ceiling — scale via the negotiated
@@ -271,7 +271,7 @@ params (`max_data_per_block`, `shard_payload`), never by widening a bound by han
 - **DoS hygiene (last):** derive the one hardcoded reassembler field (`max_frame_bytes` = 64 MiB,
   never set by `session_config`) from the negotiated mode/bitrate — strictly *tightens* the surface.
 - **Validate with the speed-test probe** (it reuses the real `submit_frame`→FEC+crypto+send path):
-  `punktfunk-client-rs --speed-test KBPS:MS`, RELEASE build (debug is CPU-bound ~30 Mbps), watching
+  `punktfunk-probe --speed-test KBPS:MS`, RELEASE build (debug is CPU-bound ~30 Mbps), watching
   `packets_send_dropped`. Open Qs: NVENC CBR rate-tracking at 0.5–1 Gbps (no explicit
   `rc_buffer_size`); LAN/QEMU-NIC jumbo/GSO support; any `web/` bitrate slider hardcoding 500 Mbps.
 
@@ -344,7 +344,7 @@ buffer; `sendmmsg`/`recvmmsg` batching; the capture-timestamp anchor placement.
 
 The native protocol had no discovery — clients connected by `--connect HOST:PORT` only, while
 GameStream already auto-discovered via mDNS (`_nvstream._tcp`). Now both the unified host
-(`serve --native`) and standalone `m3-host` advertise the native service over mDNS:
+(`serve --native`) and standalone `punktfunk1-host` advertise the native service over mDNS:
 
 - **Service**: `_punktfunk._udp.local.` (UDP — punktfunk/1 is QUIC; the advertised port is the QUIC
   control/data port). Host side: `crate::discovery::advertise_native`, wired into `m3::serve` so
@@ -353,7 +353,7 @@ GameStream already auto-discovered via mDNS (`_nvstream._tcp`). Now both the uni
 - **TXT records**: `proto=punktfunk/1`, `fp=<host cert SHA-256>` (the value a client pins — advisory
   over unauthenticated mDNS, TOFU/pinning still verifies on connect), `pair=required|optional`
   (so a picker knows up front whether the PIN ceremony is needed), `id=<host uniqueid>` (dedup).
-- **Client**: `punktfunk-client-rs --discover [SECS]` browses and prints each host (name, addr:port,
+- **Client**: `punktfunk-probe --discover [SECS]` browses and prints each host (name, addr:port,
   pairing, fingerprint), then exits. Apple clients browse the same service natively via NWBrowser
   (Bonjour) — no Rust-connector dependency; this section's service type + TXT keys are the contract.
 - **Validated**: cross-LAN — dev box discovered the GNOME-box appliance
