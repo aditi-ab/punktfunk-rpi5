@@ -103,12 +103,15 @@ jobs:
           echo "  $base/punktfunk-android-r$VERSION.aab"
           echo "  $base/punktfunk-android-r$VERSION.apk"
 
+      # Direct Publishing-API upload instead of r0adkll/upload-google-play — that action hides the
+      # real API error behind "Unknown error occurred."; this prints it. stdlib + openssl only (no
+      # pip), reuses SERVICE_ACCOUNT_JSON (raw JSON or base64), auto-handles changesNotSentForReview.
       - name: Upload to Google Play (Internal Testing)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: r0adkll/upload-google-play@v1
-        with:
-          serviceAccountJsonKeyData: ${{ secrets.SERVICE_ACCOUNT_JSON }}
-          packageName: io.unom.punktfunk
-          releaseFiles: clients/android/app/build/outputs/bundle/release/app-release.aab
-          track: internal
-          status: completed
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+        run: |
+          python3 clients/android/ci/play-upload.py \
+            --package io.unom.punktfunk \
+            --aab clients/android/app/build/outputs/bundle/release/app-release.aab \
+            --track internal --status completed
