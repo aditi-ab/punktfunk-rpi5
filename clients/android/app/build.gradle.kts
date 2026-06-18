@@ -16,7 +16,7 @@ android {
         minSdk = 31
         targetSdk = 36
         versionCode = System.getenv("VERSION_CODE")?.toInt() ?: 1
-        versionName = "0.0.1"
+        versionName = "0.0.2" // bumped for first Play Store release
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 
