@@ -186,9 +186,10 @@ private final class RumbleRenderer: @unchecked Sendable {
 
     private func teardown() {
         for m in [low, high].compactMap({ $0 }) {
-            // Drop the handlers before stopping so stop() can't re-enter teardown via stoppedHandler.
-            m.engine.stoppedHandler = nil
-            m.engine.resetHandler = nil
+            // Disarm the handlers before stopping so stop() can't re-enter teardown via them.
+            // (Both properties are non-optional closures on this SDK, so assign no-ops, not nil.)
+            m.engine.stoppedHandler = { _ in }
+            m.engine.resetHandler = {}
             try? m.player.stop(atTime: CHHapticTimeImmediate)
             m.engine.stop()
         }
