@@ -69,7 +69,7 @@ jobs:
           VERSION_CODE: ${{ github.run_number }}
         run: ./gradlew :app:assembleDebug --stacktrace
 
-      - name: Build Release Bundle (AAB)
+      - name: Build Release (signed AAB + universal APK)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: clients/android
         env:
@@ -80,7 +80,28 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
           echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > release.jks
-          ./gradlew :app:bundleRelease --stacktrace
+          # AAB for Play; a universal APK (both ABIs) for direct sideload/testing — same upload key.
+          ./gradlew :app:bundleRelease :app:assembleRelease --stacktrace
+
+      # Publish BEFORE the Play upload so artifacts land even while the Play step is still failing.
+      # Generic registry is public for reads — matches windows-msix.yml / deb.yml (REGISTRY_TOKEN, user enricobuehler).
+      - name: Publish AAB + APK to Gitea generic registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          REGISTRY: git.unom.io
+          OWNER: unom
+          PKG: punktfunk-android
+          VERSION: ${{ github.run_number }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          AAB=clients/android/app/build/outputs/bundle/release/app-release.aab
+          APK=clients/android/app/build/outputs/apk/release/app-release.apk
+          base="https://$REGISTRY/api/packages/$OWNER/generic/$PKG/$VERSION"
+          curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$AAB" "$base/punktfunk-android-r$VERSION.aab"
+          curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$APK" "$base/punktfunk-android-r$VERSION.apk"
+          echo "Published artifacts (versionCode=$VERSION):"
+          echo "  $base/punktfunk-android-r$VERSION.aab"
+          echo "  $base/punktfunk-android-r$VERSION.apk"
 
       - name: Upload to Google Play (Internal Testing)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
