@@ -73,14 +73,17 @@ fi
 
 # --- build into a local ostree repo, then export a single-file bundle --------------------
 echo "==> flatpak-builder ($APP_ID, version $VERSION)"
+# --default-branch=stable matches CI / the hosted repo ref, so a locally-built install can also
+# track flatpak.unom.io. build-bundle must then be told the branch (else it defaults to `master`).
 "${FPB[@]}" --user --force-clean --disable-rofiles-fuse \
+  --default-branch=stable \
   --install-deps-from=flathub \
   "${EXTRA_ARGS[@]}" \
   --repo="$ROOTDIR/.flatpak-repo" \
   "$ROOTDIR/.flatpak-build" "$MANIFEST"
 
 mkdir -p dist
-flatpak build-bundle "$ROOTDIR/.flatpak-repo" "$BUNDLE" "$APP_ID"
+flatpak build-bundle "$ROOTDIR/.flatpak-repo" "$BUNDLE" "$APP_ID" stable
 echo "built $BUNDLE"
 ls -lh "$BUNDLE"
 echo

@@ -118,7 +118,9 @@ jobs:
 
       - name: Export single-file bundle
         run: |
-          flatpak build-bundle "$PWD/repo" "$BUNDLE" "$APP_ID"
+          # Branch must be passed explicitly now that the repo ref is `stable` (--default-branch
+          # above); build-bundle otherwise defaults to `master` and errors "Refspec … not found".
+          flatpak build-bundle "$PWD/repo" "$BUNDLE" "$APP_ID" stable
           ls -lh "$BUNDLE"
 
       - name: Publish to the Gitea generic registry
