@@ -12,12 +12,16 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.NativeBridge
@@ -28,6 +32,10 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     val context = LocalContext.current
     val activity = context as? MainActivity
     val window = activity?.window
+    val controller = remember(window) {
+        window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+    }
+
     // Start mic only if the user enabled it AND granted RECORD_AUDIO (else the AAudio input fails).
     val micWanted = micEnabled && ContextCompat.checkSelfPermission(
         context,
@@ -36,6 +44,10 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
 
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        controller?.let {
+            it.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            it.hide(WindowInsetsCompat.Type.systemBars())
+        }
         activity?.streamHandle = handle // route hardware keys to this session
         activity?.axisMapper = Gamepad.AxisMapper(handle) // route joystick axes
         // Host→client feedback (rumble + DualSense lightbar/LEDs); poll threads stopped before close.
@@ -45,6 +57,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             activity?.axisMapper?.reset() // release-all so nothing sticks on the host
             activity?.axisMapper = null
             activity?.streamHandle = 0L
+            controller?.show(WindowInsetsCompat.Type.systemBars())
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             // Leaving the stream: stop the mic + audio + decode threads and tear down the session.
             NativeBridge.nativeStopMic(handle)

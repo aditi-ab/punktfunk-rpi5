@@ -78,9 +78,11 @@ class GamepadFeedback(private val handle: Long) {
     /** Idempotent. Stops + joins the poll threads (must complete before the session handle is freed). */
     fun stop() {
         running = false
+        rumbleThread?.interrupt()
+        hidoutThread?.interrupt()
         runCatching { vm?.cancel() } // drop any held rumble immediately
-        runCatching { rumbleThread?.join(500) }
-        runCatching { hidoutThread?.join(500) }
+        runCatching { rumbleThread?.join(200) }
+        runCatching { hidoutThread?.join(200) }
         rumbleThread = null
         hidoutThread = null
         runCatching { lightsSession?.close() }
