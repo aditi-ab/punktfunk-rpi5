@@ -218,10 +218,10 @@ fn drain(codec: &MediaCodec, window: &NativeWindow, applied_ds: &mut Option<Data
                         match window.set_buffers_data_space(ds) {
                             Ok(()) => {
                                 *applied_ds = Some(ds);
-                                log::info!("decode: HDR stream → Surface dataspace {ds:?}");
+                                log::info!("decode: HDR stream → Surface dataspace {ds}");
                             }
                             Err(e) => log::warn!(
-                                "decode: set_buffers_data_space({ds:?}) failed (non-fatal): {e}"
+                                "decode: set_buffers_data_space({ds}) failed (non-fatal): {e}"
                             ),
                         }
                     }
