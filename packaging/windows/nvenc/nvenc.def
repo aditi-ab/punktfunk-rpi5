@@ -1,0 +1,14 @@
+; Module-definition file for the NVENC import library the host links against with `--features nvenc`.
+;
+; The real entry points live in nvEncodeAPI64.dll, which ships with the NVIDIA driver. At LINK time
+; the host only needs an import library exporting these two symbols (see crates/punktfunk-host/build.rs:
+; it emits `cargo:rustc-link-lib=dylib=nvencodeapi` and searches PUNKTFUNK_NVENC_LIB_DIR). No GPU,
+; driver, or NVIDIA Video Codec SDK is required to BUILD — only to run, where the DLL resolves from
+; the installed driver. Generate nvencodeapi.lib from this file with gen-nvenc-importlib.ps1.
+;
+; The LIBRARY line names the DLL the import records point at — required for MSVC `lib.exe /def`
+; (without it the import name would default to "nvenc.dll"). llvm-dlltool takes the name from `-D`.
+LIBRARY nvEncodeAPI64.dll
+EXPORTS
+    NvEncodeAPICreateInstance
+    NvEncodeAPIGetMaxSupportedVersion

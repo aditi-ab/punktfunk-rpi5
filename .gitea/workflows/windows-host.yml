@@ -1,0 +1,128 @@
+# Build the punktfunk Windows HOST as a signed Inno Setup installer and publish it to Gitea's generic
+# package registry, so a Windows GPU box can install the streaming host (SYSTEM service + bundled
+# SudoVDA virtual-display driver) from one signed setup.exe. Runs on the self-hosted Windows runner
+# (host mode; scripts/ci/setup-windows-runner.ps1) — same MSVC/Windows-SDK/LLVM env as windows.yml.
+#
+# Why an installer and not MSIX (like the client): the host installs a LocalSystem SCM service that
+# CreateProcessAsUserW's into the interactive session for secure-desktop capture, and bundles a
+# kernel/IDD driver — neither is expressible in MSIX's sandbox. The real install logic already lives
+# in `punktfunk-host service install` (crates/punktfunk-host/src/service.rs); the installer just lays
+# the exe down and calls it elevated. Packaging internals: packaging/windows/README.md.
+#
+# Registry (public reads, unom org): https://git.unom.io/unom/-/packages  (generic group)
+#
+# Versioning (free-form; not MSIX's 4-part rule):
+#   host-win-vX.Y.Z tag -> X.Y.Z   (a real host release; own tag namespace, off host-v*/win-v*/v*
+#                                   to avoid the version-shadow bug class — see deb.yml).
+#   main push / dispatch -> 0.2.<run_number>  (rolling; climbs monotonically by run number).
+#
+# Signing reuses the client's MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD secrets (CN=unom). Without them
+# an ephemeral self-signed cert is generated and its public .cer published next to the installer
+# (import once to LocalMachine\TrustedPublisher). See packaging/windows/pack-host-installer.ps1.
+#
+# NVENC: the host builds with --features nvenc; the only link need is nvencodeapi.lib, synthesised
+# from a 2-export .def with llvm-dlltool (no GPU/SDK at build time). The resulting exe is NVIDIA-only
+# by design — CI never launches it, so no GPU is needed here.
+name: windows-host
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/punktfunk-host/**'
+      - 'crates/punktfunk-core/**'
+      - 'packaging/windows/**'
+      - 'scripts/windows/host.env.example'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.gitea/workflows/windows-host.yml'
+    tags: ['host-win-v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  PKG: punktfunk-host-windows
+
+jobs:
+  package:
+    runs-on: windows-amd64
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure + version
+        shell: pwsh
+        run: |
+          # CARGO_TARGET_DIR=C:\t dodges the MAX_PATH wall in the CMake-from-source crates (aws-lc,
+          # opus) the host pulls; CARGO_WORKSPACE_DIR mirrors the client workflows. Both via GITHUB_ENV
+          # (pwsh Out-File utf8 = no BOM, unlike Windows PowerShell 5.1 — keeps the first line clean).
+          "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $v = if ($env:GITHUB_REF -like 'refs/tags/host-win-v*') {
+            $env:GITHUB_REF_NAME -replace '^host-win-v', ''
+          } else {
+            "0.2.$($env:GITHUB_RUN_NUMBER)"
+          }
+          "HOST_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PUNKTFUNK_BUILD_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "host version $v"
+
+      - name: Generate NVENC import lib
+        shell: pwsh
+        run: |
+          & packaging/windows/nvenc/gen-nvenc-importlib.ps1 -OutDir C:\t\nvenc
+          "PUNKTFUNK_NVENC_LIB_DIR=C:\t\nvenc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build (release, nvenc)
+        shell: pwsh
+        run: cargo build --release -p punktfunk-host --features nvenc
+
+      - name: Clippy (host, Windows)
+        shell: pwsh
+        # First-ever Windows lint coverage for the host (Linux CI never lints the windows-cfg code).
+        run: cargo clippy -p punktfunk-host --features nvenc -- -D warnings
+
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe') -and -not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            Write-Output "installing Inno Setup via choco"
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Pack + sign installer
+        shell: pwsh
+        env:
+          MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+        run: |
+          & packaging/windows/pack-host-installer.ps1 `
+            -Version $env:HOST_VERSION -TargetDir C:\t\release -OutDir C:\t\out
+
+      - name: Publish to Gitea generic registry
+        shell: pwsh
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          # Check curl's exit code ourselves — a best-effort DELETE (404 on first run) must not abort.
+          $PSNativeCommandUseErrorActionPreference = $false
+          function Publish-File($f, $url) {
+            curl.exe -fsS --user "enricobuehler:$($env:REGISTRY_TOKEN)" --upload-file "$f" "$url"
+            if ($LASTEXITCODE -ne 0) { throw "upload failed ($LASTEXITCODE): $url" }
+            Write-Output "published $url"
+          }
+          $files = @($env:HOST_SETUP_PATH, $env:HOST_CER_PATH) | Where-Object { $_ -and (Test-Path $_) }
+          if (-not $files) { throw "pack produced no artifacts to publish" }
+          $base = "https://$($env:REGISTRY)/api/packages/$($env:OWNER)/generic/$($env:PKG)"
+          foreach ($f in $files) { Publish-File $f "$base/$($env:HOST_VERSION)/$(Split-Path $f -Leaf)" }
+          # On a tagged release, also refresh the stable `latest/` alias (delete-then-reupload, like
+          # flatpak.yml/decky.yml) so there's a predictable download URL.
+          if ($env:GITHUB_REF -like 'refs/tags/host-win-v*') {
+            $aliases = @{ $env:HOST_SETUP_PATH = 'punktfunk-host-setup.exe'; $env:HOST_CER_PATH = 'punktfunk-host-windows.cer' }
+            foreach ($f in $files) {
+              $alias = $aliases[$f]; if (-not $alias) { continue }
+              curl.exe -fsS -o NUL --user "enricobuehler:$($env:REGISTRY_TOKEN)" -X DELETE "$base/latest/$alias" 2>$null
+              Publish-File $f "$base/latest/$alias"
+            }
+          }

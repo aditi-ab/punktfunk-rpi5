@@ -1,4 +1,4 @@
-# Provision this Windows box as the Gitea Actions runner for the Windows client CI/packaging.
+# Provision this Windows box as the Gitea Actions runner for the Windows client + host CI/packaging.
 # The Windows analogue of scripts/ci/setup-macos-runner.sh. Idempotent — safe to re-run. Run
 # ELEVATED (admin) on the box, e.g. over SSH:
 #
@@ -82,6 +82,16 @@ if (-not (Test-Path "$RunnerHome\.runner")) {
 if (-not (Test-Path "C:\Users\Public\.rustup\settings.toml")) {
     Write-Host "==> copying rustup toolchains to an ASCII path"
     robocopy "$env:USERPROFILE\.rustup" "C:\Users\Public\.rustup" /E /NFL /NDL /NJH /NJS /MT:16 | Out-Null
+}
+
+# Inno Setup (ISCC.exe) for the host installer build (windows-host.yml). pack-host-installer.ps1
+# locates it at its fixed Program Files path, so it need not be on PATH — just present.
+if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+    if (Get-Command choco -ErrorAction SilentlyContinue) {
+        Write-Host "==> installing Inno Setup (ISCC)"
+        choco install innosetup -y --no-progress
+    }
+    else { Write-Warning "Inno Setup not found and choco unavailable - install it for windows-host.yml." }
 }
 
 # --- daemon env wrapper (the box's MSVC/WinUI/FFmpeg toolchain) ---
