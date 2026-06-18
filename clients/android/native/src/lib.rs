@@ -29,6 +29,7 @@ mod feedback;
 #[cfg(target_os = "android")]
 mod mic;
 mod session;
+mod stats;
 
 /// Initialize `android_logger` once when the JVM loads the library. Logs land in logcat under the
 /// `punktfunk` tag. Android-only — there is no JVM (and no logcat) on the host build.

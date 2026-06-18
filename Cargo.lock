@@ -2545,6 +2545,7 @@ version = "0.0.1"
 dependencies = [
  "android_logger",
  "jni",
+ "libc",
  "log",
  "ndk",
  "opus",

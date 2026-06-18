@@ -111,6 +111,22 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
                 },
             )
         }
+
+        // Live stats overlay (FPS / throughput / capture→client latency). A 3-finger tap in-stream
+        // toggles it without coming back here.
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Stats overlay", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    "Show FPS, throughput and latency while streaming (3-finger tap toggles it live)",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Switch(
+                checked = s.statsHudEnabled,
+                onCheckedChange = { on -> update(s.copy(statsHudEnabled = on)) },
+            )
+        }
     }
 }
 

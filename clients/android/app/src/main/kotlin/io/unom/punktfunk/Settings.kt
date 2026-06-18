@@ -16,6 +16,8 @@ data class Settings(
     val compositor: Int = 0,
     val gamepad: Int = 0,
     val micEnabled: Boolean = false,
+    /** Show the live stats overlay (FPS / throughput / latency) during a stream. */
+    val statsHudEnabled: Boolean = true,
 )
 
 /** Loads/saves [Settings] in the app-private `punktfunk_settings` prefs. */
@@ -31,6 +33,7 @@ class SettingsStore(context: Context) {
         compositor = prefs.getInt(K_COMPOSITOR, 0),
         gamepad = prefs.getInt(K_GAMEPAD, 0),
         micEnabled = prefs.getBoolean(K_MIC, false),
+        statsHudEnabled = prefs.getBoolean(K_HUD, true),
     )
 
     fun save(s: Settings) {
@@ -42,6 +45,7 @@ class SettingsStore(context: Context) {
             .putInt(K_COMPOSITOR, s.compositor)
             .putInt(K_GAMEPAD, s.gamepad)
             .putBoolean(K_MIC, s.micEnabled)
+            .putBoolean(K_HUD, s.statsHudEnabled)
             .apply()
     }
 
@@ -53,6 +57,7 @@ class SettingsStore(context: Context) {
         const val K_COMPOSITOR = "compositor"
         const val K_GAMEPAD = "gamepad"
         const val K_MIC = "mic_enabled"
+        const val K_HUD = "stats_hud_enabled"
     }
 }
 

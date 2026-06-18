@@ -6,17 +6,31 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -25,7 +39,9 @@ import androidx.core.view.WindowInsetsControllerCompat
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.NativeBridge
+import kotlinx.coroutines.delay
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 @Composable
 fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
@@ -41,6 +57,18 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         context,
         Manifest.permission.RECORD_AUDIO,
     ) == PackageManager.PERMISSION_GRANTED
+
+    // Live decode stats for the HUD. Poll once a second for the whole stream (cheap, and each call
+    // drains+resets the native window so it never grows unbounded even while the overlay is hidden);
+    // `showStats` only gates rendering. A 3-finger tap toggles it live; the default comes from Settings.
+    var stats by remember { mutableStateOf<DoubleArray?>(null) }
+    var showStats by remember { mutableStateOf(SettingsStore(context).load().statsHudEnabled) }
+    LaunchedEffect(handle) {
+        while (true) {
+            delay(1000)
+            stats = NativeBridge.nativeVideoStats(handle)
+        }
+    }
 
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -92,8 +120,14 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                 }
             },
         )
+        // Live stats HUD (FPS / throughput / capture→client latency), drawn over the video but
+        // BEFORE the transparent gesture layer below, so it shows through and never eats touches.
+        if (showStats) {
+            stats?.let { StatsOverlay(it, Modifier.align(Alignment.TopStart).padding(12.dp)) }
+        }
         // Touch virtual-trackpad overlay: 1-finger drag → relative mouse move; tap → left click;
-        // 2-finger drag → scroll. (Physical-mouse pointer capture comes in a later increment.)
+        // 2-finger drag → scroll; 3-finger tap → toggle the stats HUD. (Physical-mouse pointer
+        // capture comes in a later increment.)
         Box(
             Modifier.fillMaxSize().pointerInput(handle) {
                 awaitEachGesture {
@@ -124,9 +158,56 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                     if (!moved && maxFingers == 1) {
                         NativeBridge.nativeSendPointerButton(handle, 1, true)
                         NativeBridge.nativeSendPointerButton(handle, 1, false)
+                    } else if (!moved && maxFingers >= 3) {
+                        showStats = !showStats // quick in-stream HUD toggle
                     }
                 }
             },
         )
+    }
+}
+
+/**
+ * The live stats overlay — mirrors the Apple client's HUD. Reads the 10-double layout from
+ * [NativeBridge.nativeVideoStats]:
+ * `[fps, mbps, latP50Ms, latP95Ms, latValid, skew, w, h, hz, dropped]`.
+ */
+@Composable
+private fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
+    if (s.size < 10) return
+    val w = s[6].toInt()
+    val h = s[7].toInt()
+    val hz = s[8].toInt()
+    val latValid = s[4] != 0.0
+    val skew = s[5] != 0.0
+    val dropped = s[9].toLong()
+    Column(
+        modifier = modifier
+            .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+    ) {
+        Text(
+            "$w×$h@$hz   ${s[0].roundToInt()} fps   ${"%.1f".format(s[1])} Mb/s",
+            color = Color.White,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+        )
+        if (latValid) {
+            val tag = if (skew) "" else " (same-host)"
+            Text(
+                "capture→client ${"%.1f".format(s[2])}/${"%.1f".format(s[3])} ms p50/p95$tag",
+                color = Color.White,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+            )
+        }
+        if (dropped > 0) {
+            Text(
+                "dropped $dropped",
+                color = Color(0xFFFFB0B0),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+            )
+        }
     }
 }

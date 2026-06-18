@@ -14,7 +14,7 @@
 //! renegotiation. Port the remaining orchestration from `clients/linux`.
 
 use jni::objects::{JObject, JString};
-use jni::sys::{jboolean, jint, jlong};
+use jni::sys::{jboolean, jdoubleArray, jint, jlong, jsize};
 use jni::JNIEnv;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
@@ -40,6 +40,8 @@ pub(crate) struct SessionHandle {
 struct VideoThread {
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    /// Live decode stats, written by the decode thread and drained ~1 Hz by `nativeVideoStats`.
+    stats: Arc<crate::stats::VideoStats>,
 }
 
 impl SessionHandle {
@@ -331,13 +333,19 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
         }
     };
     let shutdown = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(crate::stats::VideoStats::new());
     let client = h.client.clone();
     let sd = shutdown.clone();
+    let st = stats.clone();
     let join = std::thread::Builder::new()
         .name("pf-decode".into())
-        .spawn(move || crate::decode::run(client, window, sd))
+        .spawn(move || crate::decode::run(client, window, sd, st))
         .ok();
-    *guard = Some(VideoThread { shutdown, join });
+    *guard = Some(VideoThread {
+        shutdown,
+        join,
+        stats,
+    });
 }
 
 /// `NativeBridge.nativeStopVideo(handle)` — stop + join the decode thread (without closing the
@@ -353,6 +361,50 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
         let h = unsafe { &*(handle as *const SessionHandle) };
         h.stop_video();
     }
+}
+
+/// `NativeBridge.nativeVideoStats(handle): DoubleArray?` — drain ~1 s of decode stats for the HUD.
+/// Returns 10 doubles
+/// `[fps, mbps, latP50Ms, latP95Ms, latValid, skewCorrected, width, height, refreshHz, framesDropped]`
+/// (the two flags are 1.0/0.0), or `null` when no decode thread is running. Poll ~1 Hz from the UI;
+/// each call resets the measurement window. Not android-gated — pure `jni` + connector reads, so it
+/// links on the host build too (Kotlin only ever calls it on device).
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
+    env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jdoubleArray {
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let snap = match h.video.lock().unwrap().as_ref() {
+        Some(vt) => vt.stats.drain(),
+        None => return std::ptr::null_mut(), // not streaming → no stats
+    };
+    let mode = h.client.mode();
+    let buf: [f64; 10] = [
+        snap.fps,
+        snap.mbps,
+        snap.lat_p50_ms,
+        snap.lat_p95_ms,
+        if snap.lat_valid { 1.0 } else { 0.0 },
+        if snap.skew_corrected { 1.0 } else { 0.0 },
+        mode.width as f64,
+        mode.height as f64,
+        mode.refresh_hz as f64,
+        h.client.frames_dropped() as f64,
+    ];
+    let arr = match env.new_double_array(buf.len() as jsize) {
+        Ok(a) => a,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    if env.set_double_array_region(&arr, 0, &buf).is_err() {
+        return std::ptr::null_mut();
+    }
+    arr.into_raw()
 }
 
 /// `NativeBridge.nativeStartAudio(handle)` — start the Opus→AAudio playback thread. No-op if already

@@ -76,6 +76,14 @@ object NativeBridge {
     external fun nativeStopVideo(handle: Long)
 
     /**
+     * Drain ~1 s of live decode stats for the on-stream HUD, or `null` when no decode thread runs.
+     * Returns 10 doubles:
+     * `[fps, mbps, latP50Ms, latP95Ms, latValid, skewCorrected, width, height, refreshHz, framesDropped]`
+     * (the two flags are 1.0/0.0). Poll ~1 Hz; each call resets the measurement window.
+     */
+    external fun nativeVideoStats(handle: Long): DoubleArray?
+
+    /**
      * Start host→client audio: Opus decode → jitter ring → AAudio (LowLatency), all in Rust. No-op
      * if already started. Best-effort — a failure leaves video streaming.
      */

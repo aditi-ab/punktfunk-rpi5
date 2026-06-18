@@ -29,6 +29,8 @@ android_logger = "0.14"
 # Pure-Rust FFI to libmediandk/libnativewindow/libaaudio — no C++/libc++_shared to bundle. Decode +
 # audio run entirely in Rust on native threads (the "no async on the hot path" invariant).
 ndk = { version = "0.9", features = ["media", "audio"] }
+# setpriority/gettid to raise the decode thread toward URGENT_DISPLAY (see decode::boost_thread_priority).
+libc = "0.2"
 # Opus decode for the host→client audio plane (0xC9: 48 kHz stereo, 5 ms frames). Same crate the
 # host + Linux client use. audiopus_sys vendors libopus (pure C) and builds it static via cmake —
 # the cargo-ndk build sets LIBOPUS_STATIC=1/LIBOPUS_NO_PKG=1 so it links the bundled lib, not the host's.

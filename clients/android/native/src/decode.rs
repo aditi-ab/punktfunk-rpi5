@@ -10,7 +10,7 @@ use ndk::media::media_codec::{
     DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
 };
 use ndk::media::media_format::MediaFormat;
-use ndk::native_window::NativeWindow;
+use ndk::native_window::{FrameRateCompatibility, NativeWindow};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::error::PunktfunkError;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The decode loop. Runs on the `pf-decode` thread until `shutdown` is set or the session closes.
-pub fn run(client: Arc<NativeClient>, window: NativeWindow, shutdown: Arc<AtomicBool>) {
+pub fn run(
+    client: Arc<NativeClient>,
+    window: NativeWindow,
+    shutdown: Arc<AtomicBool>,
+    stats: Arc<crate::stats::VideoStats>,
+) {
+    boost_thread_priority();
     let mode = client.mode();
     let codec = match MediaCodec::from_decoder_type("video/hevc") {
         Some(c) => c,
@@ -39,6 +45,11 @@ pub fn run(client: Arc<NativeClient>, window: NativeWindow, shutdown: Arc<Atomic
     );
     // Ask for the low-latency decode path where the decoder supports it (no reordering buffer).
     format.set_i32("low-latency", 1);
+    // Advisory low-latency hints (KEY_PRIORITY / KEY_OPERATING_RATE), ignored where unsupported:
+    // realtime priority + the target frame rate, so vendor decoders (e.g. Qualcomm) run at full
+    // clocks instead of a power-saving cadence that adds dequeue latency.
+    format.set_i32("priority", 0); // 0 = realtime
+    format.set_i32("operating-rate", mode.refresh_hz as i32);
 
     if let Err(e) = codec.configure(&format, Some(&window), MediaCodecDirection::Decoder) {
         log::error!("decode: configure failed: {e}");
@@ -53,6 +64,15 @@ pub fn run(client: Arc<NativeClient>, window: NativeWindow, shutdown: Arc<Atomic
         mode.width,
         mode.height
     );
+    // Tell the display the stream's refresh so Android can pick a matching display mode and align
+    // vsync (no 60-in-120 judder on high-refresh panels). minSdk 31 ≥ API 30, so the underlying
+    // ANativeWindow_setFrameRate is always present; non-fatal if the platform declines.
+    if let Err(e) = window.set_frame_rate(mode.refresh_hz as f32, FrameRateCompatibility::Default) {
+        log::warn!(
+            "decode: set_frame_rate({} Hz) failed (non-fatal): {e}",
+            mode.refresh_hz
+        );
+    }
 
     let mut fed: u64 = 0;
     let mut rendered: u64 = 0;
@@ -60,6 +80,9 @@ pub fn run(client: Arc<NativeClient>, window: NativeWindow, shutdown: Arc<Atomic
     // climbs.
     let mut last_dropped = client.frames_dropped();
     let mut last_kf_req: Option<Instant> = None;
+    // Capture→client-receipt latency uses the negotiated host-minus-client clock offset (0 if the
+    // host didn't answer the skew handshake — then the HUD flags it "same-host").
+    let clock_offset = client.clock_offset_ns;
     while !shutdown.load(Ordering::Relaxed) {
         match client.next_frame(Duration::from_millis(5)) {
             Ok(frame) => {
@@ -72,6 +95,11 @@ pub fn run(client: Arc<NativeClient>, window: NativeWindow, shutdown: Arc<Atomic
                     );
                 }
                 fed += 1;
+                // HUD stat: capture→client-receipt latency = client_now + (host−client) − capture_pts.
+                let lat_ns = now_realtime_ns() + clock_offset as i128 - frame.pts_ns as i128;
+                let lat_us =
+                    (lat_ns > 0 && lat_ns < 10_000_000_000).then_some((lat_ns / 1000) as u64);
+                stats.note(frame.data.len(), lat_us, clock_offset != 0);
                 feed(&codec, &frame.data, frame.pts_ns / 1000);
             }
             Err(PunktfunkError::NoFrame) => {} // timeout — still drain output below
@@ -103,6 +131,33 @@ pub fn run(client: Arc<NativeClient>, window: NativeWindow, shutdown: Arc<Atomic
 
     let _ = codec.stop();
     log::info!("decode: stopped (fed={fed} rendered={rendered})");
+}
+
+/// Wall-clock now in nanoseconds (CLOCK_REALTIME basis), to compare against the host-stamped
+/// capture `pts_ns` after the skew offset is applied.
+fn now_realtime_ns() -> i128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0)
+}
+
+/// Best-effort: raise the decode thread toward Android's URGENT_DISPLAY band so background work
+/// can't preempt it under load (which shows up as late/dropped frames). Non-fatal if the platform
+/// refuses (foreground apps may set their own threads; the exact floor is policy-dependent).
+fn boost_thread_priority() {
+    // SAFETY: `gettid`/`setpriority` on the calling thread are always-safe syscalls. PRIO_PROCESS
+    // with a TID targets that one task on Linux — the same idiom `Process.setThreadPriority` uses.
+    unsafe {
+        let tid = libc::gettid();
+        if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10) != 0 {
+            log::warn!(
+                "decode: setpriority(-10) failed (non-fatal): {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 /// Copy one access unit into a codec input buffer and queue it.
