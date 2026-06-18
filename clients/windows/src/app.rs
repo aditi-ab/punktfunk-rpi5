@@ -16,7 +16,7 @@ use crate::gamepad::GamepadService;
 use crate::present::Presenter;
 use crate::session::{self, SessionEvent, SessionParams, Stats};
 use crate::trust::{self, KnownHost, KnownHosts, Settings};
-use crate::video::DecodedFrame;
+use crate::video::{DecodedFrame, DecoderPref};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use std::cell::RefCell;
@@ -31,6 +31,14 @@ const RESOLUTIONS: &[(u32, u32)] = &[
     (3840, 2160),
 ];
 const REFRESH: &[u32] = &[0, 30, 60, 90, 120, 144, 165, 240];
+/// Decode backend presets: `(stored value, display label)`.
+const DECODERS: &[(&str, &str)] = &[
+    ("auto", "Automatic (GPU, fall back to CPU)"),
+    ("hardware", "Hardware (GPU / D3D11VA)"),
+    ("software", "Software (CPU)"),
+];
+/// Bitrate presets in Mb/s; `0` = host default.
+const BITRATES_MBPS: &[u32] = &[0, 10, 20, 30, 50, 80, 150];
 
 #[derive(Clone, PartialEq)]
 enum Screen {
@@ -189,10 +197,61 @@ fn page(children: Vec<Element>) -> Element {
     scroll_view(col).into()
 }
 
-/// A clickable host row: name + address/badge + chevron.
+/// A rounded square "monogram" for a host, the first letter on an accent fill — a clean leading
+/// visual that avoids depending on an icon font being installed.
+fn avatar(name: &str) -> Border {
+    let initial = name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
+    border(
+        text_block(initial)
+            .font_size(17.0)
+            .semibold()
+            .foreground(ThemeRef::AccentText)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center),
+    )
+    .background(ThemeRef::Accent)
+    .corner_radius(10.0)
+    .width(40.0)
+    .height(40.0)
+}
+
+/// Pill chip colour intent.
+#[derive(Clone, Copy)]
+enum Pill {
+    Accent,
+    Good,
+    Neutral,
+}
+
+/// A small rounded status chip (paired/PIN/HDR/etc.).
+fn pill(text: &str, kind: Pill) -> Border {
+    let (bg, fg) = match kind {
+        Pill::Accent => (ThemeRef::Accent, ThemeRef::AccentText),
+        Pill::Good => (ThemeRef::SystemSuccessBackground, ThemeRef::SystemSuccess),
+        Pill::Neutral => (ThemeRef::SubtleFill, ThemeRef::SecondaryText),
+    };
+    border(text_block(text).font_size(11.0).semibold().foreground(fg))
+        .background(bg)
+        .corner_radius(10.0)
+        .padding(edges(9.0, 3.0, 9.0, 3.0))
+}
+
+/// A clickable host row: monogram + name/address + status pill + chevron.
 fn host_card(name: &str, sub: &str, badge: &str, on_tap: impl Fn() + 'static) -> Element {
+    let kind = match badge {
+        "Paired" => Pill::Good,
+        "Open" => Pill::Neutral,
+        _ => Pill::Accent, // Trusted / PIN
+    };
     card(
         grid((
+            avatar(name)
+                .grid_column(0)
+                .vertical_alignment(VerticalAlignment::Center),
             vstack((
                 text_block(name).font_size(15.0).semibold(),
                 text_block(sub)
@@ -200,21 +259,25 @@ fn host_card(name: &str, sub: &str, badge: &str, on_tap: impl Fn() + 'static) ->
                     .foreground(ThemeRef::SecondaryText),
             ))
             .spacing(2.0)
-            .grid_column(0)
-            .vertical_alignment(VerticalAlignment::Center),
-            text_block(badge)
-                .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText)
-                .grid_column(1)
+            .grid_column(1)
+            .vertical_alignment(VerticalAlignment::Center)
+            .margin(edges(12.0, 0.0, 0.0, 0.0)),
+            pill(badge, kind)
+                .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)
-                .margin(edges(0.0, 0.0, 12.0, 0.0)),
+                .margin(edges(0.0, 0.0, 10.0, 0.0)),
             text_block("\u{203A}")
                 .font_size(18.0)
                 .foreground(ThemeRef::SecondaryText)
-                .grid_column(2)
+                .grid_column(3)
                 .vertical_alignment(VerticalAlignment::Center),
         ))
-        .columns([GridLength::Star(1.0), GridLength::Auto, GridLength::Auto]),
+        .columns([
+            GridLength::Auto,
+            GridLength::Star(1.0),
+            GridLength::Auto,
+            GridLength::Auto,
+        ]),
     )
     .on_tapped(on_tap)
     .into()
@@ -281,22 +344,35 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     };
     match screen {
         Screen::Hosts => component(hosts_page, HostsProps { svc, hosts, status }),
-        Screen::Connecting => vstack((
-            ProgressRing::indeterminate()
-                .width(48.0)
-                .height(48.0)
-                .horizontal_alignment(HorizontalAlignment::Center),
-            text_block("Connecting\u{2026}")
-                .font_size(16.0)
-                .horizontal_alignment(HorizontalAlignment::Center),
-            text_block(status.clone())
+        Screen::Connecting => {
+            let target_name = ctx.shared.target.lock().unwrap().name.clone();
+            let headline = if target_name.is_empty() {
+                "Connecting\u{2026}".to_string()
+            } else {
+                format!("Connecting to {target_name}\u{2026}")
+            };
+            vstack((
+                ProgressRing::indeterminate()
+                    .width(48.0)
+                    .height(48.0)
+                    .horizontal_alignment(HorizontalAlignment::Center),
+                text_block(headline)
+                    .font_size(18.0)
+                    .semibold()
+                    .horizontal_alignment(HorizontalAlignment::Center),
+                text_block(if status.is_empty() {
+                    "Negotiating the session and creating the virtual display\u{2026}".to_string()
+                } else {
+                    status.clone()
+                })
                 .foreground(ThemeRef::SecondaryText)
                 .horizontal_alignment(HorizontalAlignment::Center),
-        ))
-        .spacing(16.0)
-        .horizontal_alignment(HorizontalAlignment::Center)
-        .vertical_alignment(VerticalAlignment::Center)
-        .into(),
+            ))
+            .spacing(16.0)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
+        }
         // settings_page uses no hooks (it never touches `cx`), so calling it inline is sound.
         Screen::Settings => settings_page(ctx, &set_screen),
         Screen::Pair => component(pair_page, svc),
@@ -327,6 +403,7 @@ fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .grid_column(0)
             .vertical_alignment(VerticalAlignment::Center),
             button("Settings")
+                .icon(SymbolGlyph::Setting)
                 .on_click({
                     let ss = set_screen.clone();
                     move || ss.call(Screen::Settings)
@@ -340,7 +417,13 @@ fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     );
 
     if !status.is_empty() {
-        body.push(card(text_block(status.to_string()).foreground(ThemeRef::SystemCritical)).into());
+        body.push(
+            InfoBar::new("Couldn't connect")
+                .message(status.to_string())
+                .error()
+                .is_closable(false)
+                .into(),
+        );
     }
 
     // Saved (trusted/paired) hosts.
@@ -439,6 +522,7 @@ fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     .vertical_alignment(VerticalAlignment::Center),
                 button("Connect")
                     .accent()
+                    .icon(SymbolGlyph::Forward)
                     .on_click(connect_manual)
                     .grid_column(1)
                     .margin(edges(8.0, 0.0, 0.0, 0.0)),
@@ -515,6 +599,8 @@ fn connect(
         gamepad: gamepad_pref,
         bitrate_kbps: s.bitrate_kbps,
         mic_enabled: s.mic_enabled,
+        hdr_enabled: s.hdr_enabled,
+        decoder: DecoderPref::from_name(&s.decoder),
         pin,
         identity: ctx.identity.clone(),
     });
@@ -594,64 +680,87 @@ fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
             code.clone(),
             target.clone(),
         );
-        button("Pair & Connect").accent().on_click(move || {
-            let pin = code2.trim().to_string();
-            let (ctx3, ss, st, target3) = (ctx2.clone(), ss.clone(), st.clone(), target2.clone());
-            std::thread::spawn(move || {
-                let name =
-                    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-client".into());
-                match NativeClient::pair(
-                    &target3.addr,
-                    target3.port,
-                    (&ctx3.identity.0, &ctx3.identity.1),
-                    &pin,
-                    &name,
-                    std::time::Duration::from_secs(90),
-                ) {
-                    Ok(fp) => {
-                        let mut k = KnownHosts::load();
-                        k.upsert(KnownHost {
-                            name: target3.name.clone(),
-                            addr: target3.addr.clone(),
-                            port: target3.port,
-                            fp_hex: trust::hex(&fp),
-                            paired: true,
-                        });
-                        let _ = k.save();
-                        connect(&ctx3, &target3, Some(fp), &ss, &st);
+        button("Pair & Connect")
+            .accent()
+            .icon(SymbolGlyph::Accept)
+            .on_click(move || {
+                let pin = code2.trim().to_string();
+                let (ctx3, ss, st, target3) =
+                    (ctx2.clone(), ss.clone(), st.clone(), target2.clone());
+                std::thread::spawn(move || {
+                    let name =
+                        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-client".into());
+                    match NativeClient::pair(
+                        &target3.addr,
+                        target3.port,
+                        (&ctx3.identity.0, &ctx3.identity.1),
+                        &pin,
+                        &name,
+                        std::time::Duration::from_secs(90),
+                    ) {
+                        Ok(fp) => {
+                            let mut k = KnownHosts::load();
+                            k.upsert(KnownHost {
+                                name: target3.name.clone(),
+                                addr: target3.addr.clone(),
+                                port: target3.port,
+                                fp_hex: trust::hex(&fp),
+                                paired: true,
+                            });
+                            let _ = k.save();
+                            connect(&ctx3, &target3, Some(fp), &ss, &st);
+                        }
+                        Err(e) => {
+                            st.call(format!("Pairing failed: {e:?} (wrong PIN, or not armed?)"));
+                            ss.call(Screen::Hosts);
+                        }
                     }
-                    Err(e) => {
-                        st.call(format!("Pairing failed: {e:?} (wrong PIN, or not armed?)"));
-                        ss.call(Screen::Hosts);
-                    }
-                }
-            });
-        })
+                });
+            })
     };
     let cancel_btn = {
         let ss = set_screen.clone();
-        button("Cancel").on_click(move || ss.call(Screen::Hosts))
+        button("Cancel")
+            .icon(SymbolGlyph::Cancel)
+            .on_click(move || ss.call(Screen::Hosts))
     };
 
     let content = card(vstack((
-        text_block(format!("Pair with {}", target.name))
-            .font_size(20.0)
-            .semibold(),
-        text_block(
-            "Arm pairing on the host (its console or web console), then enter the 4-digit PIN it \
-             shows.",
-        )
-        .foreground(ThemeRef::SecondaryText)
-        .max_width(440.0),
+        grid((
+            avatar(&target.name)
+                .grid_column(0)
+                .vertical_alignment(VerticalAlignment::Center),
+            vstack((
+                text_block(format!("Pair with {}", target.name))
+                    .font_size(20.0)
+                    .semibold(),
+                text_block(format!("{}:{}", target.addr, target.port))
+                    .font_size(12.0)
+                    .foreground(ThemeRef::SecondaryText),
+            ))
+            .spacing(2.0)
+            .grid_column(1)
+            .vertical_alignment(VerticalAlignment::Center)
+            .margin(edges(12.0, 0.0, 0.0, 0.0)),
+        ))
+        .columns([GridLength::Auto, GridLength::Star(1.0)]),
+        InfoBar::new("Arm pairing on the host")
+            .message(
+                "On the host's console or web console, start pairing — it shows a 4-digit PIN. \
+                 Enter it below within 90 seconds.",
+            )
+            .informational()
+            .is_closable(false),
         text_box(code)
             .placeholder("PIN")
+            .font_size(28.0)
             .on_changed(move |s| set_code.call(s)),
         hstack((pair_btn, cancel_btn)).spacing(8.0),
     ))
-    .spacing(14.0))
+    .spacing(16.0))
     .max_width(480.0)
     .horizontal_alignment(HorizontalAlignment::Center)
-    .margin(edges(0.0, 80.0, 0.0, 0.0));
+    .margin(edges(0.0, 60.0, 0.0, 0.0));
 
     page(vec![content.into()])
 }
@@ -708,10 +817,69 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
                 s.save();
             })
     };
+    let dec_i = DECODERS
+        .iter()
+        .position(|&(v, _)| v == s.decoder)
+        .unwrap_or(0) as i32;
+    let dec_names: Vec<String> = DECODERS.iter().map(|&(_, l)| l.to_string()).collect();
+    let decoder_combo = {
+        let ctx = ctx.clone();
+        ComboBox::new(dec_names)
+            .header("Video decoder")
+            .selected_index(dec_i)
+            .on_selection_changed(move |i: i32| {
+                let (v, _) = DECODERS[(i.max(0) as usize).min(DECODERS.len() - 1)];
+                let mut s = ctx.settings.lock().unwrap();
+                s.decoder = v.to_string();
+                s.save();
+            })
+    };
+
+    let br_i = BITRATES_MBPS
+        .iter()
+        .position(|&m| m * 1000 == s.bitrate_kbps)
+        .unwrap_or(0) as i32;
+    let br_names: Vec<String> = BITRATES_MBPS
+        .iter()
+        .map(|&m| {
+            if m == 0 {
+                "Automatic".into()
+            } else {
+                format!("{m} Mb/s")
+            }
+        })
+        .collect();
+    let bitrate_combo = {
+        let ctx = ctx.clone();
+        ComboBox::new(br_names)
+            .header("Bitrate")
+            .selected_index(br_i)
+            .on_selection_changed(move |i: i32| {
+                let m = BITRATES_MBPS[(i.max(0) as usize).min(BITRATES_MBPS.len() - 1)];
+                let mut s = ctx.settings.lock().unwrap();
+                s.bitrate_kbps = m * 1000;
+                s.save();
+            })
+    };
+
+    let hdr_toggle = {
+        let ctx = ctx.clone();
+        ToggleSwitch::new(s.hdr_enabled)
+            .header("HDR (10-bit, BT.2020 PQ)")
+            .on_content("On")
+            .off_content("Off")
+            .on_changed(move |on: bool| {
+                let mut s = ctx.settings.lock().unwrap();
+                s.hdr_enabled = on;
+                s.save();
+            })
+    };
     let mic_toggle = {
         let ctx = ctx.clone();
-        check_box(s.mic_enabled)
-            .label("Stream microphone to the host")
+        ToggleSwitch::new(s.mic_enabled)
+            .header("Stream microphone to the host")
+            .on_content("On")
+            .off_content("Off")
             .on_changed(move |on: bool| {
                 let mut s = ctx.settings.lock().unwrap();
                 s.mic_enabled = on;
@@ -727,6 +895,7 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
             .vertical_alignment(VerticalAlignment::Center),
         button("Back")
             .accent()
+            .icon(SymbolGlyph::Back)
             .on_click({
                 let ss = set_screen.clone();
                 move || ss.call(Screen::Hosts)
@@ -739,7 +908,7 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
 
     let stream_card = card(
         vstack((
-            text_block("Stream").font_size(15.0).semibold(),
+            text_block("Display").font_size(15.0).semibold(),
             text_block("The host creates a virtual display at exactly this mode.")
                 .font_size(12.0)
                 .foreground(ThemeRef::SecondaryText),
@@ -749,13 +918,31 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
         .spacing(10.0),
     );
 
+    let video_card = card(
+        vstack((
+            text_block("Video").font_size(15.0).semibold(),
+            text_block(
+                "Hardware decode (D3D11VA) is zero-copy and far lighter than software — keep it on \
+                 Automatic unless debugging.",
+            )
+            .font_size(12.0)
+            .foreground(ThemeRef::SecondaryText),
+            decoder_combo,
+            bitrate_combo,
+            hdr_toggle,
+        ))
+        .spacing(10.0),
+    );
+
     let audio_card =
         card(vstack((text_block("Audio").font_size(15.0).semibold(), mic_toggle)).spacing(10.0));
 
     page(vec![
         header.into(),
-        section("STREAM"),
+        section("DISPLAY"),
         stream_card.into(),
+        section("VIDEO"),
+        video_card.into(),
         section("AUDIO"),
         audio_card.into(),
     ])
@@ -764,12 +951,13 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
 // --- stream page --------------------------------------------------------------------------
 
 fn present_newest(ctx: &mut PresentCtx) {
+    // Drain to the newest decoded frame (drop any backlog) and hand it to the presenter by value —
+    // the GPU zero-copy path retains the decoder surface across re-presents, so ownership matters.
     let mut newest = None;
     while let Ok(f) = ctx.frames.try_recv() {
         newest = Some(f);
     }
-    let cpu = newest.as_ref().map(|DecodedFrame::Cpu(c)| c);
-    ctx.presenter.present(cpu);
+    ctx.presenter.present(newest);
 }
 
 fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
@@ -839,34 +1027,53 @@ fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
     .into()
 }
 
-/// The streaming HUD overlay (top-right), mirroring the Apple client: mode + fps/throughput, the
-/// capture→client latency + decode time, and the release-cursor hint. Layered over the
+/// A small chip for the dark HUD: coloured text on a translucent dark fill.
+fn hud_chip(text: &str, color: Color) -> Border {
+    border(
+        text_block(text)
+            .font_size(11.0)
+            .semibold()
+            .foreground(color),
+    )
+    .background(Color::rgb(38, 38, 38))
+    .corner_radius(8.0)
+    .padding(edges(8.0, 2.0, 8.0, 2.0))
+}
+
+/// The streaming HUD overlay (top-right), mirroring the Apple client: a chip row (mode · decode
+/// path · HDR), the fps/throughput/latency line, and the release-cursor hint. Layered over the
 /// `SwapChainPanel` in the same grid cell.
 fn hud_overlay(stats: &Stats, mode: Option<Mode>) -> Element {
     let res = mode
         .map(|m| format!("{}\u{00D7}{}@{}", m.width, m.height, m.refresh_hz))
         .unwrap_or_else(|| "\u{2014}".into());
-    let line1 = format!("{res}   {:.0} fps   {:.1} Mb/s", stats.fps, stats.mbps);
-    let line2 = format!(
-        "capture\u{2192}client {:.1} ms p50 \u{00B7} decode {:.1} ms",
-        stats.latency_ms, stats.decode_ms
+    let mut chips: Vec<Element> = vec![hud_chip(&res, Color::rgb(235, 235, 235)).into()];
+    chips.push(if stats.hardware {
+        hud_chip("GPU decode", Color::rgb(120, 220, 150)).into()
+    } else {
+        hud_chip("CPU decode", Color::rgb(240, 190, 90)).into()
+    });
+    if stats.hdr {
+        chips.push(hud_chip("HDR", Color::rgb(255, 205, 90)).into());
+    }
+    let line = format!(
+        "{:.0} fps \u{00B7} {:.1} Mb/s \u{00B7} {:.1} ms p50 \u{00B7} decode {:.1} ms",
+        stats.fps, stats.mbps, stats.latency_ms, stats.decode_ms
     );
     border(
         vstack((
-            text_block(line1)
-                .font_size(12.0)
-                .foreground(Color::rgb(255, 255, 255)),
-            text_block(line2)
+            hstack(chips).spacing(6.0),
+            text_block(line)
                 .font_size(11.0)
-                .foreground(Color::rgb(200, 200, 200)),
+                .foreground(Color::rgb(210, 210, 210)),
             text_block("Ctrl+Alt+Shift+Q releases the mouse")
                 .font_size(11.0)
-                .foreground(Color::rgb(160, 160, 160)),
+                .foreground(Color::rgb(150, 150, 150)),
         ))
-        .spacing(2.0),
+        .spacing(6.0),
     )
     .background(Color::rgb(0, 0, 0))
-    .corner_radius(8.0)
+    .corner_radius(10.0)
     .padding(uniform(10.0))
     .opacity(0.82)
     .horizontal_alignment(HorizontalAlignment::Right)

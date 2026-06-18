@@ -10,7 +10,8 @@
 //!   punktfunk-client                          (open the WinUI 3 window: host list, settings, pairing)
 //!   punktfunk-client --discover               (list punktfunk hosts on the LAN)
 //!   punktfunk-client --headless --connect host[:port] [--pin HEX] [--pair PIN] [--mode WxHxHz]
-//!                    [--bitrate MBPS] [--mic]  (no window; count frames + print stats)
+//!                    [--bitrate MBPS] [--mic] [--decoder auto|hardware|software] [--no-hdr]
+//!                    (no window; count frames + print stats)
 
 // Link as a GUI (windows) subsystem binary so the default windowed launch (MSIX / double-click)
 // does NOT pop a console window. The CLI paths (--headless/--discover) reattach to the launching
@@ -25,6 +26,8 @@ mod audio;
 mod discovery;
 #[cfg(windows)]
 mod gamepad;
+#[cfg(windows)]
+mod gpu;
 #[cfg(windows)]
 mod input;
 #[cfg(windows)]
@@ -162,7 +165,11 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
         }
     }
 
-    tracing::info!(%host, port, ?mode, tofu = pin.is_none(), "connecting (headless)");
+    let decoder = arg("--decoder")
+        .map(|d| crate::video::DecoderPref::from_name(&d))
+        .unwrap_or_default();
+
+    tracing::info!(%host, port, ?mode, tofu = pin.is_none(), ?decoder, "connecting (headless)");
     let handle = session::start(session::SessionParams {
         host,
         port,
@@ -171,6 +178,8 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
         gamepad: GamepadPref::Auto,
         bitrate_kbps,
         mic_enabled: flag("--mic"),
+        hdr_enabled: !flag("--no-hdr"),
+        decoder,
         pin,
         identity,
     });

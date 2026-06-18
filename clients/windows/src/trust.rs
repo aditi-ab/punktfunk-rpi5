@@ -130,6 +130,11 @@ pub struct Settings {
     pub inhibit_shortcuts: bool,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
+    /// Advertise 10-bit + HDR10 so the host upgrades HDR content to a Main10/PQ stream (the client
+    /// presents it on a 10-bit ST.2084 swapchain). No effect on SDR content.
+    pub hdr_enabled: bool,
+    /// Video decode backend: `auto` (D3D11VA, fall back to software), `hardware`, or `software`.
+    pub decoder: String,
 }
 
 impl Default for Settings {
@@ -143,6 +148,8 @@ impl Default for Settings {
             compositor: "auto".into(),
             inhibit_shortcuts: true,
             mic_enabled: false,
+            hdr_enabled: true,
+            decoder: "auto".into(),
         }
     }
 }

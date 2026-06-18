@@ -1,32 +1,41 @@
-//! Direct3D11 presenter for a WinUI 3 `SwapChainPanel`: upload a decoded `CpuFrame` (RGBA)
-//! into a dynamic texture and draw it Contain-fit into a **composition** flip-model swapchain,
-//! which the reactor stream page binds to the panel via `SwapChainPanelHandle::set_swap_chain`.
+//! Direct3D11 presenter for a WinUI 3 `SwapChainPanel`. It draws a decoded frame Contain-fit into a
+//! **composition** flip-model swapchain, which the reactor stream page binds to the panel via
+//! `SwapChainPanelHandle::set_swap_chain`.
 //!
-//! The device prefers a hardware adapter and falls back to **WARP** (the GPU-less dev box runs
-//! the whole present path in software). The draw is a single full-screen triangle sampling the
-//! video texture; a letterbox is produced by clearing the back buffer black and setting the
-//! viewport to the Contain-fit rect (no per-frame vertex buffer).
+//! Two frame sources, one swapchain:
 //!
-//! **HDR10**: when a frame is BT.2020 PQ (`CpuFrame::hdr`), the swapchain flips to
-//! `R10G10B10A2` + `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` (+ HDR10 metadata) via
-//! `ResizeBuffers`/`SetColorSpace1`; the decoded samples are already PQ-encoded so the shader is a
-//! plain passthrough and the compositor maps PQ→display. SDR stays 8-bit B8G8R8A8.
+//! * **GPU (zero-copy)** — [`crate::video::GpuFrame`] is a decoder-owned NV12/P010 `ID3D11Texture2D`
+//!   array slice (D3D11VA). We create per-plane shader-resource views over the slice and convert
+//!   YUV→RGB in a pixel shader: NV12 via BT.709 (`ps_nv12`), P010 via BT.2020 with the PQ transfer
+//!   left intact (`ps_p010`). No CPU copy. The decoder uses the **same** shared device
+//!   ([`crate::gpu`]) so the texture is bindable here.
+//! * **CPU upload** — [`crate::video::CpuFrame`] is packed RGBA (SDR) or X2BGR10 (HDR) from the
+//!   software decoder; we upload it into a dynamic texture and draw it with a passthrough shader
+//!   (`ps_rgba`). The fallback path.
+//!
+//! **HDR10**: when a frame is BT.2020 PQ the swapchain flips to `R10G10B10A2` +
+//! `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` (+ HDR10 metadata) via `ResizeBuffers`/
+//! `SetColorSpace1`; the shader output is already PQ-encoded so the compositor maps PQ→display. SDR
+//! stays 8-bit B8G8R8A8.
 //!
 //! All `windows` types here come from the same windows-rs commit as `windows-reactor`, so the
 //! `IDXGISwapChain1` handed to `set_swap_chain` satisfies reactor's `windows_core::Interface`.
 
-use crate::video::CpuFrame;
+use crate::video::{DecodedFrame, GpuFrame};
 use anyhow::{anyhow, Context, Result};
 use windows::core::{Interface, PCSTR};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
 use windows::Win32::Graphics::Direct3D::{
-    ID3DBlob, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
-    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2DARRAY,
 };
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
+// One vertex shader (fullscreen triangle) + three pixel shaders, selected per frame source. tex0 is
+// RGBA (passthrough) or the luma plane; tex1 is the chroma plane. The YUV→RGB matrices fold the
+// limited→full range scale into the coefficients; for P010 the R16 sample is rescaled (×65535/65472)
+// to undo the 10-bits-in-the-high-bits packing, then converted with BT.2020 NCL, PQ preserved.
 const SHADER_HLSL: &str = r#"
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut vs_main(uint vid : SV_VertexID) {
@@ -36,44 +45,104 @@ VSOut vs_main(uint vid : SV_VertexID) {
     o.uv = uv;
     return o;
 }
-Texture2D tex : register(t0);
+Texture2D tex0 : register(t0);
+Texture2D tex1 : register(t1);
 SamplerState smp : register(s0);
-float4 ps_main(VSOut i) : SV_Target { return tex.Sample(smp, i.uv); }
+
+float4 ps_rgba(VSOut i) : SV_Target { return tex0.Sample(smp, i.uv); }
+
+float4 ps_nv12(VSOut i) : SV_Target {
+    float  y  = tex0.Sample(smp, i.uv).r;
+    float2 uv = tex1.Sample(smp, i.uv).rg;
+    float yy = (y - 0.0627451) * 1.164384;   // (Y-16/255)*255/219
+    float u  = uv.x - 0.5;
+    float v  = uv.y - 0.5;                    // BT.709 limited, chroma scale folded
+    float r = yy + 1.792741 * v;
+    float g = yy - 0.213249 * u - 0.532909 * v;
+    float b = yy + 2.112402 * u;
+    return float4(saturate(float3(r, g, b)), 1.0);
+}
+
+float4 ps_p010(VSOut i) : SV_Target {
+    const float S = 65535.0 / 65472.0;       // undo P010 high-bit packing → exact 10-bit / 1023
+    float  y  = tex0.Sample(smp, i.uv).r  * S;
+    float2 uv = tex1.Sample(smp, i.uv).rg * S;
+    float yy = (y - 0.0625611) * 1.167808;   // (Y-64/1023)*1023/876
+    float u  = uv.x - 0.5;
+    float v  = uv.y - 0.5;                    // BT.2020 NCL limited, chroma scale folded; PQ kept
+    float r = yy + 1.683611 * v;
+    float g = yy - 0.187877 * u - 0.652337 * v;
+    float b = yy + 2.148072 * u;
+    return float4(saturate(float3(r, g, b)), 1.0);
+}
 "#;
+
+/// A bound GPU frame: per-plane SRVs over the decoder's texture-array slice, plus the `GpuFrame`
+/// itself kept alive so the decoder won't recycle the slice while we re-present it.
+struct GpuView {
+    y: ID3D11ShaderResourceView,
+    c: ID3D11ShaderResourceView,
+    frame: GpuFrame,
+}
+
+/// Current draw source.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Empty,
+    Rgba,
+    Nv12,
+    P010,
+}
 
 pub struct Presenter {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     vs: ID3D11VertexShader,
-    ps: ID3D11PixelShader,
+    ps_rgba: ID3D11PixelShader,
+    ps_nv12: ID3D11PixelShader,
+    ps_p010: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     swap: IDXGISwapChain1,
     rtv: Option<ID3D11RenderTargetView>,
-    /// Video texture + SRV + dimensions; recreated when the decoded size changes.
-    tex: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, u32, u32)>,
+    /// CPU-upload texture + SRV + dimensions; recreated when the decoded size/format changes.
+    cpu_tex: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, u32, u32)>,
+    /// Bound zero-copy GPU frame (held to keep its decoder surface alive).
+    gpu: Option<GpuView>,
+    mode: Mode,
+    /// Source frame dimensions, for the Contain-fit letterbox.
+    src_w: u32,
+    src_h: u32,
     /// Panel (swapchain) size in pixels, updated on resize.
     panel_w: u32,
     panel_h: u32,
-    /// Whether the swapchain is currently in 10-bit HDR10 (R10G10B10A2 + ST.2084) mode; flipped
-    /// to match each frame's `hdr` flag.
+    /// Whether the swapchain is currently in 10-bit HDR10 (R10G10B10A2 + ST.2084) mode.
     hdr: bool,
 }
 
 impl Presenter {
-    /// Create the D3D11 device + composition swapchain + shaders, sized to the panel.
+    /// Create the presenter on the process-wide shared D3D11 device (the one the decoder uses), plus
+    /// the composition swapchain + shaders, sized to the panel.
     pub fn new(width: u32, height: u32) -> Result<Presenter> {
-        let (device, context) = create_device()?;
-        let (vs, ps, sampler) = build_pipeline(&device)?;
+        let shared = crate::gpu::shared().ok_or_else(|| anyhow!("no shared D3D11 device"))?;
+        let device = shared.device.clone();
+        let context = shared.context.clone();
+        let (vs, ps_rgba, ps_nv12, ps_p010, sampler) = build_pipeline(&device)?;
         let swap = create_composition_swapchain(&device, width.max(1), height.max(1))?;
         Ok(Presenter {
             device,
             context,
             vs,
-            ps,
+            ps_rgba,
+            ps_nv12,
+            ps_p010,
             sampler,
             swap,
             rtv: None,
-            tex: None,
+            cpu_tex: None,
+            gpu: None,
+            mode: Mode::Empty,
+            src_w: 1,
+            src_h: 1,
             panel_w: width.max(1),
             panel_h: height.max(1),
             hdr: false,
@@ -104,31 +173,122 @@ impl Presenter {
         self.panel_h = height;
     }
 
-    /// Present one decoded frame (Contain-fit) — or, when `frame` is `None`, just re-present the
-    /// last texture (or black). Called from the reactor `on_rendering` per-frame callback.
-    pub fn present(&mut self, frame: Option<&CpuFrame>) {
-        if let Some(f) = frame {
-            if f.hdr != self.hdr {
-                self.set_hdr(f.hdr);
+    /// Present one decoded frame (Contain-fit) — or, when `frame` is `None`, re-present the last one
+    /// (or black). Called from the reactor `on_rendering` per-frame callback on the UI thread. Takes
+    /// the frame by value so the GPU path can retain the decoder surface across re-presents.
+    pub fn present(&mut self, frame: Option<DecodedFrame>) {
+        match frame {
+            Some(DecodedFrame::Cpu(c)) => {
+                if c.hdr != self.hdr {
+                    self.set_hdr(c.hdr);
+                }
+                if let Err(e) = self.upload(&c) {
+                    tracing::warn!(error = %e, "frame upload failed");
+                } else {
+                    self.mode = Mode::Rgba;
+                    self.src_w = c.width;
+                    self.src_h = c.height;
+                    self.gpu = None; // drop any held GPU frame
+                }
             }
-            if let Err(e) = self.upload(f) {
-                tracing::warn!(error = %e, "frame upload failed");
+            Some(DecodedFrame::Gpu(g)) => {
+                if g.hdr != self.hdr {
+                    self.set_hdr(g.hdr);
+                }
+                match self.bind_gpu(g) {
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!(error = %e, "GPU frame bind failed"),
+                }
             }
+            None => {}
         }
+        self.draw();
+    }
+
+    /// Build per-plane SRVs over the decoded texture-array slice and retain the frame.
+    fn bind_gpu(&mut self, g: GpuFrame) -> Result<()> {
+        let tex: ID3D11Texture2D = unsafe {
+            let raw = g.texture_ptr();
+            ID3D11Texture2D::from_raw_borrowed(&raw)
+                .ok_or_else(|| anyhow!("null D3D11 texture"))?
+                .clone()
+        };
+        // NV12: R8 luma + R8G8 chroma. P010: R16 luma + R16G16 chroma (10 bits in the high bits).
+        let (fy, fc) = if g.hdr {
+            (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM)
+        } else {
+            (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM)
+        };
+        let y = self.array_srv(&tex, fy, g.index)?;
+        let c = self.array_srv(&tex, fc, g.index)?;
+        self.mode = if g.hdr { Mode::P010 } else { Mode::Nv12 };
+        self.src_w = g.width;
+        self.src_h = g.height;
+        self.gpu = Some(GpuView { y, c, frame: g });
+        Ok(())
+    }
+
+    /// A shader-resource view over a single slice of a texture array, reinterpreting the plane
+    /// format (the NV12/P010 sub-format trick D3D11 allows on video textures).
+    fn array_srv(
+        &self,
+        tex: &ID3D11Texture2D,
+        format: DXGI_FORMAT,
+        slice: u32,
+    ) -> Result<ID3D11ShaderResourceView> {
+        let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D_SRV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    FirstArraySlice: slice,
+                    ArraySize: 1,
+                },
+            },
+        };
+        unsafe {
+            let mut srv = None;
+            self.device
+                .CreateShaderResourceView(tex, Some(&desc), Some(&mut srv))
+                .context("CreateShaderResourceView (array slice)")?;
+            srv.ok_or_else(|| anyhow!("null SRV"))
+        }
+    }
+
+    fn draw(&mut self) {
         let Ok(rtv) = self.rtv() else {
             return;
         };
         let (pw, ph) = (self.panel_w, self.panel_h);
+        // Resolve the current source's shader + the (up to two) SRVs to bind — cheap interface
+        // clones. Each arm yields `Option<(&pixel_shader, [Option<SRV>; 2])>`.
+        let binding = match self.mode {
+            Mode::Rgba => self
+                .cpu_tex
+                .as_ref()
+                .map(|(_, srv, _, _)| (&self.ps_rgba, [Some(srv.clone()), None])),
+            Mode::Nv12 => self
+                .gpu
+                .as_ref()
+                .map(|g| (&self.ps_nv12, [Some(g.y.clone()), Some(g.c.clone())])),
+            Mode::P010 => self
+                .gpu
+                .as_ref()
+                .map(|g| (&self.ps_p010, [Some(g.y.clone()), Some(g.c.clone())])),
+            Mode::Empty => None,
+        };
         unsafe {
             let c = &self.context;
             c.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]);
-            if let Some((_, srv, vw, vh)) = &self.tex {
+            if let Some((ps, srvs)) = binding {
                 // Contain-fit viewport: scale to the smaller axis, centre, letterbox the rest.
                 let (ww, wh, vfw, vfh) = (
                     pw as f32,
                     ph as f32,
-                    (*vw).max(1) as f32,
-                    (*vh).max(1) as f32,
+                    self.src_w.max(1) as f32,
+                    self.src_h.max(1) as f32,
                 );
                 let scale = (ww / vfw).min(wh / vfh);
                 let (dw, dh) = (vfw * scale, vfh * scale);
@@ -146,8 +306,8 @@ impl Presenter {
                 c.IASetInputLayout(None);
                 c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 c.VSSetShader(&self.vs, None);
-                c.PSSetShader(&self.ps, None);
-                c.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+                c.PSSetShader(ps, None);
+                c.PSSetShaderResources(0, Some(&srvs));
                 c.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
                 c.Draw(3, 0);
             }
@@ -155,14 +315,13 @@ impl Presenter {
         }
     }
 
-    /// Switch the swapchain between 8-bit SDR (B8G8R8A8, sRGB/BT.709) and 10-bit HDR10
-    /// (R10G10B10A2, ST.2084 PQ BT.2020). `ResizeBuffers` can change the back-buffer format in
-    /// place, so the panel binding (`set_swap_chain`) stays valid — no rebind needed. The decoded
-    /// samples are already PQ-encoded BT.2020 (see `video::convert`), so the colour space is all the
-    /// compositor needs to map them to the display.
+    /// Switch the swapchain between 8-bit SDR (B8G8R8A8, BT.709) and 10-bit HDR10 (R10G10B10A2,
+    /// ST.2084 PQ BT.2020). `ResizeBuffers` changes the back-buffer format in place, so the panel
+    /// binding (`set_swap_chain`) stays valid — no rebind. Both frame sources already produce
+    /// PQ-encoded BT.2020 for HDR, so the colour space is all the compositor needs.
     fn set_hdr(&mut self, on: bool) {
         self.rtv = None; // release back-buffer refs before ResizeBuffers
-        self.tex = None; // texture format changes (R10G10B10A2 vs R8G8B8A8)
+        self.cpu_tex = None; // CPU texture format changes (R10G10B10A2 vs R8G8B8A8)
         let format = if on {
             DXGI_FORMAT_R10G10B10A2_UNORM
         } else {
@@ -208,9 +367,9 @@ impl Presenter {
         tracing::info!(hdr = on, "swapchain colour mode switched");
     }
 
-    fn upload(&mut self, frame: &CpuFrame) -> Result<()> {
+    fn upload(&mut self, frame: &crate::video::CpuFrame) -> Result<()> {
         let (w, h) = (frame.width, frame.height);
-        let need_new = !matches!(&self.tex, Some((_, _, tw, th)) if *tw == w && *th == h);
+        let need_new = !matches!(&self.cpu_tex, Some((_, _, tw, th)) if *tw == w && *th == h);
         if need_new {
             let format = if self.hdr {
                 DXGI_FORMAT_R10G10B10A2_UNORM
@@ -246,9 +405,9 @@ impl Presenter {
                     .context("CreateShaderResourceView")?;
                 s.unwrap()
             };
-            self.tex = Some((texture, srv, w, h));
+            self.cpu_tex = Some((texture, srv, w, h));
         }
-        let (texture, _, _, _) = self.tex.as_ref().unwrap();
+        let (texture, _, _, _) = self.cpu_tex.as_ref().unwrap();
         unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
@@ -284,38 +443,6 @@ impl Presenter {
         }
         Ok(self.rtv.clone().unwrap())
     }
-}
-
-fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
-    for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
-        let mut device = None;
-        let mut context = None;
-        let r = unsafe {
-            D3D11CreateDevice(
-                None,
-                driver,
-                None,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-        };
-        if r.is_ok() {
-            let name = if driver == D3D_DRIVER_TYPE_HARDWARE {
-                "hardware"
-            } else {
-                "WARP (software)"
-            };
-            tracing::info!(driver = name, "D3D11 device created");
-            return Ok((device.unwrap(), context.unwrap()));
-        }
-    }
-    Err(anyhow!(
-        "D3D11CreateDevice failed for both hardware and WARP"
-    ))
 }
 
 /// A composition flip-model swapchain (no HWND) for binding to a XAML `SwapChainPanel`.
@@ -357,18 +484,34 @@ fn create_composition_swapchain(
 
 fn build_pipeline(
     device: &ID3D11Device,
-) -> Result<(ID3D11VertexShader, ID3D11PixelShader, ID3D11SamplerState)> {
+) -> Result<(
+    ID3D11VertexShader,
+    ID3D11PixelShader,
+    ID3D11PixelShader,
+    ID3D11PixelShader,
+    ID3D11SamplerState,
+)> {
     let vs_blob = compile(SHADER_HLSL, "vs_main", "vs_5_0")?;
-    let ps_blob = compile(SHADER_HLSL, "ps_main", "ps_5_0")?;
+    let rgba_blob = compile(SHADER_HLSL, "ps_rgba", "ps_5_0")?;
+    let nv12_blob = compile(SHADER_HLSL, "ps_nv12", "ps_5_0")?;
+    let p010_blob = compile(SHADER_HLSL, "ps_p010", "ps_5_0")?;
     unsafe {
         let mut vs = None;
         device
             .CreateVertexShader(blob_bytes(&vs_blob), None, Some(&mut vs))
             .context("CreateVertexShader")?;
-        let mut ps = None;
+        let mut ps_rgba = None;
         device
-            .CreatePixelShader(blob_bytes(&ps_blob), None, Some(&mut ps))
-            .context("CreatePixelShader")?;
+            .CreatePixelShader(blob_bytes(&rgba_blob), None, Some(&mut ps_rgba))
+            .context("CreatePixelShader (rgba)")?;
+        let mut ps_nv12 = None;
+        device
+            .CreatePixelShader(blob_bytes(&nv12_blob), None, Some(&mut ps_nv12))
+            .context("CreatePixelShader (nv12)")?;
+        let mut ps_p010 = None;
+        device
+            .CreatePixelShader(blob_bytes(&p010_blob), None, Some(&mut ps_p010))
+            .context("CreatePixelShader (p010)")?;
         let sdesc = D3D11_SAMPLER_DESC {
             Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
             AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -381,7 +524,13 @@ fn build_pipeline(
         device
             .CreateSamplerState(&sdesc, Some(&mut sampler))
             .context("CreateSamplerState")?;
-        Ok((vs.unwrap(), ps.unwrap(), sampler.unwrap()))
+        Ok((
+            vs.unwrap(),
+            ps_rgba.unwrap(),
+            ps_nv12.unwrap(),
+            ps_p010.unwrap(),
+            sampler.unwrap(),
+        ))
     }
 }
 
@@ -427,9 +576,9 @@ fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
     }
 }
 
-/// Generic HDR10 mastering metadata: BT.2020 primaries + D65 white (0.00002 units), a 1000-nit
-/// mastering display, MaxCLL 1000 / MaxFALL 400. The protocol doesn't carry the stream's real
-/// mastering metadata yet (host follow-up), so these are sane defaults the display tone-maps from.
+/// Generic HDR10 mastering metadata: BT.2020 primaries + D65 white, a 1000-nit mastering display,
+/// MaxCLL 1000 / MaxFALL 400. The protocol doesn't carry the stream's real mastering metadata yet
+/// (host follow-up), so these are sane defaults the display tone-maps from.
 fn hdr10_metadata() -> DXGI_HDR_METADATA_HDR10 {
     DXGI_HDR_METADATA_HDR10 {
         RedPrimary: [35400, 14600],

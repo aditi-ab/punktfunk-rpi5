@@ -8,7 +8,7 @@
 //! (software-only here) and the audio backend (WASAPI). The pump body is identical.
 
 use crate::audio;
-use crate::video::{DecodedFrame, Decoder};
+use crate::video::{DecodedFrame, Decoder, DecoderPref};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use punktfunk_core::PunktfunkError;
@@ -25,6 +25,10 @@ pub struct SessionParams {
     pub bitrate_kbps: u32,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
+    /// Advertise 10-bit + HDR10 so the host may upgrade HDR content to a Main10/PQ stream.
+    pub hdr_enabled: bool,
+    /// Which video decode backend to use (auto/hardware/software).
+    pub decoder: DecoderPref,
     /// Pinned host fingerprint; `None` = trust on first use (caller persists the observed one).
     pub pin: Option<[u8; 32]>,
     pub identity: (String, String),
@@ -37,6 +41,10 @@ pub struct Stats {
     pub decode_ms: f32,
     /// Median capture→decoded latency over the last window (host-clock corrected).
     pub latency_ms: f32,
+    /// True when decoding on the GPU (D3D11VA zero-copy) vs. CPU (software).
+    pub hardware: bool,
+    /// True when the stream is BT.2020 PQ HDR10 (last decoded frame).
+    pub hdr: bool,
 }
 
 pub enum SessionEvent {
@@ -99,10 +107,15 @@ fn pump(
         params.compositor,
         params.gamepad,
         params.bitrate_kbps,
-        // Advertise 10-bit + HDR10: the presenter handles BT.2020 PQ (R10G10B10A2) frames, so the
-        // host may upgrade HDR content to a Main10/PQ stream (it still only does so for actual HDR
-        // content with its own 10-bit gate). 8-bit SDR is unaffected.
-        punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR,
+        // Advertise 10-bit + HDR10 (when enabled): the presenter handles BT.2020 PQ frames (P010 on
+        // the GPU path, X2BGR10 on software), so the host may upgrade HDR content to a Main10/PQ
+        // stream — it still only does so for actual HDR content with its own 10-bit gate. 8-bit SDR
+        // is unaffected. A client that turns HDR off advertises `0` and always gets the 8-bit stream.
+        if params.hdr_enabled {
+            punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
+        } else {
+            0
+        },
         None, // launch: the Windows client has no library picker yet
         params.pin,
         Some(params.identity),
@@ -132,13 +145,15 @@ fn pump(
         fingerprint: connector.host_fingerprint,
     });
 
-    let mut decoder = match Decoder::new() {
+    let mut decoder = match Decoder::new(params.decoder) {
         Ok(d) => d,
         Err(e) => {
             let _ = ev_tx.send_blocking(SessionEvent::Ended(Some(format!("video decoder: {e}"))));
             return;
         }
     };
+    let mut hardware = decoder.is_hardware();
+    let mut hdr = false;
     // Audio is best-effort: a session without it still streams. Gamepads are the
     // app-lifetime service's job (the UI attaches it on Connected).
     let player = audio::AudioPlayer::spawn()
@@ -178,12 +193,16 @@ fn pump(
                 match decoder.decode(&frame.data) {
                     Ok(Some(decoded)) => {
                         total_frames += 1;
+                        hdr = decoded.hdr();
+                        // The backend can demote D3D11VA → software mid-session on a hardware error.
+                        hardware = decoder.is_hardware();
                         if total_frames == 1 {
-                            let DecodedFrame::Cpu(c) = &decoded;
+                            let (w, h) = decoded.dims();
                             tracing::info!(
-                                width = c.width,
-                                height = c.height,
-                                path = "software",
+                                width = w,
+                                height = h,
+                                path = if hardware { "d3d11va" } else { "software" },
+                                hdr,
                                 "first frame decoded"
                             );
                         }
@@ -253,6 +272,8 @@ fn pump(
                     0.0
                 },
                 latency_ms: p50 as f32 / 1000.0,
+                hardware,
+                hdr,
             }));
             window_start = Instant::now();
             frames_n = 0;

@@ -123,11 +123,21 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    framework backed by WinUI; PR #4499 added the `SwapChainPanel` widget + `set_swap_chain`). The
    video is a **`SwapChainPanel`** bound to a **D3D11 composition swapchain** (WARP fallback for
    the GPU-less dev box; runtime-compiled fullscreen-triangle shaders, Contain-fit letterbox),
-   driven by reactor's per-frame `on_rendering`. **FFmpeg software HEVC decode** (D3D11VA hw decode
-   is the follow-up), **WASAPI** render + mic capture, **SDL3** gamepads (rumble/lightbar/DualSense),
-   `mdns-sd` discovery, and the full trust surface — all **in-app**: host list (live mDNS + saved +
-   manual), settings (resolution/refresh/mic), SPAKE2 PIN pairing screen, TOFU, pinned-fp-mismatch
-   re-pair. **Stream input** is Win32 low-level hooks (`WH_KEYBOARD_LL`/`WH_MOUSE_LL`) — reactor
+   driven by reactor's per-frame `on_rendering`. **FFmpeg HEVC decode with a D3D11VA
+   zero-copy hardware path** (`gpu.rs` shares one D3D11 device — hardware+`VIDEO_SUPPORT`, WARP
+   fallback, multithread-protected — between the decoder and presenter; the decoder outputs
+   NV12/P010 `ID3D11Texture2D` array slices with `BIND_SHADER_RESOURCE` and the presenter samples
+   them via per-plane SRVs + YUV→RGB shaders — NV12/BT.709, P010/BT.2020-PQ; **software CPU decode
+   stays as the robust fallback**, auto-selected with a `DecoderPref` override). **HDR10**: the
+   client advertises 10-bit/HDR (Settings toggle), detects PQ in-band (`transfer == SMPTE2084`),
+   and flips the swapchain to `R10G10B10A2` + ST.2084 with HDR10 metadata. **WASAPI** render + mic
+   capture, **SDL3** gamepads (rumble/lightbar/DualSense), `mdns-sd` discovery, and the full trust
+   surface — all **in-app**: a polished WinUI shell (host cards w/ monogram + status pills,
+   `InfoBar` errors/hints, `ToggleSwitch` settings, status-chip stream HUD showing GPU/CPU decode +
+   HDR), host list (live mDNS + saved + manual), settings (resolution/refresh/decoder/bitrate/HDR/
+   mic), SPAKE2 PIN pairing screen, TOFU, pinned-fp-mismatch re-pair. **(D3D11VA + HDR present + the
+   GUI polish are written against the windows-rs/reactor APIs but not yet on-glass validated — the
+   dev VM is headless/WARP; needs the RTX box.)** **Stream input** is Win32 low-level hooks (`WH_KEYBOARD_LL`/`WH_MOUSE_LL`) — reactor
    exposes no raw key/pointer events; native Windows VK + absolute mouse (client-rect Contain-fit) +
    wheel, Ctrl+Alt+Shift+Q capture toggle. `--headless`/`--discover` keep CLI paths. Builds + clippy
    + fmt green on `x86_64-pc-windows-msvc` (on the dev VM). **windows-reactor is unpublished** (git
@@ -135,9 +145,9 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    with `set_swap_chain`); its `build.rs` downloads the Win App SDK NuGets + needs `CARGO_WORKSPACE_DIR`
    set (in the VM build env; `/temp`+`/winmd` gitignored). Gotcha: `CARGO_HOME` must be an ASCII path
    — the `ü` in the dev box's username breaks SDL3's MSVC precompiled-header build. Next: **on-glass
-   validation** (the dev VM is headless/Session-0 → the WinUI window needs a display: RDP or the RTX
-   box), D3D11VA hw decode + 10-bit/HDR present, RAWINPUT relative-mouse pointer-lock, and a per-host
-   speed test in the UI.
+   validation** of the D3D11VA decode + HDR present + GUI on the RTX box (the dev VM is
+   headless/Session-0/WARP → the WinUI window + hardware decode need a real display+GPU: RDP or the
+   RTX box), then RAWINPUT relative-mouse pointer-lock and a per-host speed test in the UI.
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).
