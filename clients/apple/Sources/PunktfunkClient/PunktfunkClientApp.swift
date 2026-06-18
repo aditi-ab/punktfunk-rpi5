@@ -13,7 +13,7 @@ struct PunktfunkClientApp: App {
     #endif
 
     var body: some Scene {
-        WindowGroup("Punktfunkempfänger") {
+        WindowGroup("Punktfunk") {
             ContentView()
         }
         // The Stream menu (Disconnect ⌘D, Show/Hide Statistics ⌘⇧S) — a real menu bar on

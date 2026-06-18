@@ -66,7 +66,7 @@ struct HomeView: View {
                     }
                 }
             }
-            .navigationTitle("Punktfunkempfänger")
+            .navigationTitle("Punktfunk")
             // Browse the LAN for advertised hosts only while the grid is up — not during a
             // session. The home appears/disappears as the stream swaps in and out.
             .onAppear { discovery.start() }
