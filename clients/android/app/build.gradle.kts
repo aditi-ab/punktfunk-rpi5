@@ -1,5 +1,7 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // AGP 9 built-in Kotlin: NO org.jetbrains.kotlin.android. The Compose compiler plugin is
@@ -12,23 +14,37 @@ android {
     compileSdk = 37 // Android 17 — required by androidx.core 1.19.0; targetSdk stays 36 for now.
 
     defaultConfig {
+        // Load from .env if it exists (local dev), otherwise from System.getenv (CI)
+        val envFile = project.rootProject.file(".env")
+        val props = Properties()
+        if (envFile.exists()) {
+            envFile.inputStream().use { props.load(it) }
+        }
+
         applicationId = "io.unom.punktfunk"
         minSdk = 31
         targetSdk = 36
-        versionCode = System.getenv("VERSION_CODE")?.toInt() ?: 1
+        val vCode = (props.getProperty("VERSION_CODE") ?: System.getenv("VERSION_CODE"))
+        versionCode = vCode?.toInt() ?: 1
         versionName = "0.0.2" // bumped for first Play Store release
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 
     signingConfigs {
         create("release") {
-            // These are provided by CI secrets as environment variables
-            val keystoreFile = System.getenv("RELEASE_KEYSTORE_FILE")
-            if (keystoreFile != null) {
-                storeFile = file(keystoreFile)
-                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
-                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            // Load from .env if it exists (local dev), otherwise from System.getenv (CI)
+            val envFile = project.rootProject.file(".env")
+            val props = Properties()
+            if (envFile.exists()) {
+                envFile.inputStream().use { props.load(it) }
+            }
+
+            val ksFile = props.getProperty("RELEASE_KEYSTORE_FILE") ?: System.getenv("RELEASE_KEYSTORE_FILE")
+            if (ksFile != null) {
+                storeFile = file(ksFile)
+                storePassword = props.getProperty("RELEASE_KEYSTORE_PASSWORD") ?: System.getenv("RELEASE_KEYSTORE_PASSWORD")
+                keyAlias = props.getProperty("RELEASE_KEY_ALIAS") ?: System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = props.getProperty("RELEASE_KEY_PASSWORD") ?: System.getenv("RELEASE_KEY_PASSWORD")
             }
         }
     }
