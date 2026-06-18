@@ -15,7 +15,7 @@ Whichever client you install, the first connection needs a one-time [pairing](/d
 | **Steam Deck** | [Flatpak in Desktop Mode](#steam-deck) (or the Decky plugin) |
 | **Windows** | [Signed MSIX](#windows) from the package registry |
 | **macOS** | [Notarized `.dmg`](#macos) from the releases page |
-| **iPhone / iPad / Apple TV** | [App Store / TestFlight](#ios-ipados-apple-tv) |
+| **iPhone / iPad / Apple TV** | [TestFlight beta](#ios-ipados-apple-tv) |
 | **Android / Android TV** | [Google Play](#android) |
 | Anything else (browser, old phone, TV) | [Moonlight](/docs/moonlight) |
 
@@ -97,26 +97,26 @@ it without warnings:
 1. Open `Punktfunk-<version>.dmg` and drag **Punktfunk** to **Applications**.
 2. Launch it, pick your host from *On this network*, and [pair](/docs/pairing).
 
-The Mac app is also part of the TestFlight beta (see below); the DMG is the no-account path.
+The Mac app is also in the [TestFlight beta](https://testflight.apple.com/join/Qr7uSemk); the DMG
+is the no-account path.
 
 ## iOS, iPadOS, Apple TV
 
-The Apple app is a **universal purchase** — one App Store listing covers iPhone, iPad, Apple TV, and
-the Mac. It's currently distributed through **TestFlight** while in beta.
+The Apple app is in **TestFlight** beta — one universal build covers iPhone, iPad, Apple TV, and the
+Mac. Install Apple's [TestFlight](https://apps.apple.com/app/testflight/id899247664) app, then join:
 
-<!-- TODO: replace with the real public URLs once the listing/TestFlight links are live -->
-- **App Store:** _coming soon_ — [listing](https://apps.apple.com/app/punktfunk)
-- **TestFlight (beta):** _join link pending_
+**[Join the punktfunk beta on TestFlight →](https://testflight.apple.com/join/Qr7uSemk)**
 
-Install, open the app, and your hosts appear automatically under *On this network*.
+Open the app, and your hosts appear automatically under *On this network*.
 
 ## Android
 
-The Android client (phone + Android TV) is on **Google Play**, currently in closed testing.
+The Android client (phone + Android TV) is on **Google Play**:
 
-<!-- TODO: replace with the real public/testing URLs once the track is live -->
-- **Google Play:** [listing](https://play.google.com/store/apps/details?id=io.unom.punktfunk)
-  _(closed testing — request access)_
+**[Get punktfunk on Google Play →](https://play.google.com/store/apps/details?id=io.unom.punktfunk)**
+
+Install, open the app, and pick your host. _(The app is in testing — if the listing isn't visible
+to you yet, you'll need to be added to the test track.)_
 
 ## Anything else — Moonlight
 
