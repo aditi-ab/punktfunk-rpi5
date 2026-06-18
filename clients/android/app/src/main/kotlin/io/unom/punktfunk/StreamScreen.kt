@@ -39,6 +39,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.NativeBridge
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -70,6 +71,12 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         }
     }
 
+    // One-shot teardown guard. Both the SurfaceView callback and DisposableEffect tear down on the
+    // way out, but `nativeClose` frees the handle — so once it's closed, NO path may touch the handle
+    // again (use-after-free → SIGSEGV: the consistent back-while-streaming crash). Both run on the
+    // main thread, so a plain flag is race-free; AtomicBoolean just makes the intent explicit.
+    val closed = remember { AtomicBoolean(false) }
+
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         controller?.let {
@@ -81,6 +88,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         // Host→client feedback (rumble + DualSense lightbar/LEDs); poll threads stopped before close.
         val feedback = GamepadFeedback(handle).also { it.start() }
         onDispose {
+            closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
             feedback.stop() // stop + join the poll threads BEFORE nativeClose frees the handle
             activity?.axisMapper?.reset() // release-all so nothing sticks on the host
             activity?.axisMapper = null
@@ -112,9 +120,15 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
 
                         override fun surfaceDestroyed(holder: SurfaceHolder) {
-                            NativeBridge.nativeStopMic(handle)
-                            NativeBridge.nativeStopAudio(handle)
-                            NativeBridge.nativeStopVideo(handle)
+                            // Surface gone (backgrounding, or on the way out). Stop the threads that
+                            // render to it — but only while the session is still open. Once
+                            // DisposableEffect has closed it, the handle is freed; dereferencing it
+                            // here is the use-after-free that crashed on back-navigation.
+                            if (!closed.get()) {
+                                NativeBridge.nativeStopMic(handle)
+                                NativeBridge.nativeStopAudio(handle)
+                                NativeBridge.nativeStopVideo(handle)
+                            }
                         }
                     })
                 }

@@ -9,9 +9,7 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.darkColorScheme
 import androidx.compose.ui.Modifier
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.Keymap
@@ -38,7 +36,7 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            PunktfunkTheme {
                 Surface(modifier = Modifier.fillMaxSize()) { App() }
             }
         }
