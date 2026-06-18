@@ -63,7 +63,9 @@ jobs:
       - name: Tooling
         run: |
           # flatpak-cargo-generator.py (master) needs aiohttp + tomlkit (NOT the old `toml`).
-          dnf -y install flatpak flatpak-builder git python3 python3-aiohttp python3-tomlkit curl jq
+          # gnupg2/rsync/openssh-clients: sign the OSTree repo + rsync it to unom-1 (see the deploy step).
+          dnf -y install flatpak flatpak-builder git python3 python3-aiohttp python3-tomlkit curl jq \
+            gnupg2 rsync openssh-clients
           # Flathub provides the GNOME runtime/SDK + the rust-stable + ffmpeg-full extensions.
           flatpak remote-add --user --if-not-exists flathub \
             https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -106,7 +108,10 @@ jobs:
           # runtime/SDK + the rust-stable (//25.08, rustc 1.96) and llvm20 SDK extensions, plus
           # the runtime's auto codecs-extra (HEVC libavcodec). --disable-rofiles-fuse is the
           # container-safe path (no FUSE).
+          # --default-branch=stable pins the ref to app/io.unom.Punktfunk/x86_64/stable so the
+          # hosted .flatpakref (Branch=stable) matches deterministically (manifest sets no branch).
           flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --default-branch=stable \
             --install-deps-from=flathub \
             --repo="$PWD/repo" \
             "$PWD/build-dir" "$MANIFEST"
@@ -133,6 +138,72 @@ jobs:
           curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$BUNDLE" \
             "$BASE/latest/punktfunk-client.flatpak"
           echo "published $BASE/latest/punktfunk-client.flatpak"
+
+      # Sign the OSTree repo flatpak-builder already produced and publish it to flatpak.unom.io on
+      # unom-1, so users get `flatpak update` (the single-file bundle above has no remote). Mirrors
+      # docker.yml's deploy-docs (DEPLOY_* = the unom-ci-deploy key). No-ops cleanly until the GPG
+      # secret + DEPLOY_* exist, so the bundle build stays green during setup.
+      - name: Sign + deploy the OSTree repo to unom-1 (flatpak.unom.io)
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FLATPAK_GPG_PRIVATE_KEY:-}" ] || [ -z "${DEPLOY_HOST:-}" ]; then
+            echo "::warning::FLATPAK_GPG_PRIVATE_KEY/DEPLOY_* not set — skipping repo deploy (bundle still published)."
+            exit 0
+          fi
+          # 1) Import the signing key into a throwaway keyring; sign the repo (commits + summary).
+          export GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"
+          echo "$FLATPAK_GPG_PRIVATE_KEY" | base64 -d | gpg --batch --import
+          KEYID="$(gpg --list-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
+          flatpak build-update-repo --generate-static-deltas \
+            --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" "$PWD/repo"
+          # 2) Build the install descriptors (GPGKey = the committed public key, base64).
+          GPGKEY="$(base64 -w0 packaging/flatpak/unom-flatpak.gpg)"
+          rm -rf site && mkdir -p site
+          cat > site/unom.flatpakrepo <<EOF
+          [Flatpak Repo]
+          Title=unom
+          Url=$REPO_URL/repo/
+          Homepage=https://punktfunk.unom.io
+          Comment=unom Flatpak applications
+          GPGKey=$GPGKEY
+          EOF
+          cat > "site/${APP_ID}.flatpakref" <<EOF
+          [Flatpak Ref]
+          Name=$APP_ID
+          Branch=stable
+          Url=$REPO_URL/repo/
+          Title=Punktfunk
+          Homepage=https://punktfunk.unom.io
+          IsRuntime=false
+          GPGKey=$GPGKEY
+          RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
+          EOF
+          cat > site/index.html <<EOF
+          <!doctype html><meta charset=utf-8><title>unom flatpak repo</title>
+          <h1>unom Flatpak repository</h1>
+          <p>Install the Punktfunk Linux client (auto-adds Flathub for the GNOME runtime, then tracks updates):</p>
+          <pre>flatpak install --user $REPO_URL/${APP_ID}.flatpakref
+          flatpak run $APP_ID</pre>
+          <p>Or add the whole remote: <code>flatpak remote-add --user --if-not-exists unom $REPO_URL/unom.flatpakrepo</code></p>
+          EOF
+          # 3) Ship to unom-1 and (re)start the static server. rsync WITHOUT --delete keeps old
+          #    objects so clients mid-update aren't broken; the fresh signed summary advertises latest.
+          install -d -m700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy; chmod 600 ~/.ssh/deploy
+          SSH="ssh -i $HOME/.ssh/deploy -p ${DEPLOY_PORT:-22} -o StrictHostKeyChecking=accept-new"
+          DEST="${DEPLOY_USER}@${DEPLOY_HOST}"
+          $SSH "$DEST" "mkdir -p ~/$DEPLOY_DIR/site/repo"
+          rsync -az --info=stats1 -e "$SSH" repo/ "$DEST:$DEPLOY_DIR/site/repo/"
+          rsync -az -e "$SSH" site/unom.flatpakrepo "site/${APP_ID}.flatpakref" site/index.html "$DEST:$DEPLOY_DIR/site/"
+          rsync -az -e "$SSH" packaging/flatpak/server/compose.production.yml packaging/flatpak/server/Caddyfile "$DEST:$DEPLOY_DIR/"
+          $SSH "$DEST" "cd ~/$DEPLOY_DIR && docker compose -f compose.production.yml up -d"
+          echo "deployed → $REPO_URL/${APP_ID}.flatpakref"
 
       - name: Attach bundle to the Gitea release (tags only)
         if: startsWith(gitea.ref, 'refs/tags/')

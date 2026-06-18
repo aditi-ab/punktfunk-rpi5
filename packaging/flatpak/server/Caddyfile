@@ -1,0 +1,15 @@
+# Inner Caddy (plain HTTP on :3230); the edge proxy on home-reverse-proxy-1 does TLS.
+:3230 {
+	root * /srv
+	file_server browse
+
+	# OSTree summary/refs change every publish — keep them fresh; objects are immutable.
+	@mutable path /repo/summary* /repo/refs/*
+	header @mutable Cache-Control "public, max-age=30"
+	@objects path /repo/objects/* /repo/deltas/*
+	header @objects Cache-Control "public, max-age=31536000, immutable"
+
+	# Serve the install descriptors as text so browsers show them / flatpak fetches cleanly.
+	@descriptors path *.flatpakref *.flatpakrepo
+	header @descriptors Content-Type "text/plain; charset=utf-8"
+}

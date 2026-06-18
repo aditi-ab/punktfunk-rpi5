@@ -1,10 +1,16 @@
 # punktfunk client — Flatpak (Steam Deck / SteamOS, and any flatpak distro)
 
 The native Linux **client** (crate `punktfunk-client-linux`, binary `punktfunk-client`) is
-published as a single-file **`.flatpak` bundle** to **Gitea's generic package registry** in
-the public `unom` org. CI (`.gitea/workflows/flatpak.yml`) builds and publishes on every push
-to `main` (a rolling `0.0.1-ciN.<sha>` build) and on `v*` tags (a clean `X.Y.Z`), and on tags
-also attaches the bundle to the Gitea release.
+published two ways by CI (`.gitea/workflows/flatpak.yml`), on every push to `main` (a rolling
+`0.0.1-ciN.<sha>` build) and on `v*` tags (a clean `X.Y.Z`):
+
+1. **Hosted OSTree repo at `https://flatpak.unom.io`** (recommended) — a GPG-signed Flatpak
+   remote served by a static Caddy container on unom-1, so users **install once and then
+   `flatpak update`**. Shared unom-wide repo (remote name `unom`), reusable by other unom apps
+   under the same signing key. See "Install (recommended)" below.
+2. **Single-file `.flatpak` bundle** in **Gitea's generic package registry** (`unom` org) — the
+   no-remote fallback the **Decky plugin** consumes (stable `latest/punktfunk-client.flatpak`
+   URL) and the offline/manual path. On tags it's also attached to the Gitea release.
 
 > The **host** is NOT a flatpak (it needs unsandboxed `/dev/uinput` + zero-copy NVENC — see
 > [`../README.md`](../README.md) "Why not Flatpak"). Only the **client** is sandbox-friendly.
@@ -20,10 +26,34 @@ with HEVC-capable FFmpeg supplied automatically by the runtime's `codecs-extra` 
 App id: **`io.unom.Punktfunk`** (matches the Apple bundle id family and the Decky plugin's
 flatpak fallback).
 
-## Install on the Deck (one-time)
+## Install (recommended): the hosted repo
+
+One command adds the signed `unom` remote and installs the client; it auto-adds Flathub for the
+GNOME runtime, and `flatpak update` tracks new builds from then on:
+
+```sh
+flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
+flatpak run io.unom.Punktfunk
+```
+
+Equivalent two-step (add the whole remote, then install by app id):
+
+```sh
+flatpak remote-add --user --if-not-exists unom https://flatpak.unom.io/unom.flatpakrepo
+flatpak install --user unom io.unom.Punktfunk
+```
+
+Updates — the whole point of the hosted repo:
+
+```sh
+flatpak update                    # or: flatpak update io.unom.Punktfunk
+```
+
+## Install on the Deck via the bundle (no-remote fallback)
 
 The generic registry is a plain HTTP file store, so just download the bundle and install it
-per-user (no root, survives SteamOS updates):
+per-user (no root, survives SteamOS updates). This is what the Decky plugin uses; the hosted
+repo above is the better path for a human on the Deck:
 
 ```sh
 # Pick a version: a tag like 1.2.3, or the newest main build's 0.0.1-ciN.gSHA.
@@ -47,16 +77,17 @@ flatpak run io.unom.Punktfunk --connect HOST:PORT
 The **Decky plugin** launches exactly this (`flatpak run io.unom.Punktfunk --connect …`) once
 installed — see [`../../clients/decky/README.md`](../../clients/decky/README.md).
 
-## Updates
+## Updating the bundle install
 
-A bundle has no remote to track, so updates are "download the newer bundle and reinstall":
+If you installed from the **bundle** (not the hosted repo), it has no remote to track, so updates
+are "download the newer bundle and reinstall":
 
 ```sh
 flatpak install --user --bundle /tmp/punktfunk-client.flatpak   # same command, newer file
 ```
 
-(If you want `flatpak update` to track new builds automatically you'd need a hosted OSTree
-repo, which Gitea cannot serve — see "Alternatives" below. The bundle is the simplest path.)
+Installs from `https://flatpak.unom.io` instead just take `flatpak update` (see "Install
+(recommended)" above).
 
 ## Build locally / the CI fallback
 
@@ -110,13 +141,38 @@ installed by the manifest). `cargo-sources.json` (the offline crate cache) is a 
 network + `python3`/`aiohttp`/`tomlkit` (`build-flatpak.sh` does this automatically) and, for a
 build host that lacks those (the Deck), rsync the generated file in alongside the manifest.
 
-## Alternatives considered (and why the bundle wins)
+## Hosting the repo (unom-1) + one-time setup
 
-- **Generic registry bundle (chosen):** one curl to publish, one `flatpak install --bundle` to
-  consume; mirrors the existing deb/rpm curl-upload pattern exactly. No auto-update.
-- **Release attachment:** also done on tags (the bundle is attached to the Gitea release), good
-  for a human-facing download page; the generic registry gives the stable per-version URL the
-  Decky fallback and scripts use.
-- **Self-hosted OSTree repo (rejected):** would enable `flatpak update`, but Gitea has no
-  flatpak/ostree registry, so it would mean serving a static OSTree tree over Gitea raw/Pages —
-  more moving parts than the appliance needs today.
+The OSTree repo flatpak-builder produces is GPG-signed in CI and rsynced to unom-1, where a tiny
+static **Caddy container** (`server/compose.production.yml` + `server/Caddyfile`, port **3230**)
+serves the `./site` tree (`repo/` + `unom.flatpakrepo` + `io.unom.Punktfunk.flatpakref` +
+`index.html`). The edge Caddy on home-reverse-proxy-1 fronts it at `https://flatpak.unom.io`.
+The CI deploy step **no-ops until the secret + infra exist**, so it won't redden builds mid-setup.
+
+**Signing key:** dedicated RSA-4096 key `unom Flatpak Repo <flatpak@unom.io>`. Public key committed
+at [`unom-flatpak.gpg`](unom-flatpak.gpg) (its base64 goes into the `.flatpakrepo`/`.flatpakref`
+`GPGKey=`); private key (ASCII-armored, then base64) lives only in the CI secret.
+
+One-time setup (mirrors any new unom DMZ service — see the deploy-infra notes):
+
+1. **Secret** `FLATPAK_GPG_PRIVATE_KEY` on this repo = base64 of the armored private key
+   (`gpg --armor --export-secret-keys <fpr> | base64 -w0`). `DEPLOY_*` + `REGISTRY_TOKEN` already exist.
+2. **Edge Caddy** on home-reverse-proxy-1 (`/home/caddy/caddy/Caddyfile`, apply by hand + `./reload.sh`):
+   `flatpak.unom.io { reverse_proxy 192.168.50.50:3230 }`
+3. **Port allowlist:** add `3230` to `caddy_target_ports` in `unom/infra` (proxmox/unom-1) + terraform apply.
+4. **DNS:** ensure `flatpak.unom.io` resolves to the edge proxy.
+
+Re-signing/rotation: regenerate the key, replace `unom-flatpak.gpg` + the secret; every client must
+re-add the remote (the `GPGKey` changed), so rotate rarely.
+
+## Alternatives considered
+
+- **Hosted OSTree repo (chosen):** the only option that gives `flatpak update`. We self-host the
+  static tree on unom-1 behind Caddy (Gitea has no flatpak/ostree registry); the build already
+  produces the repo, so the marginal cost is GPG signing + an rsync + a 10-line static container.
+- **Generic registry bundle (kept as fallback):** one curl to publish, one `flatpak install
+  --bundle` to consume; mirrors the deb/rpm curl-upload pattern. No auto-update — this is what the
+  **Decky plugin** pulls (stable `latest/punktfunk-client.flatpak`), plus the offline/manual path.
+- **Release attachment:** also done on tags, good for a human-facing download page.
+- **Flathub (deferred):** best discoverability + zero hosting, but a separate submission/review
+  process and less control; revisit once the client is past scaffold quality.
