@@ -6,6 +6,7 @@
 //! WxH (from [`NativeClient::mode`]) and feed each access unit as it arrives. The decode thread owns
 //! the codec + window for its whole life; [`crate::session`] signals it to stop via the shared flag.
 
+use ndk::data_space::DataSpace;
 use ndk::media::media_codec::{
     DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
 };
@@ -83,6 +84,9 @@ pub fn run(
     // Capture→client-receipt latency uses the negotiated host-minus-client clock offset (0 if the
     // host didn't answer the skew handshake — then the HUD flags it "same-host").
     let clock_offset = client.clock_offset_ns;
+    // The dataspace we've signalled on the Surface so far (None = default/SDR). Set reactively once
+    // the decoder reports an HDR stream (see `drain`); avoids re-applying every format event.
+    let mut applied_ds: Option<DataSpace> = None;
     while !shutdown.load(Ordering::Relaxed) {
         match client.next_frame(Duration::from_millis(5)) {
             Ok(frame) => {
@@ -105,7 +109,7 @@ pub fn run(
             Err(PunktfunkError::NoFrame) => {} // timeout — still drain output below
             Err(_) => break,                   // session closed
         }
-        rendered += drain(&codec);
+        rendered += drain(&codec, &window, &mut applied_ds);
 
         // Loss recovery: under infinite GOP the only recovery keyframe is one we request. The
         // reassembler drops unrecoverable AUs (frames_dropped); the decoder then conceals the
@@ -191,8 +195,8 @@ fn feed(codec: &MediaCodec, au: &[u8], pts_us: u64) {
 }
 
 /// Release any ready output buffers to the surface (render = true), latency-first. Returns the
-/// number of frames presented.
-fn drain(codec: &MediaCodec) -> u64 {
+/// number of frames presented. Also reacts to `OutputFormatChanged` to signal HDR on the Surface.
+fn drain(codec: &MediaCodec, window: &NativeWindow, applied_ds: &mut Option<DataSpace>) -> u64 {
     let mut n = 0;
     loop {
         match codec.dequeue_output_buffer(Duration::from_millis(0)) {
@@ -203,7 +207,27 @@ fn drain(codec: &MediaCodec) -> u64 {
                 }
                 n += 1;
             }
-            // TryAgainLater / OutputFormatChanged / OutputBuffersChanged — nothing to render now.
+            Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {
+                // The decoder has parsed the SPS and now reports the stream's real colour signalling
+                // (the AMediaCodec analogue of VideoToolbox's format description on the Apple client).
+                // If it's HDR (BT.2020 PQ/HLG), tell the Surface so the compositor/display switch to
+                // HDR; SDR streams leave the default dataspace alone. The decoder itself picks a
+                // Main10 path from the SPS — no profile override needed. Keep looping (buffers follow).
+                if let Some(ds) = hdr_dataspace(codec) {
+                    if *applied_ds != Some(ds) {
+                        match window.set_buffers_data_space(ds) {
+                            Ok(()) => {
+                                *applied_ds = Some(ds);
+                                log::info!("decode: HDR stream → Surface dataspace {ds:?}");
+                            }
+                            Err(e) => log::warn!(
+                                "decode: set_buffers_data_space({ds:?}) failed (non-fatal): {e}"
+                            ),
+                        }
+                    }
+                }
+            }
+            // TryAgainLater / OutputBuffersChanged — nothing to render now.
             Ok(_) => break,
             Err(e) => {
                 log::warn!("decode: dequeue_output_buffer: {e}");
@@ -212,4 +236,25 @@ fn drain(codec: &MediaCodec) -> u64 {
         }
     }
     n
+}
+
+/// Map the decoder's reported output colour to a BT.2020 HDR dataspace, or `None` for SDR. The
+/// integer values are the Android MediaFormat colour constants the NDK shares: COLOR_TRANSFER
+/// ST2084 = 6 (PQ/HDR10), HLG = 7; COLOR_RANGE FULL = 1, LIMITED = 2 (the host encodes limited).
+fn hdr_dataspace(codec: &MediaCodec) -> Option<DataSpace> {
+    let fmt = codec.output_format();
+    let full_range = fmt.i32("color-range") == Some(1);
+    match fmt.i32("color-transfer") {
+        Some(6) => Some(if full_range {
+            DataSpace::Bt2020Pq
+        } else {
+            DataSpace::Bt2020ItuPq
+        }),
+        Some(7) => Some(if full_range {
+            DataSpace::Bt2020Hlg
+        } else {
+            DataSpace::Bt2020ItuHlg
+        }),
+        _ => None, // SDR (BT.709 / SDR_VIDEO) or unspecified
+    }
 }

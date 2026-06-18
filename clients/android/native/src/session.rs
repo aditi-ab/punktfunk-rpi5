@@ -184,10 +184,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         CompositorPref::from_u8(compositor_pref.clamp(0, u8::MAX as jint) as u8),
         GamepadPref::from_u8(gamepad_pref.clamp(0, u8::MAX as jint) as u8),
         bitrate_kbps.max(0) as u32, // 0 = host default
-        0,                          // video_caps: 8-bit only on Android for now
-        None,                       // launch: default app
-        pin,                        // Some → Crypto on host-fp mismatch
-        identity,                   // owned (cert, key) PEM, or None (anonymous)
+        // Advertise 10-bit + HDR: the host (e.g. Windows) only upgrades to a Main10 / BT.2020 PQ
+        // encode when the client sets these. AMediaCodec decodes Main10 from the SPS and the decode
+        // loop signals the Surface's HDR dataspace from the reported colour (see crate::decode).
+        punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR,
+        None,     // launch: default app
+        pin,      // Some → Crypto on host-fp mismatch
+        identity, // owned (cert, key) PEM, or None (anonymous)
         Duration::from_secs(10),
     ) {
         Ok(client) => {
