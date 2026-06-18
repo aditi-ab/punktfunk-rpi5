@@ -158,10 +158,15 @@ jobs:
             echo "::warning::FLATPAK_GPG_PRIVATE_KEY/DEPLOY_* not set — skipping repo deploy (bundle still published)."
             exit 0
           fi
-          # 1) Import the signing key into a throwaway keyring; sign the repo (commits + summary).
+          # 1) Import the signing key into a throwaway keyring; sign the repo.
           export GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"
           echo "$FLATPAK_GPG_PRIVATE_KEY" | base64 -d | gpg --batch --import
           KEYID="$(gpg --list-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
+          # build-sign signs the COMMIT objects; build-update-repo signs the SUMMARY. Both are
+          # required — clients with gpg-verify=true verify the commit, so summary-only signing
+          # fails the pull with "GPG verification enabled, but no signatures found".
+          flatpak build-sign "$PWD/repo" "$APP_ID" stable \
+            --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME"
           flatpak build-update-repo --generate-static-deltas \
             --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" "$PWD/repo"
           # 2) Build the install descriptors (GPGKey = the committed public key, base64).
