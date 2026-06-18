@@ -91,11 +91,9 @@ pub struct GpuFrame {
     pub height: u32,
     /// Texture-array slice this frame occupies (`AVFrame::data[1]`).
     pub index: u32,
-    /// BT.2020 PQ HDR10 (P010, ST.2084) vs ordinary 8-bit BT.709 SDR (NV12).
+    /// BT.2020 PQ HDR10 (P010, ST.2084) vs ordinary 8-bit BT.709 SDR (NV12). The present path keys
+    /// SRV format + shader off this (the host couples 10-bit ⟺ HDR).
     pub hdr: bool,
-    /// 10-bit (P010, R16 planes) vs 8-bit (NV12, R8 planes) — kept for the first-frame log; the
-    /// present path keys colour/format off `hdr` (the host couples 10-bit ⟺ HDR).
-    pub ten_bit: bool,
     guard: D3d11FrameGuard,
 }
 
@@ -472,7 +470,6 @@ impl D3d11vaDecoder {
                 height: (*self.frame).height as u32,
                 index: (*self.frame).data[1] as usize as u32,
                 hdr,
-                ten_bit,
                 guard: D3d11FrameGuard(cloned),
             };
             log_layout_once(frame.width, frame.height, frame.index, hdr, ten_bit);

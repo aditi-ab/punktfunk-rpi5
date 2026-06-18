@@ -97,7 +97,9 @@ fn create_device() -> Result<SharedDevice> {
             // FFmpeg also sets this during hwdevice init, but doing it up front keeps the
             // cross-thread `Send`/`Sync` sound from the moment the device exists.
             if let Ok(mt) = context.cast::<ID3D11Multithread>() {
-                unsafe { mt.SetMultithreadProtected(true) };
+                unsafe {
+                    let _ = mt.SetMultithreadProtected(true); // returns the prior state; ignore
+                }
             }
             tracing::info!(
                 driver = if hardware {

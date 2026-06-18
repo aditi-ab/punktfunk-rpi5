@@ -82,6 +82,8 @@ float4 ps_p010(VSOut i) : SV_Target {
 struct GpuView {
     y: ID3D11ShaderResourceView,
     c: ID3D11ShaderResourceView,
+    /// Held only for its `Drop` (returns the decoder surface to the reuse pool) — never read.
+    #[allow(dead_code)]
     frame: GpuFrame,
 }
 
