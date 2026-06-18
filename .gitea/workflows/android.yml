@@ -41,10 +41,12 @@ jobs:
       - name: Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: NDK r30 + platform 37 + build-tools + CMake (libopus cross-build)
+      - name: NDK r30 + platform 36 + build-tools + CMake (libopus cross-build)
         # cmake;3.22.1 installs cmake + ninja under $ANDROID_SDK/cmake/3.22.1/bin — the exact path
         # kit/build.gradle.kts prepends to PATH for cargo-ndk's audiopus_sys (libopus) CMake build.
-        run: sdkmanager "platform-tools" "platforms;android-37" "build-tools;37.0.0" "ndk;30.0.14904198" "cmake;3.22.1"
+        # Note: platforms;android-37 is sometimes missing from standard channels; AGP will 
+        # auto-download it if needed during the build.
+        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;37.0.0" "ndk;30.0.14904198" "cmake;3.22.1"
 
       - name: Caches (cargo + gradle)
         uses: actions/cache@v4
