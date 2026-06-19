@@ -30,10 +30,11 @@ clients/android/                   Gradle project (this dir)
     build.gradle.kts               cargoNdk{Debug,Release} → src/main/jniLibs/<abi>/*.so
 ```
 
-## Prerequisites (already set up on the dev Mac)
+## Prerequisites
 
-- Android SDK + **NDK r30** (`30.0.14904198`), `platforms;android-37.0`, `build-tools;37.0.0`
-- **JDK 21** for Gradle/AGP (the machine default JDK 25 is too new for AGP 9.2)
+- Android SDK + **NDK r30** (`30.0.14904198`), `platforms;android-37.0`, `build-tools;37.0.0`,
+  **`cmake;3.22.1`** (`sdkmanager "cmake;3.22.1"` — the `cmake` crate builds libopus with it)
+- **JDK 21** for Gradle/AGP (AGP 9.2 runs on JDK 17–21, *not* a newer default JDK like 25)
 - Rust + `rustup target add aarch64-linux-android x86_64-linux-android` + `cargo install cargo-ndk`
 
 Toolchain pinned: AGP 9.2.0 · Gradle 9.4.1 · Kotlin 2.3.21 · Compose BOM 2026.05.01 ·
@@ -44,10 +45,11 @@ compileSdk 37 · targetSdk 36 · minSdk 31 · ABIs arm64-v8a + x86_64.
 **Android Studio:** open `clients/android` — it uses its bundled JBR 21 automatically. The
 `cargoNdk*` task builds the `.so` as part of the normal build.
 
-**CLI** (the machine default is JDK 25, so point Gradle at JDK 21):
+**CLI** (point Gradle at a JDK 21 if your machine default is newer, e.g. JDK 25):
 
 ```sh
-export JAVA_HOME="$(brew --prefix openjdk@21)/libexec/openjdk.jdk/Contents/Home"
+# Adoptium/Temurin 21 (installed by the Android Studio setup, or `brew install temurin@21`):
+export JAVA_HOME="$(/usr/libexec/java_home -v 21)"
 cd clients/android
 ./gradlew :app:assembleDebug      # cargo-ndk cross-compiles libpunktfunk_android.so first
 ./gradlew :app:installDebug       # onto a running emulator/device

@@ -78,8 +78,13 @@ fun registerCargoNdk(taskName: String, release: Boolean) =
         // (pure C) so the android .so links it instead of looking for the host's libopus.so.
         environment("LIBOPUS_STATIC", "1")
         environment("LIBOPUS_NO_PKG", "1")
+        // Resolve cargo by ABSOLUTE path: Gradle's Exec resolves command[0] via the JVM's
+        // inherited PATH, NOT the environment("PATH", …) set above (that only reaches the spawned
+        // child). A GUI Android Studio launch (and any daemon it started) has no ~/.cargo/bin on
+        // its PATH, so a bare "cargo" fails to start. The env PATH above still lets cargo/cargo-ndk
+        // find their subtools.
         val cmd = mutableListOf(
-            "cargo", "ndk",
+            "$cargoBin/cargo", "ndk",
             "-t", "arm64-v8a", "-t", "x86_64",
             // Link against the minSdk-31 sysroot so libaaudio (API 26+) is found.
             "--platform", "31",
