@@ -299,7 +299,7 @@ echo "Then open http://<host-ip>:3000"
 %endif
 
 %changelog
-* Sun Jun 15 2026 punktfunk <noreply@anthropic.com> - 0.0.1-2
+* Mon Jun 15 2026 punktfunk <noreply@anthropic.com> - 0.0.1-2
 - Add punktfunk-web subpackage (management console, --with web; auto-wired to the host token).
 * Wed Jun 10 2026 punktfunk <noreply@anthropic.com> - 0.0.1-1
 - Initial RPM: punktfunk-host + udev rule + systemd user unit + headless helpers.

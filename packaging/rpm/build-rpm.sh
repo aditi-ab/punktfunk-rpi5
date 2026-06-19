@@ -28,6 +28,25 @@ mkdir -p "$TOP"/{SOURCES,SPECS,BUILD,BUILDROOT,RPMS,SRPMS}
 git archive --format=tar.gz --prefix="punktfunk-${PF_VERSION}/" \
   -o "$TOP/SOURCES/punktfunk-${PF_VERSION}.tar.gz" HEAD
 
+# libcuda link stub (self-maintaining). The zerocopy FFI links the NVIDIA driver lib (-lcuda), but
+# the CI builder has no GPU and never RUNS CUDA. Synthesize a stub libcuda that DEFINES every cu*
+# driver symbol the host source references, derived from the source HERE so a newly-added cu* call
+# can't silently break the link. (ci/fedora-rpm.Dockerfile ships a frozen list that went stale —
+# undefined cuStreamCreateWithPriority/cuMemcpy2DAsync_v2/…; this regen supersedes it.) Defining
+# extra unused symbols is harmless; a missing one fails the link. Only when /usr/lib64 is writable
+# (CI image runs as root) — COPR/mock provides the real cuda-cudart-devel stub instead.
+if [ "$(id -u)" = 0 ] && [ -d /usr/lib64 ]; then
+  CU_SYMS="$(grep -rhoE '\bcu[A-Z][A-Za-z0-9_]*' crates/punktfunk-host/src/ | sort -u || true)"
+  if [ -n "$CU_SYMS" ]; then
+    STUB_C="$(mktemp --suffix=.c)"
+    for s in $CU_SYMS; do printf 'int %s(void){return 0;}\n' "$s" >> "$STUB_C"; done
+    gcc -shared -fPIC -Wl,-soname,libcuda.so.1 -o /usr/lib64/libcuda.so.1 "$STUB_C"
+    ln -sf libcuda.so.1 /usr/lib64/libcuda.so
+    rm -f "$STUB_C"; ldconfig 2>/dev/null || true
+    echo "== libcuda stub regenerated from source: $(printf '%s\n' "$CU_SYMS" | wc -l) symbols =="
+  fi
+fi
+
 # --nodeps: the spec's BuildRequires (cargo, rust, *-devel) are for COPR's mock chroot, which
 # resolves them from RPMs. Our builder image provides the toolchain via rustup (so
 # rust-toolchain.toml's pinned channel works) and the -devel libs via dnf, neither of which
