@@ -44,13 +44,20 @@ Silent install: `punktfunk-host-setup-<ver>.exe /VERYSILENT` (omit the driver wi
 | File | Role |
 |------|------|
 | `punktfunk-host.iss` | Inno Setup script (the installer definition). |
-| `pack-host-installer.ps1` | Orchestrator: cert + sign, fetch/stage SudoVDA, run ISCC, sign setup.exe, emit registry paths. |
-| `fetch-sudovda.ps1` | Download + SHA-256-verify the **pinned** SudoVDA + nefcon releases; stage the driver payload. |
+| `pack-host-installer.ps1` | Orchestrator: cert + sign, stage the driver bundle, run ISCC, sign setup.exe, emit registry paths. |
+| `stage-sudovda.ps1` | Stage the **vendored** SudoVDA driver + fetch/verify the **pinned** nefcon release into the bundle. |
 | `install-sudovda.ps1` | Runs at install time (elevated): trust cert → gated device-node create → `pnputil` install. |
+| `sudovda/` | **Vendored** prebuilt SudoVDA driver: `SudoVDA.inf` / `sudovda.cat` / `SudoVDA.dll` / `sudovda.cer`. |
 | `nvenc/nvenc.def`, `nvenc/gen-nvenc-importlib.ps1` | Synthesise `nvencodeapi.lib` for the `--features nvenc` link (llvm-dlltool / lib.exe). |
 
-> **Pinning:** the SudoVDA / nefcon release URLs + SHA-256s in `fetch-sudovda.ps1` are the source of
-> truth for what ships. Confirm the latest asset URLs and fill the SHA-256s to lock a release.
+> **Vendored driver:** SudoVDA has no upstream release (its repo is a source-only VS solution; Apollo
+> embeds the driver in its own installer), so the prebuilt **signed** driver is checked in under
+> `sudovda/` (MIT/CC0; v1.10.9.289, signer `CN=sudovda@su.mk`, Class=Display, HWID
+> `Root\SudoMaker\SudoVDA`). To refresh it, copy the four files out of a box's driver store
+> (`C:\Windows\System32\DriverStore\FileRepository\sudovda.inf_amd64_*`) and re-derive `sudovda.cer`
+> from the `.cat` signer (`(Get-AuthenticodeSignature sudovda.cat).SignerCertificate | Export-Certificate`).
+> nefcon (the device-node tool) **is** fetched + SHA-256-verified from its pinned release in
+> `stage-sudovda.ps1`.
 
 ## Build locally (Windows, MSVC + Windows SDK + Inno Setup)
 

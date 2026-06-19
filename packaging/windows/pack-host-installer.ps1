@@ -113,7 +113,7 @@ Sign-File $exe
 $defines = @("/DMyAppVersion=$Version", "/DBinDir=$TargetDir", "/DOutputDir=$OutDir")
 if (-not $NoDriver) {
     $stage = Join-Path $OutDir 'stage'
-    & (Join-Path $here 'fetch-sudovda.ps1') -OutDir $stage
+    & (Join-Path $here 'stage-sudovda.ps1') -OutDir $stage
     Copy-Item (Join-Path $here 'install-sudovda.ps1') (Join-Path $stage 'install-sudovda.ps1') -Force
     $defines += "/DStageDir=$stage"
 }
