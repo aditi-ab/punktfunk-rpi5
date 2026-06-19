@@ -130,6 +130,13 @@ fn real_main() -> Result<()> {
         // `PUNKTFUNK_NV12` convert is colour-correct. Prints PASS/FAIL + max Y/U/V error.
         #[cfg(target_os = "linux")]
         Some("nv12-selftest") => zerocopy::nv12_selftest(),
+        // HDR P010 colour self-test (Windows; no display/capture needed): upload a known scRGB FP16
+        // pattern, run the `HdrP010Converter` shader → P010 on the GPU, read the Y/UV planes back, and
+        // compare against an f64 BT.2020-PQ limited-range reference. Validates the
+        // `PUNKTFUNK_HDR_SHADER_P010` colour math without green-screening a live HDR stream. Prints
+        // PASS/FAIL + max Y/Cb/Cr error.
+        #[cfg(target_os = "windows")]
+        Some("hdr-p010-selftest") => crate::capture::dxgi::hdr_p010_selftest(),
         // Compositor readiness probe: exit 0 iff the (detected or PUNKTFUNK_COMPOSITOR-forced)
         // compositor is up and able to create a virtual output *now*. A session-bringup
         // script polls this to gate on real readiness instead of a blind `sleep`.
@@ -551,6 +558,9 @@ NOTES:
         \x20   punktfunk-host service install    register an auto-start SYSTEM service + firewall rules\n\
         \x20   punktfunk-host service uninstall  remove the service + firewall rules\n\
         \x20   punktfunk-host service start|stop|status\n\
-        \x20   config: %ProgramData%\\punktfunk\\host.env"
+        \x20   config: %ProgramData%\\punktfunk\\host.env\n\
+        \nWINDOWS DIAGNOSTICS:\n\
+        \x20   punktfunk-host hdr-p010-selftest  GPU colour check for the PUNKTFUNK_HDR_SHADER_P010 path\n\
+        \x20                                     (scRGB FP16 -> P010 BT.2020 PQ shader vs an f64 reference)"
     );
 }

@@ -17,8 +17,8 @@
 //! the DDA backend ([`super::dxgi::DuplCapturer`]) for those (see capture.rs).
 
 use super::dxgi::{
-    find_output, make_device, nudge_cursor_onto, D3d11Frame, HdrConverter, VideoConverter,
-    WinCaptureTarget,
+    find_output, hdr_shader_p010_enabled, make_device, nudge_cursor_onto, D3d11Frame, HdrConverter,
+    HdrP010Converter, VideoConverter, WinCaptureTarget,
 };
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
@@ -130,6 +130,15 @@ pub struct WgcCapturer {
     hdr_conv: Option<HdrConverter>,
     fp16_src: Option<ID3D11Texture2D>,
     fp16_srv: Option<ID3D11ShaderResourceView>,
+    /// `PUNKTFUNK_HDR_SHADER_P010` path: emit P010 (BT.2020 PQ 10-bit limited range) DIRECTLY from our
+    /// own shader (`HdrP010Converter`) so NVENC takes native P010 and skips its SM-side RGB→YUV CSC.
+    /// Gated by [`hdr_shader_p010_enabled`] AND `self.hdr`; `None`/empty when off → the existing R10 +
+    /// VideoProcessor paths run unchanged. `p010_disabled` latches a runtime failure (e.g. a driver
+    /// that rejects the planar plane RTV) so we fall back to the R10 path and stop retrying.
+    hdr_p010_conv: Option<HdrP010Converter>,
+    p010_out: Vec<ID3D11Texture2D>,
+    p010_idx: usize,
+    p010_disabled: bool,
     /// Ring of host-owned output textures (BGRA for SDR, R10G10B10A2 for HDR), rotated per processed
     /// frame. A ring — not one texture — is required because the encode loop is PIPELINED: NVENC
     /// encodes frame N (in place, registered by pointer) while this capturer produces frame N+1, so
@@ -320,6 +329,10 @@ impl WgcCapturer {
                 hdr_conv: None,
                 fp16_src: None,
                 fp16_srv: None,
+                hdr_p010_conv: None,
+                p010_out: Vec::new(),
+                p010_idx: 0,
+                p010_disabled: false,
                 out_ring: Vec::new(),
                 ring_idx: 0,
                 video_conv: None,
@@ -503,6 +516,49 @@ impl WgcCapturer {
         Some(out)
     }
 
+    /// `PUNKTFUNK_HDR_SHADER_P010` path: convert the OS-composited FP16 scRGB capture DIRECTLY to a
+    /// host-owned P010 texture (BT.2020 PQ, 10-bit limited range) via [`HdrP010Converter`] — two
+    /// shader passes writing the P010 planes. NVENC then takes native P010 and skips its internal
+    /// RGB→YUV CSC. Returns the next ring slot's P010 texture, or `Err` if the converter / a planar
+    /// plane RTV fails (the caller latches `p010_disabled` and falls back to the R10 path).
+    unsafe fn hdr_to_p010(&mut self, src: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
+        let slot = self.p010_idx;
+        // Lazily allocate the FP16 source (shared with the R10 path) + the P010 output ring.
+        self.ensure_fp16_src()?;
+        let fp16 = self.fp16_src.clone().context("fp16 src")?;
+        self.context.CopyResource(&fp16, src);
+        if self.p010_out.is_empty() {
+            let desc = tex_desc(
+                self.width,
+                self.height,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P010,
+                D3D11_BIND_RENDER_TARGET.0 as u32,
+            );
+            for _ in 0..OUT_RING {
+                let mut t = None;
+                self.device
+                    .CreateTexture2D(&desc, None, Some(&mut t))
+                    .context("CreateTexture2D(wgc p010 ring)")?;
+                self.p010_out.push(t.context("wgc p010 ring tex")?);
+            }
+        }
+        self.p010_idx = (self.p010_idx + 1) % self.p010_out.len();
+        let out = self.p010_out[slot].clone();
+        if self.hdr_p010_conv.is_none() {
+            self.hdr_p010_conv = Some(HdrP010Converter::new(&self.device)?);
+        }
+        let srv = self.fp16_srv.clone().context("fp16 srv")?;
+        self.hdr_p010_conv.as_ref().unwrap().convert(
+            &self.device,
+            &self.context,
+            &srv,
+            &out,
+            self.width,
+            self.height,
+        )?;
+        Ok(out)
+    }
+
     fn process_frame(&mut self, frame: Direct3D11CaptureFrame) -> Result<CapturedFrame> {
         unsafe {
             let surface = frame.Surface().context("frame Surface")?;
@@ -513,11 +569,40 @@ impl WgcCapturer {
                 .GetInterface()
                 .context("GetInterface ID3D11Texture2D")?;
 
+            // GATED P010-shader path (`PUNKTFUNK_HDR_SHADER_P010`): for HDR, emit P010 (BT.2020 PQ
+            // 10-bit limited range) DIRECTLY from our shader so NVENC takes native P010 and skips its
+            // SM-side RGB→YUV CSC. Runs BEFORE the R10 + VideoProcessor path. A converter/plane-RTV
+            // failure latches `p010_disabled` → we fall through to the unchanged R10 path for the rest
+            // of the session. Default OFF → none of this executes and behaviour is byte-for-byte as
+            // today.
+            if self.hdr && !self.p010_disabled && hdr_shader_p010_enabled() {
+                match self.hdr_to_p010(&src) {
+                    Ok(p010) => {
+                        // The P010 output is host-owned (the ring), and the FP16 CopyResource read
+                        // `src` synchronously on the immediate context before the shader passes — so we
+                        // do NOT need to hold `frame` past here (unlike the SDR/R10 in-place paths).
+                        // Dropping it returns the pool buffer to WGC immediately.
+                        drop(frame);
+                        self.last_present = Some((p010.clone(), PixelFormat::P010));
+                        return Ok(self.d3d11_frame(p010, PixelFormat::P010));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"),
+                            "WGC: HDR P010 shader path failed — disabling it, falling back to R10");
+                        self.p010_disabled = true;
+                        self.hdr_p010_conv = None;
+                        self.p010_out.clear();
+                    }
+                }
+            }
+
             // Preferred path: convert the OS-composited capture (cursor already in it) DIRECTLY to
             // NVENC's native YUV on the video processor — no CopyResource, no cursor draw, and NVENC
             // skips its internal RGB→YUV (the contended 3D step). WGC's multi-buffer pool + held set
             // means reading the pool texture directly does NOT serialize (unlike DDA's single-frame
-            // model). The frame is held until the async Blt finishes.
+            // model). The frame is held until the async Blt finishes. (HDR: the video processor can't
+            // ingest FP16 scRGB, so the Blt fails and we fall back to the R10 path below; the
+            // `PUNKTFUNK_HDR_SHADER_P010` branch above is the off-the-SM HDR path.)
             if let Some(yuv) = self.convert_to_yuv(&src, self.hdr) {
                 let fmt = if self.hdr {
                     PixelFormat::P010
