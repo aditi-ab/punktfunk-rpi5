@@ -88,6 +88,8 @@ struct HostCardView: View {
             #if !os(tvOS)
             // tvOS: the .card button style owns platter + focus motion — extra chrome
             // inside it mutes the grow/tilt. Material + accent ring are for pointer UIs.
+            // Deliberately .regularMaterial, not Liquid Glass: HIG keeps glass off content
+            // tiles (it flattens hierarchy over an opaque grid) — see GlassStyle.swift.
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
             .overlay {
                 if isMostRecent {

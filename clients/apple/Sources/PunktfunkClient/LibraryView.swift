@@ -81,7 +81,7 @@ struct LibraryView: View {
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420)
             Button("Retry") { Task { await load() } }
-                .buttonStyle(.borderedProminent)
+                .glassProminentButtonStyle()
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)

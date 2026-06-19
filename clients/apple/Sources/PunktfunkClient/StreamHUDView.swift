@@ -99,7 +99,9 @@ struct StreamHUDView: View {
             #endif
         }
         .padding(10)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        // Floating HUD over live video — the canonical Liquid-Glass overlay surface (26+);
+        // falls back to .regularMaterial below 26 (see GlassStyle).
+        .glassBackground(RoundedRectangle(cornerRadius: 10))
         .padding(10)
     }
 }

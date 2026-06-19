@@ -217,7 +217,7 @@ struct HomeView: View {
             Text("Add your punktfunk host with the + button.")
         } actions: {
             Button("Add Host") { showAddHost = true }
-                .buttonStyle(.borderedProminent)
+                .glassProminentButtonStyle()
                 #if os(iOS)
                 .controlSize(.large)
                 #endif

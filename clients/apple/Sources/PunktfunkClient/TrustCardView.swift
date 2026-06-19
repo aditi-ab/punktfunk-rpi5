@@ -38,6 +38,10 @@ struct TrustCardView: View {
                     .keyboardShortcut(.cancelAction)
                     #endif
                 Button("Trust & Connect", action: onTrust)
+                    // Opaque prominent, NOT glass: this card is itself a glass panel
+                    // (.glassBackground below), and glass-on-glass loses contrast — a tinted
+                    // bordered button reads cleanly over glass (HIG). The sheet primaries stay
+                    // glass because the system manages the sheet's own glass layering.
                     .buttonStyle(.borderedProminent)
                     #if !os(tvOS)
                     .keyboardShortcut(.defaultAction)
@@ -58,7 +62,9 @@ struct TrustCardView: View {
         }
         .padding(28)
         .frame(maxWidth: 440)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+        // Floating trust card over the blurred stream — Liquid Glass on 26+, .regularMaterial
+        // fallback below. The inner fingerprint box stays .quaternary (content, not glass).
+        .glassBackground(RoundedRectangle(cornerRadius: 18))
     }
 
     /// 64 hex chars → four groups per line, two lines — easy to eyeball against the log.

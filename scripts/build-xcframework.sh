@@ -145,4 +145,23 @@ fi
 
 rm -rf clients/apple/PunktfunkCore.xcframework
 "${XCODEBUILD[@]}" -create-xcframework "${ARGS[@]}" -output clients/apple/PunktfunkCore.xcframework
-echo "OK: clients/apple/PunktfunkCore.xcframework"
+
+# Xcode (unlike `swift build`) refuses to EMBED an unsigned xcframework: the app targets in
+# Punktfunk.xcodeproj fail with "The framework 'PunktfunkCore.xcframework' is unsigned". So
+# sign the bundle here. Identity: $CODESIGN_IDENTITY if set, else the first "Apple Development"
+# identity in the keychain, else ad-hoc ("-") — ad-hoc satisfies `swift build` and most local
+# Xcode runs; a real identity is needed for device/distribution. --timestamp=none keeps it
+# offline (a secure timestamp only matters for notarized distribution, which re-signs anyway).
+SIGN_ID="${CODESIGN_IDENTITY:-}"
+if [[ -z "$SIGN_ID" ]]; then
+    SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
+        | awk -F'"' '/Apple Development/ {print $2; exit}')
+fi
+SIGN_ID="${SIGN_ID:--}" # ad-hoc fallback when no real identity is available
+if codesign --force --timestamp=none --sign "$SIGN_ID" clients/apple/PunktfunkCore.xcframework; then
+    echo "OK: clients/apple/PunktfunkCore.xcframework (signed: $SIGN_ID)"
+else
+    echo "WARN: clients/apple/PunktfunkCore.xcframework built but NOT signed — Xcode app" >&2
+    echo "      builds will report it unsigned. Set CODESIGN_IDENTITY and re-run." >&2
+    echo "OK: clients/apple/PunktfunkCore.xcframework (unsigned)"
+fi

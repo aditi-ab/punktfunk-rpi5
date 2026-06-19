@@ -91,14 +91,14 @@ struct SpeedTestSheet: View {
                         bitrateKbps = rec
                         dismiss()
                     }
-                    .buttonStyle(.borderedProminent)
+                    .glassProminentButtonStyle()
                     #if !os(tvOS)
                     .keyboardShortcut(.defaultAction)
                     #endif
                 }
                 if case .failed = phase {
                     Button("Retry") { run() }
-                        .buttonStyle(.borderedProminent)
+                        .glassProminentButtonStyle()
                 }
             }
         }
@@ -111,6 +111,12 @@ struct SpeedTestSheet: View {
         #if os(macOS)
         .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
+        #endif
+        #if os(iOS)
+        // Bottom sheet rather than a full-screen modal; .medium stays put as the result view
+        // swaps in (a measured height would resize the sheet mid-probe).
+        .presentationDetents([.medium])
+        .presentationDragIndicator(.visible)
         #endif
         .onAppear { run() }
         .onDisappear { token.cancelled = true }

@@ -150,7 +150,7 @@ struct PairSheet: View {
                         .padding(.trailing, 8)
                 }
                 Button("Pair & Connect") { runCeremony() }
-                    .buttonStyle(.borderedProminent)
+                    .glassProminentButtonStyle()
                     #if !os(tvOS)
                     .keyboardShortcut(.defaultAction)
                     #endif
@@ -164,6 +164,15 @@ struct PairSheet: View {
         #if os(macOS)
         .frame(width: 400)
         .fixedSize(horizontal: false, vertical: true)
+        #endif
+        #if os(iOS)
+        // Bottom sheet instead of a full-screen modal (Liquid Glass background on iOS 26).
+        // .medium rests; .large is included so the sheet grows to keep the Pair/Cancel row
+        // above the keyboard when the PIN field is focused. Hide the grabber while the ceremony
+        // is in flight — dismissal is disabled then (interactiveDismissDisabled), so a drag
+        // would only rubber-band; the always-enabled Cancel button is the exit.
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(busy ? .hidden : .visible)
         #endif
         .interactiveDismissDisabled(busy)
         .onDisappear { token.cancelled = true } // any other dismissal path

@@ -81,24 +81,50 @@ struct AddHostSheet: View {
             #if !os(tvOS)
         .formStyle(.grouped)
         #endif
+            #if os(macOS)
+            // macOS: UNCHANGED — Cancel + Spacer + Add in an HStack, both wired to the
+            // window's default/cancel keyboard actions. The 380-wide .fixedSize panel below
+            // keeps this compact and centered.
             HStack {
                 Button("Cancel", role: .cancel) { dismiss() }
-                    #if !os(tvOS)
                     .keyboardShortcut(.cancelAction)
-                    #endif
                 Spacer()
                 Button("Add Host") { add() }
-                .buttonStyle(.borderedProminent)
-                #if !os(tvOS)
-                .keyboardShortcut(.defaultAction)
-                #endif
-                .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .glassProminentButtonStyle()
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
             }
-            #if os(iOS)
-            .controlSize(.large)
-            #endif
             .padding(16)
+            #else
+            // iOS / iPadOS: NO Cancel — the sheet is dismissed by the drag indicator,
+            // swipe-down, or tap-outside. (AddHostSheet never sets interactiveDismissDisabled,
+            // so all three are live; if anyone adds it later, restore a Cancel here or there is
+            // no way back out.) A single FULL-WIDTH primary action reads as the one thing to do.
+            // The fill must be on the LABEL, not the Button: .frame(maxWidth:.infinity) on the
+            // Button only widens its hit area and leaves the styled capsule hugging the text —
+            // stretching the label is what makes the glass/bordered pill itself go edge-to-edge.
+            // .controlSize(.large) gives the tall, thumb-friendly height; .defaultAction lets a
+            // hardware keyboard / iPad Return submit.
+            Button { add() } label: {
+                Text("Add Host").frame(maxWidth: .infinity)
+            }
+                .glassProminentButtonStyle()
+                .controlSize(.large)
+                .keyboardShortcut(.defaultAction)
+                .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
+                .padding(16)
+            #endif
         }
+        #if os(iOS)
+        // A short bottom sheet, not a full-screen modal. .height(320) hugs the 3-field grouped
+        // Form + the full-width action row, instead of the half-screen .medium it used to rest
+        // at. A single fixed detent is enough: the system keeps the content above the keyboard
+        // when Address/Port is focused, and on iPadOS this renders as a short bottom sheet (not a
+        // centered formSheet card). If Dynamic Type grows the rows past this height the Form just
+        // scrolls inside the detent — nothing is clipped. (.height(_:) is iOS 16+, safe at iOS 17.)
+        .presentationDetents([.height(320)])
+        .presentationDragIndicator(.visible)
+        #endif
         #if os(macOS)
         .frame(width: 380)
         .fixedSize(horizontal: false, vertical: true)

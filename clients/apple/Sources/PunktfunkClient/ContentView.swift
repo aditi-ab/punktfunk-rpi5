@@ -205,7 +205,13 @@ struct ContentView: View {
                             Image(systemName: "xmark")
                                 .font(.headline.weight(.semibold))
                                 .frame(width: 36, height: 36)
-                                .background(.regularMaterial, in: Circle())
+                                // Sole touch exit when the HUD is off — a floating glass disc
+                                // over the frame (26+, material fallback). interactive: the disc
+                                // IS the tap target, so the glass reacts to press.
+                                .glassBackground(Circle(), interactive: true)
+                                // Match the hit region to the visible disc so every tap also
+                                // triggers the interactive-glass press highlight.
+                                .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
                         .padding(12)
