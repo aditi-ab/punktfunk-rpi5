@@ -56,8 +56,9 @@ Name: "startservice"; Description: "Start the punktfunk host service now (also s
 
 [Files]
 Source: "{#BinDir}\punktfunk-host.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}..\..\scripts\windows\host.env.example"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
+; {#SourcePath} (the .iss dir) has no trailing backslash — keep the explicit '\' separator.
+Source: "{#SourcePath}\..\..\scripts\windows\host.env.example"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}\README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
 #ifdef WithDriver
 ; The driver payload + nefconc.exe + install-sudovda.ps1, extracted to {tmp} and removed after install.
 Source: "{#StageDir}\*"; DestDir: "{tmp}\sudovda"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installdriver
