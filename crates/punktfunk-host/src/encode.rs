@@ -1,7 +1,8 @@
-//! Hardware video encode (plan §7). Binds FFmpeg (NVENC); never rewrites codecs.
-//! Low-latency preset, B-frames off. The spike feeds BGRx CPU frames directly — `*_nvenc`
-//! accepts `bgr0` input and converts to YUV on the GPU, so no host-side swscale is
-//! needed (dmabuf zero-copy import is deferred; plan §9).
+//! Hardware video encode (plan §7). Binds FFmpeg; never rewrites codecs. Low-latency preset,
+//! B-frames off. The backend is per-GPU: NVENC on NVIDIA (`*_nvenc`, accepts `bgr0` and does
+//! RGB→YUV on the GPU, so no host-side CSC) and VAAPI on AMD/Intel (`*_vaapi`; the CPU-input
+//! fallback swscales RGB→NV12, the zero-copy path imports the capture dmabuf straight into a
+//! VA surface). One [`Encoder`] trait, selected in [`open_video`].
 
 use crate::capture::{CapturedFrame, PixelFormat};
 use anyhow::Result;
@@ -33,6 +34,19 @@ impl Codec {
             Codec::H264 => "h264_nvenc",
             Codec::H265 => "hevc_nvenc",
             Codec::Av1 => "av1_nvenc",
+        }
+    }
+
+    /// The FFmpeg VAAPI encoder name (AMD via Mesa `radeonsi`, Intel via `iHD`/`i965`). One
+    /// libavcodec encoder per codec covers both vendors — the kernel driver differs, the libva
+    /// userspace API is identical. Selected by name (the codec id would pick the SW encoder).
+    /// AV1 VAAPI encode is narrow (Intel Arc/Xe2+, AMD RDNA3+/RDNA4) — gate it on a capability
+    /// probe, never assume it (see [`open_video`]).
+    pub fn vaapi_name(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264_vaapi",
+            Codec::H265 => "hevc_vaapi",
+            Codec::Av1 => "av1_vaapi",
         }
     }
 }
@@ -98,10 +112,13 @@ pub fn validate_dimensions(codec: Codec, width: u32, height: u32) -> Result<()> 
     Ok(())
 }
 
-/// Open an NVENC encoder for frames of the given `format` and mode. When `cuda` is true the
-/// encoder takes GPU frames (`AV_PIX_FMT_CUDA`) from the zero-copy path; otherwise it takes
-/// packed RGB/BGR CPU frames. `format`/`bitrate_bps`/`codec`/mode come from session
-/// negotiation; the caller derives `cuda` from the first captured frame's payload.
+/// Open a hardware video encoder for frames of the given `format` and mode, selecting the GPU
+/// backend for this host: **NVENC** on NVIDIA (Linux/Windows), **VAAPI** on AMD/Intel (Linux).
+/// When `cuda` is true the encoder takes GPU frames (`AV_PIX_FMT_CUDA`) from the NVIDIA zero-copy
+/// path; otherwise it takes packed RGB/BGR CPU frames (and, on VAAPI, a future dmabuf payload).
+/// `format`/`bitrate_bps`/`codec`/mode come from session negotiation; the caller derives `cuda`
+/// from the first captured frame's payload. The Linux backend is auto-detected (override:
+/// `PUNKTFUNK_ENCODER=auto|nvenc|vaapi`).
 #[allow(clippy::too_many_arguments)]
 pub fn open_video(
     codec: Codec,
@@ -116,46 +133,51 @@ pub fn open_video(
     validate_dimensions(codec, width, height)?;
     #[cfg(target_os = "linux")]
     {
-        // Identify THIS GPU's real max encode bitrate by probing instead of hard-capping every
-        // build. NVENC rejects `avcodec_open2` with EINVAL when the bitrate exceeds what any codec
-        // level can express, and that ceiling is GPU/driver-specific (an RTX 4090 caps HEVC at
-        // ~800 Mbps; an RTX 5070 Ti accepts >1 Gbps). So open at the requested rate first and step
-        // down ONLY if this GPU refuses it — each GPU then runs at its own actual maximum, and a
-        // capable card is never clamped to a conservative guess. The codec's theoretical level
-        // ceiling is just the first step-down candidate (the usual boundary), not a blind cap.
-        const MIN_PROBE_BPS: u64 = 50_000_000;
-        let mut candidates = vec![bitrate_bps];
-        let cap = codec.max_bitrate_bps();
-        if cap < bitrate_bps {
-            candidates.push(cap);
-        }
-        let mut b = bitrate_bps.min(cap);
-        while b > MIN_PROBE_BPS {
-            b = b * 3 / 4;
-            candidates.push(b);
-        }
-        let mut last: Option<anyhow::Error> = None;
-        for (i, &b) in candidates.iter().enumerate() {
-            match linux::NvencEncoder::open(codec, format, width, height, fps, b, cuda, bit_depth) {
-                Ok(enc) => {
-                    if i > 0 {
-                        tracing::warn!(
-                            requested_mbps = bitrate_bps / 1_000_000,
-                            opened_mbps = b / 1_000_000,
-                            codec = codec.nvenc_name(),
-                            "this GPU's NVENC refused the requested bitrate (EINVAL) — opened at the \
-                             highest rate it accepts; request AV1 or a lower bitrate for more"
-                        );
-                    }
-                    return Ok(Box::new(enc) as Box<dyn Encoder>);
+        // Pick the GPU encode backend. NVIDIA → NVENC/CUDA (the original path, unchanged);
+        // AMD/Intel → VAAPI (one libavcodec backend for both). Auto-detect by default so a single
+        // Linux binary serves any GPU; `PUNKTFUNK_ENCODER` forces a specific backend (and surfaces
+        // its errors crisply instead of silently trying the other).
+        let pref = std::env::var("PUNKTFUNK_ENCODER")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let open_vaapi = || -> Result<Box<dyn Encoder>> {
+            vaapi::VaapiEncoder::open(codec, format, width, height, fps, bitrate_bps, bit_depth)
+                .map(|e| Box::new(e) as Box<dyn Encoder>)
+        };
+        match pref.as_str() {
+            "nvenc" | "nvidia" | "cuda" => open_nvenc_probed(
+                codec,
+                format,
+                width,
+                height,
+                fps,
+                bitrate_bps,
+                cuda,
+                bit_depth,
+            ),
+            "vaapi" | "amd" | "intel" => open_vaapi(),
+            "auto" | "" => {
+                // A CUDA frame can ONLY be consumed by NVENC, and a box with the NVIDIA device
+                // nodes always prefers it. Everything else (AMD/Intel) takes the VAAPI path.
+                if cuda || nvidia_present() {
+                    open_nvenc_probed(
+                        codec,
+                        format,
+                        width,
+                        height,
+                        fps,
+                        bitrate_bps,
+                        cuda,
+                        bit_depth,
+                    )
+                } else {
+                    open_vaapi()
                 }
-                // EINVAL = above this GPU's level ceiling → step down. Any other failure (no GPU,
-                // bad mode, OOM) is real — surface it rather than masking it with bitrate retries.
-                Err(e) if format!("{e:#}").contains("Invalid argument") => last = Some(e),
-                Err(e) => return Err(e),
             }
+            other => anyhow::bail!(
+                "unknown PUNKTFUNK_ENCODER={other:?} — use auto (default), nvenc, or vaapi"
+            ),
         }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("encoder open failed at every probed bitrate")))
     }
     #[cfg(target_os = "windows")]
     {
@@ -220,12 +242,76 @@ pub fn open_video(
     }
 }
 
+/// Open NVENC, probing this GPU's real max bitrate. NVENC rejects `avcodec_open2` with EINVAL
+/// when the bitrate exceeds what any codec level can express, and that ceiling is
+/// GPU/driver-specific (an RTX 4090 caps HEVC at ~800 Mbps; an RTX 5070 Ti accepts >1 Gbps). So
+/// open at the requested rate first and step down ONLY if this GPU refuses it — each GPU then
+/// runs at its own actual maximum, and a capable card is never clamped to a conservative guess.
+/// The codec's theoretical level ceiling is just the first step-down candidate, not a blind cap.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn open_nvenc_probed(
+    codec: Codec,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u64,
+    cuda: bool,
+    bit_depth: u8,
+) -> Result<Box<dyn Encoder>> {
+    const MIN_PROBE_BPS: u64 = 50_000_000;
+    let mut candidates = vec![bitrate_bps];
+    let cap = codec.max_bitrate_bps();
+    if cap < bitrate_bps {
+        candidates.push(cap);
+    }
+    let mut b = bitrate_bps.min(cap);
+    while b > MIN_PROBE_BPS {
+        b = b * 3 / 4;
+        candidates.push(b);
+    }
+    let mut last: Option<anyhow::Error> = None;
+    for (i, &b) in candidates.iter().enumerate() {
+        match linux::NvencEncoder::open(codec, format, width, height, fps, b, cuda, bit_depth) {
+            Ok(enc) => {
+                if i > 0 {
+                    tracing::warn!(
+                        requested_mbps = bitrate_bps / 1_000_000,
+                        opened_mbps = b / 1_000_000,
+                        codec = codec.nvenc_name(),
+                        "this GPU's NVENC refused the requested bitrate (EINVAL) — opened at the \
+                         highest rate it accepts; request AV1 or a lower bitrate for more"
+                    );
+                }
+                return Ok(Box::new(enc) as Box<dyn Encoder>);
+            }
+            // EINVAL = above this GPU's level ceiling → step down. Any other failure (no GPU,
+            // bad mode, OOM) is real — surface it rather than masking it with bitrate retries.
+            Err(e) if format!("{e:#}").contains("Invalid argument") => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("encoder open failed at every probed bitrate")))
+}
+
+/// Cheap, side-effect-free NVIDIA-presence probe for the `auto` backend selector: the NVIDIA
+/// kernel driver exposes these device nodes, AMD/Intel boxes have neither. Deliberately does NOT
+/// create a CUDA context (that would allocate GPU state on every host that merely *might* be
+/// NVIDIA). `PUNKTFUNK_ENCODER` overrides this entirely.
+#[cfg(target_os = "linux")]
+fn nvidia_present() -> bool {
+    std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/nvidia0").exists()
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(target_os = "windows", feature = "nvenc"))]
 mod nvenc;
 #[cfg(target_os = "windows")]
 mod sw;
+#[cfg(target_os = "linux")]
+mod vaapi;
 
 #[cfg(test)]
 mod tests {
