@@ -137,7 +137,23 @@ else { Write-Host "-NoDriver: building installer WITHOUT the bundled SudoVDA dri
 # --- build the installer ----------------------------------------------------------------------
 Write-Host "==> ISCC $($defines -join ' ') $iss"
 & $iscc @defines $iss
-if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+if ($LASTEXITCODE -ne 0) {
+    $rc = $LASTEXITCODE
+    Write-Warning "ISCC failed ($rc) — diagnostics:"
+    $innoDir = Split-Path $iscc
+    Write-Host "  Inno dir: $innoDir"
+    Write-Host "  Default.isl present: $(Test-Path (Join-Path $innoDir 'Default.isl'))"
+    Get-ChildItem $innoDir -File -ErrorAction SilentlyContinue | ForEach-Object { "    $($_.Name)" }
+    Write-Host "  OutDir=$OutDir exists=$(Test-Path $OutDir) ; TargetDir=$TargetDir exists=$(Test-Path $TargetDir) ; StageExists=$(Test-Path (Join-Path $OutDir 'stage'))"
+    # smoke test: does ISCC compile a trivial [Setup]-only script on this box at all?
+    $smoke = Join-Path $OutDir 'smoke.iss'
+    "[Setup]`r`nAppName=smoke`r`nAppVersion=1.0`r`nDefaultDirName={autopf}\smoke`r`nOutputDir=$OutDir`r`nOutputBaseFilename=smoke`r`n[Files]" |
+        Set-Content -Encoding ASCII $smoke
+    Write-Host "== smoke-test ISCC (trivial script) =="
+    & $iscc $smoke
+    Write-Host "== smoke rc=$LASTEXITCODE =="
+    throw "ISCC failed ($rc)"
+}
 
 $setup = Join-Path $OutDir "punktfunk-host-setup-$Version.exe"
 if (-not (Test-Path $setup)) { throw "expected installer not produced: $setup" }

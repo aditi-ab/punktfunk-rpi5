@@ -55,6 +55,9 @@ WizardStyle=modern
 UninstallDisplayName=punktfunk host {#MyAppVersion}
 UninstallDisplayIcon={app}\punktfunk-host.exe
 
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
 [Tasks]
 #ifdef WithDriver
 Name: "installdriver"; Description: "Install the SudoVDA virtual display driver (required for native-resolution streaming)"
