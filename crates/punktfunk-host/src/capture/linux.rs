@@ -845,7 +845,9 @@ mod pipewire {
         let d = &mut datas[0];
         // CPU path may also receive LINEAR dmabufs (gamescope offers only those once its
         // modifier-bearing format pod wins); capture the fd before `data()` borrows `d`.
-        let dmabuf_fd = (d.type_() == pw::spa::buffer::DataType::DmaBuf).then(|| d.fd());
+        let data_type = d.type_();
+        // fd-backed buffer (MemFd SHM, or DmaBuf)? Capture the fd before `data()` borrows `d`.
+        let raw_fd = d.fd();
         let (size, offset, stride) = {
             let c = d.chunk();
             (
@@ -865,22 +867,43 @@ mod pipewire {
         let needed = stride * (h - 1) + row;
         // dmabuf chunks commonly report size 0; fall back to the computed span.
         let size = if size == 0 { needed } else { size };
-        // MAP_BUFFERS only maps buffers flagged mappable; Vulkan-exported dmabufs
-        // (gamescope) usually aren't, so mmap the fd ourselves for the de-pad read.
+        // For fd-backed buffers (MemFd SHM, DmaBuf) mmap the fd OURSELVES, sized to the fd's real
+        // length (fstat), rather than trusting PipeWire's MAP_BUFFERS slice: xdg-desktop-portal-wlr
+        // hands MemFd buffers whose reported `data.maxsize` exceeds the bytes actually mapped into
+        // our process, so reading to maxsize segfaults (it also covers the original case — MAP_BUFFERS
+        // not mapping Vulkan dmabufs, e.g. gamescope). The `needed > avail` guard below then drops
+        // cleanly if the real buffer is genuinely too small. MemPtr buffers (no fd) are same-process —
+        // trust `d.data()`.
+        let fd_len = if raw_fd > 0 {
+            unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                (libc::fstat(raw_fd as i32, &mut st) == 0 && st.st_size > 0)
+                    .then_some(st.st_size as usize)
+            }
+        } else {
+            None
+        };
         let _mapping; // keeps a manual mmap alive for the copy below
-        let buf: &[u8] = if let Some(data) = d.data() {
-            data
-        } else if let Some(fd) = dmabuf_fd.filter(|&fd| fd > 0) {
-            match DmabufMap::new(fd, offset + needed) {
+                      // Prefer our own fstat-sized mmap of the fd; fall back to PipeWire's MAP_BUFFERS slice
+                      // (and finally drop) so an fd PipeWire could map but we can't never silently over-reads.
+        let self_mapped: Option<&[u8]> = if raw_fd > 0 {
+            let map_len = fd_len.unwrap_or(offset + needed);
+            match DmabufMap::new(raw_fd as i32, map_len) {
                 Some(m) => {
                     _mapping = m;
-                    unsafe { std::slice::from_raw_parts(_mapping.ptr as *const u8, _mapping.len) }
+                    Some(unsafe {
+                        std::slice::from_raw_parts(_mapping.ptr as *const u8, _mapping.len)
+                    })
                 }
-                None => {
-                    warn_once("mmap(dmabuf) failed — frames dropped");
-                    return;
-                }
+                None => None,
             }
+        } else {
+            None
+        };
+        let buf: &[u8] = if let Some(b) = self_mapped {
+            b
+        } else if let Some(data) = d.data() {
+            data
         } else {
             warn_once("buffer has no mappable data — frames dropped");
             return;
@@ -890,6 +913,19 @@ mod pipewire {
             return;
         }
         let avail = buf.len() - offset;
+        {
+            // One-time geometry dump — makes a new compositor/GPU's buffer layout visible in the
+            // logs (the kind of mismatch that crashed xdpw MemFd capture before the self-mmap fix).
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static ONCE: AtomicBool = AtomicBool::new(true);
+            if ONCE.swap(false, Ordering::Relaxed) {
+                tracing::info!(
+                    stride, size, offset, buf_len = buf.len(), needed,
+                    data_type = ?data_type, fd_len = ?fd_len, self_mapped = self_mapped.is_some(),
+                    "capture CPU de-pad geometry (first frame)"
+                );
+            }
+        }
         if needed > avail || needed > size {
             warn_once("buffer smaller than frame span — frames dropped");
             return;
