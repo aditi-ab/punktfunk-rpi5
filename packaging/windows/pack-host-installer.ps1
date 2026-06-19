@@ -109,14 +109,26 @@ function Sign-File([string]$Path) {
 # --- sign the inner exe before it's packed ----------------------------------------------------
 Sign-File $exe
 
-# --- resolve + validate the installer's source files (absolute paths -> ISCC /D defines) -------
+# --- resolve + validate the installer's source files ------------------------------------------
 $repoRoot = (Resolve-Path (Join-Path $here '..\..')).Path
-$hostEnv = Join-Path $repoRoot 'scripts\windows\host.env.example'
-$readme = Join-Path $here 'README.md'
-foreach ($p in @($exe, $hostEnv, $readme)) {
+$hostEnvSrc = Join-Path $repoRoot 'scripts\windows\host.env.example'
+$readmeSrc = Join-Path $here 'README.md'
+foreach ($p in @($exe, $hostEnvSrc, $readmeSrc, $iss)) {
     if (-not (Test-Path -LiteralPath $p)) { throw "installer source file missing: $p" }
-    Write-Host "  source ok: $p"
 }
+
+# ISCC is a 32-bit program. On the self-hosted runner (which runs as SYSTEM) the checkout lives
+# under C:\Windows\System32\config\systemprofile\..., and WOW64 file-system redirection rewrites a
+# 32-bit process's System32 reads to SysWOW64 (where the files don't exist) -> ISCC dies at
+# script-open with "path not found". So stage every file ISCC reads (the .iss + the two payload
+# files) into the non-redirected build dir under C:\t. (BinDir/StageDir/OutputDir already live there.)
+$hostEnv = Join-Path $OutDir 'host.env.example'
+$readme = Join-Path $OutDir 'README.md'
+$issLocal = Join-Path $OutDir 'punktfunk-host.iss'
+Copy-Item -LiteralPath $hostEnvSrc -Destination $hostEnv -Force
+Copy-Item -LiteralPath $readmeSrc -Destination $readme -Force
+Copy-Item -LiteralPath $iss -Destination $issLocal -Force
+
 $defines = @(
     "/DMyAppVersion=$Version",
     "/DBinDir=$TargetDir",
@@ -134,26 +146,10 @@ if (-not $NoDriver) {
 }
 else { Write-Host "-NoDriver: building installer WITHOUT the bundled SudoVDA driver" }
 
-# --- build the installer ----------------------------------------------------------------------
-Write-Host "==> ISCC $($defines -join ' ') $iss"
-& $iscc @defines $iss
-if ($LASTEXITCODE -ne 0) {
-    $rc = $LASTEXITCODE
-    Write-Warning "ISCC failed ($rc) — diagnostics:"
-    $innoDir = Split-Path $iscc
-    Write-Host "  Inno dir: $innoDir"
-    Write-Host "  Default.isl present: $(Test-Path (Join-Path $innoDir 'Default.isl'))"
-    Get-ChildItem $innoDir -File -ErrorAction SilentlyContinue | ForEach-Object { "    $($_.Name)" }
-    Write-Host "  OutDir=$OutDir exists=$(Test-Path $OutDir) ; TargetDir=$TargetDir exists=$(Test-Path $TargetDir) ; StageExists=$(Test-Path (Join-Path $OutDir 'stage'))"
-    # smoke test: does ISCC compile a trivial [Setup]-only script on this box at all?
-    $smoke = Join-Path $OutDir 'smoke.iss'
-    "[Setup]`r`nAppName=smoke`r`nAppVersion=1.0`r`nDefaultDirName={autopf}\smoke`r`nOutputDir=$OutDir`r`nOutputBaseFilename=smoke`r`n[Files]" |
-        Set-Content -Encoding ASCII $smoke
-    Write-Host "== smoke-test ISCC (trivial script) =="
-    & $iscc $smoke
-    Write-Host "== smoke rc=$LASTEXITCODE =="
-    throw "ISCC failed ($rc)"
-}
+# --- build the installer (from the non-redirected copy under C:\t) -----------------------------
+Write-Host "==> ISCC $($defines -join ' ') $issLocal"
+& $iscc @defines $issLocal
+if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
 
 $setup = Join-Path $OutDir "punktfunk-host-setup-$Version.exe"
 if (-not (Test-Path $setup)) { throw "expected installer not produced: $setup" }
