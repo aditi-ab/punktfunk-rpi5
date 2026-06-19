@@ -2642,6 +2642,7 @@ dependencies = [
  "hyper-util",
  "khronos-egl",
  "libc",
+ "libloading",
  "mdns-sd",
  "nvidia-video-codec-sdk",
  "openh264",

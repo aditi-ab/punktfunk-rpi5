@@ -105,6 +105,9 @@ khronos-egl = { version = "6", features = ["dynamic"] }
 # GPU-copy into an exportable allocation, export OPAQUE_FD → cuImportExternalMemory (the
 # officially-supported CUDA pairing; raw dmabuf fds are rejected by the desktop driver).
 ash = "0.38"
+# `libcuda.so.1` is dlopen'd at runtime (NOT link-time) so one Linux binary runs on NVIDIA
+# (zero-copy via CUDA) AND on AMD/Intel (VAAPI, no NVIDIA driver present) — see `zerocopy::cuda`.
+libloading = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows host backends. `windows` covers the Win32/CCD APIs the SudoVDA virtual-display backend

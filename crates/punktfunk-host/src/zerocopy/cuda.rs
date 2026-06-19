@@ -1,6 +1,8 @@
 //! Minimal CUDA Driver API FFI for the zero-copy path. No Rust crate exposes the GL-interop
 //! driver calls we need (`cuGraphicsGLRegisterImage` & co.), so we hand-roll exactly those and
-//! link `libcuda.so.1` (the driver library — NOT `libcudart`). Symbol names verified against
+//! `dlopen` `libcuda.so.1` at runtime (the driver library — NOT `libcudart`; NOT a link-time
+//! `#[link]`, so one binary runs on NVIDIA and on AMD/Intel where `libcuda` is absent — see
+//! [`CudaApi`]). Symbol names verified against
 //! `cust_raw` + `cudaGL.h`: the context/mem ops use the `_v2` ABI suffix; the graphics-interop
 //! ops are unsuffixed. (We use GL interop, not EGL interop: `cuGraphicsEGLRegisterImage` is
 //! Tegra-only on the desktop driver — see [`super::egl`].)
@@ -86,68 +88,247 @@ pub struct CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
 
 pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
 
-#[link(name = "cuda")]
-extern "C" {
-    fn cuInit(flags: c_uint) -> CUresult;
-    fn cuDeviceGet(device: *mut CUdevice, ordinal: c_int) -> CUresult;
-    fn cuCtxCreate_v2(pctx: *mut CUcontext, flags: c_uint, dev: CUdevice) -> CUresult;
-    fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
-    fn cuMemAllocPitch_v2(
-        dptr: *mut CUdeviceptr,
-        pitch: *mut usize,
-        width_bytes: usize,
-        height: usize,
-        element_size: c_uint,
-    ) -> CUresult;
-    fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
-    fn cuMemcpy2DAsync_v2(copy: *const CUDA_MEMCPY2D, stream: CUstream) -> CUresult;
-    fn cuStreamSynchronize(stream: CUstream) -> CUresult;
-    // Greatest/least stream priority the driver exposes (greatest = numerically lowest).
-    fn cuCtxGetStreamPriorityRange(least: *mut c_int, greatest: *mut c_int) -> CUresult;
-    fn cuStreamCreateWithPriority(
-        stream: *mut CUstream,
-        flags: c_uint,
-        priority: c_int,
-    ) -> CUresult;
+/// CUDA Driver API entry points, resolved at runtime from `libcuda.so.1` via `dlopen` rather than
+/// a link-time `#[link(name = "cuda")]`. This is what lets ONE host binary run on NVIDIA
+/// (zero-copy via CUDA → NVENC) *and* on AMD/Intel (VAAPI, where the NVIDIA driver — and thus
+/// `libcuda` — is absent): with a hard link the loader would refuse to start the binary at all.
+/// Every `cu*` call below goes through a same-named wrapper fn that forwards to this table; when
+/// the driver isn't present the table is `None` and the wrappers return a non-zero `CUresult`, so
+/// `context()` fails cleanly and the capturer falls back to the CPU path. The `cuda_api()` loader
+/// is memoised; the library handle is intentionally leaked (process-lifetime, like the context).
+struct CudaApi {
+    cuInit: unsafe extern "C" fn(c_uint) -> CUresult,
+    cuDeviceGet: unsafe extern "C" fn(*mut CUdevice, c_int) -> CUresult,
+    cuCtxCreate_v2: unsafe extern "C" fn(*mut CUcontext, c_uint, CUdevice) -> CUresult,
+    cuCtxSetCurrent: unsafe extern "C" fn(CUcontext) -> CUresult,
+    cuMemAllocPitch_v2:
+        unsafe extern "C" fn(*mut CUdeviceptr, *mut usize, usize, usize, c_uint) -> CUresult,
+    cuMemFree_v2: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
+    cuMemcpy2DAsync_v2: unsafe extern "C" fn(*const CUDA_MEMCPY2D, CUstream) -> CUresult,
+    cuStreamSynchronize: unsafe extern "C" fn(CUstream) -> CUresult,
+    cuCtxGetStreamPriorityRange: unsafe extern "C" fn(*mut c_int, *mut c_int) -> CUresult,
+    cuStreamCreateWithPriority: unsafe extern "C" fn(*mut CUstream, c_uint, c_int) -> CUresult,
+    cuGraphicsGLRegisterImage:
+        unsafe extern "C" fn(*mut CUgraphicsResource, c_uint, c_uint, c_uint) -> CUresult,
+    cuGraphicsMapResources:
+        unsafe extern "C" fn(c_uint, *mut CUgraphicsResource, *mut c_void) -> CUresult,
+    cuGraphicsUnmapResources:
+        unsafe extern "C" fn(c_uint, *mut CUgraphicsResource, *mut c_void) -> CUresult,
+    cuGraphicsSubResourceGetMappedArray:
+        unsafe extern "C" fn(*mut CUarray, CUgraphicsResource, c_uint, c_uint) -> CUresult,
+    cuGraphicsUnregisterResource: unsafe extern "C" fn(CUgraphicsResource) -> CUresult,
+    cuImportExternalMemory: unsafe extern "C" fn(
+        *mut CUexternalMemory,
+        *const CUDA_EXTERNAL_MEMORY_HANDLE_DESC,
+    ) -> CUresult,
+    cuExternalMemoryGetMappedBuffer: unsafe extern "C" fn(
+        *mut CUdeviceptr,
+        CUexternalMemory,
+        *const CUDA_EXTERNAL_MEMORY_BUFFER_DESC,
+    ) -> CUresult,
+    cuDestroyExternalMemory: unsafe extern "C" fn(CUexternalMemory) -> CUresult,
+}
+// The resolved fn pointers are plain addresses into a process-lifetime mapping; safe to share.
+unsafe impl Send for CudaApi {}
+unsafe impl Sync for CudaApi {}
 
-    // GL interop (cudaGL.h) — these symbols have NO `_v2` suffix. `cuGraphicsEGLRegisterImage`
-    // is Tegra-only on the desktop driver, so we go EGLImage → GL texture → register the texture.
-    fn cuGraphicsGLRegisterImage(
-        resource: *mut CUgraphicsResource,
-        texture: c_uint, // GLuint
-        target: c_uint,  // GL_TEXTURE_2D = 0x0DE1
-        flags: c_uint,   // CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY = 0x01
-    ) -> CUresult;
-    fn cuGraphicsMapResources(
-        count: c_uint,
-        resources: *mut CUgraphicsResource,
-        stream: *mut c_void,
-    ) -> CUresult;
-    fn cuGraphicsUnmapResources(
-        count: c_uint,
-        resources: *mut CUgraphicsResource,
-        stream: *mut c_void,
-    ) -> CUresult;
-    fn cuGraphicsSubResourceGetMappedArray(
-        array: *mut CUarray,
-        resource: CUgraphicsResource,
-        array_index: c_uint,
-        mip_level: c_uint,
-    ) -> CUresult;
-    fn cuGraphicsUnregisterResource(resource: CUgraphicsResource) -> CUresult;
+/// `CUresult` returned by the wrappers when `libcuda` isn't loaded (no NVIDIA driver). Non-zero so
+/// the existing `ck()`/`!= 0` checks treat it as an ordinary driver error; distinct from any real
+/// `CUDA_ERROR_*` (all < 1000). Never produced by the actual driver.
+const CU_ERROR_NOT_LOADED: CUresult = 999;
 
-    // External memory (cuda.h, no `_v2` suffix) — imports a (Vulkan-exported) dmabuf fd as
-    // device memory. Used for LINEAR dmabufs (gamescope), which EGL/GL interop can't sample.
-    fn cuImportExternalMemory(
-        ext_mem_out: *mut CUexternalMemory,
-        mem_handle_desc: *const CUDA_EXTERNAL_MEMORY_HANDLE_DESC,
-    ) -> CUresult;
-    fn cuExternalMemoryGetMappedBuffer(
-        dev_ptr: *mut CUdeviceptr,
-        ext_mem: CUexternalMemory,
-        buffer_desc: *const CUDA_EXTERNAL_MEMORY_BUFFER_DESC,
-    ) -> CUresult;
-    fn cuDestroyExternalMemory(ext_mem: CUexternalMemory) -> CUresult;
+static CUDA_API: OnceLock<Option<CudaApi>> = OnceLock::new();
+
+/// Resolve `libcuda.so.1` and its symbols once. `None` when the NVIDIA driver isn't installed
+/// (the expected case on AMD/Intel hosts) — logged at debug, not an error.
+fn cuda_api() -> Option<&'static CudaApi> {
+    CUDA_API
+        .get_or_init(|| unsafe {
+            let lib = libloading::Library::new("libcuda.so.1")
+                .or_else(|_| libloading::Library::new("libcuda.so"))
+                .map_err(|e| {
+                    tracing::debug!(error = %e, "libcuda not loadable — CUDA zero-copy unavailable (expected on AMD/Intel)");
+                })
+                .ok()?;
+            // Resolve all symbols; the field types drive `get`'s inference. `lib` is leaked after
+            // construction so the fn pointers stay valid for the process lifetime (the temporary
+            // `Symbol` borrows end with the struct-literal statement, before the forget).
+            let api = CudaApi {
+                cuInit: *lib.get(b"cuInit\0").ok()?,
+                cuDeviceGet: *lib.get(b"cuDeviceGet\0").ok()?,
+                cuCtxCreate_v2: *lib.get(b"cuCtxCreate_v2\0").ok()?,
+                cuCtxSetCurrent: *lib.get(b"cuCtxSetCurrent\0").ok()?,
+                cuMemAllocPitch_v2: *lib.get(b"cuMemAllocPitch_v2\0").ok()?,
+                cuMemFree_v2: *lib.get(b"cuMemFree_v2\0").ok()?,
+                cuMemcpy2DAsync_v2: *lib.get(b"cuMemcpy2DAsync_v2\0").ok()?,
+                cuStreamSynchronize: *lib.get(b"cuStreamSynchronize\0").ok()?,
+                cuCtxGetStreamPriorityRange: *lib.get(b"cuCtxGetStreamPriorityRange\0").ok()?,
+                cuStreamCreateWithPriority: *lib.get(b"cuStreamCreateWithPriority\0").ok()?,
+                cuGraphicsGLRegisterImage: *lib.get(b"cuGraphicsGLRegisterImage\0").ok()?,
+                cuGraphicsMapResources: *lib.get(b"cuGraphicsMapResources\0").ok()?,
+                cuGraphicsUnmapResources: *lib.get(b"cuGraphicsUnmapResources\0").ok()?,
+                cuGraphicsSubResourceGetMappedArray: *lib
+                    .get(b"cuGraphicsSubResourceGetMappedArray\0")
+                    .ok()?,
+                cuGraphicsUnregisterResource: *lib.get(b"cuGraphicsUnregisterResource\0").ok()?,
+                cuImportExternalMemory: *lib.get(b"cuImportExternalMemory\0").ok()?,
+                cuExternalMemoryGetMappedBuffer: *lib
+                    .get(b"cuExternalMemoryGetMappedBuffer\0")
+                    .ok()?,
+                cuDestroyExternalMemory: *lib.get(b"cuDestroyExternalMemory\0").ok()?,
+            };
+            std::mem::forget(lib); // keep libcuda mapped for the fn pointers' lifetime (process)
+            Some(api)
+        })
+        .as_ref()
+}
+
+// Same-named wrappers so the call sites below are unchanged. Each forwards through the dlopen'd
+// table, or returns `CU_ERROR_NOT_LOADED` when the driver is absent (AMD/Intel) — which the
+// `CUresult` checks already handle. Only `context()` is reachable before the driver is confirmed
+// present; every other entry runs after `context()` succeeded, so its wrapper always hits `Some`.
+unsafe fn cuInit(flags: c_uint) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuInit)(flags),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuDeviceGet(device: *mut CUdevice, ordinal: c_int) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuDeviceGet)(device, ordinal),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuCtxCreate_v2(pctx: *mut CUcontext, flags: c_uint, dev: CUdevice) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuCtxCreate_v2)(pctx, flags, dev),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuCtxSetCurrent)(ctx),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuMemAllocPitch_v2(
+    dptr: *mut CUdeviceptr,
+    pitch: *mut usize,
+    width_bytes: usize,
+    height: usize,
+    element_size: c_uint,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuMemAllocPitch_v2)(dptr, pitch, width_bytes, height, element_size),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuMemFree_v2)(dptr),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuMemcpy2DAsync_v2(copy: *const CUDA_MEMCPY2D, stream: CUstream) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuMemcpy2DAsync_v2)(copy, stream),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuStreamSynchronize(stream: CUstream) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuStreamSynchronize)(stream),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuCtxGetStreamPriorityRange(least: *mut c_int, greatest: *mut c_int) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuCtxGetStreamPriorityRange)(least, greatest),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuStreamCreateWithPriority(
+    stream: *mut CUstream,
+    flags: c_uint,
+    priority: c_int,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuStreamCreateWithPriority)(stream, flags, priority),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuGraphicsGLRegisterImage(
+    resource: *mut CUgraphicsResource,
+    texture: c_uint,
+    target: c_uint,
+    flags: c_uint,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuGraphicsGLRegisterImage)(resource, texture, target, flags),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuGraphicsMapResources(
+    count: c_uint,
+    resources: *mut CUgraphicsResource,
+    stream: *mut c_void,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuGraphicsMapResources)(count, resources, stream),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuGraphicsUnmapResources(
+    count: c_uint,
+    resources: *mut CUgraphicsResource,
+    stream: *mut c_void,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuGraphicsUnmapResources)(count, resources, stream),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuGraphicsSubResourceGetMappedArray(
+    array: *mut CUarray,
+    resource: CUgraphicsResource,
+    array_index: c_uint,
+    mip_level: c_uint,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuGraphicsSubResourceGetMappedArray)(array, resource, array_index, mip_level),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuGraphicsUnregisterResource(resource: CUgraphicsResource) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuGraphicsUnregisterResource)(resource),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuImportExternalMemory(
+    ext_mem_out: *mut CUexternalMemory,
+    mem_handle_desc: *const CUDA_EXTERNAL_MEMORY_HANDLE_DESC,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuImportExternalMemory)(ext_mem_out, mem_handle_desc),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuExternalMemoryGetMappedBuffer(
+    dev_ptr: *mut CUdeviceptr,
+    ext_mem: CUexternalMemory,
+    buffer_desc: *const CUDA_EXTERNAL_MEMORY_BUFFER_DESC,
+) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuExternalMemoryGetMappedBuffer)(dev_ptr, ext_mem, buffer_desc),
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+unsafe fn cuDestroyExternalMemory(ext_mem: CUexternalMemory) -> CUresult {
+    match cuda_api() {
+        Some(a) => (a.cuDestroyExternalMemory)(ext_mem),
+        None => CU_ERROR_NOT_LOADED,
+    }
 }
 
 #[inline]
@@ -197,6 +378,9 @@ static CONTEXT: OnceLock<Context> = OnceLock::new();
 pub fn context() -> Result<CUcontext> {
     if let Some(c) = CONTEXT.get() {
         return Ok(c.0);
+    }
+    if cuda_api().is_none() {
+        bail!("libcuda.so.1 not available — no NVIDIA driver (CUDA zero-copy disabled)");
     }
     let ctx = unsafe {
         ck(cuInit(0), "cuInit")?;
