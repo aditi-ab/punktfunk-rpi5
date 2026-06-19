@@ -109,8 +109,23 @@ function Sign-File([string]$Path) {
 # --- sign the inner exe before it's packed ----------------------------------------------------
 Sign-File $exe
 
+# --- resolve + validate the installer's source files (absolute paths -> ISCC /D defines) -------
+$repoRoot = (Resolve-Path (Join-Path $here '..\..')).Path
+$hostEnv = Join-Path $repoRoot 'scripts\windows\host.env.example'
+$readme = Join-Path $here 'README.md'
+foreach ($p in @($exe, $hostEnv, $readme)) {
+    if (-not (Test-Path -LiteralPath $p)) { throw "installer source file missing: $p" }
+    Write-Host "  source ok: $p"
+}
+$defines = @(
+    "/DMyAppVersion=$Version",
+    "/DBinDir=$TargetDir",
+    "/DOutputDir=$OutDir",
+    "/DHostEnv=$hostEnv",
+    "/DReadme=$readme"
+)
+
 # --- stage the SudoVDA driver bundle ----------------------------------------------------------
-$defines = @("/DMyAppVersion=$Version", "/DBinDir=$TargetDir", "/DOutputDir=$OutDir")
 if (-not $NoDriver) {
     $stage = Join-Path $OutDir 'stage'
     & (Join-Path $here 'stage-sudovda.ps1') -OutDir $stage

@@ -21,6 +21,13 @@
 #ifndef OutputDir
   #define OutputDir "."
 #endif
+; Absolute paths to the two extra payload files, passed by pack-host-installer.ps1 (validated there).
+#ifndef HostEnv
+  #define HostEnv "..\..\scripts\windows\host.env.example"
+#endif
+#ifndef Readme
+  #define Readme "README.md"
+#endif
 ; StageDir (the staged SudoVDA payload + nefconc.exe + install-sudovda.ps1) is optional.
 #ifdef StageDir
   #define WithDriver
@@ -56,9 +63,8 @@ Name: "startservice"; Description: "Start the punktfunk host service now (also s
 
 [Files]
 Source: "{#BinDir}\punktfunk-host.exe"; DestDir: "{app}"; Flags: ignoreversion
-; {#SourcePath} (the .iss dir) has no trailing backslash — keep the explicit '\' separator.
-Source: "{#SourcePath}\..\..\scripts\windows\host.env.example"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}\README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
+Source: "{#HostEnv}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Readme}"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
 #ifdef WithDriver
 ; The driver payload + nefconc.exe + install-sudovda.ps1, extracted to {tmp} and removed after install.
 Source: "{#StageDir}\*"; DestDir: "{tmp}\sudovda"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installdriver
