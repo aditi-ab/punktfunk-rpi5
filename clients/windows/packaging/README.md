@@ -1,10 +1,18 @@
 # punktfunk Windows client — MSIX packaging
 
-The Windows client ships as a **signed MSIX** so Windows boxes get a real package (Start tile,
-clean install/uninstall) instead of a loose exe. CI builds + publishes it from
+The Windows client ships as **signed MSIX** packages so Windows boxes get a real package (Start
+tile, clean install/uninstall) instead of a loose exe. CI builds + publishes them from
 [`.gitea/workflows/windows-msix.yml`](../../../.gitea/workflows/windows-msix.yml) to Gitea's
 **generic** package registry (`https://git.unom.io/unom/-/packages`), on every `main` push that
 touches the client and on `win-v*` release tags.
+
+**Two architectures, one x64 runner.** Both `x64` and `arm64` packages are produced off the single
+x64 Windows runner — `x86_64-pc-windows-msvc` builds natively, `aarch64-pc-windows-msvc` is
+cross-compiled (the x64 MSVC toolset ships the ARM64 cross compiler; the matrix points `FFMPEG_DIR`
+at the runner's ARM64 FFmpeg tree, `C:\Users\Public\ffmpeg-arm64`). Artifacts are arch-suffixed
+(`..._x64.msix` / `..._arm64.msix`, each with its matching `.cer`); `pack-msix.ps1 -Arch x64|arm64`
+stamps the manifest `ProcessorArchitecture` and names the output. See
+[`windows.yml`](../../../.gitea/workflows/windows.yml) for the cross-build rationale.
 
 ## What's in the package
 
@@ -47,8 +55,9 @@ trusted with no further prompt:
 ```powershell
 # once per machine (elevated): trust the publisher
 Import-Certificate -FilePath .\punktfunk-codesign.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
-# then install (and re-run for each upgrade — no re-trust needed)
-Add-AppxPackage -Path .\punktfunk-client-windows_<ver>_x64.msix
+# then install the package for your CPU (and re-run for each upgrade — no re-trust needed)
+Add-AppxPackage -Path .\punktfunk-client-windows_<ver>_x64.msix     # Intel/AMD
+Add-AppxPackage -Path .\punktfunk-client-windows_<ver>_arm64.msix   # ARM64 (Snapdragon, etc.)
 ```
 
 The matching `.cer` is also published next to each `.msix` in the registry, so it's always at hand.
@@ -70,9 +79,16 @@ it changes the package identity → a one-time reinstall).
 On the Windows runner / dev VM (MSVC + Windows SDK present), after a release build:
 
 ```powershell
-cargo build --release -p punktfunk-client-windows
+# x64
+cargo build --release -p punktfunk-client-windows --target x86_64-pc-windows-msvc
 pwsh -File clients/windows/packaging/pack-msix.ps1 `
-  -Version 0.2.0.0 -TargetDir C:\t\release -OutDir C:\t\msix
+  -Version 0.2.0.0 -TargetDir C:\t\x86_64-pc-windows-msvc\release -OutDir C:\t\msix
+
+# arm64 (cross-compiled; point FFMPEG_DIR at the ARM64 tree)
+$env:FFMPEG_DIR = 'C:\Users\Public\ffmpeg-arm64'
+cargo build --release -p punktfunk-client-windows --target aarch64-pc-windows-msvc
+pwsh -File clients/windows/packaging/pack-msix.ps1 `
+  -Version 0.2.0.0 -Arch arm64 -TargetDir C:\t\aarch64-pc-windows-msvc\release -OutDir C:\t\msix
 ```
 
 Validated end-to-end on the build VM (pack → sign → `Add-AppxPackage` → framework-dependency

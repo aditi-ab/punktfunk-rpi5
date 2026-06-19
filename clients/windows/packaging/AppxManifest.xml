@@ -26,7 +26,7 @@
     Name="unom.Punktfunk"
     Publisher="{PUBLISHER}"
     Version="{VERSION}"
-    ProcessorArchitecture="x64" />
+    ProcessorArchitecture="{ARCH}" />
 
   <Properties>
     <DisplayName>Punktfunk</DisplayName>

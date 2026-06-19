@@ -140,7 +140,11 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    dev VM is headless/WARP; needs the RTX box.)** **Stream input** is Win32 low-level hooks (`WH_KEYBOARD_LL`/`WH_MOUSE_LL`) — reactor
    exposes no raw key/pointer events; native Windows VK + absolute mouse (client-rect Contain-fit) +
    wheel, Ctrl+Alt+Shift+Q capture toggle. `--headless`/`--discover` keep CLI paths. Builds + clippy
-   + fmt green on `x86_64-pc-windows-msvc` (on the dev VM). **windows-reactor is unpublished** (git
+   + fmt green on **`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`** — the latter
+   **cross-compiled off the one x64 runner** (no ARM64 runner; the x64 MSVC toolset's ARM64 cross
+   compiler + a per-arch `FFMPEG_DIR` ARM64 tree, SDL3/libopus build-from-source cross-compile
+   cleanly), and both ship as signed MSIX (`windows-msix.yml` matrix → `..._x64.msix`/`..._arm64.msix`,
+   verified: ARM64 binaries + manifest arch). **windows-reactor is unpublished** (git
    dep pinned to commit `b4129fcc`; `windows` pinned to the SAME commit so `IDXGISwapChain1` unifies
    with `set_swap_chain`); its `build.rs` downloads the Win App SDK NuGets + needs `CARGO_WORKSPACE_DIR`
    set (in the VM build env; `/temp`+`/winmd` gitignored). Gotcha: `CARGO_HOME` must be an ASCII path

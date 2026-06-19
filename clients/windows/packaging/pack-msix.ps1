@@ -18,12 +18,17 @@
   Run on the Windows runner (or the dev VM) with the MSVC/Windows SDK present.
 
 .EXAMPLE
-  pwsh -File pack-msix.ps1 -Version 0.2.137.0 -TargetDir C:\t\release -FfmpegBin C:\Users\Public\ffmpeg\bin -OutDir C:\t\msix
+  # x64 (default arch):
+  pwsh -File pack-msix.ps1 -Version 0.2.137.0 -TargetDir C:\t\x86_64-pc-windows-msvc\release -OutDir C:\t\msix
+  # arm64 (point -TargetDir + FFMPEG_DIR at the ARM64 build/tree):
+  $env:FFMPEG_DIR='C:\Users\Public\ffmpeg-arm64'
+  pwsh -File pack-msix.ps1 -Version 0.2.137.0 -Arch arm64 -TargetDir C:\t-a64\aarch64-pc-windows-msvc\release -OutDir C:\t-a64\msix
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Version,                     # 4-part numeric, e.g. 0.2.137.0
     [Parameter(Mandatory = $true)][string]$TargetDir,                   # cargo --release output dir (has the exe)
+    [ValidateSet('x64', 'arm64')][string]$Arch = 'x64',                 # package ProcessorArchitecture + artifact suffix
     [string]$FfmpegBin = $(if ($env:FFMPEG_DIR) { Join-Path $env:FFMPEG_DIR 'bin' } else { 'C:\Users\Public\ffmpeg\bin' }),
     [string]$OutDir = (Join-Path $TargetDir 'msix'),
     [string]$Publisher = 'CN=unom',                                     # MUST equal the signing cert subject DN
@@ -79,8 +84,8 @@ $ff | ForEach-Object { Copy-Item $_.FullName (Join-Path $layout $_.Name) -Force 
 # tile/store assets
 Copy-Item (Join-Path $assets '*') (Join-Path $layout 'Assets') -Force
 
-# manifest with version + publisher substituted
-$manifest = (Get-Content -Raw $manifestTemplate).Replace('{VERSION}', $Version).Replace('{PUBLISHER}', $Publisher)
+# manifest with version + publisher + architecture substituted
+$manifest = (Get-Content -Raw $manifestTemplate).Replace('{VERSION}', $Version).Replace('{PUBLISHER}', $Publisher).Replace('{ARCH}', $Arch)
 Set-Content -Path (Join-Path $layout 'AppxManifest.xml') -Value $manifest -Encoding UTF8
 
 Write-Host "layout assembled at $layout :"
@@ -88,13 +93,13 @@ Get-ChildItem $layout -Recurse -File | ForEach-Object { "  $($_.FullName.Substri
 
 # --- pack ---
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$msix = Join-Path $OutDir "punktfunk-client-windows_${Version}_x64.msix"
+$msix = Join-Path $OutDir "punktfunk-client-windows_${Version}_${Arch}.msix"
 & $makeappx pack /o /d $layout /p $msix
 if ($LASTEXITCODE -ne 0) { throw "makeappx pack failed ($LASTEXITCODE)" }
 
 # --- signing cert (supplied stable pfx OR ephemeral self-signed) ---
 $pfxPath = Join-Path $OutDir 'signing.pfx'
-$cerPath = Join-Path $OutDir "punktfunk-client-windows_${Version}_x64.cer"
+$cerPath = Join-Path $OutDir "punktfunk-client-windows_${Version}_${Arch}.cer"
 if ($PfxBase64) {
     Write-Host "signing with supplied code-signing cert (MSIX_CERT_PFX_B64)"
     [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($PfxBase64))

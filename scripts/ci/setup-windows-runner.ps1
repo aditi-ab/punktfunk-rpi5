@@ -84,6 +84,41 @@ if (-not (Test-Path "C:\Users\Public\.rustup\settings.toml")) {
     robocopy "$env:USERPROFILE\.rustup" "C:\Users\Public\.rustup" /E /NFL /NDL /NJH /NJS /MT:16 | Out-Null
 }
 
+# --- ARM64 cross-compile support (windows.yml / windows-msix.yml build aarch64-pc-windows-msvc off
+# this x64 box; no ARM64 runner needed). Two pieces beyond the x64 toolchain:
+#   1. the rustup std for the target;
+#   2. an ARM64 FFmpeg import-lib/DLL tree at C:\Users\Public\ffmpeg-arm64 (the workflow matrix
+#      points FFMPEG_DIR here for the aarch64 leg; the x64 tree stays at C:\Users\Public\ffmpeg).
+# The x64 MSVC toolset already ships the ARM64 cross compiler — if
+# VC\Tools\MSVC\<ver>\bin\Hostx64\arm64\cl.exe is missing, add the VS "MSVC v143+ ARM64/ARM64EC
+# build tools" + "C++ ARM64 build tools" workload components (the cc/cmake crates need it to
+# cross-build SDL3 + libopus).
+$env:RUSTUP_HOME = "C:\Users\Public\.rustup"
+$env:CARGO_HOME = "C:\Users\Public\.cargo"
+$rustup = (Get-Command rustup -ErrorAction SilentlyContinue).Source
+if (-not $rustup) { $rustup = "C:\Users\Public\.cargo\bin\rustup.exe" }
+if (Test-Path $rustup) {
+    Write-Host "==> rustup target add aarch64-pc-windows-msvc"
+    & $rustup target add aarch64-pc-windows-msvc
+} else { Write-Warning "rustup not found - install rustup then re-run (needed for the aarch64 target)." }
+
+$ffArm = "C:\Users\Public\ffmpeg-arm64"
+if (-not (Test-Path (Join-Path $ffArm 'lib\avcodec.lib'))) {
+    # BtbN winarm64 shared, FFmpeg 7.x (avcodec-61) to match the x64 tree's ABI. MSVC-linkable .lib
+    # import libs + headers + bin\*.dll — exactly what ffmpeg-sys-next + pack-msix.ps1 consume.
+    Write-Host "==> fetching ARM64 FFmpeg (BtbN winarm64 shared)"
+    $ffUrl = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-winarm64-gpl-shared-7.1.zip'
+    $ffZip = "C:\Users\Public\ffmpeg-arm64.zip"
+    $ffTmp = "C:\Users\Public\ffmpeg-arm64-extract"
+    Invoke-WebRequest -Uri $ffUrl -OutFile $ffZip -UseBasicParsing
+    if (Test-Path $ffTmp) { Remove-Item -Recurse -Force $ffTmp }
+    Expand-Archive -Path $ffZip -DestinationPath $ffTmp -Force   # BtbN zips have one top-level folder
+    $inner = Get-ChildItem $ffTmp -Directory | Select-Object -First 1
+    if (Test-Path $ffArm) { Remove-Item -Recurse -Force $ffArm }
+    Move-Item -Path $inner.FullName -Destination $ffArm
+    Remove-Item -Force $ffZip; Remove-Item -Recurse -Force $ffTmp -ErrorAction SilentlyContinue
+}
+
 # Inno Setup (ISCC.exe) for the host installer build (windows-host.yml). pack-host-installer.ps1
 # locates it at its fixed Program Files path, so it need not be on PATH — just present.
 if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {

@@ -1,18 +1,30 @@
 # Windows client CI — runs on the self-hosted Windows runner (home-windows-1, host mode; see
 # scripts/ci/setup-windows-runner.ps1). Build + clippy + fmt + test the WinUI 3 client
-# (windows-reactor + D3D11/SwapChainPanel + WASAPI + SDL3) on x86_64-pc-windows-msvc.
+# (windows-reactor + D3D11/SwapChainPanel + WASAPI + SDL3).
 #
-# The MSVC/WinUI/FFmpeg toolchain (cargo/rustup on ASCII paths, NASM, CMake, LLVM, FFmpeg,
-# CARGO_HOME, CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. Two
-# per-checkout vars are set in a step:
+# Two architectures from ONE x64 runner: x86_64-pc-windows-msvc natively and
+# aarch64-pc-windows-msvc by cross-compiling. The x64 MSVC toolset ships an ARM64 cross compiler
+# (VC\Tools\MSVC\<ver>\bin\Hostx64\arm64\cl.exe) and aarch64-pc-windows-msvc is a tier-2 Rust
+# target with host tools, so no ARM64 runner is needed — the cc/cmake crates pick the ARM64
+# compiler from the target triple (SDL3 + libopus build-from-source cross-compile fine). The one
+# arch-specific external dep is FFmpeg's import libs: the runner keeps an x64 tree at
+# C:\Users\Public\ffmpeg and an ARM64 tree at C:\Users\Public\ffmpeg-arm64 (both FFmpeg 7.x /
+# avcodec-61); the matrix points FFMPEG_DIR at the right one. aarch64 can't *run* on the x64 host,
+# so fmt + test run only for x64.
+#
+# The MSVC/WinUI/FFmpeg toolchain (cargo/rustup on ASCII paths, NASM, CMake, LLVM, the x64 FFmpeg,
+# CARGO_HOME, CMAKE_POLICY_VERSION_MINIMUM, …) is baked into the runner's daemon env. Per-checkout
+# / per-arch vars are set in a step:
 #   - CARGO_WORKSPACE_DIR  windows-reactor's build.rs unwraps it + stages the Win App SDK
 #                          NuGets/winmd under it (from GITHUB_WORKSPACE).
-#   - CARGO_TARGET_DIR=C:\t  the runner's host workdir is buried deep under
+#   - CARGO_TARGET_DIR=C:\t…  the runner's host workdir is buried deep under
 #                          C:\Windows\System32\config\systemprofile\.cache\act\<hash>\hostexecutor\,
 #                          so the default target\ path blows past Windows' MAX_PATH (260) inside the
 #                          CMake-from-source builds (audiopus_sys / SDL3) — MSBuild's tracker then
 #                          can't create its .tlog (DirectoryNotFoundException -> MSB6003). A short
-#                          root keeps every nested path well under the limit.
+#                          root keeps every nested path well under the limit (per-arch so the two
+#                          matrix legs don't share a target dir).
+#   - FFMPEG_DIR           per-arch FFmpeg import libs (x64 vs arm64 tree).
 #
 # Steps use `shell: pwsh` (PowerShell 7) deliberately: Windows PowerShell 5.1's
 # `Out-File -Encoding utf8` prepends a UTF-8 BOM that corrupts the first GITHUB_ENV line (the
@@ -41,7 +53,11 @@ on:
 jobs:
   build:
     runs-on: windows-amd64
-    timeout-minutes: 60
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
     steps:
       - uses: actions/checkout@v4
 
@@ -49,24 +65,31 @@ jobs:
         shell: pwsh
         run: |
           "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Per-arch short target root (dodges MAX_PATH; keeps the two legs from sharing target\).
+          $td = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'C:\t-a64' } else { 'C:\t' }
+          "CARGO_TARGET_DIR=$td" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Per-arch FFmpeg import libs (the runner provisions both — setup-windows-runner.ps1).
+          $ff = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'C:\Users\Public\ffmpeg-arm64' } else { 'C:\Users\Public\ffmpeg' }
+          "FFMPEG_DIR=$ff" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          rustup target add ${{ matrix.target }}
           rustc --version
           cargo --version
-          node --version
-          Write-Output "workspace: $env:GITHUB_WORKSPACE"
+          Write-Output "target ${{ matrix.target }}  target-dir $td  ffmpeg $ff"
 
       - name: Build
         shell: pwsh
-        run: cargo build -p punktfunk-client-windows
+        run: cargo build -p punktfunk-client-windows --target ${{ matrix.target }}
 
       - name: Clippy (-D warnings)
         shell: pwsh
-        run: cargo clippy -p punktfunk-client-windows --all-targets -- -D warnings
+        run: cargo clippy -p punktfunk-client-windows --all-targets --target ${{ matrix.target }} -- -D warnings
 
       - name: Rustfmt check
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: cargo fmt -p punktfunk-client-windows -- --check
 
       - name: Test
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
-        run: cargo test -p punktfunk-client-windows
+        run: cargo test -p punktfunk-client-windows --target ${{ matrix.target }}
