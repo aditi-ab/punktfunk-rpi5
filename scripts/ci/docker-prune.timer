@@ -1,12 +1,13 @@
-# Runs docker-prune.service hourly (the burst guard needs to react within the hour, not every 6h).
+# Runs docker-prune.service every 30 min. The runner is hammered with build bursts that can refill
+# the disk fast (and the actcache cap needs to react well within an hour), so 30 min beats hourly.
 # Persistent=true catches up after downtime. Install: see the header of docker-prune.service.
 
 [Unit]
-Description=Run docker-prune hourly (CI runner disk hygiene + burst guard)
+Description=Run docker-prune every 30 min (CI runner disk hygiene + actcache cap + burst guard)
 
 [Timer]
-OnCalendar=hourly
-RandomizedDelaySec=300
+OnCalendar=*:0/30
+RandomizedDelaySec=120
 Persistent=true
 
 [Install]

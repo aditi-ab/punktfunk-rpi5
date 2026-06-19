@@ -2,32 +2,31 @@
 #
 # Why this exists: every CI push builds and sha-<commit>-tags a Docker image per pipeline
 # (rust-ci, web, docs, fedora-rpm, fedora44-rpm, ...). Those tags are never dangling, so a
-# plain `docker image prune` SKIPS them and they accumulate — that is what filled the disk.
-# Host-level, not per-repo CI, because the runner is shared (punktfunk + other orgs all benefit).
+# plain `docker image prune` SKIPS them and they accumulate. Host-level, not per-repo CI,
+# because the runner is shared (punktfunk + other orgs all benefit).
 #
-# Two tiers: trim anything older than 12h normally, AND — because a push-burst can fill 99 GB
-# WITHIN that 12h window (a fast iteration session hit 100% and poisoned the cargo cache with a
-# truncated, half-saved target/) — a burst guard that prunes ALL idle images + cache once the
-# disk is >85% full. Images IN USE by a running container are always protected.
+# THE BIG ONE (2026-06-19): the act_runner CACHE SERVER store lives in the long-running runner
+# container's WRITABLE LAYER (HOME/.cache/actcache/cache inside gitea-runner-runner-1,
+# `cache.dir: ""` -> defaults under /root). `docker prune` can NEVER see it — only stopped
+# containers + unused images/cache are prunable, not a 13-day-up container's layer. That store
+# grew to ~66 GB and filled a 125 GB disk on its own. docker-prune.sh caps it by clearing the
+# blobs in-place (act_runner repopulates; keys are content-hashed).
+#
+# The logic is in docker-prune.sh, NOT inline ExecStart=, because systemd does its own
+# $-expansion on ExecStart and would empty the shell vars / $(...) before sh runs them.
 #
 # Install on the runner host (root):
+#   install -m755 scripts/ci/docker-prune.sh /usr/local/bin/ci-docker-prune.sh
 #   cp scripts/ci/docker-prune.{service,timer} /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now docker-prune.timer
 # See also scripts/ci/setup-macos-runner.sh for the macOS runner.
 
 [Unit]
-Description=Prune aged Docker images / build cache (CI runner disk hygiene)
+Description=Prune aged Docker images/cache + cap the act_runner cache (CI runner disk hygiene)
 Documentation=https://git.unom.io/unom/punktfunk
 Wants=docker.service
 After=docker.service
 
 [Service]
 Type=oneshot
-# '-' prefix: each step is independent — a no-op/failure never blocks the others.
-ExecStart=-/usr/bin/docker image prune -af --filter until=12h
-ExecStart=-/usr/bin/docker builder prune -af --filter until=12h
-ExecStart=-/usr/bin/docker buildx prune -af --filter until=12h
-ExecStart=-/usr/bin/docker container prune -f --filter until=12h
-# Burst guard: if STILL >85% full, prune every idle image + all build cache (in-use protected),
-# so a push-storm can't drive CI into ENOSPC (which truncates and poisons the actions/cargo cache).
-ExecStart=-/bin/sh -c 'P=$(df --output=pcent / | tr -dc 0-9); [ "$P" -ge 85 ] && { docker image prune -af; docker builder prune -af; docker buildx prune -af; } || true'
+ExecStart=/usr/local/bin/ci-docker-prune.sh
