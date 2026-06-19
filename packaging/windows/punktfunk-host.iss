@@ -3,8 +3,8 @@
 ; Produces a signed setup.exe that lays the host into Program Files, optionally installs the bundled
 ; SudoVDA virtual-display driver, and DELEGATES service registration to `punktfunk-host service
 ; install`. The real, idempotent install logic (SCM registration, firewall rules, default host.env,
-; the SYSTEM→interactive-session CreateProcessAsUserW supervisor for secure-desktop capture) lives in
-; crates/punktfunk-host/src/service.rs — this script does NOT duplicate it. That SYSTEM service model
+; the SYSTEM->interactive-session CreateProcessAsUserW supervisor for secure-desktop capture) lives in
+; crates/punktfunk-host/src/service.rs - this script does NOT duplicate it. That SYSTEM service model
 ; is exactly why MSIX is unusable here and we ship a classic elevated installer instead.
 ;
 ; Built by pack-host-installer.ps1, e.g.:
@@ -80,7 +80,7 @@ Filename: "powershell.exe"; \
   StatusMsg: "Installing the SudoVDA virtual display driver..."; \
   Flags: runhidden waituntilterminated; Tasks: installdriver
 #endif
-; Register (or re-point, on upgrade — idempotent) the SYSTEM service from its FINAL {app} location:
+; Register (or re-point, on upgrade - idempotent) the SYSTEM service from its FINAL {app} location:
 ; service install records current_exe() as the SCM binPath, so it must run from {app}, not {tmp}.
 Filename: "{app}\punktfunk-host.exe"; Parameters: "service install"; WorkingDir: "{app}"; \
   StatusMsg: "Registering the punktfunk host service..."; Flags: runhidden waituntilterminated
