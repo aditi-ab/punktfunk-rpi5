@@ -62,6 +62,21 @@ const SESSION_UNIT: &str = "punktfunk-gamescope";
 /// The gamescope-session-plus launcher script (Bazzite / SteamOS-like hosts).
 const SESSION_PLUS_BIN: &str = "/usr/share/gamescope-session-plus/gamescope-session-plus";
 
+/// The ACTUAL Steam Deck (SteamOS) ships its OWN session — NOT Bazzite's session-plus. It's the
+/// systemd-user `gamescope-session.target`, whose `gamescope-session.service` runs this script, which
+/// `exec gamescope`s with HARDCODED physical-panel args (`-w 1280 -h 800 -O '*',eDP-1`) and launches
+/// Steam via a SEPARATE `steam-launcher.service`. To honor the client's mode we (a) drop a `gamescope`
+/// PATH-shim that rewrites those args to `--backend headless -W <client> …`, and (b) write a transient
+/// user drop-in pointing the service's PATH at the shim + the mode, then restart the whole target —
+/// so `steam-launcher.service` brings Steam up IN the headless gamescope at the client's resolution.
+const STEAMOS_SESSION_BIN: &str = "/usr/lib/steamos/gamescope-session";
+const STEAMOS_SESSION_TARGET: &str = "gamescope-session.target";
+
+/// Set once we've reconfigured SteamOS's `gamescope-session.target` headless for a stream — the
+/// SteamOS analogue of [`STOPPED_AUTOLOGIN`], so the restore path knows to remove the drop-in and
+/// restart the physical session.
+static STEAMOS_TOOK_OVER: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
 impl GamescopeDisplay {
     pub fn new() -> Result<Self> {
         Ok(GamescopeDisplay)
@@ -140,6 +155,11 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
     // A (re)connect cancels any pending debounced TV-restore: we're about to (re)use the managed
     // session, so the autologin must stay stopped and the warm session stays up (no stop/relaunch).
     *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // SteamOS (the real Steam Deck) has no session-plus: take over its `gamescope-session.target`
+    // headless at the client's mode instead of launching a separate managed session.
+    if steamos_session_present() {
+        return create_managed_session_steamos(mode);
+    }
     // Steam is single-instance: if the box autologged into gaming mode on a physical display (the
     // Bazzite default — `gamescope-session-plus@ogui-steam` on the TV), that session holds Steam and
     // renders to the TV's native mode, which we'd capture instead of the client's. Free Steam by
@@ -184,6 +204,147 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
         h = mode.height,
         hz = mode.refresh_hz,
         "gamescope session: launched gamescope-session-plus at the client's mode"
+    );
+    Ok(VirtualOutput {
+        node_id,
+        remote_fd: None,
+        preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
+        keepalive: Box::new(()),
+    })
+}
+
+/// SteamOS detection: its session launcher is present and Bazzite's session-plus is NOT (so the
+/// drop-in / PATH-shim takeover applies rather than launching a separate session-plus unit).
+fn steamos_session_present() -> bool {
+    std::path::Path::new(STEAMOS_SESSION_BIN).exists()
+        && !std::path::Path::new(SESSION_PLUS_BIN).exists()
+}
+
+/// Run a `systemctl --user` subcommand best-effort — a failure just means the session won't change,
+/// which the caller's node-wait surfaces.
+fn systemctl_user(args: &[&str]) {
+    let _ = Command::new("systemctl").arg("--user").args(args).status();
+}
+
+/// Directory holding the per-user `gamescope` PATH-shim (tmpfs under `XDG_RUNTIME_DIR`).
+fn headless_shim_dir() -> std::path::PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::Path::new(&base).join("punktfunk-gsbin")
+}
+
+/// The gamescope arg-rewriting shim. SteamOS hardcodes physical-panel args, so we intercept the
+/// session's `exec gamescope` (via PATH) and rewrite to a headless output at the client's mode (read
+/// from `PF_W`/`PF_H`/`PF_HZ`), dropping the physical flags. Idempotent; returns the shim's directory.
+fn write_headless_shim() -> Result<std::path::PathBuf> {
+    const SHIM_BODY: &str = r#"#!/bin/bash
+W="${PF_W:-1920}"; H="${PF_H:-1080}"; HZ="${PF_HZ:-60}"
+keep=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --generate-drm-mode|-w|-h|-W|-H|-O|--prefer-output) shift 2;;
+    *) keep+=("$1"); shift;;
+  esac
+done
+exec /usr/bin/gamescope --backend headless -W "$W" -H "$H" -w "$W" -h "$H" -r "$HZ" "${keep[@]}"
+"#;
+    let dir = headless_shim_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    let shim = dir.join("gamescope");
+    std::fs::write(&shim, SHIM_BODY).with_context(|| format!("write shim {}", shim.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod shim {}", shim.display()))?;
+    Ok(dir)
+}
+
+/// Path of the transient user drop-in that points `gamescope-session.service` at the shim + mode.
+/// `zz-` so it sorts last (overrides any distro drop-in).
+fn steamos_dropin_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/deck".to_string());
+    std::path::Path::new(&home)
+        .join(".config/systemd/user/gamescope-session.service.d/zz-punktfunk-headless.conf")
+}
+
+/// Write the drop-in: prepend the shim dir to the service's PATH + pass the client's mode via `PF_*`.
+/// A subsequent `daemon-reload` + target restart applies it.
+fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode) -> Result<()> {
+    let path = steamos_dropin_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let body = format!(
+        "[Service]\n\
+         Environment=PATH={shim}:/usr/bin:/bin:/usr/local/bin\n\
+         Environment=PF_W={w}\n\
+         Environment=PF_H={h}\n\
+         Environment=PF_HZ={hz}\n",
+        shim = shim_dir.display(),
+        w = mode.width,
+        h = mode.height,
+        hz = mode.refresh_hz.max(1),
+    );
+    std::fs::write(&path, body).with_context(|| format!("write drop-in {}", path.display()))
+}
+
+/// Remove the headless drop-in (restore-on-disconnect). Best-effort.
+fn remove_steamos_dropin() {
+    let _ = std::fs::remove_file(steamos_dropin_path());
+}
+
+/// Take over SteamOS's `gamescope-session.target` headless at the CLIENT's mode: write the shim + a
+/// drop-in carrying the mode, `daemon-reload`, then RESTART the target so `steam-launcher.service`
+/// brings Steam up in the fresh headless gamescope — and attach to its node. A same-mode reconnect
+/// reuses the running session (no Steam restart); a different mode rewrites the drop-in + restarts.
+/// The restart kills any prior gamescope, so there's exactly one node to discover (no stale attach).
+fn create_managed_session_steamos(mode: Mode) -> Result<VirtualOutput> {
+    let mut guard = MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    let same_mode = guard.as_ref().is_some_and(|s| {
+        s.width == mode.width && s.height == mode.height && s.refresh_hz == mode.refresh_hz
+    });
+    if same_mode {
+        if let Some(node_id) = find_gamescope_node() {
+            point_injector_at_eis();
+            tracing::info!(
+                node_id,
+                w = mode.width,
+                h = mode.height,
+                hz = mode.refresh_hz,
+                "gamescope (SteamOS): reusing the headless session (same mode — no Steam restart)"
+            );
+            return Ok(VirtualOutput {
+                node_id,
+                remote_fd: None,
+                preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
+                keepalive: Box::new(()),
+            });
+        }
+        *guard = None; // tracked session lost its node — fall through to a clean restart
+    }
+    let shim_dir = write_headless_shim()?;
+    write_steamos_dropin(&shim_dir, mode)?;
+    systemctl_user(&["daemon-reload"]);
+    systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
+    *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    // gamescope's node appears within a few seconds of the restart; Steam's first FRAME is slower
+    // (Big Picture cold start) and is awaited by the caller's first-frame retry loop.
+    let node_id = wait_for_node(Duration::from_secs(30)).ok_or_else(|| {
+        anyhow!(
+            "SteamOS headless gamescope node did not appear within 30s after restarting \
+             {STEAMOS_SESSION_TARGET} — check `journalctl --user -u gamescope-session.service`"
+        )
+    })?;
+    point_injector_at_eis();
+    *guard = Some(SessionState {
+        width: mode.width,
+        height: mode.height,
+        refresh_hz: mode.refresh_hz,
+    });
+    tracing::info!(
+        node_id,
+        w = mode.width,
+        h = mode.height,
+        hz = mode.refresh_hz,
+        "gamescope (SteamOS): took over gamescope-session.target headless at the client's mode"
     );
     Ok(VirtualOutput {
         node_id,
@@ -240,12 +401,13 @@ fn stop_autologin_sessions() {
 /// per-connect churn is what leaked GPU context on F44. No-op when nothing was stolen (non-Bazzite /
 /// headless box). Idempotent / safe to call on every session end.
 pub fn schedule_restore_tv_session() {
-    if STOPPED_AUTOLOGIN
+    let nothing_to_restore = STOPPED_AUTOLOGIN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_empty()
-    {
-        return; // nothing was stolen → nothing to restore (also the non-Bazzite path)
+        && !*STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner());
+    if nothing_to_restore {
+        return; // nothing was taken over → nothing to restore (also the non-managed path)
     }
     *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) =
         Some(Instant::now() + RESTORE_DEBOUNCE);
@@ -260,6 +422,34 @@ pub fn schedule_restore_tv_session() {
 /// [`start_restore_worker`] once the debounce deadline passes; takes the stopped-unit list so a
 /// cancelled+reconnected window keeps the list for a later real restore.
 fn do_restore_tv_session() {
+    // SteamOS: we reconfigured `gamescope-session.target` headless via a drop-in. Restore = remove
+    // the drop-in + restart the target (back to the physical panel) — unless the user switched to a
+    // desktop session meanwhile, in which case drop the override and leave the desktop alone.
+    {
+        let mut took = STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner());
+        if *took {
+            *took = false;
+            *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            remove_steamos_dropin();
+            systemctl_user(&["daemon-reload"]);
+            use super::ActiveKind;
+            if matches!(
+                super::detect_active_session().kind,
+                ActiveKind::DesktopKde | ActiveKind::DesktopGnome | ActiveKind::DesktopWlroots
+            ) {
+                tracing::info!(
+                    "gamescope (SteamOS): a desktop session is active — removed the headless \
+                     override, not restarting the gaming session"
+                );
+                return;
+            }
+            systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
+            tracing::info!(
+                "gamescope (SteamOS): restored the physical gaming session (removed headless override)"
+            );
+            return;
+        }
+    }
     let units = std::mem::take(&mut *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()));
     if units.is_empty() {
         return; // nothing was stolen → nothing to restore (also the non-Bazzite path)

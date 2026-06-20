@@ -2794,7 +2794,12 @@ fn build_pipeline_with_retry(
     bitrate_kbps: u32,
     bit_depth: u8,
 ) -> Result<Pipeline> {
-    const MAX_ATTEMPTS: u32 = 4;
+    // ~10s first-frame wait per attempt. 8 gives a ~90s budget for the SLOW case: a host-managed
+    // gamescope session cold-starting Steam Big Picture (the SteamOS/Bazzite takeover) can take
+    // 30-60s to produce its first frame, and a first-connect timeout would tear down the warm
+    // session (forcing another cold start on reconnect). A genuinely permanent failure still fails
+    // fast via `is_permanent_build_error`; only transient "no frame yet" retries consume the budget.
+    const MAX_ATTEMPTS: u32 = 8;
     let mut backoff = std::time::Duration::from_millis(500);
     for attempt in 1..=MAX_ATTEMPTS {
         match build_pipeline(vd, mode, bitrate_kbps, bit_depth) {
