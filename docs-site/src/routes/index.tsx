@@ -1,5 +1,7 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { HomeLayout } from 'fumadocs-ui/layouts/home'
+import BrandMark from '@/components/BrandMark'
+import Wordmark from '@/components/Wordmark'
 import { baseOptions } from '@/lib/layout.shared'
 
 export const Route = createFileRoute('/')({ component: Home })
@@ -8,15 +10,16 @@ function Home() {
   return (
     <HomeLayout {...baseOptions()}>
       <main className="flex flex-1 flex-col items-center justify-center gap-6 px-4 py-24 text-center">
-        <h1 className="text-4xl font-bold tracking-tight">punktfunk</h1>
+        <BrandMark className="size-20 drop-shadow-[0_8px_30px_rgba(108,91,243,0.45)]" />
+        <Wordmark className="h-12 md:h-14" />
         <p className="max-w-xl text-fd-muted-foreground">
-          A ground-up low-latency desktop and game streaming stack, built Linux-first, with a
-          shared Rust protocol core and native clients per platform.
+          Linux-first, low-latency desktop and game streaming — a shared Rust protocol
+          core with native clients per platform.
         </p>
         <Link
           to="/docs/$"
           params={{ _splat: '' }}
-          className="rounded-lg bg-fd-primary px-5 py-2.5 font-medium text-fd-primary-foreground"
+          className="rounded-lg bg-brand px-5 py-2.5 font-medium text-white transition-colors hover:bg-brand/90"
         >
           Read the docs
         </Link>
