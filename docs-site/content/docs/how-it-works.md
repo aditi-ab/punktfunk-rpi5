@@ -39,7 +39,8 @@ punktfunk speaks two protocols over the same host:
   no special software. This is the most compatible way in.
 - **punktfunk/1 (native)** — a purpose-built protocol with a QUIC control channel and a UDP data
   channel hardened with forward error correction and encryption. It's lower-latency and more resilient
-  on imperfect networks, and it's what the [Apple app](/docs/clients) uses.
+  on imperfect networks, and it's what the [native clients](/docs/clients) (Apple, Linux, Windows,
+  Android) use.
 
 Both run from a single host process, so you don't choose up front — Moonlight clients use GameStream,
 the native clients use punktfunk/1.
@@ -53,7 +54,8 @@ cryptographic identity — no PIN, no account, no cloud. See [Pairing & Trust](/
 ## Finding hosts
 
 Hosts advertise themselves on your local network, so clients can **discover** them automatically
-instead of needing an IP address. The Apple app and Moonlight both list hosts they find on the LAN.
+instead of needing an IP address. The native clients and Moonlight both list hosts they find on the
+LAN.
 
 ## Multiple devices at once
 

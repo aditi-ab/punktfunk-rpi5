@@ -16,14 +16,19 @@ process, with native pairing driven from the **web console** (arm → show PIN),
 Advanced DualSense (audio-driven voice-coil) haptics **scoped NO-GO** (`docs/dualsense-haptics.md`).
 **Bazzite dynamic resolution (`c894c6f`):** the host now *manages* a headless `gamescope-session-plus`
 Steam session at the **client's exact resolution + refresh** — games see it (via injected
-`--nested-refresh` + generated CVT modes, not the box's TV EDID), relaunched per-connection on a mode
+`--nested-refresh` + generated CVT modes, not the host's TV EDID), relaunched per-connection on a mode
 change, reused (no Steam restart) on the same mode. Plus macOS/iPad input fixes (NSEvent motion +
 iPad pointer-lock) and a 4K/5K one-frame-freeze fix (grow the UDP socket buffers).
 
-**Next:** **§8 pairing & trust hardening** (mandatory PIN by default + delegated approval), the native
-client presenter + iOS (§6), and a Windows host (§7 — now **de-risked via SudoVDA**, no custom
-signed driver needed). **§10 HDR/10-bit is parked — blocked upstream at the compositor** (no
-gamescope/KWin PipeWire 10-bit producer yet).
+The four native clients — **macOS/iOS/iPadOS/tvOS**, **Linux**, **Windows**, and **Android** — are
+all real, working clients; see [Status & Progress](/docs/status) for their current state.
+
+A native **Windows host** (§7) is also implemented and shipping (NVIDIA-only, x64-only) — see
+[Windows Host](/docs/windows-host).
+
+**Next:** **§8 pairing & trust hardening** (mandatory PIN by default + delegated approval) and the
+native client presenter + iOS (§6). **§10 HDR/10-bit is parked — blocked upstream at the compositor**
+(no gamescope/KWin PipeWire 10-bit producer yet).
 
 ## 1. Reliable headless KDE/compositor spawning ✅ *(done — Phase 1 + 2)*
 
@@ -127,22 +132,26 @@ select = a `pw_stream` with `Direction::Output` + `media.class=Audio/Source`.
 PunktfunkKit is already platform-shared; iOS needs the `UIViewRepresentable` presenter twin
 + touch capture (#5) + UI. tvOS later.
 
-## 7. Windows as a host *(scoped — `docs/windows-host.md`; de-risked via SudoVDA)*
+## 7. Windows as a host ✅ *(implemented & shipping — NVIDIA-only, x64-only; see [Windows Host](/docs/windows-host))*
 
-Architecturally an "add a backend" job, not a parallel port: `punktfunk-core` (protocol/FEC/
-crypto/C-ABI) + QUIC + GameStream + mgmt + the `m3`/pipeline orchestration are all platform-agnostic
-and already `cfg`-isolated (~95% reuse). New `#[cfg(windows)]` backends behind the existing traits:
-capture (DXGI Desktop Duplication / Windows.Graphics.Capture), encode (Media Foundation / NVENC-SDK
-with a D3D11 context), input (SendInput + ViGEm), audio (WASAPI loopback + a virtual mic).
+Done as an "add a backend" job, not a parallel port: `punktfunk-core` (protocol/FEC/crypto/C-ABI) +
+QUIC + GameStream + mgmt + the pipeline orchestration are all platform-agnostic and already
+`cfg`-isolated (~95% reuse), so the Windows host is a set of `#[cfg(windows)]` backends behind the
+existing traits:
 
-**The old blocker is gone.** Rather than author + sign our own kernel IDD for the per-client virtual
-display, use **SudoVDA** (the Sunshine Virtual Display Adapter) — a pre-built, signed Indirect
-Display Driver that creates virtual displays at arbitrary WxH@Hz on demand. The `VirtualDisplay`
-backend becomes *"install + drive SudoVDA's control API"* (M effort), not *"write + WHQL-sign a
-kernel driver"* (XL). That removes the only hard blocker — the Windows host is now a medium,
-mostly-mechanical port. Recommended start: **Phase 0** — capture an existing monitor to prove the
-stack end to end; **Phase 1** wires SudoVDA for the native-resolution output. Deferred only because
-it's unbuildable on the Linux dev box; the trait boundaries are already in the right places.
+- **Capture** — DXGI Desktop Duplication → D3D11 texture.
+- **Virtual display** — **SudoVDA** (the Sunshine Virtual Display Adapter), a pre-built, signed
+  Indirect Display Driver that creates a `WxH@Hz` monitor on demand — so there's no kernel driver to
+  author or WHQL-sign. Bundled and staged by the installer; falls back to capturing an existing
+  monitor if absent.
+- **Encode** — NVENC with a D3D11 device (`--features nvenc`), so the host is **NVIDIA-only**.
+- **Input** — SendInput (mouse/keyboard) + ViGEm (virtual gamepads with rumble).
+- **Audio** — WASAPI loopback capture + a WASAPI virtual mic.
+
+It ships as a **signed Inno Setup installer** that registers a `LocalSystem` SCM service launching
+into the interactive session for secure-desktop (UAC / lock-screen) capture, published by
+`windows-host.yml`. Still open: AMD/Intel encode (none today), broader real-world testing, and
+bundling ViGEmBus.
 
 ## 8. Pairing & trust hardening *(§8a + §8b-1 done; §8b-2 next)*
 
@@ -356,8 +365,8 @@ GameStream already auto-discovered via mDNS (`_nvstream._tcp`). Now both the uni
 - **Client**: `punktfunk-probe --discover [SECS]` browses and prints each host (name, addr:port,
   pairing, fingerprint), then exits. Apple clients browse the same service natively via NWBrowser
   (Bonjour) — no Rust-connector dependency; this section's service type + TXT keys are the contract.
-- **Validated**: cross-LAN — dev box discovered the GNOME-box appliance
-  (`home-worker-3 192.168.1.248:9777 pair=required fp=1dcf3a…`) and a standalone synthetic host
+- **Validated**: cross-LAN — a client discovered a GNOME host appliance
+  (`myhost.local 9777 pair=required fp=1dcf3a…`) and a standalone synthetic host
   (`pair=optional`); fingerprint + pairing state correct in both.
 - **Next** (not done): wire NWBrowser discovery into the Apple client UI (host picker); the
   host-side contract above is all it needs.

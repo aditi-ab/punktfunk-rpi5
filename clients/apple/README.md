@@ -6,9 +6,14 @@ input datagrams, Opus audio, cert pinning — lives in the shared Rust core (sta
 linked as `PunktfunkCore.xcframework`); this package is the Swift shell: decode
 (VideoToolbox), present (SwiftUI), input capture.
 
-## Status — first light achieved (2026-06-10)
+## Status — working client (macOS, with iOS / tvOS in the shared build)
 
-Validated live, Mac ↔ Linux box over the LAN: gamescope virtual output → NVENC HEVC →
+A full streaming client: VideoToolbox HEVC decode, controllers incl. DualSense feedback, host
+discovery, PIN pairing, and a network speed test. The lower-latency **stage-2 presenter**
+(`VTDecompressionSession` → `CAMetalLayer`) is built and opt-in (Settings → Presenter); see below.
+
+First light was achieved 2026-06-10 — validated live, Mac ↔ a Linux host over the LAN: gamescope
+virtual output → NVENC HEVC →
 `punktfunk/1` (GF(2¹⁶) FEC + AES-GCM over UDP, QUIC control) → VideoToolbox →
 `AVSampleBufferDisplayLayer` on glass at 1280×720@60, with mouse/keyboard flowing back as
 QUIC datagrams into the host's gamescope EIS injector (thousands of events injected during

@@ -3,8 +3,9 @@ title: Clients
 description: The ways to connect to a punktfunk host — the Apple app, Moonlight, or the Linux client.
 ---
 
-A punktfunk host accepts clients over its own `punktfunk/1` protocol (the Apple and Linux apps) and
-over GameStream (Moonlight). Pick whichever fits the device you're streaming *to*. Ready to install?
+A punktfunk host accepts clients over its own `punktfunk/1` protocol (the macOS, Linux, Windows, and
+Android apps) and over GameStream (Moonlight). Pick whichever fits the device you're streaming *to*.
+Ready to install?
 **[Install a Client](/docs/install-client)** has the step-by-step for every device.
 
 ## Apple app (Mac, iPhone, iPad, Apple TV)
@@ -24,8 +25,9 @@ Open the app, pick your host, [pair](/docs/pairing) once, and stream. It builds 
 ## Moonlight (anything else)
 
 punktfunk also speaks the **GameStream** protocol, so any [Moonlight](https://moonlight-stream.org/)
-client — Windows, Android, Steam Deck, a browser, an old phone — connects with no punktfunk-specific
-software. See [Connect with Moonlight](/docs/moonlight).
+client — a browser, a smart TV, an old phone, a games console — connects with no punktfunk-specific
+software. (Most platforms also have a native punktfunk app below — Moonlight is the catch-all.) See
+[Connect with Moonlight](/docs/moonlight).
 
 This is the broadest-compatibility option and great for couch gaming. It doesn't use the native
 protocol's FEC/encryption extensions, but for a healthy LAN that rarely matters.
@@ -54,15 +56,31 @@ connect straight away:
 punktfunk-client --connect <host>:9777   # skip the picker, start a session immediately
 ```
 
-## Windows desktop client (in development)
+## Android app (phone + Android TV)
 
-`punktfunk-client` for Windows (`clients/windows`) is the native graphical client
-for Windows — pure Rust, the same `punktfunk/1` core as the Apple and Linux apps, with a **WinUI 3**
-UI (host list, settings, PIN pairing) and the video on a `SwapChainPanel`, plus WASAPI audio, FFmpeg
-decode, SDL3 controllers, network discovery, and PIN pairing. Launch it and pick a host from the
-list, just like the Apple and Linux apps. It builds on `x86_64-pc-windows-msvc`; hardware (D3D11VA)
-decode, 10-bit/HDR present, and packaging are in progress, so it is not yet shipped. A headless CLI
-path exists for scripting/measurement:
+The native Android app speaks `punktfunk/1` directly, on both phones and Android TV. It does hardware
+HEVC decode (including HDR10), Opus audio with a mic uplink, game controllers with rumble and
+DualSense feedback, automatic host discovery, PIN pairing with pinned reconnects, and a live stats
+overlay — with D-pad and game-controller focus navigation for the couch. It builds from the
+`clients/android` directory (Kotlin + a shared Rust core).
+
+Install it from **Google Play** — see [Install a Client](/docs/install-client#android). Open the app,
+pick your host, [pair](/docs/pairing) once, and stream.
+
+## Windows desktop client
+
+`punktfunk-client` for Windows (`clients/windows`) is the native graphical client for Windows — pure
+Rust, the same `punktfunk/1` core as the Apple, Linux, and Android apps, with a **WinUI 3** UI (host
+list, settings, PIN pairing) and the video on a `SwapChainPanel`. It does D3D11VA hardware decode
+(software fallback), 10-bit/HDR present, WASAPI audio + mic, SDL3 controllers (rumble, lightbar,
+DualSense), network discovery, and the full PIN-pairing trust surface. It builds for both `x86_64`
+and `aarch64` and ships as a **signed MSIX**. Launch it and pick a host from the list, just like the
+other native apps.
+
+> The hardware-decode and HDR paths are complete but still pending validation on real GPU hardware.
+> If anything misbehaves, **[Moonlight](/docs/moonlight)** is a proven alternative for Windows.
+
+A headless CLI path exists for scripting/measurement:
 
 ```sh
 punktfunk-client                                   # open the WinUI 3 window (host list / settings)
@@ -70,7 +88,7 @@ punktfunk-client --discover                        # list hosts on the network
 punktfunk-client --headless --connect <host>:9777  # no window: connect, count frames, print stats
 ```
 
-Until it ships, **Moonlight** remains the recommended way to stream to Windows (see below).
+Prefer the broadest compatibility, or no install? **Moonlight** also streams to Windows (see below).
 
 ## Linux reference client (headless)
 
@@ -89,7 +107,9 @@ punktfunk-probe --connect <host>:9777 --pin <fp>  # connect to one
 |---|---|
 | A Mac, iPhone, iPad, or Apple TV | The **Apple app** |
 | A Linux desktop or laptop, or a Steam Deck | **`punktfunk-client`** (GTK4) |
-| Windows, Android, a browser, a TV | **Moonlight** |
+| An Android phone or TV | The **Android app** |
+| Windows | The native **`punktfunk-client`** (signed MSIX) or **Moonlight** |
+| A browser, a smart TV, or any other device | **Moonlight** |
 | Automated tests / latency measurement | **`punktfunk-probe`** (headless) |
 
 Whichever you choose, the first connection needs a one-time [pairing](/docs/pairing).

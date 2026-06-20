@@ -17,8 +17,8 @@ It's built for the things that make streaming feel native:
 - **Low latency, GPU end to end.** Frames go straight from the compositor to the GPU encoder
   (NVENC) with zero CPU copies, and over a transport tuned for responsiveness rather than throughput.
 - **Works with the apps you already have.** punktfunk speaks the GameStream protocol, so any
-  **Moonlight** client connects out of the box — and a faster **native protocol** with a dedicated
-  app for Apple devices.
+  **Moonlight** client connects out of the box — and a faster **native protocol** with dedicated apps
+  for **macOS, iOS, tvOS, Linux, Windows, and Android**.
 - **Secure by default.** Hosts require a one-time PIN pairing; after that, devices reconnect on a
   pinned identity. No accounts, no cloud.
 
@@ -28,15 +28,16 @@ It's built for the things that make streaming feel native:
   <Card title="How It Works" href="/docs/how-it-works" description="The ideas behind punktfunk in a few minutes — virtual displays, the two protocols, pairing." />
   <Card title="Quick Start" href="/docs/quickstart" description="From nothing to streaming: set up a host and connect your first client." />
   <Card title="Host Setup" href="/docs/requirements" description="Install the host on Ubuntu (GNOME or KDE), Fedora (KDE), or Bazzite." />
-  <Card title="Connect a Client" href="/docs/clients" description="Stream with the Apple app, Moonlight, or the Linux client." />
+  <Card title="Connect a Client" href="/docs/clients" description="Stream with the native app for your device — macOS, Linux, Windows, Android — or any Moonlight client." />
 </Cards>
 
 ## What you need
 
 - A **Linux host** with an **NVIDIA GPU** (for the NVENC hardware encoder) running one of the
   [supported setups](/docs/requirements): **Ubuntu** (GNOME or KDE), **Fedora** (KDE), or **Bazzite**.
-- A **client device** to stream to — a Mac/iPhone/iPad/Apple TV (native app), or anything that runs
-  **Moonlight**.
+  A native [**Windows host**](/docs/windows-host) (NVIDIA-only) is also available.
+- A **client device** to stream to — there are native apps for **macOS, iOS/iPadOS, tvOS, Linux,
+  Windows, and Android**, plus any device that runs **Moonlight**.
 - Both on the **same network** (LAN or VPN). punktfunk is designed for a trusted local network.
 
 Ready? Head to the [Quick Start](/docs/quickstart).

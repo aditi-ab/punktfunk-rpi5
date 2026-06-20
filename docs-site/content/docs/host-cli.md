@@ -17,7 +17,7 @@ punktfunk-host serve --native
 
 | Flag | Meaning |
 |---|---|
-| `--native` | Also run the native `punktfunk/1` server (recommended; enables the Apple app and discovery). |
+| `--native` | Also run the native `punktfunk/1` server (recommended; enables the native clients and discovery). |
 | `--native-port <PORT>` | Native QUIC port (default `9777`). |
 | `--open` | Don't require pairing — serve any device on the network. Off by default; only for trusted single-user setups. |
 | `--mgmt-bind <IP:PORT>` | Management API address (default loopback `127.0.0.1:47990`). |

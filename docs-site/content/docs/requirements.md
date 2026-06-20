@@ -5,8 +5,9 @@ description: What you need to run a punktfunk host — GPU, driver, desktop, and
 
 ## Supported setups
 
-A punktfunk host runs on a Linux machine with an NVIDIA GPU. These are the desktop environments it
-supports today, each with its own guide:
+A punktfunk host runs primarily on a Linux machine with an NVIDIA GPU (a native
+[Windows host](/docs/windows-host) is also available — see below). These are the Linux desktop
+environments it supports today, each with its own guide:
 
 | Setup | Desktop / compositor | Guide |
 |---|---|---|
@@ -17,6 +18,10 @@ supports today, each with its own guide:
 
 Other wlroots compositors (Sway/Hyprland) also work but aren't a primary target. If your desktop isn't
 listed, the host still needs one of these compositor backends to create a virtual display.
+
+> **Windows host:** punktfunk also runs as a native host on **Windows 10/11 (x64) with an NVIDIA GPU**
+> — a signed installer that registers a service and bundles a virtual-display driver. It's NVIDIA-only
+> and newer than the Linux host; see [Windows Host](/docs/windows-host).
 
 ## GPU and driver
 
@@ -54,5 +59,6 @@ Minimum compositor versions (newer is fine):
 
 ## A client
 
-You also need something to stream *to* — see [Connect a Client](/docs/clients). The Apple app and any
-Moonlight client both work; both can discover the host on your network automatically.
+You also need something to stream *to* — see [Connect a Client](/docs/clients). There are native
+punktfunk clients for **Apple (macOS, iOS, iPadOS, tvOS), Linux, Windows, and Android**, and any
+Moonlight client works too. All of them can discover the host on your network automatically.

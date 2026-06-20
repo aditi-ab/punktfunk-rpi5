@@ -3,7 +3,11 @@ title: "Apple Stage-2 Presenter (handoff)"
 description: "Implementation plan for the explicit VTDecompressionSession → CAMetalLayer presenter — hand-paced present + true decode→present (glass-to-glass) measurement. Written so a Mac agent can pick it up."
 ---
 
-A pickup-ready plan for the **stage-2 Apple presenter**. The current **stage-1** presenter feeds
+> **Status update:** the stage-2 presenter described here has since been **built and live-validated**,
+> shipping behind an opt-in flag (`AVSampleBufferDisplayLayer` remains the default known-good path).
+> This page is preserved as the implementation/handoff record for that work.
+
+The implementation plan for the **stage-2 Apple presenter**. The **stage-1** presenter feeds
 compressed HEVC straight into `AVSampleBufferDisplayLayer`, which hardware-decodes **and presents
 internally with no per-frame callback** — so we can't stamp decode or present, and we can't hand-pace.
 Stage-2 takes explicit control: decode with `VTDecompressionSession`, present decoded frames through a

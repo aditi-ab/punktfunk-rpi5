@@ -6,7 +6,7 @@ description: "The full design: protocol core, milestones, and architecture."
 
 *A ground-up low-latency desktop streaming stack, built Linux-first, with a shared Rust protocol core and native clients per platform.*
 
-> `punktfunk` is a placeholder codename — rename freely. It fits the lowercase house style (`unom`, `played`, `remplir`) and reads as "glass-to-glass light," which is the whole point.
+> The name `punktfunk` fits the lowercase house style (`unom`, `played`, `remplir`) and reads as "glass-to-glass light," which is the whole point.
 
 ---
 
@@ -32,7 +32,7 @@ Two concrete gaps justify a new project rather than another fork:
 
 **Explicit non-goals (at least at first):**
 - Windows *host* support (Sunshine/Apollo already do this well; no gap to fill).
-- Internet/NAT-traversal relay infrastructure (LAN/VPN first; you already run Headscale/NetBird — lean on that).
+- Internet/NAT-traversal relay infrastructure (LAN/VPN first; lean on an existing mesh VPN such as Headscale/NetBird/Tailscale).
 - Reinventing encoders/decoders (bind to FFmpeg + vendor SDKs; never rewrite codecs).
 - A bespoke compositor (drive existing ones; only consider a dedicated headless compositor as a *deployment mode*, see §6).
 
@@ -169,7 +169,7 @@ This is the differentiator and the most fragmented part. Two deployment models �
 
 **Per-compositor (Model A) runtime virtual-output creation:**
 
-- **KWin / Plasma 6 (recommended MVP target — matches your CachyOS/KDE daily driver and where the gap is loudest):** KWin can create virtual outputs; KRdp already does this internally for remote sessions. Drive it via the KWin DBus interface; capture via `xdg-desktop-portal-kde` ScreenCast (PipeWire); inject input via the RemoteDesktop portal or `reis`.
+- **KWin / Plasma 6 (recommended MVP target — a common KDE daily-driver setup, and where the gap is loudest):** KWin can create virtual outputs; KRdp already does this internally for remote sessions. Drive it via the KWin DBus interface; capture via `xdg-desktop-portal-kde` ScreenCast (PipeWire); inject input via the RemoteDesktop portal or `reis`.
 - **wlroots (Sway/Hyprland — fastest to *prototype* the pipeline):** enable the headless backend (`WLR_BACKENDS=…,headless`), then `swaymsg create_output` / `hyprctl output create headless`. Capture via `wlr-screencopy` or the portal. Simplest API; good for validating capture→encode→send before fighting KWin/Mutter.
 - **Mutter / GNOME:** virtual monitors via the headless backend; runtime creation via Mutter DBus (`org.gnome.Mutter.*` — partly experimental). Capture via `xdg-desktop-portal-gnome` ScreenCast.
 
@@ -227,7 +227,7 @@ Sizing is rough and relative (Spike / S / M / L) for a focused solo dev; treat a
 
 **M4 — P2 transport: break the wall (L).** Add `punktfunk/1` negotiation; swap to `reed-solomon-simd` GF(2¹⁶) with multi-block per-frame framing; optional QUIC control/audio. Write a minimal **Rust** reference client (decode via VAAPI, present via wgpu/Vulkan) to exercise it. *Acceptance:* a stable stream above 1.4 Gbps at 5120×1440@240 with loss recovery working; latency unchanged vs. M2.
 
-**M5 — Apple client (L).** Swift + VideoToolbox + Metal + SwiftUI, linking `punktfunk-core` via the C header. *Acceptance:* the Mac Studio plays a stream at native resolution/refresh.
+**M5 — Apple client (L).** Swift + VideoToolbox + Metal + SwiftUI, linking `punktfunk-core` via the C header. *Acceptance:* a Mac plays a stream at native resolution/refresh.
 
 **M6 — Feature surface (M, ongoing).** Mic passthrough as a proper encrypted, per-client reverse audio stream (the thing the upstream PR got wrong); HDR signalling; per-client identity/permissions; pause/resume. *Acceptance:* feature parity with Apollo on the items you care about, plus mic done right.
 
@@ -243,7 +243,7 @@ Sizing is rough and relative (Spike / S / M / L) for a focused solo dev; treat a
 | Encoder/decoder can't sustain 1.77 Gpx/s @ 240 | Med | High | Measure in M0/M4 on real silicon; this is a hardware ceiling no rewrite fixes — discover it before P2, not after |
 | Frame pacing eats more time than expected | High | Med | M3 measurement harness first; treat pacing as a first-class subsystem, not a polish step |
 | Scope creep into a full Moonlight replacement | High | High | P1 (stock-client compat) is the firewall: it forces you to ship value before writing a client |
-| Solo bandwidth vs. your other projects (ENRW thesis, played) | High | Med | M2 is a complete, useful artifact on its own; the plan is safe to pause after any milestone |
+| Solo bandwidth vs. other projects | High | Med | M2 is a complete, useful artifact on its own; the plan is safe to pause after any milestone |
 
 ---
 
@@ -254,7 +254,7 @@ Sizing is rough and relative (Spike / S / M / L) for a focused solo dev; treat a
 - **Loss resilience:** `tc netem` to inject loss/jitter/reorder; verify FEC recovery and graceful degradation.
 - **Pacing:** log present timestamps vs. client vsync; alert on stalls and duplicate/dropped frames.
 - **Soak:** multi-hour streams; watch for buffer growth, fd leaks, encoder session exhaustion.
-- **Hardware matrix:** your NVIDIA box (NVENC), an AMD/Intel box (VAAPI), Mac Studio (VideoToolbox decode). Catch driver quirks early.
+- **Hardware matrix:** an NVIDIA box (NVENC), an AMD/Intel box (VAAPI), a Mac (VideoToolbox decode). Catch driver quirks early.
 
 ---
 
@@ -290,10 +290,10 @@ punktfunk/
 
 ## 12. Immediate next actions (first week)
 
-1. **Stand up the workspace** with `punktfunk-core` (empty ABI + `cbindgen`) and `punktfunk-host` skeletons; CI on your Gitea (you already have BuildKit pipelines).
-2. **M0 spike on wlroots:** headless output → PipeWire capture → NVENC/VAAPI encode → playable file. This validates the riskiest *pipeline* assumptions in days, on your real GPU.
-3. **Read KRdp's source** for how KDE creates virtual outputs and casts them — it's the closest existing reference for the KWin path you'll need in M2.
-4. **Decide P1 protocol depth:** confirm exactly which `serverinfo`/RTSP/pairing messages a current Moonlight client requires for a successful connect, so M2's compat surface is scoped precisely (this is also the question to take back to the dev who mentioned the 1G limit).
+1. **Stand up the workspace** with `punktfunk-core` (empty ABI + `cbindgen`) and `punktfunk-host` skeletons; wire up CI (Gitea Actions, BuildKit-based pipelines).
+2. **M0 spike on wlroots:** headless output → PipeWire capture → NVENC/VAAPI encode → playable file. This validates the riskiest *pipeline* assumptions in days, on real GPU hardware.
+3. **Read KRdp's source** for how KDE creates virtual outputs and casts them — it's the closest existing reference for the KWin path needed in M2.
+4. **Decide P1 protocol depth:** confirm exactly which `serverinfo`/RTSP/pairing messages a current Moonlight client requires for a successful connect, so M2's compat surface is scoped precisely.
 
 ---
 

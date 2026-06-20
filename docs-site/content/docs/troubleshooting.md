@@ -65,8 +65,9 @@ Then log out and back in. On other distros this is `sudo usermod -aG input $USER
 
 ## Stutter, drops, or high latency
 
-- Lower the **bitrate**. On a busy or Wi-Fi link, the requested bitrate may be too high — the Apple
-  app's [speed test](/docs/configuration#bitrate) picks a safe value; with Moonlight, set it manually.
+- Lower the **bitrate**. On a busy or Wi-Fi link, the requested bitrate may be too high — the native
+  clients' [speed test](/docs/configuration#bitrate) picks a safe value; with Moonlight, set it
+  manually.
 - Prefer a **wired** connection or 5 GHz Wi-Fi between host and client.
 - Streaming to **many devices at once** shares the GPU encoder. The production host
   (`serve --native`) handles one native session at a time, with extra clients queued; heavy load is
