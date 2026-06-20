@@ -1667,26 +1667,35 @@ fn run_probe_burst(session: &mut Session, req: ProbeRequest, stop: &AtomicBool) 
             bytes_sent: 0,
             packets_sent: 0,
             duration_ms: 0,
+            wire_packets_sent: 0,
+            send_dropped: 0,
         };
     }
     // kbps -> bytes/s (x1000/8).
     let bytes_per_sec = target_kbps as u64 * 125;
-    // ~240 AUs/s for smooth pacing, each capped so one submit_frame stays a bounded burst (a large
-    // AU fragments into many UDP shards via sendmmsg).
-    let chunk = (bytes_per_sec / 240).clamp(1200, 256 * 1024) as usize;
+    // Keep each AU a SMALL burst (~16 KB ≈ a dozen MTU shards) and let the byte budget below pace
+    // the rate finely. The old 256 KB cap blasted ~200 packets into the send buffer per submit, so
+    // a small buffer (e.g. the Deck's 416 KB) overflowed on a single AU and the test measured
+    // self-inflicted buffer overflow instead of the link — mirror how `paced_submit` spreads the
+    // real video path's frames so the probe stresses the same way a real stream does.
+    let chunk = (bytes_per_sec / 240).clamp(1200, 16 * 1024) as usize;
     let filler = vec![0u8; chunk];
-    // Host send-buffer drops over the burst — at high target rates this is where the native
-    // single-send()-per-packet path first loses, so report it alongside what we offered.
-    let send_dropped0 = session.stats().packets_send_dropped;
+    // Wire-packet accounting via session-stat deltas: `packets_sent` counts every sealed wire packet
+    // (seal_frame), `packets_send_dropped` every one the send buffer rejected (WouldBlock/ENOBUFS).
+    // Their delta over the burst is exact — and isolates host-side drops from link loss for the
+    // client. Video is paused for the burst (the data-plane loop is blocked here), so these deltas
+    // are pure probe traffic.
+    let wire0 = session.stats().packets_sent;
+    let drop0 = session.stats().packets_send_dropped;
     let start = std::time::Instant::now();
     let deadline = start + std::time::Duration::from_millis(duration_ms as u64);
     let mut bytes_sent = 0u64;
-    let mut packets_sent = 0u32;
+    let mut packets_sent = 0u32; // probe access-unit count (goodput chunks)
     while std::time::Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
         let allowed = (start.elapsed().as_secs_f64() * bytes_per_sec as f64) as u64;
         if bytes_sent < allowed {
-            // A full send buffer drops on WouldBlock (UdpTransport returns Ok) — that loss is part
-            // of what the probe measures, so count what we offered and keep going.
+            // A full send buffer drops on WouldBlock/ENOBUFS (UdpTransport returns Ok) — that loss is
+            // part of what the probe measures (it surfaces as send_dropped), so keep going.
             let _ = session.submit_frame(&filler, now_ns(), FLAG_PROBE as u32);
             bytes_sent += chunk as u64;
             packets_sent += 1;
@@ -1695,12 +1704,16 @@ fn run_probe_burst(session: &mut Session, req: ProbeRequest, stop: &AtomicBool) 
         }
     }
     let actual_ms = start.elapsed().as_millis() as u32;
-    let send_dropped = session.stats().packets_send_dropped - send_dropped0;
+    let wire_offered = (session.stats().packets_sent - wire0) as u32;
+    let send_dropped = (session.stats().packets_send_dropped - drop0) as u32;
+    let wire_packets_sent = wire_offered.saturating_sub(send_dropped);
     tracing::info!(
         target_kbps,
         duration_ms = actual_ms,
         bytes_sent,
-        packets_sent,
+        au_count = packets_sent,
+        wire_offered,
+        wire_packets_sent,
         send_dropped,
         "speed-test probe burst complete"
     );
@@ -1708,6 +1721,8 @@ fn run_probe_burst(session: &mut Session, req: ProbeRequest, stop: &AtomicBool) 
         bytes_sent,
         packets_sent,
         duration_ms: actual_ms,
+        wire_packets_sent,
+        send_dropped,
     }
 }
 

@@ -181,17 +181,30 @@ pub struct ProbeRequest {
     pub duration_ms: u32,
 }
 
-/// `host → client`: the probe burst is finished. Reports what the host actually sent so the
-/// client can compute delivery ratio (loss) = `received / bytes_sent` and throughput =
-/// `received_bytes * 8 / elapsed`.
+/// `host → client`: the probe burst is finished. Reports what the host actually put on the wire so
+/// the client can split the two failure modes apart: **host-side** drops (the send buffer couldn't
+/// keep up — raise `net.core.wmem_max`) vs **link** loss (wire packets the air dropped). The client
+/// measures delivered wire packets itself and computes:
+///
+/// - link loss   = `(wire_packets_sent − received) / wire_packets_sent`
+/// - host drop   = `send_dropped / (wire_packets_sent + send_dropped)`
+/// - throughput  = `received_wire_bytes * 8 / duration_ms`
+///
+/// Counting delivered traffic at the *packet* level (not whole reassembled AUs) makes the figure
+/// degrade gracefully past the FEC budget instead of cliffing to zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeResult {
-    /// Total access-unit payload bytes the host emitted for the probe.
+    /// Total access-unit payload bytes the host emitted for the probe (application goodput offered).
     pub bytes_sent: u64,
     /// Number of probe access units the host emitted.
     pub packets_sent: u32,
     /// The burst's actual duration in milliseconds (the host clamps/measures the request).
     pub duration_ms: u32,
+    /// Wire packets the kernel ACCEPTED for transmission — what actually went on the link (offered
+    /// minus the send-buffer drops below). `0` from a pre-wire-stats host (back-compat decode).
+    pub wire_packets_sent: u32,
+    /// Wire packets the host could NOT hand to the kernel (send buffer full): the host-side ceiling.
+    pub send_dropped: u32,
 }
 
 /// `client → host`, right after [`Start`]: one round of the wall-clock skew handshake. The client
@@ -834,23 +847,36 @@ impl ProbeRequest {
 impl ProbeResult {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] bytes_sent[5..13] packets_sent[13..17] duration_ms[17..21]
-        let mut b = Vec::with_capacity(21);
+        // wire_packets_sent[21..25] send_dropped[25..29]
+        let mut b = Vec::with_capacity(29);
         b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_PROBE_RESULT);
         b.extend_from_slice(&self.bytes_sent.to_le_bytes());
         b.extend_from_slice(&self.packets_sent.to_le_bytes());
         b.extend_from_slice(&self.duration_ms.to_le_bytes());
+        b.extend_from_slice(&self.wire_packets_sent.to_le_bytes());
+        b.extend_from_slice(&self.send_dropped.to_le_bytes());
         b
     }
 
     pub fn decode(b: &[u8]) -> Result<ProbeResult> {
-        if b.len() != 21 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PROBE_RESULT {
+        // Back-compat: 21 bytes (pre-wire-stats host, new fields default 0) or 29 bytes (with the
+        // wire_packets_sent + send_dropped tail). Accept either; reject anything shorter/garbled.
+        if b.len() < 21 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PROBE_RESULT {
             return Err(PunktfunkError::InvalidArg("bad ProbeResult"));
         }
+        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let (wire_packets_sent, send_dropped) = if b.len() >= 29 {
+            (u32at(21), u32at(25))
+        } else {
+            (0, 0)
+        };
         Ok(ProbeResult {
             bytes_sent: u64::from_le_bytes(b[5..13].try_into().unwrap()),
-            packets_sent: u32::from_le_bytes(b[13..17].try_into().unwrap()),
-            duration_ms: u32::from_le_bytes(b[17..21].try_into().unwrap()),
+            packets_sent: u32at(13),
+            duration_ms: u32at(17),
+            wire_packets_sent,
+            send_dropped,
         })
     }
 }
@@ -1862,8 +1888,20 @@ mod tests {
             bytes_sent: 62_500_000,
             packets_sent: 480,
             duration_ms: 2003,
+            wire_packets_sent: 41_000,
+            send_dropped: 1_200,
         };
         assert_eq!(ProbeResult::decode(&res.encode()).unwrap(), res);
+        assert_eq!(res.encode().len(), 29);
+        // A pre-wire-stats host's 21-byte ProbeResult still decodes, with the new fields zeroed.
+        let legacy = {
+            let full = res.encode();
+            full[..21].to_vec()
+        };
+        let decoded = ProbeResult::decode(&legacy).unwrap();
+        assert_eq!(decoded.wire_packets_sent, 0);
+        assert_eq!(decoded.send_dropped, 0);
+        assert_eq!(decoded.bytes_sent, res.bytes_sent);
         // Type bytes keep the control messages disjoint from each other.
         assert!(ProbeRequest::decode(&res.encode()).is_err());
         assert!(Reconfigure::decode(&req.encode()).is_err());

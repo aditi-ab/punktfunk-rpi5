@@ -468,22 +468,29 @@ typedef struct {
 
 // A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
 // the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
-// measured goodput to drive a bitrate choice from; `loss_pct` is the delivery loss at that rate.
+// delivered wire throughput to drive a bitrate choice from; `loss_pct` is the link loss and
+// `host_drop_pct` the host-side send-buffer drop (raise `net.core.wmem_max`) — they're measured
+// separately so a host that can't keep up reads differently from a lossy link.
 typedef struct {
     // 1 once the host's end-of-burst report arrived (measurement final); else 0 (partial).
     uint8_t done;
-    // Probe payload bytes / packets the client received.
+    // Delivered wire bytes (header + shard) / packets the client received during the burst.
     uint64_t recv_bytes;
     uint32_t recv_packets;
-    // Probe payload bytes / packets the host reported sending.
+    // Application goodput bytes / access units the host offered.
     uint64_t host_bytes;
     uint32_t host_packets;
-    // Client-measured receive window (first→last probe AU), milliseconds.
+    // The host's measured burst duration, milliseconds (the throughput denominator).
     uint32_t elapsed_ms;
-    // Measured goodput = `recv_bytes * 8 / elapsed_ms` (kilobits/second).
+    // Delivered wire throughput = `recv_bytes * 8 / elapsed_ms` (kilobits/second).
     uint32_t throughput_kbps;
-    // Delivery loss `(host_bytes - recv_bytes) / host_bytes` as a percentage (0 if unknown).
+    // Link loss `(wire_packets_sent − recv_packets) / wire_packets_sent` as a percentage.
     float loss_pct;
+    // Host-side send-buffer drop `send_dropped / (wire_packets_sent + send_dropped)`, percent.
+    float host_drop_pct;
+    // Wire packets the host put on the link, and the ones its send buffer dropped (raw counts).
+    uint32_t wire_packets_sent;
+    uint32_t send_dropped;
 } PunktfunkProbeResult;
 
 #ifdef __cplusplus

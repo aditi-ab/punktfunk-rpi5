@@ -24,7 +24,7 @@ use crate::transport::UdpTransport;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// A control-stream request the embedder makes on the open handshake stream: a mode switch or a
 /// speed test. One outbound channel carries both so the worker's `select!` has a single writer
@@ -41,22 +41,35 @@ enum CtrlRequest {
 /// (ns, host minus client; 0 = no skew correction / an old host that didn't answer the handshake).
 type Negotiated = (Mode, CompositorPref, GamepadPref, [u8; 32], u32, i64);
 
-/// Accumulated state of an in-flight / finished speed test. The data-plane pump folds each
-/// received [`FLAG_PROBE`] access unit in; the control task records the host's [`ProbeResult`]
-/// when it lands. Read (and finalized into numbers) by [`NativeClient::probe_result`].
+/// Accumulated state of an in-flight / finished speed test. The data-plane pump mirrors the
+/// session's packet-level receive counters here; the control task finalizes the delivered figure
+/// and folds in the host's [`ProbeResult`] when it lands. Read by [`NativeClient::probe_result`].
+///
+/// Counting at the *packet* level (every delivered wire packet) — not whole reassembled probe AUs —
+/// is what makes the measurement degrade gracefully: once loss exceeds the FEC budget no AU
+/// completes, so the old AU-based count cliffed to zero even though most bytes still arrived.
 #[derive(Default)]
 struct ProbeState {
     /// A probe is in progress (set by `request_probe`, cleared by nothing — the latest one wins).
     active: bool,
-    /// Probe access-unit payload bytes the client received, and their count.
-    recv_bytes: u64,
-    recv_packets: u32,
-    /// First/last probe AU arrival — the measured receive window.
-    start: Option<Instant>,
-    last: Option<Instant>,
-    /// The host's report ([`ProbeResult`]); present once the burst finished.
-    host_bytes: u64,
-    host_packets: u32,
+    /// `session.stats()` receive counters at the burst's start (snapshotted by the pump on its first
+    /// tick while active) and latest, mirrored every pump iteration.
+    base_packets: Option<u64>,
+    base_bytes: Option<u64>,
+    rx_packets_now: u64,
+    rx_bytes_now: u64,
+    /// Delivered wire packets / plaintext bytes (header + shard), frozen when the host's report lands
+    /// (so resumed video after the burst can't inflate them).
+    delivered_packets: u64,
+    delivered_bytes: u64,
+    /// The host's end-of-burst report.
+    host_goodput_bytes: u64,
+    host_au: u32,
+    /// Wire packets the host actually put on the link, and the ones its send buffer dropped.
+    host_wire_packets: u32,
+    host_send_dropped: u32,
+    /// The host's measured burst duration (the throughput denominator).
+    host_duration_ms: u32,
     /// The host's `ProbeResult` arrived → the measurement is final.
     done: bool,
 }
@@ -66,19 +79,27 @@ struct ProbeState {
 pub struct ProbeOutcome {
     /// The host's end-of-burst report has arrived — the numbers below are final.
     pub done: bool,
-    /// Probe payload bytes / packets the client received.
+    /// Delivered wire bytes (header + shard) / packets the client received during the burst.
     pub recv_bytes: u64,
     pub recv_packets: u32,
-    /// Probe payload bytes / packets the host reported sending.
+    /// Application goodput bytes / access units the host offered.
     pub host_bytes: u64,
     pub host_packets: u32,
-    /// The client-measured receive window (first→last probe AU), in milliseconds.
+    /// The burst duration the host measured, in milliseconds (the throughput denominator).
     pub elapsed_ms: u32,
-    /// Measured goodput = `recv_bytes * 8 / elapsed_ms` (kilobits/second). This is the figure to
-    /// drive a [`Hello::bitrate_kbps`] choice from.
+    /// Delivered wire throughput = `recv_bytes * 8 / elapsed_ms` (kilobits/second). The figure to
+    /// drive a [`Hello::bitrate_kbps`] choice from (allow headroom for the FEC overhead + loss).
     pub throughput_kbps: u32,
-    /// Delivery loss = `(host_bytes - recv_bytes) / host_bytes`, as a percentage (0 if unknown).
+    /// Link loss = `(wire_packets_sent − received) / wire_packets_sent`, percent. Packets the host
+    /// put on the wire that didn't arrive.
     pub loss_pct: f32,
+    /// Host-side drop = `send_dropped / (wire_packets_sent + send_dropped)`, percent. Packets the
+    /// host's send buffer couldn't accept (raise `net.core.wmem_max` / lower the rate). Distinct
+    /// from `loss_pct`: this is the host failing to keep up, not the link dropping traffic.
+    pub host_drop_pct: f32,
+    /// Wire packets the host put on the link and the ones its send buffer dropped (raw counts).
+    pub wire_packets_sent: u32,
+    pub send_dropped: u32,
 }
 
 /// Frames buffered between the data-plane pump and the embedder. Small: the embedder
@@ -458,30 +479,52 @@ impl NativeClient {
     /// end-of-burst report lands). Derives goodput + loss from the accumulated probe bytes.
     pub fn probe_result(&self) -> ProbeOutcome {
         let p = self.probe.lock().unwrap();
-        let elapsed_ms = match (p.start, p.last) {
-            (Some(s), Some(l)) => l.duration_since(s).as_millis() as u32,
-            _ => 0,
+        // Delivered figures: live (rx_now − base) while the burst runs, frozen at the host's report.
+        let (delivered_packets, delivered_bytes) = if p.done {
+            (p.delivered_packets, p.delivered_bytes)
+        } else {
+            let base_p = p.base_packets.unwrap_or(p.rx_packets_now);
+            let base_b = p.base_bytes.unwrap_or(p.rx_bytes_now);
+            (
+                p.rx_packets_now.saturating_sub(base_p),
+                p.rx_bytes_now.saturating_sub(base_b),
+            )
         };
-        // bytes × 8 / ms = kilobits/second.
-        let throughput_kbps = if elapsed_ms > 0 {
-            (p.recv_bytes.saturating_mul(8) / elapsed_ms as u64) as u32
+        // The host's burst duration is the throughput denominator. bytes × 8 / ms = kilobits/second.
+        let window_ms = p.host_duration_ms;
+        let throughput_kbps = if window_ms > 0 {
+            (delivered_bytes.saturating_mul(8) / window_ms as u64) as u32
         } else {
             0
         };
-        let loss_pct = if p.host_bytes > 0 {
-            p.host_bytes.saturating_sub(p.recv_bytes) as f64 / p.host_bytes as f64 * 100.0
+        // Link loss: wire packets the host put out that didn't arrive. Packet-level, so it degrades
+        // smoothly past the FEC budget instead of cliffing to 100% the moment AUs stop completing.
+        let loss_pct = if p.host_wire_packets > 0 {
+            (p.host_wire_packets as i64 - delivered_packets as i64).max(0) as f64
+                / p.host_wire_packets as f64
+                * 100.0
+        } else {
+            0.0
+        } as f32;
+        // Host-side drop: what the send buffer couldn't even accept (the host-side ceiling).
+        let offered_wire = p.host_wire_packets + p.host_send_dropped;
+        let host_drop_pct = if offered_wire > 0 {
+            p.host_send_dropped as f64 / offered_wire as f64 * 100.0
         } else {
             0.0
         } as f32;
         ProbeOutcome {
             done: p.done,
-            recv_bytes: p.recv_bytes,
-            recv_packets: p.recv_packets,
-            host_bytes: p.host_bytes,
-            host_packets: p.host_packets,
-            elapsed_ms,
+            recv_bytes: delivered_bytes,
+            recv_packets: delivered_packets as u32,
+            host_bytes: p.host_goodput_bytes,
+            host_packets: p.host_au,
+            elapsed_ms: window_ms,
             throughput_kbps,
             loss_pct,
+            host_drop_pct,
+            wire_packets_sent: p.host_wire_packets,
+            send_dropped: p.host_send_dropped,
         }
     }
 
@@ -824,13 +867,24 @@ async fn worker_main(args: WorkerArgs) {
                             }
                         } else if let Ok(result) = ProbeResult::decode(&msg) {
                             let mut p = probe.lock().unwrap();
-                            p.host_bytes = result.bytes_sent;
-                            p.host_packets = result.packets_sent;
+                            // Freeze the delivered figures now (the burst is done), before resumed
+                            // video can inflate the packet counters.
+                            let base_p = p.base_packets.unwrap_or(p.rx_packets_now);
+                            let base_b = p.base_bytes.unwrap_or(p.rx_bytes_now);
+                            p.delivered_packets = p.rx_packets_now.saturating_sub(base_p);
+                            p.delivered_bytes = p.rx_bytes_now.saturating_sub(base_b);
+                            p.host_goodput_bytes = result.bytes_sent;
+                            p.host_au = result.packets_sent;
+                            p.host_wire_packets = result.wire_packets_sent;
+                            p.host_send_dropped = result.send_dropped;
+                            p.host_duration_ms = result.duration_ms;
                             p.done = true;
                             tracing::info!(
-                                bytes_sent = result.bytes_sent,
-                                packets_sent = result.packets_sent,
+                                host_goodput_bytes = result.bytes_sent,
+                                wire_packets_sent = result.wire_packets_sent,
+                                send_dropped = result.send_dropped,
                                 duration_ms = result.duration_ms,
+                                delivered_packets = p.delivered_packets,
                                 "speed-test probe result"
                             );
                         } else {
@@ -892,21 +946,24 @@ async fn worker_main(args: WorkerArgs) {
         pin_thread_user_interactive(); // feeds frame_tx → the client's user-interactive video pump
         while !pump_shutdown.load(Ordering::SeqCst) {
             // Mirror the reassembler's unrecoverable-drop count for the client's keyframe-recovery
-            // loop. Updated every iteration (not just on a produced frame) so it stays current through
-            // a total-loss drought where no AU completes. Cheap: a few relaxed atomic loads.
-            frames_dropped.store(session.stats().frames_dropped, Ordering::Relaxed);
+            // loop, and (during a speed test) the packet-level receive counters for the throughput
+            // measurement. Updated every iteration (not just on a produced frame) so they stay current
+            // through a total-loss drought where no AU completes. Cheap: a few relaxed atomic loads.
+            let st = session.stats();
+            frames_dropped.store(st.frames_dropped, Ordering::Relaxed);
+            {
+                let mut p = pump_probe.lock().unwrap();
+                if p.active && !p.done {
+                    p.rx_packets_now = st.packets_received;
+                    p.rx_bytes_now = st.bytes_received;
+                    p.base_packets.get_or_insert(st.packets_received);
+                    p.base_bytes.get_or_insert(st.bytes_received);
+                }
+            }
             match session.poll_frame() {
                 Ok(frame) => {
                     if frame.flags & FLAG_PROBE as u32 != 0 {
-                        let mut p = pump_probe.lock().unwrap();
-                        if p.active {
-                            let now = Instant::now();
-                            p.start.get_or_insert(now);
-                            p.last = Some(now);
-                            p.recv_bytes += frame.data.len() as u64;
-                            p.recv_packets += 1;
-                        }
-                        continue; // not video — never enqueue for the decoder
+                        continue; // speed-test filler, not video — measured via the counters above
                     }
                     let _ = frame_tx.try_send(frame);
                 }

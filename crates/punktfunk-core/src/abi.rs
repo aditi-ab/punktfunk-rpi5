@@ -1525,24 +1525,31 @@ pub unsafe extern "C" fn punktfunk_connection_frames_dropped(
 
 /// A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
 /// the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
-/// measured goodput to drive a bitrate choice from; `loss_pct` is the delivery loss at that rate.
+/// delivered wire throughput to drive a bitrate choice from; `loss_pct` is the link loss and
+/// `host_drop_pct` the host-side send-buffer drop (raise `net.core.wmem_max`) — they're measured
+/// separately so a host that can't keep up reads differently from a lossy link.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PunktfunkProbeResult {
     /// 1 once the host's end-of-burst report arrived (measurement final); else 0 (partial).
     pub done: u8,
-    /// Probe payload bytes / packets the client received.
+    /// Delivered wire bytes (header + shard) / packets the client received during the burst.
     pub recv_bytes: u64,
     pub recv_packets: u32,
-    /// Probe payload bytes / packets the host reported sending.
+    /// Application goodput bytes / access units the host offered.
     pub host_bytes: u64,
     pub host_packets: u32,
-    /// Client-measured receive window (first→last probe AU), milliseconds.
+    /// The host's measured burst duration, milliseconds (the throughput denominator).
     pub elapsed_ms: u32,
-    /// Measured goodput = `recv_bytes * 8 / elapsed_ms` (kilobits/second).
+    /// Delivered wire throughput = `recv_bytes * 8 / elapsed_ms` (kilobits/second).
     pub throughput_kbps: u32,
-    /// Delivery loss `(host_bytes - recv_bytes) / host_bytes` as a percentage (0 if unknown).
+    /// Link loss `(wire_packets_sent − recv_packets) / wire_packets_sent` as a percentage.
     pub loss_pct: f32,
+    /// Host-side send-buffer drop `send_dropped / (wire_packets_sent + send_dropped)`, percent.
+    pub host_drop_pct: f32,
+    /// Wire packets the host put on the link, and the ones its send buffer dropped (raw counts).
+    pub wire_packets_sent: u32,
+    pub send_dropped: u32,
 }
 
 /// Start a bandwidth speed test: ask the host to burst filler over the data plane at
@@ -1602,6 +1609,9 @@ pub unsafe extern "C" fn punktfunk_connection_probe_result(
                 elapsed_ms: o.elapsed_ms,
                 throughput_kbps: o.throughput_kbps,
                 loss_pct: o.loss_pct,
+                host_drop_pct: o.host_drop_pct,
+                wire_packets_sent: o.wire_packets_sent,
+                send_dropped: o.send_dropped,
             };
         }
         PunktfunkStatus::Ok
