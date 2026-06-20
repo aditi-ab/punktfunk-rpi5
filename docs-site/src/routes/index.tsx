@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { HomeLayout } from 'fumadocs-ui/layouts/home'
 import BrandMark from '@/components/BrandMark'
+import Wordmark from '@/components/Wordmark'
 import { baseOptions } from '@/lib/layout.shared'
 
 export const Route = createFileRoute('/')({ component: Home })
@@ -10,7 +11,7 @@ function Home() {
     <HomeLayout {...baseOptions()}>
       <main className="flex flex-1 flex-col items-center justify-center gap-6 px-4 py-24 text-center">
         <BrandMark className="size-20 drop-shadow-[0_8px_30px_rgba(108,91,243,0.45)]" />
-        <h1 className="font-display text-4xl font-bold tracking-tight">punktfunk</h1>
+        <Wordmark className="h-12 md:h-14" />
         <p className="max-w-xl text-fd-muted-foreground">
           Linux-first, low-latency desktop and game streaming — a shared Rust protocol
           core with native clients per platform.
