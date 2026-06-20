@@ -1,6 +1,77 @@
 @import 'tailwindcss';
-@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/purple.css';
 @import 'fumadocs-ui/css/preset.css';
 
-/* Pull Fumadocs UI's own classes into the Tailwind 4 scan so they aren't purged. */
+/* Pull Fumadocs UI's own classes — and @unom/ui's compiled components — into
+   the Tailwind 4 scan so their utilities aren't purged. @unom/ui is the shared
+   design-token system the punktfunk marketing site also builds on. */
 @source '../../node_modules/fumadocs-ui/dist/**/*.js';
+@source '../../node_modules/@unom/ui/dist/**/*.{js,mjs}';
+
+/* ── punktfunk brand ────────────────────────────────────────────────────────
+   The brand colour is the violet lens mark. (The marketing site's blue is just
+   a page background, not the brand.) These values feed both @unom/ui's semantic
+   token contract (--brand/--primary/--accent/--highlight) and the Fumadocs
+   --color-fd-* chrome, so the docs carry the same identity in light and dark. */
+:root {
+  --pf-brand: #6c5bf3; /* deep violet — primary */
+  --pf-brand-light: #a79ff8; /* light violet */
+  --pf-highlight: #d2c9fb; /* lens highlight */
+
+  /* @unom/ui token contract. */
+  --brand: var(--pf-brand);
+  --primary: var(--pf-brand);
+  --accent: var(--pf-brand);
+  --highlight: var(--pf-highlight);
+  --radius: 0.625rem;
+
+  /* Fumadocs accent → brand violet (light mode). */
+  --color-fd-primary: var(--pf-brand);
+  --color-fd-ring: var(--pf-brand);
+}
+
+.dark {
+  /* Lighter violet reads better against the dark surface. */
+  --primary: var(--pf-brand-light);
+  --accent: var(--pf-brand-light);
+
+  --color-fd-primary: var(--pf-brand-light);
+  --color-fd-ring: var(--pf-brand-light);
+
+  /* Tint Fumadocs' dark chrome toward the brand's violet-dark (the app-icon
+     surface #1c1530) instead of the default neutral-dark. */
+  --color-fd-background: #141019;
+  --color-fd-card: #1c1530;
+  --color-fd-popover: #1c1530;
+  --color-fd-secondary: #221a36;
+  --color-fd-muted: #1f1830;
+  --color-fd-accent: #241c3d;
+  --color-fd-border: #2a2148;
+}
+
+@theme {
+  /* Geist — the punktfunk brand typeface, same as the marketing site
+     (the @fontsource-variable/geist face is loaded in __root.tsx). */
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-display: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Expose the shared brand + surface tokens as Tailwind colours (bg-brand,
+   text-primary, bg-neutral…), mirroring @unom/ui's own @theme mapping so its
+   utilities resolve to the docs' current (light/dark) surfaces. */
+@theme inline {
+  --color-brand: var(--brand);
+  --color-primary: var(--primary);
+  --color-accent: var(--accent);
+  --color-highlight: var(--highlight);
+  --color-main: var(--color-fd-foreground);
+  --color-secondary: var(--color-fd-muted-foreground);
+  --color-neutral: var(--color-fd-background);
+  --color-neutral-accent: var(--color-fd-secondary);
+}
+
+@layer base {
+  body {
+    font-family: var(--font-sans);
+  }
+}
