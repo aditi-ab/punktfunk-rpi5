@@ -1,23 +1,26 @@
 # punktfunk on Arch Linux / SteamOS
 
-Packaging for punktfunk on Arch and Arch-derived immutable distros (SteamOS 3, etc.). The
-`PKGBUILD` is a **split package** producing **`punktfunk-host`** (the gaming-rig host) and
-**`punktfunk-client`** (the GTK4 couch/Deck client) — mirrors the rpm subpackages
-(`packaging/rpm/punktfunk.spec`) and the deb build scripts. On a **Steam Deck you want
-`punktfunk-client`** (it's what the [Decky plugin](../../clients/decky/) launches); on a gaming
-rig, `punktfunk-host`.
+Packaging for punktfunk on Arch and Arch-derived immutable distros. The `PKGBUILD` is a **split
+package** producing **`punktfunk-host`** (the gaming-rig host) and **`punktfunk-client`** (the GTK4
+couch/Deck client) — mirrors the rpm subpackages (`packaging/rpm/punktfunk.spec`) and the deb build
+scripts. On a **Steam Deck used as a client you want `punktfunk-client`** (it's what the
+[Decky plugin](../../clients/decky/) launches); on a gaming rig, `punktfunk-host`.
+
+> **Steam Deck as a HOST:** don't use this PKGBUILD — SteamOS's read-only root makes `makepkg`/sysext
+> awkward, and a prebuilt binary breaks on OS library bumps. Use the on-device build script instead:
+> **[`scripts/steamdeck/install.sh`](../../scripts/steamdeck/)** (it builds in a Debian-trixie distrobox
+> ABI-matched to SteamOS and uses **VAAPI** on the Deck's AMD GPU). The Deck host path is the one
+> exception to "host encode is NVENC-only" below.
 
 A third member, **`punktfunk-web`** (the browser management console — pairing + status), is
 **opt-in**: build it by setting `PF_WITH_WEB=1`, which requires **`bun`** at build time (`bun-bin`
 from the AUR if it isn't in your repos; the console then runs on plain `nodejs`). A default
 `makepkg` builds only host+client with no JS tooling — mirroring the RPM spec's `%bcond_with web`.
 
-> ⚠️ **Host encode is NVENC-only today.** `crates/punktfunk-host/src/encode/linux.rs` implements
-> `hevc_nvenc`/`av1_nvenc`/`h264_nvenc` + a CUDA zero-copy path — there is **no VAAPI encoder**. So
-> `punktfunk-host` works on **Arch + NVIDIA** (incl. `bazzite-deck-nvidia`); an **AMD Deck-as-host**
-> can't encode until a `hevc_vaapi` backend is added (a code change, not packaging). The **client
-> is unaffected** — `punktfunk-client` decodes via **VAAPI on AMD/Intel** (the Deck) with a software
-> fallback, so streaming *to* a Deck works today.
+> **Host encode: NVENC on NVIDIA, VAAPI on AMD/Intel** (`PUNKTFUNK_ENCODER=auto` picks one). The host
+> now has a VAAPI encoder + zero-copy dmabuf path alongside NVENC/CUDA, so `punktfunk-host` works on
+> Arch + NVIDIA **and** AMD/Intel (incl. the Steam Deck — see the on-device path above). The client
+> decodes via VAAPI on AMD/Intel with a software fallback.
 
 ## Arch Linux (mutable)
 
