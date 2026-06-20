@@ -134,11 +134,19 @@ pub fn probe_can_encode(codec: Codec) -> bool {
         return false;
     }
     unsafe {
-        let hw = match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_NV12, 640, 480, 2) {
-            Ok(hw) => hw,
-            Err(_) => return false,
+        // A missing VA device (non-VAAPI host, GPU-less CI) is an expected probe outcome — quiet
+        // ffmpeg's "No VA display found" error for the probe, then restore the level.
+        let prev = ffi::av_log_get_level();
+        ffi::av_log_set_level(ffi::AV_LOG_FATAL);
+        let ok = match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_NV12, 640, 480, 2) {
+            Ok(hw) => {
+                open_vaapi_encoder(codec, 640, 480, 30, 2_000_000, hw.device_ref, hw.frames_ref)
+                    .is_ok()
+            }
+            Err(_) => false,
         };
-        open_vaapi_encoder(codec, 640, 480, 30, 2_000_000, hw.device_ref, hw.frames_ref).is_ok()
+        ffi::av_log_set_level(prev);
+        ok
     }
 }
 

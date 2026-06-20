@@ -61,7 +61,13 @@ fn codec_mode_support() -> u32 {
         if caps.av1 {
             m |= SCM_AV1_MAIN8;
         }
-        return m;
+        // Only trust a probe that actually found an encoder. An empty result means VAAPI wasn't
+        // usable at probe time (no VA display — a GPU-less CI box, or a misconfigured host), NOT
+        // that the GPU encodes nothing; advertise the static superset (pre-probe behaviour) rather
+        // than claiming zero codecs.
+        if m != 0 {
+            return m;
+        }
     }
     SERVER_CODEC_MODE_SUPPORT
 }
@@ -99,6 +105,13 @@ mod tests {
             https_port: 47984,
         };
         let xml = serverinfo_xml(&host, false);
-        assert!(xml.contains("<ServerCodecModeSupport>65793</ServerCodecModeSupport>"));
+        // The mask is the GPU-aware value (NVENC/no-GPU → the static 65793; a VAAPI host →
+        // whatever it probes). Assert the XML embeds exactly what `codec_mode_support()` returns,
+        // so the test is deterministic regardless of the build host's GPU.
+        let mask = codec_mode_support();
+        assert!(mask != 0, "must advertise at least one codec");
+        assert!(xml.contains(&format!(
+            "<ServerCodecModeSupport>{mask}</ServerCodecModeSupport>"
+        )));
     }
 }
