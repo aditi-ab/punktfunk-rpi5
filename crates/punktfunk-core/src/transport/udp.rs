@@ -26,9 +26,35 @@ const RECV_BUF: usize = MAX_DATAGRAM_BYTES + 1;
 ///   so erroring out here kills a stream that the very next packet would resume. If the peer is
 ///   genuinely gone, the QUIC control plane times out and ends the session cleanly instead. (This is
 ///   the classic connected-UDP "ICMP errors are advisory" rule, doubly true with hole-punching.)
+/// - `ENOBUFS`: a WiFi/wlan driver (e.g. `ath11k` on the Steam Deck) returns this — NOT `EAGAIN`/
+///   `WouldBlock` — when its tx queue is momentarily full. Rust maps `ENOBUFS` to
+///   `ErrorKind::Uncategorized`, so the `WouldBlock` arm misses it; without this a transient
+///   tx-queue burst tears the whole stream down (observed live: the host streamed flawlessly on
+///   loopback / under a debugger — anything slow enough not to fill the small wlan0 buffer — but
+///   died at full rate over WiFi). Same lossy-drop contract as `WouldBlock`; FEC + the next frame
+///   recover. Asynchronous network-path blips (`ENETUNREACH`/`EHOSTUNREACH`/`ENETDOWN`/`EHOSTDOWN`)
+///   are droppable for the same reason a stale ICMP is.
 fn is_transient_io(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::{ConnectionRefused, ConnectionReset, WouldBlock};
-    matches!(e.kind(), WouldBlock | ConnectionRefused | ConnectionReset)
+    if matches!(e.kind(), WouldBlock | ConnectionRefused | ConnectionReset) {
+        return true;
+    }
+    // `ENOBUFS` & friends have no stable `ErrorKind`, so match the raw errno (unix only).
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::ENOBUFS)
+                | Some(libc::ENETUNREACH)
+                | Some(libc::EHOSTUNREACH)
+                | Some(libc::ENETDOWN)
+                | Some(libc::EHOSTDOWN)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Build one `mmsghdr` per `iovec` (each a single-buffer message) for `sendmmsg`/`recvmmsg`. Shared

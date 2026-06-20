@@ -837,12 +837,19 @@ async fn serve_session(
             // can be on different subnets; control + side planes ride the client-initiated QUIC, but
             // the raw video UDP needs the client to open the path first). Falls back to the
             // client-reported address for clients that don't punch (flat-LAN, unchanged).
-            let (transport, punched) = UdpTransport::connect_via_punch(
+            let (transport, punched) = match UdpTransport::connect_via_punch(
                 &format!("0.0.0.0:{udp_port}"),
                 &client_udp.to_string(),
                 std::time::Duration::from_millis(2500),
-            )
-            .context("bind data plane")?;
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    // Surface the failure here directly: a data-plane bind error would otherwise be
+                    // reported only after teardown (and a teardown stall could swallow it entirely).
+                    tracing::error!(error = %e, %client_udp, udp_port, "data-plane socket bind/hole-punch failed");
+                    return Err(anyhow::Error::new(e)).context("bind data plane");
+                }
+            };
             tracing::info!(
                 %client_udp,
                 punched,
