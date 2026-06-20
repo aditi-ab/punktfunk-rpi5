@@ -1,11 +1,12 @@
 ---
 title: Install the Host
-description: Pick your distro and install the punktfunk host from its package registry.
+description: Install the punktfunk host — on Linux from its package registry, or on Windows from a signed installer.
 ---
 
-The package registries are the real distribution channel. Pick your distro, add the repo, and install
-with your native package manager. Each row links to the full per-distro guide (add the repo, first-run
-steps, the web console) — those are the source of truth, so this page doesn't duplicate them.
+On Linux, the package registries are the real distribution channel. Pick your distro, add the repo, and
+install with your native package manager. Each row links to the full per-distro guide (add the repo,
+first-run steps, the web console) — those are the source of truth, so this page doesn't duplicate them.
+On **Windows** (NVIDIA), the host ships as a signed installer instead — see [Windows](#windows-nvidia).
 
 ## Pick your distro
 
@@ -18,6 +19,31 @@ steps, the web console) — those are the source of truth, so this page doesn't 
 Each registry is public — no auth, you just trust the repo's signing key. Adding the repo is a
 one-time step covered in the linked guide; after that, normal `apt upgrade` / `rpm-ostree upgrade`
 tracks new builds automatically.
+
+## Windows (NVIDIA)
+
+punktfunk also runs as a native host on **Windows 10/11 (x64) with an NVIDIA GPU**, shipped as a
+signed installer — see [Windows Host](/docs/windows-host) for what it includes and its limitations.
+
+1. From the [packages page](https://git.unom.io/unom/-/packages) (generic group), download the newest
+   **`punktfunk-host-setup-<ver>.exe`** and its matching **`.cer`**.
+2. **Trust the publisher certificate once.** The installer is signed with a self-signed certificate
+   whose public `.cer` is published next to it — the **same certificate for every release**, so this is
+   genuinely one-time and later updates need nothing. In an **admin** PowerShell:
+
+   ```powershell
+   Import-Certificate -FilePath .\punktfunk-host-setup.cer `
+     -CertStoreLocation Cert:\LocalMachine\TrustedPublisher
+   ```
+
+3. Run `punktfunk-host-setup-<ver>.exe` (elevated). It installs to `C:\Program Files\punktfunk`,
+   optionally installs the bundled **SudoVDA** virtual-display driver, and registers + starts the
+   `LocalSystem` service (`/VERYSILENT` for an unattended install). Upgrades and uninstall go through
+   Add/Remove Programs.
+
+You need an NVIDIA GPU + driver (the host is NVENC-only on Windows). More detail — including the CLI
+`punktfunk-host service install` path — is in
+[Running as a Service → Windows](/docs/running-as-a-service#windows).
 
 ## What the packages are
 

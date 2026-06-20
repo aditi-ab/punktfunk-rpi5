@@ -3,9 +3,8 @@ title: "Status & Progress"
 description: "Where the work stands across the core, the host, and the native clients."
 ---
 
-A high-level view of where punktfunk stands. The full design lives in the
-[Implementation Plan](/docs/implementation-plan), the ordered plan of work in the
-[Roadmap](/docs/roadmap), and milestone-level detail in
+A high-level view of where punktfunk stands. The ordered plan of work is on the
+[Roadmap](/docs/roadmap), and milestone-level detail lives in
 [`CLAUDE.md`](https://git.unom.io/unom/punktfunk/src/branch/main/CLAUDE.md).
 
 ## Milestones at a glance

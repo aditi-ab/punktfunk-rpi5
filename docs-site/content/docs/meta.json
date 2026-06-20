@@ -11,6 +11,7 @@
     "ubuntu-kde",
     "fedora-kde",
     "bazzite",
+    "windows-host",
     "running-as-a-service",
     "---Connecting---",
     "clients",
@@ -21,13 +22,7 @@
     "configuration",
     "host-cli",
     "troubleshooting",
-    "---Project & Internals---",
-    "roadmap",
-    "implementation-plan",
-    "windows-host",
-    "apple-stage2-presenter",
-    "gamescope-multiuser",
-    "dualsense-haptics",
-    "ci"
+    "---Project---",
+    "roadmap"
   ]
 }
