@@ -94,7 +94,7 @@ pub fn run(opts: Options) -> Result<()> {
         format = ?first.format,
         codec = ?opts.codec,
         bitrate_bps = opts.bitrate_bps,
-        "opening NVENC encoder"
+        "opening video encoder"
     );
     let mut encoder = encode::open_video(
         opts.codec,

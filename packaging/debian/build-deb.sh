@@ -109,10 +109,13 @@ DEPENDS="$SHDEPS, libei1, pipewire, wireplumber"
 # ffmpeg: Ubuntu's ffmpeg ships the NVENC-enabled libav* the binary links AND is the encoder
 # runtime; the libav* sonames are already hard Depends via shlibdeps, so the ffmpeg metapackage
 # is a Recommends. gamescope = a ready compositor backend; pipewire-pulse = desktop audio.
+# mesa-va-drivers / intel-media-va-driver = the VAAPI encode drivers for AMD (radeonsi) and Intel
+# (iHD) — pulled by default so the auto-selected VAAPI backend works out of the box; NVIDIA boxes
+# don't need them (NVENC comes from the driver) and can --no-install-recommends.
 # punktfunk-web = the management web console (pairing + status) every user needs — a separate
 # Architecture:all .deb; Recommends so `apt install punktfunk-host` pulls it by default, while a
 # headless/encoding-only box can opt out with --no-install-recommends.
-RECOMMENDS="ffmpeg, gamescope, pipewire-pulse, punktfunk-web"
+RECOMMENDS="ffmpeg, gamescope, pipewire-pulse, mesa-va-drivers, intel-media-va-driver, punktfunk-web"
 SUGGESTS="kwin-wayland, mutter"
 
 INSTALLED_KB="$(du -k -s "$STAGE" | cut -f1)"

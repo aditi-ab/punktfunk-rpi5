@@ -100,6 +100,11 @@ Suggests:       kwin
 Suggests:       mutter
 # NVENC + GPU EGL come from the NVIDIA driver; on Bazzite the -nvidia image has it.
 Recommends:     (xorg-x11-drv-nvidia-cuda if xorg-x11-drv-nvidia)
+# VAAPI encode drivers for AMD (radeonsi) / Intel (iHD) — the auto-selected VAAPI backend on a
+# non-NVIDIA GPU. NOTE: Fedora's stock mesa-va-drivers has HEVC/AV1 *disabled* (patents); full
+# encode needs mesa-va-drivers-freeworld from RPM Fusion (same nonfree repo as ffmpeg-libs).
+Recommends:     mesa-va-drivers
+Recommends:     intel-media-driver
 # The management web console (pairing + status) every user needs — a separate noarch subpackage.
 # Weak-dep so `dnf install punktfunk` pulls it where it exists (the Gitea registry); harmless where
 # it doesn't (a COPR build without `--with web` simply has no punktfunk-web to satisfy).

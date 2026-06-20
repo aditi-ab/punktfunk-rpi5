@@ -125,6 +125,23 @@ unsafe fn open_vaapi_encoder(
         .with_context(|| format!("open {name} ({width}x{height}@{fps}, {bitrate_bps} bps)"))
 }
 
+/// Probe whether THIS GPU can VAAPI-encode `codec`, by opening a tiny encoder: the driver rejects
+/// codecs its video engine can't do (e.g. AV1 on pre-RDNA3 AMD / pre-Arc Intel). Used to build the
+/// GameStream codec advertisement so a client never negotiates a codec the GPU can't encode. The
+/// device + encoder are torn down immediately (RAII).
+pub fn probe_can_encode(codec: Codec) -> bool {
+    if ffmpeg::init().is_err() {
+        return false;
+    }
+    unsafe {
+        let hw = match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_NV12, 640, 480, 2) {
+            Ok(hw) => hw,
+            Err(_) => return false,
+        };
+        open_vaapi_encoder(codec, 640, 480, 30, 2_000_000, hw.device_ref, hw.frames_ref).is_ok()
+    }
+}
+
 /// Drain the encoder for one packet (shared poll logic).
 fn poll_encoder(enc: &mut encoder::video::Encoder, fps: u32) -> Result<Option<EncodedFrame>> {
     let mut pkt = Packet::empty();

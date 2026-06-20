@@ -320,6 +320,40 @@ pub fn linux_zero_copy_is_vaapi() -> bool {
     }
 }
 
+/// Which codecs the active GPU can actually ENCODE. Used to build the GameStream codec
+/// advertisement so a client never negotiates a codec the GPU can't do (AV1 encode is narrow —
+/// Intel Arc/Xe2+, AMD RDNA3+/RDNA4 — so it must be probed, not assumed).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+pub struct CodecSupport {
+    pub h264: bool,
+    pub h265: bool,
+    pub av1: bool,
+}
+
+/// Probe the active Linux GPU backend for its encodable codecs (cached; opens a tiny encoder per
+/// codec, once). Only the VAAPI (AMD/Intel) backend is probed — NVENC keeps its Moonlight-validated
+/// static advertisement (callers gate on [`linux_zero_copy_is_vaapi`]).
+#[cfg(target_os = "linux")]
+pub fn vaapi_codec_support() -> CodecSupport {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<CodecSupport> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let caps = CodecSupport {
+            h264: vaapi::probe_can_encode(Codec::H264),
+            h265: vaapi::probe_can_encode(Codec::H265),
+            av1: vaapi::probe_can_encode(Codec::Av1),
+        };
+        tracing::info!(
+            h264 = caps.h264,
+            h265 = caps.h265,
+            av1 = caps.av1,
+            "VAAPI encode capabilities probed"
+        );
+        caps
+    })
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(target_os = "windows", feature = "nvenc"))]

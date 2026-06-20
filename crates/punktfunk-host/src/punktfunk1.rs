@@ -2469,7 +2469,7 @@ fn virtual_stream_relay(
                 frame.is_cuda(),
                 bit_depth,
             )
-            .context("open NVENC for DDA")?;
+            .context("open video encoder for DDA")?;
             Ok(DdaPipe {
                 cap: Box::new(cap),
                 enc,
@@ -2883,7 +2883,7 @@ fn build_pipeline(
         frame.is_cuda(),
         bit_depth,
     )
-    .context("open NVENC")?;
+    .context("open video encoder")?;
     let interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
     Ok((capturer, enc, frame, interval))
 }

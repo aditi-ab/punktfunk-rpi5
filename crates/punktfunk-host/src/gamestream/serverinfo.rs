@@ -15,6 +15,7 @@ pub fn serverinfo_xml(host: &Host, https: bool) -> String {
     };
     // Over the mutual-TLS HTTPS port the peer is an authenticated (paired) client.
     let pair_status = u8::from(https);
+    let codec_mode_support = codec_mode_support();
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <root status_code="200">
@@ -27,7 +28,7 @@ pub fn serverinfo_xml(host: &Host, https: bool) -> String {
 <MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>
 <mac>{mac}</mac>
 <LocalIP>{local_ip}</LocalIP>
-<ServerCodecModeSupport>{SERVER_CODEC_MODE_SUPPORT}</ServerCodecModeSupport>
+<ServerCodecModeSupport>{codec_mode_support}</ServerCodecModeSupport>
 <PairStatus>{pair_status}</PairStatus>
 <currentgame>0</currentgame>
 <state>SUNSHINE_SERVER_FREE</state>
@@ -39,6 +40,30 @@ pub fn serverinfo_xml(host: &Host, https: bool) -> String {
         http_port = host.http_port,
         local_ip = host.local_ip,
     )
+}
+
+/// The `<ServerCodecModeSupport>` mask to advertise. On the VAAPI (AMD/Intel) backend it reflects
+/// what the GPU can ACTUALLY encode (probed — AV1 is narrow, and an old iGPU might lack HEVC), so a
+/// Moonlight client never negotiates a codec the encoder can't open. NVENC and Windows keep the
+/// Moonlight-validated static superset.
+fn codec_mode_support() -> u32 {
+    #[cfg(target_os = "linux")]
+    if crate::encode::linux_zero_copy_is_vaapi() {
+        use super::{SCM_AV1_MAIN8, SCM_H264, SCM_HEVC};
+        let caps = crate::encode::vaapi_codec_support();
+        let mut m = 0;
+        if caps.h264 {
+            m |= SCM_H264;
+        }
+        if caps.h265 {
+            m |= SCM_HEVC;
+        }
+        if caps.av1 {
+            m |= SCM_AV1_MAIN8;
+        }
+        return m;
+    }
+    SERVER_CODEC_MODE_SUPPORT
 }
 
 #[cfg(test)]
