@@ -17,6 +17,7 @@ export function baseOptions(): BaseLayoutProps {
     links: [
       { text: 'Docs', url: '/docs' },
       { text: 'Website', url: 'https://punktfunk.unom.io' },
+      { text: 'Source code', url: 'https://git.unom.io/unom/punktfunk' },
     ],
   }
 }
