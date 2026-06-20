@@ -17,7 +17,7 @@
 //! instead of leaking it to process exit. The portal thread (when used) still parks on its zbus
 //! connection until process exit.
 
-use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
+use super::{CapturedFrame, Capturer, DmabufFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, Context, Result};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -425,11 +425,11 @@ fn portal_thread_remote_desktop(setup_tx: std::sync::mpsc::Sender<Result<(OwnedF
 mod pipewire {
     //! The PipeWire consumer, confined to its own thread (the PW types are `!Send`).
 
-    use super::{CapturedFrame, FramePayload, PixelFormat};
+    use super::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
     use anyhow::{Context, Result};
     use pipewire as pw;
     use pw::{properties::properties, spa};
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{FromRawFd, OwnedFd};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::SyncSender;
     use std::sync::Arc;
@@ -464,8 +464,12 @@ mod pipewire {
         /// Set once a video format is agreed (`param_changed`), so a first-frame timeout can tell
         /// "format never negotiated" apart from "negotiated but no buffers arrived".
         negotiated: Arc<AtomicBool>,
-        /// Present when zero-copy is enabled: imports a dmabuf → CUDA device buffer.
+        /// Present when zero-copy is enabled on NVIDIA: imports a dmabuf → CUDA device buffer.
         importer: Option<crate::zerocopy::EglImporter>,
+        /// VAAPI zero-copy: hand the raw dmabuf to the encoder (which imports + GPU-CSCs it) instead
+        /// of a CUDA import. Set when zero-copy is on, the EGL→CUDA importer is unavailable, and the
+        /// encoder backend is VAAPI (AMD/Intel).
+        vaapi_passthrough: bool,
         /// `PUNKTFUNK_NV12`: on the tiled EGL/GL zero-copy path, convert to NV12 on the GPU and feed
         /// NVENC native YUV (Tier 2A). Off ⇒ the BGRx path is unchanged.
         nv12: bool,
@@ -767,6 +771,57 @@ mod pipewire {
             }
         }
 
+        // VAAPI zero-copy passthrough: hand the raw dmabuf straight to the encoder, which imports
+        // it into a VA surface and does RGB→NV12 on the GPU video engine. No CUDA importer here.
+        if ud.vaapi_passthrough {
+            if let Some(fmt) = ud.format {
+                if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
+                    if let Some(fourcc) = crate::zerocopy::drm_fourcc(fmt) {
+                        let chunk = datas[0].chunk();
+                        let offset = chunk.offset();
+                        let stride = chunk.stride().max(0) as u32;
+                        // dup the fd so it survives the SPA buffer recycle — the encode thread
+                        // imports it. (Content stability across the brief map+CSC window relies on
+                        // the compositor's buffer-pool depth, like any zero-copy capture.)
+                        let dup =
+                            unsafe { libc::fcntl(datas[0].fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
+                        if dup >= 0 {
+                            let pts_ns = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as u64)
+                                .unwrap_or(0);
+                            let _ = ud.tx.try_send(CapturedFrame {
+                                width: w as u32,
+                                height: h as u32,
+                                pts_ns,
+                                format: fmt,
+                                payload: FramePayload::Dmabuf(DmabufFrame {
+                                    fd: unsafe { OwnedFd::from_raw_fd(dup) },
+                                    fourcc,
+                                    modifier: ud.modifier,
+                                    offset,
+                                    stride,
+                                }),
+                            });
+                            static ONCE: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(true);
+                            if ONCE.swap(false, Ordering::Relaxed) {
+                                tracing::info!(
+                                    w,
+                                    h,
+                                    modifier = ud.modifier,
+                                    fourcc = format_args!("{:#010x}", fourcc),
+                                    "zero-copy: handing dmabuf to VAAPI (GPU import + CSC)"
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            // Not a dmabuf (or unmappable format) — fall through to the CPU de-pad path.
+        }
+
         // Zero-copy path: if the buffer is a dmabuf and we have an importer, import it
         // into a CUDA device buffer (no CPU touch) and deliver that. Otherwise fall
         // through to the shm de-pad copy below.
@@ -998,28 +1053,39 @@ mod pipewire {
         } else {
             None
         };
-        // Modifiers our import stack handles for BGRx: the EGL-importable (tiled) set, plus
-        // LINEAR (0) — NVIDIA's EGL won't list it, but LINEAR dmabufs (gamescope's only offer)
-        // import via CUDA external memory instead. Tiled stays first so allocators that can do
-        // both (KWin) prefer it. If none, we can't negotiate dmabuf → shm path.
-        let mut modifiers = importer
-            .as_ref()
-            .map(|i| i.supported_modifiers(crate::zerocopy::drm_fourcc(PixelFormat::Bgrx).unwrap()))
-            .unwrap_or_default();
-        if importer.is_some() && !modifiers.contains(&0) {
-            modifiers.push(0); // DRM_FORMAT_MOD_LINEAR
-        }
         // PUNKTFUNK_FORCE_SHM=1 forces the race-free download path (SHM, no dmabuf) — required on
         // Mutter+NVIDIA where dmabuf capture has no working sync and shows stale frames. KWin/
         // gamescope don't need it (they blit into the buffer, so no read-before-render race).
         let force_shm = std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() == Ok("1");
-        let want_dmabuf = importer.is_some() && !modifiers.is_empty() && !force_shm;
+        // VAAPI zero-copy passthrough: zero-copy on, no EGL→CUDA importer (any non-NVIDIA host), and
+        // the encoder backend is VAAPI → hand the raw dmabuf to the encoder (it imports + GPU-CSCs).
+        let vaapi_passthrough = zerocopy
+            && !force_shm
+            && importer.is_none()
+            && crate::encode::linux_zero_copy_is_vaapi();
+        // Modifiers our import stack handles for BGRx: the EGL-importable (tiled) set, plus LINEAR
+        // (0) — NVIDIA's EGL won't list it, but LINEAR dmabufs (gamescope's only offer) import via
+        // CUDA external memory instead. For the VAAPI passthrough path we advertise LINEAR only:
+        // radeonsi/iHD import it and any compositor can allocate it.
+        let mut modifiers = importer
+            .as_ref()
+            .map(|i| i.supported_modifiers(crate::zerocopy::drm_fourcc(PixelFormat::Bgrx).unwrap()))
+            .unwrap_or_default();
+        if (importer.is_some() || vaapi_passthrough) && !modifiers.contains(&0) {
+            modifiers.push(0); // DRM_FORMAT_MOD_LINEAR
+        }
+        let want_dmabuf =
+            (importer.is_some() || vaapi_passthrough) && !modifiers.is_empty() && !force_shm;
         if force_shm {
             tracing::info!(
                 "capture: PUNKTFUNK_FORCE_SHM — race-free SHM download path (no dmabuf, no zero-copy)"
             );
         } else if zerocopy && !want_dmabuf {
-            tracing::warn!("zero-copy: no EGL-importable dmabuf modifiers — using CPU path");
+            tracing::warn!("zero-copy: no importable dmabuf modifiers — using CPU path");
+        } else if vaapi_passthrough {
+            tracing::info!(
+                "zero-copy: advertising LINEAR dmabuf for direct VAAPI import (GPU CSC)"
+            );
         } else if want_dmabuf {
             tracing::info!(
                 count = modifiers.len(),
@@ -1027,7 +1093,7 @@ mod pipewire {
                 "zero-copy: advertising EGL-importable dmabuf modifiers"
             );
         }
-        if want_dmabuf && crate::zerocopy::nv12_enabled() {
+        if want_dmabuf && !vaapi_passthrough && crate::zerocopy::nv12_enabled() {
             tracing::info!(
                 "PUNKTFUNK_NV12: tiled dmabufs convert to NV12 (BT.709 limited) on the GPU — NVENC \
                  fed native YUV (no internal RGB→YUV CSC)"
@@ -1042,6 +1108,7 @@ mod pipewire {
             active,
             negotiated,
             importer,
+            vaapi_passthrough,
             nv12: crate::zerocopy::nv12_enabled(),
             dbg_log_n: 0,
         };

@@ -304,6 +304,22 @@ fn nvidia_present() -> bool {
     std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/nvidia0").exists()
 }
 
+/// True if the Linux GPU encode backend resolves to VAAPI (AMD/Intel) rather than NVENC — mirrors
+/// [`open_video`]'s dispatch so the capturer can choose the matching zero-copy path (raw dmabuf
+/// passthrough for VAAPI vs the EGL→CUDA import for NVENC).
+#[cfg(target_os = "linux")]
+pub fn linux_zero_copy_is_vaapi() -> bool {
+    match std::env::var("PUNKTFUNK_ENCODER")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "nvenc" | "nvidia" | "cuda" => false,
+        "vaapi" | "amd" | "intel" => true,
+        _ => !nvidia_present(),
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(target_os = "windows", feature = "nvenc"))]

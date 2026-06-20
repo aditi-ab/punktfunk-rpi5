@@ -56,25 +56,57 @@ pub struct CapturedFrame {
     pub payload: FramePayload,
 }
 
+/// A captured frame still living in a single-plane packed-RGB dmabuf (the VAAPI zero-copy path).
+/// Owns a *dup* of the PipeWire buffer's fd, so the frame can travel to the encode thread and be
+/// imported into a VA surface there without the compositor's buffer being closed underneath it.
+/// (Content stability across the brief import window relies on the compositor's buffer pool depth,
+/// same as any zero-copy capture — the VAAPI importer copies into its own NV12 surface promptly.)
+#[cfg(target_os = "linux")]
+pub struct DmabufFrame {
+    pub fd: std::os::fd::OwnedFd,
+    /// DRM FourCC of the packed-RGB plane (e.g. `XR24` for BGRx).
+    pub fourcc: u32,
+    /// DRM format modifier the compositor allocated (0 = LINEAR).
+    pub modifier: u64,
+    pub offset: u32,
+    pub stride: u32,
+}
+
 /// Where a captured frame's pixels live.
 pub enum FramePayload {
     /// Tightly-packed CPU pixels in `format`, `width*height*bytes_per_pixel` (no row padding).
     Cpu(Vec<u8>),
-    /// A pitched GPU buffer (BGRA-order, on the shared CUDA context) — the zero-copy path. The
-    /// dmabuf has already been imported + copied into this owned device buffer.
+    /// A pitched GPU buffer (BGRA-order, on the shared CUDA context) — the NVIDIA zero-copy path.
+    /// The dmabuf has already been imported + copied into this owned device buffer.
     #[cfg(target_os = "linux")]
     Cuda(crate::zerocopy::DeviceBuffer),
+    /// A raw packed-RGB dmabuf — the AMD/Intel (VAAPI) zero-copy path. The encoder imports it into
+    /// a VA surface and does RGB→NV12 on the GPU video engine (no host CSC, no upload).
+    #[cfg(target_os = "linux")]
+    Dmabuf(DmabufFrame),
     /// A GPU-resident D3D11 texture (Windows zero-copy path for NVENC). Owns the copied frame.
     #[cfg(target_os = "windows")]
     D3d11(dxgi::D3d11Frame),
 }
 
 impl CapturedFrame {
-    /// True if the frame's pixels are a GPU/CUDA buffer (the zero-copy path).
+    /// True if the frame's pixels are a GPU/CUDA buffer (the NVIDIA zero-copy path).
     pub fn is_cuda(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
             matches!(self.payload, FramePayload::Cuda(_))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// True if the frame is a raw dmabuf (the VAAPI zero-copy path).
+    pub fn is_dmabuf(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self.payload, FramePayload::Dmabuf(_))
         }
         #[cfg(not(target_os = "linux"))]
         {

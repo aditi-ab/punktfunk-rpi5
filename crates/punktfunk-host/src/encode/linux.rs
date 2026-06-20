@@ -310,6 +310,9 @@ impl Encoder for NvencEncoder {
         match &captured.payload {
             FramePayload::Cuda(buf) => self.submit_cuda(buf, pts, idr),
             FramePayload::Cpu(bytes) => self.submit_cpu(bytes, captured.format, pts, idr),
+            FramePayload::Dmabuf(_) => {
+                bail!("NVENC got a VAAPI dmabuf frame — capture/encoder backend mismatch")
+            }
         }
     }
 
