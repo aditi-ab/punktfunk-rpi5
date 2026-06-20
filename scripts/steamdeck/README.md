@@ -22,8 +22,10 @@ is only the build environment; `punktfunk-host` is launched directly, not via `d
 rebuild always matches the running OS. Encode is **VAAPI** on the Deck's AMD GPU (NVENC on NVIDIA),
 auto-selected by `PUNKTFUNK_ENCODER=auto`.
 
-The web console is the one part that stays in the container at runtime: it's a Nitro/Node server run
-by `bun`, so its service does `distrobox enter pf2 -- … bun run .output/server/index.mjs`.
+The web console is the one part that stays in the container at runtime: it's a Nitro **node-server**
+build (`bun` builds it; **`node` runs it** — bun mis-resolves Nitro's externalized server deps like
+`srvx` at request time), so its service does `distrobox enter pf2 -- … node .output/server/index.mjs`.
+Both `bun` and `nodejs` are provisioned in the container.
 
 ## Scripts
 

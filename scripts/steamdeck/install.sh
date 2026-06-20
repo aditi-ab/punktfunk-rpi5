@@ -85,9 +85,12 @@ sudo apt-get install -y -qq --no-install-recommends \
     libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libswscale-dev libavdevice-dev \
     libpipewire-0.3-dev libspa-0.2-dev \
     libgbm-dev libegl-dev libgl-dev libdrm-dev libva-dev \
-    libxkbcommon-dev libudev-dev libssl-dev libopus-dev libsdl2-dev >/dev/null
+    libxkbcommon-dev libudev-dev libssl-dev libopus-dev libsdl2-dev \
+    nodejs >/dev/null
 command -v rustc >/dev/null 2>&1 || command -v ~/.cargo/bin/rustc >/dev/null 2>&1 || \
     curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path >/dev/null
+# bun builds the web console; node runs it (the node-server preset; bun mis-resolves the Nitro
+# externalized server deps like srvx at request time).
 command -v bun >/dev/null 2>&1 || command -v ~/.bun/bin/bun >/dev/null 2>&1 || \
     curl -fsSL https://bun.sh/install | bash >/dev/null
 '
@@ -198,7 +201,7 @@ Description=punktfunk management web console
 After=punktfunk-host.service
 
 [Service]
-ExecStart=$DISTROBOX enter $BOX -- bash -lc 'export PATH=\$HOME/.bun/bin:\$PATH; cd $SRC/web; set -a; . $CONFIG/mgmt-token; . $CONFIG/web.env; set +a; export PUNKTFUNK_MGMT_URL=https://127.0.0.1:$MGMT_PORT NODE_TLS_REJECT_UNAUTHORIZED=0 PORT=$WEB_PORT HOST=0.0.0.0 NITRO_PORT=$WEB_PORT NITRO_HOST=0.0.0.0; exec bun run .output/server/index.mjs'
+ExecStart=$DISTROBOX enter $BOX -- bash -lc 'cd $SRC/web; set -a; . $CONFIG/mgmt-token; . $CONFIG/web.env; set +a; export PUNKTFUNK_MGMT_URL=https://127.0.0.1:$MGMT_PORT NODE_TLS_REJECT_UNAUTHORIZED=0 PORT=$WEB_PORT HOST=0.0.0.0 NITRO_PORT=$WEB_PORT NITRO_HOST=0.0.0.0; exec node .output/server/index.mjs'
 Restart=on-failure
 RestartSec=3
 
@@ -210,12 +213,16 @@ fi
 
 systemctl --user daemon-reload
 loginctl show-user "$USER" 2>/dev/null | grep -q 'Linger=yes' || { sudo loginctl enable-linger "$USER" 2>/dev/null && ok "enabled linger (services run without login)" || warn "could not enable linger — services stop when you log out (sudo loginctl enable-linger $USER)"; }
-systemctl --user enable --now punktfunk-host.service
+# enable + restart (not `enable --now`): restart picks up unit-file changes on a re-run, where
+# `--now` would no-op against an already-running service.
+systemctl --user enable punktfunk-host.service 2>/dev/null
+systemctl --user restart punktfunk-host.service
 ok "punktfunk-host started"
 if [ "$WITH_WEB" = 1 ]; then
     # The host writes the mgmt token on first start; give it a moment so the web unit finds it.
     for _ in $(seq 1 10); do [ -f "$CONFIG/mgmt-token" ] && break; sleep 0.5; done
-    systemctl --user enable --now punktfunk-web.service
+    systemctl --user enable punktfunk-web.service 2>/dev/null
+    systemctl --user restart punktfunk-web.service
     ok "punktfunk-web started"
 fi
 
