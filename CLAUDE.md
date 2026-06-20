@@ -72,8 +72,11 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   **ViGEm** gamepads (`inject/gamepad_windows.rs`), WASAPI loopback + virtual mic (`audio/wasapi_*`).
   Ships as a **signed Inno Setup installer** that registers a `LocalSystem` SCM service launching into
   the interactive session for secure-desktop (UAC/lock-screen) capture (`service.rs`), bundles the
-  SudoVDA driver, and is published by `windows-host.yml`. Newer/less battle-tested than the Linux
-  host; no AMD/Intel/software encode path. Packaging: `packaging/windows/`.
+  SudoVDA driver, and is published by `windows-host.yml`. **HDR (10-bit)**: WGC captures the HDR
+  desktop as FP16/Rgb10a2 (DDA FP16 for the secure desktop), NVENC forces HEVC Main10 + BT.2020 PQ,
+  the client auto-detects PQ from the HEVC VUI — gated by `PUNKTFUNK_10BIT` + client `VIDEO_CAP_10BIT`;
+  **Windows host only** (the Linux host stays 8-bit, blocked upstream). Newer/less battle-tested than
+  the Linux host; no AMD/Intel/software encode path. Packaging: `packaging/windows/`.
 
 ## What's left
 

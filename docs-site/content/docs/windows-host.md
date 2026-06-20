@@ -7,8 +7,9 @@ description: "Run the punktfunk streaming host on a Windows PC with an NVIDIA GP
 **Status: implemented and shipping — NVIDIA-only, x64-only.** punktfunk is Linux-first, but it also
 runs as a native **Windows host**: a signed installer registers a `LocalSystem` service that streams
 your Windows desktop or games to any punktfunk or Moonlight client, at the client's exact resolution
-via a virtual display. It's newer and less battle-tested than the Linux host, and it is built
-specifically around NVIDIA hardware.
+via a virtual display — including **HDR10** (10-bit BT.2020 PQ) when your Windows desktop is in HDR
+mode. It's newer and less battle-tested than the Linux host, and it is built specifically around
+NVIDIA hardware. (The Linux host is 8-bit only — HDR there is blocked upstream.)
 
 > This page is about the Windows **host** (streaming *from* a Windows PC). To stream *to* a Windows
 > PC, see the [Windows client](/docs/clients#windows-desktop-client).
@@ -48,9 +49,9 @@ pipeline orchestration are all shared with the Linux host. The Windows host is a
 
 | Subsystem | Linux backend | Windows backend |
 |---|---|---|
-| **Capture** | xdg ScreenCast portal → PipeWire (dmabuf) | **DXGI Desktop Duplication** → D3D11 texture |
+| **Capture** | xdg ScreenCast portal → PipeWire (dmabuf) | **Windows.Graphics.Capture** (+ Desktop Duplication for the secure desktop) → D3D11 texture; FP16/10-bit when the desktop is HDR |
 | **Virtual display** | KWin / Mutter / Sway / gamescope | **SudoVDA** signed IDD — create a `WxH@Hz` monitor per session, capture it, tear it down |
-| **Encode** | `ffmpeg-next` NVENC (CUDA hwframes) | **NVENC** with a D3D11 device (`--features nvenc`) |
+| **Encode** | `ffmpeg-next` NVENC (CUDA hwframes) | **NVENC** with a D3D11 device (`--features nvenc`); HEVC Main10 / BT.2020 PQ for HDR |
 | **Input — mouse/keyboard** | libei / wlr protocols | **SendInput** (Win32 VK + absolute mouse) |
 | **Input — gamepads** | uinput Xbox 360 pad + rumble | **ViGEm** virtual pad + rumble back-channel |
 | **Audio capture** | PipeWire sink-monitor | **WASAPI loopback** |

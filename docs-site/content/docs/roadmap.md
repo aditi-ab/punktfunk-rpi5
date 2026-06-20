@@ -24,7 +24,7 @@ see [Status & Progress](/docs/status).
 | Web console + pairing | ✅ |
 | Concurrent sessions (shared desktop) | ✅ |
 | Network speed test + bitrate | ✅ |
-| HDR / 10-bit (host capture) | ⛔ |
+| HDR / 10-bit streaming | ✅ Windows host · ⛔ Linux host |
 | Sub-frame pipelining (latency) | 🔭 |
 
 ## ✅ Shipped
@@ -35,8 +35,9 @@ see [Status & Progress](/docs/status).
 - **Native-resolution virtual displays** on Linux across KWin, GNOME/Mutter, gamescope, and
   Sway/wlroots, with a fully zero-copy GPU path to NVENC (stable 240 fps at 5120×1440).
 - **A native Windows host** (NVIDIA, x64) — a signed installer with secure-desktop capture and a
-  bundled virtual-display driver. See [Windows Host](/docs/windows-host). *(Beta — newer than the
-  Linux host.)*
+  bundled virtual-display driver, and the only host that can stream **HDR** (10-bit BT.2020 PQ,
+  captured from an HDR Windows desktop and encoded as HEVC Main10). See
+  [Windows Host](/docs/windows-host). *(Beta — newer than the Linux host.)*
 - **Clients on every platform** — native apps for **Apple** (macOS, iOS, iPadOS, tvOS), **Linux**,
   **Android** (phone + TV), and **Windows**, each with hardware decode, controllers including
   DualSense, audio + mic, and automatic host discovery. See [Clients](/docs/clients).
@@ -67,8 +68,10 @@ see [Status & Progress](/docs/status).
 
 ## ⛔ Parked / blocked
 
-- **HDR / 10-bit streaming.** Designed end to end, but blocked upstream — no shipping compositor emits
-  a 10-bit/HDR capture stream yet. Ready to build the moment one lands.
+- **HDR / 10-bit on the *Linux* host.** HDR streaming already works from a
+  [Windows host](/docs/windows-host) to an HDR-capable client (Windows, Android). On Linux it's
+  blocked upstream — no shipping compositor emits a 10-bit/HDR capture stream yet — and ready the
+  moment one does.
 - **Advanced DualSense voice-coil haptics.** Scoped and shelved (it rides the controller's USB audio
   interface, with near-zero game support on Linux). Adaptive triggers, rumble, and the lightbar
   already ship.

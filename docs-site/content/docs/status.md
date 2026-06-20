@@ -36,6 +36,9 @@ Linux, Windows, and Android.
 - **Zero-copy GPU pipeline.** Captured frames stay on the GPU (dmabuf → CUDA → NVENC) with
   automatic split-encode at very high resolutions. Stable 240 fps at 5120×1440 has been
   measured.
+- **HDR (10-bit), on the Windows host.** An HDR Windows desktop is captured and encoded as HEVC
+  Main10 (BT.2020 PQ) to HDR-capable clients (Windows, Android). Linux hosts stream 8-bit for now —
+  HDR there is blocked upstream at the compositor.
 - **Secure by default.** A **SPAKE2 PIN pairing** ceremony establishes trust (the host
   shows a 4-digit PIN; an attacker gets a single online guess, no offline dictionary
   attack). Trust-on-first-use (TOFU) remains an explicit opt-in for fully trusted LANs.
