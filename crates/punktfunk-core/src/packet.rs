@@ -96,6 +96,18 @@ impl Packetizer {
         }
     }
 
+    /// Live-adjust the FEC recovery percentage (adaptive FEC). Takes effect on the next
+    /// [`packetize`](Self::packetize); the wire is self-describing (each packet carries its block's
+    /// data/recovery counts), so the receiver needs no notification. Clamped to ≤ 90.
+    pub fn set_fec_percent(&mut self, pct: u8) {
+        self.fec.fec_percent = pct.min(90);
+    }
+
+    /// The current FEC recovery percentage.
+    pub fn fec_percent(&self) -> u8 {
+        self.fec.fec_percent
+    }
+
     /// Packetize one access unit into wire packets (header + shard payload each).
     pub fn packetize(
         &mut self,

@@ -184,6 +184,11 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`LossReport`].
+#define MSG_LOSS_REPORT 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ProbeRequest`].
 #define MSG_PROBE_REQUEST 32
 #endif

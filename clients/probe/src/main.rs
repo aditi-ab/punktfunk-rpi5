@@ -45,7 +45,8 @@ use punktfunk_core::config::Role;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::FLAG_PROBE;
 use punktfunk_core::quic::{
-    endpoint, io, Hello, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, Start, Welcome,
+    endpoint, io, window_loss_ppm, Hello, LossReport, ProbeRequest, ProbeResult, Reconfigure,
+    Reconfigured, Start, Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::{CompositorPref, Mode, PunktfunkError, Session};
@@ -438,6 +439,10 @@ async fn session(args: Args) -> Result<()> {
     // wire packet (graceful past the FEC budget), not just fully-reassembled probe AUs.
     let rx_wire_packets = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let rx_wire_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Adaptive-FEC loss feedback: the data loop publishes a windowed loss estimate here; in normal
+    // stream mode (no speed test / remode) a control-stream task relays it to the host as a
+    // LossReport so it can size FEC to the link. u32::MAX = "no fresh sample this window".
+    let loss_ppm = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
 
     // Mid-stream renegotiation test: after a delay, ask the host to switch modes on the
     // still-open control stream. The stream then carries new-mode AUs (IDR + in-band
@@ -547,6 +552,26 @@ async fn session(args: Args) -> Result<()> {
                 send_dropped = res.send_dropped,
                 "SPEED TEST complete",
             );
+        });
+    } else {
+        // Normal stream mode: relay the data loop's windowed loss estimate to the host as periodic
+        // LossReports, so it can size FEC to the link (adaptive FEC). The control stream is otherwise
+        // idle here (remode/speed-test own it in their modes).
+        let mut ls = send;
+        let lp = loss_ppm.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                let v = lp.swap(u32::MAX, Relaxed);
+                if v != u32::MAX
+                    && io::write_msg(&mut ls, &LossReport { loss_ppm: v }.encode())
+                        .await
+                        .is_err()
+                {
+                    break; // control stream gone
+                }
+            }
         });
     }
 
@@ -823,6 +848,7 @@ async fn session(args: Args) -> Result<()> {
     let expected = welcome.frames;
     let out_path = args.out.clone();
     let (rxp_dt, rxb_dt) = (rx_wire_packets.clone(), rx_wire_bytes.clone());
+    let lp_dt = loss_ppm.clone();
 
     // Express our receive time in the host clock before differencing against the host-stamped
     // capture pts. 0 ⇒ same-host or an old host that didn't answer the skew handshake (the latency
@@ -857,13 +883,31 @@ async fn session(args: Args) -> Result<()> {
         let mut latencies_us: Vec<u64> = Vec::new();
         let mut last_rx = std::time::Instant::now();
         let started = std::time::Instant::now();
+        // Adaptive-FEC loss window: publish a fresh estimate every 750 ms for the LossReport task.
+        let mut last_loss_report = std::time::Instant::now();
+        let (mut last_recovered, mut last_received, mut last_dropped) = (0u64, 0u64, 0u64);
         loop {
-            // Mirror packet-level receive counters for the speed-test reporter (reads their delta).
+            // Mirror packet-level receive counters for the speed-test reporter (reads their delta),
+            // and publish a windowed loss estimate for the adaptive-FEC LossReport task.
             {
                 use std::sync::atomic::Ordering::Relaxed;
                 let s = session.stats();
                 rxp_dt.store(s.packets_received, Relaxed);
                 rxb_dt.store(s.bytes_received, Relaxed);
+                if last_loss_report.elapsed() >= std::time::Duration::from_millis(750) {
+                    lp_dt.store(
+                        window_loss_ppm(
+                            s.fec_recovered_shards.wrapping_sub(last_recovered),
+                            s.packets_received.wrapping_sub(last_received),
+                            s.frames_dropped.wrapping_sub(last_dropped),
+                        ),
+                        Relaxed,
+                    );
+                    last_loss_report = std::time::Instant::now();
+                    last_recovered = s.fec_recovered_shards;
+                    last_received = s.packets_received;
+                    last_dropped = s.frames_dropped;
+                }
             }
             if expected > 0 && ok + mismatched >= expected {
                 break;

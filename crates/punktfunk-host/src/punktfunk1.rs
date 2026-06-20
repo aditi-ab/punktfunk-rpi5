@@ -27,13 +27,14 @@ use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, 
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
-    endpoint, io, ClockEcho, ClockProbe, Hello, PairChallenge, PairProof, PairRequest, PairResult,
-    ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, Start, Welcome,
+    endpoint, io, ClockEcho, ClockProbe, Hello, LossReport, PairChallenge, PairProof, PairRequest,
+    PairResult, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, Start,
+    Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
 use rand::RngCore;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -334,15 +335,41 @@ fn resolve_bitrate_kbps(requested: u32) -> u32 {
     }
 }
 
-/// FEC recovery percent for the session's Welcome. Default 20% (Sunshine's default too); a clean
-/// wired LAN can lower it (every recovery shard is wire bytes + packets), so `PUNKTFUNK_FEC_PCT`
-/// overrides it — e.g. `0` disables FEC entirely, `10` halves the overhead. Clamped to ≤ 90.
-fn fec_percent_from_env() -> u8 {
+/// Static FEC override: `PUNKTFUNK_FEC_PCT`, when set, PINS the recovery percent and DISABLES
+/// adaptive FEC — so a speed test / measurement keeps a fixed, known overhead. `None` ⇒ adaptive
+/// FEC (the host sizes recovery to the loss the client reports). `0` disables FEC entirely.
+/// Clamped to ≤ 90.
+fn fec_static_override() -> Option<u8> {
     std::env::var("PUNKTFUNK_FEC_PCT")
         .ok()
         .and_then(|s| s.trim().parse::<u8>().ok())
         .map(|p| p.min(90))
-        .unwrap_or(20)
+}
+
+/// Adaptive-FEC band + starting point. Every recovery shard is extra wire bytes AND an extra
+/// packet, so on a clean link FEC decays toward [`FEC_MIN`] (fewer packets — the win for a
+/// packet-rate-bound uplink like the Steam Deck's WiFi tx); loss ramps it toward [`FEC_MAX`].
+/// Sessions start moderate so the first frames (before any loss report) are protected.
+const FEC_MIN: u8 = 1;
+const FEC_MAX: u8 = 50;
+const FEC_ADAPTIVE_START: u8 = 10;
+
+/// Map the client's reported data-plane loss (ppm of shards, see [`LossReport`]) to a recovery
+/// percentage. FEC must EXCEED the loss rate to recover a block, so target ≈ loss × 1.4 + 1 pt of
+/// margin, clamped to the band. A clean link (≈0 ppm) lands on [`FEC_MIN`].
+fn adapt_fec(loss_ppm: u32) -> u8 {
+    let loss_pct = loss_ppm as f64 / 10_000.0; // ppm → percent
+    let target = (loss_pct * 1.4).ceil() as u32 + 1;
+    target.clamp(FEC_MIN as u32, FEC_MAX as u32) as u8
+}
+
+/// Apply the latest adaptive-FEC target to the session if it changed (cheap relaxed load + compare),
+/// called once per frame on the data-plane send path.
+fn apply_fec_target(session: &mut Session, fec_target: &AtomicU8) {
+    let t = fec_target.load(Ordering::Relaxed);
+    if session.fec_percent() != t {
+        session.set_fec_percent(t);
+    }
 }
 
 /// Persistent audio-capturer slot, reused across sessions (same pattern as the GameStream
@@ -588,7 +615,9 @@ async fn serve_session(
             // The post-GameStream point of punktfunk/1: Leopard GF(2¹⁶) FEC + real encryption.
             fec: FecConfig {
                 scheme: FecScheme::Gf16,
-                fec_percent: fec_percent_from_env(),
+                // Static override pins it; otherwise sessions start at the adaptive midpoint and the
+                // host re-sizes FEC live from the client's LossReports (adaptive FEC).
+                fec_percent: fec_static_override().unwrap_or(FEC_ADAPTIVE_START),
                 max_data_per_block: 4096,
             },
             // ~1452-byte payload keeps the IP datagram within a 1500 MTU (1452 + 40 header + 24
@@ -644,6 +673,12 @@ async fn serve_session(
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
     let (probe_result_tx, mut probe_result_rx) =
         tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
+    // Adaptive FEC: the control task maps each client LossReport to a recovery percent and publishes
+    // it here; the data-plane send loop reads + applies it per frame. Disabled (pinned) when
+    // PUNKTFUNK_FEC_PCT is set. Seeded with the session's starting FEC so it's a no-op until a report.
+    let adaptive_fec = fec_static_override().is_none();
+    let fec_target = Arc::new(AtomicU8::new(welcome.fec.fec_percent));
+    let fec_target_ctl = fec_target.clone();
     tokio::spawn(async move {
         let mut active = hello.mode;
         loop {
@@ -678,6 +713,22 @@ async fn serve_session(
                         tracing::debug!("client requested keyframe (decode recovery)");
                         if keyframe_tx.send(()).is_err() {
                             break; // data plane gone
+                        }
+                    } else if let Ok(rep) = LossReport::decode(&msg) {
+                        // Adaptive FEC: size recovery to the loss the client is seeing. The data-plane
+                        // send loop reads `fec_target_ctl` and applies it per frame. Ignored when FEC
+                        // is pinned via PUNKTFUNK_FEC_PCT.
+                        if adaptive_fec {
+                            let target = adapt_fec(rep.loss_ppm);
+                            let prev = fec_target_ctl.swap(target, Ordering::Relaxed);
+                            if prev != target {
+                                tracing::info!(
+                                    loss_ppm = rep.loss_ppm,
+                                    fec_pct = target,
+                                    prev_fec_pct = prev,
+                                    "adaptive FEC adjusted"
+                                );
+                            }
                         }
                     } else if let Ok(req) = ProbeRequest::decode(&msg) {
                         tracing::info!(
@@ -830,6 +881,7 @@ async fn serve_session(
     let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
     let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
     let stop_stream = stop.clone();
+    let fec_target_dp = fec_target.clone(); // data-plane handle to the adaptive-FEC target
     let result: Result<()> = async {
         tokio::task::spawn_blocking(move || -> Result<()> {
             // Wait briefly for the client to hole-punch our data port, then stream to its OBSERVED
@@ -865,6 +917,7 @@ async fn serve_session(
                     &stop_stream,
                     &probe_rx,
                     &probe_result_tx,
+                    &fec_target_dp,
                 ),
                 Punktfunk1Source::Virtual => {
                     let compositor = compositor
@@ -881,6 +934,7 @@ async fn serve_session(
                         bit_depth,
                         probe_rx,
                         probe_result_tx,
+                        fec_target_dp,
                     )
                 }
             }
@@ -1498,12 +1552,14 @@ fn synthetic_stream(
     stop: &AtomicBool,
     probe_rx: &std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    fec_target: &AtomicU8,
 ) -> Result<()> {
     let interval = std::time::Duration::from_millis(1000 / 60);
     for idx in 0..frames {
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        apply_fec_target(session, fec_target);
         // Service speed-test probes between synthetic frames (loopback bandwidth tests).
         service_probes(session, stop, probe_rx, probe_result_tx);
         let data = test_frame(idx, 64 * 1024);
@@ -1906,6 +1962,7 @@ pub(crate) fn boost_thread_priority(critical: bool) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_loop(
     mut session: Session,
     frame_rx: std::sync::mpsc::Receiver<FrameMsg>,
@@ -1914,6 +1971,7 @@ fn send_loop(
     stop: Arc<AtomicBool>,
     perf: bool,
     burst_cap: usize,
+    fec_target: Arc<AtomicU8>,
 ) {
     boost_thread_priority(false); // transmit thread: above-normal (Apollo's encoder-thread level)
     let mut last_perf = std::time::Instant::now();
@@ -1929,6 +1987,8 @@ fn send_loop(
         // Probes run here (they need the Session); a burst pauses video — the encode thread blocks
         // on the full frame channel meanwhile, which is exactly the intended pause.
         service_probes(&mut session, &stop, &probe_rx, &probe_result_tx);
+        // Adaptive FEC: pick up any new recovery target the control task set from client LossReports.
+        apply_fec_target(&mut session, &fec_target);
         // Short timeout so we keep re-checking `stop` + probes when no frames are flowing.
         match frame_rx.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(msg) => match paced_submit(
@@ -2073,6 +2133,7 @@ fn virtual_stream(
     bit_depth: u8,
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    fec_target: Arc<AtomicU8>,
 ) -> Result<()> {
     // This thread runs the capture+encode loop (single-process: Linux / synthetic / NO_WGC DDA) — or
     // tail-calls the relay below. Elevate it so a CPU-heavy game can't deschedule our GPU submission.
@@ -2095,6 +2156,7 @@ fn virtual_stream(
             bit_depth,
             probe_rx,
             probe_result_tx,
+            fec_target,
         );
     }
     tracing::info!(
@@ -2149,6 +2211,7 @@ fn virtual_stream(
                     stop,
                     perf,
                     burst_cap,
+                    fec_target,
                 )
             }
         })
@@ -2397,6 +2460,7 @@ fn virtual_stream_relay(
     bit_depth: u8,
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    fec_target: Arc<AtomicU8>,
 ) -> Result<()> {
     use crate::capture::dxgi::WinCaptureTarget;
     use crate::capture::wgc_relay::HelperRelay;
@@ -2522,6 +2586,7 @@ fn virtual_stream_relay(
                     stop,
                     perf,
                     burst_cap,
+                    fec_target,
                 )
             }
         })
@@ -2918,6 +2983,20 @@ fn build_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapt_fec_maps_loss_to_recovery_band() {
+        // A perfectly clean window (0 loss) lands on the floor.
+        assert_eq!(adapt_fec(0), FEC_MIN);
+        // Any nonzero loss rounds up past the floor (ceil) — tiny but never below the cushion.
+        assert_eq!(adapt_fec(1), 2);
+        // FEC exceeds the loss it covers (×1.4 + 1pt headroom).
+        assert_eq!(adapt_fec(50_000), 8); // 5% loss → ceil(7)+1 = 8
+        assert_eq!(adapt_fec(100_000), 15); // 10% → ceil(14)+1 = 15
+                                            // Heavy loss saturates at the ceiling, never beyond.
+        assert_eq!(adapt_fec(1_000_000), FEC_MAX); // 100% → clamped
+        assert!(adapt_fec(u32::MAX) <= FEC_MAX);
+    }
 
     #[test]
     fn compositor_resolution_precedence() {

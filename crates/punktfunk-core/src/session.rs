@@ -201,6 +201,18 @@ impl Session {
         r.map(|_| ())
     }
 
+    /// Host: live-adjust the FEC recovery percentage (adaptive FEC). Affects the next
+    /// [`submit_frame`](Self::submit_frame)/[`seal_frame`](Self::seal_frame); the receiver needs no
+    /// notification (each packet's header carries its block's data/recovery shard counts).
+    pub fn set_fec_percent(&mut self, pct: u8) {
+        self.packetizer.set_fec_percent(pct);
+    }
+
+    /// The current FEC recovery percentage (host side).
+    pub fn fec_percent(&self) -> u8 {
+        self.packetizer.fec_percent()
+    }
+
     /// Host: drain one pending input event from the client, if any.
     pub fn poll_input(&mut self) -> Result<Option<InputEvent>> {
         if self.config.role != Role::Host {

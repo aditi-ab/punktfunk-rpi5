@@ -16,15 +16,15 @@ use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
-    endpoint, io, Hello, HidOutput, ProbeRequest, ProbeResult, Reconfigure, Reconfigured,
-    RequestKeyframe, RichInput, Start, Welcome,
+    endpoint, io, window_loss_ppm, Hello, HidOutput, LossReport, ProbeRequest, ProbeResult,
+    Reconfigure, Reconfigured, RequestKeyframe, RichInput, Start, Welcome,
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A control-stream request the embedder makes on the open handshake stream: a mode switch or a
 /// speed test. One outbound channel carries both so the worker's `select!` has a single writer
@@ -33,6 +33,7 @@ enum CtrlRequest {
     Mode(Mode),
     Probe(ProbeRequest),
     Keyframe,
+    Loss(LossReport),
 }
 
 /// What the worker reports to [`NativeClient::connect`] once the handshake lands: the negotiated
@@ -245,6 +246,7 @@ impl NativeClient {
         let mode_slot_w = mode_slot.clone();
         let probe_w = probe.clone();
         let frames_dropped_w = frames_dropped.clone();
+        let ctrl_tx_pump = ctrl_tx.clone(); // the data-plane pump sends adaptive-FEC LossReports
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
             .spawn(move || {
@@ -282,6 +284,7 @@ impl NativeClient {
                     mic_rx,
                     rich_input_rx,
                     ctrl_rx,
+                    ctrl_tx: ctrl_tx_pump,
                     ready_tx,
                     shutdown: shutdown_w,
                     mode_slot: mode_slot_w,
@@ -629,6 +632,7 @@ struct WorkerArgs {
     mic_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, u64, Vec<u8>)>,
     rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<RichInput>,
     ctrl_rx: tokio::sync::mpsc::UnboundedReceiver<CtrlRequest>,
+    ctrl_tx: tokio::sync::mpsc::UnboundedSender<CtrlRequest>,
     ready_tx: std::sync::mpsc::Sender<Result<Negotiated>>,
     shutdown: Arc<AtomicBool>,
     mode_slot: Arc<std::sync::Mutex<Mode>>,
@@ -658,6 +662,7 @@ async fn worker_main(args: WorkerArgs) {
         mut mic_rx,
         mut rich_input_rx,
         mut ctrl_rx,
+        ctrl_tx,
         ready_tx,
         shutdown,
         mode_slot,
@@ -851,6 +856,7 @@ async fn worker_main(args: WorkerArgs) {
                             CtrlRequest::Mode(m) => Reconfigure { mode: m }.encode(),
                             CtrlRequest::Probe(p) => p.encode(),
                             CtrlRequest::Keyframe => RequestKeyframe.encode(),
+                            CtrlRequest::Loss(r) => r.encode(),
                         };
                         if io::write_msg(&mut ctrl_send, &bytes).await.is_err() {
                             break;
@@ -944,6 +950,12 @@ async fn worker_main(args: WorkerArgs) {
     let pump_probe = probe.clone();
     let _ = tokio::task::spawn_blocking(move || {
         pin_thread_user_interactive(); // feeds frame_tx → the client's user-interactive video pump
+                                       // Adaptive-FEC loss reporting: every ADAPT_REPORT_INTERVAL, report the loss observed over the
+                                       // window (shards FEC recovered, plus a bump if any frame went unrecoverable) so the host can
+                                       // size FEC to the link. Suppressed during a speed test (its FLAG_PROBE filler would skew it).
+        const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
+        let mut last_report = Instant::now();
+        let (mut last_recovered, mut last_received, mut last_dropped) = (0u64, 0u64, 0u64);
         while !pump_shutdown.load(Ordering::SeqCst) {
             // Mirror the reassembler's unrecoverable-drop count for the client's keyframe-recovery
             // loop, and (during a speed test) the packet-level receive counters for the throughput
@@ -951,7 +963,7 @@ async fn worker_main(args: WorkerArgs) {
             // through a total-loss drought where no AU completes. Cheap: a few relaxed atomic loads.
             let st = session.stats();
             frames_dropped.store(st.frames_dropped, Ordering::Relaxed);
-            {
+            let probe_active = {
                 let mut p = pump_probe.lock().unwrap();
                 if p.active && !p.done {
                     p.rx_packets_now = st.packets_received;
@@ -959,6 +971,19 @@ async fn worker_main(args: WorkerArgs) {
                     p.base_packets.get_or_insert(st.packets_received);
                     p.base_bytes.get_or_insert(st.bytes_received);
                 }
+                p.active && !p.done
+            };
+            if !probe_active && last_report.elapsed() >= ADAPT_REPORT_INTERVAL {
+                let loss_ppm = window_loss_ppm(
+                    st.fec_recovered_shards.wrapping_sub(last_recovered),
+                    st.packets_received.wrapping_sub(last_received),
+                    st.frames_dropped.wrapping_sub(last_dropped),
+                );
+                let _ = ctrl_tx.send(CtrlRequest::Loss(LossReport { loss_ppm }));
+                last_report = Instant::now();
+                last_recovered = st.fec_recovered_shards;
+                last_received = st.packets_received;
+                last_dropped = st.frames_dropped;
             }
             match session.poll_frame() {
                 Ok(frame) => {

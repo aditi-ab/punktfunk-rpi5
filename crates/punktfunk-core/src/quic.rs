@@ -167,6 +167,18 @@ pub struct Reconfigured {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestKeyframe;
 
+/// `client → host`, periodic: the client's observed data-plane loss, so the host can size FEC to
+/// the link instead of a flat percentage (adaptive FEC). `loss_ppm` is parts-per-million of shards
+/// that arrived missing-but-recovered (plus a bump when frames went unrecoverable) over the report
+/// window — i.e. the loss FEC is currently absorbing. The host maps it to a recovery percentage,
+/// clamped to a sane band, and applies it live; a clean link decays toward the floor (fewer packets,
+/// which directly helps a packet-rate-bound uplink like the Steam Deck's WiFi tx). Fire-and-forget.
+/// A host that predates this ignores it (unknown control message) and keeps its static FEC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LossReport {
+    pub loss_ppm: u32,
+}
+
 /// `client → host`, any time after [`Start`]: run a bandwidth speed test. The host bursts
 /// filler access units (flagged [`crate::packet::FLAG_PROBE`]) over the data plane at
 /// `target_kbps` of application goodput for `duration_ms`, *pausing video for the duration*, then
@@ -251,6 +263,8 @@ pub const MSG_RECONFIGURE: u8 = 0x01;
 pub const MSG_RECONFIGURED: u8 = 0x02;
 /// Type byte of [`RequestKeyframe`].
 pub const MSG_REQUEST_KEYFRAME: u8 = 0x03;
+/// Type byte of [`LossReport`].
+pub const MSG_LOSS_REPORT: u8 = 0x04;
 /// Type byte of [`ProbeRequest`].
 pub const MSG_PROBE_REQUEST: u8 = 0x20;
 /// Type byte of [`ProbeResult`].
@@ -819,6 +833,43 @@ impl RequestKeyframe {
         }
         Ok(RequestKeyframe)
     }
+}
+
+impl LossReport {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] loss_ppm[5..9]
+        let mut b = Vec::with_capacity(9);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_LOSS_REPORT);
+        b.extend_from_slice(&self.loss_ppm.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<LossReport> {
+        if b.len() != 9 || &b[0..4] != CTL_MAGIC || b[4] != MSG_LOSS_REPORT {
+            return Err(PunktfunkError::InvalidArg("bad LossReport"));
+        }
+        Ok(LossReport {
+            loss_ppm: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+        })
+    }
+}
+
+/// Compute a [`LossReport`] `loss_ppm` from one window's session-stat deltas: shards FEC recovered
+/// (the loss it absorbed), shards received, and frames that went unrecoverable. Loss ≈ recovered /
+/// (received + recovered) — the fraction of shards that arrived missing. A frame drop means loss
+/// exceeded the current FEC budget (so `recovered` plateaus), so add a fixed bump to push the host's
+/// FEC up past the cap on the next adjustment. Returns parts-per-million, capped at 1e6.
+pub fn window_loss_ppm(recovered: u64, received: u64, frames_dropped: u64) -> u32 {
+    let denom = received.saturating_add(recovered);
+    let mut ppm = recovered
+        .saturating_mul(1_000_000)
+        .checked_div(denom)
+        .unwrap_or(0) as u32;
+    if frames_dropped > 0 {
+        ppm = ppm.saturating_add(50_000); // +5%: unrecoverable loss → raise FEC past the current cap
+    }
+    ppm.min(1_000_000)
 }
 
 impl ProbeRequest {
@@ -1875,6 +1926,35 @@ mod tests {
         assert!(Reconfigure::decode(&bytes).is_err());
         // Length is exact (no trailing bytes accepted).
         assert!(RequestKeyframe::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+    }
+
+    #[test]
+    fn loss_report_roundtrip() {
+        for loss_ppm in [0u32, 1, 12_345, 50_000, 1_000_000] {
+            let r = LossReport { loss_ppm };
+            assert_eq!(LossReport::decode(&r.encode()).unwrap(), r);
+        }
+        // Disjoint from the other control messages (type byte + length).
+        assert!(LossReport::decode(&RequestKeyframe.encode()).is_err());
+        assert!(RequestKeyframe::decode(&LossReport { loss_ppm: 0 }.encode()).is_err());
+        assert!(LossReport::decode(
+            &[LossReport { loss_ppm: 0 }.encode().as_slice(), &[0]].concat()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn window_loss_ppm_estimates_and_caps() {
+        // No traffic → 0. A clean window (nothing recovered) → 0.
+        assert_eq!(window_loss_ppm(0, 0, 0), 0);
+        assert_eq!(window_loss_ppm(0, 1000, 0), 0);
+        // 50 recovered of 1000 total (950 received + 50 recovered) = 5%.
+        assert_eq!(window_loss_ppm(50, 950, 0), 50_000);
+        // An unrecoverable frame adds the +5% bump (push FEC past the current cap).
+        assert_eq!(window_loss_ppm(50, 950, 1), 100_000);
+        // A total-loss window with a drop but nothing received still reports the bump, capped at 1e6.
+        assert_eq!(window_loss_ppm(0, 0, 3), 50_000);
+        assert!(window_loss_ppm(u64::MAX, 1, 9) <= 1_000_000);
     }
 
     #[test]
