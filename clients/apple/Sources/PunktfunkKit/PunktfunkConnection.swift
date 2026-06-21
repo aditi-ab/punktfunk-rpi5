@@ -532,6 +532,11 @@ public final class PunktfunkConnection {
         }
     }
 
+    /// Video-capability bit: the client can decode a 10-bit (Main10) HEVC stream.
+    public static let videoCap10Bit: UInt8 = UInt8(PUNKTFUNK_VIDEO_CAP_10BIT)
+    /// Video-capability bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
+    public static let videoCapHDR: UInt8 = UInt8(PUNKTFUNK_VIDEO_CAP_HDR)
+
     /// Static HDR mastering metadata (SMPTE ST.2086 + content light level) the host sent for an HDR
     /// session. Mirrors the wire/ABI `PunktfunkHdrMeta`; primaries are in ST.2086 **G, B, R** order,
     /// 1/50000 units; mastering luminance in 0.0001 cd/m²; MaxCLL/MaxFALL in nits.

@@ -44,6 +44,7 @@ object NativeBridge {
         bitrateKbps: Int,
         compositorPref: Int,
         gamepadPref: Int,
+        hdrEnabled: Boolean,
     ): Long
 
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */

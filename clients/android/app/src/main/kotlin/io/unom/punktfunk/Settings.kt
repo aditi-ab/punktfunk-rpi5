@@ -1,6 +1,7 @@
 package io.unom.punktfunk
 
 import android.content.Context
+import android.view.Display
 
 /**
  * User-tunable stream settings, persisted in `SharedPreferences`. A `0` resolution/refresh means
@@ -74,6 +75,21 @@ fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
     val h = mode.physicalHeight
     val hz = mode.refreshRate.toInt().coerceAtLeast(1)
     return Triple(maxOf(w, h), minOf(w, h), hz)
+}
+
+/**
+ * True when this device's display can actually present HDR10, so we should advertise HDR to the
+ * host. On an SDR panel we advertise `0` instead — the host then sends a proper 8-bit BT.709 stream
+ * rather than BT.2020 PQ the panel would mis-tone-map (the washed-out/dark failure). Mirrors the
+ * capability gate the Apple/Windows clients apply.
+ */
+fun displaySupportsHdr(context: Context): Boolean {
+    val display = runCatching { context.display }.getOrNull() ?: return false
+    @Suppress("DEPRECATION") // hdrCapabilities is the supported query on minSdk 31
+    val caps = display.hdrCapabilities ?: return false
+    return caps.supportedHdrTypes.any {
+        it == Display.HdrCapabilities.HDR_TYPE_HDR10 || it == Display.HdrCapabilities.HDR_TYPE_HDR10_PLUS
+    }
 }
 
 /** Resolve [Settings] (with its 0=native placeholders) to the concrete mode to request. */

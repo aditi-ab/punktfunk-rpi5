@@ -49,6 +49,12 @@ public final class VideoDecoder: @unchecked Sendable {
     /// pump can re-gate on the next IDR.
     private let onDecodeError: @Sendable (OSStatus) -> Void
 
+    /// Latest source HDR mastering metadata (from `PunktfunkConnection.nextHdrMeta`), attached to
+    /// each decoded HDR pixel buffer so the compositor tone-maps from the real grade. Guarded by its
+    /// own lock — written by the pump thread, read on the VT decode callback.
+    private let metaLock = NSLock()
+    private var hdrMeta: PunktfunkConnection.HdrMeta?
+
     public init(
         onDecoded: @escaping @Sendable (ReadyFrame) -> Void,
         onDecodeError: @escaping @Sendable (OSStatus) -> Void = { _ in }
@@ -58,6 +64,14 @@ public final class VideoDecoder: @unchecked Sendable {
     }
 
     deinit { teardown() }
+
+    /// Set the source HDR mastering metadata (drained from `PunktfunkConnection.nextHdrMeta`). It's
+    /// attached to subsequent decoded HDR pixel buffers. Thread-safe; cheap to call on each update.
+    public func setHdrMeta(_ meta: PunktfunkConnection.HdrMeta) {
+        metaLock.lock()
+        hdrMeta = meta
+        metaLock.unlock()
+    }
 
     /// Submit one AU for asynchronous decode, (re)creating the session if `format` changed. The
     /// caller resolves `format` from the IDR exactly as stage-1 does (`AnnexB.formatDescription`).
@@ -185,6 +199,22 @@ public final class VideoDecoder: @unchecked Sendable {
         let isHDR =
             CVPixelBufferGetPixelFormatType(imageBuffer)
             == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        // Attach the source's mastering display + content light level (ST.2086 / CEA-861.3) so the
+        // compositor tone-maps from the real grade rather than inferring from the PQ colourspace
+        // alone. The SEI byte payloads map 1:1 to these CVImageBuffer attachment keys.
+        if isHDR {
+            metaLock.lock()
+            let meta = hdrMeta
+            metaLock.unlock()
+            if let meta {
+                CVBufferSetAttachment(
+                    imageBuffer, kCVImageBufferMasteringDisplayColorVolumeKey,
+                    meta.masteringDisplayColorVolume() as CFData, .shouldPropagate)
+                CVBufferSetAttachment(
+                    imageBuffer, kCVImageBufferContentLightLevelInfoKey,
+                    meta.contentLightLevelInfo() as CFData, .shouldPropagate)
+            }
+        }
         onDecoded(
             ReadyFrame(ptsNs: ptsNs, decodedNs: decodedNs, pixelBuffer: imageBuffer, isHDR: isHDR))
     }

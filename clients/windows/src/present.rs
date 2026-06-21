@@ -619,6 +619,36 @@ fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
     }
 }
 
+/// True if any attached display is currently in HDR (BT.2020 PQ) mode. The client advertises HDR
+/// caps only when this holds, so an SDR display gets a proper 8-bit BT.709 stream instead of PQ it
+/// would mis-tone-map (the washed-out/dark failure); an HDR display self-tone-maps from the
+/// mastering metadata. Coarse — checks ANY output, not the app's specific monitor; a mid-session
+/// monitor move to/from HDR is a follow-up (the `Reconfigure` downgrade).
+pub fn display_supports_hdr() -> bool {
+    unsafe {
+        let factory: IDXGIFactory1 = match CreateDXGIFactory1() {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut ai = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(ai) {
+            ai += 1;
+            let mut oi = 0u32;
+            while let Ok(output) = adapter.EnumOutputs(oi) {
+                oi += 1;
+                if let Ok(o6) = output.cast::<IDXGIOutput6>() {
+                    if let Ok(desc) = o6.GetDesc1() {
+                        if desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Generic HDR10 mastering metadata: BT.2020 primaries + D65 white, a 1000-nit mastering display,
 /// MaxCLL 1000 / MaxFALL 400. The fallback used only until the host's real `0xCE` metadata arrives.
 fn generic_hdr10_metadata() -> DXGI_HDR_METADATA_HDR10 {

@@ -140,11 +140,15 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
         status = "Connecting to $targetHost:$targetPort…"
         discovery.stop() // free the Wi-Fi radio before the stream session
         scope.launch {
+            // Advertise HDR only when this device's display can present it (else the host sends a
+            // proper SDR stream rather than PQ the panel would mis-tone-map).
+            val hdrEnabled = displaySupportsHdr(context)
             val handle = withContext(Dispatchers.IO) {
                 NativeBridge.nativeConnect(
                     targetHost, targetPort, w, h, hz,
                     id.certPem, id.privateKeyPem, pinHex ?: "",
                     settings.bitrateKbps, settings.compositor, settings.gamepad,
+                    hdrEnabled,
                 )
             }
             connecting = false

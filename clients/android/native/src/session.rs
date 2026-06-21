@@ -144,6 +144,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     bitrate_kbps: jint,
     compositor_pref: jint,
     gamepad_pref: jint,
+    hdr_enabled: jboolean,
 ) -> jlong {
     let host: String = match env.get_string(&host) {
         Ok(s) => s.into(),
@@ -184,10 +185,17 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         CompositorPref::from_u8(compositor_pref.clamp(0, u8::MAX as jint) as u8),
         GamepadPref::from_u8(gamepad_pref.clamp(0, u8::MAX as jint) as u8),
         bitrate_kbps.max(0) as u32, // 0 = host default
-        // Advertise 10-bit + HDR: the host (e.g. Windows) only upgrades to a Main10 / BT.2020 PQ
-        // encode when the client sets these. AMediaCodec decodes Main10 from the SPS and the decode
-        // loop signals the Surface's HDR dataspace from the reported colour (see crate::decode).
-        punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR,
+        // Advertise 10-bit + HDR ONLY when this device's display can actually present it (Kotlin
+        // checks Display.getHdrCapabilities() and passes the result): the host (e.g. Windows) then
+        // upgrades to a Main10 / BT.2020 PQ encode. On an SDR display we advertise 0 so the host
+        // sends a proper 8-bit BT.709 stream rather than PQ the panel would mis-tone-map. AMediaCodec
+        // decodes Main10 from the SPS and the decode loop signals the Surface HDR dataspace + static
+        // metadata (see crate::decode).
+        if hdr_enabled != 0 {
+            punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR
+        } else {
+            0
+        },
         None,     // launch: default app
         pin,      // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)

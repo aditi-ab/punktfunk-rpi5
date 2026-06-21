@@ -5,6 +5,12 @@ import Foundation
 import PunktfunkKit
 import SwiftUI
 
+#if canImport(AppKit)
+    import AppKit
+#elseif canImport(UIKit)
+    import UIKit
+#endif
+
 /// Pump-thread-side frame counters; a 1 Hz main-actor timer drains them into @Published
 /// values. NSLock instead of an actor — the writer is the (non-async) pump thread.
 final class FrameMeter: @unchecked Sendable {
@@ -93,6 +99,7 @@ final class SessionModel: ObservableObject {
                  compositor: PunktfunkConnection.Compositor = .auto,
                  gamepad: PunktfunkConnection.GamepadType = .auto,
                  bitrateKbps: UInt32 = 0,
+                 hdrEnabled: Bool = true,
                  launchID: String? = nil,
                  allowTofu: Bool = false,
                  autoTrust: Bool = false) {
@@ -101,17 +108,36 @@ final class SessionModel: ObservableObject {
         activeHost = host
         errorMessage = nil
         let pin = host.pinnedSHA256
+        // Capability gate (main-actor — screen APIs): only advertise HDR when this display can
+        // actually present it, so the host sends a proper SDR stream to an SDR display rather than
+        // BT.2020 PQ the panel would mis-tone-map. The display self-tone-maps HDR from the mastering
+        // metadata we apply (Step 2) when it IS HDR.
+        let displayHDR: Bool = {
+            #if os(macOS)
+                return (NSScreen.main?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0) > 1.0
+            #else
+                return UIScreen.main.potentialEDRHeadroom > 1.0
+            #endif
+        }()
+        let hdrCapable = hdrEnabled && displayHDR
         Task.detached(priority: .userInitiated) {
             // PunktfunkConnection.init blocks on the QUIC handshake — keep it off the main
             // actor. The persistent identity is presented on every connect so a paired
             // host recognizes this Mac (nil = anonymous, fine for hosts without
             // --require-pairing; Keychain/generation failure must not block connecting).
             let identity = (try? ClientIdentityStore.shared.load())?.identity
+            // Advertise 10-bit + HDR10 when enabled: the host upgrades to a BT.2020 PQ Main10 stream
+            // only for actual HDR content (its own gate); the VideoToolbox/Metal present path is
+            // HDR-capable (P010 + itur_2100_PQ + EDR). 0 keeps the 8-bit BT.709 SDR stream.
+            let videoCaps: UInt8 = hdrCapable
+                ? (PunktfunkConnection.videoCap10Bit | PunktfunkConnection.videoCapHDR)
+                : 0
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,
                 pinSHA256: pin, identity: identity, compositor: compositor,
-                gamepad: gamepad, bitrateKbps: bitrateKbps, launchID: launchID) }
+                gamepad: gamepad, bitrateKbps: bitrateKbps, videoCaps: videoCaps,
+                launchID: launchID) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 // The user may have abandoned this attempt (window closed, another host

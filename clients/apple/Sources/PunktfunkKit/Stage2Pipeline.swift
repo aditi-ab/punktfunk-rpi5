@@ -128,6 +128,11 @@ public final class Stage2Pipeline {
                         lastFramesDropped = dropped
                         recovery.request()
                     }
+                    // Drain any HDR mastering-metadata update (0xCE) and hand it to the decoder, which
+                    // attaches it to subsequent HDR frames. Non-blocking; only HDR sessions emit these.
+                    if connection.isHDR, let meta = try? connection.nextHdrMeta(timeoutMs: 0) {
+                        decoder.setHdrMeta(meta)
+                    }
                     guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
                     onFrame?(au)
                     if let f = AnnexB.formatDescription(fromIDR: au.data) {
