@@ -44,6 +44,71 @@ object Gamepad {
     const val AXIS_LT = 4
     const val AXIS_RT = 5
 
+    // GamepadPref wire bytes — must equal punktfunk-core `config.rs::GamepadPref::to_u8`.
+    const val PREF_AUTO = 0
+    const val PREF_XBOX360 = 1
+    const val PREF_DUALSENSE = 2
+    const val PREF_XBOXONE = 3
+    const val PREF_DUALSHOCK4 = 4
+
+    // USB vendor ids of the controllers we can identify by VID/PID.
+    private const val VID_SONY = 0x054C
+    private const val VID_MICROSOFT = 0x045E
+
+    // Sony product ids. DualSense (PS5) and DualShock 4 (PS4) map to distinct host pad types.
+    private val PID_DUALSENSE = setOf(0x0CE6, 0x0DF2)
+    private val PID_DUALSHOCK4 = setOf(0x05C4, 0x09CC)
+
+    // Microsoft Xbox One / Series product ids (wired + the common Bluetooth/dongle revisions). All
+    // behave like Xbox 360 on the host minus the glyph identity, so they share one pref byte.
+    private val PID_XBOXONE = setOf(
+        0x02D1, 0x02DD, 0x02E3, 0x02EA, 0x0B00, 0x0B12, 0x0B13, 0x0B20,
+    )
+
+    /**
+     * Resolve a connected controller's [GamepadPref] wire byte from its USB VID/PID, mirroring the
+     * Linux client's `pref_for_type` (SDL3 `GamepadType`) and the Apple client's GameController type
+     * auto-resolution. Android exposes no controller-type enum, so we match `getVendorId()` /
+     * `getProductId()`. Used only when the user picked "Automatic" — an explicit choice is honored as
+     * is. An unrecognized pad (or none) falls back to [PREF_XBOX360], the safe XInput default the
+     * host always supports. Never returns [PREF_AUTO] (the host would then decide) — once we have a
+     * physical pad we resolve it concretely, matching the other native clients.
+     */
+    fun prefFor(dev: InputDevice?): Int {
+        if (dev == null) return PREF_XBOX360
+        val vid = dev.vendorId
+        val pid = dev.productId
+        return when {
+            vid == VID_SONY && pid in PID_DUALSENSE -> PREF_DUALSENSE
+            vid == VID_SONY && pid in PID_DUALSHOCK4 -> PREF_DUALSHOCK4
+            vid == VID_MICROSOFT && pid in PID_XBOXONE -> PREF_XBOXONE
+            else -> PREF_XBOX360
+        }
+    }
+
+    /** First connected gamepad/joystick [InputDevice], or null when none is attached. */
+    fun firstPad(): InputDevice? {
+        for (id in InputDevice.getDeviceIds()) {
+            val d = InputDevice.getDevice(id) ?: continue
+            val s = d.sources
+            if (s and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
+                s and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+            ) {
+                return d
+            }
+        }
+        return null
+    }
+
+    /**
+     * The [GamepadPref] wire byte to send for the user's [setting] (the persisted gamepad index). A
+     * non-Auto setting is passed through unchanged; "Automatic" ([PREF_AUTO]) resolves to a concrete
+     * type from the first connected controller via [prefFor] (so the host gets the right pad even
+     * though Android can't tell it the controller type any other way).
+     */
+    fun resolvePref(setting: Int): Int =
+        if (setting == PREF_AUTO) prefFor(firstPad()) else setting
+
     /**
      * Gamepad `KEYCODE_*` → BTN_* bit, or 0 if not a gamepad button we forward. A/B/X/Y are
      * positional (Xbox layout; Nintendo relabeling needs device-type detection, deferred).

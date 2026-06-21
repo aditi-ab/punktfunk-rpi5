@@ -19,10 +19,27 @@ use jni::JNIEnv;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use punktfunk_core::input::{InputEvent, InputKind};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// Run a JNI body, catching any panic at the FFI boundary and returning `default` instead.
+///
+/// A panic unwinding out of an `extern "system"` function aborts the whole process on Rust ≥ 1.81 —
+/// a hard crash of the embedding Android app with no logcat trace. This mirrors the discipline the C
+/// ABI already enforces (`punktfunk_core::abi` wraps every entry point in `catch_unwind`); the
+/// `panic = "unwind"` profile in the workspace `Cargo.toml` exists precisely so these guards work.
+/// We apply it to the teardown + background-thread shims (the "leaving a stream" path), where an
+/// unexpected panic (e.g. a poisoned `Mutex` during concurrent teardown) must degrade to a logged
+/// no-op rather than kill the app.
+pub(crate) fn jni_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        log::error!("punktfunk JNI: caught a panic at the FFI boundary (returning default)");
+        default
+    })
+}
 
 /// A live session behind the `jlong` handle: the connector + the decode thread it feeds.
 pub(crate) struct SessionHandle {
@@ -231,10 +248,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     _this: JObject,
     handle: jlong,
 ) {
-    if handle != 0 {
-        // SAFETY: per the contract, `handle` is a live `Box<SessionHandle>` pointer.
-        unsafe { drop(Box::from_raw(handle as *mut SessionHandle)) };
-    }
+    jni_guard((), || {
+        if handle != 0 {
+            // SAFETY: per the contract, `handle` is a live `Box<SessionHandle>` pointer.
+            unsafe { drop(Box::from_raw(handle as *mut SessionHandle)) };
+        }
+    })
 }
 
 /// `NativeBridge.nativeHostFingerprint(handle): String` — the SHA-256 (64-hex) of the cert the host
@@ -367,11 +386,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
     _this: JObject,
     handle: jlong,
 ) {
-    if handle != 0 {
-        // SAFETY: live handle per the contract.
-        let h = unsafe { &*(handle as *const SessionHandle) };
-        h.stop_video();
-    }
+    jni_guard((), || {
+        if handle != 0 {
+            // SAFETY: live handle per the contract.
+            let h = unsafe { &*(handle as *const SessionHandle) };
+            h.stop_video();
+        }
+    })
 }
 
 /// `NativeBridge.nativeVideoStats(handle): DoubleArray?` — drain ~1 s of decode stats for the HUD.
@@ -386,36 +407,38 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
     _this: JObject,
     handle: jlong,
 ) -> jdoubleArray {
-    if handle == 0 {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: live handle per the nativeConnect/nativeClose contract.
-    let h = unsafe { &*(handle as *const SessionHandle) };
-    let snap = match h.video.lock().unwrap().as_ref() {
-        Some(vt) => vt.stats.drain(),
-        None => return std::ptr::null_mut(), // not streaming → no stats
-    };
-    let mode = h.client.mode();
-    let buf: [f64; 10] = [
-        snap.fps,
-        snap.mbps,
-        snap.lat_p50_ms,
-        snap.lat_p95_ms,
-        if snap.lat_valid { 1.0 } else { 0.0 },
-        if snap.skew_corrected { 1.0 } else { 0.0 },
-        mode.width as f64,
-        mode.height as f64,
-        mode.refresh_hz as f64,
-        h.client.frames_dropped() as f64,
-    ];
-    let arr = match env.new_double_array(buf.len() as jsize) {
-        Ok(a) => a,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    if env.set_double_array_region(&arr, 0, &buf).is_err() {
-        return std::ptr::null_mut();
-    }
-    arr.into_raw()
+    jni_guard(std::ptr::null_mut(), || {
+        if handle == 0 {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: live handle per the nativeConnect/nativeClose contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        let snap = match h.video.lock().unwrap().as_ref() {
+            Some(vt) => vt.stats.drain(),
+            None => return std::ptr::null_mut(), // not streaming → no stats
+        };
+        let mode = h.client.mode();
+        let buf: [f64; 10] = [
+            snap.fps,
+            snap.mbps,
+            snap.lat_p50_ms,
+            snap.lat_p95_ms,
+            if snap.lat_valid { 1.0 } else { 0.0 },
+            if snap.skew_corrected { 1.0 } else { 0.0 },
+            mode.width as f64,
+            mode.height as f64,
+            mode.refresh_hz as f64,
+            h.client.frames_dropped() as f64,
+        ];
+        let arr = match env.new_double_array(buf.len() as jsize) {
+            Ok(a) => a,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        if env.set_double_array_region(&arr, 0, &buf).is_err() {
+            return std::ptr::null_mut();
+        }
+        arr.into_raw()
+    })
 }
 
 /// `NativeBridge.nativeStartAudio(handle)` — start the Opus→AAudio playback thread. No-op if already
@@ -451,11 +474,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
     _this: JObject,
     handle: jlong,
 ) {
-    if handle != 0 {
-        // SAFETY: live handle per the contract.
-        let h = unsafe { &*(handle as *const SessionHandle) };
-        h.stop_audio();
-    }
+    jni_guard((), || {
+        if handle != 0 {
+            // SAFETY: live handle per the contract.
+            let h = unsafe { &*(handle as *const SessionHandle) };
+            h.stop_audio();
+        }
+    })
 }
 
 /// `NativeBridge.nativeStartMic(handle)` — start mic capture (AAudio input → Opus → host `send_mic`).
@@ -492,11 +517,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
     _this: JObject,
     handle: jlong,
 ) {
-    if handle != 0 {
-        // SAFETY: live handle per the contract.
-        let h = unsafe { &*(handle as *const SessionHandle) };
-        h.stop_mic();
-    }
+    jni_guard((), || {
+        if handle != 0 {
+            // SAFETY: live handle per the contract.
+            let h = unsafe { &*(handle as *const SessionHandle) };
+            h.stop_mic();
+        }
+    })
 }
 
 // ---- Input plane: Kotlin capture → NativeClient::send_input ----------------------------------

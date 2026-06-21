@@ -30,11 +30,22 @@ public final class GamepadManager: ObservableObject {
         public let productCategory: String
         /// The full extended profile exists — only these are forwardable.
         public let isExtended: Bool
-        public let isDualSense: Bool
+        /// The virtual-pad type a physical match resolves to under `.auto`: DualSense →
+        /// `.dualSense`, DualShock 4 → `.dualShock4`, an Xbox pad → `.xboxOne`, anything
+        /// else → `.xbox360`. (`.auto` is never stored here.)
+        public let kind: PunktfunkConnection.GamepadType
         public let hasLight: Bool
         public let hasHaptics: Bool
         public let hasMotion: Bool
         public let hasAdaptiveTriggers: Bool
+        /// Specifically a DualSense — gates the DualSense-only feedback (adaptive triggers,
+        /// player LEDs) and the PlayStation glyph in Settings.
+        public var isDualSense: Bool { kind == .dualSense }
+        /// A PlayStation pad with a touchpad + motion (DualSense OR DualShock 4) — gates
+        /// rich-input CAPTURE (touchpad contacts + gyro/accel on plane 0xCC).
+        public var hasTouchpadAndMotion: Bool {
+            kind == .dualSense || kind == .dualShock4
+        }
         /// 0...1, nil when the controller doesn't report a battery (e.g. wired).
         public let batteryLevel: Float?
         public let isCharging: Bool
@@ -102,7 +113,8 @@ public final class GamepadManager: ObservableObject {
 
     /// Connect-time resolution of the user's controller-type setting: an explicit choice
     /// wins; `.auto` matches the virtual pad to the active physical controller (DualSense →
-    /// DualSense, anything else → Xbox 360); no controller at all defers to the host.
+    /// DualSense, DualShock 4 → DualShock 4, an Xbox pad → Xbox One, anything else → Xbox
+    /// 360); no controller at all defers to the host.
     public func resolveType(
         setting: PunktfunkConnection.GamepadType
     ) -> PunktfunkConnection.GamepadType {
@@ -113,7 +125,7 @@ public final class GamepadManager: ObservableObject {
         // pad. `rebuild()` re-reads `GCController.controllers()` synchronously, closing that race.
         rebuild()
         guard let active else { return .auto }
-        return active.isDualSense ? .dualSense : .xbox360
+        return active.kind
     }
 
     private func noteConnected(_ c: GCController) {
@@ -152,20 +164,38 @@ public final class GamepadManager: ObservableObject {
 
     private static func describe(_ c: GCController, id: String) -> DiscoveredController {
         let extended = c.extendedGamepad
-        let ds = extended as? GCDualSenseGamepad
+        let kind = padKind(extended)
         return DiscoveredController(
             id: id,
             name: c.vendorName ?? c.productCategory,
             productCategory: c.productCategory,
             isExtended: extended != nil,
-            isDualSense: ds != nil,
+            kind: kind,
             hasLight: c.light != nil,
             hasHaptics: c.haptics != nil,
             hasMotion: c.motion != nil,
-            // GCDualSenseGamepad's triggers are GCDualSenseAdaptiveTrigger by declaration.
-            hasAdaptiveTriggers: ds != nil,
+            // GCDualSenseGamepad's triggers are GCDualSenseAdaptiveTrigger by declaration; the
+            // DualShock 4 has none.
+            hasAdaptiveTriggers: kind == .dualSense,
             batteryLevel: c.battery.flatMap { $0.batteryLevel >= 0 ? $0.batteryLevel : nil },
             isCharging: c.battery?.batteryState == .charging,
             controller: c)
+    }
+
+    /// Resolve a physical controller's matching virtual-pad type from its GameController
+    /// subclass. Detection order (all are `: GCExtendedGamepad`): DualSense first, then
+    /// DualShock 4, then any Xbox pad, else fall back to Xbox 360. A non-extended / absent
+    /// profile also falls back to `.xbox360` (it's never forwarded anyway).
+    private static func padKind(
+        _ extended: GCExtendedGamepad?
+    ) -> PunktfunkConnection.GamepadType {
+        guard let extended else { return .xbox360 }
+        // Deployment floor (macOS 14 / iOS 17 / tvOS 17) clears every introduction version
+        // here, so no `@available` guard is needed — matching the unguarded
+        // `GCDualSenseGamepad` use elsewhere in the package.
+        if extended is GCDualSenseGamepad { return .dualSense }
+        if extended is GCDualShockGamepad { return .dualShock4 }
+        if extended is GCXboxGamepad { return .xboxOne }
+        return .xbox360
     }
 }

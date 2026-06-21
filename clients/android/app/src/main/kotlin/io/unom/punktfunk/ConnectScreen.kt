@@ -63,6 +63,7 @@ import androidx.core.content.ContextCompat
 import io.unom.punktfunk.components.EmptyHostsState
 import io.unom.punktfunk.components.HostCard
 import io.unom.punktfunk.components.SectionLabel
+import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.discovery.HostDiscovery
@@ -143,11 +144,15 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
             // Advertise HDR only when this device's display can present it (else the host sends a
             // proper SDR stream rather than PQ the panel would mis-tone-map).
             val hdrEnabled = displaySupportsHdr(context)
+            // "Automatic" resolves to a concrete pad type from the connected controller's VID/PID
+            // (Android exposes no controller-type enum) — parity with the Linux/Apple clients. An
+            // explicit choice is passed through unchanged.
+            val gamepadPref = Gamepad.resolvePref(settings.gamepad)
             val handle = withContext(Dispatchers.IO) {
                 NativeBridge.nativeConnect(
                     targetHost, targetPort, w, h, hz,
                     id.certPem, id.privateKeyPem, pinHex ?: "",
-                    settings.bitrateKbps, settings.compositor, settings.gamepad,
+                    settings.bitrateKbps, settings.compositor, gamepadPref,
                     hdrEnabled,
                 )
             }

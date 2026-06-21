@@ -65,7 +65,15 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   `send_rich_input`. **Client-negotiated virtual pad type**: the Hello carries a gamepad
   preference byte (same trailing-byte back-compat pattern as the compositor), the Welcome
   echoes the resolved backend — precedence: explicit client choice > `PUNKTFUNK_GAMEPAD`
-  env > uinput Xbox 360; DualSense (UHID) only on Linux hosts.
+  env > uinput Xbox 360. Backends: **Xbox 360** (uinput / ViGEm), **Xbox One/Series** (the same
+  XInput backend with the One/Series USB identity for matching glyphs — no extra game-visible
+  capability; impulse-trigger rumble is unreachable through a virtual pad), and the UHID
+  `hid-playstation` pads — **DualSense** (adaptive triggers, lightbar, touchpad, motion) and
+  **DualShock 4** (lightbar, touchpad, motion, rumble; DualSense minus adaptive triggers / player
+  LEDs / mute). The UHID pads need a Linux host; off Linux they (and One/Series) fold into Xbox 360.
+  Clients auto-resolve the type from the physical controller (DS5→DualSense, DS4→DualShock 4,
+  Xbox One→Xbox One). Windows-host DualShock 4 (ViGEm) is not yet wired — Windows clients asking for
+  DS4 get Xbox 360 for now.
 - **Windows host: implemented and shipping (NVIDIA-only, x64-only).** `#[cfg(windows)]` backends
   behind the same traits as Linux — DXGI Desktop Duplication capture (`capture/dxgi.rs`), **SudoVDA**
   virtual display per session (`vdisplay/sudovda.rs`), NVENC encode (`--features nvenc`), SendInput +

@@ -8,8 +8,9 @@
 //   trigger FX    → DualSenseTriggerEffect.parse → GCDualSenseAdaptiveTrigger.
 //
 // Only pad 0 is rendered (exactly one controller is forwarded). HID-output traffic exists
-// only on DualSense sessions — the drain always polls both planes with short timeouts and
-// never spins, so an Xbox session just renders rumble. GameController profile mutation
+// only on PlayStation-pad sessions (a DualSense, or a DualShock 4 = lightbar only) — the
+// drain always polls both planes with short timeouts and never spins, so an Xbox session
+// just renders rumble. GameController profile mutation
 // happens on main; CHHapticEngine work on its own serial queue; the drain thread itself
 // touches neither. When GamepadManager switches the active controller mid-session, the
 // old pad is reset (triggers off, player index unset) and the last known feedback state
@@ -248,9 +249,12 @@ public final class GamepadFeedback {
     public func start() {
         guard !drainStarted else { return }
         drainStarted = true
-        // No hidout traffic can exist on a non-DualSense session — poll that plane
-        // nonblocking there and let rumble own the wait.
-        let hidTimeout: UInt32 = connection.resolvedGamepad == .dualSense ? 10 : 0
+        // Hidout traffic (lightbar / player LEDs / triggers) only exists on a PlayStation-pad
+        // session — a DualSense or a DualShock 4 (lightbar only). Block briefly on it there and
+        // let rumble own the wait elsewhere; on an Xbox session it stays nonblocking.
+        let hasHidout = connection.resolvedGamepad == .dualSense
+            || connection.resolvedGamepad == .dualShock4
+        let hidTimeout: UInt32 = hasHidout ? 10 : 0
         let thread = Thread { [connection, flag, drainDone, weak self] in
             while !flag.isStopped {
                 do {

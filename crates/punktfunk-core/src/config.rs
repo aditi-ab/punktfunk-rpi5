@@ -135,10 +135,10 @@ impl CompositorPref {
 /// Sent in [`Hello`](crate::quic::Hello) as a *preference* and echoed back — resolved to the
 /// backend actually chosen — in [`Welcome`](crate::quic::Welcome). `Auto` (the default) lets the
 /// host decide (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360). A concrete preference is
-/// honored only if that backend is available on the host (DualSense needs Linux UHID); otherwise
-/// the host falls back and reports the real choice in `Welcome`. The wire form is a single byte
-/// (`0 = Auto`, `1 = Xbox360`, `2 = DualSense`), appended to `Hello`/`Welcome` — older peers
-/// simply omit/ignore it.
+/// honored only if that backend is available on the host (DualSense / DualShock 4 need Linux UHID);
+/// otherwise the host falls back and reports the real choice in `Welcome`. The wire form is a single
+/// byte (`0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`), appended to
+/// `Hello`/`Welcome` — older peers simply omit/ignore it (an unknown byte degrades to `Auto`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GamepadPref {
     /// Let the host pick (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360).
@@ -148,15 +148,24 @@ pub enum GamepadPref {
     Xbox360,
     /// UHID DualSense (kernel `hid-playstation`) — adaptive triggers, lightbar, touchpad, motion.
     DualSense,
+    /// uinput X-Box One / Series pad — the X-Box 360 backend with the One/Series USB identity
+    /// (VID/PID/name), so games show One/Series glyphs. XInput-identical otherwise (impulse-trigger
+    /// rumble is unreachable through any virtual pad, so there's no game-visible gain over `Xbox360`).
+    XboxOne,
+    /// UHID DualShock 4 (kernel `hid-playstation`, ≥ 6.2) — lightbar, touchpad, motion, rumble. Like
+    /// `DualSense` minus adaptive triggers / player LEDs / mute. Needs Linux UHID on the host.
+    DualShock4,
 }
 
 impl GamepadPref {
-    /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`.
-    pub fn to_u8(self) -> u8 {
+    /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`.
+    pub const fn to_u8(self) -> u8 {
         match self {
             GamepadPref::Auto => 0,
             GamepadPref::Xbox360 => 1,
             GamepadPref::DualSense => 2,
+            GamepadPref::XboxOne => 3,
+            GamepadPref::DualShock4 => 4,
         }
     }
 
@@ -166,6 +175,8 @@ impl GamepadPref {
         match v {
             1 => GamepadPref::Xbox360,
             2 => GamepadPref::DualSense,
+            3 => GamepadPref::XboxOne,
+            4 => GamepadPref::DualShock4,
             _ => GamepadPref::Auto,
         }
     }
@@ -177,16 +188,23 @@ impl GamepadPref {
             "auto" | "default" => GamepadPref::Auto,
             "xbox" | "xbox360" | "x360" | "uinput" => GamepadPref::Xbox360,
             "dualsense" | "ds" | "ps5" => GamepadPref::DualSense,
+            "xboxone" | "xbox-one" | "xone" | "xbox1" | "series" | "xboxseries" => {
+                GamepadPref::XboxOne
+            }
+            "dualshock4" | "dualshock" | "ds4" | "ps4" => GamepadPref::DualShock4,
             _ => return None,
         })
     }
 
-    /// Canonical lowercase identifier (`"auto"`, `"xbox360"`, `"dualsense"`).
+    /// Canonical lowercase identifier (`"auto"`, `"xbox360"`, `"dualsense"`, `"xboxone"`,
+    /// `"dualshock4"`).
     pub fn as_str(self) -> &'static str {
         match self {
             GamepadPref::Auto => "auto",
             GamepadPref::Xbox360 => "xbox360",
             GamepadPref::DualSense => "dualsense",
+            GamepadPref::XboxOne => "xboxone",
+            GamepadPref::DualShock4 => "dualshock4",
         }
     }
 }

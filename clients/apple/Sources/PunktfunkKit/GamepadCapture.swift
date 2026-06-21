@@ -6,12 +6,14 @@
 // full GCExtendedGamepad state on every valueChanged and diff against the previous
 // snapshot. Sticks are ±32767 with +y = up (GC already matches, no flip), triggers 0...255.
 //
-// DualSense extras ride the rich-input plane (0xCC): touchpad contacts normalized
+// PlayStation-pad extras ride the rich-input plane (0xCC): touchpad contacts normalized
 // 0...65535 (origin top-left, +y down — GC's ±1/+y-up is converted here) and motion
 // samples in raw DualSense sensor units (gyro 20 LSB per deg/s, accel 10000 LSB per g —
 // derived from the host's fixed calibration blob; the conversion lives in ONE place,
 // `Wire`, so a live sign/scale correction is a one-line change). The host ignores both
-// unless the session's virtual pad is a DualSense.
+// unless the session's virtual pad is a DualSense or DualShock 4 — both carry a touchpad
+// and motion, so the capture below covers either (`GCDualShockGamepad` exposes the same
+// `touchpad*` surface as `GCDualSenseGamepad`).
 //
 // Unlike mouse/keyboard capture, gamepad forwarding is NOT gated on the mouse-capture
 // toggle — a controller can't click local UI, so it always drives the host while the app
@@ -154,8 +156,9 @@ public final class GamepadCapture {
         releaseAll()
         if let ext = bound?.extendedGamepad {
             ext.valueChangedHandler = nil
-            (ext as? GCDualSenseGamepad)?.touchpadPrimary.valueChangedHandler = nil
-            (ext as? GCDualSenseGamepad)?.touchpadSecondary.valueChangedHandler = nil
+            let tp = Self.touchpad(ext)
+            tp?.primary.valueChangedHandler = nil
+            tp?.secondary.valueChangedHandler = nil
         }
         if let motion = bound?.motion {
             motion.valueChangedHandler = nil
@@ -186,11 +189,11 @@ public final class GamepadCapture {
         connection.send(.gamepadAxis(GamepadWire.axisLSX, value: 0, pad: 0))
         sync(ext)
 
-        if let ds = ext as? GCDualSenseGamepad {
-            ds.touchpadPrimary.valueChangedHandler = { [weak self] _, x, y in
+        if let tp = Self.touchpad(ext) {
+            tp.primary.valueChangedHandler = { [weak self] _, x, y in
                 MainActor.assumeIsolated { self?.touch(finger: 0, x: x, y: y) }
             }
-            ds.touchpadSecondary.valueChangedHandler = { [weak self] _, x, y in
+            tp.secondary.valueChangedHandler = { [weak self] _, x, y in
                 MainActor.assumeIsolated { self?.touch(finger: 1, x: x, y: y) }
             }
         }
@@ -257,10 +260,27 @@ public final class GamepadCapture {
         if g.buttonB.isPressed { b |= GamepadWire.b }
         if g.buttonX.isPressed { b |= GamepadWire.x }
         if g.buttonY.isPressed { b |= GamepadWire.y }
-        if (g as? GCDualSenseGamepad)?.touchpadButton.isPressed == true {
+        if Self.touchpad(g)?.button.isPressed == true {
             b |= GamepadWire.touchpadClick
         }
         return b
+    }
+
+    /// The touchpad surface of a PlayStation pad — present on both `GCDualSenseGamepad` and
+    /// `GCDualShockGamepad` (DualShock 4), which don't share a common touchpad type, so we
+    /// downcast either and project the identical `touchpad*` properties. `nil` for any other
+    /// controller (Xbox, MFi).
+    private static func touchpad(
+        _ g: GCExtendedGamepad
+    ) -> (primary: GCControllerDirectionPad, secondary: GCControllerDirectionPad,
+          button: GCControllerButtonInput)? {
+        if let ds = g as? GCDualSenseGamepad {
+            return (ds.touchpadPrimary, ds.touchpadSecondary, ds.touchpadButton)
+        }
+        if let ds4 = g as? GCDualShockGamepad {
+            return (ds4.touchpadPrimary, ds4.touchpadSecondary, ds4.touchpadButton)
+        }
+        return nil
     }
 
     /// One touchpad finger moved. GC reports ±1 positions and snaps to exactly (0, 0) on

@@ -1883,13 +1883,25 @@ mod tests {
             GamepadPref::Auto,
             GamepadPref::Xbox360,
             GamepadPref::DualSense,
+            GamepadPref::XboxOne,
+            GamepadPref::DualShock4,
         ] {
             assert_eq!(GamepadPref::from_u8(p.to_u8()), p);
             assert_eq!(GamepadPref::from_name(p.as_str()), Some(p));
         }
+        // Distinct wire bytes (forward-compat with peers that only know 0..=2).
+        assert_eq!(GamepadPref::XboxOne.to_u8(), 3);
+        assert_eq!(GamepadPref::DualShock4.to_u8(), 4);
         // Aliases + unknowns.
         assert_eq!(GamepadPref::from_name("PS5"), Some(GamepadPref::DualSense));
         assert_eq!(GamepadPref::from_name("x360"), Some(GamepadPref::Xbox360));
+        assert_eq!(GamepadPref::from_name("ps4"), Some(GamepadPref::DualShock4));
+        assert_eq!(GamepadPref::from_name("DS4"), Some(GamepadPref::DualShock4));
+        assert_eq!(
+            GamepadPref::from_name("xbox-one"),
+            Some(GamepadPref::XboxOne)
+        );
+        assert_eq!(GamepadPref::from_name("series"), Some(GamepadPref::XboxOne));
         assert_eq!(GamepadPref::from_name("nope"), None);
         // Unknown wire byte degrades to Auto (forward-compatible).
         assert_eq!(GamepadPref::from_u8(200), GamepadPref::Auto);

@@ -1164,26 +1164,50 @@ fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
     tracing::debug!("mic service stopped (host shutting down)");
 }
 
-/// The session's virtual-gamepad backend. Default = uinput X-Box-360 pads
-/// ([`GamepadManager`](crate::inject::gamepad::GamepadManager)); `PUNKTFUNK_GAMEPAD=dualsense`
-/// switches to virtual DualSense pads (UHID + the kernel `hid-playstation` driver) so a game sees
-/// a *real* DualSense — adaptive triggers, lightbar, touchpad, motion — and a game's feedback
-/// flows back over the rich HID-output plane. Selected once per session (sessions run serially).
+/// The session's virtual-gamepad backend, resolved once per session (sessions run serially).
+///
+/// - `Xbox360` — uinput X-Box-360 pads on Linux ([`GamepadManager`](crate::inject::gamepad::GamepadManager)),
+///   ViGEm on Windows. Also the X-Box One/Series identity (`PUNKTFUNK_GAMEPAD=xboxone`): the same
+///   backend with the One/Series USB VID/PID so games show One/Series glyphs (XInput-identical
+///   otherwise). The Linux pad carries it as a [`PadIdentity`](crate::inject::gamepad::PadIdentity).
+/// - `DualSense` (`PUNKTFUNK_GAMEPAD=dualsense`) — virtual DualSense via UHID + `hid-playstation`,
+///   so a game sees a *real* DualSense (adaptive triggers, lightbar, touchpad, motion); feedback
+///   flows back over the rich HID-output plane.
+/// - `DualShock4` (`PUNKTFUNK_GAMEPAD=ps4`) — virtual DualShock 4 via the same UHID path: lightbar,
+///   touchpad, motion, rumble (DualSense minus adaptive triggers / player LEDs / mute).
+///
+/// The two UHID pads are Linux-only; off Linux the resolver already folds them (and One/Series)
+/// into `Xbox360`, so a non-Linux build never constructs them.
 enum PadBackend {
     Xbox360(crate::inject::gamepad::GamepadManager),
     #[cfg(target_os = "linux")]
     DualSense(crate::inject::dualsense::DualSenseManager),
+    #[cfg(target_os = "linux")]
+    DualShock4(crate::inject::dualshock4::DualShock4Manager),
 }
 
 impl PadBackend {
     /// `kind` is the session's resolved backend (see [`resolve_gamepad`] — client preference,
-    /// env var, X-Box 360, in that order). Defensive cfg guard: a non-Linux build can only
-    /// ever construct the X-Box backend, whatever the resolution said.
+    /// env var, X-Box 360, in that order). Defensive cfg guard: a non-Linux build can only ever
+    /// construct the X-Box backend, whatever the resolution said.
     fn select(kind: GamepadPref) -> PadBackend {
         #[cfg(target_os = "linux")]
-        if kind == GamepadPref::DualSense {
-            tracing::info!("gamepad backend: virtual DualSense (UHID hid-playstation)");
-            return PadBackend::DualSense(crate::inject::dualsense::DualSenseManager::new());
+        match kind {
+            GamepadPref::DualSense => {
+                tracing::info!("gamepad backend: virtual DualSense (UHID hid-playstation)");
+                return PadBackend::DualSense(crate::inject::dualsense::DualSenseManager::new());
+            }
+            GamepadPref::DualShock4 => {
+                tracing::info!("gamepad backend: virtual DualShock 4 (UHID hid-playstation)");
+                return PadBackend::DualShock4(crate::inject::dualshock4::DualShock4Manager::new());
+            }
+            GamepadPref::XboxOne => {
+                tracing::info!("gamepad backend: uinput X-Box One/Series pad");
+                return PadBackend::Xbox360(crate::inject::gamepad::GamepadManager::with_identity(
+                    crate::inject::gamepad::PadIdentity::xbox_one(),
+                ));
+            }
+            _ => {}
         }
         let _ = kind;
         PadBackend::Xbox360(crate::inject::gamepad::GamepadManager::new())
@@ -1194,21 +1218,26 @@ impl PadBackend {
             PadBackend::Xbox360(m) => m.handle(ev),
             #[cfg(target_os = "linux")]
             PadBackend::DualSense(m) => m.handle(ev),
+            #[cfg(target_os = "linux")]
+            PadBackend::DualShock4(m) => m.handle(ev),
         }
     }
 
-    /// Apply a rich client→host event (DualSense touchpad / motion). A no-op for the X-Box pad,
-    /// which has no equivalent.
+    /// Apply a rich client→host event (touchpad / motion). A no-op for the X-Box pad, which has no
+    /// equivalent; the DualSense and DualShock 4 pads both carry a touchpad + motion sensors.
     fn apply_rich(&mut self, _rich: punktfunk_core::quic::RichInput) {
         #[cfg(target_os = "linux")]
-        if let PadBackend::DualSense(m) = self {
-            m.apply_rich(_rich);
+        match self {
+            PadBackend::DualSense(m) => m.apply_rich(_rich),
+            PadBackend::DualShock4(m) => m.apply_rich(_rich),
+            PadBackend::Xbox360(_) => {}
         }
     }
 
     /// Service feedback every cycle. `rumble` carries motor force-feedback on the universal plane
-    /// (both backends); `hidout` carries DualSense-only rich feedback (lightbar / player LEDs /
-    /// adaptive triggers — DualSense backend only).
+    /// (every backend); `hidout` carries rich feedback on the HID-output plane — lightbar (both
+    /// UHID pads), plus player LEDs / adaptive triggers (DualSense only). The X-Box pad has no
+    /// rich-feedback plane.
     fn pump(
         &mut self,
         rumble: impl FnMut(u16, u16, u16),
@@ -1221,10 +1250,12 @@ impl PadBackend {
             }
             #[cfg(target_os = "linux")]
             PadBackend::DualSense(m) => m.pump(rumble, hidout),
+            #[cfg(target_os = "linux")]
+            PadBackend::DualShock4(m) => m.pump(rumble, hidout),
         }
     }
 
-    /// Keep a virtual DualSense alive during input silence: re-emit its current HID report if it's
+    /// Keep a virtual UHID pad alive during input silence: re-emit its current HID report if it's
     /// gone quiet, so the kernel `hid-playstation` driver / SDL don't treat a held-steady pad as
     /// unplugged ("controller disconnected every few seconds"). No-op for the X-Box pad (evdev
     /// holds last-known state with no periodic-report requirement). Called every input-thread tick;
@@ -1234,6 +1265,8 @@ impl PadBackend {
             PadBackend::Xbox360(_) => {}
             #[cfg(target_os = "linux")]
             PadBackend::DualSense(m) => m.heartbeat(std::time::Duration::from_millis(8)),
+            #[cfg(target_os = "linux")]
+            PadBackend::DualShock4(m) => m.heartbeat(std::time::Duration::from_millis(8)),
         }
     }
 }
@@ -1516,10 +1549,13 @@ fn synthetic_stream(
 }
 
 /// Pure selection of the session's virtual-gamepad backend: the client's explicit `pref` wins,
-/// then the host's `PUNKTFUNK_GAMEPAD` env var (under a client `Auto`), then X-Box 360. The
-/// DualSense backend needs Linux UHID — when unavailable any DualSense wish degrades to
-/// X-Box 360 (never an error: a session without rich pads still streams).
-fn pick_gamepad(pref: GamepadPref, env: Option<&str>, dualsense_available: bool) -> GamepadPref {
+/// then the host's `PUNKTFUNK_GAMEPAD` env var (under a client `Auto`), then X-Box 360.
+///
+/// `linux` is whether this is a Linux host (uinput + UHID). The rich UHID pads (DualSense, DualShock
+/// 4) need it — off Linux any such wish degrades to X-Box 360 (never an error: a session without rich
+/// pads still streams). X-Box One/Series is a distinct uinput *identity* on Linux, but XInput-identical
+/// to the 360 pad on Windows (ViGEm has no One target), so it degrades to `Xbox360` there.
+fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool) -> GamepadPref {
     let want = match pref {
         GamepadPref::Auto => env
             .and_then(GamepadPref::from_name)
@@ -1527,7 +1563,11 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, dualsense_available: bool)
         explicit => explicit,
     };
     match want {
-        GamepadPref::DualSense if dualsense_available => GamepadPref::DualSense,
+        GamepadPref::DualSense if linux => GamepadPref::DualSense,
+        GamepadPref::DualShock4 if linux => GamepadPref::DualShock4,
+        // One/Series: a real, distinct uinput identity on Linux; folded into the 360 backend on
+        // Windows (XInput can't tell them apart anyway).
+        GamepadPref::XboxOne if linux => GamepadPref::XboxOne,
         _ => GamepadPref::Xbox360,
     }
 }
@@ -3012,6 +3052,14 @@ mod tests {
         // DualSense degrades to X-Box 360 where the backend doesn't exist (non-Linux).
         assert_eq!(pick_gamepad(DualSense, None, false), Xbox360);
         assert_eq!(pick_gamepad(Auto, Some("dualsense"), false), Xbox360);
+        // DualShock 4: honored on Linux (UHID), degrades to X-Box 360 off it.
+        assert_eq!(pick_gamepad(DualShock4, None, true), DualShock4);
+        assert_eq!(pick_gamepad(Auto, Some("ps4"), true), DualShock4);
+        assert_eq!(pick_gamepad(DualShock4, None, false), Xbox360);
+        // X-Box One: a distinct uinput identity on Linux, folded into the 360 pad on Windows.
+        assert_eq!(pick_gamepad(XboxOne, None, true), XboxOne);
+        assert_eq!(pick_gamepad(Auto, Some("series"), true), XboxOne);
+        assert_eq!(pick_gamepad(XboxOne, None, false), Xbox360);
     }
 
     #[test]

@@ -27,9 +27,10 @@
 //! `gamescope`); the host honors it if available, else auto-detects and reports the resolved
 //! choice in its Welcome (logged as `session offer … compositor=…`).
 //!
-//! `--gamepad NAME` requests a host virtual-pad backend (`auto`|`xbox360`|`dualsense`); the
-//! host honors it where available (DualSense needs Linux UHID), else falls back to X-Box 360,
-//! and reports the resolved choice in its Welcome (logged as `session offer … gamepad=…`).
+//! `--gamepad NAME` requests a host virtual-pad backend
+//! (`auto`|`xbox360`|`dualsense`|`xboxone`|`dualshock4`); the host honors it where available (the
+//! UHID pads — DualSense, DualShock 4 — need Linux), else falls back to X-Box 360, and reports the
+//! resolved choice in its Welcome (logged as `session offer … gamepad=…`).
 //!
 //! `--discover [SECS]` browses the LAN for native (`_punktfunk._udp`) hosts the host advertises
 //! over mDNS, prints each (name, addr:port, pairing requirement, cert fingerprint to pin), and
@@ -178,7 +179,9 @@ fn parse_args() -> Args {
         Some(s) => match GamepadPref::from_name(s) {
             Some(g) => g,
             None => {
-                eprintln!("--gamepad must be one of: auto, xbox360, dualsense");
+                eprintln!(
+                    "--gamepad must be one of: auto, xbox360, dualsense, xboxone, dualshock4"
+                );
                 std::process::exit(2);
             }
         },

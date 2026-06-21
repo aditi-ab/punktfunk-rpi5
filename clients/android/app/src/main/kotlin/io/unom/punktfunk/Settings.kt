@@ -142,9 +142,11 @@ val COMPOSITOR_OPTIONS = listOf(
     "gamescope",
 )
 
-/** index = GamepadPref wire byte. */
+/** index = GamepadPref wire byte (0=Auto 1=Xbox360 2=DualSense 3=XboxOne 4=DualShock4). */
 val GAMEPAD_OPTIONS = listOf(
     "Automatic",
     "Xbox 360",
     "DualSense",
+    "Xbox One",
+    "DualShock 4",
 )

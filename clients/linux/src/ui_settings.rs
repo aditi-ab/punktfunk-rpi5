@@ -16,7 +16,7 @@ const RESOLUTIONS: &[(u32, u32)] = &[
 ];
 /// `0` = the monitor's native refresh, resolved at connect.
 const REFRESH: &[u32] = &[0, 30, 60, 90, 120, 144, 165, 240];
-const GAMEPADS: &[&str] = &["auto", "xbox360", "dualsense"];
+const GAMEPADS: &[&str] = &["auto", "xbox360", "dualsense", "xboxone", "dualshock4"];
 const COMPOSITORS: &[&str] = &["auto", "kwin", "wlroots", "mutter", "gamescope"];
 
 pub fn show(
@@ -85,10 +85,11 @@ pub fn show(
     let pads = gamepads.pads();
     let mut pad_names = vec!["Automatic (most recent)".to_string()];
     pad_names.extend(pads.iter().map(|p| {
-        if p.is_dualsense {
-            format!("{} · DualSense", p.name)
-        } else {
+        let kind = p.kind_label();
+        if kind.is_empty() {
             p.name.clone()
+        } else {
+            format!("{} · {kind}", p.name)
         }
     }));
     let forward_row = adw::ComboRow::builder()
@@ -126,6 +127,8 @@ pub fn show(
             "Automatic",
             "Xbox 360",
             "DualSense",
+            "Xbox One",
+            "DualShock 4",
         ]))
         .build();
     let inhibit_row = adw::SwitchRow::builder()

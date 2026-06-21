@@ -424,6 +424,8 @@ fn gs_button_to_evdev(b: u32) -> Option<u32> {
 #[cfg(target_os = "linux")]
 pub mod dualsense;
 #[cfg(target_os = "linux")]
+pub mod dualshock4;
+#[cfg(target_os = "linux")]
 pub mod gamepad;
 /// Windows: virtual Xbox 360 pads via ViGEmBus.
 #[cfg(target_os = "windows")]

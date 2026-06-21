@@ -7,7 +7,7 @@
 //! Not android-gated: `next_rumble`/`next_hidout` are pure-Rust on the `quic` feature, so these
 //! compile on the host build too (parity with the input shims in [`crate::session`]).
 
-use crate::session::SessionHandle;
+use crate::session::{jni_guard, SessionHandle};
 use jni::objects::{JByteBuffer, JObject};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
@@ -32,17 +32,20 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
     _this: JObject,
     handle: jlong,
 ) -> jlong {
-    if handle == 0 {
-        return -1;
-    }
-    // SAFETY: live handle per the nativeConnect/nativeClose contract; next_rumble is &self on the
-    // Sync connector — safe alongside the decode/audio/input threads. Kotlin stops these poll
-    // threads (and joins them) before nativeClose frees the handle.
-    let h = unsafe { &*(handle as *const SessionHandle) };
-    match h.client.next_rumble(PULL_TIMEOUT) {
-        Ok((_pad, low, high)) => (jlong::from(low) << 16) | jlong::from(high),
-        Err(_) => -1, // NoFrame (timeout) or Closed — Kotlin loops on its running flag
-    }
+    // Runs on a Kotlin poll thread, so a panic here would abort the process; guard the boundary.
+    jni_guard(-1, || {
+        if handle == 0 {
+            return -1;
+        }
+        // SAFETY: live handle per the nativeConnect/nativeClose contract; next_rumble is &self on the
+        // Sync connector — safe alongside the decode/audio/input threads. Kotlin stops these poll
+        // threads (and joins them — unbounded) before nativeClose frees the handle.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        match h.client.next_rumble(PULL_TIMEOUT) {
+            Ok((_pad, low, high)) => (jlong::from(low) << 16) | jlong::from(high),
+            Err(_) => -1, // NoFrame (timeout) or Closed — Kotlin loops on its running flag
+        }
+    })
 }
 
 /// `NativeBridge.nativeNextHidout(handle, buf): Int` — block up to ~100 ms for the next DualSense
@@ -58,57 +61,60 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
     handle: jlong,
     buf: JByteBuffer,
 ) -> jint {
-    if handle == 0 {
-        return -1;
-    }
-    // SAFETY: live handle per the contract; next_hidout is &self on the Sync connector.
-    let h = unsafe { &*(handle as *const SessionHandle) };
-    let ev = match h.client.next_hidout(PULL_TIMEOUT) {
-        Ok(ev) => ev,
-        Err(_) => return -1, // timeout or closed — Kotlin loops
-    };
+    // Runs on a Kotlin poll thread, so a panic here would abort the process; guard the boundary.
+    jni_guard(-1, || {
+        if handle == 0 {
+            return -1;
+        }
+        // SAFETY: live handle per the contract; next_hidout is &self on the Sync connector.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        let ev = match h.client.next_hidout(PULL_TIMEOUT) {
+            Ok(ev) => ev,
+            Err(_) => return -1, // timeout or closed — Kotlin loops
+        };
 
-    // The caller passes a direct ByteBuffer (allocateDirect) so we write its backing store directly.
-    let cap = match env.get_direct_buffer_capacity(&buf) {
-        Ok(c) => c,
-        Err(_) => return -1,
-    };
-    let ptr = match env.get_direct_buffer_address(&buf) {
-        Ok(p) if !p.is_null() => p,
-        _ => return -1,
-    };
-    // SAFETY: `ptr`/`cap` describe the direct ByteBuffer's backing store, valid for this call.
-    let out = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
+        // The caller passes a direct ByteBuffer (allocateDirect) so we write its backing store directly.
+        let cap = match env.get_direct_buffer_capacity(&buf) {
+            Ok(c) => c,
+            Err(_) => return -1,
+        };
+        let ptr = match env.get_direct_buffer_address(&buf) {
+            Ok(p) if !p.is_null() => p,
+            _ => return -1,
+        };
+        // SAFETY: `ptr`/`cap` describe the direct ByteBuffer's backing store, valid for this call.
+        let out = unsafe { std::slice::from_raw_parts_mut(ptr, cap) };
 
-    let n = match ev {
-        HidOutput::Led { r, g, b, .. } => {
-            if cap < 4 {
-                return -1;
+        let n = match ev {
+            HidOutput::Led { r, g, b, .. } => {
+                if cap < 4 {
+                    return -1;
+                }
+                out[0] = TAG_LED;
+                out[1] = r;
+                out[2] = g;
+                out[3] = b;
+                4
             }
-            out[0] = TAG_LED;
-            out[1] = r;
-            out[2] = g;
-            out[3] = b;
-            4
-        }
-        HidOutput::PlayerLeds { bits, .. } => {
-            if cap < 2 {
-                return -1;
+            HidOutput::PlayerLeds { bits, .. } => {
+                if cap < 2 {
+                    return -1;
+                }
+                out[0] = TAG_PLAYER_LEDS;
+                out[1] = bits;
+                2
             }
-            out[0] = TAG_PLAYER_LEDS;
-            out[1] = bits;
-            2
-        }
-        HidOutput::Trigger { which, effect, .. } => {
-            let n = 2 + effect.len();
-            if cap < n {
-                return -1; // the raw DS5 trigger block is ~11 bytes; Kotlin allocates 64
+            HidOutput::Trigger { which, effect, .. } => {
+                let n = 2 + effect.len();
+                if cap < n {
+                    return -1; // the raw DS5 trigger block is ~11 bytes; Kotlin allocates 64
+                }
+                out[0] = TAG_TRIGGER;
+                out[1] = which;
+                out[2..n].copy_from_slice(&effect);
+                n
             }
-            out[0] = TAG_TRIGGER;
-            out[1] = which;
-            out[2..n].copy_from_slice(&effect);
-            n
-        }
-    };
-    n as jint
+        };
+        n as jint
+    })
 }

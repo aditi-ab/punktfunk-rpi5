@@ -511,15 +511,18 @@ struct SettingsView: View {
     private static let padTypes: [(label: String, tag: Int)] = [
         ("Automatic", 0),
         ("Xbox 360", 1),
+        ("Xbox One", 3),
         ("DualSense", 2),
+        ("DualShock 4", 4),
     ]
 
     private static let controllersFooter =
         "One controller is forwarded to the host, as player 1 — Automatic picks the most "
         + "recently connected one. The type is the virtual pad the host creates: Automatic "
         + "matches the controller (a DualSense gets adaptive triggers, lightbar, touchpad "
-        + "and motion), and changes apply from the next session. Two identical controllers "
-        + "may swap a manual selection after reconnecting."
+        + "and motion; a DualShock 4 the same minus adaptive triggers), and changes apply "
+        + "from the next session. Two identical controllers may swap a manual selection "
+        + "after reconnecting."
 
     /// "Use controller" choices: Automatic, every forwardable controller, and — so a stale
     /// pin stays visible instead of leaving the Picker selection tag-less — any pinned id
@@ -537,7 +540,7 @@ struct SettingsView: View {
 
     private func controllerRow(_ controller: GamepadManager.DiscoveredController) -> some View {
         HStack(spacing: 10) {
-            Image(systemName: controller.isDualSense ? "playstation.logo" : "gamecontroller.fill")
+            Image(systemName: controller.hasTouchpadAndMotion ? "playstation.logo" : "gamecontroller.fill")
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(controller.name)

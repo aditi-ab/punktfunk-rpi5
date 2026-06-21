@@ -170,13 +170,18 @@ public final class PunktfunkConnection {
 
     /// Which virtual gamepad the host creates for this session's pads (the
     /// `PUNKTFUNK_GAMEPAD_*` ABI values). `.auto` lets the host decide (its env var, else
-    /// X-Box 360); `.dualSense` is honored only on hosts with UHID (Linux) — games then see
-    /// a real DualSense and their lightbar / adaptive-trigger writes come back on the
-    /// HID-output plane (`nextHidOutput`). The host's actual choice is `resolvedGamepad`.
+    /// X-Box 360); `.dualSense` / `.dualShock4` are honored only on hosts with UHID (Linux) —
+    /// games then see a real PlayStation pad and its lightbar (and, on a DualSense,
+    /// adaptive-trigger / player-LED) writes come back on the HID-output plane
+    /// (`nextHidOutput`). `.xboxOne` is an X-Box-Series-glyph variant of `.xbox360` (same
+    /// buttons/sticks/triggers + rumble, no touchpad/motion/lightbar). The host's actual
+    /// choice is `resolvedGamepad`.
     public enum GamepadType: UInt32, CaseIterable, Sendable {
         case auto = 0
         case xbox360 = 1
         case dualSense = 2
+        case xboxOne = 3
+        case dualShock4 = 4
 
         /// Loose name parsing for env/dev hooks, mirroring the host's
         /// `GamepadPref::from_name`.
@@ -184,7 +189,9 @@ public final class PunktfunkConnection {
             switch name.lowercased() {
             case "auto", "default": self = .auto
             case "xbox", "xbox360", "x360", "uinput": self = .xbox360
-            case "dualsense", "ds", "ps5": self = .dualSense
+            case "dualsense", "ds", "ds5", "ps5": self = .dualSense
+            case "xboxone", "xbox-one", "xboxseries", "series": self = .xboxOne
+            case "dualshock4", "dualshock", "ds4", "ps4": self = .dualShock4
             default: return nil
             }
         }
@@ -497,10 +504,11 @@ public final class PunktfunkConnection {
         case triggerEffect(pad: UInt8, which: UInt8, effect: [UInt8])
     }
 
-    /// Pull the next DualSense feedback event (lightbar / player LEDs / adaptive triggers);
-    /// nil on timeout, throws `.closed` once the session ended. Drain from the (single)
-    /// feedback thread, alongside `nextRumble`. Nothing ever arrives unless
-    /// `resolvedGamepad == .dualSense` — poll with a short timeout, never spin.
+    /// Pull the next PlayStation-pad feedback event (lightbar / player LEDs / adaptive
+    /// triggers); nil on timeout, throws `.closed` once the session ended. Drain from the
+    /// (single) feedback thread, alongside `nextRumble`. Nothing arrives unless the session's
+    /// virtual pad is a DualSense (all three) or a DualShock 4 (lightbar only) — poll with a
+    /// short timeout, never spin.
     public func nextHidOutput(timeoutMs: UInt32 = 0) throws -> HidOutputEvent? {
         feedbackLock.lock()
         defer { feedbackLock.unlock() }

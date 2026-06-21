@@ -687,6 +687,16 @@ pub const PUNKTFUNK_GAMEPAD_XBOX360: u32 = 1;
 /// feedback arrives on the HID-output plane ([`punktfunk_connection_next_hidout`]). Honored
 /// only where available (Linux hosts); otherwise the host falls back to X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_DUALSENSE: u32 = 2;
+/// uinput X-Box One / Series pad — the X-Box 360 backend with the One/Series USB identity, so
+/// games show One/Series glyphs. XInput-identical to `XBOX360` otherwise (no game-visible gain;
+/// impulse-trigger rumble is unreachable through a virtual pad). Useful for glyph-matching a
+/// physical X-Box One/Series controller on the client.
+pub const PUNKTFUNK_GAMEPAD_XBOXONE: u32 = 3;
+/// UHID DualShock 4 (kernel `hid-playstation` ≥ 6.2): lightbar, touchpad, motion, rumble — the
+/// touchpad/motion arrive over the rich-input plane and lightbar over the HID-output plane, like
+/// DualSense (minus adaptive triggers / player LEDs / mute). Honored only where available (Linux
+/// hosts); otherwise the host falls back to X-Box 360.
+pub const PUNKTFUNK_GAMEPAD_DUALSHOCK4: u32 = 4;
 
 /// Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
 /// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
@@ -704,6 +714,16 @@ pub const PUNKTFUNK_VIDEO_CAP_HDR: u8 = 0x02;
 const _: () = {
     assert!(PUNKTFUNK_VIDEO_CAP_10BIT == crate::quic::VIDEO_CAP_10BIT);
     assert!(PUNKTFUNK_VIDEO_CAP_HDR == crate::quic::VIDEO_CAP_HDR);
+};
+
+// Keep the ABI gamepad constants in lockstep with the wire enum (compile-time guard against drift).
+const _: () = {
+    use crate::config::GamepadPref;
+    assert!(PUNKTFUNK_GAMEPAD_AUTO == GamepadPref::Auto.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_XBOX360 == GamepadPref::Xbox360.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_DUALSENSE == GamepadPref::DualSense.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_XBOXONE == GamepadPref::XboxOne.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_DUALSHOCK4 == GamepadPref::DualShock4.to_u8() as u32);
 };
 
 /// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's

@@ -81,8 +81,16 @@ class GamepadFeedback(private val handle: Long) {
         rumbleThread?.interrupt()
         hidoutThread?.interrupt()
         runCatching { vm?.cancel() } // drop any held rumble immediately
-        runCatching { rumbleThread?.join(200) }
-        runCatching { hidoutThread?.join(200) }
+        // Join WITHOUT a timeout. These poll threads dereference the native session handle on every
+        // pull (nativeNextRumble/nativeNextHidout), so they MUST be dead before StreamScreen's
+        // onDispose reaches nativeClose, which frees that handle. A *bounded* join that times out
+        // would let a thread survive into the freed handle → use-after-free SIGSEGV (the
+        // back-while-streaming crash, on the one path the main-thread `closed` guard can't cover).
+        // Safe to block unbounded: the native pulls are internally time-bounded (PULL_TIMEOUT ~100 ms)
+        // and rendering is a quick best-effort binder call, so each thread observes running=false and
+        // exits within ~one timeout — the join returns promptly (well under any ANR threshold).
+        runCatching { rumbleThread?.join() }
+        runCatching { hidoutThread?.join() }
         rumbleThread = null
         hidoutThread = null
         runCatching { lightsSession?.close() }
@@ -94,18 +102,7 @@ class GamepadFeedback(private val handle: Long) {
     }
 
     /** First connected gamepad/joystick InputDevice, or null (→ logged no-op on the emulator). */
-    private fun resolvePad(): InputDevice? {
-        for (id in InputDevice.getDeviceIds()) {
-            val d = InputDevice.getDevice(id) ?: continue
-            val s = d.sources
-            if (s and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
-                s and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
-            ) {
-                return d
-            }
-        }
-        return null
-    }
+    private fun resolvePad(): InputDevice? = Gamepad.firstPad()
 
     // ---- Rumble ----
 

@@ -82,6 +82,53 @@ const BUTTON_MAP: [(u32, u16); 11] = [
     (gamepad::BTN_RS_CLK, BTN_THUMBR),
 ];
 
+/// The USB identity a virtual uinput pad presents. SDL/Steam/Proton key their built-in mapping off
+/// `bustype/vendor/product/version` (+ name), and games pick button glyphs from it. The button/axis
+/// layout this backend emits is the same XInput one regardless — only the identity differs between an
+/// X-Box 360 pad and an X-Box One/Series pad (which is why "Xbox One" buys glyphs, not new capability;
+/// impulse-trigger rumble is unreachable through evdev FF either way).
+#[derive(Clone, Copy)]
+pub struct PadIdentity {
+    vendor: u16,
+    product: u16,
+    version: u16,
+    name: &'static [u8],
+    /// Short label for the creation log line.
+    log: &'static str,
+}
+
+impl PadIdentity {
+    /// "Microsoft X-Box 360 pad" (`045e:028e`) — the universal default; matches the kernel `xpad`
+    /// table verbatim so SDL/Steam map it with zero config.
+    pub const fn xbox360() -> PadIdentity {
+        PadIdentity {
+            vendor: 0x045e,
+            product: 0x028e,
+            version: 0x0110,
+            name: b"Microsoft X-Box 360 pad",
+            log: "X-Box 360 pad",
+        }
+    }
+
+    /// "Microsoft X-Box One S pad" (`045e:02ea`) — an `xpad`-table entry, so games show One/Series
+    /// glyphs. XInput-identical to the 360 pad otherwise.
+    pub const fn xbox_one() -> PadIdentity {
+        PadIdentity {
+            vendor: 0x045e,
+            product: 0x02ea,
+            version: 0x0408,
+            name: b"Microsoft X-Box One S pad",
+            log: "X-Box One S pad",
+        }
+    }
+}
+
+impl Default for PadIdentity {
+    fn default() -> PadIdentity {
+        PadIdentity::xbox360()
+    }
+}
+
 #[repr(C)]
 struct InputId {
     bustype: u16,
@@ -202,7 +249,7 @@ pub struct VirtualPad {
 }
 
 impl VirtualPad {
-    pub fn create(index: usize) -> Result<VirtualPad> {
+    pub fn create(index: usize, identity: PadIdentity) -> Result<VirtualPad> {
         use std::os::fd::FromRawFd;
         let raw = unsafe {
             libc::open(
@@ -272,18 +319,22 @@ impl VirtualPad {
         let mut setup = UinputSetup {
             id: InputId {
                 bustype: 0x0003, // BUS_USB
-                vendor: 0x045e,
-                product: 0x028e,
-                version: 0x0110,
+                vendor: identity.vendor,
+                product: identity.product,
+                version: identity.version,
             },
             name: [0; 80],
             ff_effects_max: 16, // must be > 0 or FF uploads are never delivered
         };
-        let name = b"Microsoft X-Box 360 pad";
+        let name = identity.name;
         setup.name[..name.len()].copy_from_slice(name);
         ioctl_ptr(raw, UI_DEV_SETUP, &mut setup, "UI_DEV_SETUP")?;
         ioctl_int(raw, UI_DEV_CREATE, 0, "UI_DEV_CREATE")?;
-        tracing::info!(index, "virtual gamepad created (X-Box 360 pad via uinput)");
+        tracing::info!(
+            index,
+            pad = identity.log,
+            "virtual gamepad created (uinput)"
+        );
 
         Ok(VirtualPad {
             fd,
@@ -449,14 +500,24 @@ impl Drop for VirtualPad {
 #[derive(Default)]
 pub struct GamepadManager {
     pads: Vec<Option<VirtualPad>>,
+    /// The USB identity every pad in this session presents (X-Box 360 by default, One/Series when
+    /// the client asked for `XboxOne`). All pads in a session share one identity.
+    identity: PadIdentity,
     /// Pad creation failed (e.g. /dev/uinput permissions) — warn once, drop events.
     broken: bool,
 }
 
 impl GamepadManager {
+    /// A manager that creates X-Box 360 pads (the universal default).
     pub fn new() -> GamepadManager {
+        GamepadManager::with_identity(PadIdentity::xbox360())
+    }
+
+    /// A manager whose pads present `identity` (see [`PadIdentity::xbox_one`]).
+    pub fn with_identity(identity: PadIdentity) -> GamepadManager {
         GamepadManager {
             pads: (0..MAX_PADS).map(|_| None).collect(),
+            identity,
             broken: false,
         }
     }
@@ -496,7 +557,7 @@ impl GamepadManager {
         if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
             return;
         }
-        match VirtualPad::create(idx) {
+        match VirtualPad::create(idx, self.identity) {
             Ok(p) => self.pads[idx] = Some(p),
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "virtual gamepad creation failed — controller input disabled");

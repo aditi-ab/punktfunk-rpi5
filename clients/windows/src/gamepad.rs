@@ -32,12 +32,33 @@ const G: f32 = 9.80665;
 #[derive(Clone, Debug)]
 pub struct PadInfo {
     // `id`/`name` feed the settings GUI's pad list (a follow-up); the windowed client only
-    // reads `is_dualsense` (via `auto_pref`), so they're unused in reachable code for now.
+    // reads `pref` (via `auto_pref`), so they're unused in reachable code for now.
     #[allow(dead_code)]
     pub id: u32,
     #[allow(dead_code)]
     pub name: String,
-    pub is_dualsense: bool,
+    /// The virtual pad "Automatic" resolves to for this physical controller (DualSense → DualSense,
+    /// DS4 → DualShock 4, Xbox One/Series → Xbox One, else → Xbox 360).
+    pub pref: GamepadPref,
+}
+
+impl PadInfo {
+    /// True for a real DualSense — the only pad whose lightbar / player-LED / adaptive-trigger
+    /// feedback we replay as raw DS5 HID effect packets (a DS4 uses SDL's generic `set_led`).
+    fn is_dualsense(&self) -> bool {
+        self.pref == GamepadPref::DualSense
+    }
+}
+
+/// Map the SDL-reported controller type to the virtual pad we'd ask the host to create.
+fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
+    use sdl3::gamepad::GamepadType as T;
+    match t {
+        T::PS5 => GamepadPref::DualSense,
+        T::PS4 => GamepadPref::DualShock4,
+        T::XboxOne => GamepadPref::XboxOne,
+        _ => GamepadPref::Xbox360,
+    }
 }
 
 enum Ctl {
@@ -112,8 +133,7 @@ impl GamepadService {
     /// (Swift parity); no pad connected leaves the host's own default.
     pub fn auto_pref(&self) -> GamepadPref {
         match self.active() {
-            Some(p) if p.is_dualsense => GamepadPref::DualSense,
-            Some(_) => GamepadPref::Xbox360,
+            Some(p) => p.pref,
             None => GamepadPref::Auto,
         }
     }
@@ -235,10 +255,9 @@ impl Worker {
         Some(PadInfo {
             id,
             name: pad.name().unwrap_or_else(|| "Controller".into()),
-            is_dualsense: matches!(
+            pref: pref_for_type(
                 self.subsystem
                     .type_for_id(sdl3::sys::joystick::SDL_JoystickID(id)),
-                sdl3::gamepad::GamepadType::PS5
             ),
         })
     }
@@ -515,7 +534,7 @@ fn run(
             }
             while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
                 let Some(id) = w.active_id() else { continue };
-                let is_ds = w.pad_info(id).is_some_and(|p| p.is_dualsense);
+                let is_ds = w.pad_info(id).is_some_and(|p| p.is_dualsense());
                 let Some(pad) = w.opened.get_mut(&id) else {
                     continue;
                 };
