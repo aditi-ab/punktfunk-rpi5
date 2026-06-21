@@ -50,6 +50,11 @@ pub trait VirtualDisplay: Send {
     /// Create a virtual output of the given mode. Teardown is RAII: drop the returned
     /// [`VirtualOutput`]'s `keepalive`.
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput>;
+    /// Set the per-session command this display should launch into its nested output (the resolved
+    /// app/game). Carried on the backend instance — NOT a process-global env var — so concurrent
+    /// sessions can't stomp each other's launch target. Default: no-op (backends that attach to an
+    /// existing session / don't spawn a nested command ignore it; only gamescope's spawn path uses it).
+    fn set_launch_command(&mut self, _cmd: Option<String>) {}
 }
 
 /// Compositors punktfunk knows how to drive (plan §6).

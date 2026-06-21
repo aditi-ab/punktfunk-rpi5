@@ -25,7 +25,12 @@ use std::time::{Duration, Instant};
 /// * `PUNKTFUNK_GAMESCOPE_NODE=<id|auto>` — ATTACH to an already-running gamescope (capture +
 ///   inject, no lifecycle ownership).
 /// * else — SPAWN a bare headless gamescope sized to the mode, running `PUNKTFUNK_GAMESCOPE_APP`.
-pub struct GamescopeDisplay;
+#[derive(Default)]
+pub struct GamescopeDisplay {
+    /// The resolved per-session launch command (set via [`VirtualDisplay::set_launch_command`]); the
+    /// bare-spawn path runs it instead of reading the process-global `PUNKTFUNK_GAMESCOPE_APP`.
+    cmd: Option<String>,
+}
 
 /// A running host-managed session (its transient systemd --user unit) + the mode it was launched at.
 struct SessionState {
@@ -79,13 +84,17 @@ static STEAMOS_TOOK_OVER: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 impl GamescopeDisplay {
     pub fn new() -> Result<Self> {
-        Ok(GamescopeDisplay)
+        Ok(GamescopeDisplay::default())
     }
 }
 
 impl VirtualDisplay for GamescopeDisplay {
     fn name(&self) -> &'static str {
         "gamescope"
+    }
+
+    fn set_launch_command(&mut self, cmd: Option<String>) {
+        self.cmd = cmd;
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
@@ -121,7 +130,12 @@ impl VirtualDisplay for GamescopeDisplay {
             });
         }
         check_gamescope_version(); // diagnostic only — warns on known-deadlock-prone versions
-        let proc = GamescopeProc(spawn(mode.width, mode.height, mode.refresh_hz.max(1))?);
+        let proc = GamescopeProc(spawn(
+            mode.width,
+            mode.height,
+            mode.refresh_hz.max(1),
+            self.cmd.as_deref(),
+        )?);
         // gamescope creates its PipeWire node a moment after start; poll for it (the proc is held
         // alive meanwhile, and killed if we give up).
         let node_id = wait_for_node(Duration::from_secs(15)).ok_or_else(|| {
@@ -626,9 +640,17 @@ pub const EI_SOCKET_FILE: &str = "/tmp/punktfunk-gamescope-ei";
 /// stdout/stderr go to `/tmp/punktfunk-gamescope.log`. The app is launched through a tiny shell
 /// wrapper that relays gamescope's `LIBEI_SOCKET` (set for its children) to [`EI_SOCKET_FILE`]
 /// so the input injector can connect to gamescope's EIS server from outside.
-fn spawn(w: u32, h: u32, hz: u32) -> Result<Child> {
-    let app =
-        std::env::var("PUNKTFUNK_GAMESCOPE_APP").unwrap_or_else(|_| "sleep infinity".to_string());
+fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>) -> Result<Child> {
+    // A non-empty per-session command (set via `set_launch_command`) wins; else the
+    // `PUNKTFUNK_GAMESCOPE_APP` env var (the documented manual fallback); else a no-op that keeps
+    // gamescope alive. Each level is taken only if non-empty, so a blank per-session cmd transparently
+    // falls through to the env (matching the pre-fix behaviour).
+    let app = cmd
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("PUNKTFUNK_GAMESCOPE_APP").ok())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "sleep infinity".to_string());
     let _ = std::fs::remove_file(EI_SOCKET_FILE); // stale socket path from a previous session
     let mut cmd = Command::new("gamescope");
     cmd.args(["--backend", "headless"])

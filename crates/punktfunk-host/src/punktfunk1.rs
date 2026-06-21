@@ -564,10 +564,12 @@ async fn serve_session(
         };
 
         // Resolve a requested library launch (the client sends only the store-qualified id;
-        // we look it up in OUR library so a client can't inject a command). Set the gamescope
-        // backend's app env var, exactly as the GameStream /launch path does — safe per-session
-        // (one session at a time). Only the bare-spawn gamescope path reads it; on a shared
-        // desktop (kwin/mutter/wlroots) or an attach-to-existing session it's a harmless no-op.
+        // we look it up in OUR library so a client can't inject a command). The bare-spawn gamescope
+        // backend picks this up via the `PUNKTFUNK_GAMESCOPE_APP` env fallback in `spawn` (on a shared
+        // desktop / attach-to-existing session it's a harmless no-op). This is the process-global env
+        // path — safe under today's ONE-session-at-a-time model; when concurrent native sessions land
+        // (`what's left` §3), resolve the command into the per-session VirtualDisplay via
+        // `set_launch_command` (as the GameStream path now does) so sessions can't stomp each other.
         if let Some(id) = hello.launch.as_deref() {
             match crate::library::launch_command(id) {
                 Some(cmd) => {

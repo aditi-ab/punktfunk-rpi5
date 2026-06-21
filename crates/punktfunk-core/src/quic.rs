@@ -1490,6 +1490,12 @@ pub mod endpoint {
         server_from_der(cert_der, key_der, addr)
     }
 
+    /// Fixed ALPN for the punktfunk/1 QUIC handshake. Pinning it rejects a cross-protocol peer at the
+    /// TLS layer (defense-in-depth) and makes the wire protocol explicit. Both ends set the SAME value;
+    /// a host with ALPN configured rejects a client that offers none, so client + host must be updated
+    /// together (acceptable while the protocol/ABI is still evolving).
+    const QUIC_ALPN: &[u8] = b"pkf1";
+
     fn server_from_der(
         cert_der: rustls::pki_types::CertificateDer<'static>,
         key_der: rustls::pki_types::PrivateKeyDer<'static>,
@@ -1500,10 +1506,11 @@ pub mod endpoint {
         // identity is fingerprinted post-handshake (pairing / --require-pairing checks);
         // one that presents none still connects (and is rejected at the app layer when
         // pairing is required).
-        let rustls_cfg = rustls::ServerConfig::builder()
+        let mut rustls_cfg = rustls::ServerConfig::builder()
             .with_client_cert_verifier(Arc::new(AcceptAnyClientCert))
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| anyhow_result::Error::msg(format!("server config: {e}")))?;
+        rustls_cfg.alpn_protocols = vec![QUIC_ALPN.to_vec()];
         let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
             .map_err(|e| anyhow_result::Error::msg(format!("quic server config: {e}")))?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
@@ -1580,7 +1587,7 @@ pub mod endpoint {
                     pin,
                     observed: observed.clone(),
                 }));
-            let rustls_cfg = match identity {
+            let mut rustls_cfg = match identity {
                 None => builder.with_no_client_auth(),
                 Some((cert_pem, key_pem)) => {
                     use rustls::pki_types::pem::PemObject;
@@ -1596,6 +1603,8 @@ pub mod endpoint {
                         .map_err(|e| anyhow_result::Error::msg(format!("client auth: {e}")))?
                 }
             };
+            // Must match the server's ALPN ([`QUIC_ALPN`]) or the handshake is rejected.
+            rustls_cfg.alpn_protocols = vec![QUIC_ALPN.to_vec()];
             let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
                 .map_err(|e| anyhow_result::Error::msg(format!("quic client config: {e}")))?;
             let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));

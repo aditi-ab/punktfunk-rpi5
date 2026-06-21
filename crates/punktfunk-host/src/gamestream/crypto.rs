@@ -25,6 +25,12 @@ pub fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Constant-time byte-slice equality — no early exit, so a timing side-channel can't probe the
+/// expected value byte-by-byte. Returns false on a length mismatch (the length isn't secret here).
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// The PIN-derived AES-128 key: `SHA-256(salt || pin)[..16]` (salt first, PIN as ASCII).
 pub fn pin_key(salt: &[u8; 16], pin: &str) -> [u8; 16] {
     let d = sha256(&[salt, pin.as_bytes()]);

@@ -104,16 +104,11 @@ fn run(
     // output is released when this capturer drops at stream end (RAII via its keepalive).
     if std::env::var("PUNKTFUNK_VIDEO_SOURCE").as_deref() == Ok("virtual") {
         // The launched app picks the compositor (e.g. gamescope for game entries) and the
-        // nested command; env vars remain manual overrides / fallbacks.
+        // nested command.
         let compositor = app
             .and_then(|a| a.compositor)
             .map(Ok)
             .unwrap_or_else(|| crate::vdisplay::detect().context("detect compositor"))?;
-        if let Some(cmd) = app.and_then(|a| a.cmd.as_deref()) {
-            // The gamescope backend reads the nested command from this env var; setting it
-            // per-launch is safe (one stream session at a time).
-            std::env::set_var("PUNKTFUNK_GAMESCOPE_APP", cmd);
-        }
         tracing::info!(
             ?compositor,
             app = ?app.map(|a| &a.title),
@@ -122,6 +117,9 @@ fn run(
             "video source: virtual display (native client resolution)"
         );
         let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
+        // Carry the resolved launch command on the backend instance (per-session) rather than a
+        // process-global env var, so concurrent sessions can't stomp each other's launch target.
+        vd.set_launch_command(app.and_then(|a| a.cmd.clone()));
         let vout = vd
             .create(punktfunk_core::Mode {
                 width: cfg.width,

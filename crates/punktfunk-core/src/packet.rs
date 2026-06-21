@@ -296,8 +296,9 @@ impl Reassembler {
         stats: &StatsCounters,
     ) -> Result<Option<Frame>> {
         // On a lossy datagram link a malformed or non-video packet is dropped, never
-        // fatal: it must not abort `poll_frame`. Only a genuine FEC reconstruction
-        // failure propagates as an error.
+        // fatal: it must not abort `poll_frame`. A FEC reconstruction failure (corrupt or
+        // incompatible shards that passed the header checks) likewise drops the block rather
+        // than killing the whole session — the stream recovers at the next keyframe/RFI.
         if pkt.len() < HEADER_LEN {
             StatsCounters::add(&stats.packets_dropped, 1);
             return Ok(None);
@@ -407,8 +408,22 @@ impl Reassembler {
                 .iter()
                 .filter(|s| s.is_some())
                 .count();
-            let recovered =
-                coder.reconstruct(block.data_shards, block.recovery_shards, &mut block.shards)?;
+            let recovered = match coder.reconstruct(
+                block.data_shards,
+                block.recovery_shards,
+                &mut block.shards,
+            ) {
+                Ok(r) => r,
+                Err(_) => {
+                    // Corrupt/incompatible shards that slipped past the header checks: discard this
+                    // block (mark done so later shards for it are ignored) and keep the session
+                    // alive — a lossy link must not be torn down by one unrecoverable block; the
+                    // frame stays incomplete and the client recovers at the next keyframe/RFI.
+                    block.done = true;
+                    StatsCounters::add(&stats.packets_dropped, 1);
+                    return Ok(None);
+                }
+            };
             block.done = true;
             StatsCounters::add(
                 &stats.fec_recovered_shards,

@@ -23,7 +23,7 @@ use crate::gamestream::{
 use anyhow::{Context, Result};
 use axum::{
     extract::{Path, Request, State},
-    http::{header, StatusCode},
+    http::{header, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -461,10 +461,15 @@ async fn require_auth(State(st): State<Arc<MgmtState>>, req: Request, next: Next
         return next.run(req).await; // liveness probe is always open
     }
     // A paired native client authenticates by its mTLS certificate — the same identity + trust the
-    // QUIC data plane uses — so it never needs a bearer token. The fingerprint is attached by
-    // `serve_https` from the verified peer cert; we authorize it iff it's in the paired store.
+    // QUIC data plane uses. But "paired to STREAM" is not "paired to ADMINISTER": a streaming cert
+    // authorizes only the safe, read-only status routes, NOT state-changing or pairing-administration
+    // routes (which would let one paired client unpair others, read/arm the pairing PIN, stop
+    // sessions, or edit the library). Everything outside the allowlist requires the operator's bearer
+    // token. The fingerprint is attached by `serve_https` from the verified peer cert.
     if let Some(PeerCertFingerprint(Some(fp))) = req.extensions().get::<PeerCertFingerprint>() {
-        if st.native.as_ref().is_some_and(|n| n.is_paired(fp)) {
+        if cert_may_access(req.method(), req.uri().path())
+            && st.native.as_ref().is_some_and(|n| n.is_paired(fp))
+        {
             return next.run(req).await;
         }
     }
@@ -485,6 +490,27 @@ async fn require_auth(State(st): State<Arc<MgmtState>>, req: Request, next: Next
             "missing or invalid credentials (a paired client cert, or a bearer token)",
         ),
     }
+}
+
+/// Which routes a paired *streaming* cert (mTLS, no bearer token) may reach: a small allowlist of
+/// safe, read-only status routes only. Deny-by-default — every state-changing route and every route
+/// that exposes a pairing PIN or the pending-approval queue requires the operator's bearer token, so
+/// a streaming client can't administer the host (unpair others, arm/read the PIN, stop sessions,
+/// edit the library). `/health` is handled separately (always open).
+fn cert_may_access(method: &Method, path: &str) -> bool {
+    method == Method::GET
+        && matches!(
+            path,
+            "/api/v1/host"
+                | "/api/v1/compositors"
+                | "/api/v1/status"
+                | "/api/v1/clients"
+                | "/api/v1/native/clients"
+                // The native clients browse the game library with their cert (no bearer token); the
+                // library MUTATIONS (POST/PUT/DELETE /library/custom) stay token-only via the exact
+                // GET-path match above.
+                | "/api/v1/library"
+        )
 }
 
 /// Compare SHA-256 digests instead of the strings — constant-time with respect to the
@@ -1272,6 +1298,86 @@ mod tests {
 
     fn get_req(path: &str) -> axum::http::Request<Body> {
         axum::http::Request::get(path).body(Body::empty()).unwrap()
+    }
+
+    /// Send a request authenticated ONLY by a paired streaming cert (the `PeerCertFingerprint`
+    /// `serve_https` would attach) — no bearer header — so `require_auth`'s cert branch decides.
+    async fn send_cert(app: &Router, mut req: axum::http::Request<Body>, fp: &str) -> StatusCode {
+        req.extensions_mut()
+            .insert(PeerCertFingerprint(Some(fp.to_string())));
+        app.clone().oneshot(req).await.expect("infallible").status()
+    }
+
+    /// A paired *streaming* cert (mTLS, no bearer) authorizes only the read-only allowlist; every
+    /// state-changing or PIN-exposing route still requires the operator's bearer token (audit #4).
+    #[tokio::test]
+    async fn cert_auth_is_a_read_only_allowlist() {
+        let np = Arc::new(
+            crate::native_pairing::NativePairing::load_with(
+                Some(
+                    std::env::temp_dir().join(format!("pf-mgmt-cert-{}.json", std::process::id())),
+                ),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let fp = "deadbeefcafe";
+        np.add("streaming-client", fp).unwrap();
+        let app = test_app_native(test_state(), np);
+
+        // Allowlisted read-only GETs → the cert authorizes them (not 401).
+        for p in [
+            "/api/v1/host",
+            "/api/v1/status",
+            "/api/v1/compositors",
+            "/api/v1/clients",
+            "/api/v1/native/clients",
+            "/api/v1/library",
+        ] {
+            assert_ne!(
+                send_cert(&app, get_req(p), fp).await,
+                StatusCode::UNAUTHORIZED,
+                "a paired streaming cert should authorize GET {p}"
+            );
+        }
+        // PIN-exposing GET + state-changing routes → token-only (cert rejected without a bearer).
+        assert_eq!(
+            send_cert(&app, get_req("/api/v1/native/pair"), fp).await,
+            StatusCode::UNAUTHORIZED,
+            "GET /native/pair exposes the PIN → must require the bearer token"
+        );
+        assert_eq!(
+            send_cert(
+                &app,
+                post_json(
+                    "/api/v1/native/pair/arm",
+                    serde_json::json!({"ttl_secs": 60})
+                ),
+                fp,
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "arming pairing must require the bearer token"
+        );
+        assert_eq!(
+            send_cert(
+                &app,
+                axum::http::Request::delete("/api/v1/native/clients/deadbeefcafe")
+                    .body(Body::empty())
+                    .unwrap(),
+                fp,
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "unpair (DELETE) must require the bearer token"
+        );
+        // An UNPAIRED cert is rejected even on an allowlisted path.
+        assert_eq!(
+            send_cert(&app, get_req("/api/v1/status"), "not-paired").await,
+            StatusCode::UNAUTHORIZED,
+            "an unpaired cert must be rejected"
+        );
     }
 
     #[tokio::test]

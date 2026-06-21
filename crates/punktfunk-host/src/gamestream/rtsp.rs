@@ -15,11 +15,33 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Opaque per-session payload the client echoes as its first UDP datagram (port-learning).
 const PING_PAYLOAD: &str = "0011223344556677";
+
+// The RTSP listener is UNAUTHENTICATED (no TLS/pairing) and one-thread-per-connection, so bound
+// every attacker-controllable dimension to deny a pre-auth slow-loris / memory-growth DoS: a hard
+// cap on concurrent connections, a per-read timeout so a stalled peer can't pin a thread, and
+// size caps on the request headers + body (real GameStream RTSP messages are a few hundred bytes).
+const MAX_RTSP_CONNS: usize = 8;
+const RTSP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_RTSP_HEADER: usize = 16 * 1024;
+const MAX_RTSP_BODY: usize = 64 * 1024;
+const MAX_RTSP_MSG: usize = 128 * 1024;
+
+/// Live RTSP connection count, so a flood can't spawn unbounded threads. Decremented by [`ConnGuard`].
+static RTSP_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements [`RTSP_ACTIVE`] when a connection thread exits (normally OR on panic).
+struct ConnGuard;
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        RTSP_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Bind 48010 and accept RTSP connections on a dedicated thread.
 pub fn spawn(state: Arc<AppState>) -> Result<()> {
@@ -32,8 +54,19 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
             for conn in listener.incoming() {
                 match conn {
                     Ok(stream) => {
+                        // Reserve a slot; over the cap, drop the connection (close) without a thread.
+                        if RTSP_ACTIVE.fetch_add(1, Ordering::Relaxed) >= MAX_RTSP_CONNS {
+                            RTSP_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+                            tracing::warn!("RTSP: too many concurrent connections — dropping");
+                            continue; // `stream` drops → connection closed
+                        }
+                        // Construct the slot guard BEFORE spawning and move it into the worker, so the
+                        // slot is released even if `thread::spawn` itself panics (OS thread-limit) —
+                        // the closure (and its captured guard) is dropped during the unwind.
+                        let guard = ConnGuard;
                         let st = state.clone();
                         std::thread::spawn(move || {
+                            let _guard = guard; // releases the slot on exit/panic
                             if let Err(e) = handle_conn(stream, st) {
                                 tracing::warn!(error = %format!("{e:#}"), "RTSP connection ended");
                             }
@@ -57,6 +90,8 @@ struct Request {
 
 fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
     let peer = stream.peer_addr().ok();
+    // A per-read timeout so a stalled/slow-loris peer can't pin this thread indefinitely.
+    let _ = stream.set_read_timeout(Some(RTSP_READ_TIMEOUT));
     let mut buf: Vec<u8> = Vec::new();
     // GameStream RTSP is one request per TCP connection: moonlight-common-c reads the
     // response until EOF, so we answer one message and close the connection (which signals
@@ -82,10 +117,19 @@ fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
 fn read_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Result<Option<Request>> {
     loop {
         if let Some(end) = find_subslice(buf, b"\r\n\r\n") {
+            // Cap the header section even when the terminator IS present (a single oversized header
+            // block that fits a `\r\n\r\n` would otherwise skip the no-terminator cap below).
+            if end > MAX_RTSP_HEADER {
+                anyhow::bail!("RTSP headers exceed limit");
+            }
             let head = std::str::from_utf8(&buf[..end]).context("RTSP header utf8")?;
             let content_len = header_value(head, "content-length")
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(0);
+            // Reject an absurd Content-Length before waiting to buffer it (allocation amplification).
+            if content_len > MAX_RTSP_BODY {
+                anyhow::bail!("RTSP Content-Length {content_len} exceeds limit");
+            }
             let total = end + 4 + content_len;
             if buf.len() < total {
                 // headers complete but body still arriving — read more
@@ -95,6 +139,9 @@ fn read_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Result<Option<Requ
                 buf.drain(..total);
                 return Ok(Some(parse_request(&head, body)));
             }
+        } else if buf.len() > MAX_RTSP_HEADER {
+            // No header terminator within the cap — a slow-loris dribbling headers forever.
+            anyhow::bail!("RTSP headers exceed limit");
         }
         let mut tmp = [0u8; 8192];
         let n = stream.read(&mut tmp).context("RTSP read")?;
@@ -102,6 +149,9 @@ fn read_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Result<Option<Requ
             return Ok(None); // peer closed
         }
         buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > MAX_RTSP_MSG {
+            anyhow::bail!("RTSP message exceeds limit");
+        }
     }
 }
 

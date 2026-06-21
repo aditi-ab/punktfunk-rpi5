@@ -103,6 +103,18 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                 }
                 // Service the pads' force-feedback protocol every tick (games block inside
                 // EVIOCSFF until answered) and relay mixed rumble levels to the client.
+                //
+                // SECURITY NOTE (audit #5, legacy GCM nonce reuse): on the LEGACY control scheme
+                // (`NonceKind::Legacy*`, which we hit because we advertise no encryption) the nonce is
+                // just the per-direction `seq` (`iv[0]=seq&0xff`, rest zero) with NO direction byte —
+                // so host rumble (this `rumble_seq`) and client input (its own seq) share the same
+                // (key, nonce) space when their seqs collide. This is INHERENT to Nvidia's old-style
+                // GameStream control encryption (Apollo/moonlight-common-c are identical: only the V2
+                // scheme adds `iv[10..12] = 'H','C'` to separate the host direction). It can't be fixed
+                // on the legacy wire without breaking Moonlight; the GCM key is the client-supplied
+                // `rikey` (so only a passive eavesdropper who missed the HTTPS /launch is the
+                // adversary). The real fix is V2 control-encryption negotiation; for untrusted networks
+                // use the native punktfunk/1 plane (correct per-direction nonces + seq-as-AAD).
                 if let (Some(pid), Some(scheme)) = (peer, detected) {
                     let key = state.launch.lock().unwrap().map(|s| s.gcm_key);
                     if let Some(key) = key {

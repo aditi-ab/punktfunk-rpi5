@@ -224,7 +224,8 @@ impl Pairing {
         let client_secret = &data[..16];
         let client_sig = &data[16..];
         let expected = crypto::sha256(&[&s.server_challenge, &s.client_cert_sig, client_secret]);
-        let hash_ok = expected[..] == s.client_hash[..];
+        // Constant-time compare so a timing side-channel can't probe the expected hash.
+        let hash_ok = crypto::ct_eq(&expected, &s.client_hash);
         let sig_ok = verify256(&s.client_pubkey, client_secret, client_sig).is_ok();
         if hash_ok && sig_ok {
             {
