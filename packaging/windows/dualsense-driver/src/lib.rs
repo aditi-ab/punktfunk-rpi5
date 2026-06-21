@@ -14,10 +14,10 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use wdk_sys::{
-    call_unsafe_wdf_function_binding, windows::OutputDebugStringA, GUID, NTSTATUS, PCUNICODE_STRING,
-    PDRIVER_OBJECT, PWDFDEVICE_INIT, ULONG, WDFDEVICE, WDFDRIVER, WDFMEMORY, WDFQUEUE, WDFQUEUE__,
-    WDFREQUEST, WDFTIMER, WDF_DRIVER_CONFIG, WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE,
-    WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDF_TIMER_CONFIG,
+    NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PWDFDEVICE_INIT, ULONG, WDF_DRIVER_CONFIG,
+    WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES,
+    WDF_TIMER_CONFIG, WDFDEVICE, WDFDRIVER, WDFMEMORY, WDFQUEUE, WDFQUEUE__, WDFREQUEST, WDFTIMER,
+    call_unsafe_wdf_function_binding, windows::OutputDebugStringA,
 };
 
 // ---- NTSTATUS values ----
@@ -46,15 +46,6 @@ const IOCTL_UMDF_HID_GET_FEATURE: u32 = hid_ctl(21);
 const IOCTL_UMDF_HID_SET_OUTPUT_REPORT: u32 = hid_ctl(22);
 const IOCTL_UMDF_HID_GET_INPUT_REPORT: u32 = hid_ctl(23);
 
-// ---- Host control channel: CTL_CODE(FILE_DEVICE_UNKNOWN=0x22, fn, METHOD_BUFFERED=0, access) ----
-const fn pfds_ctl(func: u32, access: u32) -> u32 {
-    (0x0000_0022 << 16) | (access << 14) | (func << 2)
-}
-/// Host → driver: push the 64-byte `0x01` input report (FILE_WRITE_ACCESS).
-const IOCTL_PFDS_SET_INPUT: u32 = pfds_ctl(0x800, 2);
-/// Driver → host inverted-call: completed with a game's raw `0x02` output report (FILE_READ_ACCESS).
-const IOCTL_PFDS_GET_OUTPUT: u32 = pfds_ctl(0x801, 1);
-
 // ---- WDF enum values ----
 const WdfIoQueueDispatchParallel: i32 = 2;
 const WdfIoQueueDispatchManual: i32 = 3;
@@ -66,15 +57,6 @@ const WdfSynchronizationScopeInheritFromParent: i32 = 1; // WDF_SYNCHRONIZATION_
 const DS_VID: u16 = 0x054C;
 const DS_PID: u16 = 0x0CE6;
 const DS_VER: u16 = 0x0100;
-
-// {7B2F8E4A-9C3D-4E1F-A6B5-1234567890AB} — the host↔driver control interface the punktfunk host
-// opens (on the SwDeviceCreate'd device) to push input reports + pull a game's output reports.
-const PFDS_CONTROL_GUID: GUID = GUID {
-    Data1: 0x7b2f_8e4a,
-    Data2: 0x9c3d,
-    Data3: 0x4e1f,
-    Data4: [0xa6, 0xb5, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab],
-};
 
 // Sony DualSense USB HID report descriptor (273 bytes), verbatim from inputtino (== inject/dualsense.rs).
 // NOTE: inject/dualsense.rs comments this as "232 bytes" — that comment is wrong; it is 273.
@@ -151,16 +133,9 @@ fn neutral_report() -> [u8; 64] {
 }
 
 static MANUAL_QUEUE: AtomicPtr<WDFQUEUE__> = AtomicPtr::new(core::ptr::null_mut());
-/// Manual queue of pended host `IOCTL_PFDS_GET_OUTPUT` requests (inverted-call); completed with a
-/// game's `0x02` output report as it arrives.
-static OUTPUT_QUEUE: AtomicPtr<WDFQUEUE__> = AtomicPtr::new(core::ptr::null_mut());
-/// The latest input report the host pushed (report `0x01`); the timer + each SET_INPUT deliver it to
-/// pended game READ_REPORTs. Defaults to neutral until the host connects.
+/// The latest input report the host pushed (report `0x01`) via shared memory; the timer delivers it
+/// to pended game READ_REPORTs. Defaults to neutral until the host connects.
 static INPUT_REPORT: std::sync::Mutex<[u8; 64]> = std::sync::Mutex::new(NEUTRAL_REPORT);
-/// One-shot logs so the control channel's first traffic is visible without per-frame spam.
-static LOGGED_SET_INPUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static LOGGED_GET_OUTPUT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 
 // ---- user-mode shared-memory IPC with the punktfunk host ----
 // UMDF runs in WUDFHost.exe (user-mode) and hidclass blocks a control channel on the device stack
@@ -268,7 +243,10 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         )
     };
     if !nt_success(st) {
-        dbglog!("[pf-ds] default WdfIoQueueCreate failed 0x{:08x}", st as u32);
+        dbglog!(
+            "[pf-ds] default WdfIoQueueCreate failed 0x{:08x}",
+            st as u32
+        );
         return st;
     }
 
@@ -321,47 +299,6 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     // SAFETY: timer valid; -80000 == 8ms relative due time (100ns units, negative = relative).
     let _started = unsafe { call_unsafe_wdf_function_binding!(WdfTimerStart, timer, -80000i64) };
 
-    // Output queue: pended host GET_OUTPUT (inverted-call) requests, completed as games write 0x02.
-    // SAFETY: zeroed config then fields set.
-    let mut ocfg: WDF_IO_QUEUE_CONFIG = unsafe { core::mem::zeroed() };
-    ocfg.Size = core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG;
-    ocfg.DispatchType = WdfIoQueueDispatchManual;
-    ocfg.PowerManaged = WdfUseDefault;
-    let mut output_queue: WDFQUEUE = core::ptr::null_mut();
-    // SAFETY: device + config valid; attributes null; queue receives the handle.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfIoQueueCreate,
-            device,
-            &mut ocfg,
-            WDF_NO_OBJECT_ATTRIBUTES,
-            &mut output_queue
-        )
-    };
-    if !nt_success(st) {
-        dbglog!("[pf-ds] output WdfIoQueueCreate failed 0x{:08x}", st as u32);
-        return st;
-    }
-    OUTPUT_QUEUE.store(output_queue, Ordering::SeqCst);
-
-    // Host↔driver control interface — the punktfunk host opens this to push input + pull output.
-    // Non-fatal if it fails: the HID device still works for direct-app use, just not the host plane.
-    // SAFETY: device valid; GUID is a valid static; the reference string is optional (null).
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceCreateDeviceInterface,
-            device,
-            &PFDS_CONTROL_GUID,
-            core::ptr::null::<c_void>() as PCUNICODE_STRING
-        )
-    };
-    if !nt_success(st) {
-        dbglog!(
-            "[pf-ds] WdfDeviceCreateDeviceInterface failed 0x{:08x}",
-            st as u32
-        );
-    }
-
     log("[pf-ds] device ready (DualSense 054C:0CE6)");
     STATUS_SUCCESS
 }
@@ -376,10 +313,7 @@ extern "C" fn evt_io_device_control(
     let mut complete = true;
     // Skip the 8ms READ_REPORT cadence so the log stays readable during a game test;
     // the 0x02 OUTPUT report (the gate) and the descriptor handshake still log.
-    if !matches!(
-        ioctl,
-        IOCTL_HID_READ_REPORT | IOCTL_PFDS_SET_INPUT | IOCTL_PFDS_GET_OUTPUT
-    ) {
+    if ioctl != IOCTL_HID_READ_REPORT {
         dbglog!("[pf-ds] ioctl 0x{ioctl:08x} out={_output_len} in={_input_len}");
     }
     let status: NTSTATUS = match ioctl {
@@ -399,42 +333,23 @@ extern "C" fn evt_io_device_control(
                 st
             }
         }
-        IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => on_output_report(request, ioctl),
+        IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => {
+            on_output_report(request, ioctl)
+        }
         IOCTL_UMDF_HID_SET_FEATURE => {
             log("[pf-ds] SET_FEATURE (stub ok)");
             STATUS_SUCCESS
         }
         IOCTL_UMDF_HID_GET_FEATURE => on_get_feature(request),
         IOCTL_UMDF_HID_GET_INPUT_REPORT => copy_to_output(request, &neutral_report()),
-        // ---- host control channel ----
-        IOCTL_PFDS_SET_INPUT => on_set_input(request),
-        IOCTL_PFDS_GET_OUTPUT => {
-            let oq: WDFQUEUE = OUTPUT_QUEUE.load(Ordering::SeqCst);
-            // SAFETY: request valid; oq is the output manual queue created in EvtDeviceAdd.
-            let st = unsafe {
-                call_unsafe_wdf_function_binding!(WdfRequestForwardToIoQueue, request, oq)
-            };
-            if !LOGGED_GET_OUTPUT.swap(true, Ordering::Relaxed) {
-                dbglog!(
-                    "[pf-ds] control: first GET_OUTPUT posted (host pump up) st=0x{:08x}",
-                    st as u32
-                );
-            }
-            if nt_success(st) {
-                complete = false;
-                STATUS_SUCCESS
-            } else {
-                st
-            }
-        }
         _ => STATUS_NOT_IMPLEMENTED,
     };
 
-    if !matches!(
-        ioctl,
-        IOCTL_HID_READ_REPORT | IOCTL_PFDS_SET_INPUT | IOCTL_PFDS_GET_OUTPUT
-    ) {
-        dbglog!("[pf-ds] ioctl 0x{ioctl:08x} -> 0x{:08x} complete={complete}", status as u32);
+    if ioctl != IOCTL_HID_READ_REPORT {
+        dbglog!(
+            "[pf-ds] ioctl 0x{ioctl:08x} -> 0x{:08x} complete={complete}",
+            status as u32
+        );
     }
     if complete {
         // SAFETY: request valid and not forwarded.
@@ -472,7 +387,9 @@ fn copy_to_output(request: WDFREQUEST, src: &[u8]) -> NTSTATUS {
         return st;
     }
     // SAFETY: request valid.
-    unsafe { call_unsafe_wdf_function_binding!(WdfRequestSetInformation, request, src.len() as u64) };
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfRequestSetInformation, request, src.len() as u64)
+    };
     STATUS_SUCCESS
 }
 
@@ -490,9 +407,8 @@ fn on_output_report(request: WDFREQUEST, ioctl: ULONG) -> NTSTATUS {
     }
     let mut inlen: usize = 0;
     // SAFETY: inmem valid.
-    let inbuf =
-        unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, inmem, &mut inlen) }
-            as *const u8;
+    let inbuf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, inmem, &mut inlen) }
+        as *const u8;
 
     // report id from output-buffer length (UMDF convention).
     let mut report_id: u32 = 0;
@@ -503,7 +419,8 @@ fn on_output_report(request: WDFREQUEST, ioctl: ULONG) -> NTSTATUS {
     }) {
         let mut outlen: usize = 0;
         // SAFETY: outmem valid.
-        let _ = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, outmem, &mut outlen) };
+        let _ =
+            unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, outmem, &mut outlen) };
         report_id = outlen as u32;
     }
 
@@ -521,20 +438,10 @@ fn on_output_report(request: WDFREQUEST, ioctl: ULONG) -> NTSTATUS {
     } else {
         "SET_OUTPUT_REPORT"
     };
-    dbglog!(
-        "[pf-ds] *** OUTPUT {kind} reportId={report_id} len={inlen} data: {hex}"
-    );
+    dbglog!("[pf-ds] *** OUTPUT {kind} reportId={report_id} len={inlen} data: {hex}");
 
-    // Forward the raw report to a pended host GET_OUTPUT request so the punktfunk host can relay
-    // rumble / lightbar / player-LEDs / adaptive-trigger feedback to the client.
-    if !inbuf.is_null() && inlen > 0 {
-        // SAFETY: inbuf valid for inlen bytes; cap the copy at 64.
-        let report = unsafe { core::slice::from_raw_parts(inbuf, inlen.min(64)) };
-        deliver_output(report);
-    }
-
-    // Publish to shared memory for the host — the real feedback channel (the IOCTL path above is
-    // inert under hidclass). output_report @76, output_seq @72.
+    // Publish the game's 0x02 output report to shared memory for the host (rumble / lightbar /
+    // player-LEDs / adaptive triggers). output_report @76, output_seq @72.
     if !inbuf.is_null() && inlen > 0 {
         let n = inlen.min(64);
         with_shm(|view| {
@@ -553,73 +460,6 @@ fn on_output_report(request: WDFREQUEST, ioctl: ULONG) -> NTSTATUS {
     STATUS_SUCCESS
 }
 
-// Host → driver: store the pushed `0x01` input report and deliver it to a pending game READ_REPORT.
-fn on_set_input(request: WDFREQUEST) -> NTSTATUS {
-    let mut inmem: WDFMEMORY = core::ptr::null_mut();
-    // SAFETY: request valid.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestRetrieveInputMemory, request, &mut inmem)
-    };
-    if !nt_success(st) {
-        return st;
-    }
-    let mut inlen: usize = 0;
-    // SAFETY: inmem valid.
-    let inbuf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, inmem, &mut inlen) }
-        as *const u8;
-    if inbuf.is_null() || inlen == 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let n = inlen.min(64);
-    if let Ok(mut guard) = INPUT_REPORT.lock() {
-        // SAFETY: inbuf valid for inlen >= n bytes.
-        let src = unsafe { core::slice::from_raw_parts(inbuf, n) };
-        guard[..n].copy_from_slice(src);
-    }
-    if !LOGGED_SET_INPUT.swap(true, Ordering::Relaxed) {
-        dbglog!("[pf-ds] control: first SET_INPUT ({inlen} bytes) — host input plane up");
-    }
-    complete_one_read();
-    STATUS_SUCCESS
-}
-
-// Pull one pended game READ_REPORT and complete it with the current input report.
-fn complete_one_read() {
-    let queue: WDFQUEUE = MANUAL_QUEUE.load(Ordering::SeqCst);
-    if queue.is_null() {
-        return;
-    }
-    let mut request: WDFREQUEST = core::ptr::null_mut();
-    // SAFETY: queue valid; request receives the next pended request if any.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(WdfIoQueueRetrieveNextRequest, queue, &mut request)
-    };
-    if nt_success(st) {
-        let report = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
-        let s = copy_to_output(request, &report);
-        // SAFETY: request valid and dequeued.
-        unsafe { call_unsafe_wdf_function_binding!(WdfRequestComplete, request, s) };
-    }
-}
-
-// Deliver a game's raw `0x02` output report to a pended host GET_OUTPUT request (if one is posted).
-fn deliver_output(data: &[u8]) {
-    let oq: WDFQUEUE = OUTPUT_QUEUE.load(Ordering::SeqCst);
-    if oq.is_null() {
-        return;
-    }
-    let mut request: WDFREQUEST = core::ptr::null_mut();
-    // SAFETY: oq valid; request receives the next pended request if any.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(WdfIoQueueRetrieveNextRequest, oq, &mut request)
-    };
-    if nt_success(st) {
-        let s = copy_to_output(request, data);
-        // SAFETY: request valid and dequeued.
-        unsafe { call_unsafe_wdf_function_binding!(WdfRequestComplete, request, s) };
-    }
-}
-
 // GET_FEATURE: report id from the input buffer; reply with the matching DualSense feature blob.
 fn on_get_feature(request: WDFREQUEST) -> NTSTATUS {
     let mut inmem: WDFMEMORY = core::ptr::null_mut();
@@ -632,9 +472,8 @@ fn on_get_feature(request: WDFREQUEST) -> NTSTATUS {
     }
     let mut inlen: usize = 0;
     // SAFETY: inmem valid.
-    let inbuf =
-        unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, inmem, &mut inlen) }
-            as *const u8;
+    let inbuf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, inmem, &mut inlen) }
+        as *const u8;
     if inbuf.is_null() || inlen < 1 {
         return STATUS_INVALID_PARAMETER;
     }

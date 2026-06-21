@@ -25,7 +25,10 @@ pf_dualsense.dll=1
 %ManufacturerString%=pf, NT$ARCH$.10.0...22000
 
 [pf.NT$ARCH$.10.0...22000]
-%DeviceDesc%=pfDualSense, root\pf_dualsense
+; Two hardware ids: `root\pf_dualsense` for a root-enumerated devnode (devgen/devcon tests) and
+; `pf_dualsense` for the host's SwDeviceCreate'd software device (the `root\` prefix is reserved for
+; root enumeration, so SwDeviceCreate rejects it with E_INVALIDARG).
+%DeviceDesc%=pfDualSense, root\pf_dualsense, pf_dualsense
 
 [pfDualSense.NT]
 CopyFiles=UMDriverCopy
