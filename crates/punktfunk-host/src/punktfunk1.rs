@@ -1176,14 +1176,17 @@ fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
 /// - `DualShock4` (`PUNKTFUNK_GAMEPAD=ps4`) — virtual DualShock 4 via the same UHID path: lightbar,
 ///   touchpad, motion, rumble (DualSense minus adaptive triggers / player LEDs / mute).
 ///
-/// The two UHID pads are Linux-only; off Linux the resolver already folds them (and One/Series)
-/// into `Xbox360`, so a non-Linux build never constructs them.
+/// DualShock 4 + One/Series are Linux-only; DualSense has both a Linux (UHID) and a Windows (UMDF
+/// minidriver) backend. The resolver folds any type a platform can't build into `Xbox360`, so a
+/// build never constructs a variant it lacks.
 enum PadBackend {
     Xbox360(crate::inject::gamepad::GamepadManager),
     #[cfg(target_os = "linux")]
     DualSense(crate::inject::dualsense::DualSenseManager),
     #[cfg(target_os = "linux")]
     DualShock4(crate::inject::dualshock4::DualShock4Manager),
+    #[cfg(target_os = "windows")]
+    DualSenseWindows(crate::inject::dualsense_windows::DualSenseWindowsManager),
 }
 
 impl PadBackend {
@@ -1209,6 +1212,13 @@ impl PadBackend {
             }
             _ => {}
         }
+        #[cfg(target_os = "windows")]
+        if kind == GamepadPref::DualSense {
+            tracing::info!("gamepad backend: virtual DualSense (Windows UMDF shm channel)");
+            return PadBackend::DualSenseWindows(
+                crate::inject::dualsense_windows::DualSenseWindowsManager::new(),
+            );
+        }
         let _ = kind;
         PadBackend::Xbox360(crate::inject::gamepad::GamepadManager::new())
     }
@@ -1220,17 +1230,22 @@ impl PadBackend {
             PadBackend::DualSense(m) => m.handle(ev),
             #[cfg(target_os = "linux")]
             PadBackend::DualShock4(m) => m.handle(ev),
+            #[cfg(target_os = "windows")]
+            PadBackend::DualSenseWindows(m) => m.handle(ev),
         }
     }
 
     /// Apply a rich client→host event (touchpad / motion). A no-op for the X-Box pad, which has no
     /// equivalent; the DualSense and DualShock 4 pads both carry a touchpad + motion sensors.
     fn apply_rich(&mut self, _rich: punktfunk_core::quic::RichInput) {
-        #[cfg(target_os = "linux")]
         match self {
-            PadBackend::DualSense(m) => m.apply_rich(_rich),
-            PadBackend::DualShock4(m) => m.apply_rich(_rich),
             PadBackend::Xbox360(_) => {}
+            #[cfg(target_os = "linux")]
+            PadBackend::DualSense(m) => m.apply_rich(_rich),
+            #[cfg(target_os = "linux")]
+            PadBackend::DualShock4(m) => m.apply_rich(_rich),
+            #[cfg(target_os = "windows")]
+            PadBackend::DualSenseWindows(m) => m.apply_rich(_rich),
         }
     }
 
@@ -1252,6 +1267,8 @@ impl PadBackend {
             PadBackend::DualSense(m) => m.pump(rumble, hidout),
             #[cfg(target_os = "linux")]
             PadBackend::DualShock4(m) => m.pump(rumble, hidout),
+            #[cfg(target_os = "windows")]
+            PadBackend::DualSenseWindows(m) => m.pump(rumble, hidout),
         }
     }
 
@@ -1267,6 +1284,8 @@ impl PadBackend {
             PadBackend::DualSense(m) => m.heartbeat(std::time::Duration::from_millis(8)),
             #[cfg(target_os = "linux")]
             PadBackend::DualShock4(m) => m.heartbeat(std::time::Duration::from_millis(8)),
+            #[cfg(target_os = "windows")]
+            PadBackend::DualSenseWindows(m) => m.heartbeat(std::time::Duration::from_millis(8)),
         }
     }
 }
@@ -1555,7 +1574,7 @@ fn synthetic_stream(
 /// 4) need it — off Linux any such wish degrades to X-Box 360 (never an error: a session without rich
 /// pads still streams). X-Box One/Series is a distinct uinput *identity* on Linux, but XInput-identical
 /// to the 360 pad on Windows (ViGEm has no One target), so it degrades to `Xbox360` there.
-fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool) -> GamepadPref {
+fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool) -> GamepadPref {
     let want = match pref {
         GamepadPref::Auto => env
             .and_then(GamepadPref::from_name)
@@ -1563,7 +1582,8 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool) -> GamepadPre
         explicit => explicit,
     };
     match want {
-        GamepadPref::DualSense if linux => GamepadPref::DualSense,
+        // DualSense: Linux UHID hid-playstation, or the Windows UMDF minidriver backend.
+        GamepadPref::DualSense if linux || windows => GamepadPref::DualSense,
         GamepadPref::DualShock4 if linux => GamepadPref::DualShock4,
         // One/Series: a real, distinct uinput identity on Linux; folded into the 360 backend on
         // Windows (XInput can't tell them apart anyway).
@@ -1576,7 +1596,12 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool) -> GamepadPre
 /// [`pick_gamepad`]). Always concrete — the `Welcome` reports what the session will drive.
 fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
     let env = std::env::var("PUNKTFUNK_GAMEPAD").ok();
-    let chosen = pick_gamepad(pref, env.as_deref(), cfg!(target_os = "linux"));
+    let chosen = pick_gamepad(
+        pref,
+        env.as_deref(),
+        cfg!(target_os = "linux"),
+        cfg!(target_os = "windows"),
+    );
     match pref {
         GamepadPref::Auto => {
             // The operator's env knob deserves a diagnostic when it didn't drive the
@@ -3040,26 +3065,41 @@ mod tests {
     #[test]
     fn gamepad_resolution_precedence() {
         use GamepadPref::*;
+        // Trailing args are (linux, windows).
         // An explicit client choice wins over the env var.
-        assert_eq!(pick_gamepad(DualSense, Some("xbox360"), true), DualSense);
-        assert_eq!(pick_gamepad(Xbox360, Some("dualsense"), true), Xbox360);
+        assert_eq!(
+            pick_gamepad(DualSense, Some("xbox360"), true, false),
+            DualSense
+        );
+        assert_eq!(
+            pick_gamepad(Xbox360, Some("dualsense"), true, false),
+            Xbox360
+        );
         // Client Auto defers to the env var.
-        assert_eq!(pick_gamepad(Auto, Some("dualsense"), true), DualSense);
-        assert_eq!(pick_gamepad(Auto, Some("xbox360"), true), Xbox360);
+        assert_eq!(
+            pick_gamepad(Auto, Some("dualsense"), true, false),
+            DualSense
+        );
+        assert_eq!(pick_gamepad(Auto, Some("xbox360"), true, false), Xbox360);
         // Auto + no env (or an unparseable one) → X-Box 360.
-        assert_eq!(pick_gamepad(Auto, None, true), Xbox360);
-        assert_eq!(pick_gamepad(Auto, Some("bogus"), true), Xbox360);
-        // DualSense degrades to X-Box 360 where the backend doesn't exist (non-Linux).
-        assert_eq!(pick_gamepad(DualSense, None, false), Xbox360);
-        assert_eq!(pick_gamepad(Auto, Some("dualsense"), false), Xbox360);
-        // DualShock 4: honored on Linux (UHID), degrades to X-Box 360 off it.
-        assert_eq!(pick_gamepad(DualShock4, None, true), DualShock4);
-        assert_eq!(pick_gamepad(Auto, Some("ps4"), true), DualShock4);
-        assert_eq!(pick_gamepad(DualShock4, None, false), Xbox360);
+        assert_eq!(pick_gamepad(Auto, None, true, false), Xbox360);
+        assert_eq!(pick_gamepad(Auto, Some("bogus"), true, false), Xbox360);
+        // DualSense: honored on Linux (UHID) AND Windows (UMDF minidriver); degrades elsewhere.
+        assert_eq!(pick_gamepad(DualSense, None, false, true), DualSense);
+        assert_eq!(
+            pick_gamepad(Auto, Some("dualsense"), false, true),
+            DualSense
+        );
+        assert_eq!(pick_gamepad(DualSense, None, false, false), Xbox360);
+        assert_eq!(pick_gamepad(Auto, Some("dualsense"), false, false), Xbox360);
+        // DualShock 4: Linux-only (UHID); degrades to X-Box 360 off it (including Windows).
+        assert_eq!(pick_gamepad(DualShock4, None, true, false), DualShock4);
+        assert_eq!(pick_gamepad(Auto, Some("ps4"), true, false), DualShock4);
+        assert_eq!(pick_gamepad(DualShock4, None, false, true), Xbox360);
         // X-Box One: a distinct uinput identity on Linux, folded into the 360 pad on Windows.
-        assert_eq!(pick_gamepad(XboxOne, None, true), XboxOne);
-        assert_eq!(pick_gamepad(Auto, Some("series"), true), XboxOne);
-        assert_eq!(pick_gamepad(XboxOne, None, false), Xbox360);
+        assert_eq!(pick_gamepad(XboxOne, None, true, false), XboxOne);
+        assert_eq!(pick_gamepad(Auto, Some("series"), true, false), XboxOne);
+        assert_eq!(pick_gamepad(XboxOne, None, false, true), Xbox360);
     }
 
     #[test]

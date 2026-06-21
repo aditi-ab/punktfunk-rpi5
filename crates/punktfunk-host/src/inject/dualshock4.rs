@@ -13,7 +13,7 @@
 //! resolution differ. The report descriptor + struct offsets are the canonical real-DS4-USB layout
 //! the kernel `struct dualshock4_input_report_usb` / `_output_report_common` parse.
 
-use super::dualsense::{DsState, Touch};
+use super::dualsense_proto::{DsState, Touch};
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use anyhow::{Context, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};

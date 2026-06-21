@@ -116,6 +116,9 @@ libloading = "0.8"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # ConvertStringSecurityDescriptorToSecurityDescriptorW — the SDDL on the virtual-DualSense
+    # shared-memory section (inject/dualsense_windows.rs) so the UMDF host can open it.
+    "Win32_Security_Authorization",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Display",
     "Win32_Storage_FileSystem",

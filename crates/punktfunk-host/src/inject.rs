@@ -423,6 +423,13 @@ fn gs_button_to_evdev(b: u32) -> Option<u32> {
 
 #[cfg(target_os = "linux")]
 pub mod dualsense;
+/// Transport-independent DualSense HID contract, shared by the Linux UHID backend ([`dualsense`])
+/// and the Windows UMDF-driver backend ([`dualsense_windows`]).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub mod dualsense_proto;
+/// Windows: virtual DualSense via the UMDF minidriver + a shared-memory host channel.
+#[cfg(target_os = "windows")]
+pub mod dualsense_windows;
 #[cfg(target_os = "linux")]
 pub mod dualshock4;
 #[cfg(target_os = "linux")]

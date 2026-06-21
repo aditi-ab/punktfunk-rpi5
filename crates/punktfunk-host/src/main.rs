@@ -152,7 +152,8 @@ fn real_main() -> Result<()> {
         // sends back. Verify with `evtest` / `ls /dev/input/by-id/*Punktfunk*` / `wpctl status`.
         #[cfg(target_os = "linux")]
         Some("dualsense-test") => {
-            use inject::dualsense::{DsState, DualSensePad};
+            use inject::dualsense::DualSensePad;
+            use inject::dualsense_proto::DsState;
             let secs: u64 = args
                 .iter()
                 .skip_while(|a| *a != "--seconds")
