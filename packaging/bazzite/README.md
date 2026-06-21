@@ -233,19 +233,23 @@ systemctl --user status punktfunk-host
 journalctl --user -u punktfunk-host -f
 ```
 
-> **What `serve` actually starts.** The unit's `ExecStart` runs `punktfunk-host serve`, which is the
-> **GameStream / Moonlight-compatible** host (mDNS discovery, pairing, RTSP, the fixed GameStream
-> ports, **plus the management REST API on 47990**). The native `punktfunk/1` (QUIC) host is a
-> *separate* subcommand — `punktfunk-host punktfunk1-host` — and is **not** what the bundled systemd unit
-> launches. So out of the box on Bazzite you get the **Moonlight-compatible** host.
-> (Source: `crates/punktfunk-host/src/main.rs` — `serve` → `gamestream::serve`; `punktfunk1-host` is its own
-> path.)
+> **What `serve` actually starts.** The bundled unit's `ExecStart` runs `punktfunk-host serve
+> --gamestream`, so out of the box you get the **unified host**: the native `punktfunk/1` (QUIC) plane
+> — always on in `serve` — **plus** the GameStream/Moonlight-compat planes (mDNS discovery, pairing,
+> RTSP, the fixed GameStream ports) and the management REST API on 47990. The `--gamestream` flag is
+> what adds the Moonlight surface; GameStream pairs over plain HTTP and its legacy encryption is weaker
+> than the native plane's (security-review #5/#9), so it's **opt-in and trusted-LAN only**. For a
+> **secure native-only host**, drop `--gamestream` from the unit's `ExecStart` (bare `serve`) — native
+> clients still work; only stock Moonlight stops.
+> (Source: `crates/punktfunk-host/src/main.rs` — `serve` runs the native plane + mgmt; `--gamestream`
+> adds `gamestream::serve`.)
 
 > **Unit caveat:** `scripts/punktfunk-host.service` declares only `After=pipewire.service` and (in
 > the upstream/dev layout) assumes the binary at `%h/punktfunk/target/release/punktfunk-host`. The
 > **RPM-installed** binary lives at `/usr/bin/punktfunk-host`. If `systemctl --user cat
 > punktfunk-host` shows `ExecStart` pointing at a missing path in your home dir, drop an override
-> (`systemctl --user edit punktfunk-host`) setting `ExecStart=/usr/bin/punktfunk-host serve`.
+> (`systemctl --user edit punktfunk-host`) setting `ExecStart=/usr/bin/punktfunk-host serve
+> --gamestream` (or bare `serve` for a secure native-only host).
 
 ---
 
@@ -256,7 +260,9 @@ journalctl --user -u punktfunk-host -f
 > the GameStream-host port-map (`docs/gamestream-host-plan.md`). Treat the `firewall-cmd` lines as recommended-but-verified,
 > not a checked-in script.
 
-**GameStream / Moonlight ports** (fixed; Moonlight derives them from the HTTP base):
+**GameStream / Moonlight ports** (fixed; Moonlight derives them from the HTTP base). These only apply
+when the host runs `serve --gamestream` (the bundled unit's default); on a bare-`serve` native-only
+host you don't open them:
 
 | Port | Proto | Purpose |
 |---|---|---|
@@ -382,7 +388,8 @@ desktop viewer.
 
 - **Service `ExecStart` points at a missing path in `$HOME`.** The dev unit references
   `%h/punktfunk/target/release/...`. The RPM binary is `/usr/bin/punktfunk-host`. Override
-  `ExecStart=/usr/bin/punktfunk-host serve` if needed (section 5).
+  `ExecStart=/usr/bin/punktfunk-host serve --gamestream` (or bare `serve` for native-only) if needed
+  (section 5).
 
 - **Moonlight can't see the host.** Ensure UDP 5353 (mDNS) and the GameStream ports are open
   (section 6) and client + host are on the same L2 LAN segment.
@@ -413,6 +420,7 @@ matching your Bazzite Fedora base (`rpm -E %fedora`).
 
 1. The COPR is **operator-run / not assumed published** — both install paths depend on it.
 2. There is **no firewall script/doc in the repo** — the ports above are derived from the code.
-3. The bundled systemd unit runs the **GameStream/Moonlight** `serve` host, **not** the native
-   `punktfunk/1` QUIC host (`punktfunk1-host` is separate and unmanaged by the unit).
+3. The bundled systemd unit runs `serve --gamestream` — the native `punktfunk/1` QUIC plane (always
+   on) **plus** the GameStream/Moonlight planes. Drop `--gamestream` for a secure native-only host;
+   `punktfunk1-host` is a separate standalone native host, unmanaged by the unit.
 4. The mgmt port (47990) is **loopback-only by default** — don't open it.

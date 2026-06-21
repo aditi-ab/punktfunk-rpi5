@@ -1,4 +1,6 @@
-# punktfunk streaming host — systemd USER unit (`serve --native` = GameStream + punktfunk/1).
+# punktfunk streaming host — systemd USER unit (`serve --gamestream` = native punktfunk/1 + the
+# GameStream/Moonlight-compat planes). For a SECURE native-only host (no plain-HTTP pairing / legacy
+# GCM nonce reuse — security-review #5/#9; native clients only), drop `--gamestream` from ExecStart.
 #
 # Install (against an already-running compositor session):
 #   mkdir -p ~/.config/systemd/user && cp scripts/punktfunk-host.service ~/.config/systemd/user/
@@ -29,7 +31,7 @@ PartOf=punktfunk-kde-session.service
 
 [Service]
 EnvironmentFile=%h/.config/punktfunk/host.env
-ExecStart=%h/punktfunk/target/release/punktfunk-host serve --native
+ExecStart=%h/punktfunk/target/release/punktfunk-host serve --gamestream
 Restart=on-failure
 RestartSec=2
 

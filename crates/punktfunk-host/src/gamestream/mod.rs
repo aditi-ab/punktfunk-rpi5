@@ -154,56 +154,72 @@ impl AppState {
 /// QUIC server on `cfg.port` in the same process, sharing one [`crate::native_pairing`] handle with
 /// the management API so the web console can arm pairing and show the PIN. `None` = GameStream only
 /// (the mgmt API's native endpoints report `enabled: false`).
+/// Run the host. The **native punktfunk/1 plane + management API always run** (the secure default —
+/// SPAKE2 pairing, per-direction AEAD nonces); `gamestream` additionally brings up the
+/// GameStream/Moonlight-compat planes (nvhttp pairing, RTSP, ENet control, `_nvstream` mDNS), which
+/// carry inherent on-path weaknesses (plain-HTTP pairing + legacy GCM nonce reuse, security-review
+/// #5/#9) — so it is **opt-in** (`serve --gamestream`) and gated on a trusted LAN.
 pub fn serve(
     mgmt: crate::mgmt::Options,
-    native: Option<crate::punktfunk1::NativeServe>,
+    native: crate::punktfunk1::NativeServe,
+    gamestream: bool,
 ) -> Result<()> {
     let host = Host::detect()?;
     let identity = cert::ServerIdentity::load_or_create().context("host certificate")?;
     let state = Arc::new(AppState::new(host, identity));
-    // The shared native-pairing handle exists only when we run the native host; it links the QUIC
-    // ceremony and the management API.
-    let np = match &native {
-        Some(_) => Some(Arc::new(
-            crate::native_pairing::NativePairing::load_with(None, None, false)
-                .context("native pairing store")?,
-        )),
-        None => None,
-    };
+    // The native plane always runs, so the shared native-pairing handle (linking the QUIC ceremony
+    // and the management API) always exists.
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(None, None, false)
+            .context("native pairing store")?,
+    );
     tracing::info!(
         hostname = %state.host.hostname,
         uniqueid = %state.host.uniqueid,
         ip = %state.host.local_ip,
-        native = native.is_some(),
-        require_pairing = native.as_ref().map(|n| n.require_pairing),
-        "punktfunk host (GameStream P1.1: serverinfo + pairing + mDNS)"
+        native_port = native.port,
+        require_pairing = native.require_pairing,
+        gamestream,
+        "punktfunk host"
     );
+    if gamestream {
+        tracing::warn!(
+            "GameStream/Moonlight compat ENABLED (--gamestream): its pairing runs over plain HTTP and \
+             its legacy control encryption can reuse GCM nonces (security-review #5/#9) — an on-path \
+             LAN attacker could MITM pairing or recover input. Enable only on a TRUSTED network; prefer \
+             the native punktfunk/1 plane + clients for untrusted/WAN use."
+        );
+    }
     let rt = tokio::runtime::Runtime::new().context("build tokio runtime")?;
     rt.block_on(async move {
         // rustls needs a process-wide crypto provider before any TLS config is built.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let _advert = mdns::advertise(&state.host).context("mDNS advertise")?;
-        rtsp::spawn(state.clone()).context("start RTSP server")?;
-        control::spawn(state.clone()).context("start ENet control server")?;
-        match (native, np) {
-            (Some(cfg), Some(np)) => {
-                tracing::info!(
-                    port = cfg.port,
-                    require_pairing = cfg.require_pairing,
-                    "unified host: also serving native punktfunk/1 (QUIC)"
-                );
-                tokio::try_join!(
-                    nvhttp::run(state.clone()),
-                    crate::mgmt::run(state.clone(), mgmt, Some(np.clone())),
-                    crate::punktfunk1::serve(crate::punktfunk1::native_serve_opts(&cfg), np),
-                )?;
-            }
-            _ => {
-                tokio::try_join!(
-                    nvhttp::run(state.clone()),
-                    crate::mgmt::run(state, mgmt, None)
-                )?;
-            }
+        let native_opts = crate::punktfunk1::native_serve_opts(&native);
+        if gamestream {
+            // Unified host: GameStream compat planes + native + mgmt.
+            let _advert = mdns::advertise(&state.host).context("mDNS advertise")?;
+            rtsp::spawn(state.clone()).context("start RTSP server")?;
+            control::spawn(state.clone()).context("start ENet control server")?;
+            tracing::info!(
+                port = native.port,
+                "unified host: GameStream/Moonlight compat + native punktfunk/1 (QUIC)"
+            );
+            tokio::try_join!(
+                nvhttp::run(state.clone()),
+                crate::mgmt::run(state.clone(), mgmt, Some(np.clone())),
+                crate::punktfunk1::serve(native_opts, np),
+            )?;
+        } else {
+            // Secure default: native punktfunk/1 + management API only (no GameStream surface).
+            tracing::info!(
+                port = native.port,
+                "secure host: native punktfunk/1 (QUIC) + management API \
+                 (GameStream OFF — pass --gamestream for stock-Moonlight compat)"
+            );
+            tokio::try_join!(
+                crate::mgmt::run(state.clone(), mgmt, Some(np.clone())),
+                crate::punktfunk1::serve(native_opts, np),
+            )?;
         }
         Ok(())
     })

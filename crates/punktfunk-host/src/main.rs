@@ -6,10 +6,10 @@
 //! `#[cfg(target_os = "linux")]`; the crate compiles everywhere so the workspace builds
 //! on non-Linux dev machines — it just can't run the pipeline there.
 //!
-//! Subcommands: `serve` runs the GameStream-compatible host + management REST API (and, with
-//! `--native`, the native punktfunk/1 host in-process); `punktfunk1-host` runs the native
-//! punktfunk/1 host standalone; `spike` is a capture→encode→file pipeline dev tool that also
-//! round-trips the encoded AUs through a `punktfunk_core` loopback.
+//! Subcommands: `serve` runs the native punktfunk/1 host + management REST API by default, and —
+//! with `--gamestream` — the GameStream/Moonlight-compat planes too (opt-in, trusted-LAN only);
+//! `punktfunk1-host` runs the native punktfunk/1 host standalone; `spike` is a capture→encode→file
+//! pipeline dev tool that also round-trips the encoded AUs through a `punktfunk_core` loopback.
 
 // Scaffold: trait methods and config paths are defined ahead of their backends.
 #![allow(dead_code)]
@@ -103,11 +103,11 @@ fn real_main() -> Result<()> {
     crate::capture::dxgi::install_gpu_pref_hook();
 
     match args.first().map(String::as_str) {
-        // GameStream host control plane (P1.1: mDNS + serverinfo) + management API, and (with
-        // --native) the native punktfunk/1 host in the same process — the unified host.
+        // The host: the native punktfunk/1 plane + management API by default (secure), and — with
+        // --gamestream — the GameStream/Moonlight-compat planes too (opt-in; #5/#9 trusted-LAN caveat).
         Some("serve") => {
-            let (mgmt_opts, native) = parse_serve(&args[1..])?;
-            gamestream::serve(mgmt_opts, native)
+            let (mgmt_opts, native, gamestream) = parse_serve(&args[1..])?;
+            gamestream::serve(mgmt_opts, native, gamestream)
         }
         // Print the management API's OpenAPI document (for client codegen).
         Some("openapi") => {
@@ -332,14 +332,16 @@ fn input_test() -> Result<()> {
     bail!("input-test requires Linux")
 }
 
-/// `serve` options: the management API (GameStream ports are protocol-fixed) + whether to also run
-/// the native punktfunk/1 host in-process (`--native`, the unified host). Returns the mgmt options
-/// and the native host config (`None` = GameStream only). Native pairing is **required by default**
+/// `serve` options. The **native punktfunk/1 plane + management API are the secure default and always
+/// run**; `--gamestream` additionally enables the GameStream/Moonlight-compat planes (opt-in — they
+/// carry the inherent on-path #5/#9 weaknesses, so only on a trusted LAN). Returns the mgmt options,
+/// the native host config, and whether GameStream is enabled. Native pairing is **required by default**
 /// (an open host any LAN device can stream from is insecure); `--open` turns it off.
-fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<punktfunk1::NativeServe>)> {
+fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServe, bool)> {
     let mut opts = mgmt::Options::default();
-    let mut native_port: Option<u16> = None;
+    let mut native_port: u16 = 9777; // the native plane always runs now
     let mut open = false;
+    let mut gamestream = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -365,16 +367,17 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<punktfunk1::Nat
                 }
                 opts.token = Some(token);
             }
-            // Also run the native punktfunk/1 (QUIC) host in this process — the unified host.
-            // Pairing is then armed on demand from the management API / web console.
-            "--native" => native_port = Some(native_port.unwrap_or(9777)),
+            // The native plane is now the DEFAULT (always runs in `serve`); `--native` is kept as an
+            // accepted no-op for back-compat / explicitness.
+            "--native" => {}
             "--native-port" => {
-                native_port = Some(
-                    next()?
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("bad --native-port (want a port number)"))?,
-                )
+                native_port = next()?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad --native-port (want a port number)"))?
             }
+            // Opt into the GameStream/Moonlight-compat planes (off by default — they carry the
+            // inherent on-path #5/#9 weaknesses; only for a trusted LAN).
+            "--gamestream" | "--moonlight" => gamestream = true,
             // Disable mandatory native pairing — any device can connect (trusted single-user
             // setups only). The default REQUIRES pairing.
             "--open" => open = true,
@@ -393,11 +396,11 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, Option<punktfunk1::Nat
     if opts.token.is_none() {
         opts.token = Some(crate::mgmt_token::load_or_generate()?);
     }
-    let native = native_port.map(|port| punktfunk1::NativeServe {
-        port,
+    let native = punktfunk1::NativeServe {
+        port: native_port,
         require_pairing: !open,
-    });
-    Ok((opts, native))
+    };
+    Ok((opts, native, gamestream))
 }
 
 fn parse_spike(args: &[String]) -> Result<Options> {
@@ -502,8 +505,8 @@ fn print_usage() {
         "punktfunk-host — Linux streaming host
 
 USAGE:
-    punktfunk-host serve [OPTIONS]            GameStream host control plane (mDNS + serverinfo …)
-                                              + the management REST API
+    punktfunk-host serve [OPTIONS]            native punktfunk/1 host + management REST API
+                                              (secure default; add --gamestream for Moonlight compat)
     punktfunk-host openapi                    print the management API's OpenAPI document (codegen)
     punktfunk-host punktfunk1-host [OPTIONS]  native punktfunk/1 host (QUIC control + UDP data plane)
     punktfunk-host probe-compositor           exit 0 iff the compositor is up + ready (bringup gate)
@@ -513,9 +516,12 @@ SERVE OPTIONS:
     --mgmt-bind <IP:PORT>        management API address (default: 127.0.0.1:47990)
     --mgmt-token <TOKEN>         bearer token for the management API (or PUNKTFUNK_MGMT_TOKEN);
                                  required when --mgmt-bind is not loopback
-    --native                     also run the native punktfunk/1 (QUIC) host in this process —
-                                 the unified host; pairing is armed from the management API/console
-    --native-port <PORT>         native QUIC port (default 9777; implies --native)
+    --gamestream  (--moonlight)  ALSO run the GameStream/Moonlight-compat planes (nvhttp pairing,
+                                 RTSP, ENet control, _nvstream mDNS). OFF by default — they carry
+                                 inherent on-path weaknesses (plain-HTTP pairing + legacy GCM nonce
+                                 reuse, security-review #5/#9); enable only on a TRUSTED LAN
+    --native                     no-op (the native punktfunk/1 plane always runs in `serve` now)
+    --native-port <PORT>         native QUIC port (default 9777)
     --open                       disable mandatory native pairing (default: pairing REQUIRED —
                                  an open host any LAN device can stream from is insecure)
 
@@ -550,7 +556,7 @@ NOTES:
     (see docs/linux-setup.md). 'synthetic' needs no capture session and always runs.
     Encoded AUs are written to a playable file AND (unless --no-loopback) fed through a
     punktfunk_core host→client loopback that reassembles and byte-verifies each one.
-    Both 'serve --native' and 'punktfunk1-host' advertise the native service over mDNS
+    Both 'serve' and 'punktfunk1-host' advertise the native service over mDNS
     (_punktfunk._udp) for client auto-discovery — 'punktfunk-probe --discover' lists them."
     );
     #[cfg(target_os = "windows")]

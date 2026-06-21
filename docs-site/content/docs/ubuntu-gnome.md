@@ -148,5 +148,8 @@ The host binary lands at `target/release/punktfunk-host`. Write `~/.config/punkt
 step 3, then run it inside your GNOME session:
 
 ```sh
-cargo run --release -p punktfunk-host -- serve --native
+cargo run --release -p punktfunk-host -- serve --gamestream
 ```
+
+(The native plane is always on; `--gamestream` adds the Moonlight-compat surface this guide's
+GameStream ports refer to — trusted LAN only. Drop it for a secure native-only host.)

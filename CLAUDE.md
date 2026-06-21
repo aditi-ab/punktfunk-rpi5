@@ -47,7 +47,7 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   (no re-TOFU shortcut). Clients present persistent identities via QUIC client auth, the host stores
   paired fingerprints (`punktfunk1-paired.json`) and gates sessions with `--require-pairing` (the
   default; `--allow-tofu`/`--open` accept unpaired clients).
-  **LAN auto-discovery**: both `serve --native` and `punktfunk1-host` advertise the native service over
+  **LAN auto-discovery**: both `serve` and `punktfunk1-host` advertise the native service over
   mDNS (`_punktfunk._udp`, `crate::discovery`) with TXT `proto`/`fp`(cert fingerprint to
   pin)/`pair`(required|optional)/`id`; `punktfunk-probe --discover` lists hosts, Apple clients
   browse the same service via NWBrowser (validated cross-LAN 2026-06-12).
@@ -111,7 +111,7 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    slice threads) → `GtkGraphicsOffload`-wrapped picture, PipeWire playback (mic-player
    jitter ring inverted), SDL3 gamepad capture + rumble/lightbar feedback, keyboard via
    exact inverse of the host VK table, absolute mouse + 120-unit scroll. Validated live
-   against `serve --native` on this box: 1080p60, steady 60 fps, capture→decoded p50
+   against `serve` on this box: 1080p60, steady 60 fps, capture→decoded p50
    ≈6.4 ms (debug build). `--connect host[:port]` for scripting. **Swift-parity batch +
    stage 1.5 (2026-06-12 evening)**: capture state machine (click-to-capture,
    Ctrl+Alt+Shift+Q / focus-loss release, held-state flush), app-lifetime SDL gamepad
@@ -176,8 +176,9 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).
-3. **punktfunk/1 protocol growth.** **Done:** unified host (`serve --native` runs GameStream + the
-   punktfunk/1 QUIC host in one process) with native pairing driven over the mgmt API /
+3. **punktfunk/1 protocol growth.** **Done:** unified host (`serve --gamestream` runs GameStream + the
+   punktfunk/1 QUIC host in one process; bare `serve` is the secure native-only default — GameStream is
+   opt-in, trusted-LAN only, security-review #5/#9) with native pairing driven over the mgmt API /
    web console (`mod native_pairing`: arm-on-demand → display PIN, paired-device list).
    **Done:** PIN pairing is the default, host-gated — the host requires pairing and advertises
    `pair=required` unless opted out with `--allow-tofu`/`--open` (then `pair=optional`, accepts
@@ -280,9 +281,9 @@ scanout → KWin `--drm` impossible; everything renders offscreen via `renderD12
 # launcher menu is EMPTY (no apps, no System Settings).
 bash scripts/headless/run-headless-kde.sh 1920x1080
 
-# host (shell 2):
+# host (shell 2): bare `serve` is native-only (secure default); add --gamestream for Moonlight compat.
 WAYLAND_DISPLAY=wayland-kde XDG_CURRENT_DESKTOP=KDE PUNKTFUNK_VIDEO_SOURCE=virtual \
-PUNKTFUNK_ZEROCOPY=1 cargo run -rp punktfunk-host -- serve
+PUNKTFUNK_ZEROCOPY=1 cargo run -rp punktfunk-host -- serve --gamestream
 
 # punktfunk/1 native loopback test (no Moonlight needed; same env as serve, listener persists
 # across sessions — bound it with --max-sessions):

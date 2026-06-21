@@ -49,8 +49,10 @@ gamescope, Mutter, and Sway/wlroots backends), encoded with GPU **zero-copy** (d
 NVENC) up to 5120×1440@240. The native **`punktfunk/1`** protocol adds a QUIC control plane and a
 GF(2¹⁶) Leopard-FEC + AES-GCM data plane (p50 ~0.8 ms capture→reassembled at 720p120), with
 mid-stream mode renegotiation and a wall-clock skew handshake so latency stays valid across machines.
-Both protocols run from **one process** (`punktfunk-host serve --native`) and are managed through a
-REST API and web console. Builds against FFmpeg 7 or 8.
+Both run from **one process**: bare `punktfunk-host serve` is the **secure native-only default**
+(`punktfunk/1` + the management API/web console), and `serve --gamestream` additionally enables the
+GameStream/Moonlight-compat planes (opt-in, trusted-LAN only — GameStream has inherent on-path
+weaknesses). The host is managed through a REST API and web console. Builds against FFmpeg 7 or 8.
 
 Full milestone status: **[docs.punktfunk.unom.io/docs/status](https://docs.punktfunk.unom.io/docs/status)** ·
 roadmap: **[/docs/roadmap](https://docs.punktfunk.unom.io/docs/roadmap)**.
@@ -69,7 +71,8 @@ Windows host (NVIDIA-only) also ships as a signed installer.
 | **Windows** (NVIDIA, x64) | signed `setup.exe` from the package registry | [Windows Host](https://docs.punktfunk.unom.io/docs/windows-host) |
 
 `punktfunk-host` is the streaming host; `punktfunk-web` is the browser console (pairing + status).
-After install, run `punktfunk-host serve --native` inside your desktop session, then pair from the web
+After install, run `punktfunk-host serve` inside your desktop session (the secure native default;
+add `--gamestream` on a trusted LAN if you also want stock Moonlight clients), then pair from the web
 console. Full instructions: **[docs.punktfunk.unom.io/docs/install](https://docs.punktfunk.unom.io/docs/install)**.
 
 ## Connect a client

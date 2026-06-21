@@ -22,9 +22,11 @@ Each one covers the NVIDIA driver, the dependencies, and how to build and run th
 From a terminal **inside your desktop session** (so the host can reach your compositor):
 
 ```sh
-punktfunk-host serve --native
+punktfunk-host serve
 ```
 
+This is the secure native-only default — the native `punktfunk/1` plane plus the web console. To also
+serve stock Moonlight clients, add `--gamestream` (trusted-LAN only; see [Moonlight](/docs/moonlight)).
 The host starts listening and prints its identity fingerprint. It advertises itself on your local
 network, so clients can find it by name. Leave it running. (To start it automatically at boot, see
 [Running as a Service](/docs/running-as-a-service).)

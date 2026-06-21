@@ -850,7 +850,7 @@ async fn get_native_pairing(State(st): State<Arc<MgmtState>>) -> Json<NativePair
     request_body = ArmNativePairing,
     responses(
         (status = OK, description = "Pairing armed; the response carries the PIN to display", body = NativePairStatus),
-        (status = SERVICE_UNAVAILABLE, description = "Native host not enabled (run `serve --native`)", body = ApiError),
+        (status = SERVICE_UNAVAILABLE, description = "Native host not available in this process", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
@@ -861,7 +861,7 @@ async fn arm_native_pairing(
     let Some(np) = &st.native else {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "native host not enabled (run `serve --native`)",
+            "native host not available in this process",
         );
     };
     let ttl = req.ttl_secs.unwrap_or(120).clamp(15, 600);

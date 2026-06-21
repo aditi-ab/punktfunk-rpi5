@@ -70,7 +70,7 @@ Then log out and back in. On other distros this is `sudo usermod -aG input $USER
   manually.
 - Prefer a **wired** connection or 5 GHz Wi-Fi between host and client.
 - Streaming to **many devices at once** shares the GPU encoder. The production host
-  (`serve --native`) handles one native session at a time, with extra clients queued; heavy load is
+  (`serve`) handles one native session at a time, with extra clients queued; heavy load is
   usually bitrate-bound, so lower the bitrate first.
 
 ## Still stuck?

@@ -29,9 +29,10 @@ see [Status & Progress](/docs/status).
 
 ## ✅ Shipped
 
-- **The host, two ways.** A GameStream host any [Moonlight](/docs/moonlight) client can use, and the
-  lower-latency native [`punktfunk/1`](/docs/how-it-works) protocol (QUIC control + UDP data with
-  GF(2¹⁶) Leopard FEC + AES-GCM). Both run from one process.
+- **The host, two ways.** The lower-latency native [`punktfunk/1`](/docs/how-it-works) protocol (QUIC
+  control + UDP data with GF(2¹⁶) Leopard FEC + AES-GCM) — the secure default — and, opt-in via
+  `serve --gamestream`, a GameStream host any [Moonlight](/docs/moonlight) client can use. Both run
+  from one process.
 - **Native-resolution virtual displays** on Linux across KWin, GNOME/Mutter, gamescope, and
   Sway/wlroots, with a fully zero-copy GPU path to NVENC (stable 240 fps at 5120×1440).
 - **A native Windows host** (NVIDIA, x64) — a signed installer with secure-desktop capture and a

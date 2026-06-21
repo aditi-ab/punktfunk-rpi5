@@ -51,9 +51,10 @@ default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (3000).
 - **Config:** `~/.config/punktfunk/host.env` (encoder/compositor) and `web.env` (generated web login
   password + session secret). Trust material (`cert.pem`, `mgmt-token`, `punktfunk1-paired.json`) lives
   here too and persists across updates.
-- **Services:** `~/.config/systemd/user/punktfunk-host.service` (runs `serve --native --mgmt-bind
-  0.0.0.0:47990`, `+ --open` if chosen) and `punktfunk-web.service`. Linger is enabled so they run
-  without a login session.
+- **Services:** `~/.config/systemd/user/punktfunk-host.service` (runs `serve --gamestream --mgmt-bind
+  0.0.0.0:47990`, `+ --open` if chosen — `--gamestream` adds the Moonlight-compat planes so the Deck's
+  Game Mode also streams to stock Moonlight; the native `punktfunk/1` plane is always on) and
+  `punktfunk-web.service`. Linger is enabled so they run without a login session.
 - **System tuning (sudo):** `/etc/sysctl.d/99-punktfunk-net.conf` (32 MB UDP buffers — the #1
   high-bitrate lever), `/etc/udev/rules.d/60-punktfunk.rules`, and `$USER` in the `input` group.
 

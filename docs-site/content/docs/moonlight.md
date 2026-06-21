@@ -11,10 +11,20 @@ a browser, a smart TV, or any device without a native client.
 > discovery/pairing — including **Windows** and **Android** (phone and Android TV). See
 > [Clients](/docs/clients) before reaching for Moonlight.
 
-## 1. Make sure the host is running
+## 1. Make sure the host is running with GameStream enabled
 
-On the host machine, `serve --native` (or your [service](/docs/running-as-a-service)) should be up.
-The host advertises itself on the network, so Moonlight usually finds it on its own.
+Moonlight needs the GameStream planes, which are **opt-in**. Run the host with `--gamestream`:
+
+```sh
+punktfunk-host serve --gamestream
+```
+
+(Bare `serve` is the secure native-only default and stock Moonlight clients can't connect to it; the
+native plane is always on, and `--gamestream` adds the Moonlight-compat surface.) GameStream pairs over
+plain HTTP and its legacy control encryption is weaker than the native plane's, so only enable it on a
+**trusted LAN**. If you run the host as a [service](/docs/running-as-a-service), make sure its
+`ExecStart` includes `--gamestream`. The host advertises itself on the network, so Moonlight usually
+finds it on its own.
 
 ## 2. Add the host in Moonlight
 

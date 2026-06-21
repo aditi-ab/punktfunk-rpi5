@@ -102,11 +102,12 @@ so it's a much lighter sysext than the host.
 
 If the host box runs a firewall, open the ports it listens on. The **native `punktfunk/1`** plane:
 
-- **QUIC control plane: UDP 9777** (`serve --native --native-port N` to change).
+- **QUIC control plane: UDP 9777** (`serve --native-port N` to change).
 - **Data plane: an *ephemeral* UDP port** — negotiated per session, so there is no fixed port to
   open. For a restrictive firewall you'd need to allow a UDP range (the repo does not pin one).
 
-And the **GameStream / Moonlight** ports (fixed):
+And the **GameStream / Moonlight** ports (fixed) — only needed if you run the host with
+`serve --gamestream` (opt-in, trusted LAN only); bare `serve` is native-only and doesn't open these:
 
 | Port | Proto | Purpose |
 |---|---|---|

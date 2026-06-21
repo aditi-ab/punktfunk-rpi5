@@ -3,8 +3,13 @@ title: Running as a Service
 description: Start the host at boot — for a desktop you log into, or a fully headless always-on machine.
 ---
 
-Running `serve --native` in a terminal is fine for trying punktfunk out. To make a machine an
+Running `serve` in a terminal is fine for trying punktfunk out. To make a machine an
 always-available host, run it as a service. There are two cases.
+
+> The bundled unit `scripts/punktfunk-host.service` runs `serve --gamestream`, so it serves both the
+> native `punktfunk/1` plane and stock [Moonlight](/docs/moonlight) clients. For a **secure native-only
+> host** (no GameStream — its pairing runs over plain HTTP and its legacy encryption is weaker;
+> security-review #5/#9), drop `--gamestream` from the unit's `ExecStart` and use bare `serve`.
 
 ## A. A desktop you log into
 

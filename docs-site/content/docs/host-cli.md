@@ -6,18 +6,30 @@ description: The punktfunk-host commands and the flags you'll actually use.
 The host is one binary, `punktfunk-host`. Most of the time you'll run a single command; the rest reads
 its settings from [`host.env`](/docs/configuration).
 
-## `serve --native`
+## `serve`
 
-The normal way to run a host. Starts the unified host: the GameStream server (for Moonlight) **and**
-the native `punktfunk/1` server, plus the management API/web console — all in one process.
+The normal way to run a host. By default `serve` starts the **secure native host**: the native
+`punktfunk/1` server (QUIC, SPAKE2 PIN pairing, per-direction AEAD) plus the management API/web
+console — all in one process. The native plane is **always on**; there is no flag to turn it off.
 
 ```sh
-punktfunk-host serve --native
+punktfunk-host serve
+```
+
+Add `--gamestream` (alias `--moonlight`) to **also** run the GameStream/Moonlight-compatible planes
+(nvhttp pairing, RTSP, ENet control, `_nvstream` mDNS) — required for stock [Moonlight](/docs/moonlight)
+clients. This is **opt-in** because GameStream carries inherent on-path weaknesses (pairing over plain
+HTTP; its legacy control encryption can reuse GCM nonces — security-review #5/#9), so enable it **only
+on a trusted LAN**. The native plane is immune to those issues.
+
+```sh
+punktfunk-host serve --gamestream
 ```
 
 | Flag | Meaning |
 |---|---|
-| `--native` | Also run the native `punktfunk/1` server (recommended; enables the native clients and discovery). |
+| `--gamestream` / `--moonlight` | Also run the GameStream/Moonlight-compat planes (for stock Moonlight clients). Opt-in, trusted-LAN only — see above. |
+| `--native` | No-op. The native `punktfunk/1` server always runs in `serve`; kept only for backward compatibility. |
 | `--native-port <PORT>` | Native QUIC port (default `9777`). |
 | `--open` | Don't require pairing — serve any device on the network. Off by default; only for trusted single-user setups. |
 | `--mgmt-bind <IP:PORT>` | Management API address (default loopback `127.0.0.1:47990`). |
@@ -29,7 +41,7 @@ The management API is **always HTTPS with bearer-token auth**. If you don't pass
 is auto-generated and persisted to `~/.config/punktfunk/mgmt-token`; `--mgmt-token` only overrides it. A
 token is **required** when you bind the API off loopback with `--mgmt-bind`.
 
-By default the host **requires pairing** — see [Pairing & Trust](/docs/pairing). On `serve --native` you
+By default the host **requires pairing** — see [Pairing & Trust](/docs/pairing). On `serve` you
 **arm pairing from the web console** (or mgmt API); the host then displays a 4-digit PIN. Pass `--open` to
 turn off the mandatory-pairing default and serve any device on the network (trusted single-user setups
 only). The pairing flags below are `punktfunk1-host`-only and do **not** apply to `serve`.
@@ -54,10 +66,10 @@ punktfunk-host punktfunk1-host --source virtual
 | `--require-pairing` | Only serve paired devices (implies `--allow-pairing`). |
 
 `--max-concurrent`, `--allow-pairing`, and `--require-pairing` are **`punktfunk1-host`-only** — `serve` does not
-accept them. On `serve --native` you arm pairing from the web console instead, and concurrency is not
+accept them. On `serve` you arm pairing from the web console instead, and concurrency is not
 yet capped from the command line.
 
-Both `serve --native` and `punktfunk1-host` advertise the host on the network so clients can discover it. List
+Both `serve` and `punktfunk1-host` advertise the host on the network so clients can discover it. List
 hosts from another machine with `punktfunk-probe --discover`.
 
 ## Environment

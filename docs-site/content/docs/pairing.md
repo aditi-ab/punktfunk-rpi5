@@ -40,13 +40,13 @@ PIN ceremony before it can stream. It's the right path for the *first* device (b
 admitted anything) or when you're at the client and the console isn't handy.
 
 Pairing has to be **armed** on the host before a client can pair (so a random device can't pair
-itself). On the production host (`serve --native`), this is done from the **web console**: open the
+itself). On the production host (`serve`), this is done from the **web console**: open the
 host's management console, click to arm pairing, and the host displays a 4-digit PIN along with the
 list of paired devices. This works on a headless host over the network — there is no command-line flag
 to arm pairing on `serve`.
 
 (The standalone headless test host, `punktfunk1-host`, takes `--allow-pairing`/`--require-pairing` on its
-command line instead; the production `serve --native` host arms pairing from the console.)
+command line instead; the production `serve` host arms pairing from the console.)
 
 Then, on the client:
 
@@ -61,7 +61,7 @@ the right setting on a shared network: a device has to complete the PIN ceremony
 connect.
 
 If you're on a fully trusted single-user network and want to skip pairing, run the host open with
-`serve --native --open` (or `punktfunk1-host --allow-tofu` for the standalone host) — it then advertises
+`serve --open` (or `punktfunk1-host --allow-tofu` for the standalone host) — it then advertises
 `pair=optional` and accepts unpaired clients. Requiring pairing is strongly recommended.
 
 ## Trust-on-first-use (host opt-in)

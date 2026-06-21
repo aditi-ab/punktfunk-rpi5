@@ -58,9 +58,11 @@ const SERVICE_DESCRIPTION: &str =
     "Low-latency desktop/game streaming host. Launches the punktfunk host into the active session.";
 
 /// The host subcommand the service launches, overridable via `PUNKTFUNK_HOST_CMD` in host.env.
-/// `serve --native` runs the GameStream (Moonlight) host + the native punktfunk/1 QUIC host in one
-/// process — the unified host an end user wants.
-const DEFAULT_HOST_CMD: &str = "serve --native";
+/// `serve --gamestream` runs the native punktfunk/1 QUIC host (always on) PLUS the GameStream
+/// (Moonlight) compat planes — the unified host a Windows end user typically wants (Moonlight is the
+/// common Windows client). Drop `--gamestream` for a secure native-only host (no plain-HTTP pairing /
+/// legacy GCM nonce reuse — security-review #5/#9; native clients only).
+const DEFAULT_HOST_CMD: &str = "serve --gamestream";
 
 /// Event handles shared between the SCM control handler (which signals them) and the supervision loop
 /// (which waits on them). Stored as raw `isize` so the `'static + Send` handler can reach them without
@@ -619,8 +621,9 @@ fn ensure_default_host_env() -> Result<()> {
         PUNKTFUNK_SECURE_DDA=1\n\
         RUST_LOG=info\n\
         \n\
-        # The host subcommand the service launches (default: serve --native).\n\
-        # PUNKTFUNK_HOST_CMD=serve --native\n\
+        # The host subcommand the service launches (default: serve --gamestream = native + Moonlight\n\
+        # compat). Use `serve` for a SECURE native-only host (no GameStream #5/#9 surface).\n\
+        # PUNKTFUNK_HOST_CMD=serve --gamestream\n\
         \n\
         # Force a specific NVENC render GPU by name substring (multi-GPU boxes only):\n\
         # PUNKTFUNK_RENDER_ADAPTER=4090\n";
