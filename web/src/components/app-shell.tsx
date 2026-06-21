@@ -80,7 +80,11 @@ export function AppShell({ children }: { children: ReactNode }) {
             activeProps={{ className: 'text-[var(--brand-light)]' }}
           >
             <Icon className="size-5 shrink-0" />
-            <span className="w-full text-center text-[10px] leading-tight">{label()}</span>
+            {/* Fixed two-line-tall box so a 1- or 2-line label keeps every icon
+                at the same height (the labels vary by locale). */}
+            <span className="flex h-7 w-full items-center justify-center text-center text-[10px] leading-tight">
+              {label()}
+            </span>
           </Link>
         ))}
       </nav>
