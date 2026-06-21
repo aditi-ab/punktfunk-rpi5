@@ -12,6 +12,10 @@ name: android
 on:
   push:
     branches: [main]
+    # Single project version: a `vX.Y.Z` tag is THE release (uploads to Play's `alpha` closed
+    # track for manual promotion + attaches the .aab/.apk to the unified Gitea Release). A main
+    # push is canary (Play `internal`).
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -69,11 +73,24 @@ jobs:
           VERSION_CODE: ${{ github.run_number }}
         run: ./gradlew :app:assembleDebug --stacktrace
 
+      # Single source of the version name + the Play track for the release steps below. versionCode
+      # stays github.run_number (monotonic across both tracks; Play rejects a regressed code).
+      - name: Version + channel
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) VN="${GITHUB_REF_NAME#v}"; TRACK="alpha" ;;   # alpha = built-in closed testing
+            *)            VN="0.3.0-ci${GITHUB_RUN_NUMBER}"; TRACK="internal" ;;
+          esac
+          echo "VERSION_NAME=$VN" >> "$GITHUB_ENV"
+          echo "PLAY_TRACK=$TRACK" >> "$GITHUB_ENV"
+          echo "android version $VN -> Play track '$TRACK'"
+
       - name: Build Release (signed AAB + universal APK)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         working-directory: clients/android
         env:
-          VERSION_CODE: ${{ github.run_number }}
+          VERSION_CODE: ${{ github.run_number }}   # VERSION_NAME comes from the Version+channel step (GITHUB_ENV)
           RELEASE_KEYSTORE_FILE: "../release.jks"
           RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
@@ -85,33 +102,52 @@ jobs:
 
       # Publish BEFORE the Play upload so artifacts land even while the Play step is still failing.
       # Generic registry is public for reads — matches windows-msix.yml / deb.yml (REGISTRY_TOKEN, user enricobuehler).
-      - name: Publish AAB + APK to Gitea generic registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      # main = canary store + `canary/` sideload alias; a `vX.Y.Z` tag = `latest/` alias + attached
+      # to the unified Gitea Release.
+      - name: Publish to generic registry + attach to Gitea release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         env:
           REGISTRY: git.unom.io
           OWNER: unom
           PKG: punktfunk-android
           VERSION: ${{ github.run_number }}
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
           AAB=clients/android/app/build/outputs/bundle/release/app-release.aab
           APK=clients/android/app/build/outputs/apk/release/app-release.apk
-          base="https://$REGISTRY/api/packages/$OWNER/generic/$PKG/$VERSION"
-          curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$AAB" "$base/punktfunk-android-r$VERSION.aab"
-          curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$APK" "$base/punktfunk-android-r$VERSION.apk"
-          echo "Published artifacts (versionCode=$VERSION):"
-          echo "  $base/punktfunk-android-r$VERSION.aab"
-          echo "  $base/punktfunk-android-r$VERSION.apk"
+          base="https://$REGISTRY/api/packages/$OWNER/generic/$PKG"
+          # 1) immutable, run-number-versioned store (sideload + provenance)
+          curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$AAB" "$base/$VERSION/punktfunk-android-r$VERSION.aab"
+          curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$APK" "$base/$VERSION/punktfunk-android-r$VERSION.apk"
+          echo "published store version $VERSION (versionCode)"
+          # 2) channel alias for a predictable sideload URL: stable -> latest/, canary -> canary/
+          case "$GITHUB_REF" in refs/tags/v*) ALIAS=latest ;; *) ALIAS=canary ;; esac
+          curl -fsS -o /dev/null --user "enricobuehler:$REGISTRY_TOKEN" -X DELETE "$base/$ALIAS/punktfunk-android.apk" || true
+          curl -fsS --user "enricobuehler:$REGISTRY_TOKEN" --upload-file "$APK" "$base/$ALIAS/punktfunk-android.apk"
+          echo "sideload alias: $base/$ALIAS/punktfunk-android.apk"
+          # 3) on a real release, attach the .aab + .apk to the unified Gitea Release (X.Y.Z names)
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              . scripts/ci/gitea-release.sh
+              RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+              upsert_asset "$RID" "$AAB" "punktfunk-${VERSION_NAME}.aab"
+              upsert_asset "$RID" "$APK" "punktfunk-${VERSION_NAME}.apk"
+              ;;
+          esac
 
       # Direct Publishing-API upload instead of r0adkll/upload-google-play — that action hides the
       # real API error behind "Unknown error occurred."; this prints it. stdlib + openssl only (no
       # pip), reuses SERVICE_ACCOUNT_JSON (raw JSON or base64), auto-handles changesNotSentForReview.
-      - name: Upload to Google Play (Internal Testing)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      # Track: canary main -> `internal`; a vX.Y.Z release -> `alpha` (closed testing) for manual
+      # promotion to production in the Play console.
+      - name: Upload to Google Play
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         env:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
         run: |
+          echo "uploading to Play track '$PLAY_TRACK'"
           python3 clients/android/ci/play-upload.py \
             --package io.unom.punktfunk \
             --aab clients/android/app/build/outputs/bundle/release/app-release.aab \
-            --track internal --status completed
+            --track "$PLAY_TRACK" --status completed

@@ -4,7 +4,8 @@ The Windows client ships as **signed MSIX** packages so Windows boxes get a real
 tile, clean install/uninstall) instead of a loose exe. CI builds + publishes them from
 [`.gitea/workflows/windows-msix.yml`](../../../.gitea/workflows/windows-msix.yml) to Gitea's
 **generic** package registry (`https://git.unom.io/unom/-/packages`), on every `main` push that
-touches the client and on `win-v*` release tags.
+touches the client (canary) and on `vX.Y.Z` release tags (stable) — see
+[Release Channels](https://punktfunk.unom.io/docs/channels).
 
 **Two architectures, one x64 runner.** Both `x64` and `arm64` packages are produced off the single
 x64 Windows runner — `x86_64-pc-windows-msvc` builds natively, `aarch64-pc-windows-msvc` is
@@ -39,9 +40,9 @@ because it owns raw D3D11, Win32 low-level input hooks, WASAPI and SDL3.
 ## Versioning
 
 MSIX requires a strictly 4-part numeric version. The workflow computes:
-- `win-vX.Y.Z` tag → `X.Y.Z.0` (a real client release; `win-v*` is its own tag namespace, kept off
-  the host's `host-v*` and Apple's `v*` to avoid the version-shadow bug).
-- `main` push / `workflow_dispatch` → `0.2.<run_number>.0` (rolling, climbs by run number).
+- `vX.Y.Z` tag → `X.Y.Z.0` (THE release; any `-rc`/`+meta` suffix is dropped for MSIX). Published to
+  the stable `latest/` alias and attached to the unified Gitea Release.
+- `main` push / `workflow_dispatch` → `0.3.<run_number>.0` (canary, climbs by run number; `canary/` alias).
 
 ## Signing & install
 

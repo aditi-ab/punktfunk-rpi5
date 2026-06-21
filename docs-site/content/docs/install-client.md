@@ -7,6 +7,10 @@ This page is the **install path for each client device**. For what each client *
 pick, see [Clients](/docs/clients); to install the **host**, see [Install the Host](/docs/install).
 Whichever client you install, the first connection needs a one-time [pairing](/docs/pairing).
 
+> The links below are the **stable** channel (moves on `vX.Y.Z` releases). For the latest `main`
+> build, use the **canary** channel — TestFlight / Play Internal, the `…Canary.flatpakref`, or the
+> `canary/` download URLs. See [Release Channels](/docs/channels).
+
 ## Pick your device
 
 | Device | Install |

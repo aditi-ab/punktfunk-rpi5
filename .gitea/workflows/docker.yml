@@ -58,16 +58,21 @@ jobs:
 
       - name: Build
         run: |
+          # On a release tag, also tag the image vX.Y.Z so a release pins reproducible web/docs images.
+          EXTRA=""
+          case "$GITHUB_REF" in refs/tags/v*) EXTRA="-t $REGISTRY/$OWNER/${{ matrix.image }}:${GITHUB_REF_NAME}" ;; esac
           docker build --pull ${{ matrix.buildargs }} \
             -f "${{ matrix.dockerfile }}" \
             -t "$REGISTRY/$OWNER/${{ matrix.image }}:latest" \
             -t "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}" \
+            $EXTRA \
             "${{ matrix.context }}"
 
       - name: Push
         run: |
           docker push "$REGISTRY/$OWNER/${{ matrix.image }}:sha-${GITHUB_SHA::8}"
           docker push "$REGISTRY/$OWNER/${{ matrix.image }}:latest"
+          case "$GITHUB_REF" in refs/tags/v*) docker push "$REGISTRY/$OWNER/${{ matrix.image }}:${GITHUB_REF_NAME}" ;; esac
 
   # Deploy the docs site to unom-1, the DMZ services VM website/cms also deploy to
   # (docs.punktfunk.unom.io via Caddy on home-reverse-proxy-1 -> :3220). Same secret set

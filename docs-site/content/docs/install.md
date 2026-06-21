@@ -21,6 +21,11 @@ Each registry is public — no auth, you just trust the repo's signing key. Addi
 one-time step covered in the linked guide; after that, normal `apt upgrade` / `rpm-ostree upgrade`
 tracks new builds automatically.
 
+> **Stable vs canary.** The repos in the per-distro guides are the **stable** channel — it only
+> moves when a `vX.Y.Z` release is cut. For the latest `main` build (fast, possibly broken), point
+> at the **canary** channel instead (`canary` apt distribution / `*-canary` rpm group). See
+> [Release Channels](/docs/channels).
+
 ## Windows (NVIDIA)
 
 punktfunk also runs as a native host on **Windows 10/11 (x64) with an NVIDIA GPU**, shipped as a

@@ -56,19 +56,20 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm run build          # rollup -> clients/decky/dist/index.js
 
-      - name: Version
-        # Tag v1.2.3 -> 1.2.3; main push -> 0.0.1-ciN.g<sha>. Used only for the registry
-        # version path + the zip name (the plugin.json version is the source of truth Decky
-        # reads after install).
+      - name: Version + channel
+        # Tag vX.Y.Z -> X.Y.Z (stable `latest/` alias + Gitea Release); main push -> 0.3.0-ciN.g<sha>
+        # (`canary/` alias). Used for the registry version path + the zip name (the plugin.json
+        # version is the source of truth Decky reads after install — bump it in the release commit).
         working-directory: ${{ gitea.workspace }}
         run: |
           SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
           case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}" ;;
-            *)            V="0.0.1-ci${GITHUB_RUN_NUMBER}.g${SHORT}" ;;
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; ALIAS=latest ;;
+            *)            V="0.3.0-ci${GITHUB_RUN_NUMBER}.g${SHORT}"; ALIAS=canary ;;
           esac
           echo "VERSION=$V" >> "$GITHUB_ENV"
-          echo "decky version $V"
+          echo "ALIAS=$ALIAS" >> "$GITHUB_ENV"
+          echo "decky version $V -> alias '$ALIAS'"
 
       - name: Assemble store-layout zip
         working-directory: ${{ gitea.workspace }}
@@ -102,29 +103,21 @@ jobs:
           curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/punktfunk.zip" \
             "$BASE/$VERSION/punktfunk.zip"
           echo "published $BASE/$VERSION/punktfunk.zip"
-          # 2) Stable `latest/punktfunk.zip` — this is the link to paste into Decky's
-          #    "install from URL". The generic registry rejects re-uploading an existing
-          #    version/file (409), so delete the prior `latest` first (ignore 404 on run #1).
+          # 2) Channel alias (stable release -> latest/, canary main build -> canary/) — the link
+          #    to paste into Decky's "install from URL". The generic registry rejects re-uploading
+          #    an existing version/file (409), so delete the prior alias first (ignore 404 on run #1).
           curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
-            "$BASE/latest/punktfunk.zip" || true
+            "$BASE/$ALIAS/punktfunk.zip" || true
           curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/punktfunk.zip" \
-            "$BASE/latest/punktfunk.zip"
-          echo "install-from-URL link: $BASE/latest/punktfunk.zip"
+            "$BASE/$ALIAS/punktfunk.zip"
+          echo "install-from-URL link: $BASE/$ALIAS/punktfunk.zip"
 
-      - name: Attach zip to the Gitea release (tags only)
-        if: startsWith(gitea.ref, 'refs/tags/')
+      - name: Attach zip to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
         working-directory: ${{ gitea.workspace }}
         env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
-          API="${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}"
-          ID=$(curl -sf -X POST "$API/releases" \
-                 -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
-                 -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"$GITHUB_REF_NAME\"}" \
-               | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' \
-               || curl -sf "$API/releases/tags/$GITHUB_REF_NAME" -H "Authorization: token $TOKEN" \
-               | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
-          curl -sf -X POST "$API/releases/$ID/assets?name=punktfunk-${VERSION}.zip" \
-            -H "Authorization: token $TOKEN" \
-            -F "attachment=@$RUNNER_TEMP/punktfunk.zip" >/dev/null
-          echo "attached punktfunk-${VERSION}.zip to release $GITHUB_REF_NAME"
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          upsert_asset "$RID" "$RUNNER_TEMP/punktfunk.zip" "punktfunk-${VERSION}.zip"

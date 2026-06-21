@@ -11,11 +11,12 @@
 # Registry (public, unom org): https://git.unom.io/unom/-/packages  (generic group)
 # Packaging internals: clients/windows/packaging/README.md.
 #
-# Versioning — MSIX requires a strictly 4-part numeric version (no ~/- suffixes), so:
-#   win-vX.Y.Z tag -> X.Y.Z.0  (a real Windows-client release; `win-v*` is its own tag namespace,
-#                               kept off the host's `host-v*` and the Apple `v*` to avoid the
-#                               version-shadow class of bug — see deb.yml).
-#   main push / dispatch -> 0.2.<run_number>.0  (rolling; climbs monotonically by run number).
+# Versioning — single project version; MSIX requires a strictly 4-part numeric version, so:
+#   vX.Y.Z tag -> X.Y.Z.0  (THE release; any -rc/+meta pre-release suffix is dropped for MSIX).
+#                Published to the generic registry + the stable `latest/` alias + attached to the
+#                unified Gitea Release alongside every other platform's artifact.
+#   main push / dispatch -> 0.3.<run_number>.0  (canary; climbs monotonically by run number).
+#                Published to the generic registry + the `canary/` alias.
 # Both arches share the version; artifacts are arch-suffixed (..._x64.msix / ..._arm64.msix).
 #
 # Signing (packaging/pack-msix.ps1): if the MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD Actions secrets
@@ -34,7 +35,7 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows-msix.yml'
-    tags: ['win-v*']
+    tags: ['v*']
   workflow_dispatch:
 
 env:
@@ -72,10 +73,11 @@ jobs:
           "CARGO_TARGET_DIR=${{ matrix.td }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "FFMPEG_DIR=${{ matrix.ffmpeg }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           rustup target add ${{ matrix.target }}
-          $parts = if ($env:GITHUB_REF -like 'refs/tags/win-v*') {
-            ($env:GITHUB_REF_NAME -replace '^win-v', '').Split('.')
+          $parts = if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            # MSIX needs a purely-numeric 4-part version: drop any -rc/+meta pre-release suffix.
+            (($env:GITHUB_REF_NAME -replace '^v', '') -replace '[-+].*$', '').Split('.')
           } else {
-            @('0', '2', $env:GITHUB_RUN_NUMBER)
+            @('0', '3', $env:GITHUB_RUN_NUMBER)
           }
           while ($parts.Count -lt 4) { $parts += '0' }
           $v = ($parts[0..3] -join '.')
@@ -101,11 +103,43 @@ jobs:
         env:
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $base = "https://$($env:REGISTRY)/api/packages/$($env:OWNER)/generic/$($env:PKG)"
+          # stable release -> `latest/` alias; canary main build -> `canary/` alias.
+          $alias = if ($env:GITHUB_REF -like 'refs/tags/v*') { 'latest' } else { 'canary' }
+          # version-less, arch-suffixed alias names so each channel keeps one predictable URL.
+          $aliasNames = @{
+            "$($env:MSIX_PATH)"     = "$($env:PKG)_${{ matrix.arch }}.msix"
+            "$($env:MSIX_CER_PATH)" = "$($env:PKG)_${{ matrix.arch }}.cer"
+          }
           $files = @($env:MSIX_PATH, $env:MSIX_CER_PATH) | Where-Object { $_ -and (Test-Path $_) }
           if (-not $files) { throw "pack produced no artifacts to publish" }
+          function Put($f, $url) {
+            curl.exe -fsS --user "enricobuehler:$($env:REGISTRY_TOKEN)" --upload-file "$f" "$url"
+            if ($LASTEXITCODE -ne 0) { throw "upload failed ($LASTEXITCODE): $url" }
+            Write-Output "published $url"
+          }
           foreach ($f in $files) {
             $name = Split-Path $f -Leaf
-            $url = "https://$($env:REGISTRY)/api/packages/$($env:OWNER)/generic/$($env:PKG)/$($env:MSIX_VERSION)/$name"
-            curl.exe -fsS --user "enricobuehler:$($env:REGISTRY_TOKEN)" --upload-file "$f" "$url"
-            Write-Output "published $name -> $url"
+            # 1) immutable, versioned path
+            Put $f "$base/$($env:MSIX_VERSION)/$name"
+            # 2) channel alias (delete-then-reupload; the generic registry 409s on an existing file)
+            $an = $aliasNames["$f"]
+            curl.exe -fsS -o NUL --user "enricobuehler:$($env:REGISTRY_TOKEN)" -X DELETE "$base/$alias/$an" 2>$null
+            Put $f "$base/$alias/$an"
+          }
+
+      # On a real release, also attach the MSIX (+ its .cer) to the unified Gitea Release. Both
+      # arch legs attach to the same release concurrently — the helper's create-or-fetch handles
+      # the race, and x64/arm64 filenames differ so the assets don't collide.
+      - name: Attach MSIX to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.ps1
+          $rid = Ensure-GiteaRelease -Tag $env:GITHUB_REF_NAME -Name $env:GITHUB_REF_NAME -Prerelease 'auto'
+          foreach ($f in @($env:MSIX_PATH, $env:MSIX_CER_PATH)) {
+            if ($f -and (Test-Path $f)) { Upsert-GiteaAsset -ReleaseId $rid -File $f }
           }

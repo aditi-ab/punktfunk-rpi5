@@ -9,7 +9,7 @@
 # Output: dist/punktfunk-<version>-<release>.<arch>.rpm  (+ the -debuginfo/-debugsource subpkgs)
 set -euo pipefail
 
-PF_VERSION="${PF_VERSION:-0.2.0}"
+PF_VERSION="${PF_VERSION:-0.3.0}"   # canary base; keep one minor ahead of the latest stable release
 PF_RELEASE="${PF_RELEASE:-1}"
 # PF_WITH_WEB=1 builds the punktfunk-web subpackage too (needs `bun` on PATH — present in the CI
 # builder image, not in a plain mock chroot). Default off so a bare `rpmbuild`/COPR still works.

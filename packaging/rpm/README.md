@@ -1,11 +1,13 @@
 # punktfunk-host — RPM (Bazzite / Fedora Atomic) via the Gitea registry
 
 `punktfunk-host` is published as an RPM to **Gitea's RPM package registry** in the public `unom`
-org (group `bazzite`), so Bazzite / Fedora Atomic hosts layer and update it with `rpm-ostree`.
-CI (`.gitea/workflows/rpm.yml`) builds and publishes on every push to `main` (a rolling
-`0.2.0-0.ciN.<sha>` build, which outranks the stray `0.1.1` so `rpm-ostree upgrade` always gets the
-latest — no version pin needed) and on **host-scoped** `host-v*` tags (a clean `X.Y.Z-1`; the Apple
-client's `v*` tags deliberately do **not** publish a host RPM). The RPM is built in the
+org (stable groups `bazzite`/`fedora-44`, canary groups `bazzite-canary`/`fedora-44-canary`), so
+Bazzite / Fedora Atomic hosts layer and update it with `rpm-ostree`. CI (`.gitea/workflows/rpm.yml`)
+builds and publishes on every push to `main` (a rolling `0.3.0-0.ciN.<sha>` build to the `*-canary`
+groups) and on `vX.Y.Z` tags (a clean `X.Y.Z-1` to the base groups, plus attached to the unified
+Gitea Release) — separate repos, so a stable box never jumps to a canary build (see
+[Release Channels](https://punktfunk.unom.io/docs/channels)). The `baseurl` below subscribes to the
+`bazzite` stable group; use `bazzite-canary` for the latest main builds. The RPM is built in the
 Fedora 43 image (`ci/fedora-rpm.Dockerfile`) so its auto-generated library Requires
 (`libavcodec.so.NN`, …) match Bazzite's sonames; the NVIDIA driver lib (`libcuda.so.1`) is
 excluded — NVENC/EGL come from whatever NVIDIA stack the host runs (a weak Recommends).

@@ -17,12 +17,12 @@
 ################################################################################
 
 Name:           punktfunk
-# Version/Release are overridable so CI can stamp a rolling snapshot: a main build passes
-#   --define "pf_version 0.2.0" --define "pf_release 0.ci42.gdeadbee"
-# (Release starting "0." sorts BEFORE the eventual "1" release; base 0.2.0 sits ABOVE the stray
-# 0.1.1), a host-v* tag passes the clean version with "pf_release 1". A plain `rpmbuild` (or COPR)
-# with no defines builds 0.2.0-1.
-Version:        %{?pf_version}%{!?pf_version:0.2.0}
+# Version/Release are overridable so CI can stamp a rolling snapshot: a canary main build passes
+#   --define "pf_version 0.3.0" --define "pf_release 0.ci42.gdeadbee"
+# (Release starting "0." sorts BEFORE the eventual "1" release; the canary base stays one minor
+# ahead of the latest stable), a vX.Y.Z release tag passes the clean version with "pf_release 1".
+# A plain `rpmbuild` (or COPR) with no defines builds 0.3.0-1.
+Version:        %{?pf_version}%{!?pf_version:0.3.0}
 Release:        %{?pf_release}%{!?pf_release:1}%{?dist}
 Summary:        Low-latency desktop/game streaming host (Moonlight-compatible + punktfunk/1)
 

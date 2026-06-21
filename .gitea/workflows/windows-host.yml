@@ -11,10 +11,10 @@
 #
 # Registry (public reads, unom org): https://git.unom.io/unom/-/packages  (generic group)
 #
-# Versioning (free-form; not MSIX's 4-part rule):
-#   host-win-vX.Y.Z tag -> X.Y.Z   (a real host release; own tag namespace, off host-v*/win-v*/v*
-#                                   to avoid the version-shadow bug class — see deb.yml).
-#   main push / dispatch -> 0.2.<run_number>  (rolling; climbs monotonically by run number).
+# Versioning (free-form; not MSIX's 4-part rule) — single project version:
+#   vX.Y.Z tag -> X.Y.Z   (THE release; published + stable `latest/` alias + attached to the
+#                          unified Gitea Release).
+#   main push / dispatch -> 0.3.<run_number>  (canary; `canary/` alias; climbs by run number).
 #
 # Signing reuses the client's MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD secrets (CN=unom). Without them
 # an ephemeral self-signed cert is generated and its public .cer published next to the installer
@@ -36,7 +36,7 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows-host.yml'
-    tags: ['host-win-v*']
+    tags: ['v*']
   workflow_dispatch:
 
 env:
@@ -59,10 +59,10 @@ jobs:
           # (pwsh Out-File utf8 = no BOM, unlike Windows PowerShell 5.1 — keeps the first line clean).
           "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          $v = if ($env:GITHUB_REF -like 'refs/tags/host-win-v*') {
-            $env:GITHUB_REF_NAME -replace '^host-win-v', ''
+          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $env:GITHUB_REF_NAME -replace '^v', ''
           } else {
-            "0.2.$($env:GITHUB_RUN_NUMBER)"
+            "0.3.$($env:GITHUB_RUN_NUMBER)"
           }
           "HOST_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "PUNKTFUNK_BUILD_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -116,13 +116,25 @@ jobs:
           if (-not $files) { throw "pack produced no artifacts to publish" }
           $base = "https://$($env:REGISTRY)/api/packages/$($env:OWNER)/generic/$($env:PKG)"
           foreach ($f in $files) { Publish-File $f "$base/$($env:HOST_VERSION)/$(Split-Path $f -Leaf)" }
-          # On a tagged release, also refresh the stable `latest/` alias (delete-then-reupload, like
-          # flatpak.yml/decky.yml) so there's a predictable download URL.
-          if ($env:GITHUB_REF -like 'refs/tags/host-win-v*') {
-            $aliases = @{ $env:HOST_SETUP_PATH = 'punktfunk-host-setup.exe'; $env:HOST_CER_PATH = 'punktfunk-host-windows.cer' }
-            foreach ($f in $files) {
-              $alias = $aliases[$f]; if (-not $alias) { continue }
-              curl.exe -fsS -o NUL --user "enricobuehler:$($env:REGISTRY_TOKEN)" -X DELETE "$base/latest/$alias" 2>$null
-              Publish-File $f "$base/latest/$alias"
-            }
+          # Refresh the channel alias (delete-then-reupload, like flatpak.yml/decky.yml) for a
+          # predictable download URL: stable release -> `latest/`, canary main build -> `canary/`.
+          $alias = if ($env:GITHUB_REF -like 'refs/tags/v*') { 'latest' } else { 'canary' }
+          $aliasNames = @{ $env:HOST_SETUP_PATH = 'punktfunk-host-setup.exe'; $env:HOST_CER_PATH = 'punktfunk-host-windows.cer' }
+          foreach ($f in $files) {
+            $an = $aliasNames[$f]; if (-not $an) { continue }
+            curl.exe -fsS -o NUL --user "enricobuehler:$($env:REGISTRY_TOKEN)" -X DELETE "$base/$alias/$an" 2>$null
+            Publish-File $f "$base/$alias/$an"
+          }
+
+      # On a real release, also attach the signed installer (+ its .cer) to the unified Gitea Release.
+      - name: Attach host installer to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.ps1
+          $rid = Ensure-GiteaRelease -Tag $env:GITHUB_REF_NAME -Name $env:GITHUB_REF_NAME -Prerelease 'auto'
+          foreach ($f in @($env:HOST_SETUP_PATH, $env:HOST_CER_PATH)) {
+            if ($f -and (Test-Path $f)) { Upsert-GiteaAsset -ReleaseId $rid -File $f }
           }

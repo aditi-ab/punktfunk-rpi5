@@ -13,16 +13,16 @@ name: deb
 on:
   push:
     branches: [main]
-    # HOST-scoped tags only. The Apple client uses `v*` (release.yml); those must NOT trigger a
-    # host publish — a `v0.1.1` client tag previously shipped a host package versioned 0.1.1 that
-    # outranked every rolling build (the version-shadow). Host releases use `host-v*`.
-    tags: ['host-v*']
+    # Single project version: a `vX.Y.Z` tag is THE release for every platform (see
+    # docs-site channels.md). The old version-shadow (a client tag shipping a host package
+    # that outranked rolling builds) is now structurally impossible — main publishes to the
+    # `canary` apt distribution, tags to `stable`, so the two never share a version line.
+    tags: ['v*']
   workflow_dispatch:
 
 env:
   REGISTRY: git.unom.io
   OWNER: unom
-  DISTRIBUTION: stable
   COMPONENT: main
 
 jobs:
@@ -34,19 +34,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Version
-        # host-vX.Y.Z tag -> X.Y.Z (a real host release). A main push -> 0.2.0~ciN.g<sha>: the '~'
-        # sorts it BELOW the eventual 0.2.0 tag, it climbs monotonically by run number, AND it sits
-        # ABOVE the stray 0.1.1, so `apt upgrade` truly moves boxes forward. Computed BEFORE the
-        # build so it's stamped into the binary (PUNKTFUNK_BUILD_VERSION -> build.rs -> --version).
+      - name: Version + channel
+        # vX.Y.Z tag -> X.Y.Z, published to the `stable` apt distribution (a real release).
+        # A main push -> 0.3.0~ciN.g<sha>, published to the `canary` distribution: the '~' sorts
+        # below the eventual 0.3.0 tag, it climbs monotonically by run number, and the canary base
+        # stays one minor AHEAD of the latest stable so a stable->canary box re-point still moves
+        # forward (see channels.md). Computed BEFORE the build so it's stamped into the binary
+        # (PUNKTFUNK_BUILD_VERSION -> build.rs -> --version).
         run: |
           SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
           case "$GITHUB_REF" in
-            refs/tags/host-v*) V="${GITHUB_REF_NAME#host-v}" ;;
-            *)                 V="0.2.0~ci${GITHUB_RUN_NUMBER}.g${SHORT}" ;;
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
+            *)            V="0.3.0~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
           esac
           echo "VERSION=$V" >> "$GITHUB_ENV"
-          echo "package version $V"
+          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
+          echo "package version $V -> apt distribution '$DIST'"
 
       # dpkg-shlibdeps (Depends resolution) + dpkg-deb live in dpkg-dev. The client's link
       # deps are also baked into the rust-ci image, but this job runs against the image
@@ -55,7 +58,8 @@ jobs:
       - name: dpkg-dev + client link deps
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends dpkg-dev \
+          # python3 is used by scripts/ci/gitea-release.sh for the stable-tag release attach.
+          apt-get install -y --no-install-recommends dpkg-dev python3 \
             libgtk-4-dev libadwaita-1-dev libsdl3-dev
 
       # Share ci.yml's cache keys so the release build reuses its registry + target artifacts.
@@ -124,3 +128,17 @@ jobs:
               "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"
           done
           echo "published to $OWNER/debian $DISTRIBUTION/$COMPONENT"
+
+      # On a real release, also attach the .debs to the unified Gitea Release so they're on the
+      # downloads page next to every other platform's artifact (canary builds live in the apt
+      # `canary` distribution above — no release page for those).
+      - name: Attach .debs to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for DEB in dist/*.deb; do
+            upsert_asset "$RID" "$DEB"
+          done

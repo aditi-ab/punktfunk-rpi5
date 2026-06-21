@@ -26,7 +26,9 @@ android {
         targetSdk = 36
         val vCode = (props.getProperty("VERSION_CODE") ?: System.getenv("VERSION_CODE"))
         versionCode = vCode?.toInt() ?: 1
-        versionName = "0.0.2" // bumped for first Play Store release
+        // versionName is the single project version, threaded from CI (a vX.Y.Z release or a
+        // canary string). versionCode stays the monotonic run number (Play rejects regressions).
+        versionName = (props.getProperty("VERSION_NAME") ?: System.getenv("VERSION_NAME")) ?: "0.0.2"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 

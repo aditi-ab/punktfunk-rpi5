@@ -46,6 +46,19 @@ name: release
 
 on:
   push:
+    # Canary: a relevant main push uploads the iOS + macOS builds to TestFlight (Apple's own
+    # canary channel) — no notarized DMG, no tvOS (those are stable-only; see the per-step gates).
+    # Heavy on the shared mac-mini runner, so paths-filtered; the TestFlight steps are
+    # continue-on-error until the App Store Connect record exists, so this no-ops until then.
+    branches: [main]
+    paths:
+      - 'clients/apple/**'
+      - 'crates/punktfunk-core/**'
+      - 'scripts/build-xcframework.sh'
+      - 'Cargo.lock'
+      - '.gitea/workflows/release.yml'
+    # Stable: a `vX.Y.Z` tag is THE release — notarized DMG attached to the unified Gitea Release
+    # + macOS/iOS/tvOS to TestFlight for manual promotion to the App Store.
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -87,8 +100,8 @@ jobs:
       - name: Version from tag
         run: |
           case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}" ;;
-            *)            V="0.0.${GITHUB_RUN_NUMBER}" ;;
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; V="${V%%-*}" ;;  # App Store marketing version is numeric X.Y.Z (drop -rc)
+            *)            V="0.3.0" ;;                                # canary marketing version; the build number disambiguates
           esac
           echo "VERSION=$V" >> "$GITHUB_ENV"
           echo "BUILD_NUM=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
@@ -105,8 +118,16 @@ jobs:
           "$RUSTUP" toolchain install nightly --profile minimal
           "$RUSTUP" component add rust-src --toolchain nightly
 
-      - name: Build PunktfunkCore.xcframework (mac + iOS + tvOS)
-        run: BUILD_IOS=1 BUILD_TVOS=1 bash scripts/build-xcframework.sh
+      - name: Build PunktfunkCore.xcframework (mac + iOS; + tvOS on stable tags)
+        # tvOS uses nightly -Zbuild-std (slow) — build it only for a real release, not on every
+        # canary main push.
+        run: |
+          TV=""
+          case "$GITHUB_REF" in refs/tags/v*) TV="BUILD_TVOS=1" ;; esac
+          # `env` (not a bare prefix): a $TV-expanded `NAME=val` word is NOT re-promoted to a shell
+          # assignment, so `BUILD_IOS=1 $TV bash …` would try to RUN `BUILD_TVOS=1` (exit 127). env
+          # treats its leading NAME=val args as assignments post-expansion; empty $TV is a no-op.
+          env BUILD_IOS=1 $TV bash scripts/build-xcframework.sh
 
       - name: Stage App Store Connect API key
         env:
@@ -116,6 +137,9 @@ jobs:
           chmod 600 "$RUNNER_TEMP/asc.p8"
 
       - name: macOS — archive, codesign Developer ID, notarize, DMG
+        # Stable releases only — the notarized DMG is a Gatekeeper/direct-download artifact, not
+        # relevant to TestFlight testers (the canary channel). Skipped on canary main pushes.
+        if: startsWith(gitea.ref, 'refs/tags/v')
         run: |
           # Archive UNSIGNED, then codesign with the Developer ID Application identity from the
           # login keychain. Unsigned archive sidesteps Xcode's keychain-access-groups
@@ -154,23 +178,14 @@ jobs:
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcrun stapler staple "$DMG"
           echo "DMG=$DMG" >> "$GITHUB_ENV"
 
-      - name: Attach DMG to Gitea release
-        if: startsWith(gitea.ref, 'refs/tags/')
+      - name: Attach DMG to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
         env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
-          API="${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}"
-          # Create the release (409 -> already exists, fetch it instead).
-          ID=$(curl -sf -X POST "$API/releases" \
-                 -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
-                 -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"$GITHUB_REF_NAME\"}" \
-               | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' \
-               || curl -sf "$API/releases/tags/$GITHUB_REF_NAME" -H "Authorization: token $TOKEN" \
-               | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
-          curl -sf -X POST "$API/releases/$ID/assets?name=Punktfunk-$VERSION.dmg" \
-            -H "Authorization: token $TOKEN" \
-            -F "attachment=@$DMG" >/dev/null
-          echo "attached Punktfunk-$VERSION.dmg to release $GITHUB_REF_NAME"
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          upsert_asset "$RID" "$DMG" "Punktfunk-$VERSION.dmg"
 
       - name: macOS App Store — archive + upload to TestFlight
         if: gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true'
@@ -278,7 +293,9 @@ jobs:
             -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
 
       - name: tvOS — archive + upload to TestFlight
-        if: gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true'
+        # Stable only — the tvOS xcframework slice is built just for releases (above), and the
+        # App Store Connect record + runner platform are tvOS prerequisites.
+        if: startsWith(gitea.ref, 'refs/tags/v') && (gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true')
         # Needs tvOS added to the App Store Connect app record + the tvOS platform installed
         # on the runner (xcodebuild -downloadPlatform tvOS).
         continue-on-error: true

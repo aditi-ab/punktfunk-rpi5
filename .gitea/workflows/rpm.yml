@@ -13,9 +13,10 @@ name: rpm
 on:
   push:
     branches: [main]
-    # HOST-scoped tags only — the Apple client's `v*` tags (release.yml) must NOT publish a host
-    # RPM (a `v0.1.1` client tag previously shipped a host 0.1.1 that shadowed every rolling build).
-    tags: ['host-v*']
+    # Single project version: a `vX.Y.Z` tag is THE release. main publishes to the `*-canary` rpm
+    # groups, tags to the base groups (`bazzite`/`fedora-44`) — separate repos, so the old
+    # version-shadow (a release outranking rolling builds in one group) is structurally gone.
+    tags: ['v*']
   workflow_dispatch:
 
 env:
@@ -66,20 +67,22 @@ jobs:
           key: cargo-home-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-
 
-      - name: Version
-        # host-vX.Y.Z tag -> X.Y.Z-1 (a real host release); main push -> 0.2.0-0.ciN.g<sha>, whose
-        # "0." release sorts BELOW the eventual 0.2.0-1 yet climbs by run number AND outranks the
-        # stray 0.1.1, so `rpm-ostree upgrade` truly moves to the newest build. The spec %build
-        # stamps PUNKTFUNK_BUILD_VERSION from these macros into the binary (--version provenance).
+      - name: Version + channel
+        # vX.Y.Z tag -> X.Y.Z-1 in the base group (a real release); main push -> 0.3.0-0.ciN.g<sha>
+        # in the `<base>-canary` group, whose "0." release sorts below the eventual 0.3.0-1 yet
+        # climbs by run number. The canary base stays one minor ahead of the latest stable so a
+        # stable->canary box re-point still moves forward. The spec %build stamps
+        # PUNKTFUNK_BUILD_VERSION from these macros into the binary (--version provenance).
         run: |
           SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
           case "$GITHUB_REF" in
-            refs/tags/host-v*) V="${GITHUB_REF_NAME#host-v}"; R="1" ;;
-            *)                 V="0.2.0"; R="0.ci${GITHUB_RUN_NUMBER}.g${SHORT}" ;;
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; R="1"; GROUP="${{ matrix.group }}" ;;
+            *)            V="0.3.0"; R="0.ci${GITHUB_RUN_NUMBER}.g${SHORT}"; GROUP="${{ matrix.group }}-canary" ;;
           esac
           echo "PF_VERSION=$V" >> "$GITHUB_ENV"
           echo "PF_RELEASE=$R" >> "$GITHUB_ENV"
-          echo "rpm $V-$R"
+          echo "GROUP=$GROUP" >> "$GITHUB_ENV"
+          echo "rpm $V-$R -> group '$GROUP'"
 
       - name: Build RPM
         # PF_WITH_WEB=1 → also build the noarch punktfunk-web subpackage (the publish loop below
@@ -101,6 +104,22 @@ jobs:
             case "$rpm" in *debuginfo*|*debugsource*) echo "skip $rpm"; continue;; esac
             echo "uploading $rpm"
             curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$rpm" \
-              "https://$REGISTRY/api/packages/$OWNER/rpm/${{ matrix.group }}/upload"
+              "https://$REGISTRY/api/packages/$OWNER/rpm/$GROUP/upload"
           done
-          echo "published to $OWNER/rpm/${{ matrix.group }}"
+          echo "published to $OWNER/rpm/$GROUP"
+
+      # On a real release, also attach the .rpms to the unified Gitea Release. Both Fedora bases
+      # (bazzite=F43, fedora-44) build the SAME filename, so suffix the asset with the base to keep
+      # both on the release; canary builds live in the `*-canary` rpm groups (no release page).
+      - name: Attach .rpms to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for rpm in dist/*.rpm; do
+            case "$rpm" in *debuginfo*|*debugsource*) continue;; esac
+            base="$(basename "$rpm" .rpm)"
+            upsert_asset "$RID" "$rpm" "${base}.${{ matrix.group }}.rpm"
+          done
