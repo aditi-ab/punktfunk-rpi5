@@ -158,6 +158,24 @@ function ApiReference() {
   useEffect(() => setMounted(true), [])
   const isDark = !mounted || resolvedTheme !== 'light'
 
+  // Scalar pollutes global scope and never cleans up: it appends a persistent
+  // <style id="scalar-style"> to <head> that includes a *global*
+  // `body { background-color: var(--scalar-background-1) }`, adds its #scalar-refs
+  // teleport target, and toggles .dark-mode/.light-mode on <body>. After a
+  // client-side route change (no reload) that residue bleeds into the next page —
+  // the docs body kept painting Scalar's bg instead of --color-fd-background, so
+  // the docs looked gray until a hard reload. Strip it when /api unmounts so
+  // leaving the page restores the same DOM a fresh load has; Scalar re-injects a
+  // fresh instance on re-entry.
+  useEffect(
+    () => () => {
+      document.getElementById('scalar-style')?.remove()
+      document.getElementById('scalar-refs')?.remove()
+      document.body.classList.remove('dark-mode', 'light-mode')
+    },
+    [],
+  )
+
   // A fresh object on each theme flip so the React wrapper's
   // `updateConfiguration` effect fires and Scalar swaps the body mode class.
   const configuration = useMemo(

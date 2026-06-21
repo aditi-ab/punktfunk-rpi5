@@ -28,6 +28,16 @@
   /* Fumadocs accent → brand violet (light mode). */
   --color-fd-primary: var(--pf-brand);
   --color-fd-ring: var(--pf-brand);
+
+  /* The /api Scalar reference injects a *global* `body { background-color:
+     var(--scalar-background-1) }` (via its own stylesheet + a runtime
+     <style id="scalar-style">) that TanStack does NOT remove on a client-side
+     route change. Give that variable a fallback = the docs surface so every
+     non-API page still paints correctly while Scalar's sheet lingers (without
+     this the docs body went gray, or transparent once the body mode-class was
+     stripped). On /api itself the reference's body.{dark,light}-mode rule
+     (higher specificity) overrides this back to the brand chrome. */
+  --scalar-background-1: var(--color-fd-background);
 }
 
 .dark {
