@@ -1,26 +1,33 @@
 ---
-title: "Steam Deck (Host)"
-description: "Run a punktfunk host on a Steam Deck — stream its Game Mode (or desktop) to your other devices. One script, built on-device for SteamOS."
+title: "SteamOS (Host)"
+description: "Run a punktfunk host on SteamOS — stream its Game Mode (or desktop) to your other devices. One script, built on-device and ABI-matched to SteamOS."
 ---
 
-This is for using a **Steam Deck as the host** — streaming *from* it to a laptop, TV, phone, or
-another Deck. (For the usual case — streaming *to* a Deck — see [Install a Client](/docs/install-client),
+This is for using a **SteamOS device as the host** — streaming *from* it to a laptop, TV, phone, or
+another device. (For the usual case — streaming *to* a Steam Deck — see [Install a Client](/docs/install-client),
 which uses the Flatpak + Decky plugin.)
+
+We support SteamOS as a host mainly with an eye to the **upcoming Steam Machine** — a living-room,
+desktop-class SteamOS box is a natural always-on streaming host. The **Steam Deck** is the SteamOS
+device we can test on today, so it's what these instructions are validated against; the same
+on-device build works on any SteamOS 3 system.
 
 SteamOS is an immutable, read-only Arch base, so the host isn't a system package. Instead a single
 script builds the host **natively inside a Debian-trixie distrobox** (ABI-matched to SteamOS's
 FFmpeg/glibc — the binary then runs natively on SteamOS) and wires it up as systemd user services.
 Building on-device means a rebuild always matches the running OS, so a SteamOS update can't leave you
-with a binary linked against the wrong libraries. Encode is **VAAPI** on the Deck's AMD GPU
-(auto-detected; NVENC on NVIDIA).
+with a binary linked against the wrong libraries. Encode is **VAAPI** on the AMD GPU (auto-detected;
+NVENC on NVIDIA).
 
-> **Heads up:** the Deck's WiFi *tx* tops out around ~250 Mbps of goodput regardless of band (it's a
-> hardware/driver packet-rate limit, not bandwidth) — plenty for 1080p/1440p60, not 4K. A wired dock
-> lifts that. See [Configuration](/docs/configuration) for bitrate guidance.
+> **Heads up:** in our testing the Steam Deck's WiFi *tx* topped out around ~250 Mbps of goodput
+> regardless of band — enough for 1080p/1440p60, not 4K. This looked like a hardware/driver
+> packet-rate limit rather than a bandwidth ceiling, but it's one device measured on one network:
+> other SteamOS hardware, newer drivers, or a less congested band may do better. A wired dock
+> sidesteps it entirely. See [Configuration](/docs/configuration) for bitrate guidance.
 
 ## Prerequisites
 
-- A Steam Deck on **SteamOS 3** (LCD or OLED). Steady WiFi or, better, a wired dock.
+- A SteamOS device on **SteamOS 3** (e.g. a Steam Deck, LCD or OLED). Steady WiFi or, better, a wired dock.
 - **distrobox** installed (no root needed). If `distrobox` isn't found:
   ```sh
   curl -sfL https://raw.githubusercontent.com/89luca89/distrobox/main/install | sh -s -- --prefix ~/.local
@@ -58,19 +65,28 @@ Useful flags:
 | Flag | Effect |
 |------|--------|
 | `--open` | Accept **unpaired** clients (trust-on-first-use) — convenient on a fully trusted LAN. Default is PIN pairing required. |
+| `--no-gamestream` | Run a **secure native-only** host — skip the GameStream/Moonlight-compat planes (see below). Default keeps them on so stock Moonlight works. |
 | `--no-web` | Skip the management web console. |
 | `--src=DIR` | Build from source at `DIR` instead of `~/punktfunk`. |
 
 When it finishes it prints the web-console URL and how to pair.
 
+> **GameStream/Moonlight compat is on by default.** The native `punktfunk/1` plane (used by
+> punktfunk's own clients — SPAKE2 PIN pairing, per-direction AEAD) is **always on** and is the secure
+> path. The installer also enables the **GameStream/Moonlight-compat planes** so stock
+> [Moonlight](/docs/moonlight) works — but those carry inherent on-path weaknesses (pairing over plain
+> HTTP; legacy control encryption that can reuse GCM nonces), so enable them only on a **trusted LAN**.
+> If you only ever use native clients, install with `--no-gamestream` for a host with no GameStream
+> surface at all.
+
 ## 3. Pair a device
 
 By default the host **requires PIN pairing** (secure). Two ways to pair:
 
-- **Web console** (printed at the end of step 2): open `http://<deck-ip>:3000`, log in with the
+- **Web console** (printed at the end of step 2): open `http://<device-ip>:3000`, log in with the
   generated password (in `~/.config/punktfunk/web.env`), go to **Devices → arm pairing**, and enter
   the PIN on your client.
-- **From the client directly**: pick this Deck (it advertises over mDNS as `_punktfunk._udp`) and
+- **From the client directly**: pick this host (it advertises over mDNS as `_punktfunk._udp`) and
   enter the PIN the host shows.
 
 On a trusted home LAN you can instead install with `--open` and skip pairing entirely.
@@ -82,9 +98,10 @@ systemctl --user status punktfunk-host          # active (running)
 journalctl --user -u punktfunk-host -f          # watch a client connect
 ```
 
-Connect from any client ([Moonlight](/docs/moonlight) or a [native client](/docs/clients)). In Game
-Mode the host attaches to the running gamescope session and streams it at your client's resolution; in
-Desktop Mode it streams the KDE desktop. The host auto-detects which session is live per connection.
+Connect from a [native client](/docs/clients), or from [Moonlight](/docs/moonlight) (unless you
+installed with `--no-gamestream`). In Game Mode the host attaches to the running gamescope session and
+streams it at your client's resolution; in Desktop Mode it streams the KDE desktop. The host
+auto-detects which session is live per connection.
 
 ## Updating
 
@@ -99,8 +116,8 @@ bash ~/punktfunk/scripts/steamdeck/update.sh
 
 - **Single session at a time** at custom resolutions — two clients requesting different modes will
   thrash the managed session. Pick one mode per session.
-- **Keep the Deck awake.** Game Mode auto-suspends on idle, which drops the host off the network mid
-  stream — disable auto-suspend (Settings → Power) for a headless host.
+- **Keep the device awake.** On handhelds, Game Mode auto-suspends on idle, which drops the host off
+  the network mid stream — disable auto-suspend (Settings → Power) for a headless host.
 - **It survives OS updates**, but a major SteamOS bump can move library versions; if the host fails to
   start after an update, just re-run `update.sh` to rebuild against the new base.
 - Deeper reference (services, container, manual steps): [`scripts/steamdeck/README.md`](https://git.unom.io/unom/punktfunk/src/branch/main/scripts/steamdeck/README.md).
