@@ -5,8 +5,13 @@ OpenAPI at `docs/api/openapi.json`). It shows live status, host capabilities, pa
 clients, the pairing-PIN flow, and session controls.
 
 Stack: **TanStack Start** (full SSR) on **Bun** via **Nitro v2** (`bun` preset) · **React
-Query** through **orval** codegen from the OpenAPI spec · **shadcn/ui** (Tailwind v4) ·
+Query** through **orval** codegen from the OpenAPI spec · **[`@unom/ui`](https://git.unom.io/unom/ui)**
+— the shared punktfunk/unom design system the marketing site + docs are built on (Tailwind v4,
+animated components + specular "material" gloss, the violet brand on dark chrome) ·
 **Paraglide** i18n (en/de). Package manager + runtime: **Bun**.
+
+The `@unom` registry mapping lives in [`.npmrc`](.npmrc); the auth token comes from
+`~/.npmrc` (or a CI secret).
 
 ## Develop
 
@@ -91,8 +96,10 @@ Generated code is **not committed** (gitignored) — reproduced from sources:
 src/
   routes/            file-based routes (index=dashboard, host, clients, pairing, settings)
   components/
-    app-shell.tsx    sidebar nav + language switcher
-    ui/              shadcn/ui primitives (button, card, table, …)
+    app-shell.tsx    sidebar nav (brand lens + wordmark) + language switcher
+    brand-mark/wordmark/logo.tsx   punktfunk lens mark + wordmark (shared with the site/docs)
+    unom-providers.tsx   @unom/ui Material provider (specular gloss; no sounds, like the site)
+    ui/              @unom/ui-backed primitives (button, input, label, card; badge/table/skeleton)
     query-state.tsx  loading/error wrapper (incl. 401 → "set a token")
   api/
     fetcher.ts       orval mutator: base URL, bearer token, JSON, throwing ApiError

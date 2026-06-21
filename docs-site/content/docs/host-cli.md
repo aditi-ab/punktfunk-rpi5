@@ -39,7 +39,8 @@ These are the only flags `serve` accepts.
 
 The management API is **always HTTPS with bearer-token auth**. If you don't pass `--mgmt-token`, a token
 is auto-generated and persisted to `~/.config/punktfunk/mgmt-token`; `--mgmt-token` only overrides it. A
-token is **required** when you bind the API off loopback with `--mgmt-bind`.
+token is **required** when you bind the API off loopback with `--mgmt-bind`. Every endpoint is documented
+in the interactive [**API Reference**](/api).
 
 By default the host **requires pairing** — see [Pairing & Trust](/docs/pairing). On `serve` you
 **arm pairing from the web console** (or mgmt API); the host then displays a 4-digit PIN. Pass `--open` to

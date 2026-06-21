@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { createFileRoute, useRouter } from '@tanstack/react-router'
-import { Radio } from 'lucide-react'
+import { BrandMark } from '@/components/brand-mark'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -54,7 +54,7 @@ function LoginPage() {
       <Card className="w-full max-w-sm">
         <CardHeader className="items-center text-center">
           <div className="mb-2 flex items-center gap-2">
-            <Radio className="size-5 text-[var(--success)]" />
+            <BrandMark className="size-6 drop-shadow-[0_2px_12px_rgba(108,91,243,0.45)]" />
             <span className="font-semibold">{m.app_name()}</span>
           </div>
           <CardTitle>{m.login_title()}</CardTitle>

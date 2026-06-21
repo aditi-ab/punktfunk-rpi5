@@ -1,6 +1,8 @@
 import type { ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
-import { Activity, Server, Users, KeyRound, LibraryBig, Settings, Radio } from 'lucide-react'
+import { Activity, Server, Users, KeyRound, LibraryBig, Settings } from 'lucide-react'
+import { BrandMark } from '@/components/brand-mark'
+import { Wordmark } from '@/components/wordmark'
 import { m } from '@/paraglide/messages'
 import { useLocale, changeLocale, locales, type Locale } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
@@ -21,21 +23,22 @@ export function AppShell({ children }: { children: ReactNode }) {
     <div className="flex min-h-screen">
       {/* Desktop sidebar (≥ sm). */}
       <aside className="hidden w-60 shrink-0 flex-col border-r bg-card/40 p-4 sm:flex">
-        <div className="mb-6 flex items-center gap-2 px-2">
-          <Radio className="size-5 text-[var(--success)]" />
-          <div>
-            <div className="font-semibold leading-tight">{m.app_name()}</div>
-            <div className="text-xs text-muted-foreground">{m.app_tagline()}</div>
-          </div>
-        </div>
+        <Link
+          to="/"
+          aria-label="punktfunk"
+          className="mb-7 flex items-center gap-2 px-2 pt-1"
+        >
+          <BrandMark className="size-7 drop-shadow-[0_2px_12px_rgba(108,91,243,0.45)]" />
+          <Wordmark className="h-4" />
+        </Link>
         <nav className="flex flex-col gap-1">
           {NAV.map(({ to, icon: Icon, label }) => (
             <Link
               key={to}
               to={to}
               activeOptions={{ exact: to === '/' }}
-              className="flex items-center gap-3 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-              activeProps={{ className: 'bg-accent text-foreground font-medium' }}
+              className="flex items-center gap-3 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              activeProps={{ className: 'bg-primary/15 text-foreground font-medium' }}
             >
               <Icon className="size-4" />
               {label()}
@@ -50,8 +53,8 @@ export function AppShell({ children }: { children: ReactNode }) {
       <div className="flex flex-1 flex-col overflow-x-hidden">
         {/* Mobile top bar (< sm): brand + language. The sidebar is hidden here. */}
         <header className="flex items-center gap-2 border-b bg-card/40 px-4 py-3 sm:hidden">
-          <Radio className="size-5 text-[var(--success)]" />
-          <div className="font-semibold leading-tight">{m.app_name()}</div>
+          <BrandMark className="size-6" />
+          <Wordmark className="h-3.5" />
           <div className="ml-auto">
             <LanguageSwitcher />
           </div>
@@ -74,7 +77,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             to={to}
             activeOptions={{ exact: to === '/' }}
             className="flex flex-1 flex-col items-center gap-1 py-2 text-[10px] text-muted-foreground transition-colors"
-            activeProps={{ className: 'text-foreground' }}
+            activeProps={{ className: 'text-[var(--brand-light)]' }}
           >
             <Icon className="size-5" />
             <span className="leading-none">{label()}</span>
@@ -96,7 +99,7 @@ function LanguageSwitcher() {
           className={cn(
             'rounded px-2 py-1 text-xs uppercase transition-colors',
             l === current
-              ? 'bg-secondary text-secondary-foreground font-medium'
+              ? 'bg-primary/20 text-foreground font-medium'
               : 'text-muted-foreground hover:text-foreground',
           )}
         >

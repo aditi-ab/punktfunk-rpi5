@@ -1,14 +1,24 @@
 import * as React from 'react'
+import type { ComponentProps } from 'react'
+import { AnimatedCard } from '@unom/ui/card'
 import { cn } from '@/lib/utils'
 
-const Card = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref) => (
-    <div
-      ref={ref}
-      className={cn('rounded-xl border bg-card text-card-foreground shadow', className)}
-      {...props}
-    />
-  ),
+// The console's Card IS @unom/ui's animated card — a `bg-neutral` (#1c1530)
+// surface with a soft brand-violet ring, on-mount motion + material gloss
+// (enabled via UnomProviders). We keep the composed shadcn-style sub-component
+// API (CardHeader/Title/Description/Content/Footer own their own padding), so
+// the card defaults to `padding={false}` to avoid doubling it, and soften the
+// 2px ring to a subtle 1px brand tint.
+type CardProps = ComponentProps<typeof AnimatedCard>
+
+const Card = ({ className, padding = false, children, ...props }: CardProps) => (
+  <AnimatedCard
+    padding={padding}
+    className={cn('ring-1 ring-accent/40', className)}
+    {...props}
+  >
+    {children}
+  </AnimatedCard>
 )
 Card.displayName = 'Card'
 
@@ -21,7 +31,11 @@ CardHeader.displayName = 'CardHeader'
 
 const CardTitle = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
   ({ className, ...props }, ref) => (
-    <div ref={ref} className={cn('font-semibold leading-none tracking-tight', className)} {...props} />
+    <div
+      ref={ref}
+      className={cn('font-semibold leading-none tracking-tight', className)}
+      {...props}
+    />
   ),
 )
 CardTitle.displayName = 'CardTitle'

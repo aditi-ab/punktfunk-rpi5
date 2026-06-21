@@ -1,0 +1,1701 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "punktfunk management API",
+    "description": "Control-plane API for managing a punktfunk streaming host: host capabilities, runtime status, paired clients, the pairing PIN flow, and session control. Authentication: HTTP bearer token, enforced on every route except `/api/v1/health` when the host is started with a management token (mandatory for non-loopback binds).",
+    "contact": {
+      "name": "unom"
+    },
+    "license": {
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
+    },
+    "version": "0.0.1"
+  },
+  "paths": {
+    "/api/v1/clients": {
+      "get": {
+        "tags": [
+          "clients"
+        ],
+        "summary": "List paired clients",
+        "operationId": "listPairedClients",
+        "responses": {
+          "200": {
+            "description": "All certificate-pinned clients",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PairedClient"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/clients/{fingerprint}": {
+      "delete": {
+        "tags": [
+          "clients"
+        ],
+        "summary": "Unpair a client",
+        "description": "Removes the client's certificate from the pairing store. Caveat: the nvhttp TLS layer\ndoes not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed\nclient cert — a planned hardening step), so until that lands this removes the client\nfrom the listing without severing its ability to reconnect.",
+        "operationId": "unpairClient",
+        "parameters": [
+          {
+            "name": "fingerprint",
+            "in": "path",
+            "description": "Hex SHA-256 fingerprint of the client certificate DER (64 chars, case-insensitive)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Client unpaired"
+          },
+          "400": {
+            "description": "Malformed fingerprint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No paired client with that fingerprint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/compositors": {
+      "get": {
+        "tags": [
+          "host"
+        ],
+        "summary": "Available compositor backends",
+        "description": "Lists every backend the host knows how to drive, flags which are usable right now, and marks\nthe one an unspecified (`Auto`) client request resolves to. Clients pass an `id` to their\n`--compositor` flag (or `PUNKTFUNK_COMPOSITOR_*` over the C ABI) to request it.",
+        "operationId": "listCompositors",
+        "responses": {
+          "200": {
+            "description": "Compositor backends with availability + the auto-detected default",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AvailableCompositor"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "tags": [
+          "host"
+        ],
+        "summary": "Liveness probe",
+        "description": "Always available without authentication.",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "Host is up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/api/v1/host": {
+      "get": {
+        "tags": [
+          "host"
+        ],
+        "summary": "Host identity and capabilities",
+        "operationId": "getHostInfo",
+        "responses": {
+          "200": {
+            "description": "Host identity, versions, codecs, and port map",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/library": {
+      "get": {
+        "tags": [
+          "library"
+        ],
+        "summary": "List the game library",
+        "description": "Every installed-store title (Steam, read from the host's local files — no Steam API key)\nmerged with the user's custom entries, sorted by title. Artwork fields are URLs the client\nfetches directly (the public Steam CDN for Steam titles).",
+        "operationId": "getLibrary",
+        "responses": {
+          "200": {
+            "description": "Unified library across all stores",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GameEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/library/custom": {
+      "post": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Add a custom library entry",
+        "description": "Creates a user-curated title (e.g. a non-Steam game, an emulator, a ROM) with caller-supplied\nartwork URLs. The host assigns a stable id, returned in the body.",
+        "operationId": "createCustomGame",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Entry created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty title",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/library/custom/{id}": {
+      "put": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Update a custom library entry",
+        "operationId": "updateCustomGame",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The custom entry id (without the `custom:` prefix)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Entry updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty title",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No custom entry with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Delete a custom library entry",
+        "operationId": "deleteCustomGame",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The custom entry id (without the `custom:` prefix)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Entry deleted"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No custom entry with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/native/clients": {
+      "get": {
+        "tags": [
+          "native"
+        ],
+        "summary": "List native paired clients",
+        "operationId": "listNativeClients",
+        "responses": {
+          "200": {
+            "description": "Paired native clients",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/NativeClient"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/native/clients/{fingerprint}": {
+      "delete": {
+        "tags": [
+          "native"
+        ],
+        "summary": "Unpair a native client",
+        "description": "Removes a punktfunk/1 client from the native trust store by fingerprint.",
+        "operationId": "unpairNativeClient",
+        "parameters": [
+          {
+            "name": "fingerprint",
+            "in": "path",
+            "description": "Hex SHA-256 of the client certificate (case-insensitive)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Client unpaired"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No paired native client with that fingerprint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Native host not enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/native/pair": {
+      "get": {
+        "tags": [
+          "native"
+        ],
+        "summary": "Native pairing status",
+        "description": "The native (punktfunk/1) pairing window. Poll while armed to show the PIN + countdown.\n`enabled: false` means this host runs GameStream only (no `--native`).",
+        "operationId": "getNativePairing",
+        "responses": {
+          "200": {
+            "description": "Native pairing status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativePairStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "native"
+        ],
+        "summary": "Disarm native pairing",
+        "description": "Closes the pairing window immediately (no new ceremonies accepted).",
+        "operationId": "disarmNativePairing",
+        "responses": {
+          "204": {
+            "description": "Pairing disarmed"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Native host not enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/native/pair/arm": {
+      "post": {
+        "tags": [
+          "native"
+        ],
+        "summary": "Arm native pairing",
+        "description": "Opens a pairing window and mints a fresh PIN to display. The user enters it on their device\nwithin `ttl_secs`; the device then appears in the native client list.",
+        "operationId": "armNativePairing",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArmNativePairing"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Pairing armed; the response carries the PIN to display",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativePairStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Native host not available in this process",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/native/pending": {
+      "get": {
+        "tags": [
+          "native"
+        ],
+        "summary": "List devices awaiting pairing approval",
+        "description": "Unpaired devices that tried to connect while the host requires pairing. Approve one to pair\nit without a PIN (delegated approval); entries expire after ~10 minutes.",
+        "operationId": "listPendingDevices",
+        "responses": {
+          "200": {
+            "description": "Devices awaiting approval (empty when none, or when the native host is not enabled)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PendingDevice"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/native/pending/{id}/approve": {
+      "post": {
+        "tags": [
+          "native"
+        ],
+        "summary": "Approve a pending device",
+        "description": "Pairs the device's certificate fingerprint — it can connect immediately (no PIN). Optionally\nrelabel it via the body; send `{}` to keep the name it knocked with.",
+        "operationId": "approvePendingDevice",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Pending-request id from the pending list",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovePending"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Device paired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeClient"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No pending request with that id (expired?)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the trust store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Native host not enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/native/pending/{id}/deny": {
+      "post": {
+        "tags": [
+          "native"
+        ],
+        "summary": "Deny a pending device",
+        "description": "Drops the request. Not a blocklist — the device's next attempt knocks again.",
+        "operationId": "denyPendingDevice",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Pending-request id from the pending list",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Request dropped"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No pending request with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Native host not enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/pair": {
+      "get": {
+        "tags": [
+          "pairing"
+        ],
+        "summary": "Pairing-flow status",
+        "description": "Poll this to know when to prompt the user for the PIN Moonlight displays.",
+        "operationId": "getPairingStatus",
+        "responses": {
+          "200": {
+            "description": "Whether a pairing handshake is waiting for a PIN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairingStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/pair/pin": {
+      "post": {
+        "tags": [
+          "pairing"
+        ],
+        "summary": "Submit the pairing PIN",
+        "description": "Delivers the PIN the Moonlight client is displaying, completing the out-of-band half\nof the pairing handshake.",
+        "operationId": "submitPairingPin",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitPin"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "PIN delivered to the waiting handshake"
+          },
+          "400": {
+            "description": "Malformed PIN or unparseable JSON body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No pairing handshake is waiting for a PIN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Body is not application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "JSON body does not match the schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session": {
+      "delete": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Stop the active session",
+        "description": "Kicks the connected client: stops the video/audio stream threads and clears the launch\nstate. Idempotent — succeeds even when nothing is streaming.",
+        "operationId": "stopSession",
+        "responses": {
+          "204": {
+            "description": "Session stopped (or none was active)"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session/idr": {
+      "post": {
+        "tags": [
+          "session"
+        ],
+        "summary": "Force a keyframe",
+        "description": "Asks the encoder for an IDR frame on the active video stream (what a client requests\nafter unrecoverable loss — exposed for debugging).",
+        "operationId": "requestIdr",
+        "responses": {
+          "202": {
+            "description": "Keyframe requested"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No active video stream",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "tags": [
+          "host"
+        ],
+        "summary": "Live host status",
+        "operationId": "getStatus",
+        "responses": {
+          "200": {
+            "description": "Streaming/pairing state and the active session, if any",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiCodec": {
+        "type": "string",
+        "description": "Video codec identifier.",
+        "enum": [
+          "h264",
+          "h265",
+          "av1"
+        ]
+      },
+      "ApiError": {
+        "type": "object",
+        "description": "Error envelope for every non-2xx response.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "ApprovePending": {
+        "type": "object",
+        "description": "Approve-pending-device request body. Send `{}` to keep the device's own name.",
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Operator-chosen label for the device (defaults to the name it knocked with).",
+            "example": "Living Room TV"
+          }
+        }
+      },
+      "ArmNativePairing": {
+        "type": "object",
+        "description": "Arm-native-pairing request body.",
+        "properties": {
+          "ttl_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Window length in seconds (default 120; clamped to 15–600).",
+            "example": 120,
+            "minimum": 0
+          }
+        }
+      },
+      "Artwork": {
+        "type": "object",
+        "description": "Cover art for a title. All fields are URLs (the Steam CDN for Steam titles, user-supplied for\ncustom). The client prefers `portrait` for a grid and falls back to `header` when a title has\nno 600×900 capsule (common for older Steam apps).",
+        "properties": {
+          "header": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Horizontal header (Steam `header.jpg`) — the universal fallback."
+          },
+          "hero": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Wide background (Steam `library_hero.jpg`)."
+          },
+          "logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Transparent title logo (Steam `logo.png`)."
+          },
+          "portrait": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Vertical capsule / poster (Steam `library_600x900.jpg`). Best for a grid."
+          }
+        }
+      },
+      "AvailableCompositor": {
+        "type": "object",
+        "description": "A compositor backend the host can drive a virtual output on, and whether it's usable now.",
+        "required": [
+          "id",
+          "label",
+          "available",
+          "default"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "description": "Usable on this host right now: the live session's own compositor, or gamescope wherever\nits binary is installed."
+          },
+          "default": {
+            "type": "boolean",
+            "description": "True for the backend an `Auto` (unspecified) request resolves to right now."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable identifier (`\"kwin\"` | `\"wlroots\"` | `\"mutter\"` | `\"gamescope\"`) — pass this to a\nclient's `--compositor` flag."
+          },
+          "label": {
+            "type": "string",
+            "description": "Human-readable label for UIs."
+          }
+        }
+      },
+      "CustomEntry": {
+        "type": "object",
+        "description": "A user-added title, persisted in `~/.config/punktfunk/library.json`. Same shape the API\nreturns and the web console edits.",
+        "required": [
+          "id",
+          "title"
+        ],
+        "properties": {
+          "art": {
+            "$ref": "#/components/schemas/Artwork"
+          },
+          "id": {
+            "type": "string",
+            "description": "Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path)."
+          },
+          "launch": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LaunchSpec"
+              }
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "CustomInput": {
+        "type": "object",
+        "description": "Request body to create or replace a custom entry (no `id` — the host owns it).",
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "art": {
+            "$ref": "#/components/schemas/Artwork"
+          },
+          "launch": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LaunchSpec"
+              }
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "GameEntry": {
+        "type": "object",
+        "description": "One title in the unified library, regardless of which store it came from.",
+        "required": [
+          "id",
+          "store",
+          "title",
+          "art"
+        ],
+        "properties": {
+          "art": {
+            "$ref": "#/components/schemas/Artwork"
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable, store-qualified id: `steam:<appid>` or `custom:<id>`.",
+            "example": "steam:570"
+          },
+          "launch": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LaunchSpec",
+                "description": "How the host would launch it, when known."
+              }
+            ]
+          },
+          "store": {
+            "type": "string",
+            "description": "Which store surfaced it: `\"steam\"` or `\"custom\"`.",
+            "example": "steam"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "description": "Liveness + version probe.",
+        "required": [
+          "status",
+          "version",
+          "abi_version"
+        ],
+        "properties": {
+          "abi_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`punktfunk-core` C ABI version.",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string",
+            "description": "Always `\"ok\"` when the host responds.",
+            "example": "ok"
+          },
+          "version": {
+            "type": "string",
+            "description": "`punktfunk-host` crate version."
+          }
+        }
+      },
+      "HostInfo": {
+        "type": "object",
+        "description": "Host identity and advertised capabilities (static for the life of the process).",
+        "required": [
+          "hostname",
+          "uniqueid",
+          "local_ip",
+          "version",
+          "abi_version",
+          "app_version",
+          "gfe_version",
+          "codecs",
+          "ports"
+        ],
+        "properties": {
+          "abi_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`punktfunk-core` C ABI version.",
+            "minimum": 0
+          },
+          "app_version": {
+            "type": "string",
+            "description": "GameStream host version advertised to Moonlight clients."
+          },
+          "codecs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiCodec"
+            },
+            "description": "Codecs the host can encode (NVENC)."
+          },
+          "gfe_version": {
+            "type": "string",
+            "description": "GFE version advertised to Moonlight clients."
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "local_ip": {
+            "type": "string",
+            "description": "Best-effort primary LAN IP."
+          },
+          "ports": {
+            "$ref": "#/components/schemas/PortMap"
+          },
+          "uniqueid": {
+            "type": "string",
+            "description": "Stable per-host id (persisted across restarts), matched on pairing."
+          },
+          "version": {
+            "type": "string",
+            "description": "`punktfunk-host` crate version."
+          }
+        }
+      },
+      "LaunchSpec": {
+        "type": "object",
+        "description": "How the host would launch a title (consumed by the session launcher in a later step). Kept\nopen-ended so new stores slot in: `steam_appid` → `steam steam://rungameid/<value>`;\n`command` → run `<value>` nested in a gamescope session.",
+        "required": [
+          "kind",
+          "value"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`\"steam_appid\"` or `\"command\"`.",
+            "example": "steam_appid"
+          },
+          "value": {
+            "type": "string",
+            "description": "The appid (for `steam_appid`) or the shell command (for `command`)."
+          }
+        }
+      },
+      "NativeClient": {
+        "type": "object",
+        "description": "A paired native (punktfunk/1) client.",
+        "required": [
+          "name",
+          "fingerprint"
+        ],
+        "properties": {
+          "fingerprint": {
+            "type": "string",
+            "description": "Hex SHA-256 of the client certificate — its stable id here."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name the client supplied when pairing.",
+            "example": "Living Room iPad"
+          }
+        }
+      },
+      "NativePairStatus": {
+        "type": "object",
+        "description": "Native (punktfunk/1) pairing status. Unlike GameStream, the **host** mints the PIN (the SPAKE2\nceremony needs it client-side first), so the console **displays** `pin` for the user to enter on\ntheir device — armed on demand for a short window.",
+        "required": [
+          "enabled",
+          "armed",
+          "paired_clients"
+        ],
+        "properties": {
+          "armed": {
+            "type": "boolean",
+            "description": "True while a pairing window is open."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the native host is running (the unified host started with `--native`)."
+          },
+          "expires_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds left in the window (null = disarmed, or armed with no expiry via the CLI flag).",
+            "minimum": 0
+          },
+          "paired_clients": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of paired native clients.",
+            "minimum": 0
+          },
+          "pin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The PIN to display while armed (null when disarmed).",
+            "example": "1234"
+          }
+        }
+      },
+      "PairedClient": {
+        "type": "object",
+        "description": "A paired (certificate-pinned) Moonlight client.",
+        "required": [
+          "fingerprint"
+        ],
+        "properties": {
+          "fingerprint": {
+            "type": "string",
+            "description": "Lowercase hex SHA-256 of the client certificate DER — the client's stable id here.",
+            "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+          },
+          "not_after_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Certificate validity end (unix seconds)."
+          },
+          "not_before_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Certificate validity start (unix seconds)."
+          },
+          "subject": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Certificate subject (e.g. `CN=NVIDIA GameStream Client`), if the DER parses."
+          }
+        }
+      },
+      "PairingStatus": {
+        "type": "object",
+        "description": "Pairing-flow status.",
+        "required": [
+          "pin_pending"
+        ],
+        "properties": {
+          "pin_pending": {
+            "type": "boolean",
+            "description": "True while a pairing handshake is parked waiting for the user's PIN."
+          }
+        }
+      },
+      "PendingDevice": {
+        "type": "object",
+        "description": "An unpaired device that tried to connect while the host requires pairing — awaiting\n**delegated approval** (approve it here instead of fetching the host PIN out of band).",
+        "required": [
+          "id",
+          "name",
+          "fingerprint",
+          "age_secs"
+        ],
+        "properties": {
+          "age_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds since the device last knocked.",
+            "minimum": 0
+          },
+          "fingerprint": {
+            "type": "string",
+            "description": "Hex SHA-256 of the device's certificate — what approval pins."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Id to address approve/deny (per-process; entries expire after ~10 minutes).",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Best-effort device label (the client's own name, else fingerprint-derived).",
+            "example": "Enrico's MacBook"
+          }
+        }
+      },
+      "PortMap": {
+        "type": "object",
+        "description": "Every port a client integration may need (Moonlight derives the stream ports from the\nHTTP base; a control pane should not have to).",
+        "required": [
+          "mgmt",
+          "http",
+          "https",
+          "rtsp",
+          "video",
+          "control",
+          "audio"
+        ],
+        "properties": {
+          "audio": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "control": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "http": {
+            "type": "integer",
+            "format": "int32",
+            "description": "nvhttp plain HTTP (serverinfo, pairing).",
+            "minimum": 0
+          },
+          "https": {
+            "type": "integer",
+            "format": "int32",
+            "description": "nvhttp mutual-TLS HTTPS (post-pairing).",
+            "minimum": 0
+          },
+          "mgmt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "This management API.",
+            "minimum": 0
+          },
+          "rtsp": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "video": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "RuntimeStatus": {
+        "type": "object",
+        "description": "Live host status (changes as clients launch/end sessions).",
+        "required": [
+          "video_streaming",
+          "audio_streaming",
+          "pin_pending",
+          "paired_clients"
+        ],
+        "properties": {
+          "audio_streaming": {
+            "type": "boolean",
+            "description": "True while the audio stream thread is running."
+          },
+          "paired_clients": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of pinned (paired) client certificates.",
+            "minimum": 0
+          },
+          "pin_pending": {
+            "type": "boolean",
+            "description": "True while a pairing handshake is parked waiting for the user's PIN\n(submit it via `POST /api/v1/pair/pin`)."
+          },
+          "session": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SessionInfo",
+                "description": "The active launch session (set by Moonlight's `/launch`, cleared on cancel/stop)."
+              }
+            ]
+          },
+          "stream": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StreamInfo",
+                "description": "The RTSP-negotiated stream parameters (present once a client has completed ANNOUNCE)."
+              }
+            ]
+          },
+          "video_streaming": {
+            "type": "boolean",
+            "description": "True while the video stream thread is running."
+          }
+        }
+      },
+      "SessionInfo": {
+        "type": "object",
+        "description": "Client-requested launch parameters (key material is never exposed here).",
+        "required": [
+          "width",
+          "height",
+          "fps"
+        ],
+        "properties": {
+          "fps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "StreamInfo": {
+        "type": "object",
+        "description": "RTSP-negotiated stream parameters.",
+        "required": [
+          "width",
+          "height",
+          "fps",
+          "bitrate_kbps",
+          "packet_size",
+          "min_fec",
+          "codec"
+        ],
+        "properties": {
+          "bitrate_kbps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "codec": {
+            "$ref": "#/components/schemas/ApiCodec"
+          },
+          "fps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "min_fec": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Client's parity floor per FEC block (`minRequiredFecPackets`).",
+            "minimum": 0
+          },
+          "packet_size": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Video payload size per packet (bytes).",
+            "minimum": 0
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "SubmitPin": {
+        "type": "object",
+        "description": "The PIN Moonlight displays during pairing.",
+        "required": [
+          "pin"
+        ],
+        "properties": {
+          "pin": {
+            "type": "string",
+            "description": "1–16 ASCII digits (Moonlight shows 4).",
+            "example": "1234"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "host",
+      "description": "Host identity, capabilities, and liveness"
+    },
+    {
+      "name": "clients",
+      "description": "Paired Moonlight client management"
+    },
+    {
+      "name": "pairing",
+      "description": "Pairing PIN delivery (the out-of-band half of the GameStream pairing handshake)"
+    },
+    {
+      "name": "native",
+      "description": "Native punktfunk/1 pairing: arm a window, display the host PIN, manage paired devices"
+    },
+    {
+      "name": "session",
+      "description": "Active streaming session control"
+    },
+    {
+      "name": "library",
+      "description": "Game library: installed-store titles (Steam) plus user-curated custom entries"
+    }
+  ]
+}
