@@ -1,5 +1,7 @@
+import { useEffect, useMemo, useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { ApiReferenceReact } from '@scalar/api-reference-react'
+import { useTheme } from 'next-themes'
 // @scalar/api-reference-react@0.9.47's entry does NOT import its own stylesheet
 // (and doesn't inject it at runtime), so we must ship it ourselves or the
 // reference renders unstyled. Load it as a route-scoped <link> (same pattern as
@@ -23,44 +25,47 @@ export const Route = createFileRoute('/api/')({
   }),
 })
 
-// The full punktfunk theme rolled out onto Scalar — the same dark-violet
-// product chrome as the management console (bg #141019 / cards #1c1530, the
-// violet lens brand, Geist). Scalar is locked to dark mode below; the palette
-// maps every Scalar token (surfaces, text, sidebar, links, buttons, method
-// colours). Scalar ignores unknown custom-property names, so this is forward-safe.
+// The full punktfunk theme rolled out onto Scalar — the same dark-violet (and
+// light-lavender) product chrome as the docs/management console.
+//
+// IMPORTANT: Scalar toggles `.light-mode` / `.dark-mode` on `document.body`,
+// and it renders our `customCss` *before* its own built-in theme preset in the
+// SAME <style> tag. A bare `.dark-mode { … }` therefore has equal specificity
+// to the preset that comes after it and LOSES (you get Scalar's stock #0f0f0f
+// gray). Scoping to `body.dark-mode` / `body.light-mode` (specificity 0,1,1)
+// beats both the linked base sheet and the in-component preset, so our palette
+// wins regardless of source order. Scalar ignores unknown custom-property
+// names, so this stays forward-safe.
 const SCALAR_CSS = `
-.light-mode,
-.dark-mode {
+body.light-mode,
+body.dark-mode {
   --scalar-font: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
   --scalar-font-code: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
   --scalar-radius: 0.5rem;
   --scalar-radius-lg: 0.75rem;
   --scalar-radius-xl: 0.875rem;
 }
-.dark-mode {
-  /* Surfaces — the violet-tinted app-icon chrome. */
+
+/* ── Dark — the violet-tinted app-icon chrome (bg #141019 / cards #1c1530). ── */
+body.dark-mode {
   --scalar-background-1: #141019;
   --scalar-background-2: #1c1530;
   --scalar-background-3: #221a36;
   --scalar-background-accent: #6c5bf32e;
   --scalar-border-color: #2a2148;
 
-  /* Text. */
   --scalar-color-1: #f4f2fb;
   --scalar-color-2: #b7b1c9;
   --scalar-color-3: #8a85a0;
   --scalar-color-accent: #a79ff8;
 
-  /* Links. */
   --scalar-link-color: #a79ff8;
   --scalar-link-color-hover: #c8c0fb;
 
-  /* Primary action button (brand violet). */
   --scalar-button-1: #6c5bf3;
   --scalar-button-1-color: #ffffff;
   --scalar-button-1-hover: #5d4ee0;
 
-  /* Sidebar. */
   --scalar-sidebar-background-1: #17121f;
   --scalar-sidebar-color-1: #e9e6f4;
   --scalar-sidebar-color-2: #9a94ad;
@@ -76,16 +81,13 @@ const SCALAR_CSS = `
   --scalar-sidebar-indent-border-active: #6c5bf3;
   --scalar-sidebar-indent-border-hover: #463a78;
 
-  /* Header (if shown). */
   --scalar-header-background-1: #141019;
   --scalar-header-color-1: #f4f2fb;
   --scalar-header-border-color: #2a2148;
 
-  /* Scrollbar. */
   --scalar-scrollbar-color: #2a2148;
   --scalar-scrollbar-color-active: #463a78;
 
-  /* HTTP method / status colours — kept distinct, tuned to read on dark. */
   --scalar-color-green: #4ade80;
   --scalar-color-red: #f87171;
   --scalar-color-yellow: #fbbf24;
@@ -93,9 +95,83 @@ const SCALAR_CSS = `
   --scalar-color-orange: #fb923c;
   --scalar-color-purple: #a79ff8;
 }
+
+/* ── Light — the lavender docs surface (bg #f0ebff / white content). ── */
+body.light-mode {
+  --scalar-background-1: #ffffff;
+  --scalar-background-2: #f6f2ff;
+  --scalar-background-3: #ece6fb;
+  --scalar-background-accent: #6c5bf31a;
+  --scalar-border-color: #e4dcf7;
+
+  --scalar-color-1: #1b1430;
+  --scalar-color-2: #4a4368;
+  --scalar-color-3: #6f6a86;
+  --scalar-color-accent: #6c5bf3;
+
+  --scalar-link-color: #6c5bf3;
+  --scalar-link-color-hover: #5d4ee0;
+
+  --scalar-button-1: #6c5bf3;
+  --scalar-button-1-color: #ffffff;
+  --scalar-button-1-hover: #5d4ee0;
+
+  --scalar-sidebar-background-1: #f6f2ff;
+  --scalar-sidebar-color-1: #1b1430;
+  --scalar-sidebar-color-2: #6f6a86;
+  --scalar-sidebar-color-active: #5d4ee0;
+  --scalar-sidebar-item-hover-background: #6c5bf314;
+  --scalar-sidebar-item-hover-color: #1b1430;
+  --scalar-sidebar-item-active-background: #6c5bf322;
+  --scalar-sidebar-border-color: #e4dcf7;
+  --scalar-sidebar-search-background: #ffffff;
+  --scalar-sidebar-search-border-color: #e4dcf7;
+  --scalar-sidebar-search-color: #6f6a86;
+  --scalar-sidebar-indent-border: #e4dcf7;
+  --scalar-sidebar-indent-border-active: #6c5bf3;
+  --scalar-sidebar-indent-border-hover: #c9bdf0;
+
+  --scalar-header-background-1: #ffffff;
+  --scalar-header-color-1: #1b1430;
+  --scalar-header-border-color: #e4dcf7;
+
+  --scalar-scrollbar-color: #d9d0f2;
+  --scalar-scrollbar-color-active: #bcb0ec;
+
+  --scalar-color-green: #16a34a;
+  --scalar-color-red: #dc2626;
+  --scalar-color-yellow: #d97706;
+  --scalar-color-blue: #2563eb;
+  --scalar-color-orange: #ea580c;
+  --scalar-color-purple: #6c5bf3;
+}
 `
 
 function ApiReference() {
+  // Follow the docs' own light/dark switch (Fumadocs drives next-themes). Scalar
+  // has no way to auto-detect the host theme, so we feed it the resolved theme
+  // and hide its own toggle — the Fumadocs toggle stays the single source of
+  // truth. `mounted` avoids a hydration flash (resolvedTheme is undefined on the
+  // server); default to dark to match the docs' default.
+  const { resolvedTheme } = useTheme()
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => setMounted(true), [])
+  const isDark = !mounted || resolvedTheme !== 'light'
+
+  // A fresh object on each theme flip so the React wrapper's
+  // `updateConfiguration` effect fires and Scalar swaps the body mode class.
+  const configuration = useMemo(
+    () => ({
+      url: '/openapi.json',
+      darkMode: isDark,
+      hideDarkModeToggle: true,
+      metaData: { title: 'punktfunk Management API' },
+      hideDownloadButton: false,
+      customCss: SCALAR_CSS,
+    }),
+    [isDark],
+  )
+
   return (
     <div className="flex min-h-screen flex-col">
       {/* Slim branded bar so the reference stays inside the punktfunk identity
@@ -133,17 +209,7 @@ function ApiReference() {
       {/* Scalar mounts a Vue app client-side in a useEffect (SSR-safe: the
           server renders an empty container, the browser hydrates the reference). */}
       <div className="min-h-0 flex-1">
-        <ApiReferenceReact
-          configuration={{
-            url: '/openapi.json',
-            darkMode: true,
-            // Lock to the punktfunk dark-violet theme — no light-mode escape hatch.
-            hideDarkModeToggle: true,
-            metaData: { title: 'punktfunk Management API' },
-            hideDownloadButton: false,
-            customCss: SCALAR_CSS,
-          }}
-        />
+        <ApiReferenceReact configuration={configuration} />
       </div>
     </div>
   )
