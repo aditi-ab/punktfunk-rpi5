@@ -1,9 +1,6 @@
 @import 'tailwindcss';
 @import 'tw-animate-css';
 @import './timing-functions.css';
-/* @unom/ui's specular "material" gloss layer (.material / .material-fx). Colours
-   derive from --neutral / --neutral-accent via the --mat-* knobs it ships. */
-@import '@unom/ui/styles/material.css';
 
 @custom-variant dark (&:is(.dark *));
 

@@ -9,7 +9,6 @@ import {
 import type { QueryClient } from '@tanstack/react-query'
 import '@fontsource-variable/geist'
 import { AppShell } from '@/components/app-shell'
-import { UnomProviders } from '@/components/unom-providers'
 import appCss from '@/styles.css?url'
 
 export interface RouterContext {
@@ -38,15 +37,13 @@ function RootComponent() {
         <HeadContent />
       </head>
       <body className="min-h-screen">
-        <UnomProviders>
-          {isLogin ? (
+        {isLogin ? (
+          <Outlet />
+        ) : (
+          <AppShell>
             <Outlet />
-          ) : (
-            <AppShell>
-              <Outlet />
-            </AppShell>
-          )}
-        </UnomProviders>
+          </AppShell>
+        )}
         <Scripts />
       </body>
     </html>

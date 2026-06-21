@@ -17,19 +17,75 @@ export const Route = createFileRoute('/api/')({
   }),
 })
 
-// Brand the Scalar reference to the punktfunk violet + Geist, in both light and
-// dark. Scalar ignores unknown custom-property names, so this is forward-safe.
+// The full punktfunk theme rolled out onto Scalar — the same dark-violet
+// product chrome as the management console (bg #141019 / cards #1c1530, the
+// violet lens brand, Geist). Scalar is locked to dark mode below; the palette
+// maps every Scalar token (surfaces, text, sidebar, links, buttons, method
+// colours). Scalar ignores unknown custom-property names, so this is forward-safe.
 const SCALAR_CSS = `
-:root {
-  --scalar-color-accent: #6c5bf3;
+.light-mode,
+.dark-mode {
   --scalar-font: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  --scalar-font-code: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  --scalar-radius: 0.5rem;
+  --scalar-radius-lg: 0.75rem;
+  --scalar-radius-xl: 0.875rem;
 }
 .dark-mode {
-  --scalar-color-accent: #a79ff8;
+  /* Surfaces — the violet-tinted app-icon chrome. */
   --scalar-background-1: #141019;
   --scalar-background-2: #1c1530;
   --scalar-background-3: #221a36;
+  --scalar-background-accent: #6c5bf32e;
   --scalar-border-color: #2a2148;
+
+  /* Text. */
+  --scalar-color-1: #f4f2fb;
+  --scalar-color-2: #b7b1c9;
+  --scalar-color-3: #8a85a0;
+  --scalar-color-accent: #a79ff8;
+
+  /* Links. */
+  --scalar-link-color: #a79ff8;
+  --scalar-link-color-hover: #c8c0fb;
+
+  /* Primary action button (brand violet). */
+  --scalar-button-1: #6c5bf3;
+  --scalar-button-1-color: #ffffff;
+  --scalar-button-1-hover: #5d4ee0;
+
+  /* Sidebar. */
+  --scalar-sidebar-background-1: #17121f;
+  --scalar-sidebar-color-1: #e9e6f4;
+  --scalar-sidebar-color-2: #9a94ad;
+  --scalar-sidebar-color-active: #c8c0fb;
+  --scalar-sidebar-item-hover-background: #6c5bf31f;
+  --scalar-sidebar-item-hover-color: #f4f2fb;
+  --scalar-sidebar-item-active-background: #6c5bf333;
+  --scalar-sidebar-border-color: #241c3d;
+  --scalar-sidebar-search-background: #1c1530;
+  --scalar-sidebar-search-border-color: #2a2148;
+  --scalar-sidebar-search-color: #9a94ad;
+  --scalar-sidebar-indent-border: #2a2148;
+  --scalar-sidebar-indent-border-active: #6c5bf3;
+  --scalar-sidebar-indent-border-hover: #463a78;
+
+  /* Header (if shown). */
+  --scalar-header-background-1: #141019;
+  --scalar-header-color-1: #f4f2fb;
+  --scalar-header-border-color: #2a2148;
+
+  /* Scrollbar. */
+  --scalar-scrollbar-color: #2a2148;
+  --scalar-scrollbar-color-active: #463a78;
+
+  /* HTTP method / status colours — kept distinct, tuned to read on dark. */
+  --scalar-color-green: #4ade80;
+  --scalar-color-red: #f87171;
+  --scalar-color-yellow: #fbbf24;
+  --scalar-color-blue: #60a5fa;
+  --scalar-color-orange: #fb923c;
+  --scalar-color-purple: #a79ff8;
 }
 `
 
@@ -75,6 +131,8 @@ function ApiReference() {
           configuration={{
             url: '/openapi.json',
             darkMode: true,
+            // Lock to the punktfunk dark-violet theme — no light-mode escape hatch.
+            hideDarkModeToggle: true,
             metaData: { title: 'punktfunk Management API' },
             hideDownloadButton: false,
             customCss: SCALAR_CSS,

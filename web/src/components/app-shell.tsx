@@ -76,11 +76,11 @@ export function AppShell({ children }: { children: ReactNode }) {
             key={to}
             to={to}
             activeOptions={{ exact: to === '/' }}
-            className="flex flex-1 flex-col items-center gap-1 py-2 text-[10px] text-muted-foreground transition-colors"
+            className="flex flex-1 flex-col items-center justify-center gap-1 px-0.5 py-2 text-muted-foreground transition-colors"
             activeProps={{ className: 'text-[var(--brand-light)]' }}
           >
-            <Icon className="size-5" />
-            <span className="leading-none">{label()}</span>
+            <Icon className="size-5 shrink-0" />
+            <span className="w-full text-center text-[10px] leading-tight">{label()}</span>
           </Link>
         ))}
       </nav>
