@@ -71,7 +71,9 @@ certificate, so you import that certificate once before Windows will install the
 
 1. Open the [packages page](https://git.unom.io/unom/-/packages) (generic group), find
    **`punktfunk-client-windows`**, and download the newest **`.msix`** and its matching **`.cer`**.
-2. In an **admin** PowerShell, trust the publisher certificate (one-time), then install:
+2. **Trust the publisher certificate**, then install. The MSIX won't install until the certificate is
+   trusted — but it's the **same certificate for every release**, so this is genuinely one-time and
+   later updates need nothing. In an **admin** PowerShell:
 
    ```powershell
    Import-Certificate -FilePath .\punktfunk-client-windows.cer `
@@ -85,8 +87,9 @@ certificate, so you import that certificate once before Windows will install the
 
 3. Launch **Punktfunk** from the Start menu and pick your host.
 
-> The Windows client is young (software decode; hardware D3D11VA/HDR in progress). If it
-> misbehaves, **[Moonlight](/docs/moonlight)** is a solid alternative for Windows.
+> The Windows client's hardware-decode (D3D11VA) and HDR paths are complete but still pending
+> validation on real GPU hardware. If anything misbehaves, **[Moonlight](/docs/moonlight)** is a
+> solid alternative for Windows.
 
 ## macOS
 

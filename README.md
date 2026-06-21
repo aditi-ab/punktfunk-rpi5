@@ -1,98 +1,142 @@
 # punktfunk
 
-*A ground-up low-latency desktop streaming stack, built Linux-first, with a shared Rust
-protocol core and native clients per platform.*
+**Low-latency desktop and game streaming, Linux-first.** Run the host on a Linux machine — or a
+Windows PC — with an NVIDIA GPU, connect from a Mac, PC, phone, tablet, or TV, and stream your desktop
+or games — each device at its **own native resolution and refresh rate**, over your local network.
 
-`punktfunk` is a placeholder codename. The bet: ship a **Linux virtual-display streaming
-host** that speaks the existing Moonlight protocol (every Moonlight/Artemis client works
-day one), then break the ~1 Gbps FEC wall with a **GF(2¹⁶) Leopard-RS** transport as a
-negotiated extension. See [`docs/implementation-plan.md`](docs/implementation-plan.md).
+📖 **Documentation: [docs.punktfunk.unom.io](https://docs.punktfunk.unom.io)** — start with
+[How It Works](https://docs.punktfunk.unom.io/docs/how-it-works) or the
+[Quick Start](https://docs.punktfunk.unom.io/docs/quickstart).
+
+punktfunk pairs a **virtual-display streaming host** with native clients on every platform. It speaks
+the existing **GameStream** protocol, so any [Moonlight](https://moonlight-stream.org/) client works
+day one — and adds its own faster **`punktfunk/1`** protocol that breaks the ~1 Gbps FEC wall with a
+**GF(2¹⁶) Leopard-RS** transport. A single shared **Rust core** (`punktfunk-core`) holds the
+protocol, FEC, and crypto, linked into the host and every client over a stable C ABI.
+
+## What makes it different
+
+- **Your device's exact mode.** For each client that connects, the host spins up a virtual display
+  sized to that device — 1080p60 to a laptop, 1440p120 to a desktop, 4K to a TV, all at once. No
+  letterboxing, no scaling, no rearranging your real monitors.
+- **Low latency, GPU end to end.** Frames go straight from the compositor to the NVENC encoder with
+  zero CPU copies (dmabuf → CUDA/Vulkan → NVENC), over a transport tuned for responsiveness rather
+  than throughput. Stable 240 fps at 5120×1440; sub-millisecond capture-to-reassembly on a LAN.
+- **Works with what you already have.** Any Moonlight/Artemis client connects over GameStream — and
+  native apps for macOS, Linux, Windows, and Android use the lower-latency `punktfunk/1` protocol.
+- **Secure by default.** Hosts require a one-time SPAKE2 **PIN pairing**; after that, devices
+  reconnect on a pinned identity. No accounts, no cloud. Hosts auto-advertise over mDNS, so clients
+  find them on the network without typing an IP.
 
 ## Status
 
-| Milestone | State |
+| Component | State |
 |-----------|-------|
-| **Core — `punktfunk-core` + C ABI** | ✅ done & hardened (FEC, packetization, AES-GCM, session, adversarial-review fixes, `punktfunk_core.h`) |
-| **GameStream host → stock Moonlight** | ✅ live end-to-end: pairing, RTSP, audio, per-client virtual output at native res, GPU zero-copy NVENC, gamepads |
-| **Native protocol — `punktfunk/1`** | ✅ validated live: QUIC control + GF(2¹⁶) FEC/AES data plane, SPAKE2 PIN pairing, mid-stream mode renegotiation |
-| **Native clients — decode + present** | 🟡 macOS first light: AnnexB→VideoToolbox HEVC on glass + input/pairing over `punktfunk/1` (`clients/apple`); iOS + presenter next |
-| **Web console + management API** | ✅ TanStack web console (`web/`) over the OpenAPI mgmt API: host status, paired devices, on-demand native pairing (arm → show PIN) |
+| **Core** — `punktfunk-core` + C ABI (protocol · FEC · crypto · QUIC) | ✅ Complete & hardened |
+| **GameStream host** → stock Moonlight | ✅ Live end-to-end: pairing, RTSP, audio, per-client virtual output at native resolution, GPU zero-copy NVENC, gamepads |
+| **Native protocol** — `punktfunk/1` | ✅ Validated live: QUIC control + GF(2¹⁶) FEC/AES-GCM data plane, PIN pairing, mDNS discovery, mid-stream mode renegotiation |
+| **Windows host** (NVIDIA, x64) | 🟡 Implemented & shipping as a signed installer (DXGI capture · SudoVDA virtual display · NVENC · WASAPI · ViGEm); NVIDIA-only, newer than the Linux host |
+| **macOS / iOS / tvOS client** (`clients/apple`) | ✅ Streaming live: VideoToolbox decode, controllers incl. DualSense, discovery, pairing, speed test |
+| **Linux client** (`clients/linux`, GTK4) | ✅ Streaming live: FFmpeg + VAAPI zero-copy decode, PipeWire audio, SDL3 controllers; ships as Flatpak/apt/rpm/Arch |
+| **Android client** (`clients/android`, phone + TV) | ✅ Streaming live: AMediaCodec decode + HDR10, Oboe audio, controllers, discovery, pairing |
+| **Windows client** (`clients/windows`, WinUI 3) | 🟡 Stage 1 complete, ships as signed MSIX (x64 + ARM64); D3D11VA decode + HDR present pending on-glass validation |
+| **Web console + management API** (`web/`) | ✅ TanStack console over the OpenAPI mgmt API: host status, paired devices, on-demand PIN pairing |
 
-The **GameStream host works with a stock Moonlight client** — validated live on NVIDIA
-(RTX 5070 Ti & RTX 4090, driver 595): trust-on-first-use pairing that persists, an app
-catalog, RTSP/ENet/audio, and **video at the client's exact resolution and refresh** via a
-per-session virtual output (KWin, gamescope, Mutter, Sway backends), encoded with GPU
-**zero-copy** (dmabuf → CUDA/Vulkan → NVENC) at up to 5120×1440@240. The native
-**`punktfunk/1`** protocol adds a QUIC control plane and a GF(2¹⁶) Leopard-FEC + AES-GCM data
-plane (p50 ~0.8 ms capture→reassembled at 720p120). Its trust model is **SPAKE2 PIN pairing by
-default** — a new host requires the PIN ceremony; trust-on-first-use is an explicit host opt-in
-(`punktfunk1-host --allow-tofu` / `serve --open`, advertised as `pair=optional`) for fully trusted LANs. Both
-run from **one process** (`serve --native`), managed through a REST API + web console. Builds
-against FFmpeg 7 or 8; deployed live on Bazzite. Full status: [`CLAUDE.md`](CLAUDE.md);
-roadmap, setup guides & progress: the docs site ([`docs-site/`](docs-site) — Fumadocs;
-`bun run dev`), with the canonical [roadmap](docs-site/content/docs/roadmap.md) and
-[status](docs-site/content/docs/status.md) there. Design notes stay in [`docs/`](docs).
+The **GameStream host works with a stock Moonlight client** — validated live on NVIDIA hardware
+(RTX 5070 Ti, RTX 4090): PIN pairing that persists across restarts, an app catalog, RTSP/ENet/audio,
+and **video at the client's exact resolution and refresh** via a per-session virtual output (KWin,
+gamescope, Mutter, and Sway/wlroots backends), encoded with GPU **zero-copy** (dmabuf → CUDA/Vulkan →
+NVENC) up to 5120×1440@240. The native **`punktfunk/1`** protocol adds a QUIC control plane and a
+GF(2¹⁶) Leopard-FEC + AES-GCM data plane (p50 ~0.8 ms capture→reassembled at 720p120), with
+mid-stream mode renegotiation and a wall-clock skew handshake so latency stays valid across machines.
+Both protocols run from **one process** (`punktfunk-host serve --native`) and are managed through a
+REST API and web console. Builds against FFmpeg 7 or 8.
 
-## Install (host)
+Full milestone status: **[docs.punktfunk.unom.io/docs/status](https://docs.punktfunk.unom.io/docs/status)** ·
+roadmap: **[/docs/roadmap](https://docs.punktfunk.unom.io/docs/roadmap)**.
 
-The package registries are the real distribution channel — pick your distro and run one command.
-Per-distro setup (add the repo, first-run, web console) lives in the linked READMEs.
+## Install the host
 
-| Distro | One-command happy path | Details |
-|--------|------------------------|---------|
-| **Ubuntu / Debian** (apt) | `sudo apt install punktfunk-host` *(after adding the repo)* | [`packaging/debian/README.md`](packaging/debian/README.md) |
-| **Fedora / Bazzite** (rpm-ostree) | `rpm-ostree install punktfunk punktfunk-web` *(after adding the repo; or the bootc image)* | [`packaging/rpm/README.md`](packaging/rpm/README.md) |
-| **Arch / Steam Deck** (PKGBUILD / sysext) | `makepkg -si` *(Arch)* · sysext `.raw` *(SteamOS/Deck)* | [`packaging/arch/README.md`](packaging/arch/README.md) |
+Pick your platform and install from its package registry — the per-platform guide covers adding the
+repo, first run, and the web console. The Linux host is the primary, most battle-tested path; a
+Windows host (NVIDIA-only) also ships as a signed installer.
 
-`punktfunk-host` is the streaming host; `punktfunk-web` is the browser console (pairing + status);
-`punktfunk-client` is the GTK4 desktop client (also shipped via apt/RPM/Arch/Flatpak). After install,
-run `punktfunk-host serve --native` inside your desktop session, then pair from the web console.
+| Platform | Install | Guide |
+|--------|---------|-------|
+| **Ubuntu / Debian** (apt) | `sudo apt install punktfunk-host` *(after adding the repo)* | [Ubuntu — GNOME](https://docs.punktfunk.unom.io/docs/ubuntu-gnome) · [KDE](https://docs.punktfunk.unom.io/docs/ubuntu-kde) |
+| **Fedora / Bazzite** (rpm-ostree) | `rpm-ostree install punktfunk punktfunk-web` *(or the bootc image)* | [Fedora — KDE](https://docs.punktfunk.unom.io/docs/fedora-kde) · [Bazzite](https://docs.punktfunk.unom.io/docs/bazzite) |
+| **Arch / Steam Deck** (PKGBUILD / sysext) | `makepkg -si` *(Arch)* · sysext `.raw` *(SteamOS)* | [packaging/arch](packaging/arch/README.md) |
+| **Windows** (NVIDIA, x64) | signed `setup.exe` from the package registry | [Windows Host](https://docs.punktfunk.unom.io/docs/windows-host) |
 
-Building from source (below) is a fallback.
+`punktfunk-host` is the streaming host; `punktfunk-web` is the browser console (pairing + status).
+After install, run `punktfunk-host serve --native` inside your desktop session, then pair from the web
+console. Full instructions: **[docs.punktfunk.unom.io/docs/install](https://docs.punktfunk.unom.io/docs/install)**.
 
-## Layout
+## Connect a client
 
-```
-crates/
-  punktfunk-core/        protocol · FEC · pacing · crypto · quic — the C ABI (lib + cdylib + staticlib)
-  punktfunk-host/        Linux host: vdisplay · capture · encode · inject · gamestream · punktfunk1 · mgmt · native_pairing
-clients/
-  probe/                 punktfunk/1 reference/probe client (headless test + latency measurement)
-  linux/   windows/      native desktop clients (Rust: GTK4 / WinUI 3, link punktfunk-core directly)
-  apple/   android/      Swift (macOS+iOS) · Kotlin app + native/ Rust JNI core
-  decky/                 Steam Deck Decky plugin
-web/                       TanStack web console (host status · paired devices · pairing) over the mgmt API
-packaging/                 Fedora/Bazzite RPM · bootc image · COPR (see packaging/bazzite/README.md)
-include/punktfunk_core.h       cbindgen-generated C header (checked in)
-tools/{latency-probe,loss-harness}/   measurement (plan §10)
-docs/{implementation-plan,roadmap,windows-host,dualsense-haptics}.md
-```
+| Streaming to… | Use |
+|---|---|
+| Mac, iPhone, iPad, Apple TV | The **Apple app** (`clients/apple`) — also on TestFlight |
+| Linux desktop / laptop, Steam Deck | **`punktfunk-client`** (Flatpak / apt / rpm / Arch) |
+| Android phone or TV | The **Android app** (`clients/android`) |
+| Windows | Native **`punktfunk-client`** (signed MSIX) or **Moonlight** |
+| Anything else (browser, old phone, smart TV) | **Moonlight** over GameStream |
+
+Each client discovers hosts on the network automatically and does a one-time
+[PIN pairing](https://docs.punktfunk.unom.io/docs/pairing). Per-device install steps:
+**[/docs/install-client](https://docs.punktfunk.unom.io/docs/install-client)**.
 
 ## Build & test (from source)
 
 For development, or as an install fallback where no package is available:
 
 ```sh
-cargo build --workspace          # green on Linux and macOS
+cargo build --workspace          # the Rust core, host, Linux client, and probe (Linux & macOS)
 cargo test  --workspace          # unit + loopback + proptest + C ABI harness
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 
 cargo run -p loss-harness        # FEC loss-resilience sweep (no network needed)
-bash crates/punktfunk-core/tests/c/run.sh   # standalone C-ABI link+round-trip proof
+bash crates/punktfunk-core/tests/c/run.sh   # standalone C-ABI link + round-trip proof
 ```
 
 The C header regenerates from `crates/punktfunk-core/src/abi.rs` on every build (cbindgen via
-`build.rs`) into `include/punktfunk_core.h`.
+`build.rs`) into `include/punktfunk_core.h`. The Apple, Android, and Windows clients have their own
+toolchains (Xcode/`swift build`, Gradle, and `cargo` on the MSVC target) — see each client's README
+and the [docs site](https://docs.punktfunk.unom.io).
+
+## Layout
+
+```
+crates/
+  punktfunk-core/   protocol · FEC · pacing · crypto · QUIC control plane — the C ABI (lib + cdylib + staticlib)
+  punktfunk-host/   Linux host: virtual displays · capture · encode · input · GameStream · punktfunk/1 · mgmt
+clients/
+  apple/    macOS / iOS / tvOS app (Swift · VideoToolbox · Metal · GameController)
+  linux/    Linux desktop app (Rust · GTK4/libadwaita · FFmpeg/VAAPI · PipeWire · SDL3)
+  windows/  Windows desktop app (Rust · WinUI 3 · D3D11 · WASAPI · SDL3)
+  android/  Android phone + TV app (Kotlin · Rust JNI core · AMediaCodec · Oboe)
+  probe/    headless reference / measurement client for punktfunk/1
+  decky/    Steam Deck Decky plugin
+web/                         web console (TanStack) over the management API — status · devices · pairing
+packaging/                   apt · rpm / COPR · Arch · Flatpak · Bazzite bootc image
+docs-site/                   public documentation site (Fumadocs) — https://docs.punktfunk.unom.io
+docs/                        design notes & deep-dive plans
+include/punktfunk_core.h     cbindgen-generated C header (checked in)
+tools/                       latency-probe · loss-harness (measurement)
+```
 
 ## Design invariants
 
-- **One core, linked everywhere.** Protocol/FEC/crypto/pacing live in `punktfunk-core` exactly
-  once, exposed over a stable, versioned C ABI (`punktfunk_abi_version()`, `PunktfunkConfig`
-  carries its own `struct_size`).
-- **No async on the hot path.** The per-frame pipeline uses native threads only;
-  `tokio`/`quinn` are gated behind the off-by-default `quic` feature (control plane only).
-- **FEC is the wall-breaker.** GF(2⁸) (≤255 shards/block) for Moonlight compat;
-  GF(2¹⁶) (≤65535 shards/block, SIMD, O(n log n)) to push past ~1 Gbps.
+- **One core, linked everywhere.** Protocol, FEC, and crypto live in `punktfunk-core` exactly once,
+  exposed over a stable, versioned C ABI (`punktfunk_abi_version()`, `PunktfunkConfig` carries its own
+  `struct_size`). Every native client links the same core.
+- **No async on the hot path.** The per-frame pipeline uses native threads only; `tokio`/`quinn` are
+  gated behind the off-by-default `quic` feature (control plane only).
+- **Native client resolution, no scaling.** Each session gets a virtual output at exactly the
+  client's WxH@Hz; each compositor keeps its own backend behind a shared `VirtualDisplay` trait.
+- **FEC is the wall-breaker.** GF(2⁸) (≤255 shards/block) for Moonlight compatibility; GF(2¹⁶)
+  (≤65535 shards/block, SIMD, O(n log n)) for `punktfunk/1` to push past ~1 Gbps.
 
 ## License
 

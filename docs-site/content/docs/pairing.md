@@ -50,7 +50,8 @@ command line instead; the production `serve --native` host arms pairing from the
 
 Then, on the client:
 
-- **Apple app:** select the host (or use *Pair with PIN…* from its menu) and enter the PIN.
+- **Native clients (Apple, Linux, Windows, Android):** select the host (or use *Pair with PIN…* from
+  its menu) and enter the PIN the host displays.
 - **Moonlight:** choose **Pair**; Moonlight shows the PIN to confirm on the host side.
 
 ## Requiring pairing (the default)

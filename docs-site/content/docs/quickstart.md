@@ -31,10 +31,11 @@ network, so clients can find it by name. Leave it running. (To start it automati
 
 ## 3. Connect and pair a client
 
-On the device you want to stream to:
+On the device you want to stream to, use a [native punktfunk client](/docs/clients) for the lowest
+latency, or any Moonlight client:
 
-- **Apple (Mac, iPhone, iPad, Apple TV):** open the punktfunk app — your host appears under *On this
-  network*. Tap it, and when prompted, **pair**.
+- **Native client (Apple, Linux, Windows, Android):** open the punktfunk app — your host appears in
+  the list of hosts found on your network. Select it, and when prompted, **pair**.
 - **Anything with Moonlight:** add the host (it should be discovered automatically), then pair.
 
 To pair, the host needs to show a PIN. Arm pairing from the host's web console — the host displays a

@@ -66,6 +66,17 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   preference byte (same trailing-byte back-compat pattern as the compositor), the Welcome
   echoes the resolved backend — precedence: explicit client choice > `PUNKTFUNK_GAMEPAD`
   env > uinput Xbox 360; DualSense (UHID) only on Linux hosts.
+- **Windows host: implemented and shipping (NVIDIA-only, x64-only).** `#[cfg(windows)]` backends
+  behind the same traits as Linux — DXGI Desktop Duplication capture (`capture/dxgi.rs`), **SudoVDA**
+  virtual display per session (`vdisplay/sudovda.rs`), NVENC encode (`--features nvenc`), SendInput +
+  **ViGEm** gamepads (`inject/gamepad_windows.rs`), WASAPI loopback + virtual mic (`audio/wasapi_*`).
+  Ships as a **signed Inno Setup installer** that registers a `LocalSystem` SCM service launching into
+  the interactive session for secure-desktop (UAC/lock-screen) capture (`service.rs`), bundles the
+  SudoVDA driver, and is published by `windows-host.yml`. **HDR (10-bit)**: WGC captures the HDR
+  desktop as FP16/Rgb10a2 (DDA FP16 for the secure desktop), NVENC forces HEVC Main10 + BT.2020 PQ,
+  the client auto-detects PQ from the HEVC VUI — gated by `PUNKTFUNK_10BIT` + client `VIDEO_CAP_10BIT`;
+  **Windows host only** (the Linux host stays 8-bit, blocked upstream). Newer/less battle-tested than
+  the Linux host; no AMD/Intel/software encode path. Packaging: `packaging/windows/`.
 
 ## What's left
 
@@ -88,9 +99,11 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    `test-loopback.sh` (Swift client vs synthetic punktfunk1-hosts on loopback — runs on macOS;
    includes the pairing ceremony + `--require-pairing` gate),
    `RemoteFirstLightTests` (full pipeline over the LAN). See
-   [`clients/apple/README.md`](clients/apple/README.md). Next: stage 2 presenter
-   (`VTDecompressionSession` + `CAMetalLayer` frame pacing), glass-to-glass numbers via
-   `tools/latency-probe` (scaffold), iOS variant.
+   [`clients/apple/README.md`](clients/apple/README.md). **Stage 2 presenter**
+   (`VTDecompressionSession` + `CAMetalLayer`) is built and live-validated on glass behind the opt-in
+   `punktfunk.presenter` flag (~11 ms p50 capture→present), to become the default after a few
+   resolution/HDR checks. Next: make stage 2 the default, glass-to-glass numbers via
+   `tools/latency-probe`, iOS/iPadOS/tvOS variants.
    **Linux stage 1 done, first light 2026-06-12** (`clients/linux`, binary
    `punktfunk-client`): GTK4/libadwaita shell linking `punktfunk-core` directly (no C ABI;
    `NativeClient` is now `Sync` — mutexed plane receivers), mDNS host list, TOFU + SPAKE2
@@ -152,24 +165,35 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    validation** of the D3D11VA decode + HDR present + GUI on the RTX box (the dev VM is
    headless/Session-0/WARP → the WinUI window + hardware decode need a real display+GPU: RDP or the
    RTX box), then RAWINPUT relative-mouse pointer-lock and a per-host speed test in the UI.
+   **Android stage 1 done** (`clients/android`, Kotlin app + `native/` Rust JNI core linking
+   `punktfunk-core`; phone + Android TV): NDK `AMediaCodec` hardware HEVC decode → `SurfaceView` incl.
+   **HDR10** (Main10/BT.2020 PQ) with low-latency tuning + a live stats HUD (`decode.rs`/`stats.rs`),
+   Opus/Oboe audio + mic uplink (`audio.rs`/`mic.rs`), gamepad input with rumble/HID feedback
+   (`feedback.rs`), `NsdManager` mDNS discovery, SPAKE2 PIN pairing + TOFU (Keystore identity +
+   known-host store), Compose UI (Connect/Settings/Stream) with D-pad/controller focus nav. Built for
+   `arm64-v8a` + `x86_64`; published to Google Play (Internal Testing) via `android.yml`
+   (`ci/play-upload.py`). Next: real-device gamepad/HDR live-verify, presenter/latency polish.
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).
-3. **punktfunk/1 protocol growth**: concurrent sessions (today: one at a time, extras wait
-   in the accept queue). **Done:** unified host (`serve --native` runs GameStream + the
+3. **punktfunk/1 protocol growth.** **Done:** unified host (`serve --native` runs GameStream + the
    punktfunk/1 QUIC host in one process) with native pairing driven over the mgmt API /
    web console (`mod native_pairing`: arm-on-demand → display PIN, paired-device list).
    **Done:** PIN pairing is the default, host-gated — the host requires pairing and advertises
    `pair=required` unless opted out with `--allow-tofu`/`--open` (then `pair=optional`, accepts
    unpaired clients); clients render TOFU only for a `pair=optional` host and force re-pairing on a
-   fingerprint change. Next (see roadmap): **delegated pairing approval** (an already-paired device
-   approves a new one).
+   fingerprint change. **Done:** concurrent sessions — the accept loop spawns each session
+   (`--max-concurrent`, default 4, an NVENC bound), each with its own virtual output + encoder, sharing
+   the host-lifetime input/audio/mic services (shared-desktop multi-view on kwin/mutter/wlroots).
+   **Done:** delegated pairing approval (§8b-1) — an unpaired device shows up as a pending request in
+   the web console, one click approves + pins it. Next (see roadmap): gamescope multi-user isolation
+   (per-session input/audio = independent desktops); §8b-2 peer-push approval from a paired device's
+   own app.
 4. **GameStream host polish**: HDR/10-bit (needs HDR capture + metadata plumbing; `av1_nvenc
    -highbitdepth 1` already encodes Main10 from 8-bit input on this box),
    reconnect-at-new-mode robustness. AV1 negotiation and surround audio are implemented
    and unit/live-capture tested — both still need a live Moonlight confirmation (select
    AV1 in a stock client; a real 5.1/7.1 listen incl. FEC under loss).
-5. **Native clients** (`clients/{apple,android}` scaffolds) consuming `punktfunk_core.h`.
 
 Box one-time setup is complete: udev rule + `input` group (gamepads validated live),
 gamescope 3.16.22 installed system-wide (no PATH override), gnome-shell installed (Mutter
@@ -196,7 +220,10 @@ workspace checks inside the `git.unom.io/unom/punktfunk-rust-ci` image plus web/
 build+typecheck; `docker.yml` builds+pushes the web/docs/rust-ci images (host and native
 clients are deliberately NOT containerized); `apple.yml` builds the xcframework and runs
 `swift build`/`swift test` on the `macos-arm64` host-mode runner (home-mac-mini-1,
-provisioned by `scripts/ci/setup-macos-runner.sh`).
+provisioned by `scripts/ci/setup-macos-runner.sh`). Per-client/host release workflows:
+`deb.yml`/`rpm.yml`/`flatpak.yml` (Linux client), `android.yml` (Google Play), `windows-msix.yml`
+(Windows client), `windows-host.yml` (Windows host installer), `release.yml` (Apple notarized DMG +
+TestFlight), `decky.yml` (Steam Deck plugin); Windows builds run on a self-hosted Windows runner.
 
 ## Layout
 
@@ -211,11 +238,12 @@ crates/punktfunk-host/
 clients/probe/    punktfunk/1 reference/probe client (headless test/measurement tool)
 clients/linux/    native Linux client (GTK4/libadwaita · FFmpeg · PipeWire · SDL3)
 clients/windows/  native Windows client (WinUI 3 via windows-reactor · D3D11 · WASAPI · SDL3)
-clients/apple/    native macOS/iOS client (Swift · VideoToolbox · GameController)
+clients/apple/    native macOS/iOS/tvOS client (Swift · VideoToolbox · GameController)
 clients/android/  native Android client (Kotlin app + native/ Rust JNI core over punktfunk-core)
 clients/decky/    Steam Deck Decky plugin
+crates/punktfunk-host/src/{capture/dxgi,vdisplay/sudovda,inject/gamepad_windows,audio/wasapi_*,service}.rs   Windows host backends
 web/                          TanStack web console over the mgmt API (status · devices · pairing)
-packaging/                    Fedora/Bazzite RPM · bootc · COPR (packaging/bazzite/README.md)
+packaging/                    apt(deb) · RPM/COPR · Arch/sysext · Flatpak · Bazzite bootc · Windows host installer (per-dir READMEs)
 tools/{loss-harness,latency-probe}/     measurement (plan §10)
 scripts/                  60-punktfunk.rules · punktfunk-host.service · host.env.example · headless/
 include/punktfunk_core.h      generated C header

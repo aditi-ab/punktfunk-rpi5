@@ -79,6 +79,10 @@ session unit — see [Bazzite](/docs/bazzite).
 
 ## Windows
 
+> punktfunk is Linux-first, but a native **Windows host** also ships — a signed installer with an SCM
+> service and a bundled virtual-display driver. It's **NVIDIA-only** (NVENC) and newer than the Linux
+> host. (Not to be confused with the Windows *client*, which streams *to* a Windows PC.)
+
 On Windows the host runs as a `LocalSystem` service that launches into the interactive session, so it
 captures the secure desktop (UAC / lock screen) and survives reboots with nobody logged in — the same
 model Sunshine/Apollo use.
@@ -98,7 +102,7 @@ way you need an NVIDIA GPU + driver (the host is NVENC-only on Windows).
 After a reboot, from another machine on the network:
 
 ```sh
-punktfunk-probe --discover     # or just look for the host in the Apple app / Moonlight
+punktfunk-probe --discover     # or just look for the host in a native client / Moonlight
 ```
 
 If the host is listed, it's up. If not, check `journalctl --user -u punktfunk-host` on the host.

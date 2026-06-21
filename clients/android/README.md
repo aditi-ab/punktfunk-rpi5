@@ -19,15 +19,19 @@ The single seam is `io.unom.punktfunk.kit.NativeBridge` ⇄ `Java_io_unom_punktf
 ## Layout
 
 ```
-clients/android/native/          Rust cdylib (workspace member)
-  src/lib.rs                       JNI_OnLoad + abiVersion/coreVersion (native-link proof)
-  src/session.rs                   session handle lifecycle (connect/close); plane pumps = TODO
+clients/android/native/          Rust cdylib (workspace member) — links punktfunk-core directly
+  src/lib.rs                       JNI seam (connect/pair, input, plane getters, abi/core version)
+  src/session.rs                   session lifecycle + plane pumps
+  src/decode.rs                    AnnexB → AMediaCodec HEVC hardware decode → SurfaceView (incl. HDR10)
+  src/audio.rs · src/mic.rs        Opus + Oboe playback / mic uplink (jitter ring)
+  src/feedback.rs                  rumble + HID output (lightbar / adaptive triggers)
+  src/stats.rs                     live video stats
 
 clients/android/                   Gradle project (this dir)
   settings.gradle.kts · build.gradle.kts · gradle.properties · gradlew
-  app/                             :app — Compose application (MainActivity)
-  kit/                             :kit — Android library: NativeBridge + the cargo-ndk build
-    build.gradle.kts               cargoNdk{Debug,Release} → src/main/jniLibs/<abi>/*.so
+  app/                             :app — Compose UI: Connect / Settings / Stream screens (phone + TV)
+  kit/                             :kit — NativeBridge · discovery (NsdManager) · Gamepad · Keymap ·
+                                         security (Keystore identity + known-host store) · cargo-ndk build
 ```
 
 ## Prerequisites
@@ -57,15 +61,22 @@ cd clients/android
 # Emulators (created during env setup):  emulator -avd pf_phone   |   emulator -avd pf_tv
 ```
 
-The debug APK lands in `app/build/outputs/apk/debug/`. The scaffold screen calls
-`NativeBridge.abiVersion()` across JNI — a live ABI version proves the whole native stack is wired.
+The debug APK lands in `app/build/outputs/apk/debug/`. Launch it, pick a host from the list, pair,
+and stream.
 
 ## Status
 
-- **Scaffold (done):** Gradle modules, cargo-ndk wiring, JNI native-link proof, phone+TV-installable
-  manifest. `crates/punktfunk-core` `rcgen` switched to the `ring` backend so the client `.so` is
-  aws-lc-free.
-- **Next (Android stage 1):** video decode (`AMediaCodec` async → `SurfaceView`), audio
-  (Opus + Oboe + jitter ring), input capture → `send_input`, pairing/identity (Keystore-wrapped),
-  mDNS discovery, the phone/TV Compose UI. The Rust-side homes are stubbed in
-  `clients/android/native/src/session.rs` with port pointers to `clients/linux`.
+A working native client (phone + Android TV), at parity with the Linux and Apple apps for the core
+streaming experience:
+
+- **Video** — `AMediaCodec` hardware HEVC decode → `SurfaceView`, including **HDR10** (Main10 /
+  BT.2020 PQ), with low-latency decode tuning and a live stats HUD.
+- **Audio** — Opus + Oboe playback with a jitter ring, plus mic uplink to the host.
+- **Input** — game controllers (buttons + axes) with rumble and HID feedback; D-pad /
+  game-controller focus navigation for the couch (TV + phone).
+- **Discovery & trust** — `NsdManager` mDNS host list, SPAKE2 PIN pairing and TOFU, with a
+  Keystore-wrapped client identity and a known-host store.
+- **UI** — Compose host list / settings / stream screens, Material You theming.
+- **Shipping** — built for `arm64-v8a` + `x86_64`; published to Google Play (Internal Testing).
+
+`crates/punktfunk-core` uses the `ring` `rcgen` backend so the client `.so` is aws-lc-free.

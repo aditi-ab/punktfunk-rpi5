@@ -4,8 +4,12 @@ description: Stream from a punktfunk host using any Moonlight client.
 ---
 
 punktfunk speaks the **GameStream** protocol, so [Moonlight](https://moonlight-stream.org/) connects
-to it like it would to any GameStream host — no punktfunk-specific app needed. This is the easiest way
-to stream to Windows, Android, the Steam Deck, a browser, or a TV.
+to it like it would to any GameStream host — no punktfunk-specific app needed. It's a great option for
+a browser, a smart TV, or any device without a native client.
+
+> Many platforms also have a **native punktfunk client** with lower latency and built-in
+> discovery/pairing — including **Windows** and **Android** (phone and Android TV). See
+> [Clients](/docs/clients) before reaching for Moonlight.
 
 ## 1. Make sure the host is running
 
@@ -34,7 +38,7 @@ it. Mouse, keyboard, and controllers flow back to the host.
 - **Set your resolution and frame rate in Moonlight's settings** before connecting — the host matches
   whatever Moonlight asks for, creating the virtual display at that exact mode.
 - **Codec:** HEVC (H.265) is a good default; AV1 is available if your client supports it.
-- **Bitrate:** start moderate and raise it. For very high bitrates, the native [Apple
-  app](/docs/clients) has a built-in speed test; with Moonlight, set the bitrate manually.
+- **Bitrate:** start moderate and raise it. For very high bitrates, the [native
+  clients](/docs/clients) have a built-in speed test; with Moonlight, set the bitrate manually.
 - Moonlight uses the GameStream protocol, not punktfunk's native FEC/encryption extensions. On a
-  solid LAN this is fine; on a lossy link the [Apple app](/docs/clients) holds up better.
+  solid LAN this is fine; on a lossy link a [native client](/docs/clients) holds up better.

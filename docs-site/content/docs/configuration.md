@@ -30,15 +30,15 @@ These tell the host which desktop session to attach to. Your setup guide sets th
 
 You don't set these on the host — **the client chooses them**. When a device connects, the host
 creates a virtual display at that device's resolution and refresh rate. A 1080p60 laptop and a
-1440p120 desktop each get their own. (With Moonlight, set the mode in Moonlight's settings; with the
-Apple app, it uses the device's display.)
+1440p120 desktop each get their own. (With Moonlight, set the mode in Moonlight's settings; the
+native clients let you pick a mode or default to the device's display.)
 
 ## Bitrate
 
 The client requests a bitrate; the host encodes to it. To find a good value for your link:
 
-- **Apple app:** use the built-in **speed test** (a host card's menu → *Test Network Speed*). It
-  measures your link and suggests a bitrate, then applies it.
+- **Native clients (Apple, Linux, and more):** use the built-in **speed test** (from a host's menu).
+  It measures your link, suggests a bitrate, and applies it.
 - **Moonlight:** set the bitrate in Moonlight's settings. Start moderate and raise it.
 
 ## Multiple devices at once
