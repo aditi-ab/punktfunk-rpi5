@@ -1,0 +1,36 @@
+[package]
+edition = "2024"
+name = "pf-dualsense"
+version = "0.1.0"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "punktfunk virtual DualSense UMDF2 HID minidriver (M0 spike)"
+
+[package.metadata.wdk.driver-model]
+driver-type = "UMDF"
+target-umdf-version-minor = 31
+umdf-version-major = 2
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+wdk-build.path = "../../crates/wdk-build"
+
+[dependencies]
+wdk.path = "../../crates/wdk"
+wdk-sys.path = "../../crates/wdk-sys"
+
+[features]
+default = ["hid"]
+hid = ["wdk-sys/hid"]
+nightly = ["wdk-sys/nightly", "wdk/nightly"]
+
+[profile.dev]
+lto = true
+
+[profile.release]
+lto = true
+
+# Standalone package (not part of the windows-drivers-rs root workspace).
+[workspace]

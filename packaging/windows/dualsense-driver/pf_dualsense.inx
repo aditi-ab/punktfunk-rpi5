@@ -1,0 +1,73 @@
+;/*++
+; punktfunk virtual DualSense — UMDF2 HID minidriver INF (M0 spike).
+; Adapted from the WDK vhidmini2 UMDF2 sample (VhidminiUm.inx).
+; Depends on MsHidUmdf.inf (build >= 22000).
+; Install: devgen /add /hardwareid "root\pf_dualsense"  (after pnputil /add-driver /install)
+;--*/
+[Version]
+Signature="$WINDOWS NT$"
+Class=HIDClass
+ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider=%ProviderString%
+CatalogFile=pf_dualsense.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1=%Disk_Description%,,,
+
+[SourceDisksFiles]
+pf_dualsense.dll=1
+
+[Manufacturer]
+%ManufacturerString%=pf, NT$ARCH$.10.0...22000
+
+[pf.NT$ARCH$.10.0...22000]
+%DeviceDesc%=pfDualSense, root\pf_dualsense
+
+[pfDualSense.NT]
+CopyFiles=UMDriverCopy
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT
+
+[pfDualSense.NT.hw]
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT.hw
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.hw
+
+[pfDualSense.NT.Services]
+Include=MsHidUmdf.inf
+Needs=MsHidUmdf.NT.Services
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.Services
+
+[pfDualSense.NT.Filters]
+Include=WUDFRD.inf
+Needs=WUDFRD_LowerFilter.NT.Filters
+
+[pfDualSense.NT.Wdf]
+UmdfService="pf_dualsense", pf_dualsense_Install
+UmdfServiceOrder=pf_dualsense
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfFileObjectPolicy=AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction=Copy
+UmdfFsContextUsePolicy=CanUseFsContext2
+
+[pf_dualsense_Install]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary="%13%\pf_dualsense.dll"
+
+[UMDriverCopy]
+pf_dualsense.dll
+
+[Strings]
+ProviderString     ="punktfunk"
+ManufacturerString ="punktfunk"
+ClassName          ="HID device"
+Disk_Description   ="punktfunk DualSense Installation Disk"
+DeviceDesc         ="punktfunk Virtual DualSense"
