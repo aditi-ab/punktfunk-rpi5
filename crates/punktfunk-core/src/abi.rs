@@ -547,6 +547,56 @@ impl PunktfunkHidOutput {
     }
 }
 
+/// Static HDR metadata for an HDR session ([`punktfunk_connection_next_hdr_meta`]): SMPTE ST.2086
+/// mastering display colour volume + CEA-861.3 content light level. All fields are in the standard
+/// HDR10 SEI fixed-point units (primaries/white in 1/50000, luminance in 0.0001 cd/m²), ready for
+/// DXGI `DXGI_HDR_METADATA_HDR10` / Apple `CAEDRMetadata` / Android `KEY_HDR_STATIC_INFO`.
+#[cfg(feature = "quic")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PunktfunkHdrMeta {
+    /// Display-primaries x-chromaticities in 1/50000 units, ST.2086 order [green, blue, red].
+    pub display_primaries_x: [u16; 3],
+    /// Display-primaries y-chromaticities in 1/50000 units, ST.2086 order [green, blue, red].
+    pub display_primaries_y: [u16; 3],
+    /// White-point x-chromaticity, 1/50000 units.
+    pub white_point_x: u16,
+    /// White-point y-chromaticity, 1/50000 units.
+    pub white_point_y: u16,
+    /// Max display mastering luminance, 0.0001 cd/m² units.
+    pub max_display_mastering_luminance: u32,
+    /// Min display mastering luminance, 0.0001 cd/m² units.
+    pub min_display_mastering_luminance: u32,
+    /// Maximum content light level (MaxCLL), nits. 0 = unknown.
+    pub max_cll: u16,
+    /// Maximum frame-average light level (MaxFALL), nits. 0 = unknown.
+    pub max_fall: u16,
+}
+
+#[cfg(feature = "quic")]
+impl PunktfunkHdrMeta {
+    fn from_meta(m: &crate::quic::HdrMeta) -> PunktfunkHdrMeta {
+        PunktfunkHdrMeta {
+            display_primaries_x: [
+                m.display_primaries[0][0],
+                m.display_primaries[1][0],
+                m.display_primaries[2][0],
+            ],
+            display_primaries_y: [
+                m.display_primaries[0][1],
+                m.display_primaries[1][1],
+                m.display_primaries[2][1],
+            ],
+            white_point_x: m.white_point[0],
+            white_point_y: m.white_point[1],
+            max_display_mastering_luminance: m.max_display_mastering_luminance,
+            min_display_mastering_luminance: m.min_display_mastering_luminance,
+            max_cll: m.max_cll,
+            max_fall: m.max_fall,
+        }
+    }
+}
+
 /// `PunktfunkRichInput::kind` — a touchpad contact (`finger`/`active`/`x`/`y` valid).
 pub const PUNKTFUNK_RICH_TOUCHPAD: u8 = 1;
 /// `PunktfunkRichInput::kind` — a motion sample (`gyro`/`accel` valid).
@@ -642,6 +692,20 @@ pub const PUNKTFUNK_GAMEPAD_DUALSENSE: u32 = 2;
 /// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
 /// [`punktfunk_connect_ex`] with `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
 ///
+/// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can decode a
+/// 10-bit (Main10) HEVC stream. (Mirrors `quic::VIDEO_CAP_10BIT`.)
+pub const PUNKTFUNK_VIDEO_CAP_10BIT: u8 = 0x01;
+/// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can present
+/// BT.2020 PQ HDR10 (implies 10-bit). (Mirrors `quic::VIDEO_CAP_HDR`.)
+pub const PUNKTFUNK_VIDEO_CAP_HDR: u8 = 0x02;
+
+// Keep the ABI cap bits in lockstep with the wire constants (compile-time guard against drift).
+#[cfg(feature = "quic")]
+const _: () = {
+    assert!(PUNKTFUNK_VIDEO_CAP_10BIT == crate::quic::VIDEO_CAP_10BIT);
+    assert!(PUNKTFUNK_VIDEO_CAP_HDR == crate::quic::VIDEO_CAP_HDR);
+};
+
 /// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's
 /// certificate — a mismatching host is rejected. NULL = trust on first use; persist the
 /// fingerprint written to `observed_sha256_out` (NULL or 32 bytes, filled on success) and
@@ -844,6 +908,59 @@ pub unsafe extern "C" fn punktfunk_connect_ex4(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
+    // Back-compat: ex4 advertises no video caps (8-bit BT.709 SDR). HDR-capable embedders call
+    // `punktfunk_connect_ex5` with the cap bits.
+    unsafe {
+        punktfunk_connect_ex5(
+            host,
+            port,
+            width,
+            height,
+            refresh_hz,
+            compositor,
+            gamepad,
+            bitrate_kbps,
+            0,
+            launch_id,
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            timeout_ms,
+        )
+    }
+}
+
+/// Like [`punktfunk_connect_ex4`], but additionally advertises the embedder's video decode/present
+/// capabilities as `video_caps` — a bitfield of `PUNKTFUNK_VIDEO_CAP_10BIT` (can decode 10-bit
+/// Main10) and `PUNKTFUNK_VIDEO_CAP_HDR` (can present BT.2020 PQ HDR10). The host upgrades to a
+/// 10-bit / HDR encode ONLY when the matching bit is set (and the host opted in); `0` keeps the
+/// 8-bit BT.709 SDR stream. After connecting, read the resolved colour via
+/// [`punktfunk_connection_color_info`] and drain the mastering metadata via
+/// [`punktfunk_connection_next_hdr_meta`].
+///
+/// # Safety
+/// Same as [`punktfunk_connect`]; `launch_id`, when non-NULL, must be a NUL-terminated C string.
+#[cfg(feature = "quic")]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn punktfunk_connect_ex5(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    gamepad: u32,
+    bitrate_kbps: u32,
+    video_caps: u8,
+    launch_id: *const std::os::raw::c_char,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    timeout_ms: u32,
+) -> *mut PunktfunkConnection {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if host.is_null() {
             return std::ptr::null_mut();
@@ -891,9 +1008,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex4(
             pref,
             gamepad,
             bitrate_kbps,
-            // 8-bit only over the C ABI for now — the ABI doesn't yet carry the embedder's video
-            // caps (Apple/Android decode 8-bit). The native Windows client advertises 10-bit/HDR.
-            0,
+            video_caps,
             launch,
             pin,
             identity,
@@ -1192,6 +1307,90 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
             }
             Err(e) => e.status(),
         }
+    })
+}
+
+/// Pull the next static HDR metadata update (ST.2086 mastering display + content light level) for
+/// an HDR session, into `*out`. [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`]
+/// once the session ended. The host sends one near session start and re-sends it on mastering
+/// changes / keyframes; apply the latest to the display (`SetHDRMetaData` / `CAEDRMetadata` /
+/// `KEY_HDR_STATIC_INFO`). Only an HDR session (`punktfunk_connection_color_info` reports a PQ
+/// transfer) ever emits these. Same threading rules as [`punktfunk_connection_next_rumble`] (one
+/// puller, may run alongside the other planes).
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable for one `PunktfunkHdrMeta`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_next_hdr_meta(
+    c: *mut PunktfunkConnection,
+    out: *mut PunktfunkHdrMeta,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if out.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        match c
+            .inner
+            .next_hdr_meta(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(m) => {
+                unsafe { *out = PunktfunkHdrMeta::from_meta(&m) };
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Read the session's resolved colour signalling + encode bit depth (from the host's Welcome).
+/// Each out pointer is filled when non-NULL: `primaries`/`transfer`/`matrix` are CICP code points
+/// (BT.709 = 1; BT.2020 = 9; PQ transfer = 16, HLG = 18; BT.2020-NCL matrix = 9), `full_range` is
+/// 0 (limited) or 1 (full), `bit_depth` is 8 or 10. A `transfer` of 16/18 means HDR — configure an
+/// HDR present path and drain [`punktfunk_connection_next_hdr_meta`]. Available immediately after a
+/// successful connect (these don't change without a reconfigure).
+///
+/// # Safety
+/// `c` is a valid connection handle; each out pointer is NULL or writable for its scalar.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_color_info(
+    c: *mut PunktfunkConnection,
+    primaries: *mut u8,
+    transfer: *mut u8,
+    matrix: *mut u8,
+    full_range: *mut u8,
+    bit_depth: *mut u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        let color = c.inner.color;
+        unsafe {
+            if !primaries.is_null() {
+                *primaries = color.primaries;
+            }
+            if !transfer.is_null() {
+                *transfer = color.transfer;
+            }
+            if !matrix.is_null() {
+                *matrix = color.matrix;
+            }
+            if !full_range.is_null() {
+                *full_range = color.full_range;
+            }
+            if !bit_depth.is_null() {
+                *bit_depth = c.inner.bit_depth;
+            }
+        }
+        PunktfunkStatus::Ok
     })
 }
 

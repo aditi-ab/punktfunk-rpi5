@@ -272,7 +272,20 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
     let width = parse_u("x-nv-video[0].clientViewportWd")?;
     let height = parse_u("x-nv-video[0].clientViewportHt")?;
+    // packetSize is attacker-controlled and PRE-AUTH (the RTSP listener is unauthenticated). It sets
+    // the per-shard payload (`packet_size - 16`); a tiny value underflows / div-by-zeros the video
+    // thread, an absurd one amplifies per-shard allocation. Reject anything outside a sane range
+    // (real Moonlight uses ~1024) so a malformed ANNOUNCE fails here instead of panicking the stream.
+    const PACKET_SIZE_MIN: usize = 64;
+    const PACKET_SIZE_MAX: usize = 2048;
     let packet_size = parse_u("x-nv-video[0].packetSize")? as usize;
+    if !(PACKET_SIZE_MIN..=PACKET_SIZE_MAX).contains(&packet_size) {
+        tracing::warn!(
+            packet_size,
+            "RTSP ANNOUNCE: out-of-range packetSize — rejecting"
+        );
+        return None;
+    }
     let fps = parse_u("x-nv-video[0].maxFPS")
         .filter(|&f| f > 0)
         .unwrap_or(60);
@@ -422,6 +435,27 @@ mod tests {
         let mut map = announce(&[]);
         map.remove("x-nv-video[0].packetSize");
         assert!(stream_config(&map).is_none());
+    }
+
+    /// packetSize is attacker-controlled AND pre-auth (the RTSP listener is unauthenticated), so an
+    /// out-of-range value must be rejected here rather than panic the video thread (≤16 → div-by-zero
+    /// / underflow; absurd → allocation amplification). Sane values (real Moonlight ~1024) pass.
+    #[test]
+    fn announce_rejects_out_of_range_packet_size() {
+        for bad in ["0", "16", "63", "4096", "999999"] {
+            let map = announce(&[("x-nv-video[0].packetSize", bad)]);
+            assert!(
+                stream_config(&map).is_none(),
+                "out-of-range packetSize {bad} must be rejected"
+            );
+        }
+        for ok in ["64", "1024", "1392", "2048"] {
+            let map = announce(&[("x-nv-video[0].packetSize", ok)]);
+            assert!(
+                stream_config(&map).is_some(),
+                "in-range packetSize {ok} must be accepted"
+            );
+        }
     }
 
     /// Audio negotiation: numChannels/AudioQuality/packetDuration, with Moonlight defaults.

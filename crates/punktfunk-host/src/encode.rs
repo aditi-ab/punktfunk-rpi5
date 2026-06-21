@@ -57,6 +57,12 @@ pub trait Encoder: Send {
     /// Force the next submitted frame to be an IDR keyframe (e.g. after a client
     /// reference-frame-invalidation request). Default: no-op.
     fn request_keyframe(&mut self) {}
+    /// Set the source's static HDR mastering metadata (from the capturer). An HDR encoder emits it
+    /// as in-band SEI (`mastering_display_colour_volume` + `content_light_level_info`) on each
+    /// keyframe so any decoder — including stock Moonlight — tone-maps from the source's real grade.
+    /// Default: no-op (SDR encoders / libavcodec paths that don't attach it yet). Cheap to call
+    /// every frame; only the direct-NVENC path consumes it.
+    fn set_hdr_meta(&mut self, _meta: Option<punktfunk_core::quic::HdrMeta>) {}
     /// Invalidate a contiguous range of previously-encoded reference frames (client frame numbers,
     /// as reported in a loss-recovery request) so the encoder re-references an older still-valid
     /// frame instead of emitting a full IDR. Returns `true` if a real reference invalidation was

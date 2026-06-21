@@ -164,8 +164,27 @@ impl SoftwareDecoder {
         let rebuild =
             !matches!(&self.sws, Some((_, f, sw, sh)) if *f == fmt && *sw == w && *sh == h);
         if rebuild {
-            let ctx = scaling::Context::get(fmt, w, h, Pixel::RGBA, w, h, scaling::Flags::POINT)
-                .context("swscale context")?;
+            let mut ctx =
+                scaling::Context::get(fmt, w, h, Pixel::RGBA, w, h, scaling::Flags::POINT)
+                    .context("swscale context")?;
+            // swscale defaults to BT.601 coefficients, but our SDR HEVC stream is BT.709 limited
+            // range (the host signals BT.709 in the VUI). Without this, YUV→RGB decodes with BT.601
+            // and SDR colours shift (greens/reds off). Source = limited/studio YUV, destination =
+            // full-range RGB. Inverse of the host's RGB→YUV CSC (encode/vaapi.rs).
+            const SWS_CS_ITU709: i32 = 1;
+            unsafe {
+                let cs709 = ffmpeg::ffi::sws_getCoefficients(SWS_CS_ITU709);
+                ffmpeg::ffi::sws_setColorspaceDetails(
+                    ctx.as_mut_ptr(),
+                    cs709, // inv_table: source (YUV) coefficients — BT.709
+                    0,     // srcRange: 0 = limited/studio (MPEG)
+                    cs709, // table: destination coefficients (ignored for RGB output)
+                    1,     // dstRange: 1 = full-range RGB
+                    0,
+                    1 << 16,
+                    1 << 16, // brightness, contrast, saturation (defaults)
+                );
+            }
             self.sws = Some((ctx, fmt, w, h));
         }
         let (sws, ..) = self.sws.as_mut().unwrap();

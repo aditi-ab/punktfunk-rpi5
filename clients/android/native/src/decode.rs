@@ -52,6 +52,24 @@ pub fn run(
     format.set_i32("priority", 0); // 0 = realtime
     format.set_i32("operating-rate", mode.refresh_hz as i32);
 
+    // HDR static metadata (ST.2086 mastering + content light level): when an HDR session was
+    // negotiated, set KEY_HDR_STATIC_INFO so the display tone-maps from the source's real grade.
+    // MediaCodec wants it BEFORE configure(), and the host sends a 0xCE right after the handshake,
+    // so it's typically already queued; wait briefly otherwise. The Surface DataSpace (applied on
+    // OutputFormatChanged below) carries transfer/primaries regardless — this adds the luminance the
+    // tone-mapper needs. A non-HDR display still gets sensible SurfaceFlinger tone-mapping.
+    if client.color.is_hdr() {
+        match client.next_hdr_meta(Duration::from_millis(250)) {
+            Ok(meta) => {
+                format.set_buffer("hdr-static-info", &android_hdr_static_info(&meta));
+                log::info!("decode: HDR static metadata applied (KEY_HDR_STATIC_INFO)");
+            }
+            Err(_) => {
+                log::info!("decode: HDR session but no mastering metadata yet — DataSpace only")
+            }
+        }
+    }
+
     if let Err(e) = codec.configure(&format, Some(&window), MediaCodecDirection::Decoder) {
         log::error!("decode: configure failed: {e}");
         return;
@@ -257,4 +275,28 @@ fn hdr_dataspace(codec: &MediaCodec) -> Option<DataSpace> {
         }),
         _ => None, // SDR (BT.709 / SDR_VIDEO) or unspecified
     }
+}
+
+/// Serialize [`HdrMeta`](punktfunk_core::quic::HdrMeta) into Android's `KEY_HDR_STATIC_INFO`
+/// (`hdr-static-info`) layout: a 25-byte CTA-861.3 / `HDRStaticInfo.Type1` blob — descriptor id 0,
+/// then primaries in **R, G, B** order, white point, max/min display luminance, MaxCLL, MaxFALL, all
+/// **little-endian** `u16`. Two conversions vs our wire form: HdrMeta stores primaries in ST.2086
+/// **G, B, R** order (reorder to R, G, B), and `max_display_mastering_luminance` is in 0.0001-cd/m²
+/// units while Android wants **whole nits** (min stays 0.0001-nit). Chromaticities (1/50000) and
+/// MaxCLL/MaxFALL (nits) match 1:1.
+fn android_hdr_static_info(m: &punktfunk_core::quic::HdrMeta) -> [u8; 25] {
+    let [g, b_, r] = m.display_primaries; // ST.2086 G, B, R
+    let max_nits = (m.max_display_mastering_luminance / 10_000).min(u16::MAX as u32) as u16;
+    let min_units = m.min_display_mastering_luminance.min(u16::MAX as u32) as u16;
+    let fields: [u16; 12] = [
+        r[0], r[1], g[0], g[1], b_[0], b_[1], // R, G, B primaries
+        m.white_point[0], m.white_point[1], // white point
+        max_nits, min_units, // max (nits) / min (0.0001-nit) display luminance
+        m.max_cll, m.max_fall, // MaxCLL / MaxFALL (nits)
+    ];
+    let mut out = [0u8; 25]; // out[0] = 0 (Type 1 descriptor id), already zero
+    for (i, v) in fields.iter().enumerate() {
+        out[1 + i * 2..3 + i * 2].copy_from_slice(&v.to_le_bytes());
+    }
+    out
 }

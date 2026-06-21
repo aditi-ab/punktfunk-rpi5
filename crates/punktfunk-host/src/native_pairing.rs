@@ -115,12 +115,13 @@ fn load(path: &std::path::Path) -> PairedClients {
 
 fn save(state: &PairedState) -> Result<()> {
     if let Some(dir) = state.path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::gamestream::create_private_dir(dir)?;
     }
     // Atomic replace: a crash/full-disk mid-write must not truncate the trust store (which would
-    // silently lock out every paired client on a --require-pairing host). Temp + rename.
+    // silently lock out every paired client on a --require-pairing host). Temp + rename. The temp is
+    // written owner-only so a local user can't inject a fingerprint to pair themselves.
     let tmp = state.path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&state.clients)?)?;
+    crate::gamestream::write_secret_file(&tmp, &serde_json::to_vec_pretty(&state.clients)?)?;
     std::fs::rename(&tmp, &state.path)?;
     Ok(())
 }

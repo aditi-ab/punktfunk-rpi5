@@ -27,9 +27,9 @@ use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, 
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
-    endpoint, io, ClockEcho, ClockProbe, Hello, LossReport, PairChallenge, PairProof, PairRequest,
-    PairResult, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, Start,
-    Welcome,
+    endpoint, io, ClockEcho, ClockProbe, ColorInfo, Hello, LossReport, PairChallenge, PairProof,
+    PairRequest, PairResult, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe,
+    Start, Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
@@ -418,6 +418,17 @@ async fn pair_ceremony(
     )
     .await?;
 
+    // SINGLE-USE PIN: we've now sent the host key-confirmation, which lets the client TEST this one
+    // guess (a right PIN → its proof will match; a wrong PIN → the client detects the mismatch and
+    // aborts *without* sending its proof). So consume the PIN HERE — before reading the proof —
+    // regardless of the outcome: an attacker gets EXACTLY ONE online guess (the documented guarantee),
+    // not an unbounded brute-force of the 4-digit space against a static, never-rotating PIN. A
+    // malformed request that errored at `pake.finish` above never reached here, so it doesn't burn the
+    // window (no DoS from garbage). The operator re-arms (web console / restart) for the next device —
+    // including after a successful pair; the protocol gives no reliable host-observable "wrong PIN"
+    // signal to scope this to failures only (the client just disconnects).
+    np.disarm();
+
     let proof = tokio::time::timeout(PAIRING_TIMEOUT, io::read_msg(&mut recv))
         .await
         .map_err(|_| anyhow!("pairing timed out waiting for the client's confirmation"))??;
@@ -640,6 +651,16 @@ async fn serve_session(
             gamepad,
             bitrate_kbps,
             bit_depth,
+            // Colour signalling the client configures its decoder/presenter from. A negotiated
+            // 10-bit session is our HDR path (BT.2020 PQ — what the NVENC HEVC VUI emits from a
+            // 10-bit capture format); 8-bit stays BT.709 SDR. The mastering metadata (ST.2086 +
+            // CLL) rides the 0xCE datagram below. (A future step can refine this to the capturer's
+            // actual monitor HDR state and announce a mid-stream flip.)
+            color: if bit_depth >= 10 {
+                ColorInfo::HDR10_BT2020_PQ
+            } else {
+                ColorInfo::SDR_BT709
+            },
         };
         io::write_msg(&mut send, &welcome.encode()).await?;
 
@@ -842,6 +863,17 @@ async fn serve_session(
         None
     };
 
+    // HDR static metadata (ST.2086 mastering + CEA-861.3 content light level), host → client, sent
+    // once at session start when an HDR session was negotiated, as a generic HDR10 baseline. The
+    // virtual-source stream loop then sends the source display's REAL mastering metadata (Windows
+    // GetDesc1) as soon as capture starts and re-sends it on keyframes; the client applies the
+    // latest it receives. This baseline covers the synthetic source and the pre-capture gap.
+    if welcome.color.is_hdr() {
+        let meta = crate::hdr::generic_hdr10();
+        let _ = conn.send_datagram(punktfunk_core::quic::encode_hdr_meta_datagram(&meta).into());
+        tracing::info!("sent HDR10 static metadata (0xCE; generic baseline)");
+    }
+
     // Test hook (synthetic source only): a scripted feedback burst on the host→client
     // planes — rumble (0xCA) + DualSense HID-output (0xCD) — so loopback tests can assert
     // the client's feedback path without a real game writing output reports to a real pad.
@@ -882,6 +914,7 @@ async fn serve_session(
     let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
     let stop_stream = stop.clone();
     let fec_target_dp = fec_target.clone(); // data-plane handle to the adaptive-FEC target
+    let conn_stream = conn.clone(); // for sending the source's real HDR metadata (0xCE) mid-stream
     let result: Result<()> = async {
         tokio::task::spawn_blocking(move || -> Result<()> {
             // Wait briefly for the client to hole-punch our data port, then stream to its OBSERVED
@@ -935,6 +968,7 @@ async fn serve_session(
                         probe_rx,
                         probe_result_tx,
                         fec_target_dp,
+                        conn_stream,
                     )
                 }
             }
@@ -2041,6 +2075,7 @@ fn virtual_stream(
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     fec_target: Arc<AtomicU8>,
+    conn: quinn::Connection,
 ) -> Result<()> {
     // This thread runs the capture+encode loop (single-process: Linux / synthetic / NO_WGC DDA) — or
     // tail-calls the relay below. Elevate it so a CPU-heavy game can't deschedule our GPU submission.
@@ -2064,6 +2099,7 @@ fn virtual_stream(
             probe_rx,
             probe_result_tx,
             fec_target,
+            conn,
         );
     }
     tracing::info!(
@@ -2150,6 +2186,8 @@ fn virtual_stream(
     let mut cur_mode = mode;
     const MAX_CAPTURE_REBUILDS: u32 = 5;
     let mut capture_rebuilds: u32 = 0;
+    // Last HDR mastering metadata we forwarded — re-sent as 0xCE on change/keyframe (see below).
+    let mut last_hdr_meta: Option<punktfunk_core::quic::HdrMeta> = None;
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
         // Mid-stream session switch (the box flipped Gaming↔Desktop): rebuild the WHOLE backend in
         // place — a different compositor at the SAME client mode — keeping the Session + send thread
@@ -2285,6 +2323,16 @@ fn virtual_stream(
                 next = std::time::Instant::now();
             }
         }
+        // The source's static HDR mastering metadata (Windows GetDesc1; None on Linux/SDR) is the
+        // single source of truth: hand it to the encoder (in-band SEI on keyframes) and, when it
+        // changes, to the client (0xCE). Re-sent on each keyframe below so a dropped best-effort
+        // datagram converges within a GOP.
+        let hdr_meta = capturer.hdr_meta();
+        enc.set_hdr_meta(hdr_meta);
+        let mut resend_meta = hdr_meta != last_hdr_meta;
+        if resend_meta {
+            last_hdr_meta = hdr_meta;
+        }
         let capture_ns = now_ns();
         enc.submit(&frame).context("encoder submit")?;
         // The deadline for this frame's packets (the next frame's due time); the send thread paces
@@ -2297,6 +2345,15 @@ fn virtual_stream(
             } else {
                 FLAG_PIC as u32
             };
+            // Re-send the HDR mastering metadata (0xCE) on each keyframe (a decoder-resync point) and
+            // whenever it changed, so a client that dropped the best-effort datagram re-converges.
+            if let Some(m) = last_hdr_meta {
+                if au.keyframe || resend_meta {
+                    let _ = conn
+                        .send_datagram(punktfunk_core::quic::encode_hdr_meta_datagram(&m).into());
+                    resend_meta = false;
+                }
+            }
             let encode_us = (now_ns().saturating_sub(capture_ns) / 1000) as u32;
             let msg = FrameMsg {
                 data: au.data,
@@ -2368,6 +2425,9 @@ fn virtual_stream_relay(
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     fec_target: Arc<AtomicU8>,
+    // The SYSTEM-host relay path doesn't yet send the source mastering metadata as 0xCE — the
+    // helper's in-band SEI carries it (Windows follow-up). Held for that future wiring.
+    _conn: quinn::Connection,
 ) -> Result<()> {
     use crate::capture::dxgi::WinCaptureTarget;
     use crate::capture::wgc_relay::HelperRelay;
@@ -3329,15 +3389,7 @@ mod tests {
             refresh_hz: 60,
         };
 
-        // 1: wrong PIN → Crypto, nothing stored.
-        let err = NativeClient::pair("127.0.0.1", 19778, identity, "0000", "imposter", timeout)
-            .unwrap_err();
-        assert!(
-            matches!(err, punktfunk_core::PunktfunkError::Crypto),
-            "{err:?}"
-        );
-
-        // 2: anonymous session on a pairing-required host → rejected (connect fails).
+        // 1: anonymous session on a pairing-required host → rejected (independent of the PIN window).
         assert!(
             NativeClient::connect(
                 "127.0.0.1",
@@ -3356,16 +3408,14 @@ mod tests {
             "anonymous session must be rejected"
         );
 
-        // 3: correct PIN → paired, host fingerprint returned. Space past the pairing
-        // cooldown that the wrong-PIN attempt above just triggered (a real retry is slower).
-        std::thread::sleep(PAIRING_COOLDOWN + std::time::Duration::from_millis(200));
+        // 2: correct PIN → paired, host fingerprint returned. The ONE online attempt CONSUMES the
+        // arming window (single-use), verified by step 4.
         let host_fp =
             NativeClient::pair("127.0.0.1", 19778, identity, "4321", "test-client", timeout)
                 .expect("pairing with the right PIN");
         assert!(test_paired_path().exists());
-        let _ = std::fs::remove_file(test_paired_path()); // already loaded; tidy /tmp
 
-        // 4: the paired identity gets a session — pinned to the ceremony's fingerprint.
+        // 3: the paired identity gets a session — pinned to the ceremony's fingerprint.
         let client = NativeClient::connect(
             "127.0.0.1",
             19778,
@@ -3386,6 +3436,17 @@ mod tests {
         // a dev box exporting it must not fail the suite.)
         assert_ne!(client.resolved_gamepad, GamepadPref::Auto);
         drop(client);
+
+        // 4: SINGLE-USE PIN — the completed ceremony in step 2 consumed the arming window, so a
+        // second pairing attempt (even with the CORRECT PIN) is now rejected. This is the documented
+        // "one online guess" guarantee: an attacker can't brute-force the static 4-digit PIN. (The
+        // operator re-arms via the console / restart for the next device.)
+        std::thread::sleep(PAIRING_COOLDOWN + std::time::Duration::from_millis(200));
+        assert!(
+            NativeClient::pair("127.0.0.1", 19778, identity, "4321", "too-late", timeout).is_err(),
+            "the PIN window must be single-use (one online guess)"
+        );
+        let _ = std::fs::remove_file(test_paired_path()); // tidy /tmp
 
         host.join().unwrap().unwrap();
     }

@@ -253,6 +253,13 @@ fn pump(
             }
         }
 
+        // Drain the HDR static-metadata plane (0xCE): the source's real mastering display + content
+        // light level. Stash the latest for the UI-thread presenter to apply via SetHDRMetaData —
+        // this pump is the sole consumer of the plane. Rare (start + on change/keyframe).
+        while let Ok(meta) = connector.next_hdr_meta(Duration::ZERO) {
+            *crate::present::LATEST_HDR_META.lock().unwrap() = Some(meta);
+        }
+
         if window_start.elapsed() >= Duration::from_secs(1) {
             let secs = window_start.elapsed().as_secs_f32();
             lat_us.sort_unstable();

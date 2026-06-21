@@ -214,6 +214,20 @@ public final class PunktfunkConnection {
     /// (20 000) when 0 was requested. `0` = an older host that didn't report it.
     public private(set) var resolvedBitrateKbps: UInt32 = 0
 
+    /// The colour signalling the host actually encodes with (CICP code points): `colorPrimaries`
+    /// (1=BT.709, 9=BT.2020), `colorTransfer` (1=BT.709, 16=PQ, 18=HLG), `colorMatrix`
+    /// (1=BT.709, 9=BT.2020-NCL), `colorFullRange`. BT.709 limited SDR for an older host. Configure
+    /// the decoder/presenter from these; mastering metadata arrives via `nextHdrMeta`.
+    public private(set) var colorPrimaries: UInt8 = 1
+    public private(set) var colorTransfer: UInt8 = 1
+    public private(set) var colorMatrix: UInt8 = 1
+    public private(set) var colorFullRange: Bool = false
+    /// Encoded bit depth (8 or 10).
+    public private(set) var bitDepth: UInt8 = 8
+    /// True when the negotiated stream is HDR (PQ or HLG transfer) — drive an HDR present path and
+    /// drain `nextHdrMeta`.
+    public var isHDR: Bool { colorTransfer == 16 || colorTransfer == 18 }
+
     /// Connect and start a session at the requested mode (the host creates a native virtual
     /// output at exactly this size/refresh). Blocks up to `timeoutMs`.
     ///
@@ -242,11 +256,14 @@ public final class PunktfunkConnection {
         compositor: Compositor = .auto,
         gamepad: GamepadType = .auto,
         bitrateKbps: UInt32 = 0,
+        videoCaps: UInt8 = 0,
         launchID: String? = nil,
         timeoutMs: UInt32 = 10_000
     ) throws {
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
         var observed = [UInt8](repeating: 0, count: 32)
+        // `videoCaps` advertises decode/present capability (PUNKTFUNK_VIDEO_CAP_10BIT | _HDR): the
+        // host upgrades to a 10-bit / BT.2020 PQ stream only when set. 0 = 8-bit BT.709 SDR.
         // `launchID` (a host library id like "steam:570") asks the host to launch that title in
         // the session; the host resolves it against its own library — nil = the host's default.
         handle = host.withCString { cs in
@@ -255,16 +272,16 @@ public final class PunktfunkConnection {
                     withOptionalCString(launchID) { launch in
                         if let pin = pinSHA256 {
                             return pin.withUnsafeBytes { p in
-                                punktfunk_connect_ex4(
+                                punktfunk_connect_ex5(
                                     cs, port, width, height, refreshHz, compositor.rawValue,
-                                    gamepad.rawValue, bitrateKbps, launch,
+                                    gamepad.rawValue, bitrateKbps, videoCaps, launch,
                                     p.bindMemory(to: UInt8.self).baseAddress, &observed,
                                     cert, key, timeoutMs)
                             }
                         }
-                        return punktfunk_connect_ex4(
+                        return punktfunk_connect_ex5(
                             cs, port, width, height, refreshHz, compositor.rawValue,
-                            gamepad.rawValue, bitrateKbps, launch,
+                            gamepad.rawValue, bitrateKbps, videoCaps, launch,
                             nil, &observed, cert, key, timeoutMs)
                     }
                 }
@@ -289,6 +306,13 @@ public final class PunktfunkConnection {
         var br: UInt32 = 0
         _ = punktfunk_connection_bitrate(handle, &br)
         resolvedBitrateKbps = br
+        var prim: UInt8 = 1, trc: UInt8 = 1, mtx: UInt8 = 1, fullRange: UInt8 = 0, depth: UInt8 = 8
+        _ = punktfunk_connection_color_info(handle, &prim, &trc, &mtx, &fullRange, &depth)
+        colorPrimaries = prim
+        colorTransfer = trc
+        colorMatrix = mtx
+        colorFullRange = fullRange != 0
+        bitDepth = depth
     }
 
     /// A bandwidth speed-test measurement (see `startSpeedTest`). Partial until `done`.
@@ -499,6 +523,78 @@ public final class PunktfunkConnection {
             default:
                 return nil // unknown kind from a newer host — skip (forward-compatible)
             }
+        case statusNoFrame:
+            return nil
+        case statusClosed:
+            throw PunktfunkClientError.closed
+        default:
+            throw PunktfunkClientError.status(rc)
+        }
+    }
+
+    /// Static HDR mastering metadata (SMPTE ST.2086 + content light level) the host sent for an HDR
+    /// session. Mirrors the wire/ABI `PunktfunkHdrMeta`; primaries are in ST.2086 **G, B, R** order,
+    /// 1/50000 units; mastering luminance in 0.0001 cd/m²; MaxCLL/MaxFALL in nits.
+    public struct HdrMeta: Sendable, Equatable {
+        public let primariesX: [UInt16] // [green, blue, red]
+        public let primariesY: [UInt16]
+        public let whitePointX: UInt16
+        public let whitePointY: UInt16
+        public let maxMasteringLuminance: UInt32 // 0.0001 cd/m²
+        public let minMasteringLuminance: UInt32 // 0.0001 cd/m²
+        public let maxCLL: UInt16
+        public let maxFALL: UInt16
+
+        /// The 24-byte `mastering_display_colour_volume` payload (big-endian, ST.2086 G,B,R) — pass
+        /// directly to `kCVImageBufferMasteringDisplayColorVolumeKey` or `CAEDRMetadata`'s displayInfo.
+        public func masteringDisplayColorVolume() -> Data {
+            var d = Data()
+            func be16(_ v: UInt16) { d.append(UInt8(v >> 8)); d.append(UInt8(v & 0xFF)) }
+            func be32(_ v: UInt32) {
+                d.append(UInt8((v >> 24) & 0xFF)); d.append(UInt8((v >> 16) & 0xFF))
+                d.append(UInt8((v >> 8) & 0xFF)); d.append(UInt8(v & 0xFF))
+            }
+            for i in 0..<3 { be16(primariesX[i]); be16(primariesY[i]) } // G, B, R
+            be16(whitePointX); be16(whitePointY)
+            be32(maxMasteringLuminance); be32(minMasteringLuminance)
+            return d
+        }
+
+        /// The 4-byte `content_light_level_info` payload (big-endian: MaxCLL, MaxFALL) — for
+        /// `kCVImageBufferContentLightLevelInfoKey` or `CAEDRMetadata`'s contentInfo.
+        public func contentLightLevelInfo() -> Data {
+            var d = Data()
+            func be16(_ v: UInt16) { d.append(UInt8(v >> 8)); d.append(UInt8(v & 0xFF)) }
+            be16(maxCLL); be16(maxFALL)
+            return d
+        }
+    }
+
+    /// Pull the next static HDR metadata update; nil on timeout, throws `.closed` once the session
+    /// ended. Drain from the feedback thread alongside `nextRumble`/`nextHidOutput`. Nothing arrives
+    /// unless `isHDR` — poll with a short timeout, never spin.
+    public func nextHdrMeta(timeoutMs: UInt32 = 0) throws -> HdrMeta? {
+        feedbackLock.lock()
+        defer { feedbackLock.unlock() }
+        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
+
+        var out = PunktfunkHdrMeta()
+        let rc = punktfunk_connection_next_hdr_meta(h, &out, timeoutMs)
+        switch rc {
+        case statusOK:
+            // The fixed C `uint16_t[3]` arrays import as tuples — copy them out.
+            let px = withUnsafeBytes(of: out.display_primaries_x) {
+                Array($0.bindMemory(to: UInt16.self))
+            }
+            let py = withUnsafeBytes(of: out.display_primaries_y) {
+                Array($0.bindMemory(to: UInt16.self))
+            }
+            return HdrMeta(
+                primariesX: px, primariesY: py,
+                whitePointX: out.white_point_x, whitePointY: out.white_point_y,
+                maxMasteringLuminance: out.max_display_mastering_luminance,
+                minMasteringLuminance: out.min_display_mastering_luminance,
+                maxCLL: out.max_cll, maxFALL: out.max_fall)
         case statusNoFrame:
             return nil
         case statusClosed:

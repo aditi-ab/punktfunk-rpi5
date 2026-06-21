@@ -951,6 +951,11 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
 // --- stream page --------------------------------------------------------------------------
 
 fn present_newest(ctx: &mut PresentCtx) {
+    // Apply the latest source HDR mastering metadata (from the session pump's 0xCE drain) before
+    // presenting — a cheap no-op in the presenter when unchanged.
+    if let Some(meta) = *crate::present::LATEST_HDR_META.lock().unwrap() {
+        ctx.presenter.set_hdr_metadata(meta);
+    }
     // Drain to the newest decoded frame (drop any backlog) and hand it to the presenter by value —
     // the GPU zero-copy path retains the decoder surface across re-presents, so ownership matters.
     let mut newest = None;

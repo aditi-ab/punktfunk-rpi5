@@ -55,7 +55,12 @@ impl VideoPacketizer {
     pub fn new(packet_size: usize, fec_percentage: u8, min_fec: u8) -> Self {
         VideoPacketizer {
             packet_size,
-            payload_per_shard: packet_size + 16 - SHARD_HEADER,
+            // Defense in depth: `pps` is a divisor in `packetize` (`% pps`, `div_ceil(pps)`), so it
+            // must never be 0. `blocksize = packet_size + 16`; a tiny attacker-supplied packet_size
+            // (≤ SHARD_HEADER-16 = 16) would otherwise underflow (panic) or yield pps==0 (div-by-zero).
+            // `stream_config` already rejects out-of-range packetSize; this saturating `.max(1)` makes
+            // a degenerate value structurally unable to panic, without affecting any valid size.
+            payload_per_shard: (packet_size + 16).saturating_sub(SHARD_HEADER).max(1),
             fec_percentage: fec_percentage as usize,
             min_fec: min_fec as usize,
             frame_index: 0,
@@ -249,6 +254,18 @@ mod tests {
         assert_eq!((fec_info_last >> 12) & 0x3ff, 2);
         for (i, p) in pkts.iter().enumerate() {
             assert_eq!(u16::from_be_bytes(p[2..4].try_into().unwrap()), i as u16);
+        }
+    }
+
+    #[test]
+    fn degenerate_packet_size_does_not_panic() {
+        // A pre-auth attacker drives packetSize via the RTSP ANNOUNCE. `stream_config` rejects
+        // out-of-range values, but the packetizer must ALSO never panic (div-by-zero on `% pps` /
+        // `div_ceil(pps)`, or usize underflow) for ANY input — pps is clamped to >= 1.
+        for ps in [0usize, 15, 16, 17, 32] {
+            let mut pk = VideoPacketizer::new(ps, 20, 2);
+            assert!(pk.payload_per_shard >= 1, "pps must never be 0 (ps={ps})");
+            let _ = pk.packetize(&[0xCDu8; 200], FrameType::Idr, 0); // must not panic
         }
     }
 

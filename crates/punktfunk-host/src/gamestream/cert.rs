@@ -33,12 +33,16 @@ impl ServerIdentity {
             (Ok(c), Ok(k)) if !c.trim().is_empty() && !k.trim().is_empty() => (c, k),
             _ => {
                 let (c, k) = generate()?;
-                fs::create_dir_all(&dir).ok();
-                fs::write(&cert_path, &c)
-                    .with_context(|| format!("write {}", cert_path.display()))?;
-                fs::write(&key_path, &k)
+                // The private key is the trust root for EVERY surface (TLS server cert, pairing
+                // signing, the QUIC identity clients pin) — write it owner-only (0600 / SYSTEM-only
+                // DACL) so a local user can't read it and impersonate the host. The dir is 0700.
+                super::create_private_dir(&dir).ok();
+                super::write_secret_file(&key_path, k.as_bytes())
                     .with_context(|| format!("write {}", key_path.display()))?;
-                tracing::info!(path = %cert_path.display(), "generated punktfunk host certificate (RSA-2048)");
+                // The cert is public (handed to clients), but write it owner-only too for consistency.
+                super::write_secret_file(&cert_path, c.as_bytes())
+                    .with_context(|| format!("write {}", cert_path.display()))?;
+                tracing::info!(path = %cert_path.display(), "generated punktfunk host certificate (RSA-2048, key 0600)");
                 (c, k)
             }
         };

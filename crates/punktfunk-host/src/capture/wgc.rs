@@ -127,6 +127,11 @@ pub struct WgcCapturer {
     first_frame: bool,
 
     hdr: bool,
+    /// The source display's static HDR mastering metadata (ST.2086 + content light level), read from
+    /// `IDXGIOutput6::GetDesc1` at open when the output is HDR. Forwarded to the encoder (in-band SEI)
+    /// and the client (0xCE) by the stream loop. `None` when SDR. (The helper relay path also encodes,
+    /// so this is what gives the secure/normal-desktop HDR stream its mastering SEI.)
+    hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
     hdr_conv: Option<HdrConverter>,
     fp16_src: Option<ID3D11Texture2D>,
     fp16_srv: Option<ID3D11ShaderResourceView>,
@@ -213,12 +218,31 @@ impl WgcCapturer {
             let hmonitor = od.Monitor;
 
             // HDR iff the output's colour space is BT.2020 PQ (G2084) — matches the DDA FP16 detection.
-            let hdr = output
+            // From the same desc, read the source display's mastering metadata (ST.2086) when HDR.
+            let desc1 = output
                 .cast::<IDXGIOutput6>()
                 .ok()
-                .and_then(|o6| o6.GetDesc1().ok())
+                .and_then(|o6| o6.GetDesc1().ok());
+            let hdr = desc1
+                .as_ref()
                 .map(|d1| d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
                 .unwrap_or(false);
+            let hdr_meta = if hdr {
+                desc1.as_ref().map(|d| {
+                    crate::hdr::hdr_meta_from_display(
+                        (d.RedPrimary[0], d.RedPrimary[1]),
+                        (d.GreenPrimary[0], d.GreenPrimary[1]),
+                        (d.BluePrimary[0], d.BluePrimary[1]),
+                        (d.WhitePoint[0], d.WhitePoint[1]),
+                        d.MaxLuminance,
+                        d.MinLuminance,
+                        0, // MaxCLL: GetDesc1 has no content light level (Apollo zeroes it)
+                        0, // MaxFALL
+                    )
+                })
+            } else {
+                None
+            };
 
             // Wrap our D3D11 device as a WinRT IDirect3DDevice so the frame pool allocates on it (the
             // pool textures land on our device → CopyResource + NVENC are same-device, no readback).
@@ -326,6 +350,7 @@ impl WgcCapturer {
                 timeout_ms,
                 first_frame: true,
                 hdr,
+                hdr_meta,
                 hdr_conv: None,
                 fp16_src: None,
                 fp16_srv: None,
@@ -680,6 +705,10 @@ impl WgcCapturer {
 }
 
 impl Capturer for WgcCapturer {
+    fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
+        self.hdr_meta
+    }
+
     fn next_frame(&mut self) -> Result<CapturedFrame> {
         let overall = Instant::now() + Duration::from_secs(20);
         loop {

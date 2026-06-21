@@ -58,6 +58,11 @@ pub struct NvencD3d11Encoder {
     /// `ABGR10` input format + the BT.2020/PQ colour VUI. Derived per-frame from the capture format
     /// (HDR can toggle mid-session); a change re-inits the session.
     hdr: bool,
+    /// The source's static HDR mastering metadata (from the capturer's `GetDesc1`), emitted as
+    /// in-band SEI (`mastering_display_colour_volume` + `content_light_level_info`) on each keyframe
+    /// when `hdr`. `None` = unknown → no SEI (the VUI still signals BT.2020 PQ). Set per-frame via
+    /// [`Encoder::set_hdr_meta`], so a mid-session regrade is picked up on the next keyframe.
+    hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
     /// Registrations of the capturer's input textures, cached by texture raw pointer — NVENC encodes
     /// them in place (no per-frame copy). The cloned `ID3D11Texture2D` keeps each alive until we
     /// unregister it (the capturer may drop its copy on a device recreate before our teardown runs).
@@ -107,6 +112,7 @@ impl NvencD3d11Encoder {
             buffer_fmt: nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
             bit_depth,
             hdr: false,
+            hdr_meta: None,
             regs: HashMap::new(),
             next: 0,
             bitstreams: Vec::new(),
@@ -303,16 +309,48 @@ impl NvencD3d11Encoder {
             cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2); // 10 - 8
         }
 
-        // HDR colour signaling: BT.2020 primaries + SMPTE ST 2084 (PQ) in the HEVC VUI.
+        // HDR colour signaling: BT.2020 primaries + SMPTE ST.2084 (PQ) transfer + BT.2020-NCL
+        // matrix, limited (studio) range — NVENC's RGB→YUV default. HEVC/H.264 carry it in the VUI;
+        // AV1 has NO VUI, so the SAME CICP code points go in the sequence-header colour config
+        // (`colorPrimaries`/`transferCharacteristics`/`matrixCoefficients`/`colorRange`). Without
+        // this a non-HEVC decoder assumes BT.709 SDR → washed-out / colour-shifted HDR.
+        //
+        // This is the per-stream colour *description* only. The static mastering-display (ST.2086)
+        // and content-light (MaxCLL/MaxFALL) metadata — HEVC SEI / AV1 METADATA OBUs — is a
+        // separate follow-up, as is wiring AV1/H.264 to a true 10-bit (Main10) encode (only HEVC
+        // sets Main10 above today).
         if self.hdr {
-            let vui = &mut cfg.encodeCodecConfig.hevcConfig.hevcVUIParameters;
-            vui.videoSignalTypePresentFlag = 1;
-            vui.videoFullRangeFlag = 0; // limited (studio) range — NVENC RGB→YUV default
-            vui.colourDescriptionPresentFlag = 1;
-            vui.colourPrimaries = nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
-            vui.transferCharacteristics =
+            let prim = nv::NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
+            let trc =
                 nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
-            vui.colourMatrix = nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+            let mat = nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+            match self.codec {
+                Codec::H265 => {
+                    let vui = &mut cfg.encodeCodecConfig.hevcConfig.hevcVUIParameters;
+                    vui.videoSignalTypePresentFlag = 1;
+                    vui.videoFullRangeFlag = 0;
+                    vui.colourDescriptionPresentFlag = 1;
+                    vui.colourPrimaries = prim;
+                    vui.transferCharacteristics = trc;
+                    vui.colourMatrix = mat;
+                }
+                Codec::H264 => {
+                    let vui = &mut cfg.encodeCodecConfig.h264Config.h264VUIParameters;
+                    vui.videoSignalTypePresentFlag = 1;
+                    vui.videoFullRangeFlag = 0;
+                    vui.colourDescriptionPresentFlag = 1;
+                    vui.colourPrimaries = prim;
+                    vui.transferCharacteristics = trc;
+                    vui.colourMatrix = mat;
+                }
+                Codec::Av1 => {
+                    let av1 = &mut cfg.encodeCodecConfig.av1Config;
+                    av1.colorPrimaries = prim;
+                    av1.transferCharacteristics = trc;
+                    av1.matrixCoefficients = mat;
+                    av1.colorRange = 0; // studio/limited swing
+                }
+            }
         }
 
         // Reference-frame invalidation: keep a deeper DPB so an invalidated reference can fall back
@@ -636,6 +674,51 @@ impl Encoder for NvencD3d11Encoder {
                 encodePicFlags: flags as u32,
                 ..Default::default()
             };
+
+            // In-band HDR10 SEI on every IDR (a forced keyframe, or the first frame NVENC opens with):
+            // `mastering_display_colour_volume` (ST.2086) + `content_light_level_info` (CEA-861.3),
+            // built from the source display's metadata. Any decoder — incl. stock Moonlight — then
+            // tone-maps from the real grade. HEVC/H.264 carry SEI; AV1 uses metadata OBUs (follow-up).
+            // The scratch buffers must outlive `encode_picture`, so they live in this scope.
+            let is_idr = flags != 0 || pts == 0;
+            let mastering_sei = self
+                .hdr_meta
+                .map(|m| crate::hdr::hevc_mastering_display_sei(&m));
+            let cll_sei = self
+                .hdr_meta
+                .map(|m| crate::hdr::hevc_content_light_level_sei(&m));
+            let mut sei: Vec<nv::NV_ENC_SEI_PAYLOAD> = Vec::new();
+            if is_idr && self.hdr {
+                if let Some(p) = mastering_sei.as_ref() {
+                    sei.push(nv::NV_ENC_SEI_PAYLOAD {
+                        payloadSize: p.len() as u32,
+                        payloadType: crate::hdr::SEI_TYPE_MASTERING_DISPLAY_COLOUR_VOLUME,
+                        payload: p.as_ptr() as *mut u8,
+                    });
+                }
+                if let Some(p) = cll_sei.as_ref() {
+                    sei.push(nv::NV_ENC_SEI_PAYLOAD {
+                        payloadSize: p.len() as u32,
+                        payloadType: crate::hdr::SEI_TYPE_CONTENT_LIGHT_LEVEL_INFO,
+                        payload: p.as_ptr() as *mut u8,
+                    });
+                }
+            }
+            if !sei.is_empty() {
+                // Writing a union field is safe; the pointers/len are read during encode_picture.
+                match self.codec {
+                    Codec::H265 => {
+                        pic.codecPicParams.hevcPicParams.seiPayloadArray = sei.as_mut_ptr();
+                        pic.codecPicParams.hevcPicParams.seiPayloadArrayCnt = sei.len() as u32;
+                    }
+                    Codec::H264 => {
+                        pic.codecPicParams.h264PicParams.seiPayloadArray = sei.as_mut_ptr();
+                        pic.codecPicParams.h264PicParams.seiPayloadArrayCnt = sei.len() as u32;
+                    }
+                    // AV1 mastering/CLL ride METADATA OBUs, not SEI — separate follow-up.
+                    Codec::Av1 => {}
+                }
+            }
             (API.encode_picture)(self.encoder, &mut pic)
                 .result_without_string()
                 .map_err(|e| anyhow!("encode_picture: {e:?}"))?;
@@ -647,6 +730,12 @@ impl Encoder for NvencD3d11Encoder {
 
     fn request_keyframe(&mut self) {
         self.force_kf = true;
+    }
+
+    fn set_hdr_meta(&mut self, meta: Option<punktfunk_core::quic::HdrMeta>) {
+        // Stored and emitted as in-band SEI on the next keyframe (see `submit`). Cheap to call every
+        // frame; only changes when the source is regraded or HDR toggles.
+        self.hdr_meta = meta;
     }
 
     fn invalidate_ref_frames(&mut self, first: i64, last: i64) -> bool {

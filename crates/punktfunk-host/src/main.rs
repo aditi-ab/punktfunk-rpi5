@@ -23,6 +23,7 @@ mod dmabuf_fence;
 mod drm_sync;
 mod encode;
 mod gamestream;
+mod hdr;
 mod inject;
 mod library;
 mod mgmt;

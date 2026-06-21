@@ -119,7 +119,17 @@ pub struct Presenter {
     panel_h: u32,
     /// Whether the swapchain is currently in 10-bit HDR10 (R10G10B10A2 + ST.2084) mode.
     hdr: bool,
+    /// The source's static HDR mastering metadata received over the protocol (`0xCE`), applied via
+    /// `SetHDRMetaData` so the display tone-maps from the real grade instead of a generic 1000-nit
+    /// guess. `None` until the first update arrives (then the generic baseline is used).
+    hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
 }
+
+/// Latest source HDR mastering metadata, written by the session pump (`session.rs`, the sole
+/// `next_hdr_meta` consumer) and read by `present_newest` on the UI thread — decoupled so the
+/// presenter doesn't need the connector. One session at a time on the client, so a single slot.
+pub static LATEST_HDR_META: std::sync::Mutex<Option<punktfunk_core::quic::HdrMeta>> =
+    std::sync::Mutex::new(None);
 
 impl Presenter {
     /// Create the presenter on the process-wide shared D3D11 device (the one the decoder uses), plus
@@ -148,7 +158,21 @@ impl Presenter {
             panel_w: width.max(1),
             panel_h: height.max(1),
             hdr: false,
+            hdr_meta: None,
         })
+    }
+
+    /// Update the source HDR mastering metadata (from the `0xCE` plane). Stored for the next HDR
+    /// swapchain switch, and applied immediately if already presenting HDR. A no-op when unchanged
+    /// (so it's cheap to call every frame from the present loop).
+    pub fn set_hdr_metadata(&mut self, meta: punktfunk_core::quic::HdrMeta) {
+        if self.hdr_meta == Some(meta) {
+            return;
+        }
+        self.hdr_meta = Some(meta);
+        if self.hdr {
+            unsafe { self.apply_hdr_metadata() };
+        }
     }
 
     /// The DXGI swapchain to hand to `SwapChainPanelHandle::set_swap_chain`.
@@ -350,23 +374,40 @@ impl Presenter {
                 // DWM still tone-maps HDR10 → SDR, so leaving the default there is fine).
                 if let Ok(support) = sc3.CheckColorSpaceSupport(colorspace) {
                     if support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 != 0 {
-                        let _ = sc3.SetColorSpace1(colorspace);
+                        if let Err(e) = sc3.SetColorSpace1(colorspace) {
+                            // A silent failure here presents PQ content as SDR gamma (crushed/dark) —
+                            // surface it instead of swallowing it.
+                            tracing::warn!(error = %e, ?colorspace, "SetColorSpace1 failed");
+                        }
+                    } else if on {
+                        tracing::warn!("swapchain rejects BT.2020 PQ present colour space (SDR display?) — DWM tone-maps");
                     }
                 }
             }
+            self.hdr = on;
             if on {
-                if let Ok(sc4) = self.swap.cast::<IDXGISwapChain4>() {
-                    let md = hdr10_metadata();
-                    let bytes = std::slice::from_raw_parts(
-                        &md as *const DXGI_HDR_METADATA_HDR10 as *const u8,
-                        std::mem::size_of::<DXGI_HDR_METADATA_HDR10>(),
-                    );
-                    let _ = sc4.SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, Some(bytes));
-                }
+                self.apply_hdr_metadata();
             }
         }
-        self.hdr = on;
         tracing::info!(hdr = on, "swapchain colour mode switched");
+    }
+
+    /// Push the current `DXGI_HDR_METADATA_HDR10` to the swapchain. Uses the source's received
+    /// mastering metadata when known, else a generic HDR10 baseline. Caller ensures HDR mode.
+    unsafe fn apply_hdr_metadata(&self) {
+        if let Ok(sc4) = self.swap.cast::<IDXGISwapChain4>() {
+            let md = self
+                .hdr_meta
+                .map(hdr_meta_to_dxgi)
+                .unwrap_or_else(generic_hdr10_metadata);
+            let bytes = std::slice::from_raw_parts(
+                &md as *const DXGI_HDR_METADATA_HDR10 as *const u8,
+                std::mem::size_of::<DXGI_HDR_METADATA_HDR10>(),
+            );
+            if let Err(e) = sc4.SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, Some(bytes)) {
+                tracing::warn!(error = %e, "SetHDRMetaData failed");
+            }
+        }
     }
 
     fn upload(&mut self, frame: &crate::video::CpuFrame) -> Result<()> {
@@ -579,9 +620,8 @@ fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
 }
 
 /// Generic HDR10 mastering metadata: BT.2020 primaries + D65 white, a 1000-nit mastering display,
-/// MaxCLL 1000 / MaxFALL 400. The protocol doesn't carry the stream's real mastering metadata yet
-/// (host follow-up), so these are sane defaults the display tone-maps from.
-fn hdr10_metadata() -> DXGI_HDR_METADATA_HDR10 {
+/// MaxCLL 1000 / MaxFALL 400. The fallback used only until the host's real `0xCE` metadata arrives.
+fn generic_hdr10_metadata() -> DXGI_HDR_METADATA_HDR10 {
     DXGI_HDR_METADATA_HDR10 {
         RedPrimary: [35400, 14600],
         GreenPrimary: [8500, 39850],
@@ -591,5 +631,24 @@ fn hdr10_metadata() -> DXGI_HDR_METADATA_HDR10 {
         MinMasteringLuminance: 1, // 0.0001-nit units → 0.0001 nits
         MaxContentLightLevel: 1000,
         MaxFrameAverageLightLevel: 400,
+    }
+}
+
+/// Map the protocol's [`HdrMeta`](punktfunk_core::quic::HdrMeta) to `DXGI_HDR_METADATA_HDR10`.
+/// Two careful conversions: HdrMeta stores primaries in **ST.2086 G,B,R order**, DXGI wants
+/// **R,G,B**; and HdrMeta mastering luminance is in **0.0001-cd/m² units** while DXGI's
+/// `MaxMasteringLuminance` is in **whole nits** (MinMasteringLuminance stays 0.0001-nit). Chromaticity
+/// units (1/50000) and MaxCLL/MaxFALL (nits) match 1:1.
+fn hdr_meta_to_dxgi(m: punktfunk_core::quic::HdrMeta) -> DXGI_HDR_METADATA_HDR10 {
+    let [g, b, r] = m.display_primaries; // ST.2086 order
+    DXGI_HDR_METADATA_HDR10 {
+        RedPrimary: r,
+        GreenPrimary: g,
+        BluePrimary: b,
+        WhitePoint: m.white_point,
+        MaxMasteringLuminance: m.max_display_mastering_luminance / 10_000, // 0.0001-nit → nit
+        MinMasteringLuminance: m.min_display_mastering_luminance,          // already 0.0001-nit
+        MaxContentLightLevel: m.max_cll,
+        MaxFrameAverageLightLevel: m.max_fall,
     }
 }

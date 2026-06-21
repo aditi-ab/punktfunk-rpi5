@@ -41,7 +41,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIDevice1, IDXGIFactory1, IDXGIOutput1,
-    IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
+    IDXGIOutput5, IDXGIOutput6, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
     DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_INVALID_CALL,
     DXGI_ERROR_MODE_CHANGE_IN_PROGRESS, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC,
     DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
@@ -127,6 +127,33 @@ pub(crate) unsafe fn find_output(gdi_name: &str) -> Result<(IDXGIAdapter1, IDXGI
         i += 1;
     }
     bail!("no DXGI output named {gdi_name} (gone after ACCESS_LOST?)")
+}
+
+/// Read the source display's static HDR mastering metadata via `IDXGIOutput6::GetDesc1` (the
+/// monitor IS the "mastering display" for a desktop capture, exactly as Sunshine/Apollo treat it).
+/// GetDesc1 exposes the colour primaries, white point, and min/max mastering luminance but NOT a
+/// content light level, so MaxCLL/MaxFALL are left `0` (unknown — the display tone-maps from the
+/// mastering luminance). `None` if the output can't be cast to `IDXGIOutput6` or the call fails.
+unsafe fn read_output_hdr_meta(output: &IDXGIOutput1) -> Option<punktfunk_core::quic::HdrMeta> {
+    let out6: IDXGIOutput6 = output.cast().ok()?;
+    let d = out6.GetDesc1().ok()?;
+    let m = crate::hdr::hdr_meta_from_display(
+        (d.RedPrimary[0], d.RedPrimary[1]),
+        (d.GreenPrimary[0], d.GreenPrimary[1]),
+        (d.BluePrimary[0], d.BluePrimary[1]),
+        (d.WhitePoint[0], d.WhitePoint[1]),
+        d.MaxLuminance,
+        d.MinLuminance,
+        0, // MaxCLL: GetDesc1 has no content light level (Apollo zeroes it)
+        0, // MaxFALL
+    );
+    tracing::info!(
+        max_nits = d.MaxLuminance,
+        min_nits = d.MinLuminance,
+        max_full_frame_nits = d.MaxFullFrameLuminance,
+        "read source display HDR mastering metadata (GetDesc1)"
+    );
+    Some(m)
 }
 
 /// Create a fresh D3D11 device + context on a specific adapter (driver_type UNKNOWN with an explicit
@@ -1900,6 +1927,10 @@ pub struct DuplCapturer {
     /// produce a BT.2020 PQ 10-bit (`R10G10B10A2`) frame for NVENC. Toggling HDR fires ACCESS_LOST →
     /// `recreate_dupl` re-detects the format, so this tracks the *current* duplication.
     hdr_fp16: bool,
+    /// The source display's static HDR mastering metadata (ST.2086 + content light level), read from
+    /// `IDXGIOutput6::GetDesc1` whenever the duplication is HDR (`hdr_fp16`). The stream loop forwards
+    /// it to the encoder (in-band SEI) and the client (0xCE). `None` when SDR or the read failed.
+    hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
     /// FP16 copy of the duplication surface (RT|SRV): the cursor composites onto it and the converter
     /// samples it. Reallocated on device/size change.
     fp16_src: Option<ID3D11Texture2D>,
@@ -2129,6 +2160,14 @@ impl DuplCapturer {
             let gpu_mode = std::env::var("PUNKTFUNK_ENCODER")
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "nvenc" | "hw" | "nvidia"))
                 .unwrap_or(false);
+            // Read the source display's HDR mastering metadata while we still hold `output` (it is
+            // moved into the struct below). Only meaningful for an HDR (FP16) duplication.
+            let is_hdr_init = dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            let hdr_meta_init = if is_hdr_init {
+                read_output_hdr_meta(&output)
+            } else {
+                None
+            };
             tracing::info!(
                 "DXGI duplication: {}x{}@{} on {} ({}) dxgi_format={} (87=BGRA8 24=R10G10B10A2 10=R16G16B16A16_FLOAT)",
                 width,
@@ -2165,7 +2204,8 @@ impl DuplCapturer {
                 gpu_copy: None,
                 last_present: None,
                 want_hdr,
-                hdr_fp16: dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT,
+                hdr_fp16: is_hdr_init,
+                hdr_meta: hdr_meta_init,
                 fp16_src: None,
                 fp16_srv: None,
                 hdr10_out: None,
@@ -2661,6 +2701,12 @@ impl DuplCapturer {
                                   // Re-detect HDR and drop the HDR textures/converter (old device). Toggling HDR on or
                                   // off is exactly this path: the duplication comes back as FP16 (HDR) or BGRA8.
         self.hdr_fp16 = dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        // Re-read the source mastering metadata for the (possibly new) HDR output, or clear it on SDR.
+        self.hdr_meta = if self.hdr_fp16 {
+            read_output_hdr_meta(&self.output)
+        } else {
+            None
+        };
         self.fp16_src = None;
         self.fp16_srv = None;
         self.hdr10_out = None;
@@ -3084,6 +3130,15 @@ fn now_ns() -> u64 {
 }
 
 impl Capturer for DuplCapturer {
+    fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
+        // Only when the duplication is actually HDR (FP16); cleared to None on an SDR rebuild.
+        if self.hdr_fp16 {
+            self.hdr_meta
+        } else {
+            None
+        }
+    }
+
     fn next_frame(&mut self) -> Result<CapturedFrame> {
         // Generous: a secure-desktop switch can take several seconds to settle (re-resolve + recreate
         // the duplication up to 12 s). Better a few seconds of frozen-last-frame than dropping the stream.

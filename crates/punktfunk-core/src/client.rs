@@ -16,8 +16,8 @@ use crate::error::{PunktfunkError, Result};
 use crate::input::InputEvent;
 use crate::packet::FLAG_PROBE;
 use crate::quic::{
-    endpoint, io, window_loss_ppm, Hello, HidOutput, LossReport, ProbeRequest, ProbeResult,
-    Reconfigure, Reconfigured, RequestKeyframe, RichInput, Start, Welcome,
+    endpoint, io, window_loss_ppm, ColorInfo, HdrMeta, Hello, HidOutput, LossReport, ProbeRequest,
+    ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, RichInput, Start, Welcome,
 };
 use crate::session::{Frame, Session};
 use crate::transport::UdpTransport;
@@ -40,7 +40,18 @@ enum CtrlRequest {
 /// mode, the host-resolved compositor backend, the host-resolved gamepad backend, the host's
 /// certificate fingerprint, the resolved encoder bitrate (kbps), and the host↔client clock offset
 /// (ns, host minus client; 0 = no skew correction / an old host that didn't answer the handshake).
-type Negotiated = (Mode, CompositorPref, GamepadPref, [u8; 32], u32, i64);
+/// The trailing `u8` is the resolved encode bit depth (8/10) and [`ColorInfo`] the resolved colour
+/// signalling, both from the [`Welcome`].
+type Negotiated = (
+    Mode,
+    CompositorPref,
+    GamepadPref,
+    [u8; 32],
+    u32,
+    i64,
+    u8,
+    ColorInfo,
+);
 
 /// Accumulated state of an in-flight / finished speed test. The data-plane pump mirrors the
 /// session's packet-level receive counters here; the control task finalizes the delivered figure
@@ -121,6 +132,10 @@ const RUMBLE_QUEUE: usize = 16;
 /// Same overflow discipline as rumble; the host re-sends on the next feedback change.
 const HIDOUT_QUEUE: usize = 32;
 
+/// Static HDR metadata (ST.2086 mastering + content light level) buffered for the embedder. Tiny
+/// and low-rate (one on start, re-sent on mastering changes / keyframes); a small ring is ample.
+const HDR_META_QUEUE: usize = 8;
+
 /// One Opus packet from the host's audio datagram stream (48 kHz stereo, 5 ms frames).
 #[derive(Clone, Debug)]
 pub struct AudioPacket {
@@ -140,6 +155,8 @@ pub struct NativeClient {
     rumble: Mutex<Receiver<(u16, u16, u16)>>,
     /// Inbound DualSense feedback (lightbar / player LEDs / adaptive triggers) — 0xCD datagrams.
     hidout: Mutex<Receiver<HidOutput>>,
+    /// Inbound static HDR metadata (ST.2086 mastering + content light level) — 0xCE datagrams.
+    hdr_meta: Mutex<Receiver<HdrMeta>>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     /// Outbound mic frames `(seq, pts_ns, opus)` → encoded as 0xCB datagrams by the worker.
     mic_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64, Vec<u8>)>,
@@ -178,6 +195,13 @@ pub struct NativeClient {
     /// glass-to-glass latency valid across machines. `0` = no correction (an old host that didn't
     /// answer, or genuinely synced clocks).
     pub clock_offset_ns: i64,
+    /// The encode bit depth the host resolved for this session ([`Welcome::bit_depth`]): `8`, or
+    /// `10` for a Main10 / HDR session. `8` for an older host that didn't report it.
+    pub bit_depth: u8,
+    /// The colour signalling the host encodes with ([`Welcome::color`]): the client configures its
+    /// decoder/presenter from this. [`ColorInfo::SDR_BT709`] for an older host. The static HDR
+    /// mastering metadata (when [`ColorInfo::is_hdr`]) arrives via [`NativeClient::next_hdr_meta`].
+    pub color: ColorInfo,
 }
 
 /// Pin the calling thread to the user-interactive QoS class on Apple targets.
@@ -231,6 +255,7 @@ impl NativeClient {
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(AUDIO_QUEUE);
         let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<(u16, u16, u16)>(RUMBLE_QUEUE);
         let (hidout_tx, hidout_rx) = std::sync::mpsc::sync_channel::<HidOutput>(HIDOUT_QUEUE);
+        let (hdr_meta_tx, hdr_meta_rx) = std::sync::mpsc::sync_channel::<HdrMeta>(HDR_META_QUEUE);
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
         let (mic_tx, mic_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u64, Vec<u8>)>();
         let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<RichInput>();
@@ -280,6 +305,7 @@ impl NativeClient {
                     audio_tx,
                     rumble_tx,
                     hidout_tx,
+                    hdr_meta_tx,
                     input_rx,
                     mic_rx,
                     rich_input_rx,
@@ -301,6 +327,8 @@ impl NativeClient {
             fingerprint,
             resolved_bitrate_kbps,
             clock_offset_ns,
+            bit_depth,
+            color,
         ) = match ready_rx.recv_timeout(timeout) {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => return Err(e),
@@ -315,6 +343,7 @@ impl NativeClient {
             audio: Mutex::new(audio_rx),
             rumble: Mutex::new(rumble_rx),
             hidout: Mutex::new(hidout_rx),
+            hdr_meta: Mutex::new(hdr_meta_rx),
             input_tx,
             mic_tx,
             rich_input_tx,
@@ -329,6 +358,8 @@ impl NativeClient {
             resolved_gamepad,
             resolved_bitrate_kbps,
             clock_offset_ns,
+            bit_depth,
+            color,
         })
     }
 
@@ -579,6 +610,20 @@ impl NativeClient {
         }
     }
 
+    /// Pull the next static HDR metadata update (ST.2086 mastering display + content light level)
+    /// the host sent for an HDR session; same timeout/closed semantics as
+    /// [`NativeClient::next_hidout`]. The host sends one near session start and re-sends it on
+    /// mastering changes / keyframes, so an HDR presenter should drain this on its own thread and
+    /// apply the latest value to the display (DXGI `SetHDRMetaData` / `CAEDRMetadata` /
+    /// `KEY_HDR_STATIC_INFO`). Only an HDR session (`color.is_hdr()`, PQ) ever emits these.
+    pub fn next_hdr_meta(&self, timeout: Duration) -> Result<HdrMeta> {
+        match self.hdr_meta.lock().unwrap().recv_timeout(timeout) {
+            Ok(m) => Ok(m),
+            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
+            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
+        }
+    }
+
     /// Queue one input event for delivery as a QUIC datagram.
     pub fn send_input(&self, ev: &InputEvent) -> Result<()> {
         self.input_tx.send(*ev).map_err(|_| PunktfunkError::Closed)
@@ -628,6 +673,7 @@ struct WorkerArgs {
     audio_tx: SyncSender<AudioPacket>,
     rumble_tx: SyncSender<(u16, u16, u16)>,
     hidout_tx: SyncSender<HidOutput>,
+    hdr_meta_tx: SyncSender<HdrMeta>,
     input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     mic_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, u64, Vec<u8>)>,
     rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<RichInput>,
@@ -658,6 +704,7 @@ async fn worker_main(args: WorkerArgs) {
         audio_tx,
         rumble_tx,
         hidout_tx,
+        hdr_meta_tx,
         mut input_rx,
         mut mic_rx,
         mut rich_input_rx,
@@ -785,6 +832,8 @@ async fn worker_main(args: WorkerArgs) {
             fingerprint,
             welcome.bitrate_kbps,
             clock_offset_ns,
+            welcome.bit_depth,
+            welcome.color,
         ))
     };
 
@@ -799,6 +848,8 @@ async fn worker_main(args: WorkerArgs) {
         fingerprint,
         resolved_bitrate_kbps,
         clock_offset_ns,
+        bit_depth,
+        color,
     ) = match setup.await {
         Ok(t) => t,
         Err(e) => {
@@ -813,6 +864,8 @@ async fn worker_main(args: WorkerArgs) {
         fingerprint,
         resolved_bitrate_kbps,
         clock_offset_ns,
+        bit_depth,
+        color,
     )));
 
     // Input task: embedder events → QUIC datagrams.
@@ -925,6 +978,11 @@ async fn worker_main(args: WorkerArgs) {
                 Some(&crate::quic::HIDOUT_MAGIC) => {
                     if let Some(h) = HidOutput::decode(&d) {
                         let _ = hidout_tx.try_send(h);
+                    }
+                }
+                Some(&crate::quic::HDR_META_MAGIC) => {
+                    if let Some(m) = crate::quic::decode_hdr_meta_datagram(&d) {
+                        let _ = hdr_meta_tx.try_send(m);
                     }
                 }
                 _ => {} // unknown tag — a newer host; ignore

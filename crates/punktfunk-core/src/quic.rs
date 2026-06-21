@@ -85,6 +85,72 @@ pub const VIDEO_CAP_10BIT: u8 = 0x01;
 /// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
 pub const VIDEO_CAP_HDR: u8 = 0x02;
 
+/// Per-session colour signalling (CICP / ITU-T H.273 code points) the host resolved for the
+/// encoded video, carried on [`Welcome`]. A client configures its decoder/presenter from these
+/// instead of inferring them from the bitstream VUI. An older host omits the bytes on the wire →
+/// [`ColorInfo::SDR_BT709`] (the 8-bit BT.709 limited stream every pre-HDR build produced).
+///
+/// The *static* HDR mastering metadata (ST.2086 + content light level) is larger and can change
+/// mid-stream, so it rides the [`HDR_META_MAGIC`] datagram rather than this fixed struct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColorInfo {
+    /// CICP colour primaries: 1 = BT.709, 9 = BT.2020.
+    pub primaries: u8,
+    /// CICP transfer characteristics: 1 = BT.709, 16 = PQ (SMPTE ST.2084), 18 = HLG.
+    pub transfer: u8,
+    /// CICP matrix coefficients: 1 = BT.709, 9 = BT.2020 non-constant-luminance.
+    pub matrix: u8,
+    /// `video_full_range_flag`: 0 = limited/studio range, 1 = full range.
+    pub full_range: u8,
+}
+
+impl ColorInfo {
+    /// CICP colour-primaries code point: BT.709.
+    pub const CP_BT709: u8 = 1;
+    /// CICP colour-primaries code point: BT.2020.
+    pub const CP_BT2020: u8 = 9;
+    /// CICP transfer code point: BT.709.
+    pub const TRC_BT709: u8 = 1;
+    /// CICP transfer code point: PQ (SMPTE ST.2084).
+    pub const TRC_PQ: u8 = 16;
+    /// CICP transfer code point: HLG (ARIB STD-B67 / BT.2100).
+    pub const TRC_HLG: u8 = 18;
+    /// CICP matrix code point: BT.709.
+    pub const MC_BT709: u8 = 1;
+    /// CICP matrix code point: BT.2020 non-constant-luminance. (Never emit 10 / constant-luminance —
+    /// no client decodes it.)
+    pub const MC_BT2020_NCL: u8 = 9;
+
+    /// 8-bit BT.709 limited-range SDR — what every pre-HDR build produced, and the back-compat
+    /// default when a peer omits the colour bytes.
+    pub const SDR_BT709: ColorInfo = ColorInfo {
+        primaries: Self::CP_BT709,
+        transfer: Self::TRC_BT709,
+        matrix: Self::MC_BT709,
+        full_range: 0,
+    };
+
+    /// BT.2020 PQ (HDR10), limited range — what the Windows host's HEVC VUI emits.
+    pub const HDR10_BT2020_PQ: ColorInfo = ColorInfo {
+        primaries: Self::CP_BT2020,
+        transfer: Self::TRC_PQ,
+        matrix: Self::MC_BT2020_NCL,
+        full_range: 0,
+    };
+
+    /// True when the transfer is an HDR curve (PQ or HLG): the stream needs HDR present, and
+    /// (for PQ) a [`HdrMeta`] datagram carries the mastering metadata.
+    pub fn is_hdr(&self) -> bool {
+        self.transfer == Self::TRC_PQ || self.transfer == Self::TRC_HLG
+    }
+}
+
+impl Default for ColorInfo {
+    fn default() -> Self {
+        Self::SDR_BT709
+    }
+}
+
 /// Longest device name carried in a [`Hello`] (bytes of UTF-8; longer names are truncated on
 /// encode, rejected on decode — a one-byte length prefix caps it at 255 anyway).
 pub const HELLO_NAME_MAX: usize = 64;
@@ -124,9 +190,14 @@ pub struct Welcome {
     /// The luma/chroma bit depth the host actually encodes at — `8` (default / older host) or
     /// `10` (Main10, enabled only when the client advertised [`VIDEO_CAP_10BIT`]). The client
     /// configures its decoder for 10-bit (P010) when this is `10`. Appended to the wire form as a
-    /// single trailing byte; `8` when an older host omitted it. (Color space stays BT.709 in
-    /// Phase 1; BT.2020 PQ HDR signaling is added alongside HDR support.)
+    /// single trailing byte; `8` when an older host omitted it.
     pub bit_depth: u8,
+    /// The colour signalling (CICP primaries/transfer/matrix/range) the host encodes with — BT.709
+    /// limited SDR by default, BT.2020 PQ when a 10-bit HDR session was negotiated. Appended after
+    /// `bit_depth` as 4 trailing bytes; an older host that omits them decodes to
+    /// [`ColorInfo::SDR_BT709`]. The client configures its decoder/presenter from this instead of
+    /// guessing from the bitstream; the mastering metadata arrives separately on [`HDR_META_MAGIC`].
+    pub color: ColorInfo,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -671,6 +742,11 @@ impl Welcome {
         b.push(self.gamepad.to_u8()); // appended at offset 54 — same back-compat discipline
         b.extend_from_slice(&self.bitrate_kbps.to_le_bytes()); // appended at offset 55..59
         b.push(self.bit_depth); // appended at offset 59 — older clients read [0..59] and skip it
+                                // Colour signalling at offsets 60..64 — older clients stop before these → SDR BT.709.
+        b.push(self.color.primaries);
+        b.push(self.color.transfer);
+        b.push(self.color.matrix);
+        b.push(self.color.full_range);
         b
     }
 
@@ -678,7 +754,8 @@ impl Welcome {
         // Layout (LE): magic[0..4] abi[4..8] port[8..10] w[10..14] h[14..18] hz[18..22]
         // scheme[22] pct[23] max_data[24..26] shard[26..28] encrypt[28] key[29..45]
         // salt[45..49] frames[49..53] compositor[53] gamepad[54] bitrate_kbps[55..59]
-        // bit_depth[59] (compositor/gamepad/bitrate/bit_depth are optional trailing bytes).
+        // bit_depth[59] color.primaries[60] color.transfer[61] color.matrix[62] color.range[63]
+        // (everything from compositor on is an optional trailing byte; an older host stops earlier).
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -728,6 +805,13 @@ impl Welcome {
             // Optional trailing byte — absent on an older host → `8` (8-bit, the only depth they
             // encode).
             bit_depth: b.get(59).copied().unwrap_or(8),
+            // Optional trailing colour bytes — absent on an older host → SDR BT.709 limited.
+            color: ColorInfo {
+                primaries: b.get(60).copied().unwrap_or(ColorInfo::CP_BT709),
+                transfer: b.get(61).copied().unwrap_or(ColorInfo::TRC_BT709),
+                matrix: b.get(62).copied().unwrap_or(ColorInfo::MC_BT709),
+                full_range: b.get(63).copied().unwrap_or(0),
+            },
         })
     }
 
@@ -988,7 +1072,8 @@ pub fn frame(payload: &[u8]) -> Vec<u8> {
 /// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
 /// audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
 /// mic = [`MIC_MAGIC`] (0xCB, client→host), rich-input = [`RICH_INPUT_MAGIC`] (0xCC, client→host),
-/// HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client).
+/// HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client), HDR metadata = [`HDR_META_MAGIC`]
+/// (0xCE, host→client).
 pub const AUDIO_MAGIC: u8 = 0xC9;
 pub const RUMBLE_MAGIC: u8 = 0xCA;
 /// Microphone uplink: the client's mic, Opus-encoded, client → host (the inverse of
@@ -1201,6 +1286,79 @@ impl HidOutput {
             _ => None,
         }
     }
+}
+
+/// Static HDR metadata, host → client: SMPTE ST.2086 mastering display colour volume + CEA-861.3
+/// content light level. Tag [`HDR_META_MAGIC`]. Carried on a datagram (not [`Welcome`]) because it
+/// is larger and can change mid-stream when the source's mastering intent changes; the host
+/// re-sends it on keyframes so a client that dropped the best-effort datagram converges. Omitted
+/// for HLG (scene-referred — no mastering metadata).
+///
+/// All fields use the standard HDR10 SEI fixed-point units, so they pass straight to
+/// `DXGI_HDR_METADATA_HDR10` / Android `KEY_HDR_STATIC_INFO` / Apple `CAEDRMetadata` — the
+/// libavcodec `AVMasteringDisplayMetadata` side needs an `AVRational` conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct HdrMeta {
+    /// Display primaries G, B, R as (x, y) chromaticity in 1/50000 units (the ST.2086 RGB order
+    /// is G, B, R).
+    pub display_primaries: [[u16; 2]; 3],
+    /// White point (x, y) in 1/50000 units.
+    pub white_point: [u16; 2],
+    /// Max display mastering luminance, 0.0001 cd/m² units.
+    pub max_display_mastering_luminance: u32,
+    /// Min display mastering luminance, 0.0001 cd/m² units.
+    pub min_display_mastering_luminance: u32,
+    /// Maximum content light level (MaxCLL), nits. `0` = unknown.
+    pub max_cll: u16,
+    /// Maximum frame-average light level (MaxFALL), nits. `0` = unknown.
+    pub max_fall: u16,
+}
+
+/// HDR static-metadata datagram tag, host → client (the static analog of the per-frame VUI;
+/// see [`HdrMeta`]). Next tag after [`HIDOUT_MAGIC`].
+pub const HDR_META_MAGIC: u8 = 0xCE;
+
+/// Wire length of an [`HDR_META_MAGIC`] datagram: tag + 6×u16 primaries + 2×u16 white + 2×u32
+/// luminance + 2×u16 CLL/FALL = 29 bytes.
+const HDR_META_LEN: usize = 1 + 12 + 4 + 8 + 4;
+
+/// Encode an [`HdrMeta`] into a [`HDR_META_MAGIC`] datagram.
+pub fn encode_hdr_meta_datagram(m: &HdrMeta) -> Vec<u8> {
+    let mut b = Vec::with_capacity(HDR_META_LEN);
+    b.push(HDR_META_MAGIC);
+    for p in m.display_primaries.iter() {
+        b.extend_from_slice(&p[0].to_le_bytes());
+        b.extend_from_slice(&p[1].to_le_bytes());
+    }
+    b.extend_from_slice(&m.white_point[0].to_le_bytes());
+    b.extend_from_slice(&m.white_point[1].to_le_bytes());
+    b.extend_from_slice(&m.max_display_mastering_luminance.to_le_bytes());
+    b.extend_from_slice(&m.min_display_mastering_luminance.to_le_bytes());
+    b.extend_from_slice(&m.max_cll.to_le_bytes());
+    b.extend_from_slice(&m.max_fall.to_le_bytes());
+    b
+}
+
+/// Parse a [`HDR_META_MAGIC`] datagram → [`HdrMeta`]. `None` on bad tag or a short/truncated buffer
+/// (every attacker-controlled field is bounds-checked by the fixed length before any read).
+pub fn decode_hdr_meta_datagram(b: &[u8]) -> Option<HdrMeta> {
+    if b.len() < HDR_META_LEN || b[0] != HDR_META_MAGIC {
+        return None;
+    }
+    let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    Some(HdrMeta {
+        display_primaries: [
+            [u16at(1), u16at(3)],
+            [u16at(5), u16at(7)],
+            [u16at(9), u16at(11)],
+        ],
+        white_point: [u16at(13), u16at(15)],
+        max_display_mastering_luminance: u32at(17),
+        min_display_mastering_luminance: u32at(21),
+        max_cll: u16at(25),
+        max_fall: u16at(27),
+    })
 }
 
 /// Async framed-message IO over a quinn stream (`u16 LE length || payload`).
@@ -1636,8 +1794,32 @@ mod tests {
             gamepad: GamepadPref::DualSense,
             bitrate_kbps: 50_000,
             bit_depth: 10,
+            color: ColorInfo::HDR10_BT2020_PQ,
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
+    }
+
+    #[test]
+    fn hdr_meta_datagram_roundtrip_and_truncation() {
+        let m = HdrMeta {
+            // BT.2020 display primaries in 1/50000 units (the DXGI/ST.2086 reference values).
+            display_primaries: [[8500, 39850], [6550, 2300], [35400, 14600]],
+            white_point: [15635, 16450],                 // D65
+            max_display_mastering_luminance: 10_000_000, // 1000 nits in 0.0001 cd/m²
+            min_display_mastering_luminance: 1,          // 0.0001 nits
+            max_cll: 1000,
+            max_fall: 400,
+        };
+        let d = encode_hdr_meta_datagram(&m);
+        assert_eq!(d[0], HDR_META_MAGIC);
+        assert_eq!(decode_hdr_meta_datagram(&d), Some(m));
+        // Truncated buffers and a wrong tag are rejected (never partially read).
+        for n in 0..d.len() {
+            assert_eq!(decode_hdr_meta_datagram(&d[..n]), None);
+        }
+        let mut bad = d.clone();
+        bad[0] = HIDOUT_MAGIC;
+        assert_eq!(decode_hdr_meta_datagram(&bad), None);
     }
 
     #[test]
@@ -1760,9 +1942,10 @@ mod tests {
             gamepad: GamepadPref::Xbox360,
             bitrate_kbps: 120_000,
             bit_depth: 10,
+            color: ColorInfo::HDR10_BT2020_PQ,
         };
         let wenc = w.encode();
-        assert_eq!(wenc.len(), 60);
+        assert_eq!(wenc.len(), 64); // 60 base + 4 colour bytes
         let legacy_w = Welcome::decode(&wenc[..53]).unwrap();
         assert_eq!(legacy_w.compositor, CompositorPref::Auto);
         assert_eq!(legacy_w.gamepad, GamepadPref::Auto);
@@ -1778,8 +1961,17 @@ mod tests {
         assert_eq!(pre_bitrate_w.bitrate_kbps, 0);
         assert_eq!(pre_bitrate_w.bit_depth, 8); // older host (no trailing byte) → 8-bit assumed
         assert_eq!(legacy_w.bit_depth, 8);
+        // A pre-colour (60-byte) Welcome → SDR BT.709 (the only colour those hosts produced).
+        let pre_color_w = Welcome::decode(&wenc[..60]).unwrap();
+        assert_eq!(pre_color_w.bit_depth, 10);
+        assert_eq!(pre_color_w.color, ColorInfo::SDR_BT709);
+        assert_eq!(legacy_w.color, ColorInfo::SDR_BT709);
         assert_eq!(Welcome::decode(&wenc).unwrap().bitrate_kbps, 120_000);
         assert_eq!(Welcome::decode(&wenc).unwrap().bit_depth, 10); // full form carries it
+        assert_eq!(
+            Welcome::decode(&wenc).unwrap().color,
+            ColorInfo::HDR10_BT2020_PQ
+        );
     }
 
     #[test]

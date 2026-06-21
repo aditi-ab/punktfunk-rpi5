@@ -133,6 +133,15 @@ pub trait Capturer: Send {
     /// the default is a no-op (synthetic sources are produced on demand). Set `true` for the
     /// duration of a stream, `false` when it ends.
     fn set_active(&self, _active: bool) {}
+
+    /// The source's static HDR mastering metadata (SMPTE ST.2086 + content light level), when the
+    /// capturer can read it from the output (Windows `IDXGIOutput6::GetDesc1`). `None` = unknown /
+    /// SDR / a backend that doesn't expose it (the default — Linux capture has no HDR path yet).
+    /// The stream loop forwards this to the encoder (in-band SEI) and the client (`0xCE` datagram),
+    /// so the two stay a single source of truth. May change mid-session if the source is regraded.
+    fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
+        None
+    }
 }
 
 /// A deterministic moving test pattern (BGRx). Lets the spike exercise the encode → file →

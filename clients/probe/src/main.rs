@@ -402,6 +402,9 @@ async fn session(args: Args) -> Result<()> {
         frames = welcome.frames,
         compositor = welcome.compositor.as_str(),
         gamepad = welcome.gamepad.as_str(),
+        bit_depth = welcome.bit_depth,
+        color = ?welcome.color,
+        hdr = welcome.color.is_hdr(),
         "session offer"
     );
 
@@ -826,12 +829,20 @@ async fn session(args: Args) -> Result<()> {
         let conn2 = conn.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
+            let mut hdr_logged = false;
             while let Ok(d) = conn2.read_datagram().await {
                 if let Some((_, _, opus)) = punktfunk_core::quic::decode_audio_datagram(&d) {
                     a.fetch_add(1, Relaxed);
                     ab.fetch_add(opus.len() as u64, Relaxed);
                 } else if punktfunk_core::quic::decode_rumble_datagram(&d).is_some() {
                     r.fetch_add(1, Relaxed);
+                } else if let Some(meta) = punktfunk_core::quic::decode_hdr_meta_datagram(&d) {
+                    // HDR static metadata (0xCE). Log the first receipt so a loopback test can
+                    // assert the host sent it for an HDR session.
+                    if !hdr_logged {
+                        hdr_logged = true;
+                        tracing::info!(?meta, "HDR static metadata (0xCE)");
+                    }
                 } else if let Some(hid) = punktfunk_core::quic::HidOutput::decode(&d) {
                     // The DualSense feedback plane (lightbar / player LEDs / adaptive triggers).
                     // Log the first few so a playtest can see triggers/LEDs arrive without spam.

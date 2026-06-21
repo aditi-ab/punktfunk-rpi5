@@ -70,6 +70,18 @@
 // only where available (Linux hosts); otherwise the host falls back to X-Box 360.
 #define PUNKTFUNK_GAMEPAD_DUALSENSE 2
 
+// Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
+// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
+// [`punktfunk_connect_ex`] with `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
+//
+// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can decode a
+// 10-bit (Main10) HEVC stream. (Mirrors `quic::VIDEO_CAP_10BIT`.)
+#define PUNKTFUNK_VIDEO_CAP_10BIT 1
+
+// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can present
+// BT.2020 PQ HDR10 (implies 10-bit). (Mirrors `quic::VIDEO_CAP_HDR`.)
+#define PUNKTFUNK_VIDEO_CAP_HDR 2
+
 // 16-byte AEAD authentication tag appended by GCM.
 #define TAG_LEN 16
 
@@ -233,7 +245,8 @@
 // demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
 // audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
 // mic = [`MIC_MAGIC`] (0xCB, client→host), rich-input = [`RICH_INPUT_MAGIC`] (0xCC, client→host),
-// HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client).
+// HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client), HDR metadata = [`HDR_META_MAGIC`]
+// (0xCE, host→client).
 #define PUNKTFUNK_AUDIO_MAGIC 201
 #endif
 
@@ -259,6 +272,48 @@
 // (lightbar, player LEDs, adaptive triggers) — the rich analog of [`RUMBLE_MAGIC`]. See
 // [`HidOutput`].
 #define HIDOUT_MAGIC 205
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// HDR static-metadata datagram tag, host → client (the static analog of the per-frame VUI;
+// see [`HdrMeta`]). Next tag after [`HIDOUT_MAGIC`].
+#define HDR_META_MAGIC 206
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP colour-primaries code point: BT.709.
+#define ColorInfo_CP_BT709 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP colour-primaries code point: BT.2020.
+#define ColorInfo_CP_BT2020 9
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP transfer code point: BT.709.
+#define ColorInfo_TRC_BT709 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP transfer code point: PQ (SMPTE ST.2084).
+#define ColorInfo_TRC_PQ 16
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP transfer code point: HLG (ARIB STD-B67 / BT.2100).
+#define ColorInfo_TRC_HLG 18
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP matrix code point: BT.709.
+#define ColorInfo_MC_BT709 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// CICP matrix code point: BT.2020 non-constant-luminance. (Never emit 10 / constant-luminance —
+// no client decodes it.)
+#define ColorInfo_MC_BT2020_NCL 9
 #endif
 
 // Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
@@ -330,6 +385,17 @@ typedef enum PunktfunkInputKind PunktfunkInputKind;
 typedef uint8_t PunktfunkInputKind;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Per-session colour signalling (CICP / ITU-T H.273 code points) the host resolved for the
+// encoded video, carried on [`Welcome`]. A client configures its decoder/presenter from these
+// instead of inferring them from the bitstream VUI. An older host omits the bytes on the wire →
+// [`ColorInfo::SDR_BT709`] (the 8-bit BT.709 limited stream every pre-HDR build produced).
+//
+// The *static* HDR mastering metadata (ST.2086 + content light level) is larger and can change
+// mid-stream, so it rides the [`HDR_META_MAGIC`] datagram rather than this fixed struct.
+typedef struct ColorInfo ColorInfo;
+#endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Opaque handle to a live `punktfunk/1` connection (QUIC control plane + UDP data plane, all
@@ -448,6 +514,31 @@ typedef struct {
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Static HDR metadata for an HDR session ([`punktfunk_connection_next_hdr_meta`]): SMPTE ST.2086
+// mastering display colour volume + CEA-861.3 content light level. All fields are in the standard
+// HDR10 SEI fixed-point units (primaries/white in 1/50000, luminance in 0.0001 cd/m²), ready for
+// DXGI `DXGI_HDR_METADATA_HDR10` / Apple `CAEDRMetadata` / Android `KEY_HDR_STATIC_INFO`.
+typedef struct {
+    // Display-primaries x-chromaticities in 1/50000 units, ST.2086 order [green, blue, red].
+    uint16_t display_primaries_x[3];
+    // Display-primaries y-chromaticities in 1/50000 units, ST.2086 order [green, blue, red].
+    uint16_t display_primaries_y[3];
+    // White-point x-chromaticity, 1/50000 units.
+    uint16_t white_point_x;
+    // White-point y-chromaticity, 1/50000 units.
+    uint16_t white_point_y;
+    // Max display mastering luminance, 0.0001 cd/m² units.
+    uint32_t max_display_mastering_luminance;
+    // Min display mastering luminance, 0.0001 cd/m² units.
+    uint32_t min_display_mastering_luminance;
+    // Maximum content light level (MaxCLL), nits. 0 = unknown.
+    uint16_t max_cll;
+    // Maximum frame-average light level (MaxFALL), nits. 0 = unknown.
+    uint16_t max_fall;
+} PunktfunkHdrMeta;
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // One rich client→host input for the host's virtual DualSense
 // ([`punktfunk_connection_send_rich_input`]): a touchpad contact or a motion sample. Set `kind`
 // and the matching fields; the others are ignored.
@@ -497,6 +588,10 @@ typedef struct {
     uint32_t wire_packets_sent;
     uint32_t send_dropped;
 } PunktfunkProbeResult;
+
+
+
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -576,10 +671,6 @@ int32_t punktfunk_host_poll_input(PunktfunkSession *s);
 PunktfunkStatus punktfunk_get_stats(PunktfunkSession *s, PunktfunkStats *out);
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
-// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
-// [`punktfunk_connect_ex`] with `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
-//
 // Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's
 // certificate — a mismatching host is rejected. NULL = trust on first use; persist the
 // fingerprint written to `observed_sha256_out` (NULL or 32 bytes, filled on success) and
@@ -702,6 +793,34 @@ PunktfunkConnection *punktfunk_connect_ex4(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect_ex4`], but additionally advertises the embedder's video decode/present
+// capabilities as `video_caps` — a bitfield of `PUNKTFUNK_VIDEO_CAP_10BIT` (can decode 10-bit
+// Main10) and `PUNKTFUNK_VIDEO_CAP_HDR` (can present BT.2020 PQ HDR10). The host upgrades to a
+// 10-bit / HDR encode ONLY when the matching bit is set (and the host opted in); `0` keeps the
+// 8-bit BT.709 SDR stream. After connecting, read the resolved colour via
+// [`punktfunk_connection_color_info`] and drain the mastering metadata via
+// [`punktfunk_connection_next_hdr_meta`].
+//
+// # Safety
+// Same as [`punktfunk_connect`]; `launch_id`, when non-NULL, must be a NUL-terminated C string.
+PunktfunkConnection *punktfunk_connect_ex5(const char *host,
+                                           uint16_t port,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t refresh_hz,
+                                           uint32_t compositor,
+                                           uint32_t gamepad,
+                                           uint32_t bitrate_kbps,
+                                           uint8_t video_caps,
+                                           const char *launch_id,
+                                           const uint8_t *pin_sha256,
+                                           uint8_t *observed_sha256_out,
+                                           const char *client_cert_pem,
+                                           const char *client_key_pem,
+                                           uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Generate a persistent client identity: a self-signed certificate + private key, both
 // PEM, NUL-terminated, written into the caller's buffers. Generate ONCE, store both
 // strings (Keychain etc.), pass them to [`punktfunk_pair`] and every
@@ -793,6 +912,40 @@ PunktfunkStatus punktfunk_connection_next_rumble(PunktfunkConnection *c,
 PunktfunkStatus punktfunk_connection_next_hidout(PunktfunkConnection *c,
                                                  PunktfunkHidOutput *out,
                                                  uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pull the next static HDR metadata update (ST.2086 mastering display + content light level) for
+// an HDR session, into `*out`. [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`]
+// once the session ended. The host sends one near session start and re-sends it on mastering
+// changes / keyframes; apply the latest to the display (`SetHDRMetaData` / `CAEDRMetadata` /
+// `KEY_HDR_STATIC_INFO`). Only an HDR session (`punktfunk_connection_color_info` reports a PQ
+// transfer) ever emits these. Same threading rules as [`punktfunk_connection_next_rumble`] (one
+// puller, may run alongside the other planes).
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable for one `PunktfunkHdrMeta`.
+PunktfunkStatus punktfunk_connection_next_hdr_meta(PunktfunkConnection *c,
+                                                   PunktfunkHdrMeta *out,
+                                                   uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Read the session's resolved colour signalling + encode bit depth (from the host's Welcome).
+// Each out pointer is filled when non-NULL: `primaries`/`transfer`/`matrix` are CICP code points
+// (BT.709 = 1; BT.2020 = 9; PQ transfer = 16, HLG = 18; BT.2020-NCL matrix = 9), `full_range` is
+// 0 (limited) or 1 (full), `bit_depth` is 8 or 10. A `transfer` of 16/18 means HDR — configure an
+// HDR present path and drain [`punktfunk_connection_next_hdr_meta`]. Available immediately after a
+// successful connect (these don't change without a reconfigure).
+//
+// # Safety
+// `c` is a valid connection handle; each out pointer is NULL or writable for its scalar.
+PunktfunkStatus punktfunk_connection_color_info(PunktfunkConnection *c,
+                                                uint8_t *primaries,
+                                                uint8_t *transfer,
+                                                uint8_t *matrix,
+                                                uint8_t *full_range,
+                                                uint8_t *bit_depth);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
