@@ -11,10 +11,9 @@
 //! bytes. `hidclass` gates the device stack, so this user-mode IPC is the only viable channel (a
 //! UMDF driver has no control device); see `windows-dualsense-scoping.md`.
 //!
-//! Device lifecycle: the `root\pf_dualsense` devnode is currently created out-of-band (the dev-box
-//! `devgen` for tests; the installer for fleet use). Per-session creation via `SwDeviceCreate` (so the
-//! pad appears/disappears with the session, matching the Linux UHID lifecycle) is the next step —
-//! see [`DsWinPad::open`].
+//! Device lifecycle: each pad `SwDeviceCreate`s the `root\pf_dualsense` devnode on open and
+//! `SwDeviceClose`s it on drop, so the virtual DualSense appears/disappears with the session —
+//! matching the Linux UHID pad. (The driver itself must already be installed; the installer stages it.)
 
 use super::dualsense_proto::{
     parse_ds_output, serialize_state, DsFeedback, DsState, DS_INPUT_REPORT_LEN, DS_TOUCH_H,
@@ -25,7 +24,10 @@ use anyhow::{anyhow, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
-use windows::core::{w, HSTRING, PCWSTR};
+use windows::core::{w, HRESULT, HSTRING, PCWSTR};
+use windows::Win32::Devices::Enumeration::Pnp::{
+    SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
+};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -35,6 +37,7 @@ use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
 /// Shared-section layout — must match `packaging/windows/dualsense-driver/src/lib.rs`.
 const SHM_SIZE: usize = 256;
@@ -43,9 +46,13 @@ const OFF_INPUT: usize = 8;
 const OFF_OUT_SEQ: usize = 72;
 const OFF_OUTPUT: usize = 76;
 
-/// A single virtual DualSense: the shared-memory section the driver maps (and, in future, the
-/// `HSWDEVICE` from `SwDeviceCreate`). Dropping it unmaps + closes the section.
+/// A single virtual DualSense: the `root\pf_dualsense` software devnode (the driver loads on it and
+/// the HID DualSense appears to games) plus the shared-memory section the driver maps. Dropping it
+/// removes the devnode (`SwDeviceClose`) and unmaps + closes the section.
 struct DsWinPad {
+    /// Per-session devnode from SwDeviceCreate, when it succeeds. `None` falls back to an out-of-band
+    /// `pf_dualsense` devnode (installer/devgen).
+    hsw: Option<HSWDEVICE>,
     map: HANDLE,
     view: *mut u8,
     seq: u8,
@@ -53,10 +60,100 @@ struct DsWinPad {
     last_out_seq: u32,
 }
 
+/// Context for the async `SwDeviceCreate` completion callback: the event to signal + the result.
+#[repr(C)]
+struct SwCreateCtx {
+    event: HANDLE,
+    result: HRESULT,
+}
+
+/// `SwDeviceCreate` fires this on a worker thread once the device is created. We stash the result and
+/// wake the waiting [`create_swdevice`]; the creator blocks on the event, so there's no concurrent
+/// access to `*ctx`.
+unsafe extern "system" fn sw_create_cb(
+    _dev: HSWDEVICE,
+    result: HRESULT,
+    ctx: *const c_void,
+    _id: PCWSTR,
+) {
+    if !ctx.is_null() {
+        let c = ctx as *mut SwCreateCtx;
+        // SAFETY: c is the &mut SwCreateCtx the creator passed; it outlives this callback (the
+        // creator waits on the event before dropping it).
+        unsafe {
+            (*c).result = result;
+            let _ = SetEvent((*c).event);
+        }
+    }
+}
+
+/// Spawn the virtual DualSense software device under enumerator `punktfunk` (hardware id
+/// `pf_dualsense`, which the INF matches). The returned `HSWDEVICE` owns the devnode for the session
+/// — `SwDeviceClose` removes it.
+///
+/// NB: enumerator names with an underscore (`pf_dualsense`) get E_INVALIDARG — hence `punktfunk`.
+/// TODO: a SECOND E_INVALIDARG remains — passing the completion callback is rejected (callback-absent
+/// is accepted but then the devnode doesn't materialize). Until that's resolved [`DsWinPad::open`]
+/// treats a failure as non-fatal and relies on an out-of-band `pf_dualsense` devnode (installer /
+/// dev-box `devgen`); see `docs/windows-dualsense-scoping.md`.
+fn create_swdevice() -> Result<HSWDEVICE> {
+    let hwids: Vec<u16> = "pf_dualsense".encode_utf16().chain([0u16, 0u16]).collect();
+    let desc: Vec<u16> = "punktfunk Virtual DualSense"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: zeroed then the fields we use are set; cbSize identifies the struct version.
+    let mut info: SW_DEVICE_CREATE_INFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SW_DEVICE_CREATE_INFO>() as u32;
+    info.pszzHardwareIds = PCWSTR(hwids.as_ptr());
+    info.pszDeviceDescription = PCWSTR(desc.as_ptr());
+    // SWDeviceCapabilities: DriverRequired (8) | SilentInstall (2) | Removable (1).
+    info.CapabilityFlags = 0x0000_000B;
+
+    // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
+    let mut ctx = SwCreateCtx {
+        event,
+        result: HRESULT(0),
+    };
+    // SAFETY: info + hwids/desc outlive the call; ctx outlives the callback (we wait below).
+    // windows-rs returns the HSWDEVICE (the C out-param) as the Result value.
+    let hsw = match unsafe {
+        SwDeviceCreate(
+            w!("punktfunk"),
+            w!("HTREE\\ROOT\\0"),
+            &info,
+            None,
+            Some(sw_create_cb),
+            Some(&mut ctx as *mut SwCreateCtx as *const c_void),
+        )
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            // SAFETY: event is valid.
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+            return Err(anyhow!("SwDeviceCreate failed: {e}"));
+        }
+    };
+    // SAFETY: event is valid; block up to 10s for the creation callback.
+    unsafe {
+        WaitForSingleObject(event, 10_000);
+        let _ = CloseHandle(event);
+    }
+    if ctx.result.is_err() {
+        // SAFETY: hsw is the handle SwDeviceCreate returned.
+        unsafe { SwDeviceClose(hsw) };
+        return Err(anyhow!("SwDeviceCreate callback reported {:?}", ctx.result));
+    }
+    Ok(hsw)
+}
+
 impl DsWinPad {
-    /// Create + map the section `Global\pfds-shm-<index>` and stamp the magic so the driver accepts
-    /// it. (TODO: also `SwDeviceCreate("root\\pf_dualsense")` here to spawn the devnode per session;
-    /// for now the devnode is created out-of-band by the installer / dev-box `devgen`.)
+    /// Create + map the section `Global\pfds-shm-<index>`, stamp the magic, then spawn the
+    /// `root\pf_dualsense` devnode (the driver loads on it and maps the section). The devnode lives
+    /// for the pad's lifetime — dropping the pad removes it (`SwDeviceClose`).
     fn open(index: u8) -> Result<DsWinPad> {
         let name = HSTRING::from(format!("Global\\pfds-shm-{index}"));
 
@@ -110,7 +207,18 @@ impl DsWinPad {
             });
             std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
         }
+        // Best-effort: spawn a per-session devnode via SwDeviceCreate. It currently fails with a
+        // SwDevice quirk (see create_swdevice), so on failure we keep the section + data plane and
+        // rely on an out-of-band `pf_dualsense` devnode (installer / dev-box devgen).
+        let hsw = match create_swdevice() {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; using an out-of-band pf_dualsense devnode");
+                None
+            }
+        };
         Ok(DsWinPad {
+            hsw,
             map,
             view: base,
             seq: 0,
@@ -150,8 +258,11 @@ impl DsWinPad {
 
 impl Drop for DsWinPad {
     fn drop(&mut self) {
-        // SAFETY: view came from MapViewOfFile; map from CreateFileMappingW.
+        // SAFETY: hsw (if any) owns the devnode; view/map from MapViewOfFile/CreateFileMappingW.
         unsafe {
+            if let Some(h) = self.hsw {
+                SwDeviceClose(h);
+            }
             let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                 Value: self.view as *mut c_void,
             });

@@ -201,6 +201,53 @@ fn real_main() -> Result<()> {
             println!("dualsense-test: done");
             Ok(())
         }
+        // Windows: create a virtual DualSense via the UMDF driver (SwDeviceCreate per-session devnode
+        // + the shared-memory channel) and hold it, pushing one fixed frame (Cross + LS-right). Drives
+        // the real DualSenseWindowsManager, so it validates the device lifecycle end to end. Verify
+        // while it holds: `Get-PnpDevice` shows a VID_054C device, and a HID read returns the pushed
+        // report (byte1=0xC0, byte8=0x28). On exit the pad drops → SwDeviceClose removes the devnode.
+        #[cfg(target_os = "windows")]
+        Some("dualsense-windows-test") => {
+            use crate::gamestream::gamepad::{GamepadEvent, GamepadFrame};
+            use inject::dualsense_windows::DualSenseWindowsManager;
+            use std::time::{Duration, Instant};
+            let secs: u64 = args
+                .iter()
+                .skip_while(|a| *a != "--seconds")
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20);
+            let mut mgr = DualSenseWindowsManager::new();
+            // Arrival creates the pad (SwDeviceCreate + section); State pushes the report.
+            mgr.handle(&GamepadEvent::Arrival {
+                index: 0,
+                kind: 2,
+                capabilities: 0,
+            });
+            // ls_x 16384 → report byte1 0xC0; BTN_A (Cross) → report byte8 0x28.
+            mgr.handle(&GamepadEvent::State(GamepadFrame {
+                index: 0,
+                active_mask: 1,
+                buttons: punktfunk_core::input::gamepad::BTN_A,
+                left_trigger: 0,
+                right_trigger: 0,
+                ls_x: 16384,
+                ls_y: 0,
+                rs_x: 0,
+                rs_y: 0,
+            }));
+            println!(
+                "virtual DualSense created via SwDeviceCreate (VID 054C/PID 0CE6). Holding {secs}s — \
+                 verify Get-PnpDevice VID_054C + a HID read (expect byte1=0xC0, byte8=0x28)."
+            );
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            while Instant::now() < deadline {
+                mgr.pump(|_, _, _| {}, |_| {});
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            println!("dualsense-windows-test: done (devnode removed)");
+            Ok(())
+        }
         // Capture→encode→file pipeline spike (dev tool).
         Some("spike") => spike::run(parse_spike(&args[1..])?),
         // Native punktfunk/1 host (QUIC control plane + UDP data plane).

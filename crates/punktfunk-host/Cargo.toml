@@ -120,6 +120,9 @@ windows = { version = "0.62", features = [
     # shared-memory section (inject/dualsense_windows.rs) so the UMDF host can open it.
     "Win32_Security_Authorization",
     "Win32_Devices_DeviceAndDriverInstallation",
+    # SwDeviceCreate/SwDeviceClose — the per-session virtual-DualSense devnode
+    # (inject/dualsense_windows.rs).
+    "Win32_Devices_Enumeration_Pnp",
     "Win32_Devices_Display",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
