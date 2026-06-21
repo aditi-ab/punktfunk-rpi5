@@ -1,5 +1,10 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { ApiReferenceReact } from '@scalar/api-reference-react'
+// @scalar/api-reference-react@0.9.47's entry does NOT import its own stylesheet
+// (and doesn't inject it at runtime), so we must ship it ourselves or the
+// reference renders unstyled. Load it as a route-scoped <link> (same pattern as
+// the root app.css), so it's present for SSR + the client-side Vue mount.
+import scalarCss from '@scalar/api-reference-react/style.css?url'
 import BrandMark from '@/components/BrandMark'
 import Wordmark from '@/components/Wordmark'
 
@@ -14,6 +19,7 @@ export const Route = createFileRoute('/api/')({
           'Interactive reference for the punktfunk host management REST API (OpenAPI).',
       },
     ],
+    links: [{ rel: 'stylesheet', href: scalarCss }],
   }),
 })
 
