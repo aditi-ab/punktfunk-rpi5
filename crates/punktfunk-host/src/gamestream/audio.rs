@@ -303,6 +303,9 @@ fn run(
     audio_cap: &std::sync::Mutex<Option<Box<dyn AudioCapturer>>>,
 ) -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", AUDIO_PORT)).context("bind audio UDP")?;
+    // Grow SO_SNDBUF/RCVBUF + opt-in DSCP/QoS-tag this as the audio class (PUNKTFUNK_DSCP=1).
+    punktfunk_core::transport::grow_socket_buffers(&sock);
+    punktfunk_core::transport::set_media_qos(&sock, punktfunk_core::transport::MediaClass::Audio);
     // The client pings the audio port (~every 500ms) so we learn where to send.
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
     tracing::info!(port = AUDIO_PORT, "audio: awaiting client ping");

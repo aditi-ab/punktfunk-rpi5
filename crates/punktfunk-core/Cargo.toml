@@ -31,7 +31,9 @@ fec-rs = { path = "vendor/fec-rs" }
 aes-gcm = "0.10"               # AES-128-GCM session crypto, matches GameStream
 zerocopy = { version = "0.8", features = ["derive"] }
 bytes = "1"
-socket2 = "0.6"                # set SO_SNDBUF/SO_RCVBUF — default UDP buffers are too small for 4K/5K frame bursts
+socket2 = { version = "0.6", features = [
+    "all",
+] } # SO_SNDBUF/SO_RCVBUF growth (default UDP buffers too small for 4K/5K bursts) + DSCP/SO_PRIORITY media QoS
 thiserror = "2"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 rand = "0.9"

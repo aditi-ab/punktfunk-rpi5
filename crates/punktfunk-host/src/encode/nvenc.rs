@@ -30,6 +30,11 @@ use nvidia_video_codec_sdk::ENCODE_API as API;
 // GPU-saturating game; this must be ≥ the helper's `PUNKTFUNK_ENCODE_DEPTH` (default 4, clamped ≤ 6).
 const POOL: usize = 8;
 
+/// Reference-frame DPB depth when RFI is supported (Apollo uses 5 for H.264/HEVC). A deeper DPB
+/// lets an invalidated reference fall back to an older still-valid frame instead of a full IDR;
+/// `numRefL0 = 1` keeps each P-frame single-reference for low latency.
+const RFI_DPB: u32 = 5;
+
 fn codec_guid(codec: Codec) -> nv::GUID {
     match codec {
         Codec::H264 => nv::NV_ENC_CODEC_H264_GUID,
@@ -40,6 +45,7 @@ fn codec_guid(codec: Codec) -> nv::GUID {
 
 pub struct NvencD3d11Encoder {
     encoder: *mut c_void,
+    codec: Codec,
     codec_guid: nv::GUID,
     width: u32,
     height: u32,
@@ -63,6 +69,14 @@ pub struct NvencD3d11Encoder {
     frame_idx: i64,
     force_kf: bool,
     inited: bool,
+    /// GPU capabilities probed once via `nvEncGetEncodeCaps` before configuring (Apollo's
+    /// `get_encoder_cap`): gates 10-bit/custom-VBV/RFI on what this card actually supports instead
+    /// of failing later as an opaque `InvalidParam`. Set by [`query_caps`](Self::query_caps).
+    rfi_supported: bool,
+    custom_vbv: bool,
+    /// The last reference-frame range we invalidated — dedupes repeated RFI requests for the same
+    /// loss event (the client resends until it sees recovery).
+    last_rfi_range: Option<(i64, i64)>,
     /// Raw ptr of the D3D11 device this session was initialized with. The capturer recreates the
     /// device on a desktop switch (normal ↔ Winlogon secure); when a frame carries a new device we
     /// tear down and re-init NVENC against it.
@@ -84,6 +98,7 @@ impl NvencD3d11Encoder {
     ) -> Result<Self> {
         Ok(Self {
             encoder: ptr::null_mut(),
+            codec,
             codec_guid: codec_guid(codec),
             width,
             height,
@@ -99,6 +114,9 @@ impl NvencD3d11Encoder {
             frame_idx: 0,
             force_kf: false,
             inited: false,
+            rfi_supported: false,
+            custom_vbv: false,
+            last_rfi_range: None,
             init_device: ptr::null_mut(),
         })
     }
@@ -128,6 +146,88 @@ impl NvencD3d11Encoder {
         self.encoder = ptr::null_mut();
         self.inited = false;
         self.next = 0;
+        // The new session starts with an empty DPB (its first frame is an IDR), so any prior
+        // invalidation range is meaningless against it.
+        self.last_rfi_range = None;
+    }
+
+    /// Query one `NV_ENC_CAPS` value for this codec on an open session; 0 on any error (treat an
+    /// unqueryable cap as "unsupported", the conservative choice).
+    unsafe fn get_cap(&self, enc: *mut c_void, which: nv::NV_ENC_CAPS) -> i32 {
+        let mut param = nv::NV_ENC_CAPS_PARAM {
+            version: nv::NV_ENC_CAPS_PARAM_VER,
+            capsToQuery: which,
+            reserved: [0; 62],
+        };
+        let mut val: i32 = 0;
+        match (API.get_encode_caps)(enc, self.codec_guid, &mut param, &mut val)
+            .result_without_string()
+        {
+            Ok(()) => val,
+            Err(_) => 0,
+        }
+    }
+
+    /// Probe this GPU's real capabilities once (Apollo's `get_encoder_cap`) before the bitrate-probe
+    /// loop configures the session: opens a throwaway session, queries the codec's max dimensions +
+    /// 10-bit / custom-VBV / ref-pic-invalidation support, destroys it. Rejects an out-of-range mode
+    /// up front with a clear error, downgrades 10-bit→8-bit when unsupported, and records the
+    /// RFI/custom-VBV flags the config + [`invalidate_ref_frames`](Encoder::invalidate_ref_frames)
+    /// gate on. Without this, an unsupported config surfaces only as an opaque `InvalidParam` that
+    /// the bitrate-clamp search misreads as "bitrate too high" and binary-searches into the floor.
+    unsafe fn query_caps(&mut self, device: &ID3D11Device) -> Result<()> {
+        let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+            version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+            deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
+            device: device.as_raw(),
+            apiVersion: nv::NVENCAPI_VERSION,
+            ..Default::default()
+        };
+        let mut enc: *mut c_void = ptr::null_mut();
+        (API.open_encode_session_ex)(&mut params, &mut enc)
+            .result_without_string()
+            .map_err(|e| {
+                anyhow!("NVENC open_encode_session_ex (caps probe): {e:?} (no NVIDIA GPU?)")
+            })?;
+        let wmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
+        let hmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
+        let ten_bit = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_10BIT_ENCODE);
+        let rfi = self.get_cap(
+            enc,
+            nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION,
+        );
+        let custom_vbv = self.get_cap(
+            enc,
+            nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE,
+        );
+        let _ = (API.destroy_encoder)(enc);
+
+        // Reject an over-range mode with a clear message instead of an opaque InvalidParam.
+        if wmax > 0 && hmax > 0 && (self.width as i32 > wmax || self.height as i32 > hmax) {
+            bail!(
+                "this GPU's NVENC max encode size for {:?} is {wmax}x{hmax}; client requested \
+                 {}x{} (lower the client resolution or use a codec/GPU that supports it)",
+                self.codec,
+                self.width,
+                self.height
+            );
+        }
+        // Degrade gracefully rather than fail: no 10-bit encode on this card → 8-bit SDR.
+        if self.bit_depth >= 10 && ten_bit == 0 {
+            tracing::warn!("NVENC: this GPU can't 10-bit encode — falling back to 8-bit SDR");
+            self.bit_depth = 8;
+            self.hdr = false;
+        }
+        self.rfi_supported = rfi != 0;
+        self.custom_vbv = custom_vbv != 0;
+        tracing::info!(
+            rfi = self.rfi_supported,
+            custom_vbv = self.custom_vbv,
+            max = %format!("{wmax}x{hmax}"),
+            ten_bit = ten_bit != 0,
+            "NVENC capabilities probed"
+        );
+        Ok(())
     }
 
     /// Open + configure + initialize ONE NVENC session at `bitrate` (bps) and `split_mode`. Returns
@@ -181,10 +281,13 @@ impl NvencD3d11Encoder {
         let bps = bitrate.min(u32::MAX as u64) as u32;
         cfg.rcParams.averageBitRate = bps;
         cfg.rcParams.maxBitRate = bps;
-        // Shrink the VBV with the bitrate — NVENC validates it against the same level ceiling.
-        let vbv = (bitrate as f64 / self.fps.max(1) as f64) as u32;
-        cfg.rcParams.vbvBufferSize = vbv;
-        cfg.rcParams.vbvInitialDelay = vbv;
+        // Shrink the VBV with the bitrate — NVENC validates it against the same level ceiling. Only
+        // when the GPU advertises custom-VBV support (else leave the preset default, per the caps probe).
+        if self.custom_vbv {
+            let vbv = (bitrate as f64 / self.fps.max(1) as f64) as u32;
+            cfg.rcParams.vbvBufferSize = vbv;
+            cfg.rcParams.vbvInitialDelay = vbv;
+        }
 
         // HIGH tier + autoselect level. The codec's PER-LEVEL bitrate ceiling is otherwise the
         // MAIN-tier cap — for HEVC at 5K that's Level 6.2 Main ≈ 240 Mbps. HIGH tier lifts the HEVC
@@ -210,6 +313,27 @@ impl NvencD3d11Encoder {
             vui.transferCharacteristics =
                 nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
             vui.colourMatrix = nv::NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+        }
+
+        // Reference-frame invalidation: keep a deeper DPB so an invalidated reference can fall back
+        // to an older still-valid frame instead of a full IDR, while `numRefL0 = 1` keeps each
+        // P-frame single-reference for low latency. Only when this GPU supports RFI (else leave the
+        // preset default — `invalidate_ref_frames` then returns false and the caller forces an IDR).
+        if self.rfi_supported {
+            let one = nv::NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
+            match self.codec {
+                Codec::H264 => {
+                    cfg.encodeCodecConfig.h264Config.maxNumRefFrames = RFI_DPB;
+                    cfg.encodeCodecConfig.h264Config.numRefL0 = one;
+                }
+                Codec::H265 => {
+                    cfg.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = RFI_DPB;
+                    cfg.encodeCodecConfig.hevcConfig.numRefL0 = one;
+                }
+                Codec::Av1 => {
+                    cfg.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = RFI_DPB;
+                }
+            }
         }
 
         let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
@@ -242,6 +366,10 @@ impl NvencD3d11Encoder {
     /// Lazily create the session on the first frame's D3D11 device (so capture + encode share it).
     fn init_session(&mut self, device: &ID3D11Device) -> Result<()> {
         unsafe {
+            // Probe real GPU caps first (max dims / 10-bit / custom-VBV / RFI) so the config below is
+            // gated on what this card supports and an out-of-range mode fails with a clear error
+            // rather than being misread as a too-high bitrate by the clamp search.
+            self.query_caps(device)?;
             // Bitrate clamp (see the search below): NVENC rejects `initialize_encoder` when the bitrate
             // exceeds the GPU's max codec level. We try the requested rate, then binary-search down to
             // the MAX the level accepts and clamp to it — so an over-asking client (e.g. 1 Gbps on HEVC)
@@ -519,6 +647,47 @@ impl Encoder for NvencD3d11Encoder {
 
     fn request_keyframe(&mut self) {
         self.force_kf = true;
+    }
+
+    fn invalidate_ref_frames(&mut self, first: i64, last: i64) -> bool {
+        // No live session, the GPU can't invalidate, or a nonsense range → caller forces a full IDR.
+        // (NVENC handles are single-threaded; this runs on the encode thread, like submit/poll.)
+        if self.encoder.is_null() || !self.rfi_supported || first < 0 || first > last {
+            return false;
+        }
+        // Already invalidated a covering range for this loss event — nothing more to do, no IDR.
+        if let Some((pf, pl)) = self.last_rfi_range {
+            if first >= pf && last <= pl {
+                return true;
+            }
+        }
+        // `frame_idx` is the NEXT timestamp to assign, so the last encoded frame is `frame_idx - 1`
+        // and the DPB holds `[frame_idx - RFI_DPB, frame_idx - 1]`. A lost frame older than that
+        // can't be invalidated, so the only correct recovery is an IDR.
+        let oldest_in_dpb = self.frame_idx - RFI_DPB as i64;
+        if first < oldest_in_dpb {
+            return false;
+        }
+        // Clamp to frames we've actually encoded (don't invalidate a timestamp we never assigned).
+        let last = last.min(self.frame_idx - 1);
+        if first > last {
+            return false;
+        }
+        // We tag each input with `inputTimeStamp = frame_idx` (0,1,2,…), which is also the client's
+        // frame number (the packetizer numbers frames in submit order), so the client's lost-frame
+        // range maps 1:1 onto the timestamps NVENC invalidates here.
+        unsafe {
+            for ts in first..=last {
+                if (API.invalidate_ref_frames)(self.encoder, ts as u64)
+                    .result_without_string()
+                    .is_err()
+                {
+                    return false; // any failure → fall back to IDR
+                }
+            }
+        }
+        self.last_rfi_range = Some((first, last));
+        true
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {

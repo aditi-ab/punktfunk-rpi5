@@ -182,6 +182,7 @@ fn handle_request(req: &Request, state: &AppState) -> String {
                         app,
                         state.streaming.clone(),
                         state.force_idr.clone(),
+                        state.rfi_range.clone(),
                         state.video_cap.clone(),
                     );
                 }

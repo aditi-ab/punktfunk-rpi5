@@ -17,6 +17,7 @@
 
 use crate::encode::Codec;
 use crate::gamestream::{
+    tls::{serve_https, PeerCertFingerprint},
     AppState, APP_VERSION, AUDIO_PORT, CONTROL_PORT, GFE_VERSION, RTSP_PORT, VIDEO_PORT,
 };
 use anyhow::{Context, Result};
@@ -101,66 +102,6 @@ pub async fn run(
     );
     let app = app(state, Some(token), opts.bind.port(), native);
     serve_https(opts.bind, app, tls).await
-}
-
-/// SHA-256 of the peer's client certificate (hex), injected per-connection into each request's
-/// extensions by [`serve_https`]; `None` when the peer presented no client cert. `require_auth`
-/// authorizes a request whose fingerprint is in the paired store.
-#[derive(Clone)]
-struct PeerCertFingerprint(Option<String>);
-
-/// HTTPS server for the mgmt API. axum-server can't surface the client cert to a handler, so this
-/// runs the rustls handshake itself (via tokio-rustls), reads the verified peer certificate, and
-/// serves the axum `Router` over hyper with the peer's fingerprint attached to every request.
-async fn serve_https(bind: SocketAddr, app: Router, tls: Arc<rustls::ServerConfig>) -> Result<()> {
-    use tower::ServiceExt;
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("bind management API {bind}"))?;
-    loop {
-        let (tcp, _peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "management API accept failed");
-                continue;
-            }
-        };
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(tcp).await {
-                Ok(s) => s,
-                // A failed handshake is routine (port scan, a browser bailing on the self-signed
-                // cert, a client cert we'd still accept but the peer hung up) — not fatal.
-                Err(_) => return,
-            };
-            // The verified peer cert (the verifier accepts any well-formed one; we authorize by
-            // fingerprint in the auth layer) → its SHA-256, matched against the paired store.
-            let fp = tls_stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .and_then(|c| c.first())
-                .map(|c| hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(c.as_ref())));
-            let peer = PeerCertFingerprint(fp);
-            let svc =
-                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                    let app = app.clone();
-                    let peer = peer.clone();
-                    async move {
-                        let mut req = req.map(axum::body::Body::new);
-                        req.extensions_mut().insert(peer);
-                        app.oneshot(req).await // Router error is Infallible
-                    }
-                });
-            let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let _ =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection_with_upgrades(io, svc)
-                    .await;
-        });
-    }
 }
 
 /// Compose the full management router (also used directly by the handler tests).

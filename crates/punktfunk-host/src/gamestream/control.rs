@@ -24,10 +24,11 @@
 
 use super::{AppState, CONTROL_PORT};
 use crate::inject::gamepad::GamepadManager;
-use crate::inject::InputInjector;
 use anyhow::{anyhow, Context, Result};
+use punktfunk_core::input::InputEvent;
 use rusty_enet::{Event, Host, HostSettings, Packet, PeerID};
 use std::net::UdpSocket;
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,12 +54,14 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
     std::thread::Builder::new()
         .name("punktfunk-control".into())
         .spawn(move || {
-            // Thread-local (the injector owns non-Send Wayland/xkb state, so it must be
-            // created and live here rather than be captured into the closure).
             // GCM scheme detected from the first authenticating packet; reused thereafter.
             let mut detected: Option<Scheme> = None;
-            // Lazily opened on the first input event (Sway's Wayland socket is up by then).
-            let mut injector: Option<Box<dyn InputInjector>> = None;
+            // Decoded keyboard/mouse is forwarded to a dedicated host-lifetime injector thread —
+            // NEVER injected inline, so a slow Wayland/libei/SendInput call can't head-block ENet
+            // keepalive/retransmit servicing on this thread. The injector owns non-Send compositor
+            // state and lives on its own thread (see crate::inject::InjectorService); the held
+            // `inj_tx` clone keeps it alive for the control thread's lifetime.
+            let inj_tx = crate::inject::InjectorService::start().sender();
             // Virtual gamepads (uinput) + the host→client rumble sequence counter.
             let mut pads = GamepadManager::new();
             let mut rumble_seq: u32 = 0;
@@ -86,7 +89,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                                     channel_id,
                                     packet.data(),
                                     &mut detected,
-                                    &mut injector,
+                                    &inj_tx,
                                     &mut pads,
                                 );
                             }
@@ -128,6 +131,19 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
+/// Decode the lost-frame range from an invalidate-reference-frames (0x0301) control message: two
+/// little-endian `i64` (firstFrame, lastFrame) after the 4-byte `[u16 type][u16 length]` header,
+/// matching Sunshine/Apollo's `IDX_INVALIDATE_REF_FRAMES`. Returns `None` when the body is too
+/// short or the range is nonsensical, in which case the caller falls back to a full IDR.
+fn decode_rfi_range(pt: &[u8]) -> Option<(i64, i64)> {
+    if pt.len() < 20 {
+        return None;
+    }
+    let first = i64::from_le_bytes(pt[4..12].try_into().ok()?);
+    let last = i64::from_le_bytes(pt[12..20].try_into().ok()?);
+    (first >= 0 && last >= first).then_some((first, last))
+}
+
 /// Handle one received control packet: decrypt it (learning the GCM scheme on the first one),
 /// decode any input event, and inject it into the host session.
 fn on_receive(
@@ -135,7 +151,7 @@ fn on_receive(
     _channel_id: u8,
     d: &[u8],
     detected: &mut Option<Scheme>,
-    injector: &mut Option<Box<dyn InputInjector>>,
+    inj_tx: &Sender<InputEvent>,
     pads: &mut GamepadManager,
 ) {
     let Some(key) = state.launch.lock().unwrap().map(|s| s.gcm_key) else {
@@ -160,17 +176,32 @@ fn on_receive(
         }
     };
 
-    // Recovery requests after loss: invalidate-reference-frames (0x0301, Gen7) or request-IDR
-    // (0x0302, Gen7Enc). Force a keyframe so the client can resync without a multi-second stall.
+    // Recovery requests after loss. Invalidate-reference-frames (0x0301, Gen7) carries the lost
+    // frame range (two LE i64 after the [type][len] header, like Sunshine/Apollo's
+    // IDX_INVALIDATE_REF_FRAMES) — route it to the encoder, which invalidates those refs instead of
+    // a full IDR when it can (NVENC RFI). Request-IDR (0x0302 / 0x0305) and a malformed 0x0301 force
+    // a keyframe. The video thread drains rfi_range/force_idr and resyncs without a multi-second stall.
     if pt.len() >= 2 {
         let inner = u16::from_le_bytes([pt[0], pt[1]]);
-        if matches!(inner, 0x0301 | 0x0302 | 0x0305) {
+        if inner == 0x0301 {
+            if let Some((first, last)) = decode_rfi_range(&pt) {
+                *state.rfi_range.lock().unwrap() = Some((first, last));
+                tracing::info!(first, last, "control: RFI request → invalidate ref frames");
+            } else {
+                state
+                    .force_idr
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!("control: RFI request (no range) → keyframe");
+            }
+            return;
+        }
+        if matches!(inner, 0x0302 | 0x0305) {
             state
                 .force_idr
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             tracing::info!(
                 ty = format!("{inner:#06x}"),
-                "control: IDR/RFI request → keyframe"
+                "control: IDR request → keyframe"
             );
             return;
         }
@@ -187,27 +218,11 @@ fn on_receive(
         return; // keepalive / QoS / unhandled input kind
     }
 
-    // Open the injector on demand — by the first input event the compositor session is up.
-    // Backend auto-selects per desktop (wlr on Sway, libei on KWin/GNOME); override with
-    // PUNKTFUNK_INPUT_BACKEND.
-    if injector.is_none() {
-        let backend = crate::inject::default_backend();
-        match crate::inject::open(backend) {
-            Ok(i) => {
-                tracing::info!(?backend, "input injection backend opened");
-                *injector = Some(i);
-            }
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "input injection unavailable");
-                return;
-            }
-        }
-    }
-    let inj = injector.as_mut().unwrap();
+    // Forward to the dedicated injector thread (it opens the backend on the first event and
+    // coalesces redundant motion). A closed channel means the injector thread died at startup —
+    // input is lossy, so drop silently rather than spam.
     for ev in events {
-        if let Err(e) = inj.inject(&ev) {
-            tracing::warn!(error = %format!("{e:#}"), "inject failed");
-        }
+        let _ = inj_tx.send(ev);
     }
 }
 
@@ -424,5 +439,31 @@ fn gcm_open(key: &[u8; 16], nonce: &[u8], ct_tag: &[u8], aad: &[u8]) -> Option<V
             .decrypt(GenericArray::from_slice(nonce), p)
             .ok(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_rfi_range;
+
+    /// Build a 0x0301 invalidate-ref-frames plaintext: `[type LE][len LE][firstFrame i64 LE][last i64 LE]`.
+    fn rfi_msg(first: i64, last: i64) -> Vec<u8> {
+        let mut v = vec![0x01, 0x03, 0x10, 0x00]; // type 0x0301, length 16
+        v.extend_from_slice(&first.to_le_bytes());
+        v.extend_from_slice(&last.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn decodes_a_valid_rfi_range() {
+        assert_eq!(decode_rfi_range(&rfi_msg(40, 47)), Some((40, 47)));
+        assert_eq!(decode_rfi_range(&rfi_msg(5, 5)), Some((5, 5))); // single frame
+    }
+
+    #[test]
+    fn rejects_short_or_nonsensical_ranges() {
+        assert_eq!(decode_rfi_range(&[0x01, 0x03, 0x00, 0x00]), None); // header only, no body
+        assert_eq!(decode_rfi_range(&rfi_msg(-1, 9)), None); // negative first
+        assert_eq!(decode_rfi_range(&rfi_msg(9, 4)), None); // last < first
     }
 }

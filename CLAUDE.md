@@ -268,7 +268,8 @@ or 8.x/libavcodec 62** — validated live on Ubuntu 26.04 (8) and Bazzite F43 (7
 FFI also link-needs `libGL`/`libgbm`/`libcuda` at build time). Env knobs: `PUNKTFUNK_VIDEO_SOURCE=virtual|portal`,
 `PUNKTFUNK_COMPOSITOR=kwin|gamescope|mutter`, `PUNKTFUNK_ZEROCOPY=1`, `PUNKTFUNK_GAMESCOPE_APP=...`,
 `PUNKTFUNK_INPUT_BACKEND=...`, `PUNKTFUNK_PERF=1` (per-stage timing), `PUNKTFUNK_VIDEO_DROP=N` (FEC
-test), `PUNKTFUNK_FEC_PCT=N`.
+test), `PUNKTFUNK_FEC_PCT=N`, `PUNKTFUNK_DSCP=1` (opt-in DSCP/SO_PRIORITY media QoS on the data +
+GameStream video/audio sockets; no-op on the wire on Windows without a qWAVE policy).
 
 ## Conventions
 

@@ -1,16 +1,87 @@
-//! TLS for the HTTPS nvhttp port (47984). Moonlight does **mutual TLS** — it presents its
-//! client cert and expects the server to request one — so a plain server-auth config makes
-//! the post-pairing `pairchallenge` fail. This config requests the client cert and verifies
-//! the client owns its key, but (for now) accepts any well-formed cert; enforcing the
-//! paired allow-list (rejecting unpaired clients on /launch) is a follow-up hardening step.
+//! TLS for the HTTPS nvhttp port (47984) and the management API. Moonlight does **mutual TLS** —
+//! it presents its client cert and expects the server to request one — so a plain server-auth
+//! config makes the post-pairing `pairchallenge` fail. This config requests the client cert and
+//! verifies the client owns its key, but accepts any well-formed cert at the *handshake* (the
+//! pairing ceremony is the real proof of identity). Authorization against the paired allow-list is
+//! then enforced per-request: [`serve_https`] reads the verified peer cert and attaches its
+//! fingerprint ([`PeerCertFingerprint`]) to each request, and the nvhttp/mgmt handlers reject
+//! callers whose fingerprint is not pinned (mirroring Apollo's post-handshake `get_verified_cert`).
 
 use anyhow::{anyhow, Context, Result};
+use axum::Router;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
+use std::net::SocketAddr;
 use std::sync::Arc;
+
+/// SHA-256 of the peer's client certificate (hex), injected per-connection into each request's
+/// extensions by [`serve_https`]; `None` when the peer presented no client cert (plain HTTP, or a
+/// browser falling back to a bearer token). Handlers authorize a request whose fingerprint is in
+/// the paired store.
+#[derive(Clone)]
+pub(crate) struct PeerCertFingerprint(pub Option<String>);
+
+/// HTTPS server that surfaces the verified client cert to handlers. `axum_server` can't expose the
+/// peer cert, so this runs the rustls handshake itself (tokio-rustls), reads the peer certificate,
+/// and serves the axum `Router` over hyper with the peer's fingerprint attached to every request as
+/// a [`PeerCertFingerprint`] extension. Shared by the nvhttp HTTPS listener and the management API.
+pub(crate) async fn serve_https(
+    bind: SocketAddr,
+    app: Router,
+    tls: Arc<ServerConfig>,
+) -> Result<()> {
+    use tower::ServiceExt;
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind HTTPS {bind}"))?;
+    loop {
+        let (tcp, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "HTTPS accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                // A failed handshake is routine (port scan, a browser bailing on the self-signed
+                // cert, a peer that hung up) — not fatal.
+                Err(_) => return,
+            };
+            // The verified peer cert (the verifier accepts any well-formed one; handlers authorize
+            // by fingerprint) → its SHA-256, matched against the paired store.
+            let fp = tls_stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|c| c.first())
+                .map(|c| hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(c.as_ref())));
+            let peer = PeerCertFingerprint(fp);
+            let svc =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let app = app.clone();
+                    let peer = peer.clone();
+                    async move {
+                        let mut req = req.map(axum::body::Body::new);
+                        req.extensions_mut().insert(peer);
+                        app.oneshot(req).await // Router error is Infallible
+                    }
+                });
+            let io = hyper_util::rt::TokioIo::new(tls_stream);
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, svc)
+                    .await;
+        });
+    }
+}
 
 /// Requests + signature-checks the client cert but accepts any (the pairing handshake is
 /// the real proof). Pinning to the paired set is a hardening follow-up.

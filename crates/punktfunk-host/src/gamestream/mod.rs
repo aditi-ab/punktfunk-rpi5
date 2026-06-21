@@ -113,6 +113,10 @@ pub struct AppState {
     /// Set by the control stream when the client requests an IDR / invalidates reference
     /// frames (recovery after loss); the video thread forces a keyframe and clears it.
     pub force_idr: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A client reference-frame-invalidation request carrying the lost frame range (0x0301). The
+    /// video thread drains it and calls `Encoder::invalidate_ref_frames`, falling back to a full
+    /// IDR when the encoder can't invalidate (range too old / no NVENC RFI). `None` = nothing pending.
+    pub rfi_range: std::sync::Arc<std::sync::Mutex<Option<(i64, i64)>>>,
     /// Persistent screen capturer, reused across streams so reconnects don't spawn a second
     /// (conflicting) screencast session. The video thread borrows it for the stream's duration
     /// and returns it; `set_active` gates its cost while idle.
@@ -138,6 +142,7 @@ impl AppState {
             streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
             video_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -293,18 +298,30 @@ fn load_paired() -> Vec<Vec<u8>> {
     }
 }
 
-/// Persist the paired-client allow-list (called after each successful pairing).
+/// Persist the paired-client allow-list (called after each successful pairing). Written
+/// atomically (temp file + rename) so a crash mid-write can't truncate `paired.json` — a partial
+/// write would otherwise lock out every paired client until they re-pair.
 pub(crate) fn save_paired(paired: &[Vec<u8>]) {
     let Some(path) = paired_path() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    match serde_json::to_vec(paired) {
-        Ok(bytes) => {
-            if let Err(e) = std::fs::write(&path, bytes) {
-                tracing::warn!(error = %e, "persisting pairings failed");
-            }
+    let bytes = match serde_json::to_vec(paired) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "serializing pairings failed");
+            return;
         }
-        Err(e) => tracing::warn!(error = %e, "serializing pairings failed"),
+    };
+    // Write to a sibling temp file, then rename over the target (atomic replace on Unix and
+    // Windows). Never write `path` in place.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
+        tracing::warn!(error = %e, "persisting pairings failed (temp write)");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        tracing::warn!(error = %e, "persisting pairings failed (rename)");
+        let _ = std::fs::remove_file(&tmp);
     }
 }

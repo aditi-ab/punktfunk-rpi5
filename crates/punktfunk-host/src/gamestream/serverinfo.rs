@@ -3,18 +3,19 @@
 use super::{Host, APP_VERSION, GFE_VERSION, SERVER_CODEC_MODE_SUPPORT};
 
 /// Build the `<root status_code="200">…</root>` serverinfo document. `https` selects the
-/// paired-HTTPS variant (real MAC). Element names are case-sensitive and match what
-/// moonlight-common-c parses.
-pub fn serverinfo_xml(host: &Host, https: bool) -> String {
-    // MAC is hidden over plain HTTP; PairStatus reflects the pairing store once the HTTPS
-    // path carries per-client identity (a hardening follow-up — 0 for now).
+/// paired-HTTPS variant (real MAC); `paired` is whether the HTTPS peer presented a client cert
+/// that is in the paired allow-list (drives `PairStatus`). Element names are case-sensitive and
+/// match what moonlight-common-c parses.
+pub fn serverinfo_xml(host: &Host, https: bool, paired: bool) -> String {
+    // MAC is hidden over plain HTTP (no per-client identity there).
     let mac = if https {
         "01:02:03:04:05:06"
     } else {
         "00:00:00:00:00:00"
     };
-    // Over the mutual-TLS HTTPS port the peer is an authenticated (paired) client.
-    let pair_status = u8::from(https);
+    // PairStatus reflects the real allow-list: 1 only when the HTTPS peer's client-cert
+    // fingerprint is pinned (the nvhttp handler computes `paired`); 0 otherwise (incl. plain HTTP).
+    let pair_status = u8::from(paired);
     let codec_mode_support = codec_mode_support();
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -104,7 +105,7 @@ mod tests {
             http_port: 47989,
             https_port: 47984,
         };
-        let xml = serverinfo_xml(&host, false);
+        let xml = serverinfo_xml(&host, false, false);
         // The mask is the GPU-aware value (NVENC/no-GPU → the static 65793; a VAAPI host →
         // whatever it probes). Assert the XML embeds exactly what `codec_mode_support()` returns,
         // so the test is deterministic regardless of the build host's GPU.

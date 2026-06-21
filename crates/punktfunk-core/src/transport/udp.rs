@@ -413,26 +413,15 @@ pub struct UdpTransport {
 }
 
 impl UdpTransport {
-    /// Target kernel socket-buffer size. A high-resolution frame is a burst (a 5120×1440
-    /// keyframe is ~130 packets the send thread hands to `sendmmsg` at once); the default
-    /// UDP buffer (~208 KB on Linux) overflows on it, which EAGAINs the host send (dropping
-    /// packets) or drops on the client recv — and with infinite-GOP a single lost frame
-    /// freezes the decode until the next RFI refresh. Requested large; the OS clamps to
-    /// `net.core.{wmem,rmem}_max` (Linux) / `kern.ipc.maxsockbuf` (macOS).
-    ///
-    /// Sized for 1 Gbps+: at ~1.2 Gbps on the wire an 8 MB buffer is only ~49 ms of steady state,
-    /// and a single multi-MB IDR keyframe (~4 MB ≈ 3300 packets) instantly fills most of it. 32 MB
-    /// gives ~200 ms of headroom and absorbs a keyframe burst without EAGAIN drops. (Paced sending
-    /// — `punktfunk1.rs::paced_submit` — now spreads a big frame's overflow, so this buffer mostly absorbs
-    /// the immediate microburst rather than a whole unpaced frame.)
-    const TARGET_SOCKBUF: usize = 32 * 1024 * 1024;
-
     /// Bind `local` and `connect` to `peer`, so `send`/`recv` need no address and the
     /// kernel filters to this peer. Non-blocking, matching the [`Transport`] contract.
     pub fn connect(local: &str, peer: &str) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(local)?;
         socket.connect(peer)?;
-        Self::grow_buffers(&socket);
+        super::qos::grow_socket_buffers(&socket);
+        // The native data plane is video-dominant — tag it as the video class (opt-in via
+        // PUNKTFUNK_DSCP). Each end marks its own egress.
+        super::qos::set_media_qos(&socket, super::qos::MediaClass::Video);
         socket.set_nonblocking(true)?;
         Ok(UdpTransport { socket })
     }
@@ -481,7 +470,8 @@ impl UdpTransport {
         let target = observed.map(|s| s.to_string());
         socket.connect(target.as_deref().unwrap_or(fallback_peer))?;
         socket.set_read_timeout(None)?;
-        Self::grow_buffers(&socket);
+        super::qos::grow_socket_buffers(&socket);
+        super::qos::set_media_qos(&socket, super::qos::MediaClass::Video);
         socket.set_nonblocking(true)?;
         Ok((UdpTransport { socket }, punched))
     }
@@ -496,27 +486,6 @@ impl UdpTransport {
     /// The bound local address (e.g. to learn the OS-assigned ephemeral port).
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.socket.local_addr()
-    }
-
-    /// Best-effort grow of SO_SNDBUF/SO_RCVBUF (see [`TARGET_SOCKBUF`]). A failure isn't fatal
-    /// (the stream just runs lossier); a grant far below the request means the OS cap is too
-    /// low for clean 4K/5K streaming, so warn once with the knob to raise.
-    fn grow_buffers(socket: &UdpSocket) {
-        let sock = socket2::SockRef::from(socket);
-        let _ = sock.set_send_buffer_size(Self::TARGET_SOCKBUF);
-        let _ = sock.set_recv_buffer_size(Self::TARGET_SOCKBUF);
-        // The kernel reports back the (possibly clamped, Linux-doubled) granted size.
-        let granted = sock
-            .send_buffer_size()
-            .unwrap_or(0)
-            .min(sock.recv_buffer_size().unwrap_or(0));
-        if granted < Self::TARGET_SOCKBUF / 4 {
-            tracing::warn!(
-                granted_kb = granted / 1024,
-                "UDP socket buffer capped well below target — high-resolution streaming may drop \
-                 frames; raise net.core.wmem_max / net.core.rmem_max (Linux) for clean 4K/5K"
-            );
-        }
     }
 
     /// Apple batched receive via `recvmsg_x` — drains up to `out.len()` datagrams in one syscall into

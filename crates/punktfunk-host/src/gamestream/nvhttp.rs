@@ -3,6 +3,7 @@
 //! `/pin` endpoint to deliver the Moonlight-displayed PIN. Over HTTPS the client is
 //! mutual-TLS-authenticated, so `/serverinfo` reports `PairStatus=1` there.
 
+use super::tls::PeerCertFingerprint;
 use super::{serverinfo, AppState, LaunchSession, HTTPS_PORT, HTTP_PORT, RTSP_PORT};
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -23,22 +24,34 @@ struct Https(bool);
 pub async fn run(state: Arc<AppState>) -> Result<()> {
     // Mutual-TLS: request + verify the client cert (Moonlight presents one for the
     // post-pairing pairchallenge + all post-pair endpoints).
-    let tls = axum_server::tls_rustls::RustlsConfig::from_config(super::tls::server_config(
-        &state.identity.cert_pem,
-        &state.identity.key_pem,
-    )?);
+    let tls = super::tls::server_config(&state.identity.cert_pem, &state.identity.key_pem)?;
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], HTTP_PORT));
     let https_addr = SocketAddr::from(([0, 0, 0, 0], HTTPS_PORT));
     tracing::info!(%http_addr, %https_addr, "nvhttp listening (serverinfo + pair + launch)");
 
     let http = axum_server::bind(http_addr).serve(router(state.clone(), false).into_make_service());
-    let https =
-        axum_server::bind_rustls(https_addr, tls).serve(router(state, true).into_make_service());
-    tokio::try_join!(async { http.await.context("nvhttp HTTP server") }, async {
-        https.await.context("nvhttp HTTPS server")
-    },)?;
+    // HTTPS runs the handshake itself (super::tls::serve_https) so handlers see the verified peer
+    // cert as a PeerCertFingerprint extension; the post-pair endpoints gate on the paired allow-list.
+    tokio::try_join!(
+        async { http.await.context("nvhttp HTTP server") },
+        super::tls::serve_https(https_addr, router(state, true), tls),
+    )?;
     Ok(())
+}
+
+/// True iff the request arrived over HTTPS with a client cert whose SHA-256 fingerprint is pinned
+/// in the paired allow-list. Plain-HTTP requests carry no client cert and are never paired. This is
+/// the post-handshake authorization check (Apollo's `get_verified_cert`) gating the launch surface.
+fn peer_is_paired(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) -> bool {
+    let Some(Extension(PeerCertFingerprint(Some(fp)))) = peer else {
+        return false;
+    };
+    st.paired
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|der| hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(der)) == *fp)
 }
 
 fn router(state: Arc<AppState>, https: bool) -> Router {
@@ -61,9 +74,12 @@ fn xml(body: String) -> impl IntoResponse {
 async fn h_serverinfo(
     State(st): State<Arc<AppState>>,
     Extension(Https(https)): Extension<Https>,
+    peer: Option<Extension<PeerCertFingerprint>>,
 ) -> impl IntoResponse {
-    // Over the mutual-TLS port the peer is an authenticated (paired) client → PairStatus=1.
-    xml(serverinfo::serverinfo_xml(&st.host, https))
+    // PairStatus=1 only when the HTTPS peer presented a *pinned* client cert; an unpaired client
+    // (or plain HTTP) sees 0 and is steered into the pairing flow.
+    let paired = https && peer_is_paired(&peer, &st);
+    xml(serverinfo::serverinfo_xml(&st.host, https, paired))
 }
 
 async fn h_pin(
@@ -79,15 +95,27 @@ async fn h_pin(
     }
 }
 
-async fn h_applist(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
+async fn h_applist(
+    State(st): State<Arc<AppState>>,
+    peer: Option<Extension<PeerCertFingerprint>>,
+) -> impl IntoResponse {
+    if !peer_is_paired(&peer, &st) {
+        tracing::warn!("applist rejected — client is not paired");
+        return xml(error_xml());
+    }
     // One app for now: the headless desktop (the wlroots virtual output).
     xml(super::apps::applist_xml())
 }
 
 async fn h_launch(
     State(st): State<Arc<AppState>>,
+    peer: Option<Extension<PeerCertFingerprint>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if !peer_is_paired(&peer, &st) {
+        tracing::warn!("launch rejected — client is not paired");
+        return xml(error_xml());
+    }
     match launch(&st, &q) {
         Ok(session) => {
             *st.launch.lock().unwrap() = Some(session);
@@ -108,7 +136,14 @@ async fn h_launch(
     }
 }
 
-async fn h_resume(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+async fn h_resume(
+    State(st): State<Arc<AppState>>,
+    peer: Option<Extension<PeerCertFingerprint>>,
+) -> impl IntoResponse {
+    if !peer_is_paired(&peer, &st) {
+        tracing::warn!("resume rejected — client is not paired");
+        return xml(error_xml());
+    }
     if st.launch.lock().unwrap().is_some() {
         xml(session_url_xml(&st, "resume"))
     } else {
@@ -116,7 +151,14 @@ async fn h_resume(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-async fn h_cancel(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+async fn h_cancel(
+    State(st): State<Arc<AppState>>,
+    peer: Option<Extension<PeerCertFingerprint>>,
+) -> impl IntoResponse {
+    if !peer_is_paired(&peer, &st) {
+        tracing::warn!("cancel rejected — client is not paired");
+        return xml(error_xml());
+    }
     *st.launch.lock().unwrap() = None;
     // Quit semantics: stop the running media threads (they observe these flags) so the session
     // actually ends — the virtual output/gamescope teardown follows via the capturer's RAII.
@@ -233,4 +275,57 @@ fn pair_error_xml() -> String {
 
 fn error_xml() -> String {
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"400\"></root>\n".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn test_state() -> Arc<AppState> {
+        let host = super::super::Host {
+            hostname: "t".into(),
+            uniqueid: "id".into(),
+            local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            http_port: HTTP_PORT,
+            https_port: HTTPS_PORT,
+        };
+        let identity = super::super::cert::ServerIdentity::ephemeral().expect("ephemeral identity");
+        Arc::new(AppState::new(host, identity))
+    }
+
+    fn fp_of(der: &[u8]) -> String {
+        hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(der))
+    }
+
+    /// The launch surface (launch/resume/applist/cancel) must reject any client whose cert
+    /// fingerprint is not in the paired allow-list — including a certless (plain-HTTP) peer.
+    #[test]
+    fn launch_gate_requires_a_pinned_client_cert() {
+        let st = test_state();
+        let der = b"a-client-cert-der".to_vec();
+        let peer = Some(Extension(PeerCertFingerprint(Some(fp_of(&der)))));
+
+        // Empty allow-list: a presented cert, an absent extension, and an explicit None all fail.
+        assert!(!peer_is_paired(&peer, &st), "unknown cert must be rejected");
+        assert!(
+            !peer_is_paired(&None, &st),
+            "no client cert must be rejected"
+        );
+        assert!(
+            !peer_is_paired(&Some(Extension(PeerCertFingerprint(None))), &st),
+            "certless HTTPS peer must be rejected"
+        );
+
+        // After pinning, the same fingerprint is accepted but a different cert still isn't.
+        st.paired.lock().unwrap().push(der);
+        assert!(peer_is_paired(&peer, &st), "pinned cert must be accepted");
+        let other = Some(Extension(PeerCertFingerprint(Some(fp_of(
+            b"different-der",
+        )))));
+        assert!(
+            !peer_is_paired(&other, &st),
+            "a non-pinned cert stays rejected"
+        );
+    }
 }

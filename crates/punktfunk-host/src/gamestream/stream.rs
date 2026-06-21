@@ -31,6 +31,10 @@ pub struct StreamConfig {
 /// streams so a reconnect doesn't open a second (conflicting) screencast session.
 pub type CapturerSlot = Arc<std::sync::Mutex<Option<Box<dyn Capturer>>>>;
 
+/// A pending client reference-frame-invalidation range (lost `firstFrame..=lastFrame`), set by the
+/// control plane and drained by the video thread (see [`AppState::rfi_range`](super::AppState)).
+pub type RfiSlot = Arc<std::sync::Mutex<Option<(i64, i64)>>>;
+
 /// Spawn the video stream thread (idempotent via `running`). Stops when `running` clears.
 /// `force_idr` is set by the control stream on a client recovery request; `video_cap` holds
 /// the persistent capturer the thread borrows for the stream's duration.
@@ -39,13 +43,21 @@ pub fn start(
     app: Option<super::apps::AppEntry>,
     running: Arc<AtomicBool>,
     force_idr: Arc<AtomicBool>,
+    rfi_range: RfiSlot,
     video_cap: CapturerSlot,
 ) {
     let _ = std::thread::Builder::new()
         .name("punktfunk-video".into())
         .spawn(move || {
             tracing::info!(?cfg, "video stream starting");
-            if let Err(e) = run(cfg, app.as_ref(), &running, &force_idr, &video_cap) {
+            if let Err(e) = run(
+                cfg,
+                app.as_ref(),
+                &running,
+                &force_idr,
+                &rfi_range,
+                &video_cap,
+            ) {
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }
             running.store(false, Ordering::SeqCst);
@@ -58,6 +70,7 @@ fn run(
     app: Option<&super::apps::AppEntry>,
     running: &Arc<AtomicBool>,
     force_idr: &AtomicBool,
+    rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
     video_cap: &std::sync::Mutex<Option<Box<dyn Capturer>>>,
 ) -> Result<()> {
     // GameStream capture/encode thread: apply Windows session tuning (no-op off Windows).
@@ -66,6 +79,10 @@ fn run(
     encode::validate_dimensions(cfg.codec, cfg.width, cfg.height)
         .context("client-requested video mode")?;
     let sock = UdpSocket::bind(("0.0.0.0", VIDEO_PORT)).context("bind video UDP")?;
+    // Grow SO_SNDBUF/RCVBUF (avoid host-side ENOBUFS at high bitrate) like the native plane, and
+    // opt-in DSCP/QoS-tag this as the video class (PUNKTFUNK_DSCP=1).
+    punktfunk_core::transport::grow_socket_buffers(&sock);
+    punktfunk_core::transport::set_media_qos(&sock, punktfunk_core::transport::MediaClass::Video);
     // The client pings the video port so we learn where to send; it re-pings until video
     // flows, so a missed early ping is fine.
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -115,7 +132,7 @@ fn run(
         let mut capturer =
             capture::capture_virtual_output(vout).context("capture virtual output")?;
         capturer.set_active(true);
-        return stream_body(&mut *capturer, &sock, cfg, running, force_idr);
+        return stream_body(&mut *capturer, &sock, cfg, running, force_idr, rfi_range);
     }
 
     // Reuse the persistent capturer (one screencast session → clean reconnect); create it on
@@ -135,7 +152,7 @@ fn run(
         }
     };
     capturer.set_active(true);
-    let result = stream_body(&mut *capturer, &sock, cfg, running, force_idr);
+    let result = stream_body(&mut *capturer, &sock, cfg, running, force_idr, rfi_range);
     capturer.set_active(false);
     *video_cap.lock().unwrap() = Some(capturer);
     result
@@ -275,6 +292,7 @@ fn stream_body(
     cfg: StreamConfig,
     running: &Arc<AtomicBool>,
     force_idr: &AtomicBool,
+    rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
 ) -> Result<()> {
     // The first frame establishes the authoritative size/format for the encoder.
     let mut frame = capturer.next_frame().context("capture first frame")?;
@@ -349,8 +367,16 @@ fn stream_body(
             uniq += 1;
         }
         let t_cap = tick.elapsed();
-        // Honor a client recovery request (RFI / request-IDR): force a keyframe so the client
-        // resyncs immediately instead of waiting for the next GOP boundary.
+        // Honor a client recovery request. Prefer reference-frame invalidation (the encoder
+        // re-references an older still-valid frame — no costly IDR spike); if the encoder can't
+        // invalidate (range too old, or no NVENC RFI) it returns false and we force a keyframe.
+        if let Some((first, last)) = rfi_range.lock().unwrap().take() {
+            if !enc.invalidate_ref_frames(first, last) {
+                enc.request_keyframe();
+            }
+        }
+        // An explicit IDR request (or a rangeless RFI) forces a keyframe so the client resyncs
+        // immediately instead of waiting for the next GOP boundary.
         if force_idr.swap(false, Ordering::SeqCst) {
             enc.request_keyframe();
         }

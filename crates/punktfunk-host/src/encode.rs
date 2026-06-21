@@ -57,6 +57,16 @@ pub trait Encoder: Send {
     /// Force the next submitted frame to be an IDR keyframe (e.g. after a client
     /// reference-frame-invalidation request). Default: no-op.
     fn request_keyframe(&mut self) {}
+    /// Invalidate a contiguous range of previously-encoded reference frames (client frame numbers,
+    /// as reported in a loss-recovery request) so the encoder re-references an older still-valid
+    /// frame instead of emitting a full IDR. Returns `true` if a real reference invalidation was
+    /// performed; `false` means the encoder couldn't (range older than the DPB, or the backend has
+    /// no RFI) and the caller should fall back to [`request_keyframe`](Self::request_keyframe).
+    /// Default: `false` — only the Windows direct-NVENC path implements true RFI; libavcodec
+    /// (Linux NVENC) and VAAPI can't express `nvEncInvalidateRefFrames`, so they keyframe.
+    fn invalidate_ref_frames(&mut self, _first_frame: i64, _last_frame: i64) -> bool {
+        false
+    }
     /// Pull the next encoded AU if one is ready.
     fn poll(&mut self) -> Result<Option<EncodedFrame>>;
     /// Signal end-of-stream. After this, drain the remaining AUs with [`poll`](Self::poll)

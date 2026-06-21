@@ -200,7 +200,7 @@ pub(crate) async fn serve(opts: Punktfunk1Options, np: Arc<NativePairing>) -> Re
     // RemoteDesktop-portal grant is established ONCE and reused, instead of a CreateSession per
     // session — which, under rapid client reconnects, raced a prior session's portal teardown and
     // wedged KWin's EIS setup ("EIS setup timed out"). Gamepads stay per-session (uinput).
-    let injector = InjectorService::start();
+    let injector = crate::inject::InjectorService::start();
     // One virtual microphone for the whole host lifetime (see MicService): the client's mic uplink
     // (0xCB) is Opus-decoded and fed into a persistent virtual mic host apps record from (Linux
     // PipeWire Audio/Source; Windows a virtual audio device's render endpoint).
@@ -1028,102 +1028,9 @@ impl PadState {
 /// actual pad creation at its own MAX_PADS.
 const MAX_WIRE_PADS: usize = 16;
 
-/// Host-lifetime pointer/keyboard injector, shared across punktfunk/1 sessions.
-///
-/// The injector backend (libei/RemoteDesktop on KWin/GNOME, gamescope's EIS, wlr, uinput) owns
-/// compositor resources and is `!Send`, so — unlike the audio capturer — it can't be handed
-/// between per-session threads through a slot. Instead one host-lifetime thread *owns* it and
-/// injects events forwarded over a clonable `Send` channel. Opening it ONCE means the privileged
-/// RemoteDesktop-portal grant is established once and held for the whole run, eliminating the
-/// per-session `CreateSession` churn that wedged KWin's EIS setup (rapid client reconnects raced
-/// a prior session's portal teardown — "EIS setup timed out"). The service opens lazily on the
-/// first event and reopens, after a backoff, if injection fails — so a transient portal hiccup,
-/// or a gamescope EIS socket that respawns with its nested session, self-heals.
-struct InjectorService {
-    tx: std::sync::mpsc::Sender<InputEvent>,
-}
-
-impl InjectorService {
-    fn start() -> InjectorService {
-        let (tx, rx) = std::sync::mpsc::channel::<InputEvent>();
-        if let Err(e) = std::thread::Builder::new()
-            .name("punktfunk1-injector".into())
-            .spawn(move || injector_service_thread(rx))
-        {
-            tracing::error!(error = %e, "injector service thread spawn failed — pointer/keyboard input disabled");
-        }
-        InjectorService { tx }
-    }
-
-    /// A sender a session forwards its pointer/keyboard events to. Cloned per session; dropping a
-    /// clone does NOT stop the service (the service holds the original sender for the host life).
-    fn sender(&self) -> std::sync::mpsc::Sender<InputEvent> {
-        self.tx.clone()
-    }
-}
-
-/// Backoff between reopen attempts after the injector backend fails to open or its worker dies,
-/// so a persistently-unavailable portal isn't hammered once per event.
+/// Backoff between reopen attempts after a host-lifetime service's backend (the mic source, a
+/// capturer) fails to open or its worker dies, so a persistently-unavailable resource isn't hammered.
 const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// The host-lifetime injector worker: lazily open the pointer/keyboard backend, then inject every
-/// forwarded event into it. Reopen (after [`INJECTOR_REOPEN_BACKOFF`]) on open failure or if the
-/// backend's worker dies mid-stream. Exits only when every session sender *and* the service's own
-/// sender have dropped (host shutdown), which drops the injector and closes its portal session.
-fn injector_service_thread(rx: std::sync::mpsc::Receiver<InputEvent>) {
-    let mut injector: Option<Box<dyn crate::inject::InputInjector>> = None;
-    let mut open_backend: Option<crate::inject::Backend> = None;
-    let mut last_failed: Option<std::time::Instant> = None;
-    for ev in rx {
-        // The resolved input backend (PUNKTFUNK_INPUT_BACKEND, set per connect by apply_input_env,
-        // also on a mid-stream session switch) may have changed since we opened. Reopen against it
-        // so input FOLLOWS the active session instead of injecting into a stale, still-warm backend
-        // (e.g. the managed gamescope's EIS socket after the user switched to the KDE desktop).
-        let want = crate::inject::default_backend();
-        if injector.is_some() && open_backend != Some(want) {
-            tracing::info!(
-                ?open_backend,
-                ?want,
-                "input: backend changed — reopening injector for the active session"
-            );
-            injector = None;
-            last_failed = None; // re-resolve immediately
-        }
-        if injector.is_none() {
-            // Open on the first event; after a failure wait out the backoff before retrying (a
-            // few events drop during setup — acceptable, input is lossy).
-            let ready = last_failed.is_none_or(|t| t.elapsed() >= INJECTOR_REOPEN_BACKOFF);
-            if ready {
-                match crate::inject::open(want) {
-                    Ok(i) => {
-                        tracing::info!(
-                            backend = ?want,
-                            "punktfunk/1 input injector ready (host-lifetime)"
-                        );
-                        injector = Some(i);
-                        open_backend = Some(want);
-                        last_failed = None;
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %format!("{e:#}"), "pointer/keyboard injection unavailable — will retry");
-                        last_failed = Some(std::time::Instant::now());
-                    }
-                }
-            }
-        }
-        if let Some(inj) = injector.as_mut() {
-            if let Err(e) = inj.inject(&ev) {
-                // The backend's worker (portal session / EIS socket) died — drop it and reopen on
-                // a later event (covers a gamescope EIS socket that respawns with its session).
-                tracing::warn!(error = %format!("{e:#}"), "inject failed — reopening injector");
-                injector = None;
-                open_backend = None;
-                last_failed = Some(std::time::Instant::now());
-            }
-        }
-    }
-    tracing::debug!("injector service stopped (host shutting down)");
-}
 
 /// Mic is 48 kHz stereo — matches the Opus stereo decoder and the host→client audio layout.
 const MIC_CHANNELS: u32 = 2;
