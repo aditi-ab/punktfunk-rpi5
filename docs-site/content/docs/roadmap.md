@@ -65,6 +65,16 @@ see [Status & Progress](/docs/status).
   an available host profile (likely behind a second per-user auth layer); on connect to an idle host,
   the user lands in *their own* desktop/session, signed in, without touching the host. Turns one box
   into a personal, profile-aware streaming target for a household.
+- **Surround & spatial audio.** Today every path is stereo end to end (the Linux host already encodes
+  5.1/7.1 via multistream Opus, but no client renders it yet). Near term: carry a **7.1 channel bed** —
+  multichannel capture, surround Opus on every host, and clients that render more than two channels
+  (macOS can then spatialize the bed to head-tracked AirPods audio). The moonshot is **object-based
+  spatial audio**: native-Windows Atmos/DTS:X object capture is blocked by a closed renderer API, but
+  **Proton already routes game audio objects through Wine's `ISpatialAudioClient`** — where it currently
+  *discards* the dynamic/height objects and their 3D positions. Finishing that rendering would give
+  every Proton gamer real spatial sound, and tunnelling the objects + positions to the client would let
+  punktfunk spatialize them *on the client* — head-tracked remote Atmos-style audio that no streaming
+  stack does today.
 - **Sub-frame pipelining.** Overlap encode and transmit within a single frame (a direct NVENC slice
   path) — the next big latency lever at high resolutions.
 - **True glass-to-glass latency** measured end to end (capture → on-screen present).
