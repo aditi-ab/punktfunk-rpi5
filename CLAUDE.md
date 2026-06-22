@@ -74,17 +74,26 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   Clients auto-resolve the type from the physical controller (DS5→DualSense, DS4→DualShock 4,
   Xbox One→Xbox One). Windows-host DualShock 4 (ViGEm) is not yet wired — Windows clients asking for
   DS4 get Xbox 360 for now.
-- **Windows host: implemented and shipping (NVIDIA-only, x64-only).** `#[cfg(windows)]` backends
+- **Windows host: implemented and shipping (all-vendor, x64-only).** `#[cfg(windows)]` backends
   behind the same traits as Linux — DXGI Desktop Duplication capture (`capture/dxgi.rs`), **SudoVDA**
-  virtual display per session (`vdisplay/sudovda.rs`), NVENC encode (`--features nvenc`), SendInput +
-  **ViGEm** gamepads (`inject/gamepad_windows.rs`), WASAPI loopback + virtual mic (`audio/wasapi_*`).
-  Ships as a **signed Inno Setup installer** that registers a `LocalSystem` SCM service launching into
-  the interactive session for secure-desktop (UAC/lock-screen) capture (`service.rs`), bundles the
-  SudoVDA driver, and is published by `windows-host.yml`. **HDR (10-bit)**: WGC captures the HDR
-  desktop as FP16/Rgb10a2 (DDA FP16 for the secure desktop), NVENC forces HEVC Main10 + BT.2020 PQ,
-  the client auto-detects PQ from the HEVC VUI — gated by `PUNKTFUNK_10BIT` + client `VIDEO_CAP_10BIT`;
-  **Windows host only** (the Linux host stays 8-bit, blocked upstream). Newer/less battle-tested than
-  the Linux host; no AMD/Intel/software encode path. Packaging: `packaging/windows/`.
+  virtual display per session (`vdisplay/sudovda.rs`), GPU encode (NVENC `--features nvenc`; AMD/Intel
+  `--features amf-qsv`), SendInput + **ViGEm** gamepads (`inject/gamepad_windows.rs`), WASAPI loopback
+  + virtual mic (`audio/wasapi_*`). Ships as a **signed Inno Setup installer** that registers a
+  `LocalSystem` SCM service launching into the interactive session for secure-desktop (UAC/lock-screen)
+  capture (`service.rs`), bundles the SudoVDA driver + the FFmpeg DLLs, and is published by
+  `windows-host.yml`. **Encoder is GPU-aware** (`encode.rs` `open_video` + `windows_resolved_backend`):
+  `PUNKTFUNK_ENCODER=auto` (the host.env default) detects the DXGI adapter vendor → **NVENC** (NVIDIA,
+  direct SDK, `encode/nvenc.rs`), **AMF** (AMD) / **QSV** (Intel) via libavcodec
+  (`encode/ffmpeg_win.rs`, the Windows analogue of the Linux VAAPI backend — `WinVendor{Amf,Qsv}`,
+  system-memory NV12/P010 readback default + opt-in zero-copy D3D11 behind `PUNKTFUNK_ZEROCOPY` with a
+  system fallback), or software H.264 (`encode/sw.rs`, GPU-less). GameStream codec advertisement is
+  probed per-GPU on AMF/QSV (`windows_codec_support` → `serverinfo`, AV1 gated). **HDR (10-bit)**: WGC
+  captures the HDR desktop as FP16/Rgb10a2 (DDA FP16 for the secure desktop), the encoder forces HEVC
+  Main10 + BT.2020 PQ (NVENC ABGR10/P010; AMF/QSV P010 + a swscale Rgb10a2→P010 fallback), the client
+  auto-detects PQ from the HEVC VUI — gated by `PUNKTFUNK_10BIT` + client `VIDEO_CAP_10BIT`; **Windows
+  host only** (the Linux host stays 8-bit, blocked upstream). **AMF/QSV is CI-green but not yet
+  on-glass validated** (no AMD/Intel Windows box in the lab); NVENC is live-validated. Newer/less
+  battle-tested than the Linux host. Packaging: `packaging/windows/`.
 
 ## What's left
 
@@ -243,6 +252,7 @@ crates/punktfunk-host/
   vdisplay/{kwin,gamescope,mutter,wlroots}.rs   per-compositor client-sized virtual outputs
   zerocopy/{egl,cuda,vulkan}.rs         dmabuf → CUDA → NVENC (tiled via EGL/GL, LINEAR via Vulkan)
   inject/{libei,wlr,gamepad,dualsense}.rs   input backends (uinput xpad + UHID DualSense)
+  encode/{nvenc,linux,vaapi,ffmpeg_win,sw}.rs   per-GPU encoders (NVENC · Linux NVENC/CUDA · VAAPI · AMF/QSV · openh264)
   capture.rs · encode.rs · audio.rs · spike.rs · punktfunk1.rs · mgmt.rs · native_pairing.rs
 clients/probe/    punktfunk/1 reference/probe client (headless test/measurement tool)
 clients/linux/    native Linux client (GTK4/libadwaita · FFmpeg · PipeWire · SDL3)
@@ -250,7 +260,7 @@ clients/windows/  native Windows client (WinUI 3 via windows-reactor · D3D11 ·
 clients/apple/    native macOS/iOS/tvOS client (Swift · VideoToolbox · GameController)
 clients/android/  native Android client (Kotlin app + native/ Rust JNI core over punktfunk-core)
 clients/decky/    Steam Deck Decky plugin
-crates/punktfunk-host/src/{capture/dxgi,vdisplay/sudovda,inject/gamepad_windows,audio/wasapi_*,service}.rs   Windows host backends
+crates/punktfunk-host/src/{capture/dxgi,vdisplay/sudovda,encode/ffmpeg_win,inject/gamepad_windows,audio/wasapi_*,service}.rs   Windows host backends
 web/                          TanStack web console over the mgmt API (status · devices · pairing)
 packaging/                    apt(deb) · RPM/COPR · Arch/sysext · Flatpak · Bazzite bootc · Windows host installer (per-dir READMEs)
 tools/{loss-harness,latency-probe}/     measurement (plan §10)

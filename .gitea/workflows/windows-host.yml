@@ -20,9 +20,12 @@
 # an ephemeral self-signed cert is generated and its public .cer published next to the installer
 # (import once to LocalMachine\TrustedPublisher). See packaging/windows/pack-host-installer.ps1.
 #
-# NVENC: the host builds with --features nvenc; the only link need is nvencodeapi.lib, synthesised
-# from a 2-export .def with llvm-dlltool (no GPU/SDK at build time). The resulting exe is NVIDIA-only
-# by design — CI never launches it, so no GPU is needed here.
+# GPU backends: the host builds with --features nvenc,amf-qsv = all three vendors in one installer.
+#  - NVENC (NVIDIA, direct SDK): the only link need is nvencodeapi.lib, synthesised from a 2-export
+#    .def with llvm-dlltool (no GPU/SDK at build time).
+#  - AMF/QSV (AMD/Intel, libavcodec): link-imports the FFmpeg libs from FFMPEG_DIR (the BtbN gpl-shared
+#    tree the client uses; includes the *_amf/*_qsv encoders) and bundles its DLLs into the installer.
+# CI never launches the exe, so no GPU is needed here — this is build + Windows clippy coverage only.
 name: windows-host
 
 on:
@@ -59,6 +62,13 @@ jobs:
           # (pwsh Out-File utf8 = no BOM, unlike Windows PowerShell 5.1 — keeps the first line clean).
           "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # FFMPEG_DIR: the same BtbN gpl-shared x64 tree the Windows CLIENT links against (provisioned
+          # by scripts/ci/setup-windows-runner.ps1). The host's AMD/Intel AMF/QSV encode backend
+          # (--features amf-qsv) link-imports avcodec/avutil/swscale from it; pack-host-installer.ps1
+          # then bundles its bin\*.dll into the installer. LIBCLANG_PATH is in the runner daemon env.
+          if (-not $env:FFMPEG_DIR) {
+            "FFMPEG_DIR=C:\Users\Public\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
           $v = if ($env:GITHUB_REF -like 'refs/tags/v*') {
             $env:GITHUB_REF_NAME -replace '^v', ''
           } else {
@@ -74,14 +84,15 @@ jobs:
           & packaging/windows/nvenc/gen-nvenc-importlib.ps1 -OutDir C:\t\nvenc
           "PUNKTFUNK_NVENC_LIB_DIR=C:\t\nvenc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Build (release, nvenc)
+      - name: Build (release, nvenc + amf-qsv)
         shell: pwsh
-        run: cargo build --release -p punktfunk-host --features nvenc
+        # All-vendor host: NVENC (NVIDIA, direct SDK) + AMF/QSV (AMD/Intel, libavcodec via FFMPEG_DIR).
+        run: cargo build --release -p punktfunk-host --features nvenc,amf-qsv
 
       - name: Clippy (host, Windows)
         shell: pwsh
         # First-ever Windows lint coverage for the host (Linux CI never lints the windows-cfg code).
-        run: cargo clippy -p punktfunk-host --features nvenc -- -D warnings
+        run: cargo clippy -p punktfunk-host --features nvenc,amf-qsv -- -D warnings
 
       - name: Ensure Inno Setup
         shell: pwsh

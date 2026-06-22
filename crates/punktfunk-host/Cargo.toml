@@ -184,6 +184,12 @@ vigem-client = { version = "0.1", features = ["unstable_xtarget_notification"] }
 # the crate builds on docs.rs/CI. We enable it so the GPU-less VM/CI compiles; the DirectX NVENC path
 # never calls CUDA at runtime, so the pinned CUDA bindings version is irrelevant.
 nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
+# AMD (AMF) + Intel (QSV) hardware encode on Windows via libavcodec — the analogue of the Linux
+# VAAPI backend (`src/encode/ffmpeg_win.rs`). Optional + behind the `amf-qsv` feature because it
+# link-imports the FFmpeg libs at build time (needs a `FFMPEG_DIR` with the AMF/QSV encoders — the
+# same BtbN gpl-shared tree the Windows client uses) and pulls the shared `avcodec/avutil/...` DLLs
+# at runtime. `ffmpeg-sys-next` auto-detects the FFmpeg version (7.x/avcodec-61 or 8.x/62).
+ffmpeg-next = { version = "8", optional = true }
 
 [features]
 # NVENC hardware encode (Windows). OFF by default: it pulls the NVENC SDK, and the host then needs
@@ -191,3 +197,7 @@ nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = 
 # time — i.e. `nvencodeapi.lib` from the NVIDIA Video Codec SDK (or an import lib generated from
 # nvEncodeAPI64.dll) on the linker path. Build the GPU host with `--features nvenc`.
 nvenc = ["dep:nvidia-video-codec-sdk"]
+# AMD/Intel hardware encode on Windows (AMF/QSV via ffmpeg-next). OFF by default: it needs a
+# `FFMPEG_DIR` (BtbN gpl-shared, includes `*_amf`/`*_qsv`) at build time and bundles the FFmpeg
+# DLLs at runtime. Build the all-vendor GPU host with `--features nvenc,amf-qsv`.
+amf-qsv = ["dep:ffmpeg-next"]

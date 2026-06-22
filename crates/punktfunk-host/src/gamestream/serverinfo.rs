@@ -50,27 +50,39 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool) -> String {
 fn codec_mode_support() -> u32 {
     #[cfg(target_os = "linux")]
     if crate::encode::linux_zero_copy_is_vaapi() {
-        use super::{SCM_AV1_MAIN8, SCM_H264, SCM_HEVC};
-        let caps = crate::encode::vaapi_codec_support();
-        let mut m = 0;
-        if caps.h264 {
-            m |= SCM_H264;
+        if let Some(m) = probed_mask(crate::encode::vaapi_codec_support()) {
+            return m;
         }
-        if caps.h265 {
-            m |= SCM_HEVC;
-        }
-        if caps.av1 {
-            m |= SCM_AV1_MAIN8;
-        }
-        // Only trust a probe that actually found an encoder. An empty result means VAAPI wasn't
-        // usable at probe time (no VA display — a GPU-less CI box, or a misconfigured host), NOT
-        // that the GPU encodes nothing; advertise the static superset (pre-probe behaviour) rather
-        // than claiming zero codecs.
-        if m != 0 {
+    }
+    // Windows AMD/Intel (AMF/QSV): advertise only what the GPU actually encodes (AV1 is narrow, an
+    // old iGPU might lack HEVC). NVENC and the GPU-less software path keep the static superset.
+    #[cfg(all(target_os = "windows", feature = "amf-qsv"))]
+    if crate::encode::windows_backend_is_ffmpeg() {
+        if let Some(m) = probed_mask(crate::encode::windows_codec_support()) {
             return m;
         }
     }
     SERVER_CODEC_MODE_SUPPORT
+}
+
+/// Turn a probed [`CodecSupport`](crate::encode::CodecSupport) into a `ServerCodecModeSupport` mask,
+/// or `None` if the probe found nothing — meaning the GPU wasn't usable at probe time (GPU-less CI,
+/// a misconfigured/wrong-vendor host), NOT that it encodes zero codecs; the caller then advertises
+/// the static superset (pre-probe behaviour) rather than claiming nothing.
+#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "amf-qsv")))]
+fn probed_mask(caps: crate::encode::CodecSupport) -> Option<u32> {
+    use super::{SCM_AV1_MAIN8, SCM_H264, SCM_HEVC};
+    let mut m = 0;
+    if caps.h264 {
+        m |= SCM_H264;
+    }
+    if caps.h265 {
+        m |= SCM_HEVC;
+    }
+    if caps.av1 {
+        m |= SCM_AV1_MAIN8;
+    }
+    (m != 0).then_some(m)
 }
 
 #[cfg(test)]

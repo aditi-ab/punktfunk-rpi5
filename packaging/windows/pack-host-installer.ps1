@@ -25,6 +25,7 @@ param(
     [string]$Publisher = 'CN=unom',
     [string]$PfxBase64 = $env:MSIX_CERT_PFX_B64,                    # reuse the client's signing secret
     [string]$PfxPassword = $env:MSIX_CERT_PASSWORD,
+    [string]$FfmpegDir = $env:FFMPEG_DIR,                           # bundle its bin\*.dll (amf-qsv build)
     [switch]$NoDriver,                                              # build without the bundled SudoVDA driver
     [switch]$NoSign                                                 # skip signing (local debug)
 )
@@ -145,6 +146,24 @@ if (-not $NoDriver) {
     $defines += "/DStageDir=$stage"
 }
 else { Write-Host "-NoDriver: building installer WITHOUT the bundled SudoVDA driver" }
+
+# --- stage the FFmpeg shared DLLs (AMD/Intel AMF/QSV build) ------------------------------------
+# A host built with --features amf-qsv link-imports avcodec/avutil/swscale/... so the shared DLLs
+# MUST sit next to the exe (it won't start otherwise). Bundle them from $FfmpegDir\bin — the same
+# BtbN gpl-shared tree the build linked against. A nvenc/software-only build doesn't import them, so
+# this is a harmless extra there; skipped entirely when $FfmpegDir is unset.
+$ffmpegBinSrc = if ($FfmpegDir) { Join-Path $FfmpegDir 'bin' } else { $null }
+if ($ffmpegBinSrc -and (Test-Path $ffmpegBinSrc)) {
+    $dlls = Get-ChildItem -Path $ffmpegBinSrc -Filter '*.dll' -ErrorAction SilentlyContinue
+    if ($dlls) {
+        $ffmpegStage = Join-Path $OutDir 'ffmpeg'
+        New-Item -ItemType Directory -Force -Path $ffmpegStage | Out-Null
+        $dlls | ForEach-Object { Copy-Item $_.FullName -Destination $ffmpegStage -Force }
+        $defines += "/DFfmpegBin=$ffmpegStage"
+        Write-Host "bundling $($dlls.Count) FFmpeg DLL(s) from $ffmpegBinSrc"
+    }
+}
+else { Write-Host "no FFMPEG_DIR\bin -> installer built WITHOUT FFmpeg DLLs (nvenc/software-only host)" }
 
 # --- build the installer (from the non-redirected copy under C:\t) -----------------------------
 Write-Host "==> ISCC $($defines -join ' ') $issLocal"

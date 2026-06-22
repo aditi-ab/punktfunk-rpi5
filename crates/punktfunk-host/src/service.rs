@@ -603,7 +603,8 @@ fn uninstall() -> Result<()> {
     Ok(())
 }
 
-/// Write a default `host.env` if none exists, so a fresh install streams with NVENC out of the box.
+/// Write a default `host.env` if none exists, so a fresh install streams out of the box. The encoder
+/// defaults to `auto` — the host picks NVENC (NVIDIA) / AMF (AMD) / QSV (Intel) from the GPU vendor.
 fn ensure_default_host_env() -> Result<()> {
     let path = host_env_path();
     if path.exists() {
@@ -616,7 +617,9 @@ fn ensure_default_host_env() -> Result<()> {
         # KEY=VALUE per line; '#' comments. Restart the service after editing:\n\
         #   punktfunk-host service stop && punktfunk-host service start\n\
         \n\
-        PUNKTFUNK_ENCODER=nvenc\n\
+        # Encode backend: auto (default) detects the GPU vendor — NVIDIA->nvenc, AMD->amf, Intel->qsv.\n\
+        # Force one with nvenc | amf | qsv | sw (software H.264). amf/qsv need an FFmpeg-built host.\n\
+        PUNKTFUNK_ENCODER=auto\n\
         PUNKTFUNK_VIDEO_SOURCE=virtual\n\
         PUNKTFUNK_SECURE_DDA=1\n\
         RUST_LOG=info\n\
@@ -625,7 +628,7 @@ fn ensure_default_host_env() -> Result<()> {
         # compat). Use `serve` for a SECURE native-only host (no GameStream #5/#9 surface).\n\
         # PUNKTFUNK_HOST_CMD=serve --gamestream\n\
         \n\
-        # Force a specific NVENC render GPU by name substring (multi-GPU boxes only):\n\
+        # Force a specific render GPU by name substring (multi-GPU boxes only):\n\
         # PUNKTFUNK_RENDER_ADAPTER=4090\n";
     std::fs::write(&path, default).with_context(|| format!("write {}", path.display()))?;
     println!("Wrote default config: {}", path.display());

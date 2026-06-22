@@ -49,6 +49,26 @@ impl Codec {
             Codec::Av1 => "av1_vaapi",
         }
     }
+
+    /// The FFmpeg AMD **AMF** encoder name (the Windows AMD backend). Selected by name (the codec id
+    /// would pick the software encoder). AV1 (`av1_amf`) is RDNA3+/RX 7000+ — probe, never assume.
+    pub fn amf_name(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264_amf",
+            Codec::H265 => "hevc_amf",
+            Codec::Av1 => "av1_amf",
+        }
+    }
+
+    /// The FFmpeg Intel **QSV** encoder name (the Windows Intel backend). Selected by name. AV1
+    /// (`av1_qsv`) is Arc/Xe2+; HEVC Main10 is Gen9.5+ — probe, never assume.
+    pub fn qsv_name(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264_qsv",
+            Codec::H265 => "hevc_qsv",
+            Codec::Av1 => "av1_qsv",
+        }
+    }
 }
 
 /// A hardware encoder. One per session; runs on the encode thread.
@@ -198,49 +218,83 @@ pub fn open_video(
     #[cfg(target_os = "windows")]
     {
         let _ = cuda; // always false on Windows (no Cuda payload)
-        let _ = bit_depth; // used by the NVENC path below; the software H.264 path is 8-bit only
-        let pref = std::env::var("PUNKTFUNK_ENCODER")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if matches!(pref.as_str(), "nvenc" | "hw" | "nvidia") {
-            // Hardware path: NVENC over D3D11. The DXGI capturer switches to its zero-copy
-            // FramePayload::D3d11 output under the same env var so capture + encode share textures.
-            #[cfg(feature = "nvenc")]
-            {
-                let enc = nvenc::NvencD3d11Encoder::open(
-                    codec,
+                      // NVIDIA → NVENC (direct SDK), AMD → AMF, Intel → QSV (both libavcodec), else → software
+                      // H.264. `auto` (the default) resolves from the DXGI adapter vendor.
+        match windows_resolved_backend() {
+            WindowsBackend::Nvenc => {
+                // Hardware path: NVENC over D3D11. The DXGI capturer switches to its zero-copy
+                // FramePayload::D3d11 output under the same env var so capture + encode share textures.
+                #[cfg(feature = "nvenc")]
+                {
+                    nvenc::NvencD3d11Encoder::open(
+                        codec,
+                        format,
+                        width,
+                        height,
+                        fps,
+                        bitrate_bps,
+                        bit_depth,
+                    )
+                    .map(|e| Box::new(e) as Box<dyn Encoder>)
+                }
+                #[cfg(not(feature = "nvenc"))]
+                {
+                    anyhow::bail!(
+                        "NVENC requested/detected but this host was built without it — rebuild \
+                         with `--features nvenc` (needs the NVENC SDK's nvencodeapi.lib at link time)"
+                    )
+                }
+            }
+            backend @ (WindowsBackend::Amf | WindowsBackend::Qsv) => {
+                // AMD AMF / Intel QSV via libavcodec (the Windows analogue of the Linux VAAPI path).
+                #[cfg(feature = "amf-qsv")]
+                {
+                    let vendor = if matches!(backend, WindowsBackend::Amf) {
+                        ffmpeg_win::WinVendor::Amf
+                    } else {
+                        ffmpeg_win::WinVendor::Qsv
+                    };
+                    ffmpeg_win::FfmpegWinEncoder::open(
+                        vendor,
+                        codec,
+                        format,
+                        width,
+                        height,
+                        fps,
+                        bitrate_bps,
+                        bit_depth,
+                    )
+                    .map(|e| Box::new(e) as Box<dyn Encoder>)
+                }
+                #[cfg(not(feature = "amf-qsv"))]
+                {
+                    let _ = backend;
+                    anyhow::bail!(
+                        "AMD/Intel (AMF/QSV) encode requested/detected but this host was built \
+                         without it — rebuild with `--features amf-qsv` (needs ffmpeg-next + a \
+                         FFMPEG_DIR with the AMF/QSV encoders at build time)"
+                    )
+                }
+            }
+            WindowsBackend::Software => {
+                anyhow::ensure!(
+                    codec == Codec::H264,
+                    "the Windows software encoder supports H.264 only; client negotiated {codec:?} \
+                     (build a GPU backend: --features nvenc or amf-qsv, or request H264)"
+                );
+                let _ = bit_depth; // the software H.264 path is 8-bit only
+                                   // Software H.264 realistically caps far below the negotiated hardware rates.
+                const SW_BITRATE_CEIL: u64 = 100_000_000;
+                sw::OpenH264Encoder::open(
                     format,
                     width,
                     height,
                     fps,
-                    bitrate_bps,
-                    bit_depth,
-                )?;
-                return Ok(Box::new(enc) as Box<dyn Encoder>);
-            }
-            #[cfg(not(feature = "nvenc"))]
-            {
-                anyhow::bail!(
-                    "NVENC requested but this host was built without it — rebuild with \
-                     `--features nvenc` (needs the NVENC SDK's nvencodeapi.lib at link time)"
-                );
+                    bitrate_bps.min(SW_BITRATE_CEIL),
+                )
+                .map(|e| Box::new(e) as Box<dyn Encoder>)
             }
         }
-        anyhow::ensure!(
-            codec == Codec::H264,
-            "the Windows software encoder supports H.264 only; client negotiated {codec:?} \
-             (set PUNKTFUNK_ENCODER=nvenc for a GPU host, or request H264)"
-        );
-        // Software H.264 realistically caps far below the negotiated hardware rates.
-        const SW_BITRATE_CEIL: u64 = 100_000_000;
-        let enc = sw::OpenH264Encoder::open(
-            format,
-            width,
-            height,
-            fps,
-            bitrate_bps.min(SW_BITRATE_CEIL),
-        )?;
-        Ok(Box::new(enc) as Box<dyn Encoder>)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -339,7 +393,7 @@ pub fn linux_zero_copy_is_vaapi() -> bool {
 /// Which codecs the active GPU can actually ENCODE. Used to build the GameStream codec
 /// advertisement so a client never negotiates a codec the GPU can't do (AV1 encode is narrow —
 /// Intel Arc/Xe2+, AMD RDNA3+/RDNA4 — so it must be probed, not assumed).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Clone, Copy, Debug)]
 pub struct CodecSupport {
     pub h264: bool,
@@ -370,6 +424,123 @@ pub fn vaapi_codec_support() -> CodecSupport {
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Windows backend selection (the analogue of the Linux nvidia_present / linux_zero_copy_is_vaapi
+// logic). NVIDIA → NVENC, AMD → AMF, Intel → QSV; `auto` (default) reads the DXGI adapter vendor.
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowsBackend {
+    Nvenc,
+    Amf,
+    Qsv,
+    Software,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+}
+
+/// Resolve the active Windows encode backend from `PUNKTFUNK_ENCODER` (`auto` → the DXGI adapter
+/// vendor). Shared by [`open_video`] and the GameStream codec advertisement so both agree.
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_resolved_backend() -> WindowsBackend {
+    let pref = std::env::var("PUNKTFUNK_ENCODER")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match pref.as_str() {
+        "nvenc" | "hw" | "nvidia" | "cuda" => WindowsBackend::Nvenc,
+        "amf" | "amd" => WindowsBackend::Amf,
+        "qsv" | "intel" => WindowsBackend::Qsv,
+        "sw" | "software" | "openh264" => WindowsBackend::Software,
+        _ => match windows_gpu_vendor() {
+            Some(GpuVendor::Nvidia) => WindowsBackend::Nvenc,
+            Some(GpuVendor::Amd) => WindowsBackend::Amf,
+            Some(GpuVendor::Intel) => WindowsBackend::Qsv,
+            None => WindowsBackend::Software,
+        },
+    }
+}
+
+/// True if the active Windows backend is the libavcodec AMF/QSV path (so the codec advertisement
+/// consults a real GPU probe rather than the NVENC static superset). Always false when the
+/// `amf-qsv` feature is off — there's then no ffmpeg backend to probe.
+#[cfg(target_os = "windows")]
+pub fn windows_backend_is_ffmpeg() -> bool {
+    cfg!(feature = "amf-qsv")
+        && matches!(
+            windows_resolved_backend(),
+            WindowsBackend::Amf | WindowsBackend::Qsv
+        )
+}
+
+/// Detect the host GPU vendor from the first hardware DXGI adapter (Windows has no `/dev/nvidia*`
+/// probe). Cached. NVIDIA=0x10DE, AMD=0x1002, Intel=0x8086; the software/WARP adapter is skipped.
+#[cfg(target_os = "windows")]
+fn windows_gpu_vendor() -> Option<GpuVendor> {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+    };
+    static CACHE: OnceLock<Option<GpuVendor>> = OnceLock::new();
+    *CACHE.get_or_init(|| unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            // windows-rs 0.62: GetDesc1 returns the desc by value (no out-param).
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+                continue; // skip the Microsoft Basic Render / WARP adapter
+            }
+            match desc.VendorId {
+                0x10DE => return Some(GpuVendor::Nvidia),
+                0x1002 => return Some(GpuVendor::Amd),
+                0x8086 => return Some(GpuVendor::Intel),
+                _ => continue,
+            }
+        }
+        None
+    })
+}
+
+/// Probe the active Windows AMF/QSV backend for its encodable codecs (cached; opens a tiny encoder
+/// per codec, once). Mirrors [`vaapi_codec_support`]; called only when [`windows_backend_is_ffmpeg`]
+/// is true. AV1 is narrow (AMD RDNA3+, Intel Arc/Xe2+), so it must be probed, not assumed.
+#[cfg(all(target_os = "windows", feature = "amf-qsv"))]
+pub fn windows_codec_support() -> CodecSupport {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<CodecSupport> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let vendor = match windows_resolved_backend() {
+            WindowsBackend::Qsv => ffmpeg_win::WinVendor::Qsv,
+            _ => ffmpeg_win::WinVendor::Amf,
+        };
+        let caps = CodecSupport {
+            h264: ffmpeg_win::probe_can_encode(vendor, Codec::H264),
+            h265: ffmpeg_win::probe_can_encode(vendor, Codec::H265),
+            av1: ffmpeg_win::probe_can_encode(vendor, Codec::Av1),
+        };
+        tracing::info!(
+            backend = ?vendor,
+            h264 = caps.h264,
+            h265 = caps.h265,
+            av1 = caps.av1,
+            "Windows AMF/QSV encode capabilities probed"
+        );
+        caps
+    })
+}
+
+#[cfg(all(target_os = "windows", feature = "amf-qsv"))]
+mod ffmpeg_win;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(target_os = "windows", feature = "nvenc"))]

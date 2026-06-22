@@ -32,6 +32,11 @@
 #ifdef StageDir
   #define WithDriver
 #endif
+; FfmpegBin (a dir of FFmpeg shared DLLs) is optional — present when the host is built with
+; --features amf-qsv (the AMD/Intel AMF/QSV encode backend link-imports the FFmpeg libs).
+#ifdef FfmpegBin
+  #define WithFfmpeg
+#endif
 
 [Setup]
 AppId={{7C9E6A52-1F4B-4E8D-A3C7-2B5D8F1E0A93}
@@ -68,6 +73,12 @@ Name: "startservice"; Description: "Start the punktfunk host service now (also s
 Source: "{#BinDir}\punktfunk-host.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#HostEnv}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Readme}"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
+#ifdef WithFfmpeg
+; FFmpeg shared DLLs (avcodec/avutil/swscale/...) laid down next to the exe — the AMD/Intel
+; (AMF/QSV) encode backend link-imports them, so the exe won't start without them. NVENC/software-
+; only builds simply omit this block.
+Source: "{#FfmpegBin}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 #ifdef WithDriver
 ; The driver payload + nefconc.exe + install-sudovda.ps1, extracted to {tmp} and removed after install.
 Source: "{#StageDir}\*"; DestDir: "{tmp}\sudovda"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installdriver
