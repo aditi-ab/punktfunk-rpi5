@@ -92,7 +92,9 @@ jobs:
 
       - name: Upload screenshots (zip artifact)
         if: always()
-        uses: actions/upload-artifact@v4
+        # v3, not v4: Gitea's artifact backend identifies as GHES, which @actions/artifact v2+
+        # (upload-artifact@v4) refuses. v3 uses the older API Gitea supports; download is still a zip.
+        uses: actions/upload-artifact@v3
         with:
           name: punktfunk-appstore-screenshots
           path: clients/apple/screenshots
