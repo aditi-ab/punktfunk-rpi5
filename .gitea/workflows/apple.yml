@@ -2,6 +2,11 @@
 # see scripts/ci/setup-macos-runner.sh). Builds the Rust core into
 # PunktfunkCore.xcframework, then builds + tests the Swift package. Network-dependent
 # tests (RemoteFirstLightTests) self-skip without PUNKTFUNK_REMOTE_HOST.
+#
+# A second job (`screenshots`) captures the App Store Connect screenshots of the REAL UI
+# (mac window + iOS/iPad/tvOS Simulators, see clients/apple/tools/screenshots.sh) and attaches
+# them to the run as a single zip artifact (`punktfunk-appstore-screenshots`). It is isolated
+# from the build/test job and best-effort, so a capture gap never reds the core signal.
 name: apple
 
 on:
@@ -37,3 +42,59 @@ jobs:
       - name: Test (unit + real-codec round trip; remote tests self-skip)
         working-directory: clients/apple
         run: swift test
+
+  # App Store screenshots of the real UI, zipped and attached to the run as a build artifact.
+  # Skipped on PRs (cost); runs on main pushes + manual dispatch. Needs the build/test job green
+  # first — and being a separate job, a capture hiccup (a missing Simulator runtime, or the mac
+  # runner lacking Screen Recording permission for the window capture) can never red that signal.
+  screenshots:
+    needs: swift
+    if: gitea.event_name != 'pull_request'
+    runs-on: macos-arm64
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain + Apple targets (incl. iOS/tvOS Simulator slices)
+        run: |
+          if ! command -v rustup >/dev/null && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --profile minimal
+          fi
+          RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
+          dirname "$RUSTUP" >> "$GITHUB_PATH"
+          "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin \
+            aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          # tvOS slices are Tier-3 (build-std on nightly + rust-src) — best-effort.
+          "$RUSTUP" toolchain install nightly --profile minimal --component rust-src || true
+
+      - name: Build PunktfunkCore.xcframework (mac + iOS; tvOS best-effort)
+        run: |
+          # Prefer an all-platform framework; fall back to mac + iOS so a tvOS toolchain gap
+          # never blocks the iPhone/iPad screenshots.
+          if ! BUILD_IOS=1 BUILD_TVOS=1 bash scripts/build-xcframework.sh; then
+            echo "::warning::tvOS xcframework slice failed — rebuilding mac + iOS only"
+            BUILD_IOS=1 bash scripts/build-xcframework.sh
+          fi
+
+      - name: Capture screenshots (best-effort per platform)
+        working-directory: clients/apple
+        env:
+          SETTLE: "8" # Simulators settle slower than a local run
+        run: |
+          # Each platform is an independent invocation: a failure (no Simulator runtime, no
+          # Screen Recording grant for the mac window capture) skips that platform, not the rest.
+          bash tools/screenshots.sh macos || echo "::warning::macOS screenshots skipped"
+          bash tools/screenshots.sh ios   || echo "::warning::iOS screenshots skipped"
+          bash tools/screenshots.sh ipad  || echo "::warning::iPad screenshots skipped"
+          bash tools/screenshots.sh tvos  || echo "::warning::tvOS screenshots skipped"
+          echo "Produced:"; ls -la screenshots || true
+
+      - name: Upload screenshots (zip artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: punktfunk-appstore-screenshots
+          path: clients/apple/screenshots
+          if-no-files-found: warn
+          retention-days: 30

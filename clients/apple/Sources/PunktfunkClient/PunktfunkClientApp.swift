@@ -14,7 +14,18 @@ struct PunktfunkClientApp: App {
 
     var body: some Scene {
         WindowGroup("Punktfunk") {
+            #if DEBUG
+            // PUNKTFUNK_SHOT_SCENE=<name> → show that single mock-populated screen full-bleed for
+            // the App Store screenshot capture (tools/screenshots.sh). Normal launch otherwise;
+            // the whole path is absent from Release builds.
+            if let scene = ScreenshotMode.requestedScene {
+                ScreenshotHostView(scene: scene)
+            } else {
+                ContentView()
+            }
+            #else
             ContentView()
+            #endif
         }
         // The Stream menu (Disconnect ⌘D, Show/Hide Statistics ⌘⇧S) — a real menu bar on
         // macOS, hardware-keyboard shortcuts on iPad. tvOS has neither.

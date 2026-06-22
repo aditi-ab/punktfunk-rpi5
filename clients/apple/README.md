@@ -174,6 +174,53 @@ signing, bundle id `io.unom.punktfunk`. Notes:
   in a simulator via `xcrun simctl install/launch` — `SIMCTL_CHILD_PUNKTFUNK_AUTOCONNECT=…`
   passes the dev autoconnect env through).
 
+## App Store screenshots
+
+Automated, faithful screenshots of the real UI for App Store Connect — one set per platform at
+exactly the accepted pixel sizes. Driver: **`tools/screenshots.sh`**.
+
+```sh
+tools/screenshots.sh all                 # macOS + (if full Xcode) iOS, iPadOS, tvOS → ./screenshots
+tools/screenshots.sh macos               # just macOS
+OUT=~/Desktop/shots tools/screenshots.sh ios ipad tvos
+PUNKTFUNK_SHOT_HERO=~/frame.png tools/screenshots.sh ios   # real captured frame behind the hero
+```
+
+How it works: the app has a DEBUG-only **shot mode** (`Sources/PunktfunkClient/Screenshots/`).
+Launched with `PUNKTFUNK_SHOT_SCENE=<name>` it renders **one** mock-populated screen full-bleed
+(`ScreenshotHostView`) instead of `ContentView`, then the OS screenshots the *real, fully-rendered*
+window — `screencapture` on macOS, `xcrun simctl io booted screenshot` on the Simulators. The five
+scenes (`ShotScenes.all`): `01-stream` (the stream hero — a synthetic frame + the glass HUD, since
+`StreamView` needs a live connection), `02-hosts`, `03-pair`, `04-trust`, `05-settings`. Mock data
+is in `ShotMock`; nothing touches a host.
+
+Output pixels are App Store Connect's required/largest sizes (Apple auto-derives the smaller ones):
+`mac` 2880×1800 · `iphone-6.9` 1320×2868 (hero 2868×1320) · `ipad-13` 2064×2752 (hero 2752×2064) ·
+`appletv` 1920×1080.
+
+Why not `ImageRenderer` (the obvious offscreen route)? It can't rasterize this app's chrome —
+`NavigationStack`, `Form`/`TabView`, and Liquid-Glass/`NSVisualEffect` materials all render black or
+SwiftUI's "can't render" placeholder. Capturing the live window/Simulator avoids that entirely.
+
+Requirements / gotchas:
+- **macOS**: only the Swift toolchain is needed, **plus a one-time Screen Recording grant** for
+  your terminal (System Settings → Privacy & Security → Screen Recording) — without it
+  `screencapture -l` fails with "could not create image from window". (A no-permission fallback,
+  `PUNKTFUNK_SHOT_SELFCAPTURE=<dir>`, uses `cacheDisplay` — but it omits material blur and can't
+  read `ScrollView` content, so it's for quick checks, not submission.)
+- **iOS/iPadOS/tvOS**: needs **full Xcode** (xcodebuild + Simulators), not just Command Line Tools,
+  and the matching device Simulators installed (iPhone 16 Pro Max, iPad Pro 13", Apple TV). Run it
+  on a full-Xcode Mac (e.g. the `macos-arm64` CI mini).
+- The hero defaults to a synthetic synthwave frame — set `PUNKTFUNK_SHOT_HERO` to a real captured
+  frame for a production-quality lead screenshot.
+
+**CI**: the `apple` workflow's **`screenshots`** job runs this on the `macos-arm64` runner on every
+main push + manual dispatch (skipped on PRs), and attaches the result as a single zip artifact,
+**`punktfunk-appstore-screenshots`** (download it from the run's Artifacts). It's best-effort and
+isolated from the build/test job — a missing Simulator runtime or a runner without the Screen
+Recording grant only drops that platform, never reds the build. (The macOS window capture in
+particular needs that grant on the runner; the Simulator shots don't.)
+
 ## Notes for whoever picks this up next
 
 1. **cbindgen import quirk** (the predicted "small compile fixes", now fixed): the
