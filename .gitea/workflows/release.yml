@@ -46,8 +46,8 @@ name: release
 
 on:
   push:
-    # Canary: a relevant main push uploads the iOS + macOS builds to TestFlight (Apple's own
-    # canary channel) — no notarized DMG, no tvOS (those are stable-only; see the per-step gates).
+    # Canary: a relevant main push uploads the iOS + macOS + tvOS builds to TestFlight (Apple's
+    # own canary channel) — no notarized DMG (that's stable-only; see the per-step gates).
     # Heavy on the shared mac-mini runner, so paths-filtered; the TestFlight steps are
     # continue-on-error until the App Store Connect record exists, so this no-ops until then.
     branches: [main]
@@ -118,16 +118,11 @@ jobs:
           "$RUSTUP" toolchain install nightly --profile minimal
           "$RUSTUP" component add rust-src --toolchain nightly
 
-      - name: Build PunktfunkCore.xcframework (mac + iOS; + tvOS on stable tags)
-        # tvOS uses nightly -Zbuild-std (slow) — build it only for a real release, not on every
-        # canary main push.
-        run: |
-          TV=""
-          case "$GITHUB_REF" in refs/tags/v*) TV="BUILD_TVOS=1" ;; esac
-          # `env` (not a bare prefix): a $TV-expanded `NAME=val` word is NOT re-promoted to a shell
-          # assignment, so `BUILD_IOS=1 $TV bash …` would try to RUN `BUILD_TVOS=1` (exit 127). env
-          # treats its leading NAME=val args as assignments post-expansion; empty $TV is a no-op.
-          env BUILD_IOS=1 $TV bash scripts/build-xcframework.sh
+      - name: Build PunktfunkCore.xcframework (mac + iOS + tvOS)
+        # tvOS is a tier-3 target (nightly -Zbuild-std): slow on the first build, then cached on
+        # the self-hosted runner. Built on canary too so the tvOS archive/upload below runs on the
+        # same track as iOS/macOS (the nightly toolchain is installed unconditionally above).
+        run: BUILD_IOS=1 BUILD_TVOS=1 bash scripts/build-xcframework.sh
 
       - name: Stage App Store Connect API key
         env:
@@ -293,9 +288,9 @@ jobs:
             -authenticationKeyIssuerID "${{ secrets.ASC_API_ISSUER_ID }}"
 
       - name: tvOS — archive + upload to TestFlight
-        # Stable only — the tvOS xcframework slice is built just for releases (above), and the
-        # App Store Connect record + runner platform are tvOS prerequisites.
-        if: startsWith(gitea.ref, 'refs/tags/v') && (gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true')
+        # Canary + stable, the same track as iOS/macOS — the tvOS xcframework slice is now built
+        # on every apple push (above), so this matches the iOS step's gate exactly.
+        if: gitea.event_name != 'workflow_dispatch' || inputs.testflight == 'true'
         # Needs tvOS added to the App Store Connect app record + the tvOS platform installed
         # on the runner (xcodebuild -downloadPlatform tvOS).
         continue-on-error: true
