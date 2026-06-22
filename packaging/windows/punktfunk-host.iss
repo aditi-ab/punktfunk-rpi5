@@ -32,6 +32,10 @@
 #ifdef StageDir
   #define WithDriver
 #endif
+; GamepadStageDir (the vendored UMDF gamepad drivers + install-gamepad-drivers.ps1) is optional.
+#ifdef GamepadStageDir
+  #define WithGamepad
+#endif
 ; FfmpegBin (a dir of FFmpeg shared DLLs) is optional — present when the host is built with
 ; --features amf-qsv (the AMD/Intel AMF/QSV encode backend link-imports the FFmpeg libs).
 #ifdef FfmpegBin
@@ -67,6 +71,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 #ifdef WithDriver
 Name: "installdriver"; Description: "Install the SudoVDA virtual display driver (required for native-resolution streaming)"
 #endif
+#ifdef WithGamepad
+Name: "installgamepad"; Description: "Install the virtual gamepad drivers (DualSense / DualShock 4 / Xbox 360 — no ViGEmBus needed)"
+#endif
 Name: "startservice"; Description: "Start the punktfunk host service now (also starts on every boot)"
 
 [Files]
@@ -83,6 +90,10 @@ Source: "{#FfmpegBin}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 ; The driver payload + nefconc.exe + install-sudovda.ps1, extracted to {tmp} and removed after install.
 Source: "{#StageDir}\*"; DestDir: "{tmp}\sudovda"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installdriver
 #endif
+#ifdef WithGamepad
+; The vendored UMDF gamepad drivers + install-gamepad-drivers.ps1, extracted to {tmp}, removed after.
+Source: "{#GamepadStageDir}\*"; DestDir: "{tmp}\gamepad"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installgamepad
+#endif
 
 [Run]
 #ifdef WithDriver
@@ -90,6 +101,12 @@ Filename: "powershell.exe"; \
   Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\sudovda\install-sudovda.ps1"" -Dir ""{tmp}\sudovda"""; \
   StatusMsg: "Installing the SudoVDA virtual display driver..."; \
   Flags: runhidden waituntilterminated; Tasks: installdriver
+#endif
+#ifdef WithGamepad
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\gamepad\install-gamepad-drivers.ps1"" -Dir ""{tmp}\gamepad"""; \
+  StatusMsg: "Installing the virtual gamepad drivers..."; \
+  Flags: runhidden waituntilterminated; Tasks: installgamepad
 #endif
 ; Register (or re-point, on upgrade - idempotent) the SYSTEM service from its FINAL {app} location:
 ; service install records current_exe() as the SCM binPath, so it must run from {app}, not {tmp}.

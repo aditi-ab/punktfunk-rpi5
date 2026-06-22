@@ -432,13 +432,20 @@ pub mod dualsense_proto;
 pub mod dualsense_windows;
 #[cfg(target_os = "linux")]
 pub mod dualshock4;
+/// Transport-independent DualShock 4 HID codec used by the Windows UMDF-driver backend
+/// ([`dualshock4_windows`]). (The Linux backend still carries its own copy — see the module FIXME.)
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub mod dualshock4_proto;
+/// Windows: virtual DualShock 4 via the same UMDF minidriver + shared-memory channel (device-type 1).
+#[cfg(target_os = "windows")]
+pub mod dualshock4_windows;
 #[cfg(target_os = "linux")]
 pub mod gamepad;
-/// Windows: virtual Xbox 360 pads via ViGEmBus.
+/// Windows: virtual Xbox 360 pads via the in-tree XUSB companion UMDF driver (classic XInput).
 #[cfg(target_os = "windows")]
 #[path = "inject/gamepad_windows.rs"]
 pub mod gamepad;
-/// Stub — virtual gamepads need Linux uinput or Windows ViGEmBus; events are dropped elsewhere.
+/// Stub — virtual gamepads need Linux uinput or the Windows UMDF drivers; events are dropped elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod gamepad {
     #[derive(Default)]

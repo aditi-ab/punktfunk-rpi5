@@ -11,7 +11,7 @@
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use wdk_sys::{
     NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PWDFDEVICE_INIT, ULONG, WDF_DRIVER_CONFIG,
@@ -41,6 +41,7 @@ const IOCTL_HID_GET_REPORT_DESCRIPTOR: u32 = hid_ctl(1);
 const IOCTL_HID_READ_REPORT: u32 = hid_ctl(2);
 const IOCTL_HID_WRITE_REPORT: u32 = hid_ctl(3);
 const IOCTL_HID_GET_DEVICE_ATTRIBUTES: u32 = hid_ctl(9);
+const IOCTL_HID_GET_STRING: u32 = hid_ctl(4);
 const IOCTL_UMDF_HID_SET_FEATURE: u32 = hid_ctl(20);
 const IOCTL_UMDF_HID_GET_FEATURE: u32 = hid_ctl(21);
 const IOCTL_UMDF_HID_SET_OUTPUT_REPORT: u32 = hid_ctl(22);
@@ -57,6 +58,8 @@ const WdfSynchronizationScopeInheritFromParent: i32 = 1; // WDF_SYNCHRONIZATION_
 const DS_VID: u16 = 0x054C;
 const DS_PID: u16 = 0x0CE6;
 const DS_VER: u16 = 0x0100;
+/// DualShock 4 v2 product id — served (same VID/version) when the host stamps device_type=1.
+const DS4_PID: u16 = 0x09CC;
 
 // Sony DualSense USB HID report descriptor (273 bytes), verbatim from inputtino (== inject/dualsense.rs).
 // NOTE: inject/dualsense.rs comments this as "232 bytes" — that comment is wrong; it is 273.
@@ -84,10 +87,10 @@ static DUALSENSE_RDESC: [u8; 273] = [
 
 // Feature reports hid-playstation / Steam read during init (each array's first byte is the report id).
 #[rustfmt::skip]
-static DS_FEATURE_CALIBRATION: [u8; 42] = [ // 0x05 motion calibration
+static DS_FEATURE_CALIBRATION: [u8; 41] = [ // 0x05 motion calibration: 1 id + 40 data (descriptor declares feature 0x05 as 0x95 0x28 = 40)
     0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0xF0, 0xD8, 0x10, 0x27, 0xF0, 0xD8, 0x10,
     0x27, 0xF0, 0xD8, 0xF4, 0x01, 0xF4, 0x01, 0x10, 0x27, 0xF0, 0xD8, 0x10, 0x27, 0xF0, 0xD8, 0x10,
-    0x27, 0xF0, 0xD8, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x27, 0xF0, 0xD8, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 #[rustfmt::skip]
 static DS_FEATURE_PAIRING: [u8; 20] = [ // 0x09 pairing info (MAC at 1..7)
@@ -102,16 +105,85 @@ static DS_FEATURE_FIRMWARE: [u8; 64] = [ // 0x20 firmware info
     0x14, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-// HID descriptor (9 bytes, packed): len, type=0x21, bcdHID=0x0100, country=0, numDesc=1,
-// then {reportType=0x22, wReportLength=273 (0x0111)}.
+// ---- DualShock 4 v2 assets (served when the host stamps device_type=1) ----
+// Sony DualShock 4 v2 USB HID report descriptor (507 bytes), verbatim from inject/dualshock4.rs.
+#[rustfmt::skip]
+static DS4_RDESC: [u8; 507] = [
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x09, 0x31,
+    0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95,
+    0x04, 0x81, 0x02, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46,
+    0x3B, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0x65, 0x00,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x0E, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+    0x95, 0x0E, 0x81, 0x02, 0x06, 0x00, 0xFF, 0x09, 0x20, 0x75, 0x06, 0x95,
+    0x01, 0x15, 0x00, 0x25, 0x7F, 0x81, 0x02, 0x05, 0x01, 0x09, 0x33, 0x09,
+    0x34, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
+    0x06, 0x00, 0xFF, 0x09, 0x21, 0x95, 0x36, 0x81, 0x02, 0x85, 0x05, 0x09,
+    0x22, 0x95, 0x1F, 0x91, 0x02, 0x85, 0x04, 0x09, 0x23, 0x95, 0x24, 0xB1,
+    0x02, 0x85, 0x02, 0x09, 0x24, 0x95, 0x24, 0xB1, 0x02, 0x85, 0x08, 0x09,
+    0x25, 0x95, 0x03, 0xB1, 0x02, 0x85, 0x10, 0x09, 0x26, 0x95, 0x04, 0xB1,
+    0x02, 0x85, 0x11, 0x09, 0x27, 0x95, 0x02, 0xB1, 0x02, 0x85, 0x12, 0x06,
+    0x02, 0xFF, 0x09, 0x21, 0x95, 0x0F, 0xB1, 0x02, 0x85, 0x13, 0x09, 0x22,
+    0x95, 0x16, 0xB1, 0x02, 0x85, 0x14, 0x06, 0x05, 0xFF, 0x09, 0x20, 0x95,
+    0x10, 0xB1, 0x02, 0x85, 0x15, 0x09, 0x21, 0x95, 0x2C, 0xB1, 0x02, 0x06,
+    0x80, 0xFF, 0x85, 0x80, 0x09, 0x20, 0x95, 0x06, 0xB1, 0x02, 0x85, 0x81,
+    0x09, 0x21, 0x95, 0x06, 0xB1, 0x02, 0x85, 0x82, 0x09, 0x22, 0x95, 0x05,
+    0xB1, 0x02, 0x85, 0x83, 0x09, 0x23, 0x95, 0x01, 0xB1, 0x02, 0x85, 0x84,
+    0x09, 0x24, 0x95, 0x04, 0xB1, 0x02, 0x85, 0x85, 0x09, 0x25, 0x95, 0x06,
+    0xB1, 0x02, 0x85, 0x86, 0x09, 0x26, 0x95, 0x06, 0xB1, 0x02, 0x85, 0x87,
+    0x09, 0x27, 0x95, 0x23, 0xB1, 0x02, 0x85, 0x88, 0x09, 0x28, 0x95, 0x3F,
+    0xB1, 0x02, 0x85, 0x89, 0x09, 0x29, 0x95, 0x02, 0xB1, 0x02, 0x85, 0x90,
+    0x09, 0x30, 0x95, 0x05, 0xB1, 0x02, 0x85, 0x91, 0x09, 0x31, 0x95, 0x03,
+    0xB1, 0x02, 0x85, 0x92, 0x09, 0x32, 0x95, 0x03, 0xB1, 0x02, 0x85, 0x93,
+    0x09, 0x33, 0x95, 0x0C, 0xB1, 0x02, 0x85, 0x94, 0x09, 0x34, 0x95, 0x3F,
+    0xB1, 0x02, 0x85, 0xA0, 0x09, 0x40, 0x95, 0x06, 0xB1, 0x02, 0x85, 0xA1,
+    0x09, 0x41, 0x95, 0x01, 0xB1, 0x02, 0x85, 0xA2, 0x09, 0x42, 0x95, 0x01,
+    0xB1, 0x02, 0x85, 0xA3, 0x09, 0x43, 0x95, 0x30, 0xB1, 0x02, 0x85, 0xA4,
+    0x09, 0x44, 0x95, 0x0D, 0xB1, 0x02, 0x85, 0xF0, 0x09, 0x47, 0x95, 0x3F,
+    0xB1, 0x02, 0x85, 0xF1, 0x09, 0x48, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xF2,
+    0x09, 0x49, 0x95, 0x0F, 0xB1, 0x02, 0x85, 0xA7, 0x09, 0x4A, 0x95, 0x01,
+    0xB1, 0x02, 0x85, 0xA8, 0x09, 0x4B, 0x95, 0x01, 0xB1, 0x02, 0x85, 0xA9,
+    0x09, 0x4C, 0x95, 0x08, 0xB1, 0x02, 0x85, 0xAA, 0x09, 0x4E, 0x95, 0x01,
+    0xB1, 0x02, 0x85, 0xAB, 0x09, 0x4F, 0x95, 0x39, 0xB1, 0x02, 0x85, 0xAC,
+    0x09, 0x50, 0x95, 0x39, 0xB1, 0x02, 0x85, 0xAD, 0x09, 0x51, 0x95, 0x0B,
+    0xB1, 0x02, 0x85, 0xAE, 0x09, 0x52, 0x95, 0x01, 0xB1, 0x02, 0x85, 0xAF,
+    0x09, 0x53, 0x95, 0x02, 0xB1, 0x02, 0x85, 0xB0, 0x09, 0x54, 0x95, 0x3F,
+    0xB1, 0x02, 0x85, 0xE0, 0x09, 0x57, 0x95, 0x02, 0xB1, 0x02, 0x85, 0xB3,
+    0x09, 0x55, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xB4, 0x09, 0x55, 0x95, 0x3F,
+    0xB1, 0x02, 0x85, 0xB5, 0x09, 0x56, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xD0,
+    0x09, 0x58, 0x95, 0x3F, 0xB1, 0x02, 0x85, 0xD4, 0x09, 0x59, 0x95, 0x3F,
+    0xB1, 0x02, 0xC0,
+];
+// DS4 feature reports games read during init (each array's first byte is the report id).
+#[rustfmt::skip]
+static DS4_FEATURE_PAIRING: [u8; 16] = [ // 0x12 pairing info (MAC at bytes 1..7)
+    0x12, 0x01, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0x08, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+#[rustfmt::skip]
+static DS4_FEATURE_CALIBRATION: [u8; 37] = [ // 0x02 IMU calibration
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0xF0, 0xFF, 0x10, 0x00, 0xF0, 0xFF, 0x10,
+    0x00, 0xF0, 0xFF, 0x20, 0x00, 0x20, 0x00, 0x00, 0x20, 0x00, 0xE0, 0x00, 0x20, 0x00, 0xE0, 0x00,
+    0x20, 0x00, 0xE0, 0x00, 0x00,
+];
+#[rustfmt::skip]
+static DS4_FEATURE_FIRMWARE: [u8; 49] = [ // 0xa3 firmware/build info
+    0xA3, 0x41, 0x75, 0x67, 0x20, 0x20, 0x33, 0x20, 0x32, 0x30, 0x31, 0x33, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x30, 0x37, 0x3A, 0x30, 0x31, 0x3A, 0x31, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00,
+];
+
+// HID descriptor (9 bytes, packed): len, type=0x21, bcdHID=0x0100, country=0, numDesc=1, then
+// {reportType=0x22, wReportLength}. DualSense = 273 (0x0111); DualShock 4 = 507 (0x01FB).
 static HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0x11, 0x01];
+static DS4_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, 0xFB, 0x01];
 
 // HID_DEVICE_ATTRIBUTES (32 bytes): Size(u32)=32, VendorID, ProductID, VersionNumber, Reserved[11].
-fn hid_attrs() -> [u8; 32] {
+// `ds4` selects the DualShock 4 product id (same VID/version).
+fn hid_attrs(ds4: bool) -> [u8; 32] {
     let mut a = [0u8; 32];
     a[0..4].copy_from_slice(&32u32.to_le_bytes());
     a[4..6].copy_from_slice(&DS_VID.to_le_bytes());
-    a[6..8].copy_from_slice(&DS_PID.to_le_bytes());
+    a[6..8].copy_from_slice(&(if ds4 { DS4_PID } else { DS_PID }).to_le_bytes());
     a[8..10].copy_from_slice(&DS_VER.to_le_bytes());
     a
 }
@@ -128,8 +200,24 @@ const NEUTRAL_REPORT: [u8; 64] = {
     r[8] = 0x08; // buttons[0]: low nibble = dpad hat (8 = neutral), high nibble = face buttons (0)
     r
 };
-fn neutral_report() -> [u8; 64] {
-    NEUTRAL_REPORT
+// Neutral DualShock 4 input report 0x01: sticks centered (0x80); the dpad hat is in byte 5 (low
+// nibble), so a neutral hat (8) lands there instead of byte 8.
+const DS4_NEUTRAL_REPORT: [u8; 64] = {
+    let mut r = [0u8; 64];
+    r[0] = 0x01; // report id
+    r[1] = 0x80; // LX
+    r[2] = 0x80; // LY
+    r[3] = 0x80; // RX
+    r[4] = 0x80; // RY
+    r[5] = 0x08; // buttons[0]: low nibble = dpad hat (8 = neutral), high nibble = face buttons (0)
+    r
+};
+fn neutral_report(ds4: bool) -> [u8; 64] {
+    if ds4 {
+        DS4_NEUTRAL_REPORT
+    } else {
+        NEUTRAL_REPORT
+    }
 }
 
 static MANUAL_QUEUE: AtomicPtr<WDFQUEUE__> = AtomicPtr::new(core::ptr::null_mut());
@@ -198,6 +286,59 @@ pub unsafe extern "system" fn driver_entry(
     }
 }
 
+/// The pad index this device serves (which `pfds-shm-<index>` section to map). The host stamps it into
+/// the device Location (`pszDeviceLocation`); the driver reads it in EvtDeviceAdd. With
+/// `UmdfHostProcessSharing=ProcessSharingDisabled` (the INF) each pad gets its own WUDFHost, so this
+/// static is per-pad — the basis for multi-pad.
+static SHM_INDEX: AtomicU32 = AtomicU32::new(0);
+/// DEVICE_REGISTRY_PROPERTY: DevicePropertyLocationInformation (not re-exported at the wdk_sys root).
+const DEVICE_PROPERTY_LOCATION_INFORMATION: i32 = 10;
+
+/// Read the pad index the host stamped into the device Location (a NUL-terminated UTF-16 decimal
+/// string). Defaults to 0 (single-pad) if absent.
+fn query_shm_index(device: WDFDEVICE) -> u32 {
+    let mut mem: WDFMEMORY = core::ptr::null_mut();
+    // SAFETY: device valid; property = LocationInformation; pool ignored in UMDF; mem receives the handle.
+    let st = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceAllocAndQueryProperty,
+            device,
+            DEVICE_PROPERTY_LOCATION_INFORMATION,
+            0,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut mem
+        )
+    };
+    if !nt_success(st) || mem.is_null() {
+        return 0;
+    }
+    let mut len: usize = 0;
+    // SAFETY: mem valid.
+    let buf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, mem, &mut len) }
+        as *const u16;
+    if buf.is_null() {
+        return 0;
+    }
+    let mut idx: u32 = 0;
+    let mut any = false;
+    for i in 0..(len / 2).min(8) {
+        // SAFETY: buf valid for len bytes; i < len/2.
+        let c = unsafe { *buf.add(i) };
+        if c == 0 {
+            break;
+        }
+        if (0x30..=0x39).contains(&c) {
+            idx = idx.wrapping_mul(10).wrapping_add((c - 0x30) as u32);
+            any = true;
+        }
+    }
+    if any {
+        idx
+    } else {
+        0
+    }
+}
+
 extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INIT) -> NTSTATUS {
     log("[pf-ds] EvtDeviceAdd");
 
@@ -219,6 +360,10 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         dbglog!("[pf-ds] WdfDeviceCreate failed 0x{:08x}", st as u32);
         return st;
     }
+
+    let shm_idx = query_shm_index(device);
+    SHM_INDEX.store(shm_idx, Ordering::Relaxed);
+    dbglog!("[pf-ds] shm index = {shm_idx}");
 
     // Default parallel queue handling all IOCTLs.
     // SAFETY: zeroed config then fields set; Size matches the struct.
@@ -317,9 +462,18 @@ extern "C" fn evt_io_device_control(
         dbglog!("[pf-ds] ioctl 0x{ioctl:08x} out={_output_len} in={_input_len}");
     }
     let status: NTSTATUS = match ioctl {
-        IOCTL_HID_GET_DEVICE_DESCRIPTOR => copy_to_output(request, &HID_DESC),
-        IOCTL_HID_GET_DEVICE_ATTRIBUTES => copy_to_output(request, &hid_attrs()),
-        IOCTL_HID_GET_REPORT_DESCRIPTOR => copy_to_output(request, &DUALSENSE_RDESC),
+        IOCTL_HID_GET_DEVICE_DESCRIPTOR => {
+            copy_to_output(request, if device_type() == 1 { &DS4_HID_DESC } else { &HID_DESC })
+        }
+        IOCTL_HID_GET_DEVICE_ATTRIBUTES => copy_to_output(request, &hid_attrs(device_type() == 1)),
+        IOCTL_HID_GET_REPORT_DESCRIPTOR => copy_to_output(
+            request,
+            if device_type() == 1 {
+                &DS4_RDESC[..]
+            } else {
+                &DUALSENSE_RDESC[..]
+            },
+        ),
         IOCTL_HID_READ_REPORT => {
             let mq: WDFQUEUE = MANUAL_QUEUE.load(Ordering::SeqCst);
             // SAFETY: request valid; mq is the manual queue created in EvtDeviceAdd.
@@ -341,7 +495,10 @@ extern "C" fn evt_io_device_control(
             STATUS_SUCCESS
         }
         IOCTL_UMDF_HID_GET_FEATURE => on_get_feature(request),
-        IOCTL_UMDF_HID_GET_INPUT_REPORT => copy_to_output(request, &neutral_report()),
+        IOCTL_UMDF_HID_GET_INPUT_REPORT => {
+            copy_to_output(request, &neutral_report(device_type() == 1))
+        }
+        IOCTL_HID_GET_STRING => on_get_string(request),
         _ => STATUS_NOT_IMPLEMENTED,
     };
 
@@ -479,11 +636,15 @@ fn on_get_feature(request: WDFREQUEST) -> NTSTATUS {
     }
     // SAFETY: inbuf valid for >=1 byte.
     let report_id = unsafe { *inbuf };
-    let blob: &[u8] = match report_id {
-        0x05 => &DS_FEATURE_CALIBRATION,
-        0x09 => &DS_FEATURE_PAIRING,
-        0x20 => &DS_FEATURE_FIRMWARE,
-        other => {
+    // DualSense uses feature ids 0x05/0x09/0x20; DualShock 4 uses 0x02/0x12/0xa3.
+    let blob: &[u8] = match (device_type() == 1, report_id) {
+        (false, 0x05) => &DS_FEATURE_CALIBRATION,
+        (false, 0x09) => &DS_FEATURE_PAIRING,
+        (false, 0x20) => &DS_FEATURE_FIRMWARE,
+        (true, 0x02) => &DS4_FEATURE_CALIBRATION,
+        (true, 0x12) => &DS4_FEATURE_PAIRING,
+        (true, 0xA3) => &DS4_FEATURE_FIRMWARE,
+        (_, other) => {
             dbglog!("[pf-ds] GET_FEATURE unknown report id 0x{other:02x}");
             return STATUS_INVALID_PARAMETER;
         }
@@ -491,12 +652,70 @@ fn on_get_feature(request: WDFREQUEST) -> NTSTATUS {
     copy_to_output(request, blob)
 }
 
+// IOCTL_HID_GET_STRING: the input is a ULONG whose low word is the string id and whose high word is
+// the language id. Reply with the requested device string as a NUL-terminated UTF-16 buffer. Native
+// PS5 / Steam code reads these (HidD_GetProductString / HidD_GetSerialNumberString — the serial is one
+// way they tell USB from BT); the old default returned STATUS_NOT_IMPLEMENTED, leaving them blank.
+// Observed live on this device, Windows polls ids 0x0E/0x0F/0x10 (lang 0x0409) cyclically — the
+// manufacturer/product/serial slots — NOT the 0/1/2 HID_STRING_ID_* constants; we map both forms.
+fn on_get_string(request: WDFREQUEST) -> NTSTATUS {
+    let mut inmem: WDFMEMORY = core::ptr::null_mut();
+    // SAFETY: request valid.
+    let st = unsafe {
+        call_unsafe_wdf_function_binding!(WdfRequestRetrieveInputMemory, request, &mut inmem)
+    };
+    if !nt_success(st) {
+        return st;
+    }
+    let mut inlen: usize = 0;
+    // SAFETY: inmem valid.
+    let inbuf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, inmem, &mut inlen) }
+        as *const u8;
+    // SAFETY: inbuf is valid for inlen bytes; read the 4-byte id value when present.
+    let id_val: u32 = if !inbuf.is_null() && inlen >= 4 {
+        unsafe { core::ptr::read_unaligned(inbuf as *const u32) }
+    } else {
+        0
+    };
+    let string_id = id_val & 0xFFFF;
+    let ds4 = device_type() == 1;
+    dbglog!("[pf-ds] GET_STRING id=0x{string_id:04x} (raw 0x{id_val:08x}) ds4={ds4}");
+    let s: &str = match string_id {
+        0 | 0x000e => {
+            if ds4 {
+                "Sony Computer Entertainment"
+            } else {
+                "Sony Interactive Entertainment"
+            }
+        }
+        2 | 0x0010 => {
+            if ds4 {
+                "DEADBEEF0001"
+            } else {
+                "35533AD6E774"
+            }
+        }
+        _ => {
+            if ds4 {
+                "Wireless Controller"
+            } else {
+                "DualSense Wireless Controller"
+            }
+        }
+    };
+    let mut wide: Vec<u16> = s.encode_utf16().collect();
+    wide.push(0); // NUL terminator
+    // SAFETY: reinterpret the UTF-16 buffer as bytes for the byte-oriented copy_to_output.
+    let bytes = unsafe { core::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
+    copy_to_output(request, bytes)
+}
+
 // Open + map the host's shared-memory section (Global\pfds-shm-0) and run `f` against the mapped base
 // if it exists with a valid magic, then unmap. NOT cached: re-mapped per access so the driver always
 // sees the current section (UMDF groups all devices in one WUDFHost, and the host may recreate the
 // section across restarts — a cached view would go stale). ~125 maps/s from the timer = negligible.
 fn with_shm<F: FnOnce(*mut u8)>(f: F) {
-    let name: Vec<u16> = "Global\\pfds-shm-0"
+    let name: Vec<u16> = format!("Global\\pfds-shm-{}", SHM_INDEX.load(Ordering::Relaxed))
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -516,12 +735,28 @@ fn with_shm<F: FnOnce(*mut u8)>(f: F) {
     let magic = unsafe { core::ptr::read_unaligned(view as *const u32) };
     if magic == SHM_MAGIC {
         if !LOGGED_SHM.swap(true, Ordering::Relaxed) {
-            dbglog!("[pf-ds] control: shared memory mapped (Global\\pfds-shm-0)");
+            dbglog!(
+                "[pf-ds] control: shared memory mapped (Global\\pfds-shm-{})",
+                SHM_INDEX.load(Ordering::Relaxed)
+            );
         }
         f(view);
     }
     // SAFETY: view came from MapViewOfFile.
     unsafe { UnmapViewOfFile(view as *const c_void) };
+}
+
+/// The host's device-type selector from shared memory (`device_type` byte @140): 0 = DualSense
+/// (default), 1 = DualShock 4. Read fresh on each enumeration query — cheap, and the host stamps the
+/// section before `SwDeviceCreate`, so it's set by the time hidclass asks for the descriptor /
+/// attributes. Defaults to DualSense if the section isn't mapped yet (magic absent).
+fn device_type() -> u8 {
+    let mut t = 0u8;
+    with_shm(|view| {
+        // SAFETY: view points at a mapped 256-byte section; the device-type byte is at offset 140.
+        t = unsafe { *view.add(140) };
+    });
+    t
 }
 
 extern "C" fn evt_timer(timer: WDFTIMER) {

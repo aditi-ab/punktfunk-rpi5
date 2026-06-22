@@ -9,8 +9,9 @@ Signature="$WINDOWS NT$"
 Class=HIDClass
 ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
 Provider=%ProviderString%
-CatalogFile=pf_dualsense.cat
+CatalogFile = pf_dualsense.cat
 PnpLockdown=1
+DriverVer = 06/22/2026,16.23.43.887
 
 [DestinationDirs]
 DefaultDestDir = 13
@@ -22,9 +23,9 @@ DefaultDestDir = 13
 pf_dualsense.dll=1
 
 [Manufacturer]
-%ManufacturerString%=pf, NT$ARCH$.10.0...22000
+%ManufacturerString%=pf, NTamd64.10.0...22000
 
-[pf.NT$ARCH$.10.0...22000]
+[pf.NTamd64.10.0...22000]
 ; Hardware ids: `root\pf_dualsense` for a root-enumerated devnode (devgen/devcon tests); `pf_dualsense`
 ; for the host's SwDeviceCreate'd DualSense (the `root\` prefix is reserved for root enumeration, so
 ; SwDeviceCreate rejects it with E_INVALIDARG); `pf_dualshock4` for the host's virtual DualShock 4 — the
@@ -67,7 +68,7 @@ UmdfFsContextUsePolicy=CanUseFsContext2
 UmdfHostProcessSharing=ProcessSharingDisabled
 
 [pf_dualsense_Install]
-UmdfLibraryVersion=$UMDFVERSION$
+UmdfLibraryVersion=2.31.0
 ServiceBinary="%13%\pf_dualsense.dll"
 
 [UMDriverCopy]

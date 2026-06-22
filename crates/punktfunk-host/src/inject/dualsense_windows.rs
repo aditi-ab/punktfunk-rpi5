@@ -25,7 +25,7 @@ use anyhow::{anyhow, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
-use windows::core::{w, HRESULT, HSTRING, PCWSTR};
+use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
@@ -40,12 +40,17 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
-/// Shared-section layout — must match `packaging/windows/dualsense-driver/src/lib.rs`.
-const SHM_SIZE: usize = 256;
-const SHM_MAGIC: u32 = 0x5046_4453; // "PFDS"
-const OFF_INPUT: usize = 8;
-const OFF_OUT_SEQ: usize = 72;
-const OFF_OUTPUT: usize = 76;
+/// Shared-section layout — must match `packaging/windows/dualsense-driver/src/lib.rs`. `pub(super)`
+/// so the sibling DualShock 4 backend ([`super::dualshock4_windows`]) reuses the exact offsets.
+pub(super) const SHM_SIZE: usize = 256;
+pub(super) const SHM_MAGIC: u32 = 0x5046_4453; // "PFDS"
+pub(super) const OFF_INPUT: usize = 8;
+pub(super) const OFF_OUT_SEQ: usize = 72;
+pub(super) const OFF_OUTPUT: usize = 76;
+/// Device-type selector the driver reads to choose which HID identity/descriptor it serves: 0 =
+/// DualSense (the default — the section is zeroed), 1 = DualShock 4.
+pub(super) const OFF_DEVTYPE: usize = 140;
+pub(super) const DEVTYPE_DUALSHOCK4: u8 = 1;
 
 /// A single virtual DualSense: the SwDeviceCreate'd `pf_pad_<index>` software devnode (the driver
 /// loads on it and the HID DualSense appears to games) plus the shared-memory section the driver maps.
@@ -86,31 +91,103 @@ unsafe extern "system" fn sw_create_cb(
     }
 }
 
-/// Spawn the per-session virtual DualSense devnode for pad `index` under enumerator `punktfunk`
-/// (instance `pf_pad_<index>`, hardware id `pf_dualsense` which the INF matches). The returned
-/// `HSWDEVICE` owns it — `SwDeviceClose` removes it on drop, so the pad appears/disappears with the
-/// session and nothing persists.
+/// The PnP identity for a virtual controller devnode — varies by controller type so the same
+/// [`create_swdevice`] builds a DualSense (`VID_054C&PID_0CE6`) or a DualShock 4
+/// (`VID_054C&PID_09CC`). The fields map onto the `SW_DEVICE_CREATE_INFO` identity discussed below.
+pub(super) struct SwDeviceProfile<'a> {
+    /// PnP instance id — distinct namespaces per type (`pf_pad_<idx>` vs `pf_ds4_<idx>`) so the two
+    /// never reuse the same devnode shell.
+    pub instance: &'a str,
+    /// Index for the deterministic per-pad ContainerId.
+    pub container_index: u8,
+    /// The INF-matched hardware id (`pf_dualsense` / `pf_dualshock4`), listed FIRST so the INF binds.
+    pub hwid: &'a str,
+    /// The USB VID&PID token (`VID_054C&PID_0CE6`) used to synthesize the USB hardware/compatible ids.
+    pub usb_vid_pid: &'a str,
+    /// Device description shown in Device Manager.
+    pub description: &'a str,
+}
+
+/// Spawn the per-session virtual controller devnode under enumerator `punktfunk` (instance
+/// `profile.instance`). The returned `HSWDEVICE` owns it — `SwDeviceClose` removes it on drop, so the
+/// pad appears/disappears with the session and nothing persists.
+///
+/// **Game-detection identity** (see `docs/windows-dualsense-game-detection.md`). `HIDD_ATTRIBUTES`
+/// alone (VID/PID via the IOCTL) satisfies SDL/HIDAPI/RawInput, but a native PS5 path (libScePad-
+/// style raw HID) classifies the *connection type* by walking from the HID child to its parent
+/// (`CM_Get_Parent`) and string-matching `"USB"`/`"BTHENUM"` in that parent's
+/// `DEVPKEY_Device_CompatibleIds`; with no bus identity the pad reads as `UNKNOWN` and the native
+/// path rejects it. So we set, via `SW_DEVICE_CREATE_INFO` (NOT `pProperties` — bus/identity info is
+/// create-time-only and a `DEVPROPERTY` write of these keys is ignored):
+/// - `pszzCompatibleIds` starting with a `USB\` token → the parent walk resolves `bus_type = USB`.
+/// - `pszzHardwareIds` = `pf_dualsense` **first** (so the INF still binds our UMDF driver) followed
+///   by `USB\VID_054C&PID_0CE6[&REV_0100]`, which makes hidclass derive the real-DualSense child
+///   hardware ids `HID\VID_054C&PID_0CE6[&REV_0100]` (the set a genuine USB DS5 exposes).
+/// - a deterministic, non-sentinel per-pad `pContainerId` (groups the pad's devnodes; avoids the
+///   null-sentinel ContainerId that trips an `xinput1_4` slot-skip bug).
+///
+/// (Validated live on `.173`: the INF still binds, the child gains the `HID\VID&PID` ids, and the
+/// parent walk reports USB. Remaining gap: GameInput parses VID/PID from the child *instance path*
+/// `HID\punktfunk\…`, which only a real USB-bus instance path — a bus driver — would change.)
 ///
 /// Two requirements each yield E_INVALIDARG if violated: the enumerator name must not contain `_`
 /// (hence `punktfunk`, not `pf_dualsense`), and the completion callback is mandatory (the docs mark
 /// `pCallback` as `[in]`, not optional — a NULL callback is rejected). The caller must be
 /// Administrator (the host service runs as LocalSystem).
-fn create_swdevice(index: u8) -> Result<HSWDEVICE> {
-    let hwids: Vec<u16> = "pf_dualsense".encode_utf16().chain([0u16, 0u16]).collect();
-    let instid: Vec<u16> = format!("pf_pad_{index}")
+pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<HSWDEVICE> {
+    // Build a double-NUL-terminated UTF-16 multi-sz from a list of ids.
+    let multi_sz = |ids: &[&str]| -> Vec<u16> {
+        ids.iter()
+            .flat_map(|s| s.encode_utf16().chain(std::iter::once(0)))
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let usb_rev = format!("USB\\{}&REV_0100", p.usb_vid_pid);
+    let usb = format!("USB\\{}", p.usb_vid_pid);
+    let hwids = multi_sz(&[
+        p.hwid, // FIRST → the INF binds our UMDF driver on this id
+        usb_rev.as_str(),
+        usb.as_str(),
+    ]);
+    let compat = multi_sz(&[
+        usb.as_str(), // a `USB\` token → native bus-type detection resolves USB
+        "USB\\Class_03&SubClass_00&Prot_00",
+        "USB\\Class_03",
+    ]);
+    let instid: Vec<u16> = p
+        .instance
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let desc: Vec<u16> = "punktfunk Virtual DualSense"
+    let desc: Vec<u16> = p
+        .description
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    // SAFETY: zeroed then the fields we use are set; cbSize identifies the struct version.
+    // The pad index, stamped into the device Location — the driver reads it to map `pfds-shm-<index>`
+    // (multi-pad). The buffer outlives the SwDeviceCreate call (we wait on the event before return).
+    let loc: Vec<u16> = format!("{}", p.container_index)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // Deterministic per-pad ContainerId {50464453-0000-0000-0000-0000000000<idx>} ("PFDS").
+    let container = GUID::from_values(
+        0x5046_4453,
+        0x0000,
+        0x0000,
+        [0, 0, 0, 0, 0, 0, 0, p.container_index],
+    );
+
+    // SAFETY: zeroed then the fields we use are set; cbSize identifies the struct version. The id
+    // buffers and `container` outlive the SwDeviceCreate call (we wait on the event before return).
     let mut info: SW_DEVICE_CREATE_INFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<SW_DEVICE_CREATE_INFO>() as u32;
     info.pszInstanceId = PCWSTR(instid.as_ptr());
     info.pszzHardwareIds = PCWSTR(hwids.as_ptr());
+    info.pszzCompatibleIds = PCWSTR(compat.as_ptr());
+    info.pContainerId = &container;
     info.pszDeviceDescription = PCWSTR(desc.as_ptr());
+    info.pszDeviceLocation = PCWSTR(loc.as_ptr());
     info.CapabilityFlags = 0x0000_000B; // DriverRequired | SilentInstall | Removable
 
     // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
@@ -157,56 +234,66 @@ fn create_swdevice(index: u8) -> Result<HSWDEVICE> {
     Ok(hsw)
 }
 
+/// Create + map the named section `Global\pfds-shm-<index>`, zeroed, with a permissive DACL so the
+/// WUDFHost (whatever account it runs as) can open it. Returns `(section handle, mapped base)`; the
+/// caller stamps the device-type + initial input report and finally the magic. Shared by both Windows
+/// pad backends (DualSense + DualShock 4).
+pub(super) fn create_shm_section(index: u8) -> Result<(HANDLE, *mut u8)> {
+    let name = HSTRING::from(format!("Global\\pfds-shm-{index}"));
+
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the SDDL literal is valid; psd receives an allocated descriptor (freed by the OS when
+    // the process exits — acceptable for a host-lifetime object).
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:(A;;GA;;;WD)"),
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )?;
+    }
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: psd.0,
+        bInheritHandle: false.into(),
+    };
+
+    // SAFETY: anonymous (pagefile-backed) section of SHM_SIZE bytes with the SDDL above.
+    let map = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            Some(&sa),
+            PAGE_READWRITE,
+            0,
+            SHM_SIZE as u32,
+            PCWSTR(name.as_ptr()),
+        )?
+    };
+    // SAFETY: map is a valid section handle; map the whole thing.
+    let view = unsafe { MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, SHM_SIZE) };
+    if view.Value.is_null() {
+        // SAFETY: map is valid.
+        unsafe {
+            let _ = CloseHandle(map);
+        }
+        return Err(anyhow!("MapViewOfFile failed for {name}"));
+    }
+    let base = view.Value as *mut u8;
+    // SAFETY: base points at SHM_SIZE writable bytes.
+    unsafe { std::ptr::write_bytes(base, 0, SHM_SIZE) };
+    Ok((map, base))
+}
+
 impl DsWinPad {
     /// Create + map the section `Global\pfds-shm-<index>`, stamp the magic, then spawn the
     /// `root\pf_dualsense` devnode (the driver loads on it and maps the section). The devnode lives
     /// for the pad's lifetime — dropping the pad removes it (`SwDeviceClose`).
     fn open(index: u8) -> Result<DsWinPad> {
-        let name = HSTRING::from(format!("Global\\pfds-shm-{index}"));
-
-        // A permissive DACL so the WUDFHost (whatever account it runs as) can open the section.
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: the SDDL literal is valid; psd receives an allocated descriptor (freed by the OS
-        // when the process exits — acceptable for a host-lifetime object).
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:(A;;GA;;;WD)"),
-                SDDL_REVISION_1,
-                &mut psd,
-                None,
-            )?;
-        }
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: psd.0,
-            bInheritHandle: false.into(),
-        };
-
-        // SAFETY: anonymous (pagefile-backed) section of SHM_SIZE bytes with the SDDL above.
-        let map = unsafe {
-            CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                Some(&sa),
-                PAGE_READWRITE,
-                0,
-                SHM_SIZE as u32,
-                PCWSTR(name.as_ptr()),
-            )?
-        };
-        // SAFETY: map is a valid section handle; map the whole thing.
-        let view = unsafe { MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, SHM_SIZE) };
-        if view.Value.is_null() {
-            // SAFETY: map is valid.
-            unsafe {
-                let _ = CloseHandle(map);
-            }
-            return Err(anyhow!("MapViewOfFile failed for {name}"));
-        }
-        let base = view.Value as *mut u8;
-        // Zero the section then stamp the magic LAST (the driver only accepts it once magic is set).
+        let (map, base) = create_shm_section(index)?;
+        // Stamp the neutral input report, then the magic LAST (the driver only accepts the section
+        // once magic is set). The device-type stays 0 (DualSense — the section is already zeroed).
         // SAFETY: base points at SHM_SIZE writable bytes.
         unsafe {
-            std::ptr::write_bytes(base, 0, SHM_SIZE);
             std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; DS_INPUT_REPORT_LEN], {
                 let mut r = [0u8; DS_INPUT_REPORT_LEN];
                 serialize_state(&mut r, &DsState::neutral(), 0, 0);
@@ -217,7 +304,14 @@ impl DsWinPad {
         // Spawn the per-session devnode via SwDeviceCreate; `SwDeviceClose` removes it on drop. On the
         // rare failure we keep the section + data plane and fall back to an out-of-band `pf_dualsense`
         // devnode (installer / dev-box devgen).
-        let hsw = match create_swdevice(index) {
+        let inst = format!("pf_pad_{index}");
+        let hsw = match create_swdevice(&SwDeviceProfile {
+            instance: &inst,
+            container_index: index,
+            hwid: "pf_dualsense",
+            usb_vid_pid: "VID_054C&PID_0CE6",
+            description: "punktfunk Virtual DualSense",
+        }) {
             Ok(h) => Some(h),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; falling back to an out-of-band pf_dualsense devnode");

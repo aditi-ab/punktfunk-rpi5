@@ -209,7 +209,6 @@ fn real_main() -> Result<()> {
         #[cfg(target_os = "windows")]
         Some("dualsense-windows-test") => {
             use crate::gamestream::gamepad::{GamepadEvent, GamepadFrame};
-            use inject::dualsense_windows::DualSenseWindowsManager;
             use std::time::{Duration, Instant};
             let secs: u64 = args
                 .iter()
@@ -217,38 +216,95 @@ fn real_main() -> Result<()> {
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(20);
-            let mut mgr = DualSenseWindowsManager::new();
-            // Arrival creates the pad (SwDeviceCreate + section); State pushes the report.
-            mgr.handle(&GamepadEvent::Arrival {
-                index: 0,
-                kind: 2,
-                capabilities: 0,
-            });
-            println!(
-                "virtual DualSense up — cycling Cross + sweeping the left stick for {secs}s. Watch it \
-                 in joy.cpl / Steam / a game; any rumble / lightbar / trigger the game sends prints below."
-            );
-            let deadline = Instant::now() + Duration::from_secs(secs);
-            let (mut i, mut last) = (0i32, Instant::now());
-            while Instant::now() < deadline {
-                // Surface a game's feedback: rumble (universal) + lightbar / player-LED / adaptive
-                // triggers (DualSense-only) coming back over the shared section.
-                mgr.pump(
-                    |pad, lo, hi| println!("  rumble from game: pad={pad} low={lo} high={hi}"),
-                    |o| println!("  hid output from game: {o:?}"),
+            // `--index N` creates pad `pf_pad_N` (default 0) — use a spare index (e.g. 1) to test
+            // alongside a running host that already holds pad 0. `--ds4` drives the DualShock 4
+            // backend instead of the DualSense one.
+            let idx: u8 = args
+                .iter()
+                .skip_while(|a| *a != "--index")
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let ds4 = args.iter().any(|a| a == "--ds4");
+            let xbox = args.iter().any(|a| a == "--xbox");
+            // Same drive loop for either backend (identical method surface): Arrival creates the pad,
+            // State pushes a cycling report, pump surfaces a game's rumble/lightbar feedback.
+            macro_rules! drive {
+                ($mgr:expr, $label:expr) => {{
+                    let mut mgr = $mgr;
+                    mgr.handle(&GamepadEvent::Arrival {
+                        index: idx,
+                        kind: 2,
+                        capabilities: 0,
+                    });
+                    println!(
+                        "virtual {} up — cycling Cross + sweeping the left stick for {secs}s. Watch \
+                         it in joy.cpl / Steam / a game; any feedback the game sends prints below.",
+                        $label
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(secs);
+                    let (mut i, mut last) = (0i32, Instant::now());
+                    while Instant::now() < deadline {
+                        mgr.pump(
+                            |pad, lo, hi| {
+                                println!("  rumble from game: pad={pad} low={lo} high={hi}")
+                            },
+                            |o| println!("  hid output from game: {o:?}"),
+                        );
+                        if last.elapsed() >= Duration::from_millis(400) {
+                            last = Instant::now();
+                            i += 1;
+                            let buttons = if i % 2 == 0 {
+                                punktfunk_core::input::gamepad::BTN_A // Cross
+                            } else {
+                                0
+                            };
+                            let lx = (((i % 64) - 32) * 1024) as i16; // sweep left stick X
+                            mgr.handle(&GamepadEvent::State(GamepadFrame {
+                                index: idx as i16,
+                                active_mask: 1 << idx,
+                                buttons,
+                                left_trigger: 0,
+                                right_trigger: 0,
+                                ls_x: lx,
+                                ls_y: 0,
+                                rs_x: 0,
+                                rs_y: 0,
+                            }));
+                        }
+                        std::thread::sleep(Duration::from_millis(15));
+                    }
+                }};
+            }
+            if xbox {
+                // Xbox 360 via the XUSB companion: a different surface (handle + pump_rumble, no
+                // HID-output plane), so drive it inline rather than via the macro.
+                let mut mgr = inject::gamepad::GamepadManager::new();
+                mgr.handle(&GamepadEvent::Arrival {
+                    index: idx,
+                    kind: 1,
+                    capabilities: 0,
+                });
+                println!(
+                    "virtual Xbox 360 (XUSB) up — sweeping LS + toggling A for {secs}s. Check with \
+                     an XInput game or xinputtest.exe."
                 );
-                if last.elapsed() >= Duration::from_millis(400) {
-                    last = Instant::now();
-                    i += 1;
-                    let buttons = if i % 2 == 0 {
-                        punktfunk_core::input::gamepad::BTN_A // Cross
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                let mut t = 0i32;
+                while Instant::now() < deadline {
+                    mgr.pump_rumble(|pad, lo, hi| {
+                        println!("  rumble from game: pad={pad} low={lo} high={hi}")
+                    });
+                    t += 1;
+                    let lx = (((t % 200) - 100) * 327).clamp(-32768, 32767) as i16; // sweep ±32700
+                    let buttons = if (t / 67) % 2 == 0 {
+                        punktfunk_core::input::gamepad::BTN_A
                     } else {
                         0
                     };
-                    let lx = (((i % 64) - 32) * 1024) as i16; // sweep left stick X
                     mgr.handle(&GamepadEvent::State(GamepadFrame {
-                        index: 0,
-                        active_mask: 1,
+                        index: idx as i16,
+                        active_mask: 1 << idx,
                         buttons,
                         left_trigger: 0,
                         right_trigger: 0,
@@ -257,8 +313,18 @@ fn real_main() -> Result<()> {
                         rs_x: 0,
                         rs_y: 0,
                     }));
+                    std::thread::sleep(Duration::from_millis(15));
                 }
-                std::thread::sleep(Duration::from_millis(15));
+            } else if ds4 {
+                drive!(
+                    inject::dualshock4_windows::DualShock4WindowsManager::new(),
+                    "DualShock 4"
+                );
+            } else {
+                drive!(
+                    inject::dualsense_windows::DualSenseWindowsManager::new(),
+                    "DualSense"
+                );
             }
             println!("dualsense-windows-test: done (devnode removed)");
             Ok(())

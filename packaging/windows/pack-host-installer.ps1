@@ -147,6 +147,23 @@ if (-not $NoDriver) {
 }
 else { Write-Host "-NoDriver: building installer WITHOUT the bundled SudoVDA driver" }
 
+# --- stage the punktfunk virtual-gamepad UMDF drivers (DualSense/DS4 + Xbox 360 XUSB) ----------
+# Vendored, pre-signed under packaging/windows/gamepad-drivers/ (like SudoVDA). Rebuild + re-vendor
+# from packaging/windows/{dualsense,xusb}-driver/ when the driver source changes (see their READMEs).
+if (-not $NoDriver) {
+    $gpVendor = Join-Path $here 'gamepad-drivers'
+    if (Test-Path (Join-Path $gpVendor 'pf_dualsense.inf')) {
+        $gpStage = Join-Path $OutDir 'gamepad'
+        if (Test-Path $gpStage) { Remove-Item -Recurse -Force $gpStage }
+        New-Item -ItemType Directory -Force -Path $gpStage | Out-Null
+        Copy-Item (Join-Path $gpVendor '*') $gpStage -Force
+        Copy-Item (Join-Path $here 'install-gamepad-drivers.ps1') (Join-Path $gpStage 'install-gamepad-drivers.ps1') -Force
+        $defines += "/DGamepadStageDir=$gpStage"
+        Write-Host "==> staged vendored gamepad UMDF drivers from $gpVendor"
+    }
+    else { Write-Warning "no vendored gamepad drivers under $gpVendor — installer built WITHOUT them" }
+}
+
 # --- stage the FFmpeg shared DLLs (AMD/Intel AMF/QSV build) ------------------------------------
 # A host built with --features amf-qsv link-imports avcodec/avutil/swscale/... so the shared DLLs
 # MUST sit next to the exe (it won't start otherwise). Bundle them from $FfmpegDir\bin — the same

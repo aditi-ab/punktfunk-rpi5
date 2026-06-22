@@ -70,10 +70,23 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   capability; impulse-trigger rumble is unreachable through a virtual pad), and the UHID
   `hid-playstation` pads — **DualSense** (adaptive triggers, lightbar, touchpad, motion) and
   **DualShock 4** (lightbar, touchpad, motion, rumble; DualSense minus adaptive triggers / player
-  LEDs / mute). The UHID pads need a Linux host; off Linux they (and One/Series) fold into Xbox 360.
-  Clients auto-resolve the type from the physical controller (DS5→DualSense, DS4→DualShock 4,
-  Xbox One→Xbox One). Windows-host DualShock 4 (ViGEm) is not yet wired — Windows clients asking for
-  DS4 get Xbox 360 for now.
+  LEDs / mute). DualSense and DualShock 4 each have a Linux (UHID `hid-playstation`) **and a Windows
+  (UMDF minidriver)** backend — `inject/dualsense_windows.rs` + `inject/dualshock4_windows.rs`, one
+  driver serving either identity per a `device_type` byte the host stamps into shared memory (the DS4
+  reuses the same SwDeviceCreate game-detection identity fix as the DualSense). One/Series stays
+  Linux-only and folds into Xbox 360 off it. Clients auto-resolve the type from the physical controller
+  (DS5→DualSense, DS4→DualShock 4, Xbox One→Xbox One). **Windows uses ZERO external gamepad
+  dependencies — ViGEmBus is gone.** Xbox 360 (XInput) runs on a UMDF2 **XUSB companion** driver
+  (`packaging/windows/xusb-driver/`, `inject/gamepad_windows.rs`) that registers `GUID_DEVINTERFACE_XUSB`
+  and answers the buffered XInput IOCTLs from a shared section, so classic `XInputGetState`/`SetState`
+  work with no kernel bus driver (validated live: slot connected, state + rumble round-trip; Xbox One
+  folds to this 360 path). All three UMDF drivers (DualSense/DS4 + XUSB) are bundled + pnputil-installed
+  by the Inno Setup installer (`packaging/windows/gamepad-drivers/` + `install-gamepad-drivers.ps1`).
+  **Multi-pad ready**: the host stamps each pad's index into the device Location (`pszDeviceLocation`),
+  the driver reads it (`WdfDeviceAllocAndQueryProperty`) to map its own `*-shm-<index>`, and
+  `UmdfHostProcessSharing=ProcessSharingDisabled` gives each pad its own host (per-pad statics) —
+  validated live with 2 distinct XInput slots + 2 DualSense pads. (Client-side multi-pad forwarding is
+  the remaining piece.)
 - **Windows host: implemented and shipping (all-vendor, x64-only).** `#[cfg(windows)]` backends
   behind the same traits as Linux — DXGI Desktop Duplication capture (`capture/dxgi.rs`), **SudoVDA**
   virtual display per session (`vdisplay/sudovda.rs`), GPU encode (NVENC `--features nvenc`; AMD/Intel
