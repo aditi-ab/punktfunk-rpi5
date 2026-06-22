@@ -28,6 +28,9 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @ObservedObject private var gamepads = GamepadManager.shared
+    #if DEBUG && !os(tvOS)
+    @State private var showControllerTest = false
+    #endif
     #if os(macOS)
     @AppStorage(DefaultsKey.speakerUID) private var speakerUID = ""
     @AppStorage(DefaultsKey.micUID) private var micUID = ""
@@ -411,6 +414,11 @@ struct SettingsView: View {
                     Text(option.label).tag(option.tag)
                 }
             }
+            #if DEBUG && !os(tvOS)
+            Button("Test Controller…") { showControllerTest = true }
+                .disabled(gamepads.active == nil)
+                .sheet(isPresented: $showControllerTest) { ControllerTestView() }
+            #endif
         } header: {
             Text("Controllers")
         } footer: {

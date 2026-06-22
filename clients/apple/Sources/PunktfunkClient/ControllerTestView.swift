@@ -1,0 +1,387 @@
+// DEBUG-only controller test panel, reached from Settings → Controllers → "Test Controller…".
+// It shows the live input of the active controller and lets you fire the host→client feedback
+// channels — rumble, DualSense adaptive triggers, lightbar, player LEDs — straight at the
+// physical pad (no host needed), so the rendering paths a session uses can be confirmed
+// on-device. Driven by PunktfunkKit's `ControllerTester`, which reuses the real renderers.
+//
+// tvOS is excluded for now (it has no segmented picker / the panel wants a pointer-style
+// layout); macOS + iOS/iPadOS cover the validation need.
+
+#if DEBUG && !os(tvOS)
+import GameController
+import PunktfunkKit
+import SwiftUI
+
+@MainActor
+struct ControllerTestView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var gamepads = GamepadManager.shared
+    @StateObject private var tester = ControllerTester()
+
+    @State private var heavyOn = false
+    @State private var lightOn = false
+    @State private var intensity = 0.75
+    @State private var triggerTarget = TriggerTarget.both
+    @State private var playerLED = -1
+
+    private enum TriggerTarget: String, CaseIterable, Identifiable {
+        case left = "L2", right = "R2", both = "Both"
+        var id: String { rawValue }
+    }
+
+    private struct TriggerDemo: Identifiable {
+        let label: String
+        let effect: DualSenseTriggerEffect
+        var id: String { label }
+    }
+
+    private static let triggerDemos: [TriggerDemo] = [
+        .init(label: "Off", effect: .off),
+        .init(label: "Resistance", effect: .feedback(start: 0.3, strength: 0.7)),
+        .init(label: "Weapon", effect: .weapon(start: 0.4, end: 0.7, strength: 0.9)),
+        .init(label: "Vibration", effect: .vibration(start: 0.1, amplitude: 0.8, frequency: 0.5)),
+        .init(label: "Bow", effect: .slope(start: 0.2, end: 0.9, startStrength: 0.2, endStrength: 0.9)),
+    ]
+
+    // (display name, hardware colour, swatch colour)
+    private static let lightSwatches: [(String, GCColor, Color)] = [
+        ("Red", GCColor(red: 1, green: 0, blue: 0), .red),
+        ("Green", GCColor(red: 0, green: 1, blue: 0), .green),
+        ("Blue", GCColor(red: 0, green: 0.2, blue: 1), .blue),
+        ("White", GCColor(red: 1, green: 1, blue: 1), .white),
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Test Controller").font(.headline)
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            .padding()
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if let active = gamepads.active {
+                        header(active)
+                        inputCard
+                        rumbleCard()
+                        triggerCard(active)
+                        extrasCard(active)
+                    } else {
+                        ContentUnavailableView(
+                            "No controller",
+                            systemImage: "gamecontroller",
+                            description: Text("Connect a controller and pick it under "
+                                + "Settings → Controllers → Use controller."))
+                            .frame(maxWidth: .infinity, minHeight: 220)
+                    }
+                }
+                .padding()
+            }
+        }
+        .frame(minWidth: 420, minHeight: 540)
+        .onAppear { tester.target(gamepads.active?.controller) }
+        .onDisappear { tester.stop() }
+        .onChange(of: gamepads.active?.id) { _, _ in
+            heavyOn = false
+            lightOn = false
+            playerLED = -1
+            tester.target(gamepads.active?.controller)
+        }
+    }
+
+    // MARK: Header
+
+    private func header(_ c: GamepadManager.DiscoveredController) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: c.isDualSense ? "playstation.logo" : "gamecontroller.fill")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(c.name).font(.headline)
+                Text(c.productCategory).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+    }
+
+    // MARK: Input
+
+    private var inputCard: some View {
+        card("Input") {
+            // Poll the live controller at 30 Hz — no handlers installed, so nothing else's
+            // capture is disturbed.
+            TimelineView(.periodic(from: .now, by: 1.0 / 30.0)) { _ in
+                if let gp = gamepads.active?.controller.extendedGamepad {
+                    inputReadout(gp, controller: gamepads.active?.controller)
+                } else {
+                    Text("Not an extended gamepad").foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func inputReadout(_ g: GCExtendedGamepad, controller: GCController?) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 20) {
+                stick("L", x: g.leftThumbstick.xAxis.value, y: g.leftThumbstick.yAxis.value,
+                      pressed: g.leftThumbstickButton?.isPressed ?? false)
+                stick("R", x: g.rightThumbstick.xAxis.value, y: g.rightThumbstick.yAxis.value,
+                      pressed: g.rightThumbstickButton?.isPressed ?? false)
+                VStack(spacing: 8) {
+                    triggerBar("L2", value: g.leftTrigger.value)
+                    triggerBar("R2", value: g.rightTrigger.value)
+                }
+            }
+            buttonGrid(g)
+            if let tp = Self.touchpad(g) {
+                touchpadView(tp)
+            }
+            if let m = controller?.motion {
+                motionReadout(m)
+            }
+        }
+    }
+
+    private func stick(_ label: String, x: Float, y: Float, pressed: Bool) -> some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Circle().stroke(Color.secondary.opacity(0.3))
+                Circle()
+                    .fill(pressed ? Color.accentColor : Color.secondary)
+                    .frame(width: 12, height: 12)
+                    .offset(x: CGFloat(x) * 22, y: CGFloat(-y) * 22) // GC y is +up
+            }
+            .frame(width: 56, height: 56)
+            Text("\(label) \(sgn(x)),\(sgn(y))").font(.caption2.monospaced()).foregroundStyle(.secondary)
+        }
+    }
+
+    private func triggerBar(_ label: String, value: Float) -> some View {
+        HStack(spacing: 6) {
+            Text(label).font(.caption2.monospaced()).frame(width: 22, alignment: .leading)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.secondary.opacity(0.15))
+                    Capsule().fill(Color.accentColor).frame(width: geo.size.width * CGFloat(value))
+                }
+            }
+            .frame(height: 10)
+            Text(mag(value)).font(.caption2.monospaced()).frame(width: 34, alignment: .trailing)
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: 150)
+    }
+
+    private func buttonGrid(_ g: GCExtendedGamepad) -> some View {
+        var items: [(String, Bool)] = [
+            ("A", g.buttonA.isPressed), ("B", g.buttonB.isPressed),
+            ("X", g.buttonX.isPressed), ("Y", g.buttonY.isPressed),
+            ("LB", g.leftShoulder.isPressed), ("RB", g.rightShoulder.isPressed),
+            ("L3", g.leftThumbstickButton?.isPressed ?? false),
+            ("R3", g.rightThumbstickButton?.isPressed ?? false),
+            ("Menu", g.buttonMenu.isPressed),
+            ("Opts", g.buttonOptions?.isPressed ?? false),
+            ("↑", g.dpad.up.isPressed), ("↓", g.dpad.down.isPressed),
+            ("←", g.dpad.left.isPressed), ("→", g.dpad.right.isPressed),
+        ]
+        if let tp = Self.touchpad(g) { items.append(("Pad", tp.button.isPressed)) }
+        return LazyVGrid(
+            columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 5), spacing: 6
+        ) {
+            ForEach(items.indices, id: \.self) { i in
+                Text(items[i].0)
+                    .font(.caption.monospaced())
+                    .frame(maxWidth: .infinity, minHeight: 24)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(items[i].1 ? Color.accentColor : Color.secondary.opacity(0.15)))
+                    .foregroundStyle(items[i].1 ? Color.white : Color.secondary)
+            }
+        }
+    }
+
+    private func touchpadView(
+        _ tp: (primary: GCControllerDirectionPad, secondary: GCControllerDirectionPad,
+               button: GCControllerButtonInput)
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Touchpad\(tp.button.isPressed ? " — click" : "")")
+                .font(.caption2).foregroundStyle(.secondary)
+            ZStack {
+                RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3))
+                fingerDot(tp.primary, color: .accentColor)
+                fingerDot(tp.secondary, color: .orange)
+            }
+            .frame(width: 150, height: 74)
+        }
+    }
+
+    private func fingerDot(_ pad: GCControllerDirectionPad, color: Color) -> some View {
+        let x = pad.xAxis.value, y = pad.yAxis.value
+        let active = !(x == 0 && y == 0) // GC snaps a lifted finger to exactly (0, 0)
+        return Circle().fill(color).frame(width: 10, height: 10)
+            .offset(x: CGFloat(x) * 71, y: CGFloat(-y) * 33)
+            .opacity(active ? 1 : 0)
+    }
+
+    private func motionReadout(_ m: GCMotion) -> some View {
+        let a = Self.totalAccel(m)
+        return VStack(alignment: .leading, spacing: 2) {
+            Text("Motion").font(.caption2).foregroundStyle(.secondary)
+            Text(String(format: "gyro  %+.2f %+.2f %+.2f",
+                        m.rotationRate.x, m.rotationRate.y, m.rotationRate.z))
+                .font(.caption2.monospaced())
+            Text(String(format: "accel %+.2f %+.2f %+.2f", a.0, a.1, a.2))
+                .font(.caption2.monospaced())
+        }
+    }
+
+    // MARK: Rumble
+
+    private func rumbleCard() -> some View {
+        card("Rumble") {
+            VStack(alignment: .leading, spacing: 12) {
+                Picker("Strength", selection: $intensity) {
+                    Text("25%").tag(0.25)
+                    Text("50%").tag(0.5)
+                    Text("75%").tag(0.75)
+                    Text("100%").tag(1.0)
+                }
+                .pickerStyle(.segmented)
+                Toggle("Heavy motor (left)", isOn: $heavyOn)
+                Toggle("Light motor (right)", isOn: $lightOn)
+                Label("Backend: \(tester.rumbleBackend)", systemImage: "waveform")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Toggle a motor to feel it. The host maps a game's low/high-frequency "
+                    + "rumble onto these two. A DualSense is driven over raw HID (CoreHaptics "
+                    + "can't reach its motors on macOS).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .onChange(of: heavyOn) { _, _ in applyRumble() }
+            .onChange(of: lightOn) { _, _ in applyRumble() }
+            .onChange(of: intensity) { _, _ in applyRumble() }
+        }
+    }
+
+    private func applyRumble() {
+        tester.rumble(low: heavyOn ? Float(intensity) : 0, high: lightOn ? Float(intensity) : 0)
+    }
+
+    // MARK: Adaptive triggers
+
+    private func triggerCard(_ c: GamepadManager.DiscoveredController) -> some View {
+        card("Adaptive triggers") {
+            if c.hasAdaptiveTriggers {
+                VStack(alignment: .leading, spacing: 12) {
+                    Picker("Apply to", selection: $triggerTarget) {
+                        ForEach(TriggerTarget.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 96), spacing: 8)], spacing: 8
+                    ) {
+                        ForEach(Self.triggerDemos) { demo in
+                            Button(demo.label) { applyTrigger(demo.effect) }
+                                .buttonStyle(.bordered)
+                        }
+                    }
+                    Text("Pick an effect, then pull L2/R2 to feel the resistance.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Text("Adaptive triggers need a DualSense.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func applyTrigger(_ e: DualSenseTriggerEffect) {
+        switch triggerTarget {
+        case .left: tester.applyTrigger(e, right: false)
+        case .right: tester.applyTrigger(e, right: true)
+        case .both:
+            tester.applyTrigger(e, right: false)
+            tester.applyTrigger(e, right: true)
+        }
+    }
+
+    // MARK: Lightbar + player LED
+
+    @ViewBuilder
+    private func extrasCard(_ c: GamepadManager.DiscoveredController) -> some View {
+        if c.hasLight {
+            card("Lightbar & player LED") {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 12) {
+                        ForEach(Self.lightSwatches.indices, id: \.self) { i in
+                            Button { tester.setLight(Self.lightSwatches[i].1) } label: {
+                                Circle().fill(Self.lightSwatches[i].2)
+                                    .frame(width: 26, height: 26)
+                                    .overlay(Circle().stroke(Color.secondary.opacity(0.4)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        Button("Off") { tester.setLight(nil) }.buttonStyle(.bordered)
+                    }
+                    Picker("Player LED", selection: $playerLED) {
+                        Text("Off").tag(-1)
+                        Text("1").tag(0)
+                        Text("2").tag(1)
+                        Text("3").tag(2)
+                        Text("4").tag(3)
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: playerLED) { _, v in
+                        tester.setPlayerIndex(GCControllerPlayerIndex(rawValue: v) ?? .indexUnset)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Helpers
+
+    private func card<Content: View>(
+        _ title: String, @ViewBuilder _ content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title).font(.subheadline.weight(.semibold))
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.secondary.opacity(0.08)))
+    }
+
+    private func sgn(_ v: Float) -> String { String(format: "%+.2f", v) }
+    private func mag(_ v: Float) -> String { String(format: "%.2f", v) }
+
+    /// The touchpad surface of a PlayStation pad — `GCDualSenseGamepad` and `GCDualShockGamepad`
+    /// don't share a touchpad type, so downcast either. `nil` for any other controller.
+    private static func touchpad(
+        _ g: GCExtendedGamepad
+    ) -> (primary: GCControllerDirectionPad, secondary: GCControllerDirectionPad,
+          button: GCControllerButtonInput)? {
+        if let ds = g as? GCDualSenseGamepad {
+            return (ds.touchpadPrimary, ds.touchpadSecondary, ds.touchpadButton)
+        }
+        if let ds4 = g as? GCDualShockGamepad {
+            return (ds4.touchpadPrimary, ds4.touchpadSecondary, ds4.touchpadButton)
+        }
+        return nil
+    }
+
+    /// Total acceleration in g: gravity + user when the pad splits them, else the raw vector.
+    private static func totalAccel(_ m: GCMotion) -> (Double, Double, Double) {
+        if m.hasGravityAndUserAcceleration {
+            return (m.gravity.x + m.userAcceleration.x,
+                    m.gravity.y + m.userAcceleration.y,
+                    m.gravity.z + m.userAcceleration.z)
+        }
+        return (m.acceleration.x, m.acceleration.y, m.acceleration.z)
+    }
+}
+#endif
