@@ -87,15 +87,30 @@ shoot_macos() {
 
 # ------------------------------------------------------------------ iOS / iPadOS / tvOS
 
-# $1 device-name regex  $2 scheme  $3 sdk  $4 file prefix  $5 runtime-grep
+# $1 device-type regex (matches both existing device names and the device-type catalog)
+# $2 scheme  $3 sdk  $4 file prefix  $5 runtime platform (iOS|tvOS — for the create fallback)
 shoot_sim() {
   require_xcode
-  local match="$1" scheme="$2" sdk="$3" prefix="$4" runtime="$5"
+  local match="$1" scheme="$2" sdk="$3" prefix="$4" platform="$5"
 
+  # Reuse an existing device of this type; else create a throwaway one against the newest
+  # available runtime for the platform. CI runners commonly ship a runtime but not every device
+  # (the iPhone 16 Pro Max is absent on ours), so create-on-demand is what makes it reproducible.
   local udid
   udid="$(xcrun simctl list devices available | grep -E "$match" | grep -oE '[0-9A-F-]{36}' | head -1 || true)"
-  [ -n "$udid" ] || die "$prefix: no available Simulator matching /$match/.
-       Create one in Xcode → Settings → Components, or: xcrun simctl create …"
+  if [ -z "$udid" ]; then
+    local devtype rt
+    devtype="$(xcrun simctl list devicetypes | grep -E "$match" \
+      | grep -oE 'com\.apple\.CoreSimulator\.SimDeviceType\.[A-Za-z0-9.-]+' | head -1 || true)"
+    rt="$(xcrun simctl list runtimes available | grep -E "^$platform " \
+      | grep -oE 'com\.apple\.CoreSimulator\.SimRuntime\.[A-Za-z0-9.-]+' | tail -1 || true)"
+    if [ -n "$devtype" ] && [ -n "$rt" ]; then
+      udid="$(xcrun simctl create "pf-shot-$prefix" "$devtype" "$rt" 2>/dev/null || true)"
+      [ -n "$udid" ] && log "$prefix — created Simulator $udid ($devtype)"
+    fi
+  fi
+  [ -n "$udid" ] || die "$prefix: no Simulator matching /$match/, and none could be created
+       (needs a $platform runtime + a matching device type — check 'xcrun simctl list')."
   log "$prefix — Simulator $udid"
   xcrun simctl boot "$udid" 2>/dev/null || true
   xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || true

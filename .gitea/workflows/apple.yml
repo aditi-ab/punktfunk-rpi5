@@ -45,17 +45,22 @@ jobs:
 
   # App Store screenshots of the real UI, zipped and attached to the run as a build artifact.
   # Skipped on PRs (cost); runs on main pushes + manual dispatch. Needs the build/test job green
-  # first — and being a separate job, a capture hiccup (a missing Simulator runtime, or the mac
-  # runner lacking Screen Recording permission for the window capture) can never red that signal.
+  # first, and is a separate job so a capture hiccup can never red the core signal.
+  #
+  # Scope = the two REQUIRED iOS sizes (iPhone 6.9" + iPad 13"), captured on the Simulator
+  # (`simctl io screenshot`, no Screen Recording grant needed). macOS and tvOS are deliberately
+  # NOT in CI: the self-hosted runner is headless (no window-server session), so the mac window
+  # capture can't run there; tvOS needs the Tier-3 build-std slice. Generate those two locally on
+  # a GUI Mac with `clients/apple/tools/screenshots.sh macos tvos`.
   screenshots:
     needs: swift
     if: gitea.event_name != 'pull_request'
     runs-on: macos-arm64
-    timeout-minutes: 90
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
-      - name: Rust toolchain + Apple targets (incl. iOS/tvOS Simulator slices)
+      - name: Rust toolchain + iOS Simulator targets
         run: |
           if ! command -v rustup >/dev/null && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -65,29 +70,18 @@ jobs:
           dirname "$RUSTUP" >> "$GITHUB_PATH"
           "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin \
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-          # tvOS slices are Tier-3 (build-std on nightly + rust-src) — best-effort.
-          "$RUSTUP" toolchain install nightly --profile minimal --component rust-src || true
 
-      - name: Build PunktfunkCore.xcframework (mac + iOS; tvOS best-effort)
-        run: |
-          # Prefer an all-platform framework; fall back to mac + iOS so a tvOS toolchain gap
-          # never blocks the iPhone/iPad screenshots.
-          if ! BUILD_IOS=1 BUILD_TVOS=1 bash scripts/build-xcframework.sh; then
-            echo "::warning::tvOS xcframework slice failed — rebuilding mac + iOS only"
-            BUILD_IOS=1 bash scripts/build-xcframework.sh
-          fi
+      - name: Build PunktfunkCore.xcframework (mac + iOS slices)
+        run: BUILD_IOS=1 bash scripts/build-xcframework.sh
 
-      - name: Capture screenshots (best-effort per platform)
+      - name: Capture screenshots (iPhone 6.9" + iPad 13"; auto-creates the Simulators)
         working-directory: clients/apple
         env:
           SETTLE: "8" # Simulators settle slower than a local run
         run: |
-          # Each platform is an independent invocation: a failure (no Simulator runtime, no
-          # Screen Recording grant for the mac window capture) skips that platform, not the rest.
-          bash tools/screenshots.sh macos || echo "::warning::macOS screenshots skipped"
-          bash tools/screenshots.sh ios   || echo "::warning::iOS screenshots skipped"
-          bash tools/screenshots.sh ipad  || echo "::warning::iPad screenshots skipped"
-          bash tools/screenshots.sh tvos  || echo "::warning::tvOS screenshots skipped"
+          # Independent invocations: one platform failing skips it, not the other.
+          bash tools/screenshots.sh ios  || echo "::warning::iOS (iPhone 6.9\") screenshots skipped"
+          bash tools/screenshots.sh ipad || echo "::warning::iPad 13\" screenshots skipped"
           echo "Produced:"; ls -la screenshots || true
 
       - name: Upload screenshots (zip artifact)

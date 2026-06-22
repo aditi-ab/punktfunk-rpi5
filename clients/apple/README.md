@@ -214,12 +214,17 @@ Requirements / gotchas:
 - The hero defaults to a synthetic synthwave frame — set `PUNKTFUNK_SHOT_HERO` to a real captured
   frame for a production-quality lead screenshot.
 
-**CI**: the `apple` workflow's **`screenshots`** job runs this on the `macos-arm64` runner on every
-main push + manual dispatch (skipped on PRs), and attaches the result as a single zip artifact,
-**`punktfunk-appstore-screenshots`** (download it from the run's Artifacts). It's best-effort and
-isolated from the build/test job — a missing Simulator runtime or a runner without the Screen
-Recording grant only drops that platform, never reds the build. (The macOS window capture in
-particular needs that grant on the runner; the Simulator shots don't.)
+**CI**: the `apple` workflow's **`screenshots`** job runs on the `macos-arm64` runner on every main
+push + manual dispatch (skipped on PRs), and attaches the result as a single zip artifact,
+**`punktfunk-appstore-screenshots`** (download it from the run's Artifacts; `upload-artifact@v3` —
+Gitea's backend rejects v4). It captures the two **required iOS sizes — iPhone 6.9" + iPad 13"** —
+on the Simulator (auto-creating the device if the runner lacks it), and is isolated from the
+build/test job so a capture hiccup never reds the build.
+
+**macOS and tvOS are NOT in CI**, by design: the self-hosted runner is **headless** (no
+window-server session), so the macOS window capture can't run there, and tvOS needs the Tier-3
+build-std slice. Generate those on a GUI Mac: `tools/screenshots.sh macos tvos`. (If the runner is
+ever switched to a logged-in GUI session, re-adding macOS to the job's capture step is one line.)
 
 ## Notes for whoever picks this up next
 
