@@ -35,10 +35,10 @@ won't start. The service is down only for the build duration.
 ## Web management console
 
 On an **installed** host (the `setup.exe`) the console is set up automatically — no manual steps.
-The installer bundles the built `.output` server + a portable Node and runs
-`scripts\windows\web-setup.ps1`, which registers the **`PunktfunkWeb`** scheduled task (at boot, as
-SYSTEM, restart-on-failure) running `{app}\web\web-run.cmd` → `node …\.output\server\index.mjs` on
-`:3000`, opens inbound TCP 3000, and writes the login password to
+The installer bundles the built (self-contained, no-`node_modules`) `.output` server + a portable
+bun and runs `scripts\windows\web-setup.ps1`, which registers the **`PunktfunkWeb`** scheduled task
+(at boot, as SYSTEM, restart-on-failure) running `{app}\web\web-run.cmd` →
+`bun …\.output\server\index.mjs` on `:3000`, opens inbound TCP 3000, and writes the login password to
 `%ProgramData%\punktfunk\web-password` (ACL'd to Administrators + SYSTEM). The mgmt bearer token it
 proxies with is the host's own `%ProgramData%\punktfunk\mgmt-token`. Browse `http://<host-ip>:3000`
 and log in with the password the installer shows on its final page. To change it, edit

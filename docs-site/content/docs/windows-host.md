@@ -33,7 +33,7 @@ and the CLI `punktfunk-host service install` path) are in
 [`packaging/windows`](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/windows/README.md).
 
 The installer also sets up the **web management console** (status, paired devices, the PIN pairing
-flow): it bundles the console plus its own Node runtime and runs it as the **`PunktfunkWeb`** service
+flow): it bundles the console plus its own bun runtime and runs it as the **`PunktfunkWeb`** service
 on **`http://<this-PC>:3000`**, starting at boot. During setup you choose the console **login
 password** (pre-filled with a secure random default and shown again on the final page); change it
 later in `%ProgramData%\punktfunk\web-password`. Open the console from any browser on the LAN and log

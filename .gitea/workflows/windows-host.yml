@@ -1,7 +1,7 @@
 # Build the punktfunk Windows HOST as a signed Inno Setup installer and publish it to Gitea's generic
 # package registry, so a Windows GPU box can install the streaming host (SYSTEM service + bundled
 # SudoVDA virtual-display driver + the web management console, run by a scheduled task on a bundled
-# Node) from one signed setup.exe. Runs on the self-hosted Windows runner
+# bun) from one signed setup.exe. Runs on the self-hosted Windows runner
 # (host mode; scripts/ci/setup-windows-runner.ps1) — same MSVC/Windows-SDK/LLVM env as windows.yml.
 #
 # Why an installer and not MSIX (like the client): the host installs a LocalSystem SCM service that
@@ -104,46 +104,36 @@ jobs:
             choco install innosetup -y --no-progress
           }
 
-      - name: Fetch portable Node runtime (bundled to run the console)
+      - name: Fetch portable bun runtime (build tool + bundled to run the console)
         shell: pwsh
         run: |
-          # The installer ships a self-contained node.exe so the web console runs with no system-Node
-          # prerequisite. Pinned LTS (>= 20, matching the punktfunk-web .deb's `nodejs (>= 20)`); the
-          # smoke test below validates the .output bundle runs under exactly this node before shipping.
-          $ver = 'v22.11.0'
-          $url = "https://nodejs.org/dist/$ver/node-$ver-win-x64.zip"
+          # ONE pinned bun, used both to BUILD the console and shipped in the installer to RUN it. The
+          # .output is self-contained (Nitro noExternals — deps bundled + tree-shaken, no node_modules),
+          # so the installer ships just bun + a ~75-file .output instead of node + a node_modules forest.
+          $ver = 'bun-v1.3.14'
+          $url = "https://github.com/oven-sh/bun/releases/download/$ver/bun-windows-x64.zip"
           New-Item -ItemType Directory -Force -Path C:\t | Out-Null
-          $zip = 'C:\t\node.zip'; $dst = 'C:\t\nodedist'
+          $zip = 'C:\t\bun.zip'; $dst = 'C:\t\bundist'
           Invoke-WebRequest -Uri $url -OutFile $zip
           if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
           Expand-Archive -Path $zip -DestinationPath $dst -Force
-          $node = (Get-ChildItem -Path $dst -Recurse -Filter node.exe | Select-Object -First 1).FullName
-          if (-not $node) { throw "node.exe not found in $url" }
-          "NODE_EXE=$node" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          & $node --version
+          $bun = (Get-ChildItem -Path $dst -Recurse -Filter bun.exe | Select-Object -First 1).FullName
+          if (-not $bun) { throw "bun.exe not found in $url" }
+          "BUN_EXE=$bun" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $bun --version
 
-      - name: Build + smoke-boot web console (node-server preset)
+      - name: Build + smoke-boot web console (bun)
         shell: pwsh
         env:
-          # PAT with read access to the unom org packages — the @unom npm registry needs auth.
+          # PAT with read access to the unom org packages — the @unom npm registry needs auth to BUILD.
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
-        # Same shape as deb.yml: bun builds the Nitro node-server bundle, node runs it; the installer
-        # bundles web\.output (handed over via WEB_OUTPUT_DIR) + the portable node above. The runner
-        # runs as SYSTEM (no dev-user PATH/npmrc), so bootstrap bun if absent and supply the private
-        # @unom registry token via the SYSTEM home .npmrc — kept OUT of the shipped bundle.
+        # The bun fetched above builds the Nitro server AND runs it. noExternals (vite.config) makes the
+        # output self-contained, so there's no .output/server install — the installer ships bun + the
+        # ~75-file .output. The runner is SYSTEM with no ~/.npmrc, so supply the private @unom token in
+        # the SYSTEM home .npmrc to BUILD (kept OUT of the shipped bundle — web\.npmrc has only the
+        # registry mapping, and nothing copies it into .output).
         run: |
-          $bun = (Get-Command bun -ErrorAction SilentlyContinue).Source
-          if (-not $bun) { foreach ($p in @("$env:USERPROFILE\.bun\bin\bun.exe", 'C:\Users\Public\bun\bin\bun.exe')) { if (Test-Path $p) { $bun = $p; break } } }
-          if (-not $bun) {
-            Write-Output "bun not found - installing via bun.sh"
-            Invoke-RestMethod https://bun.sh/install.ps1 | Invoke-Expression
-            $bun = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
-          }
-          if (-not (Test-Path $bun)) { throw "bun unavailable (install failed?): $bun" }
-          & $bun --version
-          # @unom is a private Gitea npm registry. The committed web\.npmrc has only the registry
-          # mapping; put the mapping + auth token in the SYSTEM home .npmrc so the token never lands in
-          # the shipped bundle (.output\server\.npmrc stays the clean mapping-only copy).
+          $bun = $env:BUN_EXE
           if ($env:REGISTRY_TOKEN) {
             $rc = Join-Path $env:USERPROFILE '.npmrc'
             Add-Content -Path $rc -Value '@unom:registry=https://git.unom.io/api/packages/unom/npm/'
@@ -155,19 +145,16 @@ jobs:
           if (Select-String -Path .output\server\index.mjs -Pattern 'Bun\.serve' -Quiet) {
             throw "web build is a bun bundle (Bun.serve) - need the node-server preset"
           }
-          # Externalized @unom SSR deps must be installed inside .output\server (registry mapping via .npmrc).
-          Copy-Item .npmrc .output\server\.npmrc -Force
-          Push-Location .output\server; & $bun install; if ($LASTEXITCODE) { throw ".output/server dep install failed ($LASTEXITCODE)" }; Pop-Location
           Pop-Location
-          # Gate the installer on a real node boot serving /login (the runtime the installer ships).
+          # Gate the installer on a real boot under the BUNDLED bun (the runtime it ships), serving /login.
           $env:PORT = '3009'; $env:HOST = '127.0.0.1'; $env:PUNKTFUNK_UI_PASSWORD = 'ci'
           $server = (Resolve-Path 'web\.output\server\index.mjs').Path
-          $p = Start-Process -FilePath $env:NODE_EXE -ArgumentList $server -PassThru -WindowStyle Hidden
+          $p = Start-Process -FilePath $bun -ArgumentList $server -PassThru -WindowStyle Hidden
           Start-Sleep -Seconds 4
           try { $code = (Invoke-WebRequest -Uri 'http://127.0.0.1:3009/login' -UseBasicParsing -TimeoutSec 10).StatusCode } catch { $code = 0 }
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-          Write-Output "web console smoke: /login -> $code"
-          if ($code -ne 200) { throw "web console failed to boot under node" }
+          Write-Output "web console smoke (bun): /login -> $code"
+          if ($code -ne 200) { throw "web console failed to boot under bun" }
           "WEB_OUTPUT_DIR=$((Resolve-Path 'web\.output').Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Pack + sign installer

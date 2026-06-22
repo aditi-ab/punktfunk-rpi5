@@ -1,6 +1,6 @@
 <#
   Provision the punktfunk web console after the host installer has laid down its payload
-  ({app}\web\.output, {app}\node\node.exe, {app}\web\web-run.cmd). Invoked elevated from the
+  ({app}\web\.output, {app}\bun\bun.exe, {app}\web\web-run.cmd). Invoked elevated from the
   installer's [Run] section; idempotent (safe to re-run on upgrade).
 
     1. Sets the console login password file %ProgramData%\punktfunk\web-password
@@ -71,7 +71,7 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
     -StartWhenAvailable -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 10 `
     -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal `
-    -Settings $settings -Description 'punktfunk web management console (Nitro/Node SSR on :3000)' `
+    -Settings $settings -Description 'punktfunk web management console (Nitro SSR on bun, :3000)' `
     -Force | Out-Null
 Write-Host "registered scheduled task $TaskName -> $cmd"
 

@@ -2,10 +2,10 @@
 rem punktfunk web console launcher — the action the PunktfunkWeb scheduled task runs at boot.
 rem
 rem Lays out next to the installed payload: {app}\web\web-run.cmd, {app}\web\.output\... and
-rem {app}\node\node.exe (so %~dp0 = {app}\web\). Auto-wires the console the same way the Linux
+rem {app}\bun\bun.exe (so %~dp0 = {app}\web\). Auto-wires the console the same way the Linux
 rem systemd unit does: it sources the host's mgmt bearer token + the console login password from
 rem %ProgramData%\punktfunk\, points the /api proxy at the host's loopback HTTPS mgmt API, and runs
-rem the Nitro/Node server on :3000. No env editing on a packaged install.
+rem the (self-contained, no-node_modules) Nitro server on :3000 with the bundled bun. No env editing.
 setlocal EnableExtensions
 
 set "PFDATA=%ProgramData%\punktfunk"
@@ -31,10 +31,10 @@ set "HOST=0.0.0.0"
 set "PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990"
 set "NODE_TLS_REJECT_UNAUTHORIZED=0"
 
-set "NODE=%~dp0..\node\node.exe"
+set "BUN=%~dp0..\bun\bun.exe"
 set "SERVER=%~dp0.output\server\index.mjs"
-if not exist "%NODE%" (
-  echo [punktfunk-web] bundled node runtime missing at "%NODE%".
+if not exist "%BUN%" (
+  echo [punktfunk-web] bundled bun runtime missing at "%BUN%".
   exit /b 1
 )
-"%NODE%" "%SERVER%"
+"%BUN%" "%SERVER%"

@@ -33,11 +33,12 @@ exe into `C:\Program Files\punktfunk\` and calls that subcommand, elevated.
   display without it).
 - Runs `punktfunk-host service install` (idempotent; writes a default `host.env` only if absent, so
   user config survives upgrades) and, by the *Start service now* task, `service start`.
-- **Web management console** (bundled when packed with `-WebDir`/`-NodeExe`, which the CI always is):
-  lays down the built `.output` server + a portable Node, prompts for a console login password
-  (pre-filled with a secure random default, shown again on the final page; kept on upgrade), then
-  `web-setup.ps1` writes the ACL'd `%ProgramData%\punktfunk\web-password`, registers the
-  **`PunktfunkWeb`** scheduled task (boot, SYSTEM, restart-on-failure → `web-run.cmd` → `node` on
+- **Web management console** (bundled when packed with `-WebDir`/`-BunExe`, which the CI always is):
+  lays down the built **self-contained** `.output` server (Nitro `noExternals` — deps bundled +
+  tree-shaken, ~75 files, no `node_modules`) + a portable **bun**, prompts for a console login
+  password (pre-filled with a secure random default, shown again on the final page; kept on upgrade),
+  then `web-setup.ps1` writes the ACL'd `%ProgramData%\punktfunk\web-password`, registers the
+  **`PunktfunkWeb`** scheduled task (boot, SYSTEM, restart-on-failure → `web-run.cmd` → `bun` on
   `:3000`), opens TCP 3000, and starts it. It proxies the host's loopback mgmt API with the host's
   own `%ProgramData%\punktfunk\mgmt-token`.
 - **Upgrade:** stops a running `PunktfunkHost` service and waits for `STOPPED` before replacing files
@@ -63,10 +64,10 @@ read it from `%ProgramData%\punktfunk\web-password`.
 | File | Role |
 |------|------|
 | `punktfunk-host.iss` | Inno Setup script (the installer definition). |
-| `pack-host-installer.ps1` | Orchestrator: cert + sign, stage the driver + FFmpeg + **web console** (`.output` + node) bundles, run ISCC, sign setup.exe, emit registry paths. |
+| `pack-host-installer.ps1` | Orchestrator: cert + sign, stage the driver + FFmpeg + **web console** (`.output` + bun) bundles, run ISCC, sign setup.exe, emit registry paths. |
 | `stage-sudovda.ps1` | Stage the **vendored** SudoVDA driver + fetch/verify the **pinned** nefcon release into the bundle. |
 | `install-sudovda.ps1` | Runs at install time (elevated): trust cert → gated device-node create → `pnputil` install. |
-| `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `node` on the Nitro server (`:3000`). |
+| `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `bun` on the Nitro server (`:3000`). |
 | `../../scripts/windows/web-setup.ps1` | Install-time (elevated): write the ACL'd console password, register the `PunktfunkWeb` task + firewall rule, start it. |
 | `sudovda/` | **Vendored** prebuilt SudoVDA driver: `SudoVDA.inf` / `sudovda.cat` / `SudoVDA.dll` / `sudovda.cer`. |
 | `nvenc/nvenc.def`, `nvenc/gen-nvenc-importlib.ps1` | Synthesise `nvencodeapi.lib` for the `--features nvenc` link (llvm-dlltool / lib.exe). |

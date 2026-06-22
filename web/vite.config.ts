@@ -46,6 +46,14 @@ export default defineConfig({
       // .deb depend on apt-native `nodejs (>= 20)` instead of vendoring bun. CI still BUILDS with
       // bun; only the runtime target changes. (dev `vite dev` is unaffected.)
       preset: 'node-server',
+      // BUNDLE every dependency into the server output (no externalized node_modules). Three wins:
+      // (1) the .output tree drops from ~47k files / 730 MB (the whole untree-shaken @unom/ui dep
+      // tree — payload, lexical, date-fns…) to a handful of tree-shaken chunks; (2) it makes the
+      // output a self-contained graph `bun build --compile` can fold into ONE native binary (the
+      // Windows installer ships that instead of node + a node_modules forest); (3) it removes the
+      // bare external imports (`srvx`, `seroval`…) bun couldn't resolve at runtime — the reason we
+      // used to need node. node still runs the same self-contained output for the Linux .deb.
+      noExternals: true,
       compatibilityDate: '2026-06-10',
       // Scan server/{middleware,routes} for the auth gate + the /api proxy.
       scanDirs: [serverDir],

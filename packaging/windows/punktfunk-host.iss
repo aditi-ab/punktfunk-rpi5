@@ -49,10 +49,10 @@
 #ifdef FfmpegBin
   #define WithFfmpeg
 #endif
-; WebDir (the built web .output tree) + NodeExe (a portable node.exe) are passed together by
+; WebDir (the built web .output tree) + BunExe (a portable bun.exe) are passed together by
 ; pack-host-installer.ps1 to bundle the management console. Both required → WithWeb.
 #ifdef WebDir
-  #ifdef NodeExe
+  #ifdef BunExe
     #define WithWeb
   #endif
 #endif
@@ -102,12 +102,12 @@ Source: "{#Readme}"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignorevers
 Source: "{#FfmpegBin}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 #endif
 #ifdef WithWeb
-; The web management console: the built Nitro/Node SSR bundle (.output = server + public assets) →
-; {app}\web\.output, a portable Node runtime → {app}\node\node.exe, and the launcher the
-; PunktfunkWeb task runs → {app}\web\web-run.cmd. web-setup.ps1 (the provisioner) goes to {tmp} and
-; is removed after install.
+; The web management console: the self-contained Nitro SSR bundle (.output = server + public; deps
+; bundled in, no node_modules) → {app}\web\.output, a portable bun runtime → {app}\bun\bun.exe, and
+; the launcher the PunktfunkWeb task runs → {app}\web\web-run.cmd. web-setup.ps1 (the provisioner)
+; goes to {tmp} and is removed after install.
 Source: "{#WebDir}\*"; DestDir: "{app}\web\.output"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#NodeExe}"; DestDir: "{app}\node"; DestName: "node.exe"; Flags: ignoreversion
+Source: "{#BunExe}"; DestDir: "{app}\bun"; DestName: "bun.exe"; Flags: ignoreversion
 Source: "{#WebRunCmd}"; DestDir: "{app}\web"; DestName: "web-run.cmd"; Flags: ignoreversion
 Source: "{#WebSetup}"; DestDir: "{tmp}"; DestName: "web-setup.ps1"; Flags: deleteafterinstall
 #endif
