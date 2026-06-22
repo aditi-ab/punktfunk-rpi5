@@ -11,9 +11,10 @@
 //! bytes. `hidclass` gates the device stack, so this user-mode IPC is the only viable channel (a
 //! UMDF driver has no control device); see `windows-dualsense-scoping.md`.
 //!
-//! Device lifecycle: each pad `SwDeviceCreate`s the `root\pf_dualsense` devnode on open and
-//! `SwDeviceClose`s it on drop, so the virtual DualSense appears/disappears with the session —
-//! matching the Linux UHID pad. (The driver itself must already be installed; the installer stages it.)
+//! Device lifecycle: each pad `SwDeviceCreate`s a `pf_pad_<index>` software devnode (hardware id
+//! `pf_dualsense`, enumerator `punktfunk`) on open and `SwDeviceClose`s it on drop, so the virtual
+//! DualSense appears/disappears with the session — matching the Linux UHID pad. (The driver itself
+//! must already be installed; the installer stages it.)
 
 use super::dualsense_proto::{
     parse_ds_output, serialize_state, DsFeedback, DsState, DS_INPUT_REPORT_LEN, DS_TOUCH_H,
@@ -46,9 +47,9 @@ const OFF_INPUT: usize = 8;
 const OFF_OUT_SEQ: usize = 72;
 const OFF_OUTPUT: usize = 76;
 
-/// A single virtual DualSense: the `root\pf_dualsense` software devnode (the driver loads on it and
-/// the HID DualSense appears to games) plus the shared-memory section the driver maps. Dropping it
-/// removes the devnode (`SwDeviceClose`) and unmaps + closes the section.
+/// A single virtual DualSense: the SwDeviceCreate'd `pf_pad_<index>` software devnode (the driver
+/// loads on it and the HID DualSense appears to games) plus the shared-memory section the driver maps.
+/// Dropping it removes the devnode (`SwDeviceClose`) and unmaps + closes the section.
 struct DsWinPad {
     /// Per-session devnode from SwDeviceCreate, when it succeeds. `None` falls back to an out-of-band
     /// `pf_dualsense` devnode (installer/devgen).
@@ -60,16 +61,15 @@ struct DsWinPad {
     last_out_seq: u32,
 }
 
-/// Context for the async `SwDeviceCreate` completion callback: the event to signal + the result.
+/// Context for the `SwDeviceCreate` completion callback: an event to signal + the HRESULT it reports.
 #[repr(C)]
 struct SwCreateCtx {
     event: HANDLE,
     result: HRESULT,
 }
 
-/// `SwDeviceCreate` fires this on a worker thread once the device is created. We stash the result and
-/// wake the waiting [`create_swdevice`]; the creator blocks on the event, so there's no concurrent
-/// access to `*ctx`.
+/// `SwDeviceCreate` fires this once PnP has enumerated the device; stash the result and wake the
+/// creator, which blocks on the event (so there's no concurrent access to `*ctx`).
 unsafe extern "system" fn sw_create_cb(
     _dev: HSWDEVICE,
     result: HRESULT,
@@ -77,27 +77,30 @@ unsafe extern "system" fn sw_create_cb(
     _id: PCWSTR,
 ) {
     if !ctx.is_null() {
-        let c = ctx as *mut SwCreateCtx;
-        // SAFETY: c is the &mut SwCreateCtx the creator passed; it outlives this callback (the
-        // creator waits on the event before dropping it).
+        // SAFETY: ctx is the &mut SwCreateCtx the creator passed; it outlives this callback.
         unsafe {
+            let c = ctx as *mut SwCreateCtx;
             (*c).result = result;
             let _ = SetEvent((*c).event);
         }
     }
 }
 
-/// Spawn the virtual DualSense software device under enumerator `punktfunk` (hardware id
-/// `pf_dualsense`, which the INF matches). The returned `HSWDEVICE` owns the devnode for the session
-/// — `SwDeviceClose` removes it.
+/// Spawn the per-session virtual DualSense devnode for pad `index` under enumerator `punktfunk`
+/// (instance `pf_pad_<index>`, hardware id `pf_dualsense` which the INF matches). The returned
+/// `HSWDEVICE` owns it — `SwDeviceClose` removes it on drop, so the pad appears/disappears with the
+/// session and nothing persists.
 ///
-/// NB: enumerator names with an underscore (`pf_dualsense`) get E_INVALIDARG — hence `punktfunk`.
-/// TODO: a SECOND E_INVALIDARG remains — passing the completion callback is rejected (callback-absent
-/// is accepted but then the devnode doesn't materialize). Until that's resolved [`DsWinPad::open`]
-/// treats a failure as non-fatal and relies on an out-of-band `pf_dualsense` devnode (installer /
-/// dev-box `devgen`); see `docs/windows-dualsense-scoping.md`.
-fn create_swdevice() -> Result<HSWDEVICE> {
+/// Two requirements each yield E_INVALIDARG if violated: the enumerator name must not contain `_`
+/// (hence `punktfunk`, not `pf_dualsense`), and the completion callback is mandatory (the docs mark
+/// `pCallback` as `[in]`, not optional — a NULL callback is rejected). The caller must be
+/// Administrator (the host service runs as LocalSystem).
+fn create_swdevice(index: u8) -> Result<HSWDEVICE> {
     let hwids: Vec<u16> = "pf_dualsense".encode_utf16().chain([0u16, 0u16]).collect();
+    let instid: Vec<u16> = format!("pf_pad_{index}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let desc: Vec<u16> = "punktfunk Virtual DualSense"
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -105,10 +108,10 @@ fn create_swdevice() -> Result<HSWDEVICE> {
     // SAFETY: zeroed then the fields we use are set; cbSize identifies the struct version.
     let mut info: SW_DEVICE_CREATE_INFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<SW_DEVICE_CREATE_INFO>() as u32;
+    info.pszInstanceId = PCWSTR(instid.as_ptr());
     info.pszzHardwareIds = PCWSTR(hwids.as_ptr());
     info.pszDeviceDescription = PCWSTR(desc.as_ptr());
-    // SWDeviceCapabilities: DriverRequired (8) | SilentInstall (2) | Removable (1).
-    info.CapabilityFlags = 0x0000_000B;
+    info.CapabilityFlags = 0x0000_000B; // DriverRequired | SilentInstall | Removable
 
     // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
     let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
@@ -116,7 +119,7 @@ fn create_swdevice() -> Result<HSWDEVICE> {
         event,
         result: HRESULT(0),
     };
-    // SAFETY: info + hwids/desc outlive the call; ctx outlives the callback (we wait below).
+    // SAFETY: info + the buffers + ctx outlive the call (we wait on the event before returning);
     // windows-rs returns the HSWDEVICE (the C out-param) as the Result value.
     let hsw = match unsafe {
         SwDeviceCreate(
@@ -137,7 +140,8 @@ fn create_swdevice() -> Result<HSWDEVICE> {
             return Err(anyhow!("SwDeviceCreate failed: {e}"));
         }
     };
-    // SAFETY: event is valid; block up to 10s for the creation callback.
+    // Block until PnP finishes enumerating (the callback signals), then check its result.
+    // SAFETY: event is valid.
     unsafe {
         WaitForSingleObject(event, 10_000);
         let _ = CloseHandle(event);
@@ -145,7 +149,10 @@ fn create_swdevice() -> Result<HSWDEVICE> {
     if ctx.result.is_err() {
         // SAFETY: hsw is the handle SwDeviceCreate returned.
         unsafe { SwDeviceClose(hsw) };
-        return Err(anyhow!("SwDeviceCreate callback reported {:?}", ctx.result));
+        return Err(anyhow!(
+            "SwDeviceCreate enumeration failed: {:?}",
+            ctx.result
+        ));
     }
     Ok(hsw)
 }
@@ -207,13 +214,13 @@ impl DsWinPad {
             });
             std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
         }
-        // Best-effort: spawn a per-session devnode via SwDeviceCreate. It currently fails with a
-        // SwDevice quirk (see create_swdevice), so on failure we keep the section + data plane and
-        // rely on an out-of-band `pf_dualsense` devnode (installer / dev-box devgen).
-        let hsw = match create_swdevice() {
+        // Spawn the per-session devnode via SwDeviceCreate; `SwDeviceClose` removes it on drop. On the
+        // rare failure we keep the section + data plane and fall back to an out-of-band `pf_dualsense`
+        // devnode (installer / dev-box devgen).
+        let hsw = match create_swdevice(index) {
             Ok(h) => Some(h),
             Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; using an out-of-band pf_dualsense devnode");
+                tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; falling back to an out-of-band pf_dualsense devnode");
                 None
             }
         };

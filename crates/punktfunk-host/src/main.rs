@@ -224,26 +224,41 @@ fn real_main() -> Result<()> {
                 kind: 2,
                 capabilities: 0,
             });
-            // ls_x 16384 → report byte1 0xC0; BTN_A (Cross) → report byte8 0x28.
-            mgr.handle(&GamepadEvent::State(GamepadFrame {
-                index: 0,
-                active_mask: 1,
-                buttons: punktfunk_core::input::gamepad::BTN_A,
-                left_trigger: 0,
-                right_trigger: 0,
-                ls_x: 16384,
-                ls_y: 0,
-                rs_x: 0,
-                rs_y: 0,
-            }));
             println!(
-                "virtual DualSense created via SwDeviceCreate (VID 054C/PID 0CE6). Holding {secs}s — \
-                 verify Get-PnpDevice VID_054C + a HID read (expect byte1=0xC0, byte8=0x28)."
+                "virtual DualSense up — cycling Cross + sweeping the left stick for {secs}s. Watch it \
+                 in joy.cpl / Steam / a game; any rumble / lightbar / trigger the game sends prints below."
             );
             let deadline = Instant::now() + Duration::from_secs(secs);
+            let (mut i, mut last) = (0i32, Instant::now());
             while Instant::now() < deadline {
-                mgr.pump(|_, _, _| {}, |_| {});
-                std::thread::sleep(Duration::from_millis(50));
+                // Surface a game's feedback: rumble (universal) + lightbar / player-LED / adaptive
+                // triggers (DualSense-only) coming back over the shared section.
+                mgr.pump(
+                    |pad, lo, hi| println!("  rumble from game: pad={pad} low={lo} high={hi}"),
+                    |o| println!("  hid output from game: {o:?}"),
+                );
+                if last.elapsed() >= Duration::from_millis(400) {
+                    last = Instant::now();
+                    i += 1;
+                    let buttons = if i % 2 == 0 {
+                        punktfunk_core::input::gamepad::BTN_A // Cross
+                    } else {
+                        0
+                    };
+                    let lx = (((i % 64) - 32) * 1024) as i16; // sweep left stick X
+                    mgr.handle(&GamepadEvent::State(GamepadFrame {
+                        index: 0,
+                        active_mask: 1,
+                        buttons,
+                        left_trigger: 0,
+                        right_trigger: 0,
+                        ls_x: lx,
+                        ls_y: 0,
+                        rs_x: 0,
+                        rs_y: 0,
+                    }));
+                }
+                std::thread::sleep(Duration::from_millis(15));
             }
             println!("dualsense-windows-test: done (devnode removed)");
             Ok(())
