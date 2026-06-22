@@ -267,7 +267,7 @@ begin
   begin
     StopHostServiceAndWait;
 #ifdef WithWeb
-    { Stash the chosen password for web-setup.ps1 (fresh install only); {tmp} is auto-cleaned. }
+    { Stash the chosen password for web-setup.ps1 (fresh install only); the temp copy is auto-cleaned. }
     if FreshWebInstall then
       SaveStringToFile(ExpandConstant('{tmp}\webpw.txt'), Trim(WebPwPage.Values[0]), False);
 #endif
