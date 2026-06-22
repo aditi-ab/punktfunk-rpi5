@@ -1,6 +1,6 @@
 # Build the punktfunk Windows HOST as a signed Inno Setup installer and publish it to Gitea's generic
 # package registry, so a Windows GPU box can install the streaming host (SYSTEM service + bundled
-# SudoVDA virtual-display driver + the web management console, run by a scheduled task on a bundled
+# pf-vdisplay virtual-display driver + the web management console, run by a scheduled task on a bundled
 # bun) from one signed setup.exe. Runs on the self-hosted Windows runner
 # (host mode; scripts/ci/setup-windows-runner.ps1) — same MSVC/Windows-SDK/LLVM env as windows.yml.
 #

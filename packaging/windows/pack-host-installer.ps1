@@ -7,7 +7,7 @@
     1. resolves a code-signing cert (supplied stable .pfx from CI secrets OR an ephemeral self-signed
        CN=unom — same scheme as the client's pack-msix.ps1) and exports the public .cer,
     2. signs the inner punktfunk-host.exe,
-    3. fetches + stages the SudoVDA driver bundle (unless -NoDriver),
+    3. stages the pf-vdisplay virtual-display driver bundle (unless -NoDriver),
     4. runs ISCC to build punktfunk-host-setup-<ver>.exe,
     5. signs the setup.exe (timestamp best-effort),
     6. emits HOST_SETUP_PATH / HOST_CER_PATH to GITHUB_ENV for the publish step.
@@ -28,7 +28,7 @@ param(
     [string]$FfmpegDir = $env:FFMPEG_DIR,                           # bundle its bin\*.dll (amf-qsv build)
     [string]$WebDir = $env:WEB_OUTPUT_DIR,                          # built web .output tree -> bundle the mgmt console
     [string]$BunExe = $env:BUN_EXE,                                # portable bun.exe runtime for the console
-    [switch]$NoDriver,                                              # build without the bundled SudoVDA driver
+    [switch]$NoDriver,                                              # build without the bundled pf-vdisplay driver
     [switch]$NoSign                                                 # skip signing (local debug)
 )
 $ErrorActionPreference = 'Stop'
@@ -140,17 +140,19 @@ $defines = @(
     "/DReadme=$readme"
 )
 
-# --- stage the SudoVDA driver bundle ----------------------------------------------------------
+# --- stage the pf-vdisplay virtual-display driver bundle --------------------------------------
+# pf-vdisplay is our all-Rust IddCx driver (packaging/windows/vdisplay-driver/), vendored signed under
+# packaging/windows/pf-vdisplay/. It replaced the vendored SudoVDA C++ driver.
 if (-not $NoDriver) {
     $stage = Join-Path $OutDir 'stage'
-    & (Join-Path $here 'stage-sudovda.ps1') -OutDir $stage
-    Copy-Item (Join-Path $here 'install-sudovda.ps1') (Join-Path $stage 'install-sudovda.ps1') -Force
+    & (Join-Path $here 'stage-pf-vdisplay.ps1') -OutDir $stage
+    Copy-Item (Join-Path $here 'install-pf-vdisplay.ps1') (Join-Path $stage 'install-pf-vdisplay.ps1') -Force
     $defines += "/DStageDir=$stage"
 }
-else { Write-Host "-NoDriver: building installer WITHOUT the bundled SudoVDA driver" }
+else { Write-Host "-NoDriver: building installer WITHOUT the bundled pf-vdisplay driver" }
 
 # --- stage the punktfunk virtual-gamepad UMDF drivers (DualSense/DS4 + Xbox 360 XUSB) ----------
-# Vendored, pre-signed under packaging/windows/gamepad-drivers/ (like SudoVDA). Rebuild + re-vendor
+# Vendored, pre-signed under packaging/windows/gamepad-drivers/ (like pf-vdisplay). Rebuild + re-vendor
 # from packaging/windows/{dualsense,xusb}-driver/ when the driver source changes (see their READMEs).
 if (-not $NoDriver) {
     $gpVendor = Join-Path $here 'gamepad-drivers'

@@ -1,25 +1,28 @@
 <#
 .SYNOPSIS
-  Stage the driver bundle the installer ships into -OutDir: the VENDORED SudoVDA driver + the
-  fetched nefcon device tool.
+  Stage the pf-vdisplay driver bundle the installer ships into -OutDir: the VENDORED signed pf-vdisplay
+  driver + the fetched nefcon device tool.
 
 .DESCRIPTION
-  SudoVDA has no upstream release (its repo is a source-only VS solution; Apollo embeds the driver in
-  its single installer), so the prebuilt, signed driver is VENDORED in this repo under
-  packaging/windows/sudovda/ (MIT/CC0; SudoVDA v1.10.9.289, signer CN=sudovda@su.mk, Class=Display,
-  HWID Root\SudoMaker\SudoVDA). nefcon DOES publish a pinned release, so we fetch + SHA-256-verify it
-  (it provides nefconc.exe, used to create the root-enumerated device node — pnputil can't).
+  pf-vdisplay (our all-Rust IddCx virtual display) is built from packaging/windows/vdisplay-driver/, and
+  the SIGNED output (pf_vdisplay.dll/.inf/.cat + punktfunk-driver.cer) is VENDORED under
+  packaging/windows/pf-vdisplay/ (signer punktfunk-ds-test — shared with the gamepad drivers — Class=
+  Display, HWID root\pf_vdisplay). Rebuild + re-vendor with
+  packaging/windows/vdisplay-driver/deploy-dev.ps1 when the driver source changes, then copy the staged
+  pf_vdisplay.{dll,inf,cat} over the vendored copies. nefcon publishes a pinned release, so we fetch +
+  SHA-256-verify it (it provides nefconc.exe, used to create the root-enumerated device node — pnputil
+  can't).
 
-  Output (consumed by punktfunk-host.iss): -OutDir gets SudoVDA.inf/.cat/.dll + sudovda.cer and
-  nefconc.exe (x64). pack-host-installer.ps1 also drops install-sudovda.ps1 in.
+  Output (consumed by punktfunk-host.iss): -OutDir gets pf_vdisplay.inf/.cat/.dll + punktfunk-driver.cer
+  and nefconc.exe (x64). pack-host-installer.ps1 also drops install-pf-vdisplay.ps1 in.
 
 .EXAMPLE
-  pwsh -File stage-sudovda.ps1 -OutDir C:\t\out\stage
+  pwsh -File stage-pf-vdisplay.ps1 -OutDir C:\t\out\stage
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$OutDir,
-    [string]$VendorDir = (Join-Path $PSScriptRoot 'sudovda'),
+    [string]$VendorDir = (Join-Path $PSScriptRoot 'pf-vdisplay'),
     # PINNED nefcon release (https://github.com/nefarius/nefcon/releases). MIT-licensed.
     [string]$NefconUrl = 'https://github.com/nefarius/nefcon/releases/download/v1.17.40/nefcon_v1.17.40.zip',
     [string]$NefconSha256 = '812bae7ed7dfb7d6d2284bc7de2f8ccebc92ed2a0b1ae893c53b337096e50c1a'
@@ -31,11 +34,11 @@ $PSNativeCommandUseErrorActionPreference = $false
 if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-# --- vendored SudoVDA driver ------------------------------------------------------------------
-$inf = Get-ChildItem -Path $VendorDir -Filter *.inf -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $inf) { throw "no vendored SudoVDA .inf under $VendorDir — see packaging/windows/README.md" }
+# --- vendored pf-vdisplay driver --------------------------------------------------------------
+$inf = Get-ChildItem -Path $VendorDir -Filter pf_vdisplay.inf -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $inf) { throw "no vendored pf_vdisplay.inf under $VendorDir — re-vendor via vdisplay-driver/deploy-dev.ps1" }
 Copy-Item (Join-Path $VendorDir '*') $OutDir -Force
-Write-Host "==> vendored SudoVDA staged from $VendorDir"
+Write-Host "==> vendored pf-vdisplay staged from $VendorDir"
 
 # --- nefcon (fetched + verified) --------------------------------------------------------------
 $work = Join-Path ([IO.Path]::GetTempPath()) ('nefcon-' + [IO.Path]::GetRandomFileName())
@@ -51,7 +54,7 @@ try {
         }
         Write-Host "    sha256 ok ($got)"
     }
-    else { Write-Warning "no pinned nefcon SHA-256 — computed $got (PIN THIS in stage-sudovda.ps1)" }
+    else { Write-Warning "no pinned nefcon SHA-256 — computed $got (PIN THIS in stage-pf-vdisplay.ps1)" }
     Expand-Archive -Path $zip -DestinationPath $work -Force
     $nefc = Get-ChildItem -Path $work -Recurse -Filter 'nefconc.exe' |
         Where-Object { $_.FullName -match '(?i)\\x64\\' } | Select-Object -First 1

@@ -1,7 +1,7 @@
 ; punktfunk host installer (Inno Setup 6).
 ;
 ; Produces a signed setup.exe that lays the host into Program Files, optionally installs the bundled
-; SudoVDA virtual-display driver, and DELEGATES service registration to `punktfunk-host service
+; pf-vdisplay virtual-display driver, and DELEGATES service registration to `punktfunk-host service
 ; install`. The real, idempotent install logic (SCM registration, firewall rules, default host.env,
 ; the SYSTEM->interactive-session CreateProcessAsUserW supervisor for secure-desktop capture) lives in
 ; crates/punktfunk-host/src/service.rs - this script does NOT duplicate it. That SYSTEM service model
@@ -36,7 +36,7 @@
 #ifndef WebSetup
   #define WebSetup "..\..\scripts\windows\web-setup.ps1"
 #endif
-; StageDir (the staged SudoVDA payload + nefconc.exe + install-sudovda.ps1) is optional.
+; StageDir (the staged pf-vdisplay payload + nefconc.exe + install-pf-vdisplay.ps1) is optional.
 #ifdef StageDir
   #define WithDriver
 #endif
@@ -84,7 +84,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 #ifdef WithDriver
-Name: "installdriver"; Description: "Install the SudoVDA virtual display driver (required for native-resolution streaming)"
+Name: "installdriver"; Description: "Install the pf-vdisplay virtual display driver (required for native-resolution streaming)"
 #endif
 #ifdef WithGamepad
 Name: "installgamepad"; Description: "Install the virtual gamepad drivers (DualSense / DualShock 4 / Xbox 360 — no ViGEmBus needed)"
@@ -112,8 +112,8 @@ Source: "{#WebRunCmd}"; DestDir: "{app}\web"; DestName: "web-run.cmd"; Flags: ig
 Source: "{#WebSetup}"; DestDir: "{tmp}"; DestName: "web-setup.ps1"; Flags: deleteafterinstall
 #endif
 #ifdef WithDriver
-; The driver payload + nefconc.exe + install-sudovda.ps1, extracted to {tmp} and removed after install.
-Source: "{#StageDir}\*"; DestDir: "{tmp}\sudovda"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installdriver
+; The driver payload + nefconc.exe + install-pf-vdisplay.ps1, extracted to {tmp} and removed after install.
+Source: "{#StageDir}\*"; DestDir: "{tmp}\pfvdisplay"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installdriver
 #endif
 #ifdef WithGamepad
 ; The vendored UMDF gamepad drivers + install-gamepad-drivers.ps1, extracted to {tmp}, removed after.
@@ -123,8 +123,8 @@ Source: "{#GamepadStageDir}\*"; DestDir: "{tmp}\gamepad"; Flags: deleteafterinst
 [Run]
 #ifdef WithDriver
 Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\sudovda\install-sudovda.ps1"" -Dir ""{tmp}\sudovda"""; \
-  StatusMsg: "Installing the SudoVDA virtual display driver..."; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\pfvdisplay\install-pf-vdisplay.ps1"" -Dir ""{tmp}\pfvdisplay"""; \
+  StatusMsg: "Installing the pf-vdisplay virtual display driver..."; \
   Flags: runhidden waituntilterminated; Tasks: installdriver
 #endif
 #ifdef WithGamepad
