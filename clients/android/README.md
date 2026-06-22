@@ -11,8 +11,8 @@ machine, trust logic) instead of re-porting it into Kotlin.
 
 | Side | Owns |
 |------|------|
-| **Rust** (`clients/android/native` → `libpunktfunk_android.so`) | the JNI seam, `NativeClient` (QUIC control + UDP data plane), AnnexB→`AMediaCodec` decode, Opus+Oboe audio, VK keymap, latency math, trust/pairing |
-| **Kotlin** (`clients/android`) | Compose UI (host grid / settings / stream), `SurfaceView` lifecycle, input capture, `NsdManager` discovery, Keystore identity, permissions |
+| **Rust** (`clients/android/native` → `libpunktfunk_android.so`) | the JNI seam, `NativeClient` (QUIC control + UDP data plane), AnnexB→`AMediaCodec` decode, Opus+Oboe audio, VK keymap, latency math, trust/pairing, **mDNS discovery** (`mdns-sd`, the same browse the Linux/Windows clients use) |
+| **Kotlin** (`clients/android`) | Compose UI (host grid / settings / stream), `SurfaceView` lifecycle, input capture, the Wi-Fi `MulticastLock` + permission UX, Keystore identity, permissions |
 
 The single seam is `io.unom.punktfunk.kit.NativeBridge` ⇄ `Java_io_unom_punktfunk_kit_NativeBridge_*`.
 
@@ -30,7 +30,7 @@ clients/android/native/          Rust cdylib (workspace member) — links punktf
 clients/android/                   Gradle project (this dir)
   settings.gradle.kts · build.gradle.kts · gradle.properties · gradlew
   app/                             :app — Compose UI: Connect / Settings / Stream screens (phone + TV)
-  kit/                             :kit — NativeBridge · discovery (NsdManager) · Gamepad · Keymap ·
+  kit/                             :kit — NativeBridge · discovery (native mdns-sd, polled) · Gamepad · Keymap ·
                                          security (Keystore identity + known-host store) · cargo-ndk build
 ```
 
@@ -74,7 +74,8 @@ streaming experience:
 - **Audio** — Opus + Oboe playback with a jitter ring, plus mic uplink to the host.
 - **Input** — game controllers (buttons + axes) with rumble and HID feedback; D-pad /
   game-controller focus navigation for the couch (TV + phone).
-- **Discovery & trust** — `NsdManager` mDNS host list, SPAKE2 PIN pairing and TOFU, with a
+- **Discovery & trust** — native `mdns-sd` mDNS host list (polled over JNI; the same browse the
+  Linux/Windows clients use, not `NsdManager`), SPAKE2 PIN pairing and TOFU, with a
   Keystore-wrapped client identity and a known-host store.
 - **UI** — Compose host list / settings / stream screens, Material You theming.
 - **Shipping** — built for `arm64-v8a` + `x86_64`; published to Google Play (Internal Testing).

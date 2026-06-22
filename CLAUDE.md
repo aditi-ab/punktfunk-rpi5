@@ -199,7 +199,9 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    `punktfunk-core`; phone + Android TV): NDK `AMediaCodec` hardware HEVC decode → `SurfaceView` incl.
    **HDR10** (Main10/BT.2020 PQ) with low-latency tuning + a live stats HUD (`decode.rs`/`stats.rs`),
    Opus/Oboe audio + mic uplink (`audio.rs`/`mic.rs`), gamepad input with rumble/HID feedback
-   (`feedback.rs`), `NsdManager` mDNS discovery, SPAKE2 PIN pairing + TOFU (Keystore identity +
+   (`feedback.rs`), **native `mdns-sd` mDNS discovery** (`discovery.rs`, polled over JNI — the same
+   browse the Linux/Windows clients use, replacing the flaky per-OEM `NsdManager`; Kotlin keeps only
+   the `MulticastLock` + permission UX), SPAKE2 PIN pairing + TOFU (Keystore identity +
    known-host store), Compose UI (Connect/Settings/Stream) with D-pad/controller focus nav. Built for
    `arm64-v8a` + `x86_64`; published to Google Play (Internal Testing) via `android.yml`
    (`ci/play-upload.py`). Next: real-device gamepad/HDR live-verify, presenter/latency polish.

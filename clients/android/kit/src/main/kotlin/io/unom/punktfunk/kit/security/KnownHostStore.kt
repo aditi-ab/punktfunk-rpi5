@@ -50,6 +50,12 @@ class KnownHostStore(context: Context) {
         prefs.edit().remove(key(address, port)).apply()
     }
 
+    /** Set a saved host's display name, keeping its pin + paired flag. No-op if not saved. */
+    fun rename(address: String, port: Int, newName: String) {
+        val h = get(address, port) ?: return
+        save(h.copy(name = newName))
+    }
+
     /** All trusted hosts, name-sorted — backs the saved-hosts list. */
     fun all(): List<KnownHost> =
         prefs.all.values.mapNotNull { (it as? String)?.let(::parse) }.sortedBy { it.name.lowercase() }

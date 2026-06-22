@@ -557,6 +557,38 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointer
     });
 }
 
+/// `NativeBridge.nativeSendPointerAbs(handle, x, y, surfaceWidth, surfaceHeight)` — absolute cursor
+/// position: the host moves the pointer to `x`/`y` in a `surfaceWidth`×`surfaceHeight` pixel space,
+/// normalizing against the size packed into `flags` as `(w << 16) | h` and mapping into the output
+/// region (it drops the event if that size is zero). This is the touch "direct pointing" path — the
+/// cursor jumps to the finger — and matches the Apple client's absolute touch forwarding.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPointerAbs(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    x: jint,
+    y: jint,
+    surface_width: jint,
+    surface_height: jint,
+) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: live handle per the contract.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    let w = (surface_width.max(0) as u32) & 0xffff;
+    let ht = (surface_height.max(0) as u32) & 0xffff;
+    let _ = h.client.send_input(&InputEvent {
+        kind: InputKind::MouseMoveAbs,
+        _pad: [0; 3],
+        code: 0,
+        x,
+        y,
+        flags: (w << 16) | ht,
+    });
+}
+
 /// `NativeBridge.nativeSendPointerButton(handle, button, down)` — one button transition.
 /// `button`: GameStream id (1=left, 2=middle, 3=right, 4=X1, 5=X2). `down`: 1=press, 0=release.
 #[no_mangle]

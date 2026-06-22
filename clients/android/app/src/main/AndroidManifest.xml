@@ -4,11 +4,13 @@
     <!-- punktfunk/1 QUIC/UDP data plane. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- mDNS discovery of _punktfunk._udp on the LAN (NsdManager). -->
+    <!-- mDNS discovery of _punktfunk._udp on the LAN (native mdns-sd browse). Requested
+         opportunistically — raw multicast reception needs only the MulticastLock, not this. -->
     <uses-permission
         android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
-    <!-- Hold a MulticastLock while NsdManager discovery runs (OEM Wi-Fi power-save hedge). -->
+    <!-- HostDiscovery holds a MulticastLock while the native mDNS browse runs — raw multicast
+         reception needs it (also an OEM Wi-Fi power-save hedge). -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- Enforced from Android 17 (SDK 37) for ALL local-network traffic incl. the QUIC socket.

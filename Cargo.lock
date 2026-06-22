@@ -2547,6 +2547,7 @@ dependencies = [
  "jni",
  "libc",
  "log",
+ "mdns-sd",
  "ndk",
  "opus",
  "punktfunk-core",

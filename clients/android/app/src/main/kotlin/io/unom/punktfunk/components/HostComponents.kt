@@ -49,7 +49,7 @@ fun SectionLabel(text: String) {
 
 /**
  * A host as an Apple-style card: a colored letter-avatar, name + address, a trust pill, and (for
- * saved hosts) an overflow menu with Forget. Tapping the card connects.
+ * saved hosts) an overflow menu with Rename / Forget. Tapping the card connects.
  */
 @Composable
 fun HostCard(
@@ -59,6 +59,7 @@ fun HostCard(
     enabled: Boolean,
     onConnect: () -> Unit,
     onForget: (() -> Unit)?,
+    onRename: (() -> Unit)? = null,
 ) {
     // D-pad / controller focus highlight: a clickable card is focusable, but the default state
     // layer is too subtle on a TV across a room — draw a clear primary-colour border when focused.
@@ -106,7 +107,7 @@ fun HostCard(
                 StatusPill(status)
             }
 
-            if (onForget != null) {
+            if (onForget != null || onRename != null) {
                 var menu by remember { mutableStateOf(false) }
                 Box(modifier = Modifier.align(Alignment.TopEnd)) {
                     IconButton(enabled = enabled, onClick = { menu = true }) {
@@ -118,13 +119,24 @@ fun HostCard(
                         )
                     }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(
-                            text = { Text("Forget") },
-                            onClick = {
-                                menu = false
-                                onForget()
-                            },
-                        )
+                        if (onRename != null) {
+                            DropdownMenuItem(
+                                text = { Text("Rename") },
+                                onClick = {
+                                    menu = false
+                                    onRename()
+                                },
+                            )
+                        }
+                        if (onForget != null) {
+                            DropdownMenuItem(
+                                text = { Text("Forget") },
+                                onClick = {
+                                    menu = false
+                                    onForget()
+                                },
+                            )
+                        }
                     }
                 }
             }

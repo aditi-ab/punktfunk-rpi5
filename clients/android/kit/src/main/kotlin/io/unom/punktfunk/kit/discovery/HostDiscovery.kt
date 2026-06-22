@@ -1,17 +1,13 @@
 package io.unom.punktfunk.kit.discovery
 
 import android.content.Context
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
-import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import io.unom.punktfunk.kit.NativeBridge
 
-private const val TAG = "PunktfunkNsd"
-
-/** DNS-SD service type punktfunk hosts advertise (host: `_punktfunk._udp.local.`). */
-const val PUNKTFUNK_SERVICE_TYPE = "_punktfunk._udp"
-const val PUNKTFUNK_PROTO = "punktfunk/1"
+private const val TAG = "PunktfunkMdns"
 
 /** One resolved host fit for the picker. [key] is the stable dedup id. */
 data class DiscoveredHost(
@@ -23,165 +19,115 @@ data class DiscoveredHost(
     val pairingRequired: Boolean = false,
 )
 
-/** Parsed TXT fields. Pure — unit-testable without Android (see ParseTxtTest). */
-data class TxtFields(
-    val proto: String?,
-    val fp: String?,
-    val pair: String?,
-    val id: String?,
-) {
-    val pairingRequired: Boolean get() = pair == "required"
-    val isPunktfunk: Boolean get() = proto == PUNKTFUNK_PROTO
-}
+/** Field separator the native browse uses inside one record (ASCII Unit Separator). */
+private const val FIELD_SEP = '\u001F'
 
 /**
- * Pure TXT parser. NSD hands TXT as a `Map<String, ByteArray?>` (a null/empty value = present-but-
- * empty key). Decode UTF-8; missing keys are null, never an error.
+ * Parse one record from [NativeBridge.nativeDiscoveryPoll] (`key␟name␟addr␟port␟fp␟pair`), or null
+ * if it's malformed. Pure — unit-tested without Android (see ParseRecordTest). The native side
+ * already applied the protocol gate and address selection, so this is just field marshaling.
  */
-fun parseTxt(attrs: Map<String, ByteArray?>): TxtFields {
-    fun s(k: String): String? = attrs[k]?.takeIf { it.isNotEmpty() }?.toString(Charsets.UTF_8)
-    return TxtFields(proto = s("proto"), fp = s("fp"), pair = s("pair"), id = s("id"))
+fun parseHostRecord(record: String): DiscoveredHost? {
+    val f = record.split(FIELD_SEP)
+    if (f.size < 6) return null
+    val addr = f[2]
+    val port = f[3].toIntOrNull() ?: return null
+    if (addr.isBlank() || port !in 1..65535) return null
+    return DiscoveredHost(
+        key = f[0].ifBlank { "$addr:$port" },
+        name = f[1].ifBlank { addr },
+        host = addr,
+        port = port,
+        fingerprint = f[4].ifBlank { null },
+        pairingRequired = f[5] == "required",
+    )
 }
 
 /**
- * Browses `_punktfunk._udp` via NsdManager, resolves each service (the reliable
- * `registerServiceInfoCallback` path on API 34+, legacy `resolveService` on 31–33 where its TXT is
- * often empty), and pushes the live host set to [onChange] (invoked on the main thread).
+ * Browses `_punktfunk._udp` for punktfunk/1 hosts via the native `mdns-sd` core (the same browse the
+ * Linux/Windows clients use), exposed over JNI — *not* `NsdManager`, whose per-OEM system daemon
+ * made discovery "mostly broken". [start] spins up the native browse and polls it ~1 Hz on the main
+ * thread, pushing the live host set to [onChange] (also on the main thread, only when it changes);
+ * [stop] tears it down.
  *
- * Lifecycle: [start] when the picker appears, [stop] when it leaves / on connect — holds a
- * MulticastLock while running (an OEM Wi-Fi power-save hedge). Note: the Android emulator's SLIRP
- * NAT drops multicast, so on the emulator discovery starts but never finds a LAN host.
+ * We hold a Wi-Fi [WifiManager.MulticastLock] for the browse lifetime — raw multicast *reception*
+ * needs it. (The Android emulator's SLIRP NAT drops multicast, so on the emulator discovery starts
+ * but never finds a LAN host — same as before; that's the network, not the API.)
  */
 class HostDiscovery(context: Context) {
     private val appCtx = context.applicationContext
-    private val nsd = appCtx.getSystemService(Context.NSD_SERVICE) as NsdManager
 
     /** Invoked on the main thread whenever the resolved host set changes. */
     var onChange: ((List<DiscoveredHost>) -> Unit)? = null
 
-    private val resolved = LinkedHashMap<String, DiscoveredHost>() // key -> host
+    private val handler = Handler(Looper.getMainLooper())
     private var multicastLock: WifiManager.MulticastLock? = null
-    private var discoveryListener: NsdManager.DiscoveryListener? = null
-    private val infoCallbacks = mutableListOf<NsdManager.ServiceInfoCallback>() // API 34+ registrations
+    private var nativeHandle = 0L
     private var running = false
+    private var last: List<DiscoveredHost> = emptyList()
 
-    @Synchronized
-    fun start() {
-        if (running) return
-        running = true
-        acquireMulticastLock()
-        val listener = makeDiscoveryListener()
-        discoveryListener = listener
-        runCatching {
-            nsd.discoverServices(PUNKTFUNK_SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
-        }.onFailure {
-            Log.e(TAG, "discoverServices failed", it)
-            stop()
+    private val poll = object : Runnable {
+        override fun run() {
+            if (!running) return
+            val hosts = snapshot()
+            if (hosts != last) {
+                last = hosts
+                onChange?.invoke(hosts)
+            }
+            handler.postDelayed(this, POLL_MS)
         }
     }
 
-    @Synchronized
-    fun stop() {
-        if (!running) return
-        running = false
-        discoveryListener?.let { runCatching { nsd.stopServiceDiscovery(it) } }
-        discoveryListener = null
-        if (Build.VERSION.SDK_INT >= 34) {
-            for (cb in infoCallbacks) runCatching { nsd.unregisterServiceInfoCallback(cb) }
+    fun start() {
+        if (running) return
+        acquireMulticastLock()
+        val h = runCatching { NativeBridge.nativeDiscoveryStart() }
+            .onFailure { Log.e(TAG, "nativeDiscoveryStart threw", it) }
+            .getOrDefault(0L)
+        if (h == 0L) {
+            Log.e(TAG, "native mDNS discovery failed to start")
+            releaseMulticastLock()
+            return
         }
-        infoCallbacks.clear()
+        nativeHandle = h
+        running = true
+        last = emptyList()
+        handler.post(poll)
+    }
+
+    fun stop() {
+        if (!running && nativeHandle == 0L) return
+        running = false
+        handler.removeCallbacks(poll)
+        val h = nativeHandle
+        nativeHandle = 0L
+        if (h != 0L) runCatching { NativeBridge.nativeDiscoveryStop(h) }
+            .onFailure { Log.e(TAG, "nativeDiscoveryStop threw", it) }
         releaseMulticastLock()
-        resolved.clear()
+        last = emptyList()
         onChange?.invoke(emptyList())
     }
 
-    private fun publish() {
-        onChange?.invoke(resolved.values.sortedBy { it.name.lowercase() })
-    }
-
-    private fun makeDiscoveryListener() = object : NsdManager.DiscoveryListener {
-        override fun onDiscoveryStarted(type: String) {
-            Log.d(TAG, "discovery started: $type")
-        }
-        override fun onDiscoveryStopped(type: String) {
-            Log.d(TAG, "discovery stopped: $type")
-        }
-        override fun onStartDiscoveryFailed(type: String, code: Int) {
-            Log.e(TAG, "start discovery failed: $code")
-            runCatching { nsd.stopServiceDiscovery(this) }
-        }
-        override fun onStopDiscoveryFailed(type: String, code: Int) {
-            Log.e(TAG, "stop discovery failed: $code")
-        }
-
-        override fun onServiceFound(info: NsdServiceInfo) {
-            Log.d(TAG, "found: ${info.serviceName}")
-            resolve(info)
-        }
-        override fun onServiceLost(info: NsdServiceInfo) {
-            Log.d(TAG, "lost: ${info.serviceName}")
-            // onServiceLost carries no TXT, so drop by the instance-name fallback key only.
-            if (resolved.remove(info.serviceName) != null) publish()
-        }
-    }
-
-    private fun resolve(found: NsdServiceInfo) {
-        if (Build.VERSION.SDK_INT >= 34) resolveViaCallback(found) else resolveViaLegacy(found)
-    }
-
-    private fun resolveViaCallback(found: NsdServiceInfo) {
-        val cb = object : NsdManager.ServiceInfoCallback {
-            override fun onServiceUpdated(info: NsdServiceInfo) = ingest(info)
-            override fun onServiceLost() {}
-            override fun onServiceInfoCallbackRegistrationFailed(code: Int) {
-                Log.e(TAG, "ServiceInfoCallback reg failed: $code")
-            }
-            override fun onServiceInfoCallbackUnregistered() {}
-        }
-        runCatching {
-            nsd.registerServiceInfoCallback(found, appCtx.mainExecutor, cb)
-            infoCallbacks.add(cb)
-        }.onFailure { Log.e(TAG, "registerServiceInfoCallback failed", it) }
-    }
-
-    private fun resolveViaLegacy(found: NsdServiceInfo) {
-        // A ResolveListener can't be reused — allocate one per resolve. TXT may be empty pre-34.
-        val listener = object : NsdManager.ResolveListener {
-            override fun onServiceResolved(info: NsdServiceInfo) = ingest(info)
-            override fun onResolveFailed(info: NsdServiceInfo, code: Int) {
-                Log.e(TAG, "resolve failed: $code")
-            }
-        }
-        runCatching { nsd.resolveService(found, listener) }
-            .onFailure { Log.e(TAG, "resolveService failed", it) }
-    }
-
-    @Suppress("DEPRECATION") // info.host is deprecated at API 34 (replaced by hostAddresses)
-    private fun ingest(info: NsdServiceInfo) {
-        val txt = parseTxt(info.attributes)
-        // Reject an incompatible protocol IF the host advertised one; tolerate empty TXT (pre-34).
-        if (txt.proto != null && !txt.isPunktfunk) {
-            Log.d(TAG, "skip non-punktfunk proto=${txt.proto}")
-            return
-        }
-        val ip = (if (Build.VERSION.SDK_INT >= 34) info.hostAddresses.firstOrNull() else info.host)
-            ?.hostAddress ?: return
-        val key = txt.id?.takeIf { it.isNotBlank() } ?: info.serviceName
-        resolved[key] = DiscoveredHost(
-            key = key,
-            name = info.serviceName.removeSuffix("."),
-            host = ip,
-            port = info.port,
-            fingerprint = txt.fp,
-            pairingRequired = txt.pairingRequired,
-        )
-        Log.d(TAG, "resolved: ${resolved[key]}")
-        publish()
+    private fun snapshot(): List<DiscoveredHost> {
+        val h = nativeHandle
+        if (h == 0L) return emptyList()
+        // getOrNull (not getOrDefault): the JNI returns a platform String!, so a (near-impossible)
+        // native null is a *success* value here — coalesce it so the main-thread poll can't NPE.
+        val blob = runCatching { NativeBridge.nativeDiscoveryPoll(h) }
+            .onFailure { Log.e(TAG, "nativeDiscoveryPoll threw", it) }
+            .getOrNull() ?: ""
+        if (blob.isEmpty()) return emptyList()
+        return blob.split('\n')
+            .filter { it.isNotBlank() }
+            .mapNotNull { parseHostRecord(it) }
+            .associateBy { it.key } // dedup by stable key (id, or addr:port)
+            .values
+            .sortedBy { it.name.lowercase() }
     }
 
     private fun acquireMulticastLock() {
         val wifi = appCtx.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        multicastLock = wifi.createMulticastLock("punktfunk-nsd").apply {
+        multicastLock = wifi.createMulticastLock("punktfunk-mdns").apply {
             setReferenceCounted(true)
             runCatching { acquire() }
         }
@@ -190,5 +136,9 @@ class HostDiscovery(context: Context) {
     private fun releaseMulticastLock() {
         multicastLock?.takeIf { it.isHeld }?.let { runCatching { it.release() } }
         multicastLock = null
+    }
+
+    private companion object {
+        const val POLL_MS = 1000L
     }
 }

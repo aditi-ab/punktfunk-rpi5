@@ -67,6 +67,27 @@ object NativeBridge {
     /** Tear down a session handle returned by [nativeConnect]. No-op on `0`. */
     external fun nativeClose(handle: Long)
 
+    // ---- LAN discovery: mDNS browse of `_punktfunk._udp` in Rust (mdns-sd), polled by Kotlin ----
+    // Replaces NsdManager. The caller holds the Wi-Fi MulticastLock for the browse lifetime; raw
+    // multicast *reception* needs it. See io.unom.punktfunk.kit.discovery.HostDiscovery.
+
+    /**
+     * Start browsing `_punktfunk._udp` on the LAN. Returns an opaque discovery handle, or `0` on
+     * failure. Pair with exactly one [nativeDiscoveryStop]. Cheap + non-blocking (spawns the mDNS
+     * daemon + a fold thread).
+     */
+    external fun nativeDiscoveryStart(): Long
+
+    /**
+     * The current resolved-host snapshot for [handle]: newline-joined records, each
+     * `key␟name␟addr␟port␟fp␟pair` (`␟` = U+001F). Empty string = no hosts / `0` handle. Poll ~1 Hz;
+     * cheap (a lock + string build), safe to call on the main thread.
+     */
+    external fun nativeDiscoveryPoll(handle: Long): String
+
+    /** Stop the browse, shut the mDNS daemon down and join its thread. No-op on `0`. */
+    external fun nativeDiscoveryStop(handle: Long)
+
     /**
      * Start the HEVC decode thread rendering onto [surface] (a SurfaceView's surface). Decode runs
      * entirely in Rust (NDK AMediaCodec → ANativeWindow) — no per-frame JNI. No-op if already started.
@@ -107,6 +128,13 @@ object NativeBridge {
 
     /** Relative mouse move; dx/dy are device-pixel deltas (screen +y down). */
     external fun nativeSendPointerMove(handle: Long, dx: Int, dy: Int)
+
+    /**
+     * Absolute mouse position — the host moves the cursor to (x, y) in a [surfaceWidth]×[surfaceHeight]
+     * pixel space (it normalizes against that size and maps into the output region). Touch
+     * "direct pointing": the cursor jumps to the finger. Parity with the Apple client's absolute touch.
+     */
+    external fun nativeSendPointerAbs(handle: Long, x: Int, y: Int, surfaceWidth: Int, surfaceHeight: Int)
 
     /** One mouse-button transition. button: 1=left 2=middle 3=right 4=X1 5=X2. */
     external fun nativeSendPointerButton(handle: Long, button: Int, down: Boolean)

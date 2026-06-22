@@ -26,7 +26,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -43,6 +42,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
 import kotlin.math.abs
 import kotlin.math.roundToInt
+
+// Touch-gesture tuning (px / ms). TAP_SLOP: movement under this still counts as a tap, not a drag.
+// TAP_DRAG_MS: a new touch within this long after a tap starts a left-button drag. SCROLL_DIV: px of
+// two-finger pan per wheel notch (smaller = faster scroll).
+private const val TAP_SLOP = 12f
+private const val TAP_DRAG_MS = 250L
+private const val SCROLL_DIV = 4f
 
 @Composable
 fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
@@ -139,41 +145,108 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         if (showStats) {
             stats?.let { StatsOverlay(it, Modifier.align(Alignment.TopStart).padding(12.dp)) }
         }
-        // Touch virtual-trackpad overlay: 1-finger drag → relative mouse move; tap → left click;
-        // 2-finger drag → scroll; 3-finger tap → toggle the stats HUD. (Physical-mouse pointer
-        // capture comes in a later increment.)
+        // Touch → mouse, absolute "direct pointing" like the Apple client: the host cursor follows
+        // your finger (MouseMoveAbs, host-normalized against the overlay size — which fills the video,
+        // so finger position maps straight onto the remote screen). Gestures: tap = left click;
+        // two-finger tap = right click; two-finger drag = scroll; tap-then-press-and-drag = left-drag
+        // (text selection / moving windows); three-finger tap = toggle the stats HUD.
         Box(
             Modifier.fillMaxSize().pointerInput(handle) {
+                var lastTapUp = 0L
+                var lastTapX = 0f
+                var lastTapY = 0f
+                fun moveAbs(x: Float, y: Float) {
+                    val sw = size.width
+                    val sh = size.height
+                    if (sw <= 0 || sh <= 0) return
+                    NativeBridge.nativeSendPointerAbs(
+                        handle,
+                        x.coerceIn(0f, (sw - 1).toFloat()).roundToInt(),
+                        y.coerceIn(0f, (sh - 1).toFloat()).roundToInt(),
+                        sw,
+                        sh,
+                    )
+                }
                 awaitEachGesture {
-                    val first = awaitFirstDown(requireUnconsumed = false)
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val startX = down.position.x
+                    val startY = down.position.y
+                    // A touch landing just after a quick tap nearby = tap-and-drag: hold the left
+                    // button for this whole gesture (laptop-trackpad convention).
+                    val isDrag = down.uptimeMillis - lastTapUp < TAP_DRAG_MS &&
+                        abs(startX - lastTapX) < TAP_SLOP && abs(startY - lastTapY) < TAP_SLOP
+                    lastTapUp = 0L // consume the arming either way
+                    moveAbs(startX, startY) // cursor jumps to the finger immediately
+                    if (isDrag) NativeBridge.nativeSendPointerButton(handle, 1, true)
+
                     var moved = false
                     var maxFingers = 1
+                    var scrolling = false
+                    var prevCx = startX
+                    var prevCy = startY
+                    var upTime = down.uptimeMillis
+
                     while (true) {
                         val ev = awaitPointerEvent()
-                        val fingers = ev.changes.count { it.pressed }
-                        if (fingers == 0) break
-                        if (fingers > maxFingers) maxFingers = fingers
-                        val primary = ev.changes.firstOrNull { it.id == first.id } ?: ev.changes.first()
-                        val d = primary.positionChange()
-                        if (abs(d.x) > 0.5f || abs(d.y) > 0.5f) {
-                            moved = true
-                            if (fingers >= 2) {
-                                // screen +y down → wire +up, so negate y. Coarse divisor; tune live.
-                                val sy = (-d.y / 4f).toInt()
-                                val sx = (d.x / 4f).toInt()
-                                if (sy != 0) NativeBridge.nativeSendScroll(handle, 0, sy * 120)
-                                if (sx != 0) NativeBridge.nativeSendScroll(handle, 1, sx * 120)
-                            } else {
-                                NativeBridge.nativeSendPointerMove(handle, d.x.toInt(), d.y.toInt())
+                        val pressed = ev.changes.filter { it.pressed }
+                        if (pressed.isEmpty()) {
+                            upTime = ev.changes.firstOrNull()?.uptimeMillis ?: upTime
+                            break
+                        }
+                        if (pressed.size > maxFingers) maxFingers = pressed.size
+
+                        if (pressed.size >= 2) {
+                            // Two fingers → scroll by the centroid delta; never move the cursor.
+                            val cx = (pressed.sumOf { it.position.x.toDouble() } / pressed.size).toFloat()
+                            val cy = (pressed.sumOf { it.position.y.toDouble() } / pressed.size).toFloat()
+                            if (!scrolling) {
+                                scrolling = true
+                                prevCx = cx
+                                prevCy = cy
                             }
+                            val sy = ((prevCy - cy) / SCROLL_DIV).toInt() // finger up → wheel up
+                            val sx = ((cx - prevCx) / SCROLL_DIV).toInt()
+                            if (sy != 0) {
+                                NativeBridge.nativeSendScroll(handle, 0, sy * 120)
+                                prevCy = cy
+                                moved = true
+                            }
+                            if (sx != 0) {
+                                NativeBridge.nativeSendScroll(handle, 1, sx * 120)
+                                prevCx = cx
+                                moved = true
+                            }
+                        } else if (!scrolling) {
+                            // One finger → the cursor follows it (skipped once a gesture turned into
+                            // a scroll, so dropping back to one finger doesn't jerk the cursor).
+                            val p = pressed.firstOrNull { it.id == down.id } ?: pressed.first()
+                            if (abs(p.position.x - startX) > TAP_SLOP ||
+                                abs(p.position.y - startY) > TAP_SLOP
+                            ) {
+                                moved = true
+                            }
+                            moveAbs(p.position.x, p.position.y)
                         }
                         ev.changes.forEach { it.consume() }
                     }
-                    if (!moved && maxFingers == 1) {
-                        NativeBridge.nativeSendPointerButton(handle, 1, true)
-                        NativeBridge.nativeSendPointerButton(handle, 1, false)
-                    } else if (!moved && maxFingers >= 3) {
-                        showStats = !showStats // quick in-stream HUD toggle
+
+                    if (isDrag) {
+                        NativeBridge.nativeSendPointerButton(handle, 1, false) // end the drag
+                    } else if (!moved) {
+                        when {
+                            maxFingers >= 3 -> showStats = !showStats // in-stream HUD toggle
+                            maxFingers == 2 -> { // two-finger tap → right click
+                                NativeBridge.nativeSendPointerButton(handle, 3, true)
+                                NativeBridge.nativeSendPointerButton(handle, 3, false)
+                            }
+                            else -> { // tap → left click, and arm tap-and-drag
+                                NativeBridge.nativeSendPointerButton(handle, 1, true)
+                                NativeBridge.nativeSendPointerButton(handle, 1, false)
+                                lastTapUp = upTime
+                                lastTapX = startX
+                                lastTapY = startY
+                            }
+                        }
                     }
                 }
             },

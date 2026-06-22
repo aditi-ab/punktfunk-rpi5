@@ -19,6 +19,12 @@ crate-type = ["cdylib"]
 punktfunk-core = { path = "../../../crates/punktfunk-core", features = ["quic"] }
 jni = "0.21"
 log = "0.4"
+# LAN host discovery: browse the host's `_punktfunk._udp` mDNS advert — the SAME crate + service the
+# Linux/Windows clients use (`clients/linux/src/discovery.rs`), replacing Android's per-OEM
+# `NsdManager` system daemon with one tested browse path. Pure Rust (socket2/if-addrs/mio), so it
+# cross-compiles to the Android targets AND builds on the host (the JNI seam links into
+# `cargo build --workspace`). Kotlin keeps only the Wi-Fi `MulticastLock` + permission UX.
+mdns-sd = "0.20"
 
 # Android-only deps. Gated so `cargo build --workspace` on the Linux/macOS dev boxes + CI still
 # compiles this crate (as a host cdylib) — the Android-framework glue (logging now; AMediaCodec via

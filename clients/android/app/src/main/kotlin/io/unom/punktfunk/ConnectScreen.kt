@@ -84,30 +84,33 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var host by remember { mutableStateOf("") }
+    var hostName by remember { mutableStateOf("") }
     var port by remember { mutableStateOf("9777") }
     var connecting by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
     // The host streams at exactly this mode; "Native" settings resolve from the device display.
     val (w, h, hz) = settings.effectiveMode(context)
 
-    // mDNS discovery scoped to this screen; NsdManager callbacks arrive on the main thread, so the
-    // onChange callback can set Compose state directly. (Emulator SLIRP drops multicast → empty.)
-    // NsdManager discovery needs NEARBY_WIFI_DEVICES on Android 13+ (a runtime permission) — without
-    // it discoverServices silently finds nothing. Request it once, then (re)start discovery on grant.
+    // mDNS discovery scoped to this screen, via the native mdns-sd browse (HostDiscovery) — its
+    // onChange fires on the main thread, so it can set Compose state directly. (Emulator SLIRP drops
+    // multicast → empty; that's the network, not the API.) Raw multicast reception only needs the
+    // Wi-Fi MulticastLock (HostDiscovery holds it), NOT NEARBY_WIFI_DEVICES — that gated the old
+    // NsdManager path. We still request NEARBY_WIFI_DEVICES opportunistically (some OEMs filter
+    // multicast without it; harmless where it isn't), but never block discovery on the grant — a
+    // denial used to leave discovery dead forever.
     val discovery = remember { HostDiscovery(context) }
     var discovered by remember { mutableStateOf<List<DiscoveredHost>>(emptyList()) }
-    var nearbyGranted by remember { mutableStateOf(hasNearbyPermission(context)) }
     val nearbyLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
-    ) { granted -> nearbyGranted = granted }
+    ) { _ -> /* best-effort hint; discovery runs regardless of the result */ }
     LaunchedEffect(Unit) {
-        if (!nearbyGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNearbyPermission(context)) {
             nearbyLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
     }
-    DisposableEffect(nearbyGranted) {
+    DisposableEffect(Unit) {
         discovery.onChange = { discovered = it }
-        if (nearbyGranted) discovery.start()
+        discovery.start()
         onDispose {
             discovery.onChange = null
             discovery.stop()
@@ -127,6 +130,13 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     }
     // A trust decision awaiting the user (first-connect TOFU / fp changed / PIN pairing).
     var pendingTrust by remember { mutableStateOf<PendingTrust?>(null) }
+    // A saved host whose label is being edited (the Rename dialog).
+    var renameTarget by remember { mutableStateOf<KnownHost?>(null) }
+
+    // Discovered hosts not already saved — a saved host (paired or TOFU) belongs in "Saved hosts",
+    // not also in "Discovered", so we hide the overlap (matched by fingerprint when both carry it, so
+    // it survives a DHCP address change; else by address:port). Mirrors the Apple client.
+    val discoveredUnsaved = discovered.filter { dh -> savedHosts.none { it.matches(dh) } }
 
     // Issue the actual connect with identity + (optional) pin. On a TOFU connect (pinHex null),
     // pin the fingerprint the host presented (as an unpaired known host) so the next connect goes
@@ -176,10 +186,17 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     // keyed by address:port, so a discovered and a manually-typed connection to the same host share
     // one record. Trust-on-first-use is permitted ONLY when the host advertised pair=optional; a
     // pair=required host, or a manual/unknown-policy host, must pair by PIN.
-    fun connect(targetHost: String, targetPort: Int, dh: DiscoveredHost? = null) {
+    fun connect(
+        targetHost: String,
+        targetPort: Int,
+        dh: DiscoveredHost? = null,
+        manualName: String? = null,
+    ) {
         val known = knownHostStore.get(targetHost, targetPort)
         val adv = dh?.fingerprint?.lowercase()
-        val name = dh?.name ?: targetHost
+        // Label precedence: a saved host keeps its (possibly user-renamed) name; else the discovered
+        // mDNS name; else the name typed in the Add-host sheet; else the bare address.
+        val name = known?.name ?: dh?.name ?: manualName?.trim()?.takeIf { it.isNotEmpty() } ?: targetHost
         when {
             // Known host whose advertised fp still matches the pin → silent pinned reconnect.
             known != null && (adv == null || adv == known.fpHex) ->
@@ -260,7 +277,7 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                 }
             }
 
-            if (savedHosts.isEmpty() && discovered.isEmpty()) {
+            if (savedHosts.isEmpty() && discoveredUnsaved.isEmpty()) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     EmptyHostsState()
                 }
@@ -281,16 +298,17 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                             knownHostStore.remove(kh.address, kh.port)
                             savedHosts = knownHostStore.all()
                         },
+                        onRename = { renameTarget = kh },
                     )
                 }
             }
 
-            if (discovered.isNotEmpty()) {
+            if (discoveredUnsaved.isNotEmpty()) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Spacer(Modifier.height(12.dp))
                     SectionLabel("Discovered on the network")
                 }
-                items(discovered, key = { "disc-${it.host}-${it.port}" }) { dh ->
+                items(discoveredUnsaved, key = { "disc-${it.host}-${it.port}" }) { dh ->
                     HostCard(
                         name = dh.name,
                         address = "${dh.host}:${dh.port}",
@@ -302,9 +320,10 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                 }
             }
 
-            // Active-discovery hint: when we're scanning but nothing's turned up yet, show it's
-            // working rather than looking idle/empty.
-            if (nearbyGranted && discovered.isEmpty()) {
+            // Active-discovery hint: discovery runs whenever this screen is up, so while it's
+            // scanning but nothing's turned up yet (and we're not mid-connect), show it's working
+            // rather than looking idle/empty.
+            if (!connecting && discovered.isEmpty()) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
@@ -364,13 +383,22 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                 )
                 Spacer(Modifier.height(20.dp))
                 OutlinedTextField(
+                    value = hostName,
+                    onValueChange = { hostName = it },
+                    label = { Text("Name (optional)") },
+                    placeholder = { Text("e.g. Living Room") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(16.dp))
+                OutlinedTextField(
                     value = host,
                     onValueChange = { host = it },
                     label = { Text("Host") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(16.dp))
                 OutlinedTextField(
                     value = port,
                     onValueChange = { v -> port = v.filter { it.isDigit() }.take(5) },
@@ -385,9 +413,10 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                     onClick = {
                         val h = host.trim()
                         val p = port.toIntOrNull() ?: 9777
+                        val n = hostName
                         scope.launch { sheetState.hide() }.invokeOnCompletion {
                             showManualSheet = false
-                            connect(h, p)
+                            connect(h, p, manualName = n)
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -507,10 +536,57 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
             }
         }
     }
+
+    // Rename a saved host's label (discovered hosts are named by mDNS; this is how you give one a
+    // friendly name like "Living Room" after pairing). Keyed by the host so reopening resets the field.
+    renameTarget?.let { kh ->
+        var newName by remember(kh) { mutableStateOf(kh.name) }
+        AlertDialog(
+            onDismissRequest = { renameTarget = null },
+            title = { Text("Rename host") },
+            text = {
+                OutlinedTextField(
+                    value = newName,
+                    onValueChange = { newName = it },
+                    label = { Text("Name") },
+                    placeholder = { Text(kh.address) },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = newName.isNotBlank(),
+                    onClick = {
+                        knownHostStore.rename(kh.address, kh.port, newName.trim())
+                        savedHosts = knownHostStore.all()
+                        renameTarget = null
+                    },
+                ) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameTarget = null }) { Text("Cancel") }
+            },
+        )
+    }
 }
 
-/** NsdManager discovery needs NEARBY_WIFI_DEVICES on API 33+; below that it doesn't apply. */
+/**
+ * Whether NEARBY_WIFI_DEVICES is held (API 33+; not applicable below). We request it opportunistically
+ * as a multicast-reception hedge on OEMs that filter multicast without it, but discovery (raw mDNS via
+ * the native core + MulticastLock) does not depend on it.
+ */
 fun hasNearbyPermission(context: Context): Boolean =
     Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
         ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) ==
         PackageManager.PERMISSION_GRANTED
+
+/**
+ * True when a saved host and a discovered advert are the same machine — matched by certificate
+ * fingerprint when both carry it (so it survives a DHCP address change), else by address:port.
+ * Mirrors the Apple client's `StoredHost.matches`; de-dupes "Discovered" against "Saved hosts".
+ */
+private fun KnownHost.matches(dh: DiscoveredHost): Boolean {
+    val advFp = dh.fingerprint?.lowercase()
+    if (!advFp.isNullOrEmpty() && fpHex.isNotEmpty() && fpHex.lowercase() == advFp) return true
+    return address == dh.host && port == dh.port
+}
