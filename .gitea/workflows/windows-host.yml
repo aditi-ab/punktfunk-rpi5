@@ -124,20 +124,38 @@ jobs:
 
       - name: Build + smoke-boot web console (node-server preset)
         shell: pwsh
-        # Same shape as deb.yml: bun builds the Nitro node-server bundle, node runs it. The installer
-        # then bundles web\.output (handed over via WEB_OUTPUT_DIR) + the node above. bun is on the
-        # runner (per build-web.ps1); @unom packages resolve via bun.lock + web\.npmrc against the
-        # runner's Gitea access.
+        env:
+          # PAT with read access to the unom org packages — the @unom npm registry needs auth.
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        # Same shape as deb.yml: bun builds the Nitro node-server bundle, node runs it; the installer
+        # bundles web\.output (handed over via WEB_OUTPUT_DIR) + the portable node above. The runner
+        # runs as SYSTEM (no dev-user PATH/npmrc), so bootstrap bun if absent and supply the private
+        # @unom registry token via the SYSTEM home .npmrc — kept OUT of the shipped bundle.
         run: |
-          $bun = if (Get-Command bun -ErrorAction SilentlyContinue) { (Get-Command bun).Source } else { 'C:\Users\Public\bun\bin\bun.exe' }
-          if (-not (Test-Path $bun) -and -not (Get-Command $bun -ErrorAction SilentlyContinue)) { throw "bun not found (needed to build the web console)" }
+          $bun = (Get-Command bun -ErrorAction SilentlyContinue).Source
+          if (-not $bun) { foreach ($p in @("$env:USERPROFILE\.bun\bin\bun.exe", 'C:\Users\Public\bun\bin\bun.exe')) { if (Test-Path $p) { $bun = $p; break } } }
+          if (-not $bun) {
+            Write-Output "bun not found - installing via bun.sh"
+            Invoke-RestMethod https://bun.sh/install.ps1 | Invoke-Expression
+            $bun = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
+          }
+          if (-not (Test-Path $bun)) { throw "bun unavailable (install failed?): $bun" }
+          & $bun --version
+          # @unom is a private Gitea npm registry. The committed web\.npmrc has only the registry
+          # mapping; put the mapping + auth token in the SYSTEM home .npmrc so the token never lands in
+          # the shipped bundle (.output\server\.npmrc stays the clean mapping-only copy).
+          if ($env:REGISTRY_TOKEN) {
+            $rc = Join-Path $env:USERPROFILE '.npmrc'
+            Add-Content -Path $rc -Value '@unom:registry=https://git.unom.io/api/packages/unom/npm/'
+            Add-Content -Path $rc -Value "//git.unom.io/api/packages/unom/npm/:_authToken=$env:REGISTRY_TOKEN"
+          }
           Push-Location web
           & $bun install --frozen-lockfile; if ($LASTEXITCODE) { throw "bun install failed ($LASTEXITCODE)" }
           & $bun run build; if ($LASTEXITCODE) { throw "web build failed ($LASTEXITCODE)" }
           if (Select-String -Path .output\server\index.mjs -Pattern 'Bun\.serve' -Quiet) {
             throw "web build is a bun bundle (Bun.serve) - need the node-server preset"
           }
-          # Externalized @unom SSR deps must be installed inside .output\server (with the registry .npmrc).
+          # Externalized @unom SSR deps must be installed inside .output\server (registry mapping via .npmrc).
           Copy-Item .npmrc .output\server\.npmrc -Force
           Push-Location .output\server; & $bun install; if ($LASTEXITCODE) { throw ".output/server dep install failed ($LASTEXITCODE)" }; Pop-Location
           Pop-Location
