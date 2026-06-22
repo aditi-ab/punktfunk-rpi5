@@ -30,6 +30,10 @@ const IOCTL_ADD: u32 = ctl(0x800);
 const IOCTL_REMOVE: u32 = ctl(0x801);
 const IOCTL_SET_RENDER_ADAPTER: u32 = ctl(0x802);
 const IOCTL_GET_WATCHDOG: u32 = ctl(0x803);
+/// pf-vdisplay extension (NOT in SudoVDA): tear down every monitor. The host issues this on startup to
+/// reap monitors orphaned by a crashed/killed previous host instance. SudoVDA returns invalid for it
+/// (harmlessly ignored), so the host can send it unconditionally.
+const IOCTL_CLEAR_ALL: u32 = ctl(0x804);
 const IOCTL_PING: u32 = ctl(0x888);
 const IOCTL_GET_VERSION: u32 = ctl(0x8FF);
 
@@ -112,6 +116,10 @@ pub extern "C-unwind" fn device_io_control(
             IOCTL_SET_RENDER_ADAPTER => do_set_render_adapter(request, input_len),
             IOCTL_GET_WATCHDOG => do_get_watchdog(request, output_len, &mut bytes),
             IOCTL_PING => NTSTATUS::STATUS_SUCCESS,
+            IOCTL_CLEAR_ALL => {
+                disconnect_all_monitors();
+                NTSTATUS::STATUS_SUCCESS
+            }
             IOCTL_GET_VERSION => do_get_version(request, output_len, &mut bytes),
             _ => NTSTATUS::STATUS_INVALID_DEVICE_REQUEST,
         }

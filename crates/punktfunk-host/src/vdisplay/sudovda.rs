@@ -53,6 +53,9 @@ const IOCTL_ADD: u32 = ctl(0x800);
 const IOCTL_REMOVE: u32 = ctl(0x801);
 const IOCTL_SET_RENDER_ADAPTER: u32 = ctl(0x802); // == 0x0022_2008
 const IOCTL_GET_WATCHDOG: u32 = ctl(0x803);
+/// pf-vdisplay extension (NOT in SudoVDA): tear down every virtual monitor. Sent once on host startup
+/// to reap monitors orphaned by a crashed/killed previous host. SudoVDA returns invalid (ignored).
+const IOCTL_CLEAR_ALL: u32 = ctl(0x804);
 const IOCTL_DRIVER_PING: u32 = ctl(0x888);
 const IOCTL_GET_VERSION: u32 = ctl(0x8FF);
 
@@ -722,10 +725,20 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
         let stop_t = stop.clone();
         let pinger = thread::spawn(move || {
             let h = HANDLE(device_raw as *mut c_void);
+            let mut warned = false;
             while !stop_t.load(Ordering::Relaxed) {
                 let mut none: [u8; 0] = [];
-                unsafe {
-                    let _ = ioctl(h, IOCTL_DRIVER_PING, &[], &mut none);
+                match unsafe { ioctl(h, IOCTL_DRIVER_PING, &[], &mut none) } {
+                    Ok(_) => warned = false,
+                    // A persistently failing PING means the cached control handle went invalid — the
+                    // driver watchdog will then tear the monitor down mid-session. Surface it once
+                    // (the old `let _ =` swallowed it, which masked exactly this during the bad-state churn).
+                    Err(e) => {
+                        if !warned {
+                            tracing::warn!("SudoVDA keepalive PING failed (control handle lost?): {e:#}");
+                            warned = true;
+                        }
+                    }
                 }
                 thread::sleep(interval);
             }
@@ -848,6 +861,16 @@ fn mgr_ensure_device(g: &mut Mgr) -> Result<isize> {
         3
     };
     tracing::info!("SudoVDA watchdog timeout {}s", g.watchdog_s);
+    // Reap monitors orphaned by a crashed/killed previous host instance before we create ours.
+    // pf-vdisplay honors IOCTL_CLEAR_ALL; SudoVDA returns invalid (ignored). Without it an orphan
+    // lingers until the driver watchdog fires — but a still-pinging new session keeps resetting that
+    // watchdog, so orphans could accumulate (the "5-6 stale monitors that never tear down" failure).
+    {
+        let mut none: [u8; 0] = [];
+        if unsafe { ioctl(device, IOCTL_CLEAR_ALL, &[], &mut none) }.is_ok() {
+            tracing::info!("cleared orphaned virtual monitors on host startup");
+        }
+    }
     let raw = device.0 as isize;
     g.device = Some(raw);
     Ok(raw)
