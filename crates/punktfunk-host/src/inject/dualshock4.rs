@@ -258,6 +258,7 @@ impl DualShock4Pad {
         // union (uhid_create2_req) starts at byte 4.
         put_cstr(&mut ev, 4, 128, &format!("Punktfunk DualShock 4 {index}")); // name[128]
         put_cstr(&mut ev, 132, 64, &format!("punktfunk/dualshock4/{index}")); // phys[64]
+
         // A unique uniq[64] keeps the sysfs nodes tidy when several pads coexist (the kernel's
         // duplicate-device check itself keys off the per-pad MAC in the pairing feature report).
         put_cstr(&mut ev, 196, 64, &format!("punktfunk-ds4-{index}")); // uniq[64]
