@@ -60,6 +60,11 @@ see [Status & Progress](/docs/status).
 
 ## 🔭 Planned
 
+- **Magic multi-user support.** Map a connecting client to a real user account on the host and log
+  them in automatically. The client picks an identity — e.g. an **Apple TV profile** — which maps to
+  an available host profile (likely behind a second per-user auth layer); on connect to an idle host,
+  the user lands in *their own* desktop/session, signed in, without touching the host. Turns one box
+  into a personal, profile-aware streaming target for a household.
 - **Sub-frame pipelining.** Overlap encode and transmit within a single frame (a direct NVENC slice
   path) — the next big latency lever at high resolutions.
 - **True glass-to-glass latency** measured end to end (capture → on-screen present).
