@@ -1,0 +1,20 @@
+# cargo-audit configuration — consumed by `.gitea/workflows/audit.yml` (`cargo audit`).
+#
+# Silence only advisories that are KNOWN-UNFIXABLE and either not applicable to how we use the crate
+# or an accepted, documented risk. Keep this list TIGHT and justify every entry — an ignore here
+# means the audit job stops flagging it, so the reasoning must hold up.
+#
+# NOTE: `cargo audit` (no `--deny warnings`) fails only on *vulnerabilities*, not on the
+# `unmaintained` warnings (audiopus_sys / paste / rustls-pemfile). Those are left visible on purpose
+# so we keep getting the maintenance signal — they do not fail CI.
+
+[advisories]
+ignore = [
+    # rsa "Marvin Attack" — a timing sidechannel in RSA *decryption* (PKCS#1 v1.5 padding oracle).
+    # There is NO fixed rsa release (the constant-time rewrite is still unreleased upstream), and rsa
+    # is required for GameStream/Moonlight pairing. Crucially, the host uses rsa ONLY for PKCS#1 v1.5
+    # SIGNING / VERIFYING (gamestream/cert.rs + gamestream/pairing.rs: SigningKey / VerifyingKey /
+    # Signer / Verifier) — it never performs RSA decryption, which is the operation Marvin targets.
+    # So the vulnerable code path is not exercised. Revisit if a fixed rsa ships or we add RSA decrypt.
+    "RUSTSEC-2023-0071",
+]
