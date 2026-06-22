@@ -81,6 +81,19 @@ see [Status & Progress](/docs/status).
 - **gamescope multi-user isolation.** Per-session input and audio so concurrent clients are fully
   independent desktops (the shared-desktop case already works).
 - **Peer-approved pairing.** Approve a new device from an already-paired device's own app.
+- **WAN / anywhere access.** Reach a host beyond the LAN — NAT traversal (ICE/STUN/TURN) plus a
+  self-hostable relay for when no direct path can be punched, and **QUIC connection migration** so a
+  client roams between networks (Wi-Fi ↔ cellular) without dropping the session. The control plane is
+  already QUIC over UDP, so this is mostly signalling and relay rather than a protocol change.
+- **VRR / adaptive-sync passthrough.** Variable refresh end to end — the host renders at a variable
+  rate and the client presents with tearing-control/VRR instead of a fixed cadence, for tear- and
+  judder-free gaming. Builds on the client's presentation-feedback path and the per-session virtual
+  outputs.
+- **Desktop quality-of-life.** The essentials that make remote *work* pleasant, each a new side plane
+  over the existing QUIC datagram channel: bidirectional rich **clipboard sync** (text and images),
+  **multi-monitor streaming** (present the host's several outputs as separate client windows), and
+  **virtual-webcam redirection** (the client's camera shows up as a webcam on the host, so video calls
+  run on the remote machine).
 
 ## ⛔ Parked / blocked
 
