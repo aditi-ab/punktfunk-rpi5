@@ -32,14 +32,28 @@ Stops `PunktfunkHost`, backs up the current binary (`punktfunk-host.exe.bak`), b
 service on the new binary — **with automatic rollback** if the build fails or the new binary
 won't start. The service is down only for the build duration.
 
-## Rebuild + restart the web console
+## Web management console
+
+On an **installed** host (the `setup.exe`) the console is set up automatically — no manual steps.
+The installer bundles the built `.output` server + a portable Node and runs
+`scripts\windows\web-setup.ps1`, which registers the **`PunktfunkWeb`** scheduled task (at boot, as
+SYSTEM, restart-on-failure) running `{app}\web\web-run.cmd` → `node …\.output\server\index.mjs` on
+`:3000`, opens inbound TCP 3000, and writes the login password to
+`%ProgramData%\punktfunk\web-password` (ACL'd to Administrators + SYSTEM). The mgmt bearer token it
+proxies with is the host's own `%ProgramData%\punktfunk\mgmt-token`. Browse `http://<host-ip>:3000`
+and log in with the password the installer shows on its final page. To change it, edit
+`web-password` and re-run the task: `schtasks /run /tn PunktfunkWeb`.
+
+### Rebuild + restart the console (dev box)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\windows\build-web.ps1
 ```
 
 `bun install && bun run build`, installs the externalized server deps into `.output/server`
-(with the `@unom` `.npmrc`), then restarts the `PunktfunkWeb` task and checks `:3000/login`.
+(with the `@unom` `.npmrc`), then restarts the `PunktfunkWeb` task and checks `:3000/login`. Use
+this to iterate on the console against an installed host — `web-setup.ps1` (or a fresh install) is
+what creates the task in the first place.
 
 ## Typical flow after pulling new code
 

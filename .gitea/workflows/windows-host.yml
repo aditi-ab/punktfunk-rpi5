@@ -1,6 +1,7 @@
 # Build the punktfunk Windows HOST as a signed Inno Setup installer and publish it to Gitea's generic
 # package registry, so a Windows GPU box can install the streaming host (SYSTEM service + bundled
-# SudoVDA virtual-display driver) from one signed setup.exe. Runs on the self-hosted Windows runner
+# SudoVDA virtual-display driver + the web management console, run by a scheduled task on a bundled
+# Node) from one signed setup.exe. Runs on the self-hosted Windows runner
 # (host mode; scripts/ci/setup-windows-runner.ps1) — same MSVC/Windows-SDK/LLVM env as windows.yml.
 #
 # Why an installer and not MSIX (like the client): the host installs a LocalSystem SCM service that
@@ -35,7 +36,8 @@ on:
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-core/**'
       - 'packaging/windows/**'
-      - 'scripts/windows/host.env.example'
+      - 'scripts/windows/**'
+      - 'web/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - '.gitea/workflows/windows-host.yml'
@@ -101,6 +103,54 @@ jobs:
             Write-Output "installing Inno Setup via choco"
             choco install innosetup -y --no-progress
           }
+
+      - name: Fetch portable Node runtime (bundled to run the console)
+        shell: pwsh
+        run: |
+          # The installer ships a self-contained node.exe so the web console runs with no system-Node
+          # prerequisite. Pinned LTS (>= 20, matching the punktfunk-web .deb's `nodejs (>= 20)`); the
+          # smoke test below validates the .output bundle runs under exactly this node before shipping.
+          $ver = 'v22.11.0'
+          $url = "https://nodejs.org/dist/$ver/node-$ver-win-x64.zip"
+          New-Item -ItemType Directory -Force -Path C:\t | Out-Null
+          $zip = 'C:\t\node.zip'; $dst = 'C:\t\nodedist'
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+          $node = (Get-ChildItem -Path $dst -Recurse -Filter node.exe | Select-Object -First 1).FullName
+          if (-not $node) { throw "node.exe not found in $url" }
+          "NODE_EXE=$node" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $node --version
+
+      - name: Build + smoke-boot web console (node-server preset)
+        shell: pwsh
+        # Same shape as deb.yml: bun builds the Nitro node-server bundle, node runs it. The installer
+        # then bundles web\.output (handed over via WEB_OUTPUT_DIR) + the node above. bun is on the
+        # runner (per build-web.ps1); @unom packages resolve via bun.lock + web\.npmrc against the
+        # runner's Gitea access.
+        run: |
+          $bun = if (Get-Command bun -ErrorAction SilentlyContinue) { (Get-Command bun).Source } else { 'C:\Users\Public\bun\bin\bun.exe' }
+          if (-not (Test-Path $bun) -and -not (Get-Command $bun -ErrorAction SilentlyContinue)) { throw "bun not found (needed to build the web console)" }
+          Push-Location web
+          & $bun install --frozen-lockfile; if ($LASTEXITCODE) { throw "bun install failed ($LASTEXITCODE)" }
+          & $bun run build; if ($LASTEXITCODE) { throw "web build failed ($LASTEXITCODE)" }
+          if (Select-String -Path .output\server\index.mjs -Pattern 'Bun\.serve' -Quiet) {
+            throw "web build is a bun bundle (Bun.serve) - need the node-server preset"
+          }
+          # Externalized @unom SSR deps must be installed inside .output\server (with the registry .npmrc).
+          Copy-Item .npmrc .output\server\.npmrc -Force
+          Push-Location .output\server; & $bun install; if ($LASTEXITCODE) { throw ".output/server dep install failed ($LASTEXITCODE)" }; Pop-Location
+          Pop-Location
+          # Gate the installer on a real node boot serving /login (the runtime the installer ships).
+          $env:PORT = '3009'; $env:HOST = '127.0.0.1'; $env:PUNKTFUNK_UI_PASSWORD = 'ci'
+          $server = (Resolve-Path 'web\.output\server\index.mjs').Path
+          $p = Start-Process -FilePath $env:NODE_EXE -ArgumentList $server -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 4
+          try { $code = (Invoke-WebRequest -Uri 'http://127.0.0.1:3009/login' -UseBasicParsing -TimeoutSec 10).StatusCode } catch { $code = 0 }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Write-Output "web console smoke: /login -> $code"
+          if ($code -ne 200) { throw "web console failed to boot under node" }
+          "WEB_OUTPUT_DIR=$((Resolve-Path 'web\.output').Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Pack + sign installer
         shell: pwsh

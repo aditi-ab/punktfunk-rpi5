@@ -28,6 +28,14 @@
 #ifndef Readme
   #define Readme "README.md"
 #endif
+; The web console launcher (the PunktfunkWeb task action) + its post-install provisioner — committed
+; scripts staged next to the .iss by pack-host-installer.ps1 (absolute paths passed in).
+#ifndef WebRunCmd
+  #define WebRunCmd "..\..\scripts\windows\web-run.cmd"
+#endif
+#ifndef WebSetup
+  #define WebSetup "..\..\scripts\windows\web-setup.ps1"
+#endif
 ; StageDir (the staged SudoVDA payload + nefconc.exe + install-sudovda.ps1) is optional.
 #ifdef StageDir
   #define WithDriver
@@ -40,6 +48,13 @@
 ; --features amf-qsv (the AMD/Intel AMF/QSV encode backend link-imports the FFmpeg libs).
 #ifdef FfmpegBin
   #define WithFfmpeg
+#endif
+; WebDir (the built web .output tree) + NodeExe (a portable node.exe) are passed together by
+; pack-host-installer.ps1 to bundle the management console. Both required → WithWeb.
+#ifdef WebDir
+  #ifdef NodeExe
+    #define WithWeb
+  #endif
 #endif
 
 [Setup]
@@ -86,6 +101,16 @@ Source: "{#Readme}"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignorevers
 ; only builds simply omit this block.
 Source: "{#FfmpegBin}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 #endif
+#ifdef WithWeb
+; The web management console: the built Nitro/Node SSR bundle (.output = server + public assets) →
+; {app}\web\.output, a portable Node runtime → {app}\node\node.exe, and the launcher the
+; PunktfunkWeb task runs → {app}\web\web-run.cmd. web-setup.ps1 (the provisioner) goes to {tmp} and
+; is removed after install.
+Source: "{#WebDir}\*"; DestDir: "{app}\web\.output"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#NodeExe}"; DestDir: "{app}\node"; DestName: "node.exe"; Flags: ignoreversion
+Source: "{#WebRunCmd}"; DestDir: "{app}\web"; DestName: "web-run.cmd"; Flags: ignoreversion
+Source: "{#WebSetup}"; DestDir: "{tmp}"; DestName: "web-setup.ps1"; Flags: deleteafterinstall
+#endif
 #ifdef WithDriver
 ; The driver payload + nefconc.exe + install-sudovda.ps1, extracted to {tmp} and removed after install.
 Source: "{#StageDir}\*"; DestDir: "{tmp}\sudovda"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installdriver
@@ -114,11 +139,112 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service install"; WorkingDir:
   StatusMsg: "Registering the punktfunk host service..."; Flags: runhidden waituntilterminated
 Filename: "{app}\punktfunk-host.exe"; Parameters: "service start"; WorkingDir: "{app}"; \
   StatusMsg: "Starting the punktfunk host service..."; Flags: runhidden waituntilterminated; Tasks: startservice
+#ifdef WithWeb
+; Provision the console AFTER the host service is up (so the mgmt token exists): write the ACL'd
+; login password, register the PunktfunkWeb scheduled task (boot, SYSTEM, restart-on-failure),
+; open TCP 3000, and start it. {code:WebSetupParams} appends -PasswordFile only on a fresh install.
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\web-setup.ps1"" {code:WebSetupParams}"; \
+  StatusMsg: "Setting up the punktfunk web console..."; Flags: runhidden waituntilterminated
+#endif
 
 [UninstallRun]
 Filename: "{app}\punktfunk-host.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkHostServiceUninstall"
+#ifdef WithWeb
+; Stop + remove the PunktfunkWeb task and its firewall rule (leaves %ProgramData%\punktfunk config,
+; like the host uninstall does).
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Stop-ScheduledTask -TaskName PunktfunkWeb -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName PunktfunkWeb -Confirm:$false -ErrorAction SilentlyContinue; Get-NetFirewallRule -Name 'PunktfunkWeb-TCP-3000' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"""; \
+  Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkWebCleanup"
+#endif
 
 [Code]
+#ifdef WithWeb
+var
+  WebPwPage: TInputQueryWizardPage;
+  FreshWebInstall: Boolean;   { captured at start — web-setup creates the file mid-run }
+
+function WebPasswordPath: String;
+begin
+  Result := ExpandConstant('{commonappdata}\punktfunk\web-password');
+end;
+
+{ Pre-fill the console password field with a crypto-strong default (Inno has no RNG): a one-shot
+  PowerShell writes 12 random bytes as dashed hex; strip the dashes → a 24-char hex password. }
+procedure GenerateRandomWebPassword(var Pw: String);
+var
+  ResultCode: Integer;
+  TmpOut: String;
+  Lines: TArrayOfString;
+begin
+  Pw := '';
+  TmpOut := ExpandConstant('{tmp}\webpwgen.txt');
+  if Exec('powershell.exe',
+      '-NoProfile -ExecutionPolicy Bypass -Command "' +
+      '$b=New-Object byte[] 12;' +
+      '([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($b);' +
+      '[IO.File]::WriteAllText(' + '''' + TmpOut + '''' + ',[System.BitConverter]::ToString($b))"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    if (ResultCode = 0) and LoadStringsFromFile(TmpOut, Lines) and (GetArrayLength(Lines) > 0) then
+    begin
+      Pw := Trim(Lines[0]);
+      StringChangeEx(Pw, '-', '', True);
+    end;
+    DeleteFile(TmpOut);
+  end;
+end;
+
+procedure InitializeWizard;
+var
+  DefaultPw: String;
+begin
+  FreshWebInstall := not FileExists(WebPasswordPath);
+  WebPwPage := CreateInputQueryPage(wpSelectTasks,
+    'Web console', 'Set the punktfunk web console login password',
+    'The management console is served on http://this-computer:3000 and is login-gated. Keep the ' +
+    'secure password generated below (it is shown again on the final page) or enter your own — you ' +
+    'can change it later in %ProgramData%\punktfunk\web-password.');
+  WebPwPage.Add('Console password:', False);   { visible, so the admin can read the generated default }
+  DefaultPw := '';
+  GenerateRandomWebPassword(DefaultPw);
+  WebPwPage.Values[0] := DefaultPw;
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  { On upgrade the password already exists — keep it, don't re-prompt. }
+  Result := (PageID = WebPwPage.ID) and (not FreshWebInstall);
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if (CurPageID = WebPwPage.ID) and (Trim(WebPwPage.Values[0]) = '') then
+  begin
+    MsgBox('Please enter a web console password (it cannot be empty).', mbError, MB_OK);
+    Result := False;
+  end;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and FreshWebInstall then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+      'Web console:  http://<this-PC-IP>:3000' + #13#10 +
+      'Login password:  ' + Trim(WebPwPage.Values[0]);
+end;
+
+function WebSetupParams(Param: String): String;
+begin
+  { Pass the password to web-setup.ps1 via a temp file, not the cmdline (which lands in the install
+    log). Only on a fresh install — on upgrade web-setup keeps the existing file. }
+  Result := '-AppDir "' + ExpandConstant('{app}') + '"';
+  if FreshWebInstall then
+    Result := Result + ' -PasswordFile "' + ExpandConstant('{tmp}\webpw.txt') + '"';
+end;
+#endif
+
 { On upgrade the running service locks punktfunk-host.exe (and the supervisor would respawn it from
   the OLD binary), so stop it and WAIT for STOPPED before files are copied. Best-effort; a fresh
   install is a no-op (the service doesn't exist yet). }
@@ -138,5 +264,12 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
+  begin
     StopHostServiceAndWait;
+#ifdef WithWeb
+    { Stash the chosen password for web-setup.ps1 (fresh install only); {tmp} is auto-cleaned. }
+    if FreshWebInstall then
+      SaveStringToFile(ExpandConstant('{tmp}\webpw.txt'), Trim(WebPwPage.Values[0]), False);
+#endif
+  end;
 end;

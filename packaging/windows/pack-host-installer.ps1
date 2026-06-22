@@ -26,6 +26,8 @@ param(
     [string]$PfxBase64 = $env:MSIX_CERT_PFX_B64,                    # reuse the client's signing secret
     [string]$PfxPassword = $env:MSIX_CERT_PASSWORD,
     [string]$FfmpegDir = $env:FFMPEG_DIR,                           # bundle its bin\*.dll (amf-qsv build)
+    [string]$WebDir = $env:WEB_OUTPUT_DIR,                          # built web .output tree -> bundle the mgmt console
+    [string]$NodeExe = $env:NODE_EXE,                              # portable node.exe (>= 20) runtime for the console
     [switch]$NoDriver,                                              # build without the bundled SudoVDA driver
     [switch]$NoSign                                                 # skip signing (local debug)
 )
@@ -181,6 +183,31 @@ if ($ffmpegBinSrc -and (Test-Path $ffmpegBinSrc)) {
     }
 }
 else { Write-Host "no FFMPEG_DIR\bin -> installer built WITHOUT FFmpeg DLLs (nvenc/software-only host)" }
+
+# --- stage the web management console (the built .output tree + a portable node + the launcher) ---
+# The console runs as the PunktfunkWeb scheduled task (`node {app}\web\.output\server\index.mjs`),
+# auto-wired to the host's loopback mgmt API. Stage everything ISCC reads into $OutDir (the
+# non-WOW64-redirected C:\t area, same reason as the .iss/host.env staging above). Built upstream
+# (windows-host.yml mirrors deb.yml: bun build -> node-server preset + the .output/server deps);
+# omitted when -WebDir/-NodeExe are unset (host-only installer, e.g. a local debug pack).
+if ($WebDir -and (Test-Path $WebDir) -and $NodeExe -and (Test-Path $NodeExe)) {
+    $webStage = Join-Path $OutDir 'web'
+    if (Test-Path $webStage) { Remove-Item $webStage -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $webStage | Out-Null
+    Copy-Item (Join-Path $WebDir '*') -Destination $webStage -Recurse -Force
+    $nodeStage = Join-Path $OutDir 'node.exe'
+    Copy-Item -LiteralPath $NodeExe -Destination $nodeStage -Force
+    $webRun = Join-Path $OutDir 'web-run.cmd'
+    $webSetup = Join-Path $OutDir 'web-setup.ps1'
+    Copy-Item (Join-Path $repoRoot 'scripts\windows\web-run.cmd') -Destination $webRun -Force
+    Copy-Item (Join-Path $repoRoot 'scripts\windows\web-setup.ps1') -Destination $webSetup -Force
+    $defines += "/DWebDir=$webStage"
+    $defines += "/DNodeExe=$nodeStage"
+    $defines += "/DWebRunCmd=$webRun"
+    $defines += "/DWebSetup=$webSetup"
+    Write-Host "bundling the web console from $WebDir (+ node $NodeExe)"
+}
+else { Write-Host "no -WebDir/-NodeExe -> installer built WITHOUT the web console" }
 
 # --- build the installer (from the non-redirected copy under C:\t) -----------------------------
 Write-Host "==> ISCC $($defines -join ' ') $issLocal"
