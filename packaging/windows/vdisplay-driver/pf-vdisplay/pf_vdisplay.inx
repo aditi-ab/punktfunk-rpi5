@@ -1,0 +1,77 @@
+;/*++
+; pf-vdisplay - punktfunk virtual display, UMDF2 IddCx driver INF (template; stampinf -> .inf).
+; Adapted from MolotovCherry/virtual-display-rs (MIT) + SudoVDA's control-device security DACL.
+;--*/
+[Version]
+PnpLockdown=1
+Signature="$Windows NT$"
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+Class=Display
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=pf_vdisplay.cat
+DriverVer=
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%DeviceName%=pf_vdisplay_Install, Root\pf_vdisplay
+
+[SourceDisksFiles]
+pf_vdisplay.dll=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+; =================== UMDF IddCx device ====================
+
+[pf_vdisplay_Install.NT]
+CopyFiles=UMDriverCopy
+
+[pf_vdisplay_Install.NT.hw]
+AddReg=pf_vdisplay_HardwareDeviceSettings
+
+[pf_vdisplay_HardwareDeviceSettings]
+HKR, , "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "pfVDisplayGroup"
+; Let the host (LocalSystem service) + admins open the control device for the ADD/REMOVE/PING IOCTLs.
+HKR, , "Security", , "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
+
+[pf_vdisplay_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[pf_vdisplay_Install.NT.Wdf]
+UmdfService=pf_vdisplay, pf_vdisplay_Install
+UmdfServiceOrder=pf_vdisplay
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfHostProcessSharing=ProcessSharingDisabled
+
+[pf_vdisplay_Install]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%12%\UMDF\pf_vdisplay.dll
+UmdfExtensions=IddCx0102
+
+[WUDFRD_ServiceInstall]
+DisplayName=%WudfRdDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF
+
+[UMDriverCopy]
+pf_vdisplay.dll
+
+[Strings]
+ManufacturerName="punktfunk"
+DiskName="punktfunk Virtual Display Installation Disk"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
+DeviceName="punktfunk Virtual Display"
+
+REG_MULTI_SZ=0x00010000
+REG_SZ=0x00000000
+REG_EXPAND_SZ=0x00020000
+REG_DWORD=0x00010001

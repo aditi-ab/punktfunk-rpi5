@@ -1,0 +1,29 @@
+[package]
+name = "pf-vdisplay"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wdf-umdf-sys = { path = "../wdf-umdf-sys" }
+wdf-umdf = { path = "../wdf-umdf" }
+bytemuck = { version = "1.19", features = ["derive"] }
+thiserror = "2.0"
+anyhow = "1.0"
+log = "0.4"
+
+[dependencies.windows]
+version = "0.58.0"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+]
