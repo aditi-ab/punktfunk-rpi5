@@ -1454,11 +1454,16 @@ pub mod endpoint {
     /// close, while a genuinely dead peer is still detected within `MAX_IDLE`.
     fn stream_transport() -> Arc<quinn::TransportConfig> {
         use std::time::Duration;
-        const MAX_IDLE: Duration = Duration::from_secs(20);
+        // 8s idle (was 20s): a vanished client is declared dead within 8s instead of 20, so its
+        // session tears down promptly — which the Windows IDD-push path needs so a RECONNECT recreates
+        // a fresh virtual monitor (a reused monitor's IddCx swap-chain dies) instead of joining the
+        // still-lingering old session. Active sessions are unaffected: video keeps the connection live,
+        // and the 4s keep-alive holds it open through quiet control periods.
+        const MAX_IDLE: Duration = Duration::from_secs(8);
         const KEEP_ALIVE: Duration = Duration::from_secs(4);
         let mut t = quinn::TransportConfig::default();
         t.max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(MAX_IDLE).expect("20s is a valid QUIC idle timeout"),
+            quinn::IdleTimeout::try_from(MAX_IDLE).expect("8s is a valid QUIC idle timeout"),
         ));
         t.keep_alive_interval(Some(KEEP_ALIVE));
         Arc::new(t)

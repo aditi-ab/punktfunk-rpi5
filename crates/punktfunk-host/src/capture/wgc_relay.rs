@@ -278,6 +278,13 @@ unsafe fn spawn_inner(cmdline: &str, w: u32, h: u32, hz: u32) -> Result<HelperRe
     }
     tracing::info!(pid = pi.dwProcessId, mode = %format!("{w}x{h}@{hz}"), "WGC helper spawned");
 
+    // The helper does the WGC capture + NVENC encode, but it runs under the user's UAC-FILTERED token
+    // (no SE_INC_BASE_PRIORITY), so it can't raise its OWN GPU scheduling-priority class — under a
+    // GPU-saturating game NVENC then gets starved (the "240→40 fps in-game collapse"). The SYSTEM host
+    // holds the privilege, so stamp the HIGH GPU priority class onto the child here, right after spawn
+    // (the process-level class applies to the GPU contexts the helper creates afterwards).
+    crate::capture::dxgi::set_child_gpu_priority_class(pi.hProcess);
+
     // stderr → host tracing, line by line.
     let err_handle = HandleReader(err_r);
     std::thread::Builder::new()

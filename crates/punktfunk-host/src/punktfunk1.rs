@@ -2149,6 +2149,22 @@ fn session_watcher_loop(tx: std::sync::mpsc::Sender<SessionSwitch>, stop: Arc<At
 /// keepalive, the virtual output) while the data-plane `session` continues untouched —
 /// the rebuilt encoder opens with an IDR + in-band parameter sets. `probe_rx`/`probe_result_tx`
 /// carry speed-test bursts (see [`service_probes`]).
+/// The stop flag of the current in-process IDD-push session, so a NEW connection can PREEMPT it.
+/// A fresh connection means the prior client is gone (a reconnect) and a reused IddCx monitor's
+/// swap-chain is dead — so we stop the prior session (it releases its monitor cleanly while frames
+/// still flow), then build a fresh one, instead of joining a dying session or tearing its monitor out
+/// from under it (which churns the driver's ADD/REMOVE path and wedges it under rapid reconnects).
+#[cfg(target_os = "windows")]
+static IDD_SESSION_STOP: std::sync::Mutex<Option<Arc<AtomicBool>>> = std::sync::Mutex::new(None);
+
+/// Serializes IDD-push session SETUP (preempt + monitor create + first frame). Held across setup,
+/// released before the encode loop — so a reconnect FLOOD can never run concurrent monitor
+/// create/teardown (the churn that fails the ADD IOCTL and wedges the driver). Each session finishes
+/// setup before the next acquires this and preempts it, by which point the preempted session is in its
+/// encode loop and releases its monitor promptly.
+#[cfg(target_os = "windows")]
+static IDD_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[allow(clippy::too_many_arguments)]
 fn virtual_stream(
     session: Session,
@@ -2197,9 +2213,30 @@ fn virtual_stream(
         bit_depth,
         "punktfunk/1 virtual display"
     );
+    // IDD-push reconnect preempt: a fresh connection means the prior client is gone. Hold IDD_SETUP_LOCK
+    // across the preempt + pipeline build so a reconnect FLOOD can't run concurrent monitor
+    // create/teardown. Then STOP the prior session (it ends cleanly while its monitor still composites
+    // frames) and WAIT for it to release its monitor, before building a FRESH one — instead of the
+    // driver-churning teardown of a monitor under a still-live session. Register THIS session's stop so
+    // the next reconnect preempts it.
+    #[cfg(target_os = "windows")]
+    let idd_setup_guard = std::env::var_os("PUNKTFUNK_IDD_PUSH")
+        .is_some()
+        .then(|| IDD_SETUP_LOCK.lock().unwrap());
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some() {
+        let prev = IDD_SESSION_STOP.lock().unwrap().replace(stop.clone());
+        if let Some(prev_stop) = prev {
+            prev_stop.store(true, Ordering::SeqCst);
+            crate::vdisplay::sudovda::wait_for_monitor_released(std::time::Duration::from_secs(3));
+        }
+    }
     let mut vd = crate::vdisplay::open(compositor)?;
     let (mut capturer, mut enc, mut frame, mut interval) =
         build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth)?;
+    // Setup done — release the IDD-push setup lock so the next reconnect can begin (and preempt us).
+    #[cfg(target_os = "windows")]
+    drop(idd_setup_guard);
 
     // Windows single-process DDA path (PUNKTFUNK_NO_WGC=1): the SudoVDA virtual display, isolated as the
     // SOLE active output, goes into fullscreen independent-flip (one plane on one display) which Desktop
@@ -2276,6 +2313,17 @@ fn virtual_stream(
     let mut capture_rebuilds: u32 = 0;
     // Last HDR mastering metadata we forwarded — re-sent as 0xCE on change/keyframe (see below).
     let mut last_hdr_meta: Option<punktfunk_core::quic::HdrMeta> = None;
+    // Frames submitted to NVENC but not yet polled (capture_ns, pacing deadline). With a capturer that
+    // hands a fresh output texture per frame, the loop submits N+1 before polling N (pipeline depth > 1),
+    // overlapping the convert/copy of N+1 on the 3D engine with the encode of N on the NVENC ASIC.
+    let mut inflight: std::collections::VecDeque<(u64, std::time::Instant)> =
+        std::collections::VecDeque::new();
+    // Diagnostic: distinguish NEW captured frames (the source produced a fresh frame) from REPEATS (the
+    // loop re-encoded the last frame because `try_latest` had nothing). A low new-frame rate at a high
+    // send rate ⇒ the capture source isn't producing frames (e.g. an IDD virtual display DWM isn't
+    // compositing), NOT an encoder problem. Logged every 2 s when `PUNKTFUNK_PERF`.
+    let (mut diag_new, mut diag_repeat) = (0u64, 0u64);
+    let mut diag_at = std::time::Instant::now();
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
         // Mid-stream session switch (the box flipped Gaming↔Desktop): rebuild the WHOLE backend in
         // place — a different compositor at the SAME client mode — keeping the Session + send thread
@@ -2384,9 +2432,10 @@ fn virtual_stream(
         match capturer.try_latest() {
             Ok(Some(f)) => {
                 frame = f;
+                diag_new += 1;
                 capture_rebuilds = 0; // a delivered frame clears the consecutive-loss counter
             }
-            Ok(None) => {} // no new frame (static desktop / mid-rebuild) — repeat the last frame
+            Ok(None) => diag_repeat += 1, // no new frame (static desktop / mid-rebuild) — repeat the last
             // The capture source died (PipeWire/compositor thread ended, virtual output gone). Rather
             // than tear the whole session down — the client has no reconnect path and would have to
             // cold-restart the handshake — rebuild the pipeline IN PLACE at the current mode, exactly
@@ -2411,6 +2460,18 @@ fn virtual_stream(
                 next = std::time::Instant::now();
             }
         }
+        if perf && diag_at.elapsed() >= std::time::Duration::from_secs(2) {
+            let secs = diag_at.elapsed().as_secs_f64();
+            tracing::info!(
+                new_fps = format!("{:.0}", diag_new as f64 / secs),
+                repeat_fps = format!("{:.0}", diag_repeat as f64 / secs),
+                "capture diag: NEW frames from the source vs REPEATS (low new_fps at high send rate ⇒ \
+                 the source isn't producing frames, not an encode stall)"
+            );
+            diag_new = 0;
+            diag_repeat = 0;
+            diag_at = std::time::Instant::now();
+        }
         // The source's static HDR mastering metadata (Windows GetDesc1; None on Linux/SDR) is the
         // single source of truth: hand it to the encoder (in-band SEI on keyframes) and, when it
         // changes, to the client (0xCE). Re-sent on each keyframe below so a dropped best-effort
@@ -2421,13 +2482,26 @@ fn virtual_stream(
         if resend_meta {
             last_hdr_meta = hdr_meta;
         }
+        // How deep to pipeline (1 = synchronous submit→poll, the original behaviour). The IDD-push
+        // capturer hands a rotating ring of output textures, so it returns >1; other capturers default 1.
+        let depth = capturer.pipeline_depth().max(1);
         let capture_ns = now_ns();
         enc.submit(&frame).context("encoder submit")?;
-        // The deadline for this frame's packets (the next frame's due time); the send thread paces
-        // up to here so a high-bitrate frame spreads over the interval instead of bursting.
+        // This frame's pacing deadline (the next frame's due time); the send thread spreads a big frame
+        // up to here. Each in-flight frame carries its own (capture_ns, deadline) for when it's polled.
         next += interval;
+        inflight.push_back((capture_ns, next));
+        // Drain the OLDEST in-flight frames, keeping at most depth-1 deferred. At depth 1 this polls
+        // immediately after every submit (synchronous); at depth 2 it polls N right after submitting N+1,
+        // so the encode of N overlaps the convert/copy of N+1. NVENC's `pending` is FIFO, so poll() returns
+        // the oldest submitted frame's AU — matching `inflight.pop_front()`.
         let mut send_gone = false;
-        while let Some(au) = enc.poll().context("encoder poll")? {
+        while inflight.len() >= depth {
+            let au = match enc.poll().context("encoder poll")? {
+                Some(au) => au,
+                None => break, // no AU ready for a submitted frame (shouldn't happen — poll blocks)
+            };
+            let (cap_ns, deadline) = inflight.pop_front().expect("inflight non-empty");
             let flags = if au.keyframe {
                 (FLAG_PIC | FLAG_SOF) as u32
             } else {
@@ -2442,12 +2516,12 @@ fn virtual_stream(
                     resend_meta = false;
                 }
             }
-            let encode_us = (now_ns().saturating_sub(capture_ns) / 1000) as u32;
+            let encode_us = (now_ns().saturating_sub(cap_ns) / 1000) as u32;
             let msg = FrameMsg {
                 data: au.data,
-                capture_ns,
+                capture_ns: cap_ns,
                 flags,
-                deadline: next,
+                deadline,
                 encode_us,
             };
             // Hand to the send thread; this blocks (backpressure) if it's behind. An Err means it
@@ -2466,6 +2540,28 @@ fn virtual_stream(
             None => next = std::time::Instant::now(),
         }
     }
+    // Drain the in-flight tail (the depth-1 frames submitted but not yet polled) so the last frames still
+    // reach the client instead of being dropped on the way out.
+    while let Some((cap_ns, deadline)) = inflight.pop_front() {
+        let Ok(Some(au)) = enc.poll() else { break };
+        let flags = if au.keyframe {
+            (FLAG_PIC | FLAG_SOF) as u32
+        } else {
+            FLAG_PIC as u32
+        };
+        let encode_us = (now_ns().saturating_sub(cap_ns) / 1000) as u32;
+        let msg = FrameMsg {
+            data: au.data,
+            capture_ns: cap_ns,
+            flags,
+            deadline,
+            encode_us,
+        };
+        if frame_tx.send(msg).is_err() {
+            break;
+        }
+        sent += 1;
+    }
     // Signal the send thread to drain + exit (drop the channel), then join it.
     drop(frame_tx);
     let _ = send_thread.join();
@@ -2482,6 +2578,14 @@ fn virtual_stream(
 #[cfg(target_os = "windows")]
 fn should_use_helper() -> bool {
     if std::env::var_os("PUNKTFUNK_NO_HELPER").is_some() || crate::capture::wgc_disabled() {
+        return false;
+    }
+    // IDD direct-push captures IN-PROCESS in Session 0: the pf-vdisplay driver delivers frames to the
+    // SYSTEM host's session via shared memory and NVENC is headless, so no user-session WGC helper is
+    // needed for VIDEO (and a Session-1 helper couldn't open the Session-0 shared textures anyway).
+    // NOTE: input injection (SendInput) from Session 0 can't reach the user's Session-1 desktop yet —
+    // a known follow-up; this path validates the video transport. See docs/windows-virtual-display-rust-port.md.
+    if std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some() {
         return false;
     }
     std::env::var_os("PUNKTFUNK_FORCE_HELPER").is_some()
@@ -2575,6 +2679,15 @@ fn virtual_stream_relay(
 
     let (mut _keepalive, mut relay, mut target, mut effective_hz) = build(&mut vd, mode)?;
     let mut cur_mode = mode;
+
+    // O3.1: optionally observe the IDD-push ring alongside WGC (WGC = the presentation trigger) to
+    // confirm the 0257 driver pushes frames into a HOST-created ring. Diagnostic only; gated.
+    if std::env::var_os("PUNKTFUNK_IDD_PUSH_OBSERVE").is_some() {
+        crate::capture::idd_push::spawn_observer(
+            target.clone(),
+            Some((cur_mode.width, cur_mode.height, effective_hz)),
+        );
+    }
 
     // The host's own DDA capturer+encoder for the SECURE (Winlogon) desktop, which WGC — and thus the
     // helper — cannot capture. Opened lazily on the first secure transition (so a session that never
@@ -3014,8 +3127,12 @@ fn build_pipeline(
             "compositor did not honor the requested refresh — encoding at the achieved rate"
         );
     }
-    let mut capturer =
-        crate::capture::capture_virtual_output(vout).context("capture virtual output")?;
+    // HDR vs SDR for the IDD-push conversion: a negotiated 10-bit session (client advertised
+    // VIDEO_CAP_10BIT + host opted in via PUNKTFUNK_10BIT) is our HDR path → BT.2020 PQ Rgb10a2;
+    // otherwise the FP16 IDD frames are converted to 8-bit SDR. (Ignored by non-IDD-push backends,
+    // which auto-detect HDR from the monitor state.)
+    let mut capturer = crate::capture::capture_virtual_output(vout, bit_depth >= 10)
+        .context("capture virtual output")?;
     capturer.set_active(true);
     let frame = capturer.next_frame().context("first frame")?;
     // `bit_depth` is the handshake-negotiated value (8, or 10 = HEVC Main10 when the client

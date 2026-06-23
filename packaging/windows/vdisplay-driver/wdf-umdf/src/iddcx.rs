@@ -7,7 +7,8 @@ use wdf_umdf_sys::{
     IDARG_IN_ADAPTERSETRENDERADAPTER, IDARG_IN_ADAPTER_INIT, IDARG_IN_MONITORCREATE,
     IDARG_IN_QUERY_HWCURSOR, IDARG_IN_SETUP_HWCURSOR, IDARG_IN_SWAPCHAINSETDEVICE,
     IDARG_OUT_ADAPTER_INIT, IDARG_OUT_MONITORARRIVAL, IDARG_OUT_MONITORCREATE,
-    IDARG_OUT_QUERY_HWCURSOR, IDARG_OUT_RELEASEANDACQUIREBUFFER, IDDCX_ADAPTER, IDDCX_MONITOR,
+    IDARG_IN_RELEASEANDACQUIREBUFFER2, IDARG_OUT_QUERY_HWCURSOR, IDARG_OUT_RELEASEANDACQUIREBUFFER,
+    IDARG_OUT_RELEASEANDACQUIREBUFFER2, IDDCX_ADAPTER, IDDCX_MONITOR,
     IDDCX_SWAPCHAIN, IDD_CX_CLIENT_CONFIG, NTSTATUS, WDFDEVICE, WDFDEVICE_INIT,
 };
 
@@ -231,6 +232,30 @@ pub unsafe fn IddCxSwapChainReleaseAndAcquireBuffer(
         true,
         IddCxSwapChainReleaseAndAcquireBuffer(
             SwapChainObject,
+            pOutArgs
+        )
+    )
+}
+
+/// IddCx 1.10 HDR variant — required once the adapter sets `CAN_PROCESS_FP16`. Provides per-frame
+/// `IDDCX_METADATA2` (surface colour space, HDR metadata, SDR white level).
+///
+/// # Safety
+/// None. User is responsible for safety.
+#[rustfmt::skip]
+pub unsafe fn IddCxSwapChainReleaseAndAcquireBuffer2(
+    // in
+    SwapChainObject: IDDCX_SWAPCHAIN,
+    // in
+    pInArgs: &mut IDARG_IN_RELEASEANDACQUIREBUFFER2,
+    // out
+    pOutArgs: &mut IDARG_OUT_RELEASEANDACQUIREBUFFER2
+) -> Result<NTSTATUS, IddCxError> {
+    IddCxCall!(
+        true,
+        IddCxSwapChainReleaseAndAcquireBuffer2(
+            SwapChainObject,
+            pInArgs,
             pOutArgs
         )
     )

@@ -9,8 +9,25 @@
 
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
+
+/// Monotonic monitor generation. Each [`create_monitor`] stamps the next value onto the [`Monitor`]
+/// and its [`MonitorLease`]s, so a lease whose monitor was already torn down + recreated (the IDD-push
+/// reconnect-preempt path) is ignored on drop instead of decrementing the NEW monitor's refcount.
+static MON_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// The gen of the CURRENTLY-active monitor. A session capturer captures this at open and re-checks it
+/// each frame; when it changes (a reconnect preempted + recreated the monitor), the old session bails
+/// IMMEDIATELY instead of lingering on the dead ring's 20s frame deadline — which would otherwise hold
+/// its NVENC encoder open and exhaust the GPU's encode-session limit under rapid reconnects.
+pub(crate) static CURRENT_MON_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// IDD-push mode: a new client connection preempts + recreates the monitor (single-client reconnect),
+/// because a REUSED IddCx monitor's swap-chain is dead. Off → monitors are shared across sessions.
+fn idd_push_mode() -> bool {
+    std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some()
+}
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,7 +44,8 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
     DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
     DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-    QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_FORCE_MODE_ENUMERATION,
+    SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Graphics::Gdi::{
@@ -119,7 +137,9 @@ unsafe fn set_render_adapter(h: HANDLE, luid: LUID) -> Result<()> {
 /// Desktop Duplication (e.g. the RTX 4090). Default: the discrete adapter with the most
 /// `DedicatedVideoMemory`, skipping WARP / Basic-Render and the SudoVDA software adapter (≈0 VRAM).
 /// `PUNKTFUNK_RENDER_ADAPTER=<substring>` forces a match by Description (Apollo's `adapter_name`).
-unsafe fn resolve_render_adapter_luid() -> Option<LUID> {
+/// `pub(crate)` so the IDD direct-push capturer can create its shared textures on the same discrete
+/// GPU it pins here (and where NVENC runs).
+pub(crate) unsafe fn resolve_render_adapter_luid() -> Option<LUID> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
     let want = std::env::var("PUNKTFUNK_RENDER_ADAPTER")
         .ok()
@@ -497,13 +517,32 @@ unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedConfig> {
         }
     }
     if others == 0 {
-        tracing::info!("display isolate (CCD): SudoVDA target {keep_target_id} already the only active display");
+        // The virtual path shows active in the CCD database (from set_active_mode's legacy
+        // ChangeDisplaySettingsExW), but a legacy mode-set does NOT drive the IddCx adapter's
+        // EVT_IDD_CX_ADAPTER_COMMIT_MODES — and without COMMIT_MODES the OS never calls
+        // ASSIGN_SWAPCHAIN, so the driver never receives composed frames. Force an explicit CCD
+        // SetDisplayConfig commit of the (sole) virtual path so the IddCx path actually activates.
+        // SDC_FORCE_MODE_ENUMERATION makes the OS re-enumerate + re-commit even though the CCD DB
+        // already lists the path active.
+        let rc = SetDisplayConfig(
+            Some(paths.as_slice()),
+            Some(modes.as_slice()),
+            SDC_APPLY
+                | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+                | SDC_ALLOW_CHANGES
+                | SDC_SAVE_TO_DATABASE
+                | SDC_FORCE_MODE_ENUMERATION,
+        );
+        tracing::info!("display isolate (CCD): forced CCD re-commit of sole virtual path {keep_target_id} rc={rc:#x} (drives IddCx COMMIT_MODES → ASSIGN_SWAPCHAIN)");
         return Some(saved);
     }
     let rc = SetDisplayConfig(
         Some(paths.as_slice()),
         Some(modes.as_slice()),
-        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
+        SDC_APPLY
+            | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+            | SDC_ALLOW_CHANGES
+            | SDC_FORCE_MODE_ENUMERATION,
     );
     if rc == 0 {
         tracing::info!("display isolate (CCD): deactivated {others} other display(s) — SudoVDA target {keep_target_id} is now the sole desktop");
@@ -587,6 +626,8 @@ struct Monitor {
     stop: Arc<AtomicBool>,
     pinger: Option<JoinHandle<()>>,
     ccd_saved: Option<SavedConfig>,
+    /// Generation stamp ([`MON_GEN`]); a [`MonitorLease`] only releases if its gen still matches.
+    gen: u64,
 }
 
 enum MgrState {
@@ -670,6 +711,14 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
         // PUNKTFUNK_RENDER_ADAPTER=<name substring> only on a box that genuinely needs steering.
         let pinned = if std::env::var("PUNKTFUNK_RENDER_ADAPTER").is_ok() {
             unsafe { resolve_render_adapter_luid() }
+        } else if std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some() {
+            // P2 direct frame push: the host opens the driver's shared textures AND runs NVENC on the
+            // RENDER adapter, so on a hybrid box (4090 + iGPU) it MUST be the discrete encoder GPU —
+            // an iGPU-rendered surface is untouchable by NVENC. pf-vdisplay HONORS SET_RENDER_ADAPTER
+            // (SudoVDA ignored it), so pin the discrete GPU. The driver also reports the resulting
+            // render LUID in the shared header, so the host binds correctly even if this is overridden.
+            tracing::info!("IDD push: pinning the discrete render GPU (SET_RENDER_ADAPTER)");
+            unsafe { resolve_render_adapter_luid() }
         } else {
             tracing::info!(
                 "SudoVDA SET_RENDER_ADAPTER skipped (Apollo-parity: no render pin — avoids cross-GPU \
@@ -735,7 +784,9 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
                     // (the old `let _ =` swallowed it, which masked exactly this during the bad-state churn).
                     Err(e) => {
                         if !warned {
-                            tracing::warn!("SudoVDA keepalive PING failed (control handle lost?): {e:#}");
+                            tracing::warn!(
+                                "SudoVDA keepalive PING failed (control handle lost?): {e:#}"
+                            );
                             warned = true;
                         }
                     }
@@ -796,6 +847,7 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
             stop,
             pinger: Some(pinger),
             ccd_saved,
+            gen: MON_GEN.fetch_add(1, Ordering::Relaxed),
         })
     }
 }
@@ -894,6 +946,39 @@ fn mgr_acquire(mode: Mode) -> Result<VirtualOutput> {
     let device = mgr_ensure_device(&mut g)?;
     let watchdog_s = g.watchdog_s;
 
+    // IDD-push: a new connection while a monitor is live = a single-client RECONNECT (the prior client
+    // is gone — IDD-push is one display, no concurrency). A REUSED IddCx monitor's swap-chain is DEAD,
+    // so joining it would hand the new client a black screen until the old session times out. PREEMPT:
+    // tear the old monitor down (its Drop restores topology + IOCTL_REMOVEs) and fall through to create
+    // a FRESH one. The old session's lease is gen-stamped, so its later drop is ignored (mgr_release
+    // no-op) and can't tear down the new monitor.
+    if idd_push_mode()
+        && matches!(
+            g.state,
+            MgrState::Active { .. } | MgrState::Lingering { .. }
+        )
+    {
+        if let MgrState::Active { mon, .. } | MgrState::Lingering { mon, .. } =
+            std::mem::replace(&mut g.state, MgrState::Idle)
+        {
+            tracing::info!(
+                old_target = mon.target_id,
+                "IDD-push reconnect — preempting the prior session, recreating a fresh monitor"
+            );
+            // teardown() — NOT drop() — sends IOCTL_REMOVE (and restores topology). `Monitor` has NO
+            // `Drop` impl, so a bare `drop(mon)` orphaned the IddCx monitor in the driver: it was never
+            // departed, so it kept a live D3D device + a stuck swap-chain processor thread, and these
+            // accumulated every reconnect (the driver-side churn leak: +1 device, ~36 nvwgf2umx threads,
+            // ~50 MB VRAM per session, until it choked). teardown frees it via the driver's do_remove.
+            unsafe { mon.teardown(device) };
+            // Let the OS finish the ASYNC IddCx monitor departure before the next ADD. A back-to-back
+            // REMOVE→ADD races the teardown and the ADD IOCTL is rejected (`DeviceIoControl failed`)
+            // under reconnect churn. Held under the MGR lock, but IDD-push setup is already serialized
+            // (IDD_SETUP_LOCK), so this only paces the recreate — exactly what a reconnect flood needs.
+            thread::sleep(Duration::from_millis(400));
+        }
+    }
+
     // A live monitor already exists — join it (refcount++). This covers a concurrent session AND the
     // build-then-drop overlap of a mid-stream Reconfigure / secure-return (the new lease is taken while
     // the old is still held). If the requested mode differs, reconfigure the shared monitor to it so a
@@ -912,11 +997,13 @@ fn mgr_acquire(mode: Mode) -> Result<VirtualOutput> {
         );
         let pm = Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz));
         let target = mon.target();
+        let gen = mon.gen;
+        CURRENT_MON_GEN.store(gen, Ordering::Relaxed);
         return Ok(VirtualOutput {
             node_id: 0,
             preferred_mode: pm,
             win_capture: target,
-            keepalive: Box::new(MonitorLease),
+            keepalive: Box::new(MonitorLease { gen }),
         });
     }
 
@@ -937,12 +1024,14 @@ fn mgr_acquire(mode: Mode) -> Result<VirtualOutput> {
     };
     let pm = Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz));
     let target = mon.target();
+    let gen = mon.gen;
+    CURRENT_MON_GEN.store(gen, Ordering::Relaxed);
     g.state = MgrState::Active { mon, refs: 1 };
     Ok(VirtualOutput {
         node_id: 0,
         preferred_mode: pm,
         win_capture: target,
-        keepalive: Box::new(MonitorLease),
+        keepalive: Box::new(MonitorLease { gen }),
     })
 }
 
@@ -966,8 +1055,18 @@ unsafe fn mgr_reconfigure(mon: &mut Monitor, mode: Mode) {
 }
 
 /// Release a session's hold: refcount-- ; when the last session leaves, LINGER before teardown.
-fn mgr_release() {
+/// `gen` is the lease's monitor generation: a STALE lease (its monitor was already torn down +
+/// recreated under it — the IDD-push reconnect-preempt path) does nothing, so it can't decrement the
+/// CURRENT (fresh) monitor's refcount and tear it down.
+fn mgr_release(gen: u64) {
     let mut g = MGR.lock().unwrap();
+    let stale = match &g.state {
+        MgrState::Active { mon, .. } | MgrState::Lingering { mon, .. } => mon.gen != gen,
+        MgrState::Idle => true,
+    };
+    if stale {
+        return;
+    }
     g.state = match std::mem::replace(&mut g.state, MgrState::Idle) {
         MgrState::Active { mon, refs } if refs > 1 => MgrState::Active {
             mon,
@@ -986,6 +1085,28 @@ fn mgr_release() {
         }
         other => other,
     };
+}
+
+/// Wait (up to `timeout`) for the active monitor to be RELEASED — i.e. the MGR is no longer `Active`
+/// (the prior session dropped its lease → `Lingering`/`Idle`). Used by the IDD-push reconnect preempt:
+/// after signalling the old session to stop, we wait here so it tears its monitor down CLEANLY (while
+/// frames still flow) before we acquire a fresh one — instead of dropping the monitor out from under a
+/// still-live session, which churns the driver's ADD/REMOVE path and wedges it under rapid reconnects.
+pub(crate) fn wait_for_monitor_released(timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !matches!(MGR.lock().unwrap().state, MgrState::Active { .. }) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "IDD-push preempt: prior session didn't release the monitor within {timeout:?} — \
+                 proceeding (mgr_acquire will preempt it)"
+            );
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Background timer (started once): tear down a monitor that has lingered past its deadline (→ Idle),
@@ -1012,11 +1133,15 @@ fn ensure_linger_timer() {
     });
 }
 
-/// A session's lease on the shared monitor. Drop releases the refcount (→ linger when it hits 0).
-struct MonitorLease;
+/// A session's lease on the shared monitor. Drop releases the refcount (→ linger when it hits 0),
+/// UNLESS the monitor was already torn down + recreated under it (gen mismatch — the IDD-push
+/// reconnect-preempt path), in which case the drop is a no-op so it can't tear down the new monitor.
+struct MonitorLease {
+    gen: u64,
+}
 impl Drop for MonitorLease {
     fn drop(&mut self) {
-        mgr_release();
+        mgr_release(self.gen);
     }
 }
 

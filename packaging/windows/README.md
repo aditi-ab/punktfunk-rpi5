@@ -55,10 +55,11 @@ read it from `%ProgramData%\punktfunk\web-password`.
 
 ## Prerequisites on the target box
 
-- An **NVIDIA GPU + driver** — the installer's exe is built `--features nvenc` and load-depends on the
-  driver's `nvEncodeAPI64.dll`.
-- **ViGEmBus** (optional) for virtual gamepads — still a manual prerequisite (not bundled yet):
-  <https://github.com/nefarius/ViGEmBus/releases>.
+- A **GPU for hardware encode**: an NVIDIA GPU + driver (NVENC), or an AMD/Intel GPU (AMF/QSV) — the
+  exe is built `--features nvenc,amf-qsv`. Software H.264 is the GPU-less fallback.
+- **Virtual gamepads need no prerequisite.** The DualSense / DualShock 4 / Xbox 360 (XUSB) UMDF drivers
+  are **bundled** in the installer (the *Install the virtual gamepad drivers* task) and
+  `pnputil`-installed. **ViGEmBus is no longer used.**
 
 ## Files here
 

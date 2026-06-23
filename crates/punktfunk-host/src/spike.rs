@@ -76,7 +76,7 @@ pub fn run(opts: Options) -> Result<()> {
                     refresh_hz: opts.fps,
                 })
                 .context("create virtual output")?;
-            capture::capture_virtual_output(vout).context("capture virtual output")?
+            capture::capture_virtual_output(vout, false).context("capture virtual output")?
         }
     };
 

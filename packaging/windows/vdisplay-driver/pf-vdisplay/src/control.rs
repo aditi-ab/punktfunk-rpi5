@@ -6,8 +6,9 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{error, info};
 use wdf_umdf::{
@@ -16,7 +17,7 @@ use wdf_umdf::{
 };
 use wdf_umdf_sys::{IDARG_IN_ADAPTERSETRENDERADAPTER, LUID, NTSTATUS, WDFDEVICE, WDFREQUEST};
 
-use crate::context::DeviceContext;
+use crate::context::{DeviceContext, MonitorContext};
 use crate::monitor::{
     default_modes, Mode, MonitorData, MonitorObject, ADAPTER, MONITOR_MODES, NEXT_ID,
     PREFERRED_RENDER_ADAPTER, PROTOCOL_VERSION, WATCHDOG_COUNTDOWN, WATCHDOG_TIMEOUT,
@@ -36,6 +37,16 @@ const IOCTL_GET_WATCHDOG: u32 = ctl(0x803);
 const IOCTL_CLEAR_ALL: u32 = ctl(0x804);
 const IOCTL_PING: u32 = ctl(0x888);
 const IOCTL_GET_VERSION: u32 = ctl(0x8FF);
+
+/// Serializes monitor lifecycle ops — ADD / REMOVE / watchdog-teardown — against each other. Without
+/// it, a watchdog expiry can drain an entry out from under an in-flight `do_add` (which releases the
+/// `MONITOR_MODES` lock before the slow `create_monitor`), leaving `do_add` to return
+/// `STATUS_UNSUCCESSFUL` → the host sees `ERROR_GEN_FAILURE`. This was the reconnect-churn fault.
+static MONITOR_OP_LOCK: Mutex<()> = Mutex::new(());
+/// A monitor created less than this ago is still in its host-side setup window (CCD commit + GDI-name
+/// resolve + topology settle, ~5 s) and is never reaped by the watchdog — only by an explicit
+/// CLEAR_ALL. Protects a freshly-born monitor from a transient PING gap during reconnect churn.
+const MONITOR_GRACE: Duration = Duration::from_secs(6);
 
 #[repr(C)]
 struct AddParams {
@@ -117,7 +128,7 @@ pub extern "C-unwind" fn device_io_control(
             IOCTL_GET_WATCHDOG => do_get_watchdog(request, output_len, &mut bytes),
             IOCTL_PING => NTSTATUS::STATUS_SUCCESS,
             IOCTL_CLEAR_ALL => {
-                disconnect_all_monitors();
+                disconnect_all_monitors(true);
                 NTSTATUS::STATUS_SUCCESS
             }
             IOCTL_GET_VERSION => do_get_version(request, output_len, &mut bytes),
@@ -136,6 +147,11 @@ unsafe fn do_add(
     output_len: usize,
     bytes: &mut usize,
 ) -> NTSTATUS {
+    // Serialize the whole ADD (push entry → create_monitor → verify) against the watchdog teardown +
+    // REMOVE, so an expiry can never drain this entry mid-flight. `create_monitor` is fast (the slow
+    // CCD/GDI work is host-side, after this returns), and PING/GET_WATCHDOG don't take this lock, so
+    // the host keeps the watchdog reset while we hold it.
+    let _op = MONITOR_OP_LOCK.lock().unwrap();
     if input_len < size_of::<AddParams>() || output_len < size_of::<AddOut>() {
         return NTSTATUS::STATUS_BUFFER_TOO_SMALL;
     }
@@ -182,6 +198,7 @@ unsafe fn do_add(
         target_id: 0,
         adapter_luid_low: 0,
         adapter_luid_high: 0,
+        created_at: Instant::now(),
     });
 
     // Create the IddCx monitor via the device context (captures target id + LUID into the entry).
@@ -226,18 +243,37 @@ unsafe fn do_remove(request: WDFREQUEST, input_len: usize) -> NTSTATUS {
     let params = unsafe { &*pin.cast::<RemoveParams>() };
     let guid = guid_key(&params.guid);
 
-    let mut lock = MONITOR_MODES.lock().unwrap();
-    if let Some(pos) = lock.iter().position(|m| m.guid == guid) {
-        let mon = lock.remove(pos);
-        if let Some(obj) = mon.object {
-            if let Err(e) = unsafe { IddCxMonitorDeparture(obj.as_ptr()) } {
-                error!("REMOVE: departure failed: {e:?}");
-            }
+    // Serialize against ADD + watchdog teardown (lock order: OP_LOCK → MONITOR_MODES).
+    let _op = MONITOR_OP_LOCK.lock().unwrap();
+    let mon = {
+        let mut lock = MONITOR_MODES.lock().unwrap();
+        match lock.iter().position(|m| m.guid == guid) {
+            Some(pos) => lock.remove(pos),
+            None => return NTSTATUS::STATUS_NOT_FOUND,
         }
-        info!("REMOVE target_id={}", mon.target_id);
-        NTSTATUS::STATUS_SUCCESS
-    } else {
-        NTSTATUS::STATUS_NOT_FOUND
+        // MONITOR_MODES released here — the processor-join + departure below must not hold it.
+    };
+    if let Some(obj) = mon.object {
+        free_swap_chain_processor(obj.as_ptr());
+        if let Err(e) = unsafe { IddCxMonitorDeparture(obj.as_ptr()) } {
+            error!("REMOVE: departure failed: {e:?}");
+        }
+    }
+    info!("REMOVE target_id={}", mon.target_id);
+    NTSTATUS::STATUS_SUCCESS
+}
+
+/// Drop a monitor's live swap-chain processor BEFORE departure. The WDF context is an
+/// `Arc<RwLock<MonitorContext>>` that WDF frees WITHOUT running Rust `Drop` (no `EvtCleanupCallback`
+/// is wired), and the OS does not reliably call UNASSIGN on a host-initiated departure — so the
+/// streaming `Direct3DDevice` (its ~dozens of D3D worker threads + tens of MB of VRAM) was orphaned
+/// once per session, the dominant reconnect-churn leak. `get_mut` takes the context `RwLock`, so this
+/// is safe against a concurrent OS unassign callback (whichever runs second sees `None`).
+fn free_swap_chain_processor(monitor: *mut wdf_umdf_sys::IDDCX_MONITOR__) {
+    // SAFETY: `monitor` is a live IddCx monitor object whose context was init'd at creation.
+    let r = unsafe { MonitorContext::get_mut(monitor.cast(), |ctx| ctx.unassign_swap_chain()) };
+    if let Err(e) = r {
+        error!("free_swap_chain_processor: get_mut FAILED: {e:?}");
     }
 }
 
@@ -295,20 +331,44 @@ unsafe fn do_get_version(request: WDFREQUEST, output_len: usize, bytes: &mut usi
     NTSTATUS::STATUS_SUCCESS
 }
 
-/// Tear down every monitor (watchdog expiry — the host is gone). Mirrors SudoVDA's DisconnectAllMonitors.
-fn disconnect_all_monitors() {
-    let mut lock = MONITOR_MODES.lock().unwrap();
-    if lock.is_empty() {
-        return;
-    }
-    for mon in lock.drain(..) {
+/// Tear down monitors. `force` (CLEAR_ALL) reaps EVERYTHING — orphans from a crashed previous host;
+/// the watchdog passes `false`, which spares any monitor still inside its creation grace
+/// (`MONITOR_GRACE`) so a freshly-born monitor is never reaped mid-setup. Caller MUST hold
+/// `MONITOR_OP_LOCK` (lock order: OP_LOCK → MONITOR_MODES). Mirrors SudoVDA's DisconnectAllMonitors.
+fn disconnect_all_monitors_locked(force: bool) {
+    // Drain under the lock (fast); free processors + depart OUTSIDE it (the processor-join blocks).
+    let to_depart: Vec<MonitorObject> = {
+        let mut lock = MONITOR_MODES.lock().unwrap();
+        if lock.is_empty() {
+            return;
+        }
+        let mut keep: Vec<MonitorObject> = Vec::new();
+        let mut depart: Vec<MonitorObject> = Vec::new();
+        for mon in lock.drain(..) {
+            if !force && mon.created_at.elapsed() < MONITOR_GRACE {
+                keep.push(mon); // still in its host-side setup window — leave it alone
+            } else {
+                depart.push(mon);
+            }
+        }
+        *lock = keep;
+        depart
+    };
+    for mon in to_depart {
         if let Some(obj) = mon.object {
+            free_swap_chain_processor(obj.as_ptr());
             // SAFETY: `obj` is a live IddCx monitor object.
             if let Err(e) = unsafe { IddCxMonitorDeparture(obj.as_ptr()) } {
-                error!("watchdog: monitor departure failed: {e:?}");
+                error!("teardown: monitor departure failed: {e:?}");
             }
         }
     }
+}
+
+/// Public entry: takes `MONITOR_OP_LOCK`, then tears down. Used by CLEAR_ALL (`force = true`).
+fn disconnect_all_monitors(force: bool) {
+    let _op = MONITOR_OP_LOCK.lock().unwrap();
+    disconnect_all_monitors_locked(force);
 }
 
 /// Start the watchdog thread (once). The host reads the timeout via GET_WATCHDOG and PINGs every
@@ -340,8 +400,14 @@ pub fn start_watchdog() {
             .is_ok()
             && prev - 1 == 0
         {
-            error!("watchdog expired (host stopped pinging) — tearing down all monitors");
-            disconnect_all_monitors();
+            // About to fire. Serialize against do_add/do_remove (so we never tear an entry out from
+            // under an in-flight ADD), then RE-CHECK the countdown under the lock: if a concurrent
+            // IOCTL (PING/ADD) reset it while we were acquiring the lock, the host is alive — abort.
+            let _op = MONITOR_OP_LOCK.lock().unwrap();
+            if WATCHDOG_COUNTDOWN.load(Ordering::Relaxed) == 0 {
+                error!("watchdog expired (host stopped pinging) — tearing down stale monitors");
+                disconnect_all_monitors_locked(false);
+            }
         }
     });
 }

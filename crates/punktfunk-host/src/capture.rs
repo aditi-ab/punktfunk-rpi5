@@ -142,6 +142,16 @@ pub trait Capturer: Send {
     fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
         None
     }
+
+    /// How many frames the encode loop may keep in flight (submitted but not yet polled) before it
+    /// blocks. `1` (the default) is the synchronous loop: capture → submit → poll-blocks, so the
+    /// per-frame wall time is `capture+convert + encode`. A capturer that hands a fresh output texture
+    /// per frame (so the encode of N reads a different texture than the convert of N+1 writes) can return
+    /// `>1` to PIPELINE: the loop submits N+1 before polling N, overlapping the convert/copy on the 3D
+    /// engine with the NVENC-ASIC encode of the prior frame, dropping per-frame wall toward `max(...)`.
+    fn pipeline_depth(&self) -> usize {
+        1
+    }
 }
 
 /// A deterministic moving test pattern (BGRx). Lets the spike exercise the encode → file →
@@ -302,7 +312,11 @@ pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
 /// [`crate::vdisplay::VirtualDisplay`] backend. The captured size is the size the output was
 /// created at — native, no scaling.
 #[cfg(target_os = "linux")]
-pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Box<dyn Capturer>> {
+pub fn capture_virtual_output(
+    vout: crate::vdisplay::VirtualOutput,
+    _want_hdr: bool,
+) -> Result<Box<dyn Capturer>> {
+    // The Linux host stays 8-bit (HDR is blocked upstream), so `want_hdr` is unused here.
     linux::PortalCapturer::from_virtual_output(vout).map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
@@ -317,7 +331,10 @@ pub(crate) fn wgc_disabled() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Box<dyn Capturer>> {
+pub fn capture_virtual_output(
+    vout: crate::vdisplay::VirtualOutput,
+    want_hdr: bool,
+) -> Result<Box<dyn Capturer>> {
     let target = vout.win_capture.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "SudoVDA target not yet an active display (needs a WDDM GPU to activate it)"
@@ -325,6 +342,18 @@ pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Bo
     })?;
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
+    // P2 direct frame push (kill DDA): consume frames straight from the pf-vdisplay driver's shared
+    // ring — no Desktop Duplication, no win32u reparenting hook. Opt-in while it's A/B'd against DDA;
+    // `idd_push` takes the keepalive (owns the virtual display) so there's no fall-through.
+    if std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some() {
+        // Recreate the monitor + ring per session (fix-teardown): a FRESH monitor reliably gets a
+        // working IddCx swap-chain, whereas a REUSED monitor's swap-chain dies after ~2 sessions and
+        // the host can't revive it. The driver's recreate crash (target id resolved to 0) is fixed by
+        // stamping target_id onto the monitor context. The ring is always FP16 (the driver composes
+        // the IDD in FP16); `want_hdr` selects the per-frame conversion (FP16 → Rgb10a2 vs Bgra).
+        return idd_push::IddPushCapturer::open(target, pref, want_hdr, keep)
+            .map(|c| Box::new(c) as Box<dyn Capturer>);
+    }
     // WGC (Windows.Graphics.Capture) is the default: it captures the COMPOSED desktop including the
     // overlay/independent-flip planes DXGI Desktop Duplication misses (the frozen-HDR-animation bug),
     // and has no ACCESS_LOST-on-overlay churn. DDA stays available via PUNKTFUNK_CAPTURE=dda and is
@@ -376,7 +405,10 @@ pub fn capture_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<Bo
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-pub fn capture_virtual_output(_vout: crate::vdisplay::VirtualOutput) -> Result<Box<dyn Capturer>> {
+pub fn capture_virtual_output(
+    _vout: crate::vdisplay::VirtualOutput,
+    _want_hdr: bool,
+) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("virtual-output capture requires Linux or Windows")
 }
 
@@ -386,6 +418,8 @@ pub mod composed_flip;
 pub mod desktop_watch;
 #[cfg(target_os = "windows")]
 pub mod dxgi;
+#[cfg(target_os = "windows")]
+pub mod idd_push;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "windows")]

@@ -2,6 +2,7 @@ use std::{
     mem::{self, size_of},
     num::{ParseIntError, TryFromIntError},
     ptr::{addr_of_mut, NonNull},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::anyhow;
@@ -13,7 +14,7 @@ use wdf_umdf::{
 use wdf_umdf_sys::{
     DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, HANDLE, IDARG_IN_ADAPTER_INIT, IDARG_IN_MONITORCREATE,
     IDARG_IN_SETUP_HWCURSOR, IDARG_OUT_ADAPTER_INIT, IDARG_OUT_MONITORARRIVAL,
-    IDARG_OUT_MONITORCREATE, IDDCX_ADAPTER, IDDCX_ADAPTER_CAPS, IDDCX_CURSOR_CAPS,
+    IDARG_OUT_MONITORCREATE, IDDCX_ADAPTER, IDDCX_ADAPTER_CAPS, IDDCX_ADAPTER_FLAGS, IDDCX_CURSOR_CAPS,
     IDDCX_ENDPOINT_DIAGNOSTIC_INFO, IDDCX_ENDPOINT_VERSION, IDDCX_FEATURE_IMPLEMENTATION,
     IDDCX_MONITOR, IDDCX_MONITOR_DESCRIPTION, IDDCX_MONITOR_DESCRIPTION_TYPE, IDDCX_MONITOR_INFO,
     IDDCX_SWAPCHAIN, IDDCX_TRANSMISSION_TYPE, IDDCX_XOR_CURSOR_SUPPORT, LUID, NTSTATUS, WDFDEVICE,
@@ -34,6 +35,37 @@ use crate::{
 // Maximum amount of monitors that can be connected
 pub const MAX_MONITORS: u8 = 16;
 
+/// ONE shared D3D render device, reused across every swap-chain assignment (keyed by render LUID).
+/// Creating a fresh `Direct3DDevice` per assign — and the swap-chain flap fires several assigns per
+/// session — spawned a new NVIDIA UMD worker-thread set each time that was NEVER reclaimed on release
+/// (proven on the RTX box: ~70 `nvwgf2umx` threads + ~50 MB VRAM leaked per reconnect, permanently,
+/// even though our `Direct3DDevice` refcount dropped to 0). Pooling one device keeps a single, stable
+/// thread set: the processors borrow an `Arc`, so the device outlives them and is never re-created.
+static DEVICE_POOL: Mutex<Option<(i64, Arc<Direct3DDevice>)>> = Mutex::new(None);
+
+/// Get-or-create the pooled D3D device for `luid`. Re-creates only if the render adapter changes
+/// (e.g. a GPU hot-swap), which drops the old `Arc` once its last processor releases it.
+fn pooled_device(luid: windows::Win32::Foundation::LUID) -> Option<Arc<Direct3DDevice>> {
+    let key = (i64::from(luid.HighPart) << 32) | i64::from(luid.LowPart as u32);
+    let mut pool = DEVICE_POOL.lock().ok()?;
+    if let Some((k, dev)) = pool.as_ref() {
+        if *k == key {
+            return Some(dev.clone());
+        }
+    }
+    match Direct3DDevice::init(luid) {
+        Ok(d) => {
+            let a = Arc::new(d);
+            *pool = Some((key, a.clone()));
+            Some(a)
+        }
+        Err(e) => {
+            error!("pooled Direct3DDevice::init failed: {e:?}");
+            None
+        }
+    }
+}
+
 pub struct DeviceContext {
     device: WDFDEVICE,
     adapter: Option<IDDCX_ADAPTER>,
@@ -48,6 +80,11 @@ unsafe impl Sync for DeviceContext {}
 pub struct MonitorContext {
     device: IDDCX_MONITOR,
     swap_chain_processor: Option<SwapChainProcessor>,
+    /// OS target id (from IddCxMonitorArrival), stamped on this context at creation. assign_swap_chain
+    /// uses THIS instead of a MONITOR_MODES pointer lookup — the lookup returns 0 for a recreated
+    /// (session-2+) monitor, which broke the shared-ring naming and cascaded into SetDevice
+    /// E_INVALIDARG + an access violation (the fix-teardown crash).
+    target_id: u32,
 }
 
 // SAFETY: Raw ptr is managed by external library
@@ -97,6 +134,10 @@ impl DeviceContext {
         let mut adapter_caps = IDDCX_ADAPTER_CAPS {
             #[allow(clippy::cast_possible_truncation)]
             Size: size_of::<IDDCX_ADAPTER_CAPS>() as u32,
+
+            // B2 HDR: declare we can process FP16 (scRGB) desktop surfaces — enables HDR10 / SDR WCG.
+            // This OBLIGATES the *2 mode DDIs (done) + ReleaseAndAcquireBuffer2 (done in run_core).
+            Flags: IDDCX_ADAPTER_FLAGS::IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16,
 
             MaxMonitorsSupported: u32::from(MAX_MONITORS),
 
@@ -231,6 +272,14 @@ impl DeviceContext {
             }
         }
 
+        // Stamp the OS target id onto the monitor's CONTEXT so assign_swap_chain reads it directly
+        // (no MONITOR_MODES pointer lookup, which returns 0 for a recreated monitor).
+        unsafe {
+            let _ = MonitorContext::get_mut(monitor_create_out.MonitorObject.cast(), |ctx| {
+                ctx.target_id = arrival_out.OsTargetId;
+            });
+        }
+
         Ok(())
     }
 }
@@ -240,6 +289,7 @@ impl MonitorContext {
         Self {
             device,
             swap_chain_processor: None,
+            target_id: 0,
         }
     }
 
@@ -265,20 +315,37 @@ impl MonitorContext {
             render_adapter.HighPart, render_adapter.LowPart
         );
 
-        let device = Direct3DDevice::init(luid);
+        // The OS target id keys the per-monitor shared frame-push objects (header/event/textures) the
+        // host opens. Read it from THIS context (stamped at creation after IddCxMonitorArrival) — the
+        // old MONITOR_MODES pointer lookup returned 0 for a recreated (session-2+) monitor, which broke
+        // the ring naming and cascaded into SetDevice E_INVALIDARG + an access violation.
+        let target_id = self.target_id;
 
-        if let Ok(device) = device {
+        let device = pooled_device(luid);
+
+        if let Some(device) = device {
             let mut processor = SwapChainProcessor::new();
 
-            processor.run(swap_chain, device, new_frame_event);
+            processor.run(
+                swap_chain,
+                device,
+                new_frame_event,
+                target_id,
+                render_adapter.LowPart,
+                render_adapter.HighPart,
+            );
 
             self.swap_chain_processor = Some(processor);
 
-            self.setup_hw_cursor();
+            // Cursor is BAKED into the captured video: for IDD-push we deliberately do NOT advertise a
+            // hardware cursor, so DWM software-composites the mouse cursor into the swapchain surface we
+            // capture — the client then sees the cursor in the stream. (A future separate-plane cursor
+            // would re-enable setup_hw_cursor + IddCxMonitorQueryHardwareCursor.) Not advertising one
+            // also stops leaking a CreateEventA handle per assign.
         } else {
-            // It's important to delete the swap-chain if D3D initialization fails, so that the OS knows to generate a new
-            // swap-chain and try again.
-            error!("Direct3DDevice::init FAILED on render LUID: {device:?} — deleting swap chain for OS retry");
+            // It's important to delete the swap-chain if D3D init fails, so the OS generates a fresh
+            // swap-chain and retries.
+            error!("pooled Direct3DDevice unavailable for render LUID — deleting swap chain for OS retry");
 
             unsafe {
                 let _ = WdfObjectDelete(swap_chain.cast());
@@ -287,9 +354,15 @@ impl MonitorContext {
     }
 
     pub fn unassign_swap_chain(&mut self) {
-        self.swap_chain_processor.take();
+        let had = self.swap_chain_processor.take().is_some();
+        error!("unassign_swap_chain (target={}) — dropped live processor: {had}", self.target_id);
     }
 
+    /// Advertise a HARDWARE cursor. NOT called for IDD-push — we bake the cursor into the video
+    /// instead (see `assign_swap_chain`). Kept for a future separate-plane cursor (which would pair it
+    /// with `IddCxMonitorQueryHardwareCursor`). Leaks a `CreateEventA` handle per call, so only wire it
+    /// back up alongside a real cursor-plane consumer.
+    #[allow(dead_code)]
     pub fn setup_hw_cursor(&mut self) {
         let mouse_event = unsafe { CreateEventA(None, false, false, s!("vdd_mouse_event")) };
         let Ok(mouse_event) = mouse_event else {

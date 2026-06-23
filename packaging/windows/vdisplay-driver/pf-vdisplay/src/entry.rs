@@ -12,8 +12,10 @@ use wdf_umdf_sys::{
 };
 
 use crate::callbacks::{
-    adapter_commit_modes, adapter_init_finished, assign_swap_chain, device_d0_entry,
-    monitor_get_default_modes, monitor_query_modes, parse_monitor_description, unassign_swap_chain,
+    adapter_commit_modes, adapter_commit_modes2, adapter_init_finished, assign_swap_chain,
+    device_d0_entry, monitor_get_default_modes, monitor_query_modes, monitor_query_modes2,
+    parse_monitor_description, parse_monitor_description2, query_target_info,
+    set_default_hdr_metadata, set_gamma_ramp, unassign_swap_chain,
 };
 use crate::context::DeviceContext;
 use crate::control::device_io_control;
@@ -73,6 +75,15 @@ extern "C-unwind" fn driver_add(
     config.EvtIddCxMonitorGetDefaultDescriptionModes = Some(monitor_get_default_modes);
     config.EvtIddCxMonitorQueryTargetModes = Some(monitor_query_modes);
     config.EvtIddCxAdapterCommitModes = Some(adapter_commit_modes);
+    // IddCx 1.10 *2 mode DDIs (HDR-capable path). The OS prefers these on 1.10; the 1.x callbacks
+    // above stay as the down-level fallback. B1 advertises SDR through them (so behaviour is unchanged);
+    // B2 enables HDR by adding 10 bpc in `wire_bits()`, HIGH_COLOR_SPACE caps, and CAN_PROCESS_FP16.
+    config.EvtIddCxParseMonitorDescription2 = Some(parse_monitor_description2);
+    config.EvtIddCxMonitorQueryTargetModes2 = Some(monitor_query_modes2);
+    config.EvtIddCxAdapterCommitModes2 = Some(adapter_commit_modes2);
+    config.EvtIddCxAdapterQueryTargetInfo = Some(query_target_info);
+    config.EvtIddCxMonitorSetDefaultHdrMetaData = Some(set_default_hdr_metadata);
+    config.EvtIddCxMonitorSetGammaRamp = Some(set_gamma_ramp);
     config.EvtIddCxMonitorAssignSwapChain = Some(assign_swap_chain);
     config.EvtIddCxMonitorUnassignSwapChain = Some(unassign_swap_chain);
     // IddCx redirects device IOCTLs to this callback — our SudoVDA-compatible control plane.

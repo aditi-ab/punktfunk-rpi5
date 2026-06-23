@@ -127,8 +127,15 @@ fn run(
                 refresh_hz: cfg.fps,
             })
             .context("create virtual output at client resolution")?;
+        // `want_hdr=false`: the IDD-push backend (opt-in PUNKTFUNK_IDD_PUSH) has no monitor-HDR
+        // auto-detection — it converts its always-FP16 ring per this flag — and GameStream HDR is not
+        // negotiated into StreamConfig here, so an IDD-push GameStream session streams SDR even on an
+        // HDR desktop. (The default WGC backend DOES auto-detect HDR from the output colorspace, but
+        // IDD-push bypasses WGC.) Acceptable for the experimental IDD-push A/B path; HDR over IDD-push
+        // is wired only for punktfunk/1 (want_hdr = negotiated bit_depth >= 10). TODO: derive want_hdr
+        // from a GameStream HDR flag once StreamConfig carries one.
         let mut capturer =
-            capture::capture_virtual_output(vout).context("capture virtual output")?;
+            capture::capture_virtual_output(vout, false).context("capture virtual output")?;
         capturer.set_active(true);
         return stream_body(&mut *capturer, &sock, cfg, running, force_idr, rfi_range);
     }

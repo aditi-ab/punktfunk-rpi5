@@ -202,6 +202,87 @@ pub(crate) unsafe fn make_device(
     Ok((device, context))
 }
 
+/// Resolve the configured GPU scheduling-priority class from `PUNKTFUNK_GPU_PRIORITY_CLASS`
+/// (`off|normal|high|realtime`, default high). `None` = leave it at the OS default (the `off` opt-out).
+/// D3DKMT_SCHEDULINGPRIORITYCLASS: IDLE 0, BELOW_NORMAL 1, NORMAL 2, ABOVE_NORMAL 3, HIGH 4, REALTIME 5.
+fn configured_gpu_priority_class() -> Option<i32> {
+    match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
+        .ok()
+        .as_deref()
+    {
+        Some("off") => None,
+        Some("normal") => Some(2),
+        Some("realtime") => Some(5),
+        _ => Some(4), // HIGH — safe on NVIDIA+HAGS (realtime can freeze NVENC)
+    }
+}
+
+/// Enable SE_INC_BASE_PRIORITY on the CURRENT process token (best-effort) — the kernel gates the
+/// HIGH/REALTIME GPU scheduling-priority bump on it. Held by SYSTEM/Administrators; a UAC-FILTERED
+/// token (what `CreateProcessAsUserW` hands the WGC helper) does NOT have it, which is why the helper
+/// can't elevate itself and the SYSTEM host stamps the class onto it cross-process instead (see
+/// [`set_child_gpu_priority_class`]).
+unsafe fn enable_inc_base_priority() {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
+        SE_INC_BASE_PRIORITY_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+        TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = HANDLE::default();
+    if OpenProcessToken(
+        GetCurrentProcess(),
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+        &mut token,
+    )
+    .is_ok()
+    {
+        let mut luid = LUID::default();
+        if LookupPrivilegeValueW(PCWSTR::null(), SE_INC_BASE_PRIORITY_NAME, &mut luid).is_ok() {
+            let tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            if AdjustTokenPrivileges(
+                token,
+                false,
+                Some(&tp as *const TOKEN_PRIVILEGES),
+                0,
+                None,
+                None,
+            )
+            .is_err()
+            {
+                tracing::warn!("could not enable SE_INC_BASE_PRIORITY for GPU priority");
+            }
+        }
+        let _ = CloseHandle(token);
+    }
+}
+
+/// Call `gdi32!D3DKMTSetProcessSchedulingPriorityClass(process, prio)` (no stable windows-rs binding —
+/// loaded by name). Returns the NTSTATUS (0 = success) or `None` if the export can't be resolved. The
+/// CALLING process must hold SE_INC_BASE_PRIORITY ([`enable_inc_base_priority`]) for HIGH/REALTIME; the
+/// kernel checks the caller's privilege whether the target is self or a child we created.
+unsafe fn d3dkmt_set_scheduling_priority_class(
+    process: windows::Win32::Foundation::HANDLE,
+    prio: i32,
+) -> Option<i32> {
+    use windows::core::s;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+    let gdi32 = LoadLibraryA(s!("gdi32.dll")).ok()?;
+    let p = GetProcAddress(gdi32, s!("D3DKMTSetProcessSchedulingPriorityClass"))?;
+    type SetPrio = unsafe extern "system" fn(HANDLE, i32) -> i32;
+    let f: SetPrio = std::mem::transmute(p);
+    Some(f(process, prio))
+}
+
 /// Apollo-style GPU scheduling-priority hardening (Sunshine `display_base.cpp:599-709`). On a
 /// GPU-saturated game our capture+encode process is starved of GPU time slices — NVENC sits ~idle but
 /// `lock_bitstream` waits ~20 ms for our context to be scheduled. Elevating the PROCESS GPU scheduling
@@ -209,87 +290,62 @@ pub(crate) unsafe fn make_device(
 /// alone, which we measured as no help) lets our brief encode preempt the game. Uses HIGH, NOT
 /// realtime: realtime on NVIDIA + HAGS can freeze/crash NVENC (Apollo downgrades it for exactly this).
 /// Runs once per process; best-effort. `PUNKTFUNK_GPU_PRIORITY_CLASS = off|normal|high|realtime`
-/// (default high).
+/// (default high). NOTE: in the SYSTEM-host + user-session-helper deployment this self-set NO-OPs in
+/// the helper (filtered token), so the host also sets it on the helper via [`set_child_gpu_priority_class`].
 fn elevate_process_gpu_priority() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
-        use windows::core::{s, PCWSTR};
-        use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
-        use windows::Win32::Security::{
-            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
-            SE_INC_BASE_PRIORITY_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
-            TOKEN_PRIVILEGES, TOKEN_QUERY,
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let Some(prio) = configured_gpu_priority_class() else {
+            tracing::info!("GPU process scheduling priority class left at default (off)");
+            return;
         };
-        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
-        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-        // D3DKMT_SCHEDULINGPRIORITYCLASS: IDLE 0, BELOW_NORMAL 1, NORMAL 2, ABOVE_NORMAL 3, HIGH 4,
-        // REALTIME 5.
-        let prio: i32 = match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS").ok().as_deref() {
-            Some("off") => {
-                tracing::info!("GPU process scheduling priority class left at default (off)");
-                return;
-            }
-            Some("normal") => 2,
-            Some("realtime") => 5,
-            _ => 4, // HIGH — safe on NVIDIA+HAGS (realtime can freeze NVENC)
-        };
-
-        // 1. Enable SE_INC_BASE_PRIORITY so the kernel permits the GPU priority bump.
-        let mut token = HANDLE::default();
-        if OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &mut token,
-        )
-        .is_ok()
-        {
-            let mut luid = LUID::default();
-            if LookupPrivilegeValueW(PCWSTR::null(), SE_INC_BASE_PRIORITY_NAME, &mut luid).is_ok() {
-                let tp = TOKEN_PRIVILEGES {
-                    PrivilegeCount: 1,
-                    Privileges: [LUID_AND_ATTRIBUTES {
-                        Luid: luid,
-                        Attributes: SE_PRIVILEGE_ENABLED,
-                    }],
-                };
-                if AdjustTokenPrivileges(
-                    token,
-                    false,
-                    Some(&tp as *const TOKEN_PRIVILEGES),
-                    0,
-                    None,
-                    None,
-                )
-                .is_err()
-                {
-                    tracing::warn!("could not enable SE_INC_BASE_PRIORITY for GPU priority");
-                }
-            }
-            let _ = CloseHandle(token);
-        }
-
-        // 2. D3DKMTSetProcessSchedulingPriorityClass via gdi32 (no stable windows-rs binding).
-        if let Ok(gdi32) = LoadLibraryA(s!("gdi32.dll")) {
-            if let Some(p) = GetProcAddress(gdi32, s!("D3DKMTSetProcessSchedulingPriorityClass")) {
-                type SetPrio = unsafe extern "system" fn(HANDLE, i32) -> i32;
-                let f: SetPrio = std::mem::transmute(p);
-                let st = f(GetCurrentProcess(), prio);
-                if st == 0 {
-                    tracing::info!(
-                        priority_class = prio,
-                        "GPU process scheduling priority class set (2=normal 4=high 5=realtime)"
-                    );
-                } else {
-                    tracing::warn!(
-                        status = format!("0x{st:08X}"),
-                        "D3DKMTSetProcessSchedulingPriorityClass failed (run as admin/SYSTEM for GPU priority)"
-                    );
-                }
-            }
+        enable_inc_base_priority();
+        match d3dkmt_set_scheduling_priority_class(GetCurrentProcess(), prio) {
+            Some(0) => tracing::info!(
+                priority_class = prio,
+                "GPU process scheduling priority class set (2=normal 4=high 5=realtime)"
+            ),
+            Some(st) => tracing::warn!(
+                status = format!("0x{st:08X}"),
+                "D3DKMTSetProcessSchedulingPriorityClass failed (run as admin/SYSTEM for GPU priority)"
+            ),
+            None => tracing::warn!("D3DKMTSetProcessSchedulingPriorityClass export not found"),
         }
     });
+}
+
+/// Set the GPU scheduling-priority class of ANOTHER process we created — the WGC capture+encode helper
+/// in the interactive user session. The helper is spawned with the user's UAC-FILTERED token, which
+/// lacks SE_INC_BASE_PRIORITY, so its own [`elevate_process_gpu_priority`] silently no-ops and NVENC
+/// gets starved under a GPU-saturating game (the "240→40 fps in-game collapse"). The SYSTEM host DOES
+/// hold the privilege, so it stamps the class onto the child's process handle right after spawn — the
+/// process-level class applies to GPU contexts the child creates afterwards. Best-effort; logged.
+/// `PUNKTFUNK_GPU_PRIORITY_CLASS=off` disables it (same knob as the self path).
+///
+/// # Safety
+/// `process` must be a valid handle to a process we own with at least PROCESS_SET_INFORMATION access
+/// (the just-created helper, `PROCESS_INFORMATION::hProcess`).
+pub(crate) unsafe fn set_child_gpu_priority_class(process: windows::Win32::Foundation::HANDLE) {
+    let Some(prio) = configured_gpu_priority_class() else {
+        return;
+    };
+    enable_inc_base_priority(); // the SYSTEM host holds SE_INC_BASE_PRIORITY; the helper does not
+    match d3dkmt_set_scheduling_priority_class(process, prio) {
+        Some(0) => tracing::info!(
+            priority_class = prio,
+            "WGC helper GPU scheduling priority class set cross-process from the SYSTEM host \
+             (2=normal 4=high 5=realtime)"
+        ),
+        Some(st) => tracing::warn!(
+            status = format!("0x{st:08X}"),
+            "cross-process D3DKMTSetProcessSchedulingPriorityClass on the WGC helper failed"
+        ),
+        None => tracing::warn!(
+            "D3DKMTSetProcessSchedulingPriorityClass export not found — WGC helper has no GPU priority"
+        ),
+    }
 }
 
 /// Re-find the output, make a fresh device on its adapter, and duplicate it. Used by the ACCESS_LOST

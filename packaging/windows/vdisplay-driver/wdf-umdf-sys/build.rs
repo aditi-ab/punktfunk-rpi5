@@ -7,7 +7,10 @@ use winreg::enums::HKEY_LOCAL_MACHINE;
 use winreg::RegKey;
 
 const UMDF_V: &str = "2.31";
-const IDDCX_V: &str = "1.4";
+// Bumped 1.4 -> 1.10 for HDR/FP16 support (IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16,
+// IddCxSwapChainReleaseAndAcquireBuffer2, the *2 mode/metadata DDIs). 1.10 is a superset of 1.4, so
+// existing call sites keep working; the new HDR DDIs become available to bind.
+const IDDCX_V: &str = "1.10";
 
 #[derive(Debug, thiserror::Error)]
 enum Error {

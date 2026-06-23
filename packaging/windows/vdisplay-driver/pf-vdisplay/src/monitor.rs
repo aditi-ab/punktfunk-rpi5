@@ -6,6 +6,7 @@
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use wdf_umdf_sys::{IDDCX_ADAPTER__, IDDCX_MONITOR__};
 
@@ -37,6 +38,10 @@ pub struct MonitorObject {
     pub target_id: u32,
     pub adapter_luid_low: u32,
     pub adapter_luid_high: i32,
+    /// When the entry was pushed (`do_add`). The watchdog skips monitors younger than the host's
+    /// setup window (CCD commit + GDI-name resolve + settle) so a still-initializing monitor is never
+    /// torn down mid-birth during reconnect churn.
+    pub created_at: Instant,
 }
 // SAFETY: the raw IddCx object ptr is framework-managed; access is serialized by MONITOR_MODES.
 unsafe impl Send for MonitorObject {}
@@ -53,9 +58,12 @@ pub static MONITOR_MODES: Mutex<Vec<MonitorObject>> = Mutex::new(Vec::new());
 
 /// Monitor id / EDID-serial counter (unique per created monitor).
 pub static NEXT_ID: AtomicU32 = AtomicU32::new(1);
-/// Watchdog (seconds). The host reads the timeout via GET_WATCHDOG and PINGs to keep alive.
-pub static WATCHDOG_TIMEOUT: AtomicU32 = AtomicU32::new(3);
-pub static WATCHDOG_COUNTDOWN: AtomicU32 = AtomicU32::new(3);
+/// Watchdog (seconds). The host reads the timeout via GET_WATCHDOG and PINGs to keep alive. 8 s (was
+/// 3) gives the host's between-session teardown gap — stop old pinger → CCD display re-attach (a slow
+/// `SetDisplayConfig`) → REMOVE — headroom, so the watchdog doesn't spuriously fire during reconnect
+/// churn. The host derives its PING interval from this (timeout/3), so it auto-adjusts.
+pub static WATCHDOG_TIMEOUT: AtomicU32 = AtomicU32::new(8);
+pub static WATCHDOG_COUNTDOWN: AtomicU32 = AtomicU32::new(8);
 /// The preferred render adapter LUID set via SET_RENDER_ADAPTER, packed `(high<<32)|low`. 0 = none.
 pub static PREFERRED_RENDER_ADAPTER: AtomicU64 = AtomicU64::new(0);
 
