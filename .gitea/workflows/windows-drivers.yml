@@ -26,6 +26,8 @@ on:
       - 'crates/pf-vdisplay-proto/**'
       - 'packaging/windows/drivers/**'
 
+# Driver builds need the WDK on the runner (provision once via windows-drivers-provision.yml).
+
 jobs:
   probe-and-proto:
     runs-on: windows-amd64
@@ -94,9 +96,42 @@ jobs:
       - name: Build + test pf-vdisplay-proto (MSVC)
         run: |
           # Short target dir to dodge MAX_PATH inside the deep act host workdir (see windows.yml).
-          "CARGO_TARGET_DIR=C:\t\drv" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $env:CARGO_TARGET_DIR = "C:\t\drv"
           cargo build -p pf-vdisplay-proto
           cargo test  -p pf-vdisplay-proto
           cargo clippy -p pf-vdisplay-proto --all-targets -- -D warnings
           cargo fmt -p pf-vdisplay-proto -- --check
+
+  # Build the UMDF driver workspace (wdk-probe) on windows-drivers-rs: proves wdk-sys bindgen/link works
+  # on the runner's WDK + LLVM, that pf-vdisplay-proto path-deps into a driver, and exposes the produced
+  # DLL's FORCE_INTEGRITY (/INTEGRITYCHECK) bit — the M0 self-signed-load question.
+  driver-build:
+    runs-on: windows-amd64
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # wdk-build otherwise picks 10.0.28000.0 (no km/crt) and bindgen fails — pin the WDK SDK version.
+      Version_Number: '10.0.26100.0'
+      CARGO_TARGET_DIR: 'C:\t\drvws'
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo build wdk-probe (windows-drivers-rs)
+        working-directory: packaging/windows/drivers
+        run: cargo build -p wdk-probe -v
+      - name: Inspect the produced DLL's /INTEGRITYCHECK bit
+        run: |
+          $dll = "$env:CARGO_TARGET_DIR\debug\wdk_probe.dll"
+          if (-not (Test-Path $dll)) { throw "wdk_probe.dll not produced at $dll" }
+          $b = [IO.File]::ReadAllBytes($dll)
+          $pe = [BitConverter]::ToInt32($b, 0x3c)
+          $dllchar = [BitConverter]::ToUInt16($b, $pe + 0x5e)   # OptionalHeader.DllCharacteristics
+          $forceIntegrity = ($dllchar -band 0x0080) -ne 0       # IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY
+          Write-Host ("wdk_probe.dll built OK ({0:N0} bytes)" -f (Get-Item $dll).Length)
+          Write-Host ("DllCharacteristics = 0x{0:X4}; FORCE_INTEGRITY(/INTEGRITYCHECK) = $forceIntegrity" -f $dllchar)
+          if ($forceIntegrity) {
+            Write-Host '==> /INTEGRITYCHECK IS set -> self-signed load needs the flag suppressed or the PE bit cleared (M0 task).'
+          } else {
+            Write-Host '==> /INTEGRITYCHECK NOT set -> a self-signed driver should load with no PE patch.'
+          }

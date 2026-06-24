@@ -1,0 +1,26 @@
+# M0/M1 toolchain probe: the smallest possible UMDF2 driver on windows-drivers-rs (crates.io wdk 0.5).
+# Purpose: prove on the windows-amd64 runner that (1) wdk-sys bindgen + WDF stub link works against the
+# runner's WDK + LLVM, (2) the shared no_std pf-vdisplay-proto ABI crate path-deps cleanly into a driver
+# build graph, and (3) what the produced DLL's PE FORCE_INTEGRITY (/INTEGRITYCHECK) bit is. NOT shipped.
+[package]
+name = "wdk-probe"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[package.metadata.wdk.driver-model]
+driver-type = "UMDF"
+umdf-version-major = 2
+target-umdf-version-minor = 31
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+wdk-build.workspace = true
+
+[dependencies]
+wdk.workspace = true
+wdk-sys.workspace = true
+pf-vdisplay-proto.workspace = true
