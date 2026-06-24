@@ -21,6 +21,14 @@ wdk-sys = "0.5.1"
 wdk-build = "0.5.1"
 pf-vdisplay-proto = { path = "../../../crates/pf-vdisplay-proto" }
 
+# Vendored windows-drivers-rs 0.5.1 (the published, self-contained crates) + an added `iddcx`
+# ApiSubset (M1 — bindgens iddcx/1.10/IddCx.h reusing wdk_default for WDF type-identity). Redirect ALL
+# wdk-sys/wdk-build refs (incl. wdk 0.4.1's transitive deps) to the patched copies so there is exactly
+# one (iddcx-capable) wdk-sys in the graph. Pinned; do not chase upstream.
+[patch.crates-io]
+wdk-build = { path = "vendor/wdk-build" }
+wdk-sys = { path = "vendor/wdk-sys" }
+
 # wdk-sys's build script reads the WDK driver-model from the WORKSPACE metadata (a workspace build can't
 # know which member it's building for). All our drivers are UMDF 2.x (incl. pf-vdisplay's IddCx), so set
 # it once here; a member needing a different model would get its own [package.metadata.wdk.driver-model].
