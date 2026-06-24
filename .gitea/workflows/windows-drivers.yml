@@ -131,7 +131,7 @@ jobs:
         run: ../../../scripts/ci/provision-windows-wdk.ps1
       - name: cargo build wdk-probe (windows-drivers-rs)
         run: cargo build -p wdk-probe -v
-      - name: Inspect the produced DLL's /INTEGRITYCHECK bit
+      - name: Inspect /INTEGRITYCHECK (before) — expect FORCE_INTEGRITY set by wdk-build
         run: |
           # explicit --target (.cargo/config.toml) -> output under the triple subdir.
           $dll = "target\x86_64-pc-windows-msvc\debug\wdk_probe.dll"
@@ -139,11 +139,9 @@ jobs:
           $b = [IO.File]::ReadAllBytes($dll)
           $pe = [BitConverter]::ToInt32($b, 0x3c)
           $dllchar = [BitConverter]::ToUInt16($b, $pe + 0x5e)   # OptionalHeader.DllCharacteristics
-          $forceIntegrity = ($dllchar -band 0x0080) -ne 0       # IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY
           Write-Host ("wdk_probe.dll built OK ({0:N0} bytes)" -f (Get-Item $dll).Length)
-          Write-Host ("DllCharacteristics = 0x{0:X4}; FORCE_INTEGRITY(/INTEGRITYCHECK) = $forceIntegrity" -f $dllchar)
-          if ($forceIntegrity) {
-            Write-Host '==> /INTEGRITYCHECK IS set -> self-signed load needs the flag suppressed or the PE bit cleared (M0 task).'
-          } else {
-            Write-Host '==> /INTEGRITYCHECK NOT set -> a self-signed driver should load with no PE patch.'
-          }
+          Write-Host ("BEFORE: DllCharacteristics = 0x{0:X4}; FORCE_INTEGRITY = {1}" -f $dllchar, (($dllchar -band 0x0080) -ne 0))
+      - name: Clear FORCE_INTEGRITY (self-signed-load fix) + verify
+        # wdk-build sets /INTEGRITYCHECK unconditionally -> a self-signed driver won't load. Clear the PE
+        # bit deterministically (the reusable packaging step; signing/.cat happen later for real drivers).
+        run: ../clear-force-integrity.ps1 -Path target\x86_64-pc-windows-msvc\debug\wdk_probe.dll
