@@ -4,19 +4,13 @@
 fn main() -> Result<(), wdk_build::ConfigError> {
     wdk_build::configure_wdk_binary_build()?;
     link_iddcx_stub();
-    // wdk-build emits `/OPT:REF,ICF`. ICF (Identical COMDAT Folding) merges functions with identical
-    // bodies into ONE address — our many identical stub IddCx callbacks (`return STATUS_SUCCESS`) collapse
-    // to the same pointer (and even CRT EH handlers fold, hence the dumpbin `__CxxFrameHandler4 = DllMain`
-    // alias). The working virtual-display-rs links with NO `/OPT`, and IddCxAdapterInitAsync rejects a
-    // config whose distinct callbacks alias each other. Disable ICF (REF stays on); last `/OPT` wins.
-    println!("cargo::rustc-cdylib-link-arg=/OPT:NOICF");
     Ok(())
 }
 
-/// Link `IddCxStub.lib`. It ships under `Lib\<sdkver>\um\<arch>\iddcx\<iddcxver>\`, and the iddcx
-/// versions are NOT equivalent: the `1.0`/`1.2` stubs lack the versioned-struct-size table symbols
-/// (`IddStructures`/`IddStructureCount`/`IddClientVersionHigherThanFramework`) that `size.rs` needs —
-/// `1.3`+ and `1.10` have them. So pick the HIGHEST `iddcx\<X.Y>` dir that has the lib (version-aware,
+/// Link `IddCxStub.lib`. It ships under `Lib\<sdkver>\um\<arch>\iddcx\<iddcxver>\`, and the iddcx versions
+/// are NOT interchangeable: the stub's `IddFunctions` dispatch table must match the running framework
+/// (linking the `1.0` stub made even IddCxDeviceInitConfig fail; the box framework is 1.10, and upstream
+/// virtual-display-rs pins 1.10). So pick the HIGHEST `iddcx\<X.Y>` dir that has the lib (version-aware,
 /// since "1.10" < "1.2" lexically). x64 only.
 fn link_iddcx_stub() {
     const ARCH: &str = "x64";

@@ -10,7 +10,7 @@ use wdk_sys::{
     WDF_NO_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
 };
 
-use crate::{callbacks, size, STATUS_NOT_FOUND};
+use crate::callbacks;
 
 /// A WDF device context, attached to the WDFDEVICE at WdfDeviceCreate. The working virtual-display-rs +
 /// oracle both create the device with a context-typed `DeviceContext` (we previously passed
@@ -68,13 +68,9 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
         call_unsafe_wdf_function_binding!(WdfDeviceInitSetPnpPowerEventCallbacks, init, &mut pnp);
     }
 
-    // Build + size the IddCx client config (versioned size) and wire the 14 callbacks.
-    let Some(cfg_size) = size::idd_cx_client_config_size() else {
-        dbglog!("[pf-vd] config size unavailable");
-        return STATUS_NOT_FOUND;
-    };
+    // Build the IddCx client config and wire the SDR callbacks. `.Size` = size_of (1.10 structs, 1.10 fw).
     let mut cfg: iddcx::IDD_CX_CLIENT_CONFIG = unsafe { core::mem::zeroed() };
-    cfg.Size = cfg_size;
+    cfg.Size = core::mem::size_of::<iddcx::IDD_CX_CLIENT_CONFIG>() as u32;
     cfg.EvtIddCxAdapterInitFinished = Some(callbacks::adapter_init_finished);
     cfg.EvtIddCxParseMonitorDescription = Some(callbacks::parse_monitor_description);
     cfg.EvtIddCxMonitorGetDefaultDescriptionModes = Some(callbacks::monitor_get_default_modes);
@@ -112,17 +108,27 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
         return status;
     }
 
-    // IddCx must be initialized on the device BEFORE other device setup (the canonical IddCx sample order).
-    // We previously created the device interface first — which can leave IddCx not fully ready by D0Entry,
-    // making IddCxAdapterInitAsync reject (INVALID_PARAMETER) despite byte-perfect caps.
-    // DIAGNOSTIC (STEP 3): the WdfDeviceCreateDeviceInterface call is REMOVED. Upstream virtual-display-rs
-    // and the MS IddCx sample create NO device interface — IddCx's control channel is EvtIddCxDeviceIoControl
-    // (already registered in the config). A non-IddCx device interface registered on the IddCx/IndirectKmd
-    // stack is a prime suspect for IddCxAdapterInitAsync -> INVALID_PARAMETER. If removing it fixes adapter
-    // init, the proto control plane moves to EvtIddCxDeviceIoControl (STEP 4) instead of a device interface.
-    let _ = pf_vdisplay_proto::interface_guid_fields; // keep the dep referenced
     // SAFETY: device is the just-created WDFDEVICE.
     let status = unsafe { wdk_iddcx::IddCxDeviceInitialize(device) };
     dbglog!("[pf-vd] IddCxDeviceInitialize -> {status:#x}");
+    if !nt_success(status) {
+        return status;
+    }
+
+    // Expose the owned pf-vdisplay control interface: the host opens this GUID and drives the proto control
+    // plane (IOCTL_ADD/REMOVE/PING/…) which arrives at EvtIddCxDeviceIoControl. NOT SudoVDA's GUID. (The
+    // upstream uses a socket instead, so it has no interface; ours is IOCTL-based.)
+    let (d1, d2, d3, d4) = pf_vdisplay_proto::interface_guid_fields();
+    let guid = GUID {
+        Data1: d1,
+        Data2: d2,
+        Data3: d3,
+        Data4: d4,
+    };
+    // SAFETY: device is the just-created WDFDEVICE; guid lives for the call; no reference string.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(WdfDeviceCreateDeviceInterface, device, &guid, core::ptr::null())
+    };
+    dbglog!("[pf-vd] WdfDeviceCreateDeviceInterface -> {status:#x}");
     status
 }

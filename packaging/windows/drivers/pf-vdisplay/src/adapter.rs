@@ -40,10 +40,9 @@ unsafe impl Sync for SendAdapter {}
 
 static ADAPTER: OnceLock<SendAdapter> = OnceLock::new();
 
-/// A WDF context type for the adapter object. SudoVDA/the oracle create the adapter via
-/// `WDF_OBJECT_ATTRIBUTES::init_context_type(..)`; passing attributes with NO `ContextTypeInfo` is the one
-/// structural difference left vs the working SudoVDA driver. `WDF_OBJECT_CONTEXT_TYPE_INFO` holds raw
-/// pointers (so a Sync wrapper to allow a `static`); `UniqueType` self-references per `WDF_DECLARE_CONTEXT_TYPE`.
+/// A WDF context type for the adapter object (matches the upstream's `init_context_type`); STEP 4 stores
+/// adapter state here. `WDF_OBJECT_CONTEXT_TYPE_INFO` holds raw pointers (so a Sync wrapper to allow a
+/// `static`); `UniqueType` self-references per `WDF_DECLARE_CONTEXT_TYPE`.
 #[repr(transparent)]
 struct CtxTypeInfo(wdk_sys::WDF_OBJECT_CONTEXT_TYPE_INFO);
 // SAFETY: immutable 'static type metadata; the inner raw pointers are 'static and never written.
@@ -64,27 +63,11 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     }
     dbglog!("[pf-vd] init_adapter");
 
-    // The framework binds an IddCx version (the INF's UmdfExtensions) that may be OLDER than our 1.10
-    // headers, so use ITS expected struct sizes — newer fields (e.g. IDDCX_ADAPTER_CAPS's
-    // StaticDesktopReencodeFrameCount) make size_of too big and IddCxAdapterInitAsync rejects it. The
-    // table is readable now (post-IddCxDeviceInitialize). Falls back to size_of if unavailable.
-    let ver_size = crate::size::framework_struct_size(
-        iddcx::_IDDSTRUCTENUM::INDEX_IDDCX_ENDPOINT_VERSION as u32,
-    )
-    .unwrap_or(core::mem::size_of::<iddcx::IDDCX_ENDPOINT_VERSION>() as u32);
-    let diag_size = crate::size::framework_struct_size(
-        iddcx::_IDDSTRUCTENUM::INDEX_IDDCX_ENDPOINT_DIAGNOSTIC_INFO as u32,
-    )
-    .unwrap_or(core::mem::size_of::<iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO>() as u32);
-    let caps_size = crate::size::framework_struct_size(
-        iddcx::_IDDSTRUCTENUM::INDEX_IDDCX_ADAPTER_CAPS as u32,
-    )
-    .unwrap_or(core::mem::size_of::<iddcx::IDDCX_ADAPTER_CAPS>() as u32);
-
     // Firmware/hardware version (telemetry). The oracle points BOTH at one IDDCX_ENDPOINT_VERSION.
-    // `version` is a stack local read synchronously by IddCxAdapterInitAsync (same as the oracle).
+    // `version` is a stack local read synchronously by IddCxAdapterInitAsync (same as the oracle). `.Size`
+    // is `size_of` throughout — these are the IddCx 1.10 structs and the framework here is 1.10 (= upstream).
     let mut version: iddcx::IDDCX_ENDPOINT_VERSION = unsafe { core::mem::zeroed() };
-    version.Size = ver_size;
+    version.Size = core::mem::size_of::<iddcx::IDDCX_ENDPOINT_VERSION>() as u32;
     version.MajorVer = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0);
     version.MinorVer = env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0);
     version.Build = env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0);
@@ -94,7 +77,7 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     // rejects with INVALID_PARAMETER (ddivalidation.cpp:797) — set it to NONE (1) like upstream. THIS was
     // the on-glass adapter-init blocker.
     let mut diag: iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO = unsafe { core::mem::zeroed() };
-    diag.Size = diag_size;
+    diag.Size = core::mem::size_of::<iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO>() as u32;
     diag.GammaSupport = iddcx::IDDCX_FEATURE_IMPLEMENTATION::IDDCX_FEATURE_IMPLEMENTATION_NONE;
     diag.TransmissionType = iddcx::IDDCX_TRANSMISSION_TYPE::IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
     diag.pEndPointFriendlyName = wstr!("punktfunk Virtual Display Adapter");
@@ -104,7 +87,7 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     diag.pHardwareVersion = (&raw mut version).cast();
 
     let mut caps: iddcx::IDDCX_ADAPTER_CAPS = unsafe { core::mem::zeroed() };
-    caps.Size = caps_size;
+    caps.Size = core::mem::size_of::<iddcx::IDDCX_ADAPTER_CAPS>() as u32;
     // Flags = NONE (SDR). The working upstream virtual-display-rs sets NO Flags. CAN_PROCESS_FP16 requires a
     // newer IddCx contract than the INF's UmdfExtensions=IddCx0102 grants, so the framework's adapter-caps
     // Validate (ddivalidation.cpp:797) rejects it with STATUS_INVALID_PARAMETER. HDR/FP16 is deferred to
