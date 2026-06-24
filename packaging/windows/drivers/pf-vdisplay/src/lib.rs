@@ -14,6 +14,7 @@
 mod log;
 mod adapter;
 mod callbacks;
+mod control;
 #[allow(dead_code)] // salvaged verbatim; wired into the mode callbacks in STEP 4
 mod edid;
 mod entry;

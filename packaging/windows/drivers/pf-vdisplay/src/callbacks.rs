@@ -7,7 +7,7 @@
 //! is implemented now because it gates HDR (`HIGH_COLOR_SPACE`) and the adapter (STEP 3) sets FP16.
 
 use wdk_sys::iddcx;
-use wdk_sys::{call_unsafe_wdf_function_binding, NTSTATUS, WDFDEVICE, WDFREQUEST};
+use wdk_sys::{NTSTATUS, WDFDEVICE, WDFREQUEST};
 
 use crate::{STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS};
 
@@ -143,10 +143,8 @@ pub unsafe extern "C" fn device_io_control(
     request: WDFREQUEST,
     _output_len: usize,
     _input_len: usize,
-    _ioctl_code: u32,
+    ioctl_code: u32,
 ) {
-    // SAFETY: `request` is the framework-provided WDFREQUEST; completing it hands it back to the OS.
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestComplete, request, STATUS_SUCCESS);
-    }
+    // SAFETY: `request` is the framework-provided WDFREQUEST; `control::dispatch` completes it exactly once.
+    unsafe { crate::control::dispatch(request, ioctl_code) };
 }
