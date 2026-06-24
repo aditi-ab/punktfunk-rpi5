@@ -62,6 +62,27 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     )
     .unwrap_or(core::mem::size_of::<iddcx::IDDCX_ADAPTER_CAPS>() as u32);
     dbglog!("[pf-vd] fw sizes: caps={caps_size} diag={diag_size} ver={ver_size}");
+    // Field-offset audit vs the expected C layout (x64): caps Flags=4 MaxRate=8 MaxMon=16 Diag=24
+    // Static=80; diag Trans=4 Friendly=8 Model=16 Manuf=24 HwVer=32 FwVer=40 Gamma=48. A mismatch =
+    // bindgen mis-laid the struct (would make IddCxAdapterInitAsync read garbage -> INVALID_PARAMETER).
+    dbglog!(
+        "[pf-vd] caps off: Flags={} MaxRate={} MaxMon={} Diag={} Static={}",
+        core::mem::offset_of!(iddcx::IDDCX_ADAPTER_CAPS, Flags),
+        core::mem::offset_of!(iddcx::IDDCX_ADAPTER_CAPS, MaxDisplayPipelineRate),
+        core::mem::offset_of!(iddcx::IDDCX_ADAPTER_CAPS, MaxMonitorsSupported),
+        core::mem::offset_of!(iddcx::IDDCX_ADAPTER_CAPS, EndPointDiagnostics),
+        core::mem::offset_of!(iddcx::IDDCX_ADAPTER_CAPS, StaticDesktopReencodeFrameCount),
+    );
+    dbglog!(
+        "[pf-vd] diag off: Trans={} Friendly={} Model={} Manuf={} HwVer={} FwVer={} Gamma={}",
+        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, TransmissionType),
+        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, pEndPointFriendlyName),
+        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, pEndPointModelName),
+        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, pEndPointManufacturerName),
+        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, pHardwareVersion),
+        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, pFirmwareVersion),
+        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, GammaSupport),
+    );
 
     // Firmware/hardware version (telemetry). The oracle points BOTH at one IDDCX_ENDPOINT_VERSION.
     // `version` is a stack local read synchronously by IddCxAdapterInitAsync (same as the oracle).
