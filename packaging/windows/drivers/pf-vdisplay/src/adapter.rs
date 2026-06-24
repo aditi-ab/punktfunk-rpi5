@@ -14,7 +14,10 @@ use crate::STATUS_SUCCESS;
 macro_rules! wstr {
     ($s:literal) => {{
         const N: usize = $s.len() + 1;
-        const W: [u16; N] = {
+        // `static` (NOT `const`) — a const's `.as_ptr()` points to a temporary dropped at the end of the
+        // statement (a dangling pointer); IddCx then reads garbage for the endpoint name strings and
+        // IddCxAdapterInitAsync fails INVALID_PARAMETER. A `static` has a stable 'static address.
+        static W: [u16; N] = {
             let b = $s.as_bytes();
             let mut w = [0u16; N];
             let mut i = 0;
@@ -104,9 +107,9 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
 
     let mut caps: iddcx::IDDCX_ADAPTER_CAPS = unsafe { core::mem::zeroed() };
     caps.Size = caps_size;
-    // CAN_PROCESS_FP16 must be CONSISTENT with the config's callbacks: the config registers the *2 / gamma
-    // / set-default-hdr-metadata callbacks (FP16-obligated), so the adapter MUST advertise FP16 or the
-    // framework rejects the mismatch at IddCxAdapterInitAsync. The oracle sets both.
+    // FP16 (HDR) — consistent with the config's *2/gamma/hdr callbacks. NOTE: a minimal SDR adapter
+    // (Flags=NONE + only the required callbacks) ALSO fails IddCxAdapterInitAsync identically, so the
+    // FP16/*2/HDR set is NOT the blocker (see windows-pfvd-onglass-load memory).
     caps.Flags = iddcx::IDDCX_ADAPTER_FLAGS::IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
     caps.MaxMonitorsSupported = 16;
     caps.EndPointDiagnostics = diag;
