@@ -13,6 +13,9 @@
               generate documentation for their bindings"
 )]
 mod bindings {
+    // The WDK IddCx C names (PFN_IDD_CX_*, EvtIddCx* fields, *TableIndex consts) are not Rust-cased;
+    // bindgen emits them verbatim. Suppress the style lints for the generated surface.
+    #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
     #[allow(
         clippy::wildcard_imports,
         reason = "the underlying c code relies on all type definitions being in scope, which \

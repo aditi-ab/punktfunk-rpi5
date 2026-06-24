@@ -7,6 +7,7 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 mod iddcx_rt;
+mod iddcx_surface_assert;
 
 use wdk_sys::iddcx::{IDARG_IN_ADAPTER_INIT, IDARG_OUT_ADAPTER_INIT, IDD_CX_CLIENT_CONFIG};
 use wdk_sys::{
