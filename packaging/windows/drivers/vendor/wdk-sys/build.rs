@@ -356,6 +356,13 @@ fn generate_iddcx(out_path: &Path, config: &Config) -> Result<(), ConfigError> {
 
     let bindgen_builder = {
         bindgen::Builder::wdk_default(config)?
+            // IddCx headers MUST be in STUB mode (function-table dispatch): IddCxFuncEnum.h otherwise
+            // errors "IDDCX_VERSION_MAJOR is not defined", cascading into "must use 'struct' tag" on the
+            // IDARG_* types (their version-gated typedefs get skipped). `#define IDD_STUB` is exactly
+            // what the proven wdf-umdf oracle uses. Do NOT add WDF_STUB — wdk-sys parses wdf.h
+            // non-stubbed, and stubbing it only here would desync the WDF types the iddcx module resolves
+            // against, breaking type-identity.
+            .clang_arg("-DIDD_STUB")
             .with_codegen_config((CodegenConfig::TYPES | CodegenConfig::VARS).complement())
             .header_contents("iddcx-input.h", &header_contents)
             // Allowlist by the "iddcx" path component (separator-agnostic) so ONLY IddCx items are
