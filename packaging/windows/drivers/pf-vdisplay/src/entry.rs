@@ -1,7 +1,7 @@
-//! DriverEntry + driver_add — the IddCx device bring-up (STEP 2 skeleton). wdk-build links the UMDF
+//! DriverEntry + driver_add — the IddCx device bring-up (STEP 2/3). wdk-build links the UMDF
 //! `WdfDriverStubUm` whose `FxDriverEntryUm` forwards to the exported `DriverEntry`. Adapter creation is
 //! deferred to the first `EvtDeviceD0Entry` (STEP 3); monitors are created on demand by the control
-//! plane (STEP 4).
+//! plane (STEP 4). Instrumented with `dbglog!` for on-glass bring-up.
 
 use wdk_iddcx::nt_success;
 use wdk_sys::{
@@ -17,12 +17,13 @@ pub unsafe extern "system" fn driver_entry(
     driver: PDRIVER_OBJECT,
     registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
+    dbglog!("[pf-vd] DriverEntry");
     // SAFETY: zeroed then Size + the device-add callback set, per the WDF_DRIVER_CONFIG contract.
     let mut config: WDF_DRIVER_CONFIG = unsafe { core::mem::zeroed() };
     config.Size = core::mem::size_of::<WDF_DRIVER_CONFIG>() as ULONG;
     config.EvtDriverDeviceAdd = Some(driver_add);
     // SAFETY: driver + registry_path are loader-provided; config is valid for the call.
-    unsafe {
+    let st = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDriverCreate,
             driver,
@@ -31,10 +32,13 @@ pub unsafe extern "system" fn driver_entry(
             &mut config,
             WDF_NO_HANDLE.cast::<WDFDRIVER>()
         )
-    }
+    };
+    dbglog!("[pf-vd] WdfDriverCreate -> {st:#x}");
+    st
 }
 
 extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTATUS {
+    dbglog!("[pf-vd] driver_add");
     // Defer adapter creation to the first D0 entry.
     let mut pnp: WDF_PNPPOWER_EVENT_CALLBACKS = unsafe { core::mem::zeroed() };
     pnp.Size = core::mem::size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG;
@@ -46,6 +50,7 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
 
     // Build + size the IddCx client config (versioned size) and wire the 14 callbacks.
     let Some(cfg_size) = size::idd_cx_client_config_size() else {
+        dbglog!("[pf-vd] config size unavailable");
         return STATUS_NOT_FOUND;
     };
     let mut cfg: iddcx::IDD_CX_CLIENT_CONFIG = unsafe { core::mem::zeroed() };
@@ -67,6 +72,7 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
 
     // SAFETY: init is the framework device-init; cfg is fully populated + sized. (Links IddCxStub.)
     let status = unsafe { wdk_iddcx::IddCxDeviceInitConfig(init, &cfg) };
+    dbglog!("[pf-vd] IddCxDeviceInitConfig -> {status:#x}");
     if !nt_success(status) {
         return status;
     }
@@ -81,6 +87,7 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
             &mut device
         )
     };
+    dbglog!("[pf-vd] WdfDeviceCreate -> {status:#x}");
     if !nt_success(status) {
         return status;
     }
@@ -103,10 +110,13 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
             core::ptr::null()
         )
     };
+    dbglog!("[pf-vd] WdfDeviceCreateDeviceInterface -> {status:#x}");
     if !nt_success(status) {
         return status;
     }
 
     // SAFETY: device is the just-created WDFDEVICE.
-    unsafe { wdk_iddcx::IddCxDeviceInitialize(device) }
+    let status = unsafe { wdk_iddcx::IddCxDeviceInitialize(device) };
+    dbglog!("[pf-vd] IddCxDeviceInitialize -> {status:#x}");
+    status
 }

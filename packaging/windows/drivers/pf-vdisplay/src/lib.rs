@@ -10,6 +10,8 @@
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
+#[macro_use]
+mod log;
 mod adapter;
 mod callbacks;
 #[allow(dead_code)] // salvaged verbatim; wired into the mode callbacks in STEP 4

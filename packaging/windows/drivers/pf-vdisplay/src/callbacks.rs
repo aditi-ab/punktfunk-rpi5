@@ -17,6 +17,7 @@ pub unsafe extern "C" fn device_d0_entry(
     device: WDFDEVICE,
     _previous_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
+    dbglog!("[pf-vd] device_d0_entry");
     crate::adapter::init_adapter(device)
 }
 
@@ -26,6 +27,7 @@ pub unsafe extern "C" fn adapter_init_finished(
     adapter: iddcx::IDDCX_ADAPTER,
     _p_in: *const iddcx::IDARG_IN_ADAPTER_INIT_FINISHED,
 ) -> NTSTATUS {
+    dbglog!("[pf-vd] adapter_init_finished");
     crate::adapter::set_adapter(adapter);
     STATUS_SUCCESS
 }
