@@ -1,0 +1,19 @@
+# Shared host<->driver binary contract for the punktfunk pf-vdisplay virtual display.
+#
+# Deliberately self-contained (no `*.workspace = true` inheritance, no Windows deps): this crate is a
+# path dependency of BOTH the host workspace (crates/punktfunk-host) AND the out-of-workspace driver
+# workspace (packaging/windows/drivers/), so it must resolve identically from either build graph. It is
+# `no_std` (+ alloc) and platform-neutral; the GUID/LUID are plain integers each side converts to its
+# own OS type. Defining every wire struct ONCE here — with `const` size/offset asserts + bytemuck
+# round-trips — makes host<->driver ABI drift a COMPILE error instead of a silent frame/IOCTL corruption.
+[package]
+name = "pf-vdisplay-proto"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+description = "Shared host<->driver binary contract for the punktfunk pf-vdisplay virtual display (control IOCTLs + IDD-push frame transport)."
+publish = false
+
+[dependencies]
+bytemuck = { version = "1.19", features = ["derive"] }
