@@ -131,6 +131,26 @@ jobs:
         run: ../../../scripts/ci/provision-windows-wdk.ps1
       - name: cargo build wdk-probe (windows-drivers-rs)
         run: cargo build -p wdk-probe -v
+      - name: Dump generated iddcx.rs structure (diagnostic — runs even on build failure)
+        if: always()
+        run: |
+          $gen = Get-ChildItem -Recurse target -Filter iddcx.rs -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match 'out\\iddcx.rs$' } | Select-Object -First 1
+          if (-not $gen) { Write-Host "no generated iddcx.rs found"; exit 0 }
+          Write-Host "generated: $($gen.FullName)"
+          $L = Get-Content $gen.FullName
+          Write-Host "total lines: $($L.Count)"
+          Write-Host "--- head (1-6) ---"; for ($i=0; $i -lt 6 -and $i -lt $L.Count; $i++) { Write-Host ("{0}: {1}" -f ($i+1), $L[$i]) }
+          Write-Host "--- 'mod ' / 'pub mod ' lines ---"
+          Select-String -Path $gen.FullName -Pattern '^\s*(pub )?mod ' | Select-Object -First 12 | ForEach-Object { Write-Host ("{0}: {1}" -f $_.LineNumber, $_.Line.Trim()) }
+          Write-Host "--- first 4 lines containing UINT (with context module) ---"
+          Select-String -Path $gen.FullName -Pattern '\bUINT\b' | Select-Object -First 4 | ForEach-Object {
+            $n = $_.LineNumber
+            Write-Host ("L{0}: {1}" -f $n, $_.Line.Trim())
+          }
+          Write-Host "--- context around first UINT use ---"
+          $first = (Select-String -Path $gen.FullName -Pattern '\bUINT\b' | Select-Object -First 1).LineNumber
+          if ($first) { for ($i=[Math]::Max(0,$first-6); $i -lt $first+2 -and $i -lt $L.Count; $i++) { Write-Host ("{0}: {1}" -f ($i+1), $L[$i]) } }
       - name: Inspect /INTEGRITYCHECK (before) — expect FORCE_INTEGRITY set by wdk-build
         run: |
           # explicit --target (.cargo/config.toml) -> output under the triple subdir.
