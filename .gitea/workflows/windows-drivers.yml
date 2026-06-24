@@ -124,6 +124,11 @@ jobs:
       LIBCLANG_PATH: 'C:\llvm-21\bin'
     steps:
       - uses: actions/checkout@v4
+      - name: Ensure WDK + cargo-wdk + LLVM 21.1.2 (idempotent self-provision)
+        # Run the provisioning script here too so driver-build is self-sufficient and never races a
+        # separate provision run on the single runner. Path is relative to the job working-directory
+        # (packaging/windows/drivers). Near-noop once the toolchain is present.
+        run: ../../../scripts/ci/provision-windows-wdk.ps1
       - name: cargo build wdk-probe (windows-drivers-rs)
         run: cargo build -p wdk-probe -v
       - name: Inspect the produced DLL's /INTEGRITYCHECK bit

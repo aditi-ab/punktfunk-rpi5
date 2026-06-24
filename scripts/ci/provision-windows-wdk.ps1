@@ -62,15 +62,20 @@ $libclang = Join-Path $llvmDir 'bin\libclang.dll'
 if (Test-Path $libclang) {
   info "LLVM 21.1.2 already present ($libclang) — skipping."
 } else {
-  $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.2/LLVM-21.1.2-win64.exe'
-  $tmp = Join-Path $env:TEMP 'LLVM-21.1.2-win64.exe'
-  info "Downloading LLVM 21.1.2 -> $tmp"
-  Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
-  info ("downloaded {0:N1} MB; installing silently (NSIS /S /D=$llvmDir)..." -f ((Get-Item $tmp).Length / 1MB))
-  # NSIS: /S = silent; /D=<path> MUST be last and unquoted (path has no spaces).
-  $p = Start-Process -FilePath $tmp -ArgumentList '/S', "/D=$llvmDir" -Wait -PassThru
-  info "LLVM installer exit = $($p.ExitCode)"
-  if (-not (Test-Path $libclang)) { throw "LLVM 21.1.2 install did not produce $libclang (exit $($p.ExitCode))" }
+  # Use the portable .tar.xz, NOT the NSIS .exe: the .exe /S silent install HANGS in the headless SYSTEM
+  # CI session (observed stuck >15 min after download, blocking the runner). Win11's bundled tar
+  # (bsdtar/libarchive) extracts .tar.xz; the tarball has one top-level dir, so --strip-components=1
+  # lands bin/ at $llvmDir\bin. We only need libclang.dll + the clang resource dir for bindgen.
+  $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.2/clang+llvm-21.1.2-x86_64-pc-windows-msvc.tar.xz'
+  $tmp = Join-Path $env:TEMP 'llvm-21.1.2-msvc.tar.xz'
+  info "Downloading LLVM 21.1.2 portable archive (~898 MB) -> $tmp"
+  & curl.exe -L --fail --retry 3 -o $tmp $url
+  if ($LASTEXITCODE -ne 0) { throw "LLVM archive download failed ($LASTEXITCODE)" }
+  info ("downloaded {0:N0} MB; extracting to $llvmDir (tar, strip 1)..." -f ((Get-Item $tmp).Length / 1MB))
+  New-Item -ItemType Directory -Force -Path $llvmDir | Out-Null
+  & tar -xf $tmp -C $llvmDir --strip-components=1
+  if ($LASTEXITCODE -ne 0) { throw "tar extract of LLVM failed ($LASTEXITCODE) — runner tar may lack .xz support" }
+  if (-not (Test-Path $libclang)) { throw "LLVM extract did not produce $libclang" }
 }
 
 # ---- 3. Verify (enumerate the REAL layout; fail only on build-essential absences) ----
