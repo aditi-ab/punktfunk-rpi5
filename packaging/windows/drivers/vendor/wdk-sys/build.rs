@@ -369,6 +369,14 @@ fn generate_iddcx(out_path: &Path, config: &Config) -> Result<(), ConfigError> {
             .allowlist_recursively(false)
             .header_contents("iddcx-input.h", &header_contents)
             .allowlist_file("(?i).*iddcx.*")
+            // IddCx structs reference DXGI + OPM (output-protection) types and the `UINT` primitive that
+            // wdk-sys does NOT bindgen. Emit those locally (non-conflicting — they're absent from
+            // crate::types). WDF/GUID/ULONG types it shares DO resolve from crate::types (no WDF type is
+            // missing), so this stays type-identical for the WDF surface.
+            .allowlist_type("DXGI_.*")
+            .allowlist_type("IDXGI.*")
+            .allowlist_type("OPM_.*")
+            .allowlist_type("UINT")
     };
     trace!(bindgen_builder = ?bindgen_builder);
 
