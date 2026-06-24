@@ -11,20 +11,22 @@ use wdk_sys::{call_unsafe_wdf_function_binding, NTSTATUS, WDFDEVICE, WDFREQUEST}
 
 use crate::{STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS};
 
-/// PnP `EvtDeviceD0Entry` (not an IddCx config callback). STEP 3 calls `DeviceContext::init_adapter`
-/// here (adapter creation is deferred to first D0, not driver_add).
+/// PnP `EvtDeviceD0Entry` (not an IddCx config callback). Adapter creation is deferred to the first D0
+/// (the adapter object is only valid after D0), not driver_add.
 pub unsafe extern "C" fn device_d0_entry(
-    _device: WDFDEVICE,
+    device: WDFDEVICE,
     _previous_state: wdk_sys::WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
-    STATUS_SUCCESS
+    crate::adapter::init_adapter(device)
 }
 
-/// Async completion of `IddCxAdapterInitAsync`. STEP 3: stash the adapter + start the watchdog.
+/// Async completion of `IddCxAdapterInitAsync`: stash the adapter for later DDIs. STEP 4 also starts the
+/// watchdog here.
 pub unsafe extern "C" fn adapter_init_finished(
-    _adapter: iddcx::IDDCX_ADAPTER,
+    adapter: iddcx::IDDCX_ADAPTER,
     _p_in: *const iddcx::IDARG_IN_ADAPTER_INIT_FINISHED,
 ) -> NTSTATUS {
+    crate::adapter::set_adapter(adapter);
     STATUS_SUCCESS
 }
 

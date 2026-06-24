@@ -10,6 +10,7 @@
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
+mod adapter;
 mod callbacks;
 #[allow(dead_code)] // salvaged verbatim; wired into the mode callbacks in STEP 4
 mod edid;
