@@ -1,30 +1,19 @@
-//! Versioned IddCx struct sizing — the oracle's `IDD_STRUCTURE_SIZE!` ported to wdk-sys.
+//! `.Size` for `IDD_CX_CLIENT_CONFIG`.
 //!
-//! IddCx structs are versioned: if the running framework is OLDER than the (1.10) headers we built
-//! against, our locally-compiled struct may be LARGER than the framework understands, so `.Size` must
-//! come from the framework's own size table (`IddStructures[INDEX_<struct>]`), not `size_of`. `None`
-//! means the struct is unusable on this framework. When the framework is at least our version,
-//! `size_of` is correct. (wdk-sys uses ModuleConsts: `_IDDSTRUCTENUM::INDEX_*`, not the oracle's
-//! NewType `.0`.)
+//! The oracle uses a *versioned* size — `IddStructures[INDEX]` when the running framework is OLDER than
+//! the (1.10) headers we built against (`IddClientVersionHigherThanFramework != 0`). That machinery
+//! (`IddClientVersionHigherThanFramework` / `IddStructureCount` / `IddStructures`) only exists in the
+//! iddcx ≥1.4 `IddCxStub`; the WDK on the runner/box links the **1.0** stub (the only `IddCxStub.lib`
+//! present), which does NOT export those symbols — referencing them is an LNK2019. We target IddCx 1.10
+//! against a current framework (framework ≥ client ⇒ `higher == false`), where `size_of` is exactly what
+//! the versioned path returns. So use `size_of` directly. (Revisit the versioned path — with a ≥1.4
+//! `IddCxStub` linked — only if pre-1.10 Windows must ever be supported, which the punktfunk Windows
+//! host does not target.)
 
 use wdk_sys::iddcx;
 
-/// Correct `.Size` for `IDD_CX_CLIENT_CONFIG`, or `None` if it can't be used on this framework.
+/// Correct `.Size` for `IDD_CX_CLIENT_CONFIG` on a framework at least as new as our headers.
 #[must_use]
 pub fn idd_cx_client_config_size() -> Option<u32> {
-    // SAFETY: read-only access to the stub-provided framework globals.
-    let higher = unsafe { (&raw const iddcx::IddClientVersionHigherThanFramework).read() } != 0;
-    if !higher {
-        return u32::try_from(core::mem::size_of::<iddcx::IDD_CX_CLIENT_CONFIG>()).ok();
-    }
-    // SAFETY: read-only.
-    let count = unsafe { (&raw const iddcx::IddStructureCount).read() };
-    let index = iddcx::_IDDSTRUCTENUM::INDEX_IDD_CX_CLIENT_CONFIG as u32;
-    if index >= count {
-        return None; // struct cannot be used on this (older) framework
-    }
-    // SAFETY: `IddStructures` is the framework's size table; `index` is validated `< count`.
-    let table = unsafe { (&raw const iddcx::IddStructures).read() };
-    let size = unsafe { table.add(index as usize).read() };
-    u32::try_from(size).ok()
+    u32::try_from(core::mem::size_of::<iddcx::IDD_CX_CLIENT_CONFIG>()).ok()
 }
