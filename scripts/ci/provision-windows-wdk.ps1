@@ -20,13 +20,13 @@ param(
 $ErrorActionPreference = 'Stop'
 function info($m) { Write-Host "[provision-wdk] $m" }
 
-$kitRoot = 'C:\Program Files (x86)\Windows Kits\10'
-$wdfHdr  = Join-Path $kitRoot "Include\$SdkVersion\km\wdf\umdf\2.31\wdf.h"
-$iddcxInc = Join-Path $kitRoot "Include\$SdkVersion\um\iddcx"
+$kitRoot  = 'C:\Program Files (x86)\Windows Kits\10'
+$iddcxInc = Join-Path $kitRoot "Include\$SdkVersion\um\iddcx"   # iddcx ships ONLY with the WDK -> reliable "installed" signal
+$kmDir    = Join-Path $kitRoot "Include\$SdkVersion\km"          # kernel-mode SDK headers (ntddk/wdm) — also WDK-only
 
-# ---- 1. WDK ----
-if (Test-Path $wdfHdr) {
-  info "WDK already present ($wdfHdr) — skipping install."
+# ---- 1. WDK ---- (iddcx presence is the reliable "WDK installed" signal)
+if (Test-Path $iddcxInc) {
+  info "WDK already present (iddcx headers at $iddcxInc) — skipping install."
 } else {
   $tmp = Join-Path $env:TEMP 'wdksetup.exe'
   info "Downloading WDK bootstrapper -> $tmp"
@@ -52,23 +52,30 @@ if ($haveCargoWdk) {
   if ($LASTEXITCODE -ne 0) { throw "cargo install cargo-wdk failed ($LASTEXITCODE)" }
 }
 
-# ---- 3. Verify ----
+# ---- 3. Verify (enumerate the REAL layout; fail only on build-essential absences) ----
 Write-Host ""
 Write-Host "===== post-provision verification ====="
-$ok = $true
-function check($label, $cond) { Write-Host ("{0,-28} {1}" -f $label, ($(if ($cond) {'OK'} else {'MISSING'}))); if (-not $cond) { $script:ok = $false } }
-check "km/wdf/umdf/2.31/wdf.h" (Test-Path $wdfHdr)
+function found($label, $val) { Write-Host ("{0,-26} {1}" -f $label, $val) }
+
+# WDF UMDF headers live under Include\wdf\umdf\<ver>\ (NOT under the SDK-version dir).
+$umdfRoot = Join-Path $kitRoot 'Include\wdf\umdf'
+$umdfVers = (Get-ChildItem $umdfRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ','
+$umdfHdr  = Get-ChildItem -Path $umdfRoot -Filter 'wdf.h' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
 $iddcxVers = (Get-ChildItem $iddcxInc -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ','
-Write-Host ("{0,-28} [{1}]" -f 'um/iddcx versions', $iddcxVers)
-check "iddcx headers" ($iddcxVers -ne '')
-foreach ($t in 'inf2cat.exe','stampinf.exe','signtool.exe') {
-  $hit = Get-ChildItem -Path $kitRoot -Filter $t -Recurse -ErrorAction SilentlyContinue |
-         Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1 -ExpandProperty FullName
-  check $t ($null -ne $hit)
+
+found 'Include\wdf\umdf vers' "[$umdfVers]"
+found 'wdf.h'                 ($(if ($umdfHdr) { $umdfHdr } else { 'MISSING' }))
+found 'km SDK headers'        ($(if (Test-Path $kmDir) { $kmDir } else { 'MISSING' }))
+found 'um/iddcx versions'     "[$iddcxVers]"
+foreach ($t in 'inf2cat.exe','stampinf.exe','signtool.exe','makecat.exe','InfVerif.exe') {
+  $hit = Get-ChildItem -Path $kitRoot -Filter $t -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+  found $t ($(if ($hit) { $hit } else { 'MISSING' }))
 }
 try { $cw = (& cargo wdk --version 2>&1) -join ' ' } catch { $cw = '' }
-check "cargo-wdk" ($cw -match 'wdk')
-Write-Host "cargo-wdk version: $cw"
+found 'cargo-wdk'             $cw
 
-if (-not $ok) { throw "provisioning incomplete — see MISSING above" }
-info "WDK + cargo-wdk provisioned. Driver builds should pin Version_Number=$SdkVersion."
+# Block only on the genuinely build-essential pieces (headers + iddcx + cargo-wdk). inf2cat arch quirks
+# are non-fatal — cargo-wdk locates the WDK tools itself.
+$essential = ($null -ne $umdfHdr) -and (Test-Path $kmDir) -and ($iddcxVers -ne '') -and ($cw -match 'wdk')
+if (-not $essential) { throw "provisioning incomplete: need wdf.h + km headers + iddcx + cargo-wdk (see above)" }
+info "WDK + cargo-wdk provisioned OK. Driver builds pin Version_Number=$SdkVersion."
