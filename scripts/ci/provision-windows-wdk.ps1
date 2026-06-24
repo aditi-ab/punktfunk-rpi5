@@ -52,6 +52,27 @@ if ($haveCargoWdk) {
   if ($LASTEXITCODE -ne 0) { throw "cargo install cargo-wdk failed ($LASTEXITCODE)" }
 }
 
+# ---- 2b. LLVM 21.1.2 (libclang for wdk-sys bindgen) ----
+# wdk-sys's bindgen layout tests overflow (E0080 on threadlocaleinfostruct etc.) with LLVM ToT / dev
+# (22+) builds — the runner's default C:\Program Files\LLVM. The windows-drivers-rs maintainers confirm
+# the RELEASED LLVM 21.1.2 builds clean (discussion #591). Install it to a dedicated path so the client
+# builds' LLVM is untouched; the driver-build CI job points LIBCLANG_PATH here.
+$llvmDir  = 'C:\llvm-21'
+$libclang = Join-Path $llvmDir 'bin\libclang.dll'
+if (Test-Path $libclang) {
+  info "LLVM 21.1.2 already present ($libclang) — skipping."
+} else {
+  $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.2/LLVM-21.1.2-win64.exe'
+  $tmp = Join-Path $env:TEMP 'LLVM-21.1.2-win64.exe'
+  info "Downloading LLVM 21.1.2 -> $tmp"
+  Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+  info ("downloaded {0:N1} MB; installing silently (NSIS /S /D=$llvmDir)..." -f ((Get-Item $tmp).Length / 1MB))
+  # NSIS: /S = silent; /D=<path> MUST be last and unquoted (path has no spaces).
+  $p = Start-Process -FilePath $tmp -ArgumentList '/S', "/D=$llvmDir" -Wait -PassThru
+  info "LLVM installer exit = $($p.ExitCode)"
+  if (-not (Test-Path $libclang)) { throw "LLVM 21.1.2 install did not produce $libclang (exit $($p.ExitCode))" }
+}
+
 # ---- 3. Verify (enumerate the REAL layout; fail only on build-essential absences) ----
 Write-Host ""
 Write-Host "===== post-provision verification ====="
@@ -73,9 +94,10 @@ foreach ($t in 'inf2cat.exe','stampinf.exe','signtool.exe','makecat.exe','InfVer
 }
 try { $cw = (& cargo wdk --version 2>&1) -join ' ' } catch { $cw = '' }
 found 'cargo-wdk'             $cw
+found 'LLVM 21.1.2 libclang'  ($(if (Test-Path $libclang) { $libclang } else { 'MISSING' }))
 
-# Block only on the genuinely build-essential pieces (headers + iddcx + cargo-wdk). inf2cat arch quirks
-# are non-fatal — cargo-wdk locates the WDK tools itself.
-$essential = ($null -ne $umdfHdr) -and (Test-Path $kmDir) -and ($iddcxVers -ne '') -and ($cw -match 'wdk')
-if (-not $essential) { throw "provisioning incomplete: need wdf.h + km headers + iddcx + cargo-wdk (see above)" }
-info "WDK + cargo-wdk provisioned OK. Driver builds pin Version_Number=$SdkVersion."
+# Block only on the genuinely build-essential pieces (headers + iddcx + cargo-wdk + the pinned libclang).
+# inf2cat arch quirks are non-fatal — cargo-wdk locates the WDK tools itself.
+$essential = ($null -ne $umdfHdr) -and (Test-Path $kmDir) -and ($iddcxVers -ne '') -and ($cw -match 'wdk') -and (Test-Path $libclang)
+if (-not $essential) { throw "provisioning incomplete: need wdf.h + km headers + iddcx + cargo-wdk + LLVM 21.1.2 (see above)" }
+info "WDK + cargo-wdk + LLVM 21.1.2 provisioned OK. Driver builds pin Version_Number=$SdkVersion + LIBCLANG_PATH=$llvmDir\bin."
