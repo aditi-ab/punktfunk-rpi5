@@ -1,0 +1,102 @@
+# Windows driver workspace CI — runs on the self-hosted Windows runner (home-windows-1, host mode;
+# label windows-amd64). Part of the Windows-host rewrite (docs/windows-host-rewrite.md, M0).
+#
+# Stage 1 (this file): PROBE the runner's driver toolchain (WDK / EWDK / cargo-make / LLVM / the
+# inf2cat/stampinf/devgen/signtool tools) so we know what's provisioned BEFORE writing driver code,
+# and build+test the owned ABI crate (pf-vdisplay-proto) on MSVC to prove it compiles cross-OS and the
+# CI wiring works. The runner has no RTX GPU — that's fine: builds, the IddCx bindgen/link, the
+# /INTEGRITYCHECK self-sign-load, and (later) IDD-push frame flow on the basic display do not need one;
+# only live NVENC encode does, which defers to the RTX box.
+#
+# shell: pwsh deliberately (PowerShell 5.1's Out-File -Encoding utf8 prepends a BOM that corrupts the
+# first GITHUB_ENV line — see windows.yml).
+name: windows-drivers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.gitea/workflows/windows-drivers.yml'
+      - 'crates/pf-vdisplay-proto/**'
+      - 'packaging/windows/drivers/**'
+  pull_request:
+    paths:
+      - '.gitea/workflows/windows-drivers.yml'
+      - 'crates/pf-vdisplay-proto/**'
+      - 'packaging/windows/drivers/**'
+
+jobs:
+  probe-and-proto:
+    runs-on: windows-amd64
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe driver toolchain (informational — never fails the job)
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function head($t) { Write-Host ""; Write-Host "===== $t =====" }
+
+          head "Windows Kits roots"
+          $kits = @('C:\Program Files (x86)\Windows Kits\10', 'C:\Program Files\Windows Kits\10')
+          foreach ($k in $kits) { if (Test-Path $k) { Write-Host "found: $k" } }
+
+          head "SDK Include versions (um vs km — km => WDK present)"
+          foreach ($k in $kits) {
+            $inc = Join-Path $k 'Include'
+            if (Test-Path $inc) {
+              Get-ChildItem $inc -Directory | ForEach-Object {
+                $hasUm = Test-Path (Join-Path $_.FullName 'um')
+                $hasKm = Test-Path (Join-Path $_.FullName 'km')
+                $wdf   = Test-Path (Join-Path $_.FullName 'km\wdf\umdf\2.31')
+                $iddcx = (Get-ChildItem (Join-Path $_.FullName 'um\iddcx') -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ','
+                Write-Host ("{0,-16} um={1,-5} km={2,-5} wdf2.31={3,-5} iddcx=[{4}]" -f $_.Name, $hasUm, $hasKm, $wdf, $iddcx)
+              }
+            }
+          }
+
+          head "Driver tooling (inf2cat / stampinf / signtool / devgen / InfVerif)"
+          foreach ($tool in 'inf2cat.exe','stampinf.exe','signtool.exe','devgen.exe','InfVerif.exe','makecat.exe') {
+            $hits = @()
+            foreach ($k in $kits) {
+              $hits += Get-ChildItem -Path $k -Filter $tool -Recurse -ErrorAction SilentlyContinue |
+                       Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1 -ExpandProperty FullName
+            }
+            $hits = $hits | Where-Object { $_ } | Select-Object -First 1
+            Write-Host ("{0,-14} -> {1}" -f $tool, ($(if ($hits) { $hits } else { 'NOT FOUND' })))
+          }
+
+          head "EWDK"
+          Write-Host ("EWDKROOT = " + ($env:EWDKROOT ?? '<unset>'))
+
+          head "LLVM / clang (README pins 21.1.2 for wdk-sys bindgen)"
+          Write-Host ("LIBCLANG_PATH = " + ($env:LIBCLANG_PATH ?? '<unset>'))
+          $clang = Get-Command clang -ErrorAction SilentlyContinue
+          if ($clang) { & clang --version } else { Write-Host "clang: NOT on PATH" }
+
+          head "cargo-make (the gamepad drivers' build driver)"
+          $cm = & cargo make --version 2>&1; Write-Host $cm
+
+          head "Rust + targets"
+          & rustc -V; & cargo -V
+          Write-Host "installed targets:"; & rustup target list --installed
+
+          head "Env knobs the WDK build cares about"
+          Write-Host ("Version_Number = " + ($env:Version_Number ?? '<unset>'))
+          Write-Host ("CARGO_HOME     = " + ($env:CARGO_HOME ?? '<unset>'))
+          Write-Host ("CARGO_TARGET_DIR (daemon) = " + ($env:CARGO_TARGET_DIR ?? '<unset>'))
+
+      - name: Build + test pf-vdisplay-proto (MSVC)
+        run: |
+          # Short target dir to dodge MAX_PATH inside the deep act host workdir (see windows.yml).
+          "CARGO_TARGET_DIR=C:\t\drv" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $env:CARGO_TARGET_DIR = "C:\t\drv"
+          cargo build -p pf-vdisplay-proto
+          cargo test  -p pf-vdisplay-proto
+          cargo clippy -p pf-vdisplay-proto --all-targets -- -D warnings
+          cargo fmt -p pf-vdisplay-proto -- --check
