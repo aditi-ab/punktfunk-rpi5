@@ -119,6 +119,9 @@ jobs:
     env:
       # wdk-build otherwise picks 10.0.28000.0 (no km/crt) and bindgen fails — pin the WDK SDK version.
       Version_Number: '10.0.26100.0'
+      # wdk-sys bindgen layout tests overflow (E0080) on the runner's default LLVM (ToT/22-dev); point at
+      # the pinned LLVM 21.1.2 that windows-drivers-rs builds clean against (provisioned to C:\llvm-21).
+      LIBCLANG_PATH: 'C:\llvm-21\bin'
     steps:
       - uses: actions/checkout@v4
       - name: cargo build wdk-probe (windows-drivers-rs)
