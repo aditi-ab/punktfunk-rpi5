@@ -12,6 +12,26 @@ use wdk_sys::{
 
 use crate::{callbacks, size, STATUS_NOT_FOUND};
 
+/// A WDF device context, attached to the WDFDEVICE at WdfDeviceCreate. The working virtual-display-rs +
+/// oracle both create the device with a context-typed `DeviceContext` (we previously passed
+/// WDF_NO_OBJECT_ATTRIBUTES). `WDF_OBJECT_CONTEXT_TYPE_INFO` holds raw pointers (Sync wrapper for the
+/// `static`); `UniqueType` self-references per `WDF_DECLARE_CONTEXT_TYPE`.
+#[repr(C)]
+struct DeviceContext {
+    _device: WDFDEVICE,
+}
+#[repr(transparent)]
+struct DevCtxInfo(wdk_sys::WDF_OBJECT_CONTEXT_TYPE_INFO);
+// SAFETY: immutable 'static type metadata; the inner raw pointers are 'static and never written.
+unsafe impl Sync for DevCtxInfo {}
+static DEVICE_CTX: DevCtxInfo = DevCtxInfo(wdk_sys::WDF_OBJECT_CONTEXT_TYPE_INFO {
+    Size: core::mem::size_of::<wdk_sys::WDF_OBJECT_CONTEXT_TYPE_INFO>() as u32,
+    ContextName: c"PfVdDeviceCtx".as_ptr().cast(),
+    ContextSize: core::mem::size_of::<DeviceContext>(),
+    UniqueType: &DEVICE_CTX.0,
+    EvtDriverGetUniqueContextType: None,
+});
+
 #[unsafe(export_name = "DriverEntry")]
 pub unsafe extern "system" fn driver_entry(
     driver: PDRIVER_OBJECT,
@@ -78,14 +98,16 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     }
 
     let mut device: WDFDEVICE = core::ptr::null_mut();
-    // SAFETY: init configured above; no context attributes yet (STEP 3 adds DeviceContext + cleanup).
+    // Attach a device context type (like the working virtual-display-rs/oracle), not WDF_NO_OBJECT_ATTRIBUTES.
+    let mut dev_attr: wdk_sys::WDF_OBJECT_ATTRIBUTES = unsafe { core::mem::zeroed() };
+    dev_attr.Size = core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32;
+    dev_attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
+    dev_attr.SynchronizationScope =
+        wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
+    dev_attr.ContextTypeInfo = &DEVICE_CTX.0;
+    // SAFETY: init configured above; dev_attr is a valid context-typed attributes block.
     let status = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceCreate,
-            &mut init,
-            WDF_NO_OBJECT_ATTRIBUTES,
-            &mut device
-        )
+        call_unsafe_wdf_function_binding!(WdfDeviceCreate, &mut init, &mut dev_attr, &mut device)
     };
     dbglog!("[pf-vd] WdfDeviceCreate -> {status:#x}");
     if !nt_success(status) {
@@ -95,31 +117,14 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     // IddCx must be initialized on the device BEFORE other device setup (the canonical IddCx sample order).
     // We previously created the device interface first — which can leave IddCx not fully ready by D0Entry,
     // making IddCxAdapterInitAsync reject (INVALID_PARAMETER) despite byte-perfect caps.
+    // DIAGNOSTIC (STEP 3): the WdfDeviceCreateDeviceInterface call is REMOVED. Upstream virtual-display-rs
+    // and the MS IddCx sample create NO device interface — IddCx's control channel is EvtIddCxDeviceIoControl
+    // (already registered in the config). A non-IddCx device interface registered on the IddCx/IndirectKmd
+    // stack is a prime suspect for IddCxAdapterInitAsync -> INVALID_PARAMETER. If removing it fixes adapter
+    // init, the proto control plane moves to EvtIddCxDeviceIoControl (STEP 4) instead of a device interface.
+    let _ = pf_vdisplay_proto::interface_guid_fields; // keep the dep referenced
     // SAFETY: device is the just-created WDFDEVICE.
     let status = unsafe { wdk_iddcx::IddCxDeviceInitialize(device) };
     dbglog!("[pf-vd] IddCxDeviceInitialize -> {status:#x}");
-    if !nt_success(status) {
-        return status;
-    }
-
-    // Expose the owned pf-vdisplay control interface (the host opens this GUID; STEP 4 wires the host
-    // side in lockstep). NOT SudoVDA's GUID.
-    let (d1, d2, d3, d4) = pf_vdisplay_proto::interface_guid_fields();
-    let guid = GUID {
-        Data1: d1,
-        Data2: d2,
-        Data3: d3,
-        Data4: d4,
-    };
-    // SAFETY: device is the just-created WDFDEVICE; guid lives for the call; no reference string.
-    let status = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceCreateDeviceInterface,
-            device,
-            &guid,
-            core::ptr::null()
-        )
-    };
-    dbglog!("[pf-vd] WdfDeviceCreateDeviceInterface -> {status:#x}");
     status
 }

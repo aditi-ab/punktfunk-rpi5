@@ -4,6 +4,12 @@
 fn main() -> Result<(), wdk_build::ConfigError> {
     wdk_build::configure_wdk_binary_build()?;
     link_iddcx_stub();
+    // wdk-build emits `/OPT:REF,ICF`. ICF (Identical COMDAT Folding) merges functions with identical
+    // bodies into ONE address — our many identical stub IddCx callbacks (`return STATUS_SUCCESS`) collapse
+    // to the same pointer (and even CRT EH handlers fold, hence the dumpbin `__CxxFrameHandler4 = DllMain`
+    // alias). The working virtual-display-rs links with NO `/OPT`, and IddCxAdapterInitAsync rejects a
+    // config whose distinct callbacks alias each other. Disable ICF (REF stays on); last `/OPT` wins.
+    println!("cargo::rustc-cdylib-link-arg=/OPT:NOICF");
     Ok(())
 }
 

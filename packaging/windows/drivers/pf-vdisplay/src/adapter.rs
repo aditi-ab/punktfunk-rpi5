@@ -148,6 +148,18 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     attr.SynchronizationScope =
         wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
     attr.ContextTypeInfo = &ADAPTER_CTX.0;
+    dbglog!(
+        "[pf-vd] rt: dev={:#x} pCaps={:#x} model={:#x} mfg={:#x} fwVer={:#x} hwVer={:#x} verSizeOf={} verSet={} diagSet={}",
+        device as usize,
+        (&raw const caps) as usize,
+        caps.EndPointDiagnostics.pEndPointModelName as usize,
+        caps.EndPointDiagnostics.pEndPointManufacturerName as usize,
+        caps.EndPointDiagnostics.pFirmwareVersion as usize,
+        caps.EndPointDiagnostics.pHardwareVersion as usize,
+        core::mem::size_of::<iddcx::IDDCX_ENDPOINT_VERSION>(),
+        version.Size,
+        caps.EndPointDiagnostics.Size,
+    );
     let init = iddcx::IDARG_IN_ADAPTER_INIT {
         WdfDevice: device,
         pCaps: &raw mut caps,
