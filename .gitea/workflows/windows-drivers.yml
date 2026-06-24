@@ -111,18 +111,21 @@ jobs:
     defaults:
       run:
         shell: pwsh
+        # In-tree target dir on purpose: wdk-build's find_top_level_cargo_manifest() walks UP from OUT_DIR
+        # to the first ancestor with a Cargo.lock, so a relocated CARGO_TARGET_DIR (C:\t\…) hides the
+        # workspace lock and it panics. The driver deps have no deep CMake-from-source crates, so the
+        # default in-tree target stays well under MAX_PATH (unlike the SDL3/audiopus client build).
+        working-directory: packaging/windows/drivers
     env:
       # wdk-build otherwise picks 10.0.28000.0 (no km/crt) and bindgen fails — pin the WDK SDK version.
       Version_Number: '10.0.26100.0'
-      CARGO_TARGET_DIR: 'C:\t\drvws'
     steps:
       - uses: actions/checkout@v4
       - name: cargo build wdk-probe (windows-drivers-rs)
-        working-directory: packaging/windows/drivers
         run: cargo build -p wdk-probe -v
       - name: Inspect the produced DLL's /INTEGRITYCHECK bit
         run: |
-          $dll = "$env:CARGO_TARGET_DIR\debug\wdk_probe.dll"
+          $dll = "target\debug\wdk_probe.dll"
           if (-not (Test-Path $dll)) { throw "wdk_probe.dll not produced at $dll" }
           $b = [IO.File]::ReadAllBytes($dll)
           $pe = [BitConverter]::ToInt32($b, 0x3c)
