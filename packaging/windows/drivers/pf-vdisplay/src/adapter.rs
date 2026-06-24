@@ -80,28 +80,6 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
         iddcx::_IDDSTRUCTENUM::INDEX_IDDCX_ADAPTER_CAPS as u32,
     )
     .unwrap_or(core::mem::size_of::<iddcx::IDDCX_ADAPTER_CAPS>() as u32);
-    dbglog!("[pf-vd] fw sizes: caps={caps_size} diag={diag_size} ver={ver_size}");
-    // Field-offset audit vs the expected C layout (x64): caps Flags=4 MaxRate=8 MaxMon=16 Diag=24
-    // Static=80; diag Trans=4 Friendly=8 Model=16 Manuf=24 HwVer=32 FwVer=40 Gamma=48. A mismatch =
-    // bindgen mis-laid the struct (would make IddCxAdapterInitAsync read garbage -> INVALID_PARAMETER).
-    dbglog!(
-        "[pf-vd] caps off: Flags={} MaxRate={} MaxMon={} Diag={} Static={}",
-        core::mem::offset_of!(iddcx::IDDCX_ADAPTER_CAPS, Flags),
-        core::mem::offset_of!(iddcx::IDDCX_ADAPTER_CAPS, MaxDisplayPipelineRate),
-        core::mem::offset_of!(iddcx::IDDCX_ADAPTER_CAPS, MaxMonitorsSupported),
-        core::mem::offset_of!(iddcx::IDDCX_ADAPTER_CAPS, EndPointDiagnostics),
-        core::mem::offset_of!(iddcx::IDDCX_ADAPTER_CAPS, StaticDesktopReencodeFrameCount),
-    );
-    dbglog!(
-        "[pf-vd] diag off: Trans={} Friendly={} Model={} Manuf={} HwVer={} FwVer={} Gamma={}",
-        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, TransmissionType),
-        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, pEndPointFriendlyName),
-        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, pEndPointModelName),
-        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, pEndPointManufacturerName),
-        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, pHardwareVersion),
-        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, pFirmwareVersion),
-        core::mem::offset_of!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO, GammaSupport),
-    );
 
     // Firmware/hardware version (telemetry). The oracle points BOTH at one IDDCX_ENDPOINT_VERSION.
     // `version` is a stack local read synchronously by IddCxAdapterInitAsync (same as the oracle).
@@ -111,9 +89,13 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     version.MinorVer = env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0);
     version.Build = env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0);
 
-    // Endpoint diagnostics. `pEndPointModelName` must be a non-empty string. GammaSupport stays NONE.
+    // Endpoint diagnostics. `pEndPointModelName` must be a non-empty string. GammaSupport MUST be set: a
+    // zeroed value is IDDCX_FEATURE_IMPLEMENTATION_UNINITIALIZED (0), which the framework's adapter Validate
+    // rejects with INVALID_PARAMETER (ddivalidation.cpp:797) — set it to NONE (1) like upstream. THIS was
+    // the on-glass adapter-init blocker.
     let mut diag: iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO = unsafe { core::mem::zeroed() };
     diag.Size = diag_size;
+    diag.GammaSupport = iddcx::IDDCX_FEATURE_IMPLEMENTATION::IDDCX_FEATURE_IMPLEMENTATION_NONE;
     diag.TransmissionType = iddcx::IDDCX_TRANSMISSION_TYPE::IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
     diag.pEndPointFriendlyName = wstr!("punktfunk Virtual Display Adapter");
     diag.pEndPointManufacturerName = wstr!("punktfunk");
@@ -123,43 +105,21 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
 
     let mut caps: iddcx::IDDCX_ADAPTER_CAPS = unsafe { core::mem::zeroed() };
     caps.Size = caps_size;
-    // FP16 (HDR) — consistent with the config's *2/gamma/hdr callbacks. NOTE: a minimal SDR adapter
-    // (Flags=NONE + only the required callbacks) ALSO fails IddCxAdapterInitAsync identically, so the
-    // FP16/*2/HDR set is NOT the blocker (see windows-pfvd-onglass-load memory).
-    caps.Flags = iddcx::IDDCX_ADAPTER_FLAGS::IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
+    // Flags = NONE (SDR). The working upstream virtual-display-rs sets NO Flags. CAN_PROCESS_FP16 requires a
+    // newer IddCx contract than the INF's UmdfExtensions=IddCx0102 grants, so the framework's adapter-caps
+    // Validate (ddivalidation.cpp:797) rejects it with STATUS_INVALID_PARAMETER. HDR/FP16 is deferred to
+    // STEP 7 (needs a higher UmdfExtensions binding + the obligated *2/HDR DDIs).
     caps.MaxMonitorsSupported = 16;
     caps.EndPointDiagnostics = diag;
 
-    dbglog!(
-        "[pf-vd] caps Size={} Flags={:#x} MaxMon={} diagSize={} cfgSizeOf={} capsSizeOf={}",
-        caps.Size,
-        caps.Flags,
-        caps.MaxMonitorsSupported,
-        caps.EndPointDiagnostics.Size,
-        core::mem::size_of::<iddcx::IDD_CX_CLIENT_CONFIG>(),
-        core::mem::size_of::<iddcx::IDDCX_ADAPTER_CAPS>(),
-    );
-    // The adapter WDF object's attributes. The oracle passes an init'd WDF_OBJECT_ATTRIBUTES (Size +
-    // Synchronization/Execution = InheritFromParent — NOT zeroed, since zero = *Invalid*); a null/zeroed
-    // one is what IddCxAdapterInitAsync rejected. No context type yet (STEP 3).
+    // The adapter WDF object's attributes: Size + Synchronization/Execution = InheritFromParent (NOT zeroed,
+    // since zero = *Invalid*) + the adapter context type (STEP 4 stores adapter state here).
     let mut attr: wdk_sys::WDF_OBJECT_ATTRIBUTES = unsafe { core::mem::zeroed() };
     attr.Size = core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32;
     attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
     attr.SynchronizationScope =
         wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
     attr.ContextTypeInfo = &ADAPTER_CTX.0;
-    dbglog!(
-        "[pf-vd] rt: dev={:#x} pCaps={:#x} model={:#x} mfg={:#x} fwVer={:#x} hwVer={:#x} verSizeOf={} verSet={} diagSet={}",
-        device as usize,
-        (&raw const caps) as usize,
-        caps.EndPointDiagnostics.pEndPointModelName as usize,
-        caps.EndPointDiagnostics.pEndPointManufacturerName as usize,
-        caps.EndPointDiagnostics.pFirmwareVersion as usize,
-        caps.EndPointDiagnostics.pHardwareVersion as usize,
-        core::mem::size_of::<iddcx::IDDCX_ENDPOINT_VERSION>(),
-        version.Size,
-        caps.EndPointDiagnostics.Size,
-    );
     let init = iddcx::IDARG_IN_ADAPTER_INIT {
         WdfDevice: device,
         pCaps: &raw mut caps,

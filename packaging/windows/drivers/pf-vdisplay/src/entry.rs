@@ -80,12 +80,10 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     cfg.EvtIddCxMonitorGetDefaultDescriptionModes = Some(callbacks::monitor_get_default_modes);
     cfg.EvtIddCxMonitorQueryTargetModes = Some(callbacks::monitor_query_modes);
     cfg.EvtIddCxAdapterCommitModes = Some(callbacks::adapter_commit_modes);
-    cfg.EvtIddCxParseMonitorDescription2 = Some(callbacks::parse_monitor_description2);
-    cfg.EvtIddCxMonitorQueryTargetModes2 = Some(callbacks::monitor_query_modes2);
-    cfg.EvtIddCxAdapterCommitModes2 = Some(callbacks::adapter_commit_modes2);
-    cfg.EvtIddCxAdapterQueryTargetInfo = Some(callbacks::query_target_info);
-    cfg.EvtIddCxMonitorSetDefaultHdrMetaData = Some(callbacks::set_default_hdr_metadata);
-    cfg.EvtIddCxMonitorSetGammaRamp = Some(callbacks::set_gamma_ramp);
+    // SDR config — matches the working upstream virtual-display-rs. The *2 / gamma / HDR-metadata /
+    // query-target-info callbacks are FP16-OBLIGATED: registering them while caps declare no FP16 makes the
+    // framework's adapter Validate reject (ddivalidation.cpp:797 -> INVALID_PARAMETER). They return with
+    // FP16 caps under a higher UmdfExtensions binding in STEP 7 (HDR).
     cfg.EvtIddCxMonitorAssignSwapChain = Some(callbacks::assign_swap_chain);
     cfg.EvtIddCxMonitorUnassignSwapChain = Some(callbacks::unassign_swap_chain);
     cfg.EvtIddCxDeviceIoControl = Some(callbacks::device_io_control);
