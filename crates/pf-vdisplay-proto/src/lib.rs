@@ -25,6 +25,22 @@ extern crate alloc;
 /// `GUID::from_u128(PF_VDISPLAY_INTERFACE_GUID_U128)`.
 pub const PF_VDISPLAY_INTERFACE_GUID_U128: u128 = 0x7066_7664_7044_5350_a1b2_c3d4_e5f6_0001;
 
+/// The interface GUID split into Windows `GUID` fields — `(Data1, Data2, Data3, Data4)` — so the driver
+/// (and host) can build a `windows`/`wdk_sys` `GUID` without re-deriving the byte layout. Standard GUID
+/// layout from the u128: `Data1` = high 32 bits, `Data2`/`Data3` = next two 16-bit groups, `Data4` =
+/// the low 64 bits big-endian. (This crate is `no_std` + provider-agnostic, so it returns the fields
+/// rather than depend on a `GUID` type.)
+#[must_use]
+pub const fn interface_guid_fields() -> (u32, u16, u16, [u8; 8]) {
+    let g = PF_VDISPLAY_INTERFACE_GUID_U128;
+    (
+        (g >> 96) as u32,
+        (g >> 80) as u16,
+        (g >> 64) as u16,
+        (g as u64).to_be_bytes(),
+    )
+}
+
 /// Bumped on any incompatible change to either plane. Exchanged via [`control::IOCTL_GET_INFO`]; host
 /// and driver assert a match at startup so a mismatched pair fails loudly instead of corrupting.
 pub const PROTOCOL_VERSION: u32 = 1;
