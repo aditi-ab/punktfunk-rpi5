@@ -362,6 +362,12 @@ fn generate_iddcx(out_path: &Path, config: &Config) -> Result<(), ConfigError> {
             // parses wdf.h non-stubbed; stubbing only here would desync WDF type-identity).
             .clang_arg("--language=c++")
             .clang_arg("-DIDD_STUB")
+            // Parsing as C++ makes bindgen preserve the `UINT` typedef as the underlying repr of the
+            // DXGI/OPM enums it emits as `pub mod _X { pub type Type = UINT; }` — and `UINT` isn't in
+            // scope inside those nested modules. Translate enum repr types to native Rust ints (u32) so
+            // the enum modules are self-contained. (Struct fields still use `UINT`, covered by the
+            // alias in src/iddcx.rs.)
+            .translate_enum_integer_types(true)
             // Emit ONLY IddCx items (its types + the IddFunctions table enums + the DDI fn-pointer
             // typedefs) and DON'T recurse into referenced WDF/Win/DXGI types — those resolve to wdk-sys's
             // shared bindings via `use crate::types::*` in src/iddcx.rs (type-identity, no re-emission,
