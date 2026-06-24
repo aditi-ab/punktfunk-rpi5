@@ -40,6 +40,22 @@ unsafe impl Sync for SendAdapter {}
 
 static ADAPTER: OnceLock<SendAdapter> = OnceLock::new();
 
+/// A WDF context type for the adapter object. SudoVDA/the oracle create the adapter via
+/// `WDF_OBJECT_ATTRIBUTES::init_context_type(..)`; passing attributes with NO `ContextTypeInfo` is the one
+/// structural difference left vs the working SudoVDA driver. `WDF_OBJECT_CONTEXT_TYPE_INFO` holds raw
+/// pointers (so a Sync wrapper to allow a `static`); `UniqueType` self-references per `WDF_DECLARE_CONTEXT_TYPE`.
+#[repr(transparent)]
+struct CtxTypeInfo(wdk_sys::WDF_OBJECT_CONTEXT_TYPE_INFO);
+// SAFETY: immutable 'static type metadata; the inner raw pointers are 'static and never written.
+unsafe impl Sync for CtxTypeInfo {}
+static ADAPTER_CTX: CtxTypeInfo = CtxTypeInfo(wdk_sys::WDF_OBJECT_CONTEXT_TYPE_INFO {
+    Size: core::mem::size_of::<wdk_sys::WDF_OBJECT_CONTEXT_TYPE_INFO>() as u32,
+    ContextName: c"PfVdAdapterCtx".as_ptr().cast(),
+    ContextSize: core::mem::size_of::<iddcx::IDDCX_ADAPTER>(),
+    UniqueType: &ADAPTER_CTX.0,
+    EvtDriverGetUniqueContextType: None,
+});
+
 /// Build the adapter caps (FP16/HDR-capable) and kick off the async adapter creation. Called from
 /// `EvtDeviceD0Entry`; idempotent across re-entrant D0 transitions.
 pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
@@ -131,6 +147,7 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
     attr.SynchronizationScope =
         wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
+    attr.ContextTypeInfo = &ADAPTER_CTX.0;
     let init = iddcx::IDARG_IN_ADAPTER_INIT {
         WdfDevice: device,
         pCaps: &raw mut caps,

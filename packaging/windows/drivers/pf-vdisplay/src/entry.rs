@@ -92,6 +92,16 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
         return status;
     }
 
+    // IddCx must be initialized on the device BEFORE other device setup (the canonical IddCx sample order).
+    // We previously created the device interface first — which can leave IddCx not fully ready by D0Entry,
+    // making IddCxAdapterInitAsync reject (INVALID_PARAMETER) despite byte-perfect caps.
+    // SAFETY: device is the just-created WDFDEVICE.
+    let status = unsafe { wdk_iddcx::IddCxDeviceInitialize(device) };
+    dbglog!("[pf-vd] IddCxDeviceInitialize -> {status:#x}");
+    if !nt_success(status) {
+        return status;
+    }
+
     // Expose the owned pf-vdisplay control interface (the host opens this GUID; STEP 4 wires the host
     // side in lockstep). NOT SudoVDA's GUID.
     let (d1, d2, d3, d4) = pf_vdisplay_proto::interface_guid_fields();
@@ -111,12 +121,5 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
         )
     };
     dbglog!("[pf-vd] WdfDeviceCreateDeviceInterface -> {status:#x}");
-    if !nt_success(status) {
-        return status;
-    }
-
-    // SAFETY: device is the just-created WDFDEVICE.
-    let status = unsafe { wdk_iddcx::IddCxDeviceInitialize(device) };
-    dbglog!("[pf-vd] IddCxDeviceInitialize -> {status:#x}");
     status
 }
