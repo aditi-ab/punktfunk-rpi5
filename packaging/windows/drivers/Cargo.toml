@@ -7,7 +7,7 @@
 # crates/pf-vdisplay-proto from the main tree.
 [workspace]
 resolver = "2"
-members = ["wdk-probe"]
+members = ["wdk-probe", "wdk-iddcx", "pf-vdisplay"]
 
 [workspace.package]
 edition = "2024"
@@ -19,6 +19,7 @@ publish = false
 wdk = "0.4.1"
 wdk-sys = "0.5.1"
 wdk-build = "0.5.1"
+wdk-iddcx = { path = "wdk-iddcx" }
 pf-vdisplay-proto = { path = "../../../crates/pf-vdisplay-proto" }
 
 # Vendored windows-drivers-rs 0.5.1 (the published, self-contained crates) + an added `iddcx`

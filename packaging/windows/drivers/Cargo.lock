@@ -395,6 +395,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pf-vdisplay"
+version = "0.0.1"
+dependencies = [
+ "pf-vdisplay-proto",
+ "wdk",
+ "wdk-build",
+ "wdk-iddcx",
+ "wdk-sys",
+]
+
+[[package]]
 name = "pf-vdisplay-proto"
 version = "0.0.1"
 dependencies = [
@@ -733,6 +744,13 @@ dependencies = [
  "thiserror",
  "tracing",
  "windows",
+]
+
+[[package]]
+name = "wdk-iddcx"
+version = "0.0.1"
+dependencies = [
+ "wdk-sys",
 ]
 
 [[package]]
