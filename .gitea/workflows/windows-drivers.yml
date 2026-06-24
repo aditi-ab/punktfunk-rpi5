@@ -125,7 +125,8 @@ jobs:
         run: cargo build -p wdk-probe -v
       - name: Inspect the produced DLL's /INTEGRITYCHECK bit
         run: |
-          $dll = "target\debug\wdk_probe.dll"
+          # explicit --target (.cargo/config.toml) -> output under the triple subdir.
+          $dll = "target\x86_64-pc-windows-msvc\debug\wdk_probe.dll"
           if (-not (Test-Path $dll)) { throw "wdk_probe.dll not produced at $dll" }
           $b = [IO.File]::ReadAllBytes($dll)
           $pe = [BitConverter]::ToInt32($b, 0x3c)
