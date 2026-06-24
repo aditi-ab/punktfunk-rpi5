@@ -26,6 +26,10 @@ mod bindings {
     )]
     use crate::types::*;
 
+    // `UINT` (= unsigned int) is referenced by IddCx/DXGI/OPM structs but wdk-sys never uses it, so it
+    // is absent from crate::types. Define it here, in the same scope the generated bindings see.
+    pub type UINT = ::core::ffi::c_uint;
+
     include!(concat!(env!("OUT_DIR"), "/iddcx.rs"));
 }
 #[allow(

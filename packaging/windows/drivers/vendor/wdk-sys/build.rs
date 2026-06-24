@@ -373,16 +373,13 @@ fn generate_iddcx(out_path: &Path, config: &Config) -> Result<(), ConfigError> {
             // wdk-sys does NOT bindgen. Emit those locally (non-conflicting — they're absent from
             // crate::types). WDF/GUID/ULONG types it shares DO resolve from crate::types (no WDF type is
             // missing), so this stays type-identical for the WDF surface.
-            .allowlist_type("DXGI_.*")
+            .allowlist_type("_?DXGI_.*")
             .allowlist_type("IDXGI.*")
             // OPM types are `typedef struct _OPM_X {..} OPM_X` — allowlist BOTH the tag and the typedef
             // (allowlist_recursively(false) won't pull the tag in from the typedef). Plus D3DCOLORVALUE,
             // referenced by an OPM struct.
             .allowlist_type("_?OPM_.*")
             .allowlist_type("_?D3DCOLORVALUE")
-            // `UINT` is `unsigned int`; wdk-sys never references it so it's absent from crate::types and
-            // allowlist_type won't emit a bare primitive alias. Shim it (unambiguous on Windows).
-            .raw_line("pub type UINT = ::core::ffi::c_uint;")
     };
     trace!(bindgen_builder = ?bindgen_builder);
 
