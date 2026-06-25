@@ -399,10 +399,12 @@ name = "pf-vdisplay"
 version = "0.0.1"
 dependencies = [
  "pf-vdisplay-proto",
+ "thiserror",
  "wdk",
  "wdk-build",
  "wdk-iddcx",
  "wdk-sys",
+ "windows",
 ]
 
 [[package]]
