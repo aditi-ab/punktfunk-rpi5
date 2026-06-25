@@ -39,6 +39,8 @@ mod spike;
 mod vdisplay;
 #[cfg(target_os = "windows")]
 mod wgc_helper;
+#[cfg(target_os = "windows")]
+mod win_adapter;
 #[cfg(target_os = "linux")]
 mod zerocopy;
 
