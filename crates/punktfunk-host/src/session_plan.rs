@@ -1,7 +1,7 @@
 //! `SessionPlan` — the per-session capture / topology / encoder decision, resolved **once** from
 //! [`HostConfig`](crate::config) (+ the handshake-negotiated bit depth) into a typed, logged value.
 //!
-//! **Goal-1 stage 3** (`docs/windows-host-goal1-plan.md`): before this, the Windows session decision was
+//! **Goal-1 stage 3** (`docs/windows-host-rewrite.md` §2.2): before this, the Windows session decision was
 //! re-derived at three call sites — the capture backend inside `capture::capture_virtual_output`, the
 //! process topology in `punktfunk1::should_use_helper`, and the encode backend in
 //! `encode::windows_resolved_backend` — each reading [`config`](crate::config) independently, with no

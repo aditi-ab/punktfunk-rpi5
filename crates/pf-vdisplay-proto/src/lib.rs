@@ -276,7 +276,7 @@ pub mod frame {
 /// These were hand-duplicated as `OFF_*`/`SHM_*` constants in `inject/{gamepad,dualsense}_windows.rs`
 /// and (as bare literals — `*view.add(140)`) in the standalone `xusb-driver`/`dualsense-driver`
 /// workspaces, guarded only by "must match" comments — the top ABI-drift hazard the audit flagged
-/// (`docs/windows-host-rewrite-audit.md` §6.1). Owning them here with `Pod` derives + `offset_of!`
+/// (`docs/windows-host-rewrite.md` §2.7). Owning them here with `Pod` derives + `offset_of!`
 /// asserts makes a one-sided edit a compile error.
 ///
 /// The host creates the section (privileged, permissive DACL so the restricted WUDFHost token can

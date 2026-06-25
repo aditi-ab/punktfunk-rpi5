@@ -4,7 +4,7 @@
 //! environment before the host starts, and **for the knobs captured here the environment is constant for the
 //! process lifetime**, so a lazily-parsed global is equivalent to "parsed once at startup".
 //!
-//! **Goal-1 stages 1–2** (`docs/windows-host-goal1-plan.md`): stage 1 stood this up; stage 2 migrated the
+//! **Goal-1 stages 1–2** (`docs/windows-host-rewrite.md` §2.2): stage 1 stood this up; stage 2 migrated the
 //! genuinely-constant operator/dispatch knobs onto it (the dispatch-disagreement bug class: `idd_push`,
 //! `capture_backend`, `encoder_pref`, `render_adapter`, `no_wgc`, the vdisplay backend select — plus the
 //! plan-named `secure_dda`/`idd_depth`/`zerocopy`/`ten_bit` and the multi-site `perf`/`compositor`/
