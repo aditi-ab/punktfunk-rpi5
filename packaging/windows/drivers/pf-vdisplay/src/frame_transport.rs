@@ -72,6 +72,9 @@ pub struct FramePublisher {
     /// recreates the ring at a new format mid-session (the display's HDR mode flipped) — [`Self::is_stale`]
     /// detects that so `run_core` re-attaches to the new-format textures instead of dropping every frame.
     generation: u32,
+    /// Set when a surface is dropped for a descriptor mismatch (a game mode-set the display), cleared on a
+    /// matched publish — throttles the drop log to once per mismatch episode (game-capture bug GB1).
+    mismatch_logged: bool,
 }
 
 // SAFETY: created and used only on the swap-chain processor thread.
@@ -246,6 +249,7 @@ impl FramePublisher {
             // SAFETY: `header` is the mapped host header; `dxgi_format` lives within it.
             ring_format: unsafe { (*header).dxgi_format },
             generation,
+            mismatch_logged: false,
         })
     }
 
@@ -281,9 +285,28 @@ impl FramePublisher {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: `surface` is a live ID3D11Texture2D (borrowed from IddCx); `desc` is a valid local out-param.
         unsafe { surface.GetDesc(&mut desc) };
-        if desc.Format.0 as u32 != self.ring_format {
+        // Descriptor guard: CopyResource needs the surface + ring textures to share format AND dimensions.
+        // A fullscreen game can mode-set the display, changing the surface's format/size before the host
+        // recreates the ring to match (game-capture bug GB1) — drop a mismatched frame (else garbage) and
+        // report the ACTUAL descriptor once per episode so a repro shows exactly what changed.
+        // SAFETY: `self.header` stays mapped for the publisher's lifetime; width/height are plain u32 fields.
+        let (rw, rh) = unsafe { ((*self.header).width, (*self.header).height) };
+        if desc.Format.0 as u32 != self.ring_format || desc.Width != rw || desc.Height != rh {
+            if !self.mismatch_logged {
+                self.mismatch_logged = true;
+                dbglog!(
+                    "[pf-vd] frame-push DROP: surface {}x{} fmt={} != ring {}x{} fmt={} — display mode-set? (host should recreate the ring)",
+                    desc.Width,
+                    desc.Height,
+                    desc.Format.0 as u32,
+                    rw,
+                    rh,
+                    self.ring_format
+                );
+            }
             return;
         }
+        self.mismatch_logged = false;
         let start = self.next;
         for attempt in 0..ring_len {
             let slot = (start + attempt) % ring_len;
