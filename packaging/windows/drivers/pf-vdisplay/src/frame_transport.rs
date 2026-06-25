@@ -90,6 +90,7 @@ impl FramePublisher {
         context: &ID3D11DeviceContext,
     ) -> windows::core::Result<Self> {
         // 1. Open the host-created header (RW). Err if the host hasn't created it yet.
+        // SAFETY: a plain Win32 call; the name HSTRING is valid for the call (`?` returns on failure).
         let map = unsafe {
             OpenFileMappingW(
                 FILE_MAP_ALL_ACCESS.0,
@@ -97,6 +98,8 @@ impl FramePublisher {
                 &HSTRING::from(header_name(target_id)),
             )?
         };
+        // SAFETY: `map` is the just-opened file mapping; mapping size_of::<SharedHeader>() bytes of it
+        // (the host created the mapping at >= that size). The null `view.Value` is checked below.
         let view = unsafe {
             MapViewOfFile(
                 map,
@@ -107,6 +110,7 @@ impl FramePublisher {
             )
         };
         if view.Value.is_null() {
+            // SAFETY: `map` is the just-opened mapping handle, closed once here on the error path.
             unsafe {
                 let _ = CloseHandle(map);
             }
@@ -115,16 +119,21 @@ impl FramePublisher {
         let header = view.Value.cast::<SharedHeader>();
 
         // 2. Report our render adapter to the host immediately (lets it detect a mismatch).
+        // SAFETY: `header` points to the mapped, non-null host header (>= size_of::<SharedHeader>() bytes);
+        // these scalar writes are within it. The host opened the section with a permissive SDDL for us.
         unsafe {
             (*header).driver_render_luid_low = render_luid_low;
             (*header).driver_render_luid_high = render_luid_high;
         }
 
         // 3. The host sets magic==MAGIC only once the ring textures exist. Not ready → retry later.
+        // SAFETY: `header` is the mapped host header; `magic` lives within it and is read atomically
+        // (Acquire) to pair with the host's Release store once the ring textures are published.
         let magic = unsafe {
             (*(core::ptr::addr_of!((*header).magic) as *const AtomicU32)).load(Ordering::Acquire)
         };
         if magic != MAGIC {
+            // SAFETY: `header`/`map` are the live mapped view + handle; unmapped + closed once on this path.
             unsafe {
                 let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: header.cast(),
@@ -133,10 +142,12 @@ impl FramePublisher {
             }
             return Err(windows::core::Error::from_win32());
         }
+        // SAFETY: `header` is the mapped host header; these scalar fields live within it.
         let (generation, ring_len) =
             unsafe { ((*header).generation, (*header).ring_len.min(RING_LEN)) };
 
         // 4. Open the event (SYNCHRONIZE | EVENT_MODIFY_STATE so we can SetEvent).
+        // SAFETY: a plain Win32 call; the name HSTRING is valid for the call.
         let event = match unsafe {
             OpenEventW(
                 SYNCHRONIZATION_ACCESS_RIGHTS(EVENT_ACCESS),
@@ -146,6 +157,7 @@ impl FramePublisher {
         } {
             Ok(e) => e,
             Err(e) => {
+                // SAFETY: `header`/`map` are the live mapped view + handle; unmapped + closed once here.
                 unsafe {
                     let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                         Value: header.cast(),
@@ -160,6 +172,8 @@ impl FramePublisher {
         let device1: ID3D11Device1 = match device.cast() {
             Ok(d) => d,
             Err(e) => {
+                // SAFETY: `header` is the mapped host header (status write within it); `event`/`map` are the
+                // live handles, all released once on this error path.
                 unsafe {
                     (*header).driver_status = DRV_STATUS_NO_DEVICE1;
                     let _ = CloseHandle(event);
@@ -174,12 +188,15 @@ impl FramePublisher {
         let mut slots = Vec::new();
         for k in 0..ring_len {
             let name = HSTRING::from(texture_name(target_id, generation, k));
+            // SAFETY: `device1` is a live ID3D11Device1; the name HSTRING is valid for the call.
             let opened: windows::core::Result<ID3D11Texture2D> =
                 unsafe { device1.OpenSharedResourceByName(&name, DXGI_SHARED_RESOURCE_RW) };
             match opened {
                 Ok(tex) => match tex.cast::<IDXGIKeyedMutex>() {
                     Ok(mutex) => slots.push(Slot { tex, mutex }),
                     Err(e) => {
+                        // SAFETY: `header` is the mapped host header (status writes within it); `event`/`map`
+                        // are the live handles, all released once on this error path.
                         unsafe {
                             (*header).driver_status = DRV_STATUS_TEX_FAIL;
                             (*header).driver_status_detail = e.code().0 as u32;
@@ -195,6 +212,8 @@ impl FramePublisher {
                 Err(e) => {
                     // Most likely a render-adapter mismatch (the host made the textures on a different
                     // GPU than the swap-chain renders on). Tell the host so it can report it.
+                    // SAFETY: `header` is the mapped host header (status writes within it); `event`/`map`
+                    // are the live handles, all released once on this error path.
                     unsafe {
                         (*header).driver_status = DRV_STATUS_TEX_FAIL;
                         (*header).driver_status_detail = e.code().0 as u32;
@@ -209,6 +228,7 @@ impl FramePublisher {
             }
         }
 
+        // SAFETY: `header` is the mapped host header; the status field lives within it.
         unsafe {
             (*header).driver_status = DRV_STATUS_OPENED;
         }
@@ -223,6 +243,7 @@ impl FramePublisher {
             slots,
             next: 0,
             seq: 0,
+            // SAFETY: `header` is the mapped host header; `dxgi_format` lives within it.
             ring_format: unsafe { (*header).dxgi_format },
             generation,
         })
@@ -230,6 +251,8 @@ impl FramePublisher {
 
     #[inline]
     fn latest_cell(&self) -> &AtomicU64 {
+        // SAFETY: `self.header` stays mapped for the publisher's lifetime (unmapped only in Drop); the
+        // `latest` field lives within it and is naturally aligned, so this AtomicU64 reference is valid.
         unsafe { &*(core::ptr::addr_of!((*self.header).latest) as *const AtomicU64) }
     }
 
@@ -237,6 +260,8 @@ impl FramePublisher {
     /// mode flipped, so the ring format changed (FP16 ⇄ BGRA) and the texture names now carry a new
     /// generation. `run_core` drops the publisher on this so it re-attaches to the new ring.
     pub fn is_stale(&self) -> bool {
+        // SAFETY: `self.header` stays mapped for the publisher's lifetime; `generation` lives within it and
+        // is read atomically (Acquire) to pair with the host's Release bump on a mid-session ring recreate.
         let cur = unsafe {
             (*(core::ptr::addr_of!((*self.header).generation) as *const AtomicU32))
                 .load(Ordering::Acquire)
@@ -254,6 +279,7 @@ impl FramePublisher {
         // frame that doesn't match (e.g. an FP16 HDR surface arriving while the ring is still BGRA, before
         // the host recreates the ring as FP16) instead of corrupting / failing the copy.
         let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `surface` is a live ID3D11Texture2D (borrowed from IddCx); `desc` is a valid local out-param.
         unsafe { surface.GetDesc(&mut desc) };
         if desc.Format.0 as u32 != self.ring_format {
             return;
@@ -262,6 +288,8 @@ impl FramePublisher {
         for attempt in 0..ring_len {
             let slot = (start + attempt) % ring_len;
             let s = &self.slots[slot as usize];
+            // SAFETY: `s.mutex` is the live keyed mutex on this ring slot's shared texture; a 0 ms
+            // try-acquire of key 0 (released below or on WAIT_TIMEOUT it's never held).
             match unsafe { s.mutex.AcquireSync(0, 0) } {
                 Ok(()) => {
                     // STRAIGHT-LINE, NO `?` between acquire + release — a `?`-return here would leak the
@@ -269,6 +297,8 @@ impl FramePublisher {
                     // the CopyResource is GPU-ordered before the consumer via the slot keyed mutex, and the
                     // `latest` store (Release) publishes the slot only AFTER the copy is queued + the mutex
                     // released.
+                    // SAFETY: `s.tex`/`surface` are live, format-matched (checked above) D3D textures on
+                    // `self.context`'s device; the keyed mutex is held here, so we release it exactly once.
                     unsafe {
                         self.context.CopyResource(&s.tex, surface);
                         let _ = s.mutex.ReleaseSync(0);
@@ -285,6 +315,8 @@ impl FramePublisher {
                     }
                     .pack();
                     self.latest_cell().store(latest, Ordering::Release);
+                    // SAFETY: `self.event` is the live host-created frame-ready event we opened with
+                    // EVENT_MODIFY_STATE; signalling it wakes the host consumer.
                     unsafe {
                         let _ = SetEvent(self.event);
                     }
@@ -304,6 +336,8 @@ impl Drop for FramePublisher {
         // Slots FIRST (release the shared textures + keyed mutexes), THEN unmap the header, THEN the
         // handles.
         self.slots.clear();
+        // SAFETY: drop runs once; `self.header` (if non-null) is the live mapped view and `self.event`/
+        // `self.map` are the live handles this publisher opened — each unmapped/closed exactly once here.
         unsafe {
             if !self.header.is_null() {
                 let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {

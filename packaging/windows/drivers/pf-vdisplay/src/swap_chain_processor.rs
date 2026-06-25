@@ -112,6 +112,8 @@ impl SwapChainProcessor {
             // Service. It will intelligently prioritize the thread for improved throughput in high
             // CPU-load scenarios.
             let mut av_task = 0u32;
+            // SAFETY: `w!("Distribution")` is a 'static null-terminated UTF-16 task name; `av_task` is a
+            // valid local out-param. The returned handle is reverted with AvRevertMmThreadCharacteristics.
             let res = unsafe { AvSetMmThreadCharacteristicsW(w!("Distribution"), &mut av_task) };
             let Ok(av_handle) = res else {
                 dbglog!("[pf-vd] swap-chain: failed to prioritize thread: {res:?}");
@@ -141,6 +143,8 @@ impl SwapChainProcessor {
             }
 
             // Revert the thread to normal once it's done.
+            // SAFETY: `av_handle` is the live characteristics handle returned by AvSetMmThreadCharacteristicsW
+            // above, reverted exactly once here at thread exit.
             let res = unsafe { AvRevertMmThreadCharacteristics(av_handle) };
             if let Err(e) = res {
                 dbglog!("[pf-vd] swap-chain: failed to revert prioritized thread: {e:?}");
@@ -179,6 +183,8 @@ impl SwapChainProcessor {
             }
         };
         // Built zeroed + field-assigned (driver style) — robust against a bindgen field-set difference.
+        // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
+        // IDARG_IN_SWAPCHAINSETDEVICE; the `pDevice` field is set immediately below.
         let mut set_device: IDARG_IN_SWAPCHAINSETDEVICE = unsafe { core::mem::zeroed() };
         set_device.pDevice = dxgi_device.as_raw().cast();
         let mut set_ok = false;
@@ -274,6 +280,8 @@ impl SwapChainProcessor {
             // the GPU surface (out.MetaData.pSurface) — STEP 6 publishes it into the shared ring in the
             // success branch below. Built zeroed + field-assigned (driver style) so a bindgen field-set
             // difference can't break a positional struct literal.
+            // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
+            // IDARG_IN_RELEASEANDACQUIREBUFFER2; the required `.Size`/AcquireSystemMemoryBuffer are set below.
             let mut in_args: IDARG_IN_RELEASEANDACQUIREBUFFER2 = unsafe { core::mem::zeroed() };
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -283,6 +291,8 @@ impl SwapChainProcessor {
             // `core::mem::zeroed()` (not `::default()`) — consistent with every other IddCx out-struct
             // in this driver, and robust whether or not bindgen derives `Default` for this type (its
             // `MetaData` field carries a raw `pSurface` pointer + union which can suppress the derive).
+            // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
+            // IDARG_OUT_RELEASEANDACQUIREBUFFER2 (an out-param the framework fills).
             let mut buffer: IDARG_OUT_RELEASEANDACQUIREBUFFER2 = unsafe { core::mem::zeroed() };
             // SAFETY: driver is loaded; `swap_chain` is valid; in/out point to valid local storage.
             let hr: NTSTATUS = unsafe {

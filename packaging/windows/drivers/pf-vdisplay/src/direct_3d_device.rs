@@ -60,14 +60,18 @@ pub struct Direct3DDevice {
 
 impl Direct3DDevice {
     pub fn init(adapter_luid: LUID) -> Result<Self, Direct3DError> {
+        // SAFETY: a plain DXGI factory-creation call; `?` returns the error on failure.
         let dxgi_factory =
             unsafe { CreateDXGIFactory2::<IDXGIFactory5>(DXGI_CREATE_FACTORY_FLAGS(0))? };
 
+        // SAFETY: `dxgi_factory` is the live factory just created; `adapter_luid` is a by-value LUID.
         let adapter = unsafe { dxgi_factory.EnumAdapterByLuid::<IDXGIAdapter1>(adapter_luid)? };
 
         let mut device = None;
         let mut device_context = None;
 
+        // SAFETY: `adapter` is a live IDXGIAdapter1; `device`/`device_context` are valid local out-params
+        // (checked for None below); the flag set + SDK version are valid constants. `?` returns on failure.
         unsafe {
             D3D11CreateDevice(
                 &adapter,
