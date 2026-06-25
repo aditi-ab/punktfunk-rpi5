@@ -32,19 +32,22 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
-// Shared-section layout — must match `packaging/windows/xusb-driver/src/lib.rs`.
-const SHM_SIZE: usize = 64;
-const SHM_MAGIC: u32 = 0x5558_4650; // "PFXU"
-const OFF_PACKET: usize = 4;
-const OFF_BUTTONS: usize = 8;
-const OFF_LT: usize = 10;
-const OFF_RT: usize = 11;
-const OFF_LX: usize = 12;
-const OFF_LY: usize = 14;
-const OFF_RX: usize = 16;
-const OFF_RY: usize = 18;
-const OFF_RUMBLE_SEQ: usize = 24;
-const OFF_RUMBLE: usize = 28; // large @28, small @29
+// Shared-section layout — the single source of truth is `pf_vdisplay_proto::gamepad::XusbShm` (offset
+// asserts pin every field; the `pf_xusb` driver maps the same struct). Derive the size/offsets/magic from
+// it so a layout change is a compile error, not a hand-synced literal (audit §6.1).
+use pf_vdisplay_proto::gamepad::XusbShm;
+const SHM_SIZE: usize = core::mem::size_of::<XusbShm>();
+const SHM_MAGIC: u32 = pf_vdisplay_proto::gamepad::XUSB_MAGIC; // "PFXU"
+const OFF_PACKET: usize = core::mem::offset_of!(XusbShm, packet);
+const OFF_BUTTONS: usize = core::mem::offset_of!(XusbShm, buttons);
+const OFF_LT: usize = core::mem::offset_of!(XusbShm, left_trigger);
+const OFF_RT: usize = core::mem::offset_of!(XusbShm, right_trigger);
+const OFF_LX: usize = core::mem::offset_of!(XusbShm, thumb_lx);
+const OFF_LY: usize = core::mem::offset_of!(XusbShm, thumb_ly);
+const OFF_RX: usize = core::mem::offset_of!(XusbShm, thumb_rx);
+const OFF_RY: usize = core::mem::offset_of!(XusbShm, thumb_ry);
+const OFF_RUMBLE_SEQ: usize = core::mem::offset_of!(XusbShm, rumble_seq);
+const OFF_RUMBLE: usize = core::mem::offset_of!(XusbShm, rumble_large); // large @28, small @29
 
 /// Context for the `SwDeviceCreate` completion callback: an event to signal + the HRESULT it reports.
 #[repr(C)]
@@ -157,7 +160,7 @@ struct XusbWinPad {
 impl XusbWinPad {
     /// Create + map `Global\pfxusb-shm-<index>`, stamp the magic, then spawn the devnode.
     fn open(index: u8) -> Result<XusbWinPad> {
-        let name = HSTRING::from(format!("Global\\pfxusb-shm-{index}"));
+        let name = HSTRING::from(pf_vdisplay_proto::gamepad::xusb_shm_name(index));
 
         // Permissive DACL so the WUDFHost (whatever account) can open the section.
         let mut psd = PSECURITY_DESCRIPTOR::default();

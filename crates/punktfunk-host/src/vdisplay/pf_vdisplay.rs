@@ -245,16 +245,17 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
         // SET_RENDER_ADAPTER is OPT-IN. By default we do NOT pin the render adapter — let the IDD use
         // its natural adapter (Apollo-parity; avoids the cross-GPU mismatch ACCESS_LOST storm). Opt in
         // with PUNKTFUNK_RENDER_ADAPTER=<name substring> or the IDD-push path (which MUST run NVENC on
-        // the discrete render GPU it pins here). NOTE: the pf-vdisplay driver currently returns
-        // STATUS_NOT_IMPLEMENTED for this IOCTL (a STEP-4 stub), so the call below is tolerated to fail.
+        // the discrete render GPU it pins here). The pf-vdisplay driver now IMPLEMENTS this IOCTL
+        // (IddCxAdapterSetRenderAdapter); a failure is still tolerated (the driver also reports its real
+        // render LUID in the shared header, so the host binds to the right GPU regardless).
         let pinned = if std::env::var("PUNKTFUNK_RENDER_ADAPTER").is_ok() {
             unsafe { resolve_render_adapter_luid() }
         } else if std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some() {
             // P2 direct frame push: the host opens the driver's shared textures AND runs NVENC on the
             // RENDER adapter, so on a hybrid box (dGPU + iGPU) it MUST be the discrete encoder GPU — an
-            // iGPU-rendered surface is untouchable by NVENC. pf-vdisplay HONORS SET_RENDER_ADAPTER (once
-            // implemented), so pin the discrete GPU; the driver also reports the resulting render LUID in
-            // the shared header, so the host binds correctly even if this is overridden.
+            // iGPU-rendered surface is untouchable by NVENC. pf-vdisplay now IMPLEMENTS
+            // SET_RENDER_ADAPTER, so pin the discrete GPU; the driver also reports the resulting render LUID
+            // in the shared header, so the host binds correctly even if this is overridden.
             tracing::info!("IDD push: pinning the discrete render GPU (SET_RENDER_ADAPTER)");
             unsafe { resolve_render_adapter_luid() }
         } else {
@@ -270,11 +271,10 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
                     luid = format!("{:08x}:{:08x}", luid.HighPart, luid.LowPart),
                     "pf-vdisplay SET_RENDER_ADAPTER: pinned IDD render GPU"
                 ),
-                // The driver currently stubs this IOCTL (STATUS_NOT_IMPLEMENTED) — warn + continue, do
-                // NOT propagate. The natural-adapter path still works (Apollo-parity).
+                // Non-fatal: warn + continue (do NOT propagate). The driver reports its real render LUID
+                // in the shared header and the host binds to that, so the natural-adapter path still works.
                 Err(e) => tracing::warn!(
-                    "pf-vdisplay SET_RENDER_ADAPTER failed (driver stub / not implemented — \
-                     continuing): {e:#}"
+                    "pf-vdisplay SET_RENDER_ADAPTER failed (continuing on the natural adapter): {e:#}"
                 ),
             }
         }
