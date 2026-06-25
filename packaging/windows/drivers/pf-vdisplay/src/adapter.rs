@@ -88,10 +88,14 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
 
     let mut caps: iddcx::IDDCX_ADAPTER_CAPS = unsafe { core::mem::zeroed() };
     caps.Size = core::mem::size_of::<iddcx::IDDCX_ADAPTER_CAPS>() as u32;
-    // Flags = NONE (SDR). The working upstream virtual-display-rs sets NO Flags. CAN_PROCESS_FP16 requires a
-    // newer IddCx contract than the INF's UmdfExtensions=IddCx0102 grants, so the framework's adapter-caps
-    // Validate (ddivalidation.cpp:797) rejects it with STATUS_INVALID_PARAMETER. HDR/FP16 is deferred to
-    // STEP 7 (needs a higher UmdfExtensions binding + the obligated *2/HDR DDIs).
+    // STEP 7 (HDR): declare we can process FP16 (scRGB) desktop surfaces — this is what marks the virtual
+    // monitor advanced-color-capable (→ the host sees display_hdr=true → the "Use HDR" toggle appears). The
+    // ONLY reason STEP 3 rejected this flag was setting it WITHOUT the obligated *2/HDR DDIs; those are now
+    // registered in entry.rs (parse_monitor_description2/monitor_query_modes2/adapter_commit_modes2 +
+    // query_target_info/set_default_hdr_metadata/set_gamma_ramp). The proven oracle sets exactly this flag
+    // with the INF still at UmdfExtensions=IddCx0102. GammaSupport stays NONE (set above). Enum is bindgen
+    // ModuleConsts — the variant is a plain-int const assignable straight to the `Flags` field.
+    caps.Flags = iddcx::IDDCX_ADAPTER_FLAGS::IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
     caps.MaxMonitorsSupported = 16;
     caps.EndPointDiagnostics = diag;
 

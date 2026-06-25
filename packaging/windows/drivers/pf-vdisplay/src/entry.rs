@@ -76,10 +76,18 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     cfg.EvtIddCxMonitorGetDefaultDescriptionModes = Some(callbacks::monitor_get_default_modes);
     cfg.EvtIddCxMonitorQueryTargetModes = Some(callbacks::monitor_query_modes);
     cfg.EvtIddCxAdapterCommitModes = Some(callbacks::adapter_commit_modes);
-    // SDR config — matches the working upstream virtual-display-rs. The *2 / gamma / HDR-metadata /
-    // query-target-info callbacks are FP16-OBLIGATED: registering them while caps declare no FP16 makes the
-    // framework's adapter Validate reject (ddivalidation.cpp:797 -> INVALID_PARAMETER). They return with
-    // FP16 caps under a higher UmdfExtensions binding in STEP 7 (HDR).
+    // STEP 7 (HDR): the *2 mode DDIs + the gamma/HDR-metadata/query-target-info callbacks. The adapter
+    // caps now set CAN_PROCESS_FP16 (adapter.rs), which OBLIGATES this whole set — without them the OS
+    // rejects the adapter at init ("Failed to get adapter"). The proven oracle (entry.rs) registers the *2
+    // variants ALONGSIDE the v1 callbacks above (NOT instead of them) — the OS prefers the *2 on IddCx
+    // 1.10 and falls back to v1 down-level — so we replicate exactly: keep both. The framework no longer
+    // rejects the *2 set because the FP16 cap is now present (the only reason STEP 3 had to drop them).
+    cfg.EvtIddCxParseMonitorDescription2 = Some(callbacks::parse_monitor_description2);
+    cfg.EvtIddCxMonitorQueryTargetModes2 = Some(callbacks::monitor_query_modes2);
+    cfg.EvtIddCxAdapterCommitModes2 = Some(callbacks::adapter_commit_modes2);
+    cfg.EvtIddCxAdapterQueryTargetInfo = Some(callbacks::query_target_info);
+    cfg.EvtIddCxMonitorSetDefaultHdrMetaData = Some(callbacks::set_default_hdr_metadata);
+    cfg.EvtIddCxMonitorSetGammaRamp = Some(callbacks::set_gamma_ramp);
     cfg.EvtIddCxMonitorAssignSwapChain = Some(callbacks::assign_swap_chain);
     cfg.EvtIddCxMonitorUnassignSwapChain = Some(callbacks::unassign_swap_chain);
     cfg.EvtIddCxDeviceIoControl = Some(callbacks::device_io_control);

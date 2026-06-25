@@ -142,6 +142,35 @@ pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_T
     tm
 }
 
+/// Wire bit-depth advertised per mode in the `*2` (HDR) mode DDIs. STEP 7: advertise BOTH 8 and 10 bpc
+/// RGB (so the OS offers HDR10 modes), no YCbCr. The wdk-sys bindgen enum is `ModuleConsts`, so each
+/// `IDDCX_BITS_PER_COMPONENT_*` is a plain-int const and the `IDDCX_WIRE_BITS_PER_COMPONENT` fields are
+/// plain ints — OR the constants directly (NO newtype `.0` like the oracle's wdf-umdf-sys binding). Field
+/// names (Rgb/YCbCr444/YCbCr422/YCbCr420, IDDCX_BITS_PER_COMPONENT_8/_10/_NONE) are the verbatim C header
+/// names, identical across both bindings.
+pub fn wire_bits() -> iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
+    let rgb = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_8
+        | iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_10;
+    let mut w: iddcx::IDDCX_WIRE_BITS_PER_COMPONENT = unsafe { core::mem::zeroed() };
+    w.Rgb = rgb;
+    w.YCbCr444 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
+    w.YCbCr422 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
+    w.YCbCr420 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
+    w
+}
+
+/// `IDDCX_TARGET_MODE2` for a scan-out mode (HDR `*2` path): builds the v1 [`target_mode`] and copies its
+/// `TargetVideoSignalInfo`, then stamps the `*2` Size + per-mode wire bit-depth ([`wire_bits`]). Rest
+/// zeroed.
+pub fn target_mode2(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE2 {
+    let m1 = target_mode(width, height, refresh_rate);
+    let mut tm: iddcx::IDDCX_TARGET_MODE2 = unsafe { core::mem::zeroed() };
+    tm.Size = core::mem::size_of::<iddcx::IDDCX_TARGET_MODE2>() as u32;
+    tm.TargetVideoSignalInfo = m1.TargetVideoSignalInfo;
+    tm.BitsPerComponent = wire_bits();
+    tm
+}
+
 /// A monitor's advertised modes (the looked-up entry returns a clone for lock-free mode-DDI fill).
 pub fn modes_for_id(id: u32) -> Option<Vec<Mode>> {
     MONITOR_MODES
