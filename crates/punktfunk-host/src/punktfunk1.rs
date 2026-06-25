@@ -2216,15 +2216,19 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         bit_depth,
         "punktfunk/1 virtual display"
     );
+    // Open the backend FIRST — on Windows this constructs the vdisplay backend, which initialises the
+    // host-lifetime VirtualDisplayManager (§2.5). It does NO monitor work, so it must precede the IDD-push
+    // preempt below (which reaches the manager) — otherwise `vdm()` is called before init and panics.
+    let mut vd = crate::vdisplay::open(compositor)?;
     // IDD-push reconnect preempt (the dance now lives in the manager, Goal-1 §2.5): serialize setup so a
     // reconnect FLOOD can't run concurrent monitor create/teardown, STOP the prior session + WAIT for it
     // to release its monitor (instead of tearing a monitor out from under a still-live session), and
     // register THIS session's stop. The returned guard holds the setup lock across the pipeline build;
-    // dropping it lets the next reconnect begin (and preempt us).
+    // dropping it lets the next reconnect begin (and preempt us). Held BEFORE the monitor is created
+    // (build_pipeline → vd.create), so the preempt still precedes this session's monitor creation.
     #[cfg(target_os = "windows")]
     let _idd_setup_guard = (plan.capture == crate::session_plan::CaptureBackend::IddPush)
         .then(|| crate::vdisplay::manager::vdm().begin_idd_setup(stop.clone()));
-    let mut vd = crate::vdisplay::open(compositor)?;
     let (mut capturer, mut enc, mut frame, mut interval) =
         build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan)?;
     // Setup done — release the IDD-push setup lock so the next reconnect can begin (and preempt us).
