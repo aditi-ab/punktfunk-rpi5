@@ -48,7 +48,8 @@ use super::sudovda::{
 // pf-vdisplay device-interface GUID (pf_vdisplay_proto::PF_VDISPLAY_INTERFACE_GUID_U128). Deliberately
 // NOT SudoVDA's `{e5bcc234-…}` — we own this driver, so a private interface GUID signals it and avoids
 // any accidental coexistence with a real SudoVDA install.
-const PF_VDISPLAY_INTERFACE: GUID = GUID::from_u128(pf_vdisplay_proto::PF_VDISPLAY_INTERFACE_GUID_U128);
+const PF_VDISPLAY_INTERFACE: GUID =
+    GUID::from_u128(pf_vdisplay_proto::PF_VDISPLAY_INTERFACE_GUID_U128);
 
 /// IDD-push mode: a new client connection preempts + recreates the monitor (single-client reconnect),
 /// because a REUSED IddCx monitor's swap-chain is dead. Off → monitors are shared across sessions.
@@ -279,14 +280,13 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
         }
 
         let mut out = [0u8; size_of::<control::AddReply>()];
-        unsafe { ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(&add), &mut out) }.with_context(
-            || {
+        unsafe { ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(&add), &mut out) }
+            .with_context(|| {
                 format!(
                     "pf-vdisplay ADD {}x{}@{}",
                     mode.width, mode.height, mode.refresh_hz
                 )
-            },
-        )?;
+            })?;
         // `pod_read_unaligned` (NOT `from_bytes`): `out` is a stack `[u8; N]` with no guaranteed
         // 4-byte alignment, and `from_bytes` PANICS on an alignment mismatch. This copies the bytes
         // into a properly-aligned `AddReply` value.
@@ -424,7 +424,12 @@ impl Monitor {
         };
         let mut none: [u8; 0] = [];
         let h = HANDLE(device as *mut c_void);
-        if let Err(e) = ioctl(h, control::IOCTL_REMOVE, bytemuck::bytes_of(&req), &mut none) {
+        if let Err(e) = ioctl(
+            h,
+            control::IOCTL_REMOVE,
+            bytemuck::bytes_of(&req),
+            &mut none,
+        ) {
             tracing::warn!("pf-vdisplay REMOVE failed: {e:#}");
         } else {
             tracing::info!("pf-vdisplay monitor removed");
