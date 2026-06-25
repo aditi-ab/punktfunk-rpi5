@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex, Once};
 /// Monotonic monitor generation. Each [`create_monitor`] stamps the next value onto the [`Monitor`]
 /// and its [`MonitorLease`]s, so a lease whose monitor was already torn down + recreated (the IDD-push
 /// reconnect-preempt path) is ignored on drop instead of decrementing the NEW monitor's refcount.
-static MON_GEN: AtomicU64 = AtomicU64::new(1);
+// pub(crate) so vdisplay::pf_vdisplay can reuse this shared generation counter (one counter across both
+// backends keeps the idd_push stale-ring bail working regardless of which backend is active).
+pub(crate) static MON_GEN: AtomicU64 = AtomicU64::new(1);
 
 /// The gen of the CURRENTLY-active monitor. A session capturer captures this at open and re-checks it
 /// each frame; when it changes (a reconnect preempted + recreated the monitor), the old session bails
@@ -345,7 +347,9 @@ pub(crate) unsafe fn advanced_color_enabled(target_id: u32) -> bool {
 /// ADVERTISES the mode; Windows otherwise activates an IDD target at a 1280x720 default, so the
 /// ACTIVE mode (what DXGI Desktop Duplication captures) must be set explicitly. CDS_TEST first so a
 /// mode the driver didn't advertise just leaves the default instead of erroring the session.
-fn set_active_mode(gdi_name: &str, mode: Mode) {
+// pub(crate) so vdisplay::pf_vdisplay can reuse this backend-neutral CCD/GDI mode-set helper
+// (a pf-vdisplay monitor's GDI name is a real OS device name, so it works unchanged).
+pub(crate) fn set_active_mode(gdi_name: &str, mode: Mode) {
     let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
 
     // Enumerate the modes the driver actually advertises for this output and pick the best match for
@@ -470,7 +474,8 @@ fn set_active_mode(gdi_name: &str, mode: Mode) {
 }
 
 /// Saved active display topology, for restoring on teardown.
-type SavedConfig = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
+// pub(crate) so vdisplay::pf_vdisplay's Monitor can hold the same saved-topology type.
+pub(crate) type SavedConfig = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
 
 /// `DISPLAYCONFIG_PATH_ACTIVE` (wingdi.h) — the `flags` bit marking a path active. The `windows` crate
 /// doesn't export it, so define it here.
@@ -483,7 +488,9 @@ const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
 /// sees every active path; we deactivate all of them EXCEPT the SudoVDA target's, leaving the virtual
 /// display as the sole desktop so ALL content (incl. Winlogon) renders to it. Apollo isolates the same
 /// way (CCD). Returns the original active config to restore on teardown.
-unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedConfig> {
+// pub(crate) so vdisplay::pf_vdisplay can reuse this backend-neutral CCD isolation helper
+// (it operates on a real OS target id — a pf-vdisplay monitor's target_id qualifies).
+pub(crate) unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedConfig> {
     let mut np = 0u32;
     let mut nm = 0u32;
     if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
@@ -554,7 +561,8 @@ unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedConfig> {
 
 /// Restore the topology saved by [`isolate_displays_ccd`] (teardown, before the virtual output is
 /// removed), re-activating the displays we deactivated.
-unsafe fn restore_displays_ccd(saved: &SavedConfig) {
+// pub(crate) so vdisplay::pf_vdisplay can reuse this backend-neutral CCD restore helper.
+pub(crate) unsafe fn restore_displays_ccd(saved: &SavedConfig) {
     let (paths, modes) = saved;
     if paths.is_empty() {
         return;

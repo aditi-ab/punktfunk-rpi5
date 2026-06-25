@@ -188,6 +188,12 @@ nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = 
 # same BtbN gpl-shared tree the Windows client uses) and pulls the shared `avcodec/avutil/...` DLLs
 # at runtime. `ffmpeg-sys-next` auto-detects the FFmpeg version (7.x/avcodec-61 or 8.x/62).
 ffmpeg-next = { version = "8", optional = true }
+# Shared host<->driver wire contract for the pf-vdisplay IddCx virtual-display backend
+# (vdisplay/pf_vdisplay.rs): the control-plane IOCTL codes + `#[repr(C)] Pod` request/reply structs,
+# defined ONCE so host<->driver ABI drift is a compile error. `bytemuck` serializes those structs
+# to/from the DeviceIoControl byte buffers.
+pf-vdisplay-proto = { path = "../pf-vdisplay-proto" }
+bytemuck = { version = "1.19", features = ["derive"] }
 
 [features]
 # NVENC hardware encode (Windows). OFF by default: it pulls the NVENC SDK, and the host then needs

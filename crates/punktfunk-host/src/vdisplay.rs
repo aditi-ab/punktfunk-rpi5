@@ -529,14 +529,36 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     }
     #[cfg(target_os = "windows")]
     {
-        // Windows has a single virtual-display backend (SudoVDA); the compositor arg is moot.
+        // Two virtual-display backends: the new pf-vdisplay IddCx driver (pf_vdisplay_proto) and the
+        // shipping SudoVDA fallback. The compositor arg is moot on Windows. PUNKTFUNK_VDISPLAY overrides;
+        // default auto-detects (prefer pf-vdisplay if its driver interface is present).
         let _ = compositor;
-        Ok(Box::new(sudovda::SudoVdaDisplay::new()?))
+        if windows_use_pf_vdisplay() {
+            Ok(Box::new(pf_vdisplay::PfVdisplayDisplay::new()?))
+        } else {
+            Ok(Box::new(sudovda::SudoVdaDisplay::new()?))
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = compositor;
         anyhow::bail!("virtual displays require Linux or Windows")
+    }
+}
+
+/// Pick the Windows virtual-display backend. `PUNKTFUNK_VDISPLAY=pf|pf-vdisplay|pfvd` forces the new
+/// pf-vdisplay IddCx driver; `=sudovda|sudo` forces the shipping SudoVDA driver; anything else (the
+/// default) auto-detects, preferring pf-vdisplay if its device interface is enumerable.
+#[cfg(target_os = "windows")]
+fn windows_use_pf_vdisplay() -> bool {
+    match std::env::var("PUNKTFUNK_VDISPLAY")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("pf") | Some("pf-vdisplay") | Some("pfvd") => true,
+        Some("sudovda") | Some("sudo") => false,
+        _ => pf_vdisplay::is_available(),
     }
 }
 
@@ -560,7 +582,11 @@ pub fn probe(compositor: Compositor) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let _ = compositor;
-        sudovda::probe()
+        if windows_use_pf_vdisplay() {
+            pf_vdisplay::probe()
+        } else {
+            sudovda::probe()
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -607,6 +633,8 @@ mod gamescope;
 mod kwin;
 #[cfg(target_os = "linux")]
 mod mutter;
+#[cfg(target_os = "windows")]
+pub(crate) mod pf_vdisplay;
 #[cfg(target_os = "windows")]
 pub(crate) mod sudovda;
 #[cfg(target_os = "linux")]
