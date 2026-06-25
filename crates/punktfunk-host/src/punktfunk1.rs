@@ -2577,7 +2577,8 @@ fn virtual_stream(
 /// desktop, Apollo-style), which has no WGC helper to relay.
 #[cfg(target_os = "windows")]
 fn should_use_helper() -> bool {
-    if std::env::var_os("PUNKTFUNK_NO_HELPER").is_some() || crate::capture::wgc_disabled() {
+    let cfg = crate::config::config();
+    if cfg.no_helper || crate::capture::wgc_disabled() {
         return false;
     }
     // IDD direct-push captures IN-PROCESS in Session 0: the pf-vdisplay driver delivers frames to the
@@ -2585,11 +2586,10 @@ fn should_use_helper() -> bool {
     // needed for VIDEO (and a Session-1 helper couldn't open the Session-0 shared textures anyway).
     // NOTE: input injection (SendInput) from Session 0 can't reach the user's Session-1 desktop yet —
     // a known follow-up; this path validates the video transport. See docs/windows-virtual-display-rust-port.md.
-    if std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some() {
+    if cfg.idd_push {
         return false;
     }
-    std::env::var_os("PUNKTFUNK_FORCE_HELPER").is_some()
-        || crate::capture::wgc_relay::running_as_system()
+    cfg.force_helper || crate::capture::wgc_relay::running_as_system()
 }
 
 /// Windows two-process video stream: the SYSTEM host creates the SudoVDA virtual output (and holds

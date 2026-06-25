@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 mod audio;
+mod config;
 mod capture;
 mod discovery;
 #[cfg(target_os = "linux")]

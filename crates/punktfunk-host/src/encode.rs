@@ -450,10 +450,8 @@ enum GpuVendor {
 /// vendor). Shared by [`open_video`] and the GameStream codec advertisement so both agree.
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_resolved_backend() -> WindowsBackend {
-    let pref = std::env::var("PUNKTFUNK_ENCODER")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match pref.as_str() {
+    // Resolved ONCE in HostConfig (Goal-1) — was re-read from PUNKTFUNK_ENCODER on every call.
+    match crate::config::config().encoder_pref.as_str() {
         "nvenc" | "hw" | "nvidia" | "cuda" => WindowsBackend::Nvenc,
         "amf" | "amd" => WindowsBackend::Amf,
         "qsv" | "intel" => WindowsBackend::Qsv,
