@@ -120,3 +120,9 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
 pub fn set_adapter(adapter: iddcx::IDDCX_ADAPTER) {
     let _ = ADAPTER.set(SendAdapter(adapter));
 }
+
+/// The created adapter handle, once `EvtIddCxAdapterInitFinished` has fired — for `create_monitor`
+/// (`IddCxMonitorCreate`) and SET_RENDER_ADAPTER. `None` before adapter init completes.
+pub(crate) fn adapter() -> Option<iddcx::IDDCX_ADAPTER> {
+    ADAPTER.get().map(|a| a.0)
+}

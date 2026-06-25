@@ -9,7 +9,10 @@
 use wdk_sys::iddcx;
 use wdk_sys::{NTSTATUS, WDFDEVICE, WDFREQUEST};
 
-use crate::{STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS};
+use crate::{
+    STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER, STATUS_NOT_FOUND, STATUS_NOT_IMPLEMENTED,
+    STATUS_SUCCESS,
+};
 
 /// PnP `EvtDeviceD0Entry` (not an IddCx config callback). Adapter creation is deferred to the first D0
 /// (the adapter object is only valid after D0), not driver_add.
@@ -32,11 +35,48 @@ pub unsafe extern "C" fn adapter_init_finished(
     STATUS_SUCCESS
 }
 
-/// SDR mode list for an EDID monitor. STEP 4: EDID-serial lookup + count-then-fill `IDDCX_MONITOR_MODE`.
+/// SDR mode list for an EDID monitor: EDID-serial lookup → count-then-fill `IDDCX_MONITOR_MODE`.
 pub unsafe extern "C" fn parse_monitor_description(
-    _p_in: *const iddcx::IDARG_IN_PARSEMONITORDESCRIPTION,
-    _p_out: *mut iddcx::IDARG_OUT_PARSEMONITORDESCRIPTION,
+    p_in: *const iddcx::IDARG_IN_PARSEMONITORDESCRIPTION,
+    p_out: *mut iddcx::IDARG_OUT_PARSEMONITORDESCRIPTION,
 ) -> NTSTATUS {
+    // SAFETY: framework-provided in/out args, valid for the call.
+    let in_args = unsafe { &*p_in };
+    let out_args = unsafe { &mut *p_out };
+    // SAFETY: the framework supplies a valid EDID buffer of `DataSize` bytes.
+    let edid = unsafe {
+        core::slice::from_raw_parts(
+            in_args.MonitorDescription.pData.cast::<u8>(),
+            in_args.MonitorDescription.DataSize as usize,
+        )
+    };
+    let Ok(id) = crate::edid::Edid::get_serial(edid) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let Some(modes) = crate::monitor::modes_for_id(id) else {
+        return STATUS_NOT_FOUND;
+    };
+    let count = crate::monitor::flatten(&modes).count() as u32;
+    out_args.MonitorModeBufferOutputCount = count;
+    if in_args.MonitorModeBufferInputCount < count {
+        // A zero input count is a count-only probe (success); a non-zero too-small buffer is an error.
+        return if in_args.MonitorModeBufferInputCount > 0 {
+            STATUS_BUFFER_TOO_SMALL
+        } else {
+            STATUS_SUCCESS
+        };
+    }
+    // SAFETY: `pMonitorModes` points to >= `count` IDDCX_MONITOR_MODE entries (validated above).
+    let out = unsafe { core::slice::from_raw_parts_mut(in_args.pMonitorModes, count as usize) };
+    for (item, slot) in crate::monitor::flatten(&modes).zip(out.iter_mut()) {
+        let mut mode: iddcx::IDDCX_MONITOR_MODE = unsafe { core::mem::zeroed() };
+        mode.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE>() as u32;
+        mode.Origin = iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+        mode.MonitorVideoSignalInfo =
+            crate::monitor::display_info(item.width, item.height, item.refresh_rate);
+        *slot = mode;
+    }
+    out_args.PreferredMonitorModeIdx = 0;
     STATUS_SUCCESS
 }
 
@@ -57,12 +97,27 @@ pub unsafe extern "C" fn monitor_get_default_modes(
     STATUS_NOT_IMPLEMENTED
 }
 
-/// SDR target (scan-out) modes. STEP 4: pointer-match the monitor + fill `IDDCX_TARGET_MODE`.
+/// SDR target (scan-out) modes: pointer-match the monitor → fill `IDDCX_TARGET_MODE`.
 pub unsafe extern "C" fn monitor_query_modes(
-    _monitor: iddcx::IDDCX_MONITOR,
-    _p_in: *const iddcx::IDARG_IN_QUERYTARGETMODES,
-    _p_out: *mut iddcx::IDARG_OUT_QUERYTARGETMODES,
+    monitor: iddcx::IDDCX_MONITOR,
+    p_in: *const iddcx::IDARG_IN_QUERYTARGETMODES,
+    p_out: *mut iddcx::IDARG_OUT_QUERYTARGETMODES,
 ) -> NTSTATUS {
+    // SAFETY: framework-provided in/out args, valid for the call.
+    let in_args = unsafe { &*p_in };
+    let out_args = unsafe { &mut *p_out };
+    let Some(modes) = crate::monitor::modes_for_object(monitor) else {
+        return STATUS_NOT_FOUND;
+    };
+    let count = crate::monitor::flatten(&modes).count() as u32;
+    out_args.TargetModeBufferOutputCount = count;
+    if in_args.TargetModeBufferInputCount >= count {
+        // SAFETY: `pTargetModes` points to >= `count` IDDCX_TARGET_MODE entries.
+        let out = unsafe { core::slice::from_raw_parts_mut(in_args.pTargetModes, count as usize) };
+        for (item, slot) in crate::monitor::flatten(&modes).zip(out.iter_mut()) {
+            *slot = crate::monitor::target_mode(item.width, item.height, item.refresh_rate);
+        }
+    }
     STATUS_SUCCESS
 }
 
