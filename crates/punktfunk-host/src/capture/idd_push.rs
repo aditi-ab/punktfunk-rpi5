@@ -371,12 +371,18 @@ impl IddPushCapturer {
         // SDR-only client leaves the display alone (and still gets a tone-mapped picture, never a freeze,
         // if the user does enable HDR).
         unsafe {
-            if client_10bit && crate::vdisplay::sudovda::set_advanced_color(target.target_id, true)
-            {
+            // If we ENABLE advanced color for a 10-bit client, trust it (the driver will compose FP16) and
+            // size the ring FP16 directly — don't race the advanced_color_enabled poll, which may not have
+            // settled within 250 ms and would size the ring SDR while the driver composes FP16 → a format
+            // mismatch → an immediate ring recreate + dropped first frames (audit §5.4).
+            let enabled_hdr =
+                client_10bit && crate::vdisplay::sudovda::set_advanced_color(target.target_id, true);
+            if enabled_hdr {
                 // Let the colorspace change settle before the driver composes + we size the ring.
                 std::thread::sleep(Duration::from_millis(250));
             }
-            let display_hdr = crate::vdisplay::sudovda::advanced_color_enabled(target.target_id);
+            let display_hdr =
+                enabled_hdr || crate::vdisplay::sudovda::advanced_color_enabled(target.target_id);
             let ring_fmt = if display_hdr {
                 DXGI_FORMAT_R16G16B16A16_FLOAT
             } else {
@@ -810,14 +816,28 @@ impl IddPushCapturer {
         }))
     }
 
-    fn repeat_last(&self) -> Option<CapturedFrame> {
-        self.last_present.as_ref().map(|(tex, pf)| CapturedFrame {
+    fn repeat_last(&mut self) -> Option<CapturedFrame> {
+        // Copy the last presented frame into a FRESH rotated out-ring slot so a repeat (static desktop, no
+        // new driver frame) never re-hands a slot that may still be encoding under pipeline_depth>1 — the
+        // out-ring rotation IS the texture-ownership contract, and repeats must honor it too (audit §5.3).
+        // OUT_RING(3) > the max pipeline_depth(2) guarantees the rotated slot is not in flight.
+        let (src, pf) = self.last_present.clone()?;
+        let i = self.out_idx;
+        let dst = self.out_ring.get(i)?.0.clone();
+        // SAFETY: GPU copy on the owning thread's immediate context; src/dst are our out-ring textures of
+        // identical format/size (src is a previous out-ring slot; dst the next).
+        unsafe {
+            self.context.CopyResource(&dst, &src);
+        }
+        self.out_idx = (i + 1) % self.out_ring.len();
+        self.last_present = Some((dst.clone(), pf));
+        Some(CapturedFrame {
             width: self.width,
             height: self.height,
             pts_ns: now_ns(),
-            format: *pf,
+            format: pf,
             payload: FramePayload::D3d11(D3d11Frame {
-                texture: tex.clone(),
+                texture: dst,
                 device: self.device.clone(),
             }),
         })
