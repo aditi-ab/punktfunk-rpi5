@@ -315,8 +315,10 @@ pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
     _want_hdr: bool,
+    _capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
-    // The Linux host stays 8-bit (HDR is blocked upstream), so `want_hdr` is unused here.
+    // The Linux host stays 8-bit (HDR is blocked upstream), so `want_hdr` is unused here; the capture
+    // backend is always the portal (the `CaptureBackend` arg is a Windows-only dispatch — ignored here).
     linux::PortalCapturer::from_virtual_output(vout).map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
@@ -334,7 +336,9 @@ pub(crate) fn wgc_disabled() -> bool {
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
     want_hdr: bool,
+    capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
+    use crate::session_plan::CaptureBackend;
     let target = vout.win_capture.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "SudoVDA target not yet an active display (needs a WDDM GPU to activate it)"
@@ -343,9 +347,10 @@ pub fn capture_virtual_output(
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
     // P2 direct frame push (kill DDA): consume frames straight from the pf-vdisplay driver's shared
-    // ring — no Desktop Duplication, no win32u reparenting hook. Opt-in while it's A/B'd against DDA;
-    // `idd_push` takes the keepalive (owns the virtual display) so there's no fall-through.
-    if crate::config::config().idd_push {
+    // ring — no Desktop Duplication, no win32u reparenting hook. Resolved once in the `SessionPlan`
+    // (was re-derived from `config().idd_push` here); `IddPush` takes the keepalive (owns the virtual
+    // display) so there's no fall-through.
+    if capture == CaptureBackend::IddPush {
         // Recreate the monitor + ring per session (fix-teardown): a FRESH monitor reliably gets a
         // working IddCx swap-chain, whereas a REUSED monitor's swap-chain dies after ~2 sessions and
         // the host can't revive it. The driver's recreate crash (target id resolved to 0) is fixed by
@@ -370,9 +375,9 @@ pub fn capture_virtual_output(
     // overlay/independent-flip planes DXGI Desktop Duplication misses (the frozen-HDR-animation bug),
     // and has no ACCESS_LOST-on-overlay churn. DDA stays available via PUNKTFUNK_CAPTURE=dda and is
     // the secure-desktop (lock/UAC) fallback (WGC can't capture those). `keep` is moved into the
-    // chosen backend (it owns the SudoVDA keepalive), so there's no open-time auto-fallback.
-    let backend = crate::config::config().capture_backend.as_str();
-    if backend == "dda" || backend == "dxgi" || wgc_disabled() {
+    // chosen backend (it owns the SudoVDA keepalive), so there's no open-time auto-fallback. The
+    // backend choice (`dda`/`dxgi`/`PUNKTFUNK_NO_WGC` → DDA, else WGC) is now resolved once in the plan.
+    if capture == CaptureBackend::Dda {
         return dxgi::DuplCapturer::open(target, pref, keep, false)
             .map(|c| Box::new(c) as Box<dyn Capturer>);
     }
@@ -418,6 +423,7 @@ pub fn capture_virtual_output(
 pub fn capture_virtual_output(
     _vout: crate::vdisplay::VirtualOutput,
     _want_hdr: bool,
+    _capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("virtual-output capture requires Linux or Windows")
 }

@@ -2184,12 +2184,18 @@ fn virtual_stream(
     // This thread runs the capture+encode loop (single-process: Linux / synthetic / NO_WGC DDA) — or
     // tail-calls the relay below. Elevate it so a CPU-heavy game can't deschedule our GPU submission.
     boost_thread_priority(true);
+    // Resolve the per-session capture / topology / encoder decision ONCE (Goal-1 stage 3): the deployed
+    // path now reads this typed `SessionPlan` instead of re-deriving from config at each dispatch site
+    // (the latent "capture and encode disagree on the backend" hazard, plan §2.4). `bit_depth` is the
+    // only per-session input — capture/topology/encoder are otherwise pure functions of `HostConfig`.
+    let plan = crate::session_plan::SessionPlan::resolve(bit_depth);
+    tracing::info!(?plan, "resolved session plan");
     // Windows two-process secure-desktop path: when the host runs as SYSTEM (required for the secure
     // desktop + SendInput), WGC can't activate in-process, so we capture the normal desktop via a
     // helper spawned in the user session and relay its AUs. (Single-process WGC/DDA is used as the
     // user, and stays the path on Linux.) See docs/windows-secure-desktop.md.
     #[cfg(target_os = "windows")]
-    if should_use_helper() {
+    if plan.topology == crate::session_plan::SessionTopology::TwoProcessRelay {
         return virtual_stream_relay(
             session,
             mode,
@@ -2220,11 +2226,11 @@ fn virtual_stream(
     // driver-churning teardown of a monitor under a still-live session. Register THIS session's stop so
     // the next reconnect preempts it.
     #[cfg(target_os = "windows")]
-    let idd_setup_guard = crate::config::config()
-        .idd_push
-        .then(|| IDD_SETUP_LOCK.lock().unwrap());
+    let idd_push_session = plan.capture == crate::session_plan::CaptureBackend::IddPush;
     #[cfg(target_os = "windows")]
-    if crate::config::config().idd_push {
+    let idd_setup_guard = idd_push_session.then(|| IDD_SETUP_LOCK.lock().unwrap());
+    #[cfg(target_os = "windows")]
+    if idd_push_session {
         let prev = IDD_SESSION_STOP.lock().unwrap().replace(stop.clone());
         if let Some(prev_stop) = prev {
             prev_stop.store(true, Ordering::SeqCst);
@@ -2233,7 +2239,7 @@ fn virtual_stream(
     }
     let mut vd = crate::vdisplay::open(compositor)?;
     let (mut capturer, mut enc, mut frame, mut interval) =
-        build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth)?;
+        build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan)?;
     // Setup done — release the IDD-push setup lock so the next reconnect can begin (and preempt us).
     #[cfg(target_os = "windows")]
     drop(idd_setup_guard);
@@ -2362,6 +2368,7 @@ fn virtual_stream(
                             cur_mode,
                             bitrate_kbps,
                             bit_depth,
+                            plan,
                         )?;
                         Ok((new_vd, pipe))
                     })();
@@ -2405,7 +2412,7 @@ fn virtual_stream(
             // Build the new pipeline BEFORE dropping the old one: the host already acked
             // the switch as accepted, so a rebuild failure must not kill an otherwise
             // healthy session — keep streaming the current mode and log instead.
-            match build_pipeline(&mut vd, new_mode, bitrate_kbps, bit_depth) {
+            match build_pipeline(&mut vd, new_mode, bitrate_kbps, bit_depth, plan) {
                 Ok(next_pipe) => {
                     (capturer, enc, frame, interval) = next_pipe;
                     cur_mode = new_mode;
@@ -2450,7 +2457,7 @@ fn virtual_stream(
                 tracing::warn!(error = %format!("{e:#}"), rebuild = capture_rebuilds,
                     "capture lost — rebuilding pipeline in place");
                 let (new_cap, new_enc, new_frame, new_interval) =
-                    build_pipeline_with_retry(&mut vd, cur_mode, bitrate_kbps, bit_depth)
+                    build_pipeline_with_retry(&mut vd, cur_mode, bitrate_kbps, bit_depth, plan)
                         .context("rebuild after capture loss")?;
                 capturer = new_cap;
                 enc = new_enc;
@@ -2567,29 +2574,6 @@ fn virtual_stream(
     let _ = send_thread.join();
     tracing::info!(sent, "punktfunk/1 virtual stream complete");
     Ok(())
-}
-
-/// Should this host take the two-process (SYSTEM host + user-session WGC helper) path? Yes when it's
-/// running as SYSTEM — the only account that can capture the secure desktop + drive SendInput on it,
-/// and the account under which in-process WGC won't activate. `PUNKTFUNK_FORCE_HELPER` forces it on
-/// (for testing the relay as a normal user); `PUNKTFUNK_NO_HELPER` forces it off. `PUNKTFUNK_NO_WGC`
-/// also forces it off — that mode runs pure single-process DDA (one capturer for the normal AND secure
-/// desktop, Apollo-style), which has no WGC helper to relay.
-#[cfg(target_os = "windows")]
-fn should_use_helper() -> bool {
-    let cfg = crate::config::config();
-    if cfg.no_helper || crate::capture::wgc_disabled() {
-        return false;
-    }
-    // IDD direct-push captures IN-PROCESS in Session 0: the pf-vdisplay driver delivers frames to the
-    // SYSTEM host's session via shared memory and NVENC is headless, so no user-session WGC helper is
-    // needed for VIDEO (and a Session-1 helper couldn't open the Session-0 shared textures anyway).
-    // NOTE: input injection (SendInput) from Session 0 can't reach the user's Session-1 desktop yet —
-    // a known follow-up; this path validates the video transport. See docs/windows-virtual-display-rust-port.md.
-    if cfg.idd_push {
-        return false;
-    }
-    cfg.force_helper || crate::capture::wgc_relay::running_as_system()
 }
 
 /// Windows two-process video stream: the SYSTEM host creates the SudoVDA virtual output (and holds
@@ -3041,6 +3025,7 @@ fn build_pipeline_with_retry(
     mode: punktfunk_core::Mode,
     bitrate_kbps: u32,
     bit_depth: u8,
+    plan: crate::session_plan::SessionPlan,
 ) -> Result<Pipeline> {
     // ~10s first-frame wait per attempt. 8 gives a ~90s budget for the SLOW case: a host-managed
     // gamescope session cold-starting Steam Big Picture (the SteamOS/Bazzite takeover) can take
@@ -3050,7 +3035,7 @@ fn build_pipeline_with_retry(
     const MAX_ATTEMPTS: u32 = 8;
     let mut backoff = std::time::Duration::from_millis(500);
     for attempt in 1..=MAX_ATTEMPTS {
-        match build_pipeline(vd, mode, bitrate_kbps, bit_depth) {
+        match build_pipeline(vd, mode, bitrate_kbps, bit_depth, plan) {
             Ok(pipe) => {
                 if attempt > 1 {
                     tracing::info!(attempt, "pipeline up after retry");
@@ -3109,6 +3094,7 @@ fn build_pipeline(
     mode: punktfunk_core::Mode,
     bitrate_kbps: u32,
     bit_depth: u8,
+    plan: crate::session_plan::SessionPlan,
 ) -> Result<Pipeline> {
     let vout = vd.create(mode).context("create virtual output")?;
     // The backend reports the refresh it actually achieved in `preferred_mode.2` (KWin may cap a
@@ -3131,7 +3117,7 @@ fn build_pipeline(
     // VIDEO_CAP_10BIT + host opted in via PUNKTFUNK_10BIT) is our HDR path → BT.2020 PQ Rgb10a2;
     // otherwise the FP16 IDD frames are converted to 8-bit SDR. (Ignored by non-IDD-push backends,
     // which auto-detect HDR from the monitor state.)
-    let mut capturer = crate::capture::capture_virtual_output(vout, bit_depth >= 10)
+    let mut capturer = crate::capture::capture_virtual_output(vout, plan.hdr, plan.capture)
         .context("capture virtual output")?;
     capturer.set_active(true);
     let frame = capturer.next_frame().context("first frame")?;

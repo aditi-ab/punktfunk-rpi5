@@ -134,8 +134,12 @@ fn run(
         // IDD-push bypasses WGC.) Acceptable for the experimental IDD-push A/B path; HDR over IDD-push
         // is wired only for punktfunk/1 (want_hdr = negotiated bit_depth >= 10). TODO: derive want_hdr
         // from a GameStream HDR flag once StreamConfig carries one.
-        let mut capturer =
-            capture::capture_virtual_output(vout, false).context("capture virtual output")?;
+        let mut capturer = capture::capture_virtual_output(
+            vout,
+            false,
+            crate::session_plan::CaptureBackend::resolve(),
+        )
+        .context("capture virtual output")?;
         capturer.set_active(true);
         return stream_body(&mut *capturer, &sock, cfg, running, force_idr, rfi_range);
     }

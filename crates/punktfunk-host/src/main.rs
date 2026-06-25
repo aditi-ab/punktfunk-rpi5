@@ -15,8 +15,8 @@
 #![allow(dead_code)]
 
 mod audio;
-mod config;
 mod capture;
+mod config;
 mod discovery;
 #[cfg(target_os = "linux")]
 mod dmabuf_fence;
@@ -35,6 +35,7 @@ mod punktfunk1;
 mod pwinit;
 #[cfg(target_os = "windows")]
 mod service;
+mod session_plan;
 mod session_tuning;
 mod spike;
 mod vdisplay;
