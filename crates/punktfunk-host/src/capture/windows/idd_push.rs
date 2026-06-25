@@ -15,7 +15,6 @@ use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
 use pf_vdisplay_proto::frame;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Interface, HSTRING};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LUID};
@@ -152,110 +151,10 @@ pub struct IddPushCapturer {
     last_seq: u64,
     last_present: Option<(ID3D11Texture2D, PixelFormat)>,
     status_logged: bool,
-    /// The monitor generation this capturer was opened for. When the active monitor gen changes (a
-    /// reconnect preempted + recreated the monitor), `next_frame` bails immediately so this session
-    /// releases its NVENC encoder instead of lingering on the dead ring's 20s deadline.
-    my_gen: u64,
     _keepalive: Box<dyn Send>,
 }
 // COM objects used only from the owning (encode) thread.
 unsafe impl Send for IddPushCapturer {}
-
-/// The persistent IDD-push capturer, kept alive for the host lifetime and SHARED across client
-/// sessions. The driver's per-session monitor TEARDOWN→RECREATE path is unstable (on session 2 the
-/// target-id resolves to 0, `IddCxSwapChainSetDevice` fails `0x80070057`, then an access violation),
-/// while the FIRST-session path is solid. So we create the monitor + ring + swap-chain ONCE and hand
-/// every later session a thin handle delegating to this one. The persistent capturer holds a monitor
-/// lease for the host lifetime, so `VirtualDisplay::create` always JOINs the same live monitor (same
-/// target id) and the reuse match always hits — no recreate, no driver crash. Prototype scope:
-/// single-client, single-mode (a different mode would need a recreate, the unstable path).
-static IDD_PERSIST: Mutex<Option<IddPushCapturer>> = Mutex::new(None);
-
-/// Open the IDD-push capturer, reusing the persistent one across sessions (see [`IDD_PERSIST`]).
-pub fn open_or_reuse(
-    target: WinCaptureTarget,
-    preferred: Option<(u32, u32, u32)>,
-    client_10bit: bool,
-    keepalive: Box<dyn Send>,
-) -> Result<Box<dyn Capturer>> {
-    let (w, h, _) =
-        preferred.context("IDD push needs the negotiated mode (WxH) to size the ring")?;
-    let mut slot = IDD_PERSIST.lock().unwrap();
-    let reuse = matches!(slot.as_ref(), Some(c) if c.target_id == target.target_id && c.width == w && c.height == h);
-    match slot.as_mut() {
-        Some(c) if reuse => {
-            // Reuse: the persistent capturer already owns the monitor + ring + driver attach. Drop the
-            // new per-session monitor lease (the persistent capturer's lease keeps the monitor live).
-            // The ring tracks the display, not the client; only the client's 10-bit cap can differ.
-            drop(keepalive);
-            c.set_client_10bit(client_10bit);
-            tracing::info!(
-                target_id = target.target_id,
-                client_10bit,
-                "IDD push: reusing the persistent capturer (no monitor/ring recreate)"
-            );
-        }
-        Some(c) => bail!(
-            "IDD-push persistent capturer is {}x{} target {}, this session wants {}x{} target {} — a \
-             mode/target change needs a recreate (the driver's recreate path is unstable); not \
-             supported in the persistent prototype",
-            c.width,
-            c.height,
-            c.target_id,
-            w,
-            h,
-            target.target_id
-        ),
-        None => {
-            tracing::info!(
-                target_id = target.target_id,
-                client_10bit,
-                "IDD push: creating the persistent capturer (first session)"
-            );
-            // (dead persistent path) open() now returns the keepalive on failure; this path has no
-            // fallback, so discard it on error.
-            *slot = Some(
-                IddPushCapturer::open(target, preferred, client_10bit, keepalive)
-                    .map_err(|(e, _keepalive)| e)?,
-            );
-        }
-    }
-    Ok(Box::new(IddReuseHandle))
-}
-
-/// Thin per-session handle: every method delegates to the single persistent [`IddPushCapturer`].
-/// Dropping it (session end) does NOT tear down the ring/monitor — that's the whole point.
-struct IddReuseHandle;
-impl Capturer for IddReuseHandle {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
-        IDD_PERSIST
-            .lock()
-            .unwrap()
-            .as_mut()
-            .context("IDD-push persistent capturer missing")?
-            .next_frame()
-    }
-    fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        IDD_PERSIST
-            .lock()
-            .unwrap()
-            .as_mut()
-            .context("IDD-push persistent capturer missing")?
-            .try_latest()
-    }
-    fn set_active(&self, active: bool) {
-        if let Some(c) = IDD_PERSIST.lock().unwrap().as_ref() {
-            c.set_active(active);
-        }
-    }
-    fn hdr_meta(&self) -> Option<punktfunk_core::quic::HdrMeta> {
-        IDD_PERSIST
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|c| c.hdr_meta())
-    }
-}
 
 /// Build a permissive (Everyone:GenericAll) `SECURITY_ATTRIBUTES` so the restricted WUDFHost driver
 /// can OPEN the host-created objects — the same `D:(A;;GA;;;WD)` SDDL the gamepad shared section uses.
@@ -521,7 +420,6 @@ impl IddPushCapturer {
                 last_seq: 0,
                 last_present: None,
                 status_logged: false,
-                my_gen: crate::vdisplay::sudovda::CURRENT_MON_GEN.load(Ordering::Relaxed),
                 // Placeholder; `open()` attaches the real keepalive on success, so a FAILED open can hand
                 // it back to the caller for the DDA fallback (audit §5.1).
                 _keepalive: Box::new(()),
@@ -660,12 +558,6 @@ impl IddPushCapturer {
         } else {
             DXGI_FORMAT_B8G8R8A8_UNORM
         }
-    }
-
-    /// Update the client's 10-bit capability (the reuse path). Only affects whether a fresh `open`
-    /// proactively enables advanced color; the per-frame conversion follows the display, not the client.
-    fn set_client_10bit(&mut self, client_10bit: bool) {
-        self.client_10bit = client_10bit;
     }
 
     /// Recreate the ring at the format for `new_display_hdr` (the user flipped "Use HDR"). Bumps the

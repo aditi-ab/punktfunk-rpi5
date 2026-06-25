@@ -38,9 +38,9 @@ use pf_vdisplay_proto::control;
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
 // Backend-NEUTRAL CCD/DXGI helpers reused from the SudoVDA backend (a pf-vdisplay monitor's target_id
-// is a real OS target id, so these operate identically). The shared MON_GEN/CURRENT_MON_GEN generation
-// counter is reused too, so the IDD-push stale-ring bail works regardless of which backend is active.
-use super::sudovda::{CURRENT_MON_GEN, MON_GEN};
+// is a real OS target id, so these operate identically). The shared MON_GEN lease-generation counter is
+// reused too, so a stale preempted lease can't tear down the live monitor regardless of which backend is active.
+use super::sudovda::MON_GEN;
 use crate::win_adapter::resolve_render_adapter_luid;
 use crate::win_display::{
     isolate_displays_ccd, resolve_gdi_name, restore_displays_ccd, set_active_mode, SavedConfig,
@@ -554,7 +554,6 @@ fn mgr_acquire(mode: Mode) -> Result<VirtualOutput> {
         let pm = Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz));
         let target = mon.target();
         let gen = mon.gen;
-        CURRENT_MON_GEN.store(gen, Ordering::Relaxed);
         return Ok(VirtualOutput {
             node_id: 0,
             preferred_mode: pm,
@@ -581,7 +580,6 @@ fn mgr_acquire(mode: Mode) -> Result<VirtualOutput> {
     let pm = Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz));
     let target = mon.target();
     let gen = mon.gen;
-    CURRENT_MON_GEN.store(gen, Ordering::Relaxed);
     g.state = MgrState::Active { mon, refs: 1 };
     Ok(VirtualOutput {
         node_id: 0,

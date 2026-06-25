@@ -19,12 +19,6 @@ use std::sync::{Arc, Mutex, Once};
 // backends keeps the idd_push stale-ring bail working regardless of which backend is active).
 pub(crate) static MON_GEN: AtomicU64 = AtomicU64::new(1);
 
-/// The gen of the CURRENTLY-active monitor. A session capturer captures this at open and re-checks it
-/// each frame; when it changes (a reconnect preempted + recreated the monitor), the old session bails
-/// IMMEDIATELY instead of lingering on the dead ring's 20s frame deadline — which would otherwise hold
-/// its NVENC encoder open and exhaust the GPU's encode-session limit under rapid reconnects.
-pub(crate) static CURRENT_MON_GEN: AtomicU64 = AtomicU64::new(0);
-
 /// IDD-push mode: a new client connection preempts + recreates the monitor (single-client reconnect),
 /// because a REUSED IddCx monitor's swap-chain is dead. Off → monitors are shared across sessions.
 fn idd_push_mode() -> bool {
@@ -590,7 +584,6 @@ fn mgr_acquire(mode: Mode) -> Result<VirtualOutput> {
         let pm = Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz));
         let target = mon.target();
         let gen = mon.gen;
-        CURRENT_MON_GEN.store(gen, Ordering::Relaxed);
         return Ok(VirtualOutput {
             node_id: 0,
             preferred_mode: pm,
@@ -617,7 +610,6 @@ fn mgr_acquire(mode: Mode) -> Result<VirtualOutput> {
     let pm = Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz));
     let target = mon.target();
     let gen = mon.gen;
-    CURRENT_MON_GEN.store(gen, Ordering::Relaxed);
     g.state = MgrState::Active { mon, refs: 1 };
     Ok(VirtualOutput {
         node_id: 0,
