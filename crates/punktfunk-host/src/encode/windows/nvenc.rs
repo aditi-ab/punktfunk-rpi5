@@ -13,7 +13,7 @@
 //! Needs a real NVIDIA GPU at runtime (session creation fails otherwise) — compiles GPU-less, but
 //! `open`/`submit` only succeed on a GPU box. The software encoder (`super::sw`) is the fallback.
 
-use super::{Codec, EncodedFrame, Encoder};
+use super::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
@@ -730,6 +730,15 @@ impl Encoder for NvencD3d11Encoder {
 
     fn request_keyframe(&mut self) {
         self.force_kf = true;
+    }
+
+    fn caps(&self) -> EncoderCaps {
+        // RFI is probed once at open (`rfi_supported`); HDR SEI rides keyframes whenever the
+        // session is in HDR mode. Both are the real capabilities the session glue routes on.
+        EncoderCaps {
+            supports_rfi: self.rfi_supported,
+            supports_hdr_metadata: self.hdr,
+        }
     }
 
     fn set_hdr_meta(&mut self, meta: Option<punktfunk_core::quic::HdrMeta>) {

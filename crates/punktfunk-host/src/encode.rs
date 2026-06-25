@@ -71,9 +71,34 @@ impl Codec {
     }
 }
 
+/// Static capabilities an [`Encoder`] declares so the session glue routes loss-recovery and HDR
+/// plumbing by *query* rather than relying on a method's no-op/`false` default. Cheap `Copy`; fixed
+/// for the session (an HDR toggle re-initialises the encoder — re-query if that matters).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EncoderCaps {
+    /// The encoder can perform real reference-frame invalidation — i.e.
+    /// [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) can return `true`. When `false`
+    /// the caller skips that always-`false` call and forces a keyframe directly on loss recovery.
+    /// Only the Windows direct-NVENC path implements RFI; libavcodec (Linux NVENC), VAAPI and
+    /// AMF/QSV always keyframe.
+    pub supports_rfi: bool,
+    /// The encoder emits in-band HDR mastering/CLL SEI from [`set_hdr_meta`](Encoder::set_hdr_meta).
+    /// When `false`, `set_hdr_meta` is a no-op and no in-band grade reaches the client. Only the
+    /// Windows direct-NVENC path attaches it today.
+    pub supports_hdr_metadata: bool,
+}
+
 /// A hardware encoder. One per session; runs on the encode thread.
 pub trait Encoder: Send {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()>;
+    /// This encoder's static [capabilities](EncoderCaps) (RFI, HDR SEI), so the session glue can
+    /// route by query rather than rely on the no-op/`false` defaults of
+    /// [`invalidate_ref_frames`](Self::invalidate_ref_frames) / [`set_hdr_meta`](Self::set_hdr_meta).
+    /// Default: no optional capabilities (the SDR / libavcodec backends) — only the direct-NVENC
+    /// path overrides it.
+    fn caps(&self) -> EncoderCaps {
+        EncoderCaps::default()
+    }
     /// Force the next submitted frame to be an IDR keyframe (e.g. after a client
     /// reference-frame-invalidation request). Default: no-op.
     fn request_keyframe(&mut self) {}

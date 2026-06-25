@@ -367,6 +367,10 @@ fn stream_body(
         (0u128, 0u128, 0u128, 0u128, 0usize, 0u32);
     // Absolute next-frame deadline — the single pacing clock for the loop.
     let mut next_frame = Instant::now();
+    // RFI capability is fixed for the session (probed at encoder open). Query it once so the
+    // recovery path skips the always-`false` invalidate call on encoders without NVENC RFI and
+    // forces a keyframe directly instead.
+    let supports_rfi = enc.caps().supports_rfi;
 
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
@@ -380,7 +384,9 @@ fn stream_body(
         // re-references an older still-valid frame — no costly IDR spike); if the encoder can't
         // invalidate (range too old, or no NVENC RFI) it returns false and we force a keyframe.
         if let Some((first, last)) = rfi_range.lock().unwrap().take() {
-            if !enc.invalidate_ref_frames(first, last) {
+            // Prefer reference-frame invalidation when the encoder supports it (no costly IDR
+            // spike); otherwise — or if the range is too old to invalidate — force a keyframe.
+            if !(supports_rfi && enc.invalidate_ref_frames(first, last)) {
                 enc.request_keyframe();
             }
         }
