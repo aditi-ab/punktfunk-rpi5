@@ -1,0 +1,497 @@
+//! Host-lifetime virtual-display **ownership model** (Goal-1 §2.5). One reference-counted monitor
+//! lifecycle, shared by both Windows backends (SudoVDA + pf-vdisplay) instead of the two verbatim-
+//! duplicated `MGR: Mutex<Mgr>` globals each backend used to carry.
+//!
+//! [`VirtualDisplayManager`] owns the earned Idle/Active/Lingering refcount machine + the linger timer +
+//! a **typed** [`OwnedHandle`] control device (no more raw `isize` smuggled across the pinger/linger
+//! threads). The backend differences — the IOCTL protocol and the per-monitor REMOVE key — are the only
+//! thing behind the [`VdisplayDriver`] seam; the state machine, the render-adapter pin decision, the
+//! GDI/CCD glue (`crate::win_display`), and the generation-stamped [`MonitorLease`] are backend-neutral.
+//!
+//! It's a process-wide singleton ([`vdm`]) initialised once with the chosen backend's driver — the
+//! host runs exactly one virtual-display backend per process. The session holds a [`MonitorLease`];
+//! its `Drop` releases the refcount (a *stale* lease — its monitor was preempted + recreated under it —
+//! is a no-op, so it can never tear down the live monitor).
+
+use std::ffi::c_void;
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use windows::Win32::Foundation::{HANDLE, LUID};
+
+use super::{Mode, VirtualOutput};
+use crate::win_display::{
+    isolate_displays_ccd, resolve_gdi_name, restore_displays_ccd, set_active_mode, SavedConfig,
+};
+
+/// The per-backend REMOVE key the driver stamps on ADD and consumes on REMOVE. SudoVDA keys monitors by
+/// a fresh `GUID`; pf-vdisplay keys them by a monotonic `u64` session id.
+#[derive(Clone, Copy)]
+pub(crate) enum MonitorKey {
+    Guid(windows::core::GUID),
+    Session(u64),
+}
+
+/// What a backend's `add_monitor` returns: the REMOVE key + the OS target id + the render LUID.
+pub(crate) struct AddedMonitor {
+    pub key: MonitorKey,
+    pub target_id: u32,
+    pub luid: LUID,
+}
+
+/// The backend-specific IOCTL surface — the *only* thing that differs between SudoVDA and pf-vdisplay.
+/// Everything else (the refcount machine, the linger, the pinger, the CCD/GDI glue) is shared in
+/// [`VirtualDisplayManager`]. `Send + Sync` because the manager (and so the boxed driver) is a
+/// `&'static` singleton reached from the pinger + linger threads.
+pub(crate) trait VdisplayDriver: Send + Sync {
+    fn name(&self) -> &'static str;
+    /// Find + open the control device, validate it (version handshake), read the watchdog timeout, and
+    /// reap monitors orphaned by a crashed previous host (`CLEAR_ALL`). Returns the owned handle +
+    /// watchdog seconds.
+    ///
+    /// # Safety
+    /// Issues setup-API + `DeviceIoControl` calls; runs in the caller's apartment.
+    unsafe fn open(&self) -> Result<(OwnedHandle, u32)>;
+    /// ADD a virtual monitor at `mode`, pinning the IDD render GPU to `render_luid` first if `Some`.
+    /// Returns the REMOVE key + target id + the adapter LUID the driver actually used.
+    ///
+    /// # Safety
+    /// `dev` must be the live control handle from [`open`](Self::open).
+    unsafe fn add_monitor(&self, dev: HANDLE, mode: Mode, render_luid: Option<LUID>)
+        -> Result<AddedMonitor>;
+    /// REMOVE the monitor identified by `key`.
+    ///
+    /// # Safety
+    /// `dev` must be the live control handle.
+    unsafe fn remove_monitor(&self, dev: HANDLE, key: &MonitorKey) -> Result<()>;
+    /// Watchdog keepalive PING (issued every `watchdog/3` from the pinger thread).
+    ///
+    /// # Safety
+    /// `dev` must be the live control handle.
+    unsafe fn ping(&self, dev: HANDLE) -> Result<()>;
+}
+
+/// The resources backing one live virtual monitor (owned by the [`VirtualDisplayManager`] state, not by
+/// any session). No `Drop` impl — [`teardown`](VirtualDisplayManager::teardown) must be called so the
+/// REMOVE IOCTL fires (a bare drop would orphan the driver-side monitor).
+struct Monitor {
+    key: MonitorKey,
+    target_id: u32,
+    luid: LUID,
+    gdi_name: Option<String>,
+    mode: Mode,
+    stop: Arc<AtomicBool>,
+    pinger: Option<JoinHandle<()>>,
+    ccd_saved: Option<SavedConfig>,
+    /// Generation stamp; a [`MonitorLease`] only releases if its gen still matches (stale-lease no-op).
+    gen: u64,
+}
+
+impl Monitor {
+    /// The capture target handed to a session (`None` until the GDI name resolves on a WDDM GPU).
+    fn target(&self) -> Option<crate::capture::dxgi::WinCaptureTarget> {
+        self.gdi_name
+            .clone()
+            .map(|n| crate::capture::dxgi::WinCaptureTarget {
+                adapter_luid: crate::capture::dxgi::pack_luid(self.luid),
+                gdi_name: n,
+                target_id: self.target_id,
+            })
+    }
+}
+
+enum MgrState {
+    Idle,
+    Active { mon: Monitor, refs: u32 },
+    Lingering { mon: Monitor, until: Instant },
+}
+
+/// The host-lifetime virtual-display manager: the single owner of the monitor lifecycle.
+pub(crate) struct VirtualDisplayManager {
+    driver: Box<dyn VdisplayDriver>,
+    /// Control device, opened once on first acquire. Typed + `Send+Sync`, so the pinger/linger threads
+    /// share it via the `&'static` singleton with no raw-handle smuggling.
+    device: OnceLock<Arc<OwnedHandle>>,
+    watchdog_s: AtomicU32,
+    /// Monotonic lease-generation counter (was the `MON_GEN` global).
+    gen: AtomicU64,
+    state: Mutex<MgrState>,
+}
+
+static VDM: OnceLock<VirtualDisplayManager> = OnceLock::new();
+
+/// Initialise the process-wide manager with `driver` (the chosen backend) and return it. Idempotent: the
+/// first backend to call wins (the host runs one backend per process), so a later call ignores its driver.
+pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayManager {
+    VDM.get_or_init(|| VirtualDisplayManager {
+        driver,
+        device: OnceLock::new(),
+        watchdog_s: AtomicU32::new(3),
+        gen: AtomicU64::new(1),
+        state: Mutex::new(MgrState::Idle),
+    })
+}
+
+/// The process-wide manager. Panics if reached before a backend called [`init`] — by construction a
+/// session is only ever created after `vdisplay::open` constructed the backend (which calls `init`).
+pub(crate) fn vdm() -> &'static VirtualDisplayManager {
+    VDM.get().expect("VirtualDisplayManager used before a backend initialised it")
+}
+
+impl VirtualDisplayManager {
+    pub(crate) fn backend_name(&self) -> &'static str {
+        self.driver.name()
+    }
+
+    /// Open + cache the control device (once). Called under the `state` lock so two racing acquires can't
+    /// double-open.
+    fn ensure_device(&self) -> Result<HANDLE> {
+        if let Some(d) = self.device.get() {
+            return Ok(HANDLE(d.as_raw_handle() as *mut c_void));
+        }
+        let (handle, watchdog_s) = unsafe { self.driver.open()? };
+        self.watchdog_s.store(watchdog_s, Ordering::Relaxed);
+        let raw = HANDLE(handle.as_raw_handle() as *mut c_void);
+        let _ = self.device.set(Arc::new(handle));
+        Ok(raw)
+    }
+
+    /// The live control handle for the pinger/linger threads (lock-free: the device never changes once
+    /// opened). `None` only before the first acquire opened it.
+    fn device_handle(&self) -> Option<HANDLE> {
+        self.device
+            .get()
+            .map(|d| HANDLE(d.as_raw_handle() as *mut c_void))
+    }
+
+    /// Open + initialise the backend (validates the driver is present). Mirrors the old
+    /// `SudoVdaDisplay::new`/`PfVdisplayDisplay::new`.
+    pub(crate) fn open_backend(&self) -> Result<()> {
+        // Hold the state lock across the open so two racing backends can't double-open the device.
+        let _guard = self.state.lock().unwrap();
+        self.ensure_device().map(|_| ())
+    }
+
+    /// Acquire the shared monitor for a new session: preempt-recreate under IDD-push, join a live one
+    /// (refcount++), reuse a lingering one, or create one. The returned [`MonitorLease`] releases the
+    /// refcount on drop.
+    pub(crate) fn acquire(&'static self, mode: Mode) -> Result<VirtualOutput> {
+        self.ensure_linger_timer();
+        let mut state = self.state.lock().unwrap();
+        let dev = self.ensure_device()?;
+
+        // IDD-push: a new connection while a monitor is live is a single-client RECONNECT (the prior
+        // client is gone). A REUSED IddCx swap-chain is DEAD, so joining it hands a black screen —
+        // PREEMPT: tear the old monitor down (its key/topology are restored) and create a fresh one. The
+        // old session's lease is gen-stamped, so its later drop is a no-op and can't tear down the new one.
+        if idd_push_mode()
+            && matches!(*state, MgrState::Active { .. } | MgrState::Lingering { .. })
+        {
+            if let MgrState::Active { mon, .. } | MgrState::Lingering { mon, .. } =
+                std::mem::replace(&mut *state, MgrState::Idle)
+            {
+                tracing::info!(
+                    old_target = mon.target_id,
+                    "IDD-push reconnect — preempting the prior session, recreating a fresh monitor"
+                );
+                unsafe { self.teardown(dev, mon) };
+                // Let the OS finish the ASYNC monitor departure before the next ADD; a back-to-back
+                // REMOVE→ADD races the teardown and the ADD IOCTL is rejected under reconnect churn.
+                thread::sleep(Duration::from_millis(400));
+            }
+        }
+
+        // A live monitor already exists — join it (refcount++). Covers concurrent sessions AND the
+        // build-then-drop overlap of a mid-stream Reconfigure (the new lease is taken while the old is
+        // still held). Reconfigure the shared monitor if the requested mode differs.
+        if let MgrState::Active { mon, refs } = &mut *state {
+            *refs += 1;
+            if mon.mode != mode {
+                unsafe { self.reconfigure(mon, mode) };
+            }
+            tracing::info!(refs = *refs, backend = self.driver.name(), "virtual monitor reused (concurrent / reconfigure session)");
+            return Ok(self.output_for(mon));
+        }
+
+        // Idle or Lingering: repurpose a lingering monitor / create a fresh one → Active{refs:1}.
+        let mon = match std::mem::replace(&mut *state, MgrState::Idle) {
+            MgrState::Lingering { mut mon, .. } => {
+                tracing::info!(backend = self.driver.name(), "virtual monitor reused (reconnect within the linger window)");
+                if mon.mode != mode {
+                    unsafe { self.reconfigure(&mut mon, mode) };
+                }
+                mon
+            }
+            MgrState::Idle => unsafe { self.create_monitor(dev, mode)? },
+            MgrState::Active { .. } => unreachable!("handled above"),
+        };
+        let out = self.output_for(&mon);
+        *state = MgrState::Active { mon, refs: 1 };
+        Ok(out)
+    }
+
+    /// Build the [`VirtualOutput`] (preferred mode + capture target + a fresh gen-stamped lease) for `mon`.
+    fn output_for(&'static self, mon: &Monitor) -> VirtualOutput {
+        VirtualOutput {
+            node_id: 0,
+            preferred_mode: Some((mon.mode.width, mon.mode.height, mon.mode.refresh_hz)),
+            win_capture: mon.target(),
+            keepalive: Box::new(MonitorLease {
+                mgr: self,
+                gen: mon.gen,
+            }),
+        }
+    }
+
+    /// Create a fresh monitor at `mode`: ADD via the driver (pinning the discrete render GPU under the
+    /// usual conditions), start the watchdog pinger, resolve the GDI name, force the mode + isolate to a
+    /// sole composited display.
+    ///
+    /// # Safety
+    /// `dev` must be the live control handle.
+    unsafe fn create_monitor(&'static self, dev: HANDLE, mode: Mode) -> Result<Monitor> {
+        let added = unsafe { self.driver.add_monitor(dev, mode, resolve_render_pin())? };
+
+        // Mandatory keepalive: ping inside the watchdog window or the driver tears all displays down.
+        // The pinger reaches the singleton for both the device + the driver — no raw-handle smuggle.
+        let stop = Arc::new(AtomicBool::new(false));
+        let interval = Duration::from_millis(self.watchdog_s.load(Ordering::Relaxed) as u64 * 1000 / 3);
+        let stop_t = stop.clone();
+        let pinger = thread::spawn(move || {
+            let mut warned = false;
+            while !stop_t.load(Ordering::Relaxed) {
+                if let Some(h) = vdm().device_handle() {
+                    match unsafe { vdm().driver.ping(h) } {
+                        Ok(()) => warned = false,
+                        Err(e) => {
+                            if !warned {
+                                tracing::warn!("virtual-display keepalive PING failed (control handle lost?): {e:#}");
+                                warned = true;
+                            }
+                        }
+                    }
+                }
+                thread::sleep(interval);
+            }
+        });
+
+        // Resolve the capture target. May be None on a GPU-less box (target added but not WDDM-activated);
+        // the capture backend re-resolves once a GPU is present.
+        let mut gdi_name = None;
+        for _ in 0..15 {
+            thread::sleep(Duration::from_millis(200));
+            if let Some(n) = unsafe { resolve_gdi_name(added.target_id) } {
+                gdi_name = Some(n);
+                break;
+            }
+        }
+        let mut ccd_saved: Option<SavedConfig> = None;
+        match &gdi_name {
+            Some(n) => {
+                tracing::info!(backend = self.driver.name(), "target {} -> {n}", added.target_id);
+                // ADD only advertises the mode; force it active so DXGI captures the requested size.
+                set_active_mode(n, mode);
+                // Make the virtual display the SOLE active output (default): an EXTENDED (non-primary) IDD
+                // isn't DWM-composited on this box → Desktop Duplication born-losts. Deactivating the other
+                // display(s) first via the atomic CCD path promotes the IDD to a composited primary with no
+                // MODE_CHANGE storm. Opt out with PUNKTFUNK_NO_ISOLATE=1.
+                if std::env::var("PUNKTFUNK_NO_ISOLATE").is_err() {
+                    ccd_saved = unsafe { isolate_displays_ccd(added.target_id) };
+                } else {
+                    tracing::info!("display isolation skipped (PUNKTFUNK_NO_ISOLATE) — IDD stays extended");
+                }
+                thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture opens
+            }
+            None => tracing::warn!(
+                "virtual-display target {} not yet an active display path (needs a WDDM GPU to activate)",
+                added.target_id
+            ),
+        }
+
+        Ok(Monitor {
+            key: added.key,
+            target_id: added.target_id,
+            luid: added.luid,
+            gdi_name,
+            mode,
+            stop,
+            pinger: Some(pinger),
+            ccd_saved,
+            gen: self.gen.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
+    /// Re-apply a (possibly new) mode to a reused monitor on reconnect, re-resolving its GDI name.
+    ///
+    /// # Safety
+    /// Touches the live display topology via the CCD/GDI helpers.
+    unsafe fn reconfigure(&self, mon: &mut Monitor, mode: Mode) {
+        tracing::info!(
+            old = format!("{}x{}@{}", mon.mode.width, mon.mode.height, mon.mode.refresh_hz),
+            new = format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
+            "virtual-display: reconfiguring reused monitor to the new client mode"
+        );
+        if let Some(n) = unsafe { resolve_gdi_name(mon.target_id) } {
+            mon.gdi_name = Some(n);
+        }
+        if let Some(n) = &mon.gdi_name {
+            set_active_mode(n, mode);
+        }
+        mon.mode = mode;
+    }
+
+    /// Stop the watchdog ping, re-attach the displays we detached, then REMOVE the monitor. Consumes it.
+    ///
+    /// # Safety
+    /// `dev` must be the live control handle.
+    unsafe fn teardown(&self, dev: HANDLE, mut mon: Monitor) {
+        mon.stop.store(true, Ordering::Relaxed);
+        if let Some(j) = mon.pinger.take() {
+            let _ = j.join();
+        }
+        // Re-attach detached display(s) BEFORE the REMOVE so the box is never left with zero displays.
+        if let Some(saved) = &mon.ccd_saved {
+            restore_displays_ccd(saved);
+        }
+        if let Err(e) = unsafe { self.driver.remove_monitor(dev, &mon.key) } {
+            tracing::warn!("virtual-display REMOVE failed: {e:#}");
+        } else {
+            tracing::info!(backend = self.driver.name(), "virtual-display monitor removed");
+        }
+    }
+
+    /// Release a session's hold (the [`MonitorLease`] `Drop`): refcount-- ; the last session leaving
+    /// LINGERs before teardown. A STALE lease (its monitor was preempted + recreated under it) is a
+    /// no-op, so it can't tear down the CURRENT monitor.
+    fn release(&self, gen: u64) {
+        let mut state = self.state.lock().unwrap();
+        let stale = match &*state {
+            MgrState::Active { mon, .. } | MgrState::Lingering { mon, .. } => mon.gen != gen,
+            MgrState::Idle => true,
+        };
+        if stale {
+            return;
+        }
+        *state = match std::mem::replace(&mut *state, MgrState::Idle) {
+            MgrState::Active { mon, refs } if refs > 1 => MgrState::Active { mon, refs: refs - 1 },
+            MgrState::Active { mon, .. } => {
+                let ms = linger_ms();
+                tracing::info!(linger_ms = ms, "virtual-display: last session left — lingering before teardown");
+                MgrState::Lingering {
+                    mon,
+                    until: Instant::now() + Duration::from_millis(ms),
+                }
+            }
+            other => other,
+        };
+    }
+
+    /// Wait (up to `timeout`) for the active monitor to be RELEASED (the MGR is no longer `Active`).
+    /// Used by the IDD-push reconnect preempt: after signalling the old session to stop, wait here so it
+    /// tears its monitor down cleanly before we acquire a fresh one.
+    pub(crate) fn wait_for_monitor_released(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !matches!(*self.state.lock().unwrap(), MgrState::Active { .. }) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    "IDD-push preempt: prior session didn't release the monitor within {timeout:?} — proceeding"
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Background timer (started once): tear down a monitor that has lingered past its deadline (→ Idle),
+    /// so a physical-screen user gets their screen back after they stop streaming.
+    fn ensure_linger_timer(&'static self) {
+        static TIMER: Once = Once::new();
+        TIMER.call_once(|| {
+            thread::Builder::new()
+                .name("vdisplay-linger".into())
+                .spawn(move || loop {
+                    thread::sleep(Duration::from_millis(500));
+                    let due = {
+                        let g = self.state.lock().unwrap();
+                        matches!(&*g, MgrState::Lingering { until, .. } if Instant::now() >= *until)
+                    };
+                    if !due {
+                        continue;
+                    }
+                    let Some(dev) = self.device_handle() else {
+                        continue;
+                    };
+                    let taken = {
+                        let mut g = self.state.lock().unwrap();
+                        if matches!(&*g, MgrState::Lingering { until, .. } if Instant::now() >= *until) {
+                            if let MgrState::Lingering { mon, .. } =
+                                std::mem::replace(&mut *g, MgrState::Idle)
+                            {
+                                Some(mon)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(mon) = taken {
+                        unsafe { self.teardown(dev, mon) };
+                    }
+                })
+                .ok();
+        });
+    }
+}
+
+/// The session's refcount handle. `Drop` releases the manager's refcount; a stale lease (its monitor was
+/// preempted + recreated under it) is a no-op.
+struct MonitorLease {
+    mgr: &'static VirtualDisplayManager,
+    gen: u64,
+}
+
+impl Drop for MonitorLease {
+    fn drop(&mut self) {
+        self.mgr.release(self.gen);
+    }
+}
+
+/// IDD-push mode: a new client connection preempts + recreates the monitor (single-client reconnect),
+/// because a REUSED IddCx monitor's swap-chain is dead. Off → monitors are shared across sessions.
+fn idd_push_mode() -> bool {
+    crate::config::config().idd_push
+}
+
+/// The render-GPU pin decision (backend-neutral): pin the discrete render GPU when explicitly requested,
+/// or under IDD-push (the host runs NVENC on the render adapter, so it MUST be the discrete encoder GPU
+/// on a hybrid box). `None` = let the IDD use its natural adapter (Apollo parity — avoids the cross-GPU
+/// ACCESS_LOST storm SudoVDA hit when pinned).
+fn resolve_render_pin() -> Option<LUID> {
+    if crate::config::config().render_adapter.is_some() {
+        unsafe { crate::win_adapter::resolve_render_adapter_luid() }
+    } else if crate::config::config().idd_push {
+        tracing::info!("IDD push: pinning the discrete render GPU (SET_RENDER_ADAPTER)");
+        unsafe { crate::win_adapter::resolve_render_adapter_luid() }
+    } else {
+        tracing::info!(
+            "SET_RENDER_ADAPTER skipped (Apollo-parity: no render pin; set PUNKTFUNK_RENDER_ADAPTER=<name> to force one)"
+        );
+        None
+    }
+}
+
+/// Linger window before a session-less monitor is torn down (default 10 s; `PUNKTFUNK_MONITOR_LINGER_MS`).
+fn linger_ms() -> u64 {
+    std::env::var("PUNKTFUNK_MONITOR_LINGER_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000)
+}

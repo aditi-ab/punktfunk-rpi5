@@ -635,6 +635,9 @@ mod kwin;
 #[path = "vdisplay/linux/mutter.rs"]
 mod mutter;
 #[cfg(target_os = "windows")]
+#[path = "vdisplay/windows/manager.rs"]
+pub(crate) mod manager;
+#[cfg(target_os = "windows")]
 #[path = "vdisplay/windows/pf_vdisplay.rs"]
 pub(crate) mod pf_vdisplay;
 #[cfg(target_os = "windows")]

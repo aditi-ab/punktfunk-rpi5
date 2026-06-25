@@ -2255,7 +2255,8 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         let prev = IDD_SESSION_STOP.lock().unwrap().replace(stop.clone());
         if let Some(prev_stop) = prev {
             prev_stop.store(true, Ordering::SeqCst);
-            crate::vdisplay::sudovda::wait_for_monitor_released(std::time::Duration::from_secs(3));
+            crate::vdisplay::manager::vdm()
+                .wait_for_monitor_released(std::time::Duration::from_secs(3));
         }
     }
     let mut vd = crate::vdisplay::open(compositor)?;
