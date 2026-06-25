@@ -5,7 +5,6 @@
 //! `guid: u128` → `session_id: u64` for the owned `pf_vdisplay_proto` control plane.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use wdk_sys::iddcx;
@@ -69,8 +68,6 @@ unsafe impl Send for MonitorObject {}
 /// thread ([`crate::control::start_watchdog`]) races device cleanup — for no real gain. Cleanup of the
 /// heavy per-monitor resources on device removal is instead done explicitly ([`cleanup_for_device_removal`]).
 pub static MONITOR_MODES: Mutex<Vec<MonitorObject>> = Mutex::new(Vec::new());
-/// Monitor id / EDID-serial counter (unique per created monitor).
-static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
 /// True if any virtual monitor currently exists — the host-gone watchdog only reaps when there's
 /// something to reap (see [`crate::control::start_watchdog`]).
@@ -323,8 +320,6 @@ pub fn create_monitor(
         dbglog!("[pf-vd] create_monitor: session {session_id} already live — departing the stale monitor");
         remove_monitor(session_id);
     }
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-
     let mut modes = vec![Mode {
         width,
         height,
@@ -332,8 +327,17 @@ pub fn create_monitor(
     }];
     modes.extend(default_modes());
 
-    // Register the (pending) monitor so the mode DDIs can find it by EDID-serial id before arrival.
-    if let Ok(mut lock) = MONITOR_MODES.lock() {
+    // Register the (pending) monitor so the mode DDIs can find it by EDID-serial id before arrival, under a
+    // REUSED id (the lowest not currently live). Reclaiming the id on REMOVE — instead of a monotonic
+    // counter — keeps the connector index / EDID serial / container GUID bounded, so IddCx reuses the same
+    // OS target slot on a fresh ADD rather than leaving a ghost monitor node behind (the slot-exhaustion
+    // wedge: sustained ADD/REMOVE churn eventually makes ADD fail 0x80070490 ERROR_NOT_FOUND). Allocated
+    // under the lock with the push so two concurrent ADDs can't pick the same id.
+    let id = {
+        let Ok(mut lock) = MONITOR_MODES.lock() else {
+            return None;
+        };
+        let id = alloc_monitor_id(&lock);
         lock.push(MonitorObject {
             object: None,
             id,
@@ -345,9 +349,8 @@ pub fn create_monitor(
             swap_chain_processor: None,
             created_at: Instant::now(),
         });
-    } else {
-        return None;
-    }
+        id
+    };
 
     // EDID (serial = id) describes the monitor; the OS calls back into parse_monitor_description.
     let mut edid = crate::edid::Edid::generate_with(id);
@@ -503,6 +506,17 @@ fn remove_by_id(id: u32) {
     if let Ok(mut lock) = MONITOR_MODES.lock() {
         lock.retain(|m| m.id != id);
     }
+}
+
+/// The lowest monitor id (≥1) not currently live. Reusing freed ids (instead of a monotonic counter) keeps
+/// the connector index / EDID serial / container GUID bounded to the number of concurrent monitors, so a
+/// fresh ADD reuses a departed monitor's OS target slot rather than allocating a new one and orphaning the
+/// old (the ghost-monitor accumulation that wedges ADD at 0x80070490 ERROR_NOT_FOUND). Caller holds
+/// `MONITOR_MODES`. With ≤ N live ids, a free one always exists in `1..=N+1` (pigeonhole).
+fn alloc_monitor_id(modes: &[MonitorObject]) -> u32 {
+    (1u32..=modes.len() as u32 + 1)
+        .find(|id| !modes.iter().any(|m| m.id == *id))
+        .unwrap_or(1)
 }
 
 /// A deterministic, monitor-unique container GUID (groups targets into a physical device). Derived from
