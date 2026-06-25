@@ -15,9 +15,11 @@ mod log;
 mod adapter;
 mod callbacks;
 mod control;
+mod direct_3d_device;
 mod edid;
 mod entry;
 mod monitor;
+mod swap_chain_processor;
 
 use wdk_sys::NTSTATUS;
 

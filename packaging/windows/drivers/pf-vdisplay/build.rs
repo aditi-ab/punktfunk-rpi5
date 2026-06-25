@@ -45,7 +45,9 @@ fn link_iddcx_stub() {
         }
     }
     let Some((_, dir)) = best else {
-        panic!("IddCxStub.lib not found under any Windows Kits Lib\\<ver>\\um\\{ARCH}\\iddcx\\<iddcxver>\\");
+        panic!(
+            "IddCxStub.lib not found under any Windows Kits Lib\\<ver>\\um\\{ARCH}\\iddcx\\<iddcxver>\\"
+        );
     };
     println!("cargo:rustc-link-search={}", dir.display());
     println!("cargo:rustc-link-lib=static=IddCxStub");

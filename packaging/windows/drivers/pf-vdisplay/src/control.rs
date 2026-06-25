@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use pf_vdisplay_proto::control;
 use wdk_iddcx::nt_success;
-use wdk_sys::{call_unsafe_wdf_function_binding, NTSTATUS, WDFREQUEST};
+use wdk_sys::{NTSTATUS, WDFREQUEST, call_unsafe_wdf_function_binding};
 
 use crate::{STATUS_INVALID_PARAMETER, STATUS_NOT_FOUND, STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS};
 
@@ -149,6 +149,11 @@ fn complete(request: WDFREQUEST, status: NTSTATUS) {
 fn complete_info(request: WDFREQUEST, status: NTSTATUS, info: usize) {
     // SAFETY: completing hands the framework `WDFREQUEST` back to the OS.
     unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestCompleteWithInformation, request, status, info as u64)
+        call_unsafe_wdf_function_binding!(
+            WdfRequestCompleteWithInformation,
+            request,
+            status,
+            info as u64
+        )
     };
 }

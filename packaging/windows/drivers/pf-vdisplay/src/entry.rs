@@ -5,9 +5,9 @@
 
 use wdk_iddcx::nt_success;
 use wdk_sys::{
-    call_unsafe_wdf_function_binding, iddcx, GUID, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT,
-    PWDFDEVICE_INIT, ULONG, WDFDEVICE, WDFDRIVER, WDF_DRIVER_CONFIG, WDF_NO_HANDLE,
-    WDF_NO_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
+    GUID, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PWDFDEVICE_INIT, ULONG, WDF_DRIVER_CONFIG,
+    WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS, WDFDEVICE, WDFDRIVER,
+    call_unsafe_wdf_function_binding, iddcx,
 };
 
 use crate::callbacks;
@@ -127,7 +127,12 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     };
     // SAFETY: device is the just-created WDFDEVICE; guid lives for the call; no reference string.
     let status = unsafe {
-        call_unsafe_wdf_function_binding!(WdfDeviceCreateDeviceInterface, device, &guid, core::ptr::null())
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceCreateDeviceInterface,
+            device,
+            &guid,
+            core::ptr::null()
+        )
     };
     dbglog!("[pf-vd] WdfDeviceCreateDeviceInterface -> {status:#x}");
     status

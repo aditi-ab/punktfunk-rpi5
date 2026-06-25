@@ -4,8 +4,8 @@
 //! from the working upstream virtual-display-rs (`monitor.rs` + `context.rs::create_monitor`), with
 //! `guid: u128` → `session_id: u64` for the owned `pf_vdisplay_proto` control plane.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use wdk_sys::iddcx;
@@ -51,6 +51,9 @@ pub struct MonitorObject {
     pub target_id: u32,
     pub adapter_luid_low: u32,
     pub adapter_luid_high: i32,
+    /// The live swap-chain drain worker, set by `assign_swap_chain` and dropped (RAII-joins the worker
+    /// thread) by `unassign_swap_chain` / departure (STEP 5).
+    pub swap_chain_processor: Option<crate::swap_chain_processor::SwapChainProcessor>,
     /// When the entry was created — the watchdog skips still-initializing monitors.
     pub created_at: Instant,
 }
@@ -64,21 +67,44 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 /// Fallback modes appended after the requested mode, so a topology change still has options.
 fn default_modes() -> Vec<Mode> {
     vec![
-        Mode { width: 1920, height: 1080, refresh_rates: vec![60, 120] },
-        Mode { width: 1280, height: 720, refresh_rates: vec![60] },
+        Mode {
+            width: 1920,
+            height: 1080,
+            refresh_rates: vec![60, 120],
+        },
+        Mode {
+            width: 1280,
+            height: 720,
+            refresh_rates: vec![60],
+        },
     ]
 }
 
 /// `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` for a monitor mode (vSyncFreqDivider = 0, per the DDI contract).
-pub fn display_info(width: u32, height: u32, refresh_rate: u32) -> wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
+pub fn display_info(
+    width: u32,
+    height: u32,
+    refresh_rate: u32,
+) -> wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
     let clock_rate = refresh_rate * (height + 4) * (height + 4) + 1000;
     let mut si: wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO = unsafe { core::mem::zeroed() };
     si.pixelRate = u64::from(clock_rate);
-    si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL { Numerator: clock_rate, Denominator: height + 4 };
-    si.vSyncFreq =
-        wdk_sys::DISPLAYCONFIG_RATIONAL { Numerator: clock_rate, Denominator: (height + 4) * (height + 4) };
-    si.activeSize = wdk_sys::DISPLAYCONFIG_2DREGION { cx: width, cy: height };
-    si.totalSize = wdk_sys::DISPLAYCONFIG_2DREGION { cx: width + 4, cy: height + 4 };
+    si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
+        Numerator: clock_rate,
+        Denominator: height + 4,
+    };
+    si.vSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
+        Numerator: clock_rate,
+        Denominator: (height + 4) * (height + 4),
+    };
+    si.activeSize = wdk_sys::DISPLAYCONFIG_2DREGION {
+        cx: width,
+        cy: height,
+    };
+    si.totalSize = wdk_sys::DISPLAYCONFIG_2DREGION {
+        cx: width + 4,
+        cy: height + 4,
+    };
     // union { AdditionalSignalInfo bitfield | videoStandard:u32 }: videoStandard=255, vSyncFreqDivider=0.
     si.__bindgen_anon_1.videoStandard = 255;
     si.scanLineOrdering =
@@ -88,11 +114,20 @@ pub fn display_info(width: u32, height: u32, refresh_rate: u32) -> wdk_sys::DISP
 
 /// `IDDCX_TARGET_MODE` for a scan-out mode (vSyncFreqDivider = 1, per the DDI contract).
 pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE {
-    let region = wdk_sys::DISPLAYCONFIG_2DREGION { cx: width, cy: height };
+    let region = wdk_sys::DISPLAYCONFIG_2DREGION {
+        cx: width,
+        cy: height,
+    };
     let mut si: wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO = unsafe { core::mem::zeroed() };
     si.pixelRate = u64::from(refresh_rate) * u64::from(width) * u64::from(height);
-    si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL { Numerator: refresh_rate * height, Denominator: 1 };
-    si.vSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL { Numerator: refresh_rate, Denominator: 1 };
+    si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
+        Numerator: refresh_rate * height,
+        Denominator: 1,
+    };
+    si.vSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
+        Numerator: refresh_rate,
+        Denominator: 1,
+    };
     si.totalSize = region;
     si.activeSize = region;
     si.scanLineOrdering =
@@ -101,13 +136,20 @@ pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_T
     si.__bindgen_anon_1.videoStandard = 255 | (1 << 16);
     let mut tm: iddcx::IDDCX_TARGET_MODE = unsafe { core::mem::zeroed() };
     tm.Size = core::mem::size_of::<iddcx::IDDCX_TARGET_MODE>() as u32;
-    tm.TargetVideoSignalInfo = wdk_sys::DISPLAYCONFIG_TARGET_MODE { targetVideoSignalInfo: si };
+    tm.TargetVideoSignalInfo = wdk_sys::DISPLAYCONFIG_TARGET_MODE {
+        targetVideoSignalInfo: si,
+    };
     tm
 }
 
 /// A monitor's advertised modes (the looked-up entry returns a clone for lock-free mode-DDI fill).
 pub fn modes_for_id(id: u32) -> Option<Vec<Mode>> {
-    MONITOR_MODES.lock().ok()?.iter().find(|m| m.id == id).map(|m| m.modes.clone())
+    MONITOR_MODES
+        .lock()
+        .ok()?
+        .iter()
+        .find(|m| m.id == id)
+        .map(|m| m.modes.clone())
 }
 
 /// Modes for the monitor whose handle matches (used by `monitor_query_modes`).
@@ -120,14 +162,69 @@ pub fn modes_for_object(object: iddcx::IDDCX_MONITOR) -> Option<Vec<Mode>> {
         .map(|m| m.modes.clone())
 }
 
+/// The OS target id stamped on the monitor whose handle matches (used by `assign_swap_chain` to name the
+/// shared-ring objects). `None` if the monitor isn't found.
+pub fn target_id_for_object(object: iddcx::IDDCX_MONITOR) -> Option<u32> {
+    MONITOR_MODES
+        .lock()
+        .ok()?
+        .iter()
+        .find(|m| m.object == Some(object))
+        .map(|m| m.target_id)
+}
+
+/// Install a swap-chain processor on the monitor whose handle matches, returning any PREVIOUS processor
+/// for the caller to drop OUTSIDE the lock. Dropping a processor RAII-joins its worker thread, so it must
+/// never happen while holding `MONITOR_MODES` (the worker would block the whole control plane / risk a
+/// self-deadlock). `None` returned if the monitor isn't found (the caller should drop `proc` itself).
+#[must_use]
+pub fn set_swap_chain_processor(
+    object: iddcx::IDDCX_MONITOR,
+    proc: crate::swap_chain_processor::SwapChainProcessor,
+) -> Option<crate::swap_chain_processor::SwapChainProcessor> {
+    let Ok(mut lock) = MONITOR_MODES.lock() else {
+        return Some(proc);
+    };
+    if let Some(m) = lock.iter_mut().find(|m| m.object == Some(object)) {
+        m.swap_chain_processor.replace(proc)
+    } else {
+        // No such monitor — hand `proc` back so the caller drops it (joins the worker) outside the lock.
+        Some(proc)
+    }
+}
+
+/// Take (remove) the swap-chain processor from the monitor whose handle matches, returning it for the
+/// caller to drop OUTSIDE the lock (see `set_swap_chain_processor`). `None` if none was installed.
+#[must_use]
+pub fn take_swap_chain_processor(
+    object: iddcx::IDDCX_MONITOR,
+) -> Option<crate::swap_chain_processor::SwapChainProcessor> {
+    MONITOR_MODES
+        .lock()
+        .ok()?
+        .iter_mut()
+        .find(|m| m.object == Some(object))?
+        .swap_chain_processor
+        .take()
+}
+
 /// `IOCTL_ADD`: create + arrive a virtual monitor at `width`x`height`@`refresh`. Returns the OS
 /// `(target_id, adapter_luid_low, adapter_luid_high)` for the [`AddReply`](pf_vdisplay_proto::control::AddReply),
 /// or `None` on failure (no adapter yet / IddCx error).
-pub fn create_monitor(session_id: u64, width: u32, height: u32, refresh: u32) -> Option<(u32, u32, i32)> {
+pub fn create_monitor(
+    session_id: u64,
+    width: u32,
+    height: u32,
+    refresh: u32,
+) -> Option<(u32, u32, i32)> {
     let adapter = crate::adapter::adapter()?;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
-    let mut modes = vec![Mode { width, height, refresh_rates: vec![refresh] }];
+    let mut modes = vec![Mode {
+        width,
+        height,
+        refresh_rates: vec![refresh],
+    }];
     modes.extend(default_modes());
 
     // Register the (pending) monitor so the mode DDIs can find it by EDID-serial id before arrival.
@@ -140,6 +237,7 @@ pub fn create_monitor(session_id: u64, width: u32, height: u32, refresh: u32) ->
             target_id: 0,
             adapter_luid_low: 0,
             adapter_luid_high: 0,
+            swap_chain_processor: None,
             created_at: Instant::now(),
         });
     } else {
@@ -168,7 +266,10 @@ pub fn create_monitor(session_id: u64, width: u32, height: u32, refresh: u32) ->
     attr.SynchronizationScope =
         wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
 
-    let create_in = iddcx::IDARG_IN_MONITORCREATE { ObjectAttributes: &raw mut attr, pMonitorInfo: &raw mut info };
+    let create_in = iddcx::IDARG_IN_MONITORCREATE {
+        ObjectAttributes: &raw mut attr,
+        pMonitorInfo: &raw mut info,
+    };
     let mut create_out: iddcx::IDARG_OUT_MONITORCREATE = unsafe { core::mem::zeroed() };
     // SAFETY: adapter is a valid IddCx adapter; create_in points to valid local storage read synchronously.
     let st = unsafe { wdk_iddcx::IddCxMonitorCreate(adapter, &create_in, &mut create_out) };
@@ -210,12 +311,21 @@ pub fn create_monitor(session_id: u64, width: u32, height: u32, refresh: u32) ->
 
 /// `IOCTL_REMOVE`: depart + drop the monitor for `session_id`. Returns true if one was removed.
 pub fn remove_monitor(session_id: u64) -> bool {
-    let monitor = {
-        let Ok(mut lock) = MONITOR_MODES.lock() else { return false };
-        let Some(pos) = lock.iter().position(|m| m.session_id == session_id) else { return false };
-        let entry = lock.remove(pos);
-        entry.object
+    // Pull out the IddCx handle AND the swap-chain processor under the lock, but drop the processor
+    // (which RAII-joins its worker thread) only AFTER the lock guard is released — joining a worker
+    // while holding `MONITOR_MODES` would head-block the whole control plane / risk a self-deadlock.
+    let (monitor, processor) = {
+        let Ok(mut lock) = MONITOR_MODES.lock() else {
+            return false;
+        };
+        let Some(pos) = lock.iter().position(|m| m.session_id == session_id) else {
+            return false;
+        };
+        let mut entry = lock.remove(pos);
+        (entry.object, entry.swap_chain_processor.take())
     };
+    // Drop the worker FIRST (it joins + deletes the swap-chain), THEN depart the monitor.
+    drop(processor);
     if let Some(m) = monitor {
         // SAFETY: `m` is a live IddCx monitor handle; departure tears it down.
         unsafe { wdk_iddcx::IddCxMonitorDeparture(m) };
@@ -225,13 +335,28 @@ pub fn remove_monitor(session_id: u64) -> bool {
 
 /// `IOCTL_CLEAR_ALL`: depart + drop every monitor (host-startup orphan reap).
 pub fn clear_all() {
-    let monitors: Vec<iddcx::IDDCX_MONITOR> = {
-        let Ok(mut lock) = MONITOR_MODES.lock() else { return };
-        lock.drain(..).filter_map(|m| m.object).collect()
+    // Drain every entry under the lock, keeping each (handle, processor); drop the processors (RAII-join
+    // their workers) only AFTER releasing the lock, then depart the monitors. See `remove_monitor`.
+    let mut drained: Vec<(
+        Option<iddcx::IDDCX_MONITOR>,
+        Option<crate::swap_chain_processor::SwapChainProcessor>,
+    )> = {
+        let Ok(mut lock) = MONITOR_MODES.lock() else {
+            return;
+        };
+        lock.drain(..)
+            .map(|mut m| (m.object, m.swap_chain_processor.take()))
+            .collect()
     };
-    for m in monitors {
-        // SAFETY: `m` is a live IddCx monitor handle.
-        unsafe { wdk_iddcx::IddCxMonitorDeparture(m) };
+    // Drop all workers FIRST (join + delete their swap-chains), THEN depart the monitors.
+    for (_, processor) in &mut drained {
+        drop(processor.take());
+    }
+    for (object, _) in drained {
+        if let Some(m) = object {
+            // SAFETY: `m` is a live IddCx monitor handle.
+            unsafe { wdk_iddcx::IddCxMonitorDeparture(m) };
+        }
     }
 }
 
@@ -249,6 +374,15 @@ fn container_guid(id: u32) -> wdk_sys::GUID {
         Data1: 0x7066_7664u32.wrapping_add(id),
         Data2: 0x7044,
         Data3: 0x5350,
-        Data4: [0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, (id >> 8) as u8, id as u8],
+        Data4: [
+            0xa1,
+            0xb2,
+            0xc3,
+            0xd4,
+            0xe5,
+            0xf6,
+            (id >> 8) as u8,
+            id as u8,
+        ],
     }
 }

@@ -24,3 +24,18 @@ wdk.workspace = true
 wdk-sys = { workspace = true, features = ["iddcx"] }
 wdk-iddcx.workspace = true
 pf-vdisplay-proto.workspace = true
+# STEP 5: the swap-chain processor's render-side D3D11 device + worker. 0.58.0 matches the wdk-build
+# transitive `windows` already in the workspace lock (one resolved version) AND the proven oracle's
+# version, so the ported D3D/DXGI/threading calls compile verbatim.
+thiserror = "2.0"
+
+[dependencies.windows]
+version = "0.58.0"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+]

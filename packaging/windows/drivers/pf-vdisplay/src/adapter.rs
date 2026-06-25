@@ -6,7 +6,7 @@
 
 use std::sync::OnceLock;
 
-use wdk_sys::{iddcx, NTSTATUS, WDFDEVICE};
+use wdk_sys::{NTSTATUS, WDFDEVICE, iddcx};
 
 use crate::STATUS_SUCCESS;
 

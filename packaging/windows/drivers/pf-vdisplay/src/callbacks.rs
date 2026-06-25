@@ -1,13 +1,14 @@
 //! The IddCx client-config callbacks + the PnP `EvtDeviceD0Entry`.
 //!
-//! STEP 2: stubs with the correct PFN signatures (so the config wires up + the driver loads); the real
-//! mode/EDID logic (STEP 4), adapter init (STEP 3), and swap-chain handoff (STEP 5) fill them in. Every
-//! callback is `unsafe extern "C"` to match the wdk-sys `PFN_IDD_CX_*` types; with `panic = "abort"`
-//! (workspace profile) a panic across the FFI boundary aborts rather than being UB. `query_target_info`
-//! is implemented now because it gates HDR (`HIGH_COLOR_SPACE`) and the adapter (STEP 3) sets FP16.
+//! The mode/EDID logic (STEP 4), adapter init (STEP 3), and swap-chain handoff (STEP 5) are wired in; the
+//! `*2`/HDR-metadata/gamma callbacks remain stubs (STEP 7). Every callback is `unsafe extern "C"` to match
+//! the wdk-sys `PFN_IDD_CX_*` types; a panic unwinding across that `extern "C"` boundary aborts the process
+//! (Rust >= 1.81 default) rather than being UB. (The swap-chain WORKER is a plain `thread::spawn`, so a
+//! panic there only unwinds + ends that thread — it must not panic.) `query_target_info` is implemented
+//! because it gates HDR (`HIGH_COLOR_SPACE`) and the adapter (STEP 3) sets FP16.
 
 use wdk_sys::iddcx;
-use wdk_sys::{NTSTATUS, WDFDEVICE, WDFREQUEST};
+use wdk_sys::{NTSTATUS, WDFDEVICE, WDFOBJECT, WDFREQUEST, call_unsafe_wdf_function_binding};
 
 use crate::{
     STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_PARAMETER, STATUS_NOT_FOUND, STATUS_NOT_IMPLEMENTED,
@@ -178,16 +179,67 @@ pub unsafe extern "C" fn set_gamma_ramp(
     STATUS_SUCCESS
 }
 
-/// A swap-chain was assigned to the monitor. STEP 5: spawn the `SwapChainProcessor`.
+/// A swap-chain was assigned to the monitor. STEP 5: spawn the `SwapChainProcessor` that drains it (so
+/// the monitor is a usable display). Always returns `STATUS_SUCCESS` — on D3D-init failure we delete the
+/// swap-chain so the OS makes a fresh one and re-assigns (the oracle pattern).
 pub unsafe extern "C" fn assign_swap_chain(
-    _monitor: iddcx::IDDCX_MONITOR,
-    _p_in: *const iddcx::IDARG_IN_SETSWAPCHAIN,
+    monitor: iddcx::IDDCX_MONITOR,
+    p_in: *const iddcx::IDARG_IN_SETSWAPCHAIN,
 ) -> NTSTATUS {
+    // SAFETY: framework-provided in args, valid for the call.
+    let in_args = unsafe { &*p_in };
+    let swap_chain = in_args.hSwapChain;
+    let render_adapter = in_args.RenderAdapterLuid;
+    let new_frame_event = in_args.hNextSurfaceAvailable;
+
+    // wdk-sys LUID → windows-crate LUID (identical { LowPart: u32, HighPart: i32 } layout). The render
+    // adapter is the GPU the OS picked to render this virtual monitor; the pooled D3D device is keyed by
+    // it (relevant on a hybrid iGPU+dGPU box).
+    let luid = windows::Win32::Foundation::LUID {
+        LowPart: render_adapter.LowPart,
+        HighPart: render_adapter.HighPart,
+    };
+    dbglog!(
+        "[pf-vd] assign_swap_chain: OS render adapter LUID = {:08x}:{:08x}",
+        render_adapter.HighPart,
+        render_adapter.LowPart
+    );
+
+    // FIRST drop any existing processor on this monitor (RAII-joins its worker), OUTSIDE the lock.
+    drop(crate::monitor::take_swap_chain_processor(monitor));
+
+    // The OS target id (stamped on the monitor at creation, after IddCxMonitorArrival) keys the
+    // per-monitor objects STEP 6's host opens. 0 (default) if the monitor isn't found.
+    let target_id = crate::monitor::target_id_for_object(monitor).unwrap_or(0);
+
+    if let Some(device) = crate::direct_3d_device::pooled_device(luid) {
+        let mut processor = crate::swap_chain_processor::SwapChainProcessor::new();
+        processor.run(swap_chain, device, new_frame_event, target_id);
+        // Install on the monitor; drop any processor it replaced (a race lost above) OUTSIDE the lock.
+        drop(crate::monitor::set_swap_chain_processor(monitor, processor));
+    } else {
+        // D3D init failed: delete the swap-chain so the OS generates a fresh one + retries.
+        dbglog!(
+            "[pf-vd] assign_swap_chain: pooled Direct3DDevice unavailable — deleting swap-chain for OS retry"
+        );
+        // SAFETY: `swap_chain` is the framework-provided IddCx swap-chain handle.
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, swap_chain as WDFOBJECT);
+        }
+    }
     STATUS_SUCCESS
 }
 
-/// The monitor went inactive. STEP 5: drop the processor (RAII joins the worker thread).
-pub unsafe extern "C" fn unassign_swap_chain(_monitor: iddcx::IDDCX_MONITOR) -> NTSTATUS {
+/// The monitor went inactive. STEP 5: drop the processor (RAII joins the worker thread, which deletes the
+/// swap-chain object before returning).
+pub unsafe extern "C" fn unassign_swap_chain(monitor: iddcx::IDDCX_MONITOR) -> NTSTATUS {
+    // Take + drop OUTSIDE any lock (the take releases `MONITOR_MODES` before the join).
+    let had = crate::monitor::take_swap_chain_processor(monitor);
+    dbglog!(
+        "[pf-vd] unassign_swap_chain — dropped live processor: {}",
+        had.is_some()
+    );
+    drop(had);
     STATUS_SUCCESS
 }
 
