@@ -120,6 +120,13 @@ pub(crate) struct VirtualDisplayManager {
     /// Monotonic lease-generation counter (was the `MON_GEN` global).
     gen: AtomicU64,
     state: Mutex<MgrState>,
+    /// Serializes IDD-push session SETUP (preempt + monitor create) so a reconnect flood can't run
+    /// concurrent monitor create/teardown — held by the session across the pipeline build (was the
+    /// `IDD_SETUP_LOCK` global in `punktfunk1`).
+    setup_lock: Mutex<()>,
+    /// The current IDD-push session's stop flag; a new connection signals the prior one to release its
+    /// monitor before the fresh one is created (was the `IDD_SESSION_STOP` global in `punktfunk1`).
+    idd_session_stop: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 static VDM: OnceLock<VirtualDisplayManager> = OnceLock::new();
@@ -133,6 +140,8 @@ pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayMa
         watchdog_s: AtomicU32::new(3),
         gen: AtomicU64::new(1),
         state: Mutex::new(MgrState::Idle),
+        setup_lock: Mutex::new(()),
+        idd_session_stop: Mutex::new(None),
     })
 }
 
@@ -388,6 +397,25 @@ impl VirtualDisplayManager {
             }
             other => other,
         };
+    }
+
+    /// Begin an IDD-push session setup (Goal-1 §2.5 — was the `IDD_SETUP_LOCK` / `IDD_SESSION_STOP` /
+    /// `wait_for_monitor_released` dance smeared across `punktfunk1`). Serializes via the setup lock,
+    /// registers THIS session's stop flag while signalling the PRIOR IDD-push session to stop, and waits
+    /// for it to release its monitor — so a reconnect (whose reused IddCx swap-chain is dead) preempts the
+    /// stale session cleanly before a fresh monitor is created. Returns the setup guard; the caller holds
+    /// it across the pipeline build, then drops it so the next reconnect can begin (and preempt this one).
+    pub(crate) fn begin_idd_setup(
+        &'static self,
+        stop: Arc<AtomicBool>,
+    ) -> std::sync::MutexGuard<'static, ()> {
+        let guard = self.setup_lock.lock().unwrap();
+        let prev = self.idd_session_stop.lock().unwrap().replace(stop);
+        if let Some(prev_stop) = prev {
+            prev_stop.store(true, Ordering::SeqCst);
+            self.wait_for_monitor_released(Duration::from_secs(3));
+        }
+        guard
     }
 
     /// Wait (up to `timeout`) for the active monitor to be RELEASED (the MGR is no longer `Active`).

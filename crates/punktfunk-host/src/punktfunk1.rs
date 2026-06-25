@@ -2141,30 +2141,6 @@ fn session_watcher_loop(tx: std::sync::mpsc::Sender<SessionSwitch>, stop: Arc<At
     }
 }
 
-/// Real capture→encode→punktfunk/1: a native virtual output at the client's mode, NVENC AUs
-/// stamped with the capture wall clock (the client derives per-frame pipeline latency).
-///
-/// `reconfig` delivers accepted mid-stream mode switches: the capture/encode pipeline is
-/// rebuilt at the new mode (capturer drop tears down the PipeWire stream and, via its
-/// keepalive, the virtual output) while the data-plane `session` continues untouched —
-/// the rebuilt encoder opens with an IDR + in-band parameter sets. `probe_rx`/`probe_result_tx`
-/// carry speed-test bursts (see [`service_probes`]).
-/// The stop flag of the current in-process IDD-push session, so a NEW connection can PREEMPT it.
-/// A fresh connection means the prior client is gone (a reconnect) and a reused IddCx monitor's
-/// swap-chain is dead — so we stop the prior session (it releases its monitor cleanly while frames
-/// still flow), then build a fresh one, instead of joining a dying session or tearing its monitor out
-/// from under it (which churns the driver's ADD/REMOVE path and wedges it under rapid reconnects).
-#[cfg(target_os = "windows")]
-static IDD_SESSION_STOP: std::sync::Mutex<Option<Arc<AtomicBool>>> = std::sync::Mutex::new(None);
-
-/// Serializes IDD-push session SETUP (preempt + monitor create + first frame). Held across setup,
-/// released before the encode loop — so a reconnect FLOOD can never run concurrent monitor
-/// create/teardown (the churn that fails the ADD IOCTL and wedges the driver). Each session finishes
-/// setup before the next acquires this and preempts it, by which point the preempted session is in its
-/// encode loop and releases its monitor promptly.
-#[cfg(target_os = "windows")]
-static IDD_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// All per-session inputs for [`virtual_stream`] / [`virtual_stream_relay`], bundled so the session entry
 /// is one moved value instead of a 13-positional-argument `#[allow(too_many_arguments)]` signature
 /// (Goal-1 stage 4, plan §2.4). Everything is **owned** — the receivers move in (`virtual_stream` is their
@@ -2240,31 +2216,20 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         bit_depth,
         "punktfunk/1 virtual display"
     );
-    // IDD-push reconnect preempt: a fresh connection means the prior client is gone. Hold IDD_SETUP_LOCK
-    // across the preempt + pipeline build so a reconnect FLOOD can't run concurrent monitor
-    // create/teardown. Then STOP the prior session (it ends cleanly while its monitor still composites
-    // frames) and WAIT for it to release its monitor, before building a FRESH one — instead of the
-    // driver-churning teardown of a monitor under a still-live session. Register THIS session's stop so
-    // the next reconnect preempts it.
+    // IDD-push reconnect preempt (the dance now lives in the manager, Goal-1 §2.5): serialize setup so a
+    // reconnect FLOOD can't run concurrent monitor create/teardown, STOP the prior session + WAIT for it
+    // to release its monitor (instead of tearing a monitor out from under a still-live session), and
+    // register THIS session's stop. The returned guard holds the setup lock across the pipeline build;
+    // dropping it lets the next reconnect begin (and preempt us).
     #[cfg(target_os = "windows")]
-    let idd_push_session = plan.capture == crate::session_plan::CaptureBackend::IddPush;
-    #[cfg(target_os = "windows")]
-    let idd_setup_guard = idd_push_session.then(|| IDD_SETUP_LOCK.lock().unwrap());
-    #[cfg(target_os = "windows")]
-    if idd_push_session {
-        let prev = IDD_SESSION_STOP.lock().unwrap().replace(stop.clone());
-        if let Some(prev_stop) = prev {
-            prev_stop.store(true, Ordering::SeqCst);
-            crate::vdisplay::manager::vdm()
-                .wait_for_monitor_released(std::time::Duration::from_secs(3));
-        }
-    }
+    let _idd_setup_guard = (plan.capture == crate::session_plan::CaptureBackend::IddPush)
+        .then(|| crate::vdisplay::manager::vdm().begin_idd_setup(stop.clone()));
     let mut vd = crate::vdisplay::open(compositor)?;
     let (mut capturer, mut enc, mut frame, mut interval) =
         build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan)?;
     // Setup done — release the IDD-push setup lock so the next reconnect can begin (and preempt us).
     #[cfg(target_os = "windows")]
-    drop(idd_setup_guard);
+    drop(_idd_setup_guard);
 
     // Windows single-process DDA path (PUNKTFUNK_NO_WGC=1): the SudoVDA virtual display, isolated as the
     // SOLE active output, goes into fullscreen independent-flip (one plane on one display) which Desktop
