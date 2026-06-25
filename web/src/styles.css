@@ -4,55 +4,63 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* Pull @unom/ui's compiled component classes (bg-neutral, rounded-card,
-   p-padding-card, ring-accent, h-input-height, material…) into the Tailwind 4
-   scan so its utilities aren't purged. This is the shared design system the
-   punktfunk marketing site + docs are built on. */
+/* Pull @unom/ui's compiled component classes (bg-neutral,
+   rounded-card, p-padding-card, ring-accent, h-input-height, material…) into the
+   Tailwind 4 scan so their utilities aren't purged. */
 @source '../node_modules/@unom/ui/dist/**/*.{js,mjs}';
 
-/* ── punktfunk brand · dark violet product chrome ───────────────────────────
-   The console runs dark-only (html.dark). Surfaces are the violet-tinted
-   app-icon chrome (#141019 / #1c1530), the brand is the violet lens mark
-   (#6c5bf3 → #a79ff8 in dark). The token set feeds BOTH @unom/ui's semantic
-   contract (--brand/--primary/--accent/--neutral/--main…) and the shadcn-style
-   tokens the console's primitives + routes use (--background/--card/--muted…),
-   mapped onto one palette so both render the same identity. */
+/* ── punktfunk brand · violet product chrome ────────────────────────────────
+   Two themes on one violet identity: LIGHT (lavender docs surface — the same
+   palette the docs/Scalar reference uses: white bg, faint-violet cards/borders,
+   #6c5bf3 brand) is the :root default; DARK (the violet-tinted app-icon chrome
+   #141019 / #1c1530, #a79ff8 brand) is the `.dark` override. The live console
+   pins `<html class="dark">` so it stays dark by default — removing or toggling
+   that class (e.g. Storybook's theme switch) yields light. The token set feeds
+   BOTH @unom/ui's semantic contract (--brand/--primary/--accent/--neutral/
+   --main…) and the shadcn-style tokens the console's primitives + routes use
+   (--background/--card/--muted…), mapped onto one palette so both render the
+   same identity.
+
+   Brand constants and the surface tokens that are pure indirections
+   (--main, --neutral*, --error → other tokens) live in :root only — CSS resolves
+   var() per-theme at use time, so .dark overrides just the raw values. */
 :root {
   --radius: 0.625rem;
 
-  /* Brand — the violet lens mark (from the punktfunk app icon). */
-  --pf-brand: #6c5bf3; /* deep violet */
-  --pf-brand-light: #a79ff8; /* light violet — reads better on dark */
+  /* Brand — the violet lens mark (from the punktfunk app icon). Theme-independent. */
+  --pf-brand: #6c5bf3; /* deep violet — primary on light */
+  --pf-brand-light: #a79ff8; /* light violet — primary on dark */
   --pf-highlight: #d2c9fb; /* lens highlight */
 
-  /* Surfaces (violet-tinted dark chrome). */
-  --background: #141019;
-  --foreground: oklch(0.985 0 0);
-  --card: #1c1530;
-  --card-foreground: oklch(0.985 0 0);
-  --popover: #1c1530;
-  --popover-foreground: oklch(0.985 0 0);
-  --muted: #1f1830;
-  --muted-foreground: oklch(0.728 0.03 286);
-  --secondary: #241c3d;
-  --secondary-foreground: oklch(0.985 0 0);
+  /* Surfaces — light · lavender (white bg, faint-violet cards/borders). */
+  --background: #ffffff;
+  --foreground: #1b1430;
+  --card: #f6f2ff;
+  --card-foreground: #1b1430;
+  --popover: #ffffff;
+  --popover-foreground: #1b1430;
+  --muted: #f1ecfd;
+  --muted-foreground: #6f6a86;
+  --secondary: #ece6fb;
+  --secondary-foreground: #1b1430;
   /* shadcn `accent` = subtle hover surface; also @unom/ui's card ring colour,
-     so we tint it toward the brand violet. */
+     so we tint it toward the brand violet (the same in both themes). */
   --accent: var(--pf-brand);
-  --accent-foreground: oklch(0.985 0 0);
-  --border: #2a2148;
-  --input: #2a2148;
-  --ring: var(--pf-brand-light);
+  --accent-foreground: #ffffff;
+  --border: #e4dcf7;
+  --input: #e4dcf7;
+  --ring: var(--pf-brand);
 
   /* Primary = the brand (buttons, active nav, default badges). */
-  --primary: var(--pf-brand-light);
-  --primary-foreground: #141019;
+  --primary: var(--pf-brand);
+  --primary-foreground: #ffffff;
 
-  --success: oklch(0.7 0.15 160);
-  --destructive: oklch(0.62 0.21 18);
-  --destructive-foreground: oklch(0.985 0 0);
+  --success: oklch(0.6 0.14 160);
+  --destructive: oklch(0.55 0.22 18);
+  --destructive-foreground: #ffffff;
 
-  /* ── @unom/ui semantic token contract (its components read these names). ── */
+  /* ── @unom/ui semantic token contract (its components read these names). ──
+     These are indirections — they follow the raw tokens above per-theme. */
   --main: var(--foreground);
   --brand: var(--pf-brand);
   --brand-light: var(--pf-brand-light);
@@ -67,6 +75,32 @@
 
   /* @unom/ui radius/spacing contract (pill buttons, rounded cards, tall inputs). */
   --radius-card-min: var(--radius);
+}
+
+/* Dark · the violet-tinted app-icon chrome. Overrides only the raw values —
+   the indirection tokens in :root resolve to these automatically. */
+.dark {
+  --background: #141019;
+  --foreground: oklch(0.985 0 0);
+  --card: #1c1530;
+  --card-foreground: oklch(0.985 0 0);
+  --popover: #1c1530;
+  --popover-foreground: oklch(0.985 0 0);
+  --muted: #1f1830;
+  --muted-foreground: oklch(0.728 0.03 286);
+  --secondary: #241c3d;
+  --secondary-foreground: oklch(0.985 0 0);
+  --border: #2a2148;
+  --input: #2a2148;
+  --ring: var(--pf-brand-light);
+
+  /* Lighter violet reads better against the dark surface. */
+  --primary: var(--pf-brand-light);
+  --primary-foreground: #141019;
+
+  --success: oklch(0.7 0.15 160);
+  --destructive: oklch(0.62 0.21 18);
+  --destructive-foreground: oklch(0.985 0 0);
 }
 
 /* Map the palette to Tailwind colour/util tokens — both the shadcn vocabulary

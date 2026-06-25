@@ -8,7 +8,9 @@ import { useLocale } from '@/lib/i18n'
 
 export const Route = createFileRoute('/host')({ component: HostPage })
 
-function HostPage() {
+// Exported so Storybook can render the page directly (see src/stories). The
+// route gen only needs the `Route` export; this extra one is harmless.
+export function HostPage() {
   useLocale()
   const host = useGetHostInfo()
   const compositors = useListCompositors()

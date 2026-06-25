@@ -66,7 +66,8 @@ function toInput(f: FormState): CustomInput {
   }
 }
 
-function LibraryPage() {
+// Exported for Storybook (see src/stories) — harmless alongside `Route`.
+export function LibraryPage() {
   useLocale()
   const qc = useQueryClient()
   const library = useGetLibrary()

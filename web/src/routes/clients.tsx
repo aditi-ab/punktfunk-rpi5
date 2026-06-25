@@ -22,7 +22,8 @@ import { useLocale } from '@/lib/i18n'
 
 export const Route = createFileRoute('/clients')({ component: ClientsPage })
 
-function ClientsPage() {
+// Exported for Storybook (see src/stories) — harmless alongside `Route`.
+export function ClientsPage() {
   useLocale()
   const qc = useQueryClient()
   const clients = useListPairedClients()

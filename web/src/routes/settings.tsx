@@ -7,7 +7,8 @@ import { useLocale, changeLocale, locales, type Locale } from '@/lib/i18n'
 
 export const Route = createFileRoute('/settings')({ component: SettingsPage })
 
-function SettingsPage() {
+// Exported for Storybook (see src/stories) — harmless alongside `Route`.
+export function SettingsPage() {
   const current = useLocale()
 
   const onLogout = async () => {

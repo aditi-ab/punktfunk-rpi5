@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { ApiError } from '@/api/fetcher'
-import { Skeleton } from '@/components/ui/skeleton'
+import { Spinner } from '@/components/ui/spinner'
 import { Button } from '@/components/ui/button'
 import { m } from '@/paraglide/messages'
 
@@ -15,9 +15,12 @@ interface QueryStateProps {
 export function QueryState({ isLoading, error, refetch, children }: QueryStateProps) {
   if (isLoading) {
     return (
-      <div className="space-y-3">
-        <Skeleton className="h-8 w-40" />
-        <Skeleton className="h-24 w-full" />
+      <div
+        role="status"
+        className="flex min-h-40 flex-col items-center justify-center gap-3 text-sm text-muted-foreground"
+      >
+        <Spinner className="size-8" />
+        {m.common_loading()}
       </div>
     )
   }

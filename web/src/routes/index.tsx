@@ -15,7 +15,8 @@ import { useLocale } from '@/lib/i18n'
 
 export const Route = createFileRoute('/')({ component: Dashboard })
 
-function Dashboard() {
+// Exported for Storybook (see src/stories) — harmless alongside `Route`.
+export function Dashboard() {
   useLocale()
   const qc = useQueryClient()
   // Poll live status every 2s so the console tracks an active session.
