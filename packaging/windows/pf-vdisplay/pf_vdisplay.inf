@@ -1,6 +1,13 @@
 ;/*++
 ; pf-vdisplay - punktfunk virtual display, UMDF2 IddCx driver INF (template; stampinf -> .inf).
-; Adapted from MolotovCherry/virtual-display-rs (MIT) + SudoVDA's control-device security DACL.
+;
+; For the all-Rust wdk-sys / windows-drivers-rs driver in THIS tree
+; (packaging/windows/drivers/pf-vdisplay/). The driver registers the OWNED pf_vdisplay_proto
+; control-interface GUID in CODE (WdfDeviceCreateDeviceInterface), so this INF is GUID-agnostic and
+; is byte-identical to the superseded oracle's (packaging/windows/vdisplay-driver/.../pf_vdisplay.inx,
+; itself adapted from MolotovCherry/virtual-display-rs (MIT) + SudoVDA's control-device security DACL).
+; HWID Root\pf_vdisplay + IddCx0102 + the DACL match the host backend (crates/punktfunk-host/src/
+; vdisplay/pf_vdisplay.rs) and install-pf-vdisplay.ps1's Test-PfVdisplayPresent / nefconc node-create.
 ;--*/
 [Version]
 PnpLockdown=1
@@ -10,7 +17,7 @@ Class=Display
 ClassVer=2.0
 Provider=%ManufacturerName%
 CatalogFile=pf_vdisplay.cat
-DriverVer = 06/22/2026,1.0.0622.2210
+DriverVer = 06/25/2026,9.5.0625.1614
 
 [Manufacturer]
 %ManufacturerName%=Standard,NTamd64
