@@ -214,7 +214,17 @@ pub unsafe extern "C" fn assign_swap_chain(
 
     if let Some(device) = crate::direct_3d_device::pooled_device(luid) {
         let mut processor = crate::swap_chain_processor::SwapChainProcessor::new();
-        processor.run(swap_chain, device, new_frame_event, target_id);
+        // STEP 6: the publisher reports this render LUID into the host header so the host detects a
+        // render-adapter mismatch (it created the ring textures on its own GPU). `luid` is the OS-picked
+        // render adapter built above.
+        processor.run(
+            swap_chain,
+            device,
+            new_frame_event,
+            target_id,
+            luid.LowPart,
+            luid.HighPart,
+        );
         // Install on the monitor; drop any processor it replaced (a race lost above) OUTSIDE the lock.
         drop(crate::monitor::set_swap_chain_processor(monitor, processor));
     } else {

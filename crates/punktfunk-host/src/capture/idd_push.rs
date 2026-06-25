@@ -4,13 +4,16 @@
 //! event + ring of keyed-mutex textures (`Global\` names, permissive `D:(A;;GA;;;WD)` SDDL) on the
 //! discrete render GPU, and the driver only OPENS them and copies frames in. We then consume the ring
 //! straight into the zero-copy NVENC path — no DXGI Desktop Duplication, no `win32u` hook. Gated by
-//! `PUNKTFUNK_IDD_PUSH`. Driver counterpart: `packaging/windows/vdisplay-driver/pf-vdisplay/src/
-//! frame_transport.rs` — [`SharedHeader`], [`MAGIC`], [`RING_LEN`], the status codes and the `Global\`
-//! name scheme are DUPLICATED byte-identically there.
+//! `PUNKTFUNK_IDD_PUSH`. Driver counterpart: `packaging/windows/drivers/pf-vdisplay/src/
+//! frame_transport.rs`. The shared `SharedHeader` layout, `MAGIC`/`VERSION`/`RING_LEN`, the
+//! `DRV_STATUS_*` codes, the `Global\` name scheme and the publish token all come from
+//! [`pf_vdisplay_proto::frame`] (which OWNS the contract, with `const` size asserts) — both sides
+//! `use` it, so drift is a compile error rather than a "must match" comment.
 
 use super::dxgi::{make_device, D3d11Frame, HdrConverter, WinCaptureTarget};
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
+use pf_vdisplay_proto::frame;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,45 +42,26 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-// --- kept byte-identical with the driver (frame_transport.rs) ---
-pub const MAGIC: u32 = 0x4456_4650;
-pub const VERSION: u32 = 1;
-/// Ring slots — MUST equal the driver's `RING_LEN` (frame_transport.rs). 6 (was 3) gives ample headroom
-/// so the driver's 0 ms-timeout publish always finds a free slot while the host briefly holds one across
-/// the convert/copy into its output ring and the depth-2 pipelined encode runs on the rest.
-pub const RING_LEN: u32 = 6;
-const DXGI_SHARED_RESOURCE_RW: u32 = 0x8000_0000 | 0x1;
+// The frame-transport contract — `SharedHeader` layout, `MAGIC`/`VERSION`/`RING_LEN`, the
+// `DRV_STATUS_*` codes and the `Global\` name helpers — lives in `pf_vdisplay_proto::frame`; both sides
+// `use frame::*`, so a layout/name/code drift is a compile error (the proto has `const` size asserts).
+use frame::{
+    event_name, header_name, texture_name, SharedHeader, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED,
+    DRV_STATUS_TEX_FAIL, MAGIC, RING_LEN, VERSION,
+};
 
-// driver_status codes (the driver writes these; we read+log them).
-const DRV_STATUS_OPENED: u32 = 1;
-const DRV_STATUS_TEX_FAIL: u32 = 2;
-const DRV_STATUS_NO_DEVICE1: u32 = 3;
+/// `DXGI_SHARED_RESOURCE_READ | _WRITE` for `CreateSharedHandle`/`OpenSharedResourceByName`. Local (not
+/// part of the proto contract — it is a DXGI sharing-API arg, mirrored on the driver side).
+const DXGI_SHARED_RESOURCE_RW: u32 = 0x8000_0000 | 0x1;
 
 /// Host-owned output-ring depth: distinct NVENC-input textures rotated per frame so the in-flight
 /// encode of frame N and the convert/copy of frame N+1 never touch the same texture. 3 covers a
 /// pipeline depth of 2 with one slot of margin.
 const OUT_RING: usize = 3;
 
-#[repr(C)]
-struct SharedHeader {
-    magic: u32,
-    version: u32,
-    generation: u32,
-    ring_len: u32,
-    width: u32,
-    height: u32,
-    dxgi_format: u32,
-    _pad: u32,
-    latest: u64,
-    qpc_pts: u64,
-    driver_render_luid_low: u32,
-    driver_render_luid_high: i32,
-    driver_status: u32,
-    driver_status_detail: u32,
-}
-
 /// Bring-up debug block (fixed name) — the host creates it; the driver writes diagnostics into it
-/// independent of the per-target header. Byte-identical with the driver's `DebugBlock`.
+/// independent of the per-target header. NOT part of `pf_vdisplay_proto` (a host-side bring-up channel,
+/// not the data path); the matching `DebugBlock` lives in the OLD oracle driver's `frame_transport.rs`.
 #[repr(C)]
 struct DebugBlock {
     magic: u32,
@@ -93,17 +77,6 @@ struct DebugBlock {
 }
 const DBG_NAME: &str = "Global\\pfvd-dbg";
 const DBG_MAGIC: u32 = 0x4742_4450;
-
-fn hdr_name(target_id: u32) -> String {
-    format!("Global\\pfvd-hdr-{target_id}")
-}
-fn evt_name(target_id: u32) -> String {
-    format!("Global\\pfvd-evt-{target_id}")
-}
-fn tex_name(target_id: u32, generation: u32, slot: u32) -> String {
-    format!("Global\\pfvd-tex-{target_id}-{generation}-{slot}")
-}
-// ----------------------------------------------------------------
 
 /// Monotonic per-process generation: each capturer instance stamps its ring-texture names with a
 /// fresh value so a retried/overlapping `open()` never collides with a previous attempt's not-yet-
@@ -339,7 +312,7 @@ impl IddPushCapturer {
                 .CreateSharedHandle(
                     Some(&sa as *const SECURITY_ATTRIBUTES),
                     DXGI_SHARED_RESOURCE_RW,
-                    &HSTRING::from(tex_name(target_id, generation, k)),
+                    &HSTRING::from(texture_name(target_id, generation, k)),
                 )
                 .context("CreateSharedHandle(IDD-push ring slot)")?;
             let mutex: IDXGIKeyedMutex = tex.cast()?;
@@ -406,7 +379,7 @@ impl IddPushCapturer {
                 PAGE_READWRITE,
                 0,
                 bytes as u32,
-                &HSTRING::from(hdr_name(target.target_id)),
+                &HSTRING::from(header_name(target.target_id)),
             )
             .context("CreateFileMapping(IDD-push header)")?;
             let view = MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, bytes);
@@ -431,7 +404,7 @@ impl IddPushCapturer {
                 Some(&sa),
                 false,
                 false,
-                &HSTRING::from(evt_name(target.target_id)),
+                &HSTRING::from(event_name(target.target_id)),
             )
             .context("CreateEvent(IDD-push)")?;
 
@@ -719,14 +692,16 @@ impl IddPushCapturer {
         // Follow the display: a "Use HDR" flip recreates the ring at the matching format.
         self.poll_display_hdr();
         let latest = self.latest();
-        // `latest` = (generation << 40) | (seq << 8) | slot. Reject any publish whose generation isn't
-        // our CURRENT ring (a stale old-ring publish racing a recreate, or the 0 sentinel we reset to) so
-        // we never consume an unwritten new-ring slot — eliminating the toggle-time garbage frame.
-        if (latest >> 40) as u32 != self.generation {
+        // `latest` is the proto publish token `(generation << 40) | (seq << 8) | slot`. Reject any publish
+        // whose generation isn't our CURRENT ring (a stale old-ring publish racing a recreate, or the 0
+        // sentinel we reset to) so we never consume an unwritten new-ring slot — eliminating the
+        // toggle-time garbage frame.
+        let tok = frame::FrameToken::unpack(latest);
+        if tok.generation != self.generation {
             return Ok(None);
         }
-        let seq = (latest >> 8) & 0xFFFF_FFFF;
-        let slot = (latest & 0xff) as usize;
+        let seq = u64::from(tok.seq);
+        let slot = tok.slot as usize;
         if seq == self.last_seq || slot >= self.slots.len() {
             return Ok(None);
         }

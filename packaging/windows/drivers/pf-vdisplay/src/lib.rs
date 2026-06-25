@@ -18,6 +18,7 @@ mod control;
 mod direct_3d_device;
 mod edid;
 mod entry;
+mod frame_transport;
 mod monitor;
 mod swap_chain_processor;
 

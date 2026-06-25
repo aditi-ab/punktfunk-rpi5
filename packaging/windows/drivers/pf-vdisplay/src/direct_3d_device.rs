@@ -5,8 +5,9 @@
 //! D3D/DXGI types are the `windows` crate (refcounted COM, no manual Drop); the swap-chain/LUID hand-off
 //! to the wdk-sys IddCx world happens via raw pointers in `swap_chain_processor.rs`.
 //!
-//! STEP 5 only DRAINS the swap-chain to keep the monitor a live display — there is no frame publisher,
-//! so the device's immediate context is unused here (it returns to use in STEP 6's `CopyResource`).
+//! STEP 5 binds this device to the swap-chain to keep the monitor a live display; STEP 6 reuses the
+//! device's immediate context in the frame publisher's `CopyResource` (both on the swap-chain processor
+//! thread, the one thread this device is touched from).
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -54,8 +55,6 @@ pub struct Direct3DDevice {
     pub device: ID3D11Device,
     /// The single (SINGLETHREADED) immediate context — used by STEP 6's frame-push publisher's
     /// `CopyResource` on the swap-chain processor thread (the one thread this device is touched from).
-    /// Unused in STEP 5 (drain-only); kept so the device matches the oracle exactly.
-    #[allow(dead_code)]
     pub device_context: ID3D11DeviceContext,
 }
 

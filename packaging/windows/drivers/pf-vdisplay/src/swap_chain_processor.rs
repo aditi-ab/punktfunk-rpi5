@@ -1,18 +1,20 @@
-//! The swap-chain processor (STEP 5): a worker thread that DRAINS the IddCx swap-chain so the virtual
-//! monitor stays a usable display.
+//! The swap-chain processor (STEP 5 + STEP 6): a worker thread that DRAINS the IddCx swap-chain (so the
+//! virtual monitor stays a usable display) and PUBLISHES each acquired surface into the host-created
+//! shared ring (the IDD-push path).
 //!
-//! The OS presents the composited desktop to the driver through a swap-chain; the driver MUST consume
-//! it (acquire → finished-processing) or the monitor stalls. STEP 5 binds our render device to the
-//! swap-chain (`IddCxSwapChainSetDevice`) and loops acquire/finish, discarding each frame. It does NOT
-//! publish frames to the host — that is STEP 6 (the `CopyResource` of `out.MetaData.pSurface` into a
-//! shared ring), deliberately omitted here.
+//! The OS presents the composited desktop to the driver through a swap-chain; the driver MUST consume it
+//! (acquire → finished-processing) or the monitor stalls. STEP 5 binds our render device to the swap-chain
+//! (`IddCxSwapChainSetDevice`) and loops acquire/finish. STEP 6 lazily attaches a [`FramePublisher`] to
+//! the host's shared ring and, on each acquired frame, `CopyResource`s `out.MetaData.pSurface` into the
+//! next ring slot before finishing the frame (a non-IDD-push session simply never attaches and keeps
+//! draining).
 //!
 //! Ported from the proven oracle (`packaging/windows/vdisplay-driver/pf-vdisplay/src/
 //! swap_chain_processor.rs`) onto wdk-sys + wdk-iddcx. The oracle's `wdf_umdf`/`wdf_umdf_sys` are
 //! replaced by `wdk_sys::iddcx::*` + the `wdk_iddcx` DDI wrappers. Those wrappers return a RAW
 //! `NTSTATUS` (`i32`) that is HRESULT-shaped for the swap-chain DDIs, so we classify it by hand
 //! (`hr >= 0` = success; `0x8000_000A` = E_PENDING; `hr < 0 && != E_PENDING` = error) rather than with
-//! `nt_success`. The publisher + `render_luid_low/high` params are dropped (STEP 6).
+//! `nt_success`.
 
 use std::{
     mem::size_of,
@@ -35,7 +37,10 @@ use wdk_sys::{HANDLE, NTSTATUS, WDFOBJECT, call_unsafe_wdf_function_binding};
 use windows::{
     Win32::{
         Foundation::HANDLE as WHANDLE,
-        Graphics::Dxgi::IDXGIDevice,
+        Graphics::{
+            Direct3D11::ID3D11Texture2D,
+            Dxgi::{IDXGIDevice, IDXGIResource},
+        },
         System::Threading::{
             AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, WaitForSingleObject,
         },
@@ -43,7 +48,7 @@ use windows::{
     core::{Interface, w},
 };
 
-use crate::direct_3d_device::Direct3DDevice;
+use crate::{direct_3d_device::Direct3DDevice, frame_transport::FramePublisher};
 
 /// E_PENDING — `ReleaseAndAcquireBuffer2` returns this (HRESULT-shaped) when the swap-chain is valid but
 /// DWM has composed no new frame yet; wait on the surface-available event and retry.
@@ -89,6 +94,8 @@ impl SwapChainProcessor {
         device: Arc<Direct3DDevice>,
         available_buffer_event: HANDLE,
         target_id: u32,
+        render_luid_low: u32,
+        render_luid_high: i32,
     ) {
         let available_buffer_event = Sendable(available_buffer_event);
         let swap_chain = Sendable(swap_chain);
@@ -117,6 +124,8 @@ impl SwapChainProcessor {
                 available_buffer_event.0,
                 &terminate,
                 target_id,
+                render_luid_low,
+                render_luid_high,
             );
 
             dbglog!(
@@ -147,6 +156,8 @@ impl SwapChainProcessor {
         available_buffer_event: HANDLE,
         terminate: &AtomicBool,
         target_id: u32,
+        render_luid_low: u32,
+        render_luid_high: i32,
     ) {
         // SetDevice fails (0x887A0026, FACILITY_DXGI) when the monitor briefly flaps INACTIVE during
         // topology activation — the OS unassigns + re-assigns the swap-chain, and a fresh run_core thread
@@ -208,6 +219,13 @@ impl SwapChainProcessor {
             return;
         }
 
+        // STEP 6 IDD-push: lazily ATTACH to the HOST-created shared ring. The restricted UMDF token can't
+        // create named objects, so the host creates the header + event + textures and we only OPEN them
+        // once they appear (`try_open`). Until then we just drain — exactly the STEP-5 behaviour — so a
+        // non-IDD-push session never stalls. Retried every ~30 loop iterations.
+        let mut publisher: Option<FramePublisher> = None;
+        let mut frames_since_try: u32 = u32::MAX; // attach attempt on the first loop iteration
+
         let mut logged_pending = false;
         let mut logged_frame = false;
         loop {
@@ -221,9 +239,40 @@ impl SwapChainProcessor {
                 break;
             }
 
+            // The host recreates the shared ring (new format) mid-session when the display's HDR mode
+            // flips — it bumps the header generation. Detect that and drop the publisher so we re-attach to
+            // the new-format textures below; otherwise we'd keep CopyResource'ing into the stale ring, whose
+            // format now mismatches the surface → the publish() format-guard drops every frame and the
+            // stream freezes until the next swap-chain recreate.
+            if publisher.as_ref().is_some_and(FramePublisher::is_stale) {
+                publisher = None;
+                frames_since_try = u32::MAX; // re-attach immediately
+            }
+            // Lazy-attach (rate-limited) at the loop TOP so we keep trying even while the display is idle
+            // (E_PENDING / no frames presented yet), not only when a frame is acquired. `try_open` is a
+            // cheap OpenFileMapping that fails fast until the host has created the ring.
+            if publisher.is_none() {
+                if frames_since_try >= 30 {
+                    frames_since_try = 0;
+                    // `if let Ok` (not a `match` with an empty `Err` arm) keeps clippy's `single_match`
+                    // happy under `-D warnings`; semantics are identical — attach on success, retry on Err.
+                    if let Ok(p) = FramePublisher::try_open(
+                        target_id,
+                        render_luid_low,
+                        render_luid_high,
+                        &device.device,
+                        &device.device_context,
+                    ) {
+                        publisher = Some(p);
+                    }
+                } else {
+                    frames_since_try += 1;
+                }
+            }
+
             // ...Buffer2 is required once CAN_PROCESS_FP16 is set. AcquireSystemMemoryBuffer=FALSE keeps
-            // the GPU surface (out.MetaData.pSurface). STEP 5 only drains — it does NOT publish the
-            // surface (STEP 6 will). Built zeroed + field-assigned (driver style) so a bindgen field-set
+            // the GPU surface (out.MetaData.pSurface) — STEP 6 publishes it into the shared ring in the
+            // success branch below. Built zeroed + field-assigned (driver style) so a bindgen field-set
             // difference can't break a positional struct literal.
             let mut in_args: IDARG_IN_RELEASEANDACQUIREBUFFER2 = unsafe { core::mem::zeroed() };
             #[allow(clippy::cast_possible_truncation)]
@@ -275,9 +324,23 @@ impl SwapChainProcessor {
                     );
                     logged_frame = true;
                 }
-                // STEP 6 publishes `buffer.MetaData.pSurface` into the shared ring HERE (the surface is
-                // valid until the next ReleaseAndAcquire). STEP 5 only drains, so we immediately finish
-                // the frame.
+                // STEP 6: copy the acquired surface into the shared ring BEFORE FinishedProcessingFrame
+                // (the surface is valid until the next ReleaseAndAcquire). The pointer is BORROWED —
+                // `from_raw_borrowed` does NOT take IddCx's refcount — and the GPU-side copy is ordered
+                // before the consumer via the slot keyed mutex. (Attach happens at the loop top.)
+                if let Some(p) = publisher.as_mut() {
+                    let raw = buffer.MetaData.pSurface as *mut core::ffi::c_void;
+                    if !raw.is_null() {
+                        // SAFETY: `raw` is IddCx's live surface pointer (valid until the next
+                        // ReleaseAndAcquire); `from_raw_borrowed` does not consume the refcount.
+                        if let Some(res) = unsafe { IDXGIResource::from_raw_borrowed(&raw) } {
+                            if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
+                                p.publish(&tex);
+                            }
+                        }
+                    }
+                }
+
                 // SAFETY: driver is loaded; `swap_chain` is valid.
                 let hr = unsafe { wdk_iddcx::IddCxSwapChainFinishedProcessingFrame(swap_chain) };
                 if !hr_success(hr) {

@@ -37,5 +37,7 @@ fn link_iddcx_stub() {
             }
         }
     }
-    panic!("IddCxStub.lib not found under any Windows Kits Lib\\<ver>\\um\\{ARCH}\\iddcx\\<iddcxver>\\");
+    panic!(
+        "IddCxStub.lib not found under any Windows Kits Lib\\<ver>\\um\\{ARCH}\\iddcx\\<iddcxver>\\"
+    );
 }
