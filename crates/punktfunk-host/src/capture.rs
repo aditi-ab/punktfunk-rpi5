@@ -351,8 +351,20 @@ pub fn capture_virtual_output(
         // the host can't revive it. The driver's recreate crash (target id resolved to 0) is fixed by
         // stamping target_id onto the monitor context. The ring is always FP16 (the driver composes
         // the IDD in FP16); `want_hdr` selects the per-frame conversion (FP16 → Rgb10a2 vs Bgra).
-        return idd_push::IddPushCapturer::open(target, pref, want_hdr, keep)
-            .map(|c| Box::new(c) as Box<dyn Capturer>);
+        // If IDD-push can't open OR the driver doesn't attach to the ring within a few seconds (e.g. a
+        // hybrid-GPU render mismatch), fall back to DDA so the session is NEVER left black (audit §5.1).
+        // `open()` hands the keepalive back on failure so DDA can take ownership of the virtual display.
+        match idd_push::IddPushCapturer::open(target.clone(), pref, want_hdr, keep) {
+            Ok(c) => return Ok(Box::new(c) as Box<dyn Capturer>),
+            Err((e, keep)) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "IDD-push open/attach failed — falling back to DDA"
+                );
+                return dxgi::DuplCapturer::open(target, pref, keep, false)
+                    .map(|c| Box::new(c) as Box<dyn Capturer>);
+            }
+        }
     }
     // WGC (Windows.Graphics.Capture) is the default: it captures the COMPOSED desktop including the
     // overlay/independent-flip planes DXGI Desktop Duplication misses (the frozen-HDR-animation bug),

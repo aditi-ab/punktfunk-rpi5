@@ -208,7 +208,12 @@ pub fn open_or_reuse(
                 client_10bit,
                 "IDD push: creating the persistent capturer (first session)"
             );
-            *slot = Some(IddPushCapturer::open(target, preferred, client_10bit, keepalive)?);
+            // (dead persistent path) open() now returns the keepalive on failure; this path has no
+            // fallback, so discard it on error.
+            *slot = Some(
+                IddPushCapturer::open(target, preferred, client_10bit, keepalive)
+                    .map_err(|(e, _keepalive)| e)?,
+            );
         }
     }
     Ok(Box::new(IddReuseHandle))
@@ -331,11 +336,29 @@ impl IddPushCapturer {
         Ok(slots)
     }
 
+    /// Open the IDD-push capturer. On success the caller's `keepalive` is attached (the capturer owns the
+    /// virtual display); on FAILURE the keepalive is handed BACK so the caller can fall back to DDA
+    /// instead of tearing the display down (audit §5.1 — no more 20 s black bail). "Failure" includes the
+    /// driver not attaching to the ring within a few seconds (e.g. a hybrid-GPU render mismatch).
     pub fn open(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
         client_10bit: bool,
         keepalive: Box<dyn Send>,
+    ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
+        match Self::open_inner(target, preferred, client_10bit) {
+            Ok(mut me) => {
+                me._keepalive = keepalive;
+                Ok(me)
+            }
+            Err(e) => Err((e, keepalive)),
+        }
+    }
+
+    fn open_inner(
+        target: WinCaptureTarget,
+        preferred: Option<(u32, u32, u32)>,
+        client_10bit: bool,
     ) -> Result<Self> {
         let (w, h, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the shared ring")?;
@@ -451,7 +474,7 @@ impl IddPushCapturer {
                 ring_fp16 = display_hdr,
                 "IDD push(host): created shared ring; waiting for the driver to attach + publish"
             );
-            Ok(Self {
+            let me = Self {
                 device,
                 context,
                 target_id: target.target_id,
@@ -474,8 +497,43 @@ impl IddPushCapturer {
                 last_present: None,
                 status_logged: false,
                 my_gen: crate::vdisplay::sudovda::CURRENT_MON_GEN.load(Ordering::Relaxed),
-                _keepalive: keepalive,
-            })
+                // Placeholder; `open()` attaches the real keepalive on success, so a FAILED open can hand
+                // it back to the caller for the DDA fallback (audit §5.1).
+                _keepalive: Box::new(()),
+            };
+            // Bounded wait for the driver to ATTACH to the ring (it writes DRV_STATUS_OPENED). An attach
+            // failure (e.g. the OS rendered the IDD on a different GPU than our ring → DRV_STATUS_TEX_FAIL)
+            // becomes an open failure the caller falls back from, instead of next_frame's 20 s deadline.
+            me.wait_for_attach()?;
+            Ok(me)
+        }
+    }
+
+    /// Block (bounded) until the driver attaches to the host ring, else fail so the caller can fall back
+    /// to DDA (audit §5.1). Checks `driver_status` (NOT frame arrival — an idle desktop may present no
+    /// frame yet), so it never falsely fails on the happy path: the driver writes `DRV_STATUS_OPENED` as
+    /// soon as it opens the ring textures, regardless of whether DWM has composed a frame.
+    fn wait_for_attach(&self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            // Plain read: the driver writes this u32; an aligned u32 read can't tear (same access as
+            // log_driver_status_once).
+            let st = unsafe { (*self.header).driver_status };
+            match st {
+                DRV_STATUS_OPENED => return Ok(()),
+                DRV_STATUS_TEX_FAIL | DRV_STATUS_NO_DEVICE1 => {
+                    let detail = unsafe { (*self.header).driver_status_detail };
+                    bail!(
+                        "IDD-push driver failed to attach (driver_status={st} detail=0x{detail:08x} — \
+                         render-adapter mismatch?)"
+                    );
+                }
+                _ => {}
+            }
+            if Instant::now() > deadline {
+                bail!("IDD-push driver did not attach within 4s (driver_status={st})");
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -796,7 +854,7 @@ pub fn spawn_observer(target: WinCaptureTarget, preferred: Option<(u32, u32, u32
                 );
                 cap.log_debug_block();
             }
-            Err(e) => tracing::warn!(
+            Err((e, _keep)) => tracing::warn!(
                 target_id = tid,
                 "IDD push OBSERVER: ring open failed: {e:#}"
             ),
