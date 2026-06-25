@@ -37,6 +37,15 @@ pub unsafe extern "C" fn adapter_init_finished(
     STATUS_SUCCESS
 }
 
+/// `EvtCleanupCallback` on the WDFDEVICE (E1): the device is being removed (PnP / driver unload) — drop
+/// every monitor's swap-chain worker so the worker threads don't linger into teardown. IddCx-free (the
+/// framework tears the monitors down with the departing device); see
+/// [`crate::monitor::cleanup_for_device_removal`].
+pub unsafe extern "C" fn device_cleanup(_object: WDFOBJECT) {
+    dbglog!("[pf-vd] device cleanup — releasing monitors");
+    crate::monitor::cleanup_for_device_removal();
+}
+
 /// SDR mode list for an EDID monitor: EDID-serial lookup → count-then-fill `IDDCX_MONITOR_MODE`.
 pub unsafe extern "C" fn parse_monitor_description(
     p_in: *const iddcx::IDARG_IN_PARSEMONITORDESCRIPTION,

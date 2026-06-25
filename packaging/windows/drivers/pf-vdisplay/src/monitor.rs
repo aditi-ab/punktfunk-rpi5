@@ -60,6 +60,14 @@ pub struct MonitorObject {
 // SAFETY: the raw IddCx monitor handle is framework-managed; access is serialized by MONITOR_MODES.
 unsafe impl Send for MonitorObject {}
 
+/// All live monitors. A process-`static` (not a WDFDEVICE-context-owned allocation) BY NECESSITY: the IddCx
+/// monitor/mode DDIs receive only an IddCx handle — never the WDFDEVICE or its context — so this state must
+/// be reachable without one (the upstream virtual-display-rs is a process-`static` for the same reason).
+/// With a single `pf_vdisplay` devnode + `UmdfHostProcessSharing=ProcessSharingDisabled` the host process
+/// (and this state) die WITH the device, so it is effectively device-scoped already; a `Box` + `AtomicPtr`
+/// "device-owned" variant (audit §2.5) would only add a use-after-free window — the host-gone watchdog
+/// thread ([`crate::control::start_watchdog`]) races device cleanup — for no real gain. Cleanup of the
+/// heavy per-monitor resources on device removal is instead done explicitly ([`cleanup_for_device_removal`]).
 pub static MONITOR_MODES: Mutex<Vec<MonitorObject>> = Mutex::new(Vec::new());
 /// Monitor id / EDID-serial counter (unique per created monitor).
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -305,6 +313,16 @@ pub fn create_monitor(
     refresh: u32,
 ) -> Option<(u32, u32, i32)> {
     let adapter = crate::adapter::adapter()?;
+    // Single identity per session (E1): if the host re-ADDs a still-live `session_id` (it shouldn't), depart
+    // the stale monitor first, so one session maps to exactly one monitor (no duplicate EDID/target lingers).
+    if MONITOR_MODES
+        .lock()
+        .map(|l| l.iter().any(|m| m.session_id == session_id))
+        .unwrap_or(false)
+    {
+        dbglog!("[pf-vd] create_monitor: session {session_id} already live — departing the stale monitor");
+        remove_monitor(session_id);
+    }
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
     let mut modes = vec![Mode {
@@ -456,6 +474,27 @@ pub fn clear_all() {
             // SAFETY: `m` is a live IddCx monitor handle.
             unsafe { wdk_iddcx::IddCxMonitorDeparture(m) };
         }
+    }
+}
+
+/// `EvtCleanupCallback` (device removal, [`crate::callbacks::device_cleanup`]): drop every monitor's heavy
+/// resources — the swap-chain processor workers (each RAII-joins its thread + deletes its swap-chain) — and
+/// clear the list, WITHOUT `IddCxMonitorDeparture` (the framework tears the IddCx monitors down together
+/// with the departing device; departing here would double-tear). Frees our worker threads promptly even
+/// though the per-devnode WUDFHost (`ProcessSharingDisabled`) would also reap them when it exits.
+pub fn cleanup_for_device_removal() {
+    let mut drained: Vec<Option<crate::swap_chain_processor::SwapChainProcessor>> = {
+        let Ok(mut lock) = MONITOR_MODES.lock() else {
+            return;
+        };
+        lock.drain(..)
+            .map(|mut m| m.swap_chain_processor.take())
+            .collect()
+    };
+    // Drop the workers (join their threads) AFTER releasing the lock — joining under MONITOR_MODES would
+    // head-block the control plane (same discipline as remove_monitor / clear_all).
+    for processor in &mut drained {
+        drop(processor.take());
     }
 }
 

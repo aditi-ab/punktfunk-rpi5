@@ -113,6 +113,9 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     dev_attr.SynchronizationScope =
         wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
     dev_attr.ContextTypeInfo = &DEVICE_CTX.0;
+    // Drop every monitor's swap-chain worker when the device is removed (PnP / unload), so the worker
+    // threads don't linger into teardown (E1 device cleanup). IddCx-free; see callbacks::device_cleanup.
+    dev_attr.EvtCleanupCallback = Some(callbacks::device_cleanup);
     // SAFETY: init configured above; dev_attr is a valid context-typed attributes block.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(WdfDeviceCreate, &mut init, &mut dev_attr, &mut device)
