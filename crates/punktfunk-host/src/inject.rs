@@ -112,8 +112,10 @@ pub fn default_backend() -> Backend {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        if std::env::var("PUNKTFUNK_COMPOSITOR")
-            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("gamescope"))
+        if crate::config::config()
+            .compositor
+            .as_deref()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("gamescope"))
         {
             return Backend::GamescopeEi;
         }
@@ -260,8 +262,10 @@ fn coalesce(events: Vec<InputEvent>) -> Vec<InputEvent> {
 /// (`org.gnome.Mutter.RemoteDesktop`), the same direct API the Mutter video backend uses.
 #[cfg(target_os = "linux")]
 fn libei_ei_source() -> libei::EiSource {
-    let gnome = std::env::var("PUNKTFUNK_COMPOSITOR")
-        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("mutter"))
+    let gnome = crate::config::config()
+        .compositor
+        .as_deref()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("mutter"))
         || std::env::var("XDG_CURRENT_DESKTOP")
             .unwrap_or_default()
             .to_ascii_uppercase()

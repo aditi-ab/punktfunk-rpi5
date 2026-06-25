@@ -173,14 +173,12 @@ pub fn open_video(
         // AMD/Intel → VAAPI (one libavcodec backend for both). Auto-detect by default so a single
         // Linux binary serves any GPU; `PUNKTFUNK_ENCODER` forces a specific backend (and surfaces
         // its errors crisply instead of silently trying the other).
-        let pref = std::env::var("PUNKTFUNK_ENCODER")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+        let pref = crate::config::config().encoder_pref.as_str();
         let open_vaapi = || -> Result<Box<dyn Encoder>> {
             vaapi::VaapiEncoder::open(codec, format, width, height, fps, bitrate_bps, bit_depth)
                 .map(|e| Box::new(e) as Box<dyn Encoder>)
         };
-        match pref.as_str() {
+        match pref {
             "nvenc" | "nvidia" | "cuda" => open_nvenc_probed(
                 codec,
                 format,
@@ -379,11 +377,7 @@ fn nvidia_present() -> bool {
 /// passthrough for VAAPI vs the EGL→CUDA import for NVENC).
 #[cfg(target_os = "linux")]
 pub fn linux_zero_copy_is_vaapi() -> bool {
-    match std::env::var("PUNKTFUNK_ENCODER")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    match crate::config::config().encoder_pref.as_str() {
         "nvenc" | "nvidia" | "cuda" => false,
         "vaapi" | "amd" | "intel" => true,
         _ => !nvidia_present(),

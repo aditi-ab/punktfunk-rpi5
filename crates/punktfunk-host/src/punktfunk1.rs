@@ -599,7 +599,7 @@ async fn serve_session(
         // opted in (PUNKTFUNK_10BIT). A client that can't decode 10-bit (caps bit clear, or an older
         // client) always gets the 8-bit stream. PUNKTFUNK_10BIT is the host policy gate until a
         // mgmt/console toggle replaces it.
-        let host_wants_10bit = std::env::var_os("PUNKTFUNK_10BIT").is_some();
+        let host_wants_10bit = crate::config::config().ten_bit;
         let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
         let bit_depth: u8 = if host_wants_10bit && client_supports_10bit {
             10
@@ -1616,7 +1616,7 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
 /// Resolve the client's gamepad-backend preference (the env/logging shell around
 /// [`pick_gamepad`]). Always concrete — the `Welcome` reports what the session will drive.
 fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
-    let env = std::env::var("PUNKTFUNK_GAMEPAD").ok();
+    let env = crate::config::config().gamepad.clone();
     let chosen = pick_gamepad(
         pref,
         env.as_deref(),
@@ -1683,7 +1683,7 @@ fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Composito
     {
         // Explicit operator override (legacy / CI / forcing a backend for a test) wins and is assumed
         // to come with a hand-set env — don't retarget the process env in that case.
-        let overridden = std::env::var_os("PUNKTFUNK_COMPOSITOR").is_some();
+        let overridden = crate::config::config().compositor.is_some();
         let detected = if overridden {
             crate::vdisplay::detect().ok()
         } else {
@@ -2220,11 +2220,11 @@ fn virtual_stream(
     // driver-churning teardown of a monitor under a still-live session. Register THIS session's stop so
     // the next reconnect preempts it.
     #[cfg(target_os = "windows")]
-    let idd_setup_guard = std::env::var_os("PUNKTFUNK_IDD_PUSH")
-        .is_some()
+    let idd_setup_guard = crate::config::config()
+        .idd_push
         .then(|| IDD_SETUP_LOCK.lock().unwrap());
     #[cfg(target_os = "windows")]
-    if std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some() {
+    if crate::config::config().idd_push {
         let prev = IDD_SESSION_STOP.lock().unwrap().replace(stop.clone());
         if let Some(prev_stop) = prev {
             prev_stop.store(true, Ordering::SeqCst);
@@ -2251,7 +2251,7 @@ fn virtual_stream(
     #[cfg(target_os = "windows")]
     let _composed_flip = crate::capture::composed_flip::ForceComposedFlip::start();
 
-    let perf = std::env::var("PUNKTFUNK_PERF").is_ok();
+    let perf = crate::config::config().perf;
     // Microburst cap (applied in send_loop/paced_submit): a frame ≤ this bursts out immediately;
     // only a bigger frame's overflow is spread. PUNKTFUNK_PACE_BURST_KB overrides the 128 KB default.
     let burst_cap = std::env::var("PUNKTFUNK_PACE_BURST_KB")
@@ -2291,7 +2291,7 @@ fn virtual_stream(
     let mut compositor = compositor;
     let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
     let watch = std::env::var_os("PUNKTFUNK_SESSION_WATCH").is_some()
-        && std::env::var_os("PUNKTFUNK_COMPOSITOR").is_none();
+        && crate::config::config().compositor.is_none();
     let _watcher = if watch {
         let stop = stop.clone();
         std::thread::Builder::new()
@@ -2731,7 +2731,7 @@ fn virtual_stream_relay(
             })
         };
 
-    let perf = std::env::var("PUNKTFUNK_PERF").is_ok();
+    let perf = crate::config::config().perf;
     let burst_cap = std::env::var("PUNKTFUNK_PACE_BURST_KB")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -2770,7 +2770,7 @@ fn virtual_stream_relay(
     // the secure desktop's HDR independent-flip (it storms ACCESS_LOST → black), whereas the WGC helper
     // STAYS LIVE through a lock/UAC. So by default the mux keeps WGC the whole time (no DesktopWatcher
     // switch, no overlay). Enable the experimental DDA-on-secure path with PUNKTFUNK_SECURE_DDA=1.
-    let dda_secure = std::env::var("PUNKTFUNK_SECURE_DDA").is_ok() || secure_test_ms.is_some();
+    let dda_secure = crate::config::config().secure_dda || secure_test_ms.is_some();
     // The authoritative Default↔Winlogon signal (requires SYSTEM to read the Winlogon desktop name);
     // only needed when the DDA-on-secure path is enabled.
     let watcher = dda_secure.then(crate::capture::desktop_watch::DesktopWatcher::start);

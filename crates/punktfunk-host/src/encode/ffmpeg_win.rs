@@ -109,7 +109,7 @@ impl WinVendor {
 /// Is the zero-copy D3D11 path enabled? Opt-in (`PUNKTFUNK_ZEROCOPY=1`) until on-glass validated;
 /// the default is the robust system-memory readback path.
 fn zerocopy_enabled() -> bool {
-    std::env::var_os("PUNKTFUNK_ZEROCOPY").is_some()
+    crate::config::config().zerocopy
 }
 
 /// The swscale *source* pixel format for a captured packed-RGB/BGR layout (8-bit BGRA fallback only).

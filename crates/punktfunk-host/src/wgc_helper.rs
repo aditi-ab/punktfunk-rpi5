@@ -135,7 +135,7 @@ pub fn run(opts: HelperOptions) -> Result<()> {
     // the GPU scheduling priority the SYSTEM host stamps on us, not pipeline depth.
     let interval = std::time::Duration::from_secs_f64(1.0 / opts.fps.max(1) as f64);
 
-    let perf = std::env::var_os("PUNKTFUNK_PERF").is_some();
+    let perf = crate::config::config().perf;
     let mut frames = 0u64;
     let mut repeats = 0u64; // frames where no newer capture had arrived (duplicate re-encode)
     let mut cap_ns = 0u64; // time in try_latest (capture + video-processor convert)

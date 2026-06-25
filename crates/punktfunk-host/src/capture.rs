@@ -327,7 +327,7 @@ pub fn capture_virtual_output(
 /// compiled and comes back the moment the flag is unset.
 #[cfg(target_os = "windows")]
 pub(crate) fn wgc_disabled() -> bool {
-    std::env::var_os("PUNKTFUNK_NO_WGC").is_some()
+    crate::config::config().no_wgc
 }
 
 #[cfg(target_os = "windows")]
@@ -345,7 +345,7 @@ pub fn capture_virtual_output(
     // P2 direct frame push (kill DDA): consume frames straight from the pf-vdisplay driver's shared
     // ring — no Desktop Duplication, no win32u reparenting hook. Opt-in while it's A/B'd against DDA;
     // `idd_push` takes the keepalive (owns the virtual display) so there's no fall-through.
-    if std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some() {
+    if crate::config::config().idd_push {
         // Recreate the monitor + ring per session (fix-teardown): a FRESH monitor reliably gets a
         // working IddCx swap-chain, whereas a REUSED monitor's swap-chain dies after ~2 sessions and
         // the host can't revive it. The driver's recreate crash (target id resolved to 0) is fixed by
@@ -371,9 +371,7 @@ pub fn capture_virtual_output(
     // and has no ACCESS_LOST-on-overlay churn. DDA stays available via PUNKTFUNK_CAPTURE=dda and is
     // the secure-desktop (lock/UAC) fallback (WGC can't capture those). `keep` is moved into the
     // chosen backend (it owns the SudoVDA keepalive), so there's no open-time auto-fallback.
-    let backend = std::env::var("PUNKTFUNK_CAPTURE")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let backend = crate::config::config().capture_backend.as_str();
     if backend == "dda" || backend == "dxgi" || wgc_disabled() {
         return dxgi::DuplCapturer::open(target, pref, keep, false)
             .map(|c| Box::new(c) as Box<dyn Capturer>);

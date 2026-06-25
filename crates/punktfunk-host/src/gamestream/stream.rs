@@ -102,7 +102,7 @@ fn run(
     // request and capture it (no scaling). Self-contained — deliberately NOT pooled in
     // `video_cap`, since a reconnect at a different resolution needs a freshly-sized output; the
     // output is released when this capturer drops at stream end (RAII via its keepalive).
-    if std::env::var("PUNKTFUNK_VIDEO_SOURCE").as_deref() == Ok("virtual") {
+    if crate::config::config().video_source.as_deref() == Some("virtual") {
         // The launched app picks the compositor (e.g. gamescope for game entries) and the
         // nested command.
         let compositor = app
@@ -147,7 +147,7 @@ fn run(
             tracing::info!("video source: reusing capturer");
             c
         }
-        None if std::env::var("PUNKTFUNK_VIDEO_SOURCE").is_ok_and(|v| v == "portal") => {
+        None if crate::config::config().video_source.as_deref() == Some("portal") => {
             tracing::info!("video source: portal desktop capture");
             capture::open_portal_monitor().context("open portal capturer")?
         }
@@ -358,7 +358,7 @@ fn stream_body(
 
     // Per-stage timing (PUNKTFUNK_PERF=1): max µs/stage per second + unique vs re-encoded frames,
     // to pinpoint stalls. `unique` counts genuinely-new captured frames (vs re-encoded holds).
-    let perf = std::env::var_os("PUNKTFUNK_PERF").is_some();
+    let perf = crate::config::config().perf;
     let (mut mx_cap, mut mx_enc, mut mx_pkt, mut mx_send, mut mx_pkts, mut uniq) =
         (0u128, 0u128, 0u128, 0u128, 0usize, 0u32);
     // Absolute next-frame deadline — the single pacing clock for the loop.

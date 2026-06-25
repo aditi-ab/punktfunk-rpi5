@@ -55,7 +55,7 @@ const PF_VDISPLAY_INTERFACE: GUID =
 /// IDD-push mode: a new client connection preempts + recreates the monitor (single-client reconnect),
 /// because a REUSED IddCx monitor's swap-chain is dead. Off → monitors are shared across sessions.
 fn idd_push_mode() -> bool {
-    std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some()
+    crate::config::config().idd_push
 }
 
 /// Monotonic per-session id keying a pf-vdisplay monitor for `IOCTL_ADD`/`IOCTL_REMOVE`. Unlike
@@ -249,9 +249,9 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
         // the discrete render GPU it pins here). The pf-vdisplay driver now IMPLEMENTS this IOCTL
         // (IddCxAdapterSetRenderAdapter); a failure is still tolerated (the driver also reports its real
         // render LUID in the shared header, so the host binds to the right GPU regardless).
-        let pinned = if std::env::var("PUNKTFUNK_RENDER_ADAPTER").is_ok() {
+        let pinned = if crate::config::config().render_adapter.is_some() {
             unsafe { resolve_render_adapter_luid() }
-        } else if std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some() {
+        } else if crate::config::config().idd_push {
             // P2 direct frame push: the host opens the driver's shared textures AND runs NVENC on the
             // RENDER adapter, so on a hybrid box (dGPU + iGPU) it MUST be the discrete encoder GPU — an
             // iGPU-rendered surface is untouchable by NVENC. pf-vdisplay now IMPLEMENTS

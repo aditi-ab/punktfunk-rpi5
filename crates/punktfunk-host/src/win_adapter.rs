@@ -18,8 +18,9 @@ use windows::Win32::Foundation::LUID;
 /// already satisfy this).
 pub(crate) unsafe fn resolve_render_adapter_luid() -> Option<LUID> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
-    let want = std::env::var("PUNKTFUNK_RENDER_ADAPTER")
-        .ok()
+    let want = crate::config::config()
+        .render_adapter
+        .clone()
         .filter(|s| !s.is_empty());
     let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
     let mut best: Option<(LUID, u64, String)> = None;

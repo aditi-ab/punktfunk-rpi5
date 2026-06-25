@@ -28,7 +28,7 @@ pub(crate) static CURRENT_MON_GEN: AtomicU64 = AtomicU64::new(0);
 /// IDD-push mode: a new client connection preempts + recreates the monitor (single-client reconnect),
 /// because a REUSED IddCx monitor's swap-chain is dead. Off → monitors are shared across sessions.
 fn idd_push_mode() -> bool {
-    std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some()
+    crate::config::config().idd_push
 }
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -301,9 +301,9 @@ unsafe fn create_monitor(device: isize, mode: Mode, watchdog_s: u32) -> Result<M
         // the real source of the perpetual ACCESS_LOST + MODE_CHANGE_IN_PROGRESS storm. So default to
         // NOT pinning — let the IDD use its natural adapter like Apollo. Opt in with
         // PUNKTFUNK_RENDER_ADAPTER=<name substring> only on a box that genuinely needs steering.
-        let pinned = if std::env::var("PUNKTFUNK_RENDER_ADAPTER").is_ok() {
+        let pinned = if crate::config::config().render_adapter.is_some() {
             unsafe { resolve_render_adapter_luid() }
-        } else if std::env::var_os("PUNKTFUNK_IDD_PUSH").is_some() {
+        } else if crate::config::config().idd_push {
             // P2 direct frame push: the host opens the driver's shared textures AND runs NVENC on the
             // RENDER adapter, so on a hybrid box (4090 + iGPU) it MUST be the discrete encoder GPU —
             // an iGPU-rendered surface is untouchable by NVENC. pf-vdisplay HONORS SET_RENDER_ADAPTER

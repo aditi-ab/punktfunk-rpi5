@@ -479,7 +479,7 @@ pub fn apply_input_env(_chosen: Compositor) {}
 /// a backend for a test), else the **live session** ([`detect_active_session`] — so a Bazzite box
 /// follows Gaming↔Desktop switches), else a last-resort `XDG_CURRENT_DESKTOP` read.
 pub fn detect() -> Result<Compositor> {
-    if let Ok(v) = std::env::var("PUNKTFUNK_COMPOSITOR") {
+    if let Some(v) = crate::config::config().compositor.as_deref() {
         return match v.trim().to_ascii_lowercase().as_str() {
             "kwin" | "kde" | "plasma" => Ok(Compositor::Kwin),
             "wlroots" | "sway" | "hyprland" | "wlr" => Ok(Compositor::Wlroots),
@@ -551,11 +551,7 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
 /// default) auto-detects, preferring pf-vdisplay if its device interface is enumerable.
 #[cfg(target_os = "windows")]
 fn windows_use_pf_vdisplay() -> bool {
-    match std::env::var("PUNKTFUNK_VDISPLAY")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
+    match crate::config::config().vdisplay.as_deref().map(str::trim) {
         Some("pf") | Some("pf-vdisplay") | Some("pfvd") => true,
         Some("sudovda") | Some("sudo") => false,
         _ => pf_vdisplay::is_available(),
