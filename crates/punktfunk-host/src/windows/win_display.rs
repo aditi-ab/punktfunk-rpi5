@@ -5,8 +5,8 @@
 //! These are display-utility, NOT SudoVDA-specific (a pf-vdisplay monitor's target_id is a real OS target
 //! id, so they operate identically), so they live here rather than in the SudoVDA backend — breaking the
 //! circular reach-in where the capturers + the pf-vdisplay backend reached into `vdisplay::sudovda` for
-//! them, so SudoVDA can eventually be dropped without losing them (audit §9 / Goal 2). The plan's
-//! `windows/display_ccd.rs`. Moved verbatim from `vdisplay::sudovda`.
+//! them, which let the SudoVDA backend be dropped without losing them (audit §9 / Goal 2 — done). The
+//! plan's `windows/display_ccd.rs`. Extracted verbatim from the former SudoVDA backend before its removal.
 
 use std::mem::size_of;
 

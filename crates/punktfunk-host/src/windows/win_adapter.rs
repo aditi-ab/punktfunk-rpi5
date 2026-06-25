@@ -3,8 +3,8 @@
 //! The discrete render-GPU LUID picker used to live in the SudoVDA backend (`vdisplay::sudovda`) — a
 //! historical accident, since it is display-utility, not SudoVDA-specific. It lives here so the capturers
 //! (IDD-push) and the pf-vdisplay backend depend on it as a *peer* instead of reaching into the SudoVDA
-//! module — breaking that circular reach-in so SudoVDA can eventually be dropped without losing this
-//! helper (audit §9 / Goal 2). This is the plan's `windows/adapter.rs`.
+//! module — breaking that circular reach-in, which let the SudoVDA backend be dropped without losing this
+//! helper (audit §9 / Goal 2 — done). This is the plan's `windows/adapter.rs`.
 
 use windows::Win32::Foundation::LUID;
 

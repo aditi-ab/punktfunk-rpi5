@@ -72,7 +72,9 @@ pub struct HostConfig {
     pub compositor: Option<String>,
     /// `PUNKTFUNK_GAMEPAD` — client/operator virtual-pad backend preference (fed to `pick_gamepad`).
     pub gamepad: Option<String>,
-    /// `PUNKTFUNK_VDISPLAY` — Windows virtual-display backend select (`pf`/`pfvd` vs `sudovda`; else auto-detect).
+    /// `PUNKTFUNK_VDISPLAY` — Windows virtual-display backend. The pf-vdisplay IddCx driver is now the only
+    /// backend (the legacy SudoVDA backend was removed), so this is currently informational — kept for the
+    /// shipped `host.env` and as a forward seam if a second backend is ever added.
     pub vdisplay: Option<String>,
 }
 

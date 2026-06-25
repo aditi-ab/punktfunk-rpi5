@@ -2186,9 +2186,9 @@ impl DuplCapturer {
             let context = context.context("null D3D11 context")?;
             // 3) duplicate the output. Attach to the current input desktop first (as SYSTEM this can
             // be the Winlogon secure desktop) so a session that starts at the lock/login screen works.
-            // The SudoVDA is kept the sole desktop via the CCD isolation in sudovda::create_monitor
-            // (registry-persisted), so the secure desktop has nowhere to render but the output we
-            // capture — no per-open re-isolation needed.
+            // The virtual display is kept the sole desktop via the CCD isolation the pf-vdisplay backend
+            // applies at monitor creation (registry-persisted), so the secure desktop has nowhere to render
+            // but the output we capture — no per-open re-isolation needed.
             attach_input_desktop();
             let dupl = duplicate_output(&output, &device, want_hdr)
                 .context("DuplicateOutput (already duplicated by another app?)")?;

@@ -178,7 +178,7 @@ impl VirtualDisplayManager {
     }
 
     /// Open + initialise the backend (validates the driver is present). Mirrors the old
-    /// `SudoVdaDisplay::new`/`PfVdisplayDisplay::new`.
+    /// `PfVdisplayDisplay::new`.
     pub(crate) fn open_backend(&self) -> Result<()> {
         // Hold the state lock across the open so two racing backends can't double-open the device.
         let _guard = self.state.lock().unwrap();

@@ -35,7 +35,7 @@ pub struct SendInputInjector {
     desktop: Option<HDESK>,
 }
 
-// Only ever used from the host's single injector thread (like SudoVdaDisplay).
+// Only ever used from the host's single injector thread.
 unsafe impl Send for SendInputInjector {}
 
 impl SendInputInjector {

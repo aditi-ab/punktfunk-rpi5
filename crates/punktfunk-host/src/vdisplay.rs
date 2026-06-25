@@ -529,32 +529,20 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     }
     #[cfg(target_os = "windows")]
     {
-        // Two virtual-display backends: the new pf-vdisplay IddCx driver (pf_vdisplay_proto) and the
-        // shipping SudoVDA fallback. The compositor arg is moot on Windows. PUNKTFUNK_VDISPLAY overrides;
-        // default auto-detects (prefer pf-vdisplay if its driver interface is present).
+        // The pf-vdisplay all-Rust IddCx driver is the sole virtual-display backend (the legacy SudoVDA
+        // fallback was removed — its driver is no longer shipped). The compositor arg is moot on Windows.
         let _ = compositor;
-        if windows_use_pf_vdisplay() {
-            Ok(Box::new(pf_vdisplay::PfVdisplayDisplay::new()?))
-        } else {
-            Ok(Box::new(sudovda::SudoVdaDisplay::new()?))
-        }
+        anyhow::ensure!(
+            pf_vdisplay::is_available(),
+            "pf-vdisplay driver interface not found — the pf-vdisplay IddCx driver is not installed or \
+             not loaded (the host installer bundles it; reinstall or check the driver state)"
+        );
+        Ok(Box::new(pf_vdisplay::PfVdisplayDisplay::new()?))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = compositor;
         anyhow::bail!("virtual displays require Linux or Windows")
-    }
-}
-
-/// Pick the Windows virtual-display backend. `PUNKTFUNK_VDISPLAY=pf|pf-vdisplay|pfvd` forces the new
-/// pf-vdisplay IddCx driver; `=sudovda|sudo` forces the shipping SudoVDA driver; anything else (the
-/// default) auto-detects, preferring pf-vdisplay if its device interface is enumerable.
-#[cfg(target_os = "windows")]
-fn windows_use_pf_vdisplay() -> bool {
-    match crate::config::config().vdisplay.as_deref().map(str::trim) {
-        Some("pf") | Some("pf-vdisplay") | Some("pfvd") => true,
-        Some("sudovda") | Some("sudo") => false,
-        _ => pf_vdisplay::is_available(),
     }
 }
 
@@ -578,11 +566,7 @@ pub fn probe(compositor: Compositor) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let _ = compositor;
-        if windows_use_pf_vdisplay() {
-            pf_vdisplay::probe()
-        } else {
-            sudovda::probe()
-        }
+        pf_vdisplay::probe()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -640,9 +624,6 @@ pub(crate) mod manager;
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/windows/pf_vdisplay.rs"]
 pub(crate) mod pf_vdisplay;
-#[cfg(target_os = "windows")]
-#[path = "vdisplay/windows/sudovda.rs"]
-pub(crate) mod sudovda;
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/wlroots.rs"]
 mod wlroots;
