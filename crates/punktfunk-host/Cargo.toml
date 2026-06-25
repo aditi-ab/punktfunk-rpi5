@@ -155,7 +155,7 @@ windows = { version = "0.62", features = [
     "Win32_System_LibraryLoader",
     # VirtualProtect — for the inline patch of the win32u GPU-preference shim (Apollo's MinHook port:
     # the hybrid-GPU output-reparenting hook that keeps Desktop Duplication stable on a 4090+iGPU box).
-    # See capture/dxgi.rs `install_gpu_pref_hook`. No trampoline (we fully replace the fn) → no detour
+    # See capture/windows/dxgi.rs `install_gpu_pref_hook`. No trampoline (we fully replace the fn) → no detour
     # crate / no C length-disassembler dep; a 12-byte absolute-jmp prologue patch suffices.
     "Win32_System_Memory",
     # Per-monitor-v2 DPI awareness — IDXGIOutput5::DuplicateOutput1 (the modern capture path Apollo
@@ -175,7 +175,7 @@ openh264 = "0.9"
 # WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
 wasapi = "0.23"
 # Virtual Xbox 360 gamepad: the in-tree XUSB companion UMDF driver (packaging/windows/xusb-driver),
-# driven over shared memory from inject/gamepad_windows.rs — no ViGEmBus dependency.
+# driven over shared memory from inject/windows/gamepad_windows.rs — no ViGEmBus dependency.
 # NVENC hardware encoder (NVENC SDK, D3D11 input). The SDK pins `cudarc` with
 # `cuda-version-from-build-system` (a build-time CUDA-toolkit probe); its `ci-check` feature switches
 # cudarc to `dynamic-loading` (loads nvcuda.dll at runtime — nothing needed at build), which is how
