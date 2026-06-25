@@ -507,37 +507,47 @@ impl IddPushCapturer {
                 // it back to the caller for the DDA fallback (audit §5.1).
                 _keepalive: Box::new(()),
             };
-            // Bounded wait for the driver to ATTACH to the ring (it writes DRV_STATUS_OPENED). An attach
-            // failure (e.g. the OS rendered the IDD on a different GPU than our ring → DRV_STATUS_TEX_FAIL)
-            // becomes an open failure the caller falls back from, instead of next_frame's 20 s deadline.
+            // Bounded wait for the driver to ATTACH to the ring AND publish a first frame. An attach
+            // failure (DRV_STATUS_TEX_FAIL) or an attach-but-no-frames (a game left the display in a
+            // format/size the ring can't match) becomes an open failure the caller falls back from (→ DDA),
+            // instead of next_frame's 20 s black-then-bail.
             me.wait_for_attach()?;
             Ok(me)
         }
     }
 
-    /// Block (bounded) until the driver attaches to the host ring, else fail so the caller can fall back
-    /// to DDA (audit §5.1). Checks `driver_status` (NOT frame arrival — an idle desktop may present no
-    /// frame yet), so it never falsely fails on the happy path: the driver writes `DRV_STATUS_OPENED` as
-    /// soon as it opens the ring textures, regardless of whether DWM has composed a frame.
+    /// Block (bounded) until the driver has ATTACHED to the host ring (`DRV_STATUS_OPENED`) **and published
+    /// a first frame**, else fail so the caller can fall back to DDA (audit §5.1 +
+    /// `docs/windows-host-rewrite-game-capture-bug.md` P3/Stage 1).
+    ///
+    /// Requiring the first frame — not just the attach — catches the *reconnect-into-a-broken-state* case:
+    /// a fullscreen game can leave the virtual display in a format/size that the driver's `publish()` guard
+    /// rejects, so the driver ATTACHES but silently drops every frame; without this the host sails past
+    /// `open()` and only dies on `next_frame`'s 20 s deadline (the "reconnect = black + audio" symptom). At
+    /// session open the OS activates the virtual display → DWM composites it → a frame arrives within ~1 s,
+    /// so this does not false-fail a normal (even idle) open; no frame within the window = genuinely broken.
     fn wait_for_attach(&self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(4);
         loop {
             // Plain read: the driver writes this u32; an aligned u32 read can't tear (same access as
             // log_driver_status_once).
             let st = unsafe { (*self.header).driver_status };
-            match st {
-                DRV_STATUS_OPENED => return Ok(()),
-                DRV_STATUS_TEX_FAIL | DRV_STATUS_NO_DEVICE1 => {
-                    let detail = unsafe { (*self.header).driver_status_detail };
-                    bail!(
-                        "IDD-push driver failed to attach (driver_status={st} detail=0x{detail:08x} — \
-                         render-adapter mismatch?)"
-                    );
-                }
-                _ => {}
+            if matches!(st, DRV_STATUS_TEX_FAIL | DRV_STATUS_NO_DEVICE1) {
+                let detail = unsafe { (*self.header).driver_status_detail };
+                bail!(
+                    "IDD-push driver failed to attach (driver_status={st} detail=0x{detail:08x} — \
+                     render-adapter mismatch?)"
+                );
+            }
+            // Attached AND a frame has been published — the publish token's seq advances past 0.
+            if st == DRV_STATUS_OPENED && frame::FrameToken::unpack(self.latest()).seq != 0 {
+                return Ok(());
             }
             if Instant::now() > deadline {
-                bail!("IDD-push driver did not attach within 4s (driver_status={st})");
+                bail!(
+                    "IDD-push: driver_status={st} but no frame published within 4s — the virtual display \
+                     is likely in a format/size the ring can't match (fullscreen game?); falling back"
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
