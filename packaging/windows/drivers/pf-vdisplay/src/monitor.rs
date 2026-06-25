@@ -6,7 +6,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use wdk_sys::iddcx;
 
@@ -64,6 +64,50 @@ pub static MONITOR_MODES: Mutex<Vec<MonitorObject>> = Mutex::new(Vec::new());
 /// Monitor id / EDID-serial counter (unique per created monitor).
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
+/// True if any virtual monitor currently exists — the host-gone watchdog only reaps when there's
+/// something to reap (see [`crate::control::start_watchdog`]).
+pub fn has_monitors() -> bool {
+    MONITOR_MODES.lock().map(|l| !l.is_empty()).unwrap_or(false)
+}
+
+/// Depart every monitor that has existed at least `grace` — the host-gone watchdog reap
+/// ([`crate::control::start_watchdog`]). The grace skips a just-created monitor (the host adds it, then
+/// starts pinging) so a momentarily-stale ping timer can't nuke a brand-new monitor. Returns the count
+/// departed. Same lock discipline as [`remove_monitor`]: drop each worker (which RAII-joins its thread)
+/// OUTSIDE the `MONITOR_MODES` lock, then depart.
+pub fn reap_orphaned(grace: Duration) -> usize {
+    let mut drained: Vec<(
+        Option<iddcx::IDDCX_MONITOR>,
+        Option<crate::swap_chain_processor::SwapChainProcessor>,
+    )> = {
+        let Ok(mut lock) = MONITOR_MODES.lock() else {
+            return 0;
+        };
+        let mut taken = Vec::new();
+        let mut i = 0;
+        while i < lock.len() {
+            if lock[i].created_at.elapsed() >= grace {
+                let mut m = lock.remove(i);
+                taken.push((m.object, m.swap_chain_processor.take()));
+            } else {
+                i += 1;
+            }
+        }
+        taken
+    };
+    let n = drained.len();
+    for (_, processor) in &mut drained {
+        drop(processor.take());
+    }
+    for (object, _) in drained {
+        if let Some(m) = object {
+            // SAFETY: `m` is a live IddCx monitor handle; departure tears it down.
+            unsafe { wdk_iddcx::IddCxMonitorDeparture(m) };
+        }
+    }
+    n
+}
+
 /// Fallback modes appended after the requested mode, so a topology change still has options.
 fn default_modes() -> Vec<Mode> {
     vec![
@@ -86,17 +130,21 @@ pub fn display_info(
     height: u32,
     refresh_rate: u32,
 ) -> wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
-    let clock_rate = refresh_rate * (height + 4) * (height + 4) + 1000;
+    // Compute in u64 then saturate the u32 rational numerators: the old u32 `refresh*(h+4)^2` overflows
+    // for a large mode (e.g. 8K@240), which panics→aborts the extern-"C" mode DDI in a debug build.
+    // Identical for every real mode; only an absurd (also now bounds-rejected) mode saturates.
+    let clock_rate: u64 = u64::from(refresh_rate) * u64::from(height + 4) * u64::from(height + 4) + 1000;
+    let clock_rate_u32 = u32::try_from(clock_rate).unwrap_or(u32::MAX);
     // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
     // DISPLAYCONFIG_VIDEO_SIGNAL_INFO; every meaningful field is assigned below.
     let mut si: wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO = unsafe { core::mem::zeroed() };
-    si.pixelRate = u64::from(clock_rate);
+    si.pixelRate = clock_rate;
     si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
-        Numerator: clock_rate,
+        Numerator: clock_rate_u32,
         Denominator: height + 4,
     };
     si.vSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
-        Numerator: clock_rate,
+        Numerator: clock_rate_u32,
         Denominator: (height + 4) * (height + 4),
     };
     si.activeSize = wdk_sys::DISPLAYCONFIG_2DREGION {

@@ -142,3 +142,26 @@ pub fn set_adapter(adapter: iddcx::IDDCX_ADAPTER) {
 pub(crate) fn adapter() -> Option<iddcx::IDDCX_ADAPTER> {
     ADAPTER.get().map(|a| a.0)
 }
+
+/// Honor the host's `IOCTL_SET_RENDER_ADAPTER`: pin the GPU the IddCx swap-chain renders on. On a hybrid
+/// iGPU+dGPU box the OS may otherwise pick the iGPU to render the virtual monitor, so the host's shared
+/// ring textures (created on the NVENC dGPU) can't be opened → `DRV_STATUS_TEX_FAIL` → the host's 20 s
+/// black bail. Pinning the render adapter to the encode GPU fixes that. Unconditional — NOT the
+/// SudoVDA-parity default-off branch (`docs/windows-host-rewrite-audit.md` §4.2). Returns
+/// `STATUS_NOT_FOUND` if called before the adapter exists.
+pub fn set_render_adapter(luid_low: u32, luid_high: i32) -> NTSTATUS {
+    let Some(adapter) = adapter() else {
+        return crate::STATUS_NOT_FOUND;
+    };
+    // SAFETY: building a C POD — the all-zero bit pattern is a valid IDARG_IN_ADAPTERSETRENDERADAPTER;
+    // the one meaningful field is assigned below.
+    let mut in_args: iddcx::IDARG_IN_ADAPTERSETRENDERADAPTER = unsafe { core::mem::zeroed() };
+    in_args.PreferredRenderAdapter = wdk_sys::LUID {
+        LowPart: luid_low,
+        HighPart: luid_high,
+    };
+    dbglog!("[pf-vd] set_render_adapter -> {luid_high:08x}:{luid_low:08x}");
+    // SAFETY: `adapter` is the stashed IddCx adapter; `in_args` is valid local storage read synchronously.
+    unsafe { wdk_iddcx::IddCxAdapterSetRenderAdapter(adapter, &in_args) };
+    STATUS_SUCCESS
+}

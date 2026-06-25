@@ -33,6 +33,7 @@ pub unsafe extern "C" fn adapter_init_finished(
 ) -> NTSTATUS {
     dbglog!("[pf-vd] adapter_init_finished");
     crate::adapter::set_adapter(adapter);
+    crate::control::start_watchdog();
     STATUS_SUCCESS
 }
 
