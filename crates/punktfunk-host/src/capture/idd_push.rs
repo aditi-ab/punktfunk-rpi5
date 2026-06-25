@@ -136,6 +136,10 @@ pub struct IddPushCapturer {
     /// Throttle for the `advanced_color_enabled` poll (a CCD `QueryDisplayConfig`, ~ms — too costly per
     /// frame at 240 Hz).
     last_acm_poll: Instant,
+    /// Set when a display-descriptor change triggered a ring recreate (recovery, game-capture bug GB1);
+    /// cleared when a fresh frame resumes. If it stays set past the recovery window, `try_consume` drops
+    /// the session (recover-or-drop, no DDA).
+    recovering_since: Option<Instant>,
     /// Host-owned ROTATING output ring NVENC encodes (texture + RTV per slot). Rotating it per frame is
     /// the precondition for pipelining the encode loop: while NVENC encodes frame N's texture on the
     /// ASIC, frame N+1's convert/copy writes a DIFFERENT texture on the 3D engine — the two overlap. The
@@ -360,8 +364,22 @@ impl IddPushCapturer {
         preferred: Option<(u32, u32, u32)>,
         client_10bit: bool,
     ) -> Result<Self> {
-        let (w, h, _hz) = preferred
+        let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the shared ring")?;
+        // Size the ring to the display's ACTUAL current resolution if it differs from the negotiated mode:
+        // a fullscreen game can hold the virtual display at a different mode (esp. across a reconnect), so
+        // matching the actual mode lets the first frame flow instead of being dropped (game-capture bug
+        // GB1). Falls back to the negotiated mode when the CCD read is unavailable.
+        let (w, h) =
+            unsafe { crate::win_display::active_resolution(target.target_id) }.unwrap_or((pw, ph));
+        if (w, h) != (pw, ph) {
+            tracing::info!(
+                target_id = target.target_id,
+                negotiated = format!("{pw}x{ph}"),
+                actual = format!("{w}x{h}"),
+                "IDD push: sizing the ring to the display's actual mode (differs from negotiated)"
+            );
+        }
         // The driver composes the virtual display in FP16 (R16G16B16A16_FLOAT scRGB) when the display is
         // in advanced-color (HDR) mode, and 8-bit BGRA otherwise (per swap_chain_processor.rs + the
         // COMMIT_MODES2 colorspace/rgb_bpc log). The user can flip "Use HDR" in Windows at any time, so
@@ -496,6 +514,7 @@ impl IddPushCapturer {
                 client_10bit,
                 display_hdr,
                 last_acm_poll: Instant::now(),
+                recovering_since: None,
                 out_ring: Vec::new(),
                 out_idx: 0,
                 hdr_conv: None,
@@ -653,8 +672,10 @@ impl IddPushCapturer {
     /// generation so the driver re-attaches ([`is_stale`]) to the new-format textures; clears the
     /// header's `latest` so we don't consume a stale slot from the old ring; drops the conversion
     /// textures so they rebuild at the new format.
-    fn recreate_ring(&mut self, new_display_hdr: bool) -> Result<()> {
+    fn recreate_ring(&mut self, new_display_hdr: bool, new_w: u32, new_h: u32) -> Result<()> {
         self.display_hdr = new_display_hdr;
+        self.width = new_w;
+        self.height = new_h;
         let fmt = self.ring_format();
         let new_gen = IDD_GENERATION.fetch_add(1, Ordering::Relaxed);
         let new_slots = unsafe {
@@ -675,6 +696,8 @@ impl IddPushCapturer {
             (*(std::ptr::addr_of!((*self.header).latest) as *const AtomicU64))
                 .store(0, Ordering::Relaxed);
             (*self.header).dxgi_format = fmt.0 as u32;
+            (*self.header).width = new_w;
+            (*self.header).height = new_h;
             // Publish the new generation LAST (Release): when the driver observes it (Acquire) the new
             // textures already exist and the format is already updated.
             std::sync::atomic::fence(Ordering::Release);
@@ -699,16 +722,23 @@ impl IddPushCapturer {
         }
         self.last_acm_poll = Instant::now();
         let now_hdr = unsafe { crate::win_display::advanced_color_enabled(self.target_id) };
-        if now_hdr == self.display_hdr {
+        // Follow the display's ACTUAL resolution too — a fullscreen game can mode-set the virtual display
+        // out from under the negotiated size (game-capture bug GB1). Unknown read → keep our current size.
+        let (now_w, now_h) = unsafe { crate::win_display::active_resolution(self.target_id) }
+            .unwrap_or((self.width, self.height));
+        if now_hdr == self.display_hdr && now_w == self.width && now_h == self.height {
             return;
         }
         tracing::info!(
             target_id = self.target_id,
-            display_hdr = now_hdr,
-            client_10bit = self.client_10bit,
-            "IDD push: display HDR mode flipped — recreating the ring at the new format"
+            from = format!("{}x{} hdr={}", self.width, self.height, self.display_hdr),
+            to = format!("{now_w}x{now_h} hdr={now_hdr}"),
+            "IDD push: display descriptor changed — recreating the ring at the new mode"
         );
-        if let Err(e) = self.recreate_ring(now_hdr) {
+        // Start the recovery clock (if not already running): if a fresh frame doesn't resume within the
+        // window, try_consume drops the session rather than freeze.
+        self.recovering_since.get_or_insert_with(Instant::now);
+        if let Err(e) = self.recreate_ring(now_hdr, now_w, now_h) {
             tracing::warn!(error = %format!("{e:#}"), "IDD push: ring recreate failed");
         }
     }
@@ -765,6 +795,17 @@ impl IddPushCapturer {
         self.log_driver_status_once();
         // Follow the display: a "Use HDR" flip recreates the ring at the matching format.
         self.poll_display_hdr();
+        // Recover-or-drop (GB1): if a descriptor change triggered a recreate but no fresh frame has resumed
+        // within the window, the IDD-push path can't follow the display (e.g. an exclusive-flip) — drop the
+        // session cleanly (the loop's `?` ends it → the client reconnects) rather than freeze forever.
+        if let Some(since) = self.recovering_since {
+            if since.elapsed() > Duration::from_secs(3) {
+                bail!(
+                    "IDD-push: display descriptor changed and the ring could not recover within 3s — \
+                     dropping the session so the client reconnects"
+                );
+            }
+        }
         let latest = self.latest();
         // `latest` is the proto publish token `(generation << 40) | (seq << 8) | slot`. Reject any publish
         // whose generation isn't our CURRENT ring (a stale old-ring publish racing a recreate, or the 0
@@ -814,6 +855,7 @@ impl IddPushCapturer {
         self.out_idx = (i + 1) % self.out_ring.len();
         self.last_seq = seq;
         self.last_present = Some((out.clone(), pf));
+        self.recovering_since = None; // a fresh frame resumed → recovered
         Ok(Some(CapturedFrame {
             width: self.width,
             height: self.height,

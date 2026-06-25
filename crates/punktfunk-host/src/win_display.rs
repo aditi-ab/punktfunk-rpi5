@@ -23,7 +23,7 @@ use windows::Win32::Devices::Display::{
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_TEST, CDS_UPDATEREGISTRY, DEVMODEW,
     DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
-    ENUM_DISPLAY_SETTINGS_MODE,
+    ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
 
 use crate::vdisplay::Mode;
@@ -65,6 +65,27 @@ pub(crate) unsafe fn resolve_gdi_name(target_id: u32) -> Option<String> {
         }
     }
     None
+}
+
+/// The virtual display's CURRENT active resolution `(width, height)` via the GDI/CCD API, or `None` if the
+/// target isn't an active display yet / the query fails. The IDD-push capturer sizes its ring to this
+/// ACTUAL mode and polls it to recreate the ring when it changes — a fullscreen game can change the
+/// virtual display's mode out from under the session-negotiated one (game-capture bug GB1).
+///
+/// # Safety
+/// Calls the GDI/CCD APIs; safe to call from any thread.
+pub(crate) unsafe fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
+    let gdi = resolve_gdi_name(target_id)?;
+    let wname: Vec<u16> = gdi.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut dm = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let ok = EnumDisplaySettingsW(PCWSTR(wname.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool();
+    if !ok || dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0 {
+        return None;
+    }
+    Some((dm.dmPelsWidth, dm.dmPelsHeight))
 }
 
 /// Toggle the SudoVDA target's advanced-color (HDR) state via the CCD API. Disabling HDR while on the
