@@ -71,20 +71,46 @@ read it from `%ProgramData%\punktfunk\web-password`.
 | `install-pf-vdisplay.ps1` | Runs at install time (elevated): trust cert → gated device-node create (nefconc) → `pnputil` install. |
 | `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `bun` on the Nitro server (`:3000`). |
 | `../../scripts/windows/web-setup.ps1` | Install-time (elevated): write the ACL'd console password, register the `PunktfunkWeb` task + firewall rule, start it. |
-| `pf-vdisplay/` | **Vendored** signed pf-vdisplay driver: `pf_vdisplay.inf` / `pf_vdisplay.cat` / `pf_vdisplay.dll` / `punktfunk-driver.cer`. Built from `vdisplay-driver/`. |
-| `vdisplay-driver/` | The all-Rust IddCx **driver source** (`pf-vdisplay` crate + vendored `wdf-umdf*` bindings) + `deploy-dev.ps1` (build/sign/install for dev). |
+| `pf-vdisplay/` | **Vendored** signed pf-vdisplay driver: `pf_vdisplay.inf` / `pf_vdisplay.cat` / `pf_vdisplay.dll` / `punktfunk-driver.cer`. Built from `drivers/`. |
+| `drivers/` | The all-Rust IddCx **driver source** workspace: the `pf-vdisplay` crate on `wdk-sys` / windows-drivers-rs + the owned `pf-vdisplay-proto` ABI + `wdk-iddcx` / `wdk-probe`, plus `deploy-dev.ps1` (build/sign/install for dev). |
+| `reset-pf-vdisplay.ps1` | **Dev:** recover a wedged driver — stop host → reap ghost monitor nodes → reload the adapter → start host (no reboot). See *Dev iteration* below. |
+| `redeploy-pf-vdisplay.ps1` | **Dev:** one-shot redeploy — (optional) build → stop host → `deploy-dev.ps1 -Install` → reload adapter → start host. |
 | `nvenc/nvenc.def`, `nvenc/gen-nvenc-importlib.ps1` | Synthesise `nvencodeapi.lib` for the `--features nvenc` link (llvm-dlltool / lib.exe). |
 
 > **Vendored driver:** pf-vdisplay is our **all-Rust IddCx** virtual display (UMDF2), built from
-> `packaging/windows/vdisplay-driver/`. It replaced the vendored SudoVDA C++ driver — full story in
+> `packaging/windows/drivers/`. It replaced the vendored SudoVDA C++ driver — full story in
 > [`docs/windows-virtual-display-rust-port.md`](../../docs/windows-virtual-display-rust-port.md). The
 > **signed** output (`pf_vdisplay.dll`/`.inf`/`.cat` + `punktfunk-driver.cer`; signer
 > `punktfunk-ds-test` — the same cert the gamepad drivers ship, Class=Display, HWID `root\pf_vdisplay`)
 > is checked in under `pf-vdisplay/`. To refresh it after a driver-source change, rebuild + re-sign with
-> `vdisplay-driver/deploy-dev.ps1` and copy the staged `pf_vdisplay.{dll,inf,cat}` over the vendored
+> `drivers/deploy-dev.ps1` and copy the staged `pf_vdisplay.{dll,inf,cat}` over the vendored
 > copies. nefcon (the device-node tool — the install creates the node with it, **never** `devgen`, which
 > leaves persistent phantom devices) **is** fetched + SHA-256-verified from its pinned release in
 > `stage-pf-vdisplay.ps1`.
+
+## Dev iteration on the test box (driver)
+
+Two helpers wrap the painful manual steps of iterating on the pf-vdisplay driver against a live host
+service. Run **elevated**; both default to the `PunktfunkHost` service.
+
+```powershell
+# Recover a WEDGED driver. Symptom: every session fails with
+#   create virtual output: pf-vdisplay ADD ...: DeviceIoControl(0x222400): Element nicht gefunden (0x80070490)
+# i.e. ERROR_NOT_FOUND — sustained ADD/REMOVE churn exhausted the IddCx monitor slots (ghost
+# "Generic Monitor (punktfunk)" nodes pile up, target_ids climb). A host restart's CLEAR_ALL does NOT
+# fix it; the driver instance must be reloaded. This clears the ghosts + cycles the adapter (no reboot —
+# this box boots to Proxmox).
+powershell -ExecutionPolicy Bypass -File reset-pf-vdisplay.ps1 -Verify -Probe C:\t-goal1\debug\punktfunk-probe.exe
+
+# Redeploy a driver build cleanly (stop host → install with a strictly-increasing DriverVer → reload
+# adapter → start host). -Build runs `cargo build` first, but ONLY from an MSVC dev shell
+# (LIBCLANG_PATH + Version_Number=10.0.26100.0); otherwise build separately and omit -Build.
+powershell -ExecutionPolicy Bypass -File redeploy-pf-vdisplay.ps1 -Build -Verify -Probe C:\t-goal1\debug\punktfunk-probe.exe
+```
+
+The driver should reclaim monitor slots on REMOVE so churn can't wedge it; until it does, `reset` is
+the recovery. From a Linux box drive either over SSH, e.g.
+`ssh user@box 'powershell -ExecutionPolicy Bypass -File C:\...\reset-pf-vdisplay.ps1'`.
 
 ## Build locally (Windows, MSVC + Windows SDK + Inno Setup)
 
