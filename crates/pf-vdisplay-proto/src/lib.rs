@@ -119,13 +119,32 @@ pub mod control {
     }
 
     // Layout is load-bearing across the process boundary — pin it. (bytemuck's Pod derive already
-    // rejects any internal padding; these assert the externally-visible sizes too.)
+    // rejects any internal padding; these assert the externally-visible sizes too.) The `offset_of!`
+    // asserts additionally catch a SAME-SIZE field reorder, which the size+Pod checks alone miss.
     const _: () = {
-        assert!(core::mem::size_of::<AddRequest>() == 24);
-        assert!(core::mem::size_of::<AddReply>() == 16);
-        assert!(core::mem::size_of::<RemoveRequest>() == 8);
-        assert!(core::mem::size_of::<SetRenderAdapterRequest>() == 8);
-        assert!(core::mem::size_of::<InfoReply>() == 8);
+        use core::mem::{offset_of, size_of};
+
+        assert!(size_of::<AddRequest>() == 24);
+        assert!(offset_of!(AddRequest, session_id) == 0);
+        assert!(offset_of!(AddRequest, width) == 8);
+        assert!(offset_of!(AddRequest, height) == 12);
+        assert!(offset_of!(AddRequest, refresh_hz) == 16);
+
+        assert!(size_of::<AddReply>() == 16);
+        assert!(offset_of!(AddReply, adapter_luid_low) == 0);
+        assert!(offset_of!(AddReply, adapter_luid_high) == 4);
+        assert!(offset_of!(AddReply, target_id) == 8);
+
+        assert!(size_of::<RemoveRequest>() == 8);
+        assert!(offset_of!(RemoveRequest, session_id) == 0);
+
+        assert!(size_of::<SetRenderAdapterRequest>() == 8);
+        assert!(offset_of!(SetRenderAdapterRequest, luid_low) == 0);
+        assert!(offset_of!(SetRenderAdapterRequest, luid_high) == 4);
+
+        assert!(size_of::<InfoReply>() == 8);
+        assert!(offset_of!(InfoReply, protocol_version) == 0);
+        assert!(offset_of!(InfoReply, watchdog_timeout_s) == 4);
     };
 }
 
@@ -228,8 +247,138 @@ pub mod frame {
         alloc::format!("Global\\pfvd-tex-{target_id}-{generation}-{slot}")
     }
 
+    // Size + per-field offsets are load-bearing: both sides access these via raw atomic views over the
+    // mapping, so a same-size field reorder would silently corrupt. Pin every offset. The `_pad` after
+    // `dxgi_format` is what 8-aligns the `u64 latest` at offset 32 — assert that too.
     const _: () = {
-        assert!(core::mem::size_of::<SharedHeader>() == 64);
+        use core::mem::{offset_of, size_of};
+
+        assert!(size_of::<SharedHeader>() == 64);
+        assert!(offset_of!(SharedHeader, magic) == 0);
+        assert!(offset_of!(SharedHeader, version) == 4);
+        assert!(offset_of!(SharedHeader, generation) == 8);
+        assert!(offset_of!(SharedHeader, ring_len) == 12);
+        assert!(offset_of!(SharedHeader, width) == 16);
+        assert!(offset_of!(SharedHeader, height) == 20);
+        assert!(offset_of!(SharedHeader, dxgi_format) == 24);
+        assert!(offset_of!(SharedHeader, _pad) == 28);
+        assert!(offset_of!(SharedHeader, latest) == 32);
+        assert!(offset_of!(SharedHeader, qpc_pts) == 40);
+        assert!(offset_of!(SharedHeader, driver_render_luid_low) == 48);
+        assert!(offset_of!(SharedHeader, driver_render_luid_high) == 52);
+        assert!(offset_of!(SharedHeader, driver_status) == 56);
+        assert!(offset_of!(SharedHeader, driver_status_detail) == 60);
+    };
+}
+
+/// Gamepad shared-memory layouts (host ↔ the UMDF gamepad drivers `pf_xusb` / `pf_dualsense`).
+///
+/// These were hand-duplicated as `OFF_*`/`SHM_*` constants in `inject/{gamepad,dualsense}_windows.rs`
+/// and (as bare literals — `*view.add(140)`) in the standalone `xusb-driver`/`dualsense-driver`
+/// workspaces, guarded only by "must match" comments — the top ABI-drift hazard the audit flagged
+/// (`docs/windows-host-rewrite-audit.md` §6.1). Owning them here with `Pod` derives + `offset_of!`
+/// asserts makes a one-sided edit a compile error.
+///
+/// The host creates the section (privileged, permissive DACL so the restricted WUDFHost token can
+/// open it) and the driver maps it. Layout only; the section itself is host-created shared memory.
+pub mod gamepad {
+    use alloc::string::String;
+    use bytemuck::{Pod, Zeroable};
+
+    /// XUSB section magic — the exact u32 the shipped host + `pf_xusb` driver compare (loosely "PFXU").
+    pub const XUSB_MAGIC: u32 = 0x5558_4650;
+    /// Pad section magic — the exact u32 the shipped host + `pf_dualsense` driver compare (loosely
+    /// "PFDS"). (Note: the two magics happen to use opposite byte-order mnemonics in the legacy code;
+    /// only the u32 value is the contract.)
+    pub const PAD_MAGIC: u32 = 0x5046_4453;
+
+    /// `device_type` selector the `pf_dualsense` driver reads to pick its HID identity. The section is
+    /// zeroed, so `0` = DualSense is the default; one driver serves either identity.
+    pub const DEVTYPE_DUALSENSE: u8 = 0;
+    /// `device_type` = DualShock 4 (`VID_054C&PID_09CC` HID identity).
+    pub const DEVTYPE_DUALSHOCK4: u8 = 1;
+
+    /// `Global\pfxusb-shm-<index>` — the virtual Xbox 360 (XInput) shared section.
+    pub fn xusb_shm_name(index: u8) -> String {
+        alloc::format!("Global\\pfxusb-shm-{index}")
+    }
+    /// `Global\pfds-shm-<index>` — the virtual DualSense / DualShock 4 shared section.
+    pub fn pad_shm_name(index: u8) -> String {
+        alloc::format!("Global\\pfds-shm-{index}")
+    }
+
+    /// Virtual Xbox 360 (XInput) shared section (64 B). The host writes the XInput state (a bumped
+    /// `packet` number + buttons/triggers/sticks in XInput conventions); the driver answers
+    /// `XInputGetState`. The driver writes force-feedback (`XInputSetState`) into `rumble_*`, bumping
+    /// `rumble_seq`, which the host relays to the client.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug)]
+    pub struct XusbShm {
+        pub magic: u32,
+        /// XInput `dwPacketNumber` — bumped by the host on every state change.
+        pub packet: u32,
+        pub buttons: u16,
+        pub left_trigger: u8,
+        pub right_trigger: u8,
+        pub thumb_lx: i16,
+        pub thumb_ly: i16,
+        pub thumb_rx: i16,
+        pub thumb_ry: i16,
+        pub _reserved0: u32,
+        /// Bumped by the driver on a new force-feedback packet.
+        pub rumble_seq: u32,
+        pub rumble_large: u8,
+        pub rumble_small: u8,
+        pub _reserved1: [u8; 34],
+    }
+
+    /// Virtual DualSense / DualShock 4 shared section (256 B). The host writes the `0x01`-style HID
+    /// input report into `input`; the driver feeds it to game `READ_REPORT`s and publishes a game's
+    /// `0x02` output (rumble / lightbar / player-LEDs / adaptive triggers) into `output`, bumping
+    /// `out_seq`. `device_type` selects the HID identity ([`DEVTYPE_DUALSENSE`] / [`DEVTYPE_DUALSHOCK4`]).
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug)]
+    pub struct PadShm {
+        pub magic: u32,
+        pub _reserved0: u32,
+        /// Input report region (host-written; the codec's report is <= 64 B — see
+        /// `inject::dualsense_proto::DS_INPUT_REPORT_LEN`). The region spans `magic`+pad .. `out_seq`.
+        pub input: [u8; 64],
+        /// Bumped by the driver when it publishes a new `output` report.
+        pub out_seq: u32,
+        /// Output report region (driver-written): rumble / lightbar / player-LEDs / adaptive triggers.
+        pub output: [u8; 64],
+        /// HID identity selector — see [`DEVTYPE_DUALSENSE`] / [`DEVTYPE_DUALSHOCK4`].
+        pub device_type: u8,
+        pub _reserved1: [u8; 115],
+    }
+
+    // Offsets are the wire contract the shipped drivers already read by hand — pin every one. A failing
+    // assert here means the struct no longer matches the historical `OFF_*` layout (host) / `view.add(N)`
+    // literal (driver) and must be fixed before either side switches to the type.
+    const _: () = {
+        use core::mem::{offset_of, size_of};
+
+        assert!(size_of::<XusbShm>() == 64);
+        assert!(offset_of!(XusbShm, magic) == 0);
+        assert!(offset_of!(XusbShm, packet) == 4);
+        assert!(offset_of!(XusbShm, buttons) == 8);
+        assert!(offset_of!(XusbShm, left_trigger) == 10);
+        assert!(offset_of!(XusbShm, right_trigger) == 11);
+        assert!(offset_of!(XusbShm, thumb_lx) == 12);
+        assert!(offset_of!(XusbShm, thumb_ly) == 14);
+        assert!(offset_of!(XusbShm, thumb_rx) == 16);
+        assert!(offset_of!(XusbShm, thumb_ry) == 18);
+        assert!(offset_of!(XusbShm, rumble_seq) == 24);
+        assert!(offset_of!(XusbShm, rumble_large) == 28);
+        assert!(offset_of!(XusbShm, rumble_small) == 29);
+
+        assert!(size_of::<PadShm>() == 256);
+        assert!(offset_of!(PadShm, magic) == 0);
+        assert!(offset_of!(PadShm, input) == 8);
+        assert!(offset_of!(PadShm, out_seq) == 72);
+        assert!(offset_of!(PadShm, output) == 76);
+        assert!(offset_of!(PadShm, device_type) == 140);
     };
 }
 
@@ -299,6 +448,15 @@ mod tests {
         assert_eq!(frame::header_name(10), "Global\\pfvd-hdr-10");
         assert_eq!(frame::event_name(10), "Global\\pfvd-evt-10");
         assert_eq!(frame::texture_name(10, 3, 5), "Global\\pfvd-tex-10-3-5");
+    }
+
+    #[test]
+    fn gamepad_names_and_magics_are_stable() {
+        assert_eq!(gamepad::xusb_shm_name(0), "Global\\pfxusb-shm-0");
+        assert_eq!(gamepad::pad_shm_name(2), "Global\\pfds-shm-2");
+        // Lock the exact u32 magics the shipped host/drivers use (inject/{gamepad,dualsense}_windows.rs).
+        assert_eq!(gamepad::XUSB_MAGIC, 0x5558_4650);
+        assert_eq!(gamepad::PAD_MAGIC, 0x5046_4453);
     }
 
     #[test]

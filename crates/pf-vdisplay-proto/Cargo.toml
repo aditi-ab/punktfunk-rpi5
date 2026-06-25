@@ -16,4 +16,5 @@ description = "Shared host<->driver binary contract for the punktfunk pf-vdispla
 publish = false
 
 [dependencies]
-bytemuck = { version = "1.19", features = ["derive"] }
+# `min_const_generics`: Pod/Zeroable for `[u8; N]` of any N (the gamepad SHM reserved tails are >32).
+bytemuck = { version = "1.19", features = ["derive", "min_const_generics"] }
