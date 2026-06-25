@@ -36,7 +36,11 @@ use std::sync::OnceLock;
 /// derived `Debug` impl, so the parser can stay a single platform-neutral function.
 #[derive(Debug, Clone, Default)]
 pub struct HostConfig {
-    /// `PUNKTFUNK_IDD_PUSH` — use the IDD direct-push capturer (in-process Session-0 capture; no WGC helper).
+    /// `PUNKTFUNK_IDD_PUSH` — capture from the pf-vdisplay driver's shared ring (in-process Session-0
+    /// capture; no WGC helper). **Value-aware** (`0`/`false`/`no`/`off`/empty ⇒ off, else on); unset ⇒ off.
+    /// The installer's default `host.env` sets it on, so a fresh install runs the validated IDD-push path
+    /// (it falls back to DDA if the driver can't attach — see [`crate::capture`]). NOT a bare presence flag
+    /// (so an operator can turn it OFF in `host.env` with `=0`, which a `var_os` presence check can't).
     pub idd_push: bool,
     /// `PUNKTFUNK_ENCODER` — explicit encoder-backend override (lowercased; empty = auto-detect by GPU vendor).
     pub encoder_pref: String,
@@ -80,7 +84,16 @@ impl HostConfig {
         // String value: `var(k).ok()` — `Some` (possibly empty) when set with valid UTF-8, else `None`.
         let val = |k: &str| std::env::var(k).ok();
         Self {
-            idd_push: flag("PUNKTFUNK_IDD_PUSH"),
+            // Value-aware (not a bare presence flag): the shipped default `host.env` turns it ON, and an
+            // operator turns it OFF with `PUNKTFUNK_IDD_PUSH=0` (a `var_os` presence check would read `=0`
+            // as "on"). Unset ⇒ off (the dev / non-pf-driver default).
+            idd_push: match std::env::var("PUNKTFUNK_IDD_PUSH") {
+                Ok(v) => !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "no" | "off"
+                ),
+                Err(_) => false,
+            },
             encoder_pref: std::env::var("PUNKTFUNK_ENCODER")
                 .unwrap_or_default()
                 .to_ascii_lowercase(),
