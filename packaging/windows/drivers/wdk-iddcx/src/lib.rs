@@ -10,6 +10,8 @@
 //! code — handled at the call site in STEP 5).
 #![no_std]
 #![allow(non_snake_case, clippy::missing_safety_doc)]
+// P0 lint (audit §8): require explicit `unsafe {}` blocks inside `unsafe fn`s.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub use wdk_sys::iddcx;
 
