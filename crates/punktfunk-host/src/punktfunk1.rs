@@ -2715,6 +2715,9 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
                 target.clone(),
                 Some((w, h, hz)),
                 Box::new(()),
+                // The relay's host encoder is GPU (NVENC/AMF/QSV unless software) — pass `gpu` in (Goal-1
+                // stage 5) so the DDA capturer doesn't re-derive it.
+                crate::capture::gpu_encode(),
                 hdr,
             )
             .context("open DDA for secure desktop")?;
@@ -3140,8 +3143,9 @@ fn build_pipeline(
     // VIDEO_CAP_10BIT + host opted in via PUNKTFUNK_10BIT) is our HDR path → BT.2020 PQ Rgb10a2;
     // otherwise the FP16 IDD frames are converted to 8-bit SDR. (Ignored by non-IDD-push backends,
     // which auto-detect HDR from the monitor state.)
-    let mut capturer = crate::capture::capture_virtual_output(vout, plan.hdr, plan.capture)
-        .context("capture virtual output")?;
+    let mut capturer =
+        crate::capture::capture_virtual_output(vout, plan.output_format(), plan.capture)
+            .context("capture virtual output")?;
     capturer.set_active(true);
     let frame = capturer.next_frame().context("first frame")?;
     // `bit_depth` is the handshake-negotiated value (8, or 10 = HEVC Main10 when the client

@@ -78,7 +78,7 @@ pub fn run(opts: Options) -> Result<()> {
                 .context("create virtual output")?;
             capture::capture_virtual_output(
                 vout,
-                false,
+                capture::OutputFormat::resolve(false),
                 crate::session_plan::CaptureBackend::resolve(),
             )
             .context("capture virtual output")?

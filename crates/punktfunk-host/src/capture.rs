@@ -44,6 +44,49 @@ impl PixelFormat {
     }
 }
 
+/// What a Windows capturer should produce, resolved **once** per session and passed **into**
+/// [`capture_virtual_output`] (Goal-1 stage 5, plan §2.3/§5). Passing the format in is what lets a
+/// capturer stop re-deriving the encode backend itself — it kills the
+/// `capture/dxgi.rs → encode::windows_resolved_backend()` back-reference (the highest-severity coupling:
+/// capture and encode could otherwise disagree on whether frames are GPU-resident). Neutral type; the
+/// Linux portal capturer ignores it (it negotiates its own format with PipeWire).
+#[derive(Clone, Copy, Debug)]
+pub struct OutputFormat {
+    /// Produce GPU-resident D3D11 frames (zero-copy for a GPU encoder — NVENC/AMF/QSV) rather than CPU
+    /// staging. `false` **only** for the GPU-less software encoder.
+    pub gpu: bool,
+    /// HDR: the capturer converts to 10-bit (IDD-push FP16 → `Rgb10a2`; the DDA secure-desktop HDR hint).
+    /// `false` = 8-bit SDR.
+    pub hdr: bool,
+}
+
+impl OutputFormat {
+    /// Resolve the output format for an entry point that doesn't build a full [`SessionPlan`]
+    /// (`crate::session_plan`) — the GameStream + spike paths: `gpu` from the resolved encode backend,
+    /// `hdr` as given. The native punktfunk/1 path uses `SessionPlan::output_format()` instead (it already
+    /// resolved the encoder), so neither path makes a capturer re-derive it.
+    pub fn resolve(hdr: bool) -> Self {
+        OutputFormat {
+            gpu: gpu_encode(),
+            hdr,
+        }
+    }
+}
+
+/// True if the resolved encode backend produces GPU frames (anything but the software encoder). The single
+/// source for [`OutputFormat::resolve`]'s `gpu`; on Linux always true (the portal/VAAPI/CUDA path is GPU).
+#[cfg(target_os = "windows")]
+pub(crate) fn gpu_encode() -> bool {
+    !matches!(
+        crate::encode::windows_resolved_backend(),
+        crate::encode::WindowsBackend::Software
+    )
+}
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn gpu_encode() -> bool {
+    true
+}
+
 /// A captured frame. [`format`](Self::format)/dimensions describe the pixels regardless of
 /// where they live — [`payload`](Self::payload) is either a CPU buffer (the spike/fallback path)
 /// or a GPU buffer already on the device (the zero-copy path, plan §9).
@@ -314,11 +357,12 @@ pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
 #[cfg(target_os = "linux")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
-    _want_hdr: bool,
+    _want: OutputFormat,
     _capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
-    // The Linux host stays 8-bit (HDR is blocked upstream), so `want_hdr` is unused here; the capture
-    // backend is always the portal (the `CaptureBackend` arg is a Windows-only dispatch — ignored here).
+    // The Linux host stays 8-bit (HDR is blocked upstream) and the portal negotiates its own format, so
+    // the `OutputFormat` is unused here; the capture backend is always the portal (the `CaptureBackend`
+    // arg is a Windows-only dispatch — ignored here).
     linux::PortalCapturer::from_virtual_output(vout).map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
@@ -335,7 +379,7 @@ pub(crate) fn wgc_disabled() -> bool {
 #[cfg(target_os = "windows")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
-    want_hdr: bool,
+    want: OutputFormat,
     capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
     use crate::session_plan::CaptureBackend;
@@ -359,14 +403,14 @@ pub fn capture_virtual_output(
         // If IDD-push can't open OR the driver doesn't attach to the ring within a few seconds (e.g. a
         // hybrid-GPU render mismatch), fall back to DDA so the session is NEVER left black (audit §5.1).
         // `open()` hands the keepalive back on failure so DDA can take ownership of the virtual display.
-        match idd_push::IddPushCapturer::open(target.clone(), pref, want_hdr, keep) {
+        match idd_push::IddPushCapturer::open(target.clone(), pref, want.hdr, keep) {
             Ok(c) => return Ok(Box::new(c) as Box<dyn Capturer>),
             Err((e, keep)) => {
                 tracing::warn!(
                     error = %format!("{e:#}"),
                     "IDD-push open/attach failed — falling back to DDA"
                 );
-                return dxgi::DuplCapturer::open(target, pref, keep, false)
+                return dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false)
                     .map(|c| Box::new(c) as Box<dyn Capturer>);
             }
         }
@@ -378,7 +422,7 @@ pub fn capture_virtual_output(
     // chosen backend (it owns the SudoVDA keepalive), so there's no open-time auto-fallback. The
     // backend choice (`dda`/`dxgi`/`PUNKTFUNK_NO_WGC` → DDA, else WGC) is now resolved once in the plan.
     if capture == CaptureBackend::Dda {
-        return dxgi::DuplCapturer::open(target, pref, keep, false)
+        return dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false)
             .map(|c| Box::new(c) as Box<dyn Capturer>);
     }
     // WGC default, with a watchdog'd DDA fallback. WGC's Direct3D11CaptureFramePool::CreateFreeThreaded
@@ -408,12 +452,12 @@ pub fn capture_virtual_output(
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %format!("{e:#}"), "WGC open failed — falling back to DDA");
-            dxgi::DuplCapturer::open(target, pref, keep, false)
+            dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false)
                 .map(|c| Box::new(c) as Box<dyn Capturer>)
         }
         Err(_) => {
             tracing::warn!("WGC open timed out (CreateFreeThreaded hang on the virtual display) — falling back to DDA");
-            dxgi::DuplCapturer::open(target, pref, keep, false)
+            dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false)
                 .map(|c| Box::new(c) as Box<dyn Capturer>)
         }
     }
@@ -422,7 +466,7 @@ pub fn capture_virtual_output(
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn capture_virtual_output(
     _vout: crate::vdisplay::VirtualOutput,
-    _want_hdr: bool,
+    _want: OutputFormat,
     _capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("virtual-output capture requires Linux or Windows")

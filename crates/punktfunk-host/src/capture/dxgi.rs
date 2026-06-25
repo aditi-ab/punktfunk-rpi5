@@ -2046,6 +2046,9 @@ impl DuplCapturer {
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
         keepalive: Box<dyn Send>,
+        // Whether the (already-resolved) encode backend wants GPU-resident frames — passed IN (Goal-1
+        // stage 5) so the capturer never re-derives the encode backend itself.
+        gpu: bool,
         want_hdr: bool,
     ) -> Result<Self> {
         unsafe {
@@ -2213,14 +2216,13 @@ impl DuplCapturer {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or((2000 / refresh_hz.max(1)).max(100));
-            // Produce GPU-resident D3D11 frames (zero-copy NVENC, or the NV12/P010 the AMF/QSV
-            // backends read back / import) whenever the resolved encode backend is a GPU one — so the
-            // capturer's output format matches the encoder's input. Only the software (GPU-less) path
-            // takes CPU staging. Mirrors `encode::open_video`'s dispatch exactly.
-            let gpu_mode = !matches!(
-                crate::encode::windows_resolved_backend(),
-                crate::encode::WindowsBackend::Software
-            );
+            // Produce GPU-resident D3D11 frames (zero-copy NVENC, or the NV12/P010 the AMF/QSV backends
+            // read back / import) whenever the encode backend is a GPU one — so the capturer's output
+            // format matches the encoder's input. Only the software (GPU-less) path takes CPU staging.
+            // The decision is resolved ONCE per session and passed in (Goal-1 stage 5), instead of this
+            // capturer re-calling `encode::windows_resolved_backend()` — the back-reference that let
+            // capture and encode disagree (plan §2.3/§5).
+            let gpu_mode = gpu;
             // Read the source display's HDR mastering metadata while we still hold `output` (it is
             // moved into the struct below). Only meaningful for an HDR (FP16) duplication.
             let is_hdr_init = dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;

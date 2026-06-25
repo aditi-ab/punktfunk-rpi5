@@ -86,6 +86,14 @@ pub enum EncoderBackend {
     Software,
 }
 
+impl EncoderBackend {
+    /// True if this backend encodes on the GPU (so the capturer should produce GPU-resident frames). Only
+    /// the software encoder takes CPU staging; `PlatformAuto` (Linux NVENC/VAAPI) is always GPU.
+    pub fn is_gpu(self) -> bool {
+        !matches!(self, EncoderBackend::Software)
+    }
+}
+
 /// The per-session decision, resolved once. `Copy` so it threads through the capture/encode chain
 /// without ceremony (stage 4 folds it, with the rest of the arg soup, into a `SessionContext`).
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +117,16 @@ impl SessionPlan {
             encoder: resolve_encoder(),
             bit_depth,
             hdr: bit_depth >= 10,
+        }
+    }
+
+    /// The capturer's target output format (Goal-1 stage 5): `gpu` from the already-resolved `encoder`
+    /// (no second backend probe), `hdr` from the plan. Handed into `capture::capture_virtual_output` so the
+    /// capturer never re-derives the encode backend.
+    pub fn output_format(&self) -> crate::capture::OutputFormat {
+        crate::capture::OutputFormat {
+            gpu: self.encoder.is_gpu(),
+            hdr: self.hdr,
         }
     }
 }

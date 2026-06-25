@@ -136,7 +136,7 @@ fn run(
         // from a GameStream HDR flag once StreamConfig carries one.
         let mut capturer = capture::capture_virtual_output(
             vout,
-            false,
+            capture::OutputFormat::resolve(false),
             crate::session_plan::CaptureBackend::resolve(),
         )
         .context("capture virtual output")?;
