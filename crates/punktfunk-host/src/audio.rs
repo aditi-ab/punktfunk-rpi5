@@ -88,6 +88,8 @@ pub fn open_virtual_mic(_channels: u32) -> Result<Box<dyn VirtualMic>> {
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "windows")]
+#[path = "audio/windows/wasapi_cap.rs"]
 mod wasapi_cap;
 #[cfg(target_os = "windows")]
+#[path = "audio/windows/wasapi_mic.rs"]
 mod wasapi_mic;

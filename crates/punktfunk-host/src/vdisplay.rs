@@ -623,17 +623,25 @@ pub fn start_restore_worker() -> std::sync::Arc<()> {
     std::sync::Arc::new(())
 }
 
+// Goal-1 stage 6: per-compositor Linux backends under `vdisplay/linux/`, the Windows IddCx/SudoVDA
+// backends under `vdisplay/windows/`; `#[path]` keeps the `crate::vdisplay::*` module names flat.
 #[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/gamescope.rs"]
 mod gamescope;
 #[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/kwin.rs"]
 mod kwin;
 #[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/mutter.rs"]
 mod mutter;
 #[cfg(target_os = "windows")]
+#[path = "vdisplay/windows/pf_vdisplay.rs"]
 pub(crate) mod pf_vdisplay;
 #[cfg(target_os = "windows")]
+#[path = "vdisplay/windows/sudovda.rs"]
 pub(crate) mod sudovda;
 #[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/wlroots.rs"]
 mod wlroots;
 
 #[cfg(test)]

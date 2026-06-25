@@ -18,9 +18,13 @@ mod audio;
 mod capture;
 mod config;
 mod discovery;
+// Goal-1 stage 6: top-level platform-only modules live under `src/linux/` and `src/windows/`; `#[path]`
+// keeps the `crate::*` module names flat (every existing path is unchanged).
 #[cfg(target_os = "linux")]
+#[path = "linux/dmabuf_fence.rs"]
 mod dmabuf_fence;
 #[cfg(target_os = "linux")]
+#[path = "linux/drm_sync.rs"]
 mod drm_sync;
 mod encode;
 mod gamestream;
@@ -34,18 +38,23 @@ mod pipeline;
 mod punktfunk1;
 mod pwinit;
 #[cfg(target_os = "windows")]
+#[path = "windows/service.rs"]
 mod service;
 mod session_plan;
 mod session_tuning;
 mod spike;
 mod vdisplay;
 #[cfg(target_os = "windows")]
+#[path = "windows/wgc_helper.rs"]
 mod wgc_helper;
 #[cfg(target_os = "windows")]
+#[path = "windows/win_adapter.rs"]
 mod win_adapter;
 #[cfg(target_os = "windows")]
+#[path = "windows/win_display.rs"]
 mod win_display;
 #[cfg(target_os = "linux")]
+#[path = "linux/zerocopy/mod.rs"]
 mod zerocopy;
 
 use anyhow::{bail, Context, Result};

@@ -531,15 +531,21 @@ pub fn windows_codec_support() -> CodecSupport {
     })
 }
 
+// Goal-1 stage 6: GPU/CPU encoders confined to `encode/windows/` (NVENC, AMF/QSV ffmpeg, software) and
+// `encode/linux/` (NVENC/CUDA + VAAPI); `#[path]` keeps the `crate::encode::*` module names flat.
 #[cfg(all(target_os = "windows", feature = "amf-qsv"))]
+#[path = "encode/windows/ffmpeg_win.rs"]
 mod ffmpeg_win;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(target_os = "windows", feature = "nvenc"))]
+#[path = "encode/windows/nvenc.rs"]
 mod nvenc;
 #[cfg(target_os = "windows")]
+#[path = "encode/windows/sw.rs"]
 mod sw;
 #[cfg(target_os = "linux")]
+#[path = "encode/linux/vaapi.rs"]
 mod vaapi;
 
 #[cfg(test)]

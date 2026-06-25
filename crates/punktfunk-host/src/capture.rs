@@ -472,17 +472,25 @@ pub fn capture_virtual_output(
     anyhow::bail!("virtual-output capture requires Linux or Windows")
 }
 
+// Goal-1 stage 6: the Windows backends live under `capture/windows/`, the Linux one under `capture/linux/`
+// (`#[path]` keeps the module names flat, so every `crate::capture::*` path is unchanged).
 #[cfg(target_os = "windows")]
+#[path = "capture/windows/composed_flip.rs"]
 pub mod composed_flip;
 #[cfg(target_os = "windows")]
+#[path = "capture/windows/desktop_watch.rs"]
 pub mod desktop_watch;
 #[cfg(target_os = "windows")]
+#[path = "capture/windows/dxgi.rs"]
 pub mod dxgi;
 #[cfg(target_os = "windows")]
+#[path = "capture/windows/idd_push.rs"]
 pub mod idd_push;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "windows")]
+#[path = "capture/windows/wgc.rs"]
 pub mod wgc;
 #[cfg(target_os = "windows")]
+#[path = "capture/windows/wgc_relay.rs"]
 pub mod wgc_relay;

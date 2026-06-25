@@ -425,29 +425,39 @@ fn gs_button_to_evdev(b: u32) -> Option<u32> {
     })
 }
 
+// Goal-1 stage 6: Linux UHID/uinput/libei/wlr backends under `inject/linux/`, the Windows UMDF/SendInput
+// backends under `inject/windows/`, and the transport-independent HID codecs under `inject/proto/`;
+// `#[path]` keeps every `crate::inject::*` module name flat.
 #[cfg(target_os = "linux")]
+#[path = "inject/linux/dualsense.rs"]
 pub mod dualsense;
 /// Transport-independent DualSense HID contract, shared by the Linux UHID backend ([`dualsense`])
 /// and the Windows UMDF-driver backend ([`dualsense_windows`]).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "inject/proto/dualsense_proto.rs"]
 pub mod dualsense_proto;
 /// Windows: virtual DualSense via the UMDF minidriver + a shared-memory host channel.
 #[cfg(target_os = "windows")]
+#[path = "inject/windows/dualsense_windows.rs"]
 pub mod dualsense_windows;
 #[cfg(target_os = "linux")]
+#[path = "inject/linux/dualshock4.rs"]
 pub mod dualshock4;
 /// Transport-independent DualShock 4 HID codec used by the Windows UMDF-driver backend
 /// ([`dualshock4_windows`]). (The Linux backend still carries its own copy — see the module FIXME.)
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "inject/proto/dualshock4_proto.rs"]
 pub mod dualshock4_proto;
 /// Windows: virtual DualShock 4 via the same UMDF minidriver + shared-memory channel (device-type 1).
 #[cfg(target_os = "windows")]
+#[path = "inject/windows/dualshock4_windows.rs"]
 pub mod dualshock4_windows;
 #[cfg(target_os = "linux")]
+#[path = "inject/linux/gamepad.rs"]
 pub mod gamepad;
 /// Windows: virtual Xbox 360 pads via the in-tree XUSB companion UMDF driver (classic XInput).
 #[cfg(target_os = "windows")]
-#[path = "inject/gamepad_windows.rs"]
+#[path = "inject/windows/gamepad_windows.rs"]
 pub mod gamepad;
 /// Stub — virtual gamepads need Linux uinput or the Windows UMDF drivers; events are dropped elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -463,10 +473,13 @@ pub mod gamepad {
     }
 }
 #[cfg(target_os = "linux")]
+#[path = "inject/linux/libei.rs"]
 mod libei;
 #[cfg(target_os = "windows")]
+#[path = "inject/windows/sendinput.rs"]
 mod sendinput;
 #[cfg(target_os = "linux")]
+#[path = "inject/linux/wlr.rs"]
 mod wlr;
 
 #[cfg(test)]
