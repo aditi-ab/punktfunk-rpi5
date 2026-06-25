@@ -957,21 +957,21 @@ async fn serve_session(
                 Punktfunk1Source::Virtual => {
                     let compositor = compositor
                         .expect("the Virtual source resolves a compositor during the handshake");
-                    virtual_stream(
+                    virtual_stream(SessionContext {
                         session,
                         mode,
                         seconds,
-                        stop_stream,
-                        &reconfig_rx,
-                        &keyframe_rx,
+                        stop: stop_stream,
+                        reconfig: reconfig_rx,
+                        keyframe: keyframe_rx,
                         compositor,
                         bitrate_kbps,
                         bit_depth,
                         probe_rx,
                         probe_result_tx,
-                        fec_target_dp,
-                        conn_stream,
-                    )
+                        fec_target: fec_target_dp,
+                        conn: conn_stream,
+                    })
                 }
             }
         })
@@ -2165,22 +2165,40 @@ static IDD_SESSION_STOP: std::sync::Mutex<Option<Arc<AtomicBool>>> = std::sync::
 #[cfg(target_os = "windows")]
 static IDD_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[allow(clippy::too_many_arguments)]
-fn virtual_stream(
+/// All per-session inputs for [`virtual_stream`] / [`virtual_stream_relay`], bundled so the session entry
+/// is one moved value instead of a 13-positional-argument `#[allow(too_many_arguments)]` signature
+/// (Goal-1 stage 4, plan §2.4). Everything is **owned** — the receivers move in (`virtual_stream` is their
+/// only consumer) — so the whole context moves into the stream thread and the borrow plumbing disappears.
+struct SessionContext {
+    /// The hardened data-plane `Session` (Leopard FEC + AES-GCM over UDP); moved into the send thread.
     session: Session,
+    /// The client's requested mode — the virtual output is created at exactly this WxH@Hz (no scaling).
     mode: punktfunk_core::Mode,
+    /// Stream duration cap (the persistent listener bounds back-to-back sessions).
     seconds: u32,
+    /// Session stop flag (set on disconnect / reconnect-preempt).
     stop: Arc<AtomicBool>,
-    reconfig: &std::sync::mpsc::Receiver<punktfunk_core::Mode>,
-    keyframe: &std::sync::mpsc::Receiver<()>,
+    /// Accepted mid-stream mode switches — the pipeline is rebuilt at the new mode.
+    reconfig: std::sync::mpsc::Receiver<punktfunk_core::Mode>,
+    /// Client decode-recovery keyframe requests.
+    keyframe: std::sync::mpsc::Receiver<()>,
+    /// The resolved compositor backend (moot on Windows — `vdisplay::open` ignores it there).
     compositor: crate::vdisplay::Compositor,
+    /// Negotiated encoder bitrate (kbps).
     bitrate_kbps: u32,
+    /// Negotiated encode bit depth (8, or 10 = HEVC Main10).
     bit_depth: u8,
+    /// Speed-test burst requests (see [`service_probes`]).
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
+    /// Speed-test results back to the control task.
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
+    /// Adaptive-FEC target the control task updates from the client's loss reports.
     fec_target: Arc<AtomicU8>,
+    /// The QUIC control connection (carries host→client 0xCE source-HDR metadata mid-stream).
     conn: quinn::Connection,
-) -> Result<()> {
+}
+
+fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // This thread runs the capture+encode loop (single-process: Linux / synthetic / NO_WGC DDA) — or
     // tail-calls the relay below. Elevate it so a CPU-heavy game can't deschedule our GPU submission.
     boost_thread_priority(true);
@@ -2188,7 +2206,7 @@ fn virtual_stream(
     // path now reads this typed `SessionPlan` instead of re-deriving from config at each dispatch site
     // (the latent "capture and encode disagree on the backend" hazard, plan §2.4). `bit_depth` is the
     // only per-session input — capture/topology/encoder are otherwise pure functions of `HostConfig`.
-    let plan = crate::session_plan::SessionPlan::resolve(bit_depth);
+    let plan = crate::session_plan::SessionPlan::resolve(ctx.bit_depth);
     tracing::info!(?plan, "resolved session plan");
     // Windows two-process secure-desktop path: when the host runs as SYSTEM (required for the secure
     // desktop + SendInput), WGC can't activate in-process, so we capture the normal desktop via a
@@ -2196,22 +2214,25 @@ fn virtual_stream(
     // user, and stays the path on Linux.) See docs/windows-secure-desktop.md.
     #[cfg(target_os = "windows")]
     if plan.topology == crate::session_plan::SessionTopology::TwoProcessRelay {
-        return virtual_stream_relay(
-            session,
-            mode,
-            seconds,
-            stop,
-            reconfig,
-            keyframe,
-            compositor,
-            bitrate_kbps,
-            bit_depth,
-            probe_rx,
-            probe_result_tx,
-            fec_target,
-            conn,
-        );
+        return virtual_stream_relay(ctx);
     }
+    // Single-process path: unpack the context into the locals the loop below uses (names unchanged, so the
+    // body is byte-for-byte the same; the receivers are now owned but `try_recv()` is identical).
+    let SessionContext {
+        session,
+        mode,
+        seconds,
+        stop,
+        reconfig,
+        keyframe,
+        compositor,
+        bitrate_kbps,
+        bit_depth,
+        probe_rx,
+        probe_result_tx,
+        fec_target,
+        conn,
+    } = ctx;
     tracing::info!(
         compositor = compositor.id(),
         ?mode,
@@ -2587,27 +2608,29 @@ fn virtual_stream(
 /// helper at the new mode (and drops the stale-target DDA); keyframe requests forward to the active
 /// source.
 #[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn virtual_stream_relay(
-    session: Session,
-    mode: punktfunk_core::Mode,
-    seconds: u32,
-    stop: Arc<AtomicBool>,
-    reconfig: &std::sync::mpsc::Receiver<punktfunk_core::Mode>,
-    keyframe: &std::sync::mpsc::Receiver<()>,
-    compositor: crate::vdisplay::Compositor,
-    bitrate_kbps: u32,
-    bit_depth: u8,
-    probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
-    probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
-    fec_target: Arc<AtomicU8>,
-    // The SYSTEM-host relay path doesn't yet send the source mastering metadata as 0xCE — the
-    // helper's in-band SEI carries it (Windows follow-up). Held for that future wiring.
-    _conn: quinn::Connection,
-) -> Result<()> {
+fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
     use crate::capture::dxgi::WinCaptureTarget;
     use crate::capture::wgc_relay::HelperRelay;
     use crate::capture::Capturer; // trait methods (set_active/next_frame) on the concrete DuplCapturer
+
+    // Unpack the context (names unchanged so the body is identical). The relay doesn't yet send the
+    // source's 0xCE HDR metadata — the helper's in-band SEI carries it (a Windows follow-up) — so `conn`
+    // is held unused.
+    let SessionContext {
+        session,
+        mode,
+        seconds,
+        stop,
+        reconfig,
+        keyframe,
+        compositor,
+        bitrate_kbps,
+        bit_depth,
+        probe_rx,
+        probe_result_tx,
+        fec_target,
+        conn: _conn,
+    } = ctx;
     tracing::info!(
         ?mode,
         bitrate_kbps,
