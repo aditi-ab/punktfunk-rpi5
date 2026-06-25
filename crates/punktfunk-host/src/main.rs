@@ -41,6 +41,8 @@ mod vdisplay;
 mod wgc_helper;
 #[cfg(target_os = "windows")]
 mod win_adapter;
+#[cfg(target_os = "windows")]
+mod win_display;
 #[cfg(target_os = "linux")]
 mod zerocopy;
 

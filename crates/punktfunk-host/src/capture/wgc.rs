@@ -196,7 +196,7 @@ impl WgcCapturer {
             // The SudoVDA output appears a beat after the display is created — settle-retry like DDA.
             let deadline = Instant::now() + Duration::from_millis(2000);
             let (adapter, output) = loop {
-                if let Some(n) = crate::vdisplay::sudovda::resolve_gdi_name(target.target_id) {
+                if let Some(n) = crate::win_display::resolve_gdi_name(target.target_id) {
                     if let Ok(found) = find_output(&n) {
                         break found;
                     }

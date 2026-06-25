@@ -2712,7 +2712,7 @@ impl DuplCapturer {
         }
         // The SudoVDA output's GDI name can CHANGE across a secure-desktop topology rebuild —
         // re-resolve from the STABLE target id so we find it under its current name.
-        if let Some(n) = crate::vdisplay::sudovda::resolve_gdi_name(self.target_id) {
+        if let Some(n) = crate::win_display::resolve_gdi_name(self.target_id) {
             self.gdi_name = n;
         }
         // Re-sync the capture thread to the CURRENT input desktop on EVERY rebuild — symmetric for

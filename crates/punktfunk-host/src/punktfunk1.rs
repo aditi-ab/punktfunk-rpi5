@@ -2661,7 +2661,7 @@ fn virtual_stream_relay(
         #[cfg(target_os = "windows")]
         if bit_depth >= 10 {
             unsafe {
-                if crate::vdisplay::sudovda::set_advanced_color(target.target_id, true) {
+                if crate::win_display::set_advanced_color(target.target_id, true) {
                     // Let the colorspace change settle before WGC creates its capture item / detects HDR.
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
@@ -2884,7 +2884,7 @@ fn virtual_stream_relay(
                 // open DDA in HDR (FP16 DuplicateOutput1 → BT.2020 PQ Main10); the normal-desktop DDA
                 // overlay/flip issues that drove us to WGC don't apply to the composed Winlogon UI.
                 let hdr =
-                    unsafe { crate::vdisplay::sudovda::advanced_color_enabled(target.target_id) };
+                    unsafe { crate::win_display::advanced_color_enabled(target.target_id) };
                 dda = None; // reopen to capture the secure desktop
                 match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz, hdr) {
                     Ok(mut p) => {

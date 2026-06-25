@@ -40,11 +40,11 @@ use super::{Mode, VirtualDisplay, VirtualOutput};
 // Backend-NEUTRAL CCD/DXGI helpers reused from the SudoVDA backend (a pf-vdisplay monitor's target_id
 // is a real OS target id, so these operate identically). The shared MON_GEN/CURRENT_MON_GEN generation
 // counter is reused too, so the IDD-push stale-ring bail works regardless of which backend is active.
-use super::sudovda::{
-    isolate_displays_ccd, resolve_gdi_name, restore_displays_ccd, set_active_mode, SavedConfig,
-    CURRENT_MON_GEN, MON_GEN,
-};
+use super::sudovda::{CURRENT_MON_GEN, MON_GEN};
 use crate::win_adapter::resolve_render_adapter_luid;
+use crate::win_display::{
+    isolate_displays_ccd, resolve_gdi_name, restore_displays_ccd, set_active_mode, SavedConfig,
+};
 
 // pf-vdisplay device-interface GUID (pf_vdisplay_proto::PF_VDISPLAY_INTERFACE_GUID_U128). Deliberately
 // NOT SudoVDA's `{e5bcc234-…}` — we own this driver, so a private interface GUID signals it and avoids

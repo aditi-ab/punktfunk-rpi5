@@ -376,13 +376,13 @@ impl IddPushCapturer {
             // settled within 250 ms and would size the ring SDR while the driver composes FP16 → a format
             // mismatch → an immediate ring recreate + dropped first frames (audit §5.4).
             let enabled_hdr =
-                client_10bit && crate::vdisplay::sudovda::set_advanced_color(target.target_id, true);
+                client_10bit && crate::win_display::set_advanced_color(target.target_id, true);
             if enabled_hdr {
                 // Let the colorspace change settle before the driver composes + we size the ring.
                 std::thread::sleep(Duration::from_millis(250));
             }
             let display_hdr =
-                enabled_hdr || crate::vdisplay::sudovda::advanced_color_enabled(target.target_id);
+                enabled_hdr || crate::win_display::advanced_color_enabled(target.target_id);
             let ring_fmt = if display_hdr {
                 DXGI_FORMAT_R16G16B16A16_FLOAT
             } else {
@@ -688,7 +688,7 @@ impl IddPushCapturer {
             return;
         }
         self.last_acm_poll = Instant::now();
-        let now_hdr = unsafe { crate::vdisplay::sudovda::advanced_color_enabled(self.target_id) };
+        let now_hdr = unsafe { crate::win_display::advanced_color_enabled(self.target_id) };
         if now_hdr == self.display_hdr {
             return;
         }
