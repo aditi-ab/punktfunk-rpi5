@@ -8,6 +8,8 @@
 //! does *not* accept — we expand it to `rgb0` (one padding byte/pixel, no colour math).
 //! The encoder is opened *without* a global header so VPS/SPS/PPS are emitted in-band on
 //! every IDR — the output is both a playable raw Annex-B stream and self-contained AUs.
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{Codec, EncodedFrame, Encoder};
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
@@ -79,6 +81,12 @@ impl CudaHw {
 
 impl Drop for CudaHw {
     fn drop(&mut self) {
+        // SAFETY: `frames_ref`/`device_ref` are the two non-null `AVBufferRef`s `CudaHw::new` created
+        // (it bails before returning `Self` if either alloc fails, so a live `CudaHw` always holds
+        // both). `av_buffer_unref` drops one reference and nulls the pointer through the `&mut`. This
+        // `Drop` runs exactly once and `CudaHw` owns these refs exclusively → no double-free /
+        // use-after-free. Frames are unref'd before the device (the frames ctx internally refs the
+        // device; refcounted, so the order is sound regardless).
         unsafe {
             ffi::av_buffer_unref(&mut self.frames_ref);
             ffi::av_buffer_unref(&mut self.device_ref);
@@ -136,6 +144,13 @@ pub struct NvencEncoder {
 
 // `CudaHw` holds raw `AVBufferRef`s; the encoder lives on a single thread. The CPU encoder is
 // already `Send` via ffmpeg-next; assert it for the CUDA fields too.
+// SAFETY: `NvencEncoder` owns an ffmpeg-next `Encoder`/`VideoFrame` (already `Send`) plus a `CudaHw`
+// holding raw `AVBufferRef`s, which are not `Send` by default. The encoder is owned and driven by
+// exactly ONE thread — the per-session encode thread it is moved to — and is only touched through
+// `&mut self` methods, so it is never aliased or accessed concurrently. The wrapped libav contexts
+// (and the shared `CUcontext` the `CudaHw` references) have no thread affinity, so transferring
+// ownership across threads is sound. This asserts `Send` (transfer) only, extending ffmpeg-next's
+// existing `Send` to the raw CUDA fields; `Sync` (shared `&`) is deliberately NOT implemented.
 unsafe impl Send for NvencEncoder {}
 
 impl NvencEncoder {
@@ -162,6 +177,9 @@ impl NvencEncoder {
         }
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {
+            // SAFETY: `av_log_set_level` sets libav's global integer log level; `48` (= AV_LOG_DEBUG)
+            // is a valid level with no pointer args, and libav was just initialized by `ffmpeg::init()`
+            // above — always sound.
             unsafe { ffi::av_log_set_level(48) }; // AV_LOG_DEBUG — surface NVENC hw-frame rejects
         }
         let name = codec.nvenc_name();
@@ -195,6 +213,11 @@ impl NvencEncoder {
             .unwrap_or(1.0);
         let vbv_bits = ((bitrate_bps as f64 / fps.max(1) as f64) * vbv_frames as f64)
             .clamp(1.0, i32::MAX as f64);
+        // SAFETY: `video` is the ffmpeg-next encoder builder wrapping a freshly-allocated
+        // `AVCodecContext` that we hold by value and have not opened yet; `video.as_mut_ptr()` returns
+        // that non-null, properly-aligned, exclusively-owned context. Writing the plain `rc_buffer_size`
+        // int field before `open_with` is the supported way to set a field ffmpeg-next exposes no
+        // setter for. Sole owner → no aliasing; synchronous in-bounds scalar write.
         unsafe {
             (*video.as_mut_ptr()).rc_buffer_size = vbv_bits as i32;
         }
@@ -204,6 +227,9 @@ impl NvencEncoder {
         // "freeze". NVENC emits one IDR at stream start, then P-frames only; `forced-idr` (below)
         // turns a client recovery request (RFI, via `request_keyframe`) into an IDR on demand.
         // This is the Moonlight/Sunshine low-latency model.
+        // SAFETY: same `video` builder as above — a non-null, properly-aligned, sole-owned, not-yet-
+        // opened `AVCodecContext`. We write the plain `gop_size` int field (= -1, infinite GOP) before
+        // `open_with`, which ffmpeg-next has no setter for. No aliasing; synchronous scalar write.
         unsafe {
             (*video.as_mut_ptr()).gop_size = -1;
         }
@@ -214,6 +240,10 @@ impl NvencEncoder {
         // RGB-input paths leave these unset (NVENC's internal CSC writes its own VUI). Matches the
         // Windows NV12 path's BT.709 limited-range signalling.
         if matches!(format, PixelFormat::Nv12) {
+            // SAFETY: same `video` builder — `raw = video.as_mut_ptr()` is the non-null, properly-
+            // aligned, sole-owned, not-yet-opened `AVCodecContext`. We set its four VUI colour enum
+            // fields to valid `AVColorSpace`/`AVColorRange`/`AVColorPrimaries`/`AVColorTransfer-
+            // Characteristic` variants before `open_with`. Sole owner → no aliasing; synchronous writes.
             unsafe {
                 let raw = video.as_mut_ptr();
                 (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
@@ -228,7 +258,17 @@ impl NvencEncoder {
         // *before* open (NVENC derives the device from `hw_frames_ctx`).
         let cuda_hw = if cuda {
             let cu_ctx = crate::zerocopy::cuda::context().context("shared CUDA context")?;
+            // SAFETY: `CudaHw::new` (an `unsafe fn`) requires libav initialized (the `ffmpeg::init()`
+            // above ran) and a valid `CUcontext`; `cu_ctx` is the shared importer context from
+            // `zerocopy::cuda::context()?`, non-null on the `Ok` path. `nvenc_pixel` is a valid `Pixel`
+            // and `width`/`height` are the validated positive dims. It returns a RAII `CudaHw` wrapping
+            // (not owning) `cu_ctx` and owning two `AVBufferRef`s freed on drop.
             let hw = unsafe { CudaHw::new(cu_ctx, nvenc_pixel, width, height)? };
+            // SAFETY: `raw = video.as_mut_ptr()` is the non-null, sole-owned, not-yet-opened
+            // `AVCodecContext`. We set `pix_fmt = CUDA` and attach NEW refs (`av_buffer_ref`) of
+            // `hw.device_ref`/`hw.frames_ref` — both non-null (`CudaHw::new` guarantees) and from the
+            // live `hw`, which is moved into `NvencEncoder.cuda` next to `enc` and so outlives the
+            // encoder. The context owns its own refs (freed when the context closes). No aliasing.
             unsafe {
                 let raw = video.as_mut_ptr();
                 (*raw).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
@@ -428,6 +468,19 @@ impl NvencEncoder {
         // The device→device copy below uses our shared context directly; make it current on the
         // encode thread (ffmpeg pushes its own around the pool alloc, so order is fine).
         crate::zerocopy::cuda::make_current().context("CUDA context current (encode thread)")?;
+        // SAFETY: `frames_ref` is the non-null CUDA frames ctx from `self.cuda` (unwrapped via
+        // `.context(..)?` above), and the shared CUDA context was just made current on THIS thread
+        // (`make_current()?`), the precondition for the device-pointer copies below.
+        //  * `av_frame_alloc` → `f` (null-checked). `av_hwframe_get_buffer(frames_ref, f, 0)` fills `f`
+        //    with a pooled CUDA surface (sets `data[]`/`linesize[]`/`buf[0]`/`hw_frames_ctx`); on
+        //    failure we free `f` and bail.
+        //  * For NV12 we read `(*f).data[0..2]` / `linesize[0..2]` (Y + interleaved UV), else
+        //    `data[0]`/`linesize[0]` — in-struct fields of the non-null `f`, valid for the surface dims
+        //    ffmpeg allocated — and pass them to the cuda copy helpers, which device→device copy `buf`
+        //    (the imported `DeviceBuffer`, owned by the caller and live for this call) into the surface.
+        //  * On copy error we free `f` and return. Otherwise we write `pts`/`pict_type` through `f` and
+        //    `avcodec_send_frame` it into the live owned `self.enc` context (which takes its own ref of
+        //    the pooled surface), then free our `f` ref exactly once. Single-threaded encoder → no race.
         unsafe {
             let mut f = ffi::av_frame_alloc();
             if f.is_null() {

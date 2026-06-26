@@ -16,6 +16,9 @@
 //! a stream's life). Falls back cleanly: any init/import error disables the importer and the
 //! CPU mmap path takes over.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use super::cuda::{self, DeviceBuffer};
 use anyhow::{anyhow, bail, Context as _, Result};
 use ash::vk;
@@ -51,12 +54,27 @@ pub struct VkBridge {
     dst: Option<DstBuf>,
 }
 
-// Confined to the capture thread; moved there once.
+// SAFETY: `VkBridge` owns ash Vulkan handles (instance/device/queue/command pool+buffer/fence), a
+// CUDA external-memory mapping, and an fd→buffer cache — none `Sync`, and a single queue +
+// command buffer must be externally synchronized. It is created inside `EglImporter::import_linear`
+// on the dedicated `punktfunk-pipewire` capture thread and every method (`import_linear`, `Drop`)
+// runs on that thread; it is never shared via `&` across threads. `Send` asserts only that
+// transferring ownership is sound (so the bridge can live inside the `Send` `EglImporter`); the live
+// handles are never touched off-thread, and `Sync` is deliberately NOT implied.
 unsafe impl Send for VkBridge {}
 
 impl VkBridge {
     /// Bring up Vulkan on the NVIDIA GPU with the external-memory extensions.
     pub fn new() -> Result<VkBridge> {
+        // SAFETY: standard ash bring-up — every call is `unsafe` only because ash cannot statically
+        // verify Vulkan handle/CreateInfo validity. `ash::Entry::load` dlopens a real system
+        // libvulkan. Each `*CreateInfo`/`AllocateInfo` is built by ash's builders from locals (`app`,
+        // `exts`, `prio`, `qci`, and the inline infos) that all live for the duration of the
+        // synchronous `create_*`/`enumerate_*` call that reads them — in particular the
+        // `enabled_extension_names(&exts)` and `queue_priorities(&prio)` borrows outlive their calls.
+        // Every handle passed (`instance`, `phys`, `device`, `qf`, `cmd_pool`) was just created and
+        // checked via `?`/`ok_or_else` in this same function, so no invalid handle is ever used. This
+        // constructor shares nothing across threads.
         unsafe {
             let entry = ash::Entry::load().context("load libvulkan")?;
             let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
@@ -294,6 +312,19 @@ impl VkBridge {
         height: u32,
         pool: &cuda::BufferPool,
     ) -> Result<DeviceBuffer> {
+        // SAFETY: `fd` is the live dmabuf fd handed in by the caller (borrowed; `import_src` dup's it
+        // internally and Vulkan owns the dup). `libc::lseek` only queries the fd's size. The unsafe
+        // `import_src`/`ensure_dst` are called with a valid fd and a checked size. The bounds are
+        // proven: `import_src` asserts `size >= span` (so the cached `src_size >= span`),
+        // `copy_size = src_size.min(span)`, and `ensure_dst(copy_size)` makes `dst` at least
+        // `copy_size` — so the GPU `cmd_copy_buffer` of `copy_size` bytes reads/writes within both
+        // buffers, and the later CUDA pitched copy reading `[offset, span)` from `dst.cuda.ptr` (=
+        // `offset + stride*height = span <= copy_size`) stays inside the freshly-copied region. The
+        // `*Info`/`region`/`cmds`/`submit` are locals that outlive the synchronous calls reading them.
+        // `cmd`/`queue`/`fence` are this bridge's own handles, used on this single thread only. The
+        // host-side `wait_for_fences` fully retires the Vulkan copy BEFORE CUDA reads the shared
+        // memory, so there is no GPU write/read data race. `dst` is an `&self.dst` shared borrow that
+        // does not alias the `&self.device` calls.
         unsafe {
             let span = offset as u64 + stride as u64 * height as u64;
             if !self.src_cache.contains_key(&fd) {
@@ -347,6 +378,15 @@ impl VkBridge {
 
 impl Drop for VkBridge {
     fn drop(&mut self) {
+        // SAFETY: runs once when the bridge is dropped on its owning capture thread.
+        // `device_wait_idle` first drains all in-flight GPU work, so no queued command still
+        // references these objects. Every handle freed (the `src_cache` buffers+memories, the `dst`
+        // buffer+memory, `fence`, `cmd_pool`, `device`, `instance`) was created by this `VkBridge`
+        // and owned exclusively by it, so each `destroy_*`/`free_*` runs exactly once with no
+        // double-free, in dependency order (child objects before `device`, `device` before
+        // `instance`). `dst.cuda` is dropped after `free_memory`, which is safe because CUDA holds
+        // its own dup'd OPAQUE_FD reference to the underlying allocation. No other thread touches
+        // these handles.
         unsafe {
             let _ = self.device.device_wait_idle();
             for (_, s) in self.src_cache.drain() {

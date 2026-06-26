@@ -5,6 +5,9 @@
 //! keymap, and translate events into virtual pointer/keyboard requests, tracking modifier state
 //! so the compositor resolves shifted keysyms correctly.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use super::{gs_button_to_evdev, vk_to_evdev, InputEvent, InputInjector};
 use anyhow::{bail, Context, Result};
 use punktfunk_core::input::InputKind;
@@ -264,10 +267,17 @@ impl InputInjector for WlrootsInjector {
 /// Create an anonymous in-memory file holding `s` + a trailing NUL (for the keymap fd).
 fn memfd_with(s: &str) -> Result<std::fs::File> {
     let name = b"punktfunk-keymap\0";
+    // SAFETY: `name` is a byte-string literal with an explicit trailing NUL, so `name.as_ptr()` is a
+    // valid NUL-terminated C string; `memfd_create` only reads that name (copying it) and creates an
+    // anonymous file, returning a fresh fd (or -1). `MFD_CLOEXEC` is a valid flag. The 'static literal
+    // outlives the synchronous call and nothing aliases it. The result is checked `< 0` below.
     let fd = unsafe { libc::memfd_create(name.as_ptr() as *const libc::c_char, libc::MFD_CLOEXEC) };
     if fd < 0 {
         bail!("memfd_create failed: {}", std::io::Error::last_os_error());
     }
+    // SAFETY: `fd` is the fresh memfd `memfd_create` just returned and checked `>= 0`; it is a unique
+    // open fd nothing else owns, so `File` takes sole ownership and closes it exactly once on drop —
+    // no alias, no double-close.
     let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
     f.write_all(s.as_bytes()).context("write keymap")?;
     f.write_all(&[0]).context("write keymap NUL")?;

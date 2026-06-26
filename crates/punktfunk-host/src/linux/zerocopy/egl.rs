@@ -12,6 +12,8 @@
 //! owned [`DeviceBuffer`] so the dmabuf can be returned to the compositor immediately.
 
 #![allow(non_upper_case_globals)]
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::cuda::{self, DeviceBuffer};
 use anyhow::{bail, ensure, Context as _, Result};
@@ -415,6 +417,14 @@ impl Nv12Blit {
 
 impl Drop for Nv12Blit {
     fn drop(&mut self) {
+        // SAFETY: these GL names (textures/FBOs/VAO/programs) were all created by THIS `Nv12Blit`
+        // in `Nv12Blit::new` on the current GL context, which is still current because the owning
+        // `EglImporter` is dropped on its single capture thread (fields drop before
+        // `EglImporter::drop`, which never releases the context). `glDelete*` takes a count + a
+        // pointer to that many names: `&self.y_tex`/`&self.vao` are `&u32` to one live field (n=1);
+        // `[self.y_fbo, self.uv_fbo].as_ptr()` points at a 2-element temporary that lives for the
+        // whole `glDeleteFramebuffers` call (n=2 matches). The symbols dispatch through libGL
+        // (libglvnd) to the driver for the current context. Each name is deleted exactly once.
         unsafe {
             glDeleteTextures(1, &self.y_tex);
             glDeleteTextures(1, &self.uv_tex);
@@ -459,7 +469,14 @@ pub struct EglImporter {
     render_fd: c_int,
 }
 
-// The EGL handles are confined to the capture thread; the struct is moved there once.
+// SAFETY: `EglImporter` owns thread-affine handles — an EGLDisplay/contexts made current on one
+// thread, a loaded GL proc pointer, a `gbm_device*`, a raw fd, and CUDA-registered GL textures —
+// none safe to touch concurrently. It is constructed inside `pipewire_thread` on the dedicated
+// `punktfunk-pipewire` thread, and every method (`import*`, `supported_modifiers`, `Drop`) runs on
+// that same thread; it is never accessed through a shared `&` from another thread. `Send` asserts
+// only that transferring *ownership* is sound (needed so the importer can live in the PipeWire
+// stream's user-data, whose API imposes a `Send` bound) — the live handles are never used
+// off-thread. `Sync` is deliberately NOT implied.
 unsafe impl Send for EglImporter {}
 
 impl EglImporter {
@@ -470,16 +487,38 @@ impl EglImporter {
         // to the same DRM device CUDA-GL interop associates with, which the EGL device platform
         // did not (cuGraphicsGLRegisterImage rejected device-platform GL textures).
         let path = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
+        // SAFETY: `path` is a live local `CString` (built from a string with no interior NUL, so it
+        // is NUL-terminated); `path.as_ptr()` is a valid pointer to that buffer which outlives this
+        // synchronous `open`. `open` only reads the path and returns a new fd (or -1); it neither
+        // retains the pointer nor writes through it, so there is no aliasing or lifetime hazard.
         let render_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         ensure!(render_fd >= 0, "open /dev/dri/renderD128 for GBM");
+        // SAFETY: `render_fd` is the live DRM render-node fd just returned by `open` and checked
+        // `>= 0`. `gbm_create_device` (libgbm, linked above) builds a `gbm_device` over that fd and
+        // returns a `*mut gbm_device` (or null); it borrows but does not take ownership of the fd,
+        // which `EglImporter` keeps open and closes only in `Drop` after `gbm_device_destroy`. No
+        // Rust-owned memory is passed, so there is nothing to alias.
         let gbm = unsafe { gbm_create_device(render_fd) };
         if gbm.is_null() {
+            // SAFETY: reached only when `gbm_create_device` failed (null) — the fd was not consumed
+            // and no `EglImporter` exists yet to close it again, so this `close` runs exactly once on
+            // the live `render_fd`, releasing it before the error return. No double-close.
             unsafe { libc::close(render_fd) };
             anyhow::bail!("gbm_create_device failed");
         }
 
+        // SAFETY: `Egl::load_required` dlopens the system libEGL and binds its entry points,
+        // trusting that libEGL (libglvnd) is a genuine EGL 1.5 implementation whose core symbols
+        // match the ABI the `khronos_egl` `EGL1_5` bindings declare. No Rust memory is passed; the
+        // returned instance is afterwards used only through the safe `khronos_egl` wrappers.
         let egl: Egl =
             unsafe { Egl::load_required() }.context("load libEGL (EGL 1.5 dynamic instance)")?;
+        // SAFETY: `gbm` is the non-null `gbm_device*` created just above (checked), and
+        // `EGL_PLATFORM_GBM_KHR` is exactly the platform enum that pairs with a GBM device as the
+        // native-display handle, so the `gbm as NativeDisplayType` cast hands EGL a valid native
+        // display for the requested platform. `&[egl::ATTRIB_NONE]` is a properly terminated, empty
+        // attribute array borrowed for this synchronous call; EGL only reads it and returns an
+        // `EGLDisplay`, retaining no pointer into Rust memory.
         let display = unsafe {
             egl.get_platform_display(
                 EGL_PLATFORM_GBM_KHR,
@@ -533,6 +572,13 @@ impl EglImporter {
             .context("eglCreateContext(OpenGL)")?;
         egl.make_current(display, None, None, Some(gl_ctx))
             .context("eglMakeCurrent surfaceless (needs EGL_KHR_surfaceless_context)")?;
+        // SAFETY: the GL context was made current on this thread just above, which `eglGetProcAddress`
+        // requires to return a usable pointer. The non-null (`?`-checked) pointer it returns for
+        // "glEGLImageTargetTexture2DOES" is the driver's implementation of that GL-OES entry point,
+        // whose real ABI is `void(GLenum, GLeglImageOES)` = `(u32, *mut c_void)` `extern "system"`.
+        // `EglImageTargetFn` is declared with exactly that signature, so the transmute only retypes a
+        // same-size, same-ABI thin function pointer (no value/representation change). The function is
+        // present because `EGL_EXT_image_dma_buf_import` was asserted on this display above.
         let egl_image_target: EglImageTargetFn = unsafe {
             std::mem::transmute(
                 egl.get_proc_address("glEGLImageTargetTexture2DOES")
@@ -543,6 +589,10 @@ impl EglImporter {
         // Create the shared CUDA context up front so import() is pure hot path.
         cuda::context().context("create CUDA context")?;
 
+        // SAFETY: `egl::NO_CONTEXT` is EGL's defined sentinel (a null handle) for "no context";
+        // `Context::from_ptr` only stores the handle (it never dereferences it), so wrapping the
+        // null sentinel is sound and yields exactly the `EGL_NO_CONTEXT` value that
+        // `eglCreateImage(EGL_LINUX_DMA_BUF_EXT)` requires as its context argument later.
         let no_ctx = unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) };
         tracing::info!(
             "zero-copy EGL importer ready (GBM platform + GL texture interop, dma_buf_import + modifiers)"
@@ -602,8 +652,21 @@ impl EglImporter {
         let Some(sym) = self.egl.get_proc_address("eglQueryDmaBufModifiersEXT") else {
             return Vec::new();
         };
+        // SAFETY: `sym` is the non-null pointer `eglGetProcAddress("eglQueryDmaBufModifiersEXT")`
+        // returned (the `let-else` already bailed on `None`) — the driver's implementation of that
+        // EGL extension entry point. `QueryFn` is declared with that function's exact documented ABI
+        // (`EGLDisplay, EGLint, EGLint, EGLuint64* , EGLBoolean*, EGLint* -> EGLBoolean`), all
+        // `extern "system"`, so the transmute only retypes a same-size, same-ABI thin fn pointer.
         let query: QueryFn = unsafe { std::mem::transmute(sym) };
         let dpy = self.display.as_ptr();
+        // SAFETY: `dpy` is this importer's live, initialized `EGLDisplay`; `query` is the proc loaded
+        // just above. The first call passes null out-arrays with `max_modifiers == 0`, which the
+        // extension defines as "write only the count" — it writes solely through `&mut count` (a live
+        // local `i32`). For the second call, `mods`/`ext` are freshly allocated `Vec`s of exactly
+        // `count` elements and `max_modifiers == count`, so the driver writes at most `count`
+        // `u64`/`u32` entries (in bounds) plus the actual count through `&mut n` (a live local). All
+        // four Rust addresses outlive these synchronous calls and alias nothing else. `truncate` only
+        // shrinks, so even a misbehaving `n > count` cannot read out of bounds.
         unsafe {
             let mut count: i32 = 0;
             if query(
@@ -699,6 +762,10 @@ impl EglImporter {
             ]);
         }
         attrs.push(egl::ATTRIB_NONE);
+        // SAFETY: `eglCreateImage(EGL_LINUX_DMA_BUF_EXT, ...)` mandates a NULL `EGLClientBuffer`
+        // (the source is described entirely by the attribute list built above), so wrapping
+        // `null_mut()` is the required value. `from_ptr` only stores the pointer without
+        // dereferencing it, so constructing it from null is sound.
         let client = unsafe { egl::ClientBuffer::from_ptr(std::ptr::null_mut()) };
         let image = self
             .egl
@@ -733,11 +800,21 @@ impl EglImporter {
     ) -> Result<DeviceBuffer> {
         cuda::make_current()?;
         if self.blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
+            // SAFETY: `GlBlit::new` requires the GL context current on the calling thread and a
+            // current CUDA context. Both hold: this runs on the capture thread where
+            // `EglImporter::new` made the GL context current and never released it, and
+            // `cuda::make_current()?` ran at the top of this function. `width`/`height` are plain
+            // `Copy` frame dimensions.
             self.blit = Some(unsafe { GlBlit::new(width, height)? });
         }
         let egl_image_target = self.egl_image_target;
         let blit = self.blit.as_mut().unwrap();
-        // SAFETY: GL + CUDA contexts current on this thread; `image` is a valid EGLImage.
+        // SAFETY: `GlBlit::run` requires a current GL context and a valid `EGLImage`. The GL context
+        // is current on this capture thread (made current in `EglImporter::new`, never released) and
+        // `cuda::make_current()` ran above; `egl_image_target` is the `glEGLImageTargetTexture2DOES`
+        // pointer loaded in `new`; `image` is the raw handle of the live `EGLImage` that
+        // `import_inner` created with `eglCreateImage` and destroys only AFTER this call returns, so
+        // it stays valid for the whole synchronous `run`.
         unsafe { blit.run(egl_image_target, image)? };
         // Persistent registration (mapped per frame) + a pooled buffer — no per-frame
         // cuGraphicsGLRegisterImage / cuMemAllocPitch.
@@ -757,11 +834,21 @@ impl EglImporter {
     ) -> Result<DeviceBuffer> {
         cuda::make_current()?;
         if self.nv12_blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
+            // SAFETY: `Nv12Blit::new` requires the GL context current on the calling thread and a
+            // current CUDA context. Both hold: this runs on the capture thread where
+            // `EglImporter::new` made the GL context current and never released it, and
+            // `cuda::make_current()?` ran at the top of this function. `width`/`height` are plain
+            // `Copy` frame dimensions.
             self.nv12_blit = Some(unsafe { Nv12Blit::new(width, height)? });
         }
         let egl_image_target = self.egl_image_target;
         let blit = self.nv12_blit.as_mut().unwrap();
-        // SAFETY: GL + CUDA contexts current on this thread; `image` is a valid EGLImage.
+        // SAFETY: `Nv12Blit::run` requires a current GL context and a valid `EGLImage`. The GL
+        // context is current on this capture thread (made current in `EglImporter::new`, never
+        // released) and `cuda::make_current()` ran above; `egl_image_target` is the
+        // `glEGLImageTargetTexture2DOES` pointer loaded in `new`; `image` is the raw handle of the
+        // live `EGLImage` that `import_inner` created with `eglCreateImage` and destroys only AFTER
+        // this call returns, so it stays valid for the whole synchronous `run`.
         unsafe { blit.run(egl_image_target, image)? };
         let dst = blit.pool.get()?;
         cuda::copy_mapped_nv12(&mut blit.y_registered, &mut blit.uv_registered, &dst)?;
@@ -787,9 +874,22 @@ impl EglImporter {
         );
         cuda::make_current()?;
         if self.nv12_blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
+            // SAFETY: `Nv12Blit::new` requires the GL context current on the calling thread and a
+            // current CUDA context. Both hold: this self-test path runs on the thread that owns this
+            // `EglImporter` with its GL context current, and `cuda::make_current()?` ran just above.
+            // `width`/`height` are plain `Copy` scalars.
             self.nv12_blit = Some(unsafe { Nv12Blit::new(width, height)? });
         }
         let blit = self.nv12_blit.as_mut().unwrap();
+        // SAFETY: runs on the thread that owns this `EglImporter` with its GL context current.
+        // `blit.src_tex` is a texture this `Nv12Blit` owns; `glTexStorage2D` allocates immutable
+        // RGBA8 storage exactly once (guarded by `test_src_storage`) sized `width×height`.
+        // `glTexSubImage2D` then uploads exactly `width×height` RGBA8 texels, reading `width*height*4`
+        // bytes from `rgba.as_ptr()`; the caller already asserted `rgba.len() == width*height*4`, rows
+        // are `width*4` bytes (a multiple of the default 4-byte unpack alignment, so no row-padding
+        // over-read), and `rgba` is a live borrow that outlives this synchronous upload. `run_passes`
+        // then needs only the current GL context (no further Rust pointers). All GL names are this
+        // blit's own, alias no other live object, and nothing is retained past the calls.
         unsafe {
             // Upload the host RGBA into `src_tex` (an immutable GL_RGBA8 backing must exist first;
             // the live path never allocates it — it retargets `src_tex` via EGLImage instead).
@@ -824,9 +924,16 @@ impl EglImporter {
 impl Drop for EglImporter {
     fn drop(&mut self) {
         if !self.gbm.is_null() {
+            // SAFETY: `self.gbm` is the non-null `gbm_device*` from `gbm_create_device` in `new`
+            // (checked non-null here), owned exclusively by this `EglImporter` and destroyed exactly
+            // once (in `Drop`). It is freed BEFORE `render_fd` is closed below — the correct order,
+            // since the device borrowed that fd for its lifetime.
             unsafe { gbm_device_destroy(self.gbm) };
         }
         if self.render_fd >= 0 {
+            // SAFETY: `self.render_fd` is the fd `open` returned in `new` (checked `>= 0`), owned
+            // exclusively by this `EglImporter`; this `close` runs exactly once, after the gbm device
+            // that borrowed it has been destroyed. No double-close or use-after-close.
             unsafe { libc::close(self.render_fd) };
         }
     }

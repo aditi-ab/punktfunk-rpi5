@@ -13,6 +13,9 @@
 //! attaches none, the export yields an already-signaled sync_file (poll returns immediately) — no
 //! wait, no harm, and `waited=false` tells us the driver doesn't fence (so zero-copy would still race).
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use std::os::fd::RawFd;
 
 // linux/dma-buf.h ioctls on the DMA_BUF_BASE ('b' = 0x62) magic. _IOWR = dir(3)<<30 | size<<16 | base<<8 | nr.
@@ -40,6 +43,11 @@ pub fn wait_read_ready(dmabuf_fd: RawFd, timeout_ms: i32) -> std::io::Result<boo
         flags: DMA_BUF_SYNC_READ,
         fd: -1,
     };
+    // SAFETY: `dmabuf_fd` is a live dmabuf fd supplied by the caller (borrowed for this call; we
+    // never close it). `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` encodes `size_of::<DmaBufExportSyncFile>()`
+    // — the exact byte count the kernel copies — and `&mut req` is a live, correctly-sized
+    // `#[repr(C)]` struct the EXPORT_SYNC_FILE ioctl reads (`flags`) and writes (`fd`). `req`
+    // outlives this synchronous call and is not aliased elsewhere.
     let r = unsafe { libc::ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &mut req) };
     if r < 0 {
         return Err(std::io::Error::last_os_error());
@@ -54,11 +62,21 @@ pub fn wait_read_ready(dmabuf_fd: RawFd, timeout_ms: i32) -> std::io::Result<boo
         revents: 0,
     };
     // Non-blocking probe: not-yet-signaled (poll==0) means the producer is still rendering.
+    // SAFETY: `&mut pfd` points at a single live `libc::pollfd` and `nfds == 1` matches that one
+    // element; `pfd.fd` is `sync_fd`, the sync_file fd just exported (already checked `>= 0`).
+    // `poll` reads `fd`/`events` and writes `revents` for this non-blocking (timeout 0) probe, then
+    // returns — `pfd` outlives the call and aliases nothing.
     let pending = unsafe { libc::poll(&mut pfd, 1, 0) } == 0;
     if pending {
         pfd.revents = 0;
+        // SAFETY: same live single-element `pfd` (its `revents` reset to 0 just above), `nfds == 1`,
+        // and `sync_fd` still open. This blocking `poll` (up to `timeout_ms`) waits for the render
+        // fence to signal; it reads `fd`/`events`, writes `revents`, and returns before `pfd` ends.
         unsafe { libc::poll(&mut pfd, 1, timeout_ms) }; // block until the render fence signals
     }
+    // SAFETY: `sync_fd` is the sync_file fd the EXPORT_SYNC_FILE ioctl created and handed us to own;
+    // this point is reached only when `sync_fd >= 0`, this `close` runs exactly once on it, and it is
+    // never used afterward — no double-close or use-after-close.
     unsafe { libc::close(sync_fd) };
     Ok(pending)
 }

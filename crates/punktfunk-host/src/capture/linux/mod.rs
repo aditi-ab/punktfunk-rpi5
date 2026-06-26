@@ -17,6 +17,9 @@
 //! instead of leaking it to process exit. The portal thread (when used) still parks on its zbus
 //! connection until process exit.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use super::{CapturedFrame, Capturer, DmabufFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, Context, Result};
 use std::os::fd::OwnedFd;
@@ -498,6 +501,12 @@ mod pipewire {
 
     impl DmabufMap {
         fn new(fd: i32, len: usize) -> Option<DmabufMap> {
+            // SAFETY: a null `addr` lets the kernel choose the mapping address; `fd` is a caller-owned
+            // dmabuf/MemFd fd, valid for the duration of this call, and `len` is the requested map length.
+            // `mmap` reads no Rust memory — it installs a fresh PROT_READ/MAP_SHARED page mapping and
+            // returns its base (or MAP_FAILED, checked below before `DmabufMap` adopts it). The returned
+            // region is a brand-new VMA, so it aliases no live Rust object, and it keeps the underlying
+            // object mapped independently of `fd` (which may be closed after this returns).
             let ptr = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
@@ -514,6 +523,11 @@ mod pipewire {
 
     impl Drop for DmabufMap {
         fn drop(&mut self) {
+            // SAFETY: `self.ptr`/`self.len` are exactly the base+length of a successful `mmap` in
+            // `DmabufMap::new` (constructed only when `ptr != MAP_FAILED`). This `DmabufMap` uniquely owns
+            // that mapping and `drop` runs once, so `munmap` releases a live mapping exactly once — no
+            // double-unmap. Every `&[u8]` derived from the mapping is bounded by this `DmabufMap`'s
+            // lifetime, so no borrow outlives the unmap.
             unsafe {
                 libc::munmap(self.ptr, self.len);
             }
@@ -719,6 +733,14 @@ mod pipewire {
         if !ud.active.load(Ordering::Relaxed) {
             return;
         }
+        // SAFETY: `spa_buf` is the `*mut spa_buffer` of the PipeWire buffer we dequeued and still hold for
+        // this `.process` callback (not requeued until after `consume_frame` returns), so it is live. The
+        // block null-checks `spa_buf`, requires `n_datas != 0`, and null-checks the `datas` array pointer
+        // before forming any slice. `(*spa_buf).datas` points to `n_datas` libspa `spa_data` structs, and
+        // `pw::spa::buffer::Data` is `#[repr(transparent)]` over `spa_data` (the same cast
+        // `Buffer::datas_mut` performs — see the function doc), so the pointer cast + length describe
+        // exactly that array, in bounds. The PipeWire loop is single-threaded and owns the buffer here, so
+        // this `&mut` slice is the only reference to it (no aliasing/data race).
         let datas: &mut [pw::spa::buffer::Data] = unsafe {
             if spa_buf.is_null() || (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() {
                 &mut []
@@ -783,6 +805,10 @@ mod pipewire {
                         // dup the fd so it survives the SPA buffer recycle — the encode thread
                         // imports it. (Content stability across the brief map+CSC window relies on
                         // the compositor's buffer-pool depth, like any zero-copy capture.)
+                        // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
+                        // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
+                        // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
+                        // The original stays owned by PipeWire; the dup is a new fd we own (checked >= 0).
                         let dup =
                             unsafe { libc::fcntl(datas[0].fd() as i32, libc::F_DUPFD_CLOEXEC, 0) };
                         if dup >= 0 {
@@ -796,6 +822,10 @@ mod pipewire {
                                 pts_ns,
                                 format: fmt,
                                 payload: FramePayload::Dmabuf(DmabufFrame {
+                                    // SAFETY: `dup` is the fresh fd `fcntl(F_DUPFD_CLOEXEC)` just returned
+                                    // (checked `dup >= 0`); nothing else owns it, so `OwnedFd` takes sole
+                                    // ownership and closes it exactly once on drop — no alias, no
+                                    // double-close.
                                     fd: unsafe { OwnedFd::from_raw_fd(dup) },
                                     fourcc,
                                     modifier: ud.modifier,
@@ -930,6 +960,11 @@ mod pipewire {
         // cleanly if the real buffer is genuinely too small. MemPtr buffers (no fd) are same-process —
         // trust `d.data()`.
         let fd_len = if raw_fd > 0 {
+            // SAFETY: `libc::stat` is a C plain-old-data struct for which all-zero is a valid value, so
+            // `mem::zeroed()` is a sound initializer. `raw_fd` is the buffer's fd (`> 0` checked here) and
+            // valid for this callback; `fstat` writes metadata into `&mut st`, a live, aligned,
+            // correctly-sized stack `stat` that outlives the synchronous call. `st.st_size` is read only
+            // after the return value is confirmed `== 0`. `st` is a fresh local, so nothing aliases it.
             unsafe {
                 let mut st: libc::stat = std::mem::zeroed();
                 (libc::fstat(raw_fd as i32, &mut st) == 0 && st.st_size > 0)
@@ -946,6 +981,14 @@ mod pipewire {
             match DmabufMap::new(raw_fd as i32, map_len) {
                 Some(m) => {
                     _mapping = m;
+                    // SAFETY: `_mapping` is the `DmabufMap` just stored; its `ptr`/`len` come from a
+                    // successful `mmap` of `map_len` PROT_READ bytes, so `ptr` is non-null, page-aligned,
+                    // and the VMA is one allocated object of `len` bytes valid for reads. In the common
+                    // path `map_len == fd_len` (the fd's real size from `fstat`), so the mapping spans the
+                    // whole object; the de-pad copy below is further bounded by the `offset <= buf.len()`
+                    // and `needed > avail` guards. The `&[u8]` borrows `_mapping`, which lives to the end
+                    // of `consume_frame`, so the slice never outlives the mapping, and the memory is only
+                    // read here, so there is no aliasing/mutation.
                     Some(unsafe {
                         std::slice::from_raw_parts(_mapping.ptr as *const u8, _mapping.len)
                     })
@@ -1177,24 +1220,43 @@ mod pipewire {
                     // Latest-frame-only (OBS pattern): Mutter delivers buffers in bursts and
                     // recycles its pool; an older queued buffer carries a STALE frame. Drain all
                     // queued buffers, requeue the older ones, keep only the newest.
+                    // SAFETY: `stream` is the live stream PipeWire passes into this `.process` callback on
+                    // the loop thread, where `pw_stream_dequeue_buffer` is the documented call. It returns
+                    // a `*mut pw_buffer` owned by the stream (or null when the queue is drained),
+                    // null-checked before any use. The loop is single-threaded, so no concurrent access.
                     let mut newest = unsafe { stream.dequeue_raw_buffer() };
                     if newest.is_null() {
                         return;
                     }
                     let mut drained = 1u32;
                     loop {
+                        // SAFETY: same stream/loop-thread contract as the dequeue above; each call returns
+                        // the next stream-owned `*mut pw_buffer` or null (null-checked before use).
                         let next = unsafe { stream.dequeue_raw_buffer() };
                         if next.is_null() {
                             break;
                         }
+                        // SAFETY: `newest` is a non-null `*mut pw_buffer` previously dequeued from this same
+                        // stream and not yet requeued; `pw_stream_queue_buffer` hands ownership back to the
+                        // stream. We immediately overwrite `newest = next`, so the requeued pointer is never
+                        // touched again (no use-after-requeue). Loop thread, single-threaded.
                         unsafe { stream.queue_raw_buffer(newest) };
                         newest = next;
                         drained += 1;
                     }
+                    // SAFETY: `newest` is the non-null buffer we still own (dequeued, not requeued);
+                    // `.buffer` is a `*mut spa_buffer` field libpipewire populated. This is a single field
+                    // load through a valid pointer — no mutation or aliasing.
                     let spa_buf = unsafe { (*newest).buffer };
 
                     // Inspect the newest buffer's header + first chunk for the diagnostic and the
                     // CORRUPTED skip. SPA_META_Header is optional — `hdr` may be null.
+                    // SAFETY: `spa_buf` is the `*mut spa_buffer` of the buffer we still hold.
+                    // `spa_buffer_find_meta_data` scans that buffer's metadata array for a `SPA_META_Header`
+                    // of at least `size_of::<spa_meta_header>()` bytes and returns a pointer into the held
+                    // buffer's metadata (or null). The size argument matches the struct the result is cast
+                    // to, and the pointer stays valid as long as the buffer is held (until requeue). Null is
+                    // handled below.
                     let hdr = unsafe {
                         spa::sys::spa_buffer_find_meta_data(
                             spa_buf,
@@ -1205,11 +1267,20 @@ mod pipewire {
                     let hdr_flags = if hdr.is_null() {
                         0u32
                     } else {
+                        // SAFETY: reached only when `hdr` is non-null; it points to a `spa_meta_header`
+                        // inside the live buffer's metadata (returned for a size >=
+                        // `size_of::<spa_meta_header>()`, so `.flags` is in bounds). A single field read
+                        // while the buffer is still held.
                         unsafe { (*hdr).flags }
                     };
                     // First data chunk's size + flags (used for the diagnostic + CORRUPTED check)
                     // and its data type (a dmabuf legitimately reports chunk size 0, so the size-0
                     // stale skip only applies to mappable SHM buffers).
+                    // SAFETY: every dereference is guarded in order before any field read — `spa_buf`
+                    // non-null, `n_datas > 0`, the `datas` (`*mut spa_data`) array non-null, and the first
+                    // element's `chunk` (`*mut spa_chunk`) non-null. `d0` is that first `spa_data` and `c`
+                    // its chunk; reading `(*d0).type_`, `(*c).size`, `(*c).flags` are in-bounds field loads
+                    // of libspa structs inside the buffer we still hold. Single-threaded loop, no mutation.
                     let (chunk_size, chunk_flags, is_dmabuf) = unsafe {
                         if !spa_buf.is_null()
                             && (*spa_buf).n_datas > 0
@@ -1246,11 +1317,17 @@ mod pipewire {
                                 "capture: skipped a stale CORRUPTED/cursor buffer (GNOME)"
                             );
                         }
+                        // SAFETY: `newest` is the non-null buffer we own (dequeued, never requeued on this
+                        // skip path); hand it back to the stream exactly once and return without touching it
+                        // again. Loop thread inside `.process`.
                         unsafe { stream.queue_raw_buffer(newest) };
                         return;
                     }
 
                     consume_frame(ud, spa_buf);
+                    // SAFETY: `consume_frame` has finished reading `spa_buf` (and the `datas` borrows derived
+                    // from `newest`), so requeuing the owned `newest` exactly once here is sound — no
+                    // use-after-requeue. Loop thread inside `.process`.
                     unsafe { stream.queue_raw_buffer(newest) };
                 }));
                 if outcome.is_err() {

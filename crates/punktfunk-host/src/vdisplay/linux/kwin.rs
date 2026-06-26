@@ -15,6 +15,8 @@
 //! the KWin session's environment.
 
 #![allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
@@ -495,6 +497,11 @@ fn run(
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: `&mut pfd` points at a single live, fully-initialized `libc::pollfd` on the stack, and
+        // the count `1` matches that one-element array, so `poll` reads `fd`/`events` and writes `revents`
+        // strictly within `pfd`. `pfd.fd` is the Wayland connection's fd, valid because `conn` (and the
+        // `prepare_read` guard) are alive across the call. `poll` blocks up to 200 ms and writes only
+        // `revents`; `pfd` outlives the synchronous call and aliases nothing (a fresh local).
         let r = unsafe { libc::poll(&mut pfd, 1, 200) };
         if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
             let _ = guard.read();

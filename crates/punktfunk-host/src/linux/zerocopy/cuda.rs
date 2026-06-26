@@ -11,6 +11,8 @@
 //! thread) and ffmpeg's `hevc_nvenc` (encode thread); each thread makes it current before use.
 
 #![allow(non_camel_case_types, non_snake_case)]
+// Every `unsafe` block/impl below carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{bail, Result};
 use std::os::raw::{c_int, c_uint, c_void};
@@ -128,8 +130,14 @@ struct CudaApi {
     ) -> CUresult,
     cuDestroyExternalMemory: unsafe extern "C" fn(CUexternalMemory) -> CUresult,
 }
-// The resolved fn pointers are plain addresses into a process-lifetime mapping; safe to share.
+// SAFETY: every field is a bare `extern "C" fn` address into the leaked, process-lifetime
+// `libcuda` mapping (`cuda_api` `forget`s the `Library`, so it is never unloaded) — an immutable
+// value with no interior mutability and no thread affinity. Moving the table to another thread
+// cannot dangle (the code it points at stays mapped) or race (the fields are read-only).
 unsafe impl Send for CudaApi {}
+// SAFETY: as above — the table is a set of immutable fn-pointer addresses with no interior
+// mutability, so concurrent shared reads from multiple threads cannot race; the driver entry
+// points they address are themselves thread-safe.
 unsafe impl Sync for CudaApi {}
 
 /// `CUresult` returned by the wrappers when `libcuda` isn't loaded (no NVIDIA driver). Non-zero so
@@ -143,6 +151,14 @@ static CUDA_API: OnceLock<Option<CudaApi>> = OnceLock::new();
 /// (the expected case on AMD/Intel hosts) — logged at debug, not an error.
 fn cuda_api() -> Option<&'static CudaApi> {
     CUDA_API
+        // SAFETY: `Library::new` runs `libcuda.so.1`'s initializers — it is the trusted NVIDIA
+        // driver library, so loading has no unexpected effects; `?`/`None` handle its absence.
+        // Each `lib.get::<T>(name)` asserts the symbol's real ABI equals `T`: every NUL-terminated
+        // name is a documented CUDA Driver API entry point and `T` is the exact
+        // `unsafe extern "C" fn(..)` signature from cuda.h/cudaGL.h (`_v2` for ctx/mem ops). Each
+        // `Symbol` only borrows `lib` until the end of the struct-literal statement; we deref-copy
+        // the raw fn-pointer out first, then `forget(lib)` leaks the mapping so those addresses
+        // stay valid for the whole process. Runs once under the `OnceLock` init — no aliasing.
         .get_or_init(|| unsafe {
             let lib = libloading::Library::new("libcuda.so.1")
                 .or_else(|_| libloading::Library::new("libcuda.so"))
@@ -361,6 +377,12 @@ pub fn read_plane_to_host(
         Height: height,
         ..Default::default()
     };
+    // SAFETY: `copy_blocking` is unsafe because it issues a CUDA copy; its contract is a valid
+    // descriptor with the shared context current (the caller's responsibility — self-test path).
+    // `&copy` is a live local `#[repr(C)] CUDA_MEMCPY2D` that outlives the synchronous call:
+    // `srcDevice`/`srcPitch` are the caller's live pitched device plane, `dstHost` addresses the
+    // freshly-allocated `host` `Vec` of exactly `width_bytes*height` bytes, and `WidthInBytes`×
+    // `Height` fit both. The copy is synchronous, so `host` is fully written before we return it.
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(dev->host)")? };
     Ok(host)
 }
@@ -369,7 +391,13 @@ pub fn read_plane_to_host(
 /// in a `OnceLock`; the raw `CUcontext` is thread-safe to make current from any thread.
 #[derive(Clone, Copy)]
 pub struct Context(pub CUcontext);
+// SAFETY: `CUcontext` is an opaque CUDA driver handle, not a dereferenceable Rust pointer. It is
+// created once and never destroyed (process lifetime), and the only thing done with it is
+// `cuCtxSetCurrent`, which the Driver API explicitly allows from any thread — so transferring the
+// handle to another thread cannot dangle or race (the driver owns the synchronization).
 unsafe impl Send for Context {}
+// SAFETY: as above — the wrapped handle is an immutable opaque address and the driver does all the
+// synchronization, so sharing `&Context` across threads is sound.
 unsafe impl Sync for Context {}
 
 static CONTEXT: OnceLock<Context> = OnceLock::new();
@@ -382,6 +410,12 @@ pub fn context() -> Result<CUcontext> {
     if cuda_api().is_none() {
         bail!("libcuda.so.1 not available — no NVIDIA driver (CUDA zero-copy disabled)");
     }
+    // SAFETY: we returned above unless `cuda_api()` is `Some`, so every wrapper here forwards into
+    // the live, leaked `libcuda` table rather than the not-loaded stub. `cuInit(0)` passes the
+    // API-required flags value 0. `&mut dev`/`&mut ctx` are live, zero/null-initialized stack
+    // out-params the driver writes the device handle / new context into; each outlives its
+    // synchronous call and they are distinct locals (no aliasing). `cuCtxCreate_v2` yields a valid
+    // `CUcontext` on success (`ck` bails otherwise), which becomes the block's value.
     let ctx = unsafe {
         ck(cuInit(0), "cuInit")?;
         let mut dev: CUdevice = 0;
@@ -401,6 +435,10 @@ pub fn context() -> Result<CUcontext> {
 /// Make the shared context current on the calling thread (required before any CUDA op here).
 pub fn make_current() -> Result<()> {
     let ctx = context()?;
+    // SAFETY: `ctx` came from `context()?`, so it is the live shared `CUcontext` and the driver
+    // table is present. `cuCtxSetCurrent` binds that opaque handle to the calling thread; it takes
+    // no Rust-memory pointer and is thread-safe (affects only this thread's current context), so
+    // there is no aliasing or lifetime hazard.
     unsafe { ck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent") }
 }
 
@@ -423,6 +461,12 @@ fn copy_stream() -> CUstream {
         if let Some(s) = cell.get() {
             return s;
         }
+        // SAFETY: `copy_stream` runs with the shared context current (its doc contract), so the
+        // wrappers forward into the live `libcuda` table. `&mut least`/`&mut greatest` are live
+        // stack `i32`s the driver fills with the priority range; `&mut s` is a live null-init
+        // `CUstream` the driver writes the new stream into. All out-params outlive their
+        // synchronous calls and are distinct locals. On any non-zero result we fall back to a null
+        // (NULL-stream) value and never read an uninitialized handle.
         let stream = unsafe {
             let (mut least, mut greatest) = (0i32, 0i32);
             if cuCtxGetStreamPriorityRange(&mut least, &mut greatest) != 0 {
@@ -459,6 +503,11 @@ unsafe fn copy_blocking(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
 fn alloc_pitched(width: u32, height: u32) -> Result<(CUdeviceptr, usize)> {
     let mut ptr: CUdeviceptr = 0;
     let mut pitch: usize = 0;
+    // SAFETY: `cuMemAllocPitch_v2` allocates a pitched device buffer (the wrapper forwards to the
+    // live table on any path that reached allocation). `&mut ptr` (`CUdeviceptr`) and `&mut pitch`
+    // (`usize`) are live, distinct stack out-params the driver writes the allocation pointer and
+    // its pitch into; both outlive the synchronous call. Width/height/element-size are by-value
+    // ints. No aliasing — two separate locals.
     unsafe {
         ck(
             cuMemAllocPitch_v2(
@@ -486,6 +535,10 @@ fn alloc_pitched_nv12(
     let mut y_pitch: usize = 0;
     let mut uv_ptr: CUdeviceptr = 0;
     let mut uv_pitch: usize = 0;
+    // SAFETY: two independent `cuMemAllocPitch_v2` calls (wrapper → live table). `&mut y_ptr`/
+    // `&mut y_pitch` and `&mut uv_ptr`/`&mut uv_pitch` are live, distinct stack out-params the
+    // driver writes each plane's pointer and pitch into; all outlive their synchronous calls. The
+    // dimension/element-size args are by-value ints. No aliasing — four separate locals.
     unsafe {
         ck(
             cuMemAllocPitch_v2(
@@ -524,6 +577,13 @@ struct PoolInner {
 
 impl Drop for PoolInner {
     fn drop(&mut self) {
+        // SAFETY: the pool only exists because allocation succeeded, so the driver table is live.
+        // `PoolInner` drops only once every `DeviceBuffer` that referenced it (each holds an `Arc`
+        // clone) has been recycled, so `free`/`free_uv` hold every outstanding allocation exactly
+        // once and nothing else still uses them — no double-free or use-after-free. We make the
+        // shared context current first (drop may run off the allocating thread) so `cuMemFree_v2`
+        // targets the right context. Each `p` is a `CUdeviceptr` previously returned by
+        // `cuMemAllocPitch_v2`; results are ignored (best-effort teardown).
         unsafe {
             if let Some(c) = CONTEXT.get() {
                 let _ = cuCtxSetCurrent(c.0);
@@ -697,6 +757,12 @@ impl Drop for DeviceBuffer {
             }
         } else {
             // The buffer may be freed on the encode thread; cuMemFree needs a current context.
+            // SAFETY: this is the un-pooled branch (`pool` is `None`), so this `DeviceBuffer`
+            // exclusively owns `self.ptr` (and `self.uv`'s `uv_ptr`), each returned by
+            // `cuMemAllocPitch_v2` and freed exactly once here — `drop` runs once and the
+            // `self.ptr == 0` guard above skips the sentinel/empty case, so no double-free. We set
+            // the shared context current first because drop may run on a thread where it isn't, and
+            // `cuMemFree_v2` needs it. Wrapper → live table; results ignored (teardown).
             unsafe {
                 if let Some(c) = CONTEXT.get() {
                     let _ = cuCtxSetCurrent(c.0);
@@ -745,6 +811,16 @@ impl RegisteredTexture {
     /// unmap. The copy is synchronized (on our priority stream) before unmap so `dst` is ready
     /// before the source dmabuf is recycled. Always unmaps, even if the copy errors.
     pub fn copy_mapped_to(&mut self, dst: &DeviceBuffer) -> Result<()> {
+        // SAFETY: `self.resource` is the valid `CUgraphicsResource` from a successful `register_gl`
+        // (its only constructor), so the wrappers forward to the live table; the caller holds the
+        // GL+CUDA contexts current (the registration's contract). `cuGraphicsMapResources` maps
+        // `count == 1` resource via `&mut self.resource` (a live field) on the default stream;
+        // `cuGraphicsSubResourceGetMappedArray` writes the mapped `CUarray` into the live local
+        // `array` (index 0, mip 0). On failure we unmap and bail (balanced). `&copy` is a live
+        // local `CUDA_MEMCPY2D` outliving the synchronous `copy_blocking`: `srcArray` is valid
+        // while mapped, `dstDevice`/`dstPitch` are `dst`'s live allocation, `width*4`×`height` fit
+        // both. `copy_blocking` syncs before we unmap, so the array stays valid through the copy;
+        // we always unmap afterward (even on error), keeping the map/unmap pair balanced.
         unsafe {
             ck(
                 cuGraphicsMapResources(1, &mut self.resource, std::ptr::null_mut()),
@@ -783,6 +859,14 @@ impl RegisteredTexture {
         width_bytes: usize,
         height: usize,
     ) -> Result<()> {
+        // SAFETY: identical contract to `copy_mapped_to` — `self.resource` is the valid
+        // `CUgraphicsResource` from `register_gl` (wrappers → live table; caller holds GL+CUDA
+        // contexts current). Map `count == 1` resource via the live `&mut self.resource`; the
+        // mapped `CUarray` is written into the live local `array` (index 0, mip 0); on failure we
+        // unmap and bail (balanced). `&copy` is a live local outliving the synchronous
+        // `copy_blocking`: `srcArray` valid while mapped, `dstDevice`/`dstPitch` are the caller's
+        // live plane, `width_bytes`×`height` fit it. We always unmap afterward, even on copy error,
+        // so the map/unmap pair stays balanced and the array outlives the copy.
         unsafe {
             ck(
                 cuGraphicsMapResources(1, &mut self.resource, std::ptr::null_mut()),
@@ -847,6 +931,10 @@ pub fn copy_device_to_device(
         Height: src.height as usize,
         ..Default::default()
     };
+    // SAFETY: `copy_blocking` is unsafe (issues a CUDA copy); the caller must have the shared
+    // context current (documented). `&copy` is a live local device→device `CUDA_MEMCPY2D` outliving
+    // the synchronous call: `srcDevice`/`srcPitch` are `src`'s live allocation, `dstDevice`/
+    // `dstPitch` the caller's live region, `width*4`×`height` within both. Wrapper → live table.
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(dev->dev)") }
 }
 
@@ -888,6 +976,12 @@ pub fn copy_nv12_to_device(
         Height: h / 2,
         ..Default::default()
     };
+    // SAFETY: two unsafe `copy_blocking` device→device copies; the caller must have the shared
+    // context current (documented). `&y`/`&uv` are live local `CUDA_MEMCPY2D`s outliving each
+    // synchronous call. All four device pointers are valid: `src.ptr`/`src_uv_ptr` come from a live
+    // NV12 `DeviceBuffer` (its `.uv` presence was checked via `ok_or_else`), `y_dst`/`uv_dst` are
+    // the caller's live NVENC surface planes; the luma copy is `w`×`h`, the chroma copy
+    // `(w/2)*2`×`h/2`, each within its planes. Wrappers → live table.
     unsafe {
         copy_blocking(&y, "cuMemcpy2DAsync_v2(nv12 Y dev->dev)")?;
         copy_blocking(&uv, "cuMemcpy2DAsync_v2(nv12 UV dev->dev)")
@@ -897,6 +991,12 @@ pub fn copy_nv12_to_device(
 impl Drop for RegisteredTexture {
     fn drop(&mut self) {
         if !self.resource.is_null() {
+            // SAFETY: `self.resource` is non-null (just checked) and is the valid
+            // `CUgraphicsResource` from `register_gl`, owned exclusively by this `RegisteredTexture`
+            // and unregistered exactly once here (drop runs once) — no use-after-free or
+            // double-unregister. `cuGraphicsUnregisterResource` releases the GL↔CUDA registration;
+            // wrapper → live table (the resource exists ⇒ the driver was present). Result ignored
+            // (best-effort teardown).
             unsafe {
                 let _ = cuGraphicsUnregisterResource(self.resource);
             }
@@ -913,7 +1013,11 @@ pub struct ExternalDmabuf {
     pub size: u64,
 }
 
-// Raw driver handles; used from the single capture thread but moved with the importer.
+// SAFETY: the fields are opaque CUDA driver handles — an external-memory handle and a device
+// pointer — not dereferenceable Rust memory, and the value is uniquely owned (no `Clone`). It is
+// used from a single capture thread but constructed on / moved between threads with the importer;
+// transferring these handles is sound because uniqueness rules out aliasing and they are destroyed
+// exactly once in `Drop`. Only `Send` (not `Sync`) is asserted, matching the single-thread use.
 unsafe impl Send for ExternalDmabuf {}
 
 impl ExternalDmabuf {
@@ -921,6 +1025,9 @@ impl ExternalDmabuf {
     /// from then on) and map its full `size` bytes to a device pointer. The shared context
     /// must be current.
     pub fn import(fd: i32, size: u64) -> Result<ExternalDmabuf> {
+        // SAFETY: `libc::dup` only reads the integer `fd` and returns a new descriptor (or -1); it
+        // touches no Rust memory and `fd` is the caller's still-owned dmabuf fd (not consumed
+        // here). No aliasing or lifetime concern — a pure syscall on an integer.
         let dup = unsafe { libc::dup(fd) };
         if dup < 0 {
             bail!("dup(dmabuf fd) failed");
@@ -938,8 +1045,17 @@ impl ExternalDmabuf {
         };
         desc.handle[0] = dup as u32 as u64; // union member `int fd` (little-endian low bytes)
         let mut ext: CUexternalMemory = std::ptr::null_mut();
+        // SAFETY: `cuImportExternalMemory` imports the memory described by `&desc`, a live local
+        // `#[repr(C)] CUDA_EXTERNAL_MEMORY_HANDLE_DESC` (cuda.h 64-bit layout) that outlives this
+        // synchronous call: `type_` is OPAQUE_FD, `handle[0]` holds the dup'd fd in the union's
+        // `int fd` low bytes, `size` is set. `&mut ext` is a live null-init out-param the driver
+        // writes the imported handle into. The driver takes ownership of the fd only on success.
+        // Distinct locals → no aliasing. Wrapper → live table (caller holds the context current).
         let r = unsafe { cuImportExternalMemory(&mut ext, &desc) };
         if r != 0 {
+            // SAFETY: import failed (`r != 0`), so the driver did NOT take ownership of `dup`; we
+            // still own it and close it exactly once here on the error path (the success path never
+            // closes it — the driver does). `libc::close` acts on the integer fd alone.
             unsafe { libc::close(dup) }; // import failed → the driver did not take the fd
             bail!("cuImportExternalMemory failed ({r}) — LINEAR dmabuf import unsupported?");
         }
@@ -949,8 +1065,17 @@ impl ExternalDmabuf {
             ..Default::default()
         };
         let mut ptr: CUdeviceptr = 0;
+        // SAFETY: maps a device pointer from `ext` (the valid `CUexternalMemory` just imported) per
+        // `&buf`, a live local `CUDA_EXTERNAL_MEMORY_BUFFER_DESC` (offset 0, full `size`) that
+        // outlives this synchronous call. `&mut ptr` is a live zero-init out-param the driver writes
+        // the mapped device address into; distinct locals → no aliasing. Wrapper → live table
+        // (context current).
         let r = unsafe { cuExternalMemoryGetMappedBuffer(&mut ptr, ext, &buf) };
         if r != 0 {
+            // SAFETY: mapping failed; `ext` is the valid `CUexternalMemory` we imported and
+            // exclusively own. We destroy it exactly once here on the error path (the success path
+            // instead moves it into the returned `ExternalDmabuf`, whose `Drop` destroys it),
+            // releasing the fd the driver took — no double-destroy or use-after-free.
             unsafe {
                 let _ = cuDestroyExternalMemory(ext);
             }
@@ -962,6 +1087,12 @@ impl ExternalDmabuf {
 
 impl Drop for ExternalDmabuf {
     fn drop(&mut self) {
+        // SAFETY: this `ExternalDmabuf` only exists after a successful import, so the driver table
+        // is live. It exclusively owns `self.ptr` (the mapped buffer) and `self.ext` (the external
+        // memory), each torn down exactly once here (drop runs once; guarded by `!= 0` / `!null`) —
+        // no double-free or use-after-free. We make the shared context current first because drop
+        // may run off the import thread, and we free the mapped buffer before destroying its
+        // backing external memory. Results ignored (best-effort teardown).
         unsafe {
             if let Some(c) = CONTEXT.get() {
                 let _ = cuCtxSetCurrent(c.0);
@@ -996,5 +1127,10 @@ pub fn copy_pitched_to_buffer(
     };
     // copy_blocking syncs our priority stream before returning, so the copy is complete before the
     // dmabuf is requeued to the producer.
+    // SAFETY: `copy_blocking` is unsafe (issues a CUDA copy); the caller must have the shared
+    // context current (documented). `&copy` is a live local device→device `CUDA_MEMCPY2D` outliving
+    // the synchronous call: `srcDevice`/`srcPitch` are the caller's live mapped span (e.g. an
+    // `ExternalDmabuf`), `dstDevice`/`dstPitch` are `dst`'s live allocation, `width*4`×`height`
+    // within both. Wrapper → live table.
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(ext->dev)") }
 }

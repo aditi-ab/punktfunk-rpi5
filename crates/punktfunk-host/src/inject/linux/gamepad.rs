@@ -15,6 +15,9 @@
 //! `<linux/uinput.h>` on x86_64. `/dev/uinput` needs a udev rule + `input` group membership
 //! (see `scripts/60-punktfunk.rules`); creation fails with a clear error otherwise.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use crate::gamestream::gamepad::{self, GamepadFrame, MAX_PADS};
 use anyhow::{bail, Result};
 use std::collections::HashMap;
@@ -215,6 +218,11 @@ const _: () = {
 };
 
 fn ioctl_int(fd: i32, req: libc::c_ulong, arg: libc::c_int, what: &str) -> Result<()> {
+    // SAFETY: every caller passes one of UI_SET_EVBIT/KEYBIT/FFBIT/UI_DEV_CREATE/UI_DEV_DESTROY as
+    // `req` — all integer-argument ioctls whose third arg the kernel takes BY VALUE, so nothing is
+    // dereferenced through `arg` and no memory must outlive the call. The only precondition is `fd`
+    // being a valid open descriptor; callers pass the live `/dev/uinput` fd, and even a stale fd
+    // would merely return -1/EBADF (reported below), never UB.
     if unsafe { libc::ioctl(fd, req, arg) } < 0 {
         bail!("{what}: {}", std::io::Error::last_os_error());
     }
@@ -222,6 +230,12 @@ fn ioctl_int(fd: i32, req: libc::c_ulong, arg: libc::c_int, what: &str) -> Resul
 }
 
 fn ioctl_ptr<T>(fd: i32, req: libc::c_ulong, arg: *mut T, what: &str) -> Result<()> {
+    // SAFETY: `fd` is the caller's live `/dev/uinput` fd. Every call site passes `&mut x` for a live,
+    // uniquely-borrowed `#[repr(C)]` `x: T` whose size matches the struct the request number encodes
+    // (UI_DEV_SETUP=0x405c_5503 → 0x5c=92=size_of::<UinputSetup>(); UI_ABS_SETUP → 0x1c=28; the FF
+    // upload/erase ioctls → 0x68/0x0c — all pinned by the `size_of` asserts above). The kernel copies
+    // exactly that many bytes in/out through `arg`; the `&mut` keeps the pointee alive and unaliased
+    // for the whole synchronous call.
     if unsafe { libc::ioctl(fd, req, arg) } < 0 {
         bail!("{what}: {}", std::io::Error::last_os_error());
     }
@@ -251,6 +265,9 @@ pub struct VirtualPad {
 impl VirtualPad {
     pub fn create(index: usize, identity: PadIdentity) -> Result<VirtualPad> {
         use std::os::fd::FromRawFd;
+        // SAFETY: `c"/dev/uinput"` is a 'static NUL-terminated C string literal; `as_ptr()` yields a
+        // valid pointer the kernel only reads as a filesystem path. `open` returns a fresh fd (or -1)
+        // and retains nothing; no Rust memory is aliased or handed to the kernel beyond that 'static path.
         let raw = unsafe {
             libc::open(
                 c"/dev/uinput".as_ptr(),
@@ -264,6 +281,9 @@ impl VirtualPad {
                 std::io::Error::last_os_error()
             );
         }
+        // SAFETY: `raw >= 0` here (the `< 0` branch above already bailed), so it is a freshly-opened fd
+        // from `libc::open` that is not stored or owned anywhere else. Transferring it to `OwnedFd` makes
+        // this the unique owner, which will `close` it exactly once on drop (no double-close, no leak).
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
 
         ioctl_int(raw, UI_SET_EVBIT, EV_KEY as i32, "UI_SET_EVBIT(EV_KEY)")?;
@@ -356,6 +376,11 @@ impl VirtualPad {
             code,
             value,
         };
+        // SAFETY: `ev` is a live local `#[repr(C)]` struct of all-integer fields with no padding bytes
+        // (timeval=16 + u16 + u16 + i32 = 24, the size asserted above), so every byte is initialized and
+        // valid to read as `u8`. The pointer is non-null and `u8`-aligned (align 1), the length is exactly
+        // `size_of::<InputEventRaw>()` so the slice spans precisely `ev`'s bytes (in bounds), and `ev`
+        // outlives `bytes` (used immediately below) with no concurrent mutation (single-threaded local).
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 &ev as *const _ as *const u8,
@@ -363,6 +388,10 @@ impl VirtualPad {
             )
         };
         // Best-effort: a full kernel queue drops the event; the next frame re-syncs state.
+        // SAFETY: `self.fd` is the live uinput `OwnedFd` (borrowed via `as_raw_fd`, so it stays open for
+        // the call); `bytes` is the slice above backed by the still-live local `ev`. `write` only READS
+        // exactly `bytes.len()` bytes from `bytes.as_ptr()` (in bounds) and retains nothing past return,
+        // so the buffer outlives the synchronous call and the read-only access cannot race or alias.
         let _ = unsafe {
             libc::write(
                 self.fd.as_raw_fd(),
@@ -404,6 +433,10 @@ impl VirtualPad {
         let raw = self.fd.as_raw_fd();
         let mut buf = [0u8; std::mem::size_of::<InputEventRaw>()];
         loop {
+            // SAFETY: `raw` is the live raw fd of `self.fd` (the non-blocking uinput device). `buf` is a
+            // live local `[u8; size_of::<InputEventRaw>()]`; `buf.as_mut_ptr()` is a valid writable pointer
+            // to its `buf.len()` bytes. `read` writes AT MOST `buf.len()` bytes (in bounds), the buffer
+            // outlives this synchronous call, and `buf` is borrowed uniquely here (no alias/race).
             let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n != buf.len() as isize {
                 break; // EAGAIN / short read — queue drained
@@ -415,6 +448,10 @@ impl VirtualPad {
                 unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const InputEventRaw) };
             match (ev.type_, ev.code) {
                 (EV_UINPUT, UI_FF_UPLOAD) => {
+                    // SAFETY: `UinputFfUpload` is `#[repr(C)]` over integers (`u32`, `i32`) and two
+                    // `FfEffect`s (integers + `[u8; 32]`); all-zero is a valid bit pattern for every field
+                    // (no bool/NonZero/enum/reference niche), so `zeroed` yields a fully-initialized valid
+                    // value — `request_id` is then set below and the rest filled by UI_BEGIN_FF_UPLOAD.
                     let mut up: UinputFfUpload = unsafe { std::mem::zeroed() };
                     up.request_id = ev.value as u32;
                     if ioctl_ptr(raw, UI_BEGIN_FF_UPLOAD, &mut up, "UI_BEGIN_FF_UPLOAD").is_ok() {
@@ -442,6 +479,9 @@ impl VirtualPad {
                     }
                 }
                 (EV_UINPUT, UI_FF_ERASE) => {
+                    // SAFETY: `UinputFfErase` is `#[repr(C)]` over three integer fields (`u32`, `i32`,
+                    // `u32`); all-zero is a valid bit pattern for each, so `zeroed` produces a fully-valid
+                    // initialized value — `request_id` is set below and `effect_id` filled by the ioctl.
                     let mut er: UinputFfErase = unsafe { std::mem::zeroed() };
                     er.request_id = ev.value as u32;
                     if ioctl_ptr(raw, UI_BEGIN_FF_ERASE, &mut er, "UI_BEGIN_FF_ERASE").is_ok() {
@@ -492,6 +532,9 @@ impl VirtualPad {
 
 impl Drop for VirtualPad {
     fn drop(&mut self) {
+        // SAFETY: `self.fd` is still the live owned uinput fd here (the `OwnedFd` field is closed only
+        // AFTER this `drop` body returns), borrowed by `as_raw_fd`. UI_DEV_DESTROY takes its argument
+        // (0) BY VALUE, so nothing is dereferenced or aliased; the ioctl just tears down the device.
         let _ = unsafe { libc::ioctl(self.fd.as_raw_fd(), UI_DEV_DESTROY, 0) };
     }
 }

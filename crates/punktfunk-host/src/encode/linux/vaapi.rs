@@ -19,6 +19,8 @@
 //! hwdevice/hwframes/buffersrc/buffersink calls go through `ffmpeg::ffi` (= `ffmpeg_sys_next`),
 //! as the CUDA encode path and the clients' decode paths already do. The encoder is opened
 //! *without* a global header, so VPS/SPS/PPS are in-band on every IDR.
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{Codec, EncodedFrame, Encoder};
 use crate::capture::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
@@ -133,6 +135,14 @@ pub fn probe_can_encode(codec: Codec) -> bool {
     if ffmpeg::init().is_err() {
         return false;
     }
+    // SAFETY: `ffmpeg::init()` returned Ok above, so libav is initialized. `av_log_get_level`/
+    // `av_log_set_level` only read/write libav's global integer log level (no pointer args) and are
+    // always sound to call post-init. `VaapiHw::new` (an `unsafe fn`) builds a VAAPI device + NV12
+    // frames pool from the literal NV12/640x480/pool=2 args and hands back a RAII handle that unrefs
+    // both `AVBufferRef`s on drop. `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/
+    // `hw.frames_ref` — the two non-null refs `VaapiHw::new` just created — and `av_buffer_ref`s them
+    // into the encoder; `hw` is a live local for the whole match arm, so the borrows outlive the
+    // synchronous call, and both `hw` and the probe encoder are dropped (RAII) when the arm ends.
     unsafe {
         // A missing VA device (non-VAAPI host, GPU-less CI) is an expected probe outcome — quiet
         // ffmpeg's "No VA display found" error for the probe, then restore the level.
@@ -224,6 +234,12 @@ impl VaapiHw {
 
 impl Drop for VaapiHw {
     fn drop(&mut self) {
+        // SAFETY: `frames_ref`/`device_ref` are the two non-null `AVBufferRef`s `VaapiHw::new`
+        // created (it bails before constructing `Self` if either alloc fails, so a live `VaapiHw`
+        // always holds both). `av_buffer_unref` drops one reference and nulls the pointer through the
+        // `&mut`. This `Drop` runs exactly once and `VaapiHw` owns these refs exclusively, so there
+        // is no double-free / use-after-free. Frames are unref'd before the device because the frames
+        // ctx internally holds a ref on the device (refcounted, so the order is sound either way).
         unsafe {
             ffi::av_buffer_unref(&mut self.frames_ref);
             ffi::av_buffer_unref(&mut self.device_ref);
@@ -252,7 +268,16 @@ impl CpuInner {
     ) -> Result<Self> {
         let src_pixel = vaapi_sws_src(format)?;
         const POOL: c_int = 16;
+        // SAFETY: `VaapiHw::new` (an `unsafe fn`) requires libav initialized — guaranteed because the
+        // only path here is `VaapiEncoder::open` → `ensure_inner` → `CpuInner::open`, and `open` ran
+        // `ffmpeg::init()`. The args are valid: NV12 sw_format, the validated positive `width`/`height`,
+        // pool=16. It returns a RAII `VaapiHw` that unrefs its two `AVBufferRef`s on drop.
         let hw = unsafe { VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_NV12, width, height, POOL)? };
+        // SAFETY: `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/`hw.frames_ref` — both
+        // non-null (`VaapiHw::new` guarantees it) and from the `hw` just built above, which is a live
+        // local that outlives this synchronous call. The fn `av_buffer_ref`s them into the encoder, so
+        // the encoder holds its own references; `hw` is also moved into the returned `CpuInner` next to
+        // `enc`, keeping the device/frames alive for the encoder's whole lifetime.
         let enc = unsafe {
             open_vaapi_encoder(
                 codec,
@@ -266,6 +291,12 @@ impl CpuInner {
         };
         // swscale RGB→NV12, BT.709 limited (matches the VUI), no rescale.
         let src_av = pixel_to_av(src_pixel);
+        // SAFETY: `sws_getContext` allocates a swscale context for the given src/dst dimensions and
+        // pixel formats. All four dims are the encoder's positive `width`/`height` cast to `c_int`;
+        // `src_av` is a valid `AVPixelFormat` (from `pixel_to_av` of the `vaapi_sws_src`-validated
+        // `src_pixel`), the dst is NV12. The three trailing pointers (srcFilter, dstFilter, param) are
+        // explicitly null = "use defaults", which the API documents as accepted. No Rust memory is
+        // borrowed — only by-value ints/enums — and the returned pointer is null-checked just below.
         let sws = unsafe {
             ffi::sws_getContext(
                 width as c_int,
@@ -283,10 +314,23 @@ impl CpuInner {
         if sws.is_null() {
             bail!("sws_getContext(RGB→NV12) failed");
         }
+        // SAFETY: `sws` is the non-null `SwsContext` from `sws_getContext` above (the `is_null()`
+        // check immediately preceding returned false). `sws_getCoefficients(SWS_CS_ITU709)` returns a
+        // pointer into a libswscale static const coefficient table valid for the whole process, reused
+        // here for both the inverse (src) and forward (dst) matrices. `sws_setColorspaceDetails` only
+        // reads those tables and writes scalar CSC settings into `sws`; the table pointer outlives the
+        // synchronous call and no Rust memory is passed.
         unsafe {
             let cs709 = ffi::sws_getCoefficients(SWS_CS_ITU709);
             ffi::sws_setColorspaceDetails(sws, cs709, 1, cs709, 0, 0, 1 << 16, 1 << 16);
         }
+        // SAFETY: `av_frame_alloc` returns a fresh, uniquely-owned heap `AVFrame` (null-checked — on
+        // null we free the already-built `sws` and bail). We then write the plain `format`/`width`/
+        // `height` fields through the non-null, properly-aligned `f` (sole owner, not yet shared).
+        // `av_frame_get_buffer(f, 0)` allocates backing storage for those dims/format; on failure we
+        // free `f` and `sws` (unwinding the half-built state) and bail. On success `f` is a fully-owned
+        // NV12 frame stored in `CpuInner.nv12` and freed once in `CpuInner::drop`. `f` is a unique
+        // fresh pointer, so none of these writes alias anything.
         let nv12 = unsafe {
             let f = ffi::av_frame_alloc();
             if f.is_null() {
@@ -329,6 +373,18 @@ impl CpuInner {
         let h = self.height as usize;
         let src_row = w * self.src_format.bytes_per_pixel();
         anyhow::ensure!(bytes.len() >= src_row * h, "captured buffer too small");
+        // SAFETY: The `ensure!`s above guarantee `format == self.src_format` and
+        // `bytes.len() >= src_row * h`. `sws_scale` reads `h` rows of `src_row` bytes from
+        // `src_data[0] = bytes.as_ptr()` (the other planes null/0 — packed RGB is single-plane), all
+        // in bounds; `bytes`, `src_data`, `src_stride` are live locals for this synchronous call.
+        // `self.sws` is the non-null context built in `open`; it writes into `self.nv12` (a non-null
+        // owned frame whose `data`/`linesize` in-struct arrays were sized by `av_frame_get_buffer`).
+        // `av_frame_alloc` (null-checked) yields a fresh `hwf`; `av_hwframe_get_buffer` pulls a pooled
+        // VAAPI surface from the live non-null `self.hw.frames_ref`; `av_hwframe_transfer_data` uploads
+        // the staged NV12 into it — both frames live, failures free `hwf` and bail. We then write
+        // `pts`/`pict_type` through the non-null `hwf` and `avcodec_send_frame` it into the live
+        // owned `self.enc` context (which takes its own ref), then free our `hwf` ref exactly once.
+        // The encoder runs only on this thread (see `unsafe impl Send`), so no aliasing/data race.
         unsafe {
             let src_data: [*const u8; 4] = [bytes.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
             let src_stride: [c_int; 4] = [src_row as c_int, 0, 0, 0];
@@ -374,6 +430,12 @@ impl CpuInner {
 
 impl Drop for CpuInner {
     fn drop(&mut self) {
+        // SAFETY: `self.nv12` (an owned `AVFrame`) and `self.sws` (an owned `SwsContext`) are each
+        // freed exactly once here, guarded by `is_null()` so a never-set pointer is skipped (no double
+        // free). `CpuInner` owns both exclusively and `Drop` runs once. `av_frame_free` takes `&mut`
+        // and nulls the pointer. `self.enc`/`self.hw` are freed afterward by their own `Drop` impls;
+        // the encoder holds its own `av_buffer_ref`'d device/frames copies, so field-drop order is
+        // irrelevant to soundness.
         unsafe {
             if !self.nv12.is_null() {
                 ffi::av_frame_free(&mut self.nv12);
@@ -417,6 +479,31 @@ impl DmabufInner {
         let drm_fourcc = crate::zerocopy::drm_fourcc(format)
             .ok_or_else(|| anyhow!("no DRM fourcc for {format:?} (VAAPI zero-copy)"))?;
         let node = render_node();
+        // SAFETY: libav is initialized (`VaapiEncoder::open` ran `ffmpeg::init()` before
+        // `ensure_inner` → `DmabufInner::open`). Every raw pointer dereferenced below is either freshly
+        // allocated by the immediately-preceding ffmpeg call and null-checked, or an in-struct field of
+        // such an object:
+        //  * `node` is a `CString` (from `render_node`) live for the whole block; its `.as_ptr()` is a
+        //    NUL-terminated path read only during `av_hwdevice_ctx_create`.
+        //  * `av_hwdevice_ctx_create(&mut drm_device, DRM, …)` / `…_create_derived(&mut vaapi_device,
+        //    VAAPI, drm_device, …)`: on `r < 0` the out-param stays null and we bail (the derive path
+        //    unrefs `drm_device` first); on success each is a non-null owned `AVBufferRef`.
+        //  * `av_hwframe_ctx_alloc(drm_device)` → `drm_frames` (null-checked); `(*drm_frames).data` is
+        //    its `AVHWFramesContext` payload, written before `av_hwframe_ctx_init`.
+        //  * `avfilter_graph_alloc` → `graph` (null-checked); `avfilter_get_by_name` returns a static
+        //    const `AVFilter` (process-lifetime) or null; `avfilter_graph_alloc_filter` allocates each
+        //    filter ctx inside `graph`; the four are null-checked together. `inst`/arg strings are
+        //    'static C literals.
+        //  * `(*hwmap/scale).hw_device_ctx = av_buffer_ref(vaapi_device)` attaches a NEW ref owned by
+        //    the filter (freed by `avfilter_graph_free`); our `vaapi_device` ref is untouched.
+        //  * `av_buffersink_get_hw_frames_ctx(sink)` → `nv12_ctx` is a borrowed ref owned by the sink,
+        //    valid while `graph` lives (and `graph` is moved into the returned `DmabufInner`).
+        //  * `open_vaapi_encoder` borrows `vaapi_device` (our live owned ref) and `nv12_ctx` (sink's
+        //    live ref) and `av_buffer_ref`s both into the encoder.
+        // Every early-error path unref's the allocated buffers and frees the graph in the right order
+        // before bailing; on success the four `AVBufferRef`s + `graph` + `src`/`sink` are moved into
+        // `DmabufInner` and freed in its `Drop`. (Two non-UB leaks noted below: `av_buffersrc_*` and
+        // the final `?`.)
         unsafe {
             // DRM device (source dmabuf frames) + a VAAPI device derived from it (same GPU) for
             // hwmap/scale_vaapi/the encoder.
@@ -509,6 +596,11 @@ impl DmabufInner {
                 num: 1,
                 den: fps as c_int,
             };
+            // NOTE(leak, not UB): `av_buffersrc_parameters_set` takes its OWN ref of
+            // `par->hw_frames_ctx`, and `av_free(par)` frees only the struct (not the ref). So this
+            // `av_buffer_ref(drm_frames)` ref is leaked once per session — assigning `drm_frames`
+            // borrowed (no extra ref) is the correct ffmpeg pattern. Sound (a refcount leak, never a
+            // dangling/double-free), but it keeps the DRM frames ctx + device alive past `Drop`.
             (*par).hw_frames_ctx = ffi::av_buffer_ref(drm_frames);
             let r = ffi::av_buffersrc_parameters_set(src, par);
             ffi::av_free(par as *mut _);
@@ -564,6 +656,9 @@ impl DmabufInner {
                 ffi::av_buffer_unref(&mut drm_device);
                 bail!("filter sink has no VAAPI frames context");
             }
+            // NOTE(leak, not UB): unlike the error paths above, this `?` returns without unref'ing
+            // `graph`/`drm_frames`/`vaapi_device`/`drm_device` — so an encoder-open failure leaks them.
+            // Sound (leak only); only the unhappy path, when the session is failing anyway.
             let enc = open_vaapi_encoder(
                 codec,
                 width,
@@ -600,6 +695,23 @@ impl DmabufInner {
             dmabuf.fourcc,
             self.fourcc
         );
+        // SAFETY: The `ensure!` above checked `dmabuf.fourcc == self.fourcc`.
+        //  * `std::mem::zeroed::<AVDRMFrameDescriptor>()` is sound: it is a `#[repr(C)]` POD of ints and
+        //    nested int-struct arrays (no `NonNull`/refs), for which all-zero is a valid bit pattern;
+        //    `Box` puts it on the heap with a unique owner.
+        //  * `dmabuf.fd.as_raw_fd()` is the fd of the caller's `&DmabufFrame`, which owns it for the
+        //    whole synchronous `submit`; we describe one object/layer/plane from its
+        //    fourcc/modifier/offset/stride and pass `object.size = 0` (ffmpeg queries the real size).
+        //  * `av_frame_alloc` → `drm` (null-checked); we set its scalar fields and
+        //    `hw_frames_ctx = av_buffer_ref(self.drm_frames)` (new ref of the live owned ctx).
+        //  * `data[0] = Box::into_raw(desc)` transfers the box into the frame; `buf[0] =
+        //    av_buffer_create(.., free_desc, ..)` registers a destructor that reclaims it exactly once
+        //    when the buffer's refcount hits zero — matched alloc/free, no leak/double-free.
+        //  * `av_buffersrc_add_frame_flags(self.src, drm, KEEP_REF)` pushes a ref into the live
+        //    buffersrc; KEEP_REF keeps our own `drm` ref, which we then `av_frame_free`. We pull the
+        //    converted surface with `av_buffersink_get_frame(self.sink, nv12)` BEFORE returning, so the
+        //    dmabuf (owned by the caller) is read while still valid. `nv12` is sent into the live owned
+        //    `self.enc` (takes its own ref) and our ref freed once. Single-threaded encoder → no race.
         unsafe {
             // Build a DRM-PRIME AVFrame describing the dmabuf (one object/fd, one layer/plane).
             let mut desc: Box<ffi::AVDRMFrameDescriptor> = Box::new(std::mem::zeroed());
@@ -626,6 +738,11 @@ impl DmabufInner {
             // Own the descriptor so it frees with the frame (the fd is owned by the DmabufFrame,
             // which outlives this call — the graph reads the surface before submit returns).
             extern "C" fn free_desc(_opaque: *mut std::ffi::c_void, data: *mut u8) {
+                // SAFETY: `data` is exactly the pointer produced by `Box::into_raw(desc)` and passed as
+                // `av_buffer_create`'s first arg, which libav hands back verbatim to this callback. It
+                // is a valid, uniquely-owned `Box<AVDRMFrameDescriptor>` raw pointer; libav invokes the
+                // callback exactly once (when the last buffer ref drops), so `from_raw` + `drop`
+                // reclaims it exactly once — no double-free. `_opaque` is unused (we passed null).
                 unsafe { drop(Box::from_raw(data as *mut ffi::AVDRMFrameDescriptor)) };
             }
             (*drm).buf[0] = ffi::av_buffer_create(
@@ -673,6 +790,13 @@ impl DmabufInner {
 
 impl Drop for DmabufInner {
     fn drop(&mut self) {
+        // SAFETY: `graph`/`drm_frames`/`vaapi_device`/`drm_device` are the non-null objects
+        // `DmabufInner::open` built and moved into `self` (open bails before constructing `Self` if any
+        // alloc fails). `avfilter_graph_free` frees the graph (and the per-filter device refs it owns);
+        // each `av_buffer_unref` drops one ref and nulls the pointer via `&mut`. `DmabufInner` owns all
+        // four exclusively and `Drop` runs once → no double-free/use-after-free. The graph is freed
+        // first (it holds refs on the devices), then frames, then the derived VAAPI device, then DRM.
+        // (`self.enc` drops via ffmpeg-next afterward, holding its own refs.)
         unsafe {
             ffi::avfilter_graph_free(&mut self.graph);
             ffi::av_buffer_unref(&mut self.drm_frames);
@@ -703,6 +827,13 @@ pub struct VaapiEncoder {
 }
 
 // Raw FFI pointers; the encoder lives on a single thread (same contract as `NvencEncoder`).
+// SAFETY: `VaapiEncoder`'s `Inner` holds raw FFI pointers (`SwsContext`, `AVFrame`, `AVBufferRef`,
+// `AVFilterContext`, `AVCodecContext`) that are not `Send` by default. The encoder is owned and
+// driven by exactly ONE thread — the host's per-session encode thread it is moved (transferred) to —
+// and is only ever touched through `&mut self` methods, so it is never aliased or accessed
+// concurrently from two threads. None of the underlying libav/libswscale objects have thread
+// affinity (they are not thread-local), so transferring ownership across threads is sound. This
+// asserts `Send` (transfer) only; `Sync` (shared `&`) is deliberately NOT implemented.
 unsafe impl Send for VaapiEncoder {}
 
 impl VaapiEncoder {
@@ -720,6 +851,9 @@ impl VaapiEncoder {
         }
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {
+            // SAFETY: `av_log_set_level` sets libav's global integer log level; `48` (= AV_LOG_DEBUG)
+            // is a valid level and there are no pointer args. libav was just initialized by the
+            // `ffmpeg::init()` above, so the call is always sound.
             unsafe { ffi::av_log_set_level(48) };
         }
         // Validate the codec/format up front so a bad request fails at open, not on the first frame.
