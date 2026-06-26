@@ -157,21 +157,21 @@ if (-not $NoDriver) {
 }
 else { Write-Host "-NoDriver: building installer WITHOUT the bundled pf-vdisplay driver" }
 
-# --- stage the punktfunk virtual-gamepad UMDF drivers (DualSense/DS4 + Xbox 360 XUSB) ----------
-# Vendored, pre-signed under packaging/windows/gamepad-drivers/ (like pf-vdisplay). Rebuild + re-vendor
-# from packaging/windows/{dualsense,xusb}-driver/ when the driver source changes (see their READMEs).
+# --- build (from source) + stage the punktfunk virtual-gamepad UMDF drivers --------------------
+# pf-dualsense (DualSense / DualShock 4) + pf-xusb (Xbox 360 / XInput) are members of the same drivers
+# workspace as pf-vdisplay, built from source per release (build-gamepad-drivers.ps1) - same anti-stale
+# reasoning as pf-vdisplay; the prior checked-in binaries under gamepad-drivers/ are retired. install-
+# gamepad-drivers.ps1 adds each to the store (the host SwDeviceCreate's the per-session devnodes).
 if (-not $NoDriver) {
-    $gpVendor = Join-Path $here 'gamepad-drivers'
-    if (Test-Path (Join-Path $gpVendor 'pf_dualsense.inf')) {
-        $gpStage = Join-Path $OutDir 'gamepad'
-        if (Test-Path $gpStage) { Remove-Item -Recurse -Force $gpStage }
-        New-Item -ItemType Directory -Force -Path $gpStage | Out-Null
-        Copy-Item (Join-Path $gpVendor '*') $gpStage -Force
-        Copy-Item (Join-Path $here 'install-gamepad-drivers.ps1') (Join-Path $gpStage 'install-gamepad-drivers.ps1') -Force
-        $defines += "/DGamepadStageDir=$gpStage"
-        Write-Host "==> staged vendored gamepad UMDF drivers from $gpVendor"
-    }
-    else { Write-Warning "no vendored gamepad drivers under $gpVendor - installer built WITHOUT them" }
+    $gpBuilt = Join-Path $OutDir 'gamepad-built'
+    & (Join-Path $here 'build-gamepad-drivers.ps1') -Out $gpBuilt
+    $gpStage = Join-Path $OutDir 'gamepad'
+    if (Test-Path $gpStage) { Remove-Item -Recurse -Force $gpStage }
+    New-Item -ItemType Directory -Force -Path $gpStage | Out-Null
+    Copy-Item (Join-Path $gpBuilt '*') $gpStage -Force
+    Copy-Item (Join-Path $here 'install-gamepad-drivers.ps1') (Join-Path $gpStage 'install-gamepad-drivers.ps1') -Force
+    $defines += "/DGamepadStageDir=$gpStage"
+    Write-Host "==> built + staged gamepad UMDF drivers -> $gpStage"
 }
 
 # --- stage the FFmpeg shared DLLs (AMD/Intel AMF/QSV build) ------------------------------------

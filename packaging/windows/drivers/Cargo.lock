@@ -63,9 +63,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "bindgen"
@@ -402,6 +402,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-dualsense"
+version = "0.0.1"
+dependencies = [
+ "wdk",
+ "wdk-build",
+ "wdk-sys",
+]
+
+[[package]]
 name = "pf-vdisplay"
 version = "0.0.1"
 dependencies = [
@@ -412,6 +421,15 @@ dependencies = [
  "wdk-iddcx",
  "wdk-sys",
  "windows",
+]
+
+[[package]]
+name = "pf-xusb"
+version = "0.0.1"
+dependencies = [
+ "wdk",
+ "wdk-build",
+ "wdk-sys",
 ]
 
 [[package]]

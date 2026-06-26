@@ -7,7 +7,7 @@
 # crates/pf-driver-proto from the main tree.
 [workspace]
 resolver = "2"
-members = ["wdk-probe", "wdk-iddcx", "pf-vdisplay"]
+members = ["wdk-probe", "wdk-iddcx", "pf-vdisplay", "pf-dualsense", "pf-xusb"]
 
 [workspace.package]
 edition = "2024"
