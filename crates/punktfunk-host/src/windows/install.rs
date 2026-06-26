@@ -126,7 +126,10 @@ fn install_pf_vdisplay(dir: &Path) -> Result<()> {
         );
     }
     // Stage + bind the driver (idempotent; re-staging the same .inf is harmless).
-    if run_quiet("pnputil", &["/add-driver", &inf.to_string_lossy(), "/install"]) {
+    if run_quiet(
+        "pnputil",
+        &["/add-driver", &inf.to_string_lossy(), "/install"],
+    ) {
         println!("pnputil /add-driver pf_vdisplay.inf /install ok");
     } else {
         eprintln!("warning: pnputil /add-driver /install failed (driver may not have installed)");
