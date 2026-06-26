@@ -8,6 +8,8 @@
 //! verified (ioctl numbers + a live signal→wait round trip), ready to wire in the moment a producer
 //! gains working `SPA_META_SyncTimeline`.
 #![allow(dead_code)]
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
 //!
 //! Compositors that render directly into the PipeWire buffer pool (Mutter's virtual
 //! monitors) hand buffers over at GPU-submit time; on drivers without implicit dmabuf
@@ -81,6 +83,8 @@ pub struct DrmSync {
 impl DrmSync {
     pub fn open() -> Result<DrmSync> {
         let path = c"/dev/dri/renderD128";
+        // SAFETY: `path` is a 'static NUL-terminated C string literal; `open` only reads it as a
+        // filesystem path and returns an fd (or -1). No Rust memory is aliased or handed to the kernel.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if fd < 0 {
             bail!("open /dev/dri/renderD128 for syncobj ops: {}", errno());
@@ -94,6 +98,9 @@ impl DrmSync {
             fd: syncobj_fd,
             ..Default::default()
         };
+        // SAFETY: `self.fd` is the live render-node fd from `open`; the request number encodes
+        // `size_of::<DrmSyncobjHandle>()` (the bytes the kernel copies), and `&mut req` is a live,
+        // correctly-sized `#[repr(C)]` struct the FD_TO_HANDLE ioctl reads (`fd`) and writes (`handle`).
         let r = unsafe { libc::ioctl(self.fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &mut req) };
         if r < 0 {
             bail!("SYNCOBJ_FD_TO_HANDLE: {}", errno());
@@ -106,6 +113,8 @@ impl DrmSync {
             handle,
             ..Default::default()
         };
+        // SAFETY: `self.fd` is the live render-node fd; `DRM_IOCTL_SYNCOBJ_DESTROY` encodes
+        // `size_of::<DrmSyncobjDestroy>()`, and `&mut req` is a live correctly-sized struct the kernel reads.
         unsafe { libc::ioctl(self.fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut req) };
     }
 
@@ -117,6 +126,8 @@ impl DrmSync {
             tv_sec: 0,
             tv_nsec: 0,
         };
+        // SAFETY: `CLOCK_MONOTONIC` is a valid clock id and `&mut now` is a live `libc::timespec` the
+        // kernel fills in; the call returns before `now` is read, so there is no aliasing/lifetime issue.
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
         let deadline = now.tv_sec * 1_000_000_000 + now.tv_nsec + timeout_ms as i64 * 1_000_000;
         let handles = [handle];
@@ -129,6 +140,11 @@ impl DrmSync {
             flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
             ..Default::default()
         };
+        // SAFETY: `self.fd` is the live render-node fd; the request number encodes
+        // `size_of::<DrmSyncobjTimelineWait>()`; `&mut req` is a live correctly-sized struct. Its
+        // `handles`/`points` u64 fields hold the addresses of the local `handles`/`points` arrays, which
+        // outlive this synchronous call, and `count_handles == 1` matches their length — so every kernel
+        // read through those addresses stays in bounds.
         let r = unsafe { libc::ioctl(self.fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req) };
         let saved = errno();
         self.destroy(handle);
@@ -151,6 +167,10 @@ impl DrmSync {
             count_handles: 1,
             flags: 0,
         };
+        // SAFETY: `self.fd` is the live render-node fd; the request number encodes
+        // `size_of::<DrmSyncobjTimelineArray>()`; `&mut req` is a live correctly-sized struct whose
+        // `handles`/`points` u64 fields address the local `handles`/`points` arrays (alive for this
+        // synchronous call, `count_handles == 1` matching their length).
         let r = unsafe { libc::ioctl(self.fd, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &mut req) };
         let saved = errno();
         self.destroy(handle);
@@ -163,6 +183,8 @@ impl DrmSync {
 
 impl Drop for DrmSync {
     fn drop(&mut self) {
+        // SAFETY: `self.fd` is the fd `open` returned; this `DrmSync` owns it exclusively and `close`
+        // runs exactly once (here, in `Drop`), so there is no double-close or use-after-close.
         unsafe { libc::close(self.fd) };
     }
 }
@@ -203,14 +225,19 @@ mod tests {
         const CREATE: u64 = iowr(0xBF, std::mem::size_of::<Create>());
         const HANDLE_TO_FD: u64 = iowr(0xC1, std::mem::size_of::<DrmSyncobjHandle>());
         let mut c = Create::default();
+        // SAFETY: `sync.fd` is the live render-node fd; `CREATE` encodes `size_of::<Create>()`, and
+        // `&mut c` is a live correctly-sized struct the kernel fills (`handle`).
         assert!(unsafe { libc::ioctl(sync.fd, CREATE, &mut c) } >= 0);
         let mut h = DrmSyncobjHandle {
             handle: c.handle,
             ..Default::default()
         };
+        // SAFETY: `sync.fd` is live; `HANDLE_TO_FD` encodes `size_of::<DrmSyncobjHandle>()`; `&mut h`
+        // is a live correctly-sized struct (the kernel reads `handle`, writes `fd`).
         assert!(unsafe { libc::ioctl(sync.fd, HANDLE_TO_FD, &mut h) } >= 0);
         sync.signal_point(h.fd, 1).expect("signal");
         sync.wait_point(h.fd, 1, 100).expect("wait after signal");
+        // SAFETY: `h.fd` is the fd HANDLE_TO_FD just exported; we own it and close it exactly once here.
         unsafe { libc::close(h.fd) };
         sync.destroy(c.handle);
     }
