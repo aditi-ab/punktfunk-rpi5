@@ -549,6 +549,303 @@ fn heroic_launch_prefix() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------
+// Epic Games Store (Windows) — reads the launcher's local `.item` manifests under ProgramData
+// (no auth, launcher need not run). Cover art from the base64 `catcache.bin` (public Epic CDN).
+// ---------------------------------------------------------------------------------------
+
+/// Reads the Epic Games Launcher's local install manifests. Windows-only. Best-effort: empty when
+/// the launcher (or its manifest dir) isn't present.
+#[cfg(windows)]
+pub struct EpicProvider;
+
+#[cfg(windows)]
+impl LibraryProvider for EpicProvider {
+    fn store(&self) -> &'static str {
+        "epic"
+    }
+
+    fn list(&self) -> Vec<GameEntry> {
+        let data = epic_data_dir();
+        let Ok(rd) = std::fs::read_dir(data.join("Manifests")) else {
+            return Vec::new();
+        };
+        // Parse the (best-effort) artwork cache ONCE: catalogItemId -> Artwork.
+        let art = epic_art_index(&data.join("Catalog").join("catcache.bin"));
+        let mut games = Vec::new();
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("item") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            if let Some(g) = epic_entry(&v, &art) {
+                games.push(g);
+            }
+        }
+        games
+    }
+}
+
+/// `%ProgramData%\Epic\EpicGamesLauncher\Data` (machine-wide, SYSTEM-readable).
+#[cfg(windows)]
+fn epic_data_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"))
+        .join("Epic")
+        .join("EpicGamesLauncher")
+        .join("Data")
+}
+
+/// Map one `.item` manifest to a [`GameEntry`], or `None` if it isn't a launchable game. Uses
+/// Playnite's proven EXCLUSION filter (skip `UE_*` Unreal components; skip a DLC/addon unless it is
+/// `addons/launchable`) rather than a positive `games`-category match, which can drop legit titles.
+#[cfg(windows)]
+fn epic_entry(
+    v: &serde_json::Value,
+    art: &std::collections::HashMap<String, Artwork>,
+) -> Option<GameEntry> {
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str());
+    let app_name = s("AppName")?.to_string();
+    if app_name.starts_with("UE_") {
+        return None; // Unreal Engine component, not a game
+    }
+    let cats: Vec<&str> = v
+        .get("AppCategories")
+        .and_then(|c| c.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    if cats.contains(&"addons") && !cats.contains(&"addons/launchable") {
+        return None; // non-launchable DLC/addon
+    }
+    // Drop stale records whose install dir is gone.
+    let install = s("InstallLocation")?;
+    if !Path::new(install).is_dir() {
+        return None;
+    }
+    let title = s("DisplayName").unwrap_or(&app_name).to_string();
+    let namespace = s("CatalogNamespace").unwrap_or("");
+    let catalog = s("CatalogItemId").unwrap_or("");
+    // The robust launch form is the namespace:catalogItemId:appName triple; fall back to the bare
+    // appName when those ids are absent (some manifests lack them) — never drop the launch entirely.
+    let value = if !namespace.is_empty() && !catalog.is_empty() {
+        format!("{namespace}:{catalog}:{app_name}")
+    } else {
+        app_name.clone()
+    };
+    Some(GameEntry {
+        id: format!("epic:{app_name}"),
+        store: "epic".into(),
+        title,
+        art: art.get(catalog).cloned().unwrap_or_default(),
+        launch: Some(LaunchSpec {
+            kind: "epic".into(),
+            value,
+        }),
+    })
+}
+
+/// Best-effort parse of `catcache.bin` (base64-encoded JSON array of catalog items) into
+/// catalogItemId → [`Artwork`] from each item's `keyImages`. Empty map on any read/decode failure
+/// (the format is community-reverse-engineered + can lag a fresh install → titles just show no art).
+#[cfg(windows)]
+fn epic_art_index(catcache: &Path) -> std::collections::HashMap<String, Artwork> {
+    use base64::Engine as _;
+    let mut map = std::collections::HashMap::new();
+    let Ok(raw) = std::fs::read(catcache) else {
+        return map;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(raw) else {
+        return map;
+    };
+    let Ok(items) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+        return map;
+    };
+    let Some(arr) = items.as_array() else {
+        return map;
+    };
+    for item in arr {
+        let Some(cat) = item
+            .get("id")
+            .or_else(|| item.get("catalogItemId"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let Some(images) = item.get("keyImages").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let mut art = Artwork::default();
+        for img in images {
+            let (Some(ty), Some(url)) = (
+                img.get("type").and_then(|v| v.as_str()),
+                img.get("url").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                continue;
+            }
+            match ty {
+                "DieselGameBoxTall" => art.portrait = Some(url.to_string()),
+                "DieselGameBox" => art.hero = Some(url.to_string()),
+                "DieselGameBoxLogo" => art.logo = Some(url.to_string()),
+                _ => {}
+            }
+        }
+        if art.portrait.is_some() || art.hero.is_some() || art.logo.is_some() {
+            map.insert(cat.to_string(), art);
+        }
+    }
+    map
+}
+
+/// Build the `com.epicgames.launcher://` launch URI from a stored launch value — the triple
+/// `<namespace>:<catalogItemId>:<appName>` (colons URL-encoded), or a bare `<appName>` fallback.
+/// Each part is charset-validated (host-derived, but belt-and-suspenders) so no shell/URI injection.
+#[cfg(windows)]
+fn epic_launch_uri(value: &str) -> Option<String> {
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    let inner = match value.split(':').collect::<Vec<_>>().as_slice() {
+        [ns, cat, app] if ok(ns) && ok(cat) && ok(app) => format!("{ns}%3A{cat}%3A{app}"),
+        [app] if ok(app) => (*app).to_string(),
+        _ => return None,
+    };
+    Some(format!(
+        "com.epicgames.launcher://apps/{inner}?action=launch&silent=true"
+    ))
+}
+
+// ---------------------------------------------------------------------------------------
+// GOG (Windows) — registry-indexed installs + each game's `goggame-<id>.info` for a direct-exe
+// launch (no Galaxy needed, dodges its cold-start/anti-cheat). Art (api.gog.com) is a follow-up.
+// ---------------------------------------------------------------------------------------
+
+/// Reads the GOG.com install registry + per-game `.info` files. Windows-only. Best-effort: empty
+/// when GOG isn't installed.
+#[cfg(windows)]
+pub struct GogProvider;
+
+#[cfg(windows)]
+impl LibraryProvider for GogProvider {
+    fn store(&self) -> &'static str {
+        "gog"
+    }
+
+    fn list(&self) -> Vec<GameEntry> {
+        gog_games()
+    }
+}
+
+#[cfg(windows)]
+fn gog_games() -> Vec<GameEntry> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    // 32-bit GOG writes under WOW6432Node; a 64-bit process reads the explicit path directly.
+    let Ok(games_key) =
+        RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey("SOFTWARE\\WOW6432Node\\GOG.com\\Games")
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for sub in games_key.enum_keys().flatten() {
+        // The subkey name IS the GOG product id.
+        let Ok(k) = games_key.open_subkey(&sub) else {
+            continue;
+        };
+        let Ok(path) = k.get_value::<String, _>("PATH") else {
+            continue;
+        };
+        if !Path::new(&path).is_dir() {
+            continue;
+        }
+        let title = k
+            .get_value::<String, _>("GAMENAME")
+            .unwrap_or_else(|_| sub.clone());
+        // Resolve the primary play task (exe + args + workdir) from goggame-<id>.info; skip if absent.
+        let Some((exe, args, workdir)) = gog_play_task(&path, &sub) else {
+            continue;
+        };
+        out.push(GameEntry {
+            id: format!("gog:{sub}"),
+            store: "gog".into(),
+            title,
+            // GOG cover art is the public api.gog.com (no key) but needs an HTTP fetch + cache off the
+            // hot all_games() path — deferred; title-only for now (the client renders that gracefully).
+            art: Artwork::default(),
+            launch: Some(LaunchSpec {
+                kind: "gog".into(),
+                value: format!("{exe}\t{args}\t{workdir}"),
+            }),
+        });
+    }
+    out
+}
+
+/// The primary play task from `<install>\goggame-<id>.info`: `(absolute exe, args, working dir)`.
+/// Prefers `isPrimary` + `FileTask`, else the first `FileTask`. Paths are resolved against `install`.
+#[cfg(windows)]
+fn gog_play_task(install: &str, id: &str) -> Option<(String, String, String)> {
+    let text =
+        std::fs::read_to_string(Path::new(install).join(format!("goggame-{id}.info"))).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let tasks = v.get("playTasks")?.as_array()?;
+    let is_file =
+        |t: &serde_json::Value| t.get("type").and_then(|s| s.as_str()) == Some("FileTask");
+    let pick = tasks
+        .iter()
+        .find(|t| {
+            t.get("isPrimary")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false)
+                && is_file(t)
+        })
+        .or_else(|| tasks.iter().find(|t| is_file(t)))?;
+    let rel = pick.get("path").and_then(|s| s.as_str())?;
+    let exe = Path::new(install).join(rel);
+    let args = pick
+        .get("arguments")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let workdir = pick
+        .get("workingDir")
+        .and_then(|s| s.as_str())
+        .map(|w| Path::new(install).join(w))
+        .unwrap_or_else(|| Path::new(install).to_path_buf());
+    Some((
+        exe.to_string_lossy().into_owned(),
+        args,
+        workdir.to_string_lossy().into_owned(),
+    ))
+}
+
+/// Build the spawn `(command line, working dir)` for a `gog` launch value (`exe \t args \t workdir`,
+/// all host-resolved from the operator's own disk). Direct exe — no shell, no Galaxy.
+#[cfg(windows)]
+fn gog_spawn(value: &str) -> Option<(String, Option<PathBuf>)> {
+    let mut parts = value.split('\t');
+    let exe = parts.next().filter(|s| !s.is_empty())?;
+    let args = parts.next().unwrap_or("");
+    let workdir = parts.next().filter(|s| !s.is_empty()).map(PathBuf::from);
+    let cmdline = if args.trim().is_empty() {
+        format!("\"{exe}\"")
+    } else {
+        format!("\"{exe}\" {args}")
+    };
+    Some((cmdline, workdir))
+}
+
+// ---------------------------------------------------------------------------------------
 // Custom store (user-curated entries, persisted + CRUD'd via the mgmt API)
 // ---------------------------------------------------------------------------------------
 
@@ -768,6 +1065,12 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
             };
             Some((cmdline, None))
         }
+        // Epic: open the (host-built, validated) com.epicgames.launcher:// URI via explorer.exe — a
+        // concrete EXE that resolves the registered protocol handler as the user; the URI is a single
+        // argv element (no shell, no cmd /c). Same pattern as the steam explorer fallback.
+        "epic" => epic_launch_uri(&spec.value).map(|uri| (format!("explorer.exe \"{uri}\""), None)),
+        // GOG: spawn the resolved game exe directly (host-derived from goggame-<id>.info), no Galaxy.
+        "gog" => gog_spawn(&spec.value),
         // Operator-typed custom command (host-owned, never client-set): run it through the shell in the
         // interactive session. `cmd.exe /c` is acceptable here precisely because the value is operator
         // input — the same trust as the operator typing it — not a client-influenced string.
@@ -804,6 +1107,12 @@ pub fn all_games() -> Vec<GameEntry> {
     {
         games.extend(LutrisProvider.list());
         games.extend(HeroicProvider.list());
+    }
+    // Windows store providers (their launchers are Windows-only): Epic + GOG.
+    #[cfg(windows)]
+    {
+        games.extend(EpicProvider.list());
+        games.extend(GogProvider.list());
     }
     games.extend(load_custom().into_iter().map(GameEntry::from));
     games.sort_by_key(|g| g.title.to_lowercase());
@@ -1059,5 +1368,80 @@ mod tests {
             value: "x".into()
         })
         .is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epic_filters_and_builds_launch() {
+        let dir = std::env::temp_dir().join(format!("pf-epic-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inst = dir.to_string_lossy().into_owned();
+        let empty = std::collections::HashMap::new();
+        // Normal game with the full triple → kept, triple launch value.
+        let game = serde_json::json!({
+            "AppName": "Fortnite", "DisplayName": "Fortnite", "CatalogNamespace": "fn",
+            "CatalogItemId": "abc123", "InstallLocation": inst.clone(),
+            "AppCategories": ["public", "games", "applications"]
+        });
+        let e = epic_entry(&game, &empty).expect("game kept");
+        assert_eq!(e.id, "epic:Fortnite");
+        assert_eq!(e.launch.as_ref().unwrap().value, "fn:abc123:Fortnite");
+        // UE component, non-launchable addon, and a missing install dir are all skipped.
+        let ue = serde_json::json!({"AppName":"UE_5.3","InstallLocation":inst.clone(),"AppCategories":["engines"]});
+        assert!(epic_entry(&ue, &empty).is_none());
+        let dlc =
+            serde_json::json!({"AppName":"DLC","InstallLocation":inst,"AppCategories":["addons"]});
+        assert!(epic_entry(&dlc, &empty).is_none());
+        let gone = serde_json::json!({"AppName":"Gone","InstallLocation":"C:\\nope-xyz","AppCategories":["games"]});
+        assert!(epic_entry(&gone, &empty).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn epic_launch_uri_triple_bare_and_guard() {
+        assert_eq!(
+            epic_launch_uri("fn:abc:Fortnite").as_deref(),
+            Some("com.epicgames.launcher://apps/fn%3Aabc%3AFortnite?action=launch&silent=true")
+        );
+        assert_eq!(
+            epic_launch_uri("Fortnite").as_deref(),
+            Some("com.epicgames.launcher://apps/Fortnite?action=launch&silent=true")
+        );
+        assert!(epic_launch_uri("bad part:x:y").is_none()); // a space → rejected
+        assert!(epic_launch_uri("").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gog_spawn_parses_and_guards() {
+        let (cmd, wd) = gog_spawn("C:\\Games\\W3\\witcher3.exe\t--skip\tC:\\Games\\W3").unwrap();
+        assert_eq!(cmd, "\"C:\\Games\\W3\\witcher3.exe\" --skip");
+        assert_eq!(wd, Some(std::path::PathBuf::from("C:\\Games\\W3")));
+        let (cmd2, wd2) = gog_spawn("C:\\g.exe").unwrap();
+        assert_eq!(cmd2, "\"C:\\g.exe\"");
+        assert!(wd2.is_none());
+        assert!(gog_spawn("").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gog_play_task_picks_primary_filetask() {
+        let dir = std::env::temp_dir().join(format!("pf-gog-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "1207658924";
+        std::fs::write(
+            dir.join(format!("goggame-{id}.info")),
+            r#"{"playTasks":[
+                {"isPrimary":false,"type":"FileTask","path":"other.exe"},
+                {"isPrimary":true,"type":"FileTask","path":"bin\\game.exe","arguments":"-w","workingDir":"bin"}
+            ]}"#,
+        )
+        .unwrap();
+        let (exe, args, wd) = gog_play_task(&dir.to_string_lossy(), id).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(exe.ends_with("bin\\game.exe"), "exe={exe}");
+        assert_eq!(args, "-w");
+        assert!(wd.ends_with("bin"), "wd={wd}");
     }
 }
