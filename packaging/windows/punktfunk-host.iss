@@ -180,7 +180,7 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service uninstall"; Flags: ru
 ; Stop + remove the PunktfunkWeb task and its firewall rule (leaves %ProgramData%\punktfunk config,
 ; like the host uninstall does).
 Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Stop-ScheduledTask -TaskName PunktfunkWeb -ErrorAction SilentlyContinue; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Unregister-ScheduledTask -TaskName PunktfunkWeb -Confirm:$false -ErrorAction SilentlyContinue; Get-NetFirewallRule -Name 'PunktfunkWeb-TCP-3000' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"""; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Stop-ScheduledTask -TaskName PunktfunkWeb -ErrorAction SilentlyContinue; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Unregister-ScheduledTask -TaskName PunktfunkWeb -Confirm:$false -ErrorAction SilentlyContinue; Get-NetFirewallRule -Name 'PunktfunkWeb-TCP-3000' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"""; \
   Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkWebCleanup"
 #endif
 
