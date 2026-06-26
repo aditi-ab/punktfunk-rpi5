@@ -50,9 +50,9 @@ and log in with the password the installer shows on its final page. To change it
 powershell -ExecutionPolicy Bypass -File scripts\windows\build-web.ps1
 ```
 
-`bun install && bun run build`, installs the externalized server deps into `.output/server`
-(with the `@unom` `.npmrc`), then restarts the `PunktfunkWeb` task and checks `:3000/login`. Use
-this to iterate on the console against an installed host — `web-setup.ps1` (or a fresh install) is
+`bun install && bun run build` (Nitro `noExternals` -> a self-contained `.output`, no
+`node_modules`/`.npmrc`), then restarts the `PunktfunkWeb` task and checks `:3000/login`. Use
+this to iterate on the console against an installed host - `web-setup.ps1` (or a fresh install) is
 what creates the task in the first place.
 
 ## Typical flow after pulling new code

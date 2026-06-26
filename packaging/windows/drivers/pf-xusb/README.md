@@ -66,8 +66,8 @@ there); these repo files are the canonical copies — keep them in sync.
 `crates/punktfunk-host/src/inject/gamepad_windows.rs` is the Windows `GamepadManager` (used by
 `PadBackend::Xbox360`): it SwDeviceCreate's the `pf_xusb` companion, maps `pfxusb-shm-<index>`, writes
 the XInput state from the client's gamepad frame (already XInput-convention) and forwards rumble. There
-is **no ViGEmBus dependency** anymore. The driver is vendored + pnputil-installed by the Inno Setup
-installer (`packaging/windows/gamepad-drivers/` + `install-gamepad-drivers.ps1`).
+is **no ViGEmBus dependency** anymore. The driver is built from source (`packaging/windows/drivers/pf-xusb`),
+signed, and pnputil-installed by the Inno Setup installer (via `install-gamepad-drivers.ps1`).
 
 ## Multi-pad
 

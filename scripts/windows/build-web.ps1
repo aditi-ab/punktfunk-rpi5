@@ -23,7 +23,7 @@ if ($LASTEXITCODE -ne 0) { throw "web build failed (exit $LASTEXITCODE)" }
 
 Write-Host "restarting $task ..."
 & schtasks /end /tn $task 2>$null | Out-Null
-Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyContinue |
+Get-CimInstance Win32_Process -Filter "Name='bun.exe' OR Name='node.exe'" -ErrorAction SilentlyContinue |
   Where-Object { $_.CommandLine -match 'index\.mjs' } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep 2

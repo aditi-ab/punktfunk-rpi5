@@ -1,20 +1,20 @@
 <#
 .SYNOPSIS
-  Stage the pf-vdisplay driver bundle the installer ships into -OutDir: the VENDORED signed pf-vdisplay
-  driver + the fetched nefcon device tool.
+  Stage the pf-vdisplay driver bundle the installer ships into -OutDir: the freshly-built signed
+  pf-vdisplay driver (from -VendorDir) + the fetched nefcon device tool.
 
 .DESCRIPTION
-  pf-vdisplay (our all-Rust IddCx virtual display) is built from packaging/windows/drivers/, and
-  the SIGNED output (pf_vdisplay.dll/.inf/.cat + punktfunk-driver.cer) is VENDORED under
-  packaging/windows/pf-vdisplay/ (signer punktfunk-ds-test - shared with the gamepad drivers - Class=
-  Display, HWID root\pf_vdisplay). Rebuild + re-vendor with
-  packaging/windows/drivers/deploy-dev.ps1 when the driver source changes, then copy the staged
-  pf_vdisplay.{dll,inf,cat} over the vendored copies. nefcon publishes a pinned release, so we fetch +
+  pf-vdisplay (our all-Rust IddCx virtual display) is BUILT FROM SOURCE per release by
+  build-pf-vdisplay.ps1 (packaging/windows/drivers/), which emits the signed pf_vdisplay.{dll,inf,cat}
+  + punktfunk-driver.cer into a build-output dir. pack-host-installer.ps1 passes that dir here as
+  -VendorDir; we copy it + add the nefcon tool. (The old checked-in binaries under
+  packaging/windows/pf-vdisplay/ were retired - building from source keeps the .dll/.inf/.cat in
+  lockstep; see design/windows-build-and-packaging.md.) nefcon publishes a pinned release, so we fetch +
   SHA-256-verify it (it provides nefconc.exe, used to create the root-enumerated device node - pnputil
   can't).
 
   Output (consumed by punktfunk-host.iss): -OutDir gets pf_vdisplay.inf/.cat/.dll + punktfunk-driver.cer
-  and nefconc.exe (x64). pack-host-installer.ps1 also drops install-pf-vdisplay.ps1 in.
+  and nefconc.exe (x64).
 
 .EXAMPLE
   pwsh -File stage-pf-vdisplay.ps1 -OutDir C:\t\out\stage
@@ -22,7 +22,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$OutDir,
-    [string]$VendorDir = (Join-Path $PSScriptRoot 'pf-vdisplay'),
+    [Parameter(Mandatory = $true)][string]$VendorDir,   # the build-pf-vdisplay.ps1 output dir
     # PINNED nefcon release (https://github.com/nefarius/nefcon/releases). MIT-licensed.
     [string]$NefconUrl = 'https://github.com/nefarius/nefcon/releases/download/v1.17.40/nefcon_v1.17.40.zip',
     [string]$NefconSha256 = '812bae7ed7dfb7d6d2284bc7de2f8ccebc92ed2a0b1ae893c53b337096e50c1a'
@@ -34,11 +34,11 @@ $PSNativeCommandUseErrorActionPreference = $false
 if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-# --- vendored pf-vdisplay driver --------------------------------------------------------------
+# --- built pf-vdisplay driver -----------------------------------------------------------------
 $inf = Get-ChildItem -Path $VendorDir -Filter pf_vdisplay.inf -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $inf) { throw "no vendored pf_vdisplay.inf under $VendorDir - re-vendor via drivers/deploy-dev.ps1" }
+if (-not $inf) { throw "no pf_vdisplay.inf under $VendorDir - did build-pf-vdisplay.ps1 run?" }
 Copy-Item (Join-Path $VendorDir '*') $OutDir -Force
-Write-Host "==> vendored pf-vdisplay staged from $VendorDir"
+Write-Host "==> pf-vdisplay staged from $VendorDir"
 
 # --- nefcon (fetched + verified) --------------------------------------------------------------
 $work = Join-Path ([IO.Path]::GetTempPath()) ('nefcon-' + [IO.Path]::GetRandomFileName())

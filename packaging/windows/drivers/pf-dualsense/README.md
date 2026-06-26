@@ -24,8 +24,9 @@ version control / portability of the spike.
 
 ## Build / sign / install recipe (the one that actually loads)
 
-Prereqs on the Windows box: **WDK 26100**, **LLVM 21.1.2** (pinned — newer bindgen breaks),
-`cargo-make`, Rust MSVC. A self-signed CodeSigning cert in `CurrentUser\My` + `LocalMachine\Root` +
+Prereqs on the Windows box: **WDK 26100**, **LLVM** (the current default; bindgen 0.72 builds on clang
+22), Rust MSVC. Built as a member of the `packaging/windows/drivers/` workspace (plain `cargo build`, no
+cargo-make). A self-signed CodeSigning cert in `CurrentUser\My` + `LocalMachine\Root` +
 `TrustedPublisher`.
 
 Every build needs:

@@ -15,8 +15,8 @@
   Version_Number=10.0.26100.0, run `cargo build`.
 
   Re-deploying needs a HIGHER DriverVer than the installed one or pnputil silently keeps the old binary —
-  hence the 9.9.MMdd.HHmm scheme (the vendored build is 9.5.*). If the host service is running it holds the
-  driver: `punktfunk-host service stop`, deploy, then start it, for a clean test.
+  hence the 9.9.MMdd.HHmm scheme (also what the installer build uses; a later-minute dev redeploy wins).
+  If the host service is running it holds the driver: `punktfunk-host service stop`, deploy, then start it.
 .PARAMETER Install
   Also add the driver package to the store + (if absent) create the Root\pf_vdisplay devnode via nefconc.
   Needs an ELEVATED shell.
@@ -25,7 +25,7 @@
 param(
     [string]$Stage      = 'C:\Users\Public\pfvd-stage-deploy',
     [string]$Thumbprint = '6A52984E54376C45A1C236B1A2C8A746C5AB6131',
-    [string]$Nefconc    = 'C:\Users\Public\virtual-display-rs\installer\files\nefconc.exe',
+    [string]$Nefconc    = 'C:\Users\Public\nefcon\x64\nefconc.exe',   # pinned nefcon (stage-pf-vdisplay.ps1 fetches it)
     [switch]$Install
 )
 $ErrorActionPreference = 'Stop'
@@ -56,7 +56,7 @@ Copy-Item $inx $stagedInf -Force   # stampinf rewrites this copy in place
 # Clear FORCE_INTEGRITY BEFORE signing (the clear edits the PE, which invalidates any signature).
 & $clear -Path $stagedDll | Out-Null
 
-# DriverVer must strictly increase. Installed is 9.5.* — 9.9.MMdd.HHmm always wins on the same day.
+# DriverVer must strictly increase past whatever is installed; 9.9.MMdd.HHmm bumps every minute.
 $now = Get-Date
 $ver = '9.9.{0}.{1}' -f $now.ToString('MMdd'), $now.ToString('HHmm')
 

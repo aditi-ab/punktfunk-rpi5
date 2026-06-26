@@ -76,7 +76,7 @@ jobs:
           head "EWDK"
           Write-Host ("EWDKROOT = " + ($env:EWDKROOT ?? '<unset>'))
 
-          head "LLVM / clang (README pins 21.1.2 for wdk-sys bindgen)"
+          head "LLVM / clang (bindgen 0.72 builds on the runner default clang)"
           Write-Host ("LIBCLANG_PATH = " + ($env:LIBCLANG_PATH ?? '<unset>'))
           $clang = Get-Command clang -ErrorAction SilentlyContinue
           if ($clang) { & clang --version } else { Write-Host "clang: NOT on PATH" }
@@ -119,12 +119,12 @@ jobs:
     env:
       # wdk-build otherwise picks 10.0.28000.0 (no km/crt) and bindgen fails — pin the WDK SDK version.
       Version_Number: '10.0.26100.0'
-      # wdk-sys bindgen layout tests overflow (E0080) on the runner's default LLVM (ToT/22-dev); point at
-      # the pinned LLVM 21.1.2 that windows-drivers-rs builds clean against (provisioned to C:\llvm-21).
-      LIBCLANG_PATH: 'C:\llvm-21\bin'
+      # No LIBCLANG_PATH pin: the vendored bindgen 0.72 builds clean on the runner's default clang 22
+      # (the shipping pack proves it). A 0.71-era layout-test overflow once needed LLVM 21; the 0.72 bump
+      # retired that — see design/windows-build-and-packaging.md.
     steps:
       - uses: actions/checkout@v4
-      - name: Ensure WDK + cargo-wdk + LLVM 21.1.2 (idempotent self-provision)
+      - name: Ensure WDK + cargo-wdk (idempotent self-provision)
         # Run the provisioning script here too so driver-build is self-sufficient and never races a
         # separate provision run on the single runner. Path is relative to the job working-directory
         # (packaging/windows/drivers). Near-noop once the toolchain is present.

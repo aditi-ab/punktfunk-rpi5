@@ -164,7 +164,9 @@ else { Write-Host "-NoDriver: building installer WITHOUT the bundled pf-vdisplay
 # gamepad-drivers.ps1 adds each to the store (the host SwDeviceCreate's the per-session devnodes).
 if (-not $NoDriver) {
     $gpBuilt = Join-Path $OutDir 'gamepad-built'
-    & (Join-Path $here 'build-gamepad-drivers.ps1') -Out $gpBuilt
+    # -SkipBuild: build-pf-vdisplay.ps1 above already `cargo build`s the WHOLE drivers workspace (incl.
+    # the gamepad cdylibs), so just sign+stage them here - no redundant second full build.
+    & (Join-Path $here 'build-gamepad-drivers.ps1') -Out $gpBuilt -SkipBuild
     $gpStage = Join-Path $OutDir 'gamepad'
     if (Test-Path $gpStage) { Remove-Item -Recurse -Force $gpStage }
     New-Item -ItemType Directory -Force -Path $gpStage | Out-Null

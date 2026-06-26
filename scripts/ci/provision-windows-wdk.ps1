@@ -52,31 +52,10 @@ if ($haveCargoWdk) {
   if ($LASTEXITCODE -ne 0) { throw "cargo install cargo-wdk failed ($LASTEXITCODE)" }
 }
 
-# ---- 2b. LLVM 21.1.2 (libclang for wdk-sys bindgen) ----
-# wdk-sys's bindgen layout tests overflow (E0080 on threadlocaleinfostruct etc.) with LLVM ToT / dev
-# (22+) builds — the runner's default C:\Program Files\LLVM. The windows-drivers-rs maintainers confirm
-# the RELEASED LLVM 21.1.2 builds clean (discussion #591). Install it to a dedicated path so the client
-# builds' LLVM is untouched; the driver-build CI job points LIBCLANG_PATH here.
-$llvmDir  = 'C:\llvm-21'
-$libclang = Join-Path $llvmDir 'bin\libclang.dll'
-if (Test-Path $libclang) {
-  info "LLVM 21.1.2 already present ($libclang) — skipping."
-} else {
-  # Use the portable .tar.xz, NOT the NSIS .exe: the .exe /S silent install HANGS in the headless SYSTEM
-  # CI session (observed stuck >15 min after download, blocking the runner). Win11's bundled tar
-  # (bsdtar/libarchive) extracts .tar.xz; the tarball has one top-level dir, so --strip-components=1
-  # lands bin/ at $llvmDir\bin. We only need libclang.dll + the clang resource dir for bindgen.
-  $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.2/clang+llvm-21.1.2-x86_64-pc-windows-msvc.tar.xz'
-  $tmp = Join-Path $env:TEMP 'llvm-21.1.2-msvc.tar.xz'
-  info "Downloading LLVM 21.1.2 portable archive (~898 MB) -> $tmp"
-  & curl.exe -L --fail --retry 3 -o $tmp $url
-  if ($LASTEXITCODE -ne 0) { throw "LLVM archive download failed ($LASTEXITCODE)" }
-  info ("downloaded {0:N0} MB; extracting to $llvmDir (tar, strip 1)..." -f ((Get-Item $tmp).Length / 1MB))
-  New-Item -ItemType Directory -Force -Path $llvmDir | Out-Null
-  & tar -xf $tmp -C $llvmDir --strip-components=1
-  if ($LASTEXITCODE -ne 0) { throw "tar extract of LLVM failed ($LASTEXITCODE) — runner tar may lack .xz support" }
-  if (-not (Test-Path $libclang)) { throw "LLVM extract did not produce $libclang" }
-}
+# ---- 2b. (LLVM is NOT pinned) ----
+# The runner's default clang (C:\Program Files\LLVM) builds the driver workspace clean now that the
+# vendored bindgen is 0.72 (the shipping pack proves it). LLVM 21.1.2 was briefly installed here to dodge
+# a bindgen-0.71 layout-test overflow on clang 22; the 0.72 bump retired that pin. No LLVM install needed.
 
 # ---- 3. Verify (enumerate the REAL layout; fail only on build-essential absences) ----
 Write-Host ""
@@ -99,10 +78,11 @@ foreach ($t in 'inf2cat.exe','stampinf.exe','signtool.exe','makecat.exe','InfVer
 }
 try { $cw = (& cargo wdk --version 2>&1) -join ' ' } catch { $cw = '' }
 found 'cargo-wdk'             $cw
-found 'LLVM 21.1.2 libclang'  ($(if (Test-Path $libclang) { $libclang } else { 'MISSING' }))
+$defClang = 'C:\Program Files\LLVM\bin\libclang.dll'
+found 'default libclang'      ($(if (Test-Path $defClang) { $defClang } else { 'MISSING (clang not on the runner?)' }))
 
-# Block only on the genuinely build-essential pieces (headers + iddcx + cargo-wdk + the pinned libclang).
+# Block only on the genuinely build-essential pieces (headers + iddcx + cargo-wdk).
 # inf2cat arch quirks are non-fatal — cargo-wdk locates the WDK tools itself.
-$essential = ($null -ne $umdfHdr) -and (Test-Path $kmDir) -and ($iddcxVers -ne '') -and ($cw -match 'wdk') -and (Test-Path $libclang)
-if (-not $essential) { throw "provisioning incomplete: need wdf.h + km headers + iddcx + cargo-wdk + LLVM 21.1.2 (see above)" }
-info "WDK + cargo-wdk + LLVM 21.1.2 provisioned OK. Driver builds pin Version_Number=$SdkVersion + LIBCLANG_PATH=$llvmDir\bin."
+$essential = ($null -ne $umdfHdr) -and (Test-Path $kmDir) -and ($iddcxVers -ne '') -and ($cw -match 'wdk')
+if (-not $essential) { throw "provisioning incomplete: need wdf.h + km headers + iddcx + cargo-wdk (see above)" }
+info "WDK + cargo-wdk provisioned OK. Driver builds use Version_Number=$SdkVersion + the runner-default clang (bindgen 0.72)."

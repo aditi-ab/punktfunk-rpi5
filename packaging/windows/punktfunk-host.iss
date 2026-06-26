@@ -40,7 +40,7 @@
 #ifdef StageDir
   #define WithDriver
 #endif
-; GamepadStageDir (the vendored UMDF gamepad drivers + install-gamepad-drivers.ps1) is optional.
+; GamepadStageDir (the built-from-source UMDF gamepad drivers + install-gamepad-drivers.ps1) is optional.
 #ifdef GamepadStageDir
   #define WithGamepad
 #endif
@@ -126,7 +126,7 @@ Source: "{#WebSetup}"; DestDir: "{tmp}"; DestName: "web-setup.ps1"; Flags: delet
 Source: "{#StageDir}\*"; DestDir: "{tmp}\pfvdisplay"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installdriver
 #endif
 #ifdef WithGamepad
-; The vendored UMDF gamepad drivers + install-gamepad-drivers.ps1, extracted to {tmp}, removed after.
+; The built-from-source UMDF gamepad drivers + install-gamepad-drivers.ps1, extracted to {tmp}, removed after.
 Source: "{#GamepadStageDir}\*"; DestDir: "{tmp}\gamepad"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installgamepad
 #endif
 #ifdef WithVkLayer
