@@ -9,8 +9,8 @@
 
 use super::dualsense_proto::DsState;
 use super::dualsense_windows::{
-    create_shm_section, create_swdevice, SwDeviceProfile, DEVTYPE_DUALSHOCK4, OFF_DEVTYPE,
-    OFF_INPUT, OFF_OUTPUT, OFF_OUT_SEQ, SHM_MAGIC,
+    create_swdevice, SwDeviceProfile, DEVTYPE_DUALSHOCK4, OFF_DEVTYPE, OFF_INPUT, OFF_OUTPUT,
+    OFF_OUT_SEQ, SHM_MAGIC, SHM_SIZE,
 };
 use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
@@ -18,18 +18,16 @@ use super::dualshock4_proto::{
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use anyhow::Result;
 use punktfunk_core::quic::{HidOutput, RichInput};
-use std::ffi::c_void;
 use std::time::{Duration, Instant};
-use windows::Win32::Devices::Enumeration::Pnp::{SwDeviceClose, HSWDEVICE};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::Memory::{UnmapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS};
+use windows::core::HSTRING;
 
 /// A single virtual DualShock 4: the `SwDeviceCreate`'d `pf_ds4_<index>` devnode plus the mapped
 /// shared section. Dropping it removes the devnode and unmaps + closes the section.
 struct Ds4WinPad {
-    hsw: Option<HSWDEVICE>,
-    map: HANDLE,
-    view: *mut u8,
+    /// Per-session devnode from SwDeviceCreate, when it succeeds (RAII — `SwDeviceClose` on drop).
+    _sw: Option<super::gamepad_raii::SwDevice>,
+    /// The named shared section the driver maps (RAII — unmapped + closed on drop).
+    shm: super::gamepad_raii::Shm,
     counter: u8,
     ts: u16,
     last_out_seq: u32,
@@ -39,7 +37,11 @@ impl Ds4WinPad {
     /// Create + map the section, stamp `device_type = DualShock 4` + a neutral report + the magic,
     /// then spawn the `pf_ds4_<index>` devnode (the driver loads on it and maps the section).
     fn open(index: u8) -> Result<Ds4WinPad> {
-        let (map, base) = create_shm_section(index)?;
+        let shm = super::gamepad_raii::Shm::create(
+            &HSTRING::from(pf_driver_proto::gamepad::pad_shm_name(index)),
+            SHM_SIZE,
+        )?;
+        let base = shm.base();
         // device-type FIRST (so it's visible the moment magic is), neutral report, magic LAST.
         // SAFETY: base points at SHM_SIZE writable bytes; OFF_DEVTYPE/OFF_INPUT are in range.
         unsafe {
@@ -65,10 +67,10 @@ impl Ds4WinPad {
                 None
             }
         };
+        let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         Ok(Ds4WinPad {
-            hsw,
-            map,
-            view: base,
+            _sw,
+            shm,
             counter: 0,
             ts: 0,
             last_out_seq: 0,
@@ -81,41 +83,29 @@ impl Ds4WinPad {
         self.ts = self.ts.wrapping_add(188); // ~1ms in the DS4's 5.33µs sensor-clock units
         let mut r = [0u8; DS4_INPUT_REPORT_LEN];
         serialize_state(&mut r, st, self.counter, self.ts);
-        // SAFETY: view points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
-        unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), self.view.add(OFF_INPUT), r.len()) };
+        // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
+        unsafe {
+            std::ptr::copy_nonoverlapping(r.as_ptr(), self.shm.base().add(OFF_INPUT), r.len())
+        };
     }
 
     /// Poll the section's output slot; parse a new `0x05` report (rumble / lightbar) into a
     /// [`Ds4Feedback`]. Returns empty feedback if the driver hasn't published anything new.
     fn service(&mut self) -> Ds4Feedback {
         let mut fb = Ds4Feedback::default();
-        // SAFETY: view points at SHM_SIZE bytes.
-        let seq = unsafe { std::ptr::read_unaligned(self.view.add(OFF_OUT_SEQ) as *const u32) };
+        // SAFETY: base points at SHM_SIZE bytes.
+        let seq =
+            unsafe { std::ptr::read_unaligned(self.shm.base().add(OFF_OUT_SEQ) as *const u32) };
         if seq != self.last_out_seq {
             self.last_out_seq = seq;
             let mut out = [0u8; 64];
             // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
             unsafe {
-                std::ptr::copy_nonoverlapping(self.view.add(OFF_OUTPUT), out.as_mut_ptr(), 64)
+                std::ptr::copy_nonoverlapping(self.shm.base().add(OFF_OUTPUT), out.as_mut_ptr(), 64)
             };
             parse_ds4_output(&out, &mut fb);
         }
         fb
-    }
-}
-
-impl Drop for Ds4WinPad {
-    fn drop(&mut self) {
-        // SAFETY: hsw (if any) owns the devnode; view/map from MapViewOfFile/CreateFileMappingW.
-        unsafe {
-            if let Some(h) = self.hsw {
-                SwDeviceClose(h);
-            }
-            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: self.view as *mut c_void,
-            });
-            let _ = CloseHandle(self.map);
-        }
     }
 }
 

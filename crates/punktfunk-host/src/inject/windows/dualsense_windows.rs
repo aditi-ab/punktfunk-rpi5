@@ -29,15 +29,7 @@ use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
-    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
-};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
 /// Shared-section layout — the single source of truth is [`pf_driver_proto::gamepad::PadShm`] (offset
@@ -60,11 +52,11 @@ pub(super) const DEVTYPE_DUALSHOCK4: u8 = pf_driver_proto::gamepad::DEVTYPE_DUAL
 /// loads on it and the HID DualSense appears to games) plus the shared-memory section the driver maps.
 /// Dropping it removes the devnode (`SwDeviceClose`) and unmaps + closes the section.
 struct DsWinPad {
-    /// Per-session devnode from SwDeviceCreate, when it succeeds. `None` falls back to an out-of-band
-    /// `pf_dualsense` devnode (installer/devgen).
-    hsw: Option<HSWDEVICE>,
-    map: HANDLE,
-    view: *mut u8,
+    /// Per-session devnode from SwDeviceCreate, when it succeeds (RAII — `SwDeviceClose` on drop).
+    /// `None` falls back to an out-of-band `pf_dualsense` devnode (installer/devgen).
+    _sw: Option<super::gamepad_raii::SwDevice>,
+    /// The named shared section the driver maps (RAII — unmapped + closed on drop).
+    shm: super::gamepad_raii::Shm,
     seq: u8,
     ts: u32,
     last_out_seq: u32,
@@ -238,62 +230,16 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<HSWDEVICE> {
     Ok(hsw)
 }
 
-/// Create + map the named section `Global\pfds-shm-<index>`, zeroed, with a permissive DACL so the
-/// WUDFHost (whatever account it runs as) can open it. Returns `(section handle, mapped base)`; the
-/// caller stamps the device-type + initial input report and finally the magic. Shared by both Windows
-/// pad backends (DualSense + DualShock 4).
-pub(super) fn create_shm_section(index: u8) -> Result<(HANDLE, *mut u8)> {
-    let name = HSTRING::from(pf_driver_proto::gamepad::pad_shm_name(index));
-
-    let mut psd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the SDDL literal is valid; psd receives an allocated descriptor (freed by the OS when
-    // the process exits — acceptable for a host-lifetime object).
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            w!("D:(A;;GA;;;WD)"),
-            SDDL_REVISION_1,
-            &mut psd,
-            None,
-        )?;
-    }
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: psd.0,
-        bInheritHandle: false.into(),
-    };
-
-    // SAFETY: anonymous (pagefile-backed) section of SHM_SIZE bytes with the SDDL above.
-    let map = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            Some(&sa),
-            PAGE_READWRITE,
-            0,
-            SHM_SIZE as u32,
-            PCWSTR(name.as_ptr()),
-        )?
-    };
-    // SAFETY: map is a valid section handle; map the whole thing.
-    let view = unsafe { MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, SHM_SIZE) };
-    if view.Value.is_null() {
-        // SAFETY: map is valid.
-        unsafe {
-            let _ = CloseHandle(map);
-        }
-        return Err(anyhow!("MapViewOfFile failed for {name}"));
-    }
-    let base = view.Value as *mut u8;
-    // SAFETY: base points at SHM_SIZE writable bytes.
-    unsafe { std::ptr::write_bytes(base, 0, SHM_SIZE) };
-    Ok((map, base))
-}
-
 impl DsWinPad {
     /// Create + map the section `Global\pfds-shm-<index>`, stamp the magic, then spawn the
     /// `root\pf_dualsense` devnode (the driver loads on it and maps the section). The devnode lives
     /// for the pad's lifetime — dropping the pad removes it (`SwDeviceClose`).
     fn open(index: u8) -> Result<DsWinPad> {
-        let (map, base) = create_shm_section(index)?;
+        let shm = super::gamepad_raii::Shm::create(
+            &HSTRING::from(pf_driver_proto::gamepad::pad_shm_name(index)),
+            SHM_SIZE,
+        )?;
+        let base = shm.base();
         // Stamp the neutral input report, then the magic LAST (the driver only accepts the section
         // once magic is set). The device-type stays 0 (DualSense — the section is already zeroed).
         // SAFETY: base points at SHM_SIZE writable bytes.
@@ -322,10 +268,10 @@ impl DsWinPad {
                 None
             }
         };
+        let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         Ok(DsWinPad {
-            hsw,
-            map,
-            view: base,
+            _sw,
+            shm,
             seq: 0,
             ts: 0,
             last_out_seq: 0,
@@ -338,41 +284,29 @@ impl DsWinPad {
         self.ts = self.ts.wrapping_add(1);
         let mut r = [0u8; DS_INPUT_REPORT_LEN];
         serialize_state(&mut r, st, self.seq, self.ts);
-        // SAFETY: view points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
-        unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), self.view.add(OFF_INPUT), r.len()) };
+        // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
+        unsafe {
+            std::ptr::copy_nonoverlapping(r.as_ptr(), self.shm.base().add(OFF_INPUT), r.len())
+        };
     }
 
     /// Poll the section's output slot; parse a new `0x02` report (rumble / LEDs / triggers) into a
     /// [`DsFeedback`] for pad `pad`. Returns empty feedback if the driver hasn't published anything new.
     fn service(&mut self, pad: u8) -> DsFeedback {
         let mut fb = DsFeedback::default();
-        // SAFETY: view points at SHM_SIZE bytes.
-        let seq = unsafe { std::ptr::read_unaligned(self.view.add(OFF_OUT_SEQ) as *const u32) };
+        // SAFETY: base points at SHM_SIZE bytes.
+        let seq =
+            unsafe { std::ptr::read_unaligned(self.shm.base().add(OFF_OUT_SEQ) as *const u32) };
         if seq != self.last_out_seq {
             self.last_out_seq = seq;
             let mut out = [0u8; 64];
             // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
             unsafe {
-                std::ptr::copy_nonoverlapping(self.view.add(OFF_OUTPUT), out.as_mut_ptr(), 64)
+                std::ptr::copy_nonoverlapping(self.shm.base().add(OFF_OUTPUT), out.as_mut_ptr(), 64)
             };
             parse_ds_output(pad, &out, &mut fb);
         }
         fb
-    }
-}
-
-impl Drop for DsWinPad {
-    fn drop(&mut self) {
-        // SAFETY: hsw (if any) owns the devnode; view/map from MapViewOfFile/CreateFileMappingW.
-        unsafe {
-            if let Some(h) = self.hsw {
-                SwDeviceClose(h);
-            }
-            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: self.view as *mut c_void,
-            });
-            let _ = CloseHandle(self.map);
-        }
     }
 }
 

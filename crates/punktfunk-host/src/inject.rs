@@ -459,6 +459,11 @@ pub mod gamepad;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/gamepad_windows.rs"]
 pub mod gamepad;
+/// Windows: small RAII wrappers (`Shm` section+view, `SwDevice` devnode) shared by the three gamepad
+/// backends (DualSense / DualShock 4 / XUSB), so each per-pad resource closes deterministically on drop.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/gamepad_raii.rs"]
+mod gamepad_raii;
 /// Stub — virtual gamepads need Linux uinput or the Windows UMDF drivers; events are dropped elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod gamepad {

@@ -21,15 +21,7 @@ use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
-    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
-};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
 // Shared-section layout — the single source of truth is `pf_driver_proto::gamepad::XusbShm` (offset
@@ -150,9 +142,10 @@ fn create_swdevice(index: u8) -> Result<HSWDEVICE> {
 
 /// A single virtual Xbox 360 pad: the `pf_xusb_<index>` devnode plus the mapped shared section.
 struct XusbWinPad {
-    hsw: Option<HSWDEVICE>,
-    map: HANDLE,
-    view: *mut u8,
+    /// Owns the `pf_xusb_<index>` devnode (dropped → `SwDeviceClose`). `None` if `SwDeviceCreate` failed.
+    _sw: Option<super::gamepad_raii::SwDevice>,
+    /// Owns `Global\pfxusb-shm-<index>` (the section + its mapped view; drop unmaps + closes).
+    shm: super::gamepad_raii::Shm,
     packet: u32,
     last_rumble_seq: u32,
 }
@@ -160,45 +153,13 @@ struct XusbWinPad {
 impl XusbWinPad {
     /// Create + map `Global\pfxusb-shm-<index>`, stamp the magic, then spawn the devnode.
     fn open(index: u8) -> Result<XusbWinPad> {
-        let name = HSTRING::from(pf_driver_proto::gamepad::xusb_shm_name(index));
-
-        // Permissive DACL so the WUDFHost (whatever account) can open the section.
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: SDDL literal valid; psd receives an OS-freed descriptor (host-lifetime — fine).
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:(A;;GA;;;WD)"),
-                SDDL_REVISION_1,
-                &mut psd,
-                None,
-            )?;
-        }
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: psd.0,
-            bInheritHandle: false.into(),
-        };
-        // SAFETY: anonymous (pagefile-backed) section of SHM_SIZE bytes with the SDDL above.
-        let map = unsafe {
-            CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                Some(&sa),
-                PAGE_READWRITE,
-                0,
-                SHM_SIZE as u32,
-                PCWSTR(name.as_ptr()),
-            )?
-        };
-        // SAFETY: map is a valid section handle; map the whole thing.
-        let view = unsafe { MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, SHM_SIZE) };
-        if view.Value.is_null() {
-            // SAFETY: map is valid.
-            unsafe {
-                let _ = CloseHandle(map);
-            }
-            return Err(anyhow!("MapViewOfFile failed for {name}"));
-        }
-        let base = view.Value as *mut u8;
+        // Permissive-DACL named section the WUDFHost (whatever account) can open; `Shm` owns the
+        // section handle + its mapped view (zero-filled) and unmaps/closes on drop.
+        let shm = super::gamepad_raii::Shm::create(
+            &HSTRING::from(pf_driver_proto::gamepad::xusb_shm_name(index)),
+            SHM_SIZE,
+        )?;
+        let base = shm.base();
         // Zero the section then stamp the magic LAST (the driver only accepts it once magic is set).
         // SAFETY: base points at SHM_SIZE writable bytes.
         unsafe {
@@ -212,10 +173,10 @@ impl XusbWinPad {
                 None
             }
         };
+        let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         Ok(XusbWinPad {
-            hsw,
-            map,
-            view: base,
+            _sw,
+            shm,
             packet: 0,
             last_rumble_seq: 0,
         })
@@ -226,47 +187,33 @@ impl XusbWinPad {
     #[allow(clippy::too_many_arguments)]
     fn write_state(&mut self, buttons: u16, lt: u8, rt: u8, lx: i16, ly: i16, rx: i16, ry: i16) {
         self.packet = self.packet.wrapping_add(1);
-        // SAFETY: view points at SHM_SIZE bytes; all offsets are in range.
+        // SAFETY: base points at SHM_SIZE bytes; all offsets are in range.
+        let base = self.shm.base();
         unsafe {
-            std::ptr::write_unaligned(self.view.add(OFF_BUTTONS) as *mut u16, buttons);
-            *self.view.add(OFF_LT) = lt;
-            *self.view.add(OFF_RT) = rt;
-            std::ptr::write_unaligned(self.view.add(OFF_LX) as *mut i16, lx);
-            std::ptr::write_unaligned(self.view.add(OFF_LY) as *mut i16, ly);
-            std::ptr::write_unaligned(self.view.add(OFF_RX) as *mut i16, rx);
-            std::ptr::write_unaligned(self.view.add(OFF_RY) as *mut i16, ry);
-            std::ptr::write_unaligned(self.view.add(OFF_PACKET) as *mut u32, self.packet);
+            std::ptr::write_unaligned(base.add(OFF_BUTTONS) as *mut u16, buttons);
+            *base.add(OFF_LT) = lt;
+            *base.add(OFF_RT) = rt;
+            std::ptr::write_unaligned(base.add(OFF_LX) as *mut i16, lx);
+            std::ptr::write_unaligned(base.add(OFF_LY) as *mut i16, ly);
+            std::ptr::write_unaligned(base.add(OFF_RX) as *mut i16, rx);
+            std::ptr::write_unaligned(base.add(OFF_RY) as *mut i16, ry);
+            std::ptr::write_unaligned(base.add(OFF_PACKET) as *mut u32, self.packet);
         }
     }
 
     /// Poll the section for a game's rumble (the driver bumps `rumble_seq` on each SET_STATE). Returns
     /// `(large, small)` motor levels (0..=255) when a new one arrived.
     fn service(&mut self) -> Option<(u8, u8)> {
-        // SAFETY: view points at SHM_SIZE bytes.
-        let seq = unsafe { std::ptr::read_unaligned(self.view.add(OFF_RUMBLE_SEQ) as *const u32) };
+        let base = self.shm.base();
+        // SAFETY: base points at SHM_SIZE bytes.
+        let seq = unsafe { std::ptr::read_unaligned(base.add(OFF_RUMBLE_SEQ) as *const u32) };
         if seq == self.last_rumble_seq {
             return None;
         }
         self.last_rumble_seq = seq;
         // SAFETY: rumble bytes at OFF_RUMBLE / OFF_RUMBLE+1.
-        let (large, small) =
-            unsafe { (*self.view.add(OFF_RUMBLE), *self.view.add(OFF_RUMBLE + 1)) };
+        let (large, small) = unsafe { (*base.add(OFF_RUMBLE), *base.add(OFF_RUMBLE + 1)) };
         Some((large, small))
-    }
-}
-
-impl Drop for XusbWinPad {
-    fn drop(&mut self) {
-        // SAFETY: hsw (if any) owns the devnode; view/map from MapViewOfFile/CreateFileMappingW.
-        unsafe {
-            if let Some(h) = self.hsw {
-                SwDeviceClose(h);
-            }
-            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: self.view as *mut c_void,
-            });
-            let _ = CloseHandle(self.map);
-        }
     }
 }
 
