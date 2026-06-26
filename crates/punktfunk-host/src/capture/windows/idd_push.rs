@@ -132,6 +132,41 @@ struct HostSlot {
     srv: ID3D11ShaderResourceView,
 }
 
+/// RAII guard over an [`IDXGIKeyedMutex`]: [`acquire`](Self::acquire) does `AcquireSync(key, timeout)`,
+/// `Drop` does `ReleaseSync(key)`. So the lock is released even if the work between acquire and the end
+/// of the guard's scope `?`-returns or panics — the "leak the keyed-mutex lock → stall the driver on
+/// that slot" footgun the consume loop guards against by hand. Keeps the hot loop free of a raw
+/// `ReleaseSync` that a future early-return could skip.
+struct KeyedMutexGuard<'a> {
+    mutex: &'a IDXGIKeyedMutex,
+    key: u64,
+}
+
+impl<'a> KeyedMutexGuard<'a> {
+    /// Acquire `mutex` at `key`, waiting up to `timeout_ms`. `None` if the acquire times out / errors
+    /// (the caller skips the frame), so the guard is only ever held when the lock is genuinely held.
+    fn acquire(
+        mutex: &'a IDXGIKeyedMutex,
+        key: u64,
+        timeout_ms: u32,
+    ) -> Option<KeyedMutexGuard<'a>> {
+        // SAFETY: `mutex` is a live `IDXGIKeyedMutex` on this thread's immediate-context device.
+        if unsafe { mutex.AcquireSync(key, timeout_ms) }.is_err() {
+            return None;
+        }
+        Some(KeyedMutexGuard { mutex, key })
+    }
+}
+
+impl Drop for KeyedMutexGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: we hold `mutex` at `key` (acquired in `acquire`, never released elsewhere); release it.
+        unsafe {
+            let _ = self.mutex.ReleaseSync(self.key);
+        }
+    }
+}
+
 /// Creates + owns the shared ring; yields the driver's frames as [`FramePayload::D3d11`].
 pub struct IddPushCapturer {
     device: ID3D11Device,
@@ -783,20 +818,26 @@ impl IddPushCapturer {
         // ~3 ms encode — NVENC reads the host out-ring slot, not the keyed-mutex slot), so the driver gets
         // the slot back immediately and the encode of the PREVIOUS frame overlaps this convert.
         let s = &self.slots[slot];
-        if unsafe { s.mutex.AcquireSync(0, 8) }.is_err() {
-            return Ok(None);
-        }
-        unsafe {
-            if self.display_hdr {
-                // Sample the FP16 slot's SRV directly (no scratch copy) → BT.2020 PQ Rgb10a2.
-                if let Some(conv) = self.hdr_conv.as_ref() {
-                    conv.convert(&self.context, &s.srv, &out_rtv, self.width, self.height);
+        // Acquire the slot's keyed mutex via a RAII guard, scoped to JUST the convert/copy below so it
+        // releases at the same point as the old hand-written `ReleaseSync` (the driver gets the slot back
+        // immediately, NOT held across the rest of `try_consume`) — but now leak-proof on any early return.
+        {
+            let Some(_lock) = KeyedMutexGuard::acquire(&s.mutex, 0, 8) else {
+                return Ok(None);
+            };
+            // SAFETY: convert/copy on the owning (encode) thread's immediate context, holding the slot lock.
+            unsafe {
+                if self.display_hdr {
+                    // Sample the FP16 slot's SRV directly (no scratch copy) → BT.2020 PQ Rgb10a2.
+                    if let Some(conv) = self.hdr_conv.as_ref() {
+                        conv.convert(&self.context, &s.srv, &out_rtv, self.width, self.height);
+                    }
+                } else {
+                    // SDR: the slot is already 8-bit BGRA — one copy into the out-ring (hidden by pipelining).
+                    self.context.CopyResource(&out, &s.tex);
                 }
-            } else {
-                // SDR: the slot is already 8-bit BGRA — one copy into the out-ring (hidden by pipelining).
-                self.context.CopyResource(&out, &s.tex);
             }
-            let _ = s.mutex.ReleaseSync(0);
+            // `_lock` drops here → `ReleaseSync(0)`.
         }
         self.out_idx = (i + 1) % self.out_ring.len();
         self.last_seq = seq;
