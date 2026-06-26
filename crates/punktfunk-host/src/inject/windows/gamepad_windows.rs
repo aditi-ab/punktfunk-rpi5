@@ -187,8 +187,10 @@ impl XusbWinPad {
     #[allow(clippy::too_many_arguments)]
     fn write_state(&mut self, buttons: u16, lt: u8, rt: u8, lx: i16, ly: i16, rx: i16, ry: i16) {
         self.packet = self.packet.wrapping_add(1);
-        // SAFETY: base points at SHM_SIZE bytes; all offsets are in range.
         let base = self.shm.base();
+        // SAFETY: `base` is the start of the mapped section (`SHM_SIZE` bytes, owned by `Shm`); every
+        // `OFF_*` is a fixed in-range offset into it and `write_unaligned` handles the unaligned field
+        // writes. Single owner (`&mut self`), so no concurrent writer races these stores.
         unsafe {
             std::ptr::write_unaligned(base.add(OFF_BUTTONS) as *mut u16, buttons);
             *base.add(OFF_LT) = lt;

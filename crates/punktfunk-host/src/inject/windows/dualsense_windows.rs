@@ -41,7 +41,8 @@ pub(super) const SHM_MAGIC: u32 = pf_driver_proto::gamepad::PAD_MAGIC; // "PFDS"
 pub(super) const OFF_INPUT: usize = core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, input);
 pub(super) const OFF_OUT_SEQ: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, out_seq);
-pub(super) const OFF_OUTPUT: usize = core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, output);
+pub(super) const OFF_OUTPUT: usize =
+    core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, output);
 /// Device-type selector the driver reads to choose which HID identity/descriptor it serves: 0 =
 /// DualSense (the default — the section is zeroed), 1 = DualShock 4.
 pub(super) const OFF_DEVTYPE: usize =

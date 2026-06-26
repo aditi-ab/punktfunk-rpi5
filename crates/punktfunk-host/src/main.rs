@@ -13,6 +13,10 @@
 
 // Scaffold: trait methods and config paths are defined ahead of their backends.
 #![allow(dead_code)]
+// Unsafe-proof program: every `unsafe {}` / `unsafe impl` in the crate must carry a `// SAFETY:`
+// proof of why it is sound. This crate-root deny is the permanent, catch-all gate (it also covers
+// any future module); individual files keep their own `#![deny(...)]` as belt-and-suspenders.
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 mod audio;
 mod capture;

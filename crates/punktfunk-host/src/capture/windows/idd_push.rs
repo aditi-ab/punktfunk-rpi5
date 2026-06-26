@@ -10,6 +10,9 @@
 //! [`pf_driver_proto::frame`] (which OWNS the contract, with `const` size asserts) — both sides
 //! `use` it, so drift is a compile error rather than a "must match" comment.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use super::dxgi::{make_device, D3d11Frame, HdrP010Converter, VideoConverter, WinCaptureTarget};
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
@@ -225,7 +228,12 @@ pub struct IddPushCapturer {
     status_logged: bool,
     _keepalive: Box<dyn Send>,
 }
-// COM objects used only from the owning (encode) thread.
+// SAFETY: `IddPushCapturer` is `!Send` only because of its `*mut SharedHeader`/`*mut DebugBlock` raw
+// pointers (and the COM interfaces). It is created, used, and dropped by a SINGLE thread — the owning
+// capture/encode thread — never shared: the `ID3D11DeviceContext` is the device's IMMEDIATE context
+// (single-threaded by D3D11 contract) and is only ever touched from that thread, and the header/
+// dbg_block pointers (into mappings this struct owns) are only dereferenced there. `Send` transfers
+// ownership to one thread at a time with NO concurrent access; we do not (and must not) claim `Sync`.
 unsafe impl Send for IddPushCapturer {}
 
 /// Build a permissive (Everyone:GenericAll) `SECURITY_ATTRIBUTES` so the restricted WUDFHost driver
@@ -343,6 +351,9 @@ impl IddPushCapturer {
         // a fullscreen game can hold the virtual display at a different mode (esp. across a reconnect), so
         // matching the actual mode lets the first frame flow instead of being dropped (game-capture bug
         // GB1). Falls back to the negotiated mode when the CCD read is unavailable.
+        // SAFETY: `active_resolution` is an `unsafe fn` (Win32 CCD `QueryDisplayConfig`) that takes only a
+        // copy of the plain `u32` CCD target id and returns owned `(w, h)` values; it forms no borrows from
+        // us and validates the id internally, returning `None` on any failure (handled by `unwrap_or`).
         let (w, h) =
             unsafe { crate::win_display::active_resolution(target.target_id) }.unwrap_or((pw, ph));
         if (w, h) != (pw, ph) {
@@ -361,6 +372,27 @@ impl IddPushCapturer {
         // PROACTIVELY enable advanced color so HDR streams without the user toggling anything; an
         // SDR-only client leaves the display alone (and still gets a tone-mapped picture, never a freeze,
         // if the user does enable HDR).
+        // SAFETY: one block over the whole ring setup; every operation in it is sound:
+        // - `set_advanced_color`/`advanced_color_enabled` are `unsafe fn`s taking only a copy of the plain
+        //   `u32` target id; they read/flip CCD display config and return owned values, borrowing nothing.
+        // - `CreateDXGIFactory1`, `EnumAdapterByLuid`, `make_device`, `permissive_sa`, `CreateFileMappingW`,
+        //   `MapViewOfFile`, `CreateEventW`, and `create_ring_slots` are all `?`-checked, so every returned
+        //   interface/handle/view is non-error before use; `&sa`/`&adapter`/`&device`/the `&HSTRING` names
+        //   are live borrows that outlive each synchronous call, and `sa.lpSecurityDescriptor` stays valid
+        //   because its backing `_psd` is held in scope for the whole block.
+        // - The header mapping is created AND viewed at `bytes == size_of::<SharedHeader>().max(64)`; the
+        //   view's null is checked (`bail!` on failure, after which the owned `map` closes the mapping). The
+        //   OS view base is page-aligned, so `section.ptr::<SharedHeader>()` is suitably aligned for a
+        //   `SharedHeader`, and `write_bytes(.., 0, bytes)` plus the `(*header).field = ..` writes all stay
+        //   within those `bytes` and write THROUGH the raw pointer without forming any `&mut`. The debug
+        //   section is the same pattern at `dbg_bytes == size_of::<DebugBlock>()`, only entered when its
+        //   own view is non-null.
+        // - The `magic` publish stores through `addr_of!((*header).magic) as *const AtomicU32`: `addr_of!`
+        //   takes the field address without a reference; the field is a 4-aligned `u32` (valid for
+        //   `AtomicU32`), and the `Release` store after the `Release` fence is the cross-process handshake
+        //   that orders all preceding writes before the driver may observe `MAGIC`.
+        // - `header`/`dbg_block` point into the OS mappings, NOT into the `MappedSection` structs, so moving
+        //   `section`/`dbg_section` into `me` leaves them valid (see the `MappedSection` doc comment).
         unsafe {
             // If we ENABLE advanced color for a 10-bit client, trust it (the driver will compose FP16) and
             // size the ring FP16 directly — don't race the advanced_color_enabled poll, which may not have
@@ -541,10 +573,16 @@ impl IddPushCapturer {
     fn wait_for_attach(&self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(4);
         loop {
-            // Plain read: the driver writes this u32; an aligned u32 read can't tear (same access as
+            // SAFETY: `self.header` points into the live shared-header mapping this capturer owns (sized
+            // `>= size_of::<SharedHeader>()`, page-aligned), so the field read is in-bounds + aligned, and
+            // no reference into the shared region is formed. Plain read: the driver writes this `u32`
+            // cross-process, but an aligned `u32` read can't tear and `driver_status` is best-effort
+            // diagnostics — the real handshake is the atomic `magic`/`latest` (same access as
             // log_driver_status_once).
             let st = unsafe { (*self.header).driver_status };
             if matches!(st, DRV_STATUS_TEX_FAIL | DRV_STATUS_NO_DEVICE1) {
+                // SAFETY: as above — an in-bounds, aligned `u32` read of a best-effort diagnostic field
+                // through the owned, live header mapping; no reference into the shared region is formed.
                 let detail = unsafe { (*self.header).driver_status_detail };
                 bail!(
                     "IDD-push driver failed to attach (driver_status={st} detail=0x{detail:08x} — \
@@ -567,6 +605,10 @@ impl IddPushCapturer {
 
     #[inline]
     fn latest(&self) -> u64 {
+        // SAFETY: `self.header` is the live, owned shared-header mapping (page-aligned, sized for a
+        // `SharedHeader`). `addr_of!((*self.header).latest)` forms the address of the `latest` field
+        // WITHOUT a reference; it is an 8-aligned `u64` (so valid for `AtomicU64`), and the `Acquire` load
+        // is the consumer half of the cross-process publish handshake (pairs with the driver's `Release`).
         unsafe {
             (*(std::ptr::addr_of!((*self.header).latest) as *const AtomicU64))
                 .load(Ordering::Acquire)
@@ -578,6 +620,10 @@ impl IddPushCapturer {
         if self.status_logged {
             return;
         }
+        // SAFETY: four in-bounds, aligned reads of the live, owned shared-header mapping. The driver writes
+        // these `u32`/`i32` diagnostic fields cross-process, but aligned word reads can't tear and these are
+        // best-effort status (the real handshake is the atomic `magic`/`latest`); no `&`/`&mut` reference
+        // into the shared region is formed.
         let (status, detail, lo, hi) = unsafe {
             (
                 (*self.header).driver_status,
@@ -617,6 +663,11 @@ impl IddPushCapturer {
             tracing::warn!("IDD push DEBUG: no debug block");
             return;
         }
+        // SAFETY: `self.dbg_block` was just checked non-null (the early return above); it points into the
+        // owned `dbg_section` mapping sized exactly `size_of::<DebugBlock>()` and page-aligned, so it is
+        // valid + aligned for `DebugBlock`. `d` is a short-lived SHARED reference used only to read the
+        // fields below; we never form `&mut` into this region, and the driver's cross-process writes are
+        // aligned `u32`s that don't tear (best-effort bring-up diagnostics).
         let d = unsafe { &*self.dbg_block };
         tracing::error!(
             run_core_entries = d.run_core_entries,
@@ -666,6 +717,10 @@ impl IddPushCapturer {
         self.height = new_h;
         let fmt = self.ring_format();
         let new_gen = IDD_GENERATION.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `create_ring_slots` is an `unsafe fn` (it makes D3D11/DXGI COM calls); we pass a live
+        // borrow of `self.device` (the capturer's own device, on which the slots are created) plus plain
+        // `u32`/`DXGI_FORMAT` values, and `?` propagates any failure before the slots are used. Every
+        // returned slot's texture + keyed mutex belongs to that same `self.device`.
         let new_slots = unsafe {
             Self::create_ring_slots(
                 &self.device,
@@ -676,6 +731,12 @@ impl IddPushCapturer {
                 fmt,
             )?
         };
+        // SAFETY: `self.header` is the live, owned shared-header mapping (page-aligned, sized for a
+        // `SharedHeader`). The `latest`/`generation` stores go through `addr_of!`-formed field pointers (no
+        // references) of correctly-aligned `u64`/`u32` fields, valid for `AtomicU64`/`AtomicU32`; the
+        // `dxgi_format`/`width`/`height` writes are in-bounds raw writes through the pointer (no `&mut`).
+        // The `Release` fence + the `Release` `generation` store publish all preceding writes so the driver
+        // only re-attaches (`Acquire`) once the new textures + format are in place.
         unsafe {
             // Clear `latest` to the 0 sentinel (generation 0, which try_consume rejects). The real guard
             // against consuming an unwritten new-ring slot is the generation tag in `latest`: a stale
@@ -711,9 +772,13 @@ impl IddPushCapturer {
             return;
         }
         self.last_acm_poll = Instant::now();
+        // SAFETY: `advanced_color_enabled` is an `unsafe fn` taking only a copy of the plain `u32` target
+        // id; it performs a read-only CCD query and returns an owned `bool`, borrowing nothing from us.
         let now_hdr = unsafe { crate::win_display::advanced_color_enabled(self.target_id) };
         // Follow the display's ACTUAL resolution too — a fullscreen game can mode-set the virtual display
         // out from under the negotiated size (game-capture bug GB1). Unknown read → keep our current size.
+        // SAFETY: `active_resolution` is an `unsafe fn` taking only a copy of the plain `u32` target id; it
+        // performs a read-only CCD query and returns owned `(w, h)` values, borrowing nothing from us.
         let (now_w, now_h) = unsafe { crate::win_display::active_resolution(self.target_id) }
             .unwrap_or((self.width, self.height));
         if now_hdr == self.display_hdr && now_w == self.width && now_h == self.height {
@@ -760,6 +825,10 @@ impl IddPushCapturer {
         };
         for _ in 0..OUT_RING {
             let mut t: Option<ID3D11Texture2D> = None;
+            // SAFETY: `CreateTexture2D` is called on `self.device` (the capturer's live D3D11 device);
+            // `&desc` is a fully-initialized stack `D3D11_TEXTURE2D_DESC`, the data arg is `None` (no
+            // initial data), and `Some(&mut t)` is a live out-parameter the call fills. `?` rejects a failed
+            // HRESULT before `t` is unwrapped, and the created texture belongs to `self.device`.
             unsafe {
                 self.device
                     .CreateTexture2D(&desc, None, Some(&mut t))
@@ -775,9 +844,16 @@ impl IddPushCapturer {
     fn ensure_converter(&mut self) -> Result<()> {
         if self.display_hdr {
             if self.hdr_p010_conv.is_none() {
+                // SAFETY: `HdrP010Converter::new` is `unsafe` (it compiles D3D11 shaders + creates
+                // resources); we pass a live borrow of `self.device`, the device the converter's resources
+                // belong to, and `?` propagates any failure before the converter is stored.
                 self.hdr_p010_conv = Some(unsafe { HdrP010Converter::new(&self.device)? });
             }
         } else if self.video_conv.is_none() {
+            // SAFETY: `VideoConverter::new` is `unsafe` (it sets up the D3D11 VIDEO processor); we pass live
+            // borrows of `self.device` + its immediate `self.context` (single-threaded, this thread) plus
+            // plain `u32` dimensions, and `?` propagates any failure before it is stored. The converter's
+            // resources belong to that same device/context.
             self.video_conv = Some(unsafe {
                 VideoConverter::new(&self.device, &self.context, self.width, self.height, false)?
             });
@@ -942,6 +1018,8 @@ pub fn spawn_observer(target: WinCaptureTarget, preferred: Option<(u32, u32, u32
 
 /// The discrete render GPU LUID (where NVENC runs), falling back to the monitor's `OsAdapterLuid`.
 fn resolve_render_adapter_luid_or(fallback_packed: i64) -> LUID {
+    // SAFETY: `resolve_render_adapter_luid` is an `unsafe fn` (it enumerates DXGI adapters) that takes no
+    // arguments and returns an owned `Option<LUID>`, borrowing nothing.
     if let Some(l) = unsafe { crate::win_adapter::resolve_render_adapter_luid() } {
         return l;
     }
@@ -955,6 +1033,9 @@ impl Capturer for IddPushCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
+            // SAFETY: `self.event` is the live frame-ready `OwnedHandle` this capturer owns; its raw value
+            // (borrowed for the call, so it outlives this synchronous wait) is a valid auto-reset event
+            // handle. `WaitForSingleObject` only reads the handle; the 16 ms timeout bounds the wait.
             let _ = unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), 16) };
             if let Some(f) = self.try_consume()? {
                 return Ok(f);
@@ -964,6 +1045,9 @@ impl Capturer for IddPushCapturer {
             }
             if Instant::now() > deadline {
                 self.log_debug_block();
+                // SAFETY: four in-bounds, aligned reads of the live, owned shared-header mapping — the same
+                // best-effort diagnostic fields as `log_driver_status_once` (aligned word reads can't tear;
+                // no reference into the shared region is formed).
                 let (st, detail, lo, hi) = unsafe {
                     (
                         (*self.header).driver_status,

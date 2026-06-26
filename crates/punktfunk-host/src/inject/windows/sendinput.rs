@@ -238,7 +238,8 @@ impl InputInjector for SendInputInjector {
             }
             InputKind::KeyDown | InputKind::KeyUp => {
                 let down = event.kind == InputKind::KeyDown;
-                let vk = (event.code & 0xff) as u16; // client sends Windows VK
+                // client sends Windows VK
+                let vk = (event.code & 0xff) as u16;
                 // SAFETY: `MapVirtualKeyExW` is a pure value translation (VK → scancode); all three
                 // args are by-value (`u32`, the `MAPVK_VK_TO_VSC_EX` map-type constant, a `None`
                 // HKL). It dereferences no pointer and returns a `u32` — FFI-`unsafe` only.

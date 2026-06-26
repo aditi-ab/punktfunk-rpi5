@@ -63,8 +63,12 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     ///
     /// # Safety
     /// `dev` must be the live control handle from [`open`](Self::open).
-    unsafe fn add_monitor(&self, dev: HANDLE, mode: Mode, render_luid: Option<LUID>)
-        -> Result<AddedMonitor>;
+    unsafe fn add_monitor(
+        &self,
+        dev: HANDLE,
+        mode: Mode,
+        render_luid: Option<LUID>,
+    ) -> Result<AddedMonitor>;
     /// REMOVE the monitor identified by `key`.
     ///
     /// # Safety
@@ -150,7 +154,8 @@ pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayMa
 /// The process-wide manager. Panics if reached before a backend called [`init`] — by construction a
 /// session is only ever created after `vdisplay::open` constructed the backend (which calls `init`).
 pub(crate) fn vdm() -> &'static VirtualDisplayManager {
-    VDM.get().expect("VirtualDisplayManager used before a backend initialised it")
+    VDM.get()
+        .expect("VirtualDisplayManager used before a backend initialised it")
 }
 
 impl VirtualDisplayManager {
@@ -178,9 +183,7 @@ impl VirtualDisplayManager {
     /// The live control handle for the pinger/linger threads (lock-free: the device never changes once
     /// opened). `None` only before the first acquire opened it.
     fn device_handle(&self) -> Option<HANDLE> {
-        self.device
-            .get()
-            .map(|d| HANDLE(d.as_raw_handle()))
+        self.device.get().map(|d| HANDLE(d.as_raw_handle()))
     }
 
     /// Open + initialise the backend (validates the driver is present). Mirrors the old
@@ -203,8 +206,7 @@ impl VirtualDisplayManager {
         // client is gone). A REUSED IddCx swap-chain is DEAD, so joining it hands a black screen —
         // PREEMPT: tear the old monitor down (its key/topology are restored) and create a fresh one. The
         // old session's lease is gen-stamped, so its later drop is a no-op and can't tear down the new one.
-        if idd_push_mode()
-            && matches!(*state, MgrState::Active { .. } | MgrState::Lingering { .. })
+        if idd_push_mode() && matches!(*state, MgrState::Active { .. } | MgrState::Lingering { .. })
         {
             if let MgrState::Active { mon, .. } | MgrState::Lingering { mon, .. } =
                 std::mem::replace(&mut *state, MgrState::Idle)
@@ -235,14 +237,21 @@ impl VirtualDisplayManager {
                 // `Active` state, held under the `state` lock, so nothing else reconfigures it concurrently.
                 unsafe { self.reconfigure(mon, mode) };
             }
-            tracing::info!(refs = *refs, backend = self.driver.name(), "virtual monitor reused (concurrent / reconfigure session)");
+            tracing::info!(
+                refs = *refs,
+                backend = self.driver.name(),
+                "virtual monitor reused (concurrent / reconfigure session)"
+            );
             return Ok(self.output_for(mon));
         }
 
         // Idle or Lingering: repurpose a lingering monitor / create a fresh one → Active{refs:1}.
         let mon = match std::mem::replace(&mut *state, MgrState::Idle) {
             MgrState::Lingering { mut mon, .. } => {
-                tracing::info!(backend = self.driver.name(), "virtual monitor reused (reconnect within the linger window)");
+                tracing::info!(
+                    backend = self.driver.name(),
+                    "virtual monitor reused (reconnect within the linger window)"
+                );
                 if mon.mode != mode {
                     // SAFETY: `reconfigure` needs an exclusive `&mut Monitor` and only touches the live
                     // display topology. `mon` is the local monitor just moved out of the `Lingering`
@@ -291,7 +300,8 @@ impl VirtualDisplayManager {
         // Mandatory keepalive: ping inside the watchdog window or the driver tears all displays down.
         // The pinger reaches the singleton for both the device + the driver — no raw-handle smuggle.
         let stop = Arc::new(AtomicBool::new(false));
-        let interval = Duration::from_millis(self.watchdog_s.load(Ordering::Relaxed) as u64 * 1000 / 3);
+        let interval =
+            Duration::from_millis(self.watchdog_s.load(Ordering::Relaxed) as u64 * 1000 / 3);
         let stop_t = stop.clone();
         let pinger = thread::spawn(move || {
             let mut warned = false;
@@ -374,7 +384,10 @@ impl VirtualDisplayManager {
     /// Touches the live display topology via the CCD/GDI helpers.
     unsafe fn reconfigure(&self, mon: &mut Monitor, mode: Mode) {
         tracing::info!(
-            old = format!("{}x{}@{}", mon.mode.width, mon.mode.height, mon.mode.refresh_hz),
+            old = format!(
+                "{}x{}@{}",
+                mon.mode.width, mon.mode.height, mon.mode.refresh_hz
+            ),
             new = format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
             "virtual-display: reconfiguring reused monitor to the new client mode"
         );
@@ -408,7 +421,10 @@ impl VirtualDisplayManager {
         if let Err(e) = unsafe { self.driver.remove_monitor(dev, &mon.key) } {
             tracing::warn!("virtual-display REMOVE failed: {e:#}");
         } else {
-            tracing::info!(backend = self.driver.name(), "virtual-display monitor removed");
+            tracing::info!(
+                backend = self.driver.name(),
+                "virtual-display monitor removed"
+            );
         }
     }
 
@@ -425,10 +441,16 @@ impl VirtualDisplayManager {
             return;
         }
         *state = match std::mem::replace(&mut *state, MgrState::Idle) {
-            MgrState::Active { mon, refs } if refs > 1 => MgrState::Active { mon, refs: refs - 1 },
+            MgrState::Active { mon, refs } if refs > 1 => MgrState::Active {
+                mon,
+                refs: refs - 1,
+            },
             MgrState::Active { mon, .. } => {
                 let ms = linger_ms();
-                tracing::info!(linger_ms = ms, "virtual-display: last session left — lingering before teardown");
+                tracing::info!(
+                    linger_ms = ms,
+                    "virtual-display: last session left — lingering before teardown"
+                );
                 MgrState::Lingering {
                     mon,
                     until: Instant::now() + Duration::from_millis(ms),

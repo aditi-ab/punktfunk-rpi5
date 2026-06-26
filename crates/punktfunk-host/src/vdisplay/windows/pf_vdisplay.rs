@@ -238,14 +238,13 @@ impl VdisplayDriver for PfVdisplayDriver {
         // borrows the local `AddRequest` (alive across this synchronous call) as the input bytes, and
         // `out` is a stack `[u8; size_of::<AddReply>()]` whose length bounds the kernel's write — both
         // buffers outlive the call.
-        unsafe { ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(&add), &mut out) }.with_context(
-            || {
+        unsafe { ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(&add), &mut out) }
+            .with_context(|| {
                 format!(
                     "pf-vdisplay ADD {}x{}@{}",
                     mode.width, mode.height, mode.refresh_hz
                 )
-            },
-        )?;
+            })?;
         // `pod_read_unaligned` (NOT `from_bytes`): `out` is a stack `[u8; N]` with no guaranteed 4-byte
         // alignment, and `from_bytes` PANICS on a mismatch. This copies into an aligned `AddReply`.
         let reply: control::AddReply =
@@ -291,7 +290,15 @@ impl VdisplayDriver for PfVdisplayDriver {
         // SAFETY: per `remove_monitor`'s contract `dev` is the live control handle. `bytes_of(&req)`
         // borrows the local `RemoveRequest` for the duration of this synchronous call as the input
         // bytes; `none` is empty, so there is no output buffer.
-        unsafe { ioctl(dev, control::IOCTL_REMOVE, bytemuck::bytes_of(&req), &mut none) }.map(|_| ())
+        unsafe {
+            ioctl(
+                dev,
+                control::IOCTL_REMOVE,
+                bytemuck::bytes_of(&req),
+                &mut none,
+            )
+        }
+        .map(|_| ())
     }
 
     unsafe fn ping(&self, dev: HANDLE) -> Result<()> {

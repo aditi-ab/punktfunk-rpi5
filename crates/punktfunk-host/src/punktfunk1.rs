@@ -22,6 +22,9 @@
 //! Trust: the host serves with its persistent identity (`~/.config/punktfunk/cert.pem`, shared
 //! with GameStream pairing) and logs the SHA-256 fingerprint clients pin.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Role};
 use punktfunk_core::input::{InputEvent, InputKind};
@@ -1965,6 +1968,11 @@ pub(crate) fn boost_thread_priority(critical: bool) {
     // capture/encode (critical) and send (non-critical).
     crate::session_tuning::on_hot_thread();
     #[cfg(target_os = "windows")]
+    // SAFETY: `GetCurrentThread()` returns the constant pseudo-handle for the calling thread — always
+    // valid, thread-local in meaning, and never closed (no leak/double-close). `SetThreadPriority`
+    // takes that handle plus a `THREAD_PRIORITY_*` value the windows crate defines (HIGHEST or
+    // ABOVE_NORMAL here); it only reprioritizes this OS thread, borrows no Rust memory, and its
+    // `Result` is matched (a failure is logged, never UB). No pointers, lifetimes, or aliasing.
     unsafe {
         use windows::Win32::System::Threading::{
             GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
@@ -1992,6 +2000,10 @@ pub(crate) fn boost_thread_priority(critical: bool) {
         // realtime CPU class can preempt the compositor AND the game's own render thread, adding the
         // very frame-time we refuse to add (opt-in only — see PUNKTFUNK_SCHED_RR).
         let nice = if critical { -10 } else { -5 };
+        // SAFETY: `setpriority` takes three by-value integers and no pointers, so there is nothing to
+        // alias or outlive. `PRIO_PROCESS` with `who == 0` targets the calling task on Linux and
+        // `nice` is in range; the call only adjusts this thread's scheduling nice value and returns an
+        // `int` we inspect. No memory is touched.
         let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
         if rc == 0 {
             tracing::debug!(critical, nice, "thread nice raised");
@@ -2707,6 +2719,11 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
         // The secure-desktop HDR drop (for the DDA leg) keys off the monitor's real state in the mux loop.
         #[cfg(target_os = "windows")]
         if bit_depth >= 10 {
+            // SAFETY: `set_advanced_color` is marked `unsafe` only because it drives the Win32 CCD API
+            // internally; it takes `target_id` by value (Copy `u32` — this session's live SudoVDA
+            // monitor's CCD target id) and sizes + owns every buffer it hands the OS on its own stack.
+            // We pass no pointers, so nothing must outlive the call and there is no aliasing; an
+            // unknown/absent target id simply returns false.
             unsafe {
                 if crate::win_display::set_advanced_color(target.target_id, true) {
                     // Let the colorspace change settle before WGC creates its capture item / detects HDR.
@@ -2942,8 +2959,12 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
                 // desktop (the drop just churned + still went black). Instead, if the monitor is in HDR,
                 // open DDA in HDR (FP16 DuplicateOutput1 → BT.2020 PQ Main10); the normal-desktop DDA
                 // overlay/flip issues that drove us to WGC don't apply to the composed Winlogon UI.
-                let hdr =
-                    unsafe { crate::win_display::advanced_color_enabled(target.target_id) };
+                // SAFETY: `advanced_color_enabled` is `unsafe` only because it queries the Win32 CCD
+                // API; it takes `target_id` by value (the live SudoVDA monitor's CCD target id) and
+                // allocates + owns every buffer it passes the OS internally. No caller pointer is
+                // involved, so nothing must outlive the call and there is no aliasing; a missing
+                // target id just yields false.
+                let hdr = unsafe { crate::win_display::advanced_color_enabled(target.target_id) };
                 dda = None; // reopen to capture the secure desktop
                 match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz, hdr) {
                     Ok(mut p) => {
@@ -3368,12 +3389,27 @@ mod tests {
     unsafe fn pull_verified(conn: *mut punktfunk_core::abi::PunktfunkConnection, count: u32) {
         use punktfunk_core::error::PunktfunkStatus;
         let mut got = 0u32;
+        // SAFETY: the inferred type is the `#[repr(C)]` POD `PunktfunkFrame` (a raw `*const u8`, a
+        // `usize`, and integer fields); all-zero is a valid bit pattern for every field (a null
+        // `data`, `len == 0`). It is only ever read after `next_au` below fully overwrites it on `Ok`,
+        // so the zeroed value is never observed.
         let mut frame = unsafe { std::mem::zeroed() };
         while got < count {
+            // SAFETY: `conn` is the live, non-null `*mut PunktfunkConnection` from `punktfunk_connect`
+            // (the caller asserts non-null and does not close it until after this returns), meeting the
+            // ABI's "valid handle". `&mut frame` is an exclusive, writable borrow of the local
+            // `PunktfunkFrame` that outlives this synchronous call. This single test thread is the only
+            // video puller, satisfying the one-video-thread rule.
             match unsafe {
                 punktfunk_core::abi::punktfunk_connection_next_au(conn, &mut frame, 2000)
             } {
                 PunktfunkStatus::Ok => {
+                    // SAFETY: on `Ok`, `next_au` set `frame.data`/`frame.len` to the reassembled AU
+                    // buffer the connection owns; per the ABI contract that borrow stays valid until
+                    // the NEXT `next_au` call on this handle. We read the whole slice here (the assert
+                    // + length-checked indexing) before the loop's next `next_au`, and `conn` outlives
+                    // it — so the pointer is live, exactly `len` bytes, read-only, single-threaded (no
+                    // aliasing/use-after-free).
                     let data = unsafe { std::slice::from_raw_parts(frame.data, frame.len) };
                     let idx = u32::from_le_bytes(data[0..4].try_into().unwrap());
                     assert_eq!(
@@ -3421,6 +3457,11 @@ mod tests {
         // Session 1: TOFU (no pin) — observe the host fingerprint.
         let addr = std::ffi::CString::new("127.0.0.1").unwrap();
         let mut observed = [0u8; 32];
+        // SAFETY: `addr` is a live `CString` ("127.0.0.1") whose `as_ptr()` is the NUL-terminated
+        // UTF-8 host string the contract requires; `pin_sha256`/cert/key are NULL (all permitted), and
+        // `observed.as_mut_ptr()` is the local `[u8; 32]` — exactly the 32 writable bytes the contract
+        // demands, not aliased during the call. Every pointer references a live local that outlives the
+        // blocking connect.
         let conn = unsafe {
             punktfunk_connect(
                 addr.as_ptr(),
@@ -3439,26 +3480,28 @@ mod tests {
         assert_ne!(observed, [0u8; 32], "fingerprint not reported");
 
         let (mut w, mut h, mut hz) = (0u32, 0u32, 0u32);
-        assert_eq!(
-            unsafe { punktfunk_connection_mode(conn, &mut w, &mut h, &mut hz) },
-            PunktfunkStatus::Ok
-        );
+        // SAFETY: `conn` is the live, non-null connection handle just asserted above; `&mut w/h/hz` are
+        // exclusive, writable borrows of local `u32`s that outlive this synchronous call — the three
+        // writable out-params the contract names.
+        let st = unsafe { punktfunk_connection_mode(conn, &mut w, &mut h, &mut hz) };
+        assert_eq!(st, PunktfunkStatus::Ok);
         assert_eq!((w, h, hz), (1280, 720, 60));
 
         // Mid-stream renegotiation: request a new mode, the host acks on the control
         // stream, and punktfunk_connection_mode reflects the switch.
-        assert_eq!(
-            unsafe {
-                punktfunk_core::abi::punktfunk_connection_request_mode(conn, 1920, 1080, 144)
-            },
-            PunktfunkStatus::Ok
-        );
+        // SAFETY: `conn` is the live, non-null connection handle (the only pointer arg); the remaining
+        // arguments are by-value integers. The handle outlives this non-blocking enqueue.
+        let st = unsafe {
+            punktfunk_core::abi::punktfunk_connection_request_mode(conn, 1920, 1080, 144)
+        };
+        assert_eq!(st, PunktfunkStatus::Ok);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            assert_eq!(
-                unsafe { punktfunk_connection_mode(conn, &mut w, &mut h, &mut hz) },
-                PunktfunkStatus::Ok
-            );
+            // SAFETY: same as the earlier `punktfunk_connection_mode` call — `conn` is the live handle
+            // and `&mut w/h/hz` are exclusive writable borrows of locals that outlive this synchronous
+            // call.
+            let st = unsafe { punktfunk_connection_mode(conn, &mut w, &mut h, &mut hz) };
+            assert_eq!(st, PunktfunkStatus::Ok);
             if (w, h, hz) == (1920, 1080, 144) {
                 break;
             }
@@ -3469,6 +3512,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
+        // SAFETY: `pull_verified` requires a live connection handle it alone pulls video from; `conn` is
+        // the open, non-null handle from `punktfunk_connect` and this is the only thread touching it.
         unsafe { pull_verified(conn, 25) };
 
         let ev = punktfunk_core::input::InputEvent {
@@ -3479,13 +3524,19 @@ mod tests {
             y: 2,
             flags: 0,
         };
-        assert_eq!(
-            unsafe { punktfunk_connection_send_input(conn, &ev) },
-            PunktfunkStatus::Ok
-        );
+        // SAFETY: `conn` is the live handle; `&ev` borrows the local `InputEvent`, valid and immutable
+        // for this synchronous enqueue — the contract's "valid InputEvent" pointer.
+        let st = unsafe { punktfunk_connection_send_input(conn, &ev) };
+        assert_eq!(st, PunktfunkStatus::Ok);
+        // SAFETY: `conn` was returned by `punktfunk_connect` and is never used after this call (session
+        // 2 below uses a fresh `conn2`); `close` takes ownership and frees the handle exactly once.
         unsafe { punktfunk_connection_close(conn) };
 
         // Session 2 (same host process — the listener survived): pin the fingerprint.
+        // SAFETY: as for session 1 — `addr` is the live NUL-terminated host string; here
+        // `observed.as_ptr()` is the 32-byte pin (the fingerprint captured above, a valid `[u8; 32]`),
+        // `observed_sha256_out` is NULL and cert/key are NULL. All pointers reference live locals for
+        // the duration of the blocking connect.
         let conn2 = unsafe {
             punktfunk_connect(
                 addr.as_ptr(),
@@ -3501,11 +3552,17 @@ mod tests {
             )
         };
         assert!(!conn2.is_null(), "pinned reconnect failed");
+        // SAFETY: `conn2` is the live, non-null pinned handle, pulled only from this thread —
+        // `pull_verified`'s requirement.
         unsafe { pull_verified(conn2, 25) };
+        // SAFETY: `conn2` came from `punktfunk_connect` and is not used after this; `close` frees it once.
         unsafe { punktfunk_connection_close(conn2) };
 
         // Session 3: a wrong pin must be rejected by the handshake.
         let bad = [0xAAu8; 32];
+        // SAFETY: same shape as the prior connects — `addr` is the live host string, `bad.as_ptr()` is
+        // the 32-byte `[0xAA; 32]` pin, and out/cert/key are NULL; all reference live locals across the
+        // blocking call. (The handshake is expected to fail and return NULL here, which is sound.)
         let conn3 = unsafe {
             punktfunk_connect(
                 addr.as_ptr(),
@@ -3525,6 +3582,8 @@ mod tests {
         // The host saw the rejected handshake attempt as session 3? No — a TLS-failed
         // handshake never yields a connection, so accept() is still waiting. Connect once
         // more (TOFU) to complete the host's third session and let it exit.
+        // SAFETY: same as session 1's connect — `addr` is the live host string, pin/out/cert/key all
+        // NULL; the pointers reference live locals for the duration of the blocking connect.
         let conn4 = unsafe {
             punktfunk_connect(
                 addr.as_ptr(),
@@ -3540,7 +3599,9 @@ mod tests {
             )
         };
         assert!(!conn4.is_null());
+        // SAFETY: `conn4` is the live, non-null handle, pulled only from this thread.
         unsafe { pull_verified(conn4, 25) };
+        // SAFETY: `conn4` came from `punktfunk_connect` and is unused after this; `close` frees it once.
         unsafe { punktfunk_connection_close(conn4) };
 
         host.join().unwrap().unwrap();

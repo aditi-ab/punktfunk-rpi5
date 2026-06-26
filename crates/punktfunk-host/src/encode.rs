@@ -3,10 +3,9 @@
 //! RGB→YUV on the GPU, so no host-side CSC) and VAAPI on AMD/Intel (`*_vaapi`; the CPU-input
 //! fallback swscales RGB→NV12, the zero-copy path imports the capture dmabuf straight into a
 //! VA surface). One [`Encoder`] trait, selected in [`open_video`].
-// This file's own unsafe block carries a `// SAFETY:` proof, but the file-level
-// `#![deny(clippy::undocumented_unsafe_blocks)]` is deliberately NOT set yet: as a parent module it
-// would propagate the lint to `encode::windows::nvenc` (in-flight parallel work, not yet proven).
-// The deny lands here once every child module (incl. nvenc.rs) is documented.
+// Every unsafe block in this module tree carries a `// SAFETY:` proof; enforce it (unsafe-proof
+// program). As a parent module this also covers the child modules (encode::windows/linux::*).
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use crate::capture::{CapturedFrame, PixelFormat};
 use anyhow::Result;

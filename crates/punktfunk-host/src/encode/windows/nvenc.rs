@@ -13,6 +13,9 @@
 //! Needs a real NVIDIA GPU at runtime (session creation fails otherwise) — compiles GPU-less, but
 //! `open`/`submit` only succeed on a GPU box. The software encoder (`super::sw`) is the fallback.
 
+// Every `unsafe` block / impl in this file carries a `// SAFETY:` proof; enforce it.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use super::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
@@ -88,7 +91,15 @@ pub struct NvencD3d11Encoder {
     init_device: *mut c_void,
 }
 
-// Raw NVENC handle + COM ptrs; confined to the single encode thread (like the Linux encoder).
+// SAFETY: the `!Send` fields are the raw NVENC session/device handles (`encoder`, `init_device`),
+// the raw NVENC bitstream/registered/mapped pointers carried in `bitstreams`/`regs`/`pending`, and
+// the `ID3D11Texture2D` COM refs — none of which may be touched concurrently from two threads. This
+// encoder is owned by exactly one thread: it is moved onto the host encode thread once at
+// construction, and every NVENC call and D3D11 access happens only from that thread thereafter
+// (`submit`/`poll`/`invalidate_ref_frames`/`Drop` all run there, like the Linux encoder). Moving the
+// handles across that single ownership-transfer boundary is sound because no NVENC/D3D11 call is in
+// flight during the move and the session and its D3D11 immediate context are never shared (`&`) or
+// used concurrently — so `Send` introduces no data race on the non-`Send` fields.
 unsafe impl Send for NvencD3d11Encoder {}
 
 impl NvencD3d11Encoder {
@@ -403,6 +414,17 @@ impl NvencD3d11Encoder {
 
     /// Lazily create the session on the first frame's D3D11 device (so capture + encode share it).
     fn init_session(&mut self, device: &ID3D11Device) -> Result<()> {
+        // SAFETY: every call below goes through a function pointer resolved once from the loaded
+        // `nvidia_video_codec_sdk::ENCODE_API` (`nvEncodeAPI`) table, or through this type's own
+        // `unsafe fn`s whose contract is met here. `query_caps`/`try_open_session` receive `device`,
+        // the live `ID3D11Device` the caller pulled off the first frame; each returns either a valid
+        // open NVENC session handle or an `Err`. `destroy_encoder` is only ever called on a handle a
+        // `try_open_session` just returned (and `best` only when `!best.is_null()`), so it never frees
+        // a dangling or null session. `create_bitstream_buffer` is passed `enc` — the one chosen live
+        // session — and `&mut cb`, a `#[repr(C)] NV_ENC_CREATE_BITSTREAM_BUFFER` whose `version` is set
+        // to `NV_ENC_CREATE_BITSTREAM_BUFFER_VER`; `cb` lives across the synchronous call and its
+        // returned `bitstreamBuffer` is copied into `self.bitstreams` before `cb` drops. No handle
+        // escapes the encode thread.
         unsafe {
             // Probe real GPU caps first (max dims / 10-bit / custom-VBV / RFI) so the config below is
             // gated on what this card supports and an out-of-range mode fails with a clear error
@@ -589,6 +611,11 @@ impl Encoder for NvencD3d11Encoder {
                 new = format!("{}x{}", captured.width, captured.height),
                 "NVENC: capture device/size/HDR changed — re-initializing session"
             );
+            // SAFETY: `teardown` (an `unsafe fn`) requires the encode thread with no NVENC call in
+            // flight and a session whose cached regs/bitstreams/pending all belong to `self.encoder`.
+            // All hold: this is the synchronous encode thread, `self.inited` so `self.encoder` is the
+            // live session every cached resource was created against, and the previous frame's encode
+            // has already been polled (synchronous submit→poll), so nothing is mid-encode.
             unsafe { self.teardown() };
         }
         if !self.inited {
@@ -625,6 +652,21 @@ impl Encoder for NvencD3d11Encoder {
         }
         let slot = self.next % POOL;
         self.next += 1;
+        // SAFETY: every NVENC call goes through a function pointer from the loaded `ENCODE_API` table
+        // and takes `self.encoder`, the live session `init_session` just established (non-null on the
+        // path that reaches here). `NV_ENC_REGISTER_RESOURCE rr` has `version =
+        // NV_ENC_REGISTER_RESOURCE_VER` and registers `frame.texture` — a D3D11 texture from
+        // `frame.device`, which is the SAME device the session was opened against (any device change
+        // tears down and re-inits above, so `init_device == frame.device.as_raw()` here); the cloned
+        // `ID3D11Texture2D` is kept alive in `regs` so NVENC's registration never outlives the texture.
+        // `mp` (`NV_ENC_MAP_INPUT_RESOURCE`, version set) maps that registration and the map is recorded
+        // in `pending` to be unmapped exactly once in `poll`/`teardown`. `pic` (`NV_ENC_PIC_PARAMS`,
+        // version set) points `inputBuffer` at `mp.mappedResource` and `outputBitstream` at the live
+        // pool bitstream `bitstreams[slot]`; the optional SEI scratch (`mastering_sei`/`cll_sei` and the
+        // `sei` Vec whose `as_mut_ptr()` is written into the codec union) are stack locals that outlive
+        // the synchronous `encode_picture`. Every `#[repr(C)]` param is a live local borrowed `&mut`
+        // for the duration of its one synchronous call. (In-place encode without `CopyResource` is
+        // sound because the encode loop is synchronous, as the module docs state.)
         unsafe {
             // Register the capturer's texture with NVENC once (cached by raw pointer), then encode it
             // IN PLACE — no `CopyResource` into an encoder-owned pool. This is the zero-copy win: the
@@ -781,6 +823,12 @@ impl Encoder for NvencD3d11Encoder {
         // We tag each input with `inputTimeStamp = frame_idx` (0,1,2,…), which is also the client's
         // frame number (the packetizer numbers frames in submit order), so the client's lost-frame
         // range maps 1:1 onto the timestamps NVENC invalidates here.
+        // SAFETY: `invalidate_ref_frames` is a function pointer from the loaded `ENCODE_API` table.
+        // `self.encoder` was checked non-null at the top of this fn and is the live session; this runs
+        // on the encode thread (like submit/poll), so there is no concurrent NVENC use. Each `ts` was
+        // clamped to `[oldest_in_dpb, frame_idx - 1]` above, so it names a frame still in the session's
+        // DPB; the call passes only that `u64` timestamp (no struct), so there is no struct-size or
+        // lifetime concern.
         unsafe {
             for ts in first..=last {
                 if (API.invalidate_ref_frames)(self.encoder, ts as u64)
@@ -799,6 +847,16 @@ impl Encoder for NvencD3d11Encoder {
         let Some((bs, map, pts_ns)) = self.pending.pop_front() else {
             return Ok(None);
         };
+        // SAFETY: a non-empty `pending` implies `submit` ran, so `self.encoder` is the live session
+        // (`teardown` clears `pending` whenever it nulls the handle); all calls below use function
+        // pointers from the loaded `ENCODE_API` table on the encode thread. `NV_ENC_LOCK_BITSTREAM lock`
+        // (version = `NV_ENC_LOCK_BITSTREAM_VER`) locks `bs`, a pool bitstream a prior `encode_picture`
+        // targeted; `lock_bitstream` blocks until that encode finishes, so on success
+        // `lock.bitstreamBufferPtr` is non-null and points at `lock.bitstreamSizeInBytes` bytes of
+        // NVENC-owned, CPU-readable output valid until `unlock_bitstream`. The `from_raw_parts` slice is
+        // only read (copied via `to_vec()`) BEFORE `unlock_bitstream(bs)` — lock and unlock pair on the
+        // same buffer — so it never outlives the lock. `map` (the input resource paired with `bs` in
+        // `pending`) is unmapped here, after the encode completed, exactly once.
         unsafe {
             let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
                 version: nv::NV_ENC_LOCK_BITSTREAM_VER,
@@ -838,6 +896,11 @@ impl Encoder for NvencD3d11Encoder {
 
 impl Drop for NvencD3d11Encoder {
     fn drop(&mut self) {
+        // SAFETY: `teardown` (an `unsafe fn`) needs the owning thread with no NVENC call in flight and
+        // a session whose cached resources all belong to `self.encoder`. At Drop this encoder is owned
+        // exclusively (no other reference can exist), runs on the encode thread it was confined to, and
+        // `teardown` early-returns when `self.encoder` is null; otherwise every cached reg/bitstream/
+        // pending was created against that live session. It runs exactly once (here).
         unsafe { self.teardown() };
     }
 }

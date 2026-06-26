@@ -2,10 +2,9 @@
 //! CPU-copy fallback (the portal delivers a CPU buffer; the encoder uploads it to the GPU
 //! internally). Zero-copy dmabuf→NVENC import is deferred (plan §9 risk).
 
-// This file's own unsafe block carries a `// SAFETY:` proof, but the file-level
-// `#![deny(clippy::undocumented_unsafe_blocks)]` is deliberately NOT set yet: as a parent module it
-// would propagate the lint to `capture::windows::idd_push` (in-flight parallel work, not yet
-// proven). The deny lands here once every child module (incl. idd_push.rs) is documented.
+// Every unsafe block in this module tree carries a `// SAFETY:` proof; enforce it (unsafe-proof
+// program). As a parent module this also covers the child modules (capture::windows/linux::*).
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::Result;
 
