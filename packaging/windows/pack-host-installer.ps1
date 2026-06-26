@@ -141,7 +141,7 @@ $defines = @(
 )
 
 # --- stage the pf-vdisplay virtual-display driver bundle --------------------------------------
-# pf-vdisplay is our all-Rust IddCx driver (packaging/windows/vdisplay-driver/), vendored signed under
+# pf-vdisplay is our all-Rust IddCx driver (packaging/windows/drivers/), vendored signed under
 # packaging/windows/pf-vdisplay/. It replaced the vendored SudoVDA C++ driver.
 if (-not $NoDriver) {
     $stage = Join-Path $OutDir 'stage'

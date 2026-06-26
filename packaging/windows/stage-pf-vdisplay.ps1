@@ -4,11 +4,11 @@
   driver + the fetched nefcon device tool.
 
 .DESCRIPTION
-  pf-vdisplay (our all-Rust IddCx virtual display) is built from packaging/windows/vdisplay-driver/, and
+  pf-vdisplay (our all-Rust IddCx virtual display) is built from packaging/windows/drivers/, and
   the SIGNED output (pf_vdisplay.dll/.inf/.cat + punktfunk-driver.cer) is VENDORED under
   packaging/windows/pf-vdisplay/ (signer punktfunk-ds-test — shared with the gamepad drivers — Class=
   Display, HWID root\pf_vdisplay). Rebuild + re-vendor with
-  packaging/windows/vdisplay-driver/deploy-dev.ps1 when the driver source changes, then copy the staged
+  packaging/windows/drivers/deploy-dev.ps1 when the driver source changes, then copy the staged
   pf_vdisplay.{dll,inf,cat} over the vendored copies. nefcon publishes a pinned release, so we fetch +
   SHA-256-verify it (it provides nefconc.exe, used to create the root-enumerated device node — pnputil
   can't).
@@ -36,7 +36,7 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 # --- vendored pf-vdisplay driver --------------------------------------------------------------
 $inf = Get-ChildItem -Path $VendorDir -Filter pf_vdisplay.inf -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $inf) { throw "no vendored pf_vdisplay.inf under $VendorDir — re-vendor via vdisplay-driver/deploy-dev.ps1" }
+if (-not $inf) { throw "no vendored pf_vdisplay.inf under $VendorDir — re-vendor via drivers/deploy-dev.ps1" }
 Copy-Item (Join-Path $VendorDir '*') $OutDir -Force
 Write-Host "==> vendored pf-vdisplay staged from $VendorDir"
 
