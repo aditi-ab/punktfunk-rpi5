@@ -25,7 +25,7 @@ use anyhow::{bail, Context, Result};
 use std::ffi::{c_void, OsString};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use windows::core::{PCWSTR, PWSTR};
@@ -65,18 +65,19 @@ const SERVICE_DESCRIPTION: &str =
 /// legacy GCM nonce reuse — security-review #5/#9; native clients only).
 const DEFAULT_HOST_CMD: &str = "serve --gamestream";
 
-/// Event handles shared between the SCM control handler (which signals them) and the supervision loop
-/// (which waits on them). Stored as raw `isize` so the `'static + Send` handler can reach them without
-/// a non-`Send` `HANDLE` capture. Set once in `run_service`.
-///
-/// Intentionally left as raw-`isize` statics + their explicit `CloseHandle` in `run_service` (not
-/// `OwnedHandle`): they're smuggled across the C SCM control-handler boundary, so converting them is a
-/// separate, riskier redesign out of scope for the process/job-handle ownership change here.
-static STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
-static SESSION_EVENT: AtomicIsize = AtomicIsize::new(0);
+/// The STOP and SESSION manual-reset events, shared between the SCM control handler (a capture-free
+/// `'static` closure that SIGNALS them) and the supervision loop (which WAITS on them). They live in
+/// `OnceLock`s — a static the handler can reach without capturing a non-`Send` `HANDLE` — and each owns
+/// its handle (`OwnedHandle`) for the process lifetime: the service process exits right after
+/// `run_service` returns, so the OS reaps them at exit, and owning them past the handler's last possible
+/// call avoids the close-then-signal window the old raw-`isize` statics had. Set once, in `run_service`.
+static STOP_EVENT: OnceLock<OwnedHandle> = OnceLock::new();
+static SESSION_EVENT: OnceLock<OwnedHandle> = OnceLock::new();
 
-fn load_event(a: &AtomicIsize) -> HANDLE {
-    HANDLE(a.load(Ordering::Relaxed) as *mut c_void)
+/// Borrow an event's handle for the control handler's `SetEvent`. `None` until `run_service` creates the
+/// events — but the handler is registered only AFTER they're set, so in practice this is always `Some`.
+fn event_handle(ev: &OnceLock<OwnedHandle>) -> Option<HANDLE> {
+    ev.get().map(|h| HANDLE(h.as_raw_handle()))
 }
 
 /// Dispatch `service <sub>`.
@@ -204,12 +205,19 @@ fn run_service() -> Result<()> {
 
     // Two manual-reset events: STOP (set once, never reset) and SESSION (set on a console
     // connect/disconnect, reset by the supervisor after it reacts).
-    let stop =
+    let stop_raw =
         unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.context("CreateEvent stop")?;
-    let session = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+    let session_raw = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
         .context("CreateEvent session")?;
-    STOP_EVENT.store(stop.0 as isize, Ordering::Relaxed);
-    SESSION_EVENT.store(session.0 as isize, Ordering::Relaxed);
+    // Own each event handle (the OS reaps them at process exit); the handler reaches them through the
+    // OnceLocks, while `supervise` waits on the borrowed `HANDLE`s. SAFETY: each is a fresh CreateEventW
+    // handle we own — take ownership exactly once.
+    let stop_owned = unsafe { OwnedHandle::from_raw_handle(stop_raw.0) };
+    let session_owned = unsafe { OwnedHandle::from_raw_handle(session_raw.0) };
+    let stop = HANDLE(stop_owned.as_raw_handle());
+    let session = HANDLE(session_owned.as_raw_handle());
+    let _ = STOP_EVENT.set(stop_owned); // set once per process
+    let _ = SESSION_EVENT.set(session_owned);
 
     // The control handler captures nothing — it reaches the events through the statics, so it stays
     // `Fn + Send + 'static`. Session lock/unlock are handled inside the host (DesktopWatcher), so we
@@ -217,7 +225,9 @@ fn run_service() -> Result<()> {
     let handler = move |control| -> ServiceControlHandlerResult {
         match control {
             ServiceControl::Stop | ServiceControl::Preshutdown | ServiceControl::Shutdown => {
-                unsafe { SetEvent(load_event(&STOP_EVENT)) }.ok();
+                if let Some(h) = event_handle(&STOP_EVENT) {
+                    unsafe { SetEvent(h) }.ok();
+                }
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::SessionChange(param) => {
@@ -226,7 +236,9 @@ fn run_service() -> Result<()> {
                     param.reason,
                     ConsoleConnect | ConsoleDisconnect | SessionLogon
                 ) {
-                    unsafe { SetEvent(load_event(&SESSION_EVENT)) }.ok();
+                    if let Some(h) = event_handle(&SESSION_EVENT) {
+                        unsafe { SetEvent(h) }.ok();
+                    }
                 }
                 ServiceControlHandlerResult::NoError
             }
@@ -263,10 +275,8 @@ fn run_service() -> Result<()> {
         controls_accepted: ServiceControlAccept::empty(),
         ..running
     });
-    unsafe {
-        let _ = CloseHandle(stop);
-        let _ = CloseHandle(session);
-    }
+    // The STOP/SESSION events stay owned by the OnceLocks for the process lifetime (the OS reaps them at
+    // exit); NOT closing them while the SCM handler could still fire avoids a use-after-close.
     result
 }
 
