@@ -30,6 +30,9 @@ mod encode;
 mod gamestream;
 mod hdr;
 mod inject;
+#[cfg(target_os = "windows")]
+#[path = "windows/interactive.rs"]
+mod interactive;
 mod library;
 mod mgmt;
 mod mgmt_token;

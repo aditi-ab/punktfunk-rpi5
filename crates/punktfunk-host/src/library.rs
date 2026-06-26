@@ -382,15 +382,27 @@ pub fn delete_custom(id: &str) -> Result<bool> {
 // Unified library
 // ---------------------------------------------------------------------------------------
 
+/// A digits-only Steam appid: the sole client-influenced part of a Steam launch, validated before it
+/// is interpolated into any command / URI (so a client-sent id can never carry shell or URI syntax).
+/// Cross-platform — used by the Linux shell mapping ([`command_for`]) and the Windows spawn mapping
+/// ([`windows_launch_for`]).
+fn valid_steam_appid(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Resolve a store-qualified library id (as sent by a client in `Hello::launch`) to the shell
 /// command the host should run for it — looked up in the host's OWN library so a client can only
 /// pick an existing title, never inject a command. `None` = unknown id, no launch recipe, or a
 /// malformed Steam appid.
 ///
-/// - `steam_appid` → `steam steam://rungameid/<appid>` (appid validated as digits, so the only
-///   client-controlled part of the command is a number).
+/// **Linux only**: the resolved command is run nested inside the per-session gamescope. On Windows
+/// there is no gamescope to nest into; the host launches a title into the interactive user session
+/// via [`launch_title`] instead.
+///
+/// - `steam_appid` → `steam steam://rungameid/<appid>` (appid validated as digits).
 /// - `command` → the stored command verbatim. This string comes from the host's own custom store
 ///   (added by the host operator via the admin UI), never from the client, so it is trusted.
+#[cfg(not(windows))]
 pub fn launch_command(id: &str) -> Option<String> {
     let spec = all_games().into_iter().find(|g| g.id == id)?.launch?;
     command_for(&spec)
@@ -398,17 +410,90 @@ pub fn launch_command(id: &str) -> Option<String> {
 
 /// Map a resolved [`LaunchSpec`] to its shell command (pure — the unit-testable core of
 /// [`launch_command`], split out so the appid-validation can be tested without a Steam install).
+#[cfg(not(windows))]
 fn command_for(spec: &LaunchSpec) -> Option<String> {
     match spec.kind.as_str() {
-        "steam_appid" => {
-            // Only digits — the appid is the sole client-influenced part of the command.
-            (!spec.value.is_empty() && spec.value.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| format!("steam steam://rungameid/{}", spec.value))
-        }
+        "steam_appid" => valid_steam_appid(&spec.value)
+            .then(|| format!("steam steam://rungameid/{}", spec.value)),
         // Trusted: the command comes from the host's own custom store, never the client.
         "command" => (!spec.value.trim().is_empty()).then(|| spec.value.clone()),
         _ => None,
     }
+}
+
+/// Windows: launch a store-qualified library id into the **interactive user session** — the Windows
+/// analogue of the Linux gamescope-nested [`launch_command`]. The id is resolved against the host's
+/// OWN library (the client never sends a command), mapped to a concrete process by
+/// [`windows_launch_for`], and spawned via [`crate::interactive::spawn_in_active_session`].
+///
+/// Wired into the data plane *after* capture is live, so the title renders onto the already-captured
+/// desktop and grabs foreground.
+#[cfg(windows)]
+pub fn launch_title(id: &str) -> Result<()> {
+    let spec = all_games()
+        .into_iter()
+        .find(|g| g.id == id)
+        .and_then(|g| g.launch)
+        .ok_or_else(|| anyhow::anyhow!("no launchable library entry '{id}'"))?;
+    let (cmdline, workdir) = windows_launch_for(&spec).ok_or_else(|| {
+        anyhow::anyhow!(
+            "library entry '{id}' has no Windows launch recipe (kind '{}')",
+            spec.kind
+        )
+    })?;
+    let pid = crate::interactive::spawn_in_active_session(&cmdline, workdir.as_deref())
+        .with_context(|| format!("launch '{id}' in the interactive session"))?;
+    tracing::info!(launch_id = id, %cmdline, pid, "launched library title in the interactive session");
+    Ok(())
+}
+
+/// Windows: map a resolved [`LaunchSpec`] to a `(command line, working dir)` to spawn into the
+/// interactive session. Pure + unit-testable. `None` = no Windows recipe for this kind.
+///
+/// CreateProcessAsUserW does NO shell or protocol resolution, so the URI/flags are handed to a
+/// concrete EXE as plain arguments — a (host-derived) URI string can never reach a command interpreter.
+#[cfg(windows)]
+fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::PathBuf>)> {
+    match spec.kind.as_str() {
+        "steam_appid" => {
+            if !valid_steam_appid(&spec.value) {
+                return None;
+            }
+            let uri = format!("steam://rungameid/{}", spec.value);
+            // Prefer launching Steam.exe with the URI as an argument; fall back to explorer.exe, which
+            // resolves the steam:// handler from the user hive. (The appid is digits-validated, so the
+            // only variable part of the line is a number either way.)
+            let cmdline = match steam_exe() {
+                Some(exe) => format!("\"{}\" \"{uri}\"", exe.display()),
+                None => format!("explorer.exe \"{uri}\""),
+            };
+            Some((cmdline, None))
+        }
+        // Operator-typed custom command (host-owned, never client-set): run it through the shell in the
+        // interactive session. `cmd.exe /c` is acceptable here precisely because the value is operator
+        // input — the same trust as the operator typing it — not a client-influenced string.
+        "command" => {
+            let v = spec.value.trim();
+            (!v.is_empty()).then(|| (format!("cmd.exe /c {v}"), None))
+        }
+        _ => None,
+    }
+}
+
+/// Windows: the default Steam install's `steam.exe`, if present. A non-default Steam install dir
+/// (registry `Valve\Steam\InstallPath`) isn't covered — the explorer.exe protocol fallback handles
+/// that case. Mirrors [`steam_roots`]' "default Program Files dirs" approach.
+#[cfg(windows)]
+fn steam_exe() -> Option<std::path::PathBuf> {
+    for var in ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"] {
+        if let Some(pf) = std::env::var_os(var) {
+            let p = std::path::PathBuf::from(pf).join("Steam").join("steam.exe");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// The full library: every store's titles merged + the custom entries, sorted by title.
@@ -478,6 +563,7 @@ mod tests {
         assert!(art.header.unwrap().ends_with("/570/header.jpg"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn launch_command_resolves_and_guards() {
         let steam = LaunchSpec {
@@ -528,5 +614,45 @@ mod tests {
         .into();
         assert_eq!(g.id, "custom:abc123");
         assert_eq!(g.store, "custom");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_launch_for_maps_and_guards() {
+        // Steam: a digits-only appid → a steam:// URI line (via Steam.exe or explorer.exe, depending
+        // on the box) with no working dir.
+        let steam = LaunchSpec {
+            kind: "steam_appid".into(),
+            value: "570".into(),
+        };
+        let (line, wd) = windows_launch_for(&steam).expect("steam recipe");
+        assert!(line.contains("steam://rungameid/570"), "line was {line:?}");
+        assert!(wd.is_none());
+        // A non-numeric "appid" (a client trying to inject) is rejected, never interpolated.
+        let evil = LaunchSpec {
+            kind: "steam_appid".into(),
+            value: "570\" & calc".into(),
+        };
+        assert!(windows_launch_for(&evil).is_none());
+        // Operator command → cmd /c passthrough (trusted host input).
+        let cmd = LaunchSpec {
+            kind: "command".into(),
+            value: "notepad.exe".into(),
+        };
+        assert_eq!(
+            windows_launch_for(&cmd).unwrap().0,
+            "cmd.exe /c notepad.exe"
+        );
+        // Empty / unknown kinds → no recipe.
+        assert!(windows_launch_for(&LaunchSpec {
+            kind: "command".into(),
+            value: "  ".into()
+        })
+        .is_none());
+        assert!(windows_launch_for(&LaunchSpec {
+            kind: "wat".into(),
+            value: "x".into()
+        })
+        .is_none());
     }
 }

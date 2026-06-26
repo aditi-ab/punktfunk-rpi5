@@ -571,6 +571,11 @@ async fn serve_session(
         // (`what's left` §3), resolve the command into the per-session VirtualDisplay via
         // `set_launch_command` (as the GameStream path now does) so sessions can't stomp each other.
         if let Some(id) = hello.launch.as_deref() {
+            // Linux: resolve the id to a gamescope-nested command and stash it in the env the
+            // gamescope backend reads. Windows has no gamescope to nest into — the data plane launches
+            // the title into the interactive user session via `library::launch_title` once capture is
+            // live (threaded as `SessionContext.launch` below), so there is nothing to do here.
+            #[cfg(not(windows))]
             match crate::library::launch_command(id) {
                 Some(cmd) => {
                     tracing::info!(launch_id = id, command = %cmd, "launching library title");
@@ -581,6 +586,8 @@ async fn serve_session(
                     "client requested a launch id not in this host's library — ignoring"
                 ),
             }
+            #[cfg(windows)]
+            let _ = id;
         }
 
         // Resolve the client's gamepad-backend preference (pure env/cfg check — no probing
@@ -912,6 +919,10 @@ async fn serve_session(
     let source = opts.source;
     let (seconds, frames) = (opts.seconds, opts.frames);
     let mode = hello.mode;
+    // Windows: the store-qualified launch id, threaded into the data plane so the title can be
+    // launched into the interactive session once capture is live (no gamescope nesting on Windows).
+    #[cfg(target_os = "windows")]
+    let launch_for_dp = hello.launch.clone();
     let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
     let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
     let stop_stream = stop.clone();
@@ -971,6 +982,8 @@ async fn serve_session(
                         probe_result_tx,
                         fec_target: fec_target_dp,
                         conn: conn_stream,
+                        #[cfg(target_os = "windows")]
+                        launch: launch_for_dp,
                     })
                 }
             }
@@ -2172,6 +2185,11 @@ struct SessionContext {
     fec_target: Arc<AtomicU8>,
     /// The QUIC control connection (carries host→client 0xCE source-HDR metadata mid-stream).
     conn: quinn::Connection,
+    /// Windows: the store-qualified library id to launch into the interactive user session once
+    /// capture is live (no gamescope nesting on Windows). `None` = no launch requested. Linux uses the
+    /// gamescope `PUNKTFUNK_GAMESCOPE_APP` path resolved at handshake, so this field is Windows-only.
+    #[cfg(target_os = "windows")]
+    launch: Option<String>,
 }
 
 fn virtual_stream(ctx: SessionContext) -> Result<()> {
@@ -2208,6 +2226,8 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         probe_result_tx,
         fec_target,
         conn,
+        #[cfg(target_os = "windows")]
+        launch,
     } = ctx;
     tracing::info!(
         compositor = compositor.id(),
@@ -2247,6 +2267,17 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // Best-effort; disable with PUNKTFUNK_FORCE_COMPOSED=0.
     #[cfg(target_os = "windows")]
     let _composed_flip = crate::capture::composed_flip::ForceComposedFlip::start();
+
+    // Windows: capture is live (and composition forced) — launch the requested library title into the
+    // interactive user session so it renders onto the captured desktop and grabs foreground. Linux
+    // nests its launch in gamescope instead (the handshake `PUNKTFUNK_GAMESCOPE_APP` path). Best-effort:
+    // a launch failure (no recipe for the kind, no interactive user) leaves the user on the desktop.
+    #[cfg(target_os = "windows")]
+    if let Some(id) = launch.as_deref() {
+        if let Err(e) = crate::library::launch_title(id) {
+            tracing::warn!(launch_id = id, error = %e, "could not launch requested library title");
+        }
+    }
 
     let perf = crate::config::config().perf;
     // Microburst cap (applied in send_loop/paced_submit): a frame ≤ this bursts out immediately;
@@ -2600,6 +2631,7 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
         probe_result_tx,
         fec_target,
         conn: _conn,
+        launch,
     } = ctx;
     tracing::info!(
         ?mode,
@@ -2656,6 +2688,15 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
 
     let (mut _keepalive, mut relay, mut target, mut effective_hz) = build(&mut vd, mode)?;
     let mut cur_mode = mode;
+
+    // Capture is live (the WGC helper is relaying) — launch the requested library title into the
+    // interactive user session so it renders onto the captured desktop and grabs foreground.
+    // Best-effort: a failure (no recipe for the kind, no interactive user) leaves the user on the desktop.
+    if let Some(id) = launch.as_deref() {
+        if let Err(e) = crate::library::launch_title(id) {
+            tracing::warn!(launch_id = id, error = %e, "could not launch requested library title");
+        }
+    }
 
     // O3.1: optionally observe the IDD-push ring alongside WGC (WGC = the presentation trigger) to
     // confirm the 0257 driver pushes frames into a HOST-created ring. Diagnostic only; gated.
