@@ -10,7 +10,7 @@
 //! [`pf_driver_proto::frame`] (which OWNS the contract, with `const` size asserts) — both sides
 //! `use` it, so drift is a compile error rather than a "must match" comment.
 
-use super::dxgi::{make_device, D3d11Frame, HdrConverter, WinCaptureTarget};
+use super::dxgi::{make_device, D3d11Frame, HdrP010Converter, VideoConverter, WinCaptureTarget};
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::frame;
@@ -20,13 +20,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Interface, HSTRING};
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, LUID};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11ShaderResourceView,
-    ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
     DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
@@ -205,15 +204,22 @@ pub struct IddPushCapturer {
     /// cleared when a fresh frame resumes. If it stays set past the recovery window, `try_consume` drops
     /// the session (recover-or-drop, no DDA).
     recovering_since: Option<Instant>,
-    /// Host-owned ROTATING output ring NVENC encodes (texture + RTV per slot). Rotating it per frame is
-    /// the precondition for pipelining the encode loop: while NVENC encodes frame N's texture on the
-    /// ASIC, frame N+1's convert/copy writes a DIFFERENT texture on the 3D engine — the two overlap. The
-    /// HDR convert and the SDR copy both write into the current slot. Format = `out_format()` (Rgb10a2 in
-    /// HDR, Bgra in SDR); rebuilt on a display-mode flip. Built lazily.
-    out_ring: Vec<(ID3D11Texture2D, ID3D11RenderTargetView)>,
+    /// Host-owned ROTATING output ring NVENC encodes (one YUV texture per slot). Rotating it per frame
+    /// is the precondition for pipelining the encode loop: while NVENC encodes frame N's texture on the
+    /// ASIC, frame N+1's convert writes a DIFFERENT texture — the two overlap. Format = `out_format()`:
+    /// NV12 (SDR, BT.709 limited) or P010 (HDR, BT.2020 PQ limited), so NVENC takes native YUV and skips
+    /// its internal RGB→YUV CSC on the SM/3D engine the game saturates (plan §5.A). Rebuilt on a
+    /// display-mode flip. Built lazily.
+    out_ring: Vec<ID3D11Texture2D>,
     out_idx: usize,
-    /// FP16 scRGB → `Rgb10a2` BT.2020 PQ converter, used while the display is HDR. Built lazily.
-    hdr_conv: Option<HdrConverter>,
+    /// BGRA slot → NV12 (BT.709 limited) on the dedicated D3D11 VIDEO engine, used while the display is
+    /// SDR — keeps the colour-convert OFF the contended 3D/compute engine. Built lazily; rebuilt on a
+    /// size/HDR flip.
+    video_conv: Option<VideoConverter>,
+    /// FP16 scRGB slot → P010 (BT.2020 PQ limited) via two shader passes, used while the display is HDR
+    /// (NVIDIA's VideoProcessor can't do RGB→P010). The passes run on the 3D engine, but it still skips
+    /// NVENC's internal SM-side CSC. Built lazily.
+    hdr_p010_conv: Option<HdrP010Converter>,
     last_seq: u64,
     last_present: Option<(ID3D11Texture2D, PixelFormat)>,
     status_logged: bool,
@@ -504,7 +510,8 @@ impl IddPushCapturer {
                 recovering_since: None,
                 out_ring: Vec::new(),
                 out_idx: 0,
-                hdr_conv: None,
+                video_conv: None,
+                hdr_p010_conv: None,
                 last_seq: 0,
                 last_present: None,
                 status_logged: false,
@@ -625,16 +632,17 @@ impl IddPushCapturer {
         );
     }
 
-    /// The output texture format + the [`PixelFormat`] it presents as, driven SOLELY by the DISPLAY's
-    /// HDR state (like the WGC path): HDR → `Rgb10a2` BT.2020 PQ → NVENC Main10, and the client
-    /// auto-detects PQ from the HEVC VUI; SDR → 8-bit `Bgra`. We do NOT gate HDR on the client's
-    /// advertised `VIDEO_CAP_10BIT` — clients under-report it (e.g. the Mac advertises 10-bit only when
-    /// its OWN display is HDR), yet all decode Main10 + auto-switch, exactly as on the WGC path.
+    /// The output texture format + the [`PixelFormat`] NVENC encodes, driven SOLELY by the DISPLAY's HDR
+    /// state (like the WGC path): HDR → `P010` (BT.2020 PQ 10-bit limited) → NVENC Main10, and the client
+    /// auto-detects PQ from the HEVC VUI; SDR → `Nv12` (BT.709 8-bit limited). Both are native YUV so
+    /// NVENC skips its internal RGB→YUV CSC on the contended SM (plan §5.A). We do NOT gate HDR on the
+    /// client's advertised `VIDEO_CAP_10BIT` — clients under-report it (e.g. the Mac advertises 10-bit
+    /// only when its OWN display is HDR), yet all decode Main10 + auto-switch, exactly as on the WGC path.
     fn out_format(&self) -> (DXGI_FORMAT, PixelFormat) {
         if self.display_hdr {
-            (DXGI_FORMAT_R10G10B10A2_UNORM, PixelFormat::Rgb10a2)
+            (DXGI_FORMAT_P010, PixelFormat::P010)
         } else {
-            (DXGI_FORMAT_B8G8R8A8_UNORM, PixelFormat::Bgra)
+            (DXGI_FORMAT_NV12, PixelFormat::Nv12)
         }
     }
 
@@ -688,6 +696,8 @@ impl IddPushCapturer {
         self.generation = new_gen;
         self.last_seq = 0;
         self.out_ring.clear(); // the output format changed → rebuild lazily at the new format
+        self.video_conv = None; // converters are sized + HDR-specific → rebuild at the new mode
+        self.hdr_p010_conv = None;
         self.out_idx = 0;
         self.last_present = None;
         Ok(())
@@ -742,31 +752,35 @@ impl IddPushCapturer {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            // RENDER_TARGET: the VIDEO processor (NV12) and the P010 shader passes both write here, and
+            // NVENC registers it as encode input — matching the WGC YUV ring.
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
         for _ in 0..OUT_RING {
             let mut t: Option<ID3D11Texture2D> = None;
-            let mut rtv: Option<ID3D11RenderTargetView> = None;
             unsafe {
                 self.device
                     .CreateTexture2D(&desc, None, Some(&mut t))
                     .context("CreateTexture2D(IDD out ring)")?;
-                let t = t.context("null out-ring texture")?;
-                self.device
-                    .CreateRenderTargetView(&t, None, Some(&mut rtv))
-                    .context("CreateRenderTargetView(IDD out ring)")?;
-                self.out_ring.push((t, rtv.context("null out-ring rtv")?));
+                self.out_ring.push(t.context("null out-ring texture")?);
             }
         }
         Ok(())
     }
 
-    /// Build the HDR converter if not already built (HDR-display path only — an SDR display is a copy).
+    /// Build the per-mode YUV converter if not already built: a VIDEO-engine BGRA→NV12 processor on an
+    /// SDR display, or the FP16→P010 shader on an HDR display. Both keep NVENC's RGB→YUV CSC off the SM.
     fn ensure_converter(&mut self) -> Result<()> {
-        if self.hdr_conv.is_none() {
-            self.hdr_conv = Some(unsafe { HdrConverter::new(&self.device)? });
+        if self.display_hdr {
+            if self.hdr_p010_conv.is_none() {
+                self.hdr_p010_conv = Some(unsafe { HdrP010Converter::new(&self.device)? });
+            }
+        } else if self.video_conv.is_none() {
+            self.video_conv = Some(unsafe {
+                VideoConverter::new(&self.device, &self.context, self.width, self.height, false)?
+            });
         }
         Ok(())
     }
@@ -801,16 +815,11 @@ impl IddPushCapturer {
             return Ok(None);
         }
         self.ensure_out_ring()?;
-        // Build the HDR converter BEFORE acquiring the slot so nothing between Acquire and Release can
+        // Build the converter BEFORE acquiring the slot so nothing between Acquire and Release can
         // `?`-return and leak the keyed-mutex lock (which would stall the driver on that slot).
-        if self.display_hdr {
-            self.ensure_converter()?;
-        }
+        self.ensure_converter()?;
         let i = self.out_idx;
-        let (out, out_rtv) = {
-            let (t, rtv) = &self.out_ring[i];
-            (t.clone(), rtv.clone())
-        };
+        let out = self.out_ring[i].clone();
         let (_, pf) = self.out_format();
 
         // Hold the slot's keyed mutex only across the convert/copy into the host out-ring (NOT across the
@@ -824,16 +833,27 @@ impl IddPushCapturer {
             let Some(_lock) = KeyedMutexGuard::acquire(&s.mutex, 0, 8) else {
                 return Ok(None);
             };
-            // SAFETY: convert/copy on the owning (encode) thread's immediate context, holding the slot lock.
+            // SAFETY: convert on the owning (encode) thread's immediate context, holding the slot lock.
+            // A `?` here is leak-safe: `_lock` (the KeyedMutexGuard) drops on the early return, releasing
+            // the slot back to the driver.
             unsafe {
                 if self.display_hdr {
-                    // Sample the FP16 slot's SRV directly (no scratch copy) → BT.2020 PQ Rgb10a2.
-                    if let Some(conv) = self.hdr_conv.as_ref() {
-                        conv.convert(&self.context, &s.srv, &out_rtv, self.width, self.height);
+                    // HDR: FP16 slot SRV → P010 (BT.2020 PQ) via the shader; NVENC takes native P010.
+                    if let Some(conv) = self.hdr_p010_conv.as_ref() {
+                        conv.convert(
+                            &self.device,
+                            &self.context,
+                            &s.srv,
+                            &out,
+                            self.width,
+                            self.height,
+                        )?;
                     }
                 } else {
-                    // SDR: the slot is already 8-bit BGRA — one copy into the out-ring (hidden by pipelining).
-                    self.context.CopyResource(&out, &s.tex);
+                    // SDR: BGRA slot → NV12 on the VIDEO engine; NVENC takes native NV12, no SM-side CSC.
+                    if let Some(conv) = self.video_conv.as_ref() {
+                        conv.convert(&s.tex, &out)?;
+                    }
                 }
             }
             // `_lock` drops here → `ReleaseSync(0)`.
@@ -861,7 +881,7 @@ impl IddPushCapturer {
         // OUT_RING(3) > the max pipeline_depth(2) guarantees the rotated slot is not in flight.
         let (src, pf) = self.last_present.clone()?;
         let i = self.out_idx;
-        let dst = self.out_ring.get(i)?.0.clone();
+        let dst = self.out_ring.get(i)?.clone();
         // SAFETY: GPU copy on the owning thread's immediate context; src/dst are our out-ring textures of
         // identical format/size (src is a previous out-ring slot; dst the next).
         unsafe {

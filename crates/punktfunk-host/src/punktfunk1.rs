@@ -2356,6 +2356,12 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // compositing), NOT an encoder problem. Logged every 2 s when `PUNKTFUNK_PERF`.
     let (mut diag_new, mut diag_repeat) = (0u64, 0u64);
     let mut diag_at = std::time::Instant::now();
+    // Per-stage latency breakdown (PUNKTFUNK_PERF): per-call µs for the GPU-bound stages so we see
+    // exactly where the capture→encoded latency goes — cap=try_latest (ring read + colour convert),
+    // submit=encode_picture launch, wait=lock_bitstream (the scheduling wait + ASIC encode, the one
+    // that dominates under a GPU-saturating game).
+    let (mut st_cap, mut st_submit, mut st_wait): (Vec<u32>, Vec<u32>, Vec<u32>) =
+        (Vec::new(), Vec::new(), Vec::new());
     while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
         // Mid-stream session switch (the box flipped Gaming↔Desktop): rebuild the WHOLE backend in
         // place — a different compositor at the SAME client mode — keeping the Session + send thread
@@ -2462,7 +2468,12 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             tracing::debug!("forcing keyframe (client decode recovery)");
             enc.request_keyframe();
         }
-        match capturer.try_latest() {
+        let t_cap = std::time::Instant::now();
+        let cap_result = capturer.try_latest();
+        if perf {
+            st_cap.push(t_cap.elapsed().as_micros() as u32);
+        }
+        match cap_result {
             Ok(Some(f)) => {
                 frame = f;
                 diag_new += 1;
@@ -2501,6 +2512,20 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 "capture diag: NEW frames from the source vs REPEATS (low new_fps at high send rate ⇒ \
                  the source isn't producing frames, not an encode stall)"
             );
+            let wait_max = st_wait.iter().copied().max().unwrap_or(0);
+            tracing::info!(
+                cap_us_p50 = percentile(&mut st_cap, 0.50),
+                cap_us_p99 = percentile(&mut st_cap, 0.99),
+                submit_us_p50 = percentile(&mut st_submit, 0.50),
+                submit_us_p99 = percentile(&mut st_submit, 0.99),
+                wait_us_p50 = percentile(&mut st_wait, 0.50),
+                wait_us_p99 = percentile(&mut st_wait, 0.99),
+                wait_us_max = wait_max,
+                "stage perf (µs/call): cap=try_latest(ring+convert) submit=encode_picture wait=lock_bitstream(sched+ASIC)"
+            );
+            st_cap.clear();
+            st_submit.clear();
+            st_wait.clear();
             diag_new = 0;
             diag_repeat = 0;
             diag_at = std::time::Instant::now();
@@ -2519,7 +2544,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         // capturer hands a rotating ring of output textures, so it returns >1; other capturers default 1.
         let depth = capturer.pipeline_depth().max(1);
         let capture_ns = now_ns();
+        let t_submit = std::time::Instant::now();
         enc.submit(&frame).context("encoder submit")?;
+        if perf {
+            st_submit.push(t_submit.elapsed().as_micros() as u32);
+        }
         // This frame's pacing deadline (the next frame's due time); the send thread spreads a big frame
         // up to here. Each in-flight frame carries its own (capture_ns, deadline) for when it's polled.
         next += interval;
@@ -2530,7 +2559,12 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         // the oldest submitted frame's AU — matching `inflight.pop_front()`.
         let mut send_gone = false;
         while inflight.len() >= depth {
-            let au = match enc.poll().context("encoder poll")? {
+            let t_wait = std::time::Instant::now();
+            let polled = enc.poll().context("encoder poll")?;
+            if perf {
+                st_wait.push(t_wait.elapsed().as_micros() as u32);
+            }
+            let au = match polled {
                 Some(au) => au,
                 None => break, // no AU ready for a submitted frame (shouldn't happen — poll blocks)
             };

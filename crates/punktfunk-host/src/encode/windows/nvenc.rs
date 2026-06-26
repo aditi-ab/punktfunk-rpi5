@@ -609,7 +609,14 @@ impl Encoder for NvencD3d11Encoder {
                     self.bit_depth = 10;
                     nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10
                 }
-                PixelFormat::Nv12 => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
+                PixelFormat::Nv12 => {
+                    // NV12 is 8-bit 4:2:0. Force 8-bit so a transition from a prior P010 (10-bit) session
+                    // — or a 10-bit-negotiated client on an SDR display — re-inits at the matching depth.
+                    // Unlike ARGB (which NVENC upconverts to Main10), NV12 cannot feed a 10-bit session:
+                    // `register_resource` rejects it as InvalidParam (the HDR→SDR-toggle stream drop).
+                    self.bit_depth = 8;
+                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12
+                }
                 _ => nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
             };
             let device = frame.device.clone();
