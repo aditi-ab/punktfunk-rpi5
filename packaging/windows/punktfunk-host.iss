@@ -28,7 +28,7 @@
 #ifndef Readme
   #define Readme "README.md"
 #endif
-; The web console launcher (the PunktfunkWeb task action) + its post-install provisioner — committed
+; The web console launcher (the PunktfunkWeb task action) + its post-install provisioner - committed
 ; scripts staged next to the .iss by pack-host-installer.ps1 (absolute paths passed in).
 #ifndef WebRunCmd
   #define WebRunCmd "..\..\scripts\windows\web-run.cmd"
@@ -44,19 +44,19 @@
 #ifdef GamepadStageDir
   #define WithGamepad
 #endif
-; FfmpegBin (a dir of FFmpeg shared DLLs) is optional — present when the host is built with
+; FfmpegBin (a dir of FFmpeg shared DLLs) is optional - present when the host is built with
 ; --features amf-qsv (the AMD/Intel AMF/QSV encode backend link-imports the FFmpeg libs).
 #ifdef FfmpegBin
   #define WithFfmpeg
 #endif
 ; WebDir (the built web .output tree) + BunExe (a portable bun.exe) are passed together by
-; pack-host-installer.ps1 to bundle the management console. Both required → WithWeb.
+; pack-host-installer.ps1 to bundle the management console. Both required -> WithWeb.
 #ifdef WebDir
   #ifdef BunExe
     #define WithWeb
   #endif
 #endif
-; VkLayerDir (the staged pf-vkhdr-layer: pf_vkhdr_layer.dll + .json) is optional — present when the
+; VkLayerDir (the staged pf-vkhdr-layer: pf_vkhdr_layer.dll + .json) is optional - present when the
 ; HDR Vulkan layer was built. It lets Vulkan games (Doom: The Dark Ages, etc.) enable HDR over the
 ; virtual display (the ICD won't advertise HDR there; the layer injects the surface formats, self-
 ; gated on the display's actual HDR state).
@@ -94,7 +94,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "installdriver"; Description: "Install the pf-vdisplay virtual display driver (required for native-resolution streaming)"
 #endif
 #ifdef WithGamepad
-Name: "installgamepad"; Description: "Install the virtual gamepad drivers (DualSense / DualShock 4 / Xbox 360 — no ViGEmBus needed)"
+Name: "installgamepad"; Description: "Install the virtual gamepad drivers (DualSense / DualShock 4 / Xbox 360 - no ViGEmBus needed)"
 #endif
 #ifdef WithVkLayer
 Name: "installhdrlayer"; Description: "Install the HDR Vulkan layer (lets Vulkan games like Doom use HDR on the virtual display)"
@@ -106,15 +106,15 @@ Source: "{#BinDir}\punktfunk-host.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#HostEnv}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Readme}"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
 #ifdef WithFfmpeg
-; FFmpeg shared DLLs (avcodec/avutil/swscale/...) laid down next to the exe — the AMD/Intel
+; FFmpeg shared DLLs (avcodec/avutil/swscale/...) laid down next to the exe - the AMD/Intel
 ; (AMF/QSV) encode backend link-imports them, so the exe won't start without them. NVENC/software-
 ; only builds simply omit this block.
 Source: "{#FfmpegBin}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 #endif
 #ifdef WithWeb
 ; The web management console: the self-contained Nitro SSR bundle (.output = server + public; deps
-; bundled in, no node_modules) → {app}\web\.output, a portable bun runtime → {app}\bun\bun.exe, and
-; the launcher the PunktfunkWeb task runs → {app}\web\web-run.cmd. web-setup.ps1 (the provisioner)
+; bundled in, no node_modules) -> {app}\web\.output, a portable bun runtime -> {app}\bun\bun.exe, and
+; the launcher the PunktfunkWeb task runs -> {app}\web\web-run.cmd. web-setup.ps1 (the provisioner)
 ; goes to {tmp} and is removed after install.
 Source: "{#WebDir}\*"; DestDir: "{app}\web\.output"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#BunExe}"; DestDir: "{app}\bun"; DestName: "bun.exe"; Flags: ignoreversion
@@ -180,7 +180,7 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service uninstall"; Flags: ru
 ; Stop + remove the PunktfunkWeb task and its firewall rule (leaves %ProgramData%\punktfunk config,
 ; like the host uninstall does).
 Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Stop-ScheduledTask -TaskName PunktfunkWeb -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName PunktfunkWeb -Confirm:$false -ErrorAction SilentlyContinue; Get-NetFirewallRule -Name 'PunktfunkWeb-TCP-3000' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"""; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Stop-ScheduledTask -TaskName PunktfunkWeb -ErrorAction SilentlyContinue; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Unregister-ScheduledTask -TaskName PunktfunkWeb -Confirm:$false -ErrorAction SilentlyContinue; Get-NetFirewallRule -Name 'PunktfunkWeb-TCP-3000' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"""; \
   Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkWebCleanup"
 #endif
 
@@ -188,7 +188,7 @@ Filename: "powershell.exe"; \
 #ifdef WithWeb
 var
   WebPwPage: TInputQueryWizardPage;
-  FreshWebInstall: Boolean;   { captured at start — web-setup creates the file mid-run }
+  FreshWebInstall: Boolean;   { captured at start - web-setup creates the file mid-run }
 
 function WebPasswordPath: String;
 begin
@@ -196,7 +196,7 @@ begin
 end;
 
 { Pre-fill the console password field with a crypto-strong default (Inno has no RNG): a one-shot
-  PowerShell writes 12 random bytes as dashed hex; strip the dashes → a 24-char hex password. }
+  PowerShell writes 12 random bytes as dashed hex; strip the dashes -> a 24-char hex password. }
 procedure GenerateRandomWebPassword(var Pw: String);
 var
   ResultCode: Integer;
@@ -229,7 +229,7 @@ begin
   WebPwPage := CreateInputQueryPage(wpSelectTasks,
     'Web console', 'Set the punktfunk web console login password',
     'The management console is served on http://this-computer:3000 and is login-gated. Keep the ' +
-    'secure password generated below (it is shown again on the final page) or enter your own — you ' +
+    'secure password generated below (it is shown again on the final page) or enter your own - you ' +
     'can change it later in %ProgramData%\punktfunk\web-password.');
   WebPwPage.Add('Console password:', False);   { visible, so the admin can read the generated default }
   DefaultPw := '';
@@ -239,7 +239,7 @@ end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
-  { On upgrade the password already exists — keep it, don't re-prompt. }
+  { On upgrade the password already exists - keep it, don't re-prompt. }
   Result := (PageID = WebPwPage.ID) and (not FreshWebInstall);
 end;
 
@@ -264,7 +264,7 @@ end;
 function WebSetupParams(Param: String): String;
 begin
   { Pass the password to web-setup.ps1 via a temp file, not the cmdline (which lands in the install
-    log). Only on a fresh install — on upgrade web-setup keeps the existing file. }
+    log). Only on a fresh install - on upgrade web-setup keeps the existing file. }
   Result := '-AppDir "' + ExpandConstant('{app}') + '"';
   if FreshWebInstall then
     Result := Result + ' -PasswordFile "' + ExpandConstant('{tmp}\webpw.txt') + '"';
@@ -287,12 +287,31 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+#ifdef WithWeb
+{ Stop a running web console + free :3000 BEFORE the file copy, so the old server doesn't lock
+  .output / web-run.cmd / bun.exe and the new task can bind. Killing the :3000 listener owner is
+  runtime-agnostic (an early install may have run node, the current one runs bun). web-setup.ps1
+  repeats this idempotently after the copy. Best-effort; a fresh install is a no-op. }
+procedure StopWebConsole;
+var
+  ResultCode: Integer;
+begin
+  Exec('powershell.exe',
+    '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    '$ErrorActionPreference=''SilentlyContinue''; ' +
+    'Stop-ScheduledTask -TaskName PunktfunkWeb; ' +
+    'Get-NetTCPConnection -LocalPort 3000 -State Listen | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+#endif
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
   begin
     StopHostServiceAndWait;
 #ifdef WithWeb
+    StopWebConsole;   { upgrade-safe: free :3000 + unlock the web files before the copy }
     { Stash the chosen password for web-setup.ps1 (fresh install only); the temp copy is auto-cleaned. }
     if FreshWebInstall then
       SaveStringToFile(ExpandConstant('{tmp}\webpw.txt'), Trim(WebPwPage.Values[0]), False);

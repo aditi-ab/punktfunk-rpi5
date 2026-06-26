@@ -1,10 +1,10 @@
 # Clear the PE FORCE_INTEGRITY bit (IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY = 0x0080) from a driver DLL.
 #
 # windows-drivers-rs / wdk-build links UMDF drivers with /INTEGRITYCHECK (sets the bit) UNCONDITIONALLY
-# (wdk-build configure_binary_build → cargo::rustc-cdylib-link-arg=/INTEGRITYCHECK; no opt-out). With the
+# (wdk-build configure_binary_build -> cargo::rustc-cdylib-link-arg=/INTEGRITYCHECK; no opt-out). With the
 # bit set, Windows Code Integrity refuses to load a binary whose signature doesn't chain to a Microsoft
-# root (errors 3004/3089) — so a SELF-SIGNED driver won't load. Clearing the bit (then re-signing) lets a
-# self-signed driver load under Secure Boot — the same recipe the punktfunk gamepad drivers use, here as a
+# root (errors 3004/3089) - so a SELF-SIGNED driver won't load. Clearing the bit (then re-signing) lets a
+# self-signed driver load under Secure Boot - the same recipe the punktfunk gamepad drivers use, here as a
 # deterministic, idempotent, reusable step instead of a hand-run patch.
 #
 # Order in the packaging flow: cargo build -> THIS -> signtool (sign .dll) -> Inf2Cat (.cat) -> sign .cat.
@@ -28,7 +28,7 @@ $FORCE_INTEGRITY = 0x0080
 $dllchar = [BitConverter]::ToUInt16($b, $off)
 
 if (($dllchar -band $FORCE_INTEGRITY) -eq 0) {
-  Write-Host ("clear-force-integrity: already clear (DllCharacteristics=0x{0:X4}) — no change: $Path" -f $dllchar)
+  Write-Host ("clear-force-integrity: already clear (DllCharacteristics=0x{0:X4}) - no change: $Path" -f $dllchar)
 } else {
   $new = [uint16]($dllchar -band (-bnot $FORCE_INTEGRITY))
   [BitConverter]::GetBytes($new).CopyTo($b, $off)
@@ -36,7 +36,7 @@ if (($dllchar -band $FORCE_INTEGRITY) -eq 0) {
   Write-Host ("clear-force-integrity: cleared FORCE_INTEGRITY 0x{0:X4} -> 0x{1:X4} in $Path" -f $dllchar, $new)
 }
 
-# Verify on disk (re-read) — the assertion.
+# Verify on disk (re-read) - the assertion.
 $v = [BitConverter]::ToUInt16([IO.File]::ReadAllBytes($Path), $off)
 if (($v -band $FORCE_INTEGRITY) -ne 0) { throw ("FORCE_INTEGRITY still set after clear (0x{0:X4})" -f $v) }
 Write-Host ("clear-force-integrity: verified DllCharacteristics=0x{0:X4}, FORCE_INTEGRITY clear." -f $v)

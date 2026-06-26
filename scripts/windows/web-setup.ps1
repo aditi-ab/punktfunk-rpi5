@@ -14,7 +14,7 @@
     3. Opens inbound TCP 3000 (the console port) on all profiles.
     4. Waits briefly for the host's mgmt token, then starts the task.
 
-  The mgmt bearer token is NOT managed here — the host owns %ProgramData%\punktfunk\mgmt-token
+  The mgmt bearer token is NOT managed here - the host owns %ProgramData%\punktfunk\mgmt-token
   (crates/punktfunk-host/src/mgmt_token.rs writes it on `serve`); web-run.cmd sources it.
 #>
 [CmdletBinding()]
@@ -36,6 +36,22 @@ function New-RandomPassword {
     ([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($bytes)
     $s = [Convert]::ToBase64String($bytes) -replace '[/+=]', ''
     return $s.Substring(0, [Math]::Min(20, $s.Length))
+}
+
+function Stop-WebConsole {
+    # On an upgrade a console is already running. Stop + reap it before re-registering so (a) the new
+    # task can bind :3000 (else the old server keeps it and the new one restart-loops on EADDRINUSE) and
+    # (b) the installer can overwrite .output / web-run.cmd / bun.exe (a held file blocks the copy). A
+    # prior install may have run a DIFFERENT runtime (node vs bun), so kill by the script it serves AND
+    # by the :3000 owner - the latter is runtime-agnostic and future-proofs the next runtime swap.
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -Filter "Name='bun.exe' OR Name='node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'index\.mjs' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique |
+        ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 1
 }
 
 # --- 1. login password -----------------------------------------------------------------------
@@ -60,6 +76,7 @@ if ($password) {
 }
 
 # --- 2. PunktfunkWeb scheduled task ----------------------------------------------------------
+Stop-WebConsole   # reap any running (possibly old-runtime) console before re-registering (upgrade-safe)
 $cmd = Join-Path $AppDir 'web\web-run.cmd'
 if (-not (Test-Path -LiteralPath $cmd)) { throw "web launcher missing: $cmd" }
 $action = New-ScheduledTaskAction -Execute $cmd

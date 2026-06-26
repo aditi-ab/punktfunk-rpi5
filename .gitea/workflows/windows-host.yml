@@ -56,6 +56,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Locale-safety gate (installer-run scripts must be ASCII)
+        shell: pwsh
+        # The installer runs these via powershell.exe (Windows PowerShell 5.1) and cmd.exe on the END
+        # USER's box. PS 5.1 reads a BOM-less script in the active ANSI codepage, so on a non-UTF-8 locale
+        # (e.g. German Windows-1252) a stray em-dash mis-decodes into a curly quote and the script aborts
+        # with "unterminated string" - exactly how the pf-vdisplay driver install silently failed in the
+        # field. Keep every installer-run script pure ASCII (matches install-gamepad-drivers.ps1).
+        run: |
+          $bad = Get-ChildItem packaging/windows/*.ps1, scripts/windows/*.ps1, scripts/windows/*.cmd -ErrorAction SilentlyContinue |
+            Where-Object { [IO.File]::ReadAllText($_.FullName) -match '[^\x00-\x7F]' }
+          if ($bad) {
+            $bad.FullName | ForEach-Object { Write-Output "::error::non-ASCII in installer-run script: $_" }
+            throw "installer-run scripts must be pure ASCII (PS 5.1 mis-parses them on non-UTF-8 locales)"
+          }
+          Write-Output "installer-run scripts are ASCII-clean"
+
       - name: Configure + version
         shell: pwsh
         run: |

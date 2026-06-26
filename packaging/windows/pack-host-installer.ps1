@@ -5,7 +5,7 @@
 .DESCRIPTION
   From a release `cargo build -p punktfunk-host --features nvenc` output (the exe), this:
     1. resolves a code-signing cert (supplied stable .pfx from CI secrets OR an ephemeral self-signed
-       CN=unom — same scheme as the client's pack-msix.ps1) and exports the public .cer,
+       CN=unom - same scheme as the client's pack-msix.ps1) and exports the public .cer,
     2. signs the inner punktfunk-host.exe,
     3. stages the pf-vdisplay virtual-display driver bundle (unless -NoDriver),
     4. runs ISCC to build punktfunk-host-setup-<ver>.exe,
@@ -52,7 +52,7 @@ function Find-Iscc {
     }
     $c = Get-Command iscc -ErrorAction SilentlyContinue
     if ($c) { return $c.Source }
-    throw "ISCC.exe (Inno Setup 6, any 6.x) not found — install it (choco install innosetup -y)."
+    throw "ISCC.exe (Inno Setup 6, any 6.x) not found - install it (choco install innosetup -y)."
 }
 function Find-SdkTool([string]$name) {
     $root = 'C:\Program Files (x86)\Windows Kits\10\bin'
@@ -60,7 +60,7 @@ function Find-SdkTool([string]$name) {
         Where-Object { $_.FullName -match '\\(10\.0\.\d+\.\d+)\\x64\\' } |
         Sort-Object { [version]([regex]::Match($_.FullName, '\\(10\.0\.\d+\.\d+)\\x64\\').Groups[1].Value) } |
         Select-Object -Last 1
-    if (-not $hit) { throw "$name not found under $root — install the Windows 10/11 SDK." }
+    if (-not $hit) { throw "$name not found under $root - install the Windows 10/11 SDK." }
     $hit.FullName
 }
 $iscc = Find-Iscc
@@ -103,7 +103,7 @@ function Sign-File([string]$Path) {
     if ($PfxPassword) { $signArgs += @('/p', $PfxPassword) }
     & $signtool ($signArgs + @('/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', $Path))
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "timestamped sign failed for $Path — retrying without a timestamp"
+        Write-Warning "timestamped sign failed for $Path - retrying without a timestamp"
         & $signtool ($signArgs + @($Path))
         if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for $Path ($LASTEXITCODE)" }
     }
@@ -140,12 +140,18 @@ $defines = @(
     "/DReadme=$readme"
 )
 
-# --- stage the pf-vdisplay virtual-display driver bundle --------------------------------------
-# pf-vdisplay is our all-Rust IddCx driver (packaging/windows/drivers/), vendored signed under
-# packaging/windows/pf-vdisplay/. It replaced the vendored SudoVDA C++ driver.
+# --- build (from source) + stage the pf-vdisplay virtual-display driver -----------------------
+# pf-vdisplay is our all-Rust IddCx driver (packaging/windows/drivers/). It is now BUILT FROM SOURCE
+# every release (build-pf-vdisplay.ps1) instead of shipping a checked-in prebuilt binary: the vendored
+# binary went stale (its .cat stopped covering an edited .inf -> pnputil SPAPI_E_FILE_HASH_NOT_IN_CATALOG
+# on every box, and it predated IOCTL_SET_RENDER_ADAPTER the host needs on hybrid/Optimus GPUs). Building
+# here keeps the .dll/.inf/.cat in lockstep + ships current driver features. stage-pf-vdisplay.ps1 then
+# adds the fetched nefcon device tool. (Needs the WDK build env; -NoDriver skips it for a WDK-less pack.)
 if (-not $NoDriver) {
+    $built = Join-Path $OutDir 'pfvd-built'
+    & (Join-Path $here 'build-pf-vdisplay.ps1') -Out $built
     $stage = Join-Path $OutDir 'stage'
-    & (Join-Path $here 'stage-pf-vdisplay.ps1') -OutDir $stage
+    & (Join-Path $here 'stage-pf-vdisplay.ps1') -OutDir $stage -VendorDir $built
     Copy-Item (Join-Path $here 'install-pf-vdisplay.ps1') (Join-Path $stage 'install-pf-vdisplay.ps1') -Force
     $defines += "/DStageDir=$stage"
 }
@@ -165,12 +171,12 @@ if (-not $NoDriver) {
         $defines += "/DGamepadStageDir=$gpStage"
         Write-Host "==> staged vendored gamepad UMDF drivers from $gpVendor"
     }
-    else { Write-Warning "no vendored gamepad drivers under $gpVendor — installer built WITHOUT them" }
+    else { Write-Warning "no vendored gamepad drivers under $gpVendor - installer built WITHOUT them" }
 }
 
 # --- stage the FFmpeg shared DLLs (AMD/Intel AMF/QSV build) ------------------------------------
 # A host built with --features amf-qsv link-imports avcodec/avutil/swscale/... so the shared DLLs
-# MUST sit next to the exe (it won't start otherwise). Bundle them from $FfmpegDir\bin — the same
+# MUST sit next to the exe (it won't start otherwise). Bundle them from $FfmpegDir\bin - the same
 # BtbN gpl-shared tree the build linked against. A nvenc/software-only build doesn't import them, so
 # this is a harmless extra there; skipped entirely when $FfmpegDir is unset.
 $ffmpegBinSrc = if ($FfmpegDir) { Join-Path $FfmpegDir 'bin' } else { $null }
@@ -190,7 +196,7 @@ else { Write-Host "no FFMPEG_DIR\bin -> installer built WITHOUT FFmpeg DLLs (nve
 # The console runs as the PunktfunkWeb scheduled task (`bun {app}\web\.output\server\index.mjs`),
 # auto-wired to the host's loopback mgmt API. Stage everything ISCC reads into $OutDir (the
 # non-WOW64-redirected C:\t area, same reason as the .iss/host.env staging above). The .output is
-# self-contained (Nitro noExternals — deps bundled + tree-shaken, no node_modules), so bun runs it
+# self-contained (Nitro noExternals - deps bundled + tree-shaken, no node_modules), so bun runs it
 # directly; omitted when -WebDir/-BunExe are unset (host-only installer, e.g. a local debug pack).
 if ($WebDir -and (Test-Path $WebDir) -and $BunExe -and (Test-Path $BunExe)) {
     $webStage = Join-Path $OutDir 'web'
@@ -213,7 +219,7 @@ else { Write-Host "no -WebDir/-BunExe -> installer built WITHOUT the web console
 
 # --- build + stage the HDR Vulkan layer (pf-vkhdr-layer) --------------------------------------
 # A tiny always-on Vulkan implicit layer (cdylib) that advertises HDR10/scRGB surface formats on the
-# virtual display so Vulkan games (Doom: The Dark Ages, etc.) can enable HDR while streaming — the
+# virtual display so Vulkan games (Doom: The Dark Ages, etc.) can enable HDR while streaming - the
 # NVIDIA/AMD ICDs hide HDR formats on an indirect display even though they accept+present a forced HDR
 # swapchain there. Self-gated on the display's actual advanced-color state, so it's a no-op on SDR.
 # Standalone crate (own [workspace]); built here and registered by the installer. Skipped if cargo
@@ -239,7 +245,7 @@ if (Test-Path (Join-Path $layerSrc 'Cargo.toml')) {
         $defines += "/DVkLayerDir=$layerStage"
         Write-Host "==> staged pf-vkhdr-layer -> $layerStage"
     }
-    else { Write-Warning "pf-vkhdr-layer build failed ($layerExit) — installer built WITHOUT the HDR Vulkan layer" }
+    else { Write-Warning "pf-vkhdr-layer build failed ($layerExit) - installer built WITHOUT the HDR Vulkan layer" }
 }
 else { Write-Host "no pf-vkhdr-layer crate -> installer built WITHOUT the HDR Vulkan layer" }
 

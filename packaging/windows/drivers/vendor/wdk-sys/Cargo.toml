@@ -67,7 +67,7 @@ version = "=0.5.1"
 version = "1.0.97"
 
 [build-dependencies.bindgen]
-version = "0.71.0"
+version = "0.72"
 
 [build-dependencies.cargo_metadata]
 version = "0.19.2"

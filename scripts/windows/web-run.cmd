@@ -1,5 +1,5 @@
 @echo off
-rem punktfunk web console launcher — the action the PunktfunkWeb scheduled task runs at boot.
+rem punktfunk web console launcher - the action the PunktfunkWeb scheduled task runs at boot.
 rem
 rem Lays out next to the installed payload: {app}\web\web-run.cmd, {app}\web\.output\... and
 rem {app}\bun\bun.exe (so %~dp0 = {app}\web\). Auto-wires the console the same way the Linux
