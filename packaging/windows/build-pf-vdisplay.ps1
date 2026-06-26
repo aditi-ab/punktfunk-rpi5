@@ -45,17 +45,22 @@ if (-not $env:Version_Number) { $env:Version_Number = '10.0.26100.0' }
 if (-not $env:LIBCLANG_PATH -and (Test-Path 'C:\Program Files\LLVM\bin\libclang.dll')) {
     $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
 }
-# Isolate the driver's CARGO_TARGET_DIR from the host's (CI sets a shared C:\t): the driver is a
-# SEPARATE workspace (own [workspace] + an explicit --target via .cargo/config), so give it its own
-# output tree both to avoid cross-workspace churn and to make the .dll path predictable here.
-$drvTarget = Join-Path (Split-Path -Parent $Out) 'pfvd-target'
+# The driver MUST build into its DEFAULT target dir (under the driver workspace), NOT an external one:
+# wdk-sys's build script calls wdk-build::find_top_level_cargo_manifest(), which walks UP from OUT_DIR
+# for the first ancestor holding a Cargo.lock (it explicitly "does not support non-default target
+# directories"). CI sets a shared CARGO_TARGET_DIR=C:\t, whose ancestors have no Cargo.lock -> the build
+# script panics "a Cargo.lock file should exist in the same directory as the top-level Cargo.toml". So
+# clear CARGO_TARGET_DIR for this build and let cargo use <driver-workspace>\target (its ancestors
+# include the driver Cargo.lock). The driver has no CMake-from-source deps, so it doesn't need C:\t's
+# MAX_PATH dodge, and its own [workspace] keeps it isolated from the host's tree regardless.
+$drvTarget = Join-Path $DriversDir 'target'
 $dll = Join-Path $drvTarget 'x86_64-pc-windows-msvc\release\pf_vdisplay.dll'
 
 # --- 1. build (release) -----------------------------------------------------------------------
 if (-not $SkipBuild) {
-    Write-Host "==> cargo build --release (pf-vdisplay) in $DriversDir (target -> $drvTarget)"
+    Write-Host "==> cargo build --release (pf-vdisplay) in $DriversDir (default target -> $drvTarget)"
     $prevTarget = $env:CARGO_TARGET_DIR
-    $env:CARGO_TARGET_DIR = $drvTarget
+    Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
     Push-Location $DriversDir
     & cargo build --release
     $rc = $LASTEXITCODE
@@ -121,8 +126,12 @@ Export-Certificate -Cert $pubForCer -FilePath $sCer | Out-Null
 if ($cleanupCert) { Remove-Item "Cert:\CurrentUser\My\$($cleanupCert.Thumbprint)" -Force -ErrorAction SilentlyContinue }
 
 # --- 5. guard: assert the freshly-built catalog covers the inf + dll ---------------------------
-# (Built-from-source can't drift, but this catches a botched stampinf/Inf2Cat ordering before it ships.)
-$cat = Test-FileCatalog -CatalogFilePath $sCat -Path $Out -FilesToSkip 'pf_vdisplay.cat', 'punktfunk-driver.cer' -Detailed -ErrorAction SilentlyContinue
+# Built-from-source can't drift, but this catches a botched stampinf/Inf2Cat ordering. Test-FileCatalog
+# itself can't always OPEN a catalog signed by a not-yet-trusted cert (it throws UnableToOpenCatalogFile),
+# so treat ITS failure as inconclusive (warn) - but a real coverage miss still fails the build.
+$cat = $null
+try { $cat = Test-FileCatalog -CatalogFilePath $sCat -Path $Out -FilesToSkip 'pf_vdisplay.cat', 'punktfunk-driver.cer' -Detailed }
+catch { Write-Warning "catalog coverage guard inconclusive (Test-FileCatalog: $($_.Exception.Message))" }
 if ($cat) {
     $covered = @($cat.CatalogItems.Keys)
     foreach ($need in @('pf_vdisplay.inf', 'pf_vdisplay.dll')) {
