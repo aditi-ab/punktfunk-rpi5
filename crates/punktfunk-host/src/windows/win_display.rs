@@ -21,7 +21,7 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
     DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
     QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_FORCE_MODE_ENUMERATION,
-    SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_TEST, CDS_UPDATEREGISTRY, DEVMODEW,
@@ -30,6 +30,29 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use crate::vdisplay::Mode;
+
+/// Force the desktop into EXTEND topology - the programmatic equivalent of the Win+P / DisplaySwitch
+/// "Extend" shortcut. Windows defaults a FRESHLY-ADDED monitor into CLONE/duplicate mode when a
+/// physical display is already active (e.g. a laptop panel): a cloned IddCx output shares the panel's
+/// source, so the OS never commits a distinct path for it, never calls ASSIGN_SWAPCHAIN, and capture
+/// sees no frames (`resolve_gdi_name` stays `None` and the session fails "not an active display path").
+/// Applying the EXTEND preset across the live set of connected displays makes the new IddCx monitor its
+/// OWN active path, so the rest of bring-up (`resolve_gdi_name` -> `set_active_mode` ->
+/// `isolate_displays_ccd`) proceeds. Best-effort + idempotent: a no-op on a single-display (already
+/// sole/extended) box, so it is safe to call unconditionally. `rc == 0` is success.
+pub(crate) unsafe fn force_extend_topology() {
+    // A topology flag with no supplied path/mode arrays tells the OS to recompute + apply that preset
+    // for the currently-connected displays (the same code path DisplaySwitch.exe drives).
+    let rc = SetDisplayConfig(None, None, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+    if rc == 0 {
+        tracing::info!(
+            "display topology forced to EXTEND (a new IddCx monitor would otherwise be CLONED onto the \
+             existing panel -> no distinct source -> no frames)"
+        );
+    } else {
+        tracing::warn!("display force-EXTEND topology: SetDisplayConfig rc={rc:#x}");
+    }
+}
 
 /// Resolve the `\\.\DisplayN` GDI name for a SudoVDA target id via the CCD API. Returns `None`
 /// until the OS activates the target into the desktop topology (needs a real WDDM GPU; on a

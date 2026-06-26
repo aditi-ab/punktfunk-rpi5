@@ -27,7 +27,8 @@ use windows::Win32::Foundation::{HANDLE, LUID};
 
 use super::{Mode, VirtualOutput};
 use crate::win_display::{
-    isolate_displays_ccd, resolve_gdi_name, restore_displays_ccd, set_active_mode, SavedConfig,
+    force_extend_topology, isolate_displays_ccd, resolve_gdi_name, restore_displays_ccd,
+    set_active_mode, SavedConfig,
 };
 
 /// The per-backend REMOVE key the driver stamps on ADD and consumes on REMOVE. SudoVDA keys monitors by
@@ -325,6 +326,15 @@ impl VirtualDisplayManager {
                 thread::sleep(interval);
             }
         });
+
+        // Windows defaults a new IddCx monitor into CLONE mode when a physical display is already
+        // active (a laptop panel, an attached monitor): the cloned IDD shares that display's source, so
+        // the OS never commits a distinct path for it and capture sees no frames. Force EXTEND first so
+        // the IDD comes up as its OWN active path; the resolve loop below then finds it. Idempotent /
+        // no-op on a sole-display box, so it's safe on the headless single-GPU path too.
+        // SAFETY: `force_extend_topology` only calls `SetDisplayConfig` (a CCD topology apply) with no
+        // borrowed caller memory; it runs under the manager `state` lock, the sole topology mutator.
+        unsafe { force_extend_topology() };
 
         // Resolve the capture target. May be None on a GPU-less box (target added but not WDDM-activated);
         // the capture backend re-resolves once a GPU is present.
