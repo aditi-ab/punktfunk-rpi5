@@ -14,10 +14,12 @@ use super::dxgi::{make_device, D3d11Frame, HdrConverter, WinCaptureTarget};
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::frame;
+use std::ffi::c_void;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Interface, HSTRING};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LUID};
+use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, LUID};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11ShaderResourceView,
     ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
@@ -89,22 +91,45 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// RAII wrapper for a file-mapping object + its mapped view: on drop the view is `UnmapViewOfFile`'d,
+/// THEN the [`OwnedHandle`] closes the underlying mapping object (order matters — unmap before close).
+/// A `header`/`dbg_block` raw pointer borrows into the view via [`ptr`](Self::ptr); the section must
+/// outlive it (it's declared before it in [`IddPushCapturer`], and moving the section doesn't move the
+/// OS mapping, so the borrowed pointer stays valid).
+struct MappedSection {
+    handle: OwnedHandle,
+    view: MEMORY_MAPPED_VIEW_ADDRESS,
+}
+
+impl MappedSection {
+    /// The mapped view base as a `*mut T` (a borrow into the section; valid only while it lives).
+    fn ptr<T>(&self) -> *mut T {
+        self.view.Value as *mut T
+    }
+}
+
+impl Drop for MappedSection {
+    fn drop(&mut self) {
+        // SAFETY: `view` is the live view we created with `MapViewOfFile` and have not yet unmapped;
+        // unmap it BEFORE `handle` (the OwnedHandle) closes the mapping object — order matters.
+        unsafe {
+            let _ = UnmapViewOfFile(self.view);
+        }
+    }
+}
+
 struct HostSlot {
     tex: ID3D11Texture2D,
     mutex: IDXGIKeyedMutex,
-    shared: HANDLE,
+    /// The named shared-resource handle, held only to keep the resource alive (the driver opens it by
+    /// NAME). An [`OwnedHandle`] so it closes on drop (was a manual `CloseHandle` in a `Drop` impl);
+    /// never read directly — its sole purpose is the RAII close.
+    #[allow(dead_code)]
+    shared: OwnedHandle,
     /// SRV on the slot texture so the HDR path samples the FP16 slot DIRECTLY (no slot→scratch copy);
     /// the convert pass writes the output ring while holding the slot's keyed mutex. Unused for SDR
     /// (which CopyResource's the BGRA slot straight to the output).
     srv: ID3D11ShaderResourceView,
-}
-
-impl Drop for HostSlot {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.shared);
-        }
-    }
 }
 
 /// Creates + owns the shared ring; yields the driver's frames as [`FramePayload::D3d11`].
@@ -112,10 +137,17 @@ pub struct IddPushCapturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     target_id: u32,
-    map: HANDLE,
+    /// Owns the shared-header file mapping + its mapped view (RAII unmap-then-close). Declared BEFORE
+    /// `header`, which is a raw pointer borrowed into this view via [`MappedSection::ptr`]. Never read
+    /// directly (the `header` pointer is) — held purely so the mapping outlives the capturer.
+    #[allow(dead_code)]
+    section: MappedSection,
     header: *mut SharedHeader,
-    event: HANDLE,
-    dbg_map: HANDLE,
+    event: OwnedHandle,
+    /// Owns the bring-up debug section (mapping + view), or `None` when the debug block wasn't created.
+    /// Never read directly (the `dbg_block` pointer is) — held purely for the RAII unmap/close.
+    #[allow(dead_code)]
+    dbg_section: Option<MappedSection>,
     dbg_block: *mut DebugBlock,
     width: u32,
     height: u32,
@@ -223,6 +255,8 @@ impl IddPushCapturer {
                     &HSTRING::from(texture_name(target_id, generation, k)),
                 )
                 .context("CreateSharedHandle(IDD-push ring slot)")?;
+            // Own the shared handle so the slot's `Drop` closes it via RAII (was a manual `CloseHandle`).
+            let shared = OwnedHandle::from_raw_handle(shared.0 as _);
             let mutex: IDXGIKeyedMutex = tex.cast()?;
             let mut srv: Option<ID3D11ShaderResourceView> = None;
             device
@@ -328,13 +362,21 @@ impl IddPushCapturer {
                 &HSTRING::from(header_name(target.target_id)),
             )
             .context("CreateFileMapping(IDD-push header)")?;
-            let view = MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, bytes);
+            // Own the mapping handle so it (and its view) free via `MappedSection` RAII even on bail.
+            let map = OwnedHandle::from_raw_handle(map.0 as _);
+            let view = MapViewOfFile(
+                HANDLE(map.as_raw_handle() as *mut c_void),
+                FILE_MAP_ALL_ACCESS,
+                0,
+                0,
+                bytes,
+            );
             if view.Value.is_null() {
-                let _ = CloseHandle(map);
-                bail!("MapViewOfFile failed for IDD-push header");
+                bail!("MapViewOfFile failed for IDD-push header"); // `map` drops → mapping closed
             }
+            let section = MappedSection { handle: map, view };
             let generation = IDD_GENERATION.fetch_add(1, Ordering::Relaxed);
-            let header = view.Value.cast::<SharedHeader>();
+            let header = section.ptr::<SharedHeader>();
             std::ptr::write_bytes(header.cast::<u8>(), 0, bytes);
             (*header).version = VERSION;
             (*header).generation = generation;
@@ -353,6 +395,7 @@ impl IddPushCapturer {
                 &HSTRING::from(event_name(target.target_id)),
             )
             .context("CreateEvent(IDD-push)")?;
+            let event = OwnedHandle::from_raw_handle(event.0 as _);
 
             // Ring of shared keyed-mutex textures, format matched to the display's current mode.
             let slots =
@@ -360,7 +403,7 @@ impl IddPushCapturer {
 
             // Bring-up debug block (fixed name) — the driver writes diagnostics here. Best-effort.
             let dbg_bytes = std::mem::size_of::<DebugBlock>();
-            let (dbg_map, dbg_block) = match CreateFileMappingW(
+            let (dbg_section, dbg_block) = match CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 Some(&sa),
                 PAGE_READWRITE,
@@ -369,18 +412,29 @@ impl IddPushCapturer {
                 &HSTRING::from(DBG_NAME),
             ) {
                 Ok(dm) => {
-                    let dv = MapViewOfFile(dm, FILE_MAP_ALL_ACCESS, 0, 0, dbg_bytes);
+                    // Own the mapping handle so it (and its view) free via `MappedSection` RAII.
+                    let dm = OwnedHandle::from_raw_handle(dm.0 as _);
+                    let dv = MapViewOfFile(
+                        HANDLE(dm.as_raw_handle() as *mut c_void),
+                        FILE_MAP_ALL_ACCESS,
+                        0,
+                        0,
+                        dbg_bytes,
+                    );
                     if dv.Value.is_null() {
-                        let _ = CloseHandle(dm);
-                        (HANDLE::default(), std::ptr::null_mut())
+                        (None, std::ptr::null_mut()) // `dm` drops → mapping closed
                     } else {
-                        let p = dv.Value.cast::<DebugBlock>();
+                        let section = MappedSection {
+                            handle: dm,
+                            view: dv,
+                        };
+                        let p = section.ptr::<DebugBlock>();
                         std::ptr::write_bytes(p.cast::<u8>(), 0, dbg_bytes);
                         (*p).magic = DBG_MAGIC;
-                        (dm, p)
+                        (Some(section), p)
                     }
                 }
-                Err(_) => (HANDLE::default(), std::ptr::null_mut()),
+                Err(_) => (None, std::ptr::null_mut()),
             };
 
             // Publish: magic LAST (Release) — signals the driver the ring is ready to open.
@@ -401,10 +455,10 @@ impl IddPushCapturer {
                 device,
                 context,
                 target_id: target.target_id,
-                map,
+                section,
                 header,
                 event,
-                dbg_map,
+                dbg_section,
                 dbg_block,
                 width: w,
                 height: h,
@@ -841,7 +895,9 @@ impl Capturer for IddPushCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let _ = unsafe { WaitForSingleObject(self.event, 16) };
+            let _ = unsafe {
+                WaitForSingleObject(HANDLE(self.event.as_raw_handle() as *mut c_void), 16)
+            };
             if let Some(f) = self.try_consume()? {
                 return Ok(f);
             }
@@ -893,23 +949,8 @@ impl Capturer for IddPushCapturer {
 impl Drop for IddPushCapturer {
     fn drop(&mut self) {
         self.slots.clear();
-        unsafe {
-            if !self.dbg_block.is_null() {
-                let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: self.dbg_block.cast(),
-                });
-            }
-            if !self.dbg_map.is_invalid() {
-                let _ = CloseHandle(self.dbg_map);
-            }
-            if !self.header.is_null() {
-                let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: self.header.cast(),
-                });
-            }
-            let _ = CloseHandle(self.event);
-            let _ = CloseHandle(self.map);
-        }
+        // The shared header + debug sections (`MappedSection`) and the frame-ready `event`
+        // (`OwnedHandle`) free themselves via RAII (each unmaps its view, then closes its handle).
         // _keepalive drops after, REMOVEing the virtual display.
     }
 }
