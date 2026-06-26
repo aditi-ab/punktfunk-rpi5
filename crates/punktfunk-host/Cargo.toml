@@ -179,6 +179,9 @@ windows-service = "0.7"
 # Read the GOG.com install registry (HKLM\SOFTWARE\WOW6432Node\GOG.com\Games) for the GOG store
 # provider — ergonomic + correct-by-construction vs. hand-rolled Reg* FFI for subkey enumeration.
 winreg = "0.56"
+# Parse each Xbox/Game-Pass game's MicrosoftGame.config (GDK manifest XML) for the Xbox store
+# provider — a small read-only DOM is all we need (Identity/Executable/ShellVisuals/StoreId).
+roxmltree = "0.21"
 # Software H.264 encoder (GPU-less path + NVENC fallback). The default `source` feature statically
 # compiles OpenH264 (BSD-2) — no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.
 openh264 = "0.9"
