@@ -3,6 +3,8 @@
 A one-file, signed `setup.exe` for the punktfunk streaming **host** on Windows, published to Gitea's
 generic package registry (`punktfunk-host-windows`) by `.gitea/workflows/windows-host.yml`.
 
+> Full picture (drivers-from-source, toolchain, CI, dev loop): **[`design/windows-build-and-packaging.md`](../../design/windows-build-and-packaging.md)**. This README is the `packaging/windows/` file index.
+
 ## x64 only (no ARM64)
 
 Unlike the client (which ships x64 + ARM64 MSIX), the host is **x64-only by design**. It is coupled to
@@ -66,28 +68,31 @@ read it from `%ProgramData%\punktfunk\web-password`.
 | File | Role |
 |------|------|
 | `punktfunk-host.iss` | Inno Setup script (the installer definition). |
-| `pack-host-installer.ps1` | Orchestrator: cert + sign, stage the driver + FFmpeg + **web console** (`.output` + bun) bundles, run ISCC, sign setup.exe, emit registry paths. |
-| `stage-pf-vdisplay.ps1` | Stage the **vendored** pf-vdisplay driver + fetch/verify the **pinned** nefcon release into the bundle. |
+| `pack-host-installer.ps1` | Orchestrator: cert + sign exe, **build + sign the drivers from source**, stage them + FFmpeg + the **web console** (`.output` + bun) + the HDR layer, run ISCC, sign setup.exe. |
+| `build-pf-vdisplay.ps1` | Build pf-vdisplay from source (the `drivers/` workspace) + clear FORCE_INTEGRITY + sign `.dll`/`.cat` + export `.cer`. |
+| `build-gamepad-drivers.ps1` | Sign + catalog the gamepad drivers (`pf-dualsense` + `pf-xusb`) from the same workspace build (`-SkipBuild`), one shared cert. |
+| `clear-force-integrity.ps1` | Clear the `/INTEGRITYCHECK` PE bit so a self-signed driver loads (reused by every driver build). |
+| `stage-pf-vdisplay.ps1` | Stage the just-built pf-vdisplay bundle + fetch/verify the **pinned** nefcon release. |
 | `install-pf-vdisplay.ps1` | Runs at install time (elevated): trust cert → gated device-node create (nefconc) → `pnputil` install. |
+| `install-gamepad-drivers.ps1` | Runs at install time (elevated): trust cert → `pnputil /add-driver` each gamepad `.inf` (per-session devnodes are SwDeviceCreate'd by the host). |
 | `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `bun` on the Nitro server (`:3000`). |
 | `../../scripts/windows/web-setup.ps1` | Install-time (elevated): write the ACL'd console password, register the `PunktfunkWeb` task + firewall rule, start it. |
-| `pf-vdisplay/` | **Vendored** signed pf-vdisplay driver: `pf_vdisplay.inf` / `pf_vdisplay.cat` / `pf_vdisplay.dll` / `punktfunk-driver.cer`. Built from `drivers/`. |
 | `drivers/` | The all-Rust IddCx **driver source** workspace: the `pf-vdisplay` crate on `wdk-sys` / windows-drivers-rs + the owned `pf-driver-proto` ABI + `wdk-iddcx` / `wdk-probe`, plus `deploy-dev.ps1` (build/sign/install for dev). |
 | `reset-pf-vdisplay.ps1` | **Dev:** recover a wedged driver — stop host → reap ghost monitor nodes → reload the adapter → start host (no reboot). See *Dev iteration* below. |
 | `redeploy-pf-vdisplay.ps1` | **Dev:** one-shot redeploy — (optional) build → stop host → `deploy-dev.ps1 -Install` → reload adapter → start host. |
 | `nvenc/nvenc.def`, `nvenc/gen-nvenc-importlib.ps1` | Synthesise `nvencodeapi.lib` for the `--features nvenc` link (llvm-dlltool / lib.exe). |
 | `pf-vkhdr-layer/` | **HDR Vulkan layer** (standalone `cdylib`): lets Vulkan games (Doom: The Dark Ages, etc.) enable HDR over the virtual display by advertising the HDR surface formats the NVIDIA/AMD ICDs hide on an indirect display. Built by the packer, laid into `{app}\vklayer`, registered under `HKLM64\…\Khronos\Vulkan\ImplicitLayers` (opt-out *Install the HDR Vulkan layer* task). Self-gated on the display's HDR state. See its README. |
 
-> **Vendored driver:** pf-vdisplay is our **all-Rust IddCx** virtual display (UMDF2), built from
-> `packaging/windows/drivers/`. It replaced the vendored SudoVDA C++ driver — full story in
-> [`design/windows-virtual-display-rust-port.md`](../../design/windows-virtual-display-rust-port.md). The
-> **signed** output (`pf_vdisplay.dll`/`.inf`/`.cat` + `punktfunk-driver.cer`; signer
-> `punktfunk-ds-test` — the same cert the gamepad drivers ship, Class=Display, HWID `root\pf_vdisplay`)
-> is checked in under `pf-vdisplay/`. To refresh it after a driver-source change, rebuild + re-sign with
-> `drivers/deploy-dev.ps1` and copy the staged `pf_vdisplay.{dll,inf,cat}` over the vendored
-> copies. nefcon (the device-node tool — the install creates the node with it, **never** `devgen`, which
-> leaves persistent phantom devices) **is** fetched + SHA-256-verified from its pinned release in
-> `stage-pf-vdisplay.ps1`.
+> **Drivers are built from source, not vendored.** All three (pf-vdisplay + the gamepad pf-dualsense /
+> pf-xusb) are members of the all-Rust `drivers/` workspace (windows-drivers-rs / IddCx) and are
+> **rebuilt + signed every release** by `build-pf-vdisplay.ps1` + `build-gamepad-drivers.ps1` - the
+> checked-in prebuilt binaries were deleted (a stale `.cat` once stopped covering its `.inf` →
+> `SPAPI_E_FILE_HASH_NOT_IN_CATALOG` on every box, and a frozen binary predated a driver IOCTL the host
+> needed). Building from source keeps `.dll`/`.inf`/`.cat` in lockstep. nefcon (the device-node tool -
+> the install creates the `root\pf_vdisplay` node with it, **never** `devgen`, which leaves persistent
+> phantom devices) is fetched + SHA-256-verified from its pinned release in `stage-pf-vdisplay.ps1`. See
+> [`design/windows-build-and-packaging.md`](../../design/windows-build-and-packaging.md) for the toolchain
+> + signing details.
 
 ## Dev iteration on the test box (driver)
 
