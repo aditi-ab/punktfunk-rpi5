@@ -1,28 +1,26 @@
-import type { Meta, StoryObj } from '@storybook/react-vite'
-import { LibraryPage } from '@/routes/library'
-import { MockApi } from './lib/mock-api'
-import { library } from './lib/fixtures'
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { LibraryView } from "@/sections/Library/view";
+import { library } from "./lib/fixtures";
 
 const meta = {
-  title: 'Pages/Library',
-  component: LibraryPage,
-} satisfies Meta<typeof LibraryPage>
+	title: "Pages/Library",
+	component: LibraryView,
+	args: {
+		onCreate: () => Promise.resolve(),
+		onUpdate: () => Promise.resolve(),
+		onDelete: () => Promise.resolve(),
+		isSaving: false,
+		isDeleting: false,
+	},
+} satisfies Meta<typeof LibraryView>;
 
-export default meta
-type Story = StoryObj<typeof meta>
+export default meta;
+type Story = StoryObj<typeof meta>;
 
 export const Populated: Story = {
-  render: () => (
-    <MockApi routes={{ '/api/v1/library': library }}>
-      <LibraryPage />
-    </MockApi>
-  ),
-}
+	args: { library: { data: library, isLoading: false, error: null } },
+};
 
 export const Empty: Story = {
-  render: () => (
-    <MockApi routes={{ '/api/v1/library': [] }}>
-      <LibraryPage />
-    </MockApi>
-  ),
-}
+	args: { library: { data: [], isLoading: false, error: null } },
+};

@@ -1,28 +1,20 @@
-import type { Meta, StoryObj } from '@storybook/react-vite'
-import { ClientsPage } from '@/routes/clients'
-import { MockApi } from './lib/mock-api'
-import { pairedClients } from './lib/fixtures'
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { ClientsView } from "@/sections/Clients/view";
+import { pairedClients } from "./lib/fixtures";
 
 const meta = {
-  title: 'Pages/Clients',
-  component: ClientsPage,
-} satisfies Meta<typeof ClientsPage>
+	title: "Pages/Clients",
+	component: ClientsView,
+	args: { onUnpair: () => {}, isUnpairing: false },
+} satisfies Meta<typeof ClientsView>;
 
-export default meta
-type Story = StoryObj<typeof meta>
+export default meta;
+type Story = StoryObj<typeof meta>;
 
 export const Paired: Story = {
-  render: () => (
-    <MockApi routes={{ '/api/v1/clients': pairedClients }}>
-      <ClientsPage />
-    </MockApi>
-  ),
-}
+	args: { clients: { data: pairedClients, isLoading: false, error: null } },
+};
 
 export const Empty: Story = {
-  render: () => (
-    <MockApi routes={{ '/api/v1/clients': [] }}>
-      <ClientsPage />
-    </MockApi>
-  ),
-}
+	args: { clients: { data: [], isLoading: false, error: null } },
+};
