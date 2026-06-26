@@ -211,6 +211,38 @@ if ($WebDir -and (Test-Path $WebDir) -and $BunExe -and (Test-Path $BunExe)) {
 }
 else { Write-Host "no -WebDir/-BunExe -> installer built WITHOUT the web console" }
 
+# --- build + stage the HDR Vulkan layer (pf-vkhdr-layer) --------------------------------------
+# A tiny always-on Vulkan implicit layer (cdylib) that advertises HDR10/scRGB surface formats on the
+# virtual display so Vulkan games (Doom: The Dark Ages, etc.) can enable HDR while streaming — the
+# NVIDIA/AMD ICDs hide HDR formats on an indirect display even though they accept+present a forced HDR
+# swapchain there. Self-gated on the display's actual advanced-color state, so it's a no-op on SDR.
+# Standalone crate (own [workspace]); built here and registered by the installer. Skipped if cargo
+# is unavailable or the build fails -> installer is produced WITHOUT the layer (non-fatal).
+$layerSrc = Join-Path $here 'pf-vkhdr-layer'
+if (Test-Path (Join-Path $layerSrc 'Cargo.toml')) {
+    $layerTarget = Join-Path $OutDir 'vklayer-target'
+    Write-Host "==> building pf-vkhdr-layer (cdylib)"
+    $prevTarget = $env:CARGO_TARGET_DIR
+    $env:CARGO_TARGET_DIR = $layerTarget
+    Push-Location $layerSrc
+    & cargo build --release
+    $layerExit = $LASTEXITCODE
+    Pop-Location
+    if ($prevTarget) { $env:CARGO_TARGET_DIR = $prevTarget } else { Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue }
+    $layerDll = Join-Path $layerTarget 'release\pf_vkhdr_layer.dll'
+    if ($layerExit -eq 0 -and (Test-Path $layerDll)) {
+        $layerStage = Join-Path $OutDir 'vklayer'
+        New-Item -ItemType Directory -Force -Path $layerStage | Out-Null
+        Copy-Item $layerDll (Join-Path $layerStage 'pf_vkhdr_layer.dll') -Force
+        Copy-Item (Join-Path $layerSrc 'pf_vkhdr_layer.json') (Join-Path $layerStage 'pf_vkhdr_layer.json') -Force
+        Sign-File (Join-Path $layerStage 'pf_vkhdr_layer.dll')
+        $defines += "/DVkLayerDir=$layerStage"
+        Write-Host "==> staged pf-vkhdr-layer -> $layerStage"
+    }
+    else { Write-Warning "pf-vkhdr-layer build failed ($layerExit) — installer built WITHOUT the HDR Vulkan layer" }
+}
+else { Write-Host "no pf-vkhdr-layer crate -> installer built WITHOUT the HDR Vulkan layer" }
+
 # --- build the installer (from the non-redirected copy under C:\t) -----------------------------
 Write-Host "==> ISCC $($defines -join ' ') $issLocal"
 & $iscc @defines $issLocal

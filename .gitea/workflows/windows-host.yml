@@ -96,6 +96,18 @@ jobs:
         # First-ever Windows lint coverage for the host (Linux CI never lints the windows-cfg code).
         run: cargo clippy -p punktfunk-host --features nvenc,amf-qsv -- -D warnings
 
+      - name: Build + lint the HDR Vulkan layer (pf-vkhdr-layer)
+        shell: pwsh
+        # Standalone cdylib (own [workspace]) the installer bundles + registers (it lets Vulkan games
+        # like Doom use HDR on the virtual display). Lint here so a regression fails CI instead of
+        # silently shipping the host without the layer (pack-host-installer.ps1 builds it non-fatally).
+        # Windows-only FFI (user32 + the vk_layer loader glue) → can't be linted on the Linux CI.
+        run: |
+          Push-Location packaging/windows/pf-vkhdr-layer
+          cargo fmt --check; if ($LASTEXITCODE) { throw "pf-vkhdr-layer rustfmt" }
+          cargo clippy --release -- -D warnings; if ($LASTEXITCODE) { throw "pf-vkhdr-layer clippy" }
+          Pop-Location
+
       - name: Ensure Inno Setup
         shell: pwsh
         run: |

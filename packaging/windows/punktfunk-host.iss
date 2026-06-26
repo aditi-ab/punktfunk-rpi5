@@ -56,6 +56,13 @@
     #define WithWeb
   #endif
 #endif
+; VkLayerDir (the staged pf-vkhdr-layer: pf_vkhdr_layer.dll + .json) is optional — present when the
+; HDR Vulkan layer was built. It lets Vulkan games (Doom: The Dark Ages, etc.) enable HDR over the
+; virtual display (the ICD won't advertise HDR there; the layer injects the surface formats, self-
+; gated on the display's actual HDR state).
+#ifdef VkLayerDir
+  #define WithVkLayer
+#endif
 
 [Setup]
 AppId={{7C9E6A52-1F4B-4E8D-A3C7-2B5D8F1E0A93}
@@ -89,6 +96,9 @@ Name: "installdriver"; Description: "Install the pf-vdisplay virtual display dri
 #ifdef WithGamepad
 Name: "installgamepad"; Description: "Install the virtual gamepad drivers (DualSense / DualShock 4 / Xbox 360 — no ViGEmBus needed)"
 #endif
+#ifdef WithVkLayer
+Name: "installhdrlayer"; Description: "Install the HDR Vulkan layer (lets Vulkan games like Doom use HDR on the virtual display)"
+#endif
 Name: "startservice"; Description: "Start the punktfunk host service now (also starts on every boot)"
 
 [Files]
@@ -118,6 +128,22 @@ Source: "{#StageDir}\*"; DestDir: "{tmp}\pfvdisplay"; Flags: deleteafterinstall 
 #ifdef WithGamepad
 ; The vendored UMDF gamepad drivers + install-gamepad-drivers.ps1, extracted to {tmp}, removed after.
 Source: "{#GamepadStageDir}\*"; DestDir: "{tmp}\gamepad"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installgamepad
+#endif
+#ifdef WithVkLayer
+; The HDR Vulkan implicit layer (cdylib + its JSON manifest) laid into {app}\vklayer and registered
+; below. The manifest's library_path is ".\pf_vkhdr_layer.dll" (relative to the JSON), so the two
+; must live in the same directory.
+Source: "{#VkLayerDir}\pf_vkhdr_layer.dll"; DestDir: "{app}\vklayer"; Flags: ignoreversion; Tasks: installhdrlayer
+Source: "{#VkLayerDir}\pf_vkhdr_layer.json"; DestDir: "{app}\vklayer"; Flags: ignoreversion; Tasks: installhdrlayer
+#endif
+
+[Registry]
+#ifdef WithVkLayer
+; Register the HDR Vulkan implicit layer system-wide. The 64-bit Vulkan loader reads
+; HKLM64\SOFTWARE\Khronos\Vulkan\ImplicitLayers; the value NAME is the manifest path and the DWORD
+; DATA is 0 (= enabled). uninsdeletevalue removes just this value on uninstall. The layer is inert
+; unless the target display has HDR enabled, and honors DISABLE_PF_VKHDR=1 as a global off-switch.
+Root: HKLM64; Subkey: "SOFTWARE\Khronos\Vulkan\ImplicitLayers"; ValueType: dword; ValueName: "{app}\vklayer\pf_vkhdr_layer.json"; ValueData: 0; Flags: uninsdeletevalue; Tasks: installhdrlayer
 #endif
 
 [Run]

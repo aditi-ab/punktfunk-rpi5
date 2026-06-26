@@ -1,0 +1,17 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_PUNKTFUNK_hdr_inject",
+        "type": "GLOBAL",
+        "library_path": ".\\pf_vkhdr_layer.dll",
+        "api_version": "1.4.280",
+        "implementation_version": "1",
+        "description": "punktfunk: advertise HDR10/scRGB Vulkan surface formats on the virtual display (NVIDIA/AMD ICDs hide them on indirect displays even though the ICD accepts + presents a forced HDR swapchain).",
+        "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+        },
+        "disable_environment": {
+            "DISABLE_PF_VKHDR": "1"
+        }
+    }
+}
