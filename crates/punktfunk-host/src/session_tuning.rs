@@ -11,6 +11,9 @@
 //! state) auto-revert at thread exit (= session end); the process-wide bits revert at process exit.
 //! See `docs/host-latency-plan.md` Tier 3A.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 #[cfg(target_os = "windows")]
 mod imp {
     #![allow(non_snake_case)]
@@ -49,6 +52,10 @@ mod imp {
     /// Process-wide tuning, applied exactly once. Reverts at process exit. Best-effort: each call is
     /// independent and a failure is ignored (e.g. a non-elevated host may not get HIGH class).
     fn tune_process_once() {
+        // SAFETY: each call is a C-ABI FFI into winmm/kernel32/dwmapi declared with a matching
+        // `extern "system"` signature; every argument is a plain integer (no pointers/buffers escape),
+        // and `GetCurrentProcess()` returns the current-process pseudo-handle (a constant, always valid,
+        // never closed). The body runs inside `get_or_init`, so it executes exactly once per process.
         PROCESS_TUNED.get_or_init(|| unsafe {
             // 1 ms timer granularity (default ~15.6 ms) — the floor for precise frame pacing and the
             // encode|send split's sub-ms sleeps.
@@ -70,6 +77,11 @@ mod imp {
     /// thread exits, so a session that ends tears them down without explicit bookkeeping.
     pub fn on_hot_thread() {
         tune_process_once();
+        // SAFETY: C-ABI FFI declared with matching `extern "system"` signatures. SetThreadExecutionState
+        // takes only flag bits. `task` is a local NUL-terminated UTF-16 buffer ("Games\0") alive for the
+        // whole block, so `task.as_ptr()` is a valid LPCWSTR for the call, and `&mut idx` is a live local
+        // u32 the call writes the task index into. The returned MMCSS handle is intentionally leaked (the
+        // OS reverts the characteristics at thread exit), so there is nothing to free or double-free.
         unsafe {
             SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
             let task: Vec<u16> = "Games\0".encode_utf16().collect();

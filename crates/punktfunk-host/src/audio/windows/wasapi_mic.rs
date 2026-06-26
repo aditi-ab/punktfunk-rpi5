@@ -13,6 +13,9 @@
 //! when the client isn't talking. WASAPI objects are `!Send`, so they live entirely on that thread
 //! (mirrors `WasapiLoopbackCapturer`).
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use super::{VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
@@ -154,6 +157,13 @@ fn find_or_install_device() -> Result<wasapi::Device> {
         Ok(d) => Ok(d),
         Err(e) => {
             tracing::info!("no virtual mic device present — attempting auto-install");
+            // SAFETY: `try_install_virtual_mic` is `unsafe` only because it `LoadLibraryExW`s
+            // `newdev.dll` and calls `DiInstallDriverW` through a `transmute`d function pointer;
+            // calling it imposes no extra precondition here (it takes no args and aliases nothing).
+            // Its internal contract holds: the `DiInstall` type matches the documented
+            // `BOOL DiInstallDriverW(HWND, PCWSTR, DWORD, PBOOL)` ABI, and it passes a
+            // NUL-terminated UTF-16 INF path with null/zero optional args. Invoked once on the
+            // dedicated mic thread.
             if unsafe { try_install_virtual_mic() } {
                 find_device()
             } else {

@@ -15,6 +15,9 @@
 //! composed while a session is live). Effectiveness can be build/driver-dependent; gated by
 //! `PUNKTFUNK_FORCE_COMPOSED` (default ON; set =0 to disable).
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::w;
@@ -48,6 +51,10 @@ impl ForceComposedFlip {
         let st = stop.clone();
         std::thread::Builder::new()
             .name("composed-flip".into())
+            // SAFETY: `run` is this module's `unsafe fn` (it owns a desktop+window lifecycle via Win32
+            // FFI); it takes ownership of `st` (the stop `Arc<AtomicBool>`) and has no caller-side memory
+            // precondition. It is designed to own its thread for its whole duration — exactly the
+            // dedicated `composed-flip` thread spawned here.
             .spawn(move || unsafe { run(st) })
             .ok()?;
         tracing::info!("force-composed-flip overlay started (Winlogon-aware)");
@@ -62,6 +69,9 @@ impl Drop for ForceComposedFlip {
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // SAFETY: this is the window procedure the OS invokes with the window's own `hwnd` and a real
+    // message `(msg, wp, lp)`. `DefWindowProcW` performs default processing for exactly those
+    // parameters (all passed straight through by value); it borrows no Rust memory and is synchronous.
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 

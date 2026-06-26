@@ -15,6 +15,9 @@
 //! that is correct for launching *our own* streamer, but a store launcher needs the real user's token
 //! for activation + auth). The host process itself stays SYSTEM.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use windows::core::{PCWSTR, PWSTR};
@@ -40,6 +43,8 @@ use windows::Win32::System::Threading::{
 /// user is logged on (a pre-login / freshly-booted box can stream the login desktop but cannot
 /// auto-launch a store title until someone signs in).
 pub fn spawn_in_active_session(cmdline: &str, workdir: Option<&Path>) -> Result<u32> {
+    // SAFETY: `spawn_inner` is unsafe only for its Win32 FFI; it has no caller-side preconditions — it
+    // validates the session/token itself and owns every handle it opens — so calling it is always sound.
     unsafe { spawn_inner(cmdline, workdir) }
 }
 

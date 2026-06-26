@@ -2,6 +2,8 @@
 //! fallback when NVENC is unavailable). Low-latency screen-content config: single-reference,
 //! no B-frames (Baseline), bitrate rate-control, in-band SPS/PPS each IDR, BT.709 limited range.
 //! Synchronous: `submit` encodes immediately and stashes the AU for `poll` (no internal queue).
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{EncodedFrame, Encoder};
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
@@ -30,6 +32,12 @@ pub struct OpenH264Encoder {
 }
 
 // openh264's Encoder holds a raw C handle (not auto-Send); it lives on the single encode thread.
+// SAFETY: `OpenH264Encoder` wraps `Oh264` (openh264's `Encoder`), which holds a raw C handle to the
+// openh264 `ISVCEncoder` and is not auto-`Send`; the other fields (`YUVBuffer`, `Vec`, scalars,
+// `Option<EncodedFrame>`) are plain owned data. The session creates the encoder, calls
+// `submit`/`poll`/`flush`, and drops it all on one dedicated encode thread, never sharing it by
+// reference across threads, so the C handle is only ever touched from a single thread. Moving the
+// whole value to that thread is therefore sound — there is no concurrent access to the handle.
 unsafe impl Send for OpenH264Encoder {}
 
 impl OpenH264Encoder {

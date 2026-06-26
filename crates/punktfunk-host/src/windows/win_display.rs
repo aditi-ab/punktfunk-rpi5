@@ -8,6 +8,9 @@
 //! them, which let the SudoVDA backend be dropped without losing them (audit §9 / Goal 2 — done). The
 //! plan's `windows/display_ccd.rs`. Extracted verbatim from the former SudoVDA backend before its removal.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use std::mem::size_of;
 
 use windows::core::PCWSTR;
@@ -202,6 +205,10 @@ pub(crate) fn set_active_mode(gdi_name: &str, mode: Mode) {
             dmSize: size_of::<DEVMODEW>() as u16,
             ..Default::default()
         };
+        // SAFETY: `wname` is a live NUL-terminated UTF-16 device name (built above) whose pointer stays
+        // valid for the call; `&mut dm` is a live DEVMODEW with `dmSize` set that EnumDisplaySettingsW
+        // fills in for mode index `i`. Both outlive this synchronous call; the API only reads the name
+        // and writes `dm`, so nothing aliases.
         let ok = unsafe {
             EnumDisplaySettingsW(
                 PCWSTR(wname.as_ptr()),
@@ -269,6 +276,9 @@ pub(crate) fn set_active_mode(gdi_name: &str, mode: Mode) {
         dmDisplayFrequency: chosen_hz,
         ..Default::default()
     };
+    // SAFETY: `wname` is a live NUL-terminated UTF-16 device name and `&dm` is a live DEVMODEW describing
+    // the requested mode; both outlive the call. CDS_TEST only validates the mode (no apply), the two
+    // trailing args are null, and the API only reads its inputs.
     let test = unsafe {
         ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, CDS_TEST, None)
     };
@@ -282,6 +292,9 @@ pub(crate) fn set_active_mode(gdi_name: &str, mode: Mode) {
         );
         return;
     }
+    // SAFETY: same inputs as the CDS_TEST call above — `wname` (live NUL-terminated device name) and
+    // `&dm` (live DEVMODEW) both outlive the call; CDS_UPDATEREGISTRY applies the already-validated mode,
+    // and the API only reads its inputs.
     let apply = unsafe {
         ChangeDisplaySettingsExW(
             PCWSTR(wname.as_ptr()),

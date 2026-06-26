@@ -21,6 +21,9 @@
 //! loaded into the service's environment and carried to the host child. Logs land in
 //! `%ProgramData%\punktfunk\logs\`.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use anyhow::{bail, Context, Result};
 use std::ffi::{c_void, OsString};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -205,14 +208,19 @@ fn run_service() -> Result<()> {
 
     // Two manual-reset events: STOP (set once, never reset) and SESSION (set on a console
     // connect/disconnect, reset by the supervisor after it reacts).
+    // SAFETY: CreateEventW with null attributes (None), manual-reset=true, initial-state=false and a null
+    // name passes no pointers into Rust memory; it returns a fresh, owned event HANDLE (or Err, via `?`).
+    // Nothing aliases or outlives the call.
     let stop_raw =
         unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.context("CreateEvent stop")?;
+    // SAFETY: as above — a second fresh manual-reset event; no pointers into Rust memory, no aliasing.
     let session_raw = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
         .context("CreateEvent session")?;
     // Own each event handle (the OS reaps them at process exit); the handler reaches them through the
     // OnceLocks, while `supervise` waits on the borrowed `HANDLE`s. SAFETY: each is a fresh CreateEventW
     // handle we own — take ownership exactly once.
     let stop_owned = unsafe { OwnedHandle::from_raw_handle(stop_raw.0) };
+    // SAFETY: `session_raw` is the other fresh CreateEventW handle nothing else owns — take ownership once.
     let session_owned = unsafe { OwnedHandle::from_raw_handle(session_raw.0) };
     let stop = HANDLE(stop_owned.as_raw_handle());
     let session = HANDLE(session_owned.as_raw_handle());
@@ -226,6 +234,9 @@ fn run_service() -> Result<()> {
         match control {
             ServiceControl::Stop | ServiceControl::Preshutdown | ServiceControl::Shutdown => {
                 if let Some(h) = event_handle(&STOP_EVENT) {
+                    // SAFETY: `h` borrows the STOP event HANDLE from the STOP_EVENT OwnedHandle, set for
+                    // the whole process lifetime and never closed before exit, so it is open here; SetEvent
+                    // only signals the event and passes no Rust memory.
                     unsafe { SetEvent(h) }.ok();
                 }
                 ServiceControlHandlerResult::NoError
@@ -237,6 +248,9 @@ fn run_service() -> Result<()> {
                     ConsoleConnect | ConsoleDisconnect | SessionLogon
                 ) {
                     if let Some(h) = event_handle(&SESSION_EVENT) {
+                        // SAFETY: `h` borrows the SESSION event HANDLE from the SESSION_EVENT OwnedHandle,
+                        // alive for the whole process lifetime and never closed before exit; SetEvent only
+                        // signals the event and passes no Rust memory.
                         unsafe { SetEvent(h) }.ok();
                     }
                 }
@@ -297,6 +311,8 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
     // Kill-on-close job so a service crash never orphans the SYSTEM host; BREAKAWAY_OK lets the host
     // still spawn the WGC helper. Owned: dropping it at function exit (KILL_ON_JOB_CLOSE) reaps any
     // straggler still inside it — no manual CloseHandle(job).
+    // SAFETY: `make_job` is unsafe only for its Win32 FFI; it has no caller preconditions and creates +
+    // immediately takes RAII ownership of the job object, so calling it here is sound.
     let job = unsafe { make_job() }.context("create job object")?;
 
     let mut restarts: u32 = 0;
@@ -304,6 +320,8 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         if wait_one(stop, 0) {
             break;
         }
+        // SAFETY: WTSGetActiveConsoleSessionId takes no arguments and returns the active console session
+        // id (or 0xFFFFFFFF); it passes no pointers, so the call is always sound.
         let session = unsafe { WTSGetActiveConsoleSessionId() };
         if session == 0xFFFF_FFFF {
             // No interactive session yet (boot / fully logged out). Wait, but wake on stop/session.
@@ -311,12 +329,17 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
             if wait_any(&[stop, session_ev], 3000) == Some(0) {
                 break;
             }
+            // SAFETY: `session_ev` is the SESSION event HANDLE borrowed from the SESSION_EVENT OwnedHandle,
+            // alive for the process lifetime; ResetEvent only clears its signalled state, no Rust memory.
             unsafe { ResetEvent(session_ev) }.ok();
             continue;
         }
 
         // BORROW the owned job handle for AssignProcessToJobObject inside spawn_host.
         let job_h = HANDLE(job.as_raw_handle());
+        // SAFETY: `spawn_host` is unsafe only for its Win32 FFI. `session` is a valid console session id
+        // (checked != 0xFFFFFFFF above), `cmdline`/`workdir` are live borrows for the call, and `job_h`
+        // borrows the still-live `job` OwnedHandle — every argument is valid for the call's duration.
         let child = match unsafe { spawn_host(session, &cmdline, &workdir, job_h) } {
             Ok(child) => child,
             Err(e) => {
@@ -340,6 +363,9 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         match reason {
             Some(0) => {
                 // Stop: terminate the child and exit (the `child` drop closes its handles).
+                // SAFETY: `proc_h` is a HANDLE copy of the still-live `child.process` OwnedHandle (not
+                // dropped until end of iteration), so the process handle is open; TerminateProcess only
+                // signals termination by handle and passes no Rust memory.
                 unsafe {
                     let _ = TerminateProcess(proc_h, 0);
                 }
@@ -347,7 +373,10 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
             }
             Some(1) => {
                 // Session change: relaunch only if the active console session actually moved.
+                // SAFETY: `session_ev` borrows the process-lifetime SESSION_EVENT OwnedHandle; ResetEvent
+                // only clears its signalled state and passes no Rust memory.
                 unsafe { ResetEvent(session_ev) }.ok();
+                // SAFETY: WTSGetActiveConsoleSessionId takes no arguments and passes no pointers.
                 let now = unsafe { WTSGetActiveConsoleSessionId() };
                 if now != session {
                     tracing::info!(
@@ -355,6 +384,8 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                         new = now,
                         "console session changed — relaunching host"
                     );
+                    // SAFETY: `proc_h` copies the still-live `child.process` OwnedHandle (dropped only at
+                    // end of iteration), so the handle is open; TerminateProcess only signals by handle.
                     unsafe {
                         let _ = TerminateProcess(proc_h, 0);
                     }
@@ -363,6 +394,8 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                 }
                 // Same session (e.g. a stray notification) — keep waiting on the same child.
                 let r = wait_any(&[stop, proc_h], INFINITE);
+                // SAFETY: `proc_h` copies the still-live `child.process` OwnedHandle (dropped only at end
+                // of iteration), so the handle is open; TerminateProcess only signals by handle.
                 unsafe {
                     let _ = TerminateProcess(proc_h, 0);
                 }
@@ -394,11 +427,17 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
 
 /// `true` if `h` is signalled within `ms`.
 fn wait_one(h: HANDLE, ms: u32) -> bool {
+    // SAFETY: `&[h]` is a live one-element HANDLE slice the caller keeps open across the wait; the kernel
+    // reads exactly one handle (the binding derives the count from the slice length), bWaitAll=false,
+    // `ms` is a timeout — no pointers escape and the array is only read for this synchronous call.
     unsafe { WaitForMultipleObjects(&[h], false, ms) == WAIT_OBJECT_0 }
 }
 
 /// Wait on several handles; returns the index of the first signalled, or `None` on timeout.
 fn wait_any(handles: &[HANDLE], ms: u32) -> Option<usize> {
+    // SAFETY: `handles` is a live slice the caller keeps open across the wait; WaitForMultipleObjects
+    // reads exactly `handles.len()` handles (the binding derives the count from the slice), bWaitAll=false,
+    // `ms` is a timeout — the array is only read for this synchronous call and no pointers escape it.
     let r = unsafe { WaitForMultipleObjects(handles, false, ms) };
     let idx = r.0.wrapping_sub(WAIT_OBJECT_0.0);
     (idx < handles.len() as u32).then_some(idx as usize)

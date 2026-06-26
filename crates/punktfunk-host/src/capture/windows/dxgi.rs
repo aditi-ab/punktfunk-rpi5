@@ -7,6 +7,9 @@
 //! Validates only with a real GPU + an *activated* SudoVDA monitor (`DuplicateOutput` needs a live
 //! WDDM output). Compiles on the GPU-less VM; the pure helpers are unit-tested there.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::c_void;
@@ -69,7 +72,12 @@ pub struct D3d11Frame {
     pub texture: ID3D11Texture2D,
     pub device: ID3D11Device,
 }
-// COM pointers, used only from the single owning thread.
+// SAFETY: `D3d11Frame` owns an `ID3D11Texture2D` + `ID3D11Device`, which are COM interface pointers.
+// D3D11 devices/resources use thread-safe (interlocked) COM reference counting, and the device is
+// created free-threaded (`make_device` passes no `D3D11_CREATE_DEVICE_SINGLETHREADED`), so handing
+// ownership of the frame to another thread — the capture→encode handoff — and releasing it there is
+// sound. The value is moved, never aliased (no `Sync`), so there is no concurrent use of the
+// single-threaded immediate context.
 unsafe impl Send for D3d11Frame {}
 
 pub fn pack_luid(luid: LUID) -> i64 {
@@ -295,6 +303,12 @@ unsafe fn d3dkmt_set_scheduling_priority_class(
 fn elevate_process_gpu_priority() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
+    // SAFETY: the closure calls two of this module's `unsafe fn`s — `enable_inc_base_priority`
+    // (adjusts the current-process token; it has no caller precondition and builds all its FFI args
+    // locally) and `d3dkmt_set_scheduling_priority_class` (loads gdi32 by name and calls the export).
+    // The latter requires `process` to be a valid process handle; `GetCurrentProcess()` returns the
+    // current-process pseudo-handle, which is always valid and needs no close. Runs once via
+    // `Once::call_once`; no raw pointers are dereferenced here.
     ONCE.call_once(|| unsafe {
         use windows::Win32::System::Threading::GetCurrentProcess;
         let Some(prio) = configured_gpu_priority_class() else {
@@ -538,6 +552,17 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
 pub(crate) fn install_gpu_pref_hook() {
     use std::sync::Once;
     static HOOK: Once = Once::new();
+    // SAFETY: this one-time hook install only touches a region it has just validated.
+    // `LoadLibraryA("win32u.dll")` + `GetProcAddress("NtGdiDdDDIGetCachedHybridQueryValue")` yield the
+    // live base of the real exported function, so `target` is a valid executable code pointer to at
+    // least the 12 bytes the patch overwrites (an x64 prologue, per Apollo's verified hook). The two
+    // `ptr::copy_nonoverlapping`s each move exactly 12 bytes between the 12-byte stack arrays
+    // (`patch`/`readback`) and `target`, which `VirtualProtect(target, 12, PAGE_EXECUTE_READWRITE, …)`
+    // has just made writable (and is restored to `old` after) — source and dest never overlap (stack
+    // vs. loaded module image), so every access stays in mapped, in-bounds memory.
+    // `FlushInstructionCache` gets the current-process pseudo-handle + that same range. The DPI calls
+    // take by-value context handles / fill the live local `&mut old`/`&mut restore` for the duration of
+    // each synchronous call. Runs once via `Once::call_once`, before any DXGI use.
     HOOK.call_once(|| unsafe {
         use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
         use windows::Win32::System::Memory::{
@@ -1389,6 +1414,14 @@ pub fn hdr_p010_selftest() -> Result<()> {
         }
     }
 
+    // SAFETY: this self-test creates its own D3D11 device + immediate context (`D3D11CreateDevice`,
+    // both checked non-null) and uses ONLY that device for the rest of the block: every
+    // `CreateTexture2D`/`CreateShaderResourceView`/`HdrP010Converter::{new,convert}`/`CopyResource`/
+    // `Map` is invoked on that device or its context, so all resources share one device and run on this
+    // single thread. The source texture's `D3D11_SUBRESOURCE_DATA` points at `fp16`, a live
+    // `Vec<u16>` of `W*H*4` samples with `SysMemPitch = W*8`, matching the W×H R16G16B16A16 texture;
+    // `fp16` outlives the synchronous `CreateTexture2D` that reads it. The mapped-pointer reads are
+    // proven individually at the `read_u16` closure below.
     unsafe {
         // Hardware D3D11 device (no adapter pin — the default GPU is fine for the self-test).
         let mut device: Option<ID3D11Device> = None;
@@ -2038,7 +2071,11 @@ pub struct DuplCapturer {
     dbg_cursor: u64,
     _keepalive: Box<dyn Send>,
 }
-// COM objects used only from the one thread that owns the capturer (the encode thread).
+// SAFETY: `DuplCapturer` holds D3D11 device/context/duplication COM pointers plus plain data. The
+// device is created free-threaded (`make_device` sets no `D3D11_CREATE_DEVICE_SINGLETHREADED`) and
+// COM reference counting is interlocked, so moving ownership of the whole capturer to another thread
+// is sound. It is used by exactly one thread (the encode thread) at a time — moved to it once, never
+// shared (no `Sync`) — so the single-threaded immediate context is never touched concurrently.
 unsafe impl Send for DuplCapturer {}
 
 impl DuplCapturer {
@@ -2051,6 +2088,13 @@ impl DuplCapturer {
         gpu: bool,
         want_hdr: bool,
     ) -> Result<Self> {
+        // SAFETY: runs on the capture thread that will own this `DuplCapturer`. `install_gpu_pref_hook()`
+        // and the DPI-context calls take by-value handles / no args and touch only thread/process state;
+        // `SetThreadExecutionState` takes a flags bitmask by value. `CreateDXGIFactory1` yields a live
+        // `IDXGIFactory1`, and every subsequent COM method (`EnumAdapters1`/`EnumOutputs`/`GetDesc1`/
+        // `GetDesc`/`cast`) is called on that factory or on an adapter/output it returned — each obtained
+        // through a checked `while let Ok(..)`/`?` — all from this one thread. No raw pointers are
+        // dereferenced; the borrowed strings/locals outlive each synchronous call.
         unsafe {
             // Stop DXGI hybrid-GPU output reparenting BEFORE we create the factory / enumerate outputs
             // (the cause of the 0x887A0026 ACCESS_LOST churn on this hybrid box: RTX 4090 + AMD iGPU).
@@ -3207,6 +3251,11 @@ impl Capturer for DuplCapturer {
         // the duplication up to 12 s). Better a few seconds of frozen-last-frame than dropping the stream.
         let mut deadline = Instant::now() + Duration::from_secs(20);
         loop {
+            // SAFETY: `acquire` is an `unsafe fn` because it drives the D3D11 immediate context + the
+            // output duplication, which must be touched only from the capturer's owning thread.
+            // `next_frame` runs on that one thread — `DuplCapturer` is `Send` but not `Sync`, so it is
+            // owned by a single (encode) thread for its whole life — and `&mut self` gives exclusive
+            // access for the call, satisfying that contract.
             if let Some(f) = unsafe { self.acquire() }? {
                 self.ever_got_frame = true;
                 return Ok(f);
@@ -3253,6 +3302,8 @@ impl Capturer for DuplCapturer {
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
+        // SAFETY: as in `next_frame` — `acquire` must run on the capturer's single owning thread, and
+        // `try_latest` is called on it (`DuplCapturer` is `Send`, not `Sync`); `&mut self` is exclusive.
         unsafe { self.acquire() }
     }
 
@@ -3264,11 +3315,19 @@ impl Capturer for DuplCapturer {
 impl Drop for DuplCapturer {
     fn drop(&mut self) {
         if self.holding_frame {
+            // SAFETY: `self.dupl` is the live `IDXGIOutputDuplication` this capturer created and owns;
+            // `ReleaseFrame` is a valid COM method on it, called only when `holding_frame` records that a
+            // frame was acquired and not yet released (so it is not an unbalanced release). Drop runs on
+            // whichever thread owns the capturer — its sole owner, since it is `!Sync` — and the `&`
+            // borrow of the duplication outlives this synchronous call.
             unsafe {
                 let _ = self.dupl.as_ref().map(|d| d.ReleaseFrame());
             }
         }
         // Release the display/system-required execution state we took at open().
+        // SAFETY: `SetThreadExecutionState` is a Win32 FFI call taking an execution-state flag bitmask
+        // by value (`ES_CONTINUOUS` clears the display/system-required state taken at open); it borrows
+        // no Rust memory and is safe to call from any thread.
         unsafe {
             SetThreadExecutionState(ES_CONTINUOUS);
         }

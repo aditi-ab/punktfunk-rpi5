@@ -28,6 +28,8 @@
 //! through `ffmpeg::ffi` (= `ffmpeg_sys_next`), exactly as the Linux CUDA/VAAPI paths do. The
 //! `AVD3D11VADeviceContext`/`AVD3D11VAFramesContext` layouts are mirrored (the bindings don't
 //! allowlist `hwcontext_d3d11va.h`), as [`super::linux`] mirrors `AVCUDADeviceContext`.
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{Codec, EncodedFrame, Encoder};
 use crate::capture::{dxgi::D3d11Frame, CapturedFrame, FramePayload, PixelFormat};
@@ -243,6 +245,12 @@ pub fn probe_can_encode(vendor: WinVendor, codec: Codec) -> bool {
     if ffmpeg::init().is_err() {
         return false;
     }
+    // SAFETY: `ffmpeg::init()` succeeded above, so libav's global state is initialised.
+    // `av_log_get_level`/`av_log_set_level` are global scalar getters/setters with no pointer args.
+    // `open_win_encoder` (the `unsafe fn`) is called with null `device_ref`/`frames_ref` (the system
+    // path), so it touches no D3D11/hwcontext — it only allocates and opens a self-contained
+    // libavcodec encoder that is dropped at the end of `.is_ok()`. We restore the prior log level and
+    // no raw pointer escapes the block.
     unsafe {
         // A missing AMF/QSV runtime (wrong-vendor host, GPU-less CI) is an expected probe outcome —
         // quiet ffmpeg's open error for the probe, then restore the level.
@@ -337,6 +345,10 @@ impl SystemInner {
         } else {
             ffi::AVPixelFormat::AV_PIX_FMT_NV12
         };
+        // SAFETY: calls the `unsafe fn open_win_encoder` with null `device_ref`/`frames_ref`, so the
+        // system path is taken (no hw device/frames context is touched); all other args are scalars.
+        // The returned `encoder::video::Encoder` owns its `AVCodecContext` and frees it on drop; no raw
+        // pointer is aliased.
         let enc = unsafe {
             open_win_encoder(
                 vendor,
@@ -352,6 +364,11 @@ impl SystemInner {
                 ptr::null_mut(),
             )?
         };
+        // SAFETY: `av_frame_alloc` returns a freshly-allocated, uniquely-owned `AVFrame` (null-checked
+        // before any deref); writing `format`/`width`/`height` through `*f` stays inside that
+        // allocation. `av_frame_get_buffer(f, 0)` allocates the backing planes — on failure we
+        // `av_frame_free` the sole owner (no double-free) and bail; on success the raw `f` is moved into
+        // `self.sw_frame` and freed exactly once in `Drop`.
         let sw_frame = unsafe {
             let f = ffi::av_frame_alloc();
             if f.is_null() {
@@ -467,6 +484,18 @@ impl SystemInner {
         } else {
             DXGI_FORMAT_NV12
         };
+        // SAFETY: `ensure_staging` builds a STAGING texture (CPU_ACCESS_READ) matching `dxgi_fmt` on
+        // `frame.device` — the same `ID3D11Device` that owns `frame.texture` — and caches that device's
+        // immediate context in `self.ctx`. `src`/`dst` are that device's textures of identical NV12/P010
+        // format and dimensions, so `CopyResource` on the single-threaded immediate context is valid.
+        // `Map(.., D3D11_MAP_READ)` succeeds on a staging texture and yields `map.pData` valid for the
+        // whole resource; for NV12/P010 the luma plane is `H` rows at `RowPitch` and the chroma plane
+        // follows at byte offset `RowPitch*H` (`H/2` rows), so `total = pitch*(H+⌈H/2⌉)` is exactly the
+        // mapped extent and `from_raw_parts(base, total)` stays in-bounds. Each `copy_nonoverlapping`
+        // reads a bounds-checked `mapped[..]` sub-slice (`row_bytes ≤ pitch`) and writes `row_bytes ≤
+        // linesize` into the `av_frame_get_buffer`-allocated plane at row `y < H`, so every destination
+        // offset is inside the frame's plane allocation; src and dst never alias. `Unmap` pairs `Map`,
+        // then `send` (the `unsafe fn`) hands `sw_frame` to the encoder.
         unsafe {
             self.ensure_staging(&frame.device, dxgi_fmt)?;
             let staging = self.staging.clone().context("staging texture")?;
@@ -510,6 +539,14 @@ impl SystemInner {
         if self.ten_bit {
             bail!("ffmpeg_win: BGRA readback is 8-bit only (HDR needs the P010 capture path)");
         }
+        // SAFETY: `ensure_staging` builds a B8G8R8A8 STAGING texture on `frame.device` and caches that
+        // device's immediate context; `src`/`dst` are that device's textures of matching BGRA format,
+        // so `CopyResource` on the single-threaded context is valid. `Map(READ)` on the staging texture
+        // yields `base` valid for `pitch` × `h` rows. `ensure_sws` lazily builds the BGRA→NV12 context;
+        // `sws_scale` reads `h` rows of `pitch` bytes from `base` (in-bounds — the staging surface is
+        // `≥ pitch*h`) into the `sw_frame` planes addressed by its `data`/`linesize` (allocated for
+        // `width`×`height` NV12). `Unmap` pairs `Map`; the cached `sws` is freed once in `Drop`. The
+        // mapped read region never aliases the owned encoder frame.
         unsafe {
             self.ensure_staging(&frame.device, DXGI_FORMAT_B8G8R8A8_UNORM)?;
             let staging = self.staging.clone().context("staging texture")?;
@@ -552,6 +589,13 @@ impl SystemInner {
     /// R10 shader output instead of P010. DXGI `R10G10B10A2_UNORM` (R in the low 10 bits, X2 alpha in
     /// the top 2) == FFmpeg `AV_PIX_FMT_X2BGR10LE`. UNTESTED on glass (no AMD/Intel Windows box).
     fn readback_rgb10(&mut self, frame: &D3d11Frame, pts: i64, idr: bool) -> Result<()> {
+        // SAFETY: same shape as `readback_yuv`/`readback_bgra` — `ensure_staging` builds an
+        // R10G10B10A2 STAGING texture on `frame.device` and caches its immediate context; `src`/`dst`
+        // are that device's matching-format textures, so `CopyResource` on the single-threaded context
+        // is valid. `Map(READ)` yields `base` valid for `pitch` × `h` rows. `ensure_sws` builds the
+        // X2BGR10LE→P010 (BT.2020) context; `sws_scale` reads `h` rows of `pitch` bytes from `base`
+        // (in-bounds) into the `sw_frame` P010 planes (`data`/`linesize`, allocated `width`×`height`).
+        // `Unmap` pairs `Map`; `sws` is freed once in `Drop`. No aliasing between read and write.
         unsafe {
             self.ensure_staging(&frame.device, DXGI_FORMAT_R10G10B10A2_UNORM)?;
             let staging = self.staging.clone().context("staging texture")?;
@@ -605,6 +649,12 @@ impl SystemInner {
         let h = self.height as usize;
         let src_row = w * format.bytes_per_pixel();
         anyhow::ensure!(bytes.len() >= src_row * h, "captured buffer too small");
+        // SAFETY: `ensure_sws` lazily builds the (packed RGB/BGR)→NV12 context for this fixed src/dst
+        // format pair. `src_data[0] = bytes.as_ptr()` with `src_stride[0] = src_row`; the `ensure!`
+        // above guarantees `bytes` holds at least `src_row*h` bytes, so `sws_scale` reads `h` rows of
+        // `src_row` bytes in-bounds and writes the `sw_frame` NV12 planes (`data`/`linesize`, allocated
+        // `width`×`height`). `bytes` is borrowed for the call only and never aliases the owned
+        // `sw_frame`. `send` then hands `sw_frame` to the encoder.
         unsafe {
             self.ensure_sws(
                 pixel_to_av(sws_src(format)?),
@@ -667,6 +717,10 @@ impl SystemInner {
 
 impl Drop for SystemInner {
     fn drop(&mut self) {
+        // SAFETY: `sw_frame` is the `AVFrame` allocated in `open` (or null) — `av_frame_free` drops it
+        // once and nulls the pointer through the `&mut`; `sws` is the cached `SwsContext` (or null) —
+        // `sws_freeContext` frees it once. This `Drop` runs exactly once and `SystemInner` owns both
+        // exclusively, so there is no double-free or use-after-free.
         unsafe {
             if !self.sw_frame.is_null() {
                 ffi::av_frame_free(&mut self.sw_frame);
@@ -745,6 +799,12 @@ impl D3d11Hw {
 
 impl Drop for D3d11Hw {
     fn drop(&mut self) {
+        // SAFETY: `frames_ref`/`device_ref` are the two non-null `AVBufferRef`s `D3d11Hw::new` created
+        // (it bails before constructing `Self` if either alloc/init fails, so a live `D3d11Hw` always
+        // holds both). `av_buffer_unref` drops one reference and nulls the pointer through the `&mut`.
+        // This `Drop` runs exactly once and `D3d11Hw` owns these refs exclusively → no double-free /
+        // use-after-free. Frames are unref'd before the device because the frames ctx internally holds
+        // a ref on the device (refcounted, so the order is sound either way).
         unsafe {
             ffi::av_buffer_unref(&mut self.frames_ref);
             ffi::av_buffer_unref(&mut self.device_ref);
@@ -800,6 +860,18 @@ impl ZeroCopyInner {
             WinVendor::Qsv => (D3D11_BIND_DECODER.0 | D3D11_BIND_VIDEO_ENCODER.0) as u32,
         };
         const POOL: c_int = 8;
+        // SAFETY: `D3d11Hw::new` wraps the capturer's `device` as a D3D11VA hwdevice (handing FFmpeg an
+        // owned AddRef of it, balanced by FFmpeg's teardown Release) and builds an owned
+        // device_ref/frames_ref pair freed by `D3d11Hw::Drop`; `hw` is a local, so it is dropped (and
+        // both refs freed) on every early `return Err`. For QSV, `av_hwdevice_ctx_create_derived` and
+        // `av_hwframe_ctx_create_derived` fill the null-initialised `qsv_device`/`qsv_frames` out-params
+        // only on success (`r >= 0` checked); on the frames-derive failure we unref the already-created
+        // `qsv_device` before bailing. `open_win_encoder` internally `av_buffer_ref`s the dev/frames
+        // refs it is given (so ownership of `hw`'s and the derived refs stays here), and on its failure
+        // we unref the still-owned derived `qsv_frames`/`qsv_device` (null for AMF → skipped) and return
+        // — `hw` then drops its D3D11 refs. On success the derived refs are moved into `ZeroCopyInner`
+        // (freed in its `Drop`) and the encoder holds its own AddRef'd copies. Every `AVBufferRef` is
+        // unref'd exactly once across all paths — no leak, no double-free.
         unsafe {
             let hw = D3d11Hw::new(device, sw_av, bind_flags, width, height, POOL)?;
             let (pix_fmt, dev_ref, frames_ref, mut qsv_device, mut qsv_frames) = match vendor {
@@ -887,6 +959,19 @@ impl ZeroCopyInner {
     }
 
     fn submit(&mut self, frame: &D3d11Frame, pts: i64, idr: bool) -> Result<()> {
+        // SAFETY: `d3d = av_frame_alloc()` is a fresh owned frame (null-checked) and is `av_frame_free`d
+        // exactly once on every path below. `av_hwframe_get_buffer` fills it from the pool — on failure
+        // we free it and bail. `(*d3d).data[0]` is the pool's texture-array and `data[1]` the array
+        // index; `from_raw_borrowed` borrows that `ID3D11Texture2D` WITHOUT taking ownership (no Release
+        // — the frame owns it) and is null-checked. `src` (the captured texture) and `dst` (the pooled
+        // slice) live on the SAME D3D11 device wrapped by `self.hw`, and the caller guarantees
+        // `captured.format == pool_format` before calling, so `CopySubresourceRegion(dst, dst_index, ..,
+        // src, 0, ..)` on the single-threaded immediate context `self.ctx` is a valid same-format GPU
+        // copy. For QSV the mapped `qsv` frame is a fresh owned frame whose `hw_frames_ctx` takes an
+        // `av_buffer_ref` of `self.qsv_frames`; it is `av_frame_free`d (releasing that ref) on both the
+        // map-failure and success paths. `avcodec_send_frame` only internally refs the input frame, so
+        // the `av_frame_free(d3d)`/`av_frame_free(qsv)` afterwards are the sole owning frees — no leak,
+        // no double-free, no use-after-free.
         unsafe {
             // Pull a pooled D3D11 surface; its data[0] is the pool's texture-ARRAY, data[1] the slice.
             let mut d3d = ffi::av_frame_alloc();
@@ -959,6 +1044,11 @@ impl ZeroCopyInner {
 
 impl Drop for ZeroCopyInner {
     fn drop(&mut self) {
+        // SAFETY: `qsv_frames`/`qsv_device` are the derived QSV `AVBufferRef`s (or null for AMF); each
+        // is `av_buffer_unref`'d once here (nulling the pointer through the `&mut`) — `ZeroCopyInner`
+        // owns these handles exclusively and this `Drop` runs once, so no double-free. The `enc` and
+        // `hw` fields free the encoder's AddRef'd copies and the D3D11 device/frames refs through their
+        // own `Drop`, so all references stay balanced.
         unsafe {
             if !self.qsv_frames.is_null() {
                 ffi::av_buffer_unref(&mut self.qsv_frames);
@@ -996,6 +1086,13 @@ pub struct FfmpegWinEncoder {
 }
 
 // Raw FFI pointers + COM objects; the encoder lives on a single thread (same contract as NVENC/VAAPI).
+// SAFETY: `FfmpegWinEncoder` owns raw libav pointers (`AVFrame`/`SwsContext`/`AVBufferRef`) and
+// windows-rs COM handles (`ID3D11Device`/`ID3D11DeviceContext`/textures) that are not auto-`Send`. The
+// session creates the encoder, drives `submit`/`poll`/`flush`, and drops it all on one dedicated encode
+// thread; it is never shared by reference across threads, and the D3D11 immediate context is only ever
+// touched from that thread. The only cross-thread action is the initial move to the encode thread,
+// after which every interior pointer/COM ref is used single-threaded — the same contract the
+// NVENC/VAAPI encoders rely on. No interior state is accessed concurrently.
 unsafe impl Send for FfmpegWinEncoder {}
 
 impl FfmpegWinEncoder {
@@ -1012,6 +1109,8 @@ impl FfmpegWinEncoder {
     ) -> Result<Self> {
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {
+            // SAFETY: `ffmpeg::init()` ran on the line above, so libav is initialised; `av_log_set_level`
+            // is a global scalar setter with no pointer arguments.
             unsafe { ffi::av_log_set_level(48) };
         }
         // Make sure the encoder name exists in this libavcodec build up front (clear error vs a

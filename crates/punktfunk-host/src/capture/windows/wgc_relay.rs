@@ -13,6 +13,9 @@
 //! Wire framing (must match `wgc_helper::write_au`): per AU
 //! `[u32 magic "PFAU" LE][u32 len LE][u64 pts_ns LE][u8 keyframe][len bytes data]`.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use crate::capture::dxgi::WinCaptureTarget;
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, Read};
@@ -56,8 +59,18 @@ pub struct HelperRelay {
     rx: Receiver<RelayAu>,
 }
 
-// HANDLEs are just kernel handle values; we own them for the relay's lifetime and close them on Drop.
+// SAFETY: every field is itself `Send`: the `proc`/`thread` `HANDLE`s are process-global kernel
+// handle values (plain integers valid from any thread, owned for the relay's lifetime and closed once
+// on Drop), `stdin_w` is a `Mutex<HANDLE>`, and `rx` is an mpsc `Receiver<RelayAu>` (which is `Send`).
+// The relay is moved to one thread and owned there, so transferring it across threads is sound.
 unsafe impl Send for HelperRelay {}
+// SAFETY: SUSPECT — `rx: Receiver<RelayAu>` is `!Sync` (std mpsc is single-consumer; two threads
+// calling `recv_timeout`/`try_recv` through a shared `&HelperRelay` would be a data race on the
+// channel's consumer state → UB), and both are `&self` methods, so this `unsafe impl Sync` asserts
+// more than the field types support. It is not a LIVE bug only because the sole consumer (the
+// punktfunk1 two-process mux loop) owns the relay and never `&`-shares it for receiving — other
+// threads reach only `request_keyframe`, which is `stdin_w`-Mutex-guarded — but nothing in the type
+// enforces that invariant. An `Arc<HelperRelay>` recv'd from two threads would compile and be UB.
 unsafe impl Sync for HelperRelay {}
 
 /// Control byte on the helper's stdin: force the next encoded frame to be an IDR (client decode
@@ -84,6 +97,10 @@ impl HelperRelay {
         );
         tracing::info!(cmd = %cmdline, "spawning WGC helper in user session");
 
+        // SAFETY: `spawn_inner` is an `unsafe fn` only because it drives raw Win32 token/pipe/process
+        // FFI; it imposes no caller-side memory precondition beyond valid arguments. `cmdline` is a live
+        // `&str` borrowed for the synchronous call and `(w, h, hz)` are plain `u32`s. It validates its
+        // own runtime requirements (active console session, SYSTEM token) and returns `Err` otherwise.
         unsafe { spawn_inner(&cmdline, w, h, hz) }
     }
 
@@ -108,6 +125,11 @@ impl HelperRelay {
     pub fn request_keyframe(&self) {
         let h = self.stdin_w.lock().unwrap();
         let mut written = 0u32;
+        // SAFETY: `*h` is the host's write end of the helper's stdin pipe — a live `HANDLE` owned by
+        // this `HelperRelay` (held under the `stdin_w` Mutex, locked here), closed only in Drop.
+        // `WriteFile` reads the 1-byte `&[CTL_KEYFRAME]` buffer and writes the byte count into
+        // `written`; both are live locals that outlive the synchronous call. A failure (helper gone) is
+        // discarded as documented.
         unsafe {
             let _ = windows::Win32::Storage::FileSystem::WriteFile(
                 *h,
@@ -121,6 +143,10 @@ impl HelperRelay {
 
 impl Drop for HelperRelay {
     fn drop(&mut self) {
+        // SAFETY: `self.proc`/`self.thread` are the child process/thread `HANDLE`s from
+        // `CreateProcessAsUserW`, and `stdin_w` is the host's pipe write end — all owned by this
+        // `HelperRelay` and closed exactly once here in Drop (no double-close). `TerminateProcess` and
+        // the three `CloseHandle`s are FFI calls taking those handles by value, borrowing no Rust memory.
         unsafe {
             // Terminate the child first so its WGC capture + NVENC session tear down, then close our
             // handles (the reader threads end on the resulting broken pipe).
@@ -364,10 +390,17 @@ fn au_reader(mut r: HandleReader, tx: SyncSender<RelayAu>) {
 
 /// Minimal `Read` over a Win32 pipe HANDLE (the windows crate doesn't impl `Read` on HANDLE).
 struct HandleReader(HANDLE);
+// SAFETY: `HandleReader` owns a single pipe `HANDLE` (a process-global kernel handle value, valid from
+// any thread). It is moved into the dedicated reader thread and used only there (and closed once on
+// Drop), never shared — so transferring ownership across threads is sound.
 unsafe impl Send for HandleReader {}
 impl Read for HandleReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut read = 0u32;
+        // SAFETY: `self.0` is the live read end of an anonymous pipe owned by this `HandleReader`
+        // (closed only in Drop). `ReadFile` fills the caller-provided `buf` (writing at most `buf.len()`
+        // bytes) and stores the count in `read`; both outlive the synchronous call. A broken pipe
+        // surfaces as `Err` and is mapped to EOF below.
         let ok = unsafe {
             windows::Win32::Storage::FileSystem::ReadFile(self.0, Some(buf), Some(&mut read), None)
         };
@@ -380,6 +413,8 @@ impl Read for HandleReader {
 }
 impl Drop for HandleReader {
     fn drop(&mut self) {
+        // SAFETY: `self.0` is the pipe `HANDLE` this `HandleReader` owns; `CloseHandle` (an FFI call
+        // taking the handle by value) is invoked exactly once here in Drop, so there is no double-close.
         unsafe {
             let _ = CloseHandle(self.0);
         }
@@ -391,6 +426,13 @@ impl Drop for HandleReader {
 pub fn running_as_system() -> bool {
     use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    // SAFETY: `OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)` opens the current-process
+    // token (the pseudo-handle is always valid) into `token`, which is closed once before each return.
+    // The first `GetTokenInformation` (null buffer) queries the required `len`; `buf` is then a
+    // `Vec<u8>` of exactly `len` bytes and the second call fills it, so `&*(buf.as_ptr() as *const
+    // TOKEN_USER)` reads a `TOKEN_USER` the kernel just wrote into a sufficiently-sized buffer (the
+    // variable-length SID it points at also lies within `buf`, which outlives the borrow).
+    // `is_local_system_sid` is this module's `unsafe fn`, given that in-buffer `PSID`. Safe on any thread.
     unsafe {
         let mut token = HANDLE::default();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {

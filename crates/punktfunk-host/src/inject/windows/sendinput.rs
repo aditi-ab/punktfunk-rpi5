@@ -5,6 +5,9 @@
 //! thread stays bound to its desktop and only reattaches (`OpenInputDesktop`/`SetThreadDesktop`) when
 //! `SendInput` reports a short write (the input desktop switched) — no per-event reattach overhead.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use anyhow::Result;
 use punktfunk_core::input::{InputEvent, InputKind};
 use std::mem::size_of;
@@ -35,7 +38,12 @@ pub struct SendInputInjector {
     desktop: Option<HDESK>,
 }
 
-// Only ever used from the host's single injector thread.
+// SAFETY: `SendInputInjector` holds only an `Option<HDESK>` (a desktop handle). The host creates
+// and drives it from a single dedicated injector thread; the handle is opened, rebound, and closed
+// on whichever thread owns the value, and the type is not `Sync`, so there is never concurrent
+// access. A desktop `HDESK` is not thread-affine for ownership (`CloseDesktop` works from any
+// thread; `SetThreadDesktop` rebinds the current thread), so transferring ownership via `Send` is
+// sound.
 unsafe impl Send for SendInputInjector {}
 
 impl SendInputInjector {
@@ -49,6 +57,12 @@ impl SendInputInjector {
     /// Bind this thread to the desktop currently receiving input. UAC / lock screen / Ctrl-Alt-Del
     /// swap the input desktop; `SendInput` silently no-ops unless our thread is on it.
     fn reattach_input_desktop(&mut self) {
+        // SAFETY: `OpenInputDesktop`/`SetThreadDesktop`/`CloseDesktop` are FFI calls passed only
+        // by-value args (constant desktop flags, a `bool`, an access mask). `OpenInputDesktop`
+        // yields an owned `HDESK` only on `Ok`; we then either install it with `SetThreadDesktop`
+        // (closing the previously-owned handle exactly once) or close the fresh handle on failure —
+        // so every handle is closed exactly once and none is used after close. `SetThreadDesktop`
+        // only rebinds this calling thread, which is where the injector runs.
         unsafe {
             match OpenInputDesktop(
                 DESKTOP_CONTROL_FLAGS(0),
@@ -75,12 +89,17 @@ impl SendInputInjector {
     /// switched out from under us, e.g. into UAC/lock) do we reattach to the now-current input desktop
     /// and retry once. This serves both the normal and secure desktops with no steady-state overhead.
     fn send(&mut self, inputs: &[INPUT]) -> Result<()> {
+        // SAFETY: `inputs` is a live `&[INPUT]` slice that outlives this synchronous `SendInput`
+        // call; `size_of::<INPUT>()` is the exact per-element stride Win32 requires as `cbSize`. The
+        // call only reads the array (one event per element) and returns the count injected.
         let n = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
         if n as usize == inputs.len() {
             return Ok(());
         }
         // Short write → the input desktop likely changed. Reattach + retry once.
         self.reattach_input_desktop();
+        // SAFETY: same as the first `SendInput` — `inputs` is the identical live slice outliving the
+        // call and `cbSize == size_of::<INPUT>()`; only re-issued after reattaching the input desktop.
         let n = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
         if n as usize != inputs.len() {
             anyhow::bail!(
@@ -95,6 +114,9 @@ impl SendInputInjector {
 impl Drop for SendInputInjector {
     fn drop(&mut self) {
         if let Some(h) = self.desktop.take() {
+            // SAFETY: `h` is the `HDESK` this injector owned (moved out of `self.desktop`);
+            // `CloseDesktop` runs once here in `Drop` on that still-valid handle, with no later use —
+            // no double close.
             unsafe {
                 let _ = CloseDesktop(h);
             }
@@ -217,6 +239,9 @@ impl InputInjector for SendInputInjector {
             InputKind::KeyDown | InputKind::KeyUp => {
                 let down = event.kind == InputKind::KeyDown;
                 let vk = (event.code & 0xff) as u16; // client sends Windows VK
+                // SAFETY: `MapVirtualKeyExW` is a pure value translation (VK → scancode); all three
+                // args are by-value (`u32`, the `MAPVK_VK_TO_VSC_EX` map-type constant, a `None`
+                // HKL). It dereferences no pointer and returns a `u32` — FFI-`unsafe` only.
                 let sc_ex = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, None) };
                 if sc_ex == 0 {
                     return Ok(()); // unmappable -> drop
@@ -264,6 +289,8 @@ fn key(ki: KEYBDINPUT) -> INPUT {
 }
 
 fn virtual_desktop_rect() -> (i32, i32, i32, i32) {
+    // SAFETY: each `GetSystemMetrics` takes a single by-value `SYSTEM_METRICS_INDEX` constant and
+    // returns an `i32`; it dereferences no pointer and has no side effects — FFI-`unsafe` only.
     unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),

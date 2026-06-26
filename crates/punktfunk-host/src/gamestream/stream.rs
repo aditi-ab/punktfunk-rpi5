@@ -3,6 +3,9 @@
 //! either real portal desktop capture (`PUNKTFUNK_VIDEO_SOURCE=portal`, the portal PipeWire path) or
 //! a synthetic test pattern (default). Runs on its own native thread.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use super::video::{FrameType, VideoPacketizer};
 use super::VIDEO_PORT;
 use crate::capture::{self, Capturer, FastSyntheticCapturer};
@@ -207,6 +210,10 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
         let mut hdrs: Vec<libc::mmsghdr> = iovs
             .iter_mut()
             .map(|iov| {
+                // SAFETY: `libc::mmsghdr` is a plain `#[repr(C)]` struct of integers and raw
+                // pointers, for which an all-zero bit pattern is valid (null pointers / zero
+                // lengths); the fields we rely on (`msg_iov`, `msg_iovlen`) are overwritten on the
+                // next two lines before the struct is handed to the kernel.
                 let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
                 h.msg_hdr.msg_iov = iov;
                 h.msg_hdr.msg_iovlen = 1;
@@ -215,6 +222,13 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
             .collect();
         let mut off = 0usize;
         while off < hdrs.len() {
+            // SAFETY: `fd` is `sock`'s live raw fd (`sock` outlives the call). `hdrs[off..]
+            // .as_mut_ptr()` is a live slice of `(hdrs.len() - off)` `mmsghdr`s — exactly the count
+            // passed — into which the kernel writes each `msg_len`. Each header's `msg_iov` points
+            // into `iovs` (a local that outlives this call, with `msg_iovlen == 1` matching its one
+            // entry) and each `iovec.iov_base` points into the `chunk` packet buffers (the caller's
+            // `pkts`, alive for the call); the kernel only reads those payloads. Flags 0; the return
+            // is error-/progress-checked before advancing `off`.
             let n = unsafe {
                 libc::sendmmsg(fd, hdrs[off..].as_mut_ptr(), (hdrs.len() - off) as u32, 0)
             };

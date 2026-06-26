@@ -2,6 +2,11 @@
 //! CPU-copy fallback (the portal delivers a CPU buffer; the encoder uploads it to the GPU
 //! internally). Zero-copy dmabuf→NVENC import is deferred (plan §9 risk).
 
+// This file's own unsafe block carries a `// SAFETY:` proof, but the file-level
+// `#![deny(clippy::undocumented_unsafe_blocks)]` is deliberately NOT set yet: as a parent module it
+// would propagate the lint to `capture::windows::idd_push` (in-flight parallel work, not yet
+// proven). The deny lands here once every child module (incl. idd_push.rs) is documented.
+
 use anyhow::Result;
 
 /// Packed pixel layout of a [`CapturedFrame`]. The ScreenCast portal negotiates the
@@ -433,6 +438,11 @@ pub fn capture_virtual_output(
     // DDA is the safety net (+ the secure-desktop path). The encode thread is set MTA so the WGC
     // objects built on the watchdog thread (also MTA) are usable here; the keepalive is handed to WGC
     // only on success, else to DDA. A hung watchdog thread is abandoned (holds no keepalive).
+    // SAFETY: `RoInitialize` is a combase FFI call that initializes the WinRT apartment for the calling
+    // thread. It takes the `RO_INIT_MULTITHREADED` enum by value and borrows no memory, so there is no
+    // pointer/lifetime/aliasing obligation; it is safe on any thread and idempotent — a second call on a
+    // thread already in a compatible apartment returns S_FALSE / RPC_E_CHANGED_MODE, which we discard.
+    // Runs on the encode thread that goes on to use the WGC (WinRT) objects built by the watchdog thread.
     unsafe {
         let _ = windows::Win32::System::WinRT::RoInitialize(
             windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,

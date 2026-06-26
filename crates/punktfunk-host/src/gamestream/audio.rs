@@ -17,6 +17,9 @@
 //! data packets are consumed immediately and missing parity only costs loss recovery — so
 //! the validated stereo path stays byte-identical (data packets only, exactly as before).
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 use crate::audio::SAMPLE_RATE;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -409,7 +412,10 @@ struct MsEncoder {
     st: std::ptr::NonNull<audiopus_sys::OpusMSEncoder>,
 }
 
-// The raw encoder state has no thread affinity; the session owns it on one thread at a time.
+// SAFETY: `MsEncoder` owns a unique `OpusMSEncoder` via `NonNull` (it is neither `Clone` nor
+// `Sync`, so the pointer is never aliased). libopus's multistream encoder state is a self-contained
+// heap allocation with no thread-local or thread-affine state, so moving ownership to another thread
+// is sound; every method takes `&mut self`, keeping access single-threaded at any instant.
 #[cfg(target_os = "linux")]
 unsafe impl Send for MsEncoder {}
 
@@ -418,6 +424,13 @@ impl MsEncoder {
     fn new(layout: &OpusLayout) -> Result<MsEncoder> {
         use std::os::raw::c_int;
         let mut err: c_int = 0;
+        // SAFETY: every scalar arg is a valid libopus input (sample rate, channel/stream/coupled
+        // counts, the RESTRICTED_LOWDELAY application constant). `layout.mapping.as_ptr()` addresses
+        // a 'static slice of exactly `layout.channels` bytes (every `OpusLayout` constant upholds
+        // that), which is the element count `opus_multistream_encoder_create` reads through it, and
+        // `&mut err` is a live local the call writes its status into. libopus copies the mapping into
+        // its own allocation, so the pointer need only be valid for the call; the returned pointer is
+        // null/`OPUS_OK`-checked below before any use.
         let st = unsafe {
             audiopus_sys::opus_multistream_encoder_create(
                 SAMPLE_RATE as i32,
@@ -432,6 +445,11 @@ impl MsEncoder {
         let st = std::ptr::NonNull::new(st)
             .filter(|_| err == audiopus_sys::OPUS_OK)
             .ok_or_else(|| anyhow::anyhow!("opus_multistream_encoder_create failed ({err})"))?;
+        // SAFETY: `st` is the non-null encoder `opus_multistream_encoder_create` just returned, owned
+        // exclusively here. Each `opus_multistream_encoder_ctl` call passes a valid request constant
+        // with the single by-value `c_int` argument that request's variadic ABI expects
+        // (`OPUS_SET_BITRATE_REQUEST` → bitrate, `OPUS_SET_VBR_REQUEST` → 0). No pointer escapes the
+        // call and the encoder outlives it.
         unsafe {
             audiopus_sys::opus_multistream_encoder_ctl(
                 st.as_ptr(),
@@ -453,6 +471,13 @@ impl MsEncoder {
         samples_per_channel: usize,
         out: &mut [u8],
     ) -> Result<usize> {
+        // SAFETY: `self.st` is the live encoder from `new`. libopus reads `samples_per_channel *
+        // channels` f32s through `frame.as_ptr()`; every caller passes a `frame` of exactly that
+        // length together with the matching `samples_per_channel` (`audio_body`'s `frame_len =
+        // samples_per_channel * layout.channels`; the round-trip tests size identically), so the read
+        // stays in bounds. `out.as_mut_ptr()` is written for at most `out.len()` bytes, which is
+        // passed as the capacity bound. Both buffers are live locals outliving this synchronous call;
+        // the return value is range-checked before being used as a length.
         let n = unsafe {
             audiopus_sys::opus_multistream_encode_float(
                 self.st.as_ptr(),
@@ -470,6 +495,9 @@ impl MsEncoder {
 #[cfg(target_os = "linux")]
 impl Drop for MsEncoder {
     fn drop(&mut self) {
+        // SAFETY: `self.st` is the encoder `opus_multistream_encoder_create` returned; this
+        // `MsEncoder` owns it uniquely and `drop` runs exactly once, so the destroy frees it once
+        // with no subsequent use.
         unsafe { audiopus_sys::opus_multistream_encoder_destroy(self.st.as_ptr()) }
     }
 }
@@ -761,6 +789,10 @@ mod tests {
         let client_mapping = client_swap(&digits[3..]);
 
         let mut err = 0i32;
+        // SAFETY: scalar args are valid libopus inputs. `client_mapping.as_ptr()` addresses a
+        // `Vec<u8>` of exactly `ch` entries (derived from the advertised surround-params), which is
+        // the element count the decoder reads through it, and `&mut err` is a live local the call
+        // writes. The returned pointer is `OPUS_OK`/non-null-checked immediately below before use.
         let dec = unsafe {
             audiopus_sys::opus_multistream_decoder_create(
                 SAMPLE_RATE as i32,
@@ -789,6 +821,11 @@ mod tests {
                 }
                 let n = enc.encode_float(&frame, samples, &mut out).unwrap();
                 assert!(n > 0);
+                // SAFETY: `dec` is the non-null decoder asserted above. `out.as_ptr()` is read for
+                // the `n` encoded bytes just produced by `encode_float`; `decoded.as_mut_ptr()` is
+                // written for up to `samples * ch` f32s and `decoded` is exactly that long; `samples`
+                // is the per-channel frame size. All buffers are live locals outliving the call; the
+                // return is checked to equal `samples`.
                 let got = unsafe {
                     audiopus_sys::opus_multistream_decode_float(
                         dec,
@@ -817,6 +854,8 @@ mod tests {
                  (energies: {energy:?})"
             );
         }
+        // SAFETY: `dec` is the decoder `opus_multistream_decoder_create` returned; the test owns it
+        // and destroys it exactly once here, after the final decode — no later use, no double free.
         unsafe { audiopus_sys::opus_multistream_decoder_destroy(dec) };
     }
 
@@ -853,6 +892,9 @@ mod tests {
         let digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
         let client_mapping = client_swap(&digits[3..]);
         let mut err = 0i32;
+        // SAFETY: scalar args are valid; `client_mapping.as_ptr()` addresses a 6-entry `Vec<u8>`
+        // (matches the 6-channel layout the decoder reads through it), alive past the call, and
+        // `&mut err` is a live local. The pointer is `OPUS_OK`-checked before use.
         let dec = unsafe {
             audiopus_sys::opus_multistream_decoder_create(
                 48000,
@@ -865,6 +907,10 @@ mod tests {
         };
         assert_eq!(err, audiopus_sys::OPUS_OK);
         let mut pcm = vec![0f32; 240 * 6];
+        // SAFETY: `dec` is the non-null decoder from create. `out.as_ptr()` is read for the CBR
+        // packet length passed in (`*sizes.first()`, a real encoded packet size in `out`);
+        // `pcm.as_mut_ptr()` is written for up to `240 * 6` f32s and `pcm` is exactly that long;
+        // `240` is the per-channel frame size. All buffers are live locals outliving the call.
         let got = unsafe {
             audiopus_sys::opus_multistream_decode_float(
                 dec,
@@ -875,6 +921,7 @@ mod tests {
                 0,
             )
         };
+        // SAFETY: `dec` is owned by the test; destroyed exactly once here after the final decode.
         unsafe { audiopus_sys::opus_multistream_decoder_destroy(dec) };
         assert_eq!(got, 240);
     }

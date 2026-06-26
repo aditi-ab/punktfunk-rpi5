@@ -13,6 +13,9 @@
 //! owned keepalive whose `Drop` releases the output (RAII — no explicit `destroy`). Capture
 //! consumes the node via [`crate::capture::capture_virtual_output`].
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use anyhow::Result;
 pub use punktfunk_core::Mode;
 #[cfg(target_os = "linux")]
@@ -225,6 +228,8 @@ pub fn compositor_for_kind(kind: ActiveKind) -> Option<Compositor> {
 #[cfg(target_os = "linux")]
 fn default_runtime_dir() -> String {
     std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+        // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no
+        // memory — it just returns the calling process's real uid. Nothing is aliased or freed.
         let uid = unsafe { libc::getuid() };
         format!("/run/user/{uid}")
     })
@@ -245,6 +250,8 @@ fn default_bus(runtime: &str) -> String {
 #[cfg(target_os = "linux")]
 pub fn detect_active_session() -> ActiveSession {
     use std::os::unix::fs::MetadataExt;
+    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory —
+    // it just returns the calling process's real uid. Nothing is aliased or freed.
     let uid = unsafe { libc::getuid() };
     let xdg_runtime_dir = default_runtime_dir();
     let dbus = default_bus(&xdg_runtime_dir);

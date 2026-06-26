@@ -13,6 +13,9 @@
 //! its `Drop` releases the refcount (a *stale* lease — its monitor was preempted + recreated under it —
 //! is a no-op, so it can never tear down the live monitor).
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
@@ -161,6 +164,10 @@ impl VirtualDisplayManager {
         if let Some(d) = self.device.get() {
             return Ok(HANDLE(d.as_raw_handle()));
         }
+        // SAFETY: `VdisplayDriver::open` is `unsafe` only because it issues SetupAPI + `DeviceIoControl`
+        // FFI in the caller's apartment; `ensure_device` runs that on the acquiring thread under the
+        // `state` lock (callers hold it), so there is no concurrent open. `open` has no handle
+        // precondition to uphold, and the `OwnedHandle` it returns is the sole owner of the device.
         let (handle, watchdog_s) = unsafe { self.driver.open()? };
         self.watchdog_s.store(watchdog_s, Ordering::Relaxed);
         let raw = HANDLE(handle.as_raw_handle());
@@ -206,6 +213,10 @@ impl VirtualDisplayManager {
                     old_target = mon.target_id,
                     "IDD-push reconnect — preempting the prior session, recreating a fresh monitor"
                 );
+                // SAFETY: `teardown` requires `dev` to be the live control handle; `dev` is the value
+                // `ensure_device()` returned above (the device is cached in the `OnceLock` and never
+                // closed for the manager's lifetime). `mon` was moved out of the prior `Active`/
+                // `Lingering` state by `mem::replace`, so it is exclusively owned here — no aliasing.
                 unsafe { self.teardown(dev, mon) };
                 // Let the OS finish the ASYNC monitor departure before the next ADD; a back-to-back
                 // REMOVE→ADD races the teardown and the ADD IOCTL is rejected under reconnect churn.
@@ -219,6 +230,9 @@ impl VirtualDisplayManager {
         if let MgrState::Active { mon, refs } = &mut *state {
             *refs += 1;
             if mon.mode != mode {
+                // SAFETY: `reconfigure` only manipulates the live display topology via the CCD/GDI
+                // helpers and needs an exclusive `&mut Monitor`. `mon` is the `&mut` into the current
+                // `Active` state, held under the `state` lock, so nothing else reconfigures it concurrently.
                 unsafe { self.reconfigure(mon, mode) };
             }
             tracing::info!(refs = *refs, backend = self.driver.name(), "virtual monitor reused (concurrent / reconfigure session)");
@@ -230,10 +244,16 @@ impl VirtualDisplayManager {
             MgrState::Lingering { mut mon, .. } => {
                 tracing::info!(backend = self.driver.name(), "virtual monitor reused (reconnect within the linger window)");
                 if mon.mode != mode {
+                    // SAFETY: `reconfigure` needs an exclusive `&mut Monitor` and only touches the live
+                    // display topology. `mon` is the local monitor just moved out of the `Lingering`
+                    // state (sole owner), and we hold the `state` lock — no concurrent reconfigure.
                     unsafe { self.reconfigure(&mut mon, mode) };
                 }
                 mon
             }
+            // SAFETY: `create_monitor` requires `dev` to be the live control handle; `dev` is the
+            // handle `ensure_device()` returned above (cached in the `OnceLock`, never closed for the
+            // manager's lifetime), and we hold the `state` lock.
             MgrState::Idle => unsafe { self.create_monitor(dev, mode)? },
             MgrState::Active { .. } => unreachable!("handled above"),
         };
@@ -262,6 +282,10 @@ impl VirtualDisplayManager {
     /// # Safety
     /// `dev` must be the live control handle.
     unsafe fn create_monitor(&'static self, dev: HANDLE, mode: Mode) -> Result<Monitor> {
+        // SAFETY: `create_monitor`'s own `# Safety` contract guarantees `dev` is the live control
+        // handle; we forward it unchanged to `add_monitor`, whose precondition is exactly that.
+        // `resolve_render_pin()` returns an `Option<LUID>` by value (plain `Copy`), so no borrowed
+        // memory crosses the call.
         let added = unsafe { self.driver.add_monitor(dev, mode, resolve_render_pin())? };
 
         // Mandatory keepalive: ping inside the watchdog window or the driver tears all displays down.
@@ -273,6 +297,11 @@ impl VirtualDisplayManager {
             let mut warned = false;
             while !stop_t.load(Ordering::Relaxed) {
                 if let Some(h) = vdm().device_handle() {
+                    // SAFETY: `ping` requires `dev` to be the live control handle. `h` is from
+                    // `device_handle()` (the `Some` branch) — the `OnceLock<Arc<OwnedHandle>>` that,
+                    // once set, is never cleared or closed for the process lifetime, so the handle is
+                    // live for this call. The pinger thread only spins while the `&'static` manager
+                    // singleton (and thus the device) lives.
                     match unsafe { vdm().driver.ping(h) } {
                         Ok(()) => warned = false,
                         Err(e) => {
@@ -292,6 +321,9 @@ impl VirtualDisplayManager {
         let mut gdi_name = None;
         for _ in 0..15 {
             thread::sleep(Duration::from_millis(200));
+            // SAFETY: `resolve_gdi_name` is `unsafe` for its CCD (QueryDisplayConfig) FFI; it takes a
+            // plain `Copy` `u32` target id by value and returns an owned `String`, so no caller memory
+            // is borrowed across the call.
             if let Some(n) = unsafe { resolve_gdi_name(added.target_id) } {
                 gdi_name = Some(n);
                 break;
@@ -308,6 +340,9 @@ impl VirtualDisplayManager {
                 // display(s) first via the atomic CCD path promotes the IDD to a composited primary with no
                 // MODE_CHANGE storm. Opt out with PUNKTFUNK_NO_ISOLATE=1.
                 if std::env::var("PUNKTFUNK_NO_ISOLATE").is_err() {
+                    // SAFETY: `isolate_displays_ccd` is `unsafe` for its CCD topology FFI; it takes a
+                    // `Copy` `u32` by value and returns an owned `SavedConfig` snapshot (no borrowed
+                    // memory crosses). It runs under the `state` lock, the sole mutator of the topology.
                     ccd_saved = unsafe { isolate_displays_ccd(added.target_id) };
                 } else {
                     tracing::info!("display isolation skipped (PUNKTFUNK_NO_ISOLATE) — IDD stays extended");
@@ -343,6 +378,8 @@ impl VirtualDisplayManager {
             new = format!("{}x{}@{}", mode.width, mode.height, mode.refresh_hz),
             "virtual-display: reconfiguring reused monitor to the new client mode"
         );
+        // SAFETY: `resolve_gdi_name` is `unsafe` for its CCD FFI; it takes the `Copy` `u32`
+        // `mon.target_id` by value and returns an owned `String`, so nothing borrowed crosses the call.
         if let Some(n) = unsafe { resolve_gdi_name(mon.target_id) } {
             mon.gdi_name = Some(n);
         }
@@ -365,6 +402,9 @@ impl VirtualDisplayManager {
         if let Some(saved) = &mon.ccd_saved {
             restore_displays_ccd(saved);
         }
+        // SAFETY: `teardown`'s own `# Safety` contract guarantees `dev` is the live control handle, and
+        // `remove_monitor` requires exactly that. `&mon.key` borrows the `MonitorKey` inside the
+        // still-owned `mon`, alive for this synchronous IOCTL, so the pointer the driver reads stays valid.
         if let Err(e) = unsafe { self.driver.remove_monitor(dev, &mon.key) } {
             tracing::warn!("virtual-display REMOVE failed: {e:#}");
         } else {
@@ -470,6 +510,10 @@ impl VirtualDisplayManager {
                         }
                     };
                     if let Some(mon) = taken {
+                        // SAFETY: `teardown` requires `dev` to be the live control handle; `dev` is from
+                        // `self.device_handle()` (the `Some` checked just above), i.e. the cached
+                        // `OwnedHandle` live for the process lifetime. `mon` was moved out of the
+                        // `Lingering` state under the `state` lock, so it is exclusively owned here.
                         unsafe { self.teardown(dev, mon) };
                     }
                 })
@@ -503,9 +547,13 @@ fn idd_push_mode() -> bool {
 /// ACCESS_LOST storm SudoVDA hit when pinned).
 fn resolve_render_pin() -> Option<LUID> {
     if crate::config::config().render_adapter.is_some() {
+        // SAFETY: `resolve_render_adapter_luid` is `unsafe` only for its DXGI factory FFI; it takes no
+        // arguments and returns an `Option<LUID>` by value, so there is no input/borrow to keep valid.
         unsafe { crate::win_adapter::resolve_render_adapter_luid() }
     } else if crate::config::config().idd_push {
         tracing::info!("IDD push: pinning the discrete render GPU (SET_RENDER_ADAPTER)");
+        // SAFETY: as above — `resolve_render_adapter_luid` takes no arguments and returns an
+        // `Option<LUID>` by value; the `unsafe` covers only its DXGI factory enumeration FFI.
         unsafe { crate::win_adapter::resolve_render_adapter_luid() }
     } else {
         tracing::info!(

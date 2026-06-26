@@ -3,6 +3,10 @@
 //! RGB→YUV on the GPU, so no host-side CSC) and VAAPI on AMD/Intel (`*_vaapi`; the CPU-input
 //! fallback swscales RGB→NV12, the zero-copy path imports the capture dmabuf straight into a
 //! VA surface). One [`Encoder`] trait, selected in [`open_video`].
+// This file's own unsafe block carries a `// SAFETY:` proof, but the file-level
+// `#![deny(clippy::undocumented_unsafe_blocks)]` is deliberately NOT set yet: as a parent module it
+// would propagate the lint to `encode::windows::nvenc` (in-flight parallel work, not yet proven).
+// The deny lands here once every child module (incl. nvenc.rs) is documented.
 
 use crate::capture::{CapturedFrame, PixelFormat};
 use anyhow::Result;
@@ -505,6 +509,14 @@ fn windows_gpu_vendor() -> Option<GpuVendor> {
         CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
     };
     static CACHE: OnceLock<Option<GpuVendor>> = OnceLock::new();
+    // SAFETY: `CreateDXGIFactory1` returns a fresh owned `IDXGIFactory1` COM object (refcounted by the
+    // windows-rs wrapper, Released when the local drops); `.ok()?` bails on failure so `factory` is a
+    // valid interface before any use. `EnumAdapters1(i)` hands back the i-th adapter as an owned
+    // `IDXGIAdapter1` (or an error past the last adapter, which ends the loop). `GetDesc1()` returns the
+    // `DXGI_ADAPTER_DESC1` by value (no out-pointer), so reading `desc.Flags`/`desc.VendorId` is plain
+    // field access. Every call only touches COM objects this closure owns; the `OnceLock` runs the
+    // closure once (no data race) and all interfaces are Released as the locals drop. No raw pointer is
+    // dereferenced and nothing is aliased.
     *CACHE.get_or_init(|| unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
         let mut i = 0u32;

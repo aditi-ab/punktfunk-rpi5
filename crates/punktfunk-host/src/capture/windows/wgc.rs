@@ -16,6 +16,9 @@
 //! Limitation: WGC cannot capture the secure desktop (lock / UAC / login) — the caller falls back to
 //! the DDA backend ([`super::dxgi::DuplCapturer`]) for those (see capture.rs).
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use super::dxgi::{
     find_output, hdr_shader_p010_enabled, make_device, nudge_cursor_onto, D3d11Frame, HdrConverter,
     HdrP010Converter, VideoConverter, WinCaptureTarget,
@@ -92,6 +95,10 @@ struct Deimpersonate(Option<HANDLE>);
 impl Drop for Deimpersonate {
     fn drop(&mut self) {
         if let Some(tok) = self.0.take() {
+            // SAFETY: `RevertToSelf` takes no arguments and undoes the thread impersonation set during
+            // WGC activation; `tok` is the impersonation token `HANDLE` from `impersonate_active_user`,
+            // owned by this `Deimpersonate` and closed exactly once here (taken out of the `Option`, so
+            // no double-close). Both are FFI calls borrowing no Rust memory.
             unsafe {
                 let _ = RevertToSelf();
                 let _ = CloseHandle(tok);
@@ -174,7 +181,12 @@ pub struct WgcCapturer {
     _keepalive: Option<Box<dyn Send>>,
 }
 
-// COM + WinRT pointers; confined to the single owning (encode) thread, like DuplCapturer.
+// SAFETY: like `DuplCapturer`. `WgcCapturer` holds D3D11 (free-threaded device/context) plus WGC WinRT
+// objects (`Direct3D11CaptureFramePool` etc., created free-threaded via `CreateFreeThreaded`). COM/WinRT
+// reference counting is interlocked, and the capturer is owned + used by exactly one encode thread,
+// moved to it once and never shared (no `Sync`), so transferring ownership across threads is sound. The
+// free-threaded `FrameArrived` callback touches only the `Arc<WgcSignal>` (itself `Send + Sync`), not
+// the capturer's COM fields.
 unsafe impl Send for WgcCapturer {}
 
 impl WgcCapturer {
@@ -182,6 +194,15 @@ impl WgcCapturer {
     /// [`attach_keepalive`](Self::attach_keepalive) only after open succeeds, so a failure leaves the
     /// keepalive with the caller to hand to the DDA fallback.
     pub fn open(target: WinCaptureTarget, preferred: Option<(u32, u32, u32)>) -> Result<Self> {
+        // SAFETY: runs on the thread opening the WGC session. `RoInitialize` inits this thread's WinRT
+        // apartment (idempotent; result ignored). `impersonate_active_user()` and `find_output()` are
+        // this module's `unsafe fn`s whose contracts (call on the activating thread; pass a GDI name)
+        // are met, and the impersonation is reverted by `_deimp`'s Drop on every return path. Every
+        // COM/WinRT call thereafter operates on an object obtained + `?`-checked earlier in this same
+        // block on this single thread — the `IDXGIOutput1` from `find_output`, the device/context from
+        // `make_device`, the factory/interop/item/pool/session — and the `TypedEventHandler` closure
+        // captures an `Arc<WgcSignal>` (Send+Sync) by move. No raw pointers are dereferenced; borrowed
+        // locals outlive their synchronous calls.
         unsafe {
             // WGC is WinRT — the calling thread needs a COM/WinRT apartment for the GraphicsCaptureItem
             // activation factory (RoGetActivationFactory). Initialize MTA; ignore "already initialized"
@@ -585,6 +606,15 @@ impl WgcCapturer {
     }
 
     fn process_frame(&mut self, frame: Direct3D11CaptureFrame) -> Result<CapturedFrame> {
+        // SAFETY: runs on the capturer's single owning thread. `frame` is a live
+        // `Direct3D11CaptureFrame` from `self.pool`; `frame.Surface().cast::<IDirect3DDxgiInterfaceAccess
+        // >().GetInterface()` yields the frame's backing `ID3D11Texture2D`, which belongs to
+        // `self.device` (the pool was created on it via `CreateDirect3D11DeviceFromDXGIDevice`). Every
+        // helper called here — `hdr_to_p010`, `convert_to_yuv`, `ensure_fp16_src`, `ensure_out_ring`,
+        // `HdrConverter::convert`, `CopyResource`, `CreateRenderTargetView` — operates on
+        // `self.device`/`self.context` and that same-device texture, so all resources share one device.
+        // The frame is held in `self.held` until its async GPU read completes for the zero-copy paths.
+        // Single-threaded immediate-context use; borrowed textures/SRVs/RTVs outlive each synchronous call.
         unsafe {
             let surface = frame.Surface().context("frame Surface")?;
             let access: IDirect3DDxgiInterfaceAccess = surface

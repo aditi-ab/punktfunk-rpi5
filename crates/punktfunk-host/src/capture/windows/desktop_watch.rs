@@ -7,6 +7,9 @@
 //! desktop's NAME (WTS session notifications miss UAC entirely, so the name is the reliable signal)
 //! and publishes it as an atomic the capture mux + input path read.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +36,10 @@ impl DesktopWatcher {
         // mux) sees the real state immediately. Otherwise a session that begins already on the secure
         // desktop (e.g. a reconnect to a locked box) would read DESKTOP_NORMAL for the first poll
         // interval and relay one stale normal-desktop frame — the "flash of the login screen" bug.
+        // SAFETY: `is_secure_desktop` is this module's `unsafe fn` — unsafe only because it calls Win32
+        // desktop FFI (`OpenInputDesktop`/`GetUserObjectInformationW`/`CloseDesktop`), with no caller
+        // precondition; it opens, names, and closes the input-desktop handle internally and is safe to
+        // call from any thread (here, on the thread running `DesktopWatcher::start`).
         let initial = if unsafe { is_secure_desktop() } {
             DESKTOP_SECURE
         } else {
@@ -53,6 +60,9 @@ impl DesktopWatcher {
                 let mut candidate = initial;
                 let mut stable = 0u32;
                 while !st.load(Ordering::Relaxed) {
+                    // SAFETY: same as in `start` — `is_secure_desktop` is self-contained Win32 desktop
+                    // FFI with no caller precondition, called here on the dedicated `desktop-watch`
+                    // polling thread.
                     let v = if unsafe { is_secure_desktop() } {
                         DESKTOP_SECURE
                     } else {

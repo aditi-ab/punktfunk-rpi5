@@ -12,6 +12,9 @@
 //!
 //! Wire framing on stdout, per AU: `[u32 len LE][u64 pts_ns LE][u8 keyframe][len bytes data]`.
 
+// Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use crate::capture::{dxgi::WinCaptureTarget, wgc::WgcCapturer, Capturer};
 use crate::encode::{self, Codec};
 use anyhow::{Context, Result};
@@ -72,6 +75,9 @@ pub fn run(opts: HelperOptions) -> Result<()> {
             .name("pf-present-trigger".into())
             .spawn(move || {
                 tracing::info!("present-trigger: starting D3D present loop on the virtual display");
+                // SAFETY: `present_trigger` is unsafe only for its Win32/D3D11 FFI; it has no caller
+                // preconditions (it creates and exclusively owns its own window, device, and swapchain on
+                // this dedicated thread), so the call is sound.
                 if let Err(e) = unsafe { present_trigger(w, h) } {
                     tracing::warn!("present-trigger error: {e:#}");
                 }
