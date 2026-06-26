@@ -66,9 +66,7 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     // Firmware/hardware version (telemetry). The oracle points BOTH at one IDDCX_ENDPOINT_VERSION.
     // `version` is a stack local read synchronously by IddCxAdapterInitAsync (same as the oracle). `.Size`
     // is `size_of` throughout — these are the IddCx 1.10 structs and the framework here is 1.10 (= upstream).
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDDCX_ENDPOINT_VERSION;
-    // the required `.Size` (+ version fields) are set immediately below before the struct is used.
-    let mut version: iddcx::IDDCX_ENDPOINT_VERSION = unsafe { core::mem::zeroed() };
+    let mut version = pod_init!(iddcx::IDDCX_ENDPOINT_VERSION);
     version.Size = core::mem::size_of::<iddcx::IDDCX_ENDPOINT_VERSION>() as u32;
     version.MajorVer = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0);
     version.MinorVer = env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0);
@@ -78,9 +76,7 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     // zeroed value is IDDCX_FEATURE_IMPLEMENTATION_UNINITIALIZED (0), which the framework's adapter Validate
     // rejects with INVALID_PARAMETER (ddivalidation.cpp:797) — set it to NONE (1) like upstream. THIS was
     // the on-glass adapter-init blocker.
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
-    // IDDCX_ENDPOINT_DIAGNOSTIC_INFO; the required `.Size` (+ the fields read by Validate) are set below.
-    let mut diag: iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO = unsafe { core::mem::zeroed() };
+    let mut diag = pod_init!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO);
     diag.Size = core::mem::size_of::<iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO>() as u32;
     diag.GammaSupport = iddcx::IDDCX_FEATURE_IMPLEMENTATION::IDDCX_FEATURE_IMPLEMENTATION_NONE;
     diag.TransmissionType = iddcx::IDDCX_TRANSMISSION_TYPE::IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
@@ -92,9 +88,7 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     diag.pFirmwareVersion = (&raw mut version).cast();
     diag.pHardwareVersion = (&raw mut version).cast();
 
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDDCX_ADAPTER_CAPS;
-    // the required `.Size` (+ flags/limits/diag) are set immediately below.
-    let mut caps: iddcx::IDDCX_ADAPTER_CAPS = unsafe { core::mem::zeroed() };
+    let mut caps = pod_init!(iddcx::IDDCX_ADAPTER_CAPS);
     caps.Size = core::mem::size_of::<iddcx::IDDCX_ADAPTER_CAPS>() as u32;
     // STEP 7 (HDR): declare we can process FP16 (scRGB) desktop surfaces — this is what marks the virtual
     // monitor advanced-color-capable (→ the host sees display_hdr=true → the "Use HDR" toggle appears). The
@@ -109,9 +103,7 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
 
     // The adapter WDF object's attributes: Size + Synchronization/Execution = InheritFromParent (NOT zeroed,
     // since zero = *Invalid*) + the adapter context type (STEP 4 stores adapter state here).
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized WDF_OBJECT_ATTRIBUTES;
-    // the required `.Size` (+ execution/sync scope + context type) are set immediately below.
-    let mut attr: wdk_sys::WDF_OBJECT_ATTRIBUTES = unsafe { core::mem::zeroed() };
+    let mut attr = pod_init!(wdk_sys::WDF_OBJECT_ATTRIBUTES);
     attr.Size = core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32;
     attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
     attr.SynchronizationScope =
@@ -122,9 +114,7 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
         pCaps: &raw mut caps,
         ObjectAttributes: &raw mut attr,
     };
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDARG_OUT_ADAPTER_INIT
-    // (an out-param the framework fills).
-    let mut out: iddcx::IDARG_OUT_ADAPTER_INIT = unsafe { core::mem::zeroed() };
+    let mut out = pod_init!(iddcx::IDARG_OUT_ADAPTER_INIT);
     // SAFETY: `init`/`out` are valid local storage; IddCxAdapterInitAsync reads the caps synchronously
     // (the adapter object itself is delivered later via adapter_init_finished). Called once per device.
     let st = unsafe { wdk_iddcx::IddCxAdapterInitAsync(&init, &mut out) };
@@ -153,9 +143,7 @@ pub fn set_render_adapter(luid_low: u32, luid_high: i32) -> NTSTATUS {
     let Some(adapter) = adapter() else {
         return crate::STATUS_NOT_FOUND;
     };
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid IDARG_IN_ADAPTERSETRENDERADAPTER;
-    // the one meaningful field is assigned below.
-    let mut in_args: iddcx::IDARG_IN_ADAPTERSETRENDERADAPTER = unsafe { core::mem::zeroed() };
+    let mut in_args = pod_init!(iddcx::IDARG_IN_ADAPTERSETRENDERADAPTER);
     in_args.PreferredRenderAdapter = wdk_sys::LUID {
         LowPart: luid_low,
         HighPart: luid_high,

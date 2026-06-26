@@ -80,9 +80,7 @@ pub unsafe extern "C" fn parse_monitor_description(
     // SAFETY: `pMonitorModes` points to >= `count` IDDCX_MONITOR_MODE entries (validated above).
     let out = unsafe { core::slice::from_raw_parts_mut(in_args.pMonitorModes, count as usize) };
     for (item, slot) in crate::monitor::flatten(&modes).zip(out.iter_mut()) {
-        // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDDCX_MONITOR_MODE;
-        // the required `.Size` (+ origin / signal info) are set immediately below.
-        let mut mode: iddcx::IDDCX_MONITOR_MODE = unsafe { core::mem::zeroed() };
+        let mut mode = pod_init!(iddcx::IDDCX_MONITOR_MODE);
         mode.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE>() as u32;
         mode.Origin = iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
         mode.MonitorVideoSignalInfo =
@@ -131,9 +129,7 @@ pub unsafe extern "C" fn parse_monitor_description2(
     // SAFETY: `pMonitorModes` points to >= `count` IDDCX_MONITOR_MODE2 entries (validated above).
     let out = unsafe { core::slice::from_raw_parts_mut(in_args.pMonitorModes, count as usize) };
     for (item, slot) in crate::monitor::flatten(&modes).zip(out.iter_mut()) {
-        // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDDCX_MONITOR_MODE2;
-        // the required `.Size` (+ origin / signal info / bit depth) are set immediately below.
-        let mut mode: iddcx::IDDCX_MONITOR_MODE2 = unsafe { core::mem::zeroed() };
+        let mut mode = pod_init!(iddcx::IDDCX_MONITOR_MODE2);
         mode.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE2>() as u32;
         mode.Origin = iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
         mode.MonitorVideoSignalInfo =
@@ -229,7 +225,7 @@ pub unsafe extern "C" fn query_target_info(
 ) -> NTSTATUS {
     // SAFETY: p_out is the framework's (uninitialised) out buffer; zero then set the one field we report.
     unsafe {
-        core::ptr::write(p_out, core::mem::zeroed());
+        core::ptr::write(p_out, pod_init!(iddcx::IDARG_OUT_QUERYTARGET_INFO));
         (*p_out).TargetCaps = iddcx::IDDCX_TARGET_CAPS::IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE;
     }
     STATUS_SUCCESS

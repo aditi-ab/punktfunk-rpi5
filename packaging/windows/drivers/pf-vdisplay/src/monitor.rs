@@ -140,9 +140,7 @@ pub fn display_info(
     // Identical for every real mode; only an absurd (also now bounds-rejected) mode saturates.
     let clock_rate: u64 = u64::from(refresh_rate) * u64::from(height + 4) * u64::from(height + 4) + 1000;
     let clock_rate_u32 = u32::try_from(clock_rate).unwrap_or(u32::MAX);
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
-    // DISPLAYCONFIG_VIDEO_SIGNAL_INFO; every meaningful field is assigned below.
-    let mut si: wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO = unsafe { core::mem::zeroed() };
+    let mut si = pod_init!(wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO);
     si.pixelRate = clock_rate;
     si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
         Numerator: clock_rate_u32,
@@ -173,9 +171,7 @@ pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_T
         cx: width,
         cy: height,
     };
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
-    // DISPLAYCONFIG_VIDEO_SIGNAL_INFO; every meaningful field is assigned below.
-    let mut si: wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO = unsafe { core::mem::zeroed() };
+    let mut si = pod_init!(wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO);
     si.pixelRate = u64::from(refresh_rate) * u64::from(width) * u64::from(height);
     si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
         Numerator: refresh_rate * height,
@@ -191,9 +187,7 @@ pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_T
         wdk_sys::DISPLAYCONFIG_SCANLINE_ORDERING::DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
     // videoStandard=255, vSyncFreqDivider=1 (bits 16..21) => 255 | (1<<16).
     si.__bindgen_anon_1.videoStandard = 255 | (1 << 16);
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDDCX_TARGET_MODE;
-    // the required `.Size` (+ signal info) are set immediately below.
-    let mut tm: iddcx::IDDCX_TARGET_MODE = unsafe { core::mem::zeroed() };
+    let mut tm = pod_init!(iddcx::IDDCX_TARGET_MODE);
     tm.Size = core::mem::size_of::<iddcx::IDDCX_TARGET_MODE>() as u32;
     tm.TargetVideoSignalInfo = wdk_sys::DISPLAYCONFIG_TARGET_MODE {
         targetVideoSignalInfo: si,
@@ -210,9 +204,7 @@ pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_T
 pub fn wire_bits() -> iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
     let rgb = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_8
         | iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_10;
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
-    // IDDCX_WIRE_BITS_PER_COMPONENT; every field is assigned below.
-    let mut w: iddcx::IDDCX_WIRE_BITS_PER_COMPONENT = unsafe { core::mem::zeroed() };
+    let mut w = pod_init!(iddcx::IDDCX_WIRE_BITS_PER_COMPONENT);
     w.Rgb = rgb;
     w.YCbCr444 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
     w.YCbCr422 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
@@ -225,9 +217,7 @@ pub fn wire_bits() -> iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
 /// zeroed.
 pub fn target_mode2(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE2 {
     let m1 = target_mode(width, height, refresh_rate);
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDDCX_TARGET_MODE2;
-    // the required `.Size` (+ signal info + bit depth) are set immediately below.
-    let mut tm: iddcx::IDDCX_TARGET_MODE2 = unsafe { core::mem::zeroed() };
+    let mut tm = pod_init!(iddcx::IDDCX_TARGET_MODE2);
     tm.Size = core::mem::size_of::<iddcx::IDDCX_TARGET_MODE2>() as u32;
     tm.TargetVideoSignalInfo = m1.TargetVideoSignalInfo;
     tm.BitsPerComponent = wire_bits();
@@ -354,9 +344,7 @@ pub fn create_monitor(
 
     // EDID (serial = id) describes the monitor; the OS calls back into parse_monitor_description.
     let mut edid = crate::edid::Edid::generate_with(id);
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
-    // IDDCX_MONITOR_DESCRIPTION; the required `.Size`/Type/DataSize/pData are set immediately below.
-    let mut desc: iddcx::IDDCX_MONITOR_DESCRIPTION = unsafe { core::mem::zeroed() };
+    let mut desc = pod_init!(iddcx::IDDCX_MONITOR_DESCRIPTION);
     desc.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_DESCRIPTION>() as u32;
     desc.Type = iddcx::IDDCX_MONITOR_DESCRIPTION_TYPE::IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
     desc.DataSize = edid.len() as u32;
@@ -364,9 +352,7 @@ pub fn create_monitor(
     // reads through `pData` SYNCHRONOUSLY, before `edid` drops — the pointer never escapes the call.
     desc.pData = edid.as_mut_ptr().cast();
 
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDDCX_MONITOR_INFO;
-    // the required `.Size` (+ container id / type / connector / description) are set immediately below.
-    let mut info: iddcx::IDDCX_MONITOR_INFO = unsafe { core::mem::zeroed() };
+    let mut info = pod_init!(iddcx::IDDCX_MONITOR_INFO);
     info.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_INFO>() as u32;
     info.MonitorContainerId = container_guid(id);
     info.MonitorType =
@@ -374,9 +360,7 @@ pub fn create_monitor(
     info.ConnectorIndex = id;
     info.MonitorDescription = desc;
 
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized WDF_OBJECT_ATTRIBUTES;
-    // the required `.Size` (+ execution/sync scope) are set immediately below.
-    let mut attr: wdk_sys::WDF_OBJECT_ATTRIBUTES = unsafe { core::mem::zeroed() };
+    let mut attr = pod_init!(wdk_sys::WDF_OBJECT_ATTRIBUTES);
     attr.Size = core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32;
     attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
     attr.SynchronizationScope =
@@ -386,9 +370,7 @@ pub fn create_monitor(
         ObjectAttributes: &raw mut attr,
         pMonitorInfo: &raw mut info,
     };
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDARG_OUT_MONITORCREATE
-    // (an out-param the framework fills).
-    let mut create_out: iddcx::IDARG_OUT_MONITORCREATE = unsafe { core::mem::zeroed() };
+    let mut create_out = pod_init!(iddcx::IDARG_OUT_MONITORCREATE);
     // SAFETY: adapter is a valid IddCx adapter; create_in points to valid local storage read synchronously.
     let st = unsafe { wdk_iddcx::IddCxMonitorCreate(adapter, &create_in, &mut create_out) };
     dbglog!("[pf-vd] IddCxMonitorCreate(id={id}) -> {st:#x}");
@@ -404,9 +386,7 @@ pub fn create_monitor(
     }
 
     // Tell the OS the monitor is plugged in.
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDARG_OUT_MONITORARRIVAL
-    // (an out-param the framework fills).
-    let mut arrival_out: iddcx::IDARG_OUT_MONITORARRIVAL = unsafe { core::mem::zeroed() };
+    let mut arrival_out = pod_init!(iddcx::IDARG_OUT_MONITORARRIVAL);
     // SAFETY: `monitor` is the just-created IddCx monitor handle.
     let st = unsafe { wdk_iddcx::IddCxMonitorArrival(monitor, &mut arrival_out) };
     dbglog!("[pf-vd] IddCxMonitorArrival(id={id}) -> {st:#x}");

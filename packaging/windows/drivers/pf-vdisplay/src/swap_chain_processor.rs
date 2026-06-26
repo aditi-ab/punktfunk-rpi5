@@ -183,9 +183,7 @@ impl SwapChainProcessor {
             }
         };
         // Built zeroed + field-assigned (driver style) — robust against a bindgen field-set difference.
-        // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
-        // IDARG_IN_SWAPCHAINSETDEVICE; the `pDevice` field is set immediately below.
-        let mut set_device: IDARG_IN_SWAPCHAINSETDEVICE = unsafe { core::mem::zeroed() };
+        let mut set_device = pod_init!(IDARG_IN_SWAPCHAINSETDEVICE);
         set_device.pDevice = dxgi_device.as_raw().cast();
         let mut set_ok = false;
         let mut terminated = false;
@@ -280,20 +278,16 @@ impl SwapChainProcessor {
             // the GPU surface (out.MetaData.pSurface) — STEP 6 publishes it into the shared ring in the
             // success branch below. Built zeroed + field-assigned (driver style) so a bindgen field-set
             // difference can't break a positional struct literal.
-            // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
-            // IDARG_IN_RELEASEANDACQUIREBUFFER2; the required `.Size`/AcquireSystemMemoryBuffer are set below.
-            let mut in_args: IDARG_IN_RELEASEANDACQUIREBUFFER2 = unsafe { core::mem::zeroed() };
+            let mut in_args = pod_init!(IDARG_IN_RELEASEANDACQUIREBUFFER2);
             #[allow(clippy::cast_possible_truncation)]
             {
                 in_args.Size = size_of::<IDARG_IN_RELEASEANDACQUIREBUFFER2>() as u32;
             }
             in_args.AcquireSystemMemoryBuffer = 0;
-            // `core::mem::zeroed()` (not `::default()`) — consistent with every other IddCx out-struct
+            // `pod_init!` (zeroed, not `::default()`) — consistent with every other IddCx out-struct
             // in this driver, and robust whether or not bindgen derives `Default` for this type (its
             // `MetaData` field carries a raw `pSurface` pointer + union which can suppress the derive).
-            // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
-            // IDARG_OUT_RELEASEANDACQUIREBUFFER2 (an out-param the framework fills).
-            let mut buffer: IDARG_OUT_RELEASEANDACQUIREBUFFER2 = unsafe { core::mem::zeroed() };
+            let mut buffer = pod_init!(IDARG_OUT_RELEASEANDACQUIREBUFFER2);
             // SAFETY: driver is loaded; `swap_chain` is valid; in/out point to valid local storage.
             let hr: NTSTATUS = unsafe {
                 wdk_iddcx::IddCxSwapChainReleaseAndAcquireBuffer2(

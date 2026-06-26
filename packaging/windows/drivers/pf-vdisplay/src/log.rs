@@ -56,3 +56,16 @@ pub fn log(s: &str) {
 macro_rules! dbglog {
     ($($a:tt)*) => { $crate::log::log(&::std::format!($($a)*)) };
 }
+
+/// Zero-initialise a C POD struct (windows-rs / WDK / IddCx). These are `#[repr(C)]` framework structs
+/// whose all-zero bit pattern is a valid zero-initialised value; the caller stamps the required
+/// `.Size`/etc fields immediately after. Centralises the `unsafe { core::mem::zeroed() }` the IddCx/WDF
+/// bring-up needs — pass the type EXPLICITLY (`pod_init!(T)`) so it works without a binding annotation.
+/// Made crate-visible by the same `#[macro_use] mod log;` in `lib.rs` that exports `dbglog!`.
+macro_rules! pod_init {
+    ($t:ty) => {{
+        // SAFETY: $t is a C POD (windows-rs/WDK/IddCx struct); its all-zero bit pattern is a valid
+        // zero-initialised value and the caller sets the required .Size/etc fields immediately after.
+        unsafe { ::core::mem::zeroed::<$t>() }
+    }};
+}

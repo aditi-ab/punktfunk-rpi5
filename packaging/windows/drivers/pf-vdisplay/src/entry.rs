@@ -38,8 +38,7 @@ pub unsafe extern "system" fn driver_entry(
     registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
     dbglog!("[pf-vd] DriverEntry");
-    // SAFETY: zeroed then Size + the device-add callback set, per the WDF_DRIVER_CONFIG contract.
-    let mut config: WDF_DRIVER_CONFIG = unsafe { core::mem::zeroed() };
+    let mut config = pod_init!(WDF_DRIVER_CONFIG);
     config.Size = core::mem::size_of::<WDF_DRIVER_CONFIG>() as ULONG;
     config.EvtDriverDeviceAdd = Some(driver_add);
     // SAFETY: driver + registry_path are loader-provided; config is valid for the call.
@@ -60,9 +59,7 @@ pub unsafe extern "system" fn driver_entry(
 extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTATUS {
     dbglog!("[pf-vd] driver_add");
     // Defer adapter creation to the first D0 entry.
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized
-    // WDF_PNPPOWER_EVENT_CALLBACKS; the required `.Size` (+ the D0-entry callback) are set immediately below.
-    let mut pnp: WDF_PNPPOWER_EVENT_CALLBACKS = unsafe { core::mem::zeroed() };
+    let mut pnp = pod_init!(WDF_PNPPOWER_EVENT_CALLBACKS);
     pnp.Size = core::mem::size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG;
     pnp.EvtDeviceD0Entry = Some(callbacks::device_d0_entry);
     // SAFETY: init is the framework-provided device-init; pnp is valid for the call.
@@ -71,9 +68,7 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     }
 
     // Build the IddCx client config and wire the SDR callbacks. `.Size` = size_of (1.10 structs, 1.10 fw).
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized IDD_CX_CLIENT_CONFIG;
-    // the required `.Size` (+ the IddCx client callbacks) are set immediately below.
-    let mut cfg: iddcx::IDD_CX_CLIENT_CONFIG = unsafe { core::mem::zeroed() };
+    let mut cfg = pod_init!(iddcx::IDD_CX_CLIENT_CONFIG);
     cfg.Size = core::mem::size_of::<iddcx::IDD_CX_CLIENT_CONFIG>() as u32;
     cfg.EvtIddCxAdapterInitFinished = Some(callbacks::adapter_init_finished);
     cfg.EvtIddCxParseMonitorDescription = Some(callbacks::parse_monitor_description);
@@ -105,9 +100,7 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
 
     let mut device: WDFDEVICE = core::ptr::null_mut();
     // Attach a device context type (like the working virtual-display-rs/oracle), not WDF_NO_OBJECT_ATTRIBUTES.
-    // SAFETY: building a C POD — the all-zero bit pattern is a valid uninitialized WDF_OBJECT_ATTRIBUTES;
-    // the required `.Size` (+ execution/sync scope + context type) are set immediately below.
-    let mut dev_attr: wdk_sys::WDF_OBJECT_ATTRIBUTES = unsafe { core::mem::zeroed() };
+    let mut dev_attr = pod_init!(wdk_sys::WDF_OBJECT_ATTRIBUTES);
     dev_attr.Size = core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32;
     dev_attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
     dev_attr.SynchronizationScope =
