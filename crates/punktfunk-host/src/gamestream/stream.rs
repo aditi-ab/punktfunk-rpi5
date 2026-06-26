@@ -141,6 +141,25 @@ fn run(
         )
         .context("capture virtual output")?;
         capturer.set_active(true);
+        // Launch the app's command now that capture is live, for the backends that DON'T nest it via
+        // set_launch_command above: Windows (no gamescope) and Linux kwin/mutter/wlroots (which stream
+        // the existing desktop, so the app must be spawned into the session to land on the streamed
+        // output). Linux gamescope already nested it via set_launch_command, so skip it there.
+        #[cfg(windows)]
+        let launch_here = true;
+        #[cfg(target_os = "linux")]
+        let launch_here = compositor != crate::vdisplay::Compositor::Gamescope;
+        #[cfg(any(windows, target_os = "linux"))]
+        if launch_here {
+            if let Some(cmd) = app
+                .and_then(|a| a.cmd.as_deref())
+                .filter(|c| !c.trim().is_empty())
+            {
+                if let Err(e) = crate::library::launch_gamestream_command(cmd) {
+                    tracing::warn!(command = %cmd, error = %e, "gamestream: could not launch app");
+                }
+            }
+        }
         return stream_body(&mut *capturer, &sock, cfg, running, force_idr, rfi_range);
     }
 

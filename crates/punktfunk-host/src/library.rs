@@ -1436,6 +1436,38 @@ fn steam_exe() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Launch a GameStream `apps.json` command (operator-typed, trusted — never client-set) into the live
+/// session, AFTER capture is up. Used by the GameStream path for the backends that DON'T nest the
+/// command via [`VirtualDisplay::set_launch_command`]: Windows (no gamescope) and Linux
+/// kwin/mutter/wlroots (which stream the existing desktop). The caller skips this for Linux gamescope,
+/// which already nested it. On Windows it runs in the interactive USER session (the host is SYSTEM);
+/// on Linux the host is already inside the user's graphical session, so a plain spawn lands the app on
+/// the streamed (primary) output.
+#[cfg(any(windows, target_os = "linux"))]
+pub fn launch_gamestream_command(cmd: &str) -> Result<()> {
+    let cmd = cmd.trim();
+    anyhow::ensure!(!cmd.is_empty(), "empty command");
+    #[cfg(windows)]
+    {
+        // cmd.exe /c is fine here: the value is the host operator's own apps.json command, not a
+        // client-influenced string (same trust as the custom-store `command` kind).
+        let pid = crate::interactive::spawn_in_active_session(&format!("cmd.exe /c {cmd}"), None)
+            .context("spawn gamestream command in the interactive session")?;
+        tracing::info!(command = %cmd, pid, "gamestream: launched app in the interactive session");
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .spawn()
+            .context("spawn gamestream command")?;
+        tracing::info!(command = %cmd, pid = child.id(), "gamestream: launched app into the session");
+        Ok(())
+    }
+}
+
 /// The full library: every store's titles merged + the custom entries, sorted by title.
 pub fn all_games() -> Vec<GameEntry> {
     let mut games = SteamProvider.list();
