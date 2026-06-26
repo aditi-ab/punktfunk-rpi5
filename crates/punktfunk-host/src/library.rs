@@ -257,6 +257,298 @@ fn is_steam_tool(appid: u32, name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------
+// Lutris (Linux) — reads the local `pga.db` (no auth, no network). One provider covers
+// everything Lutris manages: Wine/Proton games, GOG/Epic/Battle.net installs, emulators.
+// ---------------------------------------------------------------------------------------
+
+/// Reads the **local** Lutris library DB (`pga.db`) — no network. Installed titles only; cover art
+/// from Lutris's on-disk cache, inlined as `data:` URLs. Linux-only (Lutris is Linux-only).
+#[cfg(target_os = "linux")]
+pub struct LutrisProvider;
+
+#[cfg(target_os = "linux")]
+impl LibraryProvider for LutrisProvider {
+    fn store(&self) -> &'static str {
+        "lutris"
+    }
+
+    fn list(&self) -> Vec<GameEntry> {
+        let Some(db) = lutris_db() else {
+            return Vec::new();
+        };
+        lutris_games(&db).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, db = %db.display(), "lutris pga.db read failed — skipping");
+            Vec::new()
+        })
+    }
+}
+
+/// The first existing Lutris `pga.db`: XDG data dir, the classic `~/.local/share`, or Flatpak.
+#[cfg(target_os = "linux")]
+fn lutris_db() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
+        candidates.push(PathBuf::from(d).join("lutris/pga.db"));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".local/share/lutris/pga.db"));
+        candidates.push(home.join(".var/app/net.lutris.Lutris/data/lutris/pga.db"));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Installed games from a Lutris `pga.db`. Opened **read-only + immutable** (via a SQLite URI) so a
+/// running Lutris holding the file can't make us block or fail, and we never write to it.
+#[cfg(target_os = "linux")]
+fn lutris_games(db: &Path) -> rusqlite::Result<Vec<GameEntry>> {
+    use rusqlite::OpenFlags;
+    // `immutable=1` treats the DB as read-only-and-unchanging → no locking against a live Lutris. The
+    // path goes into the URI literally; a `?`/`#` in it (vanishingly rare on Linux) would mis-parse,
+    // so fall back to a plain read-only open in that case.
+    let path = db.to_string_lossy();
+    let conn = if path.contains('?') || path.contains('#') {
+        rusqlite::Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?
+    } else {
+        rusqlite::Connection::open_with_flags(
+            format!("file:{path}?immutable=1"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, name FROM games \
+         WHERE installed = 1 AND name IS NOT NULL AND name <> '' \
+         ORDER BY name COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut games = Vec::new();
+    for (id, slug, name) in rows.flatten() {
+        games.push(GameEntry {
+            id: format!("lutris:{id}"),
+            store: "lutris".into(),
+            title: name,
+            art: slug.as_deref().map(lutris_art).unwrap_or_default(),
+            launch: Some(LaunchSpec {
+                kind: "lutris_id".into(),
+                value: id.to_string(),
+            }),
+        });
+    }
+    Ok(games)
+}
+
+/// Lutris cover art (local files keyed by slug) inlined as `data:` URLs — Lutris has no public CDN
+/// keyed by a stable id (unlike Steam/Heroic), and `Artwork` fields are URLs the client fetches, so a
+/// self-contained `data:` URL needs no host-served endpoint. `coverart` → portrait, `banners` → header.
+#[cfg(target_os = "linux")]
+fn lutris_art(slug: &str) -> Artwork {
+    Artwork {
+        portrait: lutris_image("coverart", slug),
+        header: lutris_image("banners", slug),
+        ..Default::default()
+    }
+}
+
+/// Find `<kind>/<slug>.jpg` across the current (0.5.18+), legacy (`~/.cache`), and Flatpak Lutris
+/// dirs and inline it as `data:image/jpeg;base64,…`. Skips a missing or implausibly large file (a
+/// 1 MiB cap bounds the catalog JSON so a few big files can't bloat it).
+#[cfg(target_os = "linux")]
+fn lutris_image(kind: &str, slug: &str) -> Option<String> {
+    use base64::Engine as _;
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let roots = [
+        home.join(".local/share/lutris"),
+        home.join(".cache/lutris"),
+        home.join(".var/app/net.lutris.Lutris/data/lutris"),
+        home.join(".var/app/net.lutris.Lutris/cache/lutris"),
+    ];
+    for root in roots {
+        let p = root.join(kind).join(format!("{slug}.jpg"));
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
+        if meta.len() == 0 || meta.len() > 1024 * 1024 {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(&p) {
+            let enc = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Some(format!("data:image/jpeg;base64,{enc}"));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------------------
+// Heroic (Linux) — Epic + GOG + Amazon in one provider. Reads Heroic's `store_cache` JSON
+// (no auth); cover art is already public Epic/GOG/Amazon CDN URLs the client fetches directly.
+// ---------------------------------------------------------------------------------------
+
+/// Reads Heroic Games Launcher's local library cache. One provider surfaces all three of Heroic's
+/// backends (legendary=Epic, gog=GOG, nile=Amazon). Linux-only for now (Heroic on Windows uses a
+/// different config path and the launch path isn't wired there yet).
+#[cfg(target_os = "linux")]
+pub struct HeroicProvider;
+
+#[cfg(target_os = "linux")]
+impl LibraryProvider for HeroicProvider {
+    fn store(&self) -> &'static str {
+        "heroic"
+    }
+
+    fn list(&self) -> Vec<GameEntry> {
+        let Some(root) = heroic_root() else {
+            return Vec::new();
+        };
+        let mut games = Vec::new();
+        // (cache file, runner id, the electron-store data key holding the games array)
+        for (file, runner, key) in [
+            ("legendary_library.json", "legendary", "library"),
+            ("gog_library.json", "gog", "games"),
+            ("nile_library.json", "nile", "library"),
+        ] {
+            let path = root.join("store_cache").join(file);
+            match heroic_games(&path, runner, key) {
+                Ok(mut g) => games.append(&mut g),
+                Err(e) => {
+                    tracing::debug!(error = %e, file, "heroic store_cache not read (store unused?)")
+                }
+            }
+        }
+        games
+    }
+}
+
+/// The first existing Heroic config root: `$XDG_CONFIG_HOME/heroic`, classic `~/.config/heroic`, or
+/// the Flatpak path.
+#[cfg(target_os = "linux")]
+fn heroic_root() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME") {
+        candidates.push(PathBuf::from(d).join("heroic"));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".config/heroic"));
+        candidates.push(home.join(".var/app/com.heroicgameslauncher.hgl/config/heroic"));
+    }
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
+/// Parse one runner's `store_cache/*_library.json` (an electron-store object whose `key` holds the
+/// games array). Keeps only installed titles whose install dir still exists (the latter works around
+/// Heroic's gog `is_installed` bug, #2691). Art comes straight from the cached public CDN URLs.
+#[cfg(target_os = "linux")]
+fn heroic_games(path: &Path, runner: &str, key: &str) -> anyhow::Result<Vec<GameEntry>> {
+    let raw = std::fs::read_to_string(path)?;
+    let root: serde_json::Value = serde_json::from_str(&raw)?;
+    let arr = root
+        .get(key)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("no '{key}' array in {}", path.display()))?;
+    let mut games = Vec::new();
+    for g in arr {
+        if !g
+            .get("is_installed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue; // the cache also lists owned-but-not-installed titles
+        }
+        let install_ok = g
+            .get("install")
+            .and_then(|i| i.get("install_path"))
+            .and_then(|p| p.as_str())
+            .is_some_and(|p| Path::new(p).is_dir());
+        if !install_ok {
+            continue;
+        }
+        let Some(app_name) = g
+            .get("app_name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let title = g
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or(app_name)
+            .to_string();
+        // Only emit http(s) art (sideloaded titles can carry local file:// paths the client can't fetch).
+        let http = |k: &str| {
+            g.get(k)
+                .and_then(|v| v.as_str())
+                .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+                .map(String::from)
+        };
+        let art = Artwork {
+            portrait: http("art_square"),
+            header: http("art_cover"),
+            hero: http("art_background").or_else(|| http("art_cover")),
+            logo: http("art_logo"),
+        };
+        games.push(GameEntry {
+            id: format!("heroic:{runner}:{app_name}"),
+            store: "heroic".into(),
+            title,
+            art,
+            launch: Some(LaunchSpec {
+                kind: "heroic".into(),
+                value: format!("{runner}:{app_name}"),
+            }),
+        });
+    }
+    Ok(games)
+}
+
+/// Map a `heroic` LaunchSpec value (`<runner>:<appName>`) to the Heroic launch command, run nested in
+/// gamescope. The host owns this mapping; the client only ever sends the id. CAVEAT: Heroic is a
+/// single-instance Electron app — in a fresh per-session gamescope it boots, launches the game (which
+/// renders into that gamescope) and stays hidden via `--no-gui`; but if a Heroic GUI is ALREADY
+/// running on the box, the spawned process forwards the URI and exits, which would tear the session
+/// down. The validated path is the fresh-session case; needs live confirmation on a box with Heroic.
+#[cfg(target_os = "linux")]
+fn heroic_command(value: &str) -> Option<String> {
+    let (runner, app) = value.split_once(':')?;
+    if !matches!(runner, "legendary" | "gog" | "nile") {
+        return None;
+    }
+    // appName charset (Epic alnum, GOG digits, Amazon alnum) — keep the URI a single safe token.
+    if app.is_empty()
+        || !app
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    let prefix = heroic_launch_prefix()?;
+    // No quotes: gamescope spawns the app by `split_whitespace()`, and the URI has no spaces (appName
+    // is validated above) so it stays a single argv token; `&` is fine (exec'd, not shell-parsed).
+    Some(format!(
+        "{prefix} --no-gui heroic://launch?appName={app}&runner={runner}"
+    ))
+}
+
+/// How to invoke Heroic: the native `heroic` binary if on `PATH`, else the Flatpak app if its data
+/// root is present. `None` ⇒ Heroic not found, so no launch command.
+#[cfg(target_os = "linux")]
+fn heroic_launch_prefix() -> Option<String> {
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join("heroic").is_file()));
+    if on_path {
+        return Some("heroic".into());
+    }
+    let flatpak = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .is_some_and(|h| h.join(".var/app/com.heroicgameslauncher.hgl").is_dir());
+    flatpak.then(|| "flatpak run com.heroicgameslauncher.hgl".into())
+}
+
+// ---------------------------------------------------------------------------------------
 // Custom store (user-curated entries, persisted + CRUD'd via the mgmt API)
 // ---------------------------------------------------------------------------------------
 
@@ -415,6 +707,13 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
     match spec.kind.as_str() {
         "steam_appid" => valid_steam_appid(&spec.value)
             .then(|| format!("steam steam://rungameid/{}", spec.value)),
+        // Lutris: a digits-only pga.db game id (same guard as steam_appid) → its run URI.
+        #[cfg(target_os = "linux")]
+        "lutris_id" => (!spec.value.is_empty() && spec.value.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| format!("lutris lutris:rungameid/{}", spec.value)),
+        // Heroic: `<runner>:<appName>` → the validated heroic://launch command (see heroic_command).
+        #[cfg(target_os = "linux")]
+        "heroic" => heroic_command(&spec.value),
         // Trusted: the command comes from the host's own custom store, never the client.
         "command" => (!spec.value.trim().is_empty()).then(|| spec.value.clone()),
         _ => None,
@@ -499,6 +798,13 @@ fn steam_exe() -> Option<std::path::PathBuf> {
 /// The full library: every store's titles merged + the custom entries, sorted by title.
 pub fn all_games() -> Vec<GameEntry> {
     let mut games = SteamProvider.list();
+    // The Lutris + Heroic providers are Linux-only (their launchers are); on other hosts the library
+    // is Steam + custom. Each provider is best-effort (empty when its store isn't present).
+    #[cfg(target_os = "linux")]
+    {
+        games.extend(LutrisProvider.list());
+        games.extend(HeroicProvider.list());
+    }
     games.extend(load_custom().into_iter().map(GameEntry::from));
     games.sort_by_key(|g| g.title.to_lowercase());
     games
@@ -614,6 +920,105 @@ mod tests {
         .into();
         assert_eq!(g.id, "custom:abc123");
         assert_eq!(g.store, "custom");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lutris_games_reads_installed_only() {
+        use rusqlite::Connection;
+        let dir = std::env::temp_dir().join(format!("pf-lutris-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("pga.db");
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE games (id INTEGER PRIMARY KEY, slug TEXT, name TEXT, installed INTEGER);
+                 INSERT INTO games (id,slug,name,installed) VALUES (42,'elden-ring','ELDEN RING',1);
+                 INSERT INTO games (id,slug,name,installed) VALUES (7,'owned','Owned Only',0);
+                 INSERT INTO games (id,slug,name,installed) VALUES (9,'noname',NULL,1);",
+            )
+            .unwrap();
+        }
+        let games = lutris_games(&db).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        // Only the installed, named row; the uninstalled + NULL-name rows are filtered out.
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].id, "lutris:42");
+        assert_eq!(games[0].store, "lutris");
+        assert_eq!(games[0].title, "ELDEN RING");
+        let l = games[0].launch.as_ref().unwrap();
+        assert_eq!((l.kind.as_str(), l.value.as_str()), ("lutris_id", "42"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn heroic_games_parses_installed_with_cdn_art() {
+        let dir = std::env::temp_dir().join(format!("pf-heroic-test-{}", std::process::id()));
+        let install = dir.join("game-install");
+        std::fs::create_dir_all(&install).unwrap();
+        let path = dir.join("legendary_library.json");
+        let json = format!(
+            r#"{{"library":[
+                {{"app_name":"Quail","title":"Quail","is_installed":true,
+                  "install":{{"install_path":"{inst}"}},
+                  "art_square":"https://cdn/quail_tall.jpg","art_cover":"https://cdn/quail_wide.jpg",
+                  "art_logo":"file:///local/logo.png"}},
+                {{"app_name":"Owned","title":"Owned Only","is_installed":false,
+                  "install":{{"install_path":"{inst}"}}}}
+            ]}}"#,
+            inst = install.display()
+        );
+        std::fs::write(&path, json).unwrap();
+        let games = heroic_games(&path, "legendary", "library").unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(games.len(), 1); // the uninstalled title is filtered out
+        assert_eq!(games[0].id, "heroic:legendary:Quail");
+        assert_eq!(games[0].title, "Quail");
+        assert_eq!(
+            games[0].art.portrait.as_deref(),
+            Some("https://cdn/quail_tall.jpg")
+        );
+        assert_eq!(
+            games[0].art.header.as_deref(),
+            Some("https://cdn/quail_wide.jpg")
+        );
+        assert!(games[0].art.logo.is_none()); // file:// art is dropped (client can't fetch it)
+        let l = games[0].launch.as_ref().unwrap();
+        assert_eq!(
+            (l.kind.as_str(), l.value.as_str()),
+            ("heroic", "legendary:Quail")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_for_lutris_and_heroic_guards() {
+        // Lutris: digits → its run URI; a non-numeric id (injection attempt) is rejected.
+        assert_eq!(
+            command_for(&LaunchSpec {
+                kind: "lutris_id".into(),
+                value: "42".into()
+            })
+            .as_deref(),
+            Some("lutris lutris:rungameid/42")
+        );
+        assert_eq!(
+            command_for(&LaunchSpec {
+                kind: "lutris_id".into(),
+                value: "42; rm -rf ~".into()
+            }),
+            None
+        );
+        // Heroic guards (independent of whether Heroic is installed): bad runner / appName → None.
+        assert_eq!(heroic_command("badrunner:Quail"), None);
+        assert_eq!(heroic_command("legendary:bad name"), None);
+        assert_eq!(heroic_command("nile:"), None);
+        // When Heroic IS resolvable (a dev box), a valid id yields the launch URI; on CI (no Heroic)
+        // it's None — assert the URI shape only when a launcher prefix exists.
+        if let Some(cmd) = heroic_command("legendary:Quail-1.2_x") {
+            assert!(cmd.contains("heroic://launch?appName=Quail-1.2_x&runner=legendary"));
+            assert!(cmd.contains("--no-gui"));
+        }
     }
 
     #[cfg(windows)]
