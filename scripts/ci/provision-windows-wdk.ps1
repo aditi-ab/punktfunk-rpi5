@@ -1,6 +1,6 @@
 # Provision the Windows Driver Kit (WDK) + cargo-wdk on the self-hosted windows-amd64 runner, so the
 # all-Rust UMDF drivers (pf-vdisplay + the gamepad drivers, unified on microsoft/windows-drivers-rs)
-# can build there. See docs/windows-host-rewrite.md (M0).
+# can build there. See design/windows-host-rewrite.md (M0).
 #
 # The runner already has the base Windows SDK 10.0.26100 (um/ headers) + MSVC + LLVM + Rust, but NOT the
 # WDK — no km/ + wdf/ + um/iddcx headers, no inf2cat/stampinf/devgen. wdk-sys's bindgen needs those.

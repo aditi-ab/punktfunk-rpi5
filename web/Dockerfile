@@ -1,6 +1,6 @@
 # punktfunk management console — TanStack Start built with Bun, served by the Nitro `bun`
 # preset bundle. Build context is the REPO ROOT (orval generates the API client from
-# docs/api/openapi.json, referenced as ../docs/api/openapi.json from web/):
+# api/openapi.json, referenced as ../api/openapi.json from web/):
 #
 #   docker build -f web/Dockerfile -t punktfunk-web .
 #
@@ -15,7 +15,7 @@ WORKDIR /repo/web
 COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile --ignore-scripts
 
-COPY docs/api/openapi.json /repo/docs/api/openapi.json
+COPY api/openapi.json /repo/api/openapi.json
 COPY web/ ./
 # prebuild runs orval (openapi → src/api/gen); the paraglide vite plugin compiles i18n.
 RUN bun run build

@@ -2,11 +2,11 @@ import { defineConfig } from "orval";
 
 // Generates a typed React Query client from the host's checked-in OpenAPI document.
 // Regenerate after any management-API change: `pnpm api:gen` (the Rust side regenerates
-// docs/api/openapi.json via `cargo run -p punktfunk-host -- openapi`).
+// api/openapi.json via `cargo run -p punktfunk-host -- openapi`).
 export default defineConfig({
 	punktfunk: {
 		input: {
-			target: "../docs/api/openapi.json",
+			target: "../api/openapi.json",
 		},
 		output: {
 			mode: "tags-split",

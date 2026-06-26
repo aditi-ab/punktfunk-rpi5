@@ -5,7 +5,7 @@
 # ScreenCast portal (xdg-desktop-portal-wlr) and the punktfunk host share one bus. After this
 # is up, run `prepare-session.sh` from a second shell to set the mode + portal env.
 #
-# Prereqs (see docs/linux-setup.md / scripts/bootstrap-ubuntu.sh):
+# Prereqs (see design/linux-setup.md / scripts/bootstrap-ubuntu.sh):
 #   - nvidia-drm.modeset=Y
 #   - the NVIDIA GL/EGL userspace (libnvidia-gl-NNN) — provides libEGL_nvidia + the GLVND
 #     vendor JSON; without it wlroots can't init EGL on the GPU and falls back to pixman,

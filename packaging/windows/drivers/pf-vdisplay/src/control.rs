@@ -27,7 +27,7 @@ static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
 /// without a cooperative REMOVE (crash / `TerminateProcess`) left its virtual monitor + swap-chain
 /// worker + pooled D3D device wedged in WUDFHost until the next host start's CLEAR_ALL, and a
 /// not-restarted host left the orphan monitor in the desktop topology indefinitely
-/// (`docs/windows-host-rewrite.md` §2.8). This thread closes that: if no IOCTL arrives for
+/// (`design/windows-host-rewrite.md` §2.8). This thread closes that: if no IOCTL arrives for
 /// `WATCHDOG_TIMEOUT_S` while monitors exist, it departs them all.
 ///
 /// (A WDF `EvtFileClose` on the control handle would be more immediate — the plan's preferred §3.4

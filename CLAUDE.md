@@ -2,7 +2,7 @@
 
 Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protocol core
 (`punktfunk-core`) exposed over a C ABI and native clients per platform. Full design:
-[`docs/implementation-plan.md`](docs/implementation-plan.md). Status table: `README.md`.
+[`design/implementation-plan.md`](design/implementation-plan.md). Status table: `README.md`.
 
 ## Where the work stands
 
@@ -104,9 +104,16 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   captures the HDR desktop as FP16/Rgb10a2 (DDA FP16 for the secure desktop), the encoder forces HEVC
   Main10 + BT.2020 PQ (NVENC ABGR10/P010; AMF/QSV P010 + a swscale Rgb10a2→P010 fallback), the client
   auto-detects PQ from the HEVC VUI — gated by `PUNKTFUNK_10BIT` + client `VIDEO_CAP_10BIT`; **Windows
-  host only** (the Linux host stays 8-bit, blocked upstream). **AMF/QSV is CI-green but not yet
-  on-glass validated** (no AMD/Intel Windows box in the lab); NVENC is live-validated. Newer/less
-  battle-tested than the Linux host. Packaging: `packaging/windows/`.
+  host only** (the Linux host stays 8-bit, blocked upstream). **Vulkan-game HDR over the virtual
+  display**: NVIDIA/AMD Vulkan ICDs refuse to *advertise* an HDR color space for a surface on an IddCx
+  indirect display (so Vulkan games — Doom: The Dark Ages, id Tech, etc. — say "device does not support
+  HDR"), even though the ICD happily *accepts + presents* a forced HDR swapchain there. A tiny always-on
+  Vulkan **implicit layer** (`packaging/windows/pf-vkhdr-layer/`, `VK_LAYER_PUNKTFUNK_hdr_inject`)
+  injects the `HDR10_ST2084`/scRGB surface formats into `vkGetPhysicalDeviceSurfaceFormats[2]KHR`,
+  self-gated on the display's actual advanced-color state (no-op on SDR / real monitors); bundled +
+  HKLM-registered by the installer. **Live-validated: Doom: The Dark Ages enables HDR over the virtual
+  display.** **AMF/QSV is CI-green but not yet on-glass validated** (no AMD/Intel Windows box in the
+  lab); NVENC is live-validated. Newer/less battle-tested than the Linux host. Packaging: `packaging/windows/`.
 
 ## What's left
 
@@ -245,8 +252,8 @@ bash crates/punktfunk-core/tests/c/run.sh   # standalone C-ABI link + round-trip
 ```
 
 Generated artifacts are **checked in** and CI fails on drift: `include/punktfunk_core.h`
-(cbindgen from `punktfunk-core/src/abi.rs`) and `docs/api/openapi.json` (regenerate with
-`cargo run -p punktfunk-host -- openapi > docs/api/openapi.json`; spec lives in `mgmt.rs`).
+(cbindgen from `punktfunk-core/src/abi.rs`) and `api/openapi.json` (regenerate with
+`cargo run -p punktfunk-host -- openapi > api/openapi.json`; spec lives in `mgmt.rs`).
 
 CI is Gitea Actions (`.gitea/workflows/`, guide: docs-site `ci.md`): `ci.yml` runs the
 workspace checks inside the `git.unom.io/unom/punktfunk-rust-ci` image plus web/docs-site

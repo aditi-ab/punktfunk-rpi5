@@ -1,5 +1,5 @@
 # One-shot provisioning of the WDK + cargo-wdk onto the persistent self-hosted windows-amd64 runner, so
-# the all-Rust UMDF drivers can build there (docs/windows-host-rewrite.md, M0). The runner has the base
+# the all-Rust UMDF drivers can build there (design/windows-host-rewrite.md, M0). The runner has the base
 # Windows SDK + MSVC + LLVM + Rust but NOT the WDK (no km/wdf/iddcx headers) or cargo-wdk.
 #
 # Dispatch manually (workflow_dispatch). Idempotent: re-running is a near no-op once provisioned. The

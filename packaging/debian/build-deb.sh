@@ -57,7 +57,7 @@ install -Dm0644 scripts/headless/punktfunk-sink.conf   "$SHAREDIR/headless/punkt
 install -Dm0644 scripts/host.env.example           "$SHAREDIR/host.env.example"
 install -Dm0644 packaging/bazzite/host.env         "$SHAREDIR/host.env.bazzite"
 install -Dm0644 packaging/kde/host.env             "$SHAREDIR/host.env.kde"
-install -Dm0644 docs/api/openapi.json              "$SHAREDIR/openapi.json"
+install -Dm0644 api/openapi.json              "$SHAREDIR/openapi.json"
 install -Dm0644 LICENSE-MIT                         "$DOCDIR/LICENSE-MIT"
 install -Dm0644 LICENSE-APACHE                      "$DOCDIR/LICENSE-APACHE"
 install -Dm0644 README.md                           "$DOCDIR/README.md"

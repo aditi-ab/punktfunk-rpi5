@@ -1,5 +1,5 @@
 //! USER-session WGC helper (Windows) — part of the two-process secure-desktop design
-//! (docs/windows-secure-desktop.md).
+//! (design/windows-secure-desktop.md).
 //!
 //! WGC won't activate under the SYSTEM account, but the host must run as SYSTEM for the secure
 //! desktop. So the SYSTEM host spawns THIS helper in the interactive user session

@@ -16,8 +16,8 @@ sidebar, and the landing page). It reads [`public/openapi.json`](public/openapi.
 
 ```sh
 # from the repo root — regenerate the spec, then copy the snapshot in:
-cargo run -p punktfunk-host -- openapi > docs/api/openapi.json
-cp docs/api/openapi.json docs-site/public/openapi.json
+cargo run -p punktfunk-host -- openapi > api/openapi.json
+cp api/openapi.json docs-site/public/openapi.json
 ```
 
 ## Develop

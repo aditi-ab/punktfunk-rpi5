@@ -361,4 +361,4 @@ ever switched to a logged-in GUI session, re-adding macOS to the job's capture s
 - Mid-stream renegotiation (resolution change without reconnect) is designed-for but not
   implemented (the Welcome is one-shot today).
 - Host-side gamepad injection needs `/dev/uinput` access on the box (udev rule from
-  `docs/linux-setup.md`).
+  `design/linux-setup.md`).

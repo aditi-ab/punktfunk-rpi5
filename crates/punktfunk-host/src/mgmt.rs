@@ -6,7 +6,7 @@
 //! The API is versioned under `/api/v1` and described by an OpenAPI 3.1 document generated
 //! at compile time with `utoipa` — `punktfunk-host openapi` prints it for client codegen, the
 //! running server serves it at `/api/v1/openapi.json` plus interactive docs at `/api/docs`,
-//! and a copy is checked in at `docs/api/openapi.json` (a test fails if it drifts, like the
+//! and a copy is checked in at `api/openapi.json` (a test fails if it drifts, like the
 //! cbindgen header).
 //!
 //! Security: binds loopback by default, serves HTTPS with the host's identity cert, and requires
@@ -164,7 +164,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
 }
 
 /// The OpenAPI document as pretty JSON — what `punktfunk-host openapi` prints and what is
-/// checked in at `docs/api/openapi.json` for client codegen.
+/// checked in at `api/openapi.json` for client codegen.
 pub fn openapi_json() -> String {
     let (_, api) = api_router_parts();
     let mut json = api.to_pretty_json().expect("serialize OpenAPI document");
@@ -1663,14 +1663,14 @@ mod tests {
             serde_json::json!([{}])
         );
 
-        let checked_in = include_str!("../../../docs/api/openapi.json");
+        let checked_in = include_str!("../../../api/openapi.json");
         // Compare content, not line-ending style: the generated `json` is LF (serde_json), but git
         // may check the file out CRLF on Windows.
         assert_eq!(
             json.trim().replace('\r', ""),
             checked_in.trim().replace('\r', ""),
-            "docs/api/openapi.json is stale — regenerate with: \
-             cargo run -p punktfunk-host -- openapi > docs/api/openapi.json"
+            "api/openapi.json is stale — regenerate with: \
+             cargo run -p punktfunk-host -- openapi > api/openapi.json"
         );
     }
 

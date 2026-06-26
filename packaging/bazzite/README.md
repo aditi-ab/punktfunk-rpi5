@@ -257,7 +257,7 @@ journalctl --user -u punktfunk-host -f
 
 > ⚠️ **There is no firewall script or firewall doc in the repo.** The ports below are derived
 > directly from the code constants (`crates/punktfunk-host/src/gamestream/mod.rs`, `mgmt.rs`) and
-> the GameStream-host port-map (`docs/gamestream-host-plan.md`). Treat the `firewall-cmd` lines as recommended-but-verified,
+> the GameStream-host port-map (`design/gamestream-host-plan.md`). Treat the `firewall-cmd` lines as recommended-but-verified,
 > not a checked-in script.
 
 **GameStream / Moonlight ports** (fixed; Moonlight derives them from the HTTP base). These only apply

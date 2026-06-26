@@ -1,7 +1,7 @@
 //! The 4-phase GameStream pairing state machine (over HTTP), keyed by `uniqueid`. Proves
 //! both sides know the PIN (via the SHA-256(salt||pin) AES-ECB key) and own their certs
 //! (RSA signatures), then pins the client cert. The final `pairchallenge` happens over
-//! HTTPS (handled in `nvhttp`). Byte-exact spec: `docs/research/…-research.json`.
+//! HTTPS (handled in `nvhttp`). Byte-exact spec: `design/research/…-research.json`.
 
 use super::cert::ServerIdentity;
 use super::crypto;

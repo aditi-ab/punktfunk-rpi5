@@ -205,5 +205,5 @@ cat <<'NEXT'
        export XDG_RUNTIME_DIR=/run/user/$(id -u) WAYLAND_DISPLAY=wayland-1
        swaymsg -t get_outputs                         # confirm HEADLESS-1
        bash scripts/headless/capture-smoke-test.sh    # wf-recorder -> hevc_nvenc -> /tmp/*.mkv
-  5. Then start M0 proper: see docs/linux-setup.md.
+  5. Then start M0 proper: see design/linux-setup.md.
 NEXT

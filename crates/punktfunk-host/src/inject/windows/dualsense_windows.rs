@@ -109,7 +109,7 @@ pub(super) struct SwDeviceProfile<'a> {
 /// `profile.instance`). The returned `HSWDEVICE` owns it — `SwDeviceClose` removes it on drop, so the
 /// pad appears/disappears with the session and nothing persists.
 ///
-/// **Game-detection identity** (see `docs/windows-dualsense-game-detection.md`). `HIDD_ATTRIBUTES`
+/// **Game-detection identity** (see `design/windows-dualsense-game-detection.md`). `HIDD_ATTRIBUTES`
 /// alone (VID/PID via the IOCTL) satisfies SDL/HIDAPI/RawInput, but a native PS5 path (libScePad-
 /// style raw HID) classifies the *connection type* by walking from the HID child to its parent
 /// (`CM_Get_Parent`) and string-matching `"USB"`/`"BTHENUM"` in that parent's

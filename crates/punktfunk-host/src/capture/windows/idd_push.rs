@@ -562,7 +562,7 @@ impl IddPushCapturer {
 
     /// Block (bounded) until the driver has ATTACHED to the host ring (`DRV_STATUS_OPENED`) **and published
     /// a first frame**, else fail so the caller can fall back to DDA (audit §5.1 +
-    /// `docs/windows-host-rewrite.md` §2.5 — the GB1 game-capture fix).
+    /// `design/windows-host-rewrite.md` §2.5 — the GB1 game-capture fix).
     ///
     /// Requiring the first frame — not just the attach — catches the *reconnect-into-a-broken-state* case:
     /// a fullscreen game can leave the virtual display in a format/size that the driver's `publish()` guard

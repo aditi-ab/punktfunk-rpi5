@@ -1,6 +1,6 @@
 # pf-vdisplay — the all-Rust UMDF IddCx virtual-display driver (M1 step-2 rewrite onto wdk-sys + the
 # owned pf-driver-proto ABI). Replaces the vendored-binding oracle at packaging/windows/vdisplay-driver/
-# (deleted once on-glass parity is reached, per docs/windows-host-rewrite.md §14 STEP 8).
+# (deleted once on-glass parity is reached, per design/windows-host-rewrite.md §14 STEP 8).
 [package]
 name = "pf-vdisplay"
 edition.workspace = true

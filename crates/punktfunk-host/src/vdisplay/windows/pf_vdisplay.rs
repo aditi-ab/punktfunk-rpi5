@@ -6,7 +6,7 @@
 //!
 //! Control surface: a device-interface-GUID + `CreateFileW` + `DeviceIoControl` IOCTL protocol, with
 //! the wire contract OWNED by [`pf_driver_proto::control`] (versioned + `#[repr(C)] Pod` structs,
-//! NOT the SudoVDA ABI). No DLL, no named pipe. See `docs/windows-host-rewrite.md`.
+//! NOT the SudoVDA ABI). No DLL, no named pipe. See `design/windows-host-rewrite.md`.
 //!
 //! This is a faithful clone of [`super::sudovda`] (the shipping fallback) repointed at the new driver:
 //! same reference-counted/lingering monitor lifecycle, same CCD isolation + active-mode forcing — those

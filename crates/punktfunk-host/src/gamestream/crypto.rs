@@ -1,7 +1,7 @@
 //! Pairing crypto primitives (control plane only — distinct from `punktfunk_core`'s AES-GCM
 //! data-plane sealing). GameStream pairing uses: AES-128-**ECB** with **no padding**,
 //! SHA-256 (host appversion major ≥ 7), and RSA-PKCS1v15-SHA256 signatures. See the
-//! `serverinfo + pairing` section of `docs/research/gamestream-protocol-research.json`.
+//! `serverinfo + pairing` section of `design/research/gamestream-protocol-research.json`.
 
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};

@@ -1,5 +1,5 @@
 //! Host-side WGC helper relay (Windows two-process secure-desktop design,
-//! docs/windows-secure-desktop.md — step 4).
+//! design/windows-secure-desktop.md — step 4).
 //!
 //! WGC won't activate under the SYSTEM account, so the SYSTEM host can't capture the normal desktop
 //! itself. Instead it spawns `punktfunk-host wgc-helper` in the **interactive user session** (so WGC works)

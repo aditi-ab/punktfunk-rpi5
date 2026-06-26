@@ -1,7 +1,7 @@
 # punktfunk web — management console
 
 The browser UI for the punktfunk host's **management REST API** (`crates/punktfunk-host/src/mgmt.rs`,
-OpenAPI at `docs/api/openapi.json`). It shows live status, host capabilities, paired
+OpenAPI at `api/openapi.json`). It shows live status, host capabilities, paired
 clients, the pairing-PIN flow, and session controls.
 
 Stack: **TanStack Start** (full SSR) on **Bun** via **Nitro v2** (`bun` preset) · **React
@@ -88,7 +88,7 @@ Generated code is **not committed** (gitignored) — reproduced from sources:
   `bun install` (`prepare`) and before `dev`/`build` (`pre*` for orval; the Vite plugin
   compiles paraglide on dev/build).
 - After a management-API change, regenerate the spec on the Rust side first:
-  `cargo run -p punktfunk-host -- openapi > docs/api/openapi.json`, then `bun run api:gen`.
+  `cargo run -p punktfunk-host -- openapi > api/openapi.json`, then `bun run api:gen`.
 
 ## Layout
 

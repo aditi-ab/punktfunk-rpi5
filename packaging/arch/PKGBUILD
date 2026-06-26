@@ -94,7 +94,7 @@ package_punktfunk-host() {
   install -Dm0644 "$R/scripts/host.env.example"              "$pkgdir/usr/share/punktfunk/host.env.example"
   install -Dm0644 "$R/packaging/bazzite/host.env"            "$pkgdir/usr/share/punktfunk/host.env.bazzite"
   install -Dm0644 "$R/packaging/kde/host.env"                "$pkgdir/usr/share/punktfunk/host.env.kde"
-  install -Dm0644 "$R/docs/api/openapi.json"                 "$pkgdir/usr/share/punktfunk/openapi.json"
+  install -Dm0644 "$R/api/openapi.json"                 "$pkgdir/usr/share/punktfunk/openapi.json"
   install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-MIT"
   install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-APACHE"
   install -Dm0644 "$R/README.md"      "$pkgdir/usr/share/doc/punktfunk-host/README.md"

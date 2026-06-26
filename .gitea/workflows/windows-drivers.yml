@@ -1,5 +1,5 @@
 # Windows driver workspace CI — runs on the self-hosted Windows runner (home-windows-1, host mode;
-# label windows-amd64). Part of the Windows-host rewrite (docs/windows-host-rewrite.md, M0).
+# label windows-amd64). Part of the Windows-host rewrite (design/windows-host-rewrite.md, M0).
 #
 # Stage 1 (this file): PROBE the runner's driver toolchain (WDK / EWDK / cargo-make / LLVM / the
 # inf2cat/stampinf/devgen/signtool tools) so we know what's provisioned BEFORE writing driver code,

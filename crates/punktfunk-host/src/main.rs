@@ -389,7 +389,7 @@ fn real_main() -> Result<()> {
         }
         // USER-session WGC helper (Windows two-process secure-desktop design): capture the EXISTING
         // SudoVDA via WGC + NVENC, stream AUs on stdout to the SYSTEM host. Spawned by the host
-        // (CreateProcessAsUser), not run by hand. See docs/windows-secure-desktop.md.
+        // (CreateProcessAsUser), not run by hand. See design/windows-secure-desktop.md.
         #[cfg(target_os = "windows")]
         Some("wgc-helper") => {
             let get = |flag: &str| {
@@ -704,7 +704,7 @@ SPIKE OPTIONS:
 
 NOTES:
     'portal' needs headless Sway + xdg-desktop-portal-wlr running in this session
-    (see docs/linux-setup.md). 'synthetic' needs no capture session and always runs.
+    (see design/linux-setup.md). 'synthetic' needs no capture session and always runs.
     Encoded AUs are written to a playable file AND (unless --no-loopback) fed through a
     punktfunk_core host→client loopback that reassembles and byte-verifies each one.
     Both 'serve' and 'punktfunk1-host' advertise the native service over mDNS

@@ -1,6 +1,6 @@
 # Unified in-tree workspace for punktfunk's all-Rust UMDF drivers, on microsoft/windows-drivers-rs
 # (crates.io wdk/wdk-sys/wdk-build — NOT the dev-box ../../crates/wdk* path-deps). Part of the
-# Windows-host rewrite (docs/windows-host-rewrite.md, M1). pf-vdisplay + the gamepad drivers move here.
+# Windows-host rewrite (design/windows-host-rewrite.md, M1). pf-vdisplay + the gamepad drivers move here.
 #
 # Separate from the main cargo workspace (own [workspace] root) because driver crates are cdylibs built
 # with the WDK toolchain (cargo-wdk / wdk-build) on Windows only. Path-deps the shared ABI crate

@@ -1,9 +1,9 @@
 # Root build context is used only by web/Dockerfile, which needs web/ and
-# docs/api/openapi.json. Allowlist those; keep everything else (target/, .git, crates)
+# api/openapi.json. Allowlist those; keep everything else (target/, .git, crates)
 # out of the context upload.
 *
 !web
-!docs/api/openapi.json
+!api/openapi.json
 web/node_modules
 web/.output
 web/dist

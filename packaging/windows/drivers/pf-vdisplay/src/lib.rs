@@ -1,5 +1,5 @@
 //! pf-vdisplay — the all-Rust UMDF IddCx virtual-display driver (M1 step-2 rewrite, on wdk-sys + the
-//! owned pf-driver-proto ABI). See docs/windows-host-rewrite.md §14 for the full port plan.
+//! owned pf-driver-proto ABI). See design/windows-host-rewrite.md §14 for the full port plan.
 //!
 //! STEP 2: the IddCx driver SKELETON — DriverEntry → driver_add builds the full `IDD_CX_CLIENT_CONFIG`
 //! (14 IddCx callbacks + the PnP `EvtDeviceD0Entry`, all stubs) sized via the versioned

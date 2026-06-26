@@ -2221,7 +2221,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // Windows two-process secure-desktop path: when the host runs as SYSTEM (required for the secure
     // desktop + SendInput), WGC can't activate in-process, so we capture the normal desktop via a
     // helper spawned in the user session and relay its AUs. (Single-process WGC/DDA is used as the
-    // user, and stays the path on Linux.) See docs/windows-secure-desktop.md.
+    // user, and stays the path on Linux.) See design/windows-secure-desktop.md.
     #[cfg(target_os = "windows")]
     if plan.topology == crate::session_plan::SessionTopology::TwoProcessRelay {
         return virtual_stream_relay(ctx);

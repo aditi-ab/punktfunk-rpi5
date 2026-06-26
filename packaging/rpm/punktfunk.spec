@@ -224,7 +224,7 @@ install -Dm0644 packaging/kde/host.env                 %{buildroot}%{_datadir}/%
 # Bazzite KDE Desktop-mode one-shot setup (KWIN_WAYLAND_NO_PERMISSION_CHECKS + RemoteDesktop grant).
 install -d %{buildroot}%{_datadir}/%{name}/bazzite
 install -Dm0755 packaging/bazzite/kde-desktop-setup.sh %{buildroot}%{_datadir}/%{name}/bazzite/kde-desktop-setup.sh
-install -Dm0644 docs/api/openapi.json                  %{buildroot}%{_datadir}/%{name}/openapi.json
+install -Dm0644 api/openapi.json                  %{buildroot}%{_datadir}/%{name}/openapi.json
 
 %if %{with web}
 # --- web console subpackage (punktfunk-web) ---
@@ -246,7 +246,7 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 
 %files
 %license LICENSE-MIT LICENSE-APACHE
-%doc README.md docs/implementation-plan.md packaging/README.md
+%doc README.md design/implementation-plan.md packaging/README.md
 %{_bindir}/punktfunk-host
 %{_udevrulesdir}/60-punktfunk.rules
 %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf

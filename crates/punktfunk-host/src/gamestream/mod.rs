@@ -1,7 +1,7 @@
 //! GameStream (P1) control plane — what a stock Moonlight/Artemis client talks to around
 //! the media streams: mDNS discovery, the nvhttp serverinfo + pairing HTTP(S) API, RTSP,
 //! and the ENet control stream. `tokio`/`axum` live here (control plane, I/O-bound — never
-//! the per-frame hot path; that is `punktfunk_core`'s P1 wire codec). See `docs/gamestream-host-plan.md`.
+//! the per-frame hot path; that is `punktfunk_core`'s P1 wire codec). See `design/gamestream-host-plan.md`.
 //!
 //! Status: P1.1 — mDNS `_nvstream._tcp` advertisement + `/serverinfo`. Pairing, RTSP, and
 //! the media streams follow (see the GameStream host task list / plan).

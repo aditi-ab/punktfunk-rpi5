@@ -11,7 +11,7 @@
 
 /* ── punktfunk brand · violet product chrome ────────────────────────────────
    Two themes on one violet identity: LIGHT (lavender docs surface — the same
-   palette the docs/Scalar reference uses: white bg, faint-violet cards/borders,
+   palette the design/Scalar reference uses: white bg, faint-violet cards/borders,
    #6c5bf3 brand) is the :root default; DARK (the violet-tinted app-icon chrome
    #141019 / #1c1530, #a79ff8 brand) is the `.dark` override. The live console
    pins `<html class="dark">` so it stays dark by default — removing or toggling

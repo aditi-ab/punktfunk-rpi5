@@ -24,7 +24,7 @@ on:
   push:
     branches: [main]
     # The flatpak is the CLIENT — only rebuild when the client/core/manifest change, not on every
-    # docs/host push (this is a heavy flatpak-builder run). Tags (v*, the client release) build too.
+    # design/host push (this is a heavy flatpak-builder run). Tags (v*, the client release) build too.
     paths:
       - 'clients/linux/**'
       - 'crates/punktfunk-core/**'

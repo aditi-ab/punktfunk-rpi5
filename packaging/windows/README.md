@@ -76,10 +76,11 @@ read it from `%ProgramData%\punktfunk\web-password`.
 | `reset-pf-vdisplay.ps1` | **Dev:** recover a wedged driver — stop host → reap ghost monitor nodes → reload the adapter → start host (no reboot). See *Dev iteration* below. |
 | `redeploy-pf-vdisplay.ps1` | **Dev:** one-shot redeploy — (optional) build → stop host → `deploy-dev.ps1 -Install` → reload adapter → start host. |
 | `nvenc/nvenc.def`, `nvenc/gen-nvenc-importlib.ps1` | Synthesise `nvencodeapi.lib` for the `--features nvenc` link (llvm-dlltool / lib.exe). |
+| `pf-vkhdr-layer/` | **HDR Vulkan layer** (standalone `cdylib`): lets Vulkan games (Doom: The Dark Ages, etc.) enable HDR over the virtual display by advertising the HDR surface formats the NVIDIA/AMD ICDs hide on an indirect display. Built by the packer, laid into `{app}\vklayer`, registered under `HKLM64\…\Khronos\Vulkan\ImplicitLayers` (opt-out *Install the HDR Vulkan layer* task). Self-gated on the display's HDR state. See its README. |
 
 > **Vendored driver:** pf-vdisplay is our **all-Rust IddCx** virtual display (UMDF2), built from
 > `packaging/windows/drivers/`. It replaced the vendored SudoVDA C++ driver — full story in
-> [`docs/windows-virtual-display-rust-port.md`](../../docs/windows-virtual-display-rust-port.md). The
+> [`design/windows-virtual-display-rust-port.md`](../../design/windows-virtual-display-rust-port.md). The
 > **signed** output (`pf_vdisplay.dll`/`.inf`/`.cat` + `punktfunk-driver.cer`; signer
 > `punktfunk-ds-test` — the same cert the gamepad drivers ship, Class=Display, HWID `root\pf_vdisplay`)
 > is checked in under `pf-vdisplay/`. To refresh it after a driver-source change, rebuild + re-sign with
