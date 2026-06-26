@@ -1,8 +1,12 @@
-# punktfunk
+<p align="center">
+  <img src="assets/punktfunk-logo.svg" alt="punktfunk" width="320" />
+</p>
 
-**Low-latency desktop and game streaming with first-class Linux and Windows hosts.** Run the host on
-a Linux machine or a Windows PC, connect from a Mac, PC, phone, tablet, or TV, and stream your desktop
-or games — each device at its **own native resolution and refresh rate**, over your local network.
+<p align="center"><b>Low-latency desktop and game streaming with first-class Linux and Windows hosts.</b></p>
+
+Run the host on a Linux machine or a Windows PC, connect from a Mac, PC, phone, tablet, or TV, and
+stream your desktop or games — each device at its **own native resolution and refresh rate**, over
+your local network.
 
 📖 **Documentation: [docs.punktfunk.unom.io](https://docs.punktfunk.unom.io)** — start with
 [How It Works](https://docs.punktfunk.unom.io/docs/how-it-works) or the
@@ -43,7 +47,7 @@ protocol, FEC, and crypto, linked into the host and every client over a stable C
 | **Core** — `punktfunk-core` + C ABI (protocol · FEC · crypto · QUIC) | ✅ Complete & hardened |
 | **GameStream host** → stock Moonlight | ✅ Live end-to-end: pairing, RTSP, audio, per-client virtual output at native resolution, GPU zero-copy NVENC, gamepads |
 | **Native protocol** — `punktfunk/1` | ✅ Validated live: QUIC control + GF(2¹⁶) FEC/AES-GCM data plane, PIN pairing, mDNS discovery, mid-stream mode renegotiation |
-| **Windows host** (NVIDIA, x64) | 🟡 Implemented & shipping as a signed installer (DXGI capture · SudoVDA virtual display · NVENC · WASAPI · ViGEm); NVIDIA-only, newer than the Linux host |
+| **Windows host** (x64) | 🟡 Implemented & shipping as a signed installer: DXGI/WGC capture · its own all-Rust IddCx **virtual display** (secure-desktop capable) · GPU encode (NVENC on NVIDIA, AMF/QSV on AMD/Intel) · WASAPI audio · bundled virtual-gamepad drivers (no ViGEmBus) · HDR incl. Vulkan-game HDR. NVIDIA live-validated; AMD/Intel CI-green |
 | **macOS / iOS / tvOS client** (`clients/apple`) | ✅ Streaming live: VideoToolbox decode, controllers incl. DualSense, discovery, pairing, speed test |
 | **Linux client** (`clients/linux`, GTK4) | ✅ Streaming live: FFmpeg + VAAPI zero-copy decode, PipeWire audio, SDL3 controllers; ships as Flatpak/apt/rpm/Arch |
 | **Android client** (`clients/android`, phone + TV) | ✅ Streaming live: AMediaCodec decode + HDR10, Oboe audio, controllers, discovery, pairing |
@@ -69,14 +73,14 @@ roadmap: **[/docs/roadmap](https://docs.punktfunk.unom.io/docs/roadmap)**.
 
 Pick your platform and install from its package registry — the per-platform guide covers adding the
 repo, first run, and the web console. The Linux host is the primary, most battle-tested path; a
-Windows host (NVIDIA-only) also ships as a signed installer.
+Windows host also ships as a signed installer (all-vendor: NVIDIA, AMD, Intel).
 
 | Platform | Install | Guide |
 |--------|---------|-------|
 | **Ubuntu / Debian** (apt) | `sudo apt install punktfunk-host` *(after adding the repo)* | [Ubuntu — GNOME](https://docs.punktfunk.unom.io/docs/ubuntu-gnome) · [KDE](https://docs.punktfunk.unom.io/docs/ubuntu-kde) |
 | **Fedora / Bazzite** (rpm-ostree) | `rpm-ostree install punktfunk punktfunk-web` *(or the bootc image)* | [Fedora — KDE](https://docs.punktfunk.unom.io/docs/fedora-kde) · [Bazzite](https://docs.punktfunk.unom.io/docs/bazzite) |
 | **Arch / Steam Deck** (PKGBUILD / sysext) | `makepkg -si` *(Arch)* · sysext `.raw` *(SteamOS)* | [packaging/arch](packaging/arch/README.md) |
-| **Windows** (NVIDIA, x64) | signed `setup.exe` from the package registry | [Windows Host](https://docs.punktfunk.unom.io/docs/windows-host) |
+| **Windows** (x64) | signed `setup.exe` from the package registry | [Windows Host](https://docs.punktfunk.unom.io/docs/windows-host) |
 
 `punktfunk-host` is the streaming host; `punktfunk-web` is the browser console (pairing + status).
 After install, run `punktfunk-host serve` inside your desktop session (the secure native default;
@@ -121,7 +125,7 @@ and the [docs site](https://docs.punktfunk.unom.io).
 ```
 crates/
   punktfunk-core/   protocol · FEC · pacing · crypto · QUIC control plane — the C ABI (lib + cdylib + staticlib)
-  punktfunk-host/   Linux host: virtual displays · capture · encode · input · GameStream · punktfunk/1 · mgmt
+  punktfunk-host/   the host (Linux + Windows): virtual displays · capture · encode · input · GameStream · punktfunk/1 · mgmt
 clients/
   apple/    macOS / iOS / tvOS app (Swift · VideoToolbox · Metal · GameController)
   linux/    Linux desktop app (Rust · GTK4/libadwaita · FFmpeg/VAAPI · PipeWire · SDL3)
@@ -132,7 +136,7 @@ clients/
 web/                         web console (TanStack) over the management API — status · devices · pairing
 packaging/                   apt · rpm / COPR · Arch · Flatpak · Bazzite bootc image
 docs-site/                   public documentation site (Fumadocs) — https://docs.punktfunk.unom.io
-design/                        design notes & deep-dive plans
+design/                        design notes & deep-dive plans (index: design/README.md)
 include/punktfunk_core.h     cbindgen-generated C header (checked in)
 tools/                       latency-probe · loss-harness (measurement)
 ```
