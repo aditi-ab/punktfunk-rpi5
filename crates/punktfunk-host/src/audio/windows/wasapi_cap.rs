@@ -106,7 +106,10 @@ fn capture_thread(
     }
     let res = (|| -> Result<()> {
         // Loopback = capture the RENDER endpoint: get the default render device, but open a CAPTURE
-        // client with loopback=true over it.
+        // client with loopback=true over it. NOTE: the virtual mic (`super::wasapi_mic`) is guarded
+        // to NEVER target this same endpoint — otherwise the client's injected mic would be captured
+        // here and streamed back to the client (infinite echo). Keep that guard in sync if this
+        // device selection ever changes.
         let device = DeviceEnumerator::new()
             .context("DeviceEnumerator")?
             .get_default_device(&Direction::Render)
