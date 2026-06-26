@@ -35,6 +35,9 @@ mod gamestream;
 mod hdr;
 mod inject;
 #[cfg(target_os = "windows")]
+#[path = "windows/install.rs"]
+mod install;
+#[cfg(target_os = "windows")]
 #[path = "windows/interactive.rs"]
 mod interactive;
 mod library;
@@ -390,7 +393,7 @@ fn real_main() -> Result<()> {
         }
         // USER-session WGC helper (Windows two-process secure-desktop design): capture the EXISTING
         // SudoVDA via WGC + NVENC, stream AUs on stdout to the SYSTEM host. Spawned by the host
-        // (CreateProcessAsUser), not run by hand. See design/windows-secure-desktop.md.
+        // (CreateProcessAsUser), not run by hand. See design/archive/windows-secure-desktop.md.
         #[cfg(target_os = "windows")]
         Some("wgc-helper") => {
             let get = |flag: &str| {
@@ -422,6 +425,12 @@ fn real_main() -> Result<()> {
         // that launches the host into the active interactive session.
         #[cfg(target_os = "windows")]
         Some("service") => service::main(&args[1..]),
+        // Install-time work the Windows installer delegates to the exe instead of locale-parsed
+        // PowerShell *files* (the ANSI-codepage parse-break root fix; see windows/install.rs).
+        #[cfg(target_os = "windows")]
+        Some("driver") => install::driver_main(&args[1..]),
+        #[cfg(target_os = "windows")]
+        Some("web") => install::web_main(&args[1..]),
         Some("-h") | Some("--help") | Some("help") | None => {
             print_usage();
             Ok(())

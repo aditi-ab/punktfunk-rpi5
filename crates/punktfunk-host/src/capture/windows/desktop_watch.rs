@@ -1,5 +1,5 @@
 //! Input-desktop watcher (Windows) — the authoritative "normal vs secure desktop" signal for the
-//! two-process secure-desktop design (design/windows-secure-desktop.md).
+//! two-process secure-desktop design (design/archive/windows-secure-desktop.md).
 //!
 //! Windows switches the *input desktop* to "Winlogon" (the secure desktop) for UAC elevation, the
 //! lock screen and the login screen, and back to "Default" for the normal session. WGC captures only
