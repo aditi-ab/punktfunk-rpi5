@@ -19,6 +19,8 @@ export function baseOptions(): BaseLayoutProps {
       { text: 'API', url: '/api' },
       { text: 'Website', url: 'https://punktfunk.unom.io' },
       { text: 'Source code', url: 'https://git.unom.io/unom/punktfunk' },
+      { text: 'Discord', url: 'https://discord.gg/kaPNvzMuGU' },
+      { text: 'Reddit', url: 'https://www.reddit.com/r/Punktfunk/' },
     ],
   }
 }

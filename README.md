@@ -8,6 +8,9 @@ or games — each device at its **own native resolution and refresh rate**, over
 [How It Works](https://docs.punktfunk.unom.io/docs/how-it-works) or the
 [Quick Start](https://docs.punktfunk.unom.io/docs/quickstart).
 
+💬 **Community: [Discord](https://discord.gg/kaPNvzMuGU)** — chat, support, and **Android beta
+access** · **[r/Punktfunk](https://www.reddit.com/r/Punktfunk/)**.
+
 punktfunk pairs a **virtual-display streaming host** with native clients on every platform. It speaks
 the existing **GameStream** protocol, so any [Moonlight](https://moonlight-stream.org/) client works
 day one — and adds its own faster **`punktfunk/1`** protocol that breaks the ~1 Gbps FEC wall with a

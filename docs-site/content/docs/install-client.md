@@ -20,7 +20,7 @@ Whichever client you install, the first connection needs a one-time [pairing](/d
 | **Windows** | [Signed MSIX](#windows) from the package registry |
 | **macOS** | [Notarized `.dmg`](#macos) from the releases page |
 | **iPhone / iPad / Apple TV** | [TestFlight beta](#ios-ipados-apple-tv) |
-| **Android / Android TV** | [Google Play](#android) |
+| **Android / Android TV** | [Beta — request access](#android) |
 | Anything else (browser, old phone, TV) | [Moonlight](/docs/moonlight) |
 
 ## Linux desktop (Flatpak)
@@ -118,12 +118,16 @@ Open the app, and your hosts appear automatically under *On this network*.
 
 ## Android
 
-The Android client (phone + Android TV) is on **Google Play**:
+The Android client (phone + Android TV) is in **Google Play Internal Testing**. To try it, request a
+tester invite on our [**Discord**](https://discord.gg/kaPNvzMuGU) and we'll add your Google account to
+the test track:
+
+**[Request access on Discord →](https://discord.gg/kaPNvzMuGU)**
+
+Once you're added, install it from Google Play, then open the app and pick your host:
 
 **[Get punktfunk on Google Play →](https://play.google.com/store/apps/details?id=io.unom.punktfunk)**
-
-Install, open the app, and pick your host. _(The app is in testing — if the listing isn't visible
-to you yet, you'll need to be added to the test track.)_
+_(only resolves once your account is on the tester list)_
 
 ## Anything else — Moonlight
 

@@ -64,8 +64,10 @@ DualSense feedback, automatic host discovery, PIN pairing with pinned reconnects
 overlay — with D-pad and game-controller focus navigation for the couch. It builds from the
 `clients/android` directory (Kotlin + a shared Rust core).
 
-Install it from **Google Play** — see [Install a Client](/docs/install-client#android). Open the app,
-pick your host, [pair](/docs/pairing) once, and stream.
+The app is in **Google Play Internal Testing** — request a tester invite on our
+[**Discord**](https://discord.gg/kaPNvzMuGU) and we'll add you (see
+[Install a Client](/docs/install-client#android)). Once added, open the app, pick your host,
+[pair](/docs/pairing) once, and stream.
 
 ## Windows desktop client
 
