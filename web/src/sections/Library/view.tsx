@@ -19,6 +19,22 @@ function customId(entry: GameEntry): string {
 		: entry.id;
 }
 
+/**
+ * Display label for a store badge. Steam and custom keep their localized strings; every other store
+ * (lutris, heroic, epic, …) is a proper noun shown capitalized, so new providers surface correctly
+ * without a translation per store.
+ */
+function storeLabel(store: string): string {
+	switch (store) {
+		case "custom":
+			return m.library_store_custom();
+		case "steam":
+			return m.library_store_steam();
+		default:
+			return store.charAt(0).toUpperCase() + store.slice(1);
+	}
+}
+
 interface FormState {
 	title: string;
 	portrait: string;
@@ -276,7 +292,7 @@ const GameCard: FC<GameCardProps> = ({ game, onEdit, onDelete, deleting }) => {
 						variant={isCustom ? "secondary" : "outline"}
 						className="bg-background/80 backdrop-blur"
 					>
-						{isCustom ? m.library_store_custom() : m.library_store_steam()}
+						{storeLabel(game.store)}
 					</Badge>
 				</div>
 				{isCustom && (
