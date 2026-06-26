@@ -775,13 +775,15 @@ fn gog_games() -> Vec<GameEntry> {
         let Some((exe, args, workdir)) = gog_play_task(&path, &sub) else {
             continue;
         };
+        let id = format!("gog:{sub}");
+        // Art (public api.gog.com) is resolved off the hot path by the background warmer; read
+        // whatever it has cached (title-only until warmed).
+        let art = cached_art(&id).unwrap_or_default();
         out.push(GameEntry {
-            id: format!("gog:{sub}"),
+            id,
             store: "gog".into(),
             title,
-            // GOG cover art is the public api.gog.com (no key) but needs an HTTP fetch + cache off the
-            // hot all_games() path — deferred; title-only for now (the client renders that gracefully).
-            art: Artwork::default(),
+            art,
             launch: Some(LaunchSpec {
                 kind: "gog".into(),
                 value: format!("{exe}\t{args}\t{workdir}"),
@@ -904,13 +906,15 @@ fn xbox_games() -> Vec<GameEntry> {
             } else {
                 store_id
             };
+            let id = format!("xbox:{id_key}");
+            // Art (unofficial displaycatalog, keyed by StoreId) is resolved off the hot path by the
+            // background warmer; read whatever it has cached (title-only until warmed / if no StoreId).
+            let art = cached_art(&id).unwrap_or_default();
             games.push(GameEntry {
-                id: format!("xbox:{id_key}"),
+                id,
                 store: "xbox".into(),
                 title,
-                // displaycatalog.mp.microsoft.com cover art (no key, but unofficial + needs an HTTP
-                // fetch + cache off the hot path) is deferred → title-only (rendered gracefully).
-                art: Artwork::default(),
+                art,
                 launch: Some(LaunchSpec {
                     kind: "aumid".into(),
                     value: format!("{pfn}!{app_id}"),
@@ -992,6 +996,171 @@ fn xbox_pfn(identity: &str) -> Option<String> {
 fn pfn_from_full(dir_name: &str, identity: &str) -> Option<String> {
     let hash = dir_name.rsplit('_').next()?;
     (!hash.is_empty() && hash != dir_name).then(|| format!("{identity}_{hash}"))
+}
+
+// ---------------------------------------------------------------------------------------
+// Cover-art resolver + cache (shared by the Windows GOG + Xbox providers, which have no local
+// art). A disk cache is the source of truth read by all_games() (so the list/launch path never
+// blocks on the network); a host-lifetime background warmer fetches uncached art (GOG's public
+// api.gog.com + Xbox's displaycatalog, both no-auth) and persists it. Cross-platform so the
+// HTTP/JSON code is compiled + checked everywhere; the warmer simply finds nothing to fetch on a
+// host whose stores all carry their own art (Steam CDN / Heroic CDN / Lutris data: URLs).
+// ---------------------------------------------------------------------------------------
+
+/// The persisted art cache: GameEntry id → resolved [`Artwork`]. An entry's PRESENCE means "already
+/// resolved" (even an empty Artwork = fetched, none found) so the warmer never re-fetches it.
+fn art_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Artwork>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Artwork>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let loaded = std::fs::read_to_string(art_cache_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        std::sync::Mutex::new(loaded)
+    })
+}
+
+/// The art cache lives in the canonical HOST config dir (`%ProgramData%\punktfunk` on Windows /
+/// `~/.config/punktfunk` on Linux — gamestream::config_dir, NOT the legacy XDG/HOME `config_dir`
+/// below that the custom store still uses).
+fn art_cache_path() -> PathBuf {
+    crate::gamestream::config_dir().join("library-art-cache.json")
+}
+
+/// The cached art for a library id, if it has been resolved (positive or negative). `None` = not yet
+/// warmed → the provider shows title-only until the warmer fills it in.
+fn cached_art(id: &str) -> Option<Artwork> {
+    art_cache().lock().unwrap().get(id).cloned()
+}
+
+/// Record resolved art for a library id + persist the cache (write-then-rename; best-effort).
+fn store_art(id: &str, art: Artwork) {
+    let mut cache = art_cache().lock().unwrap();
+    cache.insert(id.to_string(), art);
+    if let Ok(json) = serde_json::to_string(&*cache) {
+        let path = art_cache_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Start the host-lifetime cover-art warmer: every few minutes, fetch + cache art for any library
+/// entry whose store needs a network lookup (GOG / Xbox) and isn't cached yet. Idempotent — once
+/// everything is cached a pass makes no network calls (and a host with only self-art stores never
+/// fetches at all). Call once from `serve()`; the returned handle can be dropped to detach it.
+pub fn start_art_warmer() -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("pf-art-warmer".into())
+        .spawn(|| loop {
+            warm_art_once();
+            std::thread::sleep(std::time::Duration::from_secs(300));
+        })
+        .expect("spawn art warmer thread")
+}
+
+/// One warming pass: resolve uncached GOG/Xbox art. Other stores carry their own art (Steam CDN
+/// template, Heroic CDN URLs, Lutris data: URLs, custom user URLs) and are skipped.
+fn warm_art_once() {
+    for g in all_games() {
+        if cached_art(&g.id).is_some() {
+            continue;
+        }
+        let Some((store, localid)) = g.id.split_once(':') else {
+            continue;
+        };
+        let art = match store {
+            "gog" => fetch_gog_art(localid),
+            // The xbox id is the StoreId when present, else the PFN (contains '_', no displaycatalog
+            // entry) → cache empty for those so they aren't retried every pass.
+            "xbox" if !localid.contains('_') => fetch_xbox_art(localid),
+            "xbox" => Artwork::default(),
+            _ => continue, // steam/heroic/lutris/custom resolve their own art
+        };
+        store_art(&g.id, art);
+    }
+}
+
+/// HTTP GET + parse JSON with a bounded timeout. `None` on any network/parse failure (best-effort —
+/// art is non-essential, so a failure just leaves the title-only card).
+fn fetch_json(url: &str) -> Option<serde_json::Value> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let body = agent.get(url).call().ok()?.into_string().ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Make a protocol-relative URL (`//host/...`, common in GOG + MS catalog responses) absolute https.
+fn abs_url(u: &str) -> String {
+    u.strip_prefix("//")
+        .map(|rest| format!("https://{rest}"))
+        .unwrap_or_else(|| u.to_string())
+}
+
+/// GOG cover art via the public (no-auth) product API. Field names / URL shapes are GOG-specific and
+/// best-effort (worth on-box confirmation); a wrong URL just degrades to the title card client-side.
+fn fetch_gog_art(product_id: &str) -> Artwork {
+    let Some(v) = fetch_json(&format!(
+        "https://api.gog.com/products/{product_id}?expand=images"
+    )) else {
+        return Artwork::default();
+    };
+    let img = |k: &str| {
+        v.get("images")
+            .and_then(|i| i.get(k))
+            .and_then(|u| u.as_str())
+            .map(abs_url)
+    };
+    Artwork {
+        portrait: img("verticalCover"),
+        hero: img("background"),
+        logo: img("logo2x"),
+        header: img("logo"),
+    }
+}
+
+/// Xbox cover art via the (unofficial, no-auth) Microsoft display catalog, keyed by StoreId. Best-
+/// effort: the endpoint is internal/unstable, so on drift this just yields no art (title-only).
+fn fetch_xbox_art(store_id: &str) -> Artwork {
+    let Some(v) = fetch_json(&format!(
+        "https://displaycatalog.mp.microsoft.com/v7.0/products/{store_id}?market=US&languages=en-us&fieldsTemplate=Details"
+    )) else {
+        return Artwork::default();
+    };
+    let images = v
+        .get("Products")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())
+        .and_then(|p| p.get("LocalizedProperties"))
+        .and_then(|l| l.as_array())
+        .and_then(|a| a.first())
+        .and_then(|lp| lp.get("Images"))
+        .and_then(|i| i.as_array());
+    let mut art = Artwork::default();
+    for img in images.into_iter().flatten() {
+        let (Some(purpose), Some(uri)) = (
+            img.get("ImagePurpose").and_then(|v| v.as_str()),
+            img.get("Uri").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let url = abs_url(uri);
+        match purpose {
+            "Poster" => art.portrait = Some(url),
+            "SuperHeroArt" | "Hero" => art.hero = Some(url),
+            "Logo" => art.logo = Some(url),
+            "BoxArt" => art.header = Some(url),
+            _ => {}
+        }
+    }
+    art
 }
 
 // ---------------------------------------------------------------------------------------

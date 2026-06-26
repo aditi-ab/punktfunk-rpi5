@@ -209,6 +209,10 @@ pub(crate) async fn serve(opts: Punktfunk1Options, np: Arc<NativePairing>) -> Re
     // restores the box's autologin gaming session on idle, not per-disconnect — see
     // `vdisplay::restore_managed_session`). Held for serve()'s lifetime; dropping it stops it.
     let _restore_worker = crate::vdisplay::start_restore_worker();
+    // Host-lifetime cover-art warmer: fetches + caches GOG/Xbox cover art (no-auth api.gog.com /
+    // displaycatalog) off the hot path so `all_games()` (the library list + launch resolve) never
+    // blocks on the network. A no-op on a host whose stores all carry their own art.
+    let _art_warmer = crate::library::start_art_warmer();
     // Pairing state (arming PIN + trust store) is shared with the management API. If it was armed
     // at startup (the CLI flags), surface the PIN the headless operator reads from the log; the
     // web console arms it on demand instead (a fresh, time-limited PIN).

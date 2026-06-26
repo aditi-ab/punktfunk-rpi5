@@ -28,6 +28,11 @@ hex = "0.4"
 # Cover-art delivery in the game library: encode Lutris's local JPEGs into `data:` URLs and decode
 # the Epic launcher's base64 `catcache.bin`. Cross-platform (Linux Lutris art + Windows Epic art).
 base64 = "0.22"
+# Blocking HTTP for the library cover-art warmer (no-auth GOG api.gog.com + Xbox displaycatalog),
+# run on a background thread off the hot path. `ureq` is small + sync (no tokio here) and bundles
+# webpki roots (no system cert dependency). Cross-platform so the fetch/parse code is compiled +
+# checked everywhere even though only the Windows GOG/Xbox providers need it today.
+ureq = "2"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 x509-parser = "0.16"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
