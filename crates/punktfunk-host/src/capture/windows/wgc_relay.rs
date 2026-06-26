@@ -64,14 +64,10 @@ pub struct HelperRelay {
 // on Drop), `stdin_w` is a `Mutex<HANDLE>`, and `rx` is an mpsc `Receiver<RelayAu>` (which is `Send`).
 // The relay is moved to one thread and owned there, so transferring it across threads is sound.
 unsafe impl Send for HelperRelay {}
-// SAFETY: SUSPECT — `rx: Receiver<RelayAu>` is `!Sync` (std mpsc is single-consumer; two threads
-// calling `recv_timeout`/`try_recv` through a shared `&HelperRelay` would be a data race on the
-// channel's consumer state → UB), and both are `&self` methods, so this `unsafe impl Sync` asserts
-// more than the field types support. It is not a LIVE bug only because the sole consumer (the
-// punktfunk1 two-process mux loop) owns the relay and never `&`-shares it for receiving — other
-// threads reach only `request_keyframe`, which is `stdin_w`-Mutex-guarded — but nothing in the type
-// enforces that invariant. An `Arc<HelperRelay>` recv'd from two threads would compile and be UB.
-unsafe impl Sync for HelperRelay {}
+// NOTE: `HelperRelay` is deliberately NOT `Sync`. Its `rx: Receiver<RelayAu>` is `!Sync` (std mpsc
+// is single-consumer), and the relay is only ever a single-owner local in the punktfunk1 two-process
+// mux loop — never shared by `&` across threads — so `Sync` is neither sound nor needed. (A prior
+// `unsafe impl Sync` here asserted more than the fields support; removed.)
 
 /// Control byte on the helper's stdin: force the next encoded frame to be an IDR (client decode
 /// recovery). Mirrors `enc.request_keyframe()` in the single-process path.
