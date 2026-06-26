@@ -33,9 +33,6 @@
 #ifndef WebRunCmd
   #define WebRunCmd "..\..\scripts\windows\web-run.cmd"
 #endif
-#ifndef WebSetup
-  #define WebSetup "..\..\scripts\windows\web-setup.ps1"
-#endif
 ; StageDir (the staged pf-vdisplay payload + nefconc.exe + install-pf-vdisplay.ps1) is optional.
 #ifdef StageDir
   #define WithDriver
@@ -114,12 +111,11 @@ Source: "{#FfmpegBin}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 #ifdef WithWeb
 ; The web management console: the self-contained Nitro SSR bundle (.output = server + public; deps
 ; bundled in, no node_modules) -> {app}\web\.output, a portable bun runtime -> {app}\bun\bun.exe, and
-; the launcher the PunktfunkWeb task runs -> {app}\web\web-run.cmd. web-setup.ps1 (the provisioner)
-; goes to {tmp} and is removed after install.
+; the launcher the PunktfunkWeb task runs -> {app}\web\web-run.cmd. (`punktfunk-host.exe web setup`
+; provisions the console at install time - no staged provisioner script.)
 Source: "{#WebDir}\*"; DestDir: "{app}\web\.output"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#BunExe}"; DestDir: "{app}\bun"; DestName: "bun.exe"; Flags: ignoreversion
 Source: "{#WebRunCmd}"; DestDir: "{app}\web"; DestName: "web-run.cmd"; Flags: ignoreversion
-Source: "{#WebSetup}"; DestDir: "{tmp}"; DestName: "web-setup.ps1"; Flags: deleteafterinstall
 #endif
 #ifdef WithDriver
 ; The driver payload + nefconc.exe + install-pf-vdisplay.ps1, extracted to {tmp} and removed after install.
@@ -148,14 +144,12 @@ Root: HKLM64; Subkey: "SOFTWARE\Khronos\Vulkan\ImplicitLayers"; ValueType: dword
 
 [Run]
 #ifdef WithDriver
-Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\pfvdisplay\install-pf-vdisplay.ps1"" -Dir ""{tmp}\pfvdisplay"""; \
+Filename: "{app}\punktfunk-host.exe"; Parameters: "driver install --dir ""{tmp}\pfvdisplay"""; WorkingDir: "{app}"; \
   StatusMsg: "Installing the pf-vdisplay virtual display driver..."; \
   Flags: runhidden waituntilterminated; Tasks: installdriver
 #endif
 #ifdef WithGamepad
-Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\gamepad\install-gamepad-drivers.ps1"" -Dir ""{tmp}\gamepad"""; \
+Filename: "{app}\punktfunk-host.exe"; Parameters: "driver install --gamepad --dir ""{tmp}\gamepad"""; WorkingDir: "{app}"; \
   StatusMsg: "Installing the virtual gamepad drivers..."; \
   Flags: runhidden waituntilterminated; Tasks: installgamepad
 #endif
@@ -169,8 +163,7 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service start"; WorkingDir: "
 ; Provision the console AFTER the host service is up (so the mgmt token exists): write the ACL'd
 ; login password, register the PunktfunkWeb scheduled task (boot, SYSTEM, restart-on-failure),
 ; open TCP 3000, and start it. {code:WebSetupParams} appends -PasswordFile only on a fresh install.
-Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\web-setup.ps1"" {code:WebSetupParams}"; \
+Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParams}"; WorkingDir: "{app}"; \
   StatusMsg: "Setting up the punktfunk web console..."; Flags: runhidden waituntilterminated
 #endif
 
@@ -265,9 +258,9 @@ function WebSetupParams(Param: String): String;
 begin
   { Pass the password to web-setup.ps1 via a temp file, not the cmdline (which lands in the install
     log). Only on a fresh install - on upgrade web-setup keeps the existing file. }
-  Result := '-AppDir "' + ExpandConstant('{app}') + '"';
+  Result := '--app-dir "' + ExpandConstant('{app}') + '"';
   if FreshWebInstall then
-    Result := Result + ' -PasswordFile "' + ExpandConstant('{tmp}\webpw.txt') + '"';
+    Result := Result + ' --password-file "' + ExpandConstant('{tmp}\webpw.txt') + '"';
 end;
 #endif
 

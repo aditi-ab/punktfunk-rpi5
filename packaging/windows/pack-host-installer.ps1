@@ -152,7 +152,7 @@ if (-not $NoDriver) {
     & (Join-Path $here 'build-pf-vdisplay.ps1') -Out $built
     $stage = Join-Path $OutDir 'stage'
     & (Join-Path $here 'stage-pf-vdisplay.ps1') -OutDir $stage -VendorDir $built
-    Copy-Item (Join-Path $here 'install-pf-vdisplay.ps1') (Join-Path $stage 'install-pf-vdisplay.ps1') -Force
+    # The installer runs `punktfunk-host.exe driver install --dir {tmp}\pfvdisplay` (not a staged .ps1).
     $defines += "/DStageDir=$stage"
 }
 else { Write-Host "-NoDriver: building installer WITHOUT the bundled pf-vdisplay driver" }
@@ -160,8 +160,9 @@ else { Write-Host "-NoDriver: building installer WITHOUT the bundled pf-vdisplay
 # --- build (from source) + stage the punktfunk virtual-gamepad UMDF drivers --------------------
 # pf-dualsense (DualSense / DualShock 4) + pf-xusb (Xbox 360 / XInput) are members of the same drivers
 # workspace as pf-vdisplay, built from source per release (build-gamepad-drivers.ps1) - same anti-stale
-# reasoning as pf-vdisplay; the prior checked-in binaries under gamepad-drivers/ are retired. install-
-# gamepad-drivers.ps1 adds each to the store (the host SwDeviceCreate's the per-session devnodes).
+# reasoning as pf-vdisplay; the prior checked-in binaries under gamepad-drivers/ are retired. The
+# installer adds each to the store via `punktfunk-host.exe driver install --gamepad` (the host
+# SwDeviceCreate's the per-session devnodes).
 if (-not $NoDriver) {
     $gpBuilt = Join-Path $OutDir 'gamepad-built'
     # -SkipBuild: build-pf-vdisplay.ps1 above already `cargo build`s the WHOLE drivers workspace (incl.
@@ -171,7 +172,6 @@ if (-not $NoDriver) {
     if (Test-Path $gpStage) { Remove-Item -Recurse -Force $gpStage }
     New-Item -ItemType Directory -Force -Path $gpStage | Out-Null
     Copy-Item (Join-Path $gpBuilt '*') $gpStage -Force
-    Copy-Item (Join-Path $here 'install-gamepad-drivers.ps1') (Join-Path $gpStage 'install-gamepad-drivers.ps1') -Force
     $defines += "/DGamepadStageDir=$gpStage"
     Write-Host "==> built + staged gamepad UMDF drivers -> $gpStage"
 }
@@ -208,13 +208,11 @@ if ($WebDir -and (Test-Path $WebDir) -and $BunExe -and (Test-Path $BunExe)) {
     $bunStage = Join-Path $OutDir 'bun.exe'
     Copy-Item -LiteralPath $BunExe -Destination $bunStage -Force
     $webRun = Join-Path $OutDir 'web-run.cmd'
-    $webSetup = Join-Path $OutDir 'web-setup.ps1'
     Copy-Item (Join-Path $repoRoot 'scripts\windows\web-run.cmd') -Destination $webRun -Force
-    Copy-Item (Join-Path $repoRoot 'scripts\windows\web-setup.ps1') -Destination $webSetup -Force
+    # The console is provisioned by `punktfunk-host.exe web setup` (not a staged web-setup.ps1).
     $defines += "/DWebDir=$webStage"
     $defines += "/DBunExe=$bunStage"
     $defines += "/DWebRunCmd=$webRun"
-    $defines += "/DWebSetup=$webSetup"
     Write-Host "bundling the web console from $WebDir (+ bun $BunExe)"
 }
 else { Write-Host "no -WebDir/-BunExe -> installer built WITHOUT the web console" }
