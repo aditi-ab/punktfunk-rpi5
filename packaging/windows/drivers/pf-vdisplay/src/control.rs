@@ -1,4 +1,4 @@
-//! The `pf-vdisplay-proto` control plane (`EvtIddCxDeviceIoControl`). The host opens the device interface
+//! The `pf-driver-proto` control plane (`EvtIddCxDeviceIoControl`). The host opens the device interface
 //! (`PF_VDISPLAY_INTERFACE_GUID`) and drives the low-frequency IOCTLs: GET_INFO (version handshake), PING
 //! (watchdog keepalive), ADD/REMOVE/CLEAR_ALL (virtual monitors), and SET_RENDER_ADAPTER (next). Every
 //! path completes the `WDFREQUEST` exactly once (the `EVT_IDD_CX_DEVICE_IO_CONTROL` shape returns `()`).
@@ -6,7 +6,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use pf_vdisplay_proto::control;
+use pf_driver_proto::control;
 use wdk_iddcx::nt_success;
 use wdk_sys::{NTSTATUS, WDFREQUEST, call_unsafe_wdf_function_binding};
 
@@ -76,7 +76,7 @@ pub unsafe fn dispatch(request: WDFREQUEST, ioctl_code: u32) {
     match ioctl_code {
         control::IOCTL_GET_INFO => {
             let reply = control::InfoReply {
-                protocol_version: pf_vdisplay_proto::PROTOCOL_VERSION,
+                protocol_version: pf_driver_proto::PROTOCOL_VERSION,
                 watchdog_timeout_s: WATCHDOG_TIMEOUT_S,
             };
             // SAFETY: `request` is the framework WDFREQUEST.

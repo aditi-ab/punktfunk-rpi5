@@ -72,7 +72,7 @@ read it from `%ProgramData%\punktfunk\web-password`.
 | `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `bun` on the Nitro server (`:3000`). |
 | `../../scripts/windows/web-setup.ps1` | Install-time (elevated): write the ACL'd console password, register the `PunktfunkWeb` task + firewall rule, start it. |
 | `pf-vdisplay/` | **Vendored** signed pf-vdisplay driver: `pf_vdisplay.inf` / `pf_vdisplay.cat` / `pf_vdisplay.dll` / `punktfunk-driver.cer`. Built from `drivers/`. |
-| `drivers/` | The all-Rust IddCx **driver source** workspace: the `pf-vdisplay` crate on `wdk-sys` / windows-drivers-rs + the owned `pf-vdisplay-proto` ABI + `wdk-iddcx` / `wdk-probe`, plus `deploy-dev.ps1` (build/sign/install for dev). |
+| `drivers/` | The all-Rust IddCx **driver source** workspace: the `pf-vdisplay` crate on `wdk-sys` / windows-drivers-rs + the owned `pf-driver-proto` ABI + `wdk-iddcx` / `wdk-probe`, plus `deploy-dev.ps1` (build/sign/install for dev). |
 | `reset-pf-vdisplay.ps1` | **Dev:** recover a wedged driver — stop host → reap ghost monitor nodes → reload the adapter → start host (no reboot). See *Dev iteration* below. |
 | `redeploy-pf-vdisplay.ps1` | **Dev:** one-shot redeploy — (optional) build → stop host → `deploy-dev.ps1 -Install` → reload adapter → start host. |
 | `nvenc/nvenc.def`, `nvenc/gen-nvenc-importlib.ps1` | Synthesise `nvencodeapi.lib` for the `--features nvenc` link (llvm-dlltool / lib.exe). |

@@ -4,7 +4,7 @@
 #
 # Separate from the main cargo workspace (own [workspace] root) because driver crates are cdylibs built
 # with the WDK toolchain (cargo-wdk / wdk-build) on Windows only. Path-deps the shared ABI crate
-# crates/pf-vdisplay-proto from the main tree.
+# crates/pf-driver-proto from the main tree.
 [workspace]
 resolver = "2"
 members = ["wdk-probe", "wdk-iddcx", "pf-vdisplay"]
@@ -20,7 +20,7 @@ wdk = "0.4.1"
 wdk-sys = "0.5.1"
 wdk-build = "0.5.1"
 wdk-iddcx = { path = "wdk-iddcx" }
-pf-vdisplay-proto = { path = "../../../crates/pf-vdisplay-proto" }
+pf-driver-proto = { path = "../../../crates/pf-driver-proto" }
 
 # Vendored windows-drivers-rs 0.5.1 (the published, self-contained crates) + an added `iddcx`
 # ApiSubset (M1 — bindgens iddcx/1.10/IddCx.h reusing wdk_default for WDF type-identity). Redirect ALL

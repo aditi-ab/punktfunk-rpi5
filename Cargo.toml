@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/punktfunk-core",
     "crates/punktfunk-host",
-    "crates/pf-vdisplay-proto",
+    "crates/pf-driver-proto",
     "clients/probe",
     "clients/linux",
     "clients/windows",

@@ -7,13 +7,13 @@
 //! `PUNKTFUNK_IDD_PUSH`. Driver counterpart: `packaging/windows/drivers/pf-vdisplay/src/
 //! frame_transport.rs`. The shared `SharedHeader` layout, `MAGIC`/`VERSION`/`RING_LEN`, the
 //! `DRV_STATUS_*` codes, the `Global\` name scheme and the publish token all come from
-//! [`pf_vdisplay_proto::frame`] (which OWNS the contract, with `const` size asserts) — both sides
+//! [`pf_driver_proto::frame`] (which OWNS the contract, with `const` size asserts) — both sides
 //! `use` it, so drift is a compile error rather than a "must match" comment.
 
 use super::dxgi::{make_device, D3d11Frame, HdrConverter, WinCaptureTarget};
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
-use pf_vdisplay_proto::frame;
+use pf_driver_proto::frame;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Interface, HSTRING};
@@ -42,7 +42,7 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 // The frame-transport contract — `SharedHeader` layout, `MAGIC`/`VERSION`/`RING_LEN`, the
-// `DRV_STATUS_*` codes and the `Global\` name helpers — lives in `pf_vdisplay_proto::frame`; both sides
+// `DRV_STATUS_*` codes and the `Global\` name helpers — lives in `pf_driver_proto::frame`; both sides
 // `use frame::*`, so a layout/name/code drift is a compile error (the proto has `const` size asserts).
 use frame::{
     event_name, header_name, texture_name, SharedHeader, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED,
@@ -59,7 +59,7 @@ const DXGI_SHARED_RESOURCE_RW: u32 = 0x8000_0000 | 0x1;
 const OUT_RING: usize = 3;
 
 /// Bring-up debug block (fixed name) — the host creates it; the driver writes diagnostics into it
-/// independent of the per-target header. NOT part of `pf_vdisplay_proto` (a host-side bring-up channel,
+/// independent of the per-target header. NOT part of `pf_driver_proto` (a host-side bring-up channel,
 /// not the data path); the matching `DebugBlock` lives in the OLD oracle driver's `frame_transport.rs`.
 #[repr(C)]
 struct DebugBlock {

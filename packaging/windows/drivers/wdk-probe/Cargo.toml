@@ -1,6 +1,6 @@
 # M0/M1 toolchain probe: the smallest possible UMDF2 driver on windows-drivers-rs (crates.io wdk 0.5).
 # Purpose: prove on the windows-amd64 runner that (1) wdk-sys bindgen + WDF stub link works against the
-# runner's WDK + LLVM, (2) the shared no_std pf-vdisplay-proto ABI crate path-deps cleanly into a driver
+# runner's WDK + LLVM, (2) the shared no_std pf-driver-proto ABI crate path-deps cleanly into a driver
 # build graph, and (3) what the produced DLL's PE FORCE_INTEGRITY (/INTEGRITYCHECK) bit is. NOT shipped.
 [package]
 name = "wdk-probe"
@@ -26,4 +26,4 @@ wdk.workspace = true
 # This is the M1 make-or-break: does IddCx.h bindgen in wdk-sys's config without a header conflict, and
 # do its WDF/DXGI types resolve to wdk-sys's (so the generated module compiles)?
 wdk-sys = { workspace = true, features = ["iddcx"] }
-pf-vdisplay-proto.workspace = true
+pf-driver-proto.workspace = true

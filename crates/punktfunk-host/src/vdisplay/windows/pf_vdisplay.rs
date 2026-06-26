@@ -5,14 +5,14 @@
 //! the returned [`VirtualOutput`]'s keepalive `Drop` removes it (RAII).
 //!
 //! Control surface: a device-interface-GUID + `CreateFileW` + `DeviceIoControl` IOCTL protocol, with
-//! the wire contract OWNED by [`pf_vdisplay_proto::control`] (versioned + `#[repr(C)] Pod` structs,
+//! the wire contract OWNED by [`pf_driver_proto::control`] (versioned + `#[repr(C)] Pod` structs,
 //! NOT the SudoVDA ABI). No DLL, no named pipe. See `docs/windows-host-rewrite.md`.
 //!
 //! This is a faithful clone of [`super::sudovda`] (the shipping fallback) repointed at the new driver:
 //! same reference-counted/lingering monitor lifecycle, same CCD isolation + active-mode forcing — those
 //! backend-NEUTRAL helpers are REUSED from `sudovda` (a pf-vdisplay monitor's `target_id` is a real OS
 //! target id, so the CCD/DXGI code works unchanged). Only the driver-specific bits (GUID, IOCTL codes,
-//! request/reply structs, the version handshake) differ, per `pf_vdisplay_proto`.
+//! request/reply structs, the version handshake) differ, per `pf_driver_proto`.
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -32,16 +32,16 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 
-use pf_vdisplay_proto::control;
+use pf_driver_proto::control;
 
 use super::manager::{AddedMonitor, MonitorKey, VdisplayDriver};
 use super::{Mode, VirtualDisplay, VirtualOutput};
 
-// pf-vdisplay device-interface GUID (pf_vdisplay_proto::PF_VDISPLAY_INTERFACE_GUID_U128). Deliberately
+// pf-vdisplay device-interface GUID (pf_driver_proto::PF_VDISPLAY_INTERFACE_GUID_U128). Deliberately
 // NOT SudoVDA's `{e5bcc234-…}` — we own this driver, so a private interface GUID signals it and avoids
 // any accidental coexistence with a real SudoVDA install.
 const PF_VDISPLAY_INTERFACE: GUID =
-    GUID::from_u128(pf_vdisplay_proto::PF_VDISPLAY_INTERFACE_GUID_U128);
+    GUID::from_u128(pf_driver_proto::PF_VDISPLAY_INTERFACE_GUID_U128);
 
 /// Monotonic per-session id keying a pf-vdisplay monitor for `IOCTL_ADD`/`IOCTL_REMOVE`. Unlike
 /// SudoVDA's 16-byte GUID + pid-mangling, the proto keys monitors by a plain `u64` — the host-level
@@ -135,7 +135,7 @@ unsafe fn open_device() -> Result<HANDLE> {
 }
 
 /// The pf-vdisplay IOCTL surface behind the shared [`VirtualDisplayManager`](super::manager::VirtualDisplayManager)
-/// (Goal-1 §2.5) — the wire contract is owned by `pf_vdisplay_proto::control` (versioned, hard-checked).
+/// (Goal-1 §2.5) — the wire contract is owned by `pf_driver_proto::control` (versioned, hard-checked).
 pub(crate) struct PfVdisplayDriver;
 
 impl VdisplayDriver for PfVdisplayDriver {
@@ -152,14 +152,14 @@ impl VdisplayDriver for PfVdisplayDriver {
             .context("pf-vdisplay IOCTL_GET_INFO (version handshake)")?;
         let info: control::InfoReply =
             bytemuck::pod_read_unaligned(&info_buf[..size_of::<control::InfoReply>()]);
-        if info.protocol_version != pf_vdisplay_proto::PROTOCOL_VERSION {
+        if info.protocol_version != pf_driver_proto::PROTOCOL_VERSION {
             unsafe {
                 let _ = CloseHandle(device);
             }
             anyhow::bail!(
                 "pf-vdisplay protocol mismatch: host expects {}, driver reports {} — install matching \
                  host + driver",
-                pf_vdisplay_proto::PROTOCOL_VERSION,
+                pf_driver_proto::PROTOCOL_VERSION,
                 info.protocol_version
             );
         }

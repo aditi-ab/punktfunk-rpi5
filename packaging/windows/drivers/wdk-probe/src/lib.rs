@@ -2,7 +2,7 @@
 //! crate's Cargo.toml). DriverEntry → WdfDriverCreate → (EvtDeviceAdd) IddCxDeviceInitConfig →
 //! WdfDeviceCreate → IddCxDeviceInitialize → IddCxAdapterInitAsync: enough to exercise the wdk-sys WDF
 //! stub link AND prove the `iddcx` subset is callable + links against `IddCxStub`. Also force-links the
-//! shared `pf-vdisplay-proto` ABI crate (no_std + bytemuck) across the workspace boundary.
+//! shared `pf-driver-proto` ABI crate (no_std + bytemuck) across the workspace boundary.
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
@@ -18,10 +18,10 @@ use wdk_sys::{
 
 const STATUS_SUCCESS: NTSTATUS = 0;
 
-/// Force `pf-vdisplay-proto` to actually link into the driver build graph (validates the cross-workspace
+/// Force `pf-driver-proto` to actually link into the driver build graph (validates the cross-workspace
 /// path-dep + that the no_std bytemuck ABI crate compiles for a UMDF cdylib). `#[used]` keeps it.
 #[used]
-static PROTO_GUID_LO: u64 = pf_vdisplay_proto::PF_VDISPLAY_INTERFACE_GUID_U128 as u64;
+static PROTO_GUID_LO: u64 = pf_driver_proto::PF_VDISPLAY_INTERFACE_GUID_U128 as u64;
 
 /// IddCx (stub mode) requires the driver to export the minimum IddCx framework version it needs — the
 /// `#ifndef IDD_STUB` branch of `IddCxFuncEnum.h` (which normally emits it) is compiled out under

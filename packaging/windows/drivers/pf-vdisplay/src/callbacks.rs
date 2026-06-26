@@ -327,7 +327,7 @@ pub unsafe extern "C" fn unassign_swap_chain(monitor: iddcx::IDDCX_MONITOR) -> N
     STATUS_SUCCESS
 }
 
-/// The pf-vdisplay-proto control plane. Returns `()` and completes the request itself (matches the C
+/// The pf-driver-proto control plane. Returns `()` and completes the request itself (matches the C
 /// `EVT_IDD_CX_DEVICE_IO_CONTROL` shape). STEP 4: dispatch the proto IOCTLs; for now just complete.
 pub unsafe extern "C" fn device_io_control(
     _device: WDFDEVICE,

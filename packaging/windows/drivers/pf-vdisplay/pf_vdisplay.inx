@@ -2,7 +2,7 @@
 ; pf-vdisplay - punktfunk virtual display, UMDF2 IddCx driver INF (template; stampinf -> .inf).
 ;
 ; For the all-Rust wdk-sys / windows-drivers-rs driver in THIS tree
-; (packaging/windows/drivers/pf-vdisplay/). The driver registers the OWNED pf_vdisplay_proto
+; (packaging/windows/drivers/pf-vdisplay/). The driver registers the OWNED pf_driver_proto
 ; control-interface GUID in CODE (WdfDeviceCreateDeviceInterface), so this INF is GUID-agnostic and
 ; is byte-identical to the superseded oracle's (packaging/windows/vdisplay-driver/.../pf_vdisplay.inx,
 ; itself adapted from MolotovCherry/virtual-display-rs (MIT) + SudoVDA's control-device security DACL).

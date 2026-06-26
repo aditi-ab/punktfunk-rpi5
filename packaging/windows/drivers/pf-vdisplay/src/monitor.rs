@@ -2,7 +2,7 @@
 //! ([`crate::control`], `IOCTL_ADD`): each carries the requested mode (advertised as preferred) plus the
 //! `session_id` the host keys it by and the OS target id + render-adapter LUID captured at arrival. Ported
 //! from the working upstream virtual-display-rs (`monitor.rs` + `context.rs::create_monitor`), with
-//! `guid: u128` → `session_id: u64` for the owned `pf_vdisplay_proto` control plane.
+//! `guid: u128` → `session_id: u64` for the owned `pf_driver_proto` control plane.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -301,7 +301,7 @@ pub fn take_swap_chain_processor(
 }
 
 /// `IOCTL_ADD`: create + arrive a virtual monitor at `width`x`height`@`refresh`. Returns the OS
-/// `(target_id, adapter_luid_low, adapter_luid_high)` for the [`AddReply`](pf_vdisplay_proto::control::AddReply),
+/// `(target_id, adapter_luid_low, adapter_luid_high)` for the [`AddReply`](pf_driver_proto::control::AddReply),
 /// or `None` on failure (no adapter yet / IddCx error).
 pub fn create_monitor(
     session_id: u64,

@@ -135,7 +135,7 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     // Expose the owned pf-vdisplay control interface: the host opens this GUID and drives the proto control
     // plane (IOCTL_ADD/REMOVE/PING/…) which arrives at EvtIddCxDeviceIoControl. NOT SudoVDA's GUID. (The
     // upstream uses a socket instead, so it has no interface; ours is IOCTL-based.)
-    let (d1, d2, d3, d4) = pf_vdisplay_proto::interface_guid_fields();
+    let (d1, d2, d3, d4) = pf_driver_proto::interface_guid_fields();
     let guid = GUID {
         Data1: d1,
         Data2: d2,

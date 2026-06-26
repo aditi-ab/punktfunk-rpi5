@@ -7,7 +7,7 @@
 # own OS type. Defining every wire struct ONCE here — with `const` size/offset asserts + bytemuck
 # round-trips — makes host<->driver ABI drift a COMPILE error instead of a silent frame/IOCTL corruption.
 [package]
-name = "pf-vdisplay-proto"
+name = "pf-driver-proto"
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.82"

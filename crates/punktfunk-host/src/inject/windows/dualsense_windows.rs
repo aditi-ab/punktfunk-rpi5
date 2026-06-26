@@ -40,21 +40,21 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
-/// Shared-section layout — the single source of truth is [`pf_vdisplay_proto::gamepad::PadShm`] (offset
+/// Shared-section layout — the single source of truth is [`pf_driver_proto::gamepad::PadShm`] (offset
 /// asserts pin every field; the `pf_dualsense` driver maps the same struct). Derive the size/offsets/magic
 /// from it so a layout change is a compile error, not a hand-synced literal (audit §6.1). `pub(super)` so
 /// the sibling DualShock 4 backend ([`super::dualshock4_windows`]) reuses the exact offsets.
-pub(super) const SHM_SIZE: usize = core::mem::size_of::<pf_vdisplay_proto::gamepad::PadShm>();
-pub(super) const SHM_MAGIC: u32 = pf_vdisplay_proto::gamepad::PAD_MAGIC; // "PFDS"
-pub(super) const OFF_INPUT: usize = core::mem::offset_of!(pf_vdisplay_proto::gamepad::PadShm, input);
+pub(super) const SHM_SIZE: usize = core::mem::size_of::<pf_driver_proto::gamepad::PadShm>();
+pub(super) const SHM_MAGIC: u32 = pf_driver_proto::gamepad::PAD_MAGIC; // "PFDS"
+pub(super) const OFF_INPUT: usize = core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, input);
 pub(super) const OFF_OUT_SEQ: usize =
-    core::mem::offset_of!(pf_vdisplay_proto::gamepad::PadShm, out_seq);
-pub(super) const OFF_OUTPUT: usize = core::mem::offset_of!(pf_vdisplay_proto::gamepad::PadShm, output);
+    core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, out_seq);
+pub(super) const OFF_OUTPUT: usize = core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, output);
 /// Device-type selector the driver reads to choose which HID identity/descriptor it serves: 0 =
 /// DualSense (the default — the section is zeroed), 1 = DualShock 4.
 pub(super) const OFF_DEVTYPE: usize =
-    core::mem::offset_of!(pf_vdisplay_proto::gamepad::PadShm, device_type);
-pub(super) const DEVTYPE_DUALSHOCK4: u8 = pf_vdisplay_proto::gamepad::DEVTYPE_DUALSHOCK4;
+    core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, device_type);
+pub(super) const DEVTYPE_DUALSHOCK4: u8 = pf_driver_proto::gamepad::DEVTYPE_DUALSHOCK4;
 
 /// A single virtual DualSense: the SwDeviceCreate'd `pf_pad_<index>` software devnode (the driver
 /// loads on it and the HID DualSense appears to games) plus the shared-memory section the driver maps.
@@ -243,7 +243,7 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<HSWDEVICE> {
 /// caller stamps the device-type + initial input report and finally the magic. Shared by both Windows
 /// pad backends (DualSense + DualShock 4).
 pub(super) fn create_shm_section(index: u8) -> Result<(HANDLE, *mut u8)> {
-    let name = HSTRING::from(pf_vdisplay_proto::gamepad::pad_shm_name(index));
+    let name = HSTRING::from(pf_driver_proto::gamepad::pad_shm_name(index));
 
     let mut psd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: the SDDL literal is valid; psd receives an allocated descriptor (freed by the OS when

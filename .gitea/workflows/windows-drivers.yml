@@ -3,7 +3,7 @@
 #
 # Stage 1 (this file): PROBE the runner's driver toolchain (WDK / EWDK / cargo-make / LLVM / the
 # inf2cat/stampinf/devgen/signtool tools) so we know what's provisioned BEFORE writing driver code,
-# and build+test the owned ABI crate (pf-vdisplay-proto) on MSVC to prove it compiles cross-OS and the
+# and build+test the owned ABI crate (pf-driver-proto) on MSVC to prove it compiles cross-OS and the
 # CI wiring works. The runner has no RTX GPU — that's fine: builds, the IddCx bindgen/link, the
 # /INTEGRITYCHECK self-sign-load, and (later) IDD-push frame flow on the basic display do not need one;
 # only live NVENC encode does, which defers to the RTX box.
@@ -18,12 +18,12 @@ on:
     branches: [main]
     paths:
       - '.gitea/workflows/windows-drivers.yml'
-      - 'crates/pf-vdisplay-proto/**'
+      - 'crates/pf-driver-proto/**'
       - 'packaging/windows/drivers/**'
   pull_request:
     paths:
       - '.gitea/workflows/windows-drivers.yml'
-      - 'crates/pf-vdisplay-proto/**'
+      - 'crates/pf-driver-proto/**'
       - 'packaging/windows/drivers/**'
 
 # Driver builds need the WDK on the runner (provision once via windows-drivers-provision.yml).
@@ -93,17 +93,17 @@ jobs:
           Write-Host ("CARGO_HOME     = " + ($env:CARGO_HOME ?? '<unset>'))
           Write-Host ("CARGO_TARGET_DIR (daemon) = " + ($env:CARGO_TARGET_DIR ?? '<unset>'))
 
-      - name: Build + test pf-vdisplay-proto (MSVC)
+      - name: Build + test pf-driver-proto (MSVC)
         run: |
           # Short target dir to dodge MAX_PATH inside the deep act host workdir (see windows.yml).
           $env:CARGO_TARGET_DIR = "C:\t\drv"
-          cargo build -p pf-vdisplay-proto
-          cargo test  -p pf-vdisplay-proto
-          cargo clippy -p pf-vdisplay-proto --all-targets -- -D warnings
-          cargo fmt -p pf-vdisplay-proto -- --check
+          cargo build -p pf-driver-proto
+          cargo test  -p pf-driver-proto
+          cargo clippy -p pf-driver-proto --all-targets -- -D warnings
+          cargo fmt -p pf-driver-proto -- --check
 
   # Build the UMDF driver workspace (wdk-probe) on windows-drivers-rs: proves wdk-sys bindgen/link works
-  # on the runner's WDK + LLVM, that pf-vdisplay-proto path-deps into a driver, and exposes the produced
+  # on the runner's WDK + LLVM, that pf-driver-proto path-deps into a driver, and exposes the produced
   # DLL's FORCE_INTEGRITY (/INTEGRITYCHECK) bit — the M0 self-signed-load question.
   driver-build:
     runs-on: windows-amd64

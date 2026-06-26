@@ -32,12 +32,12 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
-// Shared-section layout — the single source of truth is `pf_vdisplay_proto::gamepad::XusbShm` (offset
+// Shared-section layout — the single source of truth is `pf_driver_proto::gamepad::XusbShm` (offset
 // asserts pin every field; the `pf_xusb` driver maps the same struct). Derive the size/offsets/magic from
 // it so a layout change is a compile error, not a hand-synced literal (audit §6.1).
-use pf_vdisplay_proto::gamepad::XusbShm;
+use pf_driver_proto::gamepad::XusbShm;
 const SHM_SIZE: usize = core::mem::size_of::<XusbShm>();
-const SHM_MAGIC: u32 = pf_vdisplay_proto::gamepad::XUSB_MAGIC; // "PFXU"
+const SHM_MAGIC: u32 = pf_driver_proto::gamepad::XUSB_MAGIC; // "PFXU"
 const OFF_PACKET: usize = core::mem::offset_of!(XusbShm, packet);
 const OFF_BUTTONS: usize = core::mem::offset_of!(XusbShm, buttons);
 const OFF_LT: usize = core::mem::offset_of!(XusbShm, left_trigger);
@@ -160,7 +160,7 @@ struct XusbWinPad {
 impl XusbWinPad {
     /// Create + map `Global\pfxusb-shm-<index>`, stamp the magic, then spawn the devnode.
     fn open(index: u8) -> Result<XusbWinPad> {
-        let name = HSTRING::from(pf_vdisplay_proto::gamepad::xusb_shm_name(index));
+        let name = HSTRING::from(pf_driver_proto::gamepad::xusb_shm_name(index));
 
         // Permissive DACL so the WUDFHost (whatever account) can open the section.
         let mut psd = PSECURITY_DESCRIPTOR::default();

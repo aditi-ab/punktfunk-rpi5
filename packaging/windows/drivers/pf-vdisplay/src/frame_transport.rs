@@ -11,12 +11,12 @@
 //!
 //! Host counterpart: `crates/punktfunk-host/src/capture/idd_push.rs`. The shared `SharedHeader` layout,
 //! the [`FrameToken`] packing, the `Global\` object-name scheme, the `MAGIC`/`RING_LEN` and the
-//! `DRV_STATUS_*` codes are NOT hand-duplicated here: both sides `use pf_vdisplay_proto::frame::*`, which
+//! `DRV_STATUS_*` codes are NOT hand-duplicated here: both sides `use pf_driver_proto::frame::*`, which
 //! OWNS the contract (with `const` size asserts so any drift is a compile error).
 //!
 //! Ported from the proven oracle (`packaging/windows/vdisplay-driver/pf-vdisplay/src/frame_transport.rs`).
 //! Differences from the oracle:
-//! * the layout/consts/names/token come from `pf_vdisplay_proto::frame` instead of being re-declared;
+//! * the layout/consts/names/token come from `pf_driver_proto::frame` instead of being re-declared;
 //! * `dbglog!` replaces `log::info!`;
 //! * the optional fixed-name `Global\pfvd-dbg` `DebugBlock` bring-up channel is SKIPPED (not on the data
 //!   path). FOLLOW-UP: if the host bring-up diagnostics are needed again, port the oracle's `DebugBlock`
@@ -24,7 +24,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use pf_vdisplay_proto::frame::{
+use pf_driver_proto::frame::{
     DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED, DRV_STATUS_TEX_FAIL, FrameToken, MAGIC, RING_LEN,
     SharedHeader, event_name, header_name, texture_name,
 };

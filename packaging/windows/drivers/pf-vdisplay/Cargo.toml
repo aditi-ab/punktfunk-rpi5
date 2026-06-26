@@ -1,5 +1,5 @@
 # pf-vdisplay — the all-Rust UMDF IddCx virtual-display driver (M1 step-2 rewrite onto wdk-sys + the
-# owned pf-vdisplay-proto ABI). Replaces the vendored-binding oracle at packaging/windows/vdisplay-driver/
+# owned pf-driver-proto ABI). Replaces the vendored-binding oracle at packaging/windows/vdisplay-driver/
 # (deleted once on-glass parity is reached, per docs/windows-host-rewrite.md §14 STEP 8).
 [package]
 name = "pf-vdisplay"
@@ -23,7 +23,7 @@ wdk-build.workspace = true
 wdk.workspace = true
 wdk-sys = { workspace = true, features = ["iddcx"] }
 wdk-iddcx.workspace = true
-pf-vdisplay-proto.workspace = true
+pf-driver-proto.workspace = true
 # STEP 5: the swap-chain processor's render-side D3D11 device + worker. 0.58.0 matches the wdk-build
 # transitive `windows` already in the workspace lock (one resolved version) AND the proven oracle's
 # version, so the ported D3D/DXGI/threading calls compile verbatim.
