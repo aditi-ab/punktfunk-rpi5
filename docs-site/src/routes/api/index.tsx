@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { ApiReferenceReact } from '@scalar/api-reference-react'
-import { useTheme } from 'next-themes'
 // @scalar/api-reference-react@0.9.47's entry does NOT import its own stylesheet
 // (and doesn't inject it at runtime), so we must ship it ourselves or the
 // reference renders unstyled. Load it as a route-scoped <link> (same pattern as
@@ -148,15 +147,24 @@ body.light-mode {
 `
 
 function ApiReference() {
-  // Follow the docs' own light/dark switch (Fumadocs drives next-themes). Scalar
-  // has no way to auto-detect the host theme, so we feed it the resolved theme
-  // and hide its own toggle — the Fumadocs toggle stays the single source of
-  // truth. `mounted` avoids a hydration flash (resolvedTheme is undefined on the
-  // server); default to dark to match the docs' default.
-  const { resolvedTheme } = useTheme()
-  const [mounted, setMounted] = useState(false)
-  useEffect(() => setMounted(true), [])
-  const isDark = !mounted || resolvedTheme !== 'light'
+  // Follow the docs' own light/dark switch and hide Scalar's own toggle, so the
+  // Fumadocs toggle stays the single source of truth. Fumadocs drives next-themes
+  // with `attribute: "class"`, which writes the resolved theme as a class on
+  // <html> — we read THAT class directly rather than next-themes' useTheme().
+  // The class is the authoritative, already-resolved signal (system → light/dark
+  // included) and, unlike the React context, can't be desynced when bridging into
+  // Scalar's separate Vue app. Default to dark (the docs default) so SSR and the
+  // first client render agree — no hydration flash; the observer then syncs to the
+  // live class, tracking the docs toggle AND OS changes while in system mode.
+  const [isDark, setIsDark] = useState(true)
+  useEffect(() => {
+    const root = document.documentElement
+    const sync = () => setIsDark(root.classList.contains('dark'))
+    sync()
+    const observer = new MutationObserver(sync)
+    observer.observe(root, { attributes: true, attributeFilter: ['class'] })
+    return () => observer.disconnect()
+  }, [])
 
   // Scalar pollutes global scope and never cleans up: it appends a persistent
   // <style id="scalar-style"> to <head> that includes a *global*
