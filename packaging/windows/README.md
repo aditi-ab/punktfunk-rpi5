@@ -20,17 +20,20 @@ interactive session for secure-desktop (UAC / lock screen) capture, adds firewal
 on the **pf-vdisplay** UMDF/IDD virtual-display driver. MSIX's sandbox can install **neither** a SYSTEM
 service of this kind **nor** a driver. So the host ships as a classic elevated installer.
 
-The installer is deliberately thin: the real install logic — SCM registration, firewall rules, the
-default `host.env`, and the SYSTEM→interactive-session supervisor — already lives in
-`punktfunk-host service install` (`crates/punktfunk-host/src/service.rs`). The installer just lays the
-exe into `C:\Program Files\punktfunk\` and calls that subcommand, elevated.
+The installer is deliberately thin: the real install logic lives in `punktfunk-host` subcommands, not
+in PowerShell — `service install` (SCM registration, firewall rules, the default `host.env`, the
+SYSTEM→interactive-session supervisor; `service.rs`), `driver install [--gamepad]` and `web setup`
+(driver/console provisioning; `windows/install.rs`). The installer lays the exe into
+`C:\Program Files\punktfunk\` and calls those subcommands elevated. Keeping the logic in the compiled
+exe — not a `.ps1` *file* PowerShell reads in the machine codepage — is the fix for the ANSI-codepage
+parse breakage that silently failed installs on non-English boxes.
 
 ## What the installer does
 
 - Installs `punktfunk-host.exe` (+ `host.env.example`, this README) to `{app}` (`C:\Program Files\punktfunk`).
-- **Optional task** *Install the pf-vdisplay virtual display driver* — imports the driver's self-signed
-  cert (machine `Root` + `TrustedPublisher`), creates the `root\pf_vdisplay` device node (only
-  if absent, via nefconc — never devgen — `install-pf-vdisplay.ps1`), and stages the driver with
+- **Optional task** *Install the pf-vdisplay virtual display driver* — `punktfunk-host.exe driver install`
+  imports the driver's self-signed cert (machine `Root` + `TrustedPublisher`), creates the
+  `root\pf_vdisplay` device node (only if absent, via nefconc — never devgen), and stages the driver with
   `pnputil /add-driver /install`.
   Best-effort: a driver failure warns but never aborts the install (the host degrades to a physical
   display without it).
@@ -40,7 +43,7 @@ exe into `C:\Program Files\punktfunk\` and calls that subcommand, elevated.
   lays down the built **self-contained** `.output` server (Nitro `noExternals` — deps bundled +
   tree-shaken, ~75 files, no `node_modules`) + a portable **bun**, prompts for a console login
   password (pre-filled with a secure random default, shown again on the final page; kept on upgrade),
-  then `web-setup.ps1` writes the ACL'd `%ProgramData%\punktfunk\web-password`, registers the
+  then `punktfunk-host.exe web setup` writes the ACL'd `%ProgramData%\punktfunk\web-password`, registers the
   **`PunktfunkWeb`** scheduled task (boot, SYSTEM, restart-on-failure → `web-run.cmd` → `bun` on
   `:3000`), opens TCP 3000, and starts it. It proxies the host's loopback mgmt API with the host's
   own `%ProgramData%\punktfunk\mgmt-token`.
@@ -73,10 +76,7 @@ read it from `%ProgramData%\punktfunk\web-password`.
 | `build-gamepad-drivers.ps1` | Sign + catalog the gamepad drivers (`pf-dualsense` + `pf-xusb`) from the same workspace build (`-SkipBuild`), one shared cert. |
 | `clear-force-integrity.ps1` | Clear the `/INTEGRITYCHECK` PE bit so a self-signed driver loads (reused by every driver build). |
 | `stage-pf-vdisplay.ps1` | Stage the just-built pf-vdisplay bundle + fetch/verify the **pinned** nefcon release. |
-| `install-pf-vdisplay.ps1` | Runs at install time (elevated): trust cert → gated device-node create (nefconc) → `pnputil` install. |
-| `install-gamepad-drivers.ps1` | Runs at install time (elevated): trust cert → `pnputil /add-driver` each gamepad `.inf` (per-session devnodes are SwDeviceCreate'd by the host). |
 | `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `bun` on the Nitro server (`:3000`). |
-| `../../scripts/windows/web-setup.ps1` | Install-time (elevated): write the ACL'd console password, register the `PunktfunkWeb` task + firewall rule, start it. |
 | `drivers/` | The all-Rust IddCx **driver source** workspace: the `pf-vdisplay` crate on `wdk-sys` / windows-drivers-rs + the owned `pf-driver-proto` ABI + `wdk-iddcx` / `wdk-probe`, plus `deploy-dev.ps1` (build/sign/install for dev). |
 | `reset-pf-vdisplay.ps1` | **Dev:** recover a wedged driver — stop host → reap ghost monitor nodes → reload the adapter → start host (no reboot). See *Dev iteration* below. |
 | `redeploy-pf-vdisplay.ps1` | **Dev:** one-shot redeploy — (optional) build → stop host → `deploy-dev.ps1 -Install` → reload adapter → start host. |
