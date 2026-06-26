@@ -596,12 +596,12 @@ impl DmabufInner {
                 num: 1,
                 den: fps as c_int,
             };
-            // NOTE(leak, not UB): `av_buffersrc_parameters_set` takes its OWN ref of
-            // `par->hw_frames_ctx`, and `av_free(par)` frees only the struct (not the ref). So this
-            // `av_buffer_ref(drm_frames)` ref is leaked once per session — assigning `drm_frames`
-            // borrowed (no extra ref) is the correct ffmpeg pattern. Sound (a refcount leak, never a
-            // dangling/double-free), but it keeps the DRM frames ctx + device alive past `Drop`.
-            (*par).hw_frames_ctx = ffi::av_buffer_ref(drm_frames);
+            // Assign `drm_frames` BORROWED (no extra ref): `av_buffersrc_parameters_set` takes its
+            // own ref of `par->hw_frames_ctx` (via av_buffer_replace), and `av_free(par)` frees only
+            // the struct, not the ref. Our single owned `drm_frames` ref is retained, lives in
+            // `DmabufInner`, and is unref'd in `Drop`. Wrapping it in `av_buffer_ref` here would leak
+            // that extra ref every session (the persistent listener would accumulate them).
+            (*par).hw_frames_ctx = drm_frames;
             let r = ffi::av_buffersrc_parameters_set(src, par);
             ffi::av_free(par as *mut _);
             if r < 0 {
@@ -656,10 +656,12 @@ impl DmabufInner {
                 ffi::av_buffer_unref(&mut drm_device);
                 bail!("filter sink has no VAAPI frames context");
             }
-            // NOTE(leak, not UB): unlike the error paths above, this `?` returns without unref'ing
-            // `graph`/`drm_frames`/`vaapi_device`/`drm_device` — so an encoder-open failure leaks them.
-            // Sound (leak only); only the unhappy path, when the session is failing anyway.
-            let enc = open_vaapi_encoder(
+            // On encoder-open failure, free the graph + our owned buffer refs before bailing (matching
+            // every error path above) so a failed session doesn't leak them. `nv12_ctx` is borrowed
+            // from the sink (owned by `graph`), so `avfilter_graph_free` reclaims it — don't unref it
+            // separately. On success the encoder takes its own ref of `vaapi_device`, and `drm_frames`/
+            // `vaapi_device`/`drm_device`/`graph` move into `DmabufInner` (freed in `Drop`).
+            let enc = match open_vaapi_encoder(
                 codec,
                 width,
                 height,
@@ -667,7 +669,16 @@ impl DmabufInner {
                 bitrate_bps,
                 vaapi_device,
                 nv12_ctx,
-            )?;
+            ) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    ffi::avfilter_graph_free(&mut graph);
+                    ffi::av_buffer_unref(&mut drm_frames);
+                    ffi::av_buffer_unref(&mut vaapi_device);
+                    ffi::av_buffer_unref(&mut drm_device);
+                    return Err(e);
+                }
+            };
 
             tracing::info!(
                 encoder = codec.vaapi_name(),
