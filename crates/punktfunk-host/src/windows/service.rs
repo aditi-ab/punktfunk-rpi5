@@ -23,6 +23,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::ffi::{c_void, OsString};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::Duration;
@@ -67,6 +68,10 @@ const DEFAULT_HOST_CMD: &str = "serve --gamestream";
 /// Event handles shared between the SCM control handler (which signals them) and the supervision loop
 /// (which waits on them). Stored as raw `isize` so the `'static + Send` handler can reach them without
 /// a non-`Send` `HANDLE` capture. Set once in `run_service`.
+///
+/// Intentionally left as raw-`isize` statics + their explicit `CloseHandle` in `run_service` (not
+/// `OwnedHandle`): they're smuggled across the C SCM control-handler boundary, so converting them is a
+/// separate, riskier redesign out of scope for the process/job-handle ownership change here.
 static STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static SESSION_EVENT: AtomicIsize = AtomicIsize::new(0);
 
@@ -280,7 +285,8 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         .collect();
 
     // Kill-on-close job so a service crash never orphans the SYSTEM host; BREAKAWAY_OK lets the host
-    // still spawn the WGC helper.
+    // still spawn the WGC helper. Owned: dropping it at function exit (KILL_ON_JOB_CLOSE) reaps any
+    // straggler still inside it — no manual CloseHandle(job).
     let job = unsafe { make_job() }.context("create job object")?;
 
     let mut restarts: u32 = 0;
@@ -299,8 +305,10 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
             continue;
         }
 
-        let pi = match unsafe { spawn_host(session, &cmdline, &workdir, job) } {
-            Ok(pi) => pi,
+        // BORROW the owned job handle for AssignProcessToJobObject inside spawn_host.
+        let job_h = HANDLE(job.as_raw_handle() as *mut c_void);
+        let child = match unsafe { spawn_host(session, &cmdline, &workdir, job_h) } {
+            Ok(child) => child,
             Err(e) => {
                 tracing::error!("failed to launch host into session {session}: {e:#}");
                 if wait_one(stop, 3000) {
@@ -309,17 +317,21 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                 continue;
             }
         };
-        tracing::info!(pid = pi.dwProcessId, session, cmd = %host_cmd, "host launched");
+        tracing::info!(pid = child.pid, session, cmd = %host_cmd, "host launched");
+
+        // A BORROW of the owned process handle for the waits + TerminateProcess (HANDLE is Copy, so
+        // `proc_h` is a plain copy that does NOT close it). `child` owns the process + thread handles
+        // and auto-closes BOTH when it drops — at the end of this iteration, on `continue`, or on
+        // `break` — so every match arm below only stops/terminates and lets the drop do the closing.
+        let proc_h = HANDLE(child.process.as_raw_handle() as *mut c_void);
 
         // Wait on stop / session-change / child-exit.
-        let reason = wait_any(&[stop, session_ev, pi.hProcess], INFINITE);
+        let reason = wait_any(&[stop, session_ev, proc_h], INFINITE);
         match reason {
             Some(0) => {
-                // Stop: terminate the child and exit.
+                // Stop: terminate the child and exit (the `child` drop closes its handles).
                 unsafe {
-                    let _ = TerminateProcess(pi.hProcess, 0);
-                    let _ = CloseHandle(pi.hProcess);
-                    let _ = CloseHandle(pi.hThread);
+                    let _ = TerminateProcess(proc_h, 0);
                 }
                 break;
             }
@@ -334,19 +346,15 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                         "console session changed — relaunching host"
                     );
                     unsafe {
-                        let _ = TerminateProcess(pi.hProcess, 0);
-                        let _ = CloseHandle(pi.hProcess);
-                        let _ = CloseHandle(pi.hThread);
+                        let _ = TerminateProcess(proc_h, 0);
                     }
                     restarts = 0;
                     continue;
                 }
                 // Same session (e.g. a stray notification) — keep waiting on the same child.
-                let r = wait_any(&[stop, pi.hProcess], INFINITE);
+                let r = wait_any(&[stop, proc_h], INFINITE);
                 unsafe {
-                    let _ = TerminateProcess(pi.hProcess, 0);
-                    let _ = CloseHandle(pi.hProcess);
-                    let _ = CloseHandle(pi.hThread);
+                    let _ = TerminateProcess(proc_h, 0);
                 }
                 if r == Some(0) {
                     break;
@@ -354,12 +362,9 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                 // child exited → fall through to relaunch
             }
             _ => {
-                // Child exited on its own — relaunch (with a small crash-loop backoff).
+                // Child exited on its own — relaunch (with a small crash-loop backoff). The `child`
+                // drop closes its (already-exited) handles.
                 tracing::warn!("host process exited — relaunching");
-                unsafe {
-                    let _ = CloseHandle(pi.hProcess);
-                    let _ = CloseHandle(pi.hThread);
-                }
             }
         }
 
@@ -368,12 +373,11 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         if wait_one(stop, backoff) {
             break;
         }
+        // `child` drops here (end of iteration) → its process + thread handles close before relaunch.
     }
 
-    unsafe {
-        // Dropping the job (KILL_ON_JOB_CLOSE) reaps any straggler in it.
-        let _ = CloseHandle(job);
-    }
+    // `job` (OwnedHandle) drops at function exit, closing the job object → KILL_ON_JOB_CLOSE reaps
+    // any straggler still inside it.
     tracing::info!("supervision loop ended");
     Ok(())
 }
@@ -390,14 +394,16 @@ fn wait_any(handles: &[HANDLE], ms: u32) -> Option<usize> {
     (idx < handles.len() as u32).then_some(idx as usize)
 }
 
-/// A kill-on-close + breakaway-ok job object.
-unsafe fn make_job() -> Result<HANDLE> {
-    let job = CreateJobObjectW(None, PCWSTR::null()).context("CreateJobObjectW")?;
+/// A kill-on-close + breakaway-ok job object, returned as an `OwnedHandle` (auto-`CloseHandle` on drop).
+unsafe fn make_job() -> Result<OwnedHandle> {
+    let job_raw = CreateJobObjectW(None, PCWSTR::null()).context("CreateJobObjectW")?;
+    // Own it immediately so any early return (e.g. a failed SetInformationJobObject) still closes it.
+    let job = OwnedHandle::from_raw_handle(job_raw.0);
     let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     info.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
     SetInformationJobObject(
-        job,
+        HANDLE(job.as_raw_handle() as *mut c_void),
         JobObjectExtendedLimitInformation,
         &info as *const _ as *const c_void,
         std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -406,13 +412,24 @@ unsafe fn make_job() -> Result<HANDLE> {
     Ok(job)
 }
 
-/// Launch the host as SYSTEM into `session_id`'s interactive desktop. Returns the child handles.
+/// The owned handles to a spawned host child. The `process`/`thread` `OwnedHandle`s auto-`CloseHandle`
+/// when the `Child` drops (or is replaced each loop iteration) — replacing the manual
+/// `CloseHandle(pi.hProcess/hThread)` the supervise loop used to scatter across its match arms.
+struct Child {
+    process: OwnedHandle,
+    /// Held only for its RAII `CloseHandle` (the thread handle is never used after spawn) — `_`-prefixed
+    /// so the `dead_code` lint (CI's `-D warnings`) doesn't flag the never-read field.
+    _thread: OwnedHandle,
+    pid: u32,
+}
+
+/// Launch the host as SYSTEM into `session_id`'s interactive desktop. Returns the owned child handles.
 unsafe fn spawn_host(
     session_id: u32,
     cmdline: &str,
     workdir: &[u16],
     job: HANDLE,
-) -> Result<PROCESS_INFORMATION> {
+) -> Result<Child> {
     // 1) A primary SYSTEM token retargeted to the active console session: duplicate THIS process's
     //    (LocalSystem) token, then set its session id. SYSTEM holds SE_TCB so SetTokenInformation
     //    (TokenSessionId) is permitted.
@@ -494,7 +511,14 @@ unsafe fn spawn_host(
 
     // Best-effort: keep the host inside the kill-on-close job.
     let _ = AssignProcessToJobObject(job, pi.hProcess);
-    Ok(pi)
+
+    // Take ownership of the process + thread handles the API filled into `pi`; the returned `Child`
+    // closes BOTH on drop, so the supervise loop no longer hand-closes them in its match arms.
+    Ok(Child {
+        process: OwnedHandle::from_raw_handle(pi.hProcess.0),
+        _thread: OwnedHandle::from_raw_handle(pi.hThread.0),
+        pid: pi.dwProcessId,
+    })
 }
 
 /// Open `path` for appending, as an INHERITABLE handle (so the child can use it as stdout/stderr).
