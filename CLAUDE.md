@@ -27,7 +27,15 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   Input: mouse/keyboard (libei via RemoteDesktop portal on KWin/GNOME, gamescope's own EIS
   socket, wlr protocols on Sway) and **gamepads** (uinput X-Box-360 pads + rumble
   back-channel; validated live — pad created/destroyed with the session). Management REST API +
-  checked-in OpenAPI doc (`mgmt.rs`).
+  checked-in OpenAPI doc (`mgmt.rs`). **Web-console performance capture** (`stats_recorder.rs`,
+  design: [`design/stats-capture-plan.md`](design/stats-capture-plan.md)): the operator arms stats
+  recording from the web console, plays, stops, and reviews the run as graphs (per-stage latency
+  breakdown · fps new/repeat · goodput · loss/FEC). A shared `Arc<StatsRecorder>` ring (the hot-path
+  gate is a runtime `AtomicBool`, replacing the startup-only `PUNKTFUNK_PERF`) is fed by **both** the
+  native `virtual_stream` and the GameStream encode loop at their existing ~2 s/~1 s aggregation
+  boundary, and finished captures are saved as on-disk recordings
+  (`~/.config/punktfunk/captures/*.json`) browsable/exportable from the console's **Performance** page
+  (recharts). Endpoints `/api/v1/stats/*` (bearer-only). *Implemented; not yet on-glass validated.*
 - **Native protocol (`punktfunk/1`): full session planes, validated live.** QUIC
   control plane (`punktfunk-core` `quic` feature: Hello{mode}/Welcome{full Config}/Start), data
   plane = the hardened core `Session` over raw UDP with **GF(2¹⁶) Leopard FEC + AES-GCM**
@@ -275,7 +283,7 @@ crates/punktfunk-host/
   zerocopy/{egl,cuda,vulkan}.rs         dmabuf → CUDA → NVENC (tiled via EGL/GL, LINEAR via Vulkan)
   inject/{libei,wlr,gamepad,dualsense}.rs   input backends (uinput xpad + UHID DualSense)
   encode/{nvenc,linux,vaapi,ffmpeg_win,sw}.rs   per-GPU encoders (NVENC · Linux NVENC/CUDA · VAAPI · AMF/QSV · openh264)
-  capture.rs · encode.rs · audio.rs · spike.rs · punktfunk1.rs · mgmt.rs · native_pairing.rs
+  capture.rs · encode.rs · audio.rs · spike.rs · punktfunk1.rs · mgmt.rs · native_pairing.rs · stats_recorder.rs
 clients/probe/    punktfunk/1 reference/probe client (headless test/measurement tool)
 clients/linux/    native Linux client (GTK4/libadwaita · FFmpeg · PipeWire · SDL3)
 clients/windows/  native Windows client (WinUI 3 via windows-reactor · D3D11 · WASAPI · SDL3)
@@ -283,7 +291,7 @@ clients/apple/    native macOS/iOS/tvOS client (Swift · VideoToolbox · GameCon
 clients/android/  native Android client (Kotlin app + native/ Rust JNI core over punktfunk-core)
 clients/decky/    Steam Deck Decky plugin
 crates/punktfunk-host/src/{capture/dxgi,vdisplay/sudovda,encode/ffmpeg_win,inject/gamepad_windows,audio/wasapi_*,service}.rs   Windows host backends
-web/                          TanStack web console over the mgmt API (status · devices · pairing)
+web/                          TanStack web console over the mgmt API (status · devices · pairing · performance graphs)
 packaging/                    apt(deb) · RPM/COPR · Arch/sysext · Flatpak · Bazzite bootc · Windows host installer (per-dir READMEs)
 tools/{loss-harness,latency-probe}/     measurement (plan §10)
 scripts/                  60-punktfunk.rules · punktfunk-host.service · host.env.example · headless/

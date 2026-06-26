@@ -125,12 +125,21 @@ pub struct AppState {
     /// (avoids a PipeWire stream setup per reconnect); drained on reuse so no stale audio is
     /// sent, dropped + reopened when a session negotiates a different channel count.
     pub audio_cap: std::sync::Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>,
+    /// Shared streaming-stats recorder (web-console capture/graph). The GameStream encode loop
+    /// reads `is_armed()` per frame and emits samples; the same `Arc` is shared with the mgmt API
+    /// and the native punktfunk/1 loops so one capture spans whichever path is streaming.
+    pub stats: Arc<crate::stats_recorder::StatsRecorder>,
 }
 
 impl AppState {
     /// Fresh control-plane state: no active session; the pairing allow-list is loaded from
-    /// disk (pairings persist across restarts).
-    pub fn new(host: Host, identity: cert::ServerIdentity) -> AppState {
+    /// disk (pairings persist across restarts). `stats` is the shared recorder handed to both the
+    /// mgmt API and the streaming loops.
+    pub fn new(
+        host: Host,
+        identity: cert::ServerIdentity,
+        stats: Arc<crate::stats_recorder::StatsRecorder>,
+    ) -> AppState {
         AppState {
             host,
             identity,
@@ -145,6 +154,7 @@ impl AppState {
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
             video_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            stats,
         }
     }
 }
@@ -166,7 +176,10 @@ pub fn serve(
 ) -> Result<()> {
     let host = Host::detect()?;
     let identity = cert::ServerIdentity::load_or_create().context("host certificate")?;
-    let state = Arc::new(AppState::new(host, identity));
+    // The shared streaming-stats recorder: one handle for the mgmt API, the GameStream encode loop
+    // (via `AppState`), and the native punktfunk/1 loops (passed to `punktfunk1::serve`).
+    let stats = crate::stats_recorder::StatsRecorder::new(crate::stats_recorder::default_dir());
+    let state = Arc::new(AppState::new(host, identity, stats.clone()));
     // The native plane always runs, so the shared native-pairing handle (linking the QUIC ceremony
     // and the management API) always exists.
     let np = Arc::new(
@@ -206,8 +219,8 @@ pub fn serve(
             );
             tokio::try_join!(
                 nvhttp::run(state.clone()),
-                crate::mgmt::run(state.clone(), mgmt, Some(np.clone())),
-                crate::punktfunk1::serve(native_opts, np),
+                crate::mgmt::run(state.clone(), mgmt, Some(np.clone()), stats.clone()),
+                crate::punktfunk1::serve(native_opts, np, stats.clone()),
             )?;
         } else {
             // Secure default: native punktfunk/1 + management API only (no GameStream surface).
@@ -217,8 +230,8 @@ pub fn serve(
                  (GameStream OFF — pass --gamestream for stock-Moonlight compat)"
             );
             tokio::try_join!(
-                crate::mgmt::run(state.clone(), mgmt, Some(np.clone())),
-                crate::punktfunk1::serve(native_opts, np),
+                crate::mgmt::run(state.clone(), mgmt, Some(np.clone()), stats.clone()),
+                crate::punktfunk1::serve(native_opts, np, stats.clone()),
             )?;
         }
         Ok(())

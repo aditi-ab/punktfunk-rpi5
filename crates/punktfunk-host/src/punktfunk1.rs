@@ -79,6 +79,9 @@ pub struct Punktfunk1Options {
 
 /// The native (punktfunk/1) trust store + on-demand arming PIN, shared with the management API.
 use crate::native_pairing::NativePairing;
+/// The shared streaming-stats recorder (web-console capture/graph), shared with the management API
+/// and the GameStream loop; threaded into each session's `SessionContext`.
+use crate::stats_recorder::StatsRecorder;
 
 /// Minimum spacing between accepted pairing ceremonies (bounds online PIN guessing — with
 /// SPAKE2 an attacker already gets only one guess per ceremony; this caps the rate).
@@ -114,7 +117,11 @@ pub fn run(opts: Punktfunk1Options) -> Result<()> {
         opts.pairing_pin.clone(),
         opts.allow_pairing || opts.require_pairing,
     )?);
-    rt.block_on(serve(opts, np))
+    // Standalone `punktfunk1-host` has no mgmt API to arm capture, so this recorder stays disarmed
+    // (harmless — the loops' `is_armed()` gate is always false). The unified `serve` shares one
+    // recorder across mgmt + both streaming paths instead.
+    let stats = StatsRecorder::new(crate::stats_recorder::default_dir());
+    rt.block_on(serve(opts, np, stats))
 }
 
 fn fingerprint_hex(fp: &[u8; 32]) -> String {
@@ -157,7 +164,11 @@ pub(crate) fn native_serve_opts(cfg: &NativeServe) -> Punktfunk1Options {
     }
 }
 
-pub(crate) async fn serve(opts: Punktfunk1Options, np: Arc<NativePairing>) -> Result<()> {
+pub(crate) async fn serve(
+    opts: Punktfunk1Options,
+    np: Arc<NativePairing>,
+    stats: Arc<StatsRecorder>,
+) -> Result<()> {
     let identity = crate::gamestream::cert::ServerIdentity::load_or_create()
         .context("load host identity (~/.config/punktfunk)")?;
     let fingerprint = endpoint::fingerprint_of_pem(&identity.cert_pem)
@@ -276,6 +287,7 @@ pub(crate) async fn serve(opts: Punktfunk1Options, np: Arc<NativePairing>) -> Re
         let audio_cap = audio_cap.clone();
         let np = np.clone();
         let last_pairing = last_pairing.clone();
+        let stats = stats.clone();
         let inj_tx = injector.sender();
         let mic_tx = mic_service.sender();
         sessions.spawn(async move {
@@ -289,6 +301,7 @@ pub(crate) async fn serve(opts: Punktfunk1Options, np: Arc<NativePairing>) -> Re
                 &fingerprint,
                 &np,
                 &last_pairing,
+                stats,
             )
             .await
             {
@@ -479,6 +492,7 @@ async fn serve_session(
     host_fp: &[u8; 32],
     np: &NativePairing,
     last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
+    stats: Arc<StatsRecorder>,
 ) -> Result<()> {
     let peer = conn.remote_address();
 
@@ -935,6 +949,12 @@ async fn serve_session(
     let stop_stream = stop.clone();
     let fec_target_dp = fec_target.clone(); // data-plane handle to the adaptive-FEC target
     let conn_stream = conn.clone(); // for sending the source's real HDR metadata (0xCE) mid-stream
+    let stats_dp = stats; // data-plane handle to the shared stats recorder
+                          // Short label for web-console stats captures: the client's cert-fingerprint prefix, else its
+                          // peer IP (no fingerprint = anonymous TOFU/--open client).
+    let client_label = endpoint::peer_fingerprint(&conn)
+        .map(|fp| fingerprint_hex(&fp)[..12].to_string())
+        .unwrap_or_else(|| conn.remote_address().ip().to_string());
     let result: Result<()> = async {
         tokio::task::spawn_blocking(move || -> Result<()> {
             // Wait briefly for the client to hole-punch our data port, then stream to its OBSERVED
@@ -989,6 +1009,8 @@ async fn serve_session(
                         probe_result_tx,
                         fec_target: fec_target_dp,
                         conn: conn_stream,
+                        stats: stats_dp,
+                        client_label,
                         #[cfg(target_os = "windows")]
                         launch: launch_for_dp,
                     })
@@ -1947,6 +1969,21 @@ struct FrameMsg {
     deadline: std::time::Instant,
     /// capture→encoded latency (µs), measured on the encode thread, carried for the perf histogram.
     encode_us: u32,
+    /// Per-stage µs splits, measured on the capture/encode thread (0 when neither `PUNKTFUNK_PERF`
+    /// nor a stats capture is armed). The send thread accumulates them for the web-console sample:
+    /// `cap_us` = `try_latest` (ring read + colour convert), `submit_us` = NVENC `encode_picture`
+    /// launch, `wait_us` = `lock_bitstream` (the scheduling wait + ASIC encode = the "encode" stage).
+    cap_us: u32,
+    submit_us: u32,
+    wait_us: u32,
+    /// This frame is a re-encoded hold (the source had no fresh frame): a source-starvation signal
+    /// the send thread folds into `repeat_fps`.
+    repeat: bool,
+    /// Whether the per-stage splits (`cap_us`/`submit_us`/`wait_us`) were actually measured at
+    /// capture time (`perf` was on or a stats capture was armed). The send thread trusts this
+    /// instead of re-reading `is_armed()`, so a capture that arms while frames are already in flight
+    /// doesn't fold their zeroed splits into the first window's percentiles.
+    was_measured: bool,
 }
 
 /// The dedicated send thread: it owns the whole [`Session`] (so no socket clone or shared stats are
@@ -2020,6 +2057,19 @@ pub(crate) fn boost_thread_priority(critical: bool) {
     }
 }
 
+/// Everything the send thread needs to emit web-console stats samples at its 2 s aggregation
+/// boundary: the shared recorder (whose `is_armed()` gates emission) plus the negotiated
+/// mode/codec/client to seed the capture's `CaptureMeta` on the first armed registration.
+struct SendStats {
+    rec: Arc<StatsRecorder>,
+    width: u32,
+    height: u32,
+    fps: u32,
+    codec: &'static str,
+    client: String,
+    bitrate_kbps: u32,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn send_loop(
     mut session: Session,
@@ -2030,6 +2080,7 @@ fn send_loop(
     perf: bool,
     burst_cap: usize,
     fec_target: Arc<AtomicU8>,
+    stats: SendStats,
 ) {
     boost_thread_priority(false); // transmit thread: above-normal (Apollo's encoder-thread level)
     let mut last_perf = std::time::Instant::now();
@@ -2038,6 +2089,16 @@ fn send_loop(
     let mut encode_us: Vec<u32> = Vec::new();
     let mut pace_us: Vec<u32> = Vec::new();
     let (mut paced_frames, mut immediate_frames) = (0u64, 0u64);
+    // Web-console stats accumulation (active when `perf` OR the recorder is armed): the per-stage
+    // split carried on each FrameMsg, the new-vs-repeat frame split, the cached registration id, and
+    // the previous window's loss snapshot for delta computation.
+    let mut sid: Option<u32> = None;
+    let (mut cap_v, mut submit_v, mut wait_v): (Vec<u32>, Vec<u32>, Vec<u32>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let (mut new_frames, mut repeat_frames) = (0u64, 0u64);
+    let mut last_frames_dropped = 0u64;
+    let mut last_packets_dropped = 0u64;
+    let mut last_fec_recovered = 0u64;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -2058,9 +2119,24 @@ fn send_loop(
                 burst_cap,
             ) {
                 Ok(stat) => {
-                    if perf {
+                    if perf || stats.rec.is_armed() {
+                        // `encode_us`/`pace_us`/fps are valid for every frame (always measured),
+                        // including the Windows relay + tail-drain frames. The cap/submit/wait splits
+                        // are only real when the frame was measured at capture time — a frame captured
+                        // before this capture armed carries zeroed splits, so skip those (an empty
+                        // window → `percentile()` returns 0) rather than pull the percentiles down.
                         encode_us.push(msg.encode_us);
                         pace_us.push(stat.spread_us);
+                        if msg.was_measured {
+                            cap_v.push(msg.cap_us);
+                            submit_v.push(msg.submit_us);
+                            wait_v.push(msg.wait_us);
+                        }
+                        if msg.repeat {
+                            repeat_frames += 1;
+                        } else {
+                            new_frames += 1;
+                        }
                         if stat.paced {
                             paced_frames += 1;
                         } else {
@@ -2076,31 +2152,91 @@ fn send_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // encode thread done
         }
-        if perf && last_perf.elapsed() >= std::time::Duration::from_secs(2) {
+        if last_perf.elapsed() >= std::time::Duration::from_secs(2) {
             let s = session.stats();
             let secs = last_perf.elapsed().as_secs_f64();
             // Attempted (sealed) transmit rate; `send_dropped` is what didn't reach the wire.
             let tx_mbps = (s.bytes_sent - last_bytes) as f64 * 8.0 / secs / 1_000_000.0;
-            tracing::info!(
-                tx_mbps = format!("{tx_mbps:.0}"),
-                send_dropped = s.packets_send_dropped - last_send_dropped,
-                send_dropped_total = s.packets_send_dropped,
-                encode_us_p50 = percentile(&mut encode_us, 0.50),
-                encode_us_p99 = percentile(&mut encode_us, 0.99),
-                pace_us_p50 = percentile(&mut pace_us, 0.50),
-                pace_us_p99 = percentile(&mut pace_us, 0.99),
-                pace_us_max = pace_us.last().copied().unwrap_or(0),
-                immediate_frames,
-                paced_frames,
-                "perf"
-            );
+            if perf {
+                tracing::info!(
+                    tx_mbps = format!("{tx_mbps:.0}"),
+                    send_dropped = s.packets_send_dropped - last_send_dropped,
+                    send_dropped_total = s.packets_send_dropped,
+                    encode_us_p50 = percentile(&mut encode_us, 0.50),
+                    encode_us_p99 = percentile(&mut encode_us, 0.99),
+                    pace_us_p50 = percentile(&mut pace_us, 0.50),
+                    pace_us_p99 = percentile(&mut pace_us, 0.99),
+                    pace_us_max = pace_us.last().copied().unwrap_or(0),
+                    immediate_frames,
+                    paced_frames,
+                    "perf"
+                );
+            }
+            // Web-console capture: this thread owns `session.stats()`, so it emits the COMPLETE
+            // sample — the cap/submit/encode split carried over from the capture thread plus this
+            // window's pacing/goodput/loss. Loss fields are deltas vs the previous window's snapshot.
+            if stats.rec.is_armed() {
+                let session_id = *sid.get_or_insert_with(|| {
+                    stats.rec.register_session(
+                        "native",
+                        stats.width,
+                        stats.height,
+                        stats.fps,
+                        stats.codec,
+                        &stats.client,
+                    )
+                });
+                let sample = crate::stats_recorder::StatsSample {
+                    t_ms: 0, // stamped by push_sample from the capture's monotonic start
+                    session_id,
+                    stages: vec![
+                        crate::stats_recorder::StageTiming {
+                            name: "capture".into(),
+                            p50_us: percentile(&mut cap_v, 0.50) as f32,
+                            p99_us: percentile(&mut cap_v, 0.99) as f32,
+                        },
+                        crate::stats_recorder::StageTiming {
+                            name: "submit".into(),
+                            p50_us: percentile(&mut submit_v, 0.50) as f32,
+                            p99_us: percentile(&mut submit_v, 0.99) as f32,
+                        },
+                        crate::stats_recorder::StageTiming {
+                            name: "encode".into(),
+                            p50_us: percentile(&mut wait_v, 0.50) as f32,
+                            p99_us: percentile(&mut wait_v, 0.99) as f32,
+                        },
+                        crate::stats_recorder::StageTiming {
+                            name: "send".into(),
+                            p50_us: percentile(&mut pace_us, 0.50) as f32,
+                            p99_us: percentile(&mut pace_us, 0.99) as f32,
+                        },
+                    ],
+                    fps: (new_frames as f64 / secs) as f32,
+                    repeat_fps: (repeat_frames as f64 / secs) as f32,
+                    mbps: tx_mbps as f32,
+                    bitrate_kbps: stats.bitrate_kbps,
+                    frames_dropped: s.frames_dropped.saturating_sub(last_frames_dropped) as u32,
+                    packets_dropped: s.packets_dropped.saturating_sub(last_packets_dropped) as u32,
+                    send_dropped: s.packets_send_dropped.saturating_sub(last_send_dropped) as u32,
+                    fec_recovered: s.fec_recovered_shards.saturating_sub(last_fec_recovered) as u32,
+                };
+                stats.rec.push_sample(session_id, sample);
+            }
             last_perf = std::time::Instant::now();
             last_bytes = s.bytes_sent;
             last_send_dropped = s.packets_send_dropped;
+            last_frames_dropped = s.frames_dropped;
+            last_packets_dropped = s.packets_dropped;
+            last_fec_recovered = s.fec_recovered_shards;
             encode_us.clear();
             pace_us.clear();
+            cap_v.clear();
+            submit_v.clear();
+            wait_v.clear();
             paced_frames = 0;
             immediate_frames = 0;
+            new_frames = 0;
+            repeat_frames = 0;
         }
     }
 }
@@ -2201,6 +2337,13 @@ struct SessionContext {
     fec_target: Arc<AtomicU8>,
     /// The QUIC control connection (carries host→client 0xCE source-HDR metadata mid-stream).
     conn: quinn::Connection,
+    /// Shared streaming-stats recorder. The capture loop reads `is_armed()` per frame to decide
+    /// whether to measure the per-stage split; the send thread builds + pushes the aggregated
+    /// `StatsSample` at its 2 s boundary.
+    stats: Arc<StatsRecorder>,
+    /// Short client label (cert-fingerprint prefix, else peer IP) seeded into the capture meta on
+    /// the first armed stats registration.
+    client_label: String,
     /// Windows: the store-qualified library id to launch into the interactive user session once
     /// capture is live (no gamescope nesting on Windows). `None` = no launch requested. Linux uses the
     /// gamescope `PUNKTFUNK_GAMESCOPE_APP` path resolved at handshake, so this field is Windows-only.
@@ -2242,6 +2385,8 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         probe_result_tx,
         fec_target,
         conn,
+        stats,
+        client_label,
         #[cfg(target_os = "windows")]
         launch,
     } = ctx;
@@ -2310,6 +2455,17 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // The bounded channel applies backpressure (the encode thread blocks if the send falls behind,
     // so frames slow down rather than a dropped frame freezing the infinite-GOP stream).
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<FrameMsg>(3);
+    // The send thread emits the web-console stats sample (it owns `session.stats()`); clone the
+    // recorder so the capture loop keeps its own handle for the per-frame `is_armed()` gate.
+    let send_stats = SendStats {
+        rec: stats.clone(),
+        width: mode.width,
+        height: mode.height,
+        fps: mode.refresh_hz,
+        codec: "hevc",
+        client: client_label,
+        bitrate_kbps,
+    };
     let send_thread = std::thread::Builder::new()
         .name("punktfunk-send".into())
         .spawn({
@@ -2324,6 +2480,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                     perf,
                     burst_cap,
                     fec_target,
+                    send_stats,
                 )
             }
         })
@@ -2480,18 +2637,31 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             tracing::debug!("forcing keyframe (client decode recovery)");
             enc.request_keyframe();
         }
+        // Measure the per-stage split when `PUNKTFUNK_PERF` is set OR a web-console stats capture is
+        // armed (a cheap Relaxed atomic, re-read each frame). The values feed the existing perf log
+        // unchanged and ride each FrameMsg to the send thread, which builds the aggregated sample.
+        let measure = perf || stats.is_armed();
         let t_cap = std::time::Instant::now();
         let cap_result = capturer.try_latest();
+        let cap_us = if measure {
+            t_cap.elapsed().as_micros() as u32
+        } else {
+            0
+        };
         if perf {
-            st_cap.push(t_cap.elapsed().as_micros() as u32);
+            st_cap.push(cap_us);
         }
+        let mut repeat = false;
         match cap_result {
             Ok(Some(f)) => {
                 frame = f;
                 diag_new += 1;
                 capture_rebuilds = 0; // a delivered frame clears the consecutive-loss counter
             }
-            Ok(None) => diag_repeat += 1, // no new frame (static desktop / mid-rebuild) — repeat the last
+            Ok(None) => {
+                diag_repeat += 1; // no new frame (static desktop / mid-rebuild) — repeat the last
+                repeat = true;
+            }
             // The capture source died (PipeWire/compositor thread ended, virtual output gone). Rather
             // than tear the whole session down — the client has no reconnect path and would have to
             // cold-restart the handshake — rebuild the pipeline IN PLACE at the current mode, exactly
@@ -2558,8 +2728,13 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         let capture_ns = now_ns();
         let t_submit = std::time::Instant::now();
         enc.submit(&frame).context("encoder submit")?;
+        let submit_us = if measure {
+            t_submit.elapsed().as_micros() as u32
+        } else {
+            0
+        };
         if perf {
-            st_submit.push(t_submit.elapsed().as_micros() as u32);
+            st_submit.push(submit_us);
         }
         // This frame's pacing deadline (the next frame's due time); the send thread spreads a big frame
         // up to here. Each in-flight frame carries its own (capture_ns, deadline) for when it's polled.
@@ -2573,8 +2748,13 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         while inflight.len() >= depth {
             let t_wait = std::time::Instant::now();
             let polled = enc.poll().context("encoder poll")?;
+            let wait_us = if measure {
+                t_wait.elapsed().as_micros() as u32
+            } else {
+                0
+            };
             if perf {
-                st_wait.push(t_wait.elapsed().as_micros() as u32);
+                st_wait.push(wait_us);
             }
             let au = match polled {
                 Some(au) => au,
@@ -2602,6 +2782,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 flags,
                 deadline,
                 encode_us,
+                cap_us,
+                submit_us,
+                wait_us,
+                repeat,
+                was_measured: measure,
             };
             // Hand to the send thread; this blocks (backpressure) if it's behind. An Err means it
             // exited (send failure / stop) — end the encode loop too.
@@ -2629,12 +2814,19 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             FLAG_PIC as u32
         };
         let encode_us = (now_ns().saturating_sub(cap_ns) / 1000) as u32;
+        // End-of-stream tail drain: the per-stage split isn't measured here (the capture loop has
+        // exited), so leave it zero — these last few frames are negligible for the aggregates.
         let msg = FrameMsg {
             data: au.data,
             capture_ns: cap_ns,
             flags,
             deadline,
             encode_us,
+            cap_us: 0,
+            submit_us: 0,
+            wait_us: 0,
+            repeat: false,
+            was_measured: false,
         };
         if frame_tx.send(msg).is_err() {
             break;
@@ -2681,6 +2873,8 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
         probe_result_tx,
         fec_target,
         conn: _conn,
+        stats,
+        client_label,
         launch,
     } = ctx;
     tracing::info!(
@@ -2815,7 +3009,18 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
         * 1024;
 
     // Same encode|send split as the single-process path: this thread relays AUs, a dedicated send
-    // thread owns the Session and does FEC+seal+paced-send.
+    // thread owns the Session and does FEC+seal+paced-send. The relay encodes in the helper process,
+    // so this path's FrameMsgs carry no cap/submit/encode split (those stages stay 0 in the sample);
+    // the send thread still emits fps/goodput/pacing/loss from `session.stats()`.
+    let send_stats = SendStats {
+        rec: stats,
+        width: mode.width,
+        height: mode.height,
+        fps: effective_hz,
+        codec: "hevc",
+        client: client_label,
+        bitrate_kbps,
+    };
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<FrameMsg>(3);
     let send_thread = std::thread::Builder::new()
         .name("punktfunk-send".into())
@@ -2831,6 +3036,7 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
                     perf,
                     burst_cap,
                     fec_target,
+                    send_stats,
                 )
             }
         })
@@ -2893,6 +3099,11 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
                 flags,
                 deadline: std::time::Instant::now() + interval,
                 encode_us,
+                cap_us: 0,
+                submit_us: 0,
+                wait_us: 0,
+                repeat: false,
+                was_measured: false,
             };
             let ok = frame_tx.send(msg).is_ok();
             if ok {
@@ -3645,6 +3856,9 @@ mod tests {
                     paired_store: None, // unused: the shared `np` IS the store handle
                 },
                 np_host,
+                StatsRecorder::new(
+                    std::env::temp_dir().join(format!("pf-approval-stats-{}", std::process::id())),
+                ),
             ))
         });
         std::thread::sleep(std::time::Duration::from_millis(500));

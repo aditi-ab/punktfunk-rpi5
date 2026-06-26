@@ -291,7 +291,10 @@ mod tests {
             https_port: HTTPS_PORT,
         };
         let identity = super::super::cert::ServerIdentity::ephemeral().expect("ephemeral identity");
-        Arc::new(AppState::new(host, identity))
+        let stats = crate::stats_recorder::StatsRecorder::new(
+            std::env::temp_dir().join(format!("pf-nvhttp-stats-{}", std::process::id())),
+        );
+        Arc::new(AppState::new(host, identity, stats))
     }
 
     fn fp_of(der: &[u8]) -> String {

@@ -48,6 +48,7 @@ pub fn start(
     force_idr: Arc<AtomicBool>,
     rfi_range: RfiSlot,
     video_cap: CapturerSlot,
+    stats: Arc<crate::stats_recorder::StatsRecorder>,
 ) {
     let _ = std::thread::Builder::new()
         .name("punktfunk-video".into())
@@ -60,6 +61,7 @@ pub fn start(
                 &force_idr,
                 &rfi_range,
                 &video_cap,
+                &stats,
             ) {
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }
@@ -68,6 +70,7 @@ pub fn start(
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     cfg: StreamConfig,
     app: Option<&super::apps::AppEntry>,
@@ -75,6 +78,9 @@ fn run(
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
     video_cap: &std::sync::Mutex<Option<Box<dyn Capturer>>>,
+    // Shared stats recorder for the web-console capture/graph. Threaded into `stream_body` (the
+    // encode loop); per-frame sample emission is wired by a later pass.
+    stats: &Arc<crate::stats_recorder::StatsRecorder>,
 ) -> Result<()> {
     // GameStream capture/encode thread: apply Windows session tuning (no-op off Windows).
     crate::session_tuning::on_hot_thread();
@@ -100,6 +106,8 @@ fn run(
     sock.connect(client)
         .context("connect client video endpoint")?;
     tracing::info!(%client, "video: client endpoint learned");
+    // Short label for web-console stats captures: the client's peer IP.
+    let client_label = client.ip().to_string();
 
     // Native client-resolution source: create a compositor virtual output sized to the client's
     // request and capture it (no scaling). Self-contained — deliberately NOT pooled in
@@ -163,7 +171,16 @@ fn run(
                 }
             }
         }
-        return stream_body(&mut *capturer, &sock, cfg, running, force_idr, rfi_range);
+        return stream_body(
+            &mut *capturer,
+            &sock,
+            cfg,
+            running,
+            force_idr,
+            rfi_range,
+            stats,
+            &client_label,
+        );
     }
 
     // Reuse the persistent capturer (one screencast session → clean reconnect); create it on
@@ -183,7 +200,16 @@ fn run(
         }
     };
     capturer.set_active(true);
-    let result = stream_body(&mut *capturer, &sock, cfg, running, force_idr, rfi_range);
+    let result = stream_body(
+        &mut *capturer,
+        &sock,
+        cfg,
+        running,
+        force_idr,
+        rfi_range,
+        stats,
+        &client_label,
+    );
     capturer.set_active(false);
     *video_cap.lock().unwrap() = Some(capturer);
     result
@@ -326,8 +352,20 @@ fn spawn_sender(
     Ok(())
 }
 
+/// Percentile of a slice (sorts it in place first). `q` in `0.0..=1.0`. Used for the web-console
+/// stats sample's per-stage p50/p99.
+fn percentile(v: &mut [u32], q: f64) -> u32 {
+    if v.is_empty() {
+        return 0;
+    }
+    v.sort_unstable();
+    let i = ((v.len() as f64 * q) as usize).min(v.len() - 1);
+    v[i]
+}
+
 /// The encode → packetize loop, over a borrowed capturer. Sending runs on a dedicated thread
 /// (see [`spawn_sender`]) so a send spike can never stall capture/encode.
+#[allow(clippy::too_many_arguments)]
 fn stream_body(
     capturer: &mut dyn Capturer,
     sock: &UdpSocket,
@@ -335,6 +373,11 @@ fn stream_body(
     running: &Arc<AtomicBool>,
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
+    // Shared stats recorder. The encode loop reads `stats.is_armed()` per frame to decide whether
+    // to accumulate the per-stage split, then emits a `StatsSample` at its 1 s aggregation boundary.
+    stats: &Arc<crate::stats_recorder::StatsRecorder>,
+    // Short client label (peer IP) seeded into the capture meta on the first armed registration.
+    client_label: &str,
 ) -> Result<()> {
     // The first frame establishes the authoritative size/format for the encoder.
     let mut frame = capturer.next_frame().context("capture first frame")?;
@@ -398,6 +441,19 @@ fn stream_body(
     let perf = crate::config::config().perf;
     let (mut mx_cap, mut mx_enc, mut mx_pkt, mut mx_send, mut mx_pkts, mut uniq) =
         (0u128, 0u128, 0u128, 0u128, 0usize, 0u32);
+    // Web-console stats accumulation (active when `perf` OR a capture is armed): per-stage vectors
+    // for p50/p99, the goodput bytes queued to the sender this window, the previous window's
+    // dropped-frame count for delta computation, and the registration id cached on the first sample.
+    let codec_name = match cfg.codec {
+        Codec::H264 => "h264",
+        Codec::H265 => "hevc",
+        Codec::Av1 => "av1",
+    };
+    let mut sid: Option<u32> = None;
+    let (mut v_cap, mut v_enc, mut v_pkt, mut v_send): (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut bytes_win: u64 = 0;
+    let mut last_dropped_batches: u64 = 0;
     // Absolute next-frame deadline — the single pacing clock for the loop.
     let mut next_frame = Instant::now();
     // RFI capability is fixed for the session (probed at encoder open). Query it once so the
@@ -407,6 +463,9 @@ fn stream_body(
 
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
+        // Measure per-stage timing when `PUNKTFUNK_PERF` is set OR a web-console stats capture is
+        // armed (cheap Relaxed atomic, re-read each frame).
+        let measure = perf || stats.is_armed();
         // Advance to the freshest captured frame if one arrived; otherwise reuse the last.
         if let Some(f) = capturer.try_latest().context("capture frame")? {
             frame = f;
@@ -447,9 +506,19 @@ fn stream_body(
         // Hand the frame's packets to the send thread; never block here. A full queue means
         // the sender is behind — drop this batch (FEC/RFI covers the client) and keep encoding.
         let n = batch.len();
+        // Goodput this window = bytes actually queued to the sender (a dropped batch never reaches
+        // the wire, so it's excluded). Summed only when measuring, to keep the idle path free.
+        let batch_bytes: u64 = if measure {
+            batch.iter().map(|p| p.len() as u64).sum()
+        } else {
+            0
+        };
         if n > 0 {
             match batch_tx.try_send(batch) {
-                Ok(()) => sent_batches += 1,
+                Ok(()) => {
+                    sent_batches += 1;
+                    bytes_win += batch_bytes;
+                }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                     dropped_batches += 1;
                     if dropped_batches.is_power_of_two() {
@@ -461,17 +530,26 @@ fn stream_body(
                 }
             }
         }
-        if perf {
+        if measure {
             let t_send = tick.elapsed();
-            mx_cap = mx_cap.max(t_cap.as_micros());
-            mx_enc = mx_enc.max((t_enc - t_cap).as_micros());
-            mx_pkt = mx_pkt.max((t_pkt - t_enc).as_micros());
-            mx_send = mx_send.max((t_send - t_pkt).as_micros());
+            let cap_us = t_cap.as_micros();
+            let enc_us = (t_enc - t_cap).as_micros();
+            let pkt_us = (t_pkt - t_enc).as_micros();
+            let send_us = (t_send - t_pkt).as_micros();
+            mx_cap = mx_cap.max(cap_us);
+            mx_enc = mx_enc.max(enc_us);
+            mx_pkt = mx_pkt.max(pkt_us);
+            mx_send = mx_send.max(send_us);
             mx_pkts = mx_pkts.max(n);
+            v_cap.push(cap_us as u32);
+            v_enc.push(enc_us as u32);
+            v_pkt.push(pkt_us as u32);
+            v_send.push(send_us as u32);
         }
 
         fps_count += 1;
         if fps_t.elapsed() >= Duration::from_secs(1) {
+            let secs = fps_t.elapsed().as_secs_f64();
             if perf {
                 // Max µs/stage this second: cap=drain channel, enc=submit (zero-copy device
                 // copy + NVENC), pkt=poll+FEC+packetize, send=paced packet send. `uniq`=new
@@ -486,12 +564,6 @@ fn stream_body(
                     max_pkts = mx_pkts,
                     "video: streaming (perf)"
                 );
-                mx_cap = 0;
-                mx_enc = 0;
-                mx_pkt = 0;
-                mx_send = 0;
-                mx_pkts = 0;
-                uniq = 0;
             } else {
                 tracing::info!(
                     fps = fps_count,
@@ -500,6 +572,68 @@ fn stream_body(
                     "video: streaming"
                 );
             }
+            // Web-console capture: build the aggregated sample. The host send side exposes no
+            // receiver-side packet loss / FEC-recovery / send-buffer EAGAIN counters, so those stay
+            // 0 (not fabricated); `frames_dropped` is the per-frame send-queue overflow delta.
+            if stats.is_armed() {
+                let session_id = *sid.get_or_insert_with(|| {
+                    stats.register_session(
+                        "gamestream",
+                        cfg.width,
+                        cfg.height,
+                        cfg.fps,
+                        codec_name,
+                        client_label,
+                    )
+                });
+                let sample = crate::stats_recorder::StatsSample {
+                    t_ms: 0, // stamped by push_sample from the capture's monotonic start
+                    session_id,
+                    stages: vec![
+                        crate::stats_recorder::StageTiming {
+                            name: "capture".into(),
+                            p50_us: percentile(&mut v_cap, 0.50) as f32,
+                            p99_us: percentile(&mut v_cap, 0.99) as f32,
+                        },
+                        crate::stats_recorder::StageTiming {
+                            name: "encode".into(),
+                            p50_us: percentile(&mut v_enc, 0.50) as f32,
+                            p99_us: percentile(&mut v_enc, 0.99) as f32,
+                        },
+                        crate::stats_recorder::StageTiming {
+                            name: "packetize".into(),
+                            p50_us: percentile(&mut v_pkt, 0.50) as f32,
+                            p99_us: percentile(&mut v_pkt, 0.99) as f32,
+                        },
+                        crate::stats_recorder::StageTiming {
+                            name: "send".into(),
+                            p50_us: percentile(&mut v_send, 0.50) as f32,
+                            p99_us: percentile(&mut v_send, 0.99) as f32,
+                        },
+                    ],
+                    fps: (uniq as f64 / secs) as f32,
+                    repeat_fps: (fps_count.saturating_sub(uniq) as f64 / secs) as f32,
+                    mbps: (bytes_win as f64 * 8.0 / secs / 1_000_000.0) as f32,
+                    bitrate_kbps: cfg.bitrate_kbps,
+                    frames_dropped: dropped_batches.saturating_sub(last_dropped_batches) as u32,
+                    packets_dropped: 0,
+                    send_dropped: 0,
+                    fec_recovered: 0,
+                };
+                stats.push_sample(session_id, sample);
+            }
+            mx_cap = 0;
+            mx_enc = 0;
+            mx_pkt = 0;
+            mx_send = 0;
+            mx_pkts = 0;
+            uniq = 0;
+            v_cap.clear();
+            v_enc.clear();
+            v_pkt.clear();
+            v_send.clear();
+            bytes_win = 0;
+            last_dropped_batches = dropped_batches;
             fps_count = 0;
             fps_t = Instant::now();
         }

@@ -20,6 +20,7 @@ use crate::gamestream::{
     tls::{serve_https, PeerCertFingerprint},
     AppState, APP_VERSION, AUDIO_PORT, CONTROL_PORT, GFE_VERSION, RTSP_PORT, VIDEO_PORT,
 };
+use crate::stats_recorder::{Capture, CaptureMeta, StatsStatus};
 use anyhow::{Context, Result};
 use axum::{
     extract::{Path, Request, State},
@@ -66,6 +67,9 @@ struct MgmtState {
     /// Native (punktfunk/1) pairing — shared with the QUIC host when the unified `serve --native`
     /// runs it. `None` ⇒ GameStream-only host (the native endpoints report `enabled: false`).
     native: Option<Arc<crate::native_pairing::NativePairing>>,
+    /// Shared streaming-stats recorder — the same handle the streaming loops emit into, so an
+    /// operator can arm/stop a capture here and review/list/delete saved recordings.
+    stats: Arc<crate::stats_recorder::StatsRecorder>,
     token: Option<String>,
     /// The port we serve on, echoed in [`PortMap`] so a client can persist a full endpoint map.
     port: u16,
@@ -77,6 +81,7 @@ pub async fn run(
     state: Arc<AppState>,
     opts: Options,
     native: Option<Arc<crate::native_pairing::NativePairing>>,
+    stats: Arc<crate::stats_recorder::StatsRecorder>,
 ) -> Result<()> {
     // The mgmt API is HTTPS + token-authenticated ALWAYS (even on loopback): `parse_serve`
     // guarantees a token (CLI flag / env / persisted ~/.config/punktfunk/mgmt-token / generated).
@@ -100,7 +105,7 @@ pub async fn run(
         auth = "mTLS (paired cert) or bearer (required)",
         "management API listening over HTTPS (docs at /api/docs, spec at /api/v1/openapi.json)"
     );
-    let app = app(state, Some(token), opts.bind.port(), native);
+    let app = app(state, Some(token), opts.bind.port(), native, stats);
     serve_https(opts.bind, app, tls).await
 }
 
@@ -110,10 +115,12 @@ fn app(
     token: Option<String>,
     port: u16,
     native: Option<Arc<crate::native_pairing::NativePairing>>,
+    stats: Arc<crate::stats_recorder::StatsRecorder>,
 ) -> Router {
     let shared = Arc::new(MgmtState {
         app: state,
         native,
+        stats,
         token,
         port,
     });
@@ -158,7 +165,13 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(request_idr))
                 .routes(routes!(get_library))
                 .routes(routes!(create_custom_game))
-                .routes(routes!(update_custom_game, delete_custom_game)),
+                .routes(routes!(update_custom_game, delete_custom_game))
+                .routes(routes!(stats_capture_start))
+                .routes(routes!(stats_capture_stop))
+                .routes(routes!(stats_capture_status))
+                .routes(routes!(stats_capture_live))
+                .routes(routes!(stats_recordings_list))
+                .routes(routes!(stats_recording_get, stats_recording_delete)),
         )
         .split_for_parts()
 }
@@ -190,6 +203,7 @@ pub fn openapi_json() -> String {
         (name = "native", description = "Native punktfunk/1 pairing: arm a window, display the host PIN, manage paired devices"),
         (name = "session", description = "Active streaming session control"),
         (name = "library", description = "Game library: installed-store titles (Steam) plus user-curated custom entries"),
+        (name = "stats", description = "Streaming performance-stats capture: arm/stop a recording, read the live + saved time-series for graphing"),
     )
 )]
 struct ApiDoc;
@@ -1219,6 +1233,185 @@ async fn delete_custom_game(Path(id): Path<String>) -> Response {
 }
 
 // ---------------------------------------------------------------------------------------
+// Streaming stats capture (design/stats-capture-plan.md §2)
+// ---------------------------------------------------------------------------------------
+
+/// Start a stats capture
+///
+/// Arms a new performance-stats capture. Idempotent: if a capture is already running this returns
+/// the current status unchanged. While armed, the streaming loops emit aggregated samples (~ every
+/// 1–2 s) into the in-progress capture, readable live via `GET /stats/capture/live`.
+#[utoipa::path(
+    post,
+    path = "/stats/capture/start",
+    tag = "stats",
+    operation_id = "statsCaptureStart",
+    responses(
+        (status = OK, description = "Capture armed (or already running)", body = StatsStatus),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn stats_capture_start(State(st): State<Arc<MgmtState>>) -> Json<StatsStatus> {
+    let status = st.stats.start();
+    tracing::info!(
+        started_unix_ms = status.started_unix_ms,
+        "management API: stats capture armed"
+    );
+    Json(status)
+}
+
+/// Stop the stats capture
+///
+/// Disarms the in-progress capture and writes it to disk atomically, returning its summary. If
+/// nothing was recording, returns `204 No Content`.
+#[utoipa::path(
+    post,
+    path = "/stats/capture/stop",
+    tag = "stats",
+    operation_id = "statsCaptureStop",
+    responses(
+        (status = OK, description = "Capture stopped and saved", body = CaptureMeta),
+        (status = NO_CONTENT, description = "Nothing was recording"),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not write the recording to disk", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn stats_capture_stop(State(st): State<Arc<MgmtState>>) -> Response {
+    match st.stats.stop() {
+        Ok(Some(meta)) => {
+            tracing::info!(id = %meta.id, samples = meta.sample_count, "management API: stats capture saved");
+            (StatusCode::OK, Json(meta)).into_response()
+        }
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not save capture: {e}"),
+        ),
+    }
+}
+
+/// Stats capture status
+///
+/// Whether a capture is armed, its sample count, and start time. Poll this (e.g. every 2 s) to
+/// drive the capture-control UI.
+#[utoipa::path(
+    get,
+    path = "/stats/capture/status",
+    tag = "stats",
+    operation_id = "statsCaptureStatus",
+    responses(
+        (status = OK, description = "In-progress capture status (idle when not armed)", body = StatsStatus),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn stats_capture_status(State(st): State<Arc<MgmtState>>) -> Json<StatsStatus> {
+    Json(st.stats.status())
+}
+
+/// Live in-progress capture
+///
+/// The full sample time-series of the capture currently recording, for live graphing. `404` when
+/// nothing is armed.
+#[utoipa::path(
+    get,
+    path = "/stats/capture/live",
+    tag = "stats",
+    operation_id = "statsCaptureLive",
+    responses(
+        (status = OK, description = "The in-progress capture (meta + samples so far)", body = Capture),
+        (status = NOT_FOUND, description = "No capture is currently recording", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn stats_capture_live(State(st): State<Arc<MgmtState>>) -> Response {
+    match st.stats.live_snapshot() {
+        Some(capture) => Json(capture).into_response(),
+        None => api_error(StatusCode::NOT_FOUND, "no capture is currently recording"),
+    }
+}
+
+/// List saved recordings
+///
+/// Every saved capture's summary (the `meta` head only — not the sample body), newest first.
+#[utoipa::path(
+    get,
+    path = "/stats/recordings",
+    tag = "stats",
+    operation_id = "statsRecordingsList",
+    responses(
+        (status = OK, description = "Saved capture summaries, newest first", body = [CaptureMeta]),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn stats_recordings_list(State(st): State<Arc<MgmtState>>) -> Json<Vec<CaptureMeta>> {
+    Json(st.stats.list())
+}
+
+/// Get a saved recording
+///
+/// The full capture (meta + samples) for `id`, for graphing or download.
+#[utoipa::path(
+    get,
+    path = "/stats/recordings/{id}",
+    tag = "stats",
+    operation_id = "statsRecordingGet",
+    params(("id" = String, Path, description = "The recording id (its filename stem)")),
+    responses(
+        (status = OK, description = "The full capture", body = Capture),
+        (status = NOT_FOUND, description = "No recording with that id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "The recording file is unreadable", body = ApiError),
+    )
+)]
+async fn stats_recording_get(State(st): State<Arc<MgmtState>>, Path(id): Path<String>) -> Response {
+    match st.stats.load(&id) {
+        Ok(capture) => Json(capture).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            api_error(StatusCode::NOT_FOUND, "no recording with that id")
+        }
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read recording: {e}"),
+        ),
+    }
+}
+
+/// Delete a saved recording
+///
+/// Removes the recording `id` from disk. `404` if there is no such recording.
+#[utoipa::path(
+    delete,
+    path = "/stats/recordings/{id}",
+    tag = "stats",
+    operation_id = "statsRecordingDelete",
+    params(("id" = String, Path, description = "The recording id (its filename stem)")),
+    responses(
+        (status = NO_CONTENT, description = "Recording deleted"),
+        (status = NOT_FOUND, description = "No recording with that id", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not delete the recording", body = ApiError),
+    )
+)]
+async fn stats_recording_delete(
+    State(st): State<Arc<MgmtState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match st.stats.delete(&id) {
+        Ok(()) => {
+            tracing::info!(id, "management API: recording deleted");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            api_error(StatusCode::NOT_FOUND, "no recording with that id")
+        }
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not delete recording: {e}"),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------
 
@@ -1231,6 +1424,15 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use tower::ServiceExt;
 
+    /// A throwaway stats recorder rooted in a unique temp dir (never touches the real config dir).
+    fn test_stats() -> Arc<crate::stats_recorder::StatsRecorder> {
+        crate::stats_recorder::StatsRecorder::new(std::env::temp_dir().join(format!(
+            "pf-mgmt-stats-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const u8
+        )))
+    }
+
     fn test_state() -> Arc<AppState> {
         let host = Host {
             hostname: "test-host".into(),
@@ -1240,18 +1442,20 @@ mod tests {
             https_port: HTTPS_PORT,
         };
         let identity = ServerIdentity::ephemeral().expect("ephemeral identity");
-        Arc::new(AppState::new(host, identity))
+        Arc::new(AppState::new(host, identity, test_stats()))
     }
 
     // The mgmt API now always requires auth, so the router always has a token. A test that passes
     // `None` gets the default "test-secret" (and `send` auto-attaches the matching bearer); a test
     // that passes an explicit token exercises a mismatch (e.g. `bearer_token_is_enforced`).
     fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
+        let stats = state.stats.clone();
         app(
             state,
             Some(token.unwrap_or("test-secret").to_string()),
             DEFAULT_PORT,
             None,
+            stats,
         )
     }
 
@@ -1261,11 +1465,13 @@ mod tests {
     ) -> Router {
         // Auth required always; the paired-cert tests inject a fingerprint (cert branch wins), the
         // rest authenticate via the `send`-attached default bearer.
+        let stats = state.stats.clone();
         app(
             state,
             Some("test-secret".to_string()),
             DEFAULT_PORT,
             Some(np),
+            stats,
         )
     }
 
@@ -1580,7 +1786,9 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             token: Some("   ".into()),
         };
-        let err = run(test_state(), opts, None).await.unwrap_err();
+        let err = run(test_state(), opts, None, test_stats())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("no token"), "{err}");
     }
 

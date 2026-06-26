@@ -978,6 +978,309 @@
         }
       }
     },
+    "/api/v1/stats/capture/live": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Live in-progress capture",
+        "description": "The full sample time-series of the capture currently recording, for live graphing. `404` when\nnothing is armed.",
+        "operationId": "statsCaptureLive",
+        "responses": {
+          "200": {
+            "description": "The in-progress capture (meta + samples so far)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capture"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No capture is currently recording",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/capture/start": {
+      "post": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Start a stats capture",
+        "description": "Arms a new performance-stats capture. Idempotent: if a capture is already running this returns\nthe current status unchanged. While armed, the streaming loops emit aggregated samples (~ every\n1–2 s) into the in-progress capture, readable live via `GET /stats/capture/live`.",
+        "operationId": "statsCaptureStart",
+        "responses": {
+          "200": {
+            "description": "Capture armed (or already running)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/capture/status": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Stats capture status",
+        "description": "Whether a capture is armed, its sample count, and start time. Poll this (e.g. every 2 s) to\ndrive the capture-control UI.",
+        "operationId": "statsCaptureStatus",
+        "responses": {
+          "200": {
+            "description": "In-progress capture status (idle when not armed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/capture/stop": {
+      "post": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Stop the stats capture",
+        "description": "Disarms the in-progress capture and writes it to disk atomically, returning its summary. If\nnothing was recording, returns `204 No Content`.",
+        "operationId": "statsCaptureStop",
+        "responses": {
+          "200": {
+            "description": "Capture stopped and saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaptureMeta"
+                }
+              }
+            }
+          },
+          "204": {
+            "description": "Nothing was recording"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not write the recording to disk",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/recordings": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "List saved recordings",
+        "description": "Every saved capture's summary (the `meta` head only — not the sample body), newest first.",
+        "operationId": "statsRecordingsList",
+        "responses": {
+          "200": {
+            "description": "Saved capture summaries, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CaptureMeta"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/recordings/{id}": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Get a saved recording",
+        "description": "The full capture (meta + samples) for `id`, for graphing or download.",
+        "operationId": "statsRecordingGet",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The recording id (its filename stem)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The full capture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capture"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No recording with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The recording file is unreadable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Delete a saved recording",
+        "description": "Removes the recording `id` from disk. `404` if there is no such recording.",
+        "operationId": "statsRecordingDelete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The recording id (its filename stem)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Recording deleted"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No recording with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not delete the recording",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/status": {
       "get": {
         "tags": [
@@ -1122,6 +1425,89 @@
           "label": {
             "type": "string",
             "description": "Human-readable label for UIs."
+          }
+        }
+      },
+      "Capture": {
+        "type": "object",
+        "description": "A full capture: summary + the sample time-series. The wire + on-disk shape.",
+        "required": [
+          "meta",
+          "samples"
+        ],
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/CaptureMeta"
+          },
+          "samples": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatsSample"
+            }
+          }
+        }
+      },
+      "CaptureMeta": {
+        "type": "object",
+        "description": "Capture summary — the filename stem plus the negotiated mode/codec/client. Stored at the head\nof each on-disk recording and listed standalone (without the sample body) by\n[`StatsRecorder::list`].",
+        "required": [
+          "id",
+          "started_unix_ms",
+          "duration_ms",
+          "kind",
+          "width",
+          "height",
+          "fps",
+          "codec",
+          "client",
+          "sample_count"
+        ],
+        "properties": {
+          "client": {
+            "type": "string",
+            "description": "Short label / fingerprint prefix, or `\"\"` if unknown."
+          },
+          "codec": {
+            "type": "string",
+            "description": "`\"h264\" | \"hevc\" | \"av1\"`."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "fps": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "e.g. `\"2026-06-26T20-14-03Z_5120x1440\"` — also the filename stem."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`\"native\" | \"gamestream\"`."
+          },
+          "sample_count": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "started_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
@@ -1595,6 +1981,144 @@
           }
         }
       },
+      "StageTiming": {
+        "type": "object",
+        "description": "One pipeline stage's latency in an aggregation window (microseconds).",
+        "required": [
+          "name",
+          "p50_us",
+          "p99_us"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "`\"capture\" | \"submit\" | \"encode\" | \"packetize\" | \"send\"` (path-dependent)."
+          },
+          "p50_us": {
+            "type": "number",
+            "format": "float"
+          },
+          "p99_us": {
+            "type": "number",
+            "format": "float"
+          }
+        }
+      },
+      "StatsSample": {
+        "type": "object",
+        "description": "One aggregated sample (~ every 2 s native, ~ every 1 s GameStream).",
+        "required": [
+          "t_ms",
+          "session_id",
+          "stages",
+          "fps",
+          "repeat_fps",
+          "mbps",
+          "bitrate_kbps",
+          "frames_dropped",
+          "packets_dropped",
+          "send_dropped",
+          "fec_recovered"
+        ],
+        "properties": {
+          "bitrate_kbps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Configured target bitrate.",
+            "minimum": 0
+          },
+          "fec_recovered": {
+            "type": "integer",
+            "format": "int32",
+            "description": "FEC shards recovered this window (delta).",
+            "minimum": 0
+          },
+          "fps": {
+            "type": "number",
+            "format": "float",
+            "description": "Genuine NEW frames/s from the source."
+          },
+          "frames_dropped": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Frames dropped this window (delta).",
+            "minimum": 0
+          },
+          "mbps": {
+            "type": "number",
+            "format": "float",
+            "description": "Transmit goodput (Mb/s)."
+          },
+          "packets_dropped": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Packets dropped this window (receiver-side / reassembler, where known).",
+            "minimum": 0
+          },
+          "repeat_fps": {
+            "type": "number",
+            "format": "float",
+            "description": "Re-encoded holds/s (source-starvation indicator)."
+          },
+          "send_dropped": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Host send-buffer overflow / EAGAIN this window (delta).",
+            "minimum": 0
+          },
+          "session_id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Disambiguates concurrent sessions (usually constant).",
+            "minimum": 0
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StageTiming"
+            },
+            "description": "Ordered pipeline stages for this path."
+          },
+          "t_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Milliseconds since capture start (monotonic; stamped by [`StatsRecorder::push_sample`]).",
+            "minimum": 0
+          }
+        }
+      },
+      "StatsStatus": {
+        "type": "object",
+        "description": "Snapshot of the in-progress capture for the management API.",
+        "required": [
+          "armed",
+          "sample_count",
+          "started_unix_ms",
+          "kind"
+        ],
+        "properties": {
+          "armed": {
+            "type": "boolean",
+            "description": "Capture currently running."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Path of the in-progress capture (`\"\"` if idle)."
+          },
+          "sample_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Samples in the in-progress capture.",
+            "minimum": 0
+          },
+          "started_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix start time of the in-progress capture (`0` if idle).",
+            "minimum": 0
+          }
+        }
+      },
       "StreamInfo": {
         "type": "object",
         "description": "RTSP-negotiated stream parameters.",
@@ -1696,6 +2220,10 @@
     {
       "name": "library",
       "description": "Game library: installed-store titles (Steam) plus user-curated custom entries"
+    },
+    {
+      "name": "stats",
+      "description": "Streaming performance-stats capture: arm/stop a recording, read the live + saved time-series for graphing"
     }
   ]
 }

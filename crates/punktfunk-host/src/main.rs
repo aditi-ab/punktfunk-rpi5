@@ -50,6 +50,7 @@ mod service;
 mod session_plan;
 mod session_tuning;
 mod spike;
+mod stats_recorder;
 mod vdisplay;
 #[cfg(target_os = "windows")]
 #[path = "windows/wgc_helper.rs"]

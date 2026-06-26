@@ -1,6 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import {
 	Activity,
+	GaugeCircle,
 	KeyRound,
 	LibraryBig,
 	Server,
@@ -21,6 +22,7 @@ const NAV = [
 	{ to: "/", icon: Activity, label: () => m.nav_dashboard() },
 	{ to: "/host", icon: Server, label: () => m.nav_host() },
 	{ to: "/library", icon: LibraryBig, label: () => m.nav_library() },
+	{ to: "/stats", icon: GaugeCircle, label: () => m.nav_stats() },
 	{ to: "/clients", icon: Users, label: () => m.nav_clients() },
 	{ to: "/pairing", icon: KeyRound, label: () => m.nav_pairing() },
 	{ to: "/settings", icon: Settings, label: () => m.nav_settings() },
