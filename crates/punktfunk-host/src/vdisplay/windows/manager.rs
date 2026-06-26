@@ -13,7 +13,6 @@
 //! its `Drop` releases the refcount (a *stale* lease — its monitor was preempted + recreated under it —
 //! is a no-op, so it can never tear down the live monitor).
 
-use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
@@ -160,11 +159,11 @@ impl VirtualDisplayManager {
     /// double-open.
     fn ensure_device(&self) -> Result<HANDLE> {
         if let Some(d) = self.device.get() {
-            return Ok(HANDLE(d.as_raw_handle() as *mut c_void));
+            return Ok(HANDLE(d.as_raw_handle()));
         }
         let (handle, watchdog_s) = unsafe { self.driver.open()? };
         self.watchdog_s.store(watchdog_s, Ordering::Relaxed);
-        let raw = HANDLE(handle.as_raw_handle() as *mut c_void);
+        let raw = HANDLE(handle.as_raw_handle());
         let _ = self.device.set(Arc::new(handle));
         Ok(raw)
     }
@@ -174,7 +173,7 @@ impl VirtualDisplayManager {
     fn device_handle(&self) -> Option<HANDLE> {
         self.device
             .get()
-            .map(|d| HANDLE(d.as_raw_handle() as *mut c_void))
+            .map(|d| HANDLE(d.as_raw_handle()))
     }
 
     /// Open + initialise the backend (validates the driver is present). Mirrors the old

@@ -138,9 +138,7 @@ fn resolve_topology() -> SessionTopology {
     let cfg = crate::config::config();
     // `NO_HELPER`/`NO_WGC` force single-process; IDD-push captures in-process in Session 0 (no helper);
     // otherwise the helper runs when forced or when we're SYSTEM (in-process WGC can't activate there).
-    let helper = if cfg.no_helper || crate::capture::wgc_disabled() {
-        false
-    } else if cfg.idd_push {
+    let helper = if cfg.no_helper || crate::capture::wgc_disabled() || cfg.idd_push {
         false
     } else {
         cfg.force_helper || crate::capture::wgc_relay::running_as_system()

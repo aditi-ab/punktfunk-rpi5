@@ -306,7 +306,7 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         }
 
         // BORROW the owned job handle for AssignProcessToJobObject inside spawn_host.
-        let job_h = HANDLE(job.as_raw_handle() as *mut c_void);
+        let job_h = HANDLE(job.as_raw_handle());
         let child = match unsafe { spawn_host(session, &cmdline, &workdir, job_h) } {
             Ok(child) => child,
             Err(e) => {
@@ -323,7 +323,7 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         // `proc_h` is a plain copy that does NOT close it). `child` owns the process + thread handles
         // and auto-closes BOTH when it drops — at the end of this iteration, on `continue`, or on
         // `break` — so every match arm below only stops/terminates and lets the drop do the closing.
-        let proc_h = HANDLE(child.process.as_raw_handle() as *mut c_void);
+        let proc_h = HANDLE(child.process.as_raw_handle());
 
         // Wait on stop / session-change / child-exit.
         let reason = wait_any(&[stop, session_ev, proc_h], INFINITE);
@@ -403,7 +403,7 @@ unsafe fn make_job() -> Result<OwnedHandle> {
     info.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
     SetInformationJobObject(
-        HANDLE(job.as_raw_handle() as *mut c_void),
+        HANDLE(job.as_raw_handle()),
         JobObjectExtendedLimitInformation,
         &info as *const _ as *const c_void,
         std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,

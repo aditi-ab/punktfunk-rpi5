@@ -14,7 +14,6 @@ use super::dxgi::{make_device, D3d11Frame, HdrConverter, WinCaptureTarget};
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::frame;
-use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -400,7 +399,7 @@ impl IddPushCapturer {
             // Own the mapping handle so it (and its view) free via `MappedSection` RAII even on bail.
             let map = OwnedHandle::from_raw_handle(map.0 as _);
             let view = MapViewOfFile(
-                HANDLE(map.as_raw_handle() as *mut c_void),
+                HANDLE(map.as_raw_handle()),
                 FILE_MAP_ALL_ACCESS,
                 0,
                 0,
@@ -450,7 +449,7 @@ impl IddPushCapturer {
                     // Own the mapping handle so it (and its view) free via `MappedSection` RAII.
                     let dm = OwnedHandle::from_raw_handle(dm.0 as _);
                     let dv = MapViewOfFile(
-                        HANDLE(dm.as_raw_handle() as *mut c_void),
+                        HANDLE(dm.as_raw_handle()),
                         FILE_MAP_ALL_ACCESS,
                         0,
                         0,
@@ -936,9 +935,7 @@ impl Capturer for IddPushCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let _ = unsafe {
-                WaitForSingleObject(HANDLE(self.event.as_raw_handle() as *mut c_void), 16)
-            };
+            let _ = unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), 16) };
             if let Some(f) = self.try_consume()? {
                 return Ok(f);
             }

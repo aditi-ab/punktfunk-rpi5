@@ -66,6 +66,10 @@ macro_rules! pod_init {
     ($t:ty) => {{
         // SAFETY: $t is a C POD (windows-rs/WDK/IddCx struct); its all-zero bit pattern is a valid
         // zero-initialised value and the caller sets the required .Size/etc fields immediately after.
-        unsafe { ::core::mem::zeroed::<$t>() }
+        // `unused_unsafe`: pod_init! is also expanded at call sites already inside an `unsafe` block
+        // (where this `unsafe` is redundant), but it IS required at the non-unsafe sites — so allow it.
+        #[allow(unused_unsafe)]
+        let zeroed = unsafe { ::core::mem::zeroed::<$t>() };
+        zeroed
     }};
 }
