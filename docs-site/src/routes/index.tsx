@@ -13,8 +13,8 @@ function Home() {
         <BrandMark className="size-20 drop-shadow-[0_8px_30px_rgba(108,91,243,0.45)]" />
         <Wordmark className="h-12 md:h-14" />
         <p className="max-w-xl text-fd-muted-foreground">
-          Linux-first, low-latency desktop and game streaming — a shared Rust protocol
-          core with native clients per platform.
+          Low-latency desktop and game streaming with first-class Linux and Windows
+          hosts — a shared Rust protocol core with native clients on every platform.
         </p>
         <Link
           to="/docs/$"

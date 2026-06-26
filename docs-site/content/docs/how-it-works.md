@@ -16,14 +16,22 @@ monitor. When the client disconnects, the virtual display goes away.
 That's why a 1080p60 laptop and a 1440p120 desktop can stream from the same host **at the same time**,
 each at its own mode — they each get their own virtual display.
 
-How the virtual display is created depends on your desktop:
+How the virtual display is created depends on your host:
 
-| Desktop | How |
+| Host | How |
 |---|---|
 | **GNOME** (Mutter) | A virtual monitor via the screen-cast API |
 | **KDE Plasma** (KWin) | A virtual output via KWin's screencast |
 | **Bazzite / Steam** (gamescope) | A nested gamescope session launched at the client's mode |
 | **Sway** (wlroots) | A headless output added to the running session |
+| **Windows** | A virtual-display driver — including punktfunk's own **indirect display driver** the host pushes frames straight into — a real virtual display, no physical monitor, even on the secure desktop |
+
+That last one is the distinctive part on Windows: rather than only capturing an existing screen,
+punktfunk has **its own indirect display driver (IDD)**, and the host can push finished frames
+**straight into the driver**. You get the same on-the-fly virtual display the Linux compositors give
+you — at the client's exact mode, with no physical monitor or dummy HDMI dongle, and even on the
+secure desktop (UAC / lock screen). That tight, push-based integration is unusual among Windows
+streaming hosts.
 
 ## From screen to GPU to wire
 

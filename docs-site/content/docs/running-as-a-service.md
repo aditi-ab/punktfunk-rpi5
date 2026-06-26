@@ -84,9 +84,10 @@ session unit — see [Bazzite](/docs/bazzite).
 
 ## Windows
 
-> punktfunk is Linux-first, but a native **Windows host** also ships — a signed installer with an SCM
-> service and a bundled virtual-display driver. It's **NVIDIA-only** (NVENC) and newer than the Linux
-> host. (Not to be confused with the Windows *client*, which streams *to* a Windows PC.)
+> punktfunk has first-class **Linux and Windows** hosts. On Windows it ships as a signed installer
+> with an SCM service and a virtual-display driver — including punktfunk's own **indirect display
+> driver** the host pushes frames straight into. The Windows host is newer than the Linux host. (Not
+> to be confused with the Windows *client*, which streams *to* a Windows PC.)
 
 On Windows the host runs as a `LocalSystem` service that launches into the interactive session, so it
 captures the secure desktop (UAC / lock screen) and survives reboots with nobody logged in — the same

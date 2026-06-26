@@ -1,7 +1,7 @@
 # punktfunk
 
-**Low-latency desktop and game streaming, Linux-first.** Run the host on a Linux machine — or a
-Windows PC — with an NVIDIA GPU, connect from a Mac, PC, phone, tablet, or TV, and stream your desktop
+**Low-latency desktop and game streaming with first-class Linux and Windows hosts.** Run the host on
+a Linux machine or a Windows PC, connect from a Mac, PC, phone, tablet, or TV, and stream your desktop
 or games — each device at its **own native resolution and refresh rate**, over your local network.
 
 📖 **Documentation: [docs.punktfunk.unom.io](https://docs.punktfunk.unom.io)** — start with
@@ -19,6 +19,11 @@ protocol, FEC, and crypto, linked into the host and every client over a stable C
 - **Your device's exact mode.** For each client that connects, the host spins up a virtual display
   sized to that device — 1080p60 to a laptop, 1440p120 to a desktop, 4K to a TV, all at once. No
   letterboxing, no scaling, no rearranging your real monitors.
+- **A real virtual display on Windows, too.** On Linux the host uses per-compositor virtual outputs;
+  on Windows you get the same on-the-fly virtual display — at the client's exact mode, no physical
+  monitor or dummy HDMI plug, even on the secure desktop (UAC / lock screen). It also has **its own
+  indirect display driver (IDD)** the host pushes finished frames straight into, rather than scraping
+  a screen — tight, push-based integration that's unusual for a Windows streaming host.
 - **Low latency, GPU end to end.** Frames go straight from the compositor to the NVENC encoder with
   zero CPU copies (dmabuf → CUDA/Vulkan → NVENC), over a transport tuned for responsiveness rather
   than throughput. Stable 240 fps at 5120×1440; sub-millisecond capture-to-reassembly on a LAN.
@@ -124,7 +129,7 @@ clients/
 web/                         web console (TanStack) over the management API — status · devices · pairing
 packaging/                   apt · rpm / COPR · Arch · Flatpak · Bazzite bootc image
 docs-site/                   public documentation site (Fumadocs) — https://docs.punktfunk.unom.io
-docs/                        design notes & deep-dive plans
+design/                        design notes & deep-dive plans
 include/punktfunk_core.h     cbindgen-generated C header (checked in)
 tools/                       latency-probe · loss-harness (measurement)
 ```

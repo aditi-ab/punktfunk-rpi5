@@ -23,9 +23,9 @@ A high-level view of where punktfunk stands. The ordered plan of work is on the
 
 ## What works today
 
-punktfunk is a low-latency desktop and game streaming **host** — Linux-first (Linux + NVIDIA, NVENC),
-with a newer **NVIDIA-only Windows host** too — and native **clients** on macOS, iOS/iPadOS/tvOS,
-Linux, Windows, and Android.
+punktfunk is a low-latency desktop and game streaming **host** with first-class **Linux and Windows**
+support — and native **clients** on macOS, iOS/iPadOS/tvOS, Linux, Windows, and Android. (The Windows
+host is newer than the Linux host.)
 
 - **Two protocols.** The host speaks the **GameStream** protocol, so any **Moonlight**
   client works out of the box, plus its own lower-latency **`punktfunk/1`** protocol

@@ -1,15 +1,17 @@
 ---
 title: "Windows Host"
-description: "Run the punktfunk streaming host on a Windows PC with an NVIDIA GPU."
+description: "Run the punktfunk streaming host on a Windows PC — a first-class, virtual-display host."
 ---
 
 
-**Status: implemented and shipping — NVIDIA-only, x64-only.** punktfunk is Linux-first, but it also
-runs as a native **Windows host**: a signed installer registers a `LocalSystem` service that streams
+**Status: implemented and shipping — x64-only.** Alongside the Linux host, punktfunk runs as a
+first-class native **Windows host**: a signed installer registers a `LocalSystem` service that streams
 your Windows desktop or games to any punktfunk or Moonlight client, at the client's exact resolution
-via a virtual display — including **HDR10** (10-bit BT.2020 PQ) when your Windows desktop is in HDR
-mode. It's newer and less battle-tested than the Linux host, and it is built specifically around
-NVIDIA hardware. (The Linux host is 8-bit only — HDR there is blocked upstream.)
+via a **virtual display** — including **HDR10** (10-bit BT.2020 PQ) when your Windows desktop is in HDR
+mode. punktfunk has its own **indirect display driver (IDD)** that the host pushes finished frames
+straight into, so you get a real on-the-fly virtual display with no physical monitor or dummy HDMI
+plug — even on the secure desktop (UAC / lock screen). The Windows host is newer and less
+battle-tested than the Linux host. (The Linux host is 8-bit only — HDR there is blocked upstream.)
 
 > This page is about the Windows **host** (streaming *from* a Windows PC). To stream *to* a Windows
 > PC, see the [Windows client](/docs/clients#windows-desktop-client).
