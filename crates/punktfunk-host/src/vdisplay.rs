@@ -457,7 +457,11 @@ pub fn settle_desktop_portal(_chosen: Compositor) {}
 pub fn apply_input_env(chosen: Compositor) {
     let backend = match chosen {
         Compositor::Gamescope => "gamescope",
-        Compositor::Kwin | Compositor::Mutter => "libei",
+        // KWin: org_kde_kwin_fake_input — direct injection, no RemoteDesktop portal / approval
+        // dialog (headless, the krdpserver path), authorized by the host's shipped .desktop.
+        Compositor::Kwin => "kwin",
+        // GNOME has neither fake_input nor the wlr protocols → RemoteDesktop portal via libei.
+        Compositor::Mutter => "libei",
         Compositor::Wlroots => "wlr",
     };
     std::env::set_var("PUNKTFUNK_INPUT_BACKEND", backend);
