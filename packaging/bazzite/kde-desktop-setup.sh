@@ -1,35 +1,36 @@
 #!/usr/bin/env bash
-# One-shot setup so the punktfunk host can stream the Bazzite KDE *Desktop* session (KWin virtual
-# output at the client's resolution). Run ONCE as the streaming user (no root needed). Gaming Mode
-# (gamescope) needs none of this — it auto-attaches. Idempotent: safe to re-run.
+# One-shot setup so the punktfunk host can INJECT INPUT while streaming the Bazzite KDE *Desktop*
+# session. Run ONCE as the streaming user (no root needed). Gaming Mode (gamescope) needs none of
+# this — it auto-attaches. Idempotent: safe to re-run.
 #
 #   bash /usr/share/punktfunk/bazzite/kde-desktop-setup.sh
 #
-# Two things a normal KDE login lacks that the headless host needs:
-#  1. KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 — so KWin exposes the privileged `zkde_screencast`
-#     virtual-output protocol to the host (an external client) at all.
-#  2. The `kde-authorized` RemoteDesktop grant — so libei input setup auto-approves instead of
-#     popping an "Allow remote control?" dialog the headless host can't answer.
-# After running, log out + back into the KDE Desktop session once (or reboot) so KWin restarts
-# with the flag. Gaming Mode is unaffected.
+# The VIRTUAL OUTPUT (video) needs no setup: the host package ships io.unom.Punktfunk.Host.desktop,
+# whose X-KDE-Wayland-Interfaces grants the host KWin's restricted zkde_screencast protocol on a
+# normal interactive Plasma session — least-privilege (only the host, only that interface), the same
+# mechanism krfb/krdp use. No session-wide KWIN_WAYLAND_NO_PERMISSION_CHECKS hack is needed. KWin
+# caches the grant per-executable on first connect, so after a FRESH host install log out + back into
+# the Desktop session once so KWin re-reads the file.
+#
+# The one thing a normal KDE login still lacks is the `kde-authorized` RemoteDesktop grant — so the
+# host's libei input setup auto-approves instead of popping an "Allow remote control?" dialog the
+# headless host can't answer. That's what this script seeds.
 set -euo pipefail
 
 GRANT_SRC="${PUNKTFUNK_GRANT_SRC:-/usr/share/punktfunk/headless/kde-authorized}"
-ENVD="$HOME/.config/environment.d/10-punktfunk-kwin.conf"
 GRANT_DST="$HOME/.local/share/flatpak/db/kde-authorized"
+# Older versions of this script wrote a session-wide KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 env file to
+# unlock screencast. The shipped .desktop replaces it; remove the stale, over-broad override.
+STALE_ENVD="$HOME/.config/environment.d/10-punktfunk-kwin.conf"
 
-echo "punktfunk: KDE Desktop-mode setup"
+echo "punktfunk: KDE Desktop-mode input setup"
 
-# 1. KWin permission-check bypass (persistent, picked up by the next KDE session via systemd).
-mkdir -p "$(dirname "$ENVD")"
-cat > "$ENVD" <<'EOF'
-# punktfunk: let the streaming host bind KWin's privileged zkde_screencast (virtual output).
-# A dedicated streaming box; this relaxes KWin's Wayland permission checks for the desktop path.
-KWIN_WAYLAND_NO_PERMISSION_CHECKS=1
-EOF
-echo "  wrote $ENVD"
+if [[ -f "$STALE_ENVD" ]] && grep -q KWIN_WAYLAND_NO_PERMISSION_CHECKS "$STALE_ENVD" 2>/dev/null; then
+    rm -f "$STALE_ENVD"
+    echo "  removed stale $STALE_ENVD (screencast is now granted via the shipped .desktop)"
+fi
 
-# 2. RemoteDesktop portal grant for headless libei input (never clobber an existing one).
+# RemoteDesktop portal grant for headless libei input (never clobber an existing one).
 if [[ -s "$GRANT_DST" ]]; then
     echo "  grant DB already present ($GRANT_DST) — leaving it"
 elif [[ -s "$GRANT_SRC" ]]; then
@@ -44,5 +45,5 @@ else
     echo "  WARN: grant source not found at $GRANT_SRC — input will need a manual portal approval" >&2
 fi
 
-echo "punktfunk: done. Log out + back into the KDE Desktop session (or reboot) so KWin restarts"
-echo "          with the flag, then connect a client while in Desktop Mode."
+echo "punktfunk: done. On a fresh host install, log out + back into the KDE Desktop session once"
+echo "          (so KWin authorizes the host's virtual output), then connect a client in Desktop Mode."

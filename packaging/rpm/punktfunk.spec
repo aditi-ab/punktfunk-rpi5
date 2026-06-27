@@ -196,6 +196,14 @@ sed -i 's#%h/punktfunk/target/release/punktfunk-host#%{_bindir}/punktfunk-host#'
 install -Dm0644 scripts/punktfunk-kde-session.service %{buildroot}%{_userunitdir}/punktfunk-kde-session.service
 sed -i 's#%h/punktfunk/scripts/headless/run-headless-kde.sh#%{_datadir}/%{name}/headless/run-headless-kde.sh#' %{buildroot}%{_userunitdir}/punktfunk-kde-session.service
 
+# KWin authorization for Desktop-mode (KWin) streaming: a non-launcher .desktop whose
+# X-KDE-Wayland-Interfaces grants the host the restricted zkde_screencast (virtual output) +
+# fake_input globals on an interactive Plasma session. Must ship with the host so it is present
+# before the host first connects (KWin caches the per-exe grant). Replaces the old manual
+# KWIN_WAYLAND_NO_PERMISSION_CHECKS hack for the screencast permission.
+install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
+                %{buildroot}%{_datadir}/applications/io.unom.Punktfunk.Host.desktop
+
 # --- client subpackage ---
 install -Dm0755 target/release/punktfunk-client %{buildroot}%{_bindir}/punktfunk-client
 install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
@@ -221,7 +229,8 @@ install -Dm0644 scripts/headless/punktfunk-sink.conf   %{buildroot}%{_datadir}/%
 install -Dm0644 scripts/host.env.example               %{buildroot}%{_datadir}/%{name}/host.env.example
 install -Dm0644 packaging/bazzite/host.env             %{buildroot}%{_datadir}/%{name}/host.env.bazzite
 install -Dm0644 packaging/kde/host.env                 %{buildroot}%{_datadir}/%{name}/host.env.kde
-# Bazzite KDE Desktop-mode one-shot setup (KWIN_WAYLAND_NO_PERMISSION_CHECKS + RemoteDesktop grant).
+# Bazzite KDE Desktop-mode one-shot setup (seeds the RemoteDesktop grant for libei input; the
+# screencast/virtual-output grant ships as io.unom.Punktfunk.Host.desktop, installed above).
 install -d %{buildroot}%{_datadir}/%{name}/bazzite
 install -Dm0755 packaging/bazzite/kde-desktop-setup.sh %{buildroot}%{_datadir}/%{name}/bazzite/kde-desktop-setup.sh
 install -Dm0644 api/openapi.json                  %{buildroot}%{_datadir}/%{name}/openapi.json
@@ -252,6 +261,7 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
 %{_userunitdir}/punktfunk-host.service
 %{_userunitdir}/punktfunk-kde-session.service
+%{_datadir}/applications/io.unom.Punktfunk.Host.desktop
 %dir %{_datadir}/%{name}
 %{_datadir}/%{name}/*
 

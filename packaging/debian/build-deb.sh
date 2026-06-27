@@ -50,6 +50,13 @@ sed -i 's#%h/punktfunk/target/release/punktfunk-host#/usr/bin/punktfunk-host#' \
 install -Dm0644 scripts/punktfunk-kde-session.service "$STAGE/usr/lib/systemd/user/punktfunk-kde-session.service"
 sed -i 's#%h/punktfunk/scripts/headless/run-headless-kde.sh#/usr/share/punktfunk-host/headless/run-headless-kde.sh#' \
     "$STAGE/usr/lib/systemd/user/punktfunk-kde-session.service"
+
+# KWin Desktop-mode authorization: non-launcher .desktop whose X-KDE-Wayland-Interfaces lets the
+# host bind KWin's restricted zkde_screencast (virtual output) + fake_input globals on an
+# interactive Plasma session. Must ship with the host — KWin caches the per-exe grant on first
+# connect, so it has to be present before the host ever connects. See the file's header comment.
+install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
+    "$STAGE/usr/share/applications/io.unom.Punktfunk.Host.desktop"
 install -Dm0755 scripts/headless/run-headless-kde.sh   "$SHAREDIR/headless/run-headless-kde.sh"
 install -Dm0755 scripts/headless/run-headless-sway.sh  "$SHAREDIR/headless/run-headless-sway.sh"
 install -Dm0644 scripts/headless/kde-authorized        "$SHAREDIR/headless/kde-authorized"

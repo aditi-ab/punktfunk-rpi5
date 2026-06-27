@@ -6,8 +6,14 @@
 //! node for it. The node lives on the user's default PipeWire daemon, so [`VirtualOutput::remote_fd`]
 //! is `None` and capture connects to that daemon directly.
 //!
-//! Requirements: KWin must expose the privileged `zkde_screencast` global — a real Plasma session
-//! authorizes it for its own clients; the headless test exposes it to bare clients via
+//! Requirements: KWin must expose the privileged `zkde_screencast` global. It is a *restricted*
+//! protocol — KWin advertises it only to a client whose installed `.desktop` lists it under
+//! `X-KDE-Wayland-Interfaces` (KWin maps the connecting client to a `.desktop` by resolving
+//! `/proc/<pid>/exe` against `Exec=`, then caches the grant per-executable for the session's life).
+//! So an interactive Plasma session does NOT hand it to a bare client — the host packages ship
+//! `io.unom.Punktfunk.Host.desktop` (`Exec=/usr/bin/punktfunk-host`,
+//! `X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1,…`) so it is present before the host first
+//! connects. The headless test path instead exposes it to bare clients via
 //! `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1`. The compositor backend must implement
 //! `createVirtualOutput`: the **DRM backend** (any version) or the **VirtualBackend since KWin
 //! 6.5.6** (`kwin_wayland --virtual`); on `--virtual` < 6.5.6 the request fails with
@@ -406,9 +412,11 @@ pub fn probe() -> Result<()> {
     queue.roundtrip(&mut state).context("registry roundtrip")?;
     if state.screencast.is_none() {
         bail!(
-            "KWin is up but does not (yet) expose zkde_screencast_unstable_v1 — needs a real \
-             KDE session (or KWIN_WAYLAND_NO_PERMISSION_CHECKS=1), and KWin ≥ 6.5.6 for the \
-             headless virtual output"
+            "KWin is up but does not expose zkde_screencast_unstable_v1 to this client — KWin gates \
+             it on the host's .desktop X-KDE-Wayland-Interfaces (install \
+             io.unom.Punktfunk.Host.desktop with Exec=/usr/bin/punktfunk-host, then re-login so KWin \
+             re-reads it — the grant is cached per-exe on first connect), or set \
+             KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 for the headless test; needs KWin ≥ 6.5.6"
         );
     }
     Ok(())
@@ -437,8 +445,9 @@ fn run(
 
     let screencast = state.screencast.clone().ok_or_else(|| {
         anyhow!(
-            "KWin does not expose zkde_screencast_unstable_v1 (need a real KDE session, or run \
-             KWin with KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 for the headless test)"
+            "KWin does not expose zkde_screencast_unstable_v1 to this client — install the host's \
+             .desktop (io.unom.Punktfunk.Host.desktop, X-KDE-Wayland-Interfaces) and re-login so \
+             KWin authorizes it, or run KWin with KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 (headless test)"
         )
     })?;
 
