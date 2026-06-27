@@ -41,6 +41,7 @@ import io.unom.punktfunk.kit.NativeBridge
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
 import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 // Touch-gesture tuning (px / ms). TAP_SLOP: movement under this still counts as a tap, not a drag.
@@ -49,6 +50,15 @@ import kotlin.math.roundToInt
 private const val TAP_SLOP = 12f
 private const val TAP_DRAG_MS = 250L
 private const val SCROLL_DIV = 4f
+
+// Trackpad-mode pointer ballistics (relative one-finger motion). POINTER_SENS: base finger-px →
+// host-px gain (~1:1, never twitchy). The rest is mild acceleration so a flick crosses the screen
+// while a slow drag stays precise: above ACCEL_SPEED_FLOOR px/ms the gain ramps by ACCEL_GAIN per
+// px/ms, capped at ACCEL_MAX (so a fast swipe can't fling the cursor uncontrollably).
+private const val POINTER_SENS = 1.3f
+private const val ACCEL_GAIN = 0.6f
+private const val ACCEL_SPEED_FLOOR = 0.3f
+private const val ACCEL_MAX = 3.0f
 
 @Composable
 fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
@@ -68,8 +78,11 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     // Live decode stats for the HUD. Poll once a second for the whole stream (cheap, and each call
     // drains+resets the native window so it never grows unbounded even while the overlay is hidden);
     // `showStats` only gates rendering. A 3-finger tap toggles it live; the default comes from Settings.
+    val initialSettings = remember { SettingsStore(context).load() }
     var stats by remember { mutableStateOf<DoubleArray?>(null) }
-    var showStats by remember { mutableStateOf(SettingsStore(context).load().statsHudEnabled) }
+    var showStats by remember { mutableStateOf(initialSettings.statsHudEnabled) }
+    // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
+    val trackpad = initialSettings.trackpadMode
     LaunchedEffect(handle) {
         while (true) {
             delay(1000)
@@ -145,13 +158,18 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         if (showStats) {
             stats?.let { StatsOverlay(it, Modifier.align(Alignment.TopStart).padding(12.dp)) }
         }
-        // Touch → mouse, absolute "direct pointing" like the Apple client: the host cursor follows
-        // your finger (MouseMoveAbs, host-normalized against the overlay size — which fills the video,
-        // so finger position maps straight onto the remote screen). Gestures: tap = left click;
-        // two-finger tap = right click; two-finger drag = scroll; tap-then-press-and-drag = left-drag
-        // (text selection / moving windows); three-finger tap = toggle the stats HUD.
+        // Touch → mouse. Two models, chosen by the Trackpad-mode setting:
+        //  • trackpad (default): the cursor STAYS where it is on touch-down and moves by the finger's
+        //    relative delta (MouseMove) with mild pointer acceleration — swipe to nudge, lift and
+        //    re-swipe to walk it across, tap to click where it is. This is what makes the cursor
+        //    reachable on a small screen.
+        //  • direct (opt-out): the cursor jumps to the finger and follows it (MouseMoveAbs,
+        //    host-normalized against the overlay size), the old "direct pointing" behaviour.
+        // Both share the same gesture vocabulary: tap = left click; two-finger tap = right click;
+        // two-finger drag = scroll; tap-then-press-and-drag = left-drag (text selection / moving
+        // windows); three-finger tap = toggle the stats HUD.
         Box(
-            Modifier.fillMaxSize().pointerInput(handle) {
+            Modifier.fillMaxSize().pointerInput(handle, trackpad) {
                 var lastTapUp = 0L
                 var lastTapX = 0f
                 var lastTapY = 0f
@@ -176,7 +194,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                     val isDrag = down.uptimeMillis - lastTapUp < TAP_DRAG_MS &&
                         abs(startX - lastTapX) < TAP_SLOP && abs(startY - lastTapY) < TAP_SLOP
                     lastTapUp = 0L // consume the arming either way
-                    moveAbs(startX, startY) // cursor jumps to the finger immediately
+                    // Direct mode jumps the cursor to the finger; trackpad mode leaves it put (the
+                    // whole point — you nudge it with swipes instead).
+                    if (!trackpad) moveAbs(startX, startY)
                     if (isDrag) NativeBridge.nativeSendPointerButton(handle, 1, true)
 
                     var moved = false
@@ -185,6 +205,14 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                     var prevCx = startX
                     var prevCy = startY
                     var upTime = down.uptimeMillis
+                    // Trackpad relative-motion state: the tracked finger, its last position/time, and
+                    // the sub-pixel remainder so a slow drag isn't lost to Int truncation.
+                    var trackId = down.id
+                    var prevX = startX
+                    var prevY = startY
+                    var prevT = down.uptimeMillis
+                    var accX = 0f
+                    var accY = 0f
 
                     while (true) {
                         val ev = awaitPointerEvent()
@@ -217,15 +245,46 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                                 moved = true
                             }
                         } else if (!scrolling) {
-                            // One finger → the cursor follows it (skipped once a gesture turned into
-                            // a scroll, so dropping back to one finger doesn't jerk the cursor).
+                            // One finger (skipped once a gesture turned into a scroll, so dropping
+                            // back to one finger doesn't jerk the cursor).
                             val p = pressed.firstOrNull { it.id == down.id } ?: pressed.first()
                             if (abs(p.position.x - startX) > TAP_SLOP ||
                                 abs(p.position.y - startY) > TAP_SLOP
                             ) {
                                 moved = true
                             }
-                            moveAbs(p.position.x, p.position.y)
+                            if (trackpad) {
+                                // Relative: move by the finger delta × (sensitivity × acceleration),
+                                // carrying the sub-pixel remainder. Re-anchor (zero delta this frame)
+                                // if the tracked finger changed, so lifting one of several fingers
+                                // never jumps the cursor.
+                                if (p.id != trackId) {
+                                    trackId = p.id
+                                    prevX = p.position.x
+                                    prevY = p.position.y
+                                    prevT = p.uptimeMillis
+                                }
+                                val dx = p.position.x - prevX
+                                val dy = p.position.y - prevY
+                                val dt = (p.uptimeMillis - prevT).coerceAtLeast(1L)
+                                prevX = p.position.x
+                                prevY = p.position.y
+                                prevT = p.uptimeMillis
+                                val speed = hypot(dx, dy) / dt // finger px per ms
+                                val accel = (1f + ACCEL_GAIN * (speed - ACCEL_SPEED_FLOOR).coerceAtLeast(0f))
+                                    .coerceAtMost(ACCEL_MAX)
+                                accX += dx * POINTER_SENS * accel
+                                accY += dy * POINTER_SENS * accel
+                                val outX = accX.toInt() // truncates toward zero → remainder kept w/ sign
+                                val outY = accY.toInt()
+                                if (outX != 0 || outY != 0) {
+                                    NativeBridge.nativeSendPointerMove(handle, outX, outY)
+                                    accX -= outX
+                                    accY -= outY
+                                }
+                            } else {
+                                moveAbs(p.position.x, p.position.y) // direct: cursor follows the finger
+                            }
                         }
                         ev.changes.forEach { it.consume() }
                     }
@@ -239,7 +298,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                                 NativeBridge.nativeSendPointerButton(handle, 3, true)
                                 NativeBridge.nativeSendPointerButton(handle, 3, false)
                             }
-                            else -> { // tap → left click, and arm tap-and-drag
+                            else -> { // tap → left click (at the cursor's current spot), arm tap-drag
                                 NativeBridge.nativeSendPointerButton(handle, 1, true)
                                 NativeBridge.nativeSendPointerButton(handle, 1, false)
                                 lastTapUp = upTime

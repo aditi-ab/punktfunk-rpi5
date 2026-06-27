@@ -119,6 +119,16 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
             )
         }
 
+        SettingsGroup("Pointer") {
+            ToggleRow(
+                title = "Trackpad mode",
+                subtitle = "Relative cursor like a laptop touchpad — swipe to nudge, tap to click. " +
+                    "Off = the cursor jumps to your finger.",
+                checked = s.trackpadMode,
+                onCheckedChange = { on -> update(s.copy(trackpadMode = on)) },
+            )
+        }
+
         SettingsGroup("Overlay") {
             ToggleRow(
                 title = "Stats overlay",

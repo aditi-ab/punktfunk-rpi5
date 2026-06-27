@@ -19,6 +19,12 @@ data class Settings(
     val micEnabled: Boolean = false,
     /** Show the live stats overlay (FPS / throughput / latency) during a stream. */
     val statsHudEnabled: Boolean = true,
+    /**
+     * Touch input model. `true` (default) = trackpad: the cursor stays put on touch-down and moves
+     * by the finger's relative delta (swipe to nudge, lift and re-swipe to walk it across), tap to
+     * click where it is. `false` = direct pointing: the cursor jumps to the finger (the old behaviour).
+     */
+    val trackpadMode: Boolean = true,
 )
 
 /** Loads/saves [Settings] in the app-private `punktfunk_settings` prefs. */
@@ -35,6 +41,7 @@ class SettingsStore(context: Context) {
         gamepad = prefs.getInt(K_GAMEPAD, 0),
         micEnabled = prefs.getBoolean(K_MIC, false),
         statsHudEnabled = prefs.getBoolean(K_HUD, true),
+        trackpadMode = prefs.getBoolean(K_TRACKPAD, true),
     )
 
     fun save(s: Settings) {
@@ -47,6 +54,7 @@ class SettingsStore(context: Context) {
             .putInt(K_GAMEPAD, s.gamepad)
             .putBoolean(K_MIC, s.micEnabled)
             .putBoolean(K_HUD, s.statsHudEnabled)
+            .putBoolean(K_TRACKPAD, s.trackpadMode)
             .apply()
     }
 
@@ -59,6 +67,7 @@ class SettingsStore(context: Context) {
         const val K_GAMEPAD = "gamepad"
         const val K_MIC = "mic_enabled"
         const val K_HUD = "stats_hud_enabled"
+        const val K_TRACKPAD = "trackpad_mode"
     }
 }
 
