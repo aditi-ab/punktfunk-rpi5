@@ -24,6 +24,9 @@ pub trait InputInjector {
 pub enum Backend {
     /// wlroots virtual pointer + keyboard Wayland protocols — the headless-Sway path.
     WlrVirtual,
+    /// KWin `org_kde_kwin_fake_input` — direct injection, no RemoteDesktop portal / approval dialog
+    /// (authorized by the host's `.desktop`). The headless KDE-Desktop path; what krdpserver uses.
+    KwinFakeInput,
     /// libei via `reis` — Wayland-native (RemoteDesktop portal). Not yet implemented.
     Libei,
     /// libei directly against gamescope's own EIS socket (no portal): input lands in the
@@ -45,6 +48,16 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
             #[cfg(not(target_os = "linux"))]
             {
                 anyhow::bail!("wlroots virtual input requires Linux + a Wayland compositor")
+            }
+        }
+        Backend::KwinFakeInput => {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Box::new(kwin_fake_input::KwinFakeInjector::open()?))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::bail!("KWin fake_input requires Linux + a KWin Wayland session")
             }
         }
         Backend::Libei => {
@@ -90,12 +103,18 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
 /// Pick the injection backend for the current session. gamescope hosts its own EIS server (no
 /// portal), so a gamescope session injects directly into it. wlroots/Sway only implements the
 /// ScreenCast portal (no RemoteDesktop), so libei can't run there — use the wlr virtual-input
-/// protocols. KWin and GNOME implement RemoteDesktop but not the wlr protocols, so use libei.
-/// `PUNKTFUNK_INPUT_BACKEND=wlr|libei|gamescope|uinput` overrides the auto-detection.
+/// protocols. **KWin** exposes `org_kde_kwin_fake_input` (direct injection, no portal / approval
+/// dialog — the only headless-capable path; what krdpserver uses), so prefer it there. **GNOME**
+/// has neither fake_input nor the wlr protocols, so it uses libei via the RemoteDesktop portal
+/// (which needs a user to approve, or a pre-seeded grant — not truly headless).
+/// `PUNKTFUNK_INPUT_BACKEND=wlr|kwin|libei|gamescope|uinput` overrides the auto-detection.
 pub fn default_backend() -> Backend {
     if let Ok(v) = std::env::var("PUNKTFUNK_INPUT_BACKEND") {
         match v.trim().to_ascii_lowercase().as_str() {
             "wlr" | "wlroots" | "wlrvirtual" => return Backend::WlrVirtual,
+            "kwin" | "fakeinput" | "fake_input" | "kwin-fake-input" => {
+                return Backend::KwinFakeInput
+            }
             "libei" | "ei" | "portal" => return Backend::Libei,
             "gamescope" | "gamescope-ei" => return Backend::GamescopeEi,
             "uinput" => return Backend::Uinput,
@@ -112,16 +131,26 @@ pub fn default_backend() -> Backend {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        if crate::config::config()
-            .compositor
-            .as_deref()
-            .is_some_and(|v| v.trim().eq_ignore_ascii_case("gamescope"))
-        {
-            return Backend::GamescopeEi;
+        // An explicit compositor pick (set per connect / mid-stream) is the strongest signal.
+        let compositor = crate::config::config().compositor.clone();
+        if let Some(c) = compositor.as_deref() {
+            let c = c.trim();
+            if c.eq_ignore_ascii_case("gamescope") {
+                return Backend::GamescopeEi;
+            }
+            if c.eq_ignore_ascii_case("kwin") {
+                return Backend::KwinFakeInput;
+            }
+            if c.eq_ignore_ascii_case("wlroots") || c.eq_ignore_ascii_case("sway") {
+                return Backend::WlrVirtual;
+            }
+            // mutter (GNOME) falls through to the XDG_CURRENT_DESKTOP check below.
         }
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
         let d = desktop.to_ascii_uppercase();
-        if d.contains("KDE") || d.contains("GNOME") {
+        if d.contains("KDE") {
+            Backend::KwinFakeInput
+        } else if d.contains("GNOME") {
             Backend::Libei
         } else {
             Backend::WlrVirtual
@@ -477,6 +506,9 @@ pub mod gamepad {
         pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16)) {}
     }
 }
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/kwin_fake_input.rs"]
+mod kwin_fake_input;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/libei.rs"]
 mod libei;
