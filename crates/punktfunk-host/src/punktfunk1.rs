@@ -2256,6 +2256,45 @@ struct SessionSwitch {
 /// read (so no handshake plumbing). Opt-in via `PUNKTFUNK_SESSION_WATCH`; readiness of the new
 /// backend is left to the encode thread's `build_pipeline_with_retry` (the watcher never writes
 /// env). Exits when `stop` is set or the channel closes.
+/// Whether to run the mid-stream session-switch watcher. An explicit `PUNKTFUNK_SESSION_WATCH` wins
+/// (truthy → on; `0`/`false`/`no`/`off`/empty → off). When unset it defaults **on** for Steam HTPC
+/// platforms (Bazzite / SteamOS) — which flip Gaming↔Desktop and need the host to follow the switch
+/// mid-stream — and **off** elsewhere, preserving the opt-in default for plain desktop hosts.
+fn session_watch_enabled() -> bool {
+    match std::env::var("PUNKTFUNK_SESSION_WATCH") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v.is_empty()
+                || v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => is_steam_htpc_platform(),
+    }
+}
+
+/// True on Bazzite or SteamOS (matched against os-release `ID`/`ID_LIKE`) — the platforms that flip
+/// between Steam Gaming Mode and a Desktop session, where following a mid-stream switch is the
+/// sensible default. Anything else (incl. non-Linux, where the file is absent) → false.
+fn is_steam_htpc_platform() -> bool {
+    let Ok(os) = std::fs::read_to_string("/etc/os-release") else {
+        return false;
+    };
+    os.lines().any(|line| {
+        let line = line.trim();
+        let Some(val) = line
+            .strip_prefix("ID=")
+            .or_else(|| line.strip_prefix("ID_LIKE="))
+        else {
+            return false;
+        };
+        val.trim_matches('"')
+            .split_whitespace()
+            .any(|tok| tok.eq_ignore_ascii_case("bazzite") || tok.eq_ignore_ascii_case("steamos"))
+    })
+}
+
 fn session_watcher_loop(tx: std::sync::mpsc::Sender<SessionSwitch>, stop: Arc<AtomicBool>) {
     use crate::vdisplay;
     const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
@@ -2491,9 +2530,9 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // place when the box flips Gaming↔Desktop. When not spawned, session_rx just stays empty.
     let mut compositor = compositor;
     let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
-    let watch = std::env::var_os("PUNKTFUNK_SESSION_WATCH").is_some()
-        && crate::config::config().compositor.is_none();
+    let watch = session_watch_enabled() && crate::config::config().compositor.is_none();
     let _watcher = if watch {
+        tracing::info!("session watcher on — following a mid-stream Gaming↔Desktop switch");
         let stop = stop.clone();
         std::thread::Builder::new()
             .name("punktfunk1-watcher".into())
