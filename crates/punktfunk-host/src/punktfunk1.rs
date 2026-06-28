@@ -2714,15 +2714,76 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 }
                 tracing::warn!(error = %format!("{e:#}"), rebuild = capture_rebuilds,
                     "capture lost — rebuilding pipeline in place");
-                let (new_cap, new_enc, new_frame, new_interval) =
-                    build_pipeline_with_retry(&mut vd, cur_mode, bitrate_kbps, bit_depth, plan)
-                        .context("rebuild after capture loss")?;
+                // A Bazzite/SteamOS Gaming↔Desktop switch tears the old compositor down and can take
+                // 15s+ to bring the new one up. Don't fail the session over that (the client would
+                // have to cold-reconnect, surfacing a "session failed") — keep retrying within a
+                // generous budget while the QUIC keepalive (its own thread) holds the connection,
+                // RE-DETECTING the live compositor each attempt so we follow the box to whatever
+                // session comes up: a fresh instance of the same compositor, OR a different one
+                // (the kind-change case the session watcher also handles). The client stays
+                // connected, frozen on the last frame, and the stream resumes when the new output
+                // appears — no reconnect.
+                const REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(40);
+                let rebuild_deadline = std::time::Instant::now() + REBUILD_BUDGET;
+                let (new_cap, new_enc, new_frame, new_interval) = loop {
+                    // Follow the active session unless an explicit PUNKTFUNK_COMPOSITOR pin forbids
+                    // retargeting (then we stick to the pinned backend and just rebuild it).
+                    if crate::config::config().compositor.is_none() {
+                        let active = crate::vdisplay::detect_active_session();
+                        if let Some(c) = crate::vdisplay::compositor_for_kind(active.kind) {
+                            crate::vdisplay::apply_session_env(&active);
+                            crate::vdisplay::apply_input_env(c);
+                            if c != compositor {
+                                if matches!(
+                                    c,
+                                    crate::vdisplay::Compositor::Kwin
+                                        | crate::vdisplay::Compositor::Mutter
+                                ) {
+                                    crate::vdisplay::settle_desktop_portal(c);
+                                }
+                                match crate::vdisplay::open(c) {
+                                    Ok(v) => {
+                                        tracing::info!(from = compositor.id(), to = c.id(),
+                                            "capture loss: active session switched compositor — retargeting");
+                                        vd = v;
+                                        compositor = c;
+                                    }
+                                    Err(e2) => tracing::warn!(error = %format!("{e2:#}"),
+                                        "capture loss: opening the newly-detected compositor failed — retrying"),
+                                }
+                            }
+                        }
+                    }
+                    match build_pipeline_with_retry(
+                        &mut vd,
+                        cur_mode,
+                        bitrate_kbps,
+                        bit_depth,
+                        plan,
+                    ) {
+                        Ok(p) => break p,
+                        Err(e2) => {
+                            if stop.load(Ordering::SeqCst)
+                                || std::time::Instant::now() >= rebuild_deadline
+                            {
+                                return Err(e2)
+                                    .context("capture lost — no compositor came up within the rebuild budget");
+                            }
+                            tracing::warn!(error = %format!("{e2:#}"),
+                                "capture lost — new session not up yet, retrying");
+                        }
+                    }
+                };
                 capturer = new_cap;
                 enc = new_enc;
                 frame = new_frame;
                 interval = new_interval;
                 enc.request_keyframe(); // belt-and-suspenders; a fresh encoder opens on an IDR anyway
                 next = std::time::Instant::now();
+                tracing::info!(
+                    compositor = compositor.id(),
+                    "capture loss: pipeline rebuilt — stream resumes"
+                );
             }
         }
         if perf && diag_at.elapsed() >= std::time::Duration::from_secs(2) {
