@@ -320,11 +320,18 @@ fn mic_pw_thread(
     .into_inner();
     let mut params = [Pod::from_bytes(&values).context("mic pod from bytes")?];
 
+    // RT_PROCESS: run the producer callback on PipeWire's realtime data loop, so the source is a
+    // *synchronous* graph node that joins its consumer's driver group and is actually driven. Without
+    // it the node is async/main-loop and, in the host's busy multi-stream graph (desktop-audio +
+    // video capture + the session), never acquires a driver — it stays suspended and its process()
+    // never fires, so every recorder hears pure silence (the long-standing "Linux host mic broken").
     stream
         .connect(
             spa::utils::Direction::Output, // we PRODUCE samples (a source)
             None,
-            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+            pw::stream::StreamFlags::AUTOCONNECT
+                | pw::stream::StreamFlags::MAP_BUFFERS
+                | pw::stream::StreamFlags::RT_PROCESS,
             &mut params,
         )
         .context("pw mic stream connect")?;
