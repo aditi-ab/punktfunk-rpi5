@@ -1,45 +1,78 @@
 ---
 title: "Windows Host"
-description: "Run the punktfunk streaming host on a Windows PC — a first-class, virtual-display host."
+description: "Run the punktfunk streaming host on a Windows PC — a first-class, all-vendor, virtual-display host."
 ---
 
+Set up a punktfunk host on a **Windows 10/11 PC** and stream its desktop or games to any punktfunk or
+[Moonlight](/docs/moonlight) client. A signed installer registers a Windows service that streams at the
+client's **exact resolution and refresh** via punktfunk's own **virtual display** — including
+**HDR10** (10-bit BT.2020 PQ) when your Windows desktop is in HDR mode. The virtual display is created
+on the fly, so you need **no second monitor and no dummy HDMI plug**, and capture keeps working even on
+the secure desktop (UAC prompts, the lock screen).
 
-**Status: implemented and shipping — x64-only.** Alongside the Linux host, punktfunk runs as a
-first-class native **Windows host**: a signed installer registers a `LocalSystem` service that streams
-your Windows desktop or games to any punktfunk or Moonlight client, at the client's exact resolution
-via a **virtual display** — including **HDR10** (10-bit BT.2020 PQ) when your Windows desktop is in HDR
-mode. punktfunk has its own **indirect display driver (IDD)** that the host pushes finished frames
-straight into, so you get a real on-the-fly virtual display with no physical monitor or dummy HDMI
-plug — even on the secure desktop (UAC / lock screen). The Windows host is newer and less
-battle-tested than the Linux host. (The Linux host is 8-bit only — HDR there is blocked upstream.)
+> New to this? Skim [Requirements](/docs/requirements) first.
 
-> This page is about the Windows **host** (streaming *from* a Windows PC). To stream *to* a Windows
-> PC, see the [Windows client](/docs/clients#windows-desktop-client).
+> This page is about the Windows **host** — streaming *from* a Windows PC. To stream *to* a Windows PC,
+> see the [Windows client](/docs/clients#windows-desktop-client).
 
 ## Requirements
 
-- **Windows 10/11, x64.** ARM64 is not supported — both NVENC and the virtual-display driver are
-  x64-only.
-- **An NVIDIA GPU + driver.** The host encodes with NVENC (`nvEncodeAPI64.dll`); there is no other
-  encoder backend on Windows.
-- **(Optional) ViGEmBus** for virtual gamepads — a manual prerequisite for now
-  ([releases](https://github.com/nefarius/ViGEmBus/releases)).
+- **Windows 10 or 11, x64.** ARM64 is not built (no ARM64 NVIDIA driver, and the virtual-display
+  driver is x64-only).
+- **A GPU for hardware encode** — the host auto-detects the vendor:
+  - **NVIDIA** → NVENC
+  - **AMD** → AMF
+  - **Intel** → QSV
+
+  No discrete GPU? The host falls back to a **software H.264** encoder (higher CPU use, lower quality —
+  fine for light desktop use).
+- **No gamepad prerequisite.** The virtual gamepad drivers are bundled in the installer — there is
+  nothing else to download. (Earlier builds needed ViGEmBus; it is no longer used.)
 
 ## Install
 
-Download the signed `punktfunk-host-setup-<ver>.exe` from the package registry and run it — it
-installs the host into `C:\Program Files\punktfunk`, optionally installs the bundled **SudoVDA**
-virtual-display driver, and registers + starts the service. Full steps (including the silent install
-and the CLI `punktfunk-host service install` path) are in
-[Running as a Service → Windows](/docs/running-as-a-service#windows); packaging internals live in
+Download the signed `punktfunk-host-setup-<ver>.exe` from the
+[package registry](https://git.unom.io/unom/-/packages) and run it. The installer:
+
+- drops the host into `C:\Program Files\punktfunk` and registers + starts the **`PunktfunkHost`**
+  service,
+- installs the bundled **virtual-display driver** (`pf-vdisplay`) so the host can create per-client
+  displays,
+- installs the bundled **virtual gamepad drivers** (DualSense, DualShock 4, Xbox 360),
+- registers the bundled **HDR Vulkan layer** so Vulkan games can enable HDR over the virtual display,
+- sets up the **web management console** (see below).
+
+For an unattended install, append `/VERYSILENT`. Upgrades and uninstall go through **Add/Remove
+Programs**; your config and pairings are kept across upgrades. Prefer the CLI, or want the full
+service/firewall details? See [Running as a Service → Windows](/docs/running-as-a-service#windows).
+Packaging internals live in
 [`packaging/windows`](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/windows/README.md).
 
+### Web console & pairing
+
 The installer also sets up the **web management console** (status, paired devices, the PIN pairing
-flow): it bundles the console plus its own bun runtime and runs it as the **`PunktfunkWeb`** service
-on **`http://<this-PC>:3000`**, starting at boot. During setup you choose the console **login
-password** (pre-filled with a secure random default and shown again on the final page); change it
-later in `%ProgramData%\punktfunk\web-password`. Open the console from any browser on the LAN and log
-in — no extra install, and the host's management API stays loopback-only behind it.
+flow): it bundles the console plus its own runtime and runs it as the **`PunktfunkWeb`** service on
+**`http://<this-PC>:3000`**, starting at boot. During setup you choose the console **login password**
+(pre-filled with a secure random default and shown again on the final page); change it later in
+`%ProgramData%\punktfunk\web-password`.
+
+The host **requires PIN pairing** by default (secure on a LAN). To connect the first time, open the
+console from any browser on the LAN, log in, go to **Devices → arm pairing**, and enter the PIN on
+your [client](/docs/clients). The host's own management API stays loopback-only behind the console.
+
+### Configure
+
+The service reads `%ProgramData%\punktfunk\host.env`. The defaults work out of the box; common knobs:
+
+- `PUNKTFUNK_ENCODER=auto` — `auto` picks NVENC/AMF/QSV by GPU vendor. Force one with `nvenc`, `amf`,
+  `qsv`, or `sw` (software).
+- `PUNKTFUNK_HOST_CMD` — the service runs `serve --gamestream` by default (native punktfunk/1 **plus**
+  the GameStream/Moonlight-compat planes). Set it to `serve` for a **secure native-only** host with no
+  GameStream surface (GameStream pairs over plain HTTP and uses weaker legacy encryption — trusted LAN
+  only).
+
+Edit the file, then restart: `punktfunk-host service stop` / `punktfunk-host service start`. See the
+[Configuration reference](/docs/configuration) for every option.
 
 ## How it works
 
@@ -58,23 +91,36 @@ pipeline orchestration are all shared with the Linux host. The Windows host is a
 
 | Subsystem | Linux backend | Windows backend |
 |---|---|---|
-| **Capture** | xdg ScreenCast portal → PipeWire (dmabuf) | **Windows.Graphics.Capture** (+ Desktop Duplication for the secure desktop) → D3D11 texture; FP16/10-bit when the desktop is HDR |
-| **Virtual display** | KWin / Mutter / Sway / gamescope | **SudoVDA** signed IDD — create a `WxH@Hz` monitor per session, capture it, tear it down |
-| **Encode** | `ffmpeg-next` NVENC (CUDA hwframes) | **NVENC** with a D3D11 device (`--features nvenc`); HEVC Main10 / BT.2020 PQ for HDR |
+| **Capture** | xdg ScreenCast portal → PipeWire (dmabuf) | **Windows.Graphics.Capture** + **Desktop Duplication** (secure desktop), with a zero-copy path straight from the virtual-display driver; FP16/10-bit when the desktop is HDR |
+| **Virtual display** | KWin / Mutter / Sway / gamescope | **pf-vdisplay** signed IDD — create a `WxH@Hz` monitor per session, capture it, tear it down |
+| **Encode** | NVENC (CUDA) / VAAPI (AMD·Intel) / software | **NVENC** (NVIDIA) · **AMF** (AMD) · **QSV** (Intel) · software H.264; HEVC Main10 / BT.2020 PQ for HDR |
 | **Input — mouse/keyboard** | libei / wlr protocols | **SendInput** (Win32 VK + absolute mouse) |
-| **Input — gamepads** | uinput Xbox 360 pad + rumble | **ViGEm** virtual pad + rumble back-channel |
+| **Input — gamepads** | uinput Xbox 360 + UHID DualSense/DS4 | **UMDF** virtual pads — DualSense, DualShock 4, Xbox 360 (XUSB) + rumble |
 | **Audio capture** | PipeWire sink-monitor | **WASAPI loopback** |
 | **Virtual mic** | PipeWire `Audio/Source` | WASAPI virtual mic |
 
-The virtual display uses **[SudoVDA](https://github.com/VirtualDrivers)** (the Sunshine Virtual
-Display Adapter) — a pre-built, signed Indirect Display Driver — so there is **no kernel driver to
-author or WHQL-sign**. The installer bundles and stages it; if it's absent, the host falls back to
-capturing an existing monitor (losing the per-client native-resolution output).
+The virtual display uses **pf-vdisplay**, punktfunk's own all-Rust **Indirect Display Driver (IDD)** —
+the host pushes finished frames straight into it, so you get a real virtual display with no physical
+monitor or dummy plug. The installer bundles and stages the (self-signed) driver; if it isn't
+installed, the host falls back to capturing an existing monitor, losing the per-client native-resolution
+output.
 
-## Limitations
+### HDR
 
-- **NVIDIA-only.** NVENC is the only encoder backend — there is no AMD / Intel / software encode path
-  on Windows.
-- **x64-only.** No ARM64 build (no ARM64 NVIDIA driver, and SudoVDA is x64-only).
+When your Windows desktop is in **HDR** mode, the host captures it as 10-bit, encodes **HEVC Main10 /
+BT.2020 PQ**, and the client auto-detects HDR from the stream. A small always-on **Vulkan layer**
+(bundled and registered by the installer) also lets **Vulkan games** enable HDR over the virtual
+display — something the NVIDIA/AMD drivers otherwise refuse on an indirect display. The layer is
+self-gating: it's a no-op on SDR and on real monitors. HDR is **Windows-only** (the Linux host is
+8-bit, blocked upstream).
+
+## Notes & limits
+
+- **AMD / Intel encode is newer.** The NVENC path is the most exercised; AMF (AMD) and QSV (Intel) are
+  built and tested in CI but less battle-tested on real hardware. Software H.264 is the GPU-less
+  fallback.
+- **x64-only.** No ARM64 build — no ARM64 NVIDIA driver, and the virtual-display driver is x64-only.
 - **Newer than the Linux host.** The Linux host is the most battle-tested path; the Windows host is
-  more recent, with the virtual-mic and gamepad backends the youngest pieces.
+  more recent, with the virtual-mic and AMD/Intel encode backends the youngest pieces.
+
+Trouble? See [Troubleshooting](/docs/troubleshooting) and [Pairing](/docs/pairing).

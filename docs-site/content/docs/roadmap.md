@@ -35,7 +35,7 @@ see [Status & Progress](/docs/status).
   from one process.
 - **Native-resolution virtual displays** on Linux across KWin, GNOME/Mutter, gamescope, and
   Sway/wlroots, with a fully zero-copy GPU path to NVENC (stable 240 fps at 5120×1440).
-- **A native Windows host** (NVIDIA, x64) — a signed installer with secure-desktop capture and a
+- **A native Windows host** (x64; NVIDIA/AMD/Intel encode) — a signed installer with secure-desktop capture and a
   bundled virtual-display driver, and the only host that can stream **HDR** (10-bit BT.2020 PQ,
   captured from an HDR Windows desktop and encoded as HEVC Main10). See
   [Windows Host](/docs/windows-host). *(Beta — newer than the Linux host.)*
@@ -55,8 +55,8 @@ see [Status & Progress](/docs/status).
 - **Apple stage-2 presenter as the default.** The lower-latency `VTDecompressionSession` →
   `CAMetalLayer` path is live behind an opt-in flag and graduating to the default.
 - **Web console parity.** Surfacing the speed test and bitrate picker the apps already have.
-- **Windows host hardening.** Broader real-world testing, AMD/Intel encode (NVIDIA-only today), and
-  bundling the ViGEm gamepad driver.
+- **Windows host hardening.** Broader real-world testing — especially on-glass validation of the
+  AMD (AMF) and Intel (QSV) encode paths, which are CI-green but newer than NVENC.
 
 ## 🔭 Planned
 

@@ -19,9 +19,10 @@ environments it supports today, each with its own guide:
 Other wlroots compositors (Sway/Hyprland) also work but aren't a primary target. If your desktop isn't
 listed, the host still needs one of these compositor backends to create a virtual display.
 
-> **Windows host:** punktfunk also runs as a native host on **Windows 10/11 (x64) with an NVIDIA GPU**
-> — a signed installer that registers a service and bundles a virtual-display driver. It's NVIDIA-only
-> and newer than the Linux host; see [Windows Host](/docs/windows-host).
+> **Windows host:** punktfunk also runs as a native host on **Windows 10/11 (x64)** — a signed
+> installer that registers a service and bundles a virtual-display driver. It encodes on NVIDIA
+> (NVENC), AMD (AMF), or Intel (QSV), with a software fallback, and is newer than the Linux host; see
+> [Windows Host](/docs/windows-host).
 
 ## GPU and driver
 

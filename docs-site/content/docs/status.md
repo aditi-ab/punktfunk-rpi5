@@ -14,7 +14,7 @@ A high-level view of where punktfunk stands. The ordered plan of work is on the
 | **Core** — `punktfunk-core` + C ABI (protocol · FEC · crypto) | ✅ complete & hardened |
 | **GameStream host** (Moonlight-compatible) | ✅ working end-to-end; HDR/surround-audio polish open |
 | **Native protocol** — `punktfunk/1` (QUIC control + UDP data, GF(2¹⁶) Leopard FEC + AES-GCM) | ✅ full session planes, validated live |
-| **Windows host** (NVIDIA, x64) | 🟡 implemented & shipping as a signed installer; NVIDIA-only, newer than the Linux host |
+| **Windows host** (x64) | 🟡 implemented & shipping as a signed installer; NVIDIA/AMD/Intel encode, newer than the Linux host |
 | **macOS / iOS / iPadOS / tvOS client** | ✅ full client; on-glass stage-2 presenter behind an opt-in flag, becoming the default |
 | **Linux client** (`punktfunk-client`, GTK4/libadwaita) | ✅ full client; VAAPI zero-copy decode + software fallback |
 | **Windows client** (`punktfunk-client`, WinUI 3) | ✅ stage 1 complete; ships as signed MSIX; on-glass hardware validation pending |

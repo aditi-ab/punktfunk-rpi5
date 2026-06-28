@@ -43,12 +43,12 @@ signed installer — see [Windows Host](/docs/windows-host) for what it includes
    ```
 
 3. Run `punktfunk-host-setup-<ver>.exe` (elevated). It installs to `C:\Program Files\punktfunk`,
-   optionally installs the bundled **SudoVDA** virtual-display driver, and registers + starts the
+   installs the bundled **pf-vdisplay** virtual-display driver, and registers + starts the
    `LocalSystem` service (`/VERYSILENT` for an unattended install). Upgrades and uninstall go through
    Add/Remove Programs.
 
-You need an NVIDIA GPU + driver (the host is NVENC-only on Windows). More detail — including the CLI
-`punktfunk-host service install` path — is in
+For hardware encode you need a GPU — NVIDIA (NVENC), AMD (AMF), or Intel (QSV); there's a software
+fallback without one. More detail — including the CLI `punktfunk-host service install` path — is in
 [Running as a Service → Windows](/docs/running-as-a-service#windows).
 
 ## What the packages are
