@@ -32,6 +32,13 @@ jobs:
           dirname "$RUSTUP" >> "$GITHUB_PATH"
           "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin
 
+      # `punktfunk-core` now decodes Opus in-core for the Apple client (surround), pulling
+      # `audiopus_sys`, which builds a vendored static libopus via CMake when pkg-config can't find a
+      # system Opus — so the xcframework is self-contained (no runtime libopus.dylib on end-user Macs).
+      # CMake must be on PATH; install it self-healing on a fresh runner.
+      - name: CMake (for the vendored libopus audiopus_sys builds)
+        run: command -v cmake >/dev/null || brew install cmake
+
       - name: Build PunktfunkCore.xcframework
         run: bash scripts/build-xcframework.sh
 
@@ -70,6 +77,10 @@ jobs:
           dirname "$RUSTUP" >> "$GITHUB_PATH"
           "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin \
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
+      # See the swift job: audiopus_sys (via the in-core Opus decode) builds vendored libopus with CMake.
+      - name: CMake (for the vendored libopus audiopus_sys builds)
+        run: command -v cmake >/dev/null || brew install cmake
 
       - name: Build PunktfunkCore.xcframework (mac + iOS slices)
         run: BUILD_IOS=1 bash scripts/build-xcframework.sh

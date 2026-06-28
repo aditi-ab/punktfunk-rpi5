@@ -177,6 +177,8 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
         compositor: CompositorPref::Auto,
         gamepad: GamepadPref::Auto,
         bitrate_kbps,
+        // Headless CLI path (test/scripting) — stereo baseline; the GUI sources this from settings.
+        audio_channels: 2,
         mic_enabled: flag("--mic"),
         hdr_enabled: !flag("--no-hdr"),
         decoder,

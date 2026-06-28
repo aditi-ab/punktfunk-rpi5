@@ -118,6 +118,11 @@ jobs:
           "$RUSTUP" toolchain install nightly --profile minimal
           "$RUSTUP" component add rust-src --toolchain nightly
 
+      # The in-core Opus decode (surround) pulls audiopus_sys, which builds a vendored static libopus
+      # via CMake — keep the xcframework self-contained (no runtime libopus.dylib on end-user devices).
+      - name: CMake (for the vendored libopus audiopus_sys builds)
+        run: command -v cmake >/dev/null || brew install cmake
+
       - name: Build PunktfunkCore.xcframework (mac + iOS + tvOS)
         # tvOS is a tier-3 target (nightly -Zbuild-std): slow on the first build, then cached on
         # the self-hosted runner. Built on canary too so the tvOS archive/upload below runs on the
