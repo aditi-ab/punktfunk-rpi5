@@ -497,7 +497,7 @@ async fn serve_session(
     opts: &Punktfunk1Options,
     audio_cap: &AudioCapSlot,
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
-    mic_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    mic_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     host_fp: &[u8; 32],
     np: &NativePairing,
     last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
@@ -597,9 +597,11 @@ async fn serve_session(
         // we look it up in OUR library so a client can't inject a command). The bare-spawn gamescope
         // backend picks this up via the `PUNKTFUNK_GAMESCOPE_APP` env fallback in `spawn` (on a shared
         // desktop / attach-to-existing session it's a harmless no-op). This is the process-global env
-        // path — safe under today's ONE-session-at-a-time model; when concurrent native sessions land
-        // (`what's left` §3), resolve the command into the per-session VirtualDisplay via
-        // `set_launch_command` (as the GameStream path now does) so sessions can't stomp each other.
+        // path; the write is serialized via `vdisplay::with_env_lock` so concurrent native-session
+        // handshakes can't race the `set_var` (security-review 2026-06-28 #7). The remaining
+        // cross-session *value* confusion (B's launch id stomping A's pending gamescope spawn) wants
+        // the command resolved into the per-session VirtualDisplay via `set_launch_command` (as the
+        // GameStream path does) — a follow-up; the data-race UB is closed here.
         if let Some(id) = hello.launch.as_deref() {
             // Linux: resolve the id to a gamescope-nested command and stash it in the env the
             // gamescope backend reads. Windows has no gamescope to nest into — the data plane launches
@@ -609,7 +611,9 @@ async fn serve_session(
             match crate::library::launch_command(id) {
                 Some(cmd) => {
                     tracing::info!(launch_id = id, command = %cmd, "launching library title");
-                    std::env::set_var("PUNKTFUNK_GAMESCOPE_APP", &cmd);
+                    crate::vdisplay::with_env_lock(|| {
+                        std::env::set_var("PUNKTFUNK_GAMESCOPE_APP", &cmd)
+                    });
                 }
                 None => tracing::warn!(
                     launch_id = id,
@@ -907,8 +911,9 @@ async fn serve_session(
         while let Ok(d) = input_conn.read_datagram().await {
             if let Some((_seq, _pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
                 mic_count += 1;
-                // Host-lifetime mic service; a send error just means the host is shutting down.
-                let _ = mic_tx.send(opus.to_vec());
+                // Host-lifetime mic service (bounded queue): `try_send` drops the frame when the
+                // service is full or gone, never blocking this datagram loop (security-review S6).
+                let _ = mic_tx.try_send(opus.to_vec());
             } else if let Some(rich) = punktfunk_core::quic::RichInput::decode(&d) {
                 rich_count += 1;
                 if rich_tx.send(rich).is_err() {
@@ -1185,6 +1190,8 @@ const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_s
 
 /// Mic is 48 kHz stereo — matches the Opus stereo decoder and the host→client audio layout.
 const MIC_CHANNELS: u32 = 2;
+/// Bound for the shared mic frame queue (drop-newest when full). See [`MicService::start`].
+const MIC_QUEUE_CAP: usize = 64;
 
 /// Host-lifetime virtual microphone, shared across punktfunk/1 sessions (mirror of
 /// [`InjectorService`]). One thread owns the PipeWire `Audio/Source` + an Opus decoder; sessions
@@ -1192,12 +1199,16 @@ const MIC_CHANNELS: u32 = 2;
 /// feeds the source. Opened lazily on the first frame, the source node persists across sessions
 /// (no per-session registration churn), and reopens after a backoff if the source/decoder fails.
 struct MicService {
-    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
 
 impl MicService {
     fn start() -> MicService {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // Bounded so the host-lifetime mic queue (shared across all concurrent sessions) can't grow
+        // without limit under a near-line-rate flood; the producer drops the newest frame when full
+        // (audio is lossy by design) rather than buffering unboundedly (security-review 2026-06-28
+        // S6). 64 × 5–10 ms frames ≈ 0.3–0.6 s of slack, far more than the decode loop ever lags.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(MIC_QUEUE_CAP);
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk1-mic".into())
             .spawn(move || mic_service_thread(rx))
@@ -1209,7 +1220,7 @@ impl MicService {
 
     /// A sender a session forwards the client's Opus mic frames to. Cloned per session; dropping a
     /// clone does NOT stop the service (it holds the original sender for the host life).
-    fn sender(&self) -> std::sync::mpsc::Sender<Vec<u8>> {
+    fn sender(&self) -> std::sync::mpsc::SyncSender<Vec<u8>> {
         self.tx.clone()
     }
 }
@@ -1224,14 +1235,17 @@ fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
 
 /// The host-lifetime mic worker: lazily open the virtual mic + decoder, then Opus-decode each
 /// forwarded frame and push the PCM into the source. Reopen (after [`INJECTOR_REOPEN_BACKOFF`])
-/// on open failure or a decode error. Exits when every session sender and the service's own
-/// sender drop (host shutdown), tearing the virtual mic down. Linux = PipeWire `Audio/Source`;
-/// Windows = a virtual audio device's render endpoint (see `audio::wasapi_mic`).
+/// only on a backend OPEN failure; a per-frame Opus DECODE error is just a dropped frame (it must
+/// not tear down this mic, which is shared across every concurrent session — otherwise one paired
+/// client's junk frames would deny everyone's mic; security-review 2026-06-28 S2). Exits when every
+/// session sender and the service's own sender drop (host shutdown), tearing the virtual mic down.
+/// Linux = PipeWire `Audio/Source`; Windows = a virtual audio device's render endpoint.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
     let mut mic: Option<Box<dyn crate::audio::VirtualMic>> = None;
     let mut decoder: Option<opus::Decoder> = None;
     let mut last_failed: Option<std::time::Instant> = None;
+    let mut decode_fails: u64 = 0;
     let mut pcm = vec![0f32; 5760 * MIC_CHANNELS as usize]; // up to 120 ms scratch
     for opus_frame in rx {
         if opus_frame.is_empty() {
@@ -1267,12 +1281,16 @@ fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
             Ok(samples_per_ch) => {
                 let total = (samples_per_ch * MIC_CHANNELS as usize).min(pcm.len());
                 m.push(&pcm[..total]);
+                decode_fails = 0;
             }
             Err(e) => {
-                tracing::warn!(error = %e, "mic opus decode failed — reopening");
-                mic = None;
-                decoder = None;
-                last_failed = Some(std::time::Instant::now());
+                // Malformed/garbage frame: drop it and keep the (shared) mic + decoder open. The
+                // next valid frame decodes normally; only a backend OPEN failure reopens. Throttle
+                // the log (1, 2, 4, … fails) so a junk flood can't spam.
+                decode_fails += 1;
+                if decode_fails.is_power_of_two() {
+                    tracing::warn!(error = %e, fails = decode_fails, "mic opus decode failed — dropping frame");
+                }
             }
         }
     }
@@ -1454,8 +1472,14 @@ fn input_thread(
     // left-button-down then turns every later click into a drag: windows move, but clicking buttons
     // and text inputs does nothing). We synthesize the matching up-events when this session ends —
     // see the release loop after the `break`.
-    let mut held_buttons: Vec<u32> = Vec::new();
-    let mut held_keys: Vec<u32> = Vec::new();
+    // Sets (not Vecs) so the presence test is O(1), not O(n) per event, and bounded by `MAX_HELD`
+    // so a client flooding distinct never-released codes can't grow the tracking state or spike the
+    // input thread (security-review 2026-06-28 S3). A real keyboard+mouse holds far fewer at once;
+    // codes past the cap simply aren't tracked for end-of-session release (worst case: one unreleased
+    // key on a pathological disconnect, which the injector's own state still bounds).
+    const MAX_HELD: usize = 256;
+    let mut held_buttons: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut held_keys: std::collections::HashSet<u32> = std::collections::HashSet::new();
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(4)) {
             Ok(ev) => match ev.kind {
@@ -1473,14 +1497,18 @@ fn input_thread(
                 _ => {
                     // Track press/release so a mid-press disconnect can be undone below.
                     match ev.kind {
-                        InputKind::MouseButtonDown if !held_buttons.contains(&ev.code) => {
-                            held_buttons.push(ev.code)
+                        InputKind::MouseButtonDown if held_buttons.len() < MAX_HELD => {
+                            held_buttons.insert(ev.code);
                         }
-                        InputKind::MouseButtonUp => held_buttons.retain(|&c| c != ev.code),
-                        InputKind::KeyDown if !held_keys.contains(&ev.code) => {
-                            held_keys.push(ev.code)
+                        InputKind::MouseButtonUp => {
+                            held_buttons.remove(&ev.code);
                         }
-                        InputKind::KeyUp => held_keys.retain(|&c| c != ev.code),
+                        InputKind::KeyDown if held_keys.len() < MAX_HELD => {
+                            held_keys.insert(ev.code);
+                        }
+                        InputKind::KeyUp => {
+                            held_keys.remove(&ev.code);
+                        }
                         _ => {}
                     }
                     // Pointer/keyboard → the host-lifetime injector service (one persistent

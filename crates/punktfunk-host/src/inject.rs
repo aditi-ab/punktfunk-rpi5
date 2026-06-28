@@ -76,9 +76,7 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
             #[cfg(target_os = "linux")]
             {
                 Ok(Box::new(libei::LibeiInjector::open_with(
-                    libei::EiSource::SocketPathFile(
-                        crate::vdisplay::gamescope_ei_socket_file().into(),
-                    ),
+                    libei::EiSource::SocketPathFile(crate::vdisplay::gamescope_ei_socket_file()),
                 )?))
             }
             #[cfg(not(target_os = "linux"))]

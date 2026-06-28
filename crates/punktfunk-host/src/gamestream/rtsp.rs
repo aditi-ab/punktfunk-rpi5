@@ -14,7 +14,7 @@ use crate::encode::Codec;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,13 +102,12 @@ fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
             "RTSP {} | {}", req.head.replace("\r\n", " | "),
             if req.body.is_empty() { String::new() } else { format!("body: {}", req.body.replace("\r\n", " | ")) }
         );
-        let resp = handle_request(&req, &state);
+        let resp = handle_request(&req, &state, peer);
         stream.write_all(resp.as_bytes()).context("RTSP write")?;
         stream.flush().ok();
         // Close (FIN after the flushed response) so the client detects end-of-response.
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
-    let _ = peer;
     Ok(())
 }
 
@@ -171,7 +170,7 @@ fn parse_request(head: &str, body: String) -> Request {
     }
 }
 
-fn handle_request(req: &Request, state: &AppState) -> String {
+fn handle_request(req: &Request, state: &AppState, peer: Option<SocketAddr>) -> String {
     match req.method.as_str() {
         "OPTIONS" => response(
             &req.cseq,
@@ -216,16 +215,30 @@ fn handle_request(req: &Request, state: &AppState) -> String {
             response(&req.cseq, &[], None)
         }
         "PLAY" => {
+            // The RTSP/UDP media plane is UNAUTHENTICATED. A stream may start only for the paired
+            // client that completed the pairing-gated `/launch` (which set `state.launch`), and —
+            // when the launching IP is known — only from that same source IP. So an unpaired RTSP
+            // peer can neither start a stream on an idle host nor ride a paired client's active
+            // launch (security-review 2026-06-28 #4). `nvhttp` gates `/launch` on a pinned cert.
+            let launch = *state.launch.lock().unwrap();
+            let Some(ls) = launch else {
+                tracing::warn!(?peer, "RTSP PLAY — refused: no paired `/launch` session");
+                return response_status("401 Unauthorized", &req.cseq, &[], None);
+            };
+            if let (Some(want), Some(got)) = (ls.peer_ip, peer.map(|p| p.ip())) {
+                if want != got {
+                    tracing::warn!(
+                        %want, %got,
+                        "RTSP PLAY — refused: peer IP does not match the launching client"
+                    );
+                    return response_status("401 Unauthorized", &req.cseq, &[], None);
+                }
+            }
             let cfg = *state.stream.lock().unwrap();
             match cfg {
                 Some(cfg) if !state.streaming.swap(true, Ordering::SeqCst) => {
                     // Resolve the launched catalog entry (session recipe) for the stream.
-                    let app = state
-                        .launch
-                        .lock()
-                        .unwrap()
-                        .map(|l| l.appid)
-                        .and_then(super::apps::by_id);
+                    let app = super::apps::by_id(ls.appid);
                     tracing::info!(app = ?app.as_ref().map(|a| &a.title), "RTSP PLAY — starting video stream");
                     stream::start(
                         cfg,
@@ -243,18 +256,15 @@ fn handle_request(req: &Request, state: &AppState) -> String {
             // Audio runs independently (Opus on UDP 48000, stereo or 5.1/7.1 multistream per
             // the ANNOUNCE); it needs the launch key for the AES-CBC payload encryption the
             // client expects.
-            let launch = *state.launch.lock().unwrap();
-            if let Some(ls) = launch {
-                if !state.audio_streaming.swap(true, Ordering::SeqCst) {
-                    tracing::info!("RTSP PLAY — starting audio stream");
-                    audio::start(
-                        state.audio_streaming.clone(),
-                        ls.gcm_key,
-                        ls.rikeyid,
-                        *state.audio_params.lock().unwrap(),
-                        state.audio_cap.clone(),
-                    );
-                }
+            if !state.audio_streaming.swap(true, Ordering::SeqCst) {
+                tracing::info!("RTSP PLAY — starting audio stream");
+                audio::start(
+                    state.audio_streaming.clone(),
+                    ls.gcm_key,
+                    ls.rikeyid,
+                    *state.audio_params.lock().unwrap(),
+                    state.audio_cap.clone(),
+                );
             }
             response(&req.cseq, &[("Session", "DEADBEEFCAFE;timeout = 90")], None)
         }

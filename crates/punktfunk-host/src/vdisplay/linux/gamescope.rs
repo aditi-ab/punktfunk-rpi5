@@ -670,11 +670,11 @@ pub fn start_restore_worker() -> std::sync::Arc<()> {
 }
 
 /// Point the libei injector at the running gamescope's EIS socket (it reads the relay file
-/// [`EI_SOCKET_FILE`]). Best-effort — video still works without it (input just won't reach the
+/// [`ei_socket_file`]). Best-effort — video still works without it (input just won't reach the
 /// session). Shared by the attach and host-managed-session paths.
 fn point_injector_at_eis() {
     match find_gamescope_eis_socket() {
-        Some(sock) => match std::fs::write(EI_SOCKET_FILE, &sock) {
+        Some(sock) => match std::fs::write(ei_socket_file(), &sock) {
             Ok(()) => {
                 tracing::info!(socket = %sock, "gamescope: pointed injector at the session's EIS socket")
             }
@@ -770,18 +770,31 @@ fn stop_session(unit_name: &str) {
     let _ = Command::new("systemctl")
         .args(["--user", "stop", unit_name])
         .status();
-    let _ = std::fs::remove_file(EI_SOCKET_FILE);
+    let _ = std::fs::remove_file(ei_socket_file());
 }
 
-/// File where the wrapper below writes gamescope's `LIBEI_SOCKET` (its EIS server socket),
-/// read by the libei injector to drive input into the nested app. See [`crate::inject`].
-pub const EI_SOCKET_FILE: &str = "/tmp/punktfunk-gamescope-ei";
+/// File where the wrapper below writes gamescope's `LIBEI_SOCKET` (its EIS server socket), read by
+/// the libei injector to drive input into the nested app. See [`crate::inject`].
+///
+/// Placed under `$XDG_RUNTIME_DIR` (a per-user, 0700 directory) — NOT a world-writable `/tmp` —
+/// so a second unprivileged local user can neither read the relayed socket path nor pre-plant the
+/// file to redirect the host's injector to a rogue EIS server (which would let them keylog or deny
+/// the remote session's keyboard/mouse input; security-review 2026-06-28 #6). Falls back to `/tmp`
+/// only if `XDG_RUNTIME_DIR` is unset (gamescope itself requires it, so this is rare); the reader
+/// ([`crate::inject`]) additionally rejects a symlinked relay file as defense-in-depth.
+pub fn ei_socket_file() -> std::path::PathBuf {
+    let runtime = crate::vdisplay::with_env_lock(|| std::env::var_os("XDG_RUNTIME_DIR"));
+    match runtime {
+        Some(rt) if !rt.is_empty() => std::path::PathBuf::from(rt).join("punktfunk-gamescope-ei"),
+        _ => std::path::PathBuf::from("/tmp/punktfunk-gamescope-ei"),
+    }
+}
 
 /// Spawn `gamescope --backend headless -W w -H h -r hz -- <app>`. The app comes from
 /// `PUNKTFUNK_GAMESCOPE_APP` (default a no-op that just keeps gamescope alive — set it to a real
 /// game/GL app for actual content, e.g. `steam -gamepadui` for the SteamOS-like session).
 /// stdout/stderr go to `/tmp/punktfunk-gamescope.log`. The app is launched through a tiny shell
-/// wrapper that relays gamescope's `LIBEI_SOCKET` (set for its children) to [`EI_SOCKET_FILE`]
+/// wrapper that relays gamescope's `LIBEI_SOCKET` (set for its children) to [`ei_socket_file`]
 /// so the input injector can connect to gamescope's EIS server from outside.
 fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>) -> Result<Child> {
     // A non-empty per-session command (set via `set_launch_command`) wins; else the
@@ -791,10 +804,13 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>) -> Result<Child> {
     let app = cmd
         .map(str::to_string)
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| std::env::var("PUNKTFUNK_GAMESCOPE_APP").ok())
+        // Read the env fallback under the shared env lock so it can't race a concurrent session's
+        // `set_var` of the same key (security-review 2026-06-28 #7).
+        .or_else(|| crate::vdisplay::with_env_lock(|| std::env::var("PUNKTFUNK_GAMESCOPE_APP").ok()))
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "sleep infinity".to_string());
-    let _ = std::fs::remove_file(EI_SOCKET_FILE); // stale socket path from a previous session
+    let relay = ei_socket_file();
+    let _ = std::fs::remove_file(&relay); // stale socket path from a previous session
     let mut cmd = Command::new("gamescope");
     cmd.args(["--backend", "headless"])
         .args(["-W", &w.to_string()])
@@ -804,7 +820,10 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>) -> Result<Child> {
         .args([
             "sh",
             "-c",
-            &format!("printf %s \"$LIBEI_SOCKET\" > {EI_SOCKET_FILE}; exec \"$@\""),
+            &format!(
+                "printf %s \"$LIBEI_SOCKET\" > '{}'; exec \"$@\"",
+                relay.display()
+            ),
             "sh",
         ])
         .args(app.split_whitespace())
@@ -997,7 +1016,7 @@ impl Drop for GamescopeProc {
         let _ = self.0.wait();
         // Clear the relayed EIS socket name so the host-lifetime injector can't reconnect to this
         // now-dead session's socket between sessions (the stale path is the "Connection refused").
-        let _ = std::fs::remove_file(EI_SOCKET_FILE);
+        let _ = std::fs::remove_file(ei_socket_file());
     }
 }
 

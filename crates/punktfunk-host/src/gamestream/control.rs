@@ -56,6 +56,9 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
         .spawn(move || {
             // GCM scheme detected from the first authenticating packet; reused thereafter.
             let mut detected: Option<Scheme> = None;
+            // Consecutive control-decrypt failures for this peer — throttles the warn log so a
+            // junk-packet flood can't spam unbounded lines (security-review 2026-06-28 #10).
+            let mut decrypt_fails: u64 = 0;
             // Decoded keyboard/mouse is forwarded to a dedicated host-lifetime injector thread —
             // NEVER injected inline, so a slow Wayland/libei/SendInput call can't head-block ENet
             // keepalive/retransmit servicing on this thread. The injector owns non-Send compositor
@@ -77,6 +80,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                             Event::Disconnect { .. } => {
                                 tracing::info!("control: client disconnected");
                                 detected = None;
+                                decrypt_fails = 0;
                                 peer = None;
                                 // Unplug the session's virtual pads.
                                 pads = GamepadManager::new();
@@ -89,6 +93,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
                                     channel_id,
                                     packet.data(),
                                     &mut detected,
+                                    &mut decrypt_fails,
                                     &inj_tx,
                                     &mut pads,
                                 );
@@ -163,6 +168,7 @@ fn on_receive(
     _channel_id: u8,
     d: &[u8],
     detected: &mut Option<Scheme>,
+    decrypt_fails: &mut u64,
     inj_tx: &Sender<InputEvent>,
     pads: &mut GamepadManager,
 ) {
@@ -180,10 +186,20 @@ fn on_receive(
                 tracing::info!(?scheme, "control: GCM scheme locked in");
             }
             *detected = Some(scheme);
+            *decrypt_fails = 0;
             pt
         }
         None => {
-            tracing::warn!(len = d.len(), "control: GCM decrypt failed");
+            // Throttle: a junk-packet flood must not spam one warn line per packet. Log the first
+            // failure, then only at exponentially-spaced counts (1, 2, 4, 8, …).
+            *decrypt_fails += 1;
+            if decrypt_fails.is_power_of_two() {
+                tracing::warn!(
+                    len = d.len(),
+                    fails = *decrypt_fails,
+                    "control: GCM decrypt failed"
+                );
+            }
             return;
         }
     };

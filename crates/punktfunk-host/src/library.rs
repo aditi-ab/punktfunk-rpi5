@@ -577,10 +577,11 @@ impl LibraryProvider for EpicProvider {
             if p.extension().and_then(|e| e.to_str()) != Some("item") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&p) else {
+            // `.item` manifests are small JSON; cap the read so a planted giant can't OOM the host.
+            let Some(bytes) = read_capped(&p, 1024 * 1024) else {
                 continue;
             };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
                 continue;
             };
             if let Some(g) = epic_entry(&v, &art) {
@@ -650,6 +651,23 @@ fn epic_entry(
     })
 }
 
+/// Read a launcher cache/manifest with a hard size cap, so a local unprivileged user can't plant a
+/// multi-GB file under the launcher's (Users-writable) data dir that OOMs the privileged host when
+/// it's loaded — then base64/JSON-decoded into further copies — during library enumeration
+/// (security-review 2026-06-28 S4). Returns `None` if missing, empty, or over `max`. Mirrors the
+/// Linux lutris-art reader's 1 MiB cap.
+#[cfg(windows)]
+fn read_capped(path: &Path, max: u64) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() == 0 || meta.len() > max {
+        if meta.len() > max {
+            tracing::warn!(path = %path.display(), len = meta.len(), max, "launcher cache exceeds size cap — skipping");
+        }
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
 /// Best-effort parse of `catcache.bin` (base64-encoded JSON array of catalog items) into
 /// catalogItemId → [`Artwork`] from each item's `keyImages`. Empty map on any read/decode failure
 /// (the format is community-reverse-engineered + can lag a fresh install → titles just show no art).
@@ -657,7 +675,8 @@ fn epic_entry(
 fn epic_art_index(catcache: &Path) -> std::collections::HashMap<String, Artwork> {
     use base64::Engine as _;
     let mut map = std::collections::HashMap::new();
-    let Ok(raw) = std::fs::read(catcache) else {
+    // 32 MiB cap: comfortably fits a real catalog cache, blocks a planted giant (S4).
+    let Some(raw) = read_capped(catcache, 32 * 1024 * 1024) else {
         return map;
     };
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(raw) else {

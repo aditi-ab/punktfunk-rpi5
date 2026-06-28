@@ -358,13 +358,30 @@ fn find_wayland_socket(runtime: &str, uid: u32) -> Option<String> {
     cands.into_iter().next().map(|(_, n)| n)
 }
 
+/// Serializes ALL process-global env mutation on the per-session setup path. `std::env::set_var`
+/// concurrent with another thread's `set_var` (glibc `environ` realloc) is a data race = UB. With
+/// the default concurrent native sessions each running `resolve_compositor` in its own
+/// `spawn_blocking`, the per-session env retargeting would otherwise race and could crash the host
+/// (security-review 2026-06-28 #7). Every env write on the setup path takes this lock; steady-state
+/// streaming reads cached config, not env. This removes the memory-unsafety; it is NOT a full fix
+/// for cross-session env *value* confusion (that needs per-session `SessionContext` threading, as the
+/// GameStream/Windows path already does via `set_launch_command`).
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` with [`ENV_LOCK`] held. Use around any `set_var`/`remove_var` on the session-setup path.
+pub fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 /// Write a detected session's [`SessionEnv`] into the process env so every backend (video capture
 /// and input alike) that reads `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` /
-/// `XDG_CURRENT_DESKTOP` at open time targets the live session. The host serves one session at a
-/// time, so a process-global write is sound; the next connect re-detects and re-applies. Same
-/// `set_var` discipline already used for `PUNKTFUNK_GAMESCOPE_APP` on the launch path.
+/// `XDG_CURRENT_DESKTOP` at open time targets the live session. Serialized via [`ENV_LOCK`] so
+/// concurrent session handshakes can't race the `set_var`s; the next connect re-detects and
+/// re-applies. Same `set_var` discipline used for `PUNKTFUNK_GAMESCOPE_APP` on the launch path.
 #[cfg(target_os = "linux")]
 pub fn apply_session_env(active: &ActiveSession) {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let e = &active.env;
     std::env::set_var("XDG_RUNTIME_DIR", &e.xdg_runtime_dir);
     std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &e.dbus_session_bus_address);
@@ -455,6 +472,7 @@ pub fn settle_desktop_portal(_chosen: Compositor) {}
 /// `PUNKTFUNK_GAMESCOPE_MANAGED` forces managed over either.
 #[cfg(target_os = "linux")]
 pub fn apply_input_env(chosen: Compositor) {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let backend = match chosen {
         Compositor::Gamescope => "gamescope",
         // KWin: org_kde_kwin_fake_input — direct injection, no RemoteDesktop portal / approval
@@ -587,10 +605,10 @@ pub fn probe(compositor: Compositor) -> Result<()> {
 }
 
 /// Path of the file where the gamescope backend relays the nested session's `LIBEI_SOCKET`
-/// (gamescope's EIS server) for the input injector.
+/// (gamescope's EIS server) for the input injector. Under `$XDG_RUNTIME_DIR` (per-user 0700).
 #[cfg(target_os = "linux")]
-pub fn gamescope_ei_socket_file() -> &'static str {
-    gamescope::EI_SOCKET_FILE
+pub fn gamescope_ei_socket_file() -> std::path::PathBuf {
+    gamescope::ei_socket_file()
 }
 
 /// Call when a client session ends: if the host-managed gamescope path took over a box's autologin

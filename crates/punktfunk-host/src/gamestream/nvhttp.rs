@@ -1,9 +1,14 @@
 //! The nvhttp servers: plain HTTP on 47989 and mutual-TLS on 47984. Serves `/serverinfo`,
-//! the `/pair` flow, `/applist`, and `/launch`/`/resume`/`/cancel`, plus a punktfunk-only
-//! `/pin` endpoint to deliver the Moonlight-displayed PIN. Over HTTPS the client is
+//! the `/pair` flow, `/applist`, and `/launch`/`/resume`/`/cancel`. Over HTTPS the client is
 //! mutual-TLS-authenticated, so `/serverinfo` reports `PairStatus=1` there.
+//!
+//! The pairing PIN is delivered out-of-band ONLY through the bearer-authenticated management
+//! API (`POST /api/v1/pair/pin`): the operator reads the PIN off the Moonlight client and
+//! types it into the host console. There is deliberately NO unauthenticated nvhttp PIN
+//! endpoint — one would let a network client submit its own displayed PIN and drive the whole
+//! ceremony to a pinned cert with no operator consent (security-review 2026-06-28 #1).
 
-use super::tls::PeerCertFingerprint;
+use super::tls::{PeerAddr, PeerCertFingerprint};
 use super::{serverinfo, AppState, LaunchSession, HTTPS_PORT, HTTP_PORT, RTSP_PORT};
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -58,7 +63,6 @@ fn router(state: Arc<AppState>, https: bool) -> Router {
     Router::new()
         .route("/serverinfo", get(h_serverinfo))
         .route("/pair", get(h_pair))
-        .route("/pin", get(h_pin))
         .route("/applist", get(h_applist))
         .route("/launch", get(h_launch))
         .route("/resume", get(h_resume))
@@ -82,19 +86,6 @@ async fn h_serverinfo(
     xml(serverinfo::serverinfo_xml(&st.host, https, paired))
 }
 
-async fn h_pin(
-    State(st): State<Arc<AppState>>,
-    Query(q): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    match q.get("pin").filter(|p| !p.is_empty()) {
-        Some(pin) => {
-            st.pairing.pin.submit(pin.clone());
-            "PIN accepted\n".to_string()
-        }
-        None => "usage: GET /pin?pin=NNNN\n".to_string(),
-    }
-}
-
 async fn h_applist(
     State(st): State<Arc<AppState>>,
     peer: Option<Extension<PeerCertFingerprint>>,
@@ -110,6 +101,7 @@ async fn h_applist(
 async fn h_launch(
     State(st): State<Arc<AppState>>,
     peer: Option<Extension<PeerCertFingerprint>>,
+    addr: Option<Extension<PeerAddr>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if !peer_is_paired(&peer, &st) {
@@ -117,7 +109,9 @@ async fn h_launch(
         return xml(error_xml());
     }
     match launch(&st, &q) {
-        Ok(session) => {
+        Ok(mut session) => {
+            // Bind the (unauthenticated) RTSP/UDP media plane to this paired client's source IP.
+            session.peer_ip = addr.map(|Extension(PeerAddr(a))| a.ip());
             *st.launch.lock().unwrap() = Some(session);
             tracing::info!(
                 w = session.width,
@@ -193,6 +187,7 @@ fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> 
         height,
         fps,
         appid,
+        peer_ip: None, // set by `h_launch` from the verified HTTPS peer address
     })
 }
 

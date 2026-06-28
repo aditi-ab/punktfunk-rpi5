@@ -1680,6 +1680,7 @@ mod tests {
             height: 1440,
             fps: 120,
             appid: 1,
+            peer_ip: None,
         });
         state.streaming.store(true, Ordering::SeqCst);
 
@@ -1805,6 +1806,7 @@ mod tests {
             height: 1080,
             fps: 60,
             appid: 1,
+            peer_ip: None,
         });
 
         let del = axum::http::Request::delete("/api/v1/session")

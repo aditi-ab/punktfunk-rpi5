@@ -24,6 +24,12 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct PeerCertFingerprint(pub Option<String>);
 
+/// The TCP source address of an HTTPS request, injected per-connection by [`serve_https`]. Used by
+/// `/launch` to record which paired client owns the session so the unauthenticated RTSP/UDP media
+/// plane can bind to that peer's IP (security-review 2026-06-28 #4).
+#[derive(Clone, Copy)]
+pub(crate) struct PeerAddr(pub SocketAddr);
+
 /// HTTPS server that surfaces the verified client cert to handlers. `axum_server` can't expose the
 /// peer cert, so this runs the rustls handshake itself (tokio-rustls), reads the peer certificate,
 /// and serves the axum `Router` over hyper with the peer's fingerprint attached to every request as
@@ -39,7 +45,7 @@ pub(crate) async fn serve_https(
         .await
         .with_context(|| format!("bind HTTPS {bind}"))?;
     loop {
-        let (tcp, _peer) = match listener.accept().await {
+        let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "HTTPS accept failed");
@@ -63,14 +69,16 @@ pub(crate) async fn serve_https(
                 .peer_certificates()
                 .and_then(|c| c.first())
                 .map(|c| hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(c.as_ref())));
-            let peer = PeerCertFingerprint(fp);
+            let fp = PeerCertFingerprint(fp);
+            let addr = PeerAddr(peer);
             let svc =
                 hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                     let app = app.clone();
-                    let peer = peer.clone();
+                    let fp = fp.clone();
                     async move {
                         let mut req = req.map(axum::body::Body::new);
-                        req.extensions_mut().insert(peer);
+                        req.extensions_mut().insert(fp);
+                        req.extensions_mut().insert(addr);
                         app.oneshot(req).await // Router error is Infallible
                     }
                 });

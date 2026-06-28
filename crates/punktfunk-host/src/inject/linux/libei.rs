@@ -305,6 +305,19 @@ async fn connect_socket_file(file: &std::path::Path) -> Result<UnixStream> {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut logged = String::new();
     loop {
+        // Defense-in-depth: never follow a symlinked relay file. It lives under `$XDG_RUNTIME_DIR`
+        // (per-user 0700) so a cross-user plant is already blocked, but refuse a symlink outright
+        // rather than read through one to an attacker-chosen target (a rogue EIS server would
+        // keylog/deny the session's input; security-review 2026-06-28 #6).
+        if std::fs::symlink_metadata(file)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "EIS relay file {} is a symlink — refusing to follow it",
+                file.display()
+            ));
+        }
         if let Ok(s) = std::fs::read_to_string(file) {
             let name = s.trim();
             if !name.is_empty() {

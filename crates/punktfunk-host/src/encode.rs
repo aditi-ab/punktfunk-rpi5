@@ -230,6 +230,14 @@ pub fn open_video(
     chroma: ChromaFormat,
 ) -> Result<Box<dyn Encoder>> {
     validate_dimensions(codec, width, height)?;
+    // Refresh/fps must be positive and sane: fps feeds the encoder time_base (`Rational(1, fps)`)
+    // and the pts→ns conversion (`pts * 1e9 / fps`), so 0 builds a 1/0 rational / divides by zero.
+    // The mid-stream Reconfigure path already guards `refresh_hz > 0`; enforcing it at this single
+    // open chokepoint makes EVERY path (initial Hello, GameStream ANNOUNCE, Reconfigure) safe
+    // regardless of which backend opens (security-review 2026-06-28 S5).
+    if fps == 0 || fps > 1000 {
+        anyhow::bail!("invalid refresh/fps {fps}: must be 1..=1000 Hz");
+    }
     // 4:4:4 is HEVC-only. The negotiator should never pass `Yuv444` for another codec (it gates on
     // `codec == H265`), but defend the contract here so a future caller can't silently emit a stream
     // no decoder expects: a non-HEVC 4:4:4 request degrades to 4:2:0 with a warning.

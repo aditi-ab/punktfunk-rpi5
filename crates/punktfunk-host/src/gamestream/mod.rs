@@ -90,6 +90,11 @@ pub struct LaunchSession {
     pub fps: u32,
     /// `/launch?appid=N` — selects the app-catalog entry (session recipe).
     pub appid: u32,
+    /// Source IP of the paired HTTPS client that issued `/launch`. The unauthenticated RTSP/UDP
+    /// media plane binds to this so only the launching peer can start/own the stream — an
+    /// unpaired RTSP peer cannot ride a paired client's launch (security-review 2026-06-28 #4).
+    /// `None` if the address could not be captured (then RTSP falls back to launch-present only).
+    pub peer_ip: Option<std::net::IpAddr>,
 }
 
 /// Shared control-plane state used as the axum app state.

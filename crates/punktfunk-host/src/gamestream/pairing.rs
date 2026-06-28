@@ -17,9 +17,14 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::Notify;
 
-/// Out-of-band PIN delivery. Moonlight generates + displays a PIN; the user submits it
-/// (via the management API's `POST /api/v1/pair/pin` or nvhttp's `GET /pin?pin=NNNN`).
-/// `getservercert` parks until a PIN arrives.
+/// Out-of-band PIN delivery. Moonlight generates + displays a PIN; the operator submits it
+/// via the bearer-authenticated management API (`POST /api/v1/pair/pin`) only — there is no
+/// unauthenticated nvhttp delivery path (a network client must never be able to submit its
+/// own PIN; security-review 2026-06-28 #1). `getservercert` parks until a PIN arrives.
+/// Max pairing handshakes parked in [`PinGate::take`] at once (each holds a slot for up to
+/// 300s), bounding a pre-auth waiter flood. Real pairing is one operator-driven client at a time.
+const MAX_PARKED_WAITERS: usize = 4;
+
 pub struct PinGate {
     pin: Mutex<Option<String>>,
     notify: Notify,
@@ -48,7 +53,20 @@ impl PinGate {
     }
 
     async fn take(&self, timeout: Duration) -> Option<String> {
-        self.waiters.fetch_add(1, Ordering::SeqCst);
+        // Bound the number of pairing handshakes parked at once: each `getservercert` is
+        // pre-auth and parks for up to 300s, so without a cap an unpaired LAN peer could pin
+        // unbounded tasks + keep `awaiting_pin` asserted (security-review 2026-06-28 #12).
+        // Reserve a slot atomically; refuse (treated as "no PIN") once the cap is reached.
+        if self
+            .waiters
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < MAX_PARKED_WAITERS).then_some(n + 1)
+            })
+            .is_err()
+        {
+            tracing::warn!("pairing: too many handshakes awaiting a PIN — refusing");
+            return None;
+        }
         // Decrement on every exit path (PIN delivered, timeout, or future cancellation).
         struct WaiterGuard<'a>(&'a AtomicUsize);
         impl Drop for WaiterGuard<'_> {
@@ -117,7 +135,8 @@ impl Pairing {
 
         tracing::info!(
             uniqueid,
-            "pairing phase 1 (getservercert) — awaiting PIN: submit `GET /pin?pin=NNNN`"
+            "pairing phase 1 (getservercert) — awaiting PIN: deliver it via the management \
+             API `POST /api/v1/pair/pin` (operator reads the PIN off the Moonlight client)"
         );
         let pin = self
             .pin
@@ -303,5 +322,29 @@ mod tests {
         // Timeout path also clears the flag.
         assert_eq!(pairing.pin.take(Duration::from_millis(10)).await, None);
         assert!(!pairing.pin.awaiting_pin());
+    }
+
+    /// A pre-auth peer flood can park at most `MAX_PARKED_WAITERS` pairing handshakes; the next
+    /// `take` is refused immediately (returns `None` without parking), bounding the 300s-waiter DoS
+    /// (security-review 2026-06-28 #12).
+    #[tokio::test]
+    async fn pin_gate_caps_parked_waiters() {
+        let pairing = Arc::new(Pairing::new());
+        let mut handles = Vec::new();
+        for _ in 0..MAX_PARKED_WAITERS {
+            let p = pairing.clone();
+            handles.push(tokio::spawn(async move {
+                p.pin.take(Duration::from_secs(5)).await
+            }));
+        }
+        // Wait until all the slots are taken.
+        while pairing.pin.waiters.load(Ordering::SeqCst) < MAX_PARKED_WAITERS {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // One more is refused right away (no parking), even with a long timeout.
+        assert_eq!(pairing.pin.take(Duration::from_secs(5)).await, None);
+        for h in handles {
+            h.abort();
+        }
     }
 }
