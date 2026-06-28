@@ -7,6 +7,7 @@
    design-token system the punktfunk marketing site also builds on. */
 @source '../../node_modules/fumadocs-ui/dist/**/*.js';
 @source '../../node_modules/@unom/ui/dist/**/*.{js,mjs}';
+@source '../../node_modules/@unom/app-ui/dist/**/*.{js,mjs}';
 
 /* ── punktfunk brand ────────────────────────────────────────────────────────
    The brand colour is the violet lens mark. (The marketing site's blue is just

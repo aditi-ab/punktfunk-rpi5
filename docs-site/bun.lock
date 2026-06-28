@@ -9,6 +9,7 @@
         "@scalar/api-reference-react": "^0.9.47",
         "@tanstack/react-router": "^1.121.0",
         "@tanstack/react-start": "^1.121.0",
+        "@unom/app-ui": "^0.1.0",
         "@unom/style": "^0.4.4",
         "@unom/ui": "^0.8.16",
         "fumadocs-core": "^16.10.5",
@@ -230,6 +231,8 @@
     "@headlessui/tailwindcss": ["@headlessui/tailwindcss@0.2.2", "", { "peerDependencies": { "tailwindcss": "^3.0 || ^4.0" } }, "sha512-xNe42KjdyA4kfUKLLPGzME9zkH7Q3rOZ5huFihWNWOQFxnItxPB3/67yBI8/qBfY8nwBRx5GHn4VprsoluVMGw=="],
 
     "@headlessui/vue": ["@headlessui/vue@1.7.23", "", { "dependencies": { "@tanstack/vue-virtual": "^3.0.0-beta.60" }, "peerDependencies": { "vue": "^3.2.0" } }, "sha512-JzdCNqurrtuu0YW6QaDtR2PIYCKPUWq28csDyMvN4zmGccmE7lz40Is6hc3LA4HFeCI7sekZ/PQMTNmn9I/4Wg=="],
+
+    "@icons-pack/react-simple-icons": ["@icons-pack/react-simple-icons@13.13.0", "", { "peerDependencies": { "react": "^16.13 || ^17 || ^18 || ^19" } }, "sha512-B5HhQMIpcSH4z8IZ8HFhD59CboHceKYMpPC9kAwGyKntvPdyJJv26DLu4Z1wAjcCLyrJhf11tMhiQGom9Rxb9g=="],
 
     "@img/colour": ["@img/colour@1.1.0", "", {}, "sha512-Td76q7j57o/tLVdgS746cYARfSyxk8iEfRxewL9h4OMzYhbW4TAcppl0mT4eyqXddh6L/jwoM75mo7ixa/pCeQ=="],
 
@@ -908,6 +911,8 @@
     "@ungap/structured-clone": ["@ungap/structured-clone@1.3.1", "", {}, "sha512-mUFwbeTqrVgDQxFveS+df2yfap6iuP20NAKAsBt5jDEoOTDew+zwLAOilHCeQJOVSvmgCX4ogqIrA0mnyr08yQ=="],
 
     "@unhead/vue": ["@unhead/vue@2.1.15", "", { "dependencies": { "hookable": "^6.0.1", "unhead": "2.1.15" }, "peerDependencies": { "vue": ">=3.5.18" } }, "sha512-SSByXfEjhzPn8gXdEdgpYqpLMPSkLUH2HVE0GxZfOtNsJ0GgOHQs0g9T67ZZ1z0kTELLKdtOtYrzrbv9+ffF7g=="],
+
+    "@unom/app-ui": ["@unom/app-ui@0.1.0", "https://git.unom.io/api/packages/unom/npm/%40unom%2Fapp-ui/-/0.1.0/app-ui-0.1.0.tgz", { "dependencies": { "@icons-pack/react-simple-icons": "^13.13.0" }, "peerDependencies": { "@unom/style": "^0.4.4", "react": "^19.0.0" } }, "sha512-znHZOIRWyJDj4va2X/E4GwvxWZsVeWEYpvu7iHTBIa0UXjkX9aoiujJcMyfPpc2Vof53iafl9hIszgSgjQwzhg=="],
 
     "@unom/style": ["@unom/style@0.4.4", "https://git.unom.io/api/packages/unom/npm/%40unom%2Fstyle/-/0.4.4/style-0.4.4.tgz", { "peerDependencies": { "motion": "^12" } }, "sha512-M45nihK+LGyxwy2mmHYRKggaocTt+EKNVFNaMpTvTaIUpozi7bmKIkbM2/enMYS0/UYTaZrBSZs/a0nPXqkAKw=="],
 
