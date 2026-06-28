@@ -319,7 +319,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
  * `[fps, mbps, latP50Ms, latP95Ms, latValid, skew, w, h, hz, dropped]`.
  */
 @Composable
-private fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
+internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
     if (s.size < 10) return
     val w = s[6].toInt()
     val h = s[7].toInt()

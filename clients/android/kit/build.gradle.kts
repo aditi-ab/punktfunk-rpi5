@@ -99,6 +99,12 @@ val cargoNdkDebug = registerCargoNdk("cargoNdkDebug", release = false)
 val cargoNdkRelease = registerCargoNdk("cargoNdkRelease", release = true)
 
 afterEvaluate {
-    tasks.named("preDebugBuild").configure { dependsOn(cargoNdkDebug) }
-    tasks.named("preReleaseBuild").configure { dependsOn(cargoNdkRelease) }
+    // `-PskipRustBuild` skips the cargo-ndk native build — for JVM-only tasks (the Roborazzi
+    // screenshot unit tests render Compose on the JVM and never load libpunktfunk_android.so), so
+    // CI/local screenshot runs don't need the Rust toolchain or NDK. The native build stays wired
+    // for every normal APK/AAR build.
+    if (!project.hasProperty("skipRustBuild")) {
+        tasks.named("preDebugBuild").configure { dependsOn(cargoNdkDebug) }
+        tasks.named("preReleaseBuild").configure { dependsOn(cargoNdkRelease) }
+    }
 }

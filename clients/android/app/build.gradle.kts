@@ -62,6 +62,10 @@ android {
 
     buildFeatures { compose = true }
 
+    // Roborazzi/Robolectric render Compose on the host JVM (the CI screenshot harness) and need the
+    // merged Android resources + the app's manifest/theme available to the unit tests.
+    testOptions { unitTests { isIncludeAndroidResources = true } }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
@@ -99,4 +103,21 @@ dependencies {
     // Android TV components (we target phone + TV) land in the TV-UI milestone:
     //   implementation("androidx.tv:tv-material:1.1.0")
     // The manifest already declares leanback so the scaffold installs on TV.
+
+    // --- CI screenshot harness (Roborazzi on the JVM via Robolectric — no emulator/GPU). The
+    // screenshot tests render the real Compose UI with mock state; never load the JNI core, so the
+    // job runs `:app:testDebugUnitTest -PskipRustBuild` (see kit/build.gradle.kts). ---
+    testImplementation(composeBom)
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest") // the ComponentActivity test host
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.16.1")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi:1.64.0")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi-compose:1.64.0")
+}
+
+// Record (write) the screenshots when the unit tests run. These tests exist to GENERATE marketing
+// images, not to diff goldens, so always capture rather than verify.
+tasks.withType<Test>().configureEach {
+    systemProperty("roborazzi.test.record", "true")
 }

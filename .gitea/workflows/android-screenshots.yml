@@ -1,0 +1,57 @@
+# Android client screenshots for the Play listing / marketing. Roborazzi renders the real Compose
+# UI with mock state on the host JVM via Robolectric — NO emulator, GPU, KVM, host, or JNI core
+# (`-PskipRustBuild` skips the cargo-ndk native build). The Android analogue of apple.yml's
+# `screenshots` job, gated to STABLE RELEASE tags only. Standalone + best-effort: a failure here
+# reds nothing else. PNGs land as a 30-day artifact; not committed or published.
+name: android-screenshots
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  screenshots:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 21 (AGP 9.2 + Robolectric's SDK-36 android-all jar both want 17–21)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      # No NDK/CMake — the screenshot unit tests are pure JVM. compileSdk 37 auto-downloads via AGP
+      # if the platform channel lacks it (same note as android.yml).
+      - name: platform-tools + platform 36 + build-tools
+        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;37.0.0"
+
+      - name: Cache (gradle)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: android-screenshots-${{ hashFiles('clients/android/**/*.gradle.kts') }}
+          restore-keys: android-screenshots-
+
+      # Roborazzi renders Compose on the JVM (Robolectric Native Graphics). `-PskipRustBuild` keeps
+      # the cargo-ndk native build out of the graph — the tests never load libpunktfunk_android.so.
+      - name: Capture screenshots (Roborazzi)
+        working-directory: clients/android
+        run: ./gradlew :app:testDebugUnitTest -PskipRustBuild --stacktrace
+
+      - name: Upload screenshots
+        if: always()
+        # v3: Gitea's API rejects upload-artifact@v4 (see apple.yml). Download is a zip.
+        uses: actions/upload-artifact@v3
+        with:
+          name: punktfunk-android-screenshots
+          path: clients/android/app/build/outputs/roborazzi
+          retention-days: 30
