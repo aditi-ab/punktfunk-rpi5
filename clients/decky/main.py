@@ -17,6 +17,8 @@ The backend's jobs are the things Steam can't do:
 * **get_settings() / set_settings()** — read/write the flatpak client's stream settings JSON
   (resolution / bitrate / gamepad), so the Deck UI configures the stream the client reads.
 * **kill_stream()** — force-stop a wedged stream (``flatpak kill``).
+* **check_update()** — poll the registry's per-channel ``manifest.json`` and report whether a
+  newer build is available (the frontend then drives Decky's own install RPC to apply it).
 
 The TXT-record keys parsed (``proto`` / ``fp`` / ``pair`` / ``id``) are defined by the host
 advert in ``crates/punktfunk-host/src/discovery.rs``.
@@ -26,7 +28,10 @@ import asyncio
 import json
 import os
 import shutil
+import ssl
 import stat
+import time
+import urllib.request
 from pathlib import Path
 
 import decky
@@ -37,20 +42,97 @@ APP_ID = "io.unom.Punktfunk"
 # Service type advertised by punktfunk/1 hosts (matches NATIVE_SERVICE in the Rust host).
 SERVICE_TYPE = "_punktfunk._udp"
 
-# The flatpak client persists identity / known-hosts / settings under HOME/.config/punktfunk;
-# inside the flatpak sandbox HOME is ~/.var/app/<APP_ID>, so the real on-disk location is this.
-# The backend writes settings here so the (sandboxed) client reads them.
+# The flatpak client persists identity / known-hosts / settings under HOME/.config/punktfunk.
+# The sandbox HOME resolves to the REAL user home (== DECKY_USER_HOME), NOT the per-app
+# ~/.var/app/<APP_ID> dir — verified on-device (`flatpak run … sh -c 'echo $HOME'` prints
+# /home/deck, and the manifest's `--filesystem=~/.config/punktfunk` grants exactly that path;
+# we also pass HOME=DECKY_USER_HOME into `flatpak run`, see _flatpak_env). Pointing here is what
+# lets plugin settings actually reach the client AND lets us read the client's known-hosts to
+# tell whether THIS device is already paired with a given host.
 def _client_config_dir() -> Path:
-    return Path(decky.DECKY_USER_HOME) / ".var" / "app" / APP_ID / ".config" / "punktfunk"
+    return Path(decky.DECKY_USER_HOME) / ".config" / "punktfunk"
 
 
 def _settings_path() -> Path:
     return _client_config_dir() / "client-gtk-settings.json"
 
 
+def _paired_fingerprints() -> set[str]:
+    """Host cert fingerprints (lowercase hex) this client has PIN-paired, from the client's
+    known-hosts store. Keyed by fingerprint so it survives a host changing IP address."""
+    try:
+        data = json.loads((_client_config_dir() / "client-known-hosts.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return set()
+    hosts = data.get("hosts", []) if isinstance(data, dict) else []
+    return {
+        h["fp_hex"].lower()
+        for h in hosts
+        if isinstance(h, dict) and h.get("paired") and isinstance(h.get("fp_hex"), str)
+    }
+
+
 def _runner_path() -> str:
     """Absolute path to the launch wrapper shipped with the plugin (bin/punktfunkrun.sh)."""
     return str(Path(decky.DECKY_PLUGIN_DIR) / "bin" / "punktfunkrun.sh")
+
+
+# ----------------------------------------------------------------------------------------
+# Self-update check (no Decky store). The plugin is distributed via "Install Plugin from
+# URL" pointing at our Gitea generic registry, so the official store never sees it and
+# can't offer updates. Instead the backend polls a tiny per-channel ``manifest.json`` the
+# CI publishes next to the zip, compares it to the installed version, and the frontend
+# offers a one-tap update that drives Decky's own (root, privileged) install RPC. The
+# channel + manifest URL are baked into ``update.json`` by CI (.gitea/workflows/decky.yml);
+# a dev/sideload build has no ``update.json`` and update checks are simply disabled.
+_UPDATE_TTL_S = 1800.0  # cache a successful check for 30 min (the QAM remounts often)
+_update_cache: dict = {"at": 0.0, "data": None}
+
+
+def _update_config() -> dict:
+    """The CI-baked ``{channel, manifest}`` next to the plugin (absent on dev builds)."""
+    try:
+        return json.loads((Path(decky.DECKY_PLUGIN_DIR) / "update.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _installed_version() -> str:
+    """The version Decky itself reports for this plugin — it reads ``package.json`` (NOT
+    plugin.json), so the CI stamps the build version there."""
+    try:
+        pkg = json.loads((Path(decky.DECKY_PLUGIN_DIR) / "package.json").read_text())
+        return str(pkg.get("version", "0.0.0"))
+    except (OSError, json.JSONDecodeError):
+        return "0.0.0"
+
+
+def _semver_tuple(v: str) -> tuple[int, int, int]:
+    """A tolerant (major, minor, patch) tuple for ``>`` comparison. We control the version
+    format (plain numeric ``X.Y.Z`` on both channels), so leading-int-per-component is
+    enough; any pre-release suffix is dropped before comparing."""
+    parts: list[int] = []
+    for comp in str(v).split("-", 1)[0].split(".")[:3]:
+        digits = ""
+        for ch in comp:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return (parts[0], parts[1], parts[2])
+
+
+def _fetch_json(url: str, timeout: float = 8.0) -> dict:
+    """Blocking HTTPS GET of a small JSON document (run in an executor)."""
+    req = urllib.request.Request(
+        url, headers={"Accept": "application/json", "User-Agent": "punktfunk-decky"}
+    )
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
 def _flatpak() -> str | None:
@@ -179,6 +261,13 @@ class Plugin:
         if stderr:
             decky.logger.debug("avahi-browse stderr: %s", stderr.decode(errors="replace"))
         hosts = _parse_avahi_browse(stdout.decode(errors="replace"))
+        # Mark which hosts THIS device has already paired (by cert fingerprint), so the UI can
+        # show "Stream" instead of "Pair" — the mDNS `pair` field is the host's policy, not our
+        # per-device pairing state.
+        paired = _paired_fingerprints()
+        for h in hosts:
+            fp = h.get("fp") or ""
+            h["paired"] = bool(fp) and fp.lower() in paired
         decky.logger.info("discovered %d punktfunk host(s)", len(hosts))
         return hosts
 
@@ -278,6 +367,54 @@ class Plugin:
             decky.logger.exception("flatpak kill failed")
             return {"ok": False}
         return {"ok": True}
+
+    async def check_update(self, force: bool = False) -> dict:
+        """Is a newer build available in our registry? Compares the installed version
+        (``package.json``) against the per-channel ``manifest.json`` the CI publishes, and
+        returns everything the frontend needs to drive Decky's install RPC. Non-fatal: any
+        failure (no channel baked in, network down) returns ``update_available: False``.
+        """
+        current = _installed_version()
+        cfg = _update_config()
+        result = {
+            "current": current,
+            "latest": current,
+            "artifact": "",
+            "hash": "",
+            "channel": str(cfg.get("channel", "")),
+            "update_available": False,
+        }
+
+        manifest_url = cfg.get("manifest")
+        if not manifest_url:
+            result["error"] = "update-channel-unknown"  # dev / sideloaded build
+            return result
+
+        now = time.monotonic()
+        cached = _update_cache["data"]
+        if not force and cached and (now - _update_cache["at"]) < _UPDATE_TTL_S:
+            return cached
+
+        try:
+            loop = asyncio.get_running_loop()
+            manifest = await loop.run_in_executor(None, _fetch_json, manifest_url)
+        except Exception as exc:  # noqa: BLE001
+            decky.logger.warning("update check failed: %s", exc)
+            result["error"] = "fetch-failed"
+            return result  # transient — don't cache, retry next open
+
+        latest = str(manifest.get("version", current))
+        result["latest"] = latest
+        result["artifact"] = str(manifest.get("artifact", ""))
+        result["hash"] = str(manifest.get("sha256", ""))
+        result["update_available"] = bool(result["artifact"]) and (
+            _semver_tuple(latest) > _semver_tuple(current)
+        )
+        if result["update_available"]:
+            decky.logger.info("update available: %s -> %s (%s)", current, latest, result["channel"])
+        _update_cache["at"] = now
+        _update_cache["data"] = result
+        return result
 
     # ---- Decky lifecycle ----
 

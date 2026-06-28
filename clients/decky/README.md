@@ -45,8 +45,9 @@ Gaming Mode automatically.
 | `src/steam.ts` | Steam-shortcut launch (`AddShortcut` / `SetAppLaunchOptions` / `RunGame`) — the focus-correct stream start. |
 | `src/backend.ts` | Typed `callable` bridges to `main.py`. |
 | `bin/punktfunkrun.sh` | The launch wrapper the Steam shortcut targets (so the window is focusable). |
-| `main.py` | Backend: `discover` / `pair` / `runner_info` / `get_settings` / `set_settings` / `kill_stream`. |
+| `main.py` | Backend: `discover` / `pair` / `runner_info` / `get_settings` / `set_settings` / `kill_stream` / `check_update`. |
 | `plugin.json` | Decky plugin manifest. |
+| `update.json` | CI-baked `{channel, manifest}` — where `check_update()` polls (absent on dev builds). |
 | `decky.pyi` | Type stub for the injected `decky` module (vendored from the template). |
 
 ### Discovery (`discover()`)
@@ -139,6 +140,40 @@ shows up in the Quick Access Menu.
 > The plugin launches the client via the flatpak `io.unom.Punktfunk` (see
 > [`../../packaging/flatpak/README.md`](../../packaging/flatpak/README.md)) — install that on
 > the Deck too, or the panel's Connect surfaces a `client-not-found` error.
+
+## Updating (self-update, no store)
+
+The plugin updates itself without the official Decky store. CI (`decky.yml`) publishes a tiny
+per-channel `manifest.json` next to the zip in the Gitea registry:
+
+```json
+{"version":"0.3.123","artifact":".../punktfunk-decky/0.3.123/punktfunk.zip","sha256":"…"}
+```
+
+and bakes an `update.json` (`{channel, manifest}`) into the plugin so it knows which channel it was
+installed from. The backend `check_update()` reads the **installed** version from `package.json` —
+the value Decky itself reports (it does **not** read `plugin.json`) — fetches the channel manifest,
+and compares. When a newer build exists the frontend shows an **Update to vX** button that drives
+Decky Loader's own install RPC:
+
+```ts
+window.DeckyBackend.callable("utilities/install_plugin")(artifact, "punktfunk", version, hash, /*UPDATE=*/2)
+```
+
+The loader (root) downloads the immutable per-version zip, **SHA-256-verifies** it against `hash`,
+replaces `~/homebrew/plugins/punktfunk`, and hot-reloads — the unprivileged backend never writes the
+root-owned plugins dir itself. `window.DeckyBackend` / `utilities/install_plugin` are loader
+internals (not `@decky/api`), so every access is guarded; missing them, the button falls back to a
+toast pointing at **Install Plugin from URL**.
+
+> CI stamps a **plain numeric** semver per channel (`0.3.<run>` canary, `X.Y.Z` stable) into
+> `package.json`. Decky's `compare-versions` orders pre-release identifiers lexically (so `ci10 < ci9`)
+> — a `-ciN` suffix would mis-detect updates.
+
+**Optional — native Updates tab:** Decky's store is single-source (a custom store URL *replaces* the
+official catalog), so punktfunk doesn't ship one by default. A user who wants the native update badge
+can point Decky → Settings → **Custom store** at a punktfunk-only store JSON — not recommended if you
+use other plugins, since it hides the official catalog.
 
 ## Limitations / next steps
 

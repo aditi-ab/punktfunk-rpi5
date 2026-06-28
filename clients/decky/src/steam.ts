@@ -24,11 +24,30 @@ declare const SteamClient: {
     SetShortcutExe(appId: number, exe: string): void;
     SetShortcutStartDir(appId: number, dir: string): void;
     SetAppLaunchOptions(appId: number, options: string): void;
-    SetAppHidden(appId: number, hidden: boolean): void;
     RunGame(gameId: string, _unused: string, _i: number, _j: number): void;
     TerminateApp(gameId: string, _b: boolean): void;
   };
 };
+
+// Steam removed `SteamClient.Apps.SetAppHidden`. Hiding a non-Steam shortcut now goes through
+// `collectionStore.SetAppsAsHidden([appId], true)` — but that looks the app up in appStore, which
+// only registers a freshly-created shortcut a moment later (calling it immediately throws on a
+// null overview). So hiding is BEST-EFFORT + DEFERRED and must NEVER block the launch.
+declare const collectionStore:
+  | { SetAppsAsHidden?: (appIds: number[], hidden: boolean) => void }
+  | undefined;
+
+function hideShortcut(appId: number): void {
+  const attempt = () => {
+    try {
+      collectionStore?.SetAppsAsHidden?.([appId], true);
+    } catch {
+      /* overview not registered yet, or the API changed — cosmetic, ignore */
+    }
+  };
+  attempt(); // succeeds immediately for an already-registered (reused) shortcut
+  setTimeout(attempt, 2500); // fresh shortcut: retry once its app overview lands
+}
 
 const SHORTCUT_NAME = "punktfunk";
 
@@ -88,7 +107,8 @@ async function ensureShortcut(): Promise<number> {
   );
   SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
   // Hide it from the library — it's an implementation detail, launched programmatically.
-  SteamClient.Apps.SetAppHidden(appId, true);
+  // Best-effort + deferred (see hideShortcut); never let it block the launch.
+  hideShortcut(appId);
   rememberAppId(appId);
   return appId;
 }

@@ -16,7 +16,7 @@ Whichever client you install, the first connection needs a one-time [pairing](/d
 | Device | Install |
 |--------|---------|
 | **Linux** desktop / laptop | [Flatpak](#linux-desktop-flatpak) (any distro) or native apt/rpm/Arch packages |
-| **Steam Deck** | [Flatpak in Desktop Mode](#steam-deck) (or the Decky plugin) |
+| **Steam Deck** | [Decky plugin](/docs/steam-deck) for Gaming Mode, or [Flatpak in Desktop Mode](#steam-deck) |
 | **Windows** | [Signed MSIX](#windows) from the package registry |
 | **macOS** | [Notarized `.dmg`](#macos) from the releases page |
 | **iPhone / iPad / Apple TV** | [TestFlight beta](#ios-ipados-apple-tv) |
@@ -57,16 +57,23 @@ punktfunk-client --connect <host>:9777
 
 ## Steam Deck
 
-In **Desktop Mode**, install the Flatpak exactly as [above](#linux-desktop-flatpak) — it carries
-its own libadwaita + SDL3 and survives SteamOS updates:
+Most Deck users want **Gaming Mode**: install the **[Decky plugin](/docs/steam-deck)** and a
+**punktfunk** panel lands in the Quick Access Menu, so you can discover hosts, pair with a PIN, and
+stream **without dropping to the desktop**. Follow the **[Steam Deck (Decky) guide](/docs/steam-deck)**
+— it walks through Decky Loader, the plugin, and the one-time client install.
+
+> The plugin doesn't decode video itself — it launches the Flatpak client below. The Decky guide
+> covers installing both, so start there: a Flatpak on its own won't add the Gaming Mode panel.
+
+For **Desktop Mode** (or to add the client to Game Mode as a non-Steam app yourself), install the
+Flatpak exactly as [above](#linux-desktop-flatpak) — it carries its own libadwaita + SDL3 and
+survives SteamOS updates:
 
 ```sh
 flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
 ```
 
-Add it to Game Mode as a non-Steam app, or use the **Decky plugin**, which launches this same
-Flatpak (`flatpak run io.unom.Punktfunk --connect …`). See
-[packaging/flatpak](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/flatpak/README.md).
+See [packaging/flatpak](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/flatpak/README.md).
 
 ## Windows
 

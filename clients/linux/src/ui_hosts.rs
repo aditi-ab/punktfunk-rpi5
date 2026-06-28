@@ -181,6 +181,52 @@ pub fn new(
                     // pinned connect; TOFU eligibility is irrelevant.
                     pair_optional: false,
                 };
+                // Forget this host (drops the pinned fingerprint — a later connect re-pairs).
+                // Confirmed first, since it's destructive and a misclick on the Deck is easy.
+                let remove_btn = gtk::Button::from_icon_name("user-trash-symbolic");
+                remove_btn.set_tooltip_text(Some("Remove saved host"));
+                remove_btn.set_valign(gtk::Align::Center);
+                remove_btn.add_css_class("flat");
+                {
+                    let fp = k.fp_hex.clone();
+                    let name = k.name.clone();
+                    let saved_list = saved_list.clone();
+                    let saved_label = saved_label.clone();
+                    let row = row.clone();
+                    remove_btn.connect_clicked(move |_| {
+                        let dialog = adw::AlertDialog::new(
+                            Some("Remove saved host?"),
+                            Some(&format!(
+                                "Forget “{name}”? You'll need to pair (or trust) it again to reconnect."
+                            )),
+                        );
+                        dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
+                        dialog.set_response_appearance(
+                            "remove",
+                            adw::ResponseAppearance::Destructive,
+                        );
+                        dialog.set_default_response(Some("cancel"));
+                        dialog.set_close_response("cancel");
+                        {
+                            // Scoped clones for the response handler so `row` survives for present().
+                            let fp = fp.clone();
+                            let saved_list = saved_list.clone();
+                            let saved_label = saved_label.clone();
+                            let row = row.clone();
+                            dialog.connect_response(Some("remove"), move |_, _| {
+                                let mut known = KnownHosts::load();
+                                known.remove_by_fp(&fp);
+                                let _ = known.save();
+                                saved_list.remove(&row);
+                                let empty = known.hosts.is_empty();
+                                saved_list.set_visible(!empty);
+                                saved_label.set_visible(!empty);
+                            });
+                        }
+                        dialog.present(Some(&row));
+                    });
+                }
+                row.add_suffix(&remove_btn);
                 let speed_btn = gtk::Button::from_icon_name("network-transmit-receive-symbolic");
                 speed_btn.set_tooltip_text(Some("Test network speed"));
                 speed_btn.set_valign(gtk::Align::Center);

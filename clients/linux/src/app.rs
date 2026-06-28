@@ -22,6 +22,8 @@ struct App {
     gamepad: crate::gamepad::GamepadService,
     /// One session at a time — ignore connects while one is starting/running.
     busy: std::cell::Cell<bool>,
+    /// Steam Deck / Gaming-Mode launch: fullscreen the window (chrome-less) when a stream starts.
+    fullscreen: bool,
 }
 
 impl App {
@@ -54,6 +56,20 @@ fn arg_value(flag: &str) -> Option<String> {
         .skip_while(|a| a != flag)
         .nth(1)
         .filter(|v| !v.starts_with("--"))
+}
+
+/// True if argv contains `flag` (a valueless switch).
+fn arg_flag(flag: &str) -> bool {
+    std::env::args().any(|a| a == flag)
+}
+
+/// Run the stream fullscreen with no window chrome — the Steam Deck / Gaming-Mode launch path.
+/// The Decky wrapper passes `--fullscreen`; we also honor the Deck/gamescope env as a fallback
+/// so a manual launch under Gaming Mode does the right thing too.
+fn fullscreen_mode() -> bool {
+    arg_flag("--fullscreen")
+        || std::env::var_os("SteamDeck").is_some()
+        || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
 }
 
 /// Run the SPAKE2 PIN ceremony without a GTK window and persist the verified host to the
@@ -161,6 +177,7 @@ fn build_ui(gtk_app: &adw::Application) {
         identity,
         gamepad: crate::gamepad::GamepadService::start(),
         busy: std::cell::Cell::new(false),
+        fullscreen: fullscreen_mode(),
     });
 
     let hosts_page = crate::ui_hosts::new(
@@ -443,11 +460,19 @@ fn resolve_mode(app: &App) -> punktfunk_core::config::Mode {
         refresh_hz: s.refresh_hz,
     };
     if mode.width == 0 || mode.refresh_hz == 0 {
+        // Prefer the monitor the window is on; fall back to the display's first monitor. On a
+        // `--connect` launch the window may not be mapped yet when this runs, and without the
+        // fallback we'd drop to the 1920×1080 floor below — wrong on the Deck (1280×800).
         let monitor = app
             .window
             .surface()
             .zip(gdk::Display::default())
-            .and_then(|(surf, d)| d.monitor_at_surface(&surf));
+            .and_then(|(surf, d)| d.monitor_at_surface(&surf))
+            .or_else(|| {
+                gdk::Display::default()
+                    .and_then(|d| d.monitors().item(0))
+                    .and_then(|o| o.downcast::<gdk::Monitor>().ok())
+            });
         if let Some(m) = monitor {
             let geo = m.geometry();
             let scale = m.scale_factor().max(1);
@@ -540,6 +565,12 @@ fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
                         &title,
                     );
                     app.nav.push(&p.page);
+                    // Steam Deck / Gaming Mode: gamescope fullscreens the window but GTK doesn't
+                    // know it, so its header bar stays drawn. Enter GTK fullscreen explicitly —
+                    // the stream page's `connect_fullscreened_notify` then hides all chrome.
+                    if app.fullscreen {
+                        app.window.fullscreen();
+                    }
                     page = Some(p);
                 }
                 SessionEvent::Stats(s) => {

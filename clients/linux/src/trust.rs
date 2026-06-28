@@ -90,6 +90,14 @@ impl KnownHosts {
         self.hosts.iter().find(|h| h.addr == addr && h.port == port)
     }
 
+    /// Forget the entry with this fingerprint. Returns true if one was removed (the user
+    /// will have to pair/trust again to reconnect).
+    pub fn remove_by_fp(&mut self, fp_hex: &str) -> bool {
+        let before = self.hosts.len();
+        self.hosts.retain(|h| h.fp_hex != fp_hex);
+        self.hosts.len() != before
+    }
+
     /// Insert or refresh an entry, keyed by fingerprint. `paired` only ever upgrades
     /// (a later TOFU connect must not demote a PIN-paired host).
     pub fn upsert(&mut self, entry: KnownHost) {

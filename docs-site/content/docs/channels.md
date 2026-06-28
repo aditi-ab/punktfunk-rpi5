@@ -44,9 +44,10 @@ one-line edit of `/etc/apt/sources.list.d/punktfunk.list` (`stable` ↔ `canary`
 
 1. Make sure `main` is green.
 2. (Optional) bump any user-facing version that isn't derived from the tag — the Android
-   `versionName` fallback (`clients/android/app/build.gradle.kts`) and the Decky `plugin.json`
-   `version` are cosmetic self-reported strings; everything else (binaries via
-   `PUNKTFUNK_BUILD_VERSION`, MSIX, apt/rpm, the `.dmg`) derives from the tag automatically.
+   `versionName` fallback (`clients/android/app/build.gradle.kts`) is a cosmetic self-reported
+   string; everything else (binaries via `PUNKTFUNK_BUILD_VERSION`, MSIX, apt/rpm, the `.dmg`, and
+   the **Decky** plugin version — CI stamps it into `package.json`, where it drives the plugin's own
+   [self-update check](/docs/steam-deck#updating)) derives from the tag automatically.
 3. Tag and push — **one** tag releases every platform:
    ```sh
    git tag v0.2.0

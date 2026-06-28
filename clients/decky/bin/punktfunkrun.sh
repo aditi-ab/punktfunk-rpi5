@@ -31,4 +31,6 @@ fi
 echo "punktfunkrun: streaming $APPID --connect $PF_HOST" >&2
 # exec so the flatpak client IS the game process — when it exits, Steam ends the "game" and
 # Gaming Mode reclaims focus automatically (no manual refocus needed).
-exec "$FLATPAK" run --arch=x86_64 "$APPID" --connect "$PF_HOST"
+# --fullscreen: present the stream chrome-less and fullscreen (the client also auto-detects the
+# Deck/gamescope env, and ignores the flag harmlessly on older builds that predate it).
+exec "$FLATPAK" run --arch=x86_64 "$APPID" --connect "$PF_HOST" --fullscreen

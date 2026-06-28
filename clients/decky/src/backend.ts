@@ -5,8 +5,9 @@ export interface Host {
   name: string;
   host: string;
   port: number;
-  pair: string; // "required" | "optional"
+  pair: string; // "required" | "optional" — the HOST's policy
   fp: string;
+  paired: boolean; // whether THIS device has already PIN-paired this host (by fingerprint)
 }
 
 export interface PairResult {
@@ -32,6 +33,16 @@ export interface StreamSettings {
   mic_enabled: boolean;
 }
 
+export interface UpdateInfo {
+  current: string; // installed version (package.json)
+  latest: string; // newest version in our registry for this channel
+  artifact: string; // immutable zip URL Decky should install
+  hash: string; // sha256 of that zip (Decky verifies it)
+  channel: string; // "latest" (stable) | "canary"
+  update_available: boolean;
+  error?: string; // "update-channel-unknown" (dev build) | "fetch-failed"
+}
+
 export const discover = callable<[], Host[]>("discover");
 export const pair = callable<
   [host: string, port: number, pin: string, name: string],
@@ -43,3 +54,4 @@ export const setSettings = callable<[settings: StreamSettings], { ok: boolean }>
   "set_settings",
 );
 export const killStream = callable<[], { ok: boolean }>("kill_stream");
+export const checkUpdate = callable<[force: boolean], UpdateInfo>("check_update");

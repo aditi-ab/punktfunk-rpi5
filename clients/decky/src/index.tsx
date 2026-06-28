@@ -10,12 +10,22 @@ import {
   PanelSectionRow,
   SliderField,
   Spinner,
+  Tabs,
   ToggleField,
   showModal,
   staticClasses,
 } from "@decky/ui";
 import { definePlugin, routerHook, toaster } from "@decky/api";
-import { FC, useCallback, useEffect, useState } from "react";
+import {
+  Component,
+  CSSProperties,
+  ErrorInfo,
+  FC,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useState,
+} from "react";
 import {
   FaTv,
   FaSyncAlt,
@@ -23,18 +33,129 @@ import {
   FaLockOpen,
   FaPlay,
   FaArrowLeft,
+  FaDownload,
 } from "react-icons/fa";
 import {
   discover,
   getSettings,
   pair,
   setSettings,
+  checkUpdate,
   Host,
   StreamSettings,
+  UpdateInfo,
 } from "./backend";
 import { launchStream } from "./steam";
 
 const ROUTE = "/punktfunk";
+
+// Decky Loader exposes its already-authenticated WSRouter as a global. This is NOT part of
+// @decky/api (it's a loader internal), so we treat it as optional and guard every use — on a
+// loader without it we fall back to manual "Install Plugin from URL". We use it to drive
+// Decky's own privileged install path (the root loader does the download + SHA-256 verify +
+// extract + hot-reload), which is the only way a plugin can update itself: ~/homebrew/plugins
+// is root-owned, so our unprivileged backend can't swap its own files.
+declare global {
+  interface Window {
+    DeckyBackend?: {
+      callable: (route: string) => (...args: unknown[]) => Promise<unknown>;
+    };
+  }
+}
+
+// PluginInstallType.UPDATE in decky-loader's browser.py (INSTALL=0/REINSTALL=1/UPDATE=2/…).
+const INSTALL_TYPE_UPDATE = 2;
+
+// ----------------------------------------------------------------------------------------
+// Error boundary — contains ANY render failure in our UI so a single bad render can never take
+// down the whole Quick Access "Decky" section (Decky's tab-level boundary shows the generic
+// "Something went wrong while displaying this content" for the entire tab when one plugin
+// throws). The realistic trigger is a future Steam client update that makes a @decky/ui
+// component resolve to `undefined` (React then throws "Element type is invalid"). The fallback
+// is built from ONLY plain DOM elements + inline styles, so it cannot itself depend on a
+// (possibly broken) Steam-internal component — it is guaranteed to render.
+// ----------------------------------------------------------------------------------------
+class PluginErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    // Surface it for diagnosis, but never rethrow — containment is the whole point.
+    // eslint-disable-next-line no-console
+    console.error("[punktfunk] contained UI render error:", error, info?.componentStack);
+  }
+
+  render() {
+    const { error } = this.state;
+    if (!error) return this.props.children;
+    return (
+      <div style={{ padding: "1em", lineHeight: 1.45 }}>
+        <div style={{ fontWeight: "bold", marginBottom: "0.4em" }}>
+          punktfunk couldn’t draw this view
+        </div>
+        <div style={{ opacity: 0.8, marginBottom: "0.6em" }}>
+          The plugin hit a display error — your Steam Deck is fine. Reload punktfunk from
+          Decky&apos;s plugin list, or update the plugin.
+        </div>
+        <div
+          style={{
+            opacity: 0.55,
+            fontFamily: "monospace",
+            fontSize: "0.8em",
+            wordBreak: "break-word",
+          }}
+        >
+          {String(error?.message ?? error)}
+        </div>
+      </div>
+    );
+  }
+}
+
+// Checks our registry for a newer build on mount (the backend caches + is non-fatal offline).
+function useUpdate() {
+  const [info, setInfo] = useState<UpdateInfo | null>(null);
+  useEffect(() => {
+    void checkUpdate(false)
+      .then(setInfo)
+      .catch(() => {});
+  }, []);
+  return info;
+}
+
+async function applyUpdate(info: UpdateInfo) {
+  try {
+    const backend = window.DeckyBackend;
+    if (backend?.callable) {
+      // Fire-and-forget: the loader reinstalls + reloads THIS plugin, tearing the panel down
+      // before any result could arrive — so never await it. Decky shows its own confirm prompt.
+      void backend.callable("utilities/install_plugin")(
+        info.artifact,
+        "punktfunk",
+        info.latest,
+        info.hash,
+        INSTALL_TYPE_UPDATE,
+      );
+      toaster.toast({
+        title: "punktfunk",
+        body: `Updating to v${info.latest}… confirm the Decky prompt.`,
+      });
+      return;
+    }
+  } catch {
+    // fall through to the manual path
+  }
+  toaster.toast({
+    title: "punktfunk",
+    body: "Update from Decky → Developer → Install Plugin from URL.",
+  });
+}
 
 // ----------------------------------------------------------------------------------------
 // Discovery hook — shared by the QAM panel and the full page.
@@ -255,20 +376,24 @@ const SettingsSection: FC = () => {
 // One host row on the full page.
 // ----------------------------------------------------------------------------------------
 const HostRow: FC<{ host: Host }> = ({ host }) => {
-  const pairRequired = host.pair === "required";
+  // The host's policy is `pair=required`, but if THIS device is already paired we don't need to
+  // pair again — show it as trusted and go straight to Stream.
+  const needsPair = host.pair === "required" && !host.paired;
   return (
     <Field
       label={
         <span style={{ display: "inline-flex", alignItems: "center", gap: "0.4em" }}>
-          {pairRequired ? <FaLock /> : <FaLockOpen />}
+          {needsPair ? <FaLock /> : <FaLockOpen />}
           {host.name}
         </span>
       }
-      description={`${host.host}:${host.port}${pairRequired ? " · pairing required" : ""}`}
+      description={`${host.host}:${host.port}${
+        needsPair ? " · pairing required" : host.paired ? " · paired" : ""
+      }`}
       childrenContainerWidth="max"
     >
       <Focusable style={{ display: "flex", gap: "0.5em" }}>
-        {pairRequired && (
+        {needsPair && (
           <DialogButton
             style={{ minWidth: "5em" }}
             onClick={() =>
@@ -288,52 +413,129 @@ const HostRow: FC<{ host: Host }> = ({ host }) => {
 };
 
 // ----------------------------------------------------------------------------------------
-// The fullscreen page (registered as the /punktfunk route).
+// The fullscreen page (registered as the /punktfunk route) — a tabbed Hosts / Settings view.
 // ----------------------------------------------------------------------------------------
+
+// Bottom inset so the last control clears Gaming Mode's footer hint bar. Routed pages render
+// *under* that bar otherwise — that's why the last Stream-settings row was getting hidden. The
+// value is generous on purpose (and harmless where the tab area already insets); tune to taste.
+const SAFE_BOTTOM = "80px";
+
+// Each tab is its own scroll area so long content is always reachable above the footer.
+const tabScroll: CSSProperties = {
+  height: "100%",
+  overflowY: "auto",
+  padding: "0.5em 2.5em",
+  paddingBottom: SAFE_BOTTOM,
+  boxSizing: "border-box",
+};
+
+const HostsTab: FC<{
+  hosts: Host[];
+  scanning: boolean;
+  refresh: () => void;
+}> = ({ hosts, scanning, refresh }) => (
+  <div style={tabScroll}>
+    <Field
+      label="Discover"
+      description={
+        scanning
+          ? "Scanning the LAN…"
+          : `${hosts.length} host${hosts.length === 1 ? "" : "s"} on your network`
+      }
+      childrenContainerWidth="max"
+      bottomSeparator={hosts.length ? "standard" : "none"}
+    >
+      <DialogButton style={{ minWidth: "8em" }} disabled={scanning} onClick={refresh}>
+        {scanning ? (
+          <Spinner style={{ height: "1em", marginRight: "0.5em" }} />
+        ) : (
+          <FaSyncAlt style={{ marginRight: "0.5em" }} />
+        )}
+        {scanning ? "Scanning…" : "Refresh"}
+      </DialogButton>
+    </Field>
+
+    {hosts.length === 0 && !scanning && (
+      <Field
+        focusable={false}
+        description="No punktfunk hosts found. Make sure a host is running on the same network."
+      >
+        No hosts found
+      </Field>
+    )}
+    {hosts.map((h) => (
+      <HostRow key={h.fp || `${h.host}:${h.port}`} host={h} />
+    ))}
+  </div>
+);
+
+const SettingsTab: FC = () => (
+  <div style={tabScroll}>
+    <SettingsSection />
+  </div>
+);
+
 const PunktfunkPage: FC = () => {
   const { hosts, scanning, refresh } = useHosts();
+  const update = useUpdate();
+  const [tab, setTab] = useState("hosts");
 
   return (
     <div
       style={{
         marginTop: "40px",
         height: "calc(100% - 40px)",
-        overflowY: "auto",
-        padding: "0 2.5em 2.5em",
+        display: "flex",
+        flexDirection: "column",
       }}
     >
-      <Focusable style={{ display: "flex", alignItems: "center", gap: "1em", marginBottom: "1em" }}>
+      <Focusable
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "1em",
+          padding: "0 2.5em",
+          marginBottom: "0.4em",
+          flexShrink: 0,
+        }}
+      >
         <DialogButton
-          style={{ width: "3em", minWidth: "3em" }}
+          style={{ width: "3em", minWidth: "3em", padding: 0 }}
           onClick={() => Navigation.NavigateBack()}
         >
           <FaArrowLeft />
         </DialogButton>
-        <div className={staticClasses.Title} style={{ flex: 1 }}>
+        <div className={staticClasses?.Title} style={{ flex: 1, margin: 0 }}>
           punktfunk
         </div>
-        <DialogButton style={{ width: "10em" }} disabled={scanning} onClick={refresh}>
-          {scanning ? (
-            <Spinner style={{ height: "1em", marginRight: "0.5em" }} />
-          ) : (
-            <FaSyncAlt style={{ marginRight: "0.5em" }} />
-          )}
-          {scanning ? "Scanning…" : "Refresh"}
-        </DialogButton>
+        {update?.update_available && (
+          <DialogButton style={{ minWidth: "9em" }} onClick={() => applyUpdate(update)}>
+            <FaDownload style={{ marginRight: "0.4em" }} />
+            Update v{update.latest}
+          </DialogButton>
+        )}
       </Focusable>
 
-      <div style={{ fontSize: "1.1em", fontWeight: "bold", margin: "0.5em 0" }}>Hosts</div>
-      {hosts.length === 0 && !scanning && (
-        <Field focusable={false}>No hosts discovered on the LAN.</Field>
-      )}
-      {hosts.map((h) => (
-        <HostRow key={h.fp || `${h.host}:${h.port}`} host={h} />
-      ))}
-
-      <div style={{ fontSize: "1.1em", fontWeight: "bold", margin: "1.5em 0 0.5em" }}>
-        Stream settings
+      <div style={{ flex: 1, minHeight: 0 }}>
+        <Tabs
+          activeTab={tab}
+          onShowTab={(id: string) => setTab(id)}
+          autoFocusContents
+          tabs={[
+            {
+              id: "hosts",
+              title: "Hosts",
+              content: <HostsTab hosts={hosts} scanning={scanning} refresh={refresh} />,
+            },
+            {
+              id: "settings",
+              title: "Settings",
+              content: <SettingsTab />,
+            },
+          ]}
+        />
       </div>
-      <SettingsSection />
     </div>
   );
 };
@@ -343,9 +545,25 @@ const PunktfunkPage: FC = () => {
 // ----------------------------------------------------------------------------------------
 const QamPanel: FC = () => {
   const { hosts, scanning, refresh } = useHosts();
+  const update = useUpdate();
 
   return (
     <>
+      {update?.update_available && (
+        <PanelSection title="Update">
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              onClick={() => applyUpdate(update)}
+              label={`v${update.current} → v${update.latest}`}
+            >
+              <FaDownload style={{ marginRight: "0.5em" }} />
+              Update punktfunk
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+
       <PanelSection title="punktfunk">
         <PanelSectionRow>
           <ButtonItem
@@ -378,25 +596,25 @@ const QamPanel: FC = () => {
           </PanelSectionRow>
         )}
         {hosts.map((h) => {
-          const pairRequired = h.pair === "required";
+          const needsPair = h.pair === "required" && !h.paired;
           return (
             <PanelSectionRow key={h.fp || `${h.host}:${h.port}`}>
               <ButtonItem
                 layout="below"
                 onClick={() =>
-                  pairRequired
+                  needsPair
                     ? showModal(<PairModal host={h} onPaired={() => startStream(h)} />)
                     : startStream(h)
                 }
                 label={
                   <span style={{ display: "inline-flex", alignItems: "center", gap: "0.4em" }}>
-                    {pairRequired ? <FaLock /> : <FaLockOpen />}
+                    {needsPair ? <FaLock /> : <FaLockOpen />}
                     {h.name}
                   </span>
                 }
-                description={`${h.host}:${h.port}`}
+                description={`${h.host}:${h.port}${h.paired ? " · paired" : ""}`}
               >
-                {pairRequired ? "Pair & Stream" : "Stream"}
+                {needsPair ? "Pair & Stream" : "Stream"}
               </ButtonItem>
             </PanelSectionRow>
           );
@@ -406,12 +624,25 @@ const QamPanel: FC = () => {
   );
 };
 
+// Full page behind the boundary — registered as the /punktfunk route.
+const PunktfunkRoute: FC = () => (
+  <PluginErrorBoundary>
+    <PunktfunkPage />
+  </PluginErrorBoundary>
+);
+
 export default definePlugin(() => {
-  routerHook.addRoute(ROUTE, PunktfunkPage, { exact: true });
+  routerHook.addRoute(ROUTE, PunktfunkRoute, { exact: true });
   return {
     name: "punktfunk",
-    titleView: <div className={staticClasses.Title}>punktfunk</div>,
-    content: <QamPanel />,
+    // `staticClasses?.Title` is guarded so a future client that drops the export can't throw
+    // at plugin-load time (an error boundary only catches render-time, not load-time, errors).
+    titleView: <div className={staticClasses?.Title}>punktfunk</div>,
+    content: (
+      <PluginErrorBoundary>
+        <QamPanel />
+      </PluginErrorBoundary>
+    ),
     icon: <FaTv />,
     onDismount() {
       routerHook.removeRoute(ROUTE);
