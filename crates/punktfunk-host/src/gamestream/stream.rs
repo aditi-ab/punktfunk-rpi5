@@ -114,12 +114,12 @@ fn run(
     // `video_cap`, since a reconnect at a different resolution needs a freshly-sized output; the
     // output is released when this capturer drops at stream end (RAII via its keepalive).
     if crate::config::config().video_source.as_deref() == Some("virtual") {
-        // The launched app picks the compositor (e.g. gamescope for game entries) and the
-        // nested command.
-        let compositor = app
-            .and_then(|a| a.compositor)
-            .map(Ok)
-            .unwrap_or_else(|| crate::vdisplay::detect().context("detect compositor"))?;
+        // Open the virtual-display source: pick the live compositor, normalize the session env
+        // (apply_session_env/apply_input_env — gamescope ATTACH/resize + KWin/Mutter retargeting,
+        // exactly like the native plane), create a virtual output at the client mode, and capture it.
+        // Re-runnable: the encode loop calls it again on a mid-stream capture loss to FOLLOW a
+        // Desktop<->Game switch.
+        let (mut capturer, compositor) = open_gs_virtual_source(cfg, app)?;
         tracing::info!(
             ?compositor,
             app = ?app.map(|a| &a.title),
@@ -127,31 +127,6 @@ fn run(
             h = cfg.height,
             "video source: virtual display (native client resolution)"
         );
-        let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
-        // Carry the resolved launch command on the backend instance (per-session) rather than a
-        // process-global env var, so concurrent sessions can't stomp each other's launch target.
-        vd.set_launch_command(app.and_then(|a| a.cmd.clone()));
-        let vout = vd
-            .create(punktfunk_core::Mode {
-                width: cfg.width,
-                height: cfg.height,
-                refresh_hz: cfg.fps,
-            })
-            .context("create virtual output at client resolution")?;
-        // `want_hdr=false`: the IDD-push backend (opt-in PUNKTFUNK_IDD_PUSH) has no monitor-HDR
-        // auto-detection — it converts its always-FP16 ring per this flag — and GameStream HDR is not
-        // negotiated into StreamConfig here, so an IDD-push GameStream session streams SDR even on an
-        // HDR desktop. (The default WGC backend DOES auto-detect HDR from the output colorspace, but
-        // IDD-push bypasses WGC.) Acceptable for the experimental IDD-push A/B path; HDR over IDD-push
-        // is wired only for punktfunk/1 (want_hdr = negotiated bit_depth >= 10). TODO: derive want_hdr
-        // from a GameStream HDR flag once StreamConfig carries one.
-        let mut capturer = capture::capture_virtual_output(
-            vout,
-            capture::OutputFormat::resolve(false),
-            crate::session_plan::CaptureBackend::resolve(),
-        )
-        .context("capture virtual output")?;
-        capturer.set_active(true);
         // Launch the app's command now that capture is live, for the backends that DON'T nest it via
         // set_launch_command above: Windows (no gamescope) and Linux kwin/mutter/wlroots (which stream
         // the existing desktop, so the app must be spawned into the session to land on the streamed
@@ -171,8 +146,14 @@ fn run(
                 }
             }
         }
+        // Rebuild closure: re-open the source on a mid-stream capture loss, RE-DETECTING the live
+        // compositor — so a Desktop<->Game switch (at the client's fixed mode) is FOLLOWED in place
+        // without a Moonlight reconnect. (A resolution change can't be followed mid-stream on
+        // GameStream — WxH is locked at ANNOUNCE — but a session toggle keeps the negotiated mode.)
+        let rebuild = || open_gs_virtual_source(cfg, app).map(|(c, _)| c);
         return stream_body(
-            &mut *capturer,
+            &mut capturer,
+            Some(&rebuild),
             &sock,
             cfg,
             running,
@@ -200,8 +181,10 @@ fn run(
         }
     };
     capturer.set_active(true);
+    // Portal/synthetic source: no compositor virtual output to re-detect, so no rebuild closure.
     let result = stream_body(
-        &mut *capturer,
+        &mut capturer,
+        None,
         &sock,
         cfg,
         running,
@@ -213,6 +196,53 @@ fn run(
     capturer.set_active(false);
     *video_cap.lock().unwrap() = Some(capturer);
     result
+}
+
+/// Open the virtual-display video source for a GameStream session: pick the LIVE compositor + normalize
+/// the session env (apply_session_env/apply_input_env — gamescope ATTACH/resize, KWin/Mutter
+/// retargeting) exactly like the native plane (punktfunk1.rs resolve_compositor), create a virtual
+/// output at the client's mode, and capture it. Returns the capturer (it owns the output's keepalive;
+/// the stateless VirtualDisplay factory is dropped here) plus the resolved compositor. An apps.json
+/// entry can PIN a compositor (skips the live detect/retarget). Re-run on a mid-stream capture loss to
+/// FOLLOW a Desktop<->Game switch: it re-detects the now-live compositor and re-targets at it. Does NOT
+/// launch the app (that happens once at stream start; a rebuild must not re-spawn it).
+fn open_gs_virtual_source(
+    cfg: StreamConfig,
+    app: Option<&super::apps::AppEntry>,
+) -> Result<(Box<dyn Capturer>, crate::vdisplay::Compositor)> {
+    let compositor = if let Some(c) = app.and_then(|a| a.compositor) {
+        c
+    } else {
+        let active = crate::vdisplay::detect_active_session();
+        crate::vdisplay::apply_session_env(&active);
+        let c = crate::vdisplay::compositor_for_kind(active.kind)
+            .map(Ok)
+            .unwrap_or_else(crate::vdisplay::detect)
+            .context("detect compositor")?;
+        crate::vdisplay::apply_input_env(c);
+        c
+    };
+    let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
+    // Carry the resolved launch command on the backend instance (per-session) rather than a
+    // process-global env var, so concurrent sessions can't stomp each other's launch target.
+    vd.set_launch_command(app.and_then(|a| a.cmd.clone()));
+    let vout = vd
+        .create(punktfunk_core::Mode {
+            width: cfg.width,
+            height: cfg.height,
+            refresh_hz: cfg.fps,
+        })
+        .context("create virtual output at client resolution")?;
+    // want_hdr=false: GameStream HDR is not negotiated into StreamConfig here (the default WGC backend
+    // still auto-detects HDR from the output colorspace; only the opt-in IDD-push path streams SDR).
+    let capturer = capture::capture_virtual_output(
+        vout,
+        capture::OutputFormat::resolve(false),
+        crate::session_plan::CaptureBackend::resolve(),
+    )
+    .context("capture virtual output")?;
+    capturer.set_active(true);
+    Ok((capturer, compositor))
 }
 
 /// One frame's packets, handed from the encode thread to the send thread.
@@ -367,7 +397,11 @@ fn percentile(v: &mut [u32], q: f64) -> u32 {
 /// (see [`spawn_sender`]) so a send spike can never stall capture/encode.
 #[allow(clippy::too_many_arguments)]
 fn stream_body(
-    capturer: &mut dyn Capturer,
+    // `&mut Box` (not `&mut dyn`) so a mid-stream capture-loss rebuild can SWAP the capturer in place.
+    capturer: &mut Box<dyn Capturer>,
+    // Re-open the video source on capture loss (virtual-display path → follow a Desktop<->Game switch);
+    // `None` for the portal/synthetic source, which has nothing to re-detect (propagate the error).
+    rebuild: Option<&dyn Fn() -> Result<Box<dyn Capturer>>>,
     sock: &UdpSocket,
     cfg: StreamConfig,
     running: &Arc<AtomicBool>,
@@ -459,7 +493,12 @@ fn stream_body(
     // RFI capability is fixed for the session (probed at encoder open). Query it once so the
     // recovery path skips the always-`false` invalidate call on encoders without NVENC RFI and
     // forces a keyframe directly instead.
-    let supports_rfi = enc.caps().supports_rfi;
+    let mut supports_rfi = enc.caps().supports_rfi;
+
+    // Bound consecutive capture-loss rebuilds (a delivered frame clears the counter) so a permanently
+    // dead source can't loop forever — it ends the stream after the cap, falling back to a reconnect.
+    const MAX_REBUILDS: u32 = 5;
+    let mut rebuilds: u32 = 0;
 
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
@@ -467,9 +506,68 @@ fn stream_body(
         // armed (cheap Relaxed atomic, re-read each frame).
         let measure = perf || stats.is_armed();
         // Advance to the freshest captured frame if one arrived; otherwise reuse the last.
-        if let Some(f) = capturer.try_latest().context("capture frame")? {
-            frame = f;
-            uniq += 1;
+        match capturer.try_latest() {
+            Ok(Some(f)) => {
+                frame = f;
+                uniq += 1;
+                rebuilds = 0; // a delivered frame clears the consecutive-loss counter
+            }
+            Ok(None) => {} // no new frame — reuse the last (static/idle desktop)
+            Err(e) => {
+                // The capture source went away — the compositor was torn down on a Desktop<->Game
+                // switch, or the virtual output was removed. On the virtual-display path, re-detect the
+                // now-live compositor and re-attach IN PLACE (the send thread + packetizer + socket +
+                // RTP clock all survive), then force an IDR so Moonlight resyncs — so the stream FOLLOWS
+                // the switch with no client reconnect. Build the new source BEFORE dropping the old.
+                // Bounded by a counter + a ~40s budget; on exhaustion, end the stream (Moonlight
+                // reconnect). The portal/synthetic path has no rebuild closure → propagate as before.
+                let Some(rebuild) = rebuild else {
+                    return Err(e).context("capture frame");
+                };
+                rebuilds += 1;
+                if rebuilds > MAX_REBUILDS {
+                    return Err(e).context("capture lost — rebuild attempts exhausted");
+                }
+                tracing::warn!(error = %format!("{e:#}"), rebuild = rebuilds,
+                    "gamestream: capture lost — rebuilding source in place (following a session switch)");
+                let rebuild_deadline = Instant::now() + Duration::from_secs(40);
+                let new_cap = loop {
+                    match rebuild() {
+                        Ok(c) => break c,
+                        Err(e2) => {
+                            if !running.load(Ordering::SeqCst) || Instant::now() >= rebuild_deadline
+                            {
+                                return Err(e2)
+                                    .context("capture lost — no source within the rebuild budget");
+                            }
+                            tracing::warn!(error = %format!("{e2:#}"),
+                                "gamestream: source not up yet — retrying");
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                    }
+                };
+                *capturer = new_cap;
+                capturer.set_active(true);
+                frame = capturer.next_frame().context("first frame after rebuild")?;
+                // Re-open the encoder for the new source (same negotiated WxH → same SPS profile) and
+                // force an IDR so Moonlight resyncs on the first emitted AU.
+                enc = encode::open_video(
+                    cfg.codec,
+                    frame.format,
+                    frame.width,
+                    frame.height,
+                    cfg.fps,
+                    cfg.bitrate_kbps as u64 * 1000,
+                    frame.is_cuda(),
+                    8,
+                )
+                .context("reopen encoder after rebuild")?;
+                supports_rfi = enc.caps().supports_rfi;
+                enc.request_keyframe();
+                next_frame = Instant::now();
+                tracing::info!("gamestream: source rebuilt — stream continues");
+                continue;
+            }
         }
         let t_cap = tick.elapsed();
         // Honor a client recovery request. Prefer reference-frame invalidation (the encoder
