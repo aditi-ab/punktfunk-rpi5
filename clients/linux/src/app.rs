@@ -43,7 +43,13 @@ pub fn run() -> glib::ExitCode {
     if let Some(pin) = arg_value("--pair") {
         return headless_pair(&pin);
     }
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    let mut builder = adw::Application::builder().application_id(APP_ID);
+    // Screenshot mode launches the app once per scene back-to-back; NON_UNIQUE keeps each
+    // launch its own primary instance instead of forwarding to a still-registered name.
+    if shot_scene().is_some() {
+        builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let app = builder.build();
     app.connect_activate(build_ui);
     // GTK doesn't see our argv (`--connect` is handled in `build_ui`); an empty argv also
     // keeps GApplication from rejecting unknown options.
@@ -199,9 +205,63 @@ fn build_ui(gtk_app: &adw::Application) {
     nav.add(&hosts_page);
     window.present();
 
+    // CI screenshot mode: render one scripted, host-free scene and signal readiness
+    // (clients/linux/tools/screenshots.sh). Mutually exclusive with a real connect.
+    if let Some(scene) = shot_scene() {
+        run_shot(app, &scene);
+        return;
+    }
+
     if let Some(req) = cli_connect_request() {
         initiate_connect(app, req);
     }
+}
+
+/// `PUNKTFUNK_SHOT_SCENE`, when set, selects a scripted host-free scene for CI screenshots.
+fn shot_scene() -> Option<String> {
+    std::env::var("PUNKTFUNK_SHOT_SCENE")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Render one mock-populated, host-free scene over the already-presented window, then print
+/// `PF_SHOT_READY` once it has had a moment to map + settle so the driver knows when to capture.
+/// No `NativeClient` or session is created. The stream scene is deliberately absent — its page
+/// requires a live connector (`ui_stream::new` takes an `Arc<NativeClient>`).
+fn run_shot(app: Rc<App>, scene: &str) {
+    // A plausible host for the trust/pair dialogs (fp_hex is 64 hex chars, like a real SHA-256).
+    let mock_req = || ConnectRequest {
+        name: "Living Room PC".to_string(),
+        addr: "192.168.1.42".to_string(),
+        port: 9777,
+        fp_hex: Some(
+            "9f8e7d6c5b4a39281706f5e4d3c2b1a0998877665544332211ffeeddccbbaa00".to_string(),
+        ),
+        pair_optional: true,
+    };
+
+    match scene {
+        // The saved-hosts grid reads ~/.config/punktfunk/client-known-hosts.json, which the
+        // driver seeds — so the already-shown hosts page is the scene; nothing to do here.
+        "hosts" | "02-hosts" => {}
+        "settings" | "03-settings" => {
+            crate::ui_settings::show(&app.window, app.settings.clone(), &app.gamepad);
+        }
+        "trust" | "04-trust" => tofu_dialog(app.clone(), mock_req()),
+        "pair" | "05-pair" => pin_dialog(app.clone(), mock_req()),
+        other => tracing::warn!("unknown PUNKTFUNK_SHOT_SCENE={other:?}; showing hosts only"),
+    }
+
+    let settle_ms = std::env::var("PUNKTFUNK_SHOT_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900);
+    let scene = scene.to_string();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(settle_ms), move || {
+        use std::io::Write as _;
+        println!("PF_SHOT_READY scene={scene}");
+        let _ = std::io::stdout().flush();
+    });
 }
 
 /// The trust gate in front of every connect. The host is the policy authority (it
