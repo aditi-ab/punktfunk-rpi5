@@ -166,7 +166,7 @@ pub fn probe_can_encode(codec: Codec) -> bool {
 /// validated hardware to build + verify the 4:4:4 surface/profile path against. Returning `false`
 /// keeps the negotiation honest: a VAAPI host resolves every session to 4:2:0 before the Welcome, so
 /// the client never builds a 4:4:4 decoder it would only get 4:2:0 frames for. (Follow-up: implement
-/// + validate on an Intel Arc / RDNA4-class box that advertises a HEVC 4:4:4 encode entrypoint.)
+/// and validate on an Intel Arc / RDNA4-class box that advertises a HEVC 4:4:4 encode entrypoint.)
 pub fn probe_can_encode_444(_codec: Codec) -> bool {
     tracing::info!("VAAPI HEVC 4:4:4 encode is not implemented yet — declining (encoding 4:2:0)");
     false

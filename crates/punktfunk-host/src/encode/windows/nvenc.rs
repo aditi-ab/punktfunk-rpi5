@@ -58,8 +58,8 @@ pub struct NvencD3d11Encoder {
     /// Encoded bit depth (8 or 10). 10 → HEVC Main10 (NVENC upconverts the 8-bit ARGB input).
     bit_depth: u8,
     /// Full-chroma 4:4:4 (HEVC Range Extensions, `chroma_format_idc = 3`) requested for this session.
-    /// NVENC ingests the RGB (ARGB/ABGR10) input and CSCs it to YUV444 internally — the `FREXT` profile
-    /// + `chromaFormatIDC = 3` in the encode config carry the chroma. Gated on the GPU's
+    /// NVENC ingests the RGB (ARGB/ABGR10) input and CSCs it to YUV444 internally; the `FREXT` profile
+    /// and `chromaFormatIDC = 3` in the encode config carry the chroma. Gated on the GPU's
     /// `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE` (cleared in `query_caps` on a card that lacks it) and on an
     /// RGB input format (NV12/P010 capture can't reconstruct 4:4:4). HEVC-only.
     chroma_444: bool,
