@@ -15,7 +15,7 @@
 //! `inject/libei.rs`) — wired and live-validated.
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -110,12 +110,11 @@ impl VirtualDisplay for GamescopeDisplay {
         // PUNKTFUNK_GAMESCOPE_NODE=<id|auto>; "auto" discovers the gamescope `Video/Source` node.
         if let Ok(id) = std::env::var("PUNKTFUNK_GAMESCOPE_NODE") {
             let node_id: u32 = if id.trim().eq_ignore_ascii_case("auto") {
-                find_gamescope_node().ok_or_else(|| {
-                    anyhow!(
-                        "PUNKTFUNK_GAMESCOPE_NODE=auto but no running gamescope Video/Source node \
-                         was found — is the headless gamescope/Steam session up?"
-                    )
-                })?
+                // Attach to the box-owned game-mode session, but FIRST make it run at the connecting
+                // client's resolution (the box is headless, so its game-mode mode is ours to set).
+                // Reuse if it already matches (fast, no restart); otherwise relaunch the box's own
+                // session at the client mode. Without this the client gets the box's default mode.
+                ensure_box_gamescope_mode(mode)?
             } else {
                 id.parse()
                     .context("PUNKTFUNK_GAMESCOPE_NODE must be a node id or 'auto'")?
@@ -366,6 +365,150 @@ fn create_managed_session_steamos(mode: Mode) -> Result<VirtualOutput> {
         preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
         keepalive: Box::new(()),
     })
+}
+
+/// ATTACH at the CLIENT's resolution: ensure the box's own game-mode session is running at `mode`'s
+/// output size, then return its capture node. Reuses the running session if it already matches (no
+/// restart — the rock-solid fast path a stable client always hits); otherwise reconfigures + restarts
+/// the box's OWN autologin `gamescope-session-plus@<client>` unit at the client mode. Restarting the
+/// box's own unit (rather than spawning a competing one) avoids the autologin-respawn fight the old
+/// MANAGED path hit. A headless box has no physical panel, so its game-mode resolution is ours to set;
+/// Steam restarts only on an actual resolution CHANGE.
+fn ensure_box_gamescope_mode(mode: Mode) -> Result<u32> {
+    let target = (mode.width, mode.height);
+    // Fast path: already at the client's resolution — just attach to the live node.
+    if current_gamescope_output_size() == Some(target) {
+        if let Some(node) = find_gamescope_node() {
+            tracing::info!(
+                w = mode.width,
+                h = mode.height,
+                node,
+                "gamescope: box game-mode session already at the client's resolution — reusing"
+            );
+            return Ok(node);
+        }
+    }
+    let Some(unit) = running_autologin_gamescope_unit() else {
+        // No box-owned autologin session to reconfigure (a bare/foreign gamescope): attach to
+        // whatever node exists, accepting its resolution.
+        return find_gamescope_node().ok_or_else(|| {
+            anyhow!(
+                "no running gamescope Video/Source node — is the headless game mode up? \
+                 (put the box into Steam Game Mode)"
+            )
+        });
+    };
+    tracing::info!(
+        from = ?current_gamescope_output_size(),
+        to_w = mode.width,
+        to_h = mode.height,
+        hz = mode.refresh_hz,
+        %unit,
+        "gamescope: relaunching the box game-mode session at the client's resolution"
+    );
+    // The session reads SCREEN_WIDTH/HEIGHT (+ CUSTOM_REFRESH_RATES) from the user-manager
+    // environment; set them and restart the box's own unit.
+    systemctl_user(&[
+        "set-environment",
+        &format!("SCREEN_WIDTH={}", mode.width),
+        &format!("SCREEN_HEIGHT={}", mode.height),
+        &format!("CUSTOM_REFRESH_RATES={}", mode.refresh_hz.max(1)),
+    ]);
+    systemctl_user(&["restart", &unit]);
+    // Wait for the relaunched session to come up at the new size and publish its capture node. The
+    // node appears when gamescope is up (well before Steam finishes booting); the caller's
+    // first-frame retry absorbs Steam's cold start.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if current_gamescope_output_size() == Some(target) {
+            if let Some(node) = find_gamescope_node() {
+                tracing::info!(
+                    node,
+                    w = mode.width,
+                    h = mode.height,
+                    "gamescope: box game-mode session relaunched at the client's resolution"
+                );
+                return Ok(node);
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "box game-mode session did not come up at {}x{} within 45s after relaunch \
+                 (Steam may still be booting)",
+                mode.width,
+                mode.height
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Output (capture) resolution `-W <w> -H <h>` of the running `gamescope` binary, parsed from its
+/// `/proc/<pid>/cmdline`. `None` if no gamescope is running or the flags aren't present.
+fn current_gamescope_output_size() -> Option<(u32, u32)> {
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str() else { continue };
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let args: Vec<String> = raw
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        // Match the gamescope BINARY by argv[0]'s basename — NOT /proc/<pid>/exe, which is commonly
+        // unreadable for the gamescope process (returns empty). The session wrapper scripts run as
+        // bash/sh (argv[0] != gamescope), so they're excluded; the -W/-H presence check below is the
+        // final filter.
+        let is_gamescope = args
+            .first()
+            .map(|a0| a0.rsplit('/').next().unwrap_or(a0) == "gamescope")
+            .unwrap_or(false);
+        if !is_gamescope {
+            continue;
+        }
+        let flag = |names: &[&str]| -> Option<u32> {
+            args.iter().enumerate().find_map(|(i, a)| {
+                names
+                    .contains(&a.as_str())
+                    .then(|| args.get(i + 1).and_then(|v| v.parse().ok()))
+                    .flatten()
+            })
+        };
+        if let (Some(w), Some(h)) = (
+            flag(&["-W", "--output-width"]),
+            flag(&["-H", "--output-height"]),
+        ) {
+            return Some((w, h));
+        }
+    }
+    None
+}
+
+/// The running autologin gaming-mode unit (`gamescope-session-plus@<client>.service`), if any — the
+/// box's own game-mode session, which [`ensure_box_gamescope_mode`] reconfigures + restarts.
+fn running_autologin_gamescope_unit() -> Option<String> {
+    let out = Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--type=service",
+            "--state=running",
+            "--no-legend",
+            "--plain",
+            "gamescope-session-plus@*.service",
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .find(|u| u.starts_with("gamescope-session-plus@") && u.ends_with(".service"))
+        .map(|u| u.to_string())
 }
 
 /// Stop every running autologin gaming-mode session (`gamescope-session-plus@*.service`) so its

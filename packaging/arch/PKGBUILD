@@ -72,6 +72,8 @@ package_punktfunk-host() {
               'xdg-desktop-portal-wlr: portal for the headless Sway session helper'
               'punktfunk-web: browser management console (device pairing + status)')
   install=punktfunk-host.install
+  # User-editable config: the headless game-mode drop-in (see below) — don't clobber local edits.
+  backup=('etc/gamescope-session-plus/sessions.d/steam')
   local R; R="$(_repo)"; local T="$srcdir/target/release"
 
   install -Dm0755 "$T/punktfunk-host"                 "$pkgdir/usr/bin/punktfunk-host"
@@ -100,6 +102,11 @@ package_punktfunk-host() {
   install -Dm0644 "$R/scripts/host.env.example"              "$pkgdir/usr/share/punktfunk/host.env.example"
   install -Dm0644 "$R/packaging/bazzite/host.env"            "$pkgdir/usr/share/punktfunk/host.env.bazzite"
   install -Dm0644 "$R/packaging/kde/host.env"                "$pkgdir/usr/share/punktfunk/host.env.kde"
+  # Headless GAME-mode fix: gamescope-session-plus drop-in that uses the headless backend when no
+  # display is connected (so SteamOS/Bazzite "Switch to Game Mode" works on a display-less streaming
+  # host). No-op on display-attached boxes; sourced as /etc/gamescope-session-plus/sessions.d/steam.
+  install -Dm0644 "$R/packaging/bazzite/gamescope-headless-session" \
+    "$pkgdir/etc/gamescope-session-plus/sessions.d/steam"
   install -Dm0644 "$R/api/openapi.json"                 "$pkgdir/usr/share/punktfunk/openapi.json"
   install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-MIT"
   install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-APACHE"

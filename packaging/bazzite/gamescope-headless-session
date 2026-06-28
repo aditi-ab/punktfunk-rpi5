@@ -1,0 +1,22 @@
+# punktfunk: headless game-mode fallback for gamescope-session-plus.
+#
+# Installed as /etc/gamescope-session-plus/sessions.d/steam. The gamescope-session-plus launcher
+# SOURCES this (shell, with `set -a` so assignments auto-export) AFTER its /usr/share defaults, so it
+# can override the session's gamescope flags.
+#
+# Why: on a box with NO connected display (a dedicated streaming host), the stock Steam game mode runs
+# gamescope's DRM backend against a physical panel (`--prefer-output *,eDP-1`). With nothing to scan
+# out, gamescope crashes on launch; after 5 strikes Bazzite/SteamOS force-selects the desktop session
+# and "Switch to Game Mode" appears broken. Falling back to gamescope's HEADLESS backend makes game
+# mode render entirely offscreen and expose a PipeWire node, which the punktfunk host captures and
+# streams — full gamescope game mode (per-game res / FSR / HDR / VRR / frame-limit), no monitor needed.
+#
+# Safe by construction:
+#   * NO-OP when any display is connected -> the normal DRM game mode runs unchanged.
+#   * Only sets values that are still unset (`: "${VAR:=...}"`), so the punktfunk host's per-client
+#     mode (SCREEN_WIDTH/SCREEN_HEIGHT injected via systemd-run for a managed session) still wins.
+if ! grep -qx connected /sys/class/drm/*/status 2>/dev/null; then
+    : "${BACKEND:=headless}"
+    : "${SCREEN_WIDTH:=1920}"
+    : "${SCREEN_HEIGHT:=1080}"
+fi

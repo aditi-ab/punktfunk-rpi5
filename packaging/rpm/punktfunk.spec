@@ -233,6 +233,13 @@ install -Dm0644 packaging/kde/host.env                 %{buildroot}%{_datadir}/%
 # screencast/virtual-output grant ships as io.unom.Punktfunk.Host.desktop, installed above).
 install -d %{buildroot}%{_datadir}/%{name}/bazzite
 install -Dm0755 packaging/bazzite/kde-desktop-setup.sh %{buildroot}%{_datadir}/%{name}/bazzite/kde-desktop-setup.sh
+# Headless GAME-mode fix: a gamescope-session-plus sessions.d drop-in that falls back to gamescope's
+# headless backend when no display is connected (so "Switch to Game Mode" works on a display-less
+# streaming host instead of crashing + 5-striking back to desktop). No-op on display-attached boxes.
+# Sourced by gamescope-session-plus as /etc/gamescope-session-plus/sessions.d/steam (after its
+# /usr/share defaults). Harmless on non-gamescope systems (the file is simply never read).
+install -Dm0644 packaging/bazzite/gamescope-headless-session \
+                %{buildroot}/etc/gamescope-session-plus/sessions.d/steam
 install -Dm0644 api/openapi.json                  %{buildroot}%{_datadir}/%{name}/openapi.json
 
 %if %{with web}
@@ -262,6 +269,9 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %{_userunitdir}/punktfunk-host.service
 %{_userunitdir}/punktfunk-kde-session.service
 %{_datadir}/applications/io.unom.Punktfunk.Host.desktop
+%dir /etc/gamescope-session-plus
+%dir /etc/gamescope-session-plus/sessions.d
+%config(noreplace) /etc/gamescope-session-plus/sessions.d/steam
 %dir %{_datadir}/%{name}
 %{_datadir}/%{name}/*
 
