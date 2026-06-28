@@ -11,9 +11,6 @@
 use anyhow::{Context, Result};
 use rand::RngCore;
 use std::fs;
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 const ENV_VAR: &str = "PUNKTFUNK_MGMT_TOKEN";
@@ -38,9 +35,10 @@ pub fn load_or_generate() -> Result<String> {
     rand::thread_rng().fill_bytes(&mut buf);
     let token = hex::encode(buf);
     let dir = crate::gamestream::config_dir();
-    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    // Owner-private dir (0700 Unix / DACL-locked Windows) so the token can't leak via the config path.
+    crate::gamestream::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
     write_token(&path, &token)?;
-    tracing::info!(path = %path.display(), "generated and persisted management API token (0600)");
+    tracing::info!(path = %path.display(), "generated and persisted management API token (owner-only)");
     Ok(token)
 }
 
@@ -55,19 +53,15 @@ fn parse_token(contents: &str) -> Option<String> {
     (!tok.is_empty()).then(|| tok.to_string())
 }
 
-/// Write `PUNKTFUNK_MGMT_TOKEN=<token>` to `path`, mode 0600 (never briefly world-readable).
+/// Write `PUNKTFUNK_MGMT_TOKEN=<token>` to `path` as an owner-only secret — 0600 on Unix AND
+/// DACL-locked to SYSTEM/Administrators on Windows. Routes through the shared `write_secret_file` so
+/// the mgmt bearer token (full admin authority) gets the SAME Windows lockdown as the host key; the
+/// bespoke `cfg(unix)`-only writer used to leave it readable by any local user (security-review
+/// 2026-06-28 #2).
 fn write_token(path: &Path, token: &str) -> Result<()> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let mut f = opts
-        .open(path)
-        .with_context(|| format!("write {}", path.display()))?;
-    writeln!(f, "PUNKTFUNK_MGMT_TOKEN={token}")?;
-    #[cfg(unix)]
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    Ok(())
+    let line = format!("PUNKTFUNK_MGMT_TOKEN={token}\n");
+    crate::gamestream::write_secret_file(path, line.as_bytes())
+        .with_context(|| format!("write {}", path.display()))
 }
 
 #[cfg(test)]
@@ -95,6 +89,7 @@ mod tests {
         assert_eq!(parse_token(&read).as_deref(), Some("cafef00d"));
         #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }

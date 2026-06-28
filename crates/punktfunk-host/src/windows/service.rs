@@ -114,13 +114,15 @@ pub fn main(args: &[String]) -> Result<()> {
 /// stdout/stderr are redirected to `host.log` in the same dir.
 pub fn service_log_path() -> PathBuf {
     let dir = crate::gamestream::config_dir().join("logs");
-    let _ = std::fs::create_dir_all(&dir);
+    // DACL-locked (Users read-only, no create) so a local user can't pre-plant SYSTEM log files as
+    // reparse points / hardlinks to redirect the SYSTEM service's writes (security-review #11).
+    let _ = crate::gamestream::create_private_dir(&dir);
     dir.join("service.log")
 }
 
 fn host_log_path() -> PathBuf {
     let dir = crate::gamestream::config_dir().join("logs");
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = crate::gamestream::create_private_dir(&dir);
     dir.join("host.log")
 }
 
@@ -684,7 +686,9 @@ fn ensure_default_host_env() -> Result<()> {
         return Ok(());
     }
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok();
+        // DACL-lock the config dir on creation so a local user can't pre-create it and plant a
+        // host.env (which feeds the SYSTEM service's env + command line) — security-review #3.
+        crate::gamestream::create_private_dir(dir).ok();
     }
     let default = "# punktfunk host configuration (read by the Windows service).\n\
         # KEY=VALUE per line; '#' comments. Restart the service after editing:\n\
@@ -707,7 +711,11 @@ fn ensure_default_host_env() -> Result<()> {
         \n\
         # Force a specific render GPU by name substring (multi-GPU boxes only):\n\
         # PUNKTFUNK_RENDER_ADAPTER=4090\n";
-    std::fs::write(&path, default).with_context(|| format!("write {}", path.display()))?;
+    // Write host.env DACL-locked to SYSTEM/Administrators: it controls the SYSTEM service's
+    // environment + launched command line, so a local user must not be able to read or tamper with
+    // it (security-review 2026-06-28 #3).
+    crate::gamestream::write_secret_file(&path, default.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
     println!("Wrote default config: {}", path.display());
     Ok(())
 }

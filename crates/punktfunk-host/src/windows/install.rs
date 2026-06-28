@@ -271,8 +271,11 @@ fn set_web_password(pw_path: &Path, pw_file: Option<&str>) {
             }
         });
     if let Some(pw) = password {
-        if std::fs::write(pw_path, format!("PUNKTFUNK_UI_PASSWORD={pw}\n")).is_err() {
-            eprintln!("warning: could not write {}", pw_path.display());
+        // Create the file EMPTY first, lock its DACL, THEN write the secret — so the cleartext
+        // password is never present at the inherited (Users-readable) %ProgramData% ACL, even for
+        // the brief window before icacls runs (security-review 2026-06-28 #8).
+        if std::fs::write(pw_path, b"").is_err() {
+            eprintln!("warning: could not create {}", pw_path.display());
             return;
         }
         // Lock down: drop inheritance, grant only Administrators (S-1-5-32-544) + SYSTEM (S-1-5-18).
@@ -287,6 +290,10 @@ fn set_web_password(pw_path: &Path, pw_file: Option<&str>) {
                 "*S-1-5-18:F",
             ],
         );
+        // Now write the secret into the already-locked file (truncate keeps the explicit DACL).
+        if std::fs::write(pw_path, format!("PUNKTFUNK_UI_PASSWORD={pw}\n")).is_err() {
+            eprintln!("warning: could not write {}", pw_path.display());
+        }
     }
 }
 
