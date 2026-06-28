@@ -39,6 +39,9 @@ const DECODERS: &[(&str, &str)] = &[
 ];
 /// Bitrate presets in Mb/s; `0` = host default.
 const BITRATES_MBPS: &[u32] = &[0, 10, 20, 30, 50, 80, 150];
+/// Audio channel presets: `(channel count, display label)`. The host clamps to what it can
+/// capture; the resolved count drives the decoder + WASAPI render layout.
+const AUDIO_CHANNELS: &[(u8, &str)] = &[(2, "Stereo"), (6, "5.1 Surround"), (8, "7.1 Surround")];
 
 #[derive(Clone, PartialEq)]
 enum Screen {
@@ -598,6 +601,7 @@ fn connect(
         compositor: CompositorPref::Auto,
         gamepad: gamepad_pref,
         bitrate_kbps: s.bitrate_kbps,
+        audio_channels: s.audio_channels,
         mic_enabled: s.mic_enabled,
         hdr_enabled: s.hdr_enabled,
         decoder: DecoderPref::from_name(&s.decoder),
@@ -886,6 +890,23 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
                 s.save();
             })
     };
+    let ac_i = AUDIO_CHANNELS
+        .iter()
+        .position(|&(v, _)| v == s.audio_channels)
+        .unwrap_or(0) as i32;
+    let ac_names: Vec<String> = AUDIO_CHANNELS.iter().map(|&(_, l)| l.to_string()).collect();
+    let channels_combo = {
+        let ctx = ctx.clone();
+        ComboBox::new(ac_names)
+            .header("Audio channels")
+            .selected_index(ac_i)
+            .on_selection_changed(move |i: i32| {
+                let (v, _) = AUDIO_CHANNELS[(i.max(0) as usize).min(AUDIO_CHANNELS.len() - 1)];
+                let mut s = ctx.settings.lock().unwrap();
+                s.audio_channels = v;
+                s.save();
+            })
+    };
 
     let header = grid((
         text_block("Settings")
@@ -934,8 +955,17 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
         .spacing(10.0),
     );
 
-    let audio_card =
-        card(vstack((text_block("Audio").font_size(15.0).semibold(), mic_toggle)).spacing(10.0));
+    let audio_card = card(
+        vstack((
+            text_block("Audio").font_size(15.0).semibold(),
+            text_block("Request stereo or surround — the host downmixes if its output has fewer.")
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText),
+            channels_combo,
+            mic_toggle,
+        ))
+        .spacing(10.0),
+    );
 
     page(vec![
         header.into(),

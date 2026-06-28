@@ -21,9 +21,9 @@ use std::time::Duration;
 use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
 
 const SAMPLE_RATE: usize = 48_000;
+/// The microphone uplink stays stereo (the host's virtual mic is stereo). The render path is
+/// multichannel — its channel count + block align are runtime, driven by the host-resolved layout.
 const CHANNELS: usize = 2;
-/// 48 kHz stereo f32: 2 channels * 4 bytes = 8 bytes per frame.
-const BLOCK_ALIGN: usize = CHANNELS * 4;
 /// Mic frames are 20 ms (960 samples/channel) — any size ≤ 120 ms is fine host-side.
 const MIC_FRAME: usize = 960;
 
@@ -34,9 +34,10 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// Spawn the WASAPI render thread. Failure (no render endpoint on this box) is
-    /// survivable — the caller streams video-only.
-    pub fn spawn() -> Result<AudioPlayer> {
+    /// Spawn the WASAPI render thread for `channels` (2/6/8, canonical wire order
+    /// FL FR FC LFE RL RR SL SR). Failure (no render endpoint on this box) is survivable — the
+    /// caller streams video-only.
+    pub fn spawn(channels: u8) -> Result<AudioPlayer> {
         // 64 × 5 ms = 320 ms of slack between the pump and the WASAPI loop.
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
         let stop = Arc::new(AtomicBool::new(false));
@@ -45,14 +46,14 @@ impl AudioPlayer {
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) = render_thread(pcm_rx, stop_t, ready_tx) {
+                if let Err(e) = render_thread(pcm_rx, stop_t, ready_tx, channels) {
                     tracing::warn!(error = format!("{e:#}"), "audio playback thread ended");
                 }
             })
             .context("spawn audio thread")?;
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => {
-                tracing::info!("WASAPI render: 48 kHz stereo f32 (default endpoint)");
+                tracing::info!(channels, "WASAPI render: 48 kHz f32 (default endpoint)");
                 Ok(AudioPlayer {
                     pcm_tx,
                     stop,
@@ -66,8 +67,8 @@ impl AudioPlayer {
         }
     }
 
-    /// Queue one interleaved-stereo f32 chunk. Drops the chunk if the WASAPI side is wedged
-    /// (the renderer conceals the gap; never block the session pump).
+    /// Queue one interleaved f32 chunk (in the session's channel layout). Drops the chunk if the
+    /// WASAPI side is wedged (the renderer conceals the gap; never block the session pump).
     pub fn push(&self, pcm: Vec<f32>) {
         if let Err(TrySendError::Disconnected(_)) = self.pcm_tx.try_send(pcm) {
             // Thread already dead — Drop will reap it; nothing to do per-chunk.
@@ -88,6 +89,7 @@ fn render_thread(
     pcm_rx: Receiver<Vec<f32>>,
     stop: Arc<AtomicBool>,
     ready: SyncSender<Result<()>>,
+    channels: u8,
 ) -> Result<()> {
     if let Err(e) = wasapi::initialize_mta()
         .ok()
@@ -97,12 +99,26 @@ fn render_thread(
         return Ok(());
     }
     let res = (|| -> Result<()> {
+        // F32LE interleaved: channels × 4 bytes/sample. Stereo (channels == 2) is byte-identical
+        // to the old fixed path (mask 0x3, block align 8).
+        let block_align = channels as usize * 4;
         let device = DeviceEnumerator::new()
             .context("DeviceEnumerator")?
             .get_default_device(&Direction::Render)
             .context("default render endpoint")?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
-        let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, CHANNELS, None);
+        // The explicit dwChannelMask is the wire order (FL FR FC LFE RL RR SL SR); 5.1 = 0x3F,
+        // 7.1 = 0x63F. WASAPI delivers channels in ascending mask-bit order, which equals the wire
+        // order, so the render mapping is the identity — no permute. `autoconvert` (below) lets the
+        // audio engine downmix when the endpoint has fewer speakers.
+        let desired = WaveFormat::new(
+            32,
+            32,
+            &SampleType::Float,
+            SAMPLE_RATE,
+            channels as usize,
+            Some(punktfunk_core::audio::wasapi_channel_mask(channels)),
+        );
         let (default_period, _min_period) =
             audio_client.get_device_period().context("device period")?;
         let mode = StreamMode::EventsShared {
@@ -139,10 +155,10 @@ fn render_thread(
             if avail_frames == 0 {
                 continue;
             }
-            let want_bytes = avail_frames * BLOCK_ALIGN;
+            let want_bytes = avail_frames * block_align;
 
             // Prime to ~3 quanta; cap at ~1 quantum of slack beyond that; re-prime on drain.
-            let target = (3 * want_bytes).clamp(720 * BLOCK_ALIGN, 9600 * BLOCK_ALIGN);
+            let target = (3 * want_bytes).clamp(720 * block_align, 9600 * block_align);
             while ring.len() > target.max(want_bytes) + want_bytes {
                 ring.pop_front();
             }

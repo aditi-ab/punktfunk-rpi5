@@ -431,6 +431,9 @@ fn stream_body(
         cfg.bitrate_kbps as u64 * 1000,
         frame.is_cuda(),
         8, // GameStream/Moonlight path: 8-bit (its own codec negotiation)
+        // GameStream/Moonlight stays 4:2:0 — stock Moonlight clients can't decode 4:4:4, and the
+        // protocol has no chroma negotiation. 4:4:4 is punktfunk/1-native only.
+        encode::ChromaFormat::Yuv420,
     )
     .context("open video encoder for stream")?;
     // FEC overhead percent (Sunshine default 20). Override with PUNKTFUNK_FEC_PCT (0 = data-only).
@@ -560,6 +563,7 @@ fn stream_body(
                     cfg.bitrate_kbps as u64 * 1000,
                     frame.is_cuda(),
                     8,
+                    encode::ChromaFormat::Yuv420, // GameStream stays 4:2:0
                 )
                 .context("reopen encoder after rebuild")?;
                 supports_rfi = enc.caps().supports_rfi;

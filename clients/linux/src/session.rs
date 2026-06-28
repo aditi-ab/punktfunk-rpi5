@@ -20,6 +20,8 @@ pub struct SessionParams {
     pub compositor: CompositorPref,
     pub gamepad: GamepadPref,
     pub bitrate_kbps: u32,
+    /// Requested audio channel count (2/6/8); the host echoes the resolved value.
+    pub audio_channels: u8,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
     /// Pinned host fingerprint; `None` = trust on first use (caller persists the observed one).
@@ -83,6 +85,42 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// Opus decoder for the audio plane: a plain stereo decoder (the validated path) or a multistream
+/// decoder for 5.1/7.1, both behind one `decode_float`. Built from the host-RESOLVED channel count
+/// via the shared layout table.
+enum AudioDec {
+    Stereo(opus::Decoder),
+    Surround(opus::MSDecoder),
+}
+
+impl AudioDec {
+    fn new(channels: u8) -> Result<AudioDec, opus::Error> {
+        if channels == 2 {
+            Ok(AudioDec::Stereo(opus::Decoder::new(
+                48_000,
+                opus::Channels::Stereo,
+            )?))
+        } else {
+            let l = punktfunk_core::audio::layout_for(channels, false);
+            Ok(AudioDec::Surround(opus::MSDecoder::new(
+                48_000, l.streams, l.coupled, l.mapping,
+            )?))
+        }
+    }
+
+    fn decode_float(
+        &mut self,
+        input: &[u8],
+        out: &mut [f32],
+        fec: bool,
+    ) -> Result<usize, opus::Error> {
+        match self {
+            AudioDec::Stereo(d) => d.decode_float(input, out, fec),
+            AudioDec::Surround(d) => d.decode_float(input, out, fec),
+        }
+    }
+}
+
 fn pump(
     params: SessionParams,
     ev_tx: async_channel::Sender<SessionEvent>,
@@ -96,7 +134,8 @@ fn pump(
         params.compositor,
         params.gamepad,
         params.bitrate_kbps,
-        0,    // video_caps: the Linux client has no 10-bit/HDR present path yet
+        0, // video_caps: the Linux client has no 10-bit/HDR present path yet
+        params.audio_channels,
         None, // launch: the Linux client has no library picker yet
         params.pin,
         Some(params.identity),
@@ -134,11 +173,14 @@ fn pump(
         }
     };
     // Audio is best-effort: a session without it still streams. Gamepads are the
-    // app-lifetime service's job (the UI attaches it on Connected).
-    let player = audio::AudioPlayer::spawn()
+    // app-lifetime service's job (the UI attaches it on Connected). Build the decoder + playback
+    // from the host-RESOLVED channel count (never the request), so an older/clamping host that
+    // resolves stereo is decoded as stereo.
+    let channels = connector.audio_channels;
+    let player = audio::AudioPlayer::spawn(channels as u32)
         .map_err(|e| tracing::warn!(error = %e, "audio disabled"))
         .ok();
-    let mut opus_dec = opus::Decoder::new(48_000, opus::Channels::Stereo)
+    let mut opus_dec = AudioDec::new(channels)
         .map_err(|e| tracing::warn!(error = %e, "opus decoder failed — audio disabled"))
         .ok();
     let _mic = params
@@ -157,8 +199,8 @@ fn pump(
     let mut bytes_n = 0u64;
     let mut decode_us_sum = 0u64;
     let mut lat_us: Vec<u64> = Vec::with_capacity(256);
-    let mut pcm = vec![0f32; 5760 * 2]; // decode scratch: max Opus frame (120 ms stereo)
-                                        // Loss recovery: watch the host→client unrecoverable-drop count and ask for an IDR when it climbs.
+    let mut pcm = vec![0f32; 5760 * channels as usize]; // scratch: max Opus frame (120 ms) × channels
+                                                        // Loss recovery: watch the host→client unrecoverable-drop count and ask for an IDR when it climbs.
     let mut last_dropped = connector.frames_dropped();
     let mut last_kf_req: Option<Instant> = None;
 
@@ -221,7 +263,8 @@ fn pump(
         while let Ok(pkt) = connector.next_audio(Duration::ZERO) {
             if let (Some(player), Some(dec)) = (&player, opus_dec.as_mut()) {
                 match dec.decode_float(&pkt.data, &mut pcm, false) {
-                    Ok(samples) => player.push(pcm[..samples * 2].to_vec()),
+                    // `samples` is per-channel; the interleaved frame is `samples * channels`.
+                    Ok(samples) => player.push(pcm[..samples * channels as usize].to_vec()),
                     Err(e) => tracing::debug!(error = %e, "opus decode"),
                 }
             }

@@ -31,7 +31,7 @@
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use super::{Codec, EncodedFrame, Encoder};
+use super::{ChromaFormat, Codec, EncodedFrame, Encoder};
 use crate::capture::{dxgi::D3d11Frame, CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
@@ -241,6 +241,18 @@ unsafe fn open_win_encoder(
 /// driver/runtime rejects codecs the video engine can't do (AV1 on pre-RDNA3 AMD / pre-Arc Intel,
 /// or HEVC on a very old part). Used to build the GameStream codec advertisement so a client never
 /// negotiates a codec the encoder can't open. Torn down immediately.
+/// Whether the active AMD (AMF) / Intel (QSV) GPU can encode HEVC **4:4:4**. **Deferred in v1 —
+/// always `false`.** AMF/QSV HEVC 4:4:4 encode is narrow (AMD RDNA3+, Intel Arc/Xe2+) and the
+/// libavcodec profile/pixel-format incantation is vendor- and driver-specific — a wrong profile
+/// `avcodec_open2` *silently* falls back to 4:2:0, so a positive probe would need a verify-by-frame,
+/// and there is no AMD/Intel Windows box in the lab to build + validate that against. Returning
+/// `false` keeps the negotiation honest: an AMF/QSV host resolves every session to 4:2:0 before the
+/// Welcome. (Follow-up: implement + validate on an RDNA3+/Arc Windows box.)
+pub fn probe_can_encode_444(_vendor: WinVendor, _codec: Codec) -> bool {
+    tracing::info!("AMF/QSV HEVC 4:4:4 encode is not implemented yet — declining (encoding 4:2:0)");
+    false
+}
+
 pub fn probe_can_encode(vendor: WinVendor, codec: Codec) -> bool {
     if ffmpeg::init().is_err() {
         return false;
@@ -1097,6 +1109,7 @@ unsafe impl Send for FfmpegWinEncoder {}
 
 impl FfmpegWinEncoder {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         vendor: WinVendor,
         codec: Codec,
@@ -1106,7 +1119,15 @@ impl FfmpegWinEncoder {
         fps: u32,
         bitrate_bps: u64,
         bit_depth: u8,
+        chroma: ChromaFormat,
     ) -> Result<Self> {
+        // AMF/QSV 4:4:4 is deferred (see `probe_can_encode_444`): no validated AMD/Intel Windows
+        // hardware in the lab, and the AMF/QSV HEVC 4:4:4 profile/format incantations are vendor- and
+        // driver-specific (a wrong profile silently encodes 4:2:0). The probe returns false so the host
+        // never negotiates 4:4:4 for an AMF/QSV session; if a request slips through, fall back to 4:2:0.
+        if chroma.is_444() {
+            tracing::warn!("AMF/QSV 4:4:4 encode not implemented — encoding 4:2:0");
+        }
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {
             // SAFETY: `ffmpeg::init()` ran on the line above, so libav is initialised; `av_log_set_level`

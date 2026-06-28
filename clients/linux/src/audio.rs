@@ -27,16 +27,17 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// Spawn the PipeWire playback thread. Failure (no PipeWire in the session) is
-    /// survivable — the caller streams video-only.
-    pub fn spawn() -> Result<AudioPlayer> {
+    /// Spawn the PipeWire playback thread for `channels` (2/6/8, canonical wire order
+    /// FL FR FC LFE RL RR SL SR). Failure (no PipeWire in the session) is survivable — the
+    /// caller streams video-only.
+    pub fn spawn(channels: u32) -> Result<AudioPlayer> {
         // 64 × 5 ms = 320 ms of slack between the pump and the PipeWire loop.
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) = pw_thread(pcm_rx, quit_rx) {
+                if let Err(e) = pw_thread(pcm_rx, quit_rx, channels as usize) {
                     tracing::warn!(error = %e, "audio playback thread ended");
                 }
             })
@@ -48,8 +49,8 @@ impl AudioPlayer {
         })
     }
 
-    /// Queue one interleaved-stereo f32 chunk. Drops the chunk if the PipeWire side is
-    /// wedged (the renderer conceals the gap; never block the session pump).
+    /// Queue one interleaved f32 chunk (in the session's channel layout). Drops the chunk if the
+    /// PipeWire side is wedged (the renderer conceals the gap; never block the session pump).
     pub fn push(&self, pcm: Vec<f32>) {
         if let Err(TrySendError::Disconnected(_)) = self.pcm_tx.try_send(pcm) {
             // Thread already dead — Drop will reap it; nothing to do per-chunk.
@@ -71,11 +72,14 @@ struct PlayerData {
     rx: Receiver<Vec<f32>>,
     ring: VecDeque<f32>,
     primed: bool,
+    /// Interleaved channel count this stream was opened with (2/6/8).
+    channels: usize,
 }
 
 fn pw_thread(
     pcm_rx: Receiver<Vec<f32>>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
+    channels: usize,
 ) -> Result<()> {
     use pipewire as pw;
     use pw::{properties::properties, spa};
@@ -115,6 +119,7 @@ fn pw_thread(
         rx: pcm_rx,
         ring: VecDeque::new(),
         primed: false,
+        channels,
     };
 
     let _listener = stream
@@ -130,19 +135,19 @@ fn pw_thread(
                 while let Ok(chunk) = ud.rx.try_recv() {
                     ud.ring.extend(chunk);
                 }
-                let stride = 4 * CHANNELS; // F32LE interleaved
+                let stride = 4 * ud.channels; // F32LE interleaved
                 let datas = buffer.datas_mut();
                 if datas.is_empty() {
                     return;
                 }
                 let data = &mut datas[0];
                 let want_frames = data.data().map(|s| s.len() / stride).unwrap_or(0);
-                let want = want_frames * CHANNELS;
+                let want = want_frames * ud.channels;
 
                 // Adaptive jitter buffer (same shape as the host's virtual mic): prime to
                 // ~3 quanta, cap at ~1 quantum of slack beyond that, re-prime after a
                 // genuine drain.
-                let target = (3 * want).clamp(720 * CHANNELS, 9600 * CHANNELS);
+                let target = (3 * want).clamp(720 * ud.channels, 9600 * ud.channels);
                 while ud.ring.len() > target.max(want) + want {
                     ud.ring.pop_front();
                 }
@@ -182,7 +187,13 @@ fn pw_thread(
     let mut info = AudioInfoRaw::new();
     info.set_format(AudioFormat::F32LE);
     info.set_rate(SAMPLE_RATE);
-    info.set_channels(CHANNELS as u32);
+    info.set_channels(channels as u32);
+    // Channel positions in canonical wire order (FL FR FC LFE RL RR SL SR) so PipeWire routes each
+    // slot to the matching speaker (and downmixes when the sink has fewer). Identity, no permute.
+    let order = punktfunk_core::audio::spa_positions(channels as u8);
+    let mut positions = [0u32; 64];
+    positions[..order.len()].copy_from_slice(order);
+    info.set_position(positions);
     let obj = pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: pw::spa::param::ParamType::EnumFormat.as_raw(),

@@ -25,6 +25,7 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.compositor) private var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
+    @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
@@ -252,6 +253,7 @@ struct ContentView: View {
                 setting: PunktfunkConnection.GamepadType(
                     rawValue: UInt32(clamping: gamepadType)) ?? .auto),
             bitrateKbps: UInt32(clamping: bitrateKbps),
+            audioChannels: UInt8(clamping: audioChannels),
             launchID: launchID,
             allowTofu: host.pinnedSHA256 == nil)
     }
@@ -351,6 +353,7 @@ struct ContentView: View {
             compositor: pref,
             gamepad: pad,
             bitrateKbps: bitrate,
+            audioChannels: UInt8(clamping: audioChannels),
             autoTrust: true)
     }
 }

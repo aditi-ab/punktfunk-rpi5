@@ -1,7 +1,9 @@
 //! WASAPI loopback capture of the default render endpoint (system output) — the Windows analogue
-//! of the PipeWire sink-monitor backend. Delivers interleaved f32 PCM at 48 kHz stereo, ready for
-//! the existing Opus path with NO resampling (WASAPI shared-mode autoconvert does any SRC). WASAPI
-//! objects are COM-apartment-bound and not `Send`, so they live on a dedicated thread (mirrors
+//! of the PipeWire sink-monitor backend. Delivers interleaved f32 PCM at 48 kHz in the requested
+//! channel count (stereo / 5.1 / 7.1, canonical wire order FL FR FC LFE RL RR SL SR via the
+//! explicit `dwChannelMask`), ready for the Opus path with NO resampling (WASAPI shared-mode
+//! autoconvert does any SRC + up/downmix to the requested layout). WASAPI objects are
+//! COM-apartment-bound and not `Send`, so they live on a dedicated thread (mirrors
 //! `linux::PwAudioCapturer`); only the channel + stop flag + join handle are in the struct.
 
 use super::{AudioCapturer, SAMPLE_RATE};
@@ -14,9 +16,6 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
 
-// 48 kHz stereo 32-bit float: 2 channels * 4 bytes = 8 bytes per frame.
-const BLOCK_ALIGN: usize = 2 * 4;
-
 pub struct WasapiLoopbackCapturer {
     chunks: Receiver<Vec<f32>>,
     channels: u32,
@@ -27,8 +26,8 @@ pub struct WasapiLoopbackCapturer {
 impl WasapiLoopbackCapturer {
     pub fn open(channels: u32) -> Result<WasapiLoopbackCapturer> {
         anyhow::ensure!(
-            channels == 2,
-            "WASAPI loopback backend is stereo-only (got {channels})"
+            matches!(channels, 2 | 6 | 8),
+            "WASAPI loopback backend supports 2/6/8 channels (got {channels})"
         );
         let (tx, rx) = sync_channel::<Vec<f32>>(64);
         let stop = Arc::new(AtomicBool::new(false));
@@ -39,7 +38,7 @@ impl WasapiLoopbackCapturer {
         let join = thread::Builder::new()
             .name("punktfunk-wasapi-audio".into())
             .spawn(move || {
-                if let Err(e) = capture_thread(tx, stop_t, ready_tx) {
+                if let Err(e) = capture_thread(tx, stop_t, ready_tx, channels) {
                     tracing::error!(error = format!("{e:#}"), "wasapi loopback thread failed");
                 }
             })
@@ -47,7 +46,8 @@ impl WasapiLoopbackCapturer {
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => {
                 tracing::info!(
-                    "WASAPI loopback capture: 48 kHz stereo f32 (default render endpoint)"
+                    channels,
+                    "WASAPI loopback capture: 48 kHz f32 (default render endpoint)"
                 );
                 Ok(WasapiLoopbackCapturer {
                     chunks: rx,
@@ -95,7 +95,10 @@ fn capture_thread(
     tx: SyncSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
     ready: SyncSender<Result<()>>,
+    channels: u32,
 ) -> Result<()> {
+    // Interleaved f32: channels * 4 bytes per frame.
+    let block_align = channels as usize * 4;
     // COM must be initialized on THIS thread (MTA), before any device call.
     if let Err(e) = wasapi::initialize_mta()
         .ok()
@@ -115,10 +118,20 @@ fn capture_thread(
             .get_default_device(&Direction::Render)
             .context("default render endpoint (loopback needs a render device)")?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
-        // 48 kHz stereo f32 interleaved; autoconvert lets WASAPI's shared-mode SRC match the engine
-        // mix format to ours, so we never resample in Rust. Loopback is implied by capturing a
-        // RENDER device with Direction::Capture in shared mode (wasapi sets STREAMFLAGS_LOOPBACK).
-        let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, 2, None);
+        // 48 kHz f32 interleaved in the requested channel layout; autoconvert lets WASAPI's
+        // shared-mode SRC match the engine mix format to ours (incl. up/downmix to the requested
+        // channel count), so we never resample/remix in Rust. The explicit dwChannelMask pins the
+        // wire order (FL FR FC LFE RL RR SL SR; 7.1 = 0x63F, not 0xFF). Loopback is implied by
+        // capturing a RENDER device with Direction::Capture in shared mode (STREAMFLAGS_LOOPBACK).
+        let mask = punktfunk_core::audio::wasapi_channel_mask(channels as u8);
+        let desired = WaveFormat::new(
+            32,
+            32,
+            &SampleType::Float,
+            SAMPLE_RATE as usize,
+            channels as usize,
+            Some(mask),
+        );
         let (default_period, _min_period) =
             audio_client.get_device_period().context("device period")?;
         let mode = StreamMode::EventsShared {
@@ -154,7 +167,7 @@ fn capture_thread(
                     Err(e) => return Err(anyhow!("get_next_packet_size: {e}")),
                 }
             }
-            let whole = (bytes.len() / BLOCK_ALIGN) * BLOCK_ALIGN;
+            let whole = (bytes.len() / block_align) * block_align;
             if whole == 0 {
                 continue;
             }

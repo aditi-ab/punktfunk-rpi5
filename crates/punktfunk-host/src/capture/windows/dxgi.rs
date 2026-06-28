@@ -2010,6 +2010,10 @@ pub struct DuplCapturer {
     /// first, retried (legacy DuplicateOutput can't capture HDR). Set for the secure-desktop DDA leg
     /// when the SudoVDA is in HDR; threaded into every (re)duplication incl. ACCESS_LOST recovery.
     want_hdr: bool,
+    /// Full-chroma 4:4:4 session: deliver packed RGB (`Bgra` SDR / `Rgb10a2` HDR) and SKIP the
+    /// video-engine RGB→YUV (NV12/P010) conversion — NVENC reconstructs 4:4:4 only from a full-chroma
+    /// source, so we hand it the RGB texture and it CSCs to YUV444 at encode (chroma_format_idc=3).
+    chroma_444: bool,
     /// HDR (scRGB FP16) capture state. Set when the duplication surface is `R16G16B16A16_FLOAT`
     /// (the desktop has HDR on). The frame can't be `CopyResource`d into a BGRA target, so the HDR
     /// path copies it into an FP16 SRV texture, composites the cursor, then runs [`HdrConverter`] to
@@ -2087,6 +2091,8 @@ impl DuplCapturer {
         // stage 5) so the capturer never re-derives the encode backend itself.
         gpu: bool,
         want_hdr: bool,
+        // 4:4:4 session → deliver RGB, skip the NV12/P010 video-engine conversion (see the field doc).
+        chroma_444: bool,
     ) -> Result<Self> {
         // SAFETY: runs on the capture thread that will own this `DuplCapturer`. `install_gpu_pref_hook()`
         // and the DPI-context calls take by-value handles / no args and touch only thread/process state;
@@ -2311,6 +2317,7 @@ impl DuplCapturer {
                 gpu_copy: None,
                 last_present: None,
                 want_hdr,
+                chroma_444,
                 hdr_fp16: is_hdr_init,
                 hdr_meta: hdr_meta_init,
                 fp16_src: None,
@@ -3088,7 +3095,10 @@ impl DuplCapturer {
                                                     // Video-engine path: scRGB FP16 → BT.2020 PQ P010 on the VIDEO engine (no 3D shader, and
                                                     // NVENC encodes P010 natively). Fall back to the HdrConverter pixel shader (3D) only if the
                                                     // video processor is unavailable.
-            if let Some(p010) = self.convert_to_yuv(&src, true) {
+            if let Some(p010) = (!self.chroma_444)
+                .then(|| self.convert_to_yuv(&src, true))
+                .flatten()
+            {
                 self.last_present = Some((p010.clone(), PixelFormat::P010));
                 return Ok(CapturedFrame {
                     width: self.width,
@@ -3148,7 +3158,10 @@ impl DuplCapturer {
             // conversion AND NVENC's encode stay OFF the 3D engine — the only way to keep up when a
             // game pins the 3D engine at ~100%. Fall back to handing NVENC the BGRA texture (it then
             // does RGB→YUV internally on the 3D/compute engine).
-            if let Some(nv12) = self.convert_to_yuv(&gpu, false) {
+            if let Some(nv12) = (!self.chroma_444)
+                .then(|| self.convert_to_yuv(&gpu, false))
+                .flatten()
+            {
                 self.last_present = Some((nv12.clone(), PixelFormat::Nv12));
                 return Ok(CapturedFrame {
                     width: self.width,

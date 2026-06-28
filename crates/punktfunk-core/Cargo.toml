@@ -19,7 +19,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 default = []
 # Control-plane QUIC (pairing, config, reverse audio). tokio is permitted ONLY here,
 # never on the per-frame hot path. Off by default so the core stays runtime-free.
-quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:sha2", "dep:hmac", "dep:spake2"]
+quic = ["dep:quinn", "dep:tokio", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:sha2", "dep:hmac", "dep:spake2", "dep:opus"]
 
 [dependencies]
 reed-solomon-simd = "3.1"      # GF(2^16) Leopard-RS, SIMD, O(n log n) — the wall-breaker (P2)
@@ -51,6 +51,12 @@ sha2 = { version = "0.10", optional = true }
 hmac = { version = "0.12", optional = true }
 spake2 = { version = "0.4", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "sync", "macros"] }
+# In-core Opus (multistream) DECODE for the C-ABI `punktfunk_connection_next_audio_pcm` path —
+# used by embedders without a multistream-capable Opus decoder (Apple's AudioToolbox is
+# stereo-only). The Rust clients link `opus` themselves and decode the raw `next_audio` frames,
+# so this only matters when the connection API (quic) is built. Same libopus the host vendors;
+# cargo unifies the build. Multistream API: `opus::MSDecoder` (lib.rs:1187).
+opus = { version = "0.3", optional = true }
 
 # `libc` for batched UDP syscalls: `sendmmsg`/`recvmmsg` on Linux (the 1 Gbps+ lever) and the
 # `recv(MSG_DONTWAIT)` drain on the other unix (Apple/BSD) targets, which have no `recvmmsg`

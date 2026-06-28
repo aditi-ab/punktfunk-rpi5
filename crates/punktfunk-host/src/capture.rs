@@ -62,6 +62,11 @@ pub struct OutputFormat {
     /// HDR: the capturer converts to 10-bit (IDD-push FP16 → `Rgb10a2`; the DDA secure-desktop HDR hint).
     /// `false` = 8-bit SDR.
     pub hdr: bool,
+    /// Full-chroma 4:4:4 session: the capturer must keep full chroma — deliver packed **RGB**
+    /// (`Bgra` / `Rgb10a2`), NOT the subsampled `Nv12`/`P010` the Windows video-engine path produces by
+    /// default — because 4:4:4 can only be recovered from a full-chroma source. NVENC then does the
+    /// RGB→YUV444 CSC at encode (chroma_format_idc=3). `false` on every 4:2:0 session.
+    pub chroma_444: bool,
 }
 
 impl OutputFormat {
@@ -73,6 +78,8 @@ impl OutputFormat {
         OutputFormat {
             gpu: gpu_encode(),
             hdr,
+            // The GameStream + spike paths are always 4:2:0 (4:4:4 is punktfunk/1-native only).
+            chroma_444: false,
         }
     }
 }
@@ -361,13 +368,16 @@ pub fn open_portal_monitor() -> Result<Box<dyn Capturer>> {
 #[cfg(target_os = "linux")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
-    _want: OutputFormat,
+    want: OutputFormat,
     _capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
-    // The Linux host stays 8-bit (HDR is blocked upstream) and the portal negotiates its own format, so
-    // the `OutputFormat` is unused here; the capture backend is always the portal (the `CaptureBackend`
-    // arg is a Windows-only dispatch — ignored here).
-    linux::PortalCapturer::from_virtual_output(vout).map(|c| Box::new(c) as Box<dyn Capturer>)
+    // The Linux host stays 8-bit (HDR is blocked upstream) and the portal negotiates its own pixel
+    // format, so only `want.gpu` is honored here: it gates GPU zero-copy capture (the capture backend
+    // is always the portal — the `CaptureBackend` arg is a Windows-only dispatch). `gpu = false`
+    // (a 4:4:4 NVENC session) forces the CPU mmap path so the encoder gets CPU-resident RGB to swscale
+    // into YUV444P — otherwise it would receive CUDA frames and bail.
+    linux::PortalCapturer::from_virtual_output(vout, want.gpu)
+        .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
 /// `PUNKTFUNK_NO_WGC=1` forces the pure single-process DDA (Desktop Duplication) path everywhere: it
@@ -394,6 +404,14 @@ pub fn capture_virtual_output(
     })?;
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
+    // Full-chroma 4:4:4 needs a full-chroma RGB source. The IDD-push and WGC paths emit subsampled
+    // NV12/P010 by default, which can't reconstruct 4:4:4; route a 4:4:4 session to DDA, which delivers
+    // RGB (Bgra) when its `chroma_444` flag is set. (IDD-push/WGC 4:4:4 capture is a follow-up.)
+    if want.chroma_444 && capture != CaptureBackend::Dda {
+        tracing::info!("4:4:4 session — using DDA capture (RGB source) instead of {capture:?}");
+        return dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false, want.chroma_444)
+            .map(|c| Box::new(c) as Box<dyn Capturer>);
+    }
     // P2 direct frame push (kill DDA): consume frames straight from the pf-vdisplay driver's shared
     // ring — no Desktop Duplication, no win32u reparenting hook. Resolved once in the `SessionPlan`
     // (was re-derived from `config().idd_push` here); `IddPush` takes the keepalive (owns the virtual
@@ -414,8 +432,15 @@ pub fn capture_virtual_output(
                     error = %format!("{e:#}"),
                     "IDD-push open/attach failed — falling back to DDA"
                 );
-                return dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false)
-                    .map(|c| Box::new(c) as Box<dyn Capturer>);
+                return dxgi::DuplCapturer::open(
+                    target,
+                    pref,
+                    keep,
+                    want.gpu,
+                    false,
+                    want.chroma_444,
+                )
+                .map(|c| Box::new(c) as Box<dyn Capturer>);
             }
         }
     }
@@ -426,7 +451,7 @@ pub fn capture_virtual_output(
     // chosen backend (it owns the SudoVDA keepalive), so there's no open-time auto-fallback. The
     // backend choice (`dda`/`dxgi`/`PUNKTFUNK_NO_WGC` → DDA, else WGC) is now resolved once in the plan.
     if capture == CaptureBackend::Dda {
-        return dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false)
+        return dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false, want.chroma_444)
             .map(|c| Box::new(c) as Box<dyn Capturer>);
     }
     // WGC default, with a watchdog'd DDA fallback. WGC's Direct3D11CaptureFramePool::CreateFreeThreaded
@@ -461,12 +486,12 @@ pub fn capture_virtual_output(
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %format!("{e:#}"), "WGC open failed — falling back to DDA");
-            dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false)
+            dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false, want.chroma_444)
                 .map(|c| Box::new(c) as Box<dyn Capturer>)
         }
         Err(_) => {
             tracing::warn!("WGC open timed out (CreateFreeThreaded hang on the virtual display) — falling back to DDA");
-            dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false)
+            dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false, want.chroma_444)
                 .map(|c| Box::new(c) as Box<dyn Capturer>)
         }
     }

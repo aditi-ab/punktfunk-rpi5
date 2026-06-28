@@ -11,7 +11,7 @@
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use super::{Codec, EncodedFrame, Encoder};
+use super::{ChromaFormat, Codec, EncodedFrame, Encoder};
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg::format::Pixel;
@@ -19,8 +19,32 @@ use ffmpeg::util::frame::Video as VideoFrame;
 use ffmpeg::{codec, encoder, Dictionary, Packet, Rational};
 use ffmpeg_next as ffmpeg;
 use std::os::raw::c_int;
+use std::ptr;
 
 use ffmpeg::ffi; // = ffmpeg_sys_next
+
+/// swscale: nearest-neighbour scaler flag (`SWS_POINT`). We never rescale (src dims == dst dims), so
+/// the resampler choice only governs the colour-conversion path; POINT is the cheapest.
+const SWS_POINT: c_int = 0x10;
+/// swscale colorspace id for ITU-R BT.709 (`SWS_CS_ITU709`) — the CSC coefficients for our RGB→YUV.
+const SWS_CS_ITU709: c_int = 1;
+
+/// The swscale *source* pixel format for a captured packed RGB/BGR layout (the real byte order, not
+/// the NVENC-padded `*0` form). Used by the 4:4:4 RGB→YUV444P conversion path. Mirrors the VAAPI
+/// CPU-input mapping; YUV/10-bit inputs can't feed this path (the 4:4:4 session forces packed RGB).
+fn sws_src_pixel(format: PixelFormat) -> Result<Pixel> {
+    Ok(match format {
+        PixelFormat::Bgrx => Pixel::BGRZ, // bgr0
+        PixelFormat::Rgbx => Pixel::RGBZ, // rgb0
+        PixelFormat::Bgra => Pixel::BGRA,
+        PixelFormat::Rgba => Pixel::RGBA,
+        PixelFormat::Rgb => Pixel::RGB24,
+        PixelFormat::Bgr => Pixel::BGR24,
+        PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Rgb10a2 => {
+            bail!("NVENC 4:4:4 CPU-input path supports packed RGB/BGR only; got {format:?}")
+        }
+    })
+}
 
 /// `AVCUDADeviceContext` (libavutil/hwcontext_cuda.h) — not in the ffmpeg-sys bindings (the
 /// crate doesn't allowlist that header), so mirror its stable 3-pointer layout. We set the
@@ -131,6 +155,10 @@ pub struct NvencEncoder {
     frame: Option<VideoFrame>,
     /// Zero-copy path: CUDA hwdevice/hwframes contexts (the encoder takes `AV_PIX_FMT_CUDA`).
     cuda: Option<CudaHw>,
+    /// 4:4:4 path only: swscale context converting the captured packed RGB/BGR → planar YUV444P
+    /// (BT.709 limited) into [`Self::frame`], because `hevc_nvenc` only emits 4:4:4 from a YUV444
+    /// *input* (RGB-in is always 4:2:0). `None` on the ordinary 4:2:0 RGB path. Freed in `Drop`.
+    sws_444: Option<*mut ffi::SwsContext>,
     src_format: PixelFormat,
     expand: bool,
     width: u32,
@@ -142,10 +170,12 @@ pub struct NvencEncoder {
     force_kf: bool,
 }
 
-// `CudaHw` holds raw `AVBufferRef`s; the encoder lives on a single thread. The CPU encoder is
-// already `Send` via ffmpeg-next; assert it for the CUDA fields too.
+// `CudaHw` holds raw `AVBufferRef`s and `sws_444` a raw `SwsContext`; the encoder lives on a single
+// thread. The CPU encoder is already `Send` via ffmpeg-next; assert it for the raw fields too.
 // SAFETY: `NvencEncoder` owns an ffmpeg-next `Encoder`/`VideoFrame` (already `Send`) plus a `CudaHw`
-// holding raw `AVBufferRef`s, which are not `Send` by default. The encoder is owned and driven by
+// holding raw `AVBufferRef`s and an optional raw `SwsContext`, none of which are `Send` by default.
+// The `SwsContext` is a self-contained swscale state object with no thread affinity, touched only
+// through `&mut self` on the one encode thread. The encoder is owned and driven by
 // exactly ONE thread — the per-session encode thread it is moved to — and is only touched through
 // `&mut self` methods, so it is never aliased or accessed concurrently. The wrapped libav contexts
 // (and the shared `CUcontext` the `CudaHw` references) have no thread affinity, so transferring
@@ -164,6 +194,7 @@ impl NvencEncoder {
         bitrate_bps: u64,
         cuda: bool,
         bit_depth: u8,
+        chroma: ChromaFormat,
     ) -> Result<Self> {
         // TODO(hdr): Linux 10-bit parity. Unlike the Windows raw-SDK path (which upconverts 8-bit
         // ARGB → Main10 via pixelBitDepthMinus8), libavcodec hevc_nvenc needs a 10-bit input pixel
@@ -173,6 +204,18 @@ impl NvencEncoder {
             tracing::warn!(
                 bit_depth,
                 "Linux NVENC 10-bit not yet wired — encoding 8-bit"
+            );
+        }
+        // Full-chroma 4:4:4 (HEVC Range Extensions). `hevc_nvenc` only emits 4:4:4 from a YUV444
+        // *input* frame — feeding RGB always subsamples to 4:2:0 regardless of profile (verified on
+        // the RTX 5070 Ti). So a 4:4:4 session swscales the captured RGB → YUV444P (BT.709 limited)
+        // and feeds that with `profile=rext`. The negotiator gates this to HEVC + the single-process
+        // CPU-capture topology, so `cuda` must be false here; defend the contract.
+        let want_444 = chroma.is_444() && codec == Codec::H265;
+        if want_444 && cuda {
+            bail!(
+                "NVENC 4:4:4 needs CPU RGB frames (the session forces non-zero-copy capture for \
+                 4:4:4); got a CUDA frame — capture/encoder negotiation mismatch"
             );
         }
         ffmpeg::init().context("ffmpeg init")?;
@@ -185,7 +228,14 @@ impl NvencEncoder {
         let name = codec.nvenc_name();
         let av_codec = encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("{name} not built into libavcodec"))?;
-        let (nvenc_pixel, expand) = nvenc_input(format);
+        let (rgb_pixel, rgb_expand) = nvenc_input(format);
+        // 4:4:4 feeds NVENC a planar YUV444P frame we produce by swscale; the ordinary path feeds the
+        // captured RGB straight in and lets NVENC's internal CSC subsample to 4:2:0.
+        let (nvenc_pixel, expand) = if want_444 {
+            (Pixel::YUV444P, false)
+        } else {
+            (rgb_pixel, rgb_expand)
+        };
 
         let mut video = codec::context::Context::new_with_codec(av_codec)
             .encoder()
@@ -234,12 +284,12 @@ impl NvencEncoder {
             (*video.as_mut_ptr()).gop_size = -1;
         }
 
-        // NV12 path: we did the RGB→YUV conversion ourselves as BT.709 *limited* range, so signal
-        // that in the bitstream VUI (colorspace/range/primaries/transfer) — otherwise the client
-        // decoder assumes a default and the picture comes out washed-out / wrong-contrast. The
-        // RGB-input paths leave these unset (NVENC's internal CSC writes its own VUI). Matches the
-        // Windows NV12 path's BT.709 limited-range signalling.
-        if matches!(format, PixelFormat::Nv12) {
+        // NV12 / 4:4:4 paths: we do the RGB→YUV conversion ourselves as BT.709 *limited* range
+        // (swscale), so signal that in the bitstream VUI (colorspace/range/primaries/transfer) —
+        // otherwise the client decoder assumes a default and the picture comes out washed-out /
+        // wrong-contrast. The RGB-input 4:2:0 path leaves these unset (NVENC's internal CSC writes
+        // its own VUI). Matches the Windows NV12 path's BT.709 limited-range signalling.
+        if matches!(format, PixelFormat::Nv12) || want_444 {
             // SAFETY: same `video` builder — `raw = video.as_mut_ptr()` is the non-null, properly-
             // aligned, sole-owned, not-yet-opened `AVCodecContext`. We set its four VUI colour enum
             // fields to valid `AVColorSpace`/`AVColorRange`/`AVColorPrimaries`/`AVColorTransfer-
@@ -280,6 +330,45 @@ impl NvencEncoder {
             None
         };
 
+        // 4:4:4: build the RGB→YUV444P swscale (BT.709 limited, no rescale). Mirrors the VAAPI CPU
+        // path's RGB→NV12 scaler, but the dst is full-chroma planar 4:4:4.
+        let sws_444 = if want_444 {
+            let src_av = pixel_to_av(sws_src_pixel(format)?);
+            // SAFETY: `sws_getContext` allocates a swscale context for the given src/dst dims + pixel
+            // formats. Both dims are the encoder's positive `width`/`height` as `c_int`; `src_av` is a
+            // valid `AVPixelFormat` (from the `sws_src_pixel`-validated, packed-RGB-only source), the
+            // dst is YUV444P. The trailing filter/param pointers are null = "use defaults" (documented
+            // as accepted). No Rust memory is borrowed; the returned pointer is null-checked below.
+            let sws = unsafe {
+                ffi::sws_getContext(
+                    width as c_int,
+                    height as c_int,
+                    src_av,
+                    width as c_int,
+                    height as c_int,
+                    ffi::AVPixelFormat::AV_PIX_FMT_YUV444P,
+                    SWS_POINT,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                )
+            };
+            if sws.is_null() {
+                bail!("sws_getContext(RGB→YUV444P) failed");
+            }
+            // SAFETY: `sws` is the non-null context from the call above (null-checked). The ITU-709
+            // coefficient table from `sws_getCoefficients` is a process-lifetime libswscale static,
+            // reused for src+dst matrices; `sws_setColorspaceDetails` only reads it and writes scalar
+            // CSC settings into `sws` (limited-range dst: dstRange = 0). No Rust memory is passed.
+            unsafe {
+                let cs709 = ffi::sws_getCoefficients(SWS_CS_ITU709);
+                ffi::sws_setColorspaceDetails(sws, cs709, 1, cs709, 0, 0, 1 << 16, 1 << 16);
+            }
+            Some(sws)
+        } else {
+            None
+        };
+
         // Low-latency NVENC tuning (plan §7 / linux-setup doc).
         let mut opts = Dictionary::new();
         opts.set("preset", "p1"); // fastest
@@ -288,6 +377,12 @@ impl NvencEncoder {
         opts.set("bf", "0");
         opts.set("delay", "0");
         opts.set("forced-idr", "1"); // RFI/request_keyframe → real IDR under the infinite GOP
+        if want_444 {
+            // HEVC Range Extensions — the profile that carries chroma_format_idc=3. With a YUV444P
+            // input `hevc_nvenc` auto-selects it, but pin it explicitly so the chroma is never silently
+            // dropped on a future libavcodec.
+            opts.set("profile", "rext");
+        }
 
         // Split-frame encode across both NVENC engines (GB203 has 2) when the pixel rate exceeds
         // a single engine's HEVC capacity (~1 Gpix/s); e.g. 5120x1440@240 = 1.77 Gpix/s needs it,
@@ -321,6 +416,7 @@ impl NvencEncoder {
             enc,
             frame,
             cuda: cuda_hw,
+            sws_444,
             src_format: format,
             expand,
             width,
@@ -333,6 +429,15 @@ impl NvencEncoder {
 }
 
 impl Encoder for NvencEncoder {
+    fn caps(&self) -> super::EncoderCaps {
+        super::EncoderCaps {
+            // 4:4:4 iff this session opened the RGB→YUV444P swscale path (FREXT). RFI/HDR-SEI stay
+            // unsupported on libavcodec NVENC (the trait defaults).
+            chroma_444: self.sws_444.is_some(),
+            ..super::EncoderCaps::default()
+        }
+    }
+
     fn submit(&mut self, captured: &CapturedFrame) -> Result<()> {
         anyhow::ensure!(
             captured.width == self.width && captured.height == self.height,
@@ -411,6 +516,47 @@ impl NvencEncoder {
             bytes.len(),
             src_row * h
         );
+        // 4:4:4: swscale the packed RGB straight into the planar YUV444P input frame (BT.709 limited),
+        // then send it — no byte-expand. The 4:2:0 RGB path (below) feeds NVENC packed RGB directly.
+        if let Some(sws) = self.sws_444 {
+            let frame = self
+                .frame
+                .as_mut()
+                .context("CPU frame missing (encoder opened in CUDA mode)")?;
+            // SAFETY: `format == self.src_format` and `bytes.len() >= src_row * h` (the `ensure!`s
+            // above), so `sws_scale` reads `h` rows of `src_row` bytes from `src_data[0] = bytes`
+            // (packed RGB is single-plane; the other src planes are null/0) — all in bounds. `sws` is
+            // the non-null context built in `open`. The dst is `frame`'s underlying `AVFrame`: its
+            // `data`/`linesize` in-struct arrays were sized for YUV444P by `VideoFrame::new`, and the
+            // 3 planes are each `width`×`height`. All pointers are live locals for this synchronous
+            // call; the encoder runs only on this thread (`unsafe impl Send`), so no aliasing/race.
+            unsafe {
+                let dst_av = frame.as_mut_ptr();
+                let src_data: [*const u8; 4] =
+                    [bytes.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
+                let src_stride: [c_int; 4] = [src_row as c_int, 0, 0, 0];
+                let r = ffi::sws_scale(
+                    sws,
+                    src_data.as_ptr(),
+                    src_stride.as_ptr(),
+                    0,
+                    h as c_int,
+                    (*dst_av).data.as_ptr(),
+                    (*dst_av).linesize.as_ptr(),
+                );
+                if r < 0 {
+                    bail!("sws_scale(RGB→YUV444P) failed ({r})");
+                }
+            }
+            frame.set_pts(Some(pts));
+            frame.set_kind(if idr {
+                ffmpeg::picture::Type::I
+            } else {
+                ffmpeg::picture::Type::None
+            });
+            self.enc.send_frame(frame).context("send_frame(444)")?;
+            return Ok(());
+        }
         let frame = self
             .frame
             .as_mut()
@@ -525,4 +671,52 @@ impl NvencEncoder {
         }
         Ok(())
     }
+}
+
+impl Drop for NvencEncoder {
+    fn drop(&mut self) {
+        if let Some(sws) = self.sws_444.take() {
+            // SAFETY: `sws` is the non-null `SwsContext` allocated by `sws_getContext` in `open` and
+            // owned exclusively by this encoder (taken out of the field so it can't be freed twice).
+            // `sws_freeContext` frees it; nothing else references it after this single-threaded drop.
+            unsafe { ffi::sws_freeContext(sws) };
+        }
+    }
+}
+
+/// Probe whether this NVIDIA GPU + driver + libavcodec can actually encode HEVC **4:4:4** (Range
+/// Extensions). Opens a tiny real `hevc_nvenc` 4:4:4 session — the exact path [`NvencEncoder::open`]
+/// takes for a live 4:4:4 stream — and reports whether it succeeded. HEVC-only; the result is cached
+/// by the caller ([`crate::encode::can_encode_444`]). A GPU/driver/ffmpeg without RExt 4:4:4 fails
+/// the open here, so the host resolves the session to 4:2:0 before the Welcome (honest downgrade).
+pub fn probe_can_encode_444(codec: Codec) -> bool {
+    if codec != Codec::H265 {
+        return false;
+    }
+    if ffmpeg::init().is_err() {
+        return false;
+    }
+    // Quiet ffmpeg's open error on a GPU that lacks 4:4:4 — the probe failing is an expected outcome.
+    // SAFETY: libav initialized above; `av_log_{get,set}_level` only read/write the global int level
+    // (no pointer args) and are always sound post-init.
+    let prev = unsafe {
+        let p = ffi::av_log_get_level();
+        ffi::av_log_set_level(ffi::AV_LOG_FATAL);
+        p
+    };
+    let ok = NvencEncoder::open(
+        codec,
+        PixelFormat::Bgra,
+        640,
+        480,
+        30,
+        2_000_000,
+        false, // CPU input (the 4:4:4 path never uses CUDA)
+        8,
+        ChromaFormat::Yuv444,
+    )
+    .is_ok();
+    // SAFETY: restore the saved global log level (scalar arg, no pointers).
+    unsafe { ffi::av_log_set_level(prev) };
+    ok
 }

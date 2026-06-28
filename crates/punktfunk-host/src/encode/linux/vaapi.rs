@@ -160,6 +160,18 @@ pub fn probe_can_encode(codec: Codec) -> bool {
     }
 }
 
+/// Whether the active VAAPI GPU can encode HEVC **4:4:4** (Range Extensions). **Deferred in v1 —
+/// always `false`.** VAAPI HEVC 4:4:4 encode is narrow and vendor-specific (the lab's AMD Phoenix1 /
+/// RDNA3 exposes only `VAProfileHEVCMain`/`Main10` `EncSlice`, no `Main444`), and there is no
+/// validated hardware to build + verify the 4:4:4 surface/profile path against. Returning `false`
+/// keeps the negotiation honest: a VAAPI host resolves every session to 4:2:0 before the Welcome, so
+/// the client never builds a 4:4:4 decoder it would only get 4:2:0 frames for. (Follow-up: implement
+/// + validate on an Intel Arc / RDNA4-class box that advertises a HEVC 4:4:4 encode entrypoint.)
+pub fn probe_can_encode_444(_codec: Codec) -> bool {
+    tracing::info!("VAAPI HEVC 4:4:4 encode is not implemented yet — declining (encoding 4:2:0)");
+    false
+}
+
 /// Drain the encoder for one packet (shared poll logic).
 fn poll_encoder(enc: &mut encoder::video::Encoder, fps: u32) -> Result<Option<EncodedFrame>> {
     let mut pkt = Packet::empty();
@@ -848,6 +860,7 @@ pub struct VaapiEncoder {
 unsafe impl Send for VaapiEncoder {}
 
 impl VaapiEncoder {
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
         format: PixelFormat,
@@ -856,9 +869,17 @@ impl VaapiEncoder {
         fps: u32,
         bitrate_bps: u64,
         bit_depth: u8,
+        chroma: super::ChromaFormat,
     ) -> Result<Self> {
         if bit_depth != 8 {
             tracing::warn!(bit_depth, "VAAPI 10-bit not yet wired — encoding 8-bit");
+        }
+        // VAAPI 4:4:4 is deferred (see `probe_can_encode_444`): no validated AMD/Intel hardware in the
+        // lab exposes a HEVC 4:4:4 encode entrypoint, and the probe returns false so the host never
+        // negotiates 4:4:4 for a VAAPI session. If a request slips through, fall back to 4:2:0 rather
+        // than emit an unverified stream — the host signalled 4:2:0 in the Welcome anyway.
+        if chroma.is_444() {
+            tracing::warn!("VAAPI 4:4:4 encode not implemented — encoding 4:2:0");
         }
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {

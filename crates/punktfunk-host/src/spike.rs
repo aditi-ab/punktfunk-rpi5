@@ -109,7 +109,8 @@ pub fn run(opts: Options) -> Result<()> {
         opts.fps,
         opts.bitrate_bps,
         first.is_cuda(),
-        8, // spike synthetic harness: 8-bit
+        8,                            // spike synthetic harness: 8-bit
+        encode::ChromaFormat::Yuv420, // ...and 4:2:0
     )
     .context("open encoder")?;
 

@@ -140,6 +140,16 @@ pub fn show(
     input.add(&inhibit_row);
 
     let audio = adw::PreferencesGroup::builder().title("Audio").build();
+    let surround_row = adw::ComboRow::builder()
+        .title("Audio channels")
+        .subtitle("Request stereo or surround (the host downmixes if its output has fewer)")
+        .model(&gtk::StringList::new(&[
+            "Stereo",
+            "5.1 Surround",
+            "7.1 Surround",
+        ]))
+        .build();
+    audio.add(&surround_row);
     let mic_row = adw::SwitchRow::builder()
         .title("Stream microphone")
         .subtitle("Send the default input device to the host's virtual microphone")
@@ -170,6 +180,11 @@ pub fn show(
         compositor_row.set_selected(comp_i as u32);
         inhibit_row.set_active(s.inhibit_shortcuts);
         mic_row.set_active(s.mic_enabled);
+        surround_row.set_selected(match s.audio_channels {
+            6 => 1,
+            8 => 2,
+            _ => 0,
+        });
     }
 
     let dialog = adw::PreferencesDialog::new();
@@ -186,6 +201,11 @@ pub fn show(
             .to_string();
         s.inhibit_shortcuts = inhibit_row.is_active();
         s.mic_enabled = mic_row.is_active();
+        s.audio_channels = match surround_row.selected() {
+            1 => 6,
+            2 => 8,
+            _ => 2,
+        };
         s.save();
     });
     dialog.present(Some(parent));

@@ -16,6 +16,9 @@ data class Settings(
     val bitrateKbps: Int = 0,
     val compositor: Int = 0,
     val gamepad: Int = 0,
+    /** Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
+     * can capture; the resolved count drives the decoder + AAudio layout. */
+    val audioChannels: Int = 2,
     val micEnabled: Boolean = false,
     /** Show the live stats overlay (FPS / throughput / latency) during a stream. */
     val statsHudEnabled: Boolean = true,
@@ -39,6 +42,7 @@ class SettingsStore(context: Context) {
         bitrateKbps = prefs.getInt(K_BITRATE, 0),
         compositor = prefs.getInt(K_COMPOSITOR, 0),
         gamepad = prefs.getInt(K_GAMEPAD, 0),
+        audioChannels = prefs.getInt(K_AUDIO_CH, 2),
         micEnabled = prefs.getBoolean(K_MIC, false),
         statsHudEnabled = prefs.getBoolean(K_HUD, true),
         trackpadMode = prefs.getBoolean(K_TRACKPAD, true),
@@ -52,6 +56,7 @@ class SettingsStore(context: Context) {
             .putInt(K_BITRATE, s.bitrateKbps)
             .putInt(K_COMPOSITOR, s.compositor)
             .putInt(K_GAMEPAD, s.gamepad)
+            .putInt(K_AUDIO_CH, s.audioChannels)
             .putBoolean(K_MIC, s.micEnabled)
             .putBoolean(K_HUD, s.statsHudEnabled)
             .putBoolean(K_TRACKPAD, s.trackpadMode)
@@ -65,6 +70,7 @@ class SettingsStore(context: Context) {
         const val K_BITRATE = "bitrate_kbps"
         const val K_COMPOSITOR = "compositor"
         const val K_GAMEPAD = "gamepad"
+        const val K_AUDIO_CH = "audio_channels"
         const val K_MIC = "mic_enabled"
         const val K_HUD = "stats_hud_enabled"
         const val K_TRACKPAD = "trackpad_mode"
@@ -131,6 +137,13 @@ val REFRESH_OPTIONS = listOf(
     144 to "144 Hz",
     165 to "165 Hz",
     240 to "240 Hz",
+)
+
+/** (channel count, label). 2 = stereo (default), 6 = 5.1, 8 = 7.1. */
+val AUDIO_CHANNEL_OPTIONS = listOf(
+    2 to "Stereo",
+    6 to "5.1 Surround",
+    8 to "7.1 Surround",
 )
 
 /** (kbps, label). `0` = host default. */

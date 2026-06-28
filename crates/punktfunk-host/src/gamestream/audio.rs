@@ -41,8 +41,6 @@ type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 /// `RTP_PAYLOAD_TYPE_FEC  127`).
 const AUDIO_PACKET_TYPE: u8 = 97;
 const AUDIO_FEC_PACKET_TYPE: u8 = 127;
-/// Stereo Opus bitrate (unchanged from the live-validated stereo path).
-const OPUS_BITRATE: i32 = 128_000;
 
 /// Audio FEC geometry (moonlight-common-c `RtpAudioQueue.h`: `RTPA_DATA_SHARDS 4`,
 /// `RTPA_FEC_SHARDS 2`). Blocks are aligned: the client synthesizes the block base as
@@ -82,67 +80,20 @@ impl Default for AudioParams {
     }
 }
 
-/// One Opus (multi)stream layout. Channel order is the GameStream/Moonlight order
-/// FL FR FC LFE RL RR [SL SR]; `mapping` is the libopus multistream mapping we *encode*
-/// with — identical to Sunshine's `audio.cpp stream_configs` (verified verbatim 2026-06-10):
-/// identity mapping, so normal quality couples (FL,FR) and (FC,LFE) [+ (RL,RR) on 7.1] with
-/// the remaining channels as mono streams; high quality is one mono stream per channel.
-/// Bitrates are Sunshine's per-config values (stereo keeps punktfunk's existing 128 kbps).
-pub struct OpusLayout {
-    pub channels: u8,
-    pub streams: u8,
-    pub coupled: u8,
-    pub mapping: &'static [u8],
-    pub bitrate: i32,
-}
-
-pub const LAYOUT_STEREO: OpusLayout = OpusLayout {
-    channels: 2,
-    streams: 1,
-    coupled: 1,
-    mapping: &[0, 1],
-    bitrate: OPUS_BITRATE,
-};
-pub const LAYOUT_51: OpusLayout = OpusLayout {
-    channels: 6,
-    streams: 4,
-    coupled: 2,
-    mapping: &[0, 1, 2, 3, 4, 5],
-    bitrate: 256_000,
-};
-pub const LAYOUT_51_HQ: OpusLayout = OpusLayout {
-    channels: 6,
-    streams: 6,
-    coupled: 0,
-    mapping: &[0, 1, 2, 3, 4, 5],
-    bitrate: 1_536_000,
-};
-pub const LAYOUT_71: OpusLayout = OpusLayout {
-    channels: 8,
-    streams: 5,
-    coupled: 3,
-    mapping: &[0, 1, 2, 3, 4, 5, 6, 7],
-    bitrate: 450_000,
-};
-pub const LAYOUT_71_HQ: OpusLayout = OpusLayout {
-    channels: 8,
-    streams: 8,
-    coupled: 0,
-    mapping: &[0, 1, 2, 3, 4, 5, 6, 7],
-    bitrate: 2_048_000,
+// The Opus surround layout table (channel order FL FR FC LFE RL RR [SL SR], identity mapping,
+// Sunshine's per-config bitrates) now lives in `punktfunk_core::audio`, shared with the native
+// `punktfunk/1` path and every client decoder. Re-export the pieces the GameStream module + its
+// RTSP SDP (`rtsp.rs`) reference; the GFE-specific `surround_params` SDP rotation stays below.
+pub use punktfunk_core::audio::{
+    OpusLayout, LAYOUT_51, LAYOUT_51_HQ, LAYOUT_71, LAYOUT_71_HQ, LAYOUT_STEREO,
 };
 
-/// Pick the encoder layout for the negotiated session parameters. Unknown channel counts
-/// fall back to stereo (the client can only request 2/6/8 — `AUDIO_CONFIGURATION_*` in
+/// Pick the encoder layout for the negotiated session parameters. Thin wrapper over the shared
+/// [`punktfunk_core::audio::layout_for`] keyed on this module's [`AudioParams`] (unknown channel
+/// counts fall back to stereo; the client can only request 2/6/8 — `AUDIO_CONFIGURATION_*` in
 /// Limelight.h).
 pub fn layout_for(params: &AudioParams) -> &'static OpusLayout {
-    match (params.channels, params.high_quality) {
-        (6, false) => &LAYOUT_51,
-        (6, true) => &LAYOUT_51_HQ,
-        (8, false) => &LAYOUT_71,
-        (8, true) => &LAYOUT_71_HQ,
-        _ => &LAYOUT_STEREO,
-    }
+    punktfunk_core::audio::layout_for(params.channels, params.high_quality)
 }
 
 /// The `a=fmtp:97 surround-params=` digit string for a layout: channelCount, streams,
@@ -345,21 +296,21 @@ fn run(
 }
 
 /// Opus encoder for one session: the plain stereo encoder (the live-validated path, byte
-/// identical) or a libopus multistream encoder for 5.1/7.1.
+/// identical) or the safe `opus::MSEncoder` multistream encoder for 5.1/7.1. Both are
+/// cross-platform (Linux + Windows) — surround no longer needs `audiopus_sys`.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 enum SessionEncoder {
     Stereo(opus::Encoder),
-    // Surround needs the libopus *multistream* encoder via `audiopus_sys` (Linux-only dep).
-    #[cfg(target_os = "linux")]
-    Surround(MsEncoder),
+    Surround(opus::MSEncoder),
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl SessionEncoder {
     fn new(layout: &'static OpusLayout) -> Result<SessionEncoder> {
+        // RESTRICTED_LOWDELAY (`opus::Application::LowDelay`) + hard CBR, matching Sunshine — CBR
+        // keeps the Opus packet size constant, which the GameStream audio FEC (equal-length shards)
+        // relies on, and the client asserts a constant per-stream TOC.
         if layout.channels == 2 {
-            // RESTRICTED_LOWDELAY + CBR, matching Sunshine — CBR keeps the Opus TOC byte
-            // constant, which the client asserts per stream.
             let mut enc = opus::Encoder::new(
                 SAMPLE_RATE,
                 opus::Channels::Stereo,
@@ -370,135 +321,29 @@ impl SessionEncoder {
             enc.set_vbr(false).ok();
             Ok(SessionEncoder::Stereo(enc))
         } else {
-            #[cfg(target_os = "linux")]
-            {
-                Ok(SessionEncoder::Surround(MsEncoder::new(layout)?))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                anyhow::bail!(
-                    "surround audio ({} ch) needs the libopus multistream encoder (Linux only) — \
-                     use a stereo session",
-                    layout.channels
-                )
-            }
+            let mut enc = opus::MSEncoder::new(
+                SAMPLE_RATE,
+                layout.streams,
+                layout.coupled,
+                layout.mapping,
+                opus::Application::LowDelay,
+            )
+            .map_err(|e| anyhow::anyhow!("create Opus multistream encoder: {e}"))?;
+            enc.set_bitrate(opus::Bitrate::Bits(layout.bitrate)).ok();
+            enc.set_vbr(false).ok();
+            Ok(SessionEncoder::Surround(enc))
         }
     }
 
-    /// Encode one interleaved frame (`samples_per_channel * channels` f32s) into `out`,
-    /// returning the packet length.
-    fn encode_float(
-        &mut self,
-        frame: &[f32],
-        samples_per_channel: usize,
-        out: &mut [u8],
-    ) -> Result<usize> {
-        // `samples_per_channel` only feeds the multistream (surround) encoder; stereo infers it.
-        #[cfg(not(target_os = "linux"))]
-        let _ = samples_per_channel;
+    /// Encode one interleaved frame into `out`, returning the packet length. Both encoders infer
+    /// the per-channel sample count from `frame.len()` and their channel count.
+    fn encode_float(&mut self, frame: &[f32], out: &mut [u8]) -> Result<usize> {
         match self {
             SessionEncoder::Stereo(enc) => enc.encode_float(frame, out).context("opus encode"),
-            #[cfg(target_os = "linux")]
-            SessionEncoder::Surround(enc) => enc.encode_float(frame, samples_per_channel, out),
+            SessionEncoder::Surround(enc) => enc
+                .encode_float(frame, out)
+                .context("opus multistream encode"),
         }
-    }
-}
-
-/// RAII wrapper for `OpusMSEncoder` (the safe `opus` crate is stereo-only; the multistream
-/// API comes from `audiopus_sys`, the same libopus the crate already links). Configured like
-/// the stereo path: RESTRICTED_LOWDELAY, hard CBR, per-layout bitrate.
-#[cfg(target_os = "linux")]
-struct MsEncoder {
-    st: std::ptr::NonNull<audiopus_sys::OpusMSEncoder>,
-}
-
-// SAFETY: `MsEncoder` owns a unique `OpusMSEncoder` via `NonNull` (it is neither `Clone` nor
-// `Sync`, so the pointer is never aliased). libopus's multistream encoder state is a self-contained
-// heap allocation with no thread-local or thread-affine state, so moving ownership to another thread
-// is sound; every method takes `&mut self`, keeping access single-threaded at any instant.
-#[cfg(target_os = "linux")]
-unsafe impl Send for MsEncoder {}
-
-#[cfg(target_os = "linux")]
-impl MsEncoder {
-    fn new(layout: &OpusLayout) -> Result<MsEncoder> {
-        use std::os::raw::c_int;
-        let mut err: c_int = 0;
-        // SAFETY: every scalar arg is a valid libopus input (sample rate, channel/stream/coupled
-        // counts, the RESTRICTED_LOWDELAY application constant). `layout.mapping.as_ptr()` addresses
-        // a 'static slice of exactly `layout.channels` bytes (every `OpusLayout` constant upholds
-        // that), which is the element count `opus_multistream_encoder_create` reads through it, and
-        // `&mut err` is a live local the call writes its status into. libopus copies the mapping into
-        // its own allocation, so the pointer need only be valid for the call; the returned pointer is
-        // null/`OPUS_OK`-checked below before any use.
-        let st = unsafe {
-            audiopus_sys::opus_multistream_encoder_create(
-                SAMPLE_RATE as i32,
-                layout.channels as c_int,
-                layout.streams as c_int,
-                layout.coupled as c_int,
-                layout.mapping.as_ptr(),
-                audiopus_sys::OPUS_APPLICATION_RESTRICTED_LOWDELAY,
-                &mut err,
-            )
-        };
-        let st = std::ptr::NonNull::new(st)
-            .filter(|_| err == audiopus_sys::OPUS_OK)
-            .ok_or_else(|| anyhow::anyhow!("opus_multistream_encoder_create failed ({err})"))?;
-        // SAFETY: `st` is the non-null encoder `opus_multistream_encoder_create` just returned, owned
-        // exclusively here. Each `opus_multistream_encoder_ctl` call passes a valid request constant
-        // with the single by-value `c_int` argument that request's variadic ABI expects
-        // (`OPUS_SET_BITRATE_REQUEST` → bitrate, `OPUS_SET_VBR_REQUEST` → 0). No pointer escapes the
-        // call and the encoder outlives it.
-        unsafe {
-            audiopus_sys::opus_multistream_encoder_ctl(
-                st.as_ptr(),
-                audiopus_sys::OPUS_SET_BITRATE_REQUEST,
-                layout.bitrate as c_int,
-            );
-            audiopus_sys::opus_multistream_encoder_ctl(
-                st.as_ptr(),
-                audiopus_sys::OPUS_SET_VBR_REQUEST,
-                0 as c_int, // hard CBR (constant packet size — also what audio FEC relies on)
-            );
-        }
-        Ok(MsEncoder { st })
-    }
-
-    fn encode_float(
-        &mut self,
-        frame: &[f32],
-        samples_per_channel: usize,
-        out: &mut [u8],
-    ) -> Result<usize> {
-        // SAFETY: `self.st` is the live encoder from `new`. libopus reads `samples_per_channel *
-        // channels` f32s through `frame.as_ptr()`; every caller passes a `frame` of exactly that
-        // length together with the matching `samples_per_channel` (`audio_body`'s `frame_len =
-        // samples_per_channel * layout.channels`; the round-trip tests size identically), so the read
-        // stays in bounds. `out.as_mut_ptr()` is written for at most `out.len()` bytes, which is
-        // passed as the capacity bound. Both buffers are live locals outliving this synchronous call;
-        // the return value is range-checked before being used as a length.
-        let n = unsafe {
-            audiopus_sys::opus_multistream_encode_float(
-                self.st.as_ptr(),
-                frame.as_ptr(),
-                samples_per_channel as std::os::raw::c_int,
-                out.as_mut_ptr(),
-                out.len() as i32,
-            )
-        };
-        anyhow::ensure!(n > 0, "opus_multistream_encode_float failed ({n})");
-        Ok(n as usize)
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for MsEncoder {
-    fn drop(&mut self) {
-        // SAFETY: `self.st` is the encoder `opus_multistream_encoder_create` returned; this
-        // `MsEncoder` owns it uniquely and `drop` runs exactly once, so the destroy frees it once
-        // with no subsequent use.
-        unsafe { audiopus_sys::opus_multistream_encoder_destroy(self.st.as_ptr()) }
     }
 }
 
@@ -565,7 +410,7 @@ fn audio_body(
                     *s = (*s * gain).clamp(-1.0, 1.0);
                 }
             }
-            let n = enc.encode_float(&frame, samples_per_channel, &mut out)?;
+            let n = enc.encode_float(&frame, &mut out)?;
             // AES-128-CBC the Opus payload (RTP header stays plaintext). Per-packet IV =
             // BE32(rikeyid + seq) in [0..4], zero elsewhere; PKCS7 padding.
             let iv_seq = (rikeyid as u32).wrapping_add(seq as u32);
@@ -775,41 +620,33 @@ mod tests {
     /// Real-codec proof of the 5.1 mapping math: encode with our encoder layout, decode with
     /// the mapping a stock Moonlight client derives from our advertised surround-params
     /// (parse → GFE swap), and verify a tone fed into each input channel comes out on the
-    /// same output channel.
-    #[cfg(target_os = "linux")]
+    /// same output channel. Cross-platform via the safe `opus` crate — this also guards the
+    /// (now un-gated) Windows GameStream surround build.
     #[test]
     fn multistream_51_roundtrip_channel_identity() {
         let layout = &LAYOUT_51;
         let samples = 240; // 5 ms
         let ch = layout.channels as usize;
 
-        // Client-side decoder mapping derived exactly as moonlight-common-c does.
+        // Client-side decoder mapping derived exactly as moonlight-common-c does (GFE swap).
         let s = surround_params(layout, false);
         let digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
         let client_mapping = client_swap(&digits[3..]);
 
-        let mut err = 0i32;
-        // SAFETY: scalar args are valid libopus inputs. `client_mapping.as_ptr()` addresses a
-        // `Vec<u8>` of exactly `ch` entries (derived from the advertised surround-params), which is
-        // the element count the decoder reads through it, and `&mut err` is a live local the call
-        // writes. The returned pointer is `OPUS_OK`/non-null-checked immediately below before use.
-        let dec = unsafe {
-            audiopus_sys::opus_multistream_decoder_create(
-                SAMPLE_RATE as i32,
-                ch as i32,
-                layout.streams as i32,
-                layout.coupled as i32,
-                client_mapping.as_ptr(),
-                &mut err,
-            )
-        };
-        assert_eq!(err, audiopus_sys::OPUS_OK);
-        assert!(!dec.is_null());
+        let mut dec =
+            opus::MSDecoder::new(SAMPLE_RATE, layout.streams, layout.coupled, &client_mapping)
+                .expect("multistream decoder");
 
         for tone_ch in 0..ch {
-            let mut enc = MsEncoder::new(layout).unwrap();
+            let mut enc = opus::MSEncoder::new(
+                SAMPLE_RATE,
+                layout.streams,
+                layout.coupled,
+                layout.mapping,
+                opus::Application::LowDelay,
+            )
+            .expect("multistream encoder");
             let mut out = vec![0u8; 1400];
-            let mut decoded = vec![0f32; samples * ch];
             let mut energy = vec![0f64; ch];
             // A few frames so the codec converges past its startup transient.
             for f in 0..8 {
@@ -819,28 +656,15 @@ mod tests {
                         / SAMPLE_RATE as f32;
                     frame[t * ch + tone_ch] = 0.5 * phase.sin();
                 }
-                let n = enc.encode_float(&frame, samples, &mut out).unwrap();
+                let n = enc.encode_float(&frame, &mut out).unwrap();
                 assert!(n > 0);
-                // SAFETY: `dec` is the non-null decoder asserted above. `out.as_ptr()` is read for
-                // the `n` encoded bytes just produced by `encode_float`; `decoded.as_mut_ptr()` is
-                // written for up to `samples * ch` f32s and `decoded` is exactly that long; `samples`
-                // is the per-channel frame size. All buffers are live locals outliving the call; the
-                // return is checked to equal `samples`.
-                let got = unsafe {
-                    audiopus_sys::opus_multistream_decode_float(
-                        dec,
-                        out.as_ptr(),
-                        n as i32,
-                        decoded.as_mut_ptr(),
-                        samples as i32,
-                        0,
-                    )
-                };
-                assert_eq!(got as usize, samples);
+                let mut decoded = vec![0f32; samples * ch];
+                let got = dec.decode_float(&out[..n], &mut decoded, false).unwrap();
+                assert_eq!(got, samples);
                 if f >= 4 {
                     for t in 0..samples {
-                        for c in 0..ch {
-                            energy[c] += (decoded[t * ch + c] as f64).powi(2);
+                        for (c, e) in energy.iter_mut().enumerate() {
+                            *e += (decoded[t * ch + c] as f64).powi(2);
                         }
                     }
                 }
@@ -854,9 +678,6 @@ mod tests {
                  (energies: {energy:?})"
             );
         }
-        // SAFETY: `dec` is the decoder `opus_multistream_decoder_create` returned; the test owns it
-        // and destroys it exactly once here, after the final decode — no later use, no double free.
-        unsafe { audiopus_sys::opus_multistream_decoder_destroy(dec) };
     }
 
     /// Live 5.1 capture → multistream encode → decode, against a real PipeWire session.
@@ -869,7 +690,15 @@ mod tests {
     fn surround_capture_live() {
         let mut cap = crate::audio::open_audio_capture(6).expect("open 6ch capture");
         let layout = &LAYOUT_51;
-        let mut enc = MsEncoder::new(layout).unwrap();
+        let mut enc = opus::MSEncoder::new(
+            SAMPLE_RATE,
+            layout.streams,
+            layout.coupled,
+            layout.mapping,
+            opus::Application::LowDelay,
+        )
+        .unwrap();
+        enc.set_vbr(false).ok(); // hard CBR so packet sizes are constant (audio FEC relies on it)
         let mut out = vec![0u8; 1400];
         let mut acc: Vec<f32> = Vec::new();
         let frame_len = 240 * 6;
@@ -880,49 +709,24 @@ mod tests {
             acc.extend_from_slice(&chunk);
             while acc.len() >= frame_len && packets < 100 {
                 let frame: Vec<f32> = acc.drain(..frame_len).collect();
-                let n = enc.encode_float(&frame, 240, &mut out).unwrap();
+                let n = enc.encode_float(&frame, &mut out).unwrap();
                 sizes.insert(n);
                 packets += 1;
             }
         }
         // Hard CBR: every multistream packet must be the same size (audio FEC relies on it).
         assert_eq!(sizes.len(), 1, "CBR sizes: {sizes:?}");
-        // And a stock client's decoder must accept them.
+        // And a stock client's GFE-derived decoder must accept them.
         let s = surround_params(layout, false);
         let digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
         let client_mapping = client_swap(&digits[3..]);
-        let mut err = 0i32;
-        // SAFETY: scalar args are valid; `client_mapping.as_ptr()` addresses a 6-entry `Vec<u8>`
-        // (matches the 6-channel layout the decoder reads through it), alive past the call, and
-        // `&mut err` is a live local. The pointer is `OPUS_OK`-checked before use.
-        let dec = unsafe {
-            audiopus_sys::opus_multistream_decoder_create(
-                48000,
-                6,
-                layout.streams as i32,
-                layout.coupled as i32,
-                client_mapping.as_ptr(),
-                &mut err,
-            )
-        };
-        assert_eq!(err, audiopus_sys::OPUS_OK);
+        let mut dec =
+            opus::MSDecoder::new(SAMPLE_RATE, layout.streams, layout.coupled, &client_mapping)
+                .unwrap();
         let mut pcm = vec![0f32; 240 * 6];
-        // SAFETY: `dec` is the non-null decoder from create. `out.as_ptr()` is read for the CBR
-        // packet length passed in (`*sizes.first()`, a real encoded packet size in `out`);
-        // `pcm.as_mut_ptr()` is written for up to `240 * 6` f32s and `pcm` is exactly that long;
-        // `240` is the per-channel frame size. All buffers are live locals outliving the call.
-        let got = unsafe {
-            audiopus_sys::opus_multistream_decode_float(
-                dec,
-                out.as_ptr(),
-                *sizes.first().unwrap() as i32,
-                pcm.as_mut_ptr(),
-                240,
-                0,
-            )
-        };
-        // SAFETY: `dec` is owned by the test; destroyed exactly once here after the final decode.
-        unsafe { audiopus_sys::opus_multistream_decoder_destroy(dec) };
+        let got = dec
+            .decode_float(&out[..*sizes.first().unwrap()], &mut pcm, false)
+            .unwrap();
         assert_eq!(got, 240);
     }
 }

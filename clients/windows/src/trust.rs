@@ -130,6 +130,9 @@ pub struct Settings {
     pub inhibit_shortcuts: bool,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
+    /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
+    /// can capture; the resolved count drives the decoder + WASAPI render layout.
+    pub audio_channels: u8,
     /// Advertise 10-bit + HDR10 so the host upgrades HDR content to a Main10/PQ stream (the client
     /// presents it on a 10-bit ST.2084 swapchain). No effect on SDR content.
     pub hdr_enabled: bool,
@@ -148,6 +151,7 @@ impl Default for Settings {
             compositor: "auto".into(),
             inhibit_shortcuts: true,
             mic_enabled: false,
+            audio_channels: 2,
             hdr_enabled: true,
             decoder: "auto".into(),
         }

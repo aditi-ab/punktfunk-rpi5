@@ -355,6 +355,15 @@ fn resolve_bitrate_kbps(requested: u32) -> u32 {
     }
 }
 
+/// Resolve the audio channel count the session will capture + encode from the client's request.
+/// Normalizes to one of 2 (stereo) / 6 (5.1) / 8 (7.1); anything else (older client, garbage)
+/// becomes stereo. Both backends can produce the requested count (PipeWire pads/upmixes positions,
+/// WASAPI loopback up/downmixes via AUTOCONVERTPCM), so no capability clamp is needed here — the
+/// surround channels just carry up/downmixed content when the host's sink has fewer real channels.
+fn resolve_audio_channels(requested: u8) -> u8 {
+    punktfunk_core::audio::normalize_channels(requested)
+}
+
 /// Static FEC override: `PUNKTFUNK_FEC_PCT`, when set, PINS the recovery percent and DISABLES
 /// adaptive FEC — so a speed test / measurement keeps a fixed, known overhead. `None` ⇒ adaptive
 /// FEC (the host sizes recovery to the loss the client reports). `0` disables FEC entirely.
@@ -623,6 +632,17 @@ async fn serve_session(
             "encoder bitrate"
         );
 
+        // Resolve the audio channel count (client request → stereo / 5.1 / 7.1). The capturer opens
+        // at this count: PipeWire synthesizes the requested positions (padding with silence when the
+        // sink has fewer), WASAPI loopback up/downmixes via AUTOCONVERTPCM — so a client always gets
+        // the channels it asked for, and the Welcome echoes the value the audio thread will encode.
+        let audio_channels = resolve_audio_channels(hello.audio_channels);
+        tracing::info!(
+            requested = hello.audio_channels,
+            resolved = audio_channels,
+            "audio channels"
+        );
+
         // Resolve the encode bit depth: HEVC Main10 only when the client advertised it AND the host
         // opted in (PUNKTFUNK_10BIT). A client that can't decode 10-bit (caps bit clear, or an older
         // client) always gets the 8-bit stream. PUNKTFUNK_10BIT is the host policy gate until a
@@ -640,6 +660,44 @@ async fn serve_session(
             client_supports_10bit,
             client_video_caps = hello.video_caps,
             "encode bit depth"
+        );
+
+        // Resolve the chroma subsampling: full-chroma HEVC 4:4:4 only when ALL of — the host opted in
+        // (PUNKTFUNK_444), the client advertised VIDEO_CAP_444, the session is single-process (the
+        // two-process WGC relay encodes 4:2:0 in v1), and the active GPU/driver actually supports a
+        // 4:4:4 encode (probed, cached). The native path always encodes HEVC. We resolve this BEFORE
+        // the Welcome so `chroma_format` reflects what we'll really emit — the honest-downgrade
+        // channel: if any gate fails the client is told 4:2:0 before it builds its decoder. The probe
+        // opens a tiny encoder; it runs only when both opt-ins are set and is cached after the first.
+        let host_wants_444 = crate::config::config().four_four_four;
+        let client_supports_444 = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
+        let single_process = crate::session_plan::resolve_topology()
+            == crate::session_plan::SessionTopology::SingleProcess;
+        // The GPU probe opens a real (tiny) encoder on first use, so run it off the reactor like the
+        // compositor probe above (blocking probes → spawn_blocking). Short-circuit so it only runs when
+        // the cheap gates already pass. The result is cached process-wide (a negative latches until
+        // restart — acceptable: a GPU either supports HEVC 4:4:4 or it doesn't, and a transient open
+        // failure here is rare since the session's own encoder isn't open yet).
+        let gpu_supports_444 = if host_wants_444 && client_supports_444 && single_process {
+            tokio::task::spawn_blocking(|| {
+                crate::encode::can_encode_444(crate::encode::Codec::H265)
+            })
+            .await
+            .context("4:4:4 capability probe task")?
+        } else {
+            false
+        };
+        let chroma = if gpu_supports_444 {
+            crate::encode::ChromaFormat::Yuv444
+        } else {
+            crate::encode::ChromaFormat::Yuv420
+        };
+        tracing::info!(
+            chroma = ?chroma,
+            host_wants_444,
+            client_supports_444,
+            single_process,
+            "encode chroma"
         );
 
         // Reserve a UDP port for the data plane (bind, read it back, rebind in UdpTransport).
@@ -691,6 +749,12 @@ async fn serve_session(
             } else {
                 ColorInfo::SDR_BT709
             },
+            // The chroma the encoder will actually emit (resolved + GPU-probed above) — 4:4:4 only
+            // when every gate passed, else 4:2:0. The client sizes its decoder from this.
+            chroma_format: chroma.idc(),
+            // The resolved audio channel count the audio thread will capture + Opus-(multi)stream
+            // encode (2/6/8). The client builds its decoder from this echoed value.
+            audio_channels,
         };
         io::write_msg(&mut send, &welcome.encode()).await?;
 
@@ -884,9 +948,10 @@ async fn serve_session(
         let conn = conn.clone();
         let stop = stop.clone();
         let cap = audio_cap.clone();
+        let channels = welcome.audio_channels;
         std::thread::Builder::new()
             .name("punktfunk1-audio".into())
-            .spawn(move || audio_thread(conn, stop, cap))
+            .spawn(move || audio_thread(conn, stop, cap, channels))
             .map_err(|e| tracing::error!(error = %e, "audio thread spawn failed — session continues without audio"))
             .ok()
     } else {
@@ -946,6 +1011,13 @@ async fn serve_session(
     let launch_for_dp = hello.launch.clone();
     let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
     let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
+                                       // Resolved chroma — derive the typed value back from the wire byte the Welcome carried (so the
+                                       // session uses exactly what the client was told). `Yuv444` only when the handshake gate passed.
+    let chroma = if welcome.chroma_format == punktfunk_core::quic::CHROMA_IDC_444 {
+        crate::encode::ChromaFormat::Yuv444
+    } else {
+        crate::encode::ChromaFormat::Yuv420
+    };
     let stop_stream = stop.clone();
     let fec_target_dp = fec_target.clone(); // data-plane handle to the adaptive-FEC target
     let conn_stream = conn.clone(); // for sending the source's real HDR metadata (0xCE) mid-stream
@@ -1005,6 +1077,7 @@ async fn serve_session(
                         compositor,
                         bitrate_kbps,
                         bit_depth,
+                        chroma,
                         probe_rx,
                         probe_result_tx,
                         fec_target: fec_target_dp,
@@ -1493,33 +1566,88 @@ fn input_thread(
     }
 }
 
-/// The audio thread: desktop capture → Opus (48 kHz stereo, 5 ms, CBR — same tuning as the
-/// GameStream path) → `AUDIO_MAGIC` datagrams. QUIC already encrypts; no extra layer.
-/// The capturer comes from (and returns to) the persistent slot — see [`AudioCapSlot`].
+/// Opus encoder for the native audio plane: a plain stereo encoder (the live-validated,
+/// byte-identical path) or a libopus *multistream* encoder for 5.1/7.1, both behind one
+/// `encode_float`. Surround uses the safe `opus::MSEncoder` (no `audiopus_sys`).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn audio_thread(conn: quinn::Connection, stop: Arc<AtomicBool>, audio_cap: AudioCapSlot) {
-    use crate::audio::{CHANNELS, SAMPLE_RATE};
+enum NativeAudioEnc {
+    Stereo(opus::Encoder),
+    Surround(opus::MSEncoder),
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl NativeAudioEnc {
+    /// Build the encoder for `channels` (2/6/8), hard-CBR + RESTRICTED_LOWDELAY like the
+    /// GameStream path; bitrate from the shared layout table (stereo keeps the validated 128 kbps).
+    fn new(channels: u8) -> Result<NativeAudioEnc, opus::Error> {
+        if channels == 2 {
+            let mut e = opus::Encoder::new(
+                crate::audio::SAMPLE_RATE,
+                opus::Channels::Stereo,
+                opus::Application::LowDelay,
+            )?;
+            e.set_bitrate(opus::Bitrate::Bits(128_000)).ok();
+            e.set_vbr(false).ok();
+            Ok(NativeAudioEnc::Stereo(e))
+        } else {
+            let l = punktfunk_core::audio::layout_for(channels, false);
+            let mut e = opus::MSEncoder::new(
+                crate::audio::SAMPLE_RATE,
+                l.streams,
+                l.coupled,
+                l.mapping,
+                opus::Application::LowDelay,
+            )?;
+            e.set_bitrate(opus::Bitrate::Bits(l.bitrate)).ok();
+            e.set_vbr(false).ok();
+            Ok(NativeAudioEnc::Surround(e))
+        }
+    }
+
+    fn encode_float(&mut self, frame: &[f32], out: &mut [u8]) -> Result<usize, opus::Error> {
+        match self {
+            NativeAudioEnc::Stereo(e) => e.encode_float(frame, out),
+            NativeAudioEnc::Surround(e) => e.encode_float(frame, out),
+        }
+    }
+}
+
+/// The audio thread: desktop capture → Opus (48 kHz, 5 ms, CBR — same tuning as the GameStream
+/// path) → `AUDIO_MAGIC` datagrams, at the negotiated `channels` (2 stereo / 6 = 5.1 / 8 = 7.1,
+/// canonical wire order FL FR FC LFE RL RR SL SR). QUIC already encrypts; no extra layer. The
+/// capturer comes from (and returns to) the persistent slot — see [`AudioCapSlot`].
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn audio_thread(
+    conn: quinn::Connection,
+    stop: Arc<AtomicBool>,
+    audio_cap: AudioCapSlot,
+    channels: u8,
+) {
+    use crate::audio::SAMPLE_RATE;
     const FRAME_MS: usize = 5;
     const SAMPLES_PER_FRAME: usize = SAMPLE_RATE as usize * FRAME_MS / 1000; // 240
+    let want = punktfunk_core::audio::normalize_channels(channels);
 
+    // Reuse the cached capturer ONLY when its channel count matches this session's; a stereo
+    // capturer left by a prior session must not feed a 5.1/7.1 session (the encoder + the client's
+    // decoder are sized for `want`, so a mismatched capturer would garble/desync the audio).
     let capturer = match audio_cap.lock().unwrap().take() {
-        Some(mut c) => {
+        Some(mut c) if c.channels() == want as u32 => {
             c.drain(); // discard audio captured between sessions
             c
         }
-        None => match crate::audio::open_audio_capture(CHANNELS as u32) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "punktfunk/1 audio unavailable — session continues without it");
-                return;
+        prev => {
+            drop(prev); // wrong channel count (or none): clean teardown, open fresh at `want`
+            match crate::audio::open_audio_capture(want as u32) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "punktfunk/1 audio unavailable — session continues without it");
+                    return;
+                }
             }
-        },
+        }
     };
-    let mut enc = match opus::Encoder::new(
-        SAMPLE_RATE,
-        opus::Channels::Stereo,
-        opus::Application::LowDelay,
-    ) {
+    let mut enc = match NativeAudioEnc::new(want) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "opus encoder");
@@ -1527,12 +1655,11 @@ fn audio_thread(conn: quinn::Connection, stop: Arc<AtomicBool>, audio_cap: Audio
             return;
         }
     };
-    enc.set_bitrate(opus::Bitrate::Bits(128_000)).ok();
-    enc.set_vbr(false).ok();
 
-    let frame_len = SAMPLES_PER_FRAME * CHANNELS;
+    let frame_len = SAMPLES_PER_FRAME * want as usize;
     let mut acc: Vec<f32> = Vec::with_capacity(frame_len * 4);
-    let mut opus_buf = vec![0u8; 1500];
+    // Sized for the largest surround frame (7.1 HQ ≈ 1.3 KB at 5 ms); ample for normal quality.
+    let mut opus_buf = vec![0u8; 4096];
     let mut seq: u32 = 0;
     // Reopen-with-backoff: hold the capturer in an Option so a mid-session capture-thread death
     // (device unplug, daemon restart) reopens instead of muting the rest of a multi-hour session.
@@ -1542,14 +1669,17 @@ fn audio_thread(conn: quinn::Connection, stop: Arc<AtomicBool>, audio_cap: Audio
     // restart). The first open already happened above; failing THAT still ends the session quietly.
     let mut capturer = Some(capturer);
     let mut last_failed: Option<std::time::Instant> = None;
-    tracing::info!("punktfunk/1 audio streaming (Opus 48 kHz stereo, 5 ms datagrams)");
+    tracing::info!(
+        channels = want,
+        "punktfunk/1 audio streaming (Opus 48 kHz, 5 ms datagrams)"
+    );
     'session: while !stop.load(Ordering::SeqCst) {
         if capturer.is_none() {
             if last_failed.is_some_and(|t| t.elapsed() < INJECTOR_REOPEN_BACKOFF) {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
             }
-            match crate::audio::open_audio_capture(CHANNELS as u32) {
+            match crate::audio::open_audio_capture(want as u32) {
                 Ok(c) => {
                     tracing::info!("punktfunk/1 audio capture reopened");
                     capturer = Some(c);
@@ -1599,7 +1729,12 @@ fn audio_thread(conn: quinn::Connection, stop: Arc<AtomicBool>, audio_cap: Audio
 /// Stub — punktfunk/1 audio needs Linux (PipeWire capture + libopus); non-Linux dev builds
 /// run sessions without it, same as when the capturer fails to open.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn audio_thread(_conn: quinn::Connection, _stop: Arc<AtomicBool>, _audio_cap: AudioCapSlot) {
+fn audio_thread(
+    _conn: quinn::Connection,
+    _stop: Arc<AtomicBool>,
+    _audio_cap: AudioCapSlot,
+    _channels: u8,
+) {
     tracing::warn!("punktfunk/1 audio requires Linux or Windows — session continues without it");
 }
 
@@ -2368,6 +2503,8 @@ struct SessionContext {
     bitrate_kbps: u32,
     /// Negotiated encode bit depth (8, or 10 = HEVC Main10).
     bit_depth: u8,
+    /// Negotiated chroma subsampling (4:2:0, or 4:4:4 when the client + host + GPU all support it).
+    chroma: crate::encode::ChromaFormat,
     /// Speed-test burst requests (see [`service_probes`]).
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     /// Speed-test results back to the control task.
@@ -2398,7 +2535,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // path now reads this typed `SessionPlan` instead of re-deriving from config at each dispatch site
     // (the latent "capture and encode disagree on the backend" hazard, plan §2.4). `bit_depth` is the
     // only per-session input — capture/topology/encoder are otherwise pure functions of `HostConfig`.
-    let plan = crate::session_plan::SessionPlan::resolve(ctx.bit_depth);
+    let plan = crate::session_plan::SessionPlan::resolve(ctx.bit_depth, ctx.chroma);
     tracing::info!(?plan, "resolved session plan");
     // Windows two-process secure-desktop path: when the host runs as SYSTEM (required for the secure
     // desktop + SendInput), WGC can't activate in-process, so we capture the normal desktop via a
@@ -2420,6 +2557,8 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         compositor,
         bitrate_kbps,
         bit_depth,
+        // The resolved chroma is already captured in `plan` (above); ignore the duplicate here.
+        chroma: _,
         probe_rx,
         probe_result_tx,
         fec_target,
@@ -2969,6 +3108,9 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
         compositor,
         bitrate_kbps,
         bit_depth,
+        // The two-process WGC relay encodes 4:2:0 in v1 — the handshake's `single_process` gate already
+        // forced `chroma` to Yuv420 for this topology, so the helper + secure-desktop DDA stay 4:2:0.
+        chroma: _,
         probe_rx,
         probe_result_tx,
         fec_target,
@@ -3079,6 +3221,7 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
                 // stage 5) so the DDA capturer doesn't re-derive it.
                 crate::capture::gpu_encode(),
                 hdr,
+                false, // the two-process relay path is 4:2:0 in v1
             )
             .context("open DDA for secure desktop")?;
             cap.set_active(true);
@@ -3092,6 +3235,8 @@ fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
                 bitrate_kbps as u64 * 1000,
                 frame.is_cuda(),
                 bit_depth,
+                // Secure-desktop DDA on the two-process relay path: 4:2:0 in v1 (matches the helper).
+                crate::encode::ChromaFormat::Yuv420,
             )
             .context("open video encoder for DDA")?;
             Ok(DdaPipe {
@@ -3491,6 +3636,9 @@ fn is_permanent_build_error(chain: &str) -> bool {
         "could not find output", // KWin < 6.5.6: createVirtualOutput unsupported
         "must be a node id",     // PUNKTFUNK_GAMESCOPE_NODE not an integer
         "is it installed",       // gamescope / kscreen-doctor not on PATH
+        // 4:4:4 NVENC got a CUDA frame — should never happen now the Linux capturer honors gpu=false,
+        // but fail fast instead of 8× retry (~90 s) rather than wedge the session if it ever recurs.
+        "capture/encoder negotiation mismatch",
     ];
     let lower = chain.to_ascii_lowercase();
     PERMANENT.iter().any(|p| lower.contains(p))
@@ -3540,8 +3688,20 @@ fn build_pipeline(
         bitrate_kbps as u64 * 1000,
         frame.is_cuda(),
         bit_depth,
+        plan.chroma,
     )
     .context("open video encoder")?;
+    // Post-open cross-check: the Welcome already committed `chroma_format` from the pre-open probe, so
+    // warn loudly if the encoder actually opened a different chroma than negotiated (the in-band SPS is
+    // authoritative for the decoder, but a mismatch means the probe and the live open disagreed).
+    let opened_444 = enc.caps().chroma_444;
+    if opened_444 != plan.chroma.is_444() {
+        tracing::warn!(
+            negotiated_444 = plan.chroma.is_444(),
+            opened_444,
+            "encoder chroma disagrees with the negotiated Welcome — the client was told the other value"
+        );
+    }
     let interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
     Ok((capturer, enc, frame, interval))
 }
@@ -3980,6 +4140,7 @@ mod tests {
                 GamepadPref::Auto,
                 0,
                 0,    // video_caps
+                2,    // audio_channels (stereo)
                 None, // launch
                 None,
                 Some((cert.clone(), key.clone())),
@@ -4012,6 +4173,7 @@ mod tests {
             GamepadPref::Auto,
             0,
             0,    // video_caps
+            2,    // audio_channels (stereo)
             None, // launch
             None,
             Some((cert, key)),
@@ -4065,6 +4227,7 @@ mod tests {
                 GamepadPref::Auto,
                 0,
                 0,    // video_caps
+                2,    // audio_channels (stereo)
                 None, // launch
                 None,
                 None,
@@ -4090,6 +4253,7 @@ mod tests {
             GamepadPref::Auto,
             0,
             0,    // video_caps
+            2,    // audio_channels (stereo)
             None, // launch
             Some(host_fp),
             Some((cert.clone(), key.clone())),

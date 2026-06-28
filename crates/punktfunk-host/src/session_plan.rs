@@ -106,17 +106,22 @@ pub struct SessionPlan {
     /// The IDD-push HDR hint (`bit_depth >= 10`) — the want-HDR flag the capturer was passed before.
     /// Non-IDD-push Windows backends ignore it and auto-detect HDR from the monitor; Linux is 8-bit.
     pub hdr: bool,
+    /// Handshake-negotiated chroma subsampling (4:2:0, or full-chroma 4:4:4 when the client + host +
+    /// GPU all support it). Resolved before the Welcome; `Yuv420` on every backend that declined it.
+    pub chroma: crate::encode::ChromaFormat,
 }
 
 impl SessionPlan {
-    /// Resolve the whole plan once from [`config`](crate::config) + the negotiated `bit_depth`.
-    pub fn resolve(bit_depth: u8) -> Self {
+    /// Resolve the whole plan once from [`config`](crate::config) + the negotiated `bit_depth` and
+    /// `chroma`.
+    pub fn resolve(bit_depth: u8, chroma: crate::encode::ChromaFormat) -> Self {
         SessionPlan {
             capture: CaptureBackend::resolve(),
             topology: resolve_topology(),
             encoder: resolve_encoder(),
             bit_depth,
             hdr: bit_depth >= 10,
+            chroma,
         }
     }
 
@@ -124,9 +129,24 @@ impl SessionPlan {
     /// (no second backend probe), `hdr` from the plan. Handed into `capture::capture_virtual_output` so the
     /// capturer never re-derives the encode backend.
     pub fn output_format(&self) -> crate::capture::OutputFormat {
+        let gpu = self.encoder.is_gpu();
+        // Linux NVENC 4:4:4: libavcodec `hevc_nvenc` only emits 4:4:4 from a YUV444 *input* frame —
+        // RGB-in is always subsampled to 4:2:0 (verified on the RTX 5070 Ti). So the encoder does an
+        // RGB→YUV444P swscale and needs CPU-resident RGB frames; force the zero-copy GPU capture off
+        // for a 4:4:4 NVENC session. (VAAPI 4:4:4, where the hardware supports it, keeps its dmabuf
+        // path via `scale_vaapi`; Windows NVENC ingests ARGB directly and stays GPU.)
+        #[cfg(target_os = "linux")]
+        let gpu = {
+            let force_cpu_for_nvenc_444 =
+                self.chroma.is_444() && !crate::encode::linux_zero_copy_is_vaapi();
+            gpu && !force_cpu_for_nvenc_444
+        };
         crate::capture::OutputFormat {
-            gpu: self.encoder.is_gpu(),
+            gpu,
             hdr: self.hdr,
+            // 4:4:4 needs a full-chroma source: on Windows this keeps the capturer on RGB (not the
+            // default NV12/P010 video-engine output) so NVENC can CSC to 4:4:4.
+            chroma_444: self.chroma.is_444(),
         }
     }
 }
@@ -134,7 +154,7 @@ impl SessionPlan {
 /// Process topology. On Windows this is the former `punktfunk1::should_use_helper` logic verbatim; on
 /// every other platform the session is always single-process.
 #[cfg(target_os = "windows")]
-fn resolve_topology() -> SessionTopology {
+pub(crate) fn resolve_topology() -> SessionTopology {
     let cfg = crate::config::config();
     // `NO_HELPER`/`NO_WGC` force single-process; IDD-push captures in-process in Session 0 (no helper);
     // otherwise the helper runs when forced or when we're SYSTEM (in-process WGC can't activate there).
@@ -151,7 +171,7 @@ fn resolve_topology() -> SessionTopology {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn resolve_topology() -> SessionTopology {
+pub(crate) fn resolve_topology() -> SessionTopology {
     SessionTopology::SingleProcess
 }
 

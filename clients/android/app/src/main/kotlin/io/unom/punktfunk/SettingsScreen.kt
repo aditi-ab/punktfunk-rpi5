@@ -104,6 +104,12 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
         }
 
         SettingsGroup("Audio") {
+            SettingDropdown(
+                label = "Audio channels",
+                options = AUDIO_CHANNEL_OPTIONS,
+                selected = s.audioChannels,
+            ) { ch -> update(s.copy(audioChannels = ch)) }
+
             ToggleRow(
                 title = "Microphone",
                 subtitle = "Send your mic to the host's virtual microphone",

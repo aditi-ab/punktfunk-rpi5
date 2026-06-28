@@ -29,6 +29,33 @@ pub enum Codec {
     Av1,
 }
 
+/// Chroma subsampling the encoder emits, negotiated with the client (the `PUNKTFUNK_444` gate + the
+/// client's `VIDEO_CAP_444` + a GPU probe). `Yuv420` is the universal default; `Yuv444` is HEVC-only,
+/// native-protocol-only (GameStream stays 4:2:0), and the host only ever passes it after
+/// [`can_encode_444`] confirmed the active backend supports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChromaFormat {
+    #[default]
+    Yuv420,
+    Yuv444,
+}
+
+impl ChromaFormat {
+    /// The HEVC `chroma_format_idc` this maps to: `1` (4:2:0) or `3` (4:4:4). Also the wire value
+    /// echoed in [`punktfunk_core::quic::Welcome::chroma_format`].
+    pub fn idc(self) -> u8 {
+        match self {
+            ChromaFormat::Yuv420 => punktfunk_core::quic::CHROMA_IDC_420,
+            ChromaFormat::Yuv444 => punktfunk_core::quic::CHROMA_IDC_444,
+        }
+    }
+
+    /// True for full-chroma 4:4:4.
+    pub fn is_444(self) -> bool {
+        matches!(self, ChromaFormat::Yuv444)
+    }
+}
+
 impl Codec {
     /// The FFmpeg NVENC encoder name (selected by name, not codec id — the latter would
     /// pick the software encoder).
@@ -89,6 +116,13 @@ pub struct EncoderCaps {
     /// When `false`, `set_hdr_meta` is a no-op and no in-band grade reaches the client. Only the
     /// Windows direct-NVENC path attaches it today.
     pub supports_hdr_metadata: bool,
+    /// The opened encoder is actually producing a full-chroma 4:4:4 (`chroma_format_idc = 3`) stream.
+    /// `false` on every 4:2:0 session (the default) and on a backend that declined 4:4:4. Set by the
+    /// NVENC backends (Linux + Windows). The chroma is committed to the wire (`Welcome::chroma_format`)
+    /// from the pre-open probe, so this is a *post-open cross-check*: the session glue logs loudly if
+    /// the encoder's real chroma disagrees with what was negotiated (the in-band SPS is authoritative
+    /// for the decoder either way).
+    pub chroma_444: bool,
 }
 
 /// A hardware encoder. One per session; runs on the encode thread.
@@ -193,8 +227,21 @@ pub fn open_video(
     bitrate_bps: u64,
     cuda: bool,
     bit_depth: u8,
+    chroma: ChromaFormat,
 ) -> Result<Box<dyn Encoder>> {
     validate_dimensions(codec, width, height)?;
+    // 4:4:4 is HEVC-only. The negotiator should never pass `Yuv444` for another codec (it gates on
+    // `codec == H265`), but defend the contract here so a future caller can't silently emit a stream
+    // no decoder expects: a non-HEVC 4:4:4 request degrades to 4:2:0 with a warning.
+    let chroma = if chroma.is_444() && codec != Codec::H265 {
+        tracing::warn!(
+            ?codec,
+            "4:4:4 requested for a non-HEVC codec — encoding 4:2:0"
+        );
+        ChromaFormat::Yuv420
+    } else {
+        chroma
+    };
     #[cfg(target_os = "linux")]
     {
         // Pick the GPU encode backend. NVIDIA → NVENC/CUDA (the original path, unchanged);
@@ -203,8 +250,17 @@ pub fn open_video(
         // its errors crisply instead of silently trying the other).
         let pref = crate::config::config().encoder_pref.as_str();
         let open_vaapi = || -> Result<Box<dyn Encoder>> {
-            vaapi::VaapiEncoder::open(codec, format, width, height, fps, bitrate_bps, bit_depth)
-                .map(|e| Box::new(e) as Box<dyn Encoder>)
+            vaapi::VaapiEncoder::open(
+                codec,
+                format,
+                width,
+                height,
+                fps,
+                bitrate_bps,
+                bit_depth,
+                chroma,
+            )
+            .map(|e| Box::new(e) as Box<dyn Encoder>)
         };
         match pref {
             "nvenc" | "nvidia" | "cuda" => open_nvenc_probed(
@@ -216,6 +272,7 @@ pub fn open_video(
                 bitrate_bps,
                 cuda,
                 bit_depth,
+                chroma,
             ),
             "vaapi" | "amd" | "intel" => open_vaapi(),
             "auto" | "" => {
@@ -231,6 +288,7 @@ pub fn open_video(
                         bitrate_bps,
                         cuda,
                         bit_depth,
+                        chroma,
                     )
                 } else {
                     open_vaapi()
@@ -260,6 +318,7 @@ pub fn open_video(
                         fps,
                         bitrate_bps,
                         bit_depth,
+                        chroma,
                     )
                     .map(|e| Box::new(e) as Box<dyn Encoder>)
                 }
@@ -289,6 +348,7 @@ pub fn open_video(
                         fps,
                         bitrate_bps,
                         bit_depth,
+                        chroma,
                     )
                     .map(|e| Box::new(e) as Box<dyn Encoder>)
                 }
@@ -333,6 +393,7 @@ pub fn open_video(
             bitrate_bps,
             cuda,
             bit_depth,
+            chroma,
         );
         anyhow::bail!("video encode requires Linux or Windows")
     }
@@ -355,6 +416,7 @@ fn open_nvenc_probed(
     bitrate_bps: u64,
     cuda: bool,
     bit_depth: u8,
+    chroma: ChromaFormat,
 ) -> Result<Box<dyn Encoder>> {
     const MIN_PROBE_BPS: u64 = 50_000_000;
     let mut candidates = vec![bitrate_bps];
@@ -369,7 +431,9 @@ fn open_nvenc_probed(
     }
     let mut last: Option<anyhow::Error> = None;
     for (i, &b) in candidates.iter().enumerate() {
-        match linux::NvencEncoder::open(codec, format, width, height, fps, b, cuda, bit_depth) {
+        match linux::NvencEncoder::open(
+            codec, format, width, height, fps, b, cuda, bit_depth, chroma,
+        ) {
             Ok(enc) => {
                 if i > 0 {
                     tracing::warn!(
@@ -443,6 +507,65 @@ pub fn vaapi_codec_support() -> CodecSupport {
             "VAAPI encode capabilities probed"
         );
         caps
+    })
+}
+
+/// Whether the active GPU encode backend can actually produce a full-chroma **4:4:4** HEVC stream.
+/// Resolved (and cached, once) *before* the Welcome so the host advertises the chroma it will really
+/// encode — the honest-downgrade channel. 4:4:4 is HEVC-only; the probe opens a tiny encoder on the
+/// active backend (NVENC FREXT is broad on NVIDIA, but VAAPI / AMF / QSV 4:4:4 is hardware-specific,
+/// so it must be probed, never assumed). Non-HEVC codecs are always `false`.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn can_encode_444(codec: Codec) -> bool {
+    use std::sync::OnceLock;
+    if codec != Codec::H265 {
+        return false;
+    }
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let supported = {
+            #[cfg(target_os = "linux")]
+            {
+                // Mirror open_video's backend dispatch: VAAPI (AMD/Intel) vs NVENC (NVIDIA).
+                if linux_zero_copy_is_vaapi() {
+                    vaapi::probe_can_encode_444(codec)
+                } else {
+                    linux::probe_can_encode_444(codec)
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                match windows_resolved_backend() {
+                    WindowsBackend::Nvenc => {
+                        #[cfg(feature = "nvenc")]
+                        {
+                            nvenc::probe_can_encode_444(codec)
+                        }
+                        #[cfg(not(feature = "nvenc"))]
+                        {
+                            false
+                        }
+                    }
+                    WindowsBackend::Amf | WindowsBackend::Qsv => {
+                        #[cfg(feature = "amf-qsv")]
+                        {
+                            let vendor = match windows_resolved_backend() {
+                                WindowsBackend::Qsv => ffmpeg_win::WinVendor::Qsv,
+                                _ => ffmpeg_win::WinVendor::Amf,
+                            };
+                            ffmpeg_win::probe_can_encode_444(vendor, codec)
+                        }
+                        #[cfg(not(feature = "amf-qsv"))]
+                        {
+                            false
+                        }
+                    }
+                    WindowsBackend::Software => false,
+                }
+            }
+        };
+        tracing::info!(supported, "HEVC 4:4:4 encode capability probed");
+        supported
     })
 }
 

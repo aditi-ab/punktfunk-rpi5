@@ -163,7 +163,7 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                     targetHost, targetPort, w, h, hz,
                     id.certPem, id.privateKeyPem, pinHex ?: "",
                     settings.bitrateKbps, settings.compositor, gamepadPref,
-                    hdrEnabled,
+                    hdrEnabled, settings.audioChannels,
                 )
             }
             connecting = false

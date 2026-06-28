@@ -1,7 +1,11 @@
 //! Android audio playback (android-only): pull Opus packets from the connector, decode to
-//! interleaved f32 stereo, and feed AAudio (LowLatency) via its realtime data callback through a
-//! jitter ring. Mirrors [`crate::decode`]: one thread we own (the Opus decode producer) plus a
-//! shutdown flag; the realtime callback thread is owned by AAudio.
+//! interleaved f32 (stereo or 5.1/7.1 surround), and feed AAudio (LowLatency) via its realtime data
+//! callback through a jitter ring. Mirrors [`crate::decode`]: one thread we own (the Opus decode
+//! producer) plus a shutdown flag; the realtime callback thread is owned by AAudio.
+//!
+//! The layout is the host-RESOLVED channel count (`NativeClient::audio_channels`, negotiated at
+//! connect), so an older/clamping host that can only capture stereo is decoded + played as stereo.
+//! 2 = stereo / 6 = 5.1 / 8 = 7.1, in the canonical wire order FL FR FC LFE RL RR SL SR.
 //!
 //! The ring started as a port of `punktfunk-client-linux/src/audio.rs`, but AAudio — unlike
 //! PipeWire, which adaptively rate-matches the stream and absorbs a shallow buffer — hands us a raw
@@ -26,35 +30,71 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
-const CHANNELS: usize = 2;
 const SAMPLE_RATE: i32 = 48_000;
 /// Decoded-chunk hand-off depth: 64 × 5 ms = 320 ms slack (matches the core's AUDIO_QUEUE).
 const RING_CHUNKS: usize = 64;
-/// Opus decode scratch: worst-case 120 ms stereo frame (5760 samples/ch × 2 ch).
-const PCM_SCRATCH: usize = 5760 * CHANNELS;
 
-// --- Jitter-ring depths, in interleaved-f32 samples (all expressed in ms via `MS`). -----------
+// --- Jitter-ring depths, in MILLISECONDS (scaled to interleaved-f32 samples at runtime). --------
+// The channel count is negotiated, not a compile-time const, so these are kept in ms and multiplied
+// by `ms` (interleaved-f32 samples per millisecond at the resolved layout) inside `start`.
 // Unlike the Linux client (PipeWire adaptively rate-matches the stream to the graph clock, masking
 // host↔DAC drift + a shallow ring), AAudio hands us a raw callback and we own the buffer: drift and
 // WiFi power-save bunching land as underruns/overflows = crackle. So Android runs a deliberately
 // deeper, smoothly-managed ring than Linux — keep the two clients' depths intentionally divergent.
-/// Interleaved f32 samples per millisecond (48 kHz × 2 ch).
-const MS: usize = (SAMPLE_RATE as usize / 1000) * CHANNELS; // 96
 /// Prime/target floor: fill to ~40 ms before playing (and after a sustained drain). Deep enough to
 /// ride out WiFi arrival jitter + clock drift; the dominant Android-only anti-crackle lever.
-const PRIME_FLOOR: usize = 40 * MS;
+const PRIME_FLOOR_MS: usize = 40;
 /// Ceiling for the burst-scaled target (so a large quantum can't push the prime depth too high).
-const PRIME_CEIL: usize = 80 * MS;
+const PRIME_CEIL_MS: usize = 80;
 /// Drop-oldest headroom above the target before trimming — a ~80 ms band swallows an arrival burst
 /// without overflowing.
-const JITTER_HEADROOM: usize = 80 * MS;
+const JITTER_HEADROOM_MS: usize = 80;
 /// Hard latency bound: never let the ring exceed ~150 ms (the only thing that caps added latency).
-const HARD_CAP: usize = 150 * MS;
+const HARD_CAP_MS: usize = 150;
 /// Re-prime (go silent to refill) only after this many CONSECUTIVE empty callbacks, so one transient
 /// drain doesn't manufacture a fresh 40 ms silence (the old `if ring.is_empty()` re-primed instantly).
 const DEPRIME_AFTER_CALLBACKS: u32 = 5;
 /// Throttle the AAudio XRun-driven HW-buffer grow check (cheap, but no need to poll every quantum).
 const XRUN_CHECK_EVERY: u32 = 128;
+
+/// Opus decoder for the audio plane: a plain stereo decoder (the validated path) or a multistream
+/// decoder for 5.1/7.1, both behind one `decode_float`. Built from the host-RESOLVED channel count
+/// via the shared layout table. Mirrors the Linux client's `AudioDec`.
+enum AudioDec {
+    Stereo(opus::Decoder),
+    Surround(opus::MSDecoder),
+}
+
+impl AudioDec {
+    fn new(channels: u8) -> Result<AudioDec, opus::Error> {
+        if channels == 2 {
+            Ok(AudioDec::Stereo(opus::Decoder::new(
+                SAMPLE_RATE as u32,
+                opus::Channels::Stereo,
+            )?))
+        } else {
+            let l = punktfunk_core::audio::layout_for(channels, false);
+            Ok(AudioDec::Surround(opus::MSDecoder::new(
+                SAMPLE_RATE as u32,
+                l.streams,
+                l.coupled,
+                l.mapping,
+            )?))
+        }
+    }
+
+    fn decode_float(
+        &mut self,
+        input: &[u8],
+        out: &mut [f32],
+        fec: bool,
+    ) -> Result<usize, opus::Error> {
+        match self {
+            AudioDec::Stereo(d) => d.decode_float(input, out, fec),
+            AudioDec::Surround(d) => d.decode_float(input, out, fec),
+        }
+    }
+}
 
 /// Diagnostics — written by the decode thread + the realtime callback, logged periodically. The
 /// audio analogue of the video `fed`/`rendered` counters (we can't "screenshot" sound).
@@ -74,9 +114,20 @@ pub struct AudioPlayback {
 }
 
 impl AudioPlayback {
-    /// Open AAudio (LowLatency, 48 kHz/stereo/f32) with a realtime callback draining a jitter ring,
-    /// then spawn the Opus decode thread. `None` on failure (the caller leaves video streaming).
+    /// Open AAudio (LowLatency, 48 kHz/f32, the host-resolved channel layout) with a realtime
+    /// callback draining a jitter ring, then spawn the Opus decode thread. `None` on failure (the
+    /// caller leaves video streaming).
     pub fn start(client: Arc<NativeClient>) -> Option<AudioPlayback> {
+        // Build playback from the host-RESOLVED channel count (never the request): 2 = stereo /
+        // 6 = 5.1 / 8 = 7.1, canonical wire order FL FR FC LFE RL RR SL SR.
+        let channels = punktfunk_core::audio::normalize_channels(client.audio_channels) as usize;
+        // Interleaved f32 samples per millisecond at this layout (48 kHz × channels); the ms-
+        // denominated jitter-ring depths scale by it.
+        let ms = (SAMPLE_RATE as usize / 1000) * channels;
+        let prime_floor = PRIME_FLOOR_MS * ms;
+        let prime_ceil = PRIME_CEIL_MS * ms;
+        let jitter_headroom = JITTER_HEADROOM_MS * ms;
+        let hard_cap_max = HARD_CAP_MS * ms;
         let counters = Arc::new(Counters::default());
         let (tx, rx) = sync_channel::<Vec<f32>>(RING_CHUNKS);
         // Recycle free-list: drained PCM buffers go BACK to the decode thread to be refilled, so the
@@ -92,13 +143,13 @@ impl AudioPlayback {
         // before the trim below = the hard cap plus one full channel of 5 ms (480-f32) frames — the
         // punktfunk protocol always sends 5 ms Opus frames (host `audio_thread`); a larger frame
         // would force a one-time realloc, asserted (not silently corrupted) in `decode_loop`.
-        let mut ring: VecDeque<f32> = VecDeque::with_capacity(HARD_CAP + RING_CHUNKS * 5 * MS);
+        let mut ring: VecDeque<f32> = VecDeque::with_capacity(hard_cap_max + RING_CHUNKS * 5 * ms);
         let mut primed = false;
         let mut empties: u32 = 0; // consecutive empty callbacks (de-prime hysteresis)
         let mut cb_count: u32 = 0; // callbacks since open (throttles the XRun grow check)
         let mut last_xrun: i32 = 0; // last AAudio XRun count we grew the buffer for
         let callback = move |s: &AudioStream, data: *mut c_void, num_frames: i32| {
-            let want = num_frames as usize * CHANNELS;
+            let want = num_frames as usize * channels;
             // SAFETY: AAudio provides `num_frames * channel_count` F32 slots at `data`.
             let out = unsafe { std::slice::from_raw_parts_mut(data as *mut f32, want) };
             // Drain decoded chunks into the ring WITHOUT freeing on the RT thread: `drain(..)` empties
@@ -108,11 +159,11 @@ impl AudioPlayback {
                 ring.extend(chunk.drain(..));
                 let _ = free_tx.try_send(chunk);
             }
-            // Jitter buffer: prime to ~40 ms (PRIME_FLOOR) before playing and after a sustained drain;
+            // Jitter buffer: prime to ~40 ms (prime_floor) before playing and after a sustained drain;
             // drop-oldest only above a wide ~120 ms band. Decoupled from the AAudio burst `want` (tiny
             // on the LowLatency MMAP path) so the depth doesn't collapse to a single quantum.
-            let target = (3 * want).clamp(PRIME_FLOOR, PRIME_CEIL);
-            let hard_cap = (target + JITTER_HEADROOM).min(HARD_CAP);
+            let target = (3 * want).clamp(prime_floor, prime_ceil);
+            let hard_cap = (target + jitter_headroom).min(hard_cap_max);
             while ring.len() > hard_cap {
                 ring.pop_front();
             }
@@ -166,7 +217,11 @@ impl AudioPlayback {
             .ok()?
             .direction(AudioDirection::Output)
             .sample_rate(SAMPLE_RATE)
-            .channel_count(CHANNELS as i32)
+            // The wire order (FL FR FC LFE RL RR SL SR) is the standard AAudio/Android channel
+            // order, so this is an IDENTITY mapping — no permute. AAudio infers the 5.1/7.1 mask
+            // from `channel_count` (the ndk crate's builder exposes no setChannelMask); the host
+            // captures + Opus-encodes in exactly this order.
+            .channel_count(channels as i32)
             .format(AudioFormat::PCM_Float)
             .performance_mode(AudioPerformanceMode::LowLatency)
             .sharing_mode(AudioSharingMode::Shared)
@@ -206,7 +261,7 @@ impl AudioPlayback {
         let sd = shutdown.clone();
         let join = std::thread::Builder::new()
             .name("pf-audio".into())
-            .spawn(move || decode_loop(client, tx, free_rx, sd, counters))
+            .spawn(move || decode_loop(client, tx, free_rx, sd, counters, channels))
             .ok();
 
         Some(AudioPlayback {
@@ -236,29 +291,34 @@ fn decode_loop(
     free_rx: Receiver<Vec<f32>>,
     shutdown: Arc<AtomicBool>,
     counters: Arc<Counters>,
+    channels: usize,
 ) {
-    let mut dec = match opus::Decoder::new(SAMPLE_RATE as u32, opus::Channels::Stereo) {
+    // Interleaved f32 samples per millisecond at this layout — the ring's 5 ms reserve check below.
+    let ms = (SAMPLE_RATE as usize / 1000) * channels;
+    // Opus decode scratch: worst-case 120 ms frame (5760 samples/ch) × channels.
+    let pcm_scratch = 5760 * channels;
+    let mut dec = match AudioDec::new(channels as u8) {
         Ok(d) => d,
         Err(e) => {
             log::error!("audio: opus decoder init: {e} — audio disabled");
             return;
         }
     };
-    let mut pcm = vec![0f32; PCM_SCRATCH];
+    let mut pcm = vec![0f32; pcm_scratch];
     let mut window_peak = 0f32; // loudest |sample| since the last log — tells a tone from silence
     while !shutdown.load(Ordering::Relaxed) {
         match client.next_audio(Duration::from_millis(5)) {
             Ok(pkt) => match dec.decode_float(&pkt.data, &mut pcm, false) {
                 Ok(samples) => {
-                    let n = samples * CHANNELS;
+                    let n = samples * channels;
                     for &s in &pcm[..n] {
                         window_peak = window_peak.max(s.abs());
                     }
-                    // The ring's pre-reservation in `start` assumes the protocol's 5 ms (≤480-f32)
+                    // The ring's pre-reservation in `start` assumes the protocol's 5 ms (≤480-f32/ch)
                     // frames; a larger frame would force a one-time realloc on the RT thread. Catch a
                     // future host frame-size change here in debug, not as a silent audio glitch.
                     debug_assert!(
-                        n <= 5 * MS,
+                        n <= 5 * ms,
                         "audio frame {n} f32 exceeds the 5 ms ring reserve"
                     );
                     let count = counters.opus_decoded.fetch_add(1, Ordering::Relaxed) + 1;
@@ -266,7 +326,7 @@ fn decode_loop(
                     // free-list is momentarily empty (startup / after a backpressure drop).
                     let mut buf = free_rx
                         .try_recv()
-                        .unwrap_or_else(|_| Vec::with_capacity(PCM_SCRATCH));
+                        .unwrap_or_else(|_| Vec::with_capacity(pcm_scratch));
                     buf.clear();
                     buf.extend_from_slice(&pcm[..n]);
                     match tx.try_send(buf) {

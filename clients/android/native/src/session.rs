@@ -140,10 +140,12 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIde
 }
 
 /// `NativeBridge.nativeConnect(host, port, w, h, hz, certPem, keyPem, pinHex, bitrateKbps,
-/// compositorPref, gamepadPref): Long`. `certPem`/`keyPem` empty = anonymous, else presented as the
-/// persistent identity. `pinHex` empty = TOFU (read `nativeHostFingerprint` after), else 64-hex
-/// SHA-256 to pin the host (mismatch → 0). `bitrateKbps` 0 = host default. `compositorPref`/
-/// `gamepadPref` are `CompositorPref`/`GamepadPref` wire bytes (0 = Auto; unknown → Auto).
+/// compositorPref, gamepadPref, hdrEnabled, audioChannels): Long`. `certPem`/`keyPem` empty =
+/// anonymous, else presented as the persistent identity. `pinHex` empty = TOFU (read
+/// `nativeHostFingerprint` after), else 64-hex SHA-256 to pin the host (mismatch → 0). `bitrateKbps`
+/// 0 = host default. `compositorPref`/`gamepadPref` are `CompositorPref`/`GamepadPref` wire bytes
+/// (0 = Auto; unknown → Auto). `audioChannels` is the requested surround layout (2/6/8; normalized,
+/// anything else → stereo) — the host clamps it and the resolved count drives playback.
 /// Returns an opaque handle, or 0 on failure (logged).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
@@ -162,6 +164,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     compositor_pref: jint,
     gamepad_pref: jint,
     hdr_enabled: jboolean,
+    audio_channels: jint,
 ) -> jlong {
     let host: String = match env.get_string(&host) {
         Ok(s) => s.into(),
@@ -213,6 +216,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         } else {
             0
         },
+        // Requested surround layout (2 = stereo / 6 = 5.1 / 8 = 7.1). The host clamps to what it can
+        // capture and echoes the resolved count in `connector.audio_channels`, which drives the
+        // decoder + AAudio layout (read in `crate::audio::AudioPlayback::start`). Anything else
+        // normalizes to stereo here.
+        punktfunk_core::audio::normalize_channels(audio_channels.clamp(0, u8::MAX as jint) as u8),
         None,     // launch: default app
         pin,      // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)

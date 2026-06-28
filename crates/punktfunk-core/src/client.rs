@@ -40,8 +40,9 @@ enum CtrlRequest {
 /// mode, the host-resolved compositor backend, the host-resolved gamepad backend, the host's
 /// certificate fingerprint, the resolved encoder bitrate (kbps), and the host↔client clock offset
 /// (ns, host minus client; 0 = no skew correction / an old host that didn't answer the handshake).
-/// The trailing `u8` is the resolved encode bit depth (8/10) and [`ColorInfo`] the resolved colour
-/// signalling, both from the [`Welcome`].
+/// The trailing `u8`s are the resolved encode bit depth (8/10), the chroma `chroma_format_idc`
+/// (1 = 4:2:0, 3 = 4:4:4), and the resolved audio channel count (2/6/8), with [`ColorInfo`] the
+/// resolved colour signalling — all from the [`Welcome`].
 type Negotiated = (
     Mode,
     CompositorPref,
@@ -51,6 +52,8 @@ type Negotiated = (
     i64,
     u8,
     ColorInfo,
+    u8,
+    u8,
 );
 
 /// Accumulated state of an in-flight / finished speed test. The data-plane pump mirrors the
@@ -202,6 +205,17 @@ pub struct NativeClient {
     /// decoder/presenter from this. [`ColorInfo::SDR_BT709`] for an older host. The static HDR
     /// mastering metadata (when [`ColorInfo::is_hdr`]) arrives via [`NativeClient::next_hdr_meta`].
     pub color: ColorInfo,
+    /// The chroma subsampling the host resolved for this session ([`Welcome::chroma_format`]), as the
+    /// HEVC `chroma_format_idc`: [`quic::CHROMA_IDC_420`] (4:2:0, the default / older host) or
+    /// [`quic::CHROMA_IDC_444`] (full-chroma 4:4:4). The in-band SPS is authoritative; this lets the
+    /// client pre-size its decoder. `CHROMA_IDC_420` for an older host that didn't report it.
+    pub chroma_format: u8,
+    /// The audio channel count the host resolved for this session ([`Welcome::audio_channels`]):
+    /// `2` (stereo), `6` (5.1) or `8` (7.1). The client MUST build its Opus (multistream) decoder
+    /// from this value (via [`crate::audio::layout_for`]) — never from its own request — so an older
+    /// host that omits it (→ `2`) yields working stereo. The `0xC9` audio frames are encoded with the
+    /// matching layout.
+    pub audio_channels: u8,
 }
 
 /// Pin the calling thread to the user-interactive QoS class on Apple targets.
@@ -246,6 +260,9 @@ impl NativeClient {
         // VIDEO_CAP_HDR) — the host upgrades to a 10-bit / HDR encode only when the matching bit is
         // set. 0 = the 8-bit BT.709 stream every client understands.
         video_caps: u8,
+        // Requested audio channel count (2 = stereo / 6 = 5.1 / 8 = 7.1); the host clamps to what it
+        // can capture and echoes the result in [`NativeClient::audio_channels`].
+        audio_channels: u8,
         launch: Option<String>,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
@@ -298,6 +315,7 @@ impl NativeClient {
                     gamepad,
                     bitrate_kbps,
                     video_caps,
+                    audio_channels,
                     launch,
                     pin,
                     identity,
@@ -329,6 +347,8 @@ impl NativeClient {
             clock_offset_ns,
             bit_depth,
             color,
+            chroma_format,
+            audio_channels,
         ) = match ready_rx.recv_timeout(timeout) {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => return Err(e),
@@ -360,6 +380,8 @@ impl NativeClient {
             clock_offset_ns,
             bit_depth,
             color,
+            chroma_format,
+            audio_channels,
         })
     }
 
@@ -666,6 +688,7 @@ struct WorkerArgs {
     gamepad: GamepadPref,
     bitrate_kbps: u32,
     video_caps: u8,
+    audio_channels: u8,
     launch: Option<String>,
     pin: Option<[u8; 32]>,
     identity: Option<(String, String)>,
@@ -697,6 +720,7 @@ async fn worker_main(args: WorkerArgs) {
         gamepad,
         bitrate_kbps,
         video_caps,
+        audio_channels,
         launch,
         pin,
         identity,
@@ -763,6 +787,8 @@ async fn worker_main(args: WorkerArgs) {
                 // VIDEO_CAP_10BIT | VIDEO_CAP_HDR). The host only upgrades to a 10-bit / HDR encode
                 // when the matching bit is set, so `0` stays an 8-bit BT.709 stream.
                 video_caps,
+                // Requested surround channel count; the host echoes the resolved value in Welcome.
+                audio_channels,
             }
             .encode(),
         )
@@ -834,6 +860,8 @@ async fn worker_main(args: WorkerArgs) {
             clock_offset_ns,
             welcome.bit_depth,
             welcome.color,
+            welcome.chroma_format,
+            welcome.audio_channels,
         ))
     };
 
@@ -850,6 +878,8 @@ async fn worker_main(args: WorkerArgs) {
         clock_offset_ns,
         bit_depth,
         color,
+        chroma_format,
+        audio_channels,
     ) = match setup.await {
         Ok(t) => t,
         Err(e) => {
@@ -866,6 +896,8 @@ async fn worker_main(args: WorkerArgs) {
         clock_offset_ns,
         bit_depth,
         color,
+        chroma_format,
+        audio_channels,
     )));
 
     // Input task: embedder events → QUIC datagrams.

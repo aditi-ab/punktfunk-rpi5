@@ -7,7 +7,7 @@
 //! **Goal-1 stages 1–2** (`design/windows-host-rewrite.md` §2.2): stage 1 stood this up; stage 2 migrated the
 //! genuinely-constant operator/dispatch knobs onto it (the dispatch-disagreement bug class: `idd_push`,
 //! `capture_backend`, `encoder_pref`, `render_adapter`, `no_wgc`, the vdisplay backend select — plus the
-//! plan-named `secure_dda`/`idd_depth`/`zerocopy`/`ten_bit` and the multi-site `perf`/`compositor`/
+//! plan-named `secure_dda`/`idd_depth`/`zerocopy`/`ten_bit`/`four_four_four` and the multi-site `perf`/`compositor`/
 //! `video_source`/`gamepad`). `SessionPlan` (stage 3) consumes it as the single owner of the
 //! capture/topology/encoder decision.
 //!
@@ -63,6 +63,10 @@ pub struct HostConfig {
     pub zerocopy: bool,
     /// `PUNKTFUNK_10BIT` — host policy gate for HEVC Main10 (only honored when the client also advertised 10-bit).
     pub ten_bit: bool,
+    /// `PUNKTFUNK_444` — host policy gate for full-chroma HEVC 4:4:4 (Range Extensions). Honored only
+    /// when the client also advertised 4:4:4, the codec is HEVC, and the GPU/driver supports a 4:4:4
+    /// encode (probed) — otherwise the session stays 4:2:0. Independent of `ten_bit` (chroma vs depth).
+    pub four_four_four: bool,
     /// `PUNKTFUNK_PERF` — per-stage timing instrumentation.
     pub perf: bool,
     /// `PUNKTFUNK_VIDEO_SOURCE` — GameStream video source select (`virtual` / `portal` / unset → synthetic).
@@ -112,6 +116,7 @@ impl HostConfig {
                 .unwrap_or(2),
             zerocopy: flag("PUNKTFUNK_ZEROCOPY"),
             ten_bit: flag("PUNKTFUNK_10BIT"),
+            four_four_four: flag("PUNKTFUNK_444"),
             perf: flag("PUNKTFUNK_PERF"),
             video_source: val("PUNKTFUNK_VIDEO_SOURCE"),
             compositor: val("PUNKTFUNK_COMPOSITOR"),

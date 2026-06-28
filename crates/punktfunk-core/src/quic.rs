@@ -78,12 +78,33 @@ pub struct Hello {
     /// zero-length name/launch placeholder precedes it when those are absent so the offset stays
     /// deterministic. Omitted by older clients (decodes to `0`).
     pub video_caps: u8,
+    /// Requested audio channel count: `2` (stereo, default), `6` (5.1) or `8` (7.1). The host
+    /// resolves it against what it can capture and echoes the final count in
+    /// [`Welcome::audio_channels`], which is what both ends build their Opus (multistream)
+    /// codec from. Appended after `video_caps` as a single trailing byte; when it differs from
+    /// the stereo default the name/launch/video_caps placeholders are forced (0) so it lands at a
+    /// deterministic offset. Omitted by older clients / when `2` (decodes to `2`, i.e. stereo) so
+    /// the stereo wire form stays byte-identical to the pre-surround build.
+    pub audio_channels: u8,
 }
 
 /// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
 pub const VIDEO_CAP_10BIT: u8 = 0x01;
 /// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
 pub const VIDEO_CAP_HDR: u8 = 0x02;
+/// [`Hello::video_caps`] bit: the client can decode a full-chroma **4:4:4** HEVC stream (HEVC
+/// Range Extensions / Rec.ITU-T H.265 `chroma_format_idc = 3`). The host emits 4:4:4 ONLY when this
+/// bit is set, the host opted in (`PUNKTFUNK_444`), the codec is HEVC, **and** the GPU/driver
+/// actually supports a 4:4:4 encode (probed) — otherwise the session stays 4:2:0 and
+/// [`Welcome::chroma_format`] reflects the real resolved value. Independent of 10-bit/HDR (4:4:4 is a
+/// chroma decision, bit depth is a depth decision; the two may combine where the hardware allows).
+pub const VIDEO_CAP_444: u8 = 0x04;
+
+/// HEVC `chroma_format_idc` for 4:2:0 — what every pre-4:4:4 build produced and the back-compat
+/// default when a peer omits [`Welcome::chroma_format`].
+pub const CHROMA_IDC_420: u8 = 1;
+/// HEVC `chroma_format_idc` for full-chroma 4:4:4 (Range Extensions).
+pub const CHROMA_IDC_444: u8 = 3;
 
 /// Per-session colour signalling (CICP / ITU-T H.273 code points) the host resolved for the
 /// encoded video, carried on [`Welcome`]. A client configures its decoder/presenter from these
@@ -198,6 +219,22 @@ pub struct Welcome {
     /// [`ColorInfo::SDR_BT709`]. The client configures its decoder/presenter from this instead of
     /// guessing from the bitstream; the mastering metadata arrives separately on [`HDR_META_MAGIC`].
     pub color: ColorInfo,
+    /// The chroma subsampling the host actually encodes at, as the HEVC `chroma_format_idc`:
+    /// [`CHROMA_IDC_420`] (4:2:0, default / older host) or [`CHROMA_IDC_444`] (full-chroma 4:4:4,
+    /// enabled only when the client advertised [`VIDEO_CAP_444`] *and* the host could open a real
+    /// 4:4:4 encode). The client sizes its decoder/surface pool from this; the in-band SPS carries
+    /// the authoritative value, so this is a hint (and the honest-downgrade channel — if the host
+    /// requested 4:4:4 but the GPU declined, this reads `CHROMA_IDC_420`). Appended after the colour
+    /// bytes as a single trailing byte; an older host that omits it decodes to [`CHROMA_IDC_420`].
+    pub chroma_format: u8,
+    /// The audio channel count the host actually resolved and **will** send on the `0xC9` plane:
+    /// `2` (stereo, default), `6` (5.1) or `8` (7.1). Echoes [`Hello::audio_channels`] clamped to
+    /// what the host can capture (Linux PipeWire always synthesizes the count; Windows WASAPI
+    /// loopback is clamped to the render endpoint's mix-format channels). The client builds its Opus
+    /// (multistream) decoder from THIS value via [`crate::audio::layout_for`] — never from its own
+    /// request — so an older host that omits the byte (→ `2`) always yields working stereo. Appended
+    /// after `chroma_format` as a single trailing byte.
+    pub audio_channels: u8,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -630,10 +667,11 @@ impl Hello {
                                                                // so a Hello with neither name nor launch stays byte-identical to the bitrate-era form
                                                                // (26 bytes). When `launch` is present we must still emit name's length byte (0 for None)
                                                                // so `launch` lands at a deterministic offset.
-                                                               // `video_caps` is the last trailing field, after `launch`; when it's present (non-zero)
-                                                               // the name/launch length bytes must still be emitted (0 for absent) so it lands at a
+                                                               // `video_caps`/`audio_channels` are the trailing fields, after `launch`; when either is
+                                                               // present (video_caps non-zero / audio_channels not stereo) the name/launch length bytes
+                                                               // AND the video_caps byte must still be emitted (0 / 0) so the later byte lands at a
                                                                // deterministic offset — the same discipline `launch` already imposes on `name`.
-        let need_placeholders = self.video_caps != 0;
+        let need_placeholders = self.video_caps != 0 || self.audio_channels != 2;
         match (&self.name, &self.launch) {
             (None, None) if !need_placeholders => {}
             (name, _) => {
@@ -648,9 +686,14 @@ impl Hello {
             b.push(l.len() as u8);
             b.extend_from_slice(l.as_bytes());
         }
-        // video_caps: single trailing byte. Last field.
-        if self.video_caps != 0 {
+        // video_caps: single trailing byte. Emitted when non-zero OR when audio_channels follows
+        // (so audio_channels lands at a deterministic offset right after it).
+        if self.video_caps != 0 || self.audio_channels != 2 {
             b.push(self.video_caps);
+        }
+        // audio_channels: single trailing byte. Last field; omitted when stereo (default).
+        if self.audio_channels != 2 {
+            b.push(self.audio_channels);
         }
         b
     }
@@ -714,6 +757,15 @@ impl Hello {
                 let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
                 b.get(launch_off + 1 + launch_len).copied().unwrap_or(0)
             },
+            // Optional trailing audio-channel byte, one past video_caps. Absent on an older client
+            // → stereo. Normalized so a corrupt/unsupported value can't build a bad decoder.
+            audio_channels: {
+                let name_len = b.get(26).copied().unwrap_or(0) as usize;
+                let launch_off = 27 + name_len;
+                let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
+                let video_caps_off = launch_off + 1 + launch_len;
+                crate::audio::normalize_channels(b.get(video_caps_off + 1).copied().unwrap_or(2))
+            },
         })
     }
 }
@@ -747,6 +799,10 @@ impl Welcome {
         b.push(self.color.transfer);
         b.push(self.color.matrix);
         b.push(self.color.full_range);
+        // Chroma subsampling at offset 64 — older clients stop before this → 4:2:0 (CHROMA_IDC_420).
+        b.push(self.chroma_format);
+        // Audio channel count at offset 65 — older clients stop before this → stereo (2).
+        b.push(self.audio_channels);
         b
     }
 
@@ -755,7 +811,8 @@ impl Welcome {
         // scheme[22] pct[23] max_data[24..26] shard[26..28] encrypt[28] key[29..45]
         // salt[45..49] frames[49..53] compositor[53] gamepad[54] bitrate_kbps[55..59]
         // bit_depth[59] color.primaries[60] color.transfer[61] color.matrix[62] color.range[63]
-        // (everything from compositor on is an optional trailing byte; an older host stops earlier).
+        // chroma_format[64] audio_channels[65] (everything from compositor on is an optional
+        // trailing byte; an older host stops earlier).
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -812,6 +869,15 @@ impl Welcome {
                 matrix: b.get(62).copied().unwrap_or(ColorInfo::MC_BT709),
                 full_range: b.get(63).copied().unwrap_or(0),
             },
+            // Optional trailing chroma byte — absent on an older host (or an explicit 0 / unknown
+            // value) → 4:2:0. Only `CHROMA_IDC_444` flips the client to a 4:4:4 decode.
+            chroma_format: match b.get(64).copied() {
+                Some(CHROMA_IDC_444) => CHROMA_IDC_444,
+                _ => CHROMA_IDC_420,
+            },
+            // Optional trailing audio-channel byte — absent on an older host → stereo. Any
+            // non-{6,8} value normalizes to stereo so a corrupt byte never builds a bad decoder.
+            audio_channels: crate::audio::normalize_channels(b.get(65).copied().unwrap_or(2)),
         })
     }
 
@@ -1809,6 +1875,8 @@ mod tests {
             bitrate_kbps: 50_000,
             bit_depth: 10,
             color: ColorInfo::HDR10_BT2020_PQ,
+            chroma_format: CHROMA_IDC_444,
+            audio_channels: 2,
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
     }
@@ -1851,6 +1919,7 @@ mod tests {
             name: Some("Test Device".into()),
             launch: Some("steam:570".into()),
             video_caps: VIDEO_CAP_10BIT,
+            audio_channels: 2,
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -1930,6 +1999,7 @@ mod tests {
             name: None,
             launch: None,
             video_caps: 0,
+            audio_channels: 2,
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -1969,9 +2039,11 @@ mod tests {
             bitrate_kbps: 120_000,
             bit_depth: 10,
             color: ColorInfo::HDR10_BT2020_PQ,
+            chroma_format: CHROMA_IDC_444,
+            audio_channels: 6, // 5.1 — exercises the non-default trailing byte
         };
         let wenc = w.encode();
-        assert_eq!(wenc.len(), 64); // 60 base + 4 colour bytes
+        assert_eq!(wenc.len(), 66); // 60 base + 4 colour + 1 chroma + 1 audio-channels byte
         let legacy_w = Welcome::decode(&wenc[..53]).unwrap();
         assert_eq!(legacy_w.compositor, CompositorPref::Auto);
         assert_eq!(legacy_w.gamepad, GamepadPref::Auto);
@@ -1991,13 +2063,29 @@ mod tests {
         let pre_color_w = Welcome::decode(&wenc[..60]).unwrap();
         assert_eq!(pre_color_w.bit_depth, 10);
         assert_eq!(pre_color_w.color, ColorInfo::SDR_BT709);
+        assert_eq!(pre_color_w.chroma_format, CHROMA_IDC_420); // pre-chroma host → 4:2:0
         assert_eq!(legacy_w.color, ColorInfo::SDR_BT709);
+        assert_eq!(legacy_w.chroma_format, CHROMA_IDC_420);
+        // A pre-chroma (64-byte) Welcome carries colour but no chroma/audio bytes → 4:2:0 + stereo.
+        let pre_chroma_w = Welcome::decode(&wenc[..64]).unwrap();
+        assert_eq!(pre_chroma_w.color, ColorInfo::HDR10_BT2020_PQ);
+        assert_eq!(pre_chroma_w.chroma_format, CHROMA_IDC_420);
+        assert_eq!(pre_chroma_w.audio_channels, 2); // audio byte (offset 65) absent → stereo
+                                                    // A pre-audio (65-byte) Welcome carries chroma but no audio byte → 4:4:4 + stereo.
+        let pre_audio_w = Welcome::decode(&wenc[..65]).unwrap();
+        assert_eq!(pre_audio_w.chroma_format, CHROMA_IDC_444);
+        assert_eq!(pre_audio_w.audio_channels, 2);
         assert_eq!(Welcome::decode(&wenc).unwrap().bitrate_kbps, 120_000);
         assert_eq!(Welcome::decode(&wenc).unwrap().bit_depth, 10); // full form carries it
         assert_eq!(
             Welcome::decode(&wenc).unwrap().color,
             ColorInfo::HDR10_BT2020_PQ
         );
+        assert_eq!(
+            Welcome::decode(&wenc).unwrap().chroma_format,
+            CHROMA_IDC_444
+        ); // full form carries 4:4:4
+        assert_eq!(Welcome::decode(&wenc).unwrap().audio_channels, 6); // ...and 5.1
     }
 
     #[test]
@@ -2015,6 +2103,7 @@ mod tests {
             name: Some("Enrico's MacBook".into()),
             launch: None,
             video_caps: 0,
+            audio_channels: 2,
         };
         let enc = base.encode();
         assert_eq!(
@@ -2062,6 +2151,7 @@ mod tests {
             name: None,
             launch: None,
             video_caps: 0,
+            audio_channels: 2,
         };
         // launch alone (no name): a zero-length name placeholder keeps the offset deterministic.
         let with_launch = Hello {
@@ -2268,6 +2358,7 @@ mod tests {
                 name: None,
                 launch: None,
                 video_caps: 0,
+                audio_channels: 2,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");

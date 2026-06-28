@@ -89,21 +89,29 @@ impl PortalCapturer {
             node_id,
             "ScreenCast portal session started; connecting PipeWire"
         );
-        Ok(spawn_pipewire(Some(fd), node_id, None)?.into_capturer(node_id, None))
+        // This portal path (GameStream / monitor capture) is always 4:2:0, so allow zero-copy as before.
+        Ok(spawn_pipewire(Some(fd), node_id, None, true)?.into_capturer(node_id, None))
     }
 
     /// Build a capturer from an already-created virtual output ([`crate::vdisplay::VirtualOutput`]):
     /// connect PipeWire to its node (`remote_fd` selects portal-remote vs. default-daemon) and
     /// take ownership of its keepalive so the output lives exactly as long as this capturer. This
     /// is how the client's requested resolution becomes the captured resolution without scaling.
-    pub fn from_virtual_output(vout: crate::vdisplay::VirtualOutput) -> Result<PortalCapturer> {
+    /// `allow_zerocopy` mirrors [`OutputFormat::gpu`](crate::capture::OutputFormat): `false` forces the
+    /// CPU mmap path (a 4:4:4 NVENC session needs CPU-resident RGB), `true` keeps the GPU zero-copy
+    /// path subject to `PUNKTFUNK_ZEROCOPY`.
+    pub fn from_virtual_output(
+        vout: crate::vdisplay::VirtualOutput,
+        allow_zerocopy: bool,
+    ) -> Result<PortalCapturer> {
         tracing::info!(
             node_id = vout.node_id,
+            allow_zerocopy,
             "connecting PipeWire to virtual output"
         );
         let node_id = vout.node_id;
         Ok(
-            spawn_pipewire(vout.remote_fd, node_id, vout.preferred_mode)?
+            spawn_pipewire(vout.remote_fd, node_id, vout.preferred_mode, allow_zerocopy)?
                 .into_capturer(node_id, Some(vout.keepalive)),
         )
     }
@@ -146,6 +154,12 @@ fn spawn_pipewire(
     fd: Option<OwnedFd>,
     node_id: u32,
     preferred: Option<(u32, u32, u32)>,
+    // Allow GPU zero-copy capture (dmabuf→CUDA/VA). `false` forces the CPU mmap path even when
+    // `PUNKTFUNK_ZEROCOPY` is set — a 4:4:4 NVENC session needs CPU-resident RGB (the encoder
+    // swscales RGB→YUV444P; `hevc_nvenc` can't 4:4:4 from a CUDA RGB surface), so the session plan
+    // passes `gpu = false` for it. Without this, a 4:4:4 session under `PUNKTFUNK_ZEROCOPY=1` would
+    // get CUDA frames and the encoder would bail (`want_444 && cuda`).
+    allow_zerocopy: bool,
 ) -> Result<PwHandles> {
     // Frames flow from the pipewire thread over a small bounded channel.
     let (frame_tx, frame_rx) = sync_channel::<CapturedFrame>(8);
@@ -159,7 +173,7 @@ fn spawn_pipewire(
     // sender lives on the capturer and fires in its `Drop`. Absolute `::pipewire` path — the
     // inner `mod pipewire` shadows the crate name at this scope.
     let (quit_tx, quit_rx) = ::pipewire::channel::channel::<()>();
-    let zerocopy = crate::zerocopy::enabled();
+    let zerocopy = allow_zerocopy && crate::zerocopy::enabled();
     let join = thread::Builder::new()
         .name("punktfunk-pipewire".into())
         .spawn(move || {

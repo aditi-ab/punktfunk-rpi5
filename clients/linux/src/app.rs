@@ -452,6 +452,7 @@ fn speed_test(app: Rc<App>, req: ConnectRequest) {
                 GamepadPref::Auto,
                 0,    // bitrate_kbps (host default)
                 0,    // video_caps: the Linux client has no 10-bit/HDR present path yet
+                2,    // audio_channels: speed-test probe, stereo
                 None, // launch: speed-test probe connect, no game
                 pin,
                 Some(identity),
@@ -573,6 +574,7 @@ fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
         },
         bitrate_kbps: s.bitrate_kbps,
         mic_enabled: s.mic_enabled,
+        audio_channels: s.audio_channels,
         pin,
         identity: app.identity.clone(),
     };

@@ -13,8 +13,10 @@ use std::process::Command;
 fn native_libs() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
         // The workspace build unifies features into the staticlib, and `quic` pulls
-        // rustls's platform verifier → Security/CoreFoundation.
+        // rustls's platform verifier → Security/CoreFoundation, plus libopus (the in-core
+        // `next_audio_pcm` decode path) which the `abi.rs` object references.
         &[
+            "-lopus",
             "-liconv",
             "-lm",
             "-framework",
@@ -23,7 +25,17 @@ fn native_libs() -> &'static [&'static str] {
             "CoreFoundation",
         ]
     } else if cfg!(target_os = "linux") {
-        &["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl"]
+        // `-lopus`: the `quic` feature pulls in-core Opus decode (`next_audio_pcm`), whose
+        // symbols the linked `abi.rs` object references. Before `-lm` (opus needs libm).
+        &[
+            "-lopus",
+            "-lgcc_s",
+            "-lutil",
+            "-lrt",
+            "-lpthread",
+            "-lm",
+            "-ldl",
+        ]
     } else {
         &[]
     }

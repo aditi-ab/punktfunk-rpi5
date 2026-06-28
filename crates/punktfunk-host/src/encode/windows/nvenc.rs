@@ -16,7 +16,7 @@
 // Every `unsafe` block / impl in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use super::{Codec, EncodedFrame, Encoder, EncoderCaps};
+use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::capture::{CapturedFrame, FramePayload, PixelFormat};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
@@ -57,6 +57,15 @@ pub struct NvencD3d11Encoder {
     buffer_fmt: nv::NV_ENC_BUFFER_FORMAT,
     /// Encoded bit depth (8 or 10). 10 → HEVC Main10 (NVENC upconverts the 8-bit ARGB input).
     bit_depth: u8,
+    /// Full-chroma 4:4:4 (HEVC Range Extensions, `chroma_format_idc = 3`) requested for this session.
+    /// NVENC ingests the RGB (ARGB/ABGR10) input and CSCs it to YUV444 internally — the `FREXT` profile
+    /// + `chromaFormatIDC = 3` in the encode config carry the chroma. Gated on the GPU's
+    /// `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE` (cleared in `query_caps` on a card that lacks it) and on an
+    /// RGB input format (NV12/P010 capture can't reconstruct 4:4:4). HEVC-only.
+    chroma_444: bool,
+    /// `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE` from the caps probe — whether this GPU can 4:4:4 encode at
+    /// all. `chroma_444` is forced off when this is false (graceful downgrade to 4:2:0).
+    yuv444_supported: bool,
     /// HDR: the capturer is delivering BT.2020 PQ 10-bit (`PixelFormat::Rgb10a2`) frames. Sets the
     /// `ABGR10` input format + the BT.2020/PQ colour VUI. Derived per-frame from the capture format
     /// (HDR can toggle mid-session); a change re-inits the session.
@@ -103,6 +112,7 @@ pub struct NvencD3d11Encoder {
 unsafe impl Send for NvencD3d11Encoder {}
 
 impl NvencD3d11Encoder {
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
         _format: PixelFormat,
@@ -111,6 +121,7 @@ impl NvencD3d11Encoder {
         fps: u32,
         bitrate_bps: u64,
         bit_depth: u8,
+        chroma: ChromaFormat,
     ) -> Result<Self> {
         Ok(Self {
             encoder: ptr::null_mut(),
@@ -122,6 +133,9 @@ impl NvencD3d11Encoder {
             bitrate_bps,
             buffer_fmt: nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
             bit_depth,
+            // 4:4:4 is HEVC-only; the GPU-support gate is applied in `query_caps`.
+            chroma_444: chroma.is_444() && codec == Codec::H265,
+            yuv444_supported: false,
             hdr: false,
             hdr_meta: None,
             regs: HashMap::new(),
@@ -209,6 +223,7 @@ impl NvencD3d11Encoder {
         let wmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
         let hmax = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
         let ten_bit = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_10BIT_ENCODE);
+        let yuv444 = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE);
         let rfi = self.get_cap(
             enc,
             nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION,
@@ -234,6 +249,13 @@ impl NvencD3d11Encoder {
             tracing::warn!("NVENC: this GPU can't 10-bit encode — falling back to 8-bit SDR");
             self.bit_depth = 8;
             self.hdr = false;
+        }
+        // Same for 4:4:4: a card without YUV444 encode falls back to 4:2:0. (The host already probed
+        // this via `probe_can_encode_444` before the Welcome, so this is a belt-and-braces guard.)
+        self.yuv444_supported = yuv444 != 0;
+        if self.chroma_444 && !self.yuv444_supported {
+            tracing::warn!("NVENC: this GPU can't 4:4:4 encode — falling back to 4:2:0");
+            self.chroma_444 = false;
         }
         self.rfi_supported = rfi != 0;
         self.custom_vbv = custom_vbv != 0;
@@ -313,9 +335,31 @@ impl NvencD3d11Encoder {
         cfg.encodeCodecConfig.hevcConfig.tier = 1;
         cfg.encodeCodecConfig.hevcConfig.level = 0;
 
-        // 10-bit HEVC Main10 (HDR foundation): NVENC upconverts the 8-bit input; 8-bit leaves the
-        // preset default (Main) untouched.
-        if self.bit_depth == 10 {
+        // Chroma + bit depth. Full-chroma 4:4:4 (HEVC Range Extensions) takes precedence and composes
+        // with 10-bit (Main 4:4:4 10): NVENC ingests the RGB input (ARGB / ABGR10) and CSCs it to
+        // YUV444 internally when `chromaFormatIDC = 3` under the FREXT profile. Only valid on an RGB
+        // input — a subsampled NV12/P010 source can't reconstruct full chroma (so the capturer is
+        // forced to RGB for a 4:4:4 session, and we guard on the input format here too).
+        //
+        // ON-GLASS TODO (RTX box): confirm ARGB + chromaFormatIDC=3 + FREXT yields a *true* 4:4:4
+        // stream. NVENC's RGB→YUV CSC is documented to honor chromaFormatIDC (unlike libavcodec's
+        // wrapper, which always subsamples RGB to 4:2:0 — hence the Linux path feeds planar YUV444
+        // instead). If on-glass shows 4:2:0, the follow-up is a BGRA→AYUV shader feeding the native
+        // `NV_ENC_BUFFER_FORMAT_AYUV` 4:4:4 input format.
+        let rgb_input = matches!(
+            self.buffer_fmt,
+            nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+                | nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10
+        );
+        if self.chroma_444 && rgb_input {
+            cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_FREXT_GUID;
+            cfg.encodeCodecConfig.hevcConfig.set_chromaFormatIDC(3);
+            if self.bit_depth == 10 {
+                cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2); // Main 4:4:4 10
+            }
+        } else if self.bit_depth == 10 {
+            // 10-bit HEVC Main10 (HDR foundation): NVENC upconverts the 8-bit input; 8-bit leaves the
+            // preset default (Main) untouched.
             cfg.profileGUID = nv::NV_ENC_HEVC_PROFILE_MAIN10_GUID;
             cfg.encodeCodecConfig.hevcConfig.set_pixelBitDepthMinus8(2); // 10 - 8
         }
@@ -787,6 +831,9 @@ impl Encoder for NvencD3d11Encoder {
         EncoderCaps {
             supports_rfi: self.rfi_supported,
             supports_hdr_metadata: self.hdr,
+            // Reflects what the session actually configured (cleared in `query_caps` if the GPU lacks
+            // YUV444 encode), so the glue can confirm 4:4:4 vs the negotiated request.
+            chroma_444: self.chroma_444,
         }
     }
 
@@ -902,5 +949,71 @@ impl Drop for NvencD3d11Encoder {
         // `teardown` early-returns when `self.encoder` is null; otherwise every cached reg/bitstream/
         // pending was created against that live session. It runs exactly once (here).
         unsafe { self.teardown() };
+    }
+}
+
+/// Probe whether the active NVIDIA GPU can encode HEVC **4:4:4** (`NV_ENC_CAPS_SUPPORT_YUV444_ENCODE`).
+/// Creates a throwaway hardware D3D11 device + NVENC session, queries the cap, and tears down. HEVC-only;
+/// the result is cached by the caller ([`crate::encode::can_encode_444`]) and read *before* the Welcome
+/// so the host advertises the chroma it can really encode (honest downgrade to 4:2:0 on a card without it).
+pub fn probe_can_encode_444(codec: Codec) -> bool {
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+    };
+    if codec != Codec::H265 {
+        return false;
+    }
+    // SAFETY: a self-contained probe owning every handle it creates. `D3D11CreateDevice` (HARDWARE
+    // driver, NULL adapter) fills `device` or returns Err (→ false). `open_encode_session_ex` opens an
+    // NVENC session against that device's raw pointer (valid while `device` is held) or errors (→ false,
+    // tearing nothing down). `get_encode_caps` reads one scalar cap into `val` via the loaded API table.
+    // `destroy_encoder` frees the session exactly once; `device`/its context drop with the COM wrappers.
+    // No handle escapes this call and nothing runs concurrently.
+    unsafe {
+        let mut device: Option<ID3D11Device> = None;
+        if D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&[D3D_FEATURE_LEVEL_11_0]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let Some(device) = device else { return false };
+        let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+            version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+            deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,
+            device: device.as_raw(),
+            apiVersion: nv::NVENCAPI_VERSION,
+            ..Default::default()
+        };
+        let mut enc: *mut c_void = ptr::null_mut();
+        if (API.open_encode_session_ex)(&mut params, &mut enc)
+            .result_without_string()
+            .is_err()
+        {
+            return false;
+        }
+        let mut param = nv::NV_ENC_CAPS_PARAM {
+            version: nv::NV_ENC_CAPS_PARAM_VER,
+            capsToQuery: nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE,
+            reserved: [0; 62],
+        };
+        let mut val: i32 = 0;
+        let ok = (API.get_encode_caps)(enc, nv::NV_ENC_CODEC_HEVC_GUID, &mut param, &mut val)
+            .result_without_string()
+            .is_ok()
+            && val != 0;
+        let _ = (API.destroy_encoder)(enc);
+        ok
     }
 }

@@ -25,6 +25,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
+    @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
     @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @ObservedObject private var gamepads = GamepadManager.shared
@@ -173,6 +174,10 @@ struct SettingsView: View {
                 TVSelectionRow(title: "Stream mode", options: options, selection: modeTag)
                 TVSelectionRow(
                     title: "Bitrate", options: bitrateOptions, selection: $bitrateKbps)
+                TVSelectionRow(
+                    title: "Audio channels",
+                    options: [("Stereo", 2), ("5.1 Surround", 6), ("7.1 Surround", 8)],
+                    selection: $audioChannels)
                 if bitrateKbps > 1_000_000 {
                     Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
@@ -271,6 +276,11 @@ struct SettingsView: View {
 
     @ViewBuilder private var audioSection: some View {
         Section {
+            Picker("Audio channels", selection: $audioChannels) {
+                Text("Stereo").tag(2)
+                Text("5.1 Surround").tag(6)
+                Text("7.1 Surround").tag(8)
+            }
             #if os(macOS)
             Picker("Speaker", selection: $speakerUID) {
                 Text("System default").tag("")

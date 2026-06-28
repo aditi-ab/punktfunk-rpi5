@@ -94,6 +94,12 @@
 // BT.2020 PQ HDR10 (implies 10-bit). (Mirrors `quic::VIDEO_CAP_HDR`.)
 #define PUNKTFUNK_VIDEO_CAP_HDR 2
 
+// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can decode a
+// full-chroma 4:4:4 HEVC stream (Range Extensions). The host emits 4:4:4 only when this is set,
+// the host opted in, the codec is HEVC, and the GPU supports it — else the stream stays 4:2:0 and
+// [`punktfunk_connection_chroma_format`] reports the real value. (Mirrors `quic::VIDEO_CAP_444`.)
+#define PUNKTFUNK_VIDEO_CAP_444 4
+
 // 16-byte AEAD authentication tag appended by GCM.
 #define TAG_LEN 16
 
@@ -178,6 +184,27 @@
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
 #define VIDEO_CAP_HDR 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client can decode a full-chroma **4:4:4** HEVC stream (HEVC
+// Range Extensions / Rec.ITU-T H.265 `chroma_format_idc = 3`). The host emits 4:4:4 ONLY when this
+// bit is set, the host opted in (`PUNKTFUNK_444`), the codec is HEVC, **and** the GPU/driver
+// actually supports a 4:4:4 encode (probed) — otherwise the session stays 4:2:0 and
+// [`Welcome::chroma_format`] reflects the real resolved value. Independent of 10-bit/HDR (4:4:4 is a
+// chroma decision, bit depth is a depth decision; the two may combine where the hardware allows).
+#define VIDEO_CAP_444 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// HEVC `chroma_format_idc` for 4:2:0 — what every pre-4:4:4 build produced and the back-compat
+// default when a peer omits [`Welcome::chroma_format`].
+#define CHROMA_IDC_420 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// HEVC `chroma_format_idc` for full-chroma 4:4:4 (Range Extensions).
+#define CHROMA_IDC_444 3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -496,6 +523,25 @@ typedef struct {
     uint32_t seq;
     uint64_t pts_ns;
 } PunktfunkAudioPacket;
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved 32-bit
+// float PCM at 48 kHz, in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the
+// first `channels` of it). `samples` points at `frame_count * channels` floats and borrows
+// connection memory **until the next PCM call** on this handle.
+typedef struct {
+    // Interleaved f32 samples (wire channel order), `frame_count * channels` long.
+    const float *samples;
+    // Samples per channel in this frame.
+    uint32_t frame_count;
+    // Channel count (2/6/8) — the negotiated [`punktfunk_connection_audio_channels`].
+    uint8_t channels;
+    // Source packet sequence number.
+    uint32_t seq;
+    // Capture presentation timestamp (ns).
+    uint64_t pts_ns;
+} PunktfunkAudioPcm;
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -833,6 +879,33 @@ PunktfunkConnection *punktfunk_connect_ex5(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect_ex5`], but additionally requests the audio channel count:
+// `2` (stereo, the default behaviour of every earlier variant), `6` (5.1) or `8` (7.1). The host
+// clamps the request to what it can actually capture and echoes the resolved count via
+// [`punktfunk_connection_audio_channels`]; the `0xC9` audio frames are Opus-(multi)stream encoded
+// for that layout. A client that wants surround calls this; everything else inherits stereo.
+//
+// # Safety
+// Same as [`punktfunk_connect`].
+PunktfunkConnection *punktfunk_connect_ex6(const char *host,
+                                           uint16_t port,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t refresh_hz,
+                                           uint32_t compositor,
+                                           uint32_t gamepad,
+                                           uint32_t bitrate_kbps,
+                                           uint8_t video_caps,
+                                           uint8_t audio_channels,
+                                           const char *launch_id,
+                                           const uint8_t *pin_sha256,
+                                           uint8_t *observed_sha256_out,
+                                           const char *client_cert_pem,
+                                           const char *client_key_pem,
+                                           uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Generate a persistent client identity: a self-signed certificate + private key, both
 // PEM, NUL-terminated, written into the caller's buffers. Generate ONCE, store both
 // strings (Keychain etc.), pass them to [`punktfunk_pair`] and every
@@ -898,6 +971,36 @@ PunktfunkStatus punktfunk_connection_next_audio(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Read the audio channel count the host resolved for this session (from its Welcome): `2`
+// (stereo), `6` (5.1) or `8` (7.1). `*out` is filled when non-NULL. The `0xC9` Opus frames are
+// (multistream-)encoded for this layout; an embedder decoding raw frames itself must build its
+// decoder from THIS value (see [`crate::audio::layout_for`]) — or use
+// [`punktfunk_connection_next_audio_pcm`], which decodes in-core. Available immediately after a
+// successful connect (it doesn't change without a reconfigure).
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+PunktfunkStatus punktfunk_connection_audio_channels(PunktfunkConnection *c, uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pull the next audio frame and **decode it in-core** to interleaved f32 PCM — for embedders
+// without a multistream-capable Opus decoder (e.g. Apple, whose AudioToolbox Opus path is
+// stereo-only). The decoder is built once from the negotiated channel count and handles 2/6/8
+// channels (a 1-coupled-stream multistream decoder is exactly a stereo decoder). Same
+// timeout/closed semantics as [`punktfunk_connection_next_audio`]; `out->samples` borrows
+// connection memory until the next PCM call on this handle. Use EITHER this or
+// [`punktfunk_connection_next_audio`] on a given connection, from one dedicated audio thread —
+// not both (they share the underlying queue).
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
+PunktfunkStatus punktfunk_connection_next_audio_pcm(PunktfunkConnection *c,
+                                                    PunktfunkAudioPcm *out,
+                                                    uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Pull the next rumble (force-feedback) update, waiting up to `timeout_ms`. Amplitudes
 // are 0..0xFFFF (`low` = low-frequency motor, `high` = high-frequency), `(0, 0)` = stop.
 // Same timeout/closed semantics as [`punktfunk_connection_next_audio`].
@@ -958,6 +1061,18 @@ PunktfunkStatus punktfunk_connection_color_info(PunktfunkConnection *c,
                                                 uint8_t *matrix,
                                                 uint8_t *full_range,
                                                 uint8_t *bit_depth);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Read the session's resolved chroma subsampling (from the host's Welcome) as the HEVC
+// `chroma_format_idc`: `1` = 4:2:0 (the default every pre-4:4:4 host produced), `3` = full-chroma
+// 4:4:4. `*out` is filled when non-NULL. The in-band SPS is authoritative; this lets the embedder
+// pre-size its decoder / pick a 4:4:4 pixel format up front. Available immediately after a
+// successful connect (it doesn't change without a reconfigure).
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+PunktfunkStatus punktfunk_connection_chroma_format(PunktfunkConnection *c, uint8_t *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

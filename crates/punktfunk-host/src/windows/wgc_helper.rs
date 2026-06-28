@@ -98,6 +98,9 @@ pub fn run(opts: HelperOptions) -> Result<()> {
         opts.bitrate_kbps as u64 * 1000,
         false,          // not cuda
         opts.bit_depth, // 8, or 10 = Main10 (HDR auto-upgrades from the Rgb10a2 frame regardless)
+        // The two-process WGC relay helper encodes 4:2:0 in v1 (4:4:4 over the relay is a follow-up);
+        // the host gates 4:4:4 to the single-process topology.
+        encode::ChromaFormat::Yuv420,
     )
     .context("open NVENC")?;
 

@@ -78,6 +78,10 @@ struct Args {
     gamepad: GamepadPref,
     /// `--bitrate KBPS` — request this encoder bitrate (kilobits/s); 0 = host default.
     bitrate_kbps: u32,
+    /// `--audio-channels N` — request stereo (2), 5.1 (6) or 7.1 (8) audio; default 2. The probe
+    /// multistream-decodes the host's frames and asserts the per-channel sample count, so it's the
+    /// headless validator for the surround encode path.
+    audio_channels: u8,
     /// `--launch ID` — ask the host to launch a library title in this session (a store-qualified
     /// id from the host's `GET /api/v1/library`, e.g. `steam:570`). Host resolves it; `None` = none.
     launch: Option<String>,
@@ -201,6 +205,11 @@ fn parse_args() -> Args {
         compositor,
         gamepad,
         bitrate_kbps: get("--bitrate").and_then(|s| s.parse().ok()).unwrap_or(0),
+        audio_channels: punktfunk_core::audio::normalize_channels(
+            get("--audio-channels")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
+        ),
         launch: get("--launch").map(str::to_string),
         speed_test: get("--speed-test").and_then(|s| {
             let (kbps, ms) = s.split_once(':')?;
@@ -385,13 +394,23 @@ async fn session(args: Args) -> Result<()> {
             // `--launch ID` — host resolves it against its own library and runs it this session.
             launch: args.launch.clone(),
             // This headless tool just dumps the bitstream (no decode), so it can always claim
-            // 10-bit support. Gated by env so latency runs stay on the 8-bit baseline:
-            // PUNKTFUNK_CLIENT_10BIT=1 advertises VIDEO_CAP_10BIT to exercise the host Main10 path.
-            video_caps: if std::env::var_os("PUNKTFUNK_CLIENT_10BIT").is_some() {
-                punktfunk_core::quic::VIDEO_CAP_10BIT
-            } else {
-                0
+            // 10-bit / 4:4:4 support. Gated by env so latency runs stay on the 8-bit 4:2:0 baseline:
+            // PUNKTFUNK_CLIENT_10BIT=1 advertises VIDEO_CAP_10BIT (host Main10 path);
+            // PUNKTFUNK_CLIENT_444=1 advertises VIDEO_CAP_444 (host HEVC 4:4:4 path) — verify the
+            // resulting chroma with `ffprobe` on the `--out` .h265.
+            video_caps: {
+                let mut caps = 0u8;
+                if std::env::var_os("PUNKTFUNK_CLIENT_10BIT").is_some() {
+                    caps |= punktfunk_core::quic::VIDEO_CAP_10BIT;
+                }
+                if std::env::var_os("PUNKTFUNK_CLIENT_444").is_some() {
+                    caps |= punktfunk_core::quic::VIDEO_CAP_444;
+                }
+                caps
             },
+            // `--audio-channels` (default stereo); the probe multistream-decodes + validates the
+            // host's frames to exercise the surround encode path headlessly.
+            audio_channels: args.audio_channels,
         }
         .encode(),
     )
@@ -408,6 +427,8 @@ async fn session(args: Args) -> Result<()> {
         bit_depth = welcome.bit_depth,
         color = ?welcome.color,
         hdr = welcome.color.is_hdr(),
+        chroma_444 = welcome.chroma_format == punktfunk_core::quic::CHROMA_IDC_444,
+        chroma_format_idc = welcome.chroma_format,
         "session offer"
     );
 
@@ -830,13 +851,37 @@ async fn session(args: Args) -> Result<()> {
             hidout_pkts.clone(),
         );
         let conn2 = conn.clone();
+        // Build a multistream decoder for the host-RESOLVED layout so the probe actually decodes
+        // the surround stream (not just counts bytes) — the headless validator for the encode path.
+        let audio_channels = welcome.audio_channels;
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             let mut hdr_logged = false;
+            let layout = punktfunk_core::audio::layout_for(audio_channels, false);
+            let mut audio_dec =
+                opus::MSDecoder::new(48_000, layout.streams, layout.coupled, layout.mapping).ok();
+            let mut pcm = vec![0f32; 5760 * audio_channels as usize];
+            let mut audio_decoded_logged = false;
             while let Ok(d) = conn2.read_datagram().await {
                 if let Some((_, _, opus)) = punktfunk_core::quic::decode_audio_datagram(&d) {
                     a.fetch_add(1, Relaxed);
                     ab.fetch_add(opus.len() as u64, Relaxed);
+                    // Decode + validate: the per-channel sample count must be a legal Opus frame
+                    // size; log the first success so a loopback test can assert surround decoded.
+                    if let Some(dec) = audio_dec.as_mut() {
+                        match dec.decode_float(opus, &mut pcm, false) {
+                            Ok(samples) if !audio_decoded_logged => {
+                                audio_decoded_logged = true;
+                                tracing::info!(
+                                    channels = audio_channels,
+                                    samples_per_channel = samples,
+                                    "audio decoded (Opus multistream)"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::debug!(error = %e, "probe audio decode"),
+                        }
+                    }
                 } else if punktfunk_core::quic::decode_rumble_datagram(&d).is_some() {
                     r.fetch_add(1, Relaxed);
                 } else if let Some(meta) = punktfunk_core::quic::decode_hdr_meta_datagram(&d) {

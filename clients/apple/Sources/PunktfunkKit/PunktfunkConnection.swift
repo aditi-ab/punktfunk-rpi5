@@ -235,6 +235,12 @@ public final class PunktfunkConnection {
     /// drain `nextHdrMeta`.
     public var isHDR: Bool { colorTransfer == 16 || colorTransfer == 18 }
 
+    /// The audio channel count the host resolved for this session (the Welcome's echo of the
+    /// requested `audioChannels`, clamped to what the host can capture): `2` (stereo), `6` (5.1)
+    /// or `8` (7.1). Build the playback layout from THIS, never the request. `2` for an older host.
+    /// PCM from `nextAudioPcm` is interleaved in the canonical wire order FL FR FC LFE RL RR SL SR.
+    public private(set) var resolvedAudioChannels: UInt8 = 2
+
     /// Connect and start a session at the requested mode (the host creates a native virtual
     /// output at exactly this size/refresh). Blocks up to `timeoutMs`.
     ///
@@ -264,6 +270,7 @@ public final class PunktfunkConnection {
         gamepad: GamepadType = .auto,
         bitrateKbps: UInt32 = 0,
         videoCaps: UInt8 = 0,
+        audioChannels: UInt8 = 2,
         launchID: String? = nil,
         timeoutMs: UInt32 = 10_000
     ) throws {
@@ -279,16 +286,16 @@ public final class PunktfunkConnection {
                     withOptionalCString(launchID) { launch in
                         if let pin = pinSHA256 {
                             return pin.withUnsafeBytes { p in
-                                punktfunk_connect_ex5(
+                                punktfunk_connect_ex6(
                                     cs, port, width, height, refreshHz, compositor.rawValue,
-                                    gamepad.rawValue, bitrateKbps, videoCaps, launch,
+                                    gamepad.rawValue, bitrateKbps, videoCaps, audioChannels, launch,
                                     p.bindMemory(to: UInt8.self).baseAddress, &observed,
                                     cert, key, timeoutMs)
                             }
                         }
-                        return punktfunk_connect_ex5(
+                        return punktfunk_connect_ex6(
                             cs, port, width, height, refreshHz, compositor.rawValue,
-                            gamepad.rawValue, bitrateKbps, videoCaps, launch,
+                            gamepad.rawValue, bitrateKbps, videoCaps, audioChannels, launch,
                             nil, &observed, cert, key, timeoutMs)
                     }
                 }
@@ -320,6 +327,9 @@ public final class PunktfunkConnection {
         colorMatrix = mtx
         colorFullRange = fullRange != 0
         bitDepth = depth
+        var ac: UInt8 = 2
+        _ = punktfunk_connection_audio_channels(handle, &ac)
+        resolvedAudioChannels = ac
     }
 
     /// A bandwidth speed-test measurement (see `startSpeedTest`). Partial until `done`.
@@ -459,6 +469,50 @@ public final class PunktfunkConnection {
             guard let base = pkt.data, pkt.len > 0 else { return nil }
             let data = Data(bytes: base, count: Int(pkt.len)) // copy: ptr valid only until next call
             return AudioPacket(data: data, ptsNs: pkt.pts_ns, seq: pkt.seq)
+        case statusNoFrame:
+            return nil
+        case statusClosed:
+            throw PunktfunkClientError.closed
+        default:
+            throw PunktfunkClientError.status(rc)
+        }
+    }
+
+    /// One decoded audio frame from `nextAudioPcm`: interleaved 32-bit float at 48 kHz, in the
+    /// canonical wire channel order FL FR FC LFE RL RR SL SR (the first `channels`).
+    public struct AudioPCM: Sendable {
+        /// Interleaved f32 samples (`frameCount * channels` long), wire channel order.
+        public let samples: [Float]
+        /// Samples per channel.
+        public let frameCount: Int
+        /// Channel count (2/6/8) — `resolvedAudioChannels`.
+        public let channels: Int
+        public let ptsNs: UInt64
+        public let seq: UInt32
+    }
+
+    /// Pull the next audio frame, **decoded in-core** to interleaved f32 PCM — Apple's AudioToolbox
+    /// Opus path is stereo-only, so surround (and, for uniformity, stereo too) is decoded by the
+    /// Rust core (libopus multistream) and handed back as PCM. nil on timeout, throws `.closed` once
+    /// the session ended. Drain from a dedicated audio thread (do NOT also call `nextAudio` — they
+    /// share the underlying queue). The returned `samples` are copied out, so the buffer is owned.
+    public func nextAudioPcm(timeoutMs: UInt32 = 100) throws -> AudioPCM? {
+        audioLock.lock()
+        defer { audioLock.unlock() }
+        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
+
+        var out = PunktfunkAudioPcm()
+        let rc = punktfunk_connection_next_audio_pcm(h, &out, timeoutMs)
+        switch rc {
+        case statusOK:
+            let channels = Int(out.channels)
+            let total = Int(out.frame_count) * channels
+            guard let base = out.samples, total > 0 else { return nil }
+            // Copy: the pointer borrows connection memory only until the next PCM call.
+            let samples = Array(UnsafeBufferPointer(start: base, count: total))
+            return AudioPCM(
+                samples: samples, frameCount: Int(out.frame_count),
+                channels: channels, ptsNs: out.pts_ns, seq: out.seq)
         case statusNoFrame:
             return nil
         case statusClosed:

@@ -15,6 +15,9 @@ public enum DefaultsKey {
     public static let gamepadType = "punktfunk.gamepadType"
     public static let gamepadID = "punktfunk.gamepadID"
     public static let bitrateKbps = "punktfunk.bitrateKbps"
+    /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
+    /// can capture; the resolved count drives the in-core decode + AVAudioEngine layout.
+    public static let audioChannels = "punktfunk.audioChannels"
     public static let micEnabled = "punktfunk.micEnabled"
     public static let speakerUID = "punktfunk.speakerUID"
     public static let micUID = "punktfunk.micUID"

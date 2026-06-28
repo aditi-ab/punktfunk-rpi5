@@ -19,13 +19,13 @@ import os
 
 private let log = Logger(subsystem: "io.unom.punktfunk", category: "audio")
 
-/// SPSC-ish jitter ring (interleaved stereo float), drain thread → render callback.
-/// The unfair lock is held for microseconds; fine at render-callback rates. Priming:
+/// SPSC-ish jitter ring (interleaved float, `channels` per frame), drain thread → render
+/// callback. The unfair lock is held for microseconds; fine at render-callback rates. Priming:
 /// reads return silence until enough is buffered (at least `prefill`, and at least one
 /// packet more than the device's render quantum — large-buffer devices would otherwise
 /// chronically out-demand the prefill and oscillate prime → dropout → re-prime), and an
 /// underrun re-primes, concealing jitter as one short dip instead of sustained crackle.
-/// All counts stay even (whole stereo frames), so L/R interleave can never flip.
+/// All counts stay whole frames (multiples of `channels`), so the interleave can never slip.
 final class AudioRing: @unchecked Sendable {
     private var buf: [Float]
     private var readIdx = 0
@@ -34,12 +34,14 @@ final class AudioRing: @unchecked Sendable {
     private var renderQuantum = 0
     private let prefill: Int
     private let highWater: Int
+    private let channels: Int
     private let lock = OSAllocatedUnfairLock()
 
-    /// `capacity`/`prefill` in samples (interleaved — 2 per frame, both must be even).
-    init(capacity: Int, prefill: Int) {
+    /// `capacity`/`prefill` in samples (interleaved — `channels` per frame, both whole frames).
+    init(capacity: Int, prefill: Int, channels: Int) {
         buf = [Float](repeating: 0, count: capacity)
         self.prefill = prefill
+        self.channels = channels
         highWater = prefill * 4
     }
 
@@ -74,8 +76,8 @@ final class AudioRing: @unchecked Sendable {
         renderQuantum = max(renderQuantum, count)
         let available = writeIdx - readIdx
         if !primed {
-            // 480 samples = one 5 ms host packet of slack beyond the device's demand.
-            if available >= max(prefill, renderQuantum + 480) {
+            // One 5 ms host packet (240 frames × channels) of slack beyond the device's demand.
+            if available >= max(prefill, renderQuantum + 240 * channels) {
                 primed = true
             } else {
                 for i in 0..<count { out[i] = 0 }
@@ -113,8 +115,53 @@ private final class StopFlag: @unchecked Sendable {
 /// Render-block-owned scratch storage: freed exactly when the closure (and thus the
 /// last possible render call) is released — never racing CoreAudio.
 private final class ScratchBuffer {
-    let ptr = UnsafeMutablePointer<Float>.allocate(capacity: 8192 * 2)
+    // 8192 frames × up to 8 channels (7.1) — the render block caps `frames` at 8192.
+    let ptr = UnsafeMutablePointer<Float>.allocate(capacity: 8192 * 8)
     deinit { ptr.deallocate() }
+}
+
+/// CoreAudio channel layout for the canonical wire order FL FR FC LFE RL RR [SL SR]. nil for
+/// stereo (the standard layout is correct). For 5.1/7.1 we list explicit channel labels via
+/// `kAudioChannelLayoutTag_UseChannelDescriptions` — preset tags (DTS_5_1 etc.) don't reliably
+/// match Moonlight's order. NB the 7.1 mapping (verified against the WASAPI 0x63F + SPA orderings):
+/// wire idx 4-5 = RL/RR = the WAVE *back* pair → LeftSurround/RightSurround; idx 6-7 = SL/SR = the
+/// WAVE *side* pair → LeftSurroundDirect/RightSurroundDirect. (Using RearSurround* for 6-7 would
+/// swap side/back vs the Windows/Linux clients.)
+private func wireChannelLayout(channels: Int) -> AVAudioChannelLayout? {
+    let labels: [AudioChannelLabel]
+    switch channels {
+    case 6:
+        labels = [
+            kAudioChannelLabel_Left, kAudioChannelLabel_Right, kAudioChannelLabel_Center,
+            kAudioChannelLabel_LFEScreen, kAudioChannelLabel_LeftSurround,
+            kAudioChannelLabel_RightSurround,
+        ]
+    case 8:
+        labels = [
+            kAudioChannelLabel_Left, kAudioChannelLabel_Right, kAudioChannelLabel_Center,
+            kAudioChannelLabel_LFEScreen,
+            kAudioChannelLabel_LeftSurround, kAudioChannelLabel_RightSurround, // wire RL/RR (back)
+            kAudioChannelLabel_LeftSurroundDirect, kAudioChannelLabel_RightSurroundDirect, // wire SL/SR (side)
+        ]
+    default:
+        return nil
+    }
+    let size = MemoryLayout<AudioChannelLayout>.size
+        + (labels.count - 1) * MemoryLayout<AudioChannelDescription>.stride
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 16)
+    defer { raw.deallocate() }
+    let layout = raw.bindMemory(to: AudioChannelLayout.self, capacity: 1)
+    layout.pointee.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions
+    layout.pointee.mChannelBitmap = AudioChannelBitmap(rawValue: 0)
+    layout.pointee.mNumberChannelDescriptions = UInt32(labels.count)
+    let descs = UnsafeMutableBufferPointer(
+        start: &layout.pointee.mChannelDescriptions, count: labels.count)
+    for (i, lbl) in labels.enumerated() {
+        descs[i] = AudioChannelDescription(
+            mChannelLabel: lbl, mChannelFlags: AudioChannelFlags(rawValue: 0),
+            mCoordinates: (0, 0, 0))
+    }
+    return AVAudioChannelLayout(layout: layout)
 }
 
 public final class SessionAudio {
@@ -229,9 +276,13 @@ public final class SessionAudio {
     // MARK: - Playback (host → speaker)
 
     private func startPlayback(speakerUID: String) {
-        // 1 s of interleaved stereo capacity, ~20 ms prefill: four 5 ms host packets of
-        // jitter absorption before the first sample plays.
-        let ring = AudioRing(capacity: 96_000, prefill: 1920)
+        // Build the playback layout from the host-RESOLVED channel count (never the request):
+        // 2 = stereo / 6 = 5.1 / 8 = 7.1, canonical wire order FL FR FC LFE RL RR SL SR.
+        let channels = Int(connection.resolvedAudioChannels)
+        // 1 s interleaved capacity, ~20 ms prefill (four 5 ms host packets of jitter absorption
+        // before the first sample plays), both scaled by the channel count.
+        let ring = AudioRing(
+            capacity: 48_000 * channels, prefill: 960 * channels, channels: channels)
 
         let engine = AVAudioEngine()
         #if os(macOS)
@@ -247,21 +298,32 @@ public final class SessionAudio {
         }
         #endif
 
-        // Engine-native deinterleaved float; the render block deinterleaves from the ring.
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)
-        else { return }
+        // Engine-native deinterleaved float; the render block deinterleaves from the ring. Surround
+        // uses an explicit wire-order channel layout; the mixer downmixes to the output device when
+        // it has fewer speakers (e.g. an iPhone's stereo built-ins). (Explicit if/else rather than
+        // map/flatMap so it's correct whether the channelLayout initializer is failable or not.)
+        var format: AVAudioFormat?
+        if channels == 2 {
+            format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)
+        } else if let layout = wireChannelLayout(channels: channels) {
+            format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channelLayout: layout)
+        }
+        guard let format else {
+            log.error("could not build \(channels)-channel audio format — audio disabled")
+            return
+        }
         let scratch = ScratchBuffer() // block-owned; freed with the closure
         let source = AVAudioSourceNode(format: format) { _, _, frameCount, abl -> OSStatus in
             let frames = Int(frameCount)
             guard frames <= 8192 else { return kAudioUnitErr_TooManyFramesToProcess }
-            ring.read(into: scratch.ptr, count: frames * 2)
+            ring.read(into: scratch.ptr, count: frames * channels)
             let buffers = UnsafeMutableAudioBufferListPointer(abl)
-            if buffers.count >= 2,
-               let left = buffers[0].mData?.assumingMemoryBound(to: Float.self),
-               let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) {
-                for f in 0..<frames {
-                    left[f] = scratch.ptr[f * 2]
-                    right[f] = scratch.ptr[f * 2 + 1]
+            // Deinterleave the wire-order interleaved ring into the engine's per-channel buses.
+            if buffers.count >= channels {
+                for ch in 0..<channels {
+                    if let dst = buffers[ch].mData?.assumingMemoryBound(to: Float.self) {
+                        for f in 0..<frames { dst[f] = scratch.ptr[f * channels + ch] }
+                    }
                 }
             }
             return noErr
@@ -292,29 +354,20 @@ public final class SessionAudio {
         stateLock.unlock()
         let thread = Thread { [connection, flag, drainDone] in
             defer { drainDone.signal() }
-            guard let decoder = try? OpusDecoder(framesPerPacket: 240),
-                  let pcm = AVAudioPCMBuffer(
-                      pcmFormat: decoder.pcmFormat, frameCapacity: 5760)
-            else {
-                log.error("Opus decoder unavailable — audio playback disabled")
-                return
-            }
+            // Decode happens IN-CORE (libopus multistream) — AudioToolbox's Opus path is
+            // stereo-only — and is handed back as interleaved f32 PCM in wire channel order.
             while !flag.isStopped {
-                let packet: AudioPacket?
+                let pcm: PunktfunkConnection.AudioPCM?
                 do {
-                    packet = try connection.nextAudio(timeoutMs: 100)
+                    pcm = try connection.nextAudioPcm(timeoutMs: 100)
                 } catch {
                     break // session closed
                 }
-                guard let packet else { continue }
-                do {
-                    let frames = try decoder.decode(packet.data, into: pcm)
-                    if frames > 0, let p = pcm.floatChannelData?[0] {
-                        ring.write(p, count: Int(frames) * 2)
+                guard let pcm, pcm.frameCount > 0 else { continue }
+                pcm.samples.withUnsafeBufferPointer { p in
+                    if let base = p.baseAddress {
+                        ring.write(base, count: pcm.frameCount * pcm.channels)
                     }
-                } catch {
-                    // One corrupt packet ≠ a dead stream; skip it.
-                    log.warning("audio decode failed: \(error.localizedDescription)")
                 }
             }
         }

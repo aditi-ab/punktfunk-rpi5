@@ -346,7 +346,23 @@ FFI also link-needs `libGL`/`libgbm`/`libcuda` at build time). Env knobs: `PUNKT
 `PUNKTFUNK_COMPOSITOR=kwin|gamescope|mutter`, `PUNKTFUNK_ZEROCOPY=1`, `PUNKTFUNK_GAMESCOPE_APP=...`,
 `PUNKTFUNK_INPUT_BACKEND=...`, `PUNKTFUNK_PERF=1` (per-stage timing), `PUNKTFUNK_VIDEO_DROP=N` (FEC
 test), `PUNKTFUNK_FEC_PCT=N`, `PUNKTFUNK_DSCP=1` (opt-in DSCP/SO_PRIORITY media QoS on the data +
-GameStream video/audio sockets; no-op on the wire on Windows without a qWAVE policy).
+GameStream video/audio sockets; no-op on the wire on Windows without a qWAVE policy),
+`PUNKTFUNK_444=1` (full-chroma HEVC 4:4:4, see below).
+
+**HEVC 4:4:4 (full chroma, Range Extensions)**: opt-in via `PUNKTFUNK_444`, negotiated like 10-bit —
+the host emits 4:4:4 only when the client advertised `VIDEO_CAP_444` (wire bit `0x04` + ABI
+`PUNKTFUNK_VIDEO_CAP_444`), the codec is HEVC, the session is single-process, **and** a GPU probe
+(`encode::can_encode_444`, run before the Welcome) confirms support — else it resolves to 4:2:0 and
+`Welcome::chroma_format` reflects the real value (honest downgrade; the client reads it via
+`punktfunk_connection_chroma_format`). **punktfunk/1-native only** — GameStream/Moonlight stays 4:2:0
+(stock clients can't decode 4:4:4). **NVENC is the implemented path**: Linux `hevc_nvenc` feeds a
+swscale'd `yuv444p` (RGB-in is always 4:2:0 — verified on the RTX 5070 Ti — so the session forces CPU
+RGB capture for 4:4:4); Windows NVENC keeps ARGB input + FREXT profile + `chromaFormatIDC=3` and the
+DDA capturer delivers RGB. VAAPI / AMF / QSV **decline** (probe returns false — no validated 4:4:4
+hardware in the lab; they'd produce 4:2:0). Software (openh264) is 4:2:0-only. Test with
+`PUNKTFUNK_CLIENT_444=1 punktfunk-probe --out x.h265` then `ffprobe x.h265` (expect `pix_fmt yuv444p`).
+*Linux NVENC mechanism validated on the RTX 5070 Ti (ffmpeg CLI); Windows NVENC + 10-bit-4:4:4 not yet
+on-glass validated.*
 
 ## Conventions
 

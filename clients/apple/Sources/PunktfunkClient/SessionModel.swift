@@ -99,6 +99,7 @@ final class SessionModel: ObservableObject {
                  compositor: PunktfunkConnection.Compositor = .auto,
                  gamepad: PunktfunkConnection.GamepadType = .auto,
                  bitrateKbps: UInt32 = 0,
+                 audioChannels: UInt8 = 2,
                  hdrEnabled: Bool = true,
                  launchID: String? = nil,
                  allowTofu: Bool = false,
@@ -137,7 +138,7 @@ final class SessionModel: ObservableObject {
                 width: width, height: height, refreshHz: hz,
                 pinSHA256: pin, identity: identity, compositor: compositor,
                 gamepad: gamepad, bitrateKbps: bitrateKbps, videoCaps: videoCaps,
-                launchID: launchID) }
+                audioChannels: audioChannels, launchID: launchID) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 // The user may have abandoned this attempt (window closed, another host

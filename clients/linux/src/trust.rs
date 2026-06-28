@@ -132,6 +132,9 @@ pub struct Settings {
     pub inhibit_shortcuts: bool,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
+    /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
+    /// can capture; the resolved count drives the decoder + playback layout.
+    pub audio_channels: u8,
 }
 
 impl Default for Settings {
@@ -145,6 +148,7 @@ impl Default for Settings {
             compositor: "auto".into(),
             inhibit_shortcuts: true,
             mic_enabled: false,
+            audio_channels: 2,
         }
     }
 }
