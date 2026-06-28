@@ -1,10 +1,18 @@
 // Mock API payloads for the page stories — typed against the generated models so
 // they stay honest if the OpenAPI schema changes.
 import type { AvailableCompositor } from "@/api/gen/model/availableCompositor";
+import type { Capture } from "@/api/gen/model/capture";
+import type { CaptureMeta } from "@/api/gen/model/captureMeta";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
 import type { HostInfo } from "@/api/gen/model/hostInfo";
+import type { NativeClient } from "@/api/gen/model/nativeClient";
+import type { NativePairStatus } from "@/api/gen/model/nativePairStatus";
 import type { PairedClient } from "@/api/gen/model/pairedClient";
+import type { PairingStatus } from "@/api/gen/model/pairingStatus";
+import type { PendingDevice } from "@/api/gen/model/pendingDevice";
 import type { RuntimeStatus } from "@/api/gen/model/runtimeStatus";
+import type { StatsSample } from "@/api/gen/model/statsSample";
+import type { StatsStatus } from "@/api/gen/model/statsStatus";
 
 export const hostInfo: HostInfo = {
 	abi_version: 2,
@@ -112,3 +120,115 @@ export const library: GameEntry[] = [
 		launch: null,
 	},
 ];
+
+// --- Performance (stats) page ------------------------------------------------
+
+export const statsStatusIdle: StatsStatus = {
+	armed: false,
+	kind: "native",
+	sample_count: 0,
+	started_unix_ms: 0,
+};
+
+// A native-path pipeline: capture → submit → encode → send. Deterministic (no
+// Math.random) so the screenshot is byte-stable across CI runs; a gentle sine
+// gives the charts a realistic shape without a live capture.
+const STAGE_BASE_US: Record<string, number> = {
+	capture: 320,
+	submit: 90,
+	encode: 760,
+	send: 140,
+};
+const STAGE_ORDER = ["capture", "submit", "encode", "send"];
+
+function buildSamples(n: number): StatsSample[] {
+	const out: StatsSample[] = [];
+	for (let i = 0; i < n; i++) {
+		const wobble = Math.sin(i / 4);
+		out.push({
+			t_ms: i * 1000,
+			session_id: 1,
+			fps: 240,
+			repeat_fps: i % 3 === 0 ? 2 : 1,
+			mbps: 920 + wobble * 55,
+			bitrate_kbps: 150_000,
+			frames_dropped: i % 17 === 0 ? 1 : 0,
+			packets_dropped: i % 9 === 0 ? 2 : 0,
+			send_dropped: 0,
+			fec_recovered: i % 5 === 0 ? 3 : 1,
+			stages: STAGE_ORDER.map((name) => {
+				const base = STAGE_BASE_US[name] ?? 100;
+				const p50 = Math.round(base + wobble * base * 0.15);
+				return { name, p50_us: p50, p99_us: Math.round(p50 * 1.8) };
+			}),
+		});
+	}
+	return out;
+}
+
+export const captureMetas: CaptureMeta[] = [
+	{
+		id: "cap-20260628-2041",
+		client: "enricos-macbook",
+		kind: "native",
+		codec: "h265",
+		width: 5120,
+		height: 1440,
+		fps: 240,
+		duration_ms: 92_000,
+		sample_count: 92,
+		started_unix_ms: 1_782_415_260_000,
+	},
+	{
+		id: "cap-20260628-1903",
+		client: "living-room-tv",
+		kind: "gamestream",
+		codec: "av1",
+		width: 3840,
+		height: 2160,
+		fps: 120,
+		duration_ms: 240_000,
+		sample_count: 240,
+		started_unix_ms: 1_782_409_380_000,
+	},
+];
+
+export const captureDetail: Capture = {
+	meta: captureMetas[0] as CaptureMeta,
+	samples: buildSamples(60),
+};
+
+// --- Pairing page ------------------------------------------------------------
+
+export const nativePairArmed: NativePairStatus = {
+	enabled: true,
+	armed: true,
+	pin: "4827",
+	expires_in_secs: 98,
+	paired_clients: 2,
+};
+
+export const pendingDevices: PendingDevice[] = [
+	{
+		id: 1,
+		name: "studio-deck",
+		fingerprint:
+			"9f8e7d6c5b4a39281706f5e4d3c2b1a0998877665544332211ffeeddccbbaa00",
+		age_secs: 8,
+	},
+];
+
+export const nativeClients: NativeClient[] = [
+	{
+		name: "enricos-macbook",
+		fingerprint:
+			"a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
+	},
+	{
+		name: "living-room-tv",
+		fingerprint:
+			"ff00eeddccbbaa998877665544332211009f8e7d6c5b4a39281706f5e4d3c2b1",
+	},
+];
+
+export const pairingIdle: PairingStatus = { pin_pending: false };

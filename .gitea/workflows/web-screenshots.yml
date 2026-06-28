@@ -1,0 +1,53 @@
+# Management-console screenshots for the app/marketing listings. Captured from the
+# built Storybook with headless Chromium (web/tools/screenshots.mjs) — the page
+# stories render from fixtures, so no live mgmt API, login, or GPU is needed. This
+# is the web analogue of apple.yml's `screenshots` job, but gated to STABLE RELEASE
+# tags only (the console has no release workflow of its own — it ships inside the
+# host packaging). Best-effort: a standalone workflow, so a failure here reds
+# nothing else. PNGs land as a 30-day artifact; they are not committed or published.
+name: web-screenshots
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  screenshots:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      # oven/bun ships neither git nor a real node (the driver runs under node), and
+      # the slim Debian base lacks a CA bundle — without it actions/checkout's HTTPS
+      # fetch dies with "Problem with the SSL CA cert" (same as ci.yml's web job).
+      - name: Install git + node + CA certs
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
+      - uses: actions/checkout@v4
+      # --ignore-scripts skips the prepare→codegen hook (mirrors ci.yml); run codegen
+      # explicitly since build-storybook has no prebuild hook of its own.
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Generate API client + i18n messages
+        run: bun run codegen
+      # Pulls the matching Chromium build + the apt libs it needs (root in-container).
+      - name: Install Chromium
+        run: bunx playwright install --with-deps chromium
+      - name: Build Storybook
+        run: bun run build-storybook
+      - name: Capture screenshots
+        run: bun run screenshots
+      - name: Upload screenshots
+        if: always()
+        # v3: Gitea's API rejects upload-artifact@v4 (see apple.yml). Download is a zip.
+        uses: actions/upload-artifact@v3
+        with:
+          name: punktfunk-web-console-screenshots
+          path: web/screenshots
+          retention-days: 30
