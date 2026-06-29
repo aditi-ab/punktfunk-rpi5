@@ -41,6 +41,12 @@
 #ifdef GamepadStageDir
   #define WithGamepad
 #endif
+; AudioCableStageDir (the official base VB-CABLE package + install-vbcable.ps1) is optional - present
+; when the VB-CABLE package was supplied to the packer. It is the streaming virtual microphone; on a
+; headless host (no real audio output) a virtual cable is required for mic + desktop-audio passthrough.
+#ifdef AudioCableStageDir
+  #define WithAudioCable
+#endif
 ; FfmpegBin (a dir of FFmpeg shared DLLs) is optional - present when the host is built with
 ; --features amf-qsv (the AMD/Intel AMF/QSV encode backend link-imports the FFmpeg libs).
 #ifdef FfmpegBin
@@ -93,6 +99,9 @@ Name: "installdriver"; Description: "Install the pf-vdisplay virtual display dri
 #ifdef WithGamepad
 Name: "installgamepad"; Description: "Install the virtual gamepad drivers (DualSense / DualShock 4 / Xbox 360 - no ViGEmBus needed)"
 #endif
+#ifdef WithAudioCable
+Name: "installaudiocable"; Description: "Install VB-CABLE virtual audio (microphone passthrough - VB-Audio donationware, www.vb-cable.com)"
+#endif
 #ifdef WithVkLayer
 Name: "installhdrlayer"; Description: "Install the HDR Vulkan layer (lets Vulkan games like Doom use HDR on the virtual display)"
 #endif
@@ -132,6 +141,10 @@ Source: "{#StageDir}\*"; DestDir: "{tmp}\pfvdisplay"; Flags: deleteafterinstall 
 ; The built-from-source UMDF gamepad drivers + install-gamepad-drivers.ps1, extracted to {tmp}, removed after.
 Source: "{#GamepadStageDir}\*"; DestDir: "{tmp}\gamepad"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installgamepad
 #endif
+#ifdef WithAudioCable
+; The official base VB-CABLE package + install-vbcable.ps1, extracted to {tmp}, removed after install.
+Source: "{#AudioCableStageDir}\*"; DestDir: "{tmp}\vbcable"; Flags: deleteafterinstall recursesubdirs createallsubdirs; Tasks: installaudiocable
+#endif
 #ifdef WithVkLayer
 ; The HDR Vulkan implicit layer (cdylib + its JSON manifest) laid into {app}\vklayer and registered
 ; below. The manifest's library_path is ".\pf_vkhdr_layer.dll" (relative to the JSON), so the two
@@ -159,6 +172,15 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "driver install --dir ""{tmp}\
 Filename: "{app}\punktfunk-host.exe"; Parameters: "driver install --gamepad --dir ""{tmp}\gamepad"""; WorkingDir: "{app}"; \
   StatusMsg: "Installing the virtual gamepad drivers..."; \
   Flags: runhidden waituntilterminated; Tasks: installgamepad
+#endif
+#ifdef WithAudioCable
+; Silently install the bundled VB-CABLE (the streaming virtual microphone). Best-effort: install-vbcable.ps1
+; always exits 0 (a missing cable just disables mic passthrough; the host falls back + retries), so a
+; cable hiccup never fails the whole install.
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\vbcable\install-vbcable.ps1"" -Dir ""{tmp}\vbcable"""; \
+  StatusMsg: "Installing VB-CABLE virtual audio (microphone passthrough)..."; \
+  Flags: runhidden waituntilterminated; Tasks: installaudiocable
 #endif
 ; Register (or re-point, on upgrade - idempotent) the SYSTEM service from its FINAL {app} location:
 ; service install records current_exe() as the SCM binPath, so it must run from {app}, not {tmp}.

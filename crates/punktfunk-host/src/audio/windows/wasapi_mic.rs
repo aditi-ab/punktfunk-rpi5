@@ -4,10 +4,12 @@
 //! **capture** endpoint then surfaces as a microphone that host apps can record from.
 //!
 //! Target device, by friendly-name substring (first match wins; override with `PUNKTFUNK_MIC_DEVICE`):
-//! "Steam Streaming Microphone" (ships with Steam Remote Play — exactly this purpose), VB-Audio
-//! "CABLE Input", VoiceMeeter, or anything with "virtual" in the name. If none is present we
-//! auto-install the Steam Streaming audio pair (see [`install_steam_audio_pair`]); failing that we
-//! return an error with install guidance and the host runs without mic passthrough.
+//! VB-Audio "CABLE Input" (bundled by the installer — the preferred, dedicated mic target), the
+//! "Steam Streaming Microphone", VoiceMeeter, or anything with "virtual" in the name.
+//! [`super::audio_control`] sets the default playback to a DIFFERENT loopback-capable device so the
+//! chosen mic is never the endpoint the loopback captures. If no candidate is present we auto-install
+//! the Steam Streaming audio pair (see [`install_steam_audio_pair`]); failing that we return an error
+//! with install guidance and the host runs without mic passthrough.
 //!
 //! **Anti-echo guard (the whole point of this being non-trivial).** The desktop-audio plane
 //! ([`super::wasapi_cap`]) loopback-captures the **default render endpoint**. WASAPI loopback
@@ -45,8 +47,8 @@ const MAX_QUEUE_BYTES: usize = (SAMPLE_RATE as usize * 80 / 1000) * BLOCK_ALIGN;
 /// Render-endpoint friendly-name substrings (lowercased) we can write into so the device's capture
 /// endpoint becomes a host mic. Ordered by preference.
 const CANDIDATES: &[&str] = &[
+    "cable input", // VB-Audio Virtual Cable — bundled by the installer; the preferred dedicated mic target
     "steam streaming microphone",
-    "cable input",
     "voicemeeter input",
     "voicemeeter aux input",
     "virtual",

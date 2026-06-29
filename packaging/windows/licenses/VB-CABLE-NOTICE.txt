@@ -1,0 +1,26 @@
+VB-CABLE Virtual Audio Device — Attribution
+===========================================
+
+The punktfunk host installer bundles and silently installs VB-CABLE, the virtual
+audio cable used as the streaming virtual microphone (the client's mic is written
+into VB-CABLE's input, and its "CABLE Output" capture endpoint surfaces as a host
+microphone that games and apps record from).
+
+  VB-CABLE is a product of VB-Audio Software.
+  Origin:  https://vb-cable.com  (https://vb-audio.com)
+  VB-CABLE is DONATIONWARE — all participations are welcome.
+  Please consider donating to VB-Audio if you find it useful:
+    https://vb-audio.com/Cable/
+
+VB-CABLE is redistributed here, unmodified (the official base VB-CABLE package),
+under VB-Audio's distribution grant for bundling the base cable with another
+application; see VB-Audio's licensing terms:
+    https://vb-audio.com/Services/licensing.htm
+
+Only the single base VB-CABLE is bundled. VB-CABLE A+B and C+D are not
+redistributed. VB-Audio retains all rights to VB-CABLE; punktfunk claims no
+ownership of it.
+
+To remove VB-CABLE, use its own uninstaller (VBCABLE_Setup_x64.exe -u -h) or the
+"VB-Audio Virtual Cable" entry in Windows "Apps & features"; uninstalling the
+punktfunk host does not remove VB-CABLE.

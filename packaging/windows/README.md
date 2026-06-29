@@ -65,6 +65,16 @@ read it from `%ProgramData%\punktfunk\web-password`.
 - **Virtual gamepads need no prerequisite.** The DualSense / DualShock 4 / Xbox 360 (XUSB) UMDF drivers
   are **bundled** in the installer (the *Install the virtual gamepad drivers* task) and
   `pnputil`-installed. **ViGEmBus is no longer used.**
+- **The streaming microphone uses VB-CABLE**, bundled + silently installed by the installer (the *Install
+  VB-CABLE virtual audio* task). The host writes the client's mic into VB-CABLE's input; its `CABLE
+  Output` capture endpoint surfaces as a host mic. A Windows audio device can only be created by a
+  **kernel-mode** driver (no UMDF path exists), so unlike our self-signed UMDF drivers we cannot ship our
+  own — VB-CABLE is a vendor-signed cable that loads with no test-signing. It is **donationware** by
+  VB-Audio, redistributed under VB-Audio's bundling grant (only the single base cable); see
+  `licenses/VB-CABLE-NOTICE.txt`. The package binary is **not** in the repo — supply it to the packer via
+  `-VbCableDir` / `$env:VBCABLE_DIR` (the extracted official package, containing `VBCABLE_Setup_x64.exe`).
+  Absent → the installer is built without it and the host falls back to auto-installing the Steam
+  Streaming pair. *(Endgame: attestation-sign our own MIT virtual-audio driver to drop this dependency.)*
 
 ## Files here
 
@@ -74,6 +84,7 @@ read it from `%ProgramData%\punktfunk\web-password`.
 | `pack-host-installer.ps1` | Orchestrator: cert + sign exe, **build + sign the drivers from source**, stage them + FFmpeg + the **web console** (`.output` + bun) + the HDR layer, run ISCC, sign setup.exe. |
 | `build-pf-vdisplay.ps1` | Build pf-vdisplay from source (the `drivers/` workspace) + clear FORCE_INTEGRITY + sign `.dll`/`.cat` + export `.cer`. |
 | `build-gamepad-drivers.ps1` | Sign + catalog the gamepad drivers (`pf-dualsense` + `pf-xusb`) from the same workspace build (`-SkipBuild`), one shared cert. |
+| `install-vbcable.ps1` | On-target: seed VB-Audio's cert into `TrustedPublisher`, silently install the bundled VB-CABLE (`-i -h`). Run by the installer's *Install VB-CABLE virtual audio* task; idempotent + always exits 0 (non-fatal). |
 | `clear-force-integrity.ps1` | Clear the `/INTEGRITYCHECK` PE bit so a self-signed driver loads (reused by every driver build). |
 | `stage-pf-vdisplay.ps1` | Stage the just-built pf-vdisplay bundle + fetch/verify the **pinned** nefcon release. |
 | `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `bun` on the Nitro server (`:3000`). |

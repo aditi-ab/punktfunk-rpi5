@@ -182,6 +182,9 @@ windows = { version = "0.62", features = [
     # Windows service supervisor (src/service.rs): a kill-on-close job object so a service crash never
     # orphans the SYSTEM host it launched into the interactive session.
     "Win32_System_JobObjects",
+    # CoCreateInstance(PolicyConfigClient) — set the default audio playback/recording endpoints via the
+    # undocumented IPolicyConfig (audio/windows/audio_control.rs) so mic + desktop audio auto-wire.
+    "Win32_System_Com",
 ] }
 # The SCM plumbing for the `service` subcommand (define_windows_service! / dispatcher / control
 # handler / ServiceManager install). Wraps the Win32 service API; the supervision loop itself uses

@@ -42,6 +42,7 @@ pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
 
 #[cfg(target_os = "windows")]
 pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
+    audio_control::ensure_wired_once();
     wasapi_cap::WasapiLoopbackCapturer::open(channels)
         .map(|c| Box::new(c) as Box<dyn AudioCapturer>)
 }
@@ -77,6 +78,7 @@ pub fn open_virtual_mic(channels: u32) -> Result<Box<dyn VirtualMic>> {
 
 #[cfg(target_os = "windows")]
 pub fn open_virtual_mic(channels: u32) -> Result<Box<dyn VirtualMic>> {
+    audio_control::ensure_wired_once();
     wasapi_mic::WasapiVirtualMic::open(channels).map(|m| Box::new(m) as Box<dyn VirtualMic>)
 }
 
@@ -85,6 +87,9 @@ pub fn open_virtual_mic(_channels: u32) -> Result<Box<dyn VirtualMic>> {
     anyhow::bail!("virtual mic requires Linux + PipeWire or Windows + a virtual audio device")
 }
 
+#[cfg(target_os = "windows")]
+#[path = "audio/windows/audio_control.rs"]
+mod audio_control;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "windows")]
