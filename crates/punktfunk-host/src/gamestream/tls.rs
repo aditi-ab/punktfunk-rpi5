@@ -7,11 +7,12 @@
 //! fingerprint ([`PeerCertFingerprint`]) to each request, and the nvhttp/mgmt handlers reject
 //! callers whose fingerprint is not pinned (mirroring Apollo's post-handshake `get_verified_cert`).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use axum::Router;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
-use rustls::pki_types::{CertificateDer, UnixTime};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
 use std::net::SocketAddr;
@@ -177,12 +178,12 @@ fn build_server_config(
     mandatory: bool,
 ) -> Result<Arc<ServerConfig>> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    // PEM parsing via rustls-pki-types (the same `PemObject` path punktfunk-core/quic.rs uses),
+    // so we don't pull the unmaintained `rustls-pemfile`.
+    let certs = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("parse host cert PEM")?;
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .context("parse host key PEM")?
-        .ok_or_else(|| anyhow!("no private key in host key PEM"))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).context("parse host key PEM")?;
 
     let verifier = Arc::new(AcceptAnyClientCert {
         provider: provider.clone(),

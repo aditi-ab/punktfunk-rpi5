@@ -35,9 +35,11 @@ base64 = "0.22"
 ureq = "2"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 x509-parser = "0.16"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Only used for the plain-HTTP nvhttp listener (`bind().serve()`); HTTPS/mTLS is hand-rolled over
+# tokio-rustls (axum-server can't surface the peer cert), so we do NOT enable `tls-rustls` — that
+# feature is what pulled the unmaintained `rustls-pemfile` (security-review dep hygiene).
+axum-server = "0.8"
 rustls = "0.23"
-rustls-pemfile = "2"
 # Manual HTTPS+mTLS serve loop for the mgmt API (axum-server can't surface the peer cert): a
 # tokio-rustls handshake exposes the client cert, then hyper serves the axum Router with the
 # verified fingerprint injected as a request extension. Versions match the workspace lock.

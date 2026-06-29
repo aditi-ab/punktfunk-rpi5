@@ -5,8 +5,11 @@
 # means the audit job stops flagging it, so the reasoning must hold up.
 #
 # NOTE: `cargo audit` (no `--deny warnings`) fails only on *vulnerabilities*, not on the
-# `unmaintained` warnings (audiopus_sys / paste / rustls-pemfile). Those are left visible on purpose
-# so we keep getting the maintenance signal — they do not fail CI.
+# `unmaintained` warnings (audiopus_sys via opus, paste via utoipa-axum). Both are transitive, at
+# their latest published version with no successor, so there's nothing to bump — left visible on
+# purpose so we keep getting the maintenance signal; they do not fail CI. (rustls-pemfile was dropped
+# 2026-06-29 by removing axum-server's unused tls-rustls feature + moving our own PEM parsing to
+# rustls-pki-types; memmap2's unsoundness was fixed by the 0.9.11 bump.)
 
 [advisories]
 ignore = [
