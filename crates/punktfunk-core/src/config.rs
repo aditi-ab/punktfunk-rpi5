@@ -137,8 +137,9 @@ impl CompositorPref {
 /// host decide (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360). A concrete preference is
 /// honored only if that backend is available on the host (DualSense / DualShock 4 need Linux UHID);
 /// otherwise the host falls back and reports the real choice in `Welcome`. The wire form is a single
-/// byte (`0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`), appended to
-/// `Hello`/`Welcome` — older peers simply omit/ignore it (an unknown byte degrades to `Auto`).
+/// byte (`0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
+/// `5 = SteamController`, `6 = SteamDeck`), appended to `Hello`/`Welcome` — older peers simply
+/// omit/ignore it (an unknown byte degrades to `Auto`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GamepadPref {
     /// Let the host pick (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360).
@@ -155,10 +156,19 @@ pub enum GamepadPref {
     /// UHID DualShock 4 (kernel `hid-playstation`, ≥ 6.2) — lightbar, touchpad, motion, rumble. Like
     /// `DualSense` minus adaptive triggers / player LEDs / mute. Needs Linux UHID on the host.
     DualShock4,
+    /// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`) — dual trackpads, gyro,
+    /// two grip paddles, trackpad-only haptics. Needs Linux UHID. *(Reserved; its backend is not yet
+    /// built — currently folds to `Xbox360`; the Deck identity below is the implemented one.)*
+    SteamController,
+    /// UHID Steam Deck controller (Valve `28DE:1205`, kernel `hid-steam`) — full Deck gamepad incl.
+    /// the four back grips (L4/L5/R4/R5), a right trackpad, and the IMU; re-grabbed by Steam Input
+    /// with native glyphs when Steam runs on the host. Needs Linux UHID.
+    SteamDeck,
 }
 
 impl GamepadPref {
-    /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`.
+    /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
+    /// `5 = SteamController`, `6 = SteamDeck`.
     pub const fn to_u8(self) -> u8 {
         match self {
             GamepadPref::Auto => 0,
@@ -166,6 +176,8 @@ impl GamepadPref {
             GamepadPref::DualSense => 2,
             GamepadPref::XboxOne => 3,
             GamepadPref::DualShock4 => 4,
+            GamepadPref::SteamController => 5,
+            GamepadPref::SteamDeck => 6,
         }
     }
 
@@ -177,6 +189,8 @@ impl GamepadPref {
             2 => GamepadPref::DualSense,
             3 => GamepadPref::XboxOne,
             4 => GamepadPref::DualShock4,
+            5 => GamepadPref::SteamController,
+            6 => GamepadPref::SteamDeck,
             _ => GamepadPref::Auto,
         }
     }
@@ -192,12 +206,14 @@ impl GamepadPref {
                 GamepadPref::XboxOne
             }
             "dualshock4" | "dualshock" | "ds4" | "ps4" => GamepadPref::DualShock4,
+            "steamdeck" | "steam-deck" | "deck" => GamepadPref::SteamDeck,
+            "steamcontroller" | "steam-controller" | "steamcon" => GamepadPref::SteamController,
             _ => return None,
         })
     }
 
     /// Canonical lowercase identifier (`"auto"`, `"xbox360"`, `"dualsense"`, `"xboxone"`,
-    /// `"dualshock4"`).
+    /// `"dualshock4"`, `"steamcontroller"`, `"steamdeck"`).
     pub fn as_str(self) -> &'static str {
         match self {
             GamepadPref::Auto => "auto",
@@ -205,6 +221,8 @@ impl GamepadPref {
             GamepadPref::DualSense => "dualsense",
             GamepadPref::XboxOne => "xboxone",
             GamepadPref::DualShock4 => "dualshock4",
+            GamepadPref::SteamController => "steamcontroller",
+            GamepadPref::SteamDeck => "steamdeck",
         }
     }
 }

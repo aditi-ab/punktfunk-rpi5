@@ -1399,6 +1399,8 @@ enum PadBackend {
     DualSense(crate::inject::dualsense::DualSenseManager),
     #[cfg(target_os = "linux")]
     DualShock4(crate::inject::dualshock4::DualShock4Manager),
+    #[cfg(target_os = "linux")]
+    SteamDeck(crate::inject::steam_controller::SteamControllerManager),
     #[cfg(target_os = "windows")]
     DualSenseWindows(crate::inject::dualsense_windows::DualSenseWindowsManager),
     #[cfg(target_os = "windows")]
@@ -1419,6 +1421,12 @@ impl PadBackend {
             GamepadPref::DualShock4 => {
                 tracing::info!("gamepad backend: virtual DualShock 4 (UHID hid-playstation)");
                 return PadBackend::DualShock4(crate::inject::dualshock4::DualShock4Manager::new());
+            }
+            GamepadPref::SteamDeck => {
+                tracing::info!("gamepad backend: virtual Steam Deck (UHID hid-steam)");
+                return PadBackend::SteamDeck(
+                    crate::inject::steam_controller::SteamControllerManager::new(),
+                );
             }
             GamepadPref::XboxOne => {
                 tracing::info!("gamepad backend: uinput X-Box One/Series pad");
@@ -1455,6 +1463,8 @@ impl PadBackend {
             PadBackend::DualSense(m) => m.handle(ev),
             #[cfg(target_os = "linux")]
             PadBackend::DualShock4(m) => m.handle(ev),
+            #[cfg(target_os = "linux")]
+            PadBackend::SteamDeck(m) => m.handle(ev),
             #[cfg(target_os = "windows")]
             PadBackend::DualSenseWindows(m) => m.handle(ev),
             #[cfg(target_os = "windows")]
@@ -1471,6 +1481,8 @@ impl PadBackend {
             PadBackend::DualSense(m) => m.apply_rich(_rich),
             #[cfg(target_os = "linux")]
             PadBackend::DualShock4(m) => m.apply_rich(_rich),
+            #[cfg(target_os = "linux")]
+            PadBackend::SteamDeck(m) => m.apply_rich(_rich),
             #[cfg(target_os = "windows")]
             PadBackend::DualSenseWindows(m) => m.apply_rich(_rich),
             #[cfg(target_os = "windows")]
@@ -1496,6 +1508,8 @@ impl PadBackend {
             PadBackend::DualSense(m) => m.pump(rumble, hidout),
             #[cfg(target_os = "linux")]
             PadBackend::DualShock4(m) => m.pump(rumble, hidout),
+            #[cfg(target_os = "linux")]
+            PadBackend::SteamDeck(m) => m.pump(rumble, hidout),
             #[cfg(target_os = "windows")]
             PadBackend::DualSenseWindows(m) => m.pump(rumble, hidout),
             #[cfg(target_os = "windows")]
@@ -1515,6 +1529,8 @@ impl PadBackend {
             PadBackend::DualSense(m) => m.heartbeat(std::time::Duration::from_millis(8)),
             #[cfg(target_os = "linux")]
             PadBackend::DualShock4(m) => m.heartbeat(std::time::Duration::from_millis(8)),
+            #[cfg(target_os = "linux")]
+            PadBackend::SteamDeck(m) => m.heartbeat(std::time::Duration::from_millis(8)),
             #[cfg(target_os = "windows")]
             PadBackend::DualSenseWindows(m) => m.heartbeat(std::time::Duration::from_millis(8)),
             #[cfg(target_os = "windows")]
@@ -1894,6 +1910,9 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // One/Series: a real, distinct uinput identity on Linux; folded into the 360 backend on
         // Windows (XInput can't tell them apart anyway).
         GamepadPref::XboxOne if linux => GamepadPref::XboxOne,
+        // Steam Deck: Linux UHID hid-steam. The classic Steam Controller's backend isn't built yet,
+        // so it folds to Xbox360 for now (Windows Steam devices are M7).
+        GamepadPref::SteamDeck if linux => GamepadPref::SteamDeck,
         _ => GamepadPref::Xbox360,
     }
 }
