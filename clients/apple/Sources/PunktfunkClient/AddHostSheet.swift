@@ -81,6 +81,11 @@ struct AddHostSheet: View {
             #if !os(tvOS)
         .formStyle(.grouped)
         #endif
+            #if os(iOS)
+            // The detent below is sized to fit all 3 rows + the action button exactly, so the
+            // Form must NOT scroll/bounce inside it — lock it. (iOS 16+; safe at iOS 17.)
+            .scrollDisabled(true)
+            #endif
             #if os(macOS)
             // macOS: UNCHANGED — Cancel + Spacer + Add in an HStack, both wired to the
             // window's default/cancel keyboard actions. The 380-wide .fixedSize panel below
@@ -120,8 +125,8 @@ struct AddHostSheet: View {
         // Form + the full-width action row, instead of the half-screen .medium it used to rest
         // at. A single fixed detent is enough: the system keeps the content above the keyboard
         // when Address/Port is focused, and on iPadOS this renders as a short bottom sheet (not a
-        // centered formSheet card). If Dynamic Type grows the rows past this height the Form just
-        // scrolls inside the detent — nothing is clipped. (.height(_:) is iOS 16+, safe at iOS 17.)
+        // centered formSheet card). The Form itself is .scrollDisabled (above) so it can't
+        // bounce/scroll inside this fixed detent. (.height(_:) is iOS 16+, safe at iOS 17.)
         .presentationDetents([.height(320)])
         .presentationDragIndicator(.visible)
         #endif
