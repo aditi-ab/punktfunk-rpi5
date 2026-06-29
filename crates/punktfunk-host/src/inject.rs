@@ -495,6 +495,12 @@ mod gamepad_raii;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]
 pub mod steam_controller;
+/// Linux: virtual Steam Deck via the USB gadget subsystem (`raw_gadget` + `dummy_hcd`) — the only
+/// virtual-Deck transport Steam Input promotes (presents the controller on USB interface 2).
+/// SteamOS-host only (needs `dummy_hcd` + `raw_gadget`).
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/steam_gadget.rs"]
+pub mod steam_gadget;
 /// Transport-independent Steam Controller / Steam Deck HID contract (descriptor, byte-exact Deck
 /// serializer, XInput/rich mappers, rumble parser), used by the Linux UHID backend ([`steam_controller`]).
 #[cfg(target_os = "linux")]

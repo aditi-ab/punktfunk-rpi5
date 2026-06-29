@@ -56,9 +56,24 @@ Steam Input, which exposes its own X-Box 360 pad — exactly a real Deck's behav
   `EP_WRITE` starves the control path.
 - `dummy_hcd` + `raw_gadget` must both be loaded and `/dev/raw-gadget` present before launch.
 
-## Status / next
+## Host backend (shipped, opt-in)
 
-Recognition is proven. Remaining: feed real client state (the `steam_proto` serializer already
-produces correct Deck reports) through the interface-2 endpoint, and wrap this as a host gamepad
-backend (a `raw_gadget` alternative to the UHID `SteamDeckPad`) — SteamOS-host only, since it needs
-`dummy_hcd` + `raw_gadget`.
+The C PoC's transport is ported to a Rust host gamepad backend:
+`crates/punktfunk-host/src/inject/linux/steam_gadget.rs` (`SteamDeckGadget`), driven by the same
+`steam_proto` serializer as the UHID `SteamDeckPad`. The Steam-Deck manager
+(`inject/linux/steam_controller.rs`) now selects per-pad between **UHID** (default, universal) and the
+**USB gadget** (`PUNKTFUNK_STEAM_GADGET=1`, SteamOS-only — best-effort `modprobe dummy_hcd raw_gadget`,
+graceful fallback to UHID if `/dev/raw-gadget` is unusable).
+
+The Rust transport is **validated on the Deck** (a static musl test binary that `#[path]`-includes the
+real module): it enumerates the 3-interface Deck, hid-steam binds it + reads our serial + creates the
+`Steam Deck` + `Motion Sensors` evdevs — identical to the C PoC. A real USB-stack bug it caught: on
+musl, `ioctl(fd, RUN)` with no third arg passes a garbage `value`, and raw_gadget's `RUN`/`CONFIGURE`/
+`EP0_STALL` reject a non-zero `value` with `EINVAL` — so the no-arg ioctls must pass an explicit `0`.
+
+## Remaining
+
+- **Harden the feature contract** so Steam stops re-probing + the gamepad evdev stops churning (serve
+  Steam's full `GetControllerInfo` attribute set, captured from a physical Deck) — then a clean live
+  input-flow check + defaulting the gadget on for SteamOS hosts.
+- A `punktfunk-host` build for SteamOS to exercise the integrated path end-to-end with a live client.

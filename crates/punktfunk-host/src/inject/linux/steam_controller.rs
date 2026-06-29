@@ -239,8 +239,39 @@ impl Drop for SteamDeckPad {
 /// Button/stick frames arrive via [`handle`](Self::handle); the right trackpad + motion via
 /// [`apply_rich`](Self::apply_rich); [`pump`](Self::pump) services the kernel handshake + routes
 /// rumble back; [`heartbeat`](Self::heartbeat) keeps the pad alive (and drives the mode-entry pulse).
+/// The transport a manager pad drives. UHID is universal but Steam Input won't promote it (a UHID
+/// device has no USB interface number); the USB gadget is SteamOS-only but Steam Input *does* promote
+/// it (it presents the controller on interface 2). Selected per-pad in [`SteamControllerManager::ensure`].
+enum DeckTransport {
+    Uhid(SteamDeckPad),
+    Gadget(crate::inject::steam_gadget::SteamDeckGadget),
+}
+
+impl DeckTransport {
+    fn write_state(&mut self, st: &SteamState) {
+        match self {
+            DeckTransport::Uhid(p) => {
+                let _ = p.write_state(st);
+            }
+            DeckTransport::Gadget(g) => g.write_state(st),
+        }
+    }
+    fn service(&mut self) -> Option<(u16, u16)> {
+        match self {
+            DeckTransport::Uhid(p) => p.service(),
+            DeckTransport::Gadget(g) => g.service().rumble,
+        }
+    }
+    fn in_mode_entry(&self) -> bool {
+        match self {
+            DeckTransport::Uhid(p) => p.in_mode_entry(),
+            DeckTransport::Gadget(_) => false,
+        }
+    }
+}
+
 pub struct SteamControllerManager {
-    pads: Vec<Option<SteamDeckPad>>,
+    pads: Vec<Option<DeckTransport>>,
     state: Vec<SteamState>,
     last_rumble: Vec<(u16, u16)>,
     last_write: Vec<Instant>,
@@ -329,7 +360,7 @@ impl SteamControllerManager {
     fn write(&mut self, idx: usize) {
         let st = self.state[idx];
         if let Some(pad) = self.pads[idx].as_mut() {
-            let _ = pad.write_state(&st);
+            pad.write_state(&st);
         }
         self.last_write[idx] = Instant::now();
     }
@@ -353,10 +384,32 @@ impl SteamControllerManager {
         if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
             return;
         }
-        match SteamDeckPad::open(idx as u8) {
-            Ok(p) => {
-                tracing::info!(index = idx, "virtual Steam Deck created (UHID hid-steam)");
-                self.pads[idx] = Some(p);
+        // Prefer the USB gadget on SteamOS (the only transport Steam Input promotes); fall back to the
+        // universal UHID pad if the gadget is unavailable or not opted in.
+        let opened = if crate::inject::steam_gadget::gadget_preferred() {
+            crate::inject::steam_gadget::ensure_modules();
+            match crate::inject::steam_gadget::SteamDeckGadget::open(idx as u8) {
+                Ok(g) => {
+                    tracing::info!(
+                        index = idx,
+                        "virtual Steam Deck created (USB gadget — Steam Input recognizes it)"
+                    );
+                    Ok(DeckTransport::Gadget(g))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "USB-gadget Deck unavailable — falling back to UHID");
+                    SteamDeckPad::open(idx as u8).map(DeckTransport::Uhid)
+                }
+            }
+        } else {
+            SteamDeckPad::open(idx as u8).map(DeckTransport::Uhid)
+        };
+        match opened {
+            Ok(t) => {
+                if matches!(t, DeckTransport::Uhid(_)) {
+                    tracing::info!(index = idx, "virtual Steam Deck created (UHID hid-steam)");
+                }
+                self.pads[idx] = Some(t);
                 self.state[idx] = SteamState::neutral();
                 self.last_rumble[idx] = (0, 0);
                 self.last_write[idx] = Instant::now();
