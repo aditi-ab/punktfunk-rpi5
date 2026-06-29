@@ -1947,6 +1947,57 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
     chosen
 }
 
+/// True if a **physical** Valve Steam controller (`28DE`) is already attached. The host's own Steam
+/// Input is then managing a `28DE` device, and presenting a second (virtual) one makes Steam juggle
+/// two Decks — confirmed conflict-prone on a Deck-as-host (the physical `28DE:1205` + Steam's
+/// `28DE:11FF` XInput output pad are both live). HID device dirs are named `BUS:VID:PID.INST`
+/// (uppercase); a UHID virtual device resolves through `/devices/virtual/…`, a real one does not.
+#[cfg(target_os = "linux")]
+fn physical_steam_controller_present() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/bus/hid/devices") else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        if !e.file_name().to_string_lossy().contains(":28DE:") {
+            return false;
+        }
+        match std::fs::read_link(e.path()) {
+            Ok(target) => !target.to_string_lossy().contains("/virtual/"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// Gate a virtual Steam pad off when a physical Steam controller is attached (§ conflict). Degrade to
+/// DualSense (then the uhid ladder), which Steam treats as an ordinary, distinct pad. Override with
+/// `PUNKTFUNK_STEAM_FORCE=1` when the host has no competing Steam Input (e.g. a remote-only box).
+#[cfg(target_os = "linux")]
+fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
+    if !matches!(
+        chosen,
+        GamepadPref::SteamDeck | GamepadPref::SteamController
+    ) {
+        return chosen;
+    }
+    let forced = std::env::var("PUNKTFUNK_STEAM_FORCE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !forced && physical_steam_controller_present() {
+        tracing::warn!(
+            wanted = chosen.as_str(),
+            "a physical Steam controller is attached — the host's Steam Input would manage two 28DE \
+             devices; falling back to DualSense (set PUNKTFUNK_STEAM_FORCE=1 to override)"
+        );
+        return degrade_if_no_uhid(GamepadPref::DualSense);
+    }
+    chosen
+}
+
+#[cfg(not(target_os = "linux"))]
+fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
+    chosen
+}
+
 /// Resolve the client's gamepad-backend preference (the env/logging shell around
 /// [`pick_gamepad`]). Always concrete — the `Welcome` reports what the session will drive.
 fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
@@ -1961,6 +2012,10 @@ fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
     // backends need `/dev/uhid` usable *now*, else creating the device just fails and the controller
     // goes dead — fall back to the always-available uinput X-Box 360 pad instead.
     let chosen = degrade_if_no_uhid(chosen);
+    // Conflict gate: don't present a virtual Steam (28DE) pad when the host already has a physical
+    // Steam controller — its own Steam Input would then manage two Decks (confirmed conflict-prone on
+    // a Deck-as-host). `PUNKTFUNK_STEAM_FORCE=1` overrides.
+    let chosen = degrade_steam_on_conflict(chosen);
     match pref {
         GamepadPref::Auto => {
             // The operator's env knob deserves a diagnostic when it didn't drive the
