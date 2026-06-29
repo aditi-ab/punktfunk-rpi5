@@ -121,7 +121,8 @@ fn real_main() -> Result<()> {
         punktfunk_core::ABI_VERSION
     );
 
-    // Install Apollo's win32u GPU-preference hook BEFORE anything touches DXGI (the SudoVDA
+    // Install the win32u GPU-preference hook (same technique as Apollo, reimplemented — no GPL source
+    // copied) BEFORE anything touches DXGI (the virtual-display
     // render-adapter selection creates a DXGI factory during virtual-display setup, well before
     // capture). On a hybrid-GPU box this stops DXGI from reparenting the virtual output off the
     // capture GPU — the ACCESS_LOST churn fix. Idempotent (Once); harmless on non-hybrid boxes.

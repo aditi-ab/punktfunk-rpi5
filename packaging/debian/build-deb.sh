@@ -68,6 +68,10 @@ install -Dm0644 api/openapi.json              "$SHAREDIR/openapi.json"
 install -Dm0644 LICENSE-MIT                         "$DOCDIR/LICENSE-MIT"
 install -Dm0644 LICENSE-APACHE                      "$DOCDIR/LICENSE-APACHE"
 install -Dm0644 README.md                           "$DOCDIR/README.md"
+# Third-party crate attributions (regenerate with scripts/gen-third-party-notices.sh).
+if [ -f THIRD-PARTY-NOTICES.txt ]; then
+    install -Dm0644 THIRD-PARTY-NOTICES.txt "$DOCDIR/THIRD-PARTY-NOTICES.txt"
+fi
 
 # Debian copyright + changelog (cheap, keeps the package well-formed).
 cat > "$DOCDIR/copyright" <<EOF
@@ -76,7 +80,7 @@ Upstream-Name: punktfunk
 Source: https://git.unom.io/unom/punktfunk
 
 Files: *
-Copyright: punktfunk contributors
+Copyright: unom and the punktfunk contributors
 License: MIT or Apache-2.0
  Dual-licensed. Full texts in /usr/share/doc/$PKG/LICENSE-MIT and
  /usr/share/doc/$PKG/LICENSE-APACHE.

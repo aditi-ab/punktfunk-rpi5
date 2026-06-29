@@ -76,10 +76,28 @@ foreach ($f in $required) {
     Copy-Item $src (Join-Path $layout $f) -Force
 }
 
-# FFmpeg runtime DLLs (the exe link-imports the decode set; copy them all — small and correct)
+# FFmpeg runtime DLLs (the exe link-imports the decode set; copy them all — small and correct).
+# These are unmodified BtbN *lgpl-shared* builds, linked dynamically (replaceable DLLs) — FFmpeg is
+# used under the LGPL v2.1+; the license text + notice ship in licenses\ below.
 $ff = Get-ChildItem -Path $FfmpegBin -Filter *.dll -ErrorAction SilentlyContinue
 if (-not $ff) { throw "no FFmpeg DLLs in $FfmpegBin" }
 $ff | ForEach-Object { Copy-Item $_.FullName (Join-Path $layout $_.Name) -Force }
+
+# license/attribution payload (MSIX has no installer EULA page, so ship them as files): FFmpeg's LGPL
+# notice + license text, the project's own MIT/Apache texts, and the generated third-party notices.
+$licDir = Join-Path $layout 'licenses'
+New-Item -ItemType Directory -Force -Path $licDir | Out-Null
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+Copy-Item (Join-Path $repoRoot 'packaging\windows\licenses\FFmpeg-LGPL-NOTICE.txt') $licDir -Force -ErrorAction SilentlyContinue
+foreach ($n in @('THIRD-PARTY-NOTICES.txt', 'LICENSE-MIT', 'LICENSE-APACHE')) {
+    $p = Join-Path $repoRoot $n
+    if (Test-Path $p) { Copy-Item $p $licDir -Force }
+}
+$ffRoot = Split-Path $FfmpegBin -Parent
+foreach ($lic in @('LICENSE.txt', 'LICENSE', 'COPYING.LGPLv2.1', 'COPYING.LGPLv3', 'COPYING.txt')) {
+    $p = Join-Path $ffRoot $lic
+    if (Test-Path $p) { Copy-Item $p $licDir -Force }
+}
 
 # tile/store assets
 Copy-Item (Join-Path $assets '*') (Join-Path $layout 'Assets') -Force

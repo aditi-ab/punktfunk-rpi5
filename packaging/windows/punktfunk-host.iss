@@ -102,10 +102,17 @@ Name: "startservice"; Description: "Start the punktfunk host service now (also s
 Source: "{#BinDir}\punktfunk-host.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#HostEnv}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Readme}"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
+#ifdef LicensesDir
+; License/attribution payload -> {app}\licenses: the project's MIT/Apache texts, the generated
+; THIRD-PARTY-NOTICES (permissive crate attributions), and (on an amf-qsv build) the FFmpeg LGPL
+; notice + license text. Staged by pack-host-installer.ps1.
+Source: "{#LicensesDir}\*"; DestDir: "{app}\licenses"; Flags: ignoreversion
+#endif
 #ifdef WithFfmpeg
 ; FFmpeg shared DLLs (avcodec/avutil/swscale/...) laid down next to the exe - the AMD/Intel
 ; (AMF/QSV) encode backend link-imports them, so the exe won't start without them. NVENC/software-
-; only builds simply omit this block.
+; only builds simply omit this block. These are unmodified BtbN *lgpl-shared* builds, linked
+; dynamically (replaceable DLLs) - FFmpeg is used under the LGPL v2.1+; see {app}\licenses.
 Source: "{#FfmpegBin}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 #endif
 #ifdef WithWeb

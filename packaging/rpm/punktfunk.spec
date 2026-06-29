@@ -261,7 +261,7 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %endif
 
 %files
-%license LICENSE-MIT LICENSE-APACHE
+%license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %doc README.md design/implementation-plan.md packaging/README.md
 %{_bindir}/punktfunk-host
 %{_udevrulesdir}/60-punktfunk.rules
@@ -276,7 +276,7 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %{_datadir}/%{name}/*
 
 %files client
-%license LICENSE-MIT LICENSE-APACHE
+%license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %{_bindir}/punktfunk-client
 %{_datadir}/applications/io.unom.Punktfunk.desktop
 %{_udevrulesdir}/70-punktfunk-client.rules
@@ -284,7 +284,7 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 
 %if %{with web}
 %files web
-%license LICENSE-MIT LICENSE-APACHE
+%license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %{_bindir}/punktfunk-web-server
 %dir %{_datadir}/punktfunk-web
 %{_datadir}/punktfunk-web/.output

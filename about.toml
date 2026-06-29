@@ -1,0 +1,49 @@
+# cargo-about config — full-fidelity third-party license harvest for CI.
+#
+#   cargo install cargo-about
+#   cargo about generate about.hbs > THIRD-PARTY-NOTICES.txt   # (or use scripts/gen-third-party-notices.sh)
+#
+# `accepted` is the allow-list of SPDX licenses permitted in the dependency tree. CI fails if a crate
+# carries anything not listed here — which is exactly the regression guard we want against a copyleft
+# dependency silently entering the linked set. All entries
+# below are permissive / attribution-only; deliberately NO GPL/LGPL/AGPL/MPL-link/SSPL/EPL.
+#
+# The dependency-free fallback is scripts/gen-third-party-notices.py (reads the cargo registry cache),
+# which is what produced the committed baseline when cargo-about is unavailable offline.
+
+accepted = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "CC0-1.0",
+    "Unlicense",
+    "WTFPL",
+    "OpenSSL",
+]
+
+# cbindgen is MPL-2.0 but it is a BUILD-ONLY codegen tool that never links into a shipped artifact
+# (its generated header is not a derivative work), so it is excluded from the notices rather than
+# accepted as a linked license.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# r-efi offers an LGPL-2.1-or-later arm but is tri-licensed; take a permissive arm. (It is also
+# UEFI-target-gated out of every shipped build.)
+[r-efi.clarify]
+license = "MIT OR Apache-2.0"
+
+[ring.clarify]
+license = "MIT AND ISC AND OpenSSL"
+
+[aws-lc-sys.clarify]
+license = "ISC AND Apache-2.0 AND MIT AND BSD-3-Clause AND OpenSSL"

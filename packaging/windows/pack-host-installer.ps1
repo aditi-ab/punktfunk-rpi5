@@ -132,12 +132,25 @@ Copy-Item -LiteralPath $hostEnvSrc -Destination $hostEnv -Force
 Copy-Item -LiteralPath $readmeSrc -Destination $readme -Force
 Copy-Item -LiteralPath $iss -Destination $issLocal -Force
 
+# License/attribution payload bundled into {app}\licenses: the project's own MIT/Apache texts and the
+# generated third-party crate notices. The FFmpeg LGPL notice + license text are added to this same
+# dir below when the AMF/QSV FFmpeg DLLs are bundled. (THIRD-PARTY-NOTICES.txt is committed; CI may
+# regenerate it via scripts/gen-third-party-notices.sh before packaging.)
+$licStage = Join-Path $OutDir 'licenses'
+New-Item -ItemType Directory -Force -Path $licStage | Out-Null
+foreach ($n in @('LICENSE-MIT', 'LICENSE-APACHE', 'THIRD-PARTY-NOTICES.txt')) {
+    $p = Join-Path $repoRoot $n
+    if (Test-Path $p) { Copy-Item $p -Destination $licStage -Force }
+    else { Write-Warning "license payload missing (skipped): $p" }
+}
+
 $defines = @(
     "/DMyAppVersion=$Version",
     "/DBinDir=$TargetDir",
     "/DOutputDir=$OutDir",
     "/DHostEnv=$hostEnv",
-    "/DReadme=$readme"
+    "/DReadme=$readme",
+    "/DLicensesDir=$licStage"
 )
 
 # --- build (from source) + stage the pf-vdisplay virtual-display driver -----------------------
@@ -179,7 +192,7 @@ if (-not $NoDriver) {
 # --- stage the FFmpeg shared DLLs (AMD/Intel AMF/QSV build) ------------------------------------
 # A host built with --features amf-qsv link-imports avcodec/avutil/swscale/... so the shared DLLs
 # MUST sit next to the exe (it won't start otherwise). Bundle them from $FfmpegDir\bin - the same
-# BtbN gpl-shared tree the build linked against. A nvenc/software-only build doesn't import them, so
+# BtbN lgpl-shared tree the build linked against. A nvenc/software-only build doesn't import them, so
 # this is a harmless extra there; skipped entirely when $FfmpegDir is unset.
 $ffmpegBinSrc = if ($FfmpegDir) { Join-Path $FfmpegDir 'bin' } else { $null }
 if ($ffmpegBinSrc -and (Test-Path $ffmpegBinSrc)) {
@@ -190,6 +203,16 @@ if ($ffmpegBinSrc -and (Test-Path $ffmpegBinSrc)) {
         $dlls | ForEach-Object { Copy-Item $_.FullName -Destination $ffmpegStage -Force }
         $defines += "/DFfmpegBin=$ffmpegStage"
         Write-Host "bundling $($dlls.Count) FFmpeg DLL(s) from $ffmpegBinSrc"
+        # LGPL compliance: add FFmpeg's own license text (preserved in the BtbN tree root) + our
+        # attribution notice to the {app}\licenses payload so the conveyed installer carries the
+        # LGPLv2.1+ terms. FFmpeg is linked dynamically (separate, user-replaceable DLLs), which
+        # satisfies the LGPL relink requirement.
+        Copy-Item (Join-Path $here 'licenses\FFmpeg-LGPL-NOTICE.txt') -Destination $licStage -Force -ErrorAction SilentlyContinue
+        foreach ($lic in @('LICENSE.txt', 'LICENSE', 'COPYING.LGPLv2.1', 'COPYING.LGPLv3', 'COPYING.txt')) {
+            $p = Join-Path $FfmpegDir $lic
+            if (Test-Path $p) { Copy-Item $p -Destination (Join-Path $licStage "FFmpeg-$lic") -Force }
+        }
+        Write-Host "added FFmpeg license/notice to $licStage"
     }
 }
 else { Write-Host "no FFMPEG_DIR\bin -> installer built WITHOUT FFmpeg DLLs (nvenc/software-only host)" }

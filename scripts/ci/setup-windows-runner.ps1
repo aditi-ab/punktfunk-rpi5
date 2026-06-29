@@ -102,22 +102,35 @@ if (Test-Path $rustup) {
     & $rustup target add aarch64-pc-windows-msvc
 } else { Write-Warning "rustup not found - install rustup then re-run (needed for the aarch64 target)." }
 
-$ffArm = "C:\Users\Public\ffmpeg-arm64"
-if (-not (Test-Path (Join-Path $ffArm 'lib\avcodec.lib'))) {
-    # BtbN winarm64 shared, FFmpeg 7.x (avcodec-61) to match the x64 tree's ABI. MSVC-linkable .lib
-    # import libs + headers + bin\*.dll — exactly what ffmpeg-sys-next + pack-msix.ps1 consume.
-    Write-Host "==> fetching ARM64 FFmpeg (BtbN winarm64 shared)"
-    $ffUrl = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-winarm64-gpl-shared-7.1.zip'
-    $ffZip = "C:\Users\Public\ffmpeg-arm64.zip"
-    $ffTmp = "C:\Users\Public\ffmpeg-arm64-extract"
-    Invoke-WebRequest -Uri $ffUrl -OutFile $ffZip -UseBasicParsing
-    if (Test-Path $ffTmp) { Remove-Item -Recurse -Force $ffTmp }
-    Expand-Archive -Path $ffZip -DestinationPath $ffTmp -Force   # BtbN zips have one top-level folder
-    $inner = Get-ChildItem $ffTmp -Directory | Select-Object -First 1
-    if (Test-Path $ffArm) { Remove-Item -Recurse -Force $ffArm }
-    Move-Item -Path $inner.FullName -Destination $ffArm
-    Remove-Item -Force $ffZip; Remove-Item -Recurse -Force $ffTmp -ErrorAction SilentlyContinue
+# FFmpeg shared trees for the host (amf-qsv encode) + clients (decode). We use BtbN **lgpl-shared**
+# builds: the AMD/Intel AMF + Intel QSV encoders, swscale, and the HEVC decoder are all present in the
+# LGPL build, and punktfunk never calls the GPL-only encoders (x264/x265 — software encode is the
+# separate BSD-2 openh264 crate; NVENC is the direct NVIDIA SDK). lgpl-shared keeps the bundled DLLs
+# LGPL-2.1+ (dynamic linking satisfies the relink duty) rather than GPL, so the shipped installer/MSIX
+# stay consistent with punktfunk's MIT OR Apache-2.0 posture.
+# MIGRATION: a runner previously provisioned with the old *gpl-shared* trees must be re-provisioned —
+# delete C:\Users\Public\ffmpeg and C:\Users\Public\ffmpeg-arm64, then re-run this script.
+function Get-BtbnFfmpeg {
+    param([string]$Dir, [string]$ZipTag)   # ZipTag: 'win64' (x64) or 'winarm64' (ARM64 cross tree)
+    if (Test-Path (Join-Path $Dir 'lib\avcodec.lib')) { return }
+    # FFmpeg 7.x (avcodec-61); MSVC-linkable .lib import libs + headers + bin\*.dll — exactly what
+    # ffmpeg-sys-next + pack-host-installer.ps1 + pack-msix.ps1 consume. The extracted top-level folder
+    # also carries FFmpeg's own LICENSE/COPYING text, preserved in $Dir for the packagers to bundle.
+    Write-Host "==> fetching FFmpeg ($ZipTag, BtbN lgpl-shared)"
+    $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-$ZipTag-lgpl-shared-7.1.zip"
+    $zip = "$Dir.zip"; $tmp = "$Dir-extract"
+    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    Expand-Archive -Path $zip -DestinationPath $tmp -Force   # BtbN zips have one top-level folder
+    $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
+    if (Test-Path $Dir) { Remove-Item -Recurse -Force $Dir }
+    Move-Item -Path $inner.FullName -Destination $Dir
+    Remove-Item -Force $zip; Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
+# x64 host+client tree (the workflow's default FFMPEG_DIR = C:\Users\Public\ffmpeg) and the ARM64 cross
+# tree (the aarch64 leg points FFMPEG_DIR at C:\Users\Public\ffmpeg-arm64).
+Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg"       -ZipTag 'win64'
+Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg-arm64" -ZipTag 'winarm64'
 
 # Inno Setup (ISCC.exe) for the host installer build (windows-host.yml). pack-host-installer.ps1
 # locates it at its fixed Program Files path, so it need not be on PATH — just present.

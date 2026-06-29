@@ -217,6 +217,7 @@ bytemuck = { version = "1.19", features = ["derive"] }
 # nvEncodeAPI64.dll) on the linker path. Build the GPU host with `--features nvenc`.
 nvenc = ["dep:nvidia-video-codec-sdk"]
 # AMD/Intel hardware encode on Windows (AMF/QSV via ffmpeg-next). OFF by default: it needs a
-# `FFMPEG_DIR` (BtbN gpl-shared, includes `*_amf`/`*_qsv`) at build time and bundles the FFmpeg
-# DLLs at runtime. Build the all-vendor GPU host with `--features nvenc,amf-qsv`.
+# `FFMPEG_DIR` (BtbN lgpl-shared — includes `*_amf`/`*_qsv`; the GPL-only x264/x265 are never used,
+# so the LGPL build suffices and keeps the bundled DLLs LGPL, not GPL) at build time and bundles the
+# FFmpeg DLLs at runtime. Build the all-vendor GPU host with `--features nvenc,amf-qsv`.
 amf-qsv = ["dep:ffmpeg-next"]

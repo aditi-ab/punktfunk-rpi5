@@ -1,0 +1,41 @@
+FFmpeg — third-party component notice
+=====================================
+
+This product bundles unmodified shared libraries from the FFmpeg project
+(avcodec / avutil / avformat / swscale / swresample and their dependencies) as
+separate dynamic-link libraries (DLLs). punktfunk uses them only for hardware
+video encode (AMD AMF / Intel QSV) on the host and hardware/software video
+decode on the client.
+
+License
+-------
+The bundled FFmpeg libraries are distributed under the GNU Lesser General Public
+License (LGPL), version 2.1 or later. The bundled builds are the "lgpl-shared"
+configuration — they do NOT include any GPL-licensed components (notably they do
+not include libx264 or libx265; punktfunk does not use them). The full text of
+the LGPL accompanies this notice (see the COPYING.LGPLv2.1 / LICENSE files in
+this directory; if absent, see https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html).
+
+How punktfunk complies (dynamic linking)
+----------------------------------------
+punktfunk links FFmpeg only dynamically: the FFmpeg DLLs are shipped as separate
+files alongside the application and are not statically combined into the
+punktfunk executable. You may replace these DLLs with your own ABI-compatible
+build of FFmpeg, which satisfies LGPL section 6 (the right to relink the work
+against a modified version of the library).
+
+Source code
+-----------
+The bundled binaries are unmodified builds produced by the BtbN/FFmpeg-Builds
+project. The exact source for the FFmpeg release used is available from:
+
+  * FFmpeg project source:   https://ffmpeg.org/download.html  (release n7.1)
+  * Exact build recipe:      https://github.com/BtbN/FFmpeg-Builds
+
+A copy of the corresponding FFmpeg source for the version shipped here is
+available on request from the punktfunk maintainers (https://git.unom.io/unom/punktfunk).
+
+Trademark
+---------
+FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
+punktfunk is not affiliated with or endorsed by the FFmpeg project.

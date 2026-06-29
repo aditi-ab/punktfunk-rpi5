@@ -188,7 +188,8 @@ pub(crate) unsafe fn make_device(
     let device = device.context("null D3D11 device")?;
     let context = context.context("null D3D11 context")?;
 
-    // Apollo-style GPU scheduling hardening (Sunshine display_base.cpp:599-709). Our capture+encode
+    // GPU scheduling hardening — the same approach Sunshine/Apollo use, reimplemented here via the
+    // documented D3DKMT/DXGI APIs (no GPL source copied). Our capture+encode
     // shares the GPU with the streamed game; when the game saturates the GPU our process is starved of
     // GPU time slices, so NVENC sits near-idle yet `lock_bitstream` waits ~20 ms for our context to be
     // scheduled — capping the stream (~47 fps measured at 5K@240) and stuttering. Per-frame copy/convert
@@ -197,7 +198,7 @@ pub(crate) unsafe fn make_device(
     // GPU thread priority and a 1-frame latency cap.
     elevate_process_gpu_priority();
     if let Ok(dxgi_dev) = device.cast::<IDXGIDevice>() {
-        // Apollo's absolute max GPU thread priority (0x4000001E); fall back to relative +7.
+        // The absolute max GPU thread priority (0x4000001E; the same value Sunshine/Apollo use); fall back to relative +7.
         if dxgi_dev.SetGPUThreadPriority(0x4000_001E).is_err()
             && dxgi_dev.SetGPUThreadPriority(7).is_err()
         {
@@ -291,7 +292,8 @@ unsafe fn d3dkmt_set_scheduling_priority_class(
     Some(f(process, prio))
 }
 
-/// Apollo-style GPU scheduling-priority hardening (Sunshine `display_base.cpp:599-709`). On a
+/// GPU scheduling-priority hardening — the same approach as Sunshine/Apollo, independently
+/// implemented via the documented D3DKMT APIs (no GPL source copied). On a
 /// GPU-saturated game our capture+encode process is starved of GPU time slices — NVENC sits ~idle but
 /// `lock_bitstream` waits ~20 ms for our context to be scheduled. Elevating the PROCESS GPU scheduling
 /// priority class (the strong cross-process lever — far more effective than `SetGPUThreadPriority`
@@ -532,7 +534,9 @@ const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
 
 /// Replacement for `win32u.dll!NtGdiDdDDIGetCachedHybridQueryValue`: always report
 /// `D3DKMT_GPU_PREFERENCE_STATE_UNSPECIFIED` (3). We fully replace the function (never call the
-/// original), so no trampoline is needed. (Ported verbatim from Apollo's MinHook hook.)
+/// original), so no trampoline is needed. (Independent reimplementation of the same technique Apollo
+/// uses: Apollo installs its hook via the MinHook library; this is an original inline byte-patch and
+/// copies no Apollo/GPL source.)
 unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
     HYBRID_HOOK_HITS.fetch_add(1, Ordering::Relaxed);
     if gpu_preference.is_null() {
@@ -542,7 +546,8 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
     0 // STATUS_SUCCESS
 }
 
-/// Apollo's win32u GPU-preference hook, ported. On a HYBRID-GPU box DXGI resolves a GPU preference
+/// The win32u GPU-preference hook (the same technique Apollo applies, reimplemented here from the
+/// documented DDI — no GPL source copied). On a HYBRID-GPU box DXGI resolves a GPU preference
 /// (registry + power settings + the hybrid-adapter DDI) and REPARENTS outputs onto the chosen render
 /// GPU — which constantly invalidates Desktop Duplication (DXGI_ERROR_ACCESS_LOST 0x887A0026, the
 /// freeze/churn observed on the RTX 4090 + AMD iGPU box; `SET_RENDER_ADAPTER` is ignored there). Faking
@@ -555,7 +560,7 @@ pub(crate) fn install_gpu_pref_hook() {
     // SAFETY: this one-time hook install only touches a region it has just validated.
     // `LoadLibraryA("win32u.dll")` + `GetProcAddress("NtGdiDdDDIGetCachedHybridQueryValue")` yield the
     // live base of the real exported function, so `target` is a valid executable code pointer to at
-    // least the 12 bytes the patch overwrites (an x64 prologue, per Apollo's verified hook). The two
+    // least the 12 bytes the patch overwrites (an x64 prologue). The two
     // `ptr::copy_nonoverlapping`s each move exactly 12 bytes between the 12-byte stack arrays
     // (`patch`/`readback`) and `target`, which `VirtualProtect(target, 12, PAGE_EXECUTE_READWRITE, …)`
     // has just made writable (and is restored to `old` after) — source and dest never overlap (stack

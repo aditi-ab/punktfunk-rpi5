@@ -43,6 +43,10 @@ install -Dm0644 scripts/99-punktfunk-client-net.conf \
 install -Dm0644 LICENSE-MIT                              "$DOCDIR/LICENSE-MIT"
 install -Dm0644 LICENSE-APACHE                           "$DOCDIR/LICENSE-APACHE"
 install -Dm0644 README.md                                "$DOCDIR/README.md"
+# Third-party crate attributions (regenerate with scripts/gen-third-party-notices.sh).
+if [ -f THIRD-PARTY-NOTICES.txt ]; then
+    install -Dm0644 THIRD-PARTY-NOTICES.txt "$DOCDIR/THIRD-PARTY-NOTICES.txt"
+fi
 
 cat > "$DOCDIR/copyright" <<EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
@@ -50,7 +54,7 @@ Upstream-Name: punktfunk
 Source: https://git.unom.io/unom/punktfunk
 
 Files: *
-Copyright: punktfunk contributors
+Copyright: unom and the punktfunk contributors
 License: MIT or Apache-2.0
  Dual-licensed. Full texts in /usr/share/doc/$PKG/LICENSE-MIT and
  /usr/share/doc/$PKG/LICENSE-APACHE.

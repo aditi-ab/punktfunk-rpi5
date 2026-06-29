@@ -155,4 +155,31 @@ tools/                       latency-probe · loss-harness (measurement)
 
 ## License
 
-MIT OR Apache-2.0.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option — `SPDX-License-Identifier: MIT OR Apache-2.0`.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Third-party components
+
+punktfunk's own source is MIT/Apache-2.0. Shipped binaries additionally link third-party components
+under their own (permissive) licenses — see [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt)
+(regenerate with `scripts/gen-third-party-notices.sh`). The Windows host and client builds also
+bundle FFmpeg under the **LGPL v2.1+** (dynamically linked, replaceable DLLs; the license text and
+notice ship in the installed `licenses/` folder).
+
+### Trademarks
+
+punktfunk is an independent project and is **not affiliated with, endorsed by, or sponsored by**
+NVIDIA, Microsoft, Sony, Valve, or the Moonlight project. "GameStream", "Moonlight", "Xbox",
+"DualSense", "DualShock", and "PlayStation" are trademarks of their respective owners and are used
+here only to describe interoperability.

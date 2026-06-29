@@ -24,8 +24,9 @@
 # GPU backends: the host builds with --features nvenc,amf-qsv = all three vendors in one installer.
 #  - NVENC (NVIDIA, direct SDK): the only link need is nvencodeapi.lib, synthesised from a 2-export
 #    .def with llvm-dlltool (no GPU/SDK at build time).
-#  - AMF/QSV (AMD/Intel, libavcodec): link-imports the FFmpeg libs from FFMPEG_DIR (the BtbN gpl-shared
+#  - AMF/QSV (AMD/Intel, libavcodec): link-imports the FFmpeg libs from FFMPEG_DIR (the BtbN lgpl-shared
 #    tree the client uses; includes the *_amf/*_qsv encoders) and bundles its DLLs into the installer.
+#    lgpl-shared (not gpl-shared) keeps those bundled DLLs LGPL (we never use the GPL-only x264/x265).
 # CI never launches the exe, so no GPU is needed here — this is build + Windows clippy coverage only.
 name: windows-host
 
@@ -80,7 +81,7 @@ jobs:
           # (pwsh Out-File utf8 = no BOM, unlike Windows PowerShell 5.1 — keeps the first line clean).
           "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # FFMPEG_DIR: the same BtbN gpl-shared x64 tree the Windows CLIENT links against (provisioned
+          # FFMPEG_DIR: the same BtbN lgpl-shared x64 tree the Windows CLIENT links against (provisioned
           # by scripts/ci/setup-windows-runner.ps1). The host's AMD/Intel AMF/QSV encode backend
           # (--features amf-qsv) link-imports avcodec/avutil/swscale from it; pack-host-installer.ps1
           # then bundles its bin\*.dll into the installer. LIBCLANG_PATH is in the runner daemon env.
