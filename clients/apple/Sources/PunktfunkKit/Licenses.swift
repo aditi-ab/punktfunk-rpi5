@@ -33,4 +33,18 @@ public enum Licenses {
         let text = resource("THIRD-PARTY-NOTICES")
         return text.isEmpty ? "Third-party notices unavailable." : text
     }
+
+    /// `thirdPartyNotices` pre-split into render-sized line chunks. The full notices are ~885 KB /
+    /// 16k lines; a single SwiftUI `Text` that large overshoots CoreText/CoreAnimation's max
+    /// renderable height — it lays out for ages and draws blank past the limit — so the
+    /// Acknowledgements screen renders these chunks in a `LazyVStack` (only on-screen chunks lay
+    /// out, and no chunk is tall enough to clip). Split at line boundaries and joined with "\n";
+    /// the inter-chunk break is the `LazyVStack` row boundary, so no text is lost. Computed once.
+    public static let thirdPartyNoticesChunks: [String] = {
+        let lines = thirdPartyNotices.split(separator: "\n", omittingEmptySubsequences: false)
+        let chunkSize = 200
+        return stride(from: 0, to: lines.count, by: chunkSize).map { start in
+            lines[start..<min(start + chunkSize, lines.count)].joined(separator: "\n")
+        }
+    }()
 }
