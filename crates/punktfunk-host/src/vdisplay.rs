@@ -58,6 +58,12 @@ pub trait VirtualDisplay: Send {
     /// sessions can't stomp each other's launch target. Default: no-op (backends that attach to an
     /// existing session / don't spawn a nested command ignore it; only gamescope's spawn path uses it).
     fn set_launch_command(&mut self, _cmd: Option<String>) {}
+    /// Set the connecting client's cert fingerprint so the backend can give that client a STABLE virtual
+    /// monitor identity across reconnects — Windows then reapplies the client's saved per-monitor config
+    /// (notably DPI scaling). Carried on the backend instance; set once before [`create`](Self::create).
+    /// Default: no-op — only the Windows pf-vdisplay backend uses it (Linux compositors own their virtual
+    /// output identity). `None` = anonymous/unpaired/GameStream → the backend's auto (slot-based) identity.
+    fn set_client_identity(&mut self, _fingerprint: Option<[u8; 32]>) {}
 }
 
 /// Compositors punktfunk knows how to drive (plan §6).
@@ -641,6 +647,9 @@ pub fn start_restore_worker() -> std::sync::Arc<()> {
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/gamescope.rs"]
 mod gamescope;
+#[cfg(target_os = "windows")]
+#[path = "vdisplay/windows/identity.rs"]
+pub(crate) mod identity;
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/kwin.rs"]
 mod kwin;

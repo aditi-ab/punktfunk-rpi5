@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use wdk_sys::iddcx;
+use wdk_sys::{WDFOBJECT, call_unsafe_wdf_function_binding, iddcx};
 
 /// One resolution with the refresh rates it supports.
 #[derive(Clone)]
@@ -69,10 +69,23 @@ unsafe impl Send for MonitorObject {}
 /// heavy per-monitor resources on device removal is instead done explicitly ([`cleanup_for_device_removal`]).
 pub static MONITOR_MODES: Mutex<Vec<MonitorObject>> = Mutex::new(Vec::new());
 
+/// Lock [`MONITOR_MODES`], recovering the guard on poison instead of failing. DEFENSIVE ONLY: this driver
+/// workspace builds with `panic = "abort"` (packaging/windows/drivers/Cargo.toml), so a panic while the
+/// lock is held aborts the process WITHOUT unwinding — `MutexGuard::drop` never runs, the poison flag is
+/// never set, and `.lock()` can never return `Err`. The `into_inner()` arm is therefore currently
+/// unreachable; it is retained to consolidate the lock pattern and to stay correct if the panic strategy
+/// ever becomes `unwind` (the guarded data is a plain `Vec` with no cross-field invariant a half-completed
+/// panic could corrupt, so recovering the guard is sound). NOTE: this does NOT explain the observed ADD
+/// 0x80070490 wedge — that is ghost-monitor slot-budget exhaustion (the arrival-failure `WdfObjectDelete`
+/// teardown above + the host-side reap), not lock poisoning.
+fn lock_monitors() -> std::sync::MutexGuard<'static, Vec<MonitorObject>> {
+    MONITOR_MODES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// True if any virtual monitor currently exists — the host-gone watchdog only reaps when there's
 /// something to reap (see [`crate::control::start_watchdog`]).
 pub fn has_monitors() -> bool {
-    MONITOR_MODES.lock().map(|l| !l.is_empty()).unwrap_or(false)
+    !lock_monitors().is_empty()
 }
 
 /// Depart every monitor that has existed at least `grace` — the host-gone watchdog reap
@@ -85,9 +98,7 @@ pub fn reap_orphaned(grace: Duration) -> usize {
         Option<iddcx::IDDCX_MONITOR>,
         Option<crate::swap_chain_processor::SwapChainProcessor>,
     )> = {
-        let Ok(mut lock) = MONITOR_MODES.lock() else {
-            return 0;
-        };
+        let mut lock = lock_monitors();
         let mut taken = Vec::new();
         let mut i = 0;
         while i < lock.len() {
@@ -138,7 +149,8 @@ pub fn display_info(
     // Compute in u64 then saturate the u32 rational numerators: the old u32 `refresh*(h+4)^2` overflows
     // for a large mode (e.g. 8K@240), which panics→aborts the extern-"C" mode DDI in a debug build.
     // Identical for every real mode; only an absurd (also now bounds-rejected) mode saturates.
-    let clock_rate: u64 = u64::from(refresh_rate) * u64::from(height + 4) * u64::from(height + 4) + 1000;
+    let clock_rate: u64 =
+        u64::from(refresh_rate) * u64::from(height + 4) * u64::from(height + 4) + 1000;
     let clock_rate_u32 = u32::try_from(clock_rate).unwrap_or(u32::MAX);
     let mut si = pod_init!(wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO);
     si.pixelRate = clock_rate;
@@ -264,9 +276,7 @@ pub fn set_swap_chain_processor(
     object: iddcx::IDDCX_MONITOR,
     proc: crate::swap_chain_processor::SwapChainProcessor,
 ) -> Option<crate::swap_chain_processor::SwapChainProcessor> {
-    let Ok(mut lock) = MONITOR_MODES.lock() else {
-        return Some(proc);
-    };
+    let mut lock = lock_monitors();
     if let Some(m) = lock.iter_mut().find(|m| m.object == Some(object)) {
         m.swap_chain_processor.replace(proc)
     } else {
@@ -290,15 +300,17 @@ pub fn take_swap_chain_processor(
         .take()
 }
 
-/// `IOCTL_ADD`: create + arrive a virtual monitor at `width`x`height`@`refresh`. Returns the OS
-/// `(target_id, adapter_luid_low, adapter_luid_high)` for the [`AddReply`](pf_driver_proto::control::AddReply),
-/// or `None` on failure (no adapter yet / IddCx error).
+/// `IOCTL_ADD`: create + arrive a virtual monitor at `width`x`height`@`refresh` for `session_id`, naming it
+/// by `preferred_id` (the host's per-client stable id; `0` = auto-allocate). Returns the resolved
+/// `(monitor_id, target_id, adapter_luid_low, adapter_luid_high)` for the
+/// [`AddReply`](pf_driver_proto::control::AddReply), or `None` on failure (no adapter yet / IddCx error).
 pub fn create_monitor(
     session_id: u64,
     width: u32,
     height: u32,
     refresh: u32,
-) -> Option<(u32, u32, i32)> {
+    preferred_id: u32,
+) -> Option<(u32, u32, u32, i32)> {
     let adapter = crate::adapter::adapter()?;
     // Single identity per session (E1): if the host re-ADDs a still-live `session_id` (it shouldn't), depart
     // the stale monitor first, so one session maps to exactly one monitor (no duplicate EDID/target lingers).
@@ -307,7 +319,9 @@ pub fn create_monitor(
         .map(|l| l.iter().any(|m| m.session_id == session_id))
         .unwrap_or(false)
     {
-        dbglog!("[pf-vd] create_monitor: session {session_id} already live — departing the stale monitor");
+        dbglog!(
+            "[pf-vd] create_monitor: session {session_id} already live — departing the stale monitor"
+        );
         remove_monitor(session_id);
     }
     let mut modes = vec![Mode {
@@ -317,17 +331,17 @@ pub fn create_monitor(
     }];
     modes.extend(default_modes());
 
-    // Register the (pending) monitor so the mode DDIs can find it by EDID-serial id before arrival, under a
-    // REUSED id (the lowest not currently live). Reclaiming the id on REMOVE — instead of a monotonic
-    // counter — keeps the connector index / EDID serial / container GUID bounded, so IddCx reuses the same
-    // OS target slot on a fresh ADD rather than leaving a ghost monitor node behind (the slot-exhaustion
-    // wedge: sustained ADD/REMOVE churn eventually makes ADD fail 0x80070490 ERROR_NOT_FOUND). Allocated
-    // under the lock with the push so two concurrent ADDs can't pick the same id.
+    // Register the (pending) monitor so the mode DDIs can find it by EDID-serial id before arrival. The id
+    // seeds the EDID serial + IddCx ConnectorIndex + ContainerId — i.e. the monitor's OS IDENTITY. Honor the
+    // host's per-client `preferred_id` when it is valid + not currently live, so a given client gets a
+    // STABLE identity across reconnects (→ Windows reapplies its saved per-monitor DPI scaling); else fall
+    // back to the lowest-free id (auto — the original slot-based behavior). A bounded reused id (vs a
+    // monotonic counter) keeps IddCx reusing the same OS target slot rather than leaving a ghost monitor
+    // node behind (the slot-exhaustion wedge). Allocated under the lock with the push so two concurrent ADDs
+    // can't pick the same id.
     let id = {
-        let Ok(mut lock) = MONITOR_MODES.lock() else {
-            return None;
-        };
-        let id = alloc_monitor_id(&lock);
+        let mut lock = lock_monitors();
+        let id = resolve_id(&lock, preferred_id);
         lock.push(MonitorObject {
             object: None,
             id,
@@ -379,7 +393,8 @@ pub fn create_monitor(
         return None;
     }
     let monitor = create_out.MonitorObject;
-    if let Ok(mut lock) = MONITOR_MODES.lock() {
+    {
+        let mut lock = lock_monitors();
         if let Some(m) = lock.iter_mut().find(|m| m.id == id) {
             m.object = Some(monitor);
         }
@@ -391,6 +406,24 @@ pub fn create_monitor(
     let st = unsafe { wdk_iddcx::IddCxMonitorArrival(monitor, &mut arrival_out) };
     dbglog!("[pf-vd] IddCxMonitorArrival(id={id}) -> {st:#x}");
     if !wdk_iddcx::nt_success(st) {
+        // Arrival failed on a monitor we already CREATED. It must be torn down with `WdfObjectDelete`:
+        // `IddCxMonitorDeparture` is only valid for an ARRIVED monitor, so departing here would be a
+        // no-op that LEAKS the IddCx monitor object and permanently pins its slot against the adapter's
+        // `MaxMonitorsSupported` budget — the leak that, asymmetric with the create-failure path just
+        // above (which only reclaims the id, having no object to delete), accelerates the ADD 0x80070490
+        // wedge. Reclaim the id FIRST (drop the `MONITOR_MODES` entry that still holds this handle) so a
+        // concurrent `clear_all`/`reap_orphaned` can't grab + depart the handle we're about to delete,
+        // THEN delete the object — `monitor` is a local copy of the handle, valid across both.
+        dbglog!(
+            "[pf-vd] IddCxMonitorArrival(id={id}) FAILED — reclaiming the id + deleting the created monitor"
+        );
+        remove_by_id(id);
+        // SAFETY: `monitor` is the just-created (not-yet-arrived) IddCx monitor handle, now owned solely
+        // here (its `MONITOR_MODES` entry was just removed); `WdfObjectDelete` takes a `WDFOBJECT` (a raw
+        // handle cast, as in the swap-chain / device-cleanup teardowns).
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, monitor as WDFOBJECT);
+        }
         return None;
     }
 
@@ -399,14 +432,15 @@ pub fn create_monitor(
         arrival_out.OsAdapterLuid.LowPart,
         arrival_out.OsAdapterLuid.HighPart,
     );
-    if let Ok(mut lock) = MONITOR_MODES.lock() {
+    {
+        let mut lock = lock_monitors();
         if let Some(m) = lock.iter_mut().find(|m| m.id == id) {
             m.target_id = target_id;
             m.adapter_luid_low = luid_low;
             m.adapter_luid_high = luid_high;
         }
     }
-    Some((target_id, luid_low, luid_high))
+    Some((id, target_id, luid_low, luid_high))
 }
 
 /// `IOCTL_REMOVE`: depart + drop the monitor for `session_id`. Returns true if one was removed.
@@ -415,9 +449,7 @@ pub fn remove_monitor(session_id: u64) -> bool {
     // (which RAII-joins its worker thread) only AFTER the lock guard is released — joining a worker
     // while holding `MONITOR_MODES` would head-block the whole control plane / risk a self-deadlock.
     let (monitor, processor) = {
-        let Ok(mut lock) = MONITOR_MODES.lock() else {
-            return false;
-        };
+        let mut lock = lock_monitors();
         let Some(pos) = lock.iter().position(|m| m.session_id == session_id) else {
             return false;
         };
@@ -441,9 +473,7 @@ pub fn clear_all() {
         Option<iddcx::IDDCX_MONITOR>,
         Option<crate::swap_chain_processor::SwapChainProcessor>,
     )> = {
-        let Ok(mut lock) = MONITOR_MODES.lock() else {
-            return;
-        };
+        let mut lock = lock_monitors();
         lock.drain(..)
             .map(|mut m| (m.object, m.swap_chain_processor.take()))
             .collect()
@@ -467,9 +497,7 @@ pub fn clear_all() {
 /// though the per-devnode WUDFHost (`ProcessSharingDisabled`) would also reap them when it exits.
 pub fn cleanup_for_device_removal() {
     let mut drained: Vec<Option<crate::swap_chain_processor::SwapChainProcessor>> = {
-        let Ok(mut lock) = MONITOR_MODES.lock() else {
-            return;
-        };
+        let mut lock = lock_monitors();
         lock.drain(..)
             .map(|mut m| m.swap_chain_processor.take())
             .collect()
@@ -483,8 +511,20 @@ pub fn cleanup_for_device_removal() {
 
 /// Drop a pending entry by id (create failed before arrival).
 fn remove_by_id(id: u32) {
-    if let Ok(mut lock) = MONITOR_MODES.lock() {
-        lock.retain(|m| m.id != id);
+    lock_monitors().retain(|m| m.id != id);
+}
+
+/// Resolve the id to name a new monitor by: honor the host's `preferred` per-client id when it is in the
+/// valid range (`1..=15`, so the IddCx `ConnectorIndex` = id stays `< MaxMonitorsSupported` = 16) AND not
+/// currently live (two live monitors MUST have distinct ids/connectors); otherwise fall back to
+/// [`alloc_monitor_id`] (auto, lowest-free). NEVER auto-departs a colliding live monitor — that would tear
+/// down an unrelated concurrent client — so the live-uniqueness invariant is preserved even against a host
+/// bug. `preferred == 0` (anonymous/TOFU/GameStream) always falls through to auto. Caller holds `MONITOR_MODES`.
+fn resolve_id(modes: &[MonitorObject], preferred: u32) -> u32 {
+    if (1..=15).contains(&preferred) && !modes.iter().any(|m| m.id == preferred) {
+        preferred
+    } else {
+        alloc_monitor_id(modes)
     }
 }
 

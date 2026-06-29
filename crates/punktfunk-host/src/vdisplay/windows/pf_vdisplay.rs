@@ -75,6 +75,65 @@ unsafe fn ioctl(h: HANDLE, code: u32, input: &[u8], output: &mut [u8]) -> Result
     Ok(returned)
 }
 
+/// Reap the ghost (NOT-present) "punktfunk" virtual-monitor device nodes that `IddCxMonitorDeparture`
+/// leaves behind. Each departed monitor leaves a not-present "Generic Monitor (punktfunk)" PDO that keeps
+/// pinning an OS VidPN target against the IddCx adapter's fixed monitor-slot budget; once ~16 accumulate,
+/// `IOCTL_ADD` wedges at 0x80070490 (`ERROR_NOT_FOUND`) and every session black-screens until a manual
+/// reset/reboot. Removing the not-present PDOs frees the slots — the in-process equivalent of
+/// `reset-pf-vdisplay.ps1` step 2 (proven on-box). Best-effort + idempotent: only NOT-present nodes
+/// (`Status != OK`) are removed, so the LIVE session's monitor (`Status OK`) is never touched; any
+/// failure is logged and swallowed. Returns the number removed.
+fn reap_ghost_monitors() -> u32 {
+    // Mirrors reset-pf-vdisplay.ps1 step 2. powershell is always present for the SYSTEM service; the
+    // matched tokens ('OK', 'punktfunk', the InstanceId) are locale-invariant, so this is safe on a
+    // non-English box (unlike a .ps1 *file* read in the machine codepage).
+    const REAP_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
+        $g = Get-PnpDevice -Class Monitor | Where-Object { $_.Status -ne 'OK' -and $_.FriendlyName -match 'punktfunk' }; \
+        $n = 0; foreach ($d in $g) { pnputil /remove-device $d.InstanceId *> $null; if ($LASTEXITCODE -eq 0) { $n++ } }; \
+        Write-Output $n";
+    // Resolve powershell by full path — the LocalSystem service's PATH is not guaranteed to include
+    // System32 — with a bare-name fallback.
+    let ps = std::env::var("SystemRoot")
+        .map(|r| format!(r"{r}\System32\WindowsPowerShell\v1.0\powershell.exe"))
+        .unwrap_or_else(|_| "powershell.exe".to_string());
+    match std::process::Command::new(&ps)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            REAP_PS,
+        ])
+        .output()
+    {
+        Ok(o) => {
+            let n = String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(0);
+            if n > 0 {
+                tracing::warn!(
+                    reaped = n,
+                    "pf-vdisplay: reaped ghost (not-present) virtual-monitor nodes — IddCx slot-exhaustion prevention"
+                );
+            }
+            n
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "pf-vdisplay: ghost-monitor reap could not spawn powershell");
+            0
+        }
+    }
+}
+
+/// True if `e`'s chain carries the IddCx monitor-slot-exhaustion wedge HRESULT (0x80070490,
+/// `ERROR_NOT_FOUND`) — the `IOCTL_ADD` failure that ghost-PDO accumulation produces. The hex code is
+/// locale-invariant (the OS message text is not), so we match on it.
+fn is_slot_exhaustion_wedge(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("0x80070490")
+}
+
 /// Pin the pf-vdisplay IddCx's RENDER GPU to `luid` (the analogue of Apollo's `SetRenderAdapter`). No
 /// output buffer. Issued on the driver handle BEFORE `IOCTL_ADD` to steer which GPU the new target
 /// renders on — on a multi-adapter box this stops DXGI from reparenting the virtual output onto a
@@ -193,6 +252,12 @@ impl VdisplayDriver for PfVdisplayDriver {
         } else {
             tracing::warn!("pf-vdisplay IOCTL_CLEAR_ALL failed on startup (continuing)");
         }
+        // CLEAR_ALL only departs the driver's own (in-process) monitor list; it can NOT remove the
+        // OS-side not-present "Generic Monitor (punktfunk)" PDOs that a previous host-run's monitor
+        // departures left behind. Reap those here so a fresh host start begins with a clean IddCx
+        // monitor-slot budget — prevents the 0x80070490 slot-exhaustion wedge from carrying across
+        // restarts (the reason a restart's CLEAR_ALL alone never recovered it before).
+        reap_ghost_monitors();
         Ok((
             // SAFETY: `device` is the valid handle from `open_device`, still owned here and NOT closed
             // on this success path (the error paths above close it and return). `from_raw_handle`'s
@@ -208,6 +273,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         dev: HANDLE,
         mode: Mode,
         render_luid: Option<LUID>,
+        preferred_monitor_id: u32,
     ) -> Result<AddedMonitor> {
         let session_id = next_session_id();
         let add = control::AddRequest {
@@ -215,7 +281,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             width: mode.width,
             height: mode.height,
             refresh_hz: mode.refresh_hz,
-            _reserved: 0,
+            preferred_monitor_id,
         };
         // SET_RENDER_ADAPTER (opt-in; pf-vdisplay IMPLEMENTS it). Non-fatal on failure: the driver reports
         // its real render LUID in the shared header, so the host binds correctly even if this is ignored.
@@ -238,13 +304,47 @@ impl VdisplayDriver for PfVdisplayDriver {
         // borrows the local `AddRequest` (alive across this synchronous call) as the input bytes, and
         // `out` is a stack `[u8; size_of::<AddReply>()]` whose length bounds the kernel's write — both
         // buffers outlive the call.
-        unsafe { ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(&add), &mut out) }
-            .with_context(|| {
-                format!(
-                    "pf-vdisplay ADD {}x{}@{}",
-                    mode.width, mode.height, mode.refresh_hz
-                )
-            })?;
+        let add_res = unsafe { ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(&add), &mut out) };
+        let add_res = match add_res {
+            Err(e) if is_slot_exhaustion_wedge(&e) => {
+                // The IddCx monitor-slot pool is exhausted by accumulated ghost (departed-but-not-present)
+                // virtual-monitor PDOs → ADD failed 0x80070490. Reap the ghosts in-process and retry ONCE
+                // so the wedge SELF-HEALS instead of hard-failing every session until a manual reset/reboot
+                // (the long-standing failure mode). pnputil removal is synchronous; a brief settle lets the
+                // OS recompute the adapter's monitor budget before the retry.
+                let reaped = reap_ghost_monitors();
+                tracing::warn!(
+                    reaped,
+                    "pf-vdisplay ADD wedged (0x80070490 ERROR_NOT_FOUND) — reaped ghost monitor nodes, retrying ADD"
+                );
+                // pnputil removal is durable (the ghosts are gone permanently), but the OS reclaims the
+                // IddCx VidPN-target slots via ASYNC PnP teardown that can lag the synchronous pnputil
+                // return. Retry the ADD a few times (300 ms apart, NO re-reap — the ghosts are already
+                // removed) to ride out that variable reclaim latency rather than guess one magic settle.
+                // ~1.5 s worst case, only on the rare wedge path.
+                let mut res = Err(anyhow::anyhow!("pf-vdisplay ADD retry loop did not run"));
+                for _ in 0..5 {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    // SAFETY: identical to the first IOCTL_ADD above — `dev` is the live control handle
+                    // (`add_monitor`'s contract), and `bytemuck::bytes_of(&add)` + `&mut out` borrow locals
+                    // that outlive this synchronous call.
+                    res = unsafe {
+                        ioctl(dev, control::IOCTL_ADD, bytemuck::bytes_of(&add), &mut out)
+                    };
+                    if res.is_ok() {
+                        break;
+                    }
+                }
+                res
+            }
+            other => other,
+        };
+        add_res.with_context(|| {
+            format!(
+                "pf-vdisplay ADD {}x{}@{}",
+                mode.width, mode.height, mode.refresh_hz
+            )
+        })?;
         // `pod_read_unaligned` (NOT `from_bytes`): `out` is a stack `[u8; N]` with no guaranteed 4-byte
         // alignment, and `from_bytes` PANICS on a mismatch. This copies into an aligned `AddReply`.
         let reply: control::AddReply =
@@ -261,6 +361,25 @@ impl VdisplayDriver for PfVdisplayDriver {
             reply.target_id,
             luid.LowPart
         );
+        // Per-client identity diagnostic: did the driver honor the host's preferred (stable) monitor id?
+        // A pre-Phase-2 driver leaves resolved_monitor_id=0 (it ignored the field); a current driver echoes
+        // the id it actually used. A mismatch means this session fell back to an auto id, so Windows won't
+        // reapply this client's saved per-monitor config (scaling) until it gets its stable id back.
+        if preferred_monitor_id != 0 {
+            if reply.resolved_monitor_id == preferred_monitor_id {
+                tracing::info!(
+                    monitor_id = preferred_monitor_id,
+                    "pf-vdisplay: per-client monitor id honored (stable identity → saved config persists)"
+                );
+            } else {
+                tracing::warn!(
+                    preferred = preferred_monitor_id,
+                    resolved = reply.resolved_monitor_id,
+                    "pf-vdisplay: preferred monitor id NOT honored (live-id collision, or a pre-Phase-2 \
+                     driver) — per-client config persistence degraded to auto identity this session"
+                );
+            }
+        }
         if let Some(pin) = render_luid {
             if luid.LowPart == pin.LowPart && luid.HighPart == pin.HighPart {
                 tracing::info!("pf-vdisplay ADD render adapter matches the pinned GPU (pin took)");
@@ -309,14 +428,19 @@ impl VdisplayDriver for PfVdisplayDriver {
     }
 }
 
-/// The Windows pf-vdisplay virtual-display backend. A marker — the lifecycle lives in the shared
-/// [`VirtualDisplayManager`](super::manager::VirtualDisplayManager).
-pub struct PfVdisplayDisplay;
+/// The Windows pf-vdisplay virtual-display backend. Near-stateless — the lifecycle lives in the shared
+/// [`VirtualDisplayManager`](super::manager::VirtualDisplayManager); it only carries the connecting
+/// client's fingerprint so the manager can assign a STABLE per-client monitor id (config persistence).
+pub struct PfVdisplayDisplay {
+    /// The connecting client's cert fingerprint (`None` = anonymous/GameStream → the manager's auto id).
+    /// Set by [`set_client_identity`](VirtualDisplay::set_client_identity) before `create`.
+    client_fp: Option<[u8; 32]>,
+}
 
 impl PfVdisplayDisplay {
     pub fn new() -> Result<Self> {
         super::manager::init(Box::new(PfVdisplayDriver)).open_backend()?;
-        Ok(Self)
+        Ok(Self { client_fp: None })
     }
 }
 
@@ -325,8 +449,12 @@ impl VirtualDisplay for PfVdisplayDisplay {
         "pf-vdisplay"
     }
 
+    fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
+        self.client_fp = fingerprint;
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        super::manager::vdm().acquire(mode)
+        super::manager::vdm().acquire(mode, self.client_fp)
     }
 }
 

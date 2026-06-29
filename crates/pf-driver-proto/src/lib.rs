@@ -80,7 +80,14 @@ pub mod control {
         pub width: u32,
         pub height: u32,
         pub refresh_hz: u32,
-        pub _reserved: u32,
+        /// Host-preferred per-client monitor id (`1..=15`) — the EDID serial / IddCx `ConnectorIndex` /
+        /// `ContainerId` the driver names this monitor by. A given client (keyed by its cert fingerprint)
+        /// gets a STABLE id across reconnects, so the OS device path + EDID stay identical and Windows
+        /// reapplies that client's saved per-monitor config (DPI scaling). `0` = AUTO: the driver
+        /// allocates the lowest-free id (the original slot-based behavior — used for anonymous/TOFU and
+        /// GameStream sessions). Byte-compatible with the old `_reserved` (offset 20): an un-upgraded
+        /// driver ignores it (→ auto), which the host detects via [`AddReply::resolved_monitor_id`].
+        pub preferred_monitor_id: u32,
     }
 
     /// `IOCTL_ADD` reply: the OS target id + the adapter LUID the IDD landed on (split low/high to
@@ -91,7 +98,11 @@ pub mod control {
         pub adapter_luid_low: u32,
         pub adapter_luid_high: i32,
         pub target_id: u32,
-        pub _reserved: u32,
+        /// The monitor id the driver ACTUALLY used — echoes [`AddRequest::preferred_monitor_id`] when the
+        /// preference was honored, or the auto-allocated id otherwise. Byte-compatible with the old
+        /// `_reserved` (offset 12): an un-upgraded driver leaves it `0`, so the host can tell its
+        /// preference was ignored (stale driver) and log it instead of silently losing per-client config.
+        pub resolved_monitor_id: u32,
     }
 
     /// `IOCTL_REMOVE` input.
@@ -129,11 +140,13 @@ pub mod control {
         assert!(offset_of!(AddRequest, width) == 8);
         assert!(offset_of!(AddRequest, height) == 12);
         assert!(offset_of!(AddRequest, refresh_hz) == 16);
+        assert!(offset_of!(AddRequest, preferred_monitor_id) == 20);
 
         assert!(size_of::<AddReply>() == 16);
         assert!(offset_of!(AddReply, adapter_luid_low) == 0);
         assert!(offset_of!(AddReply, adapter_luid_high) == 4);
         assert!(offset_of!(AddReply, target_id) == 8);
+        assert!(offset_of!(AddReply, resolved_monitor_id) == 12);
 
         assert!(size_of::<RemoveRequest>() == 8);
         assert!(offset_of!(RemoveRequest, session_id) == 0);
@@ -436,11 +449,25 @@ mod tests {
             width: 3840,
             height: 2160,
             refresh_hz: 120,
-            _reserved: 0,
+            preferred_monitor_id: 7,
         };
         let bytes = bytemuck::bytes_of(&req);
         assert_eq!(bytes.len(), 24);
         assert_eq!(*bytemuck::from_bytes::<control::AddRequest>(bytes), req);
+        // preferred_monitor_id occupies the old `_reserved` slot at offset 20 — byte-compatible.
+        assert_eq!(bytes[20..24], 7u32.to_le_bytes());
+
+        let reply = control::AddReply {
+            adapter_luid_low: 0x1234_5678,
+            adapter_luid_high: -2,
+            target_id: 262,
+            resolved_monitor_id: 7,
+        };
+        let rbytes = bytemuck::bytes_of(&reply);
+        assert_eq!(rbytes.len(), 16);
+        assert_eq!(*bytemuck::from_bytes::<control::AddReply>(rbytes), reply);
+        // resolved_monitor_id occupies the old `_reserved` slot at offset 12 — byte-compatible.
+        assert_eq!(rbytes[12..16], 7u32.to_le_bytes());
     }
 
     #[test]

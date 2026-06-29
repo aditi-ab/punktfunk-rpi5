@@ -2792,6 +2792,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // host-lifetime VirtualDisplayManager (§2.5). It does NO monitor work, so it must precede the IDD-push
     // preempt below (which reaches the manager) — otherwise `vdm()` is called before init and panics.
     let mut vd = crate::vdisplay::open(compositor)?;
+    // Per-client STABLE monitor identity (Phase 2): hand the backend the connecting client's cert
+    // fingerprint so a freshly CREATED virtual monitor gets this client's persistent id — Windows then
+    // reapplies the client's saved per-monitor config (DPI scaling) on reconnect. No-op on Linux backends
+    // and for anonymous/GameStream clients (no fingerprint → the driver auto-allocates).
+    vd.set_client_identity(endpoint::peer_fingerprint(&conn));
     // IDD-push reconnect preempt (the dance now lives in the manager, Goal-1 §2.5): serialize setup so a
     // reconnect FLOOD can't run concurrent monitor create/teardown, STOP the prior session + WAIT for it
     // to release its monitor (instead of tearing a monitor out from under a still-live session), and
@@ -3310,6 +3315,23 @@ fn build_pipeline_with_retry(
     // 30-60s to produce its first frame, and a first-connect timeout would tear down the warm
     // session (forcing another cold start on reconnect). A genuinely permanent failure still fails
     // fast via `is_permanent_build_error`; only transient "no frame yet" retries consume the budget.
+    // IDD-push only: HOLD one monitor lease across all build attempts. A failed attempt's capturer
+    // drop releases ITS lease, but this held lease keeps the shared monitor Active (refs >= 1), so the
+    // next attempt's `vd.create` JOINS it (refcount++) instead of finding it Lingering and tripping the
+    // IDD-push reconnect PREEMPT (teardown + recreate). That preempt-per-retry was the REMOVE→ADD churn
+    // that exhausts the IddCx monitor-slot pool and wedges ADD at 0x80070490 — one ADD per cold start
+    // now, not one per attempt. Non-IDD-push backends (Linux portal, WGC) don't use the refcount manager
+    // and aren't churn-wedge-prone, so they keep create-per-attempt (a held lease there would allocate a
+    // second virtual output). Dropped when this fn returns — on success the Pipeline's own lease keeps
+    // the monitor Active; on failure refs falls to 0 → Lingering → linger-timeout teardown.
+    let _retry_hold = if matches!(plan.capture, crate::session_plan::CaptureBackend::IddPush) {
+        Some(
+            vd.create(mode)
+                .context("acquire virtual output for the session (retry-hold lease)")?,
+        )
+    } else {
+        None
+    };
     const MAX_ATTEMPTS: u32 = 8;
     let mut backoff = std::time::Duration::from_millis(500);
     for attempt in 1..=MAX_ATTEMPTS {

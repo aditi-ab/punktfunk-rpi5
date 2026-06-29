@@ -59,8 +59,9 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     /// # Safety
     /// Issues setup-API + `DeviceIoControl` calls; runs in the caller's apartment.
     unsafe fn open(&self) -> Result<(OwnedHandle, u32)>;
-    /// ADD a virtual monitor at `mode`, pinning the IDD render GPU to `render_luid` first if `Some`.
-    /// Returns the REMOVE key + target id + the adapter LUID the driver actually used.
+    /// ADD a virtual monitor at `mode`, pinning the IDD render GPU to `render_luid` first if `Some`, and
+    /// requesting `preferred_monitor_id` (the host's per-client stable id; `0` = auto). Returns the REMOVE
+    /// key + target id + the adapter LUID the driver actually used.
     ///
     /// # Safety
     /// `dev` must be the live control handle from [`open`](Self::open).
@@ -69,6 +70,7 @@ pub(crate) trait VdisplayDriver: Send + Sync {
         dev: HANDLE,
         mode: Mode,
         render_luid: Option<LUID>,
+        preferred_monitor_id: u32,
     ) -> Result<AddedMonitor>;
     /// REMOVE the monitor identified by `key`.
     ///
@@ -134,6 +136,10 @@ pub(crate) struct VirtualDisplayManager {
     /// The current IDD-push session's stop flag; a new connection signals the prior one to release its
     /// monitor before the fresh one is created (was the `IDD_SESSION_STOP` global in `punktfunk1`).
     idd_session_stop: Mutex<Option<Arc<AtomicBool>>>,
+    /// Persistent per-client (cert-fingerprint) → stable monitor-id map. A monitor CREATE resolves the
+    /// connecting client's id here, so the client keeps the same EDID serial + IddCx ConnectorIndex across
+    /// reconnects and Windows reapplies its saved per-monitor config (DPI scaling). See [`super::identity`].
+    identity_map: Mutex<super::identity::MonitorIdentityMap>,
 }
 
 static VDM: OnceLock<VirtualDisplayManager> = OnceLock::new();
@@ -149,6 +155,7 @@ pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayMa
         state: Mutex::new(MgrState::Idle),
         setup_lock: Mutex::new(()),
         idd_session_stop: Mutex::new(None),
+        identity_map: Mutex::new(super::identity::MonitorIdentityMap::load()),
     })
 }
 
@@ -196,30 +203,40 @@ impl VirtualDisplayManager {
     }
 
     /// Acquire the shared monitor for a new session: preempt-recreate under IDD-push, join a live one
-    /// (refcount++), reuse a lingering one, or create one. The returned [`MonitorLease`] releases the
-    /// refcount on drop.
-    pub(crate) fn acquire(&'static self, mode: Mode) -> Result<VirtualOutput> {
+    /// (refcount++), reuse a lingering one, or create one. `client_fp` (the connecting client's cert
+    /// fingerprint; `None` = anonymous/GameStream) gives a freshly CREATED monitor a STABLE per-client id
+    /// (so Windows reapplies that client's saved per-monitor config); JOIN and lingering-reuse keep the
+    /// existing monitor's id. The returned [`MonitorLease`] releases the refcount on drop.
+    pub(crate) fn acquire(
+        &'static self,
+        mode: Mode,
+        client_fp: Option<[u8; 32]>,
+    ) -> Result<VirtualOutput> {
         self.ensure_linger_timer();
         let mut state = self.state.lock().unwrap();
         let dev = self.ensure_device()?;
 
-        // IDD-push: a new connection while a monitor is live is a single-client RECONNECT (the prior
-        // client is gone). A REUSED IddCx swap-chain is DEAD, so joining it hands a black screen —
-        // PREEMPT: tear the old monitor down (its key/topology are restored) and create a fresh one. The
-        // old session's lease is gen-stamped, so its later drop is a no-op and can't tear down the new one.
-        if idd_push_mode() && matches!(*state, MgrState::Active { .. } | MgrState::Lingering { .. })
-        {
-            if let MgrState::Active { mon, .. } | MgrState::Lingering { mon, .. } =
-                std::mem::replace(&mut *state, MgrState::Idle)
+        // IDD-push: a new connection while a monitor is LINGERING is a single-client RECONNECT (the
+        // prior session fully released). A REUSED IddCx swap-chain is DEAD, so reusing it hands a black
+        // screen — PREEMPT: tear the lingering monitor down (its key/topology are restored) and create a
+        // fresh one. The old session's lease is gen-stamped, so its later drop is a no-op.
+        //
+        // ONLY Lingering, NOT Active: an Active monitor still has a lease held — that's the build-retry
+        // path (`build_pipeline_with_retry` holds one lease across all attempts) or a concurrent session,
+        // NOT a reconnect. Preempting Active would tear a live session down AND churn REMOVE→ADD on every
+        // retry — the per-cold-start monitor churn that exhausts the IddCx slot pool and wedges ADD at
+        // 0x80070490. Active falls through to the JOIN path below (refcount++, no ADD).
+        if idd_push_mode() && matches!(*state, MgrState::Lingering { .. }) {
+            if let MgrState::Lingering { mon, .. } = std::mem::replace(&mut *state, MgrState::Idle)
             {
                 tracing::info!(
                     old_target = mon.target_id,
-                    "IDD-push reconnect — preempting the prior session, recreating a fresh monitor"
+                    "IDD-push reconnect — preempting the lingering monitor, recreating a fresh one"
                 );
                 // SAFETY: `teardown` requires `dev` to be the live control handle; `dev` is the value
                 // `ensure_device()` returned above (the device is cached in the `OnceLock` and never
-                // closed for the manager's lifetime). `mon` was moved out of the prior `Active`/
-                // `Lingering` state by `mem::replace`, so it is exclusively owned here — no aliasing.
+                // closed for the manager's lifetime). `mon` was moved out of the prior `Lingering`
+                // state by `mem::replace`, so it is exclusively owned here — no aliasing.
                 unsafe { self.teardown(dev, mon) };
                 // Let the OS finish the ASYNC monitor departure before the next ADD; a back-to-back
                 // REMOVE→ADD races the teardown and the ADD IOCTL is rejected under reconnect churn.
@@ -264,7 +281,7 @@ impl VirtualDisplayManager {
             // SAFETY: `create_monitor` requires `dev` to be the live control handle; `dev` is the
             // handle `ensure_device()` returned above (cached in the `OnceLock`, never closed for the
             // manager's lifetime), and we hold the `state` lock.
-            MgrState::Idle => unsafe { self.create_monitor(dev, mode)? },
+            MgrState::Idle => unsafe { self.create_monitor(dev, mode, client_fp)? },
             MgrState::Active { .. } => unreachable!("handled above"),
         };
         let out = self.output_for(&mon);
@@ -291,12 +308,26 @@ impl VirtualDisplayManager {
     ///
     /// # Safety
     /// `dev` must be the live control handle.
-    unsafe fn create_monitor(&'static self, dev: HANDLE, mode: Mode) -> Result<Monitor> {
+    unsafe fn create_monitor(
+        &'static self,
+        dev: HANDLE,
+        mode: Mode,
+        client_fp: Option<[u8; 32]>,
+    ) -> Result<Monitor> {
+        // Resolve the connecting client's STABLE per-client monitor id (so Windows reapplies its saved
+        // per-monitor config — DPI scaling — on reconnect); `None`/anonymous → 0 = the driver
+        // auto-allocates the lowest-free id (the original slot-based behavior).
+        let preferred_id = client_fp
+            .map(|fp| self.identity_map.lock().unwrap().resolve(fp))
+            .unwrap_or(0);
         // SAFETY: `create_monitor`'s own `# Safety` contract guarantees `dev` is the live control
         // handle; we forward it unchanged to `add_monitor`, whose precondition is exactly that.
         // `resolve_render_pin()` returns an `Option<LUID>` by value (plain `Copy`), so no borrowed
         // memory crosses the call.
-        let added = unsafe { self.driver.add_monitor(dev, mode, resolve_render_pin())? };
+        let added = unsafe {
+            self.driver
+                .add_monitor(dev, mode, resolve_render_pin(), preferred_id)?
+        };
 
         // Mandatory keepalive: ping inside the watchdog window or the driver tears all displays down.
         // The pinger reaches the singleton for both the device + the driver — no raw-handle smuggle.
@@ -510,25 +541,62 @@ impl VirtualDisplayManager {
         let prev = self.idd_session_stop.lock().unwrap().replace(stop);
         if let Some(prev_stop) = prev {
             prev_stop.store(true, Ordering::SeqCst);
-            self.wait_for_monitor_released(Duration::from_secs(3));
+            if !self.wait_for_monitor_released(Duration::from_secs(3)) {
+                // TIMEOUT: the prior session is STILL Active (a wedged/slow teardown). `acquire`'s preempt
+                // is now Lingering-only (so build-retries JOIN the held monitor instead of churning
+                // REMOVE→ADD), which means the upcoming `_retry_hold` acquire would JOIN this stuck monitor
+                // and reuse its DEAD IddCx swap-chain → a full-session black screen with no self-heal until
+                // this session disconnects. Force-preempt it HERE instead. This runs at most ONCE per
+                // session (we hold `setup_lock`), so — unlike preempting inside `acquire` — it does not
+                // reintroduce the per-retry churn. The next `acquire` then sees `Idle` and creates a fresh
+                // monitor; the stale session's gen-stamped lease release is a no-op.
+                if let Some(dev) = self.device_handle() {
+                    let taken = {
+                        let mut state = self.state.lock().unwrap();
+                        match std::mem::replace(&mut *state, MgrState::Idle) {
+                            MgrState::Active { mon, .. } => Some(mon),
+                            // Raced to Lingering/Idle between the wait and here — restore + nothing stuck.
+                            other => {
+                                *state = other;
+                                None
+                            }
+                        }
+                    };
+                    if let Some(mon) = taken {
+                        tracing::warn!(
+                            old_target = mon.target_id,
+                            "IDD-push setup: force-preempting the stuck-Active prior monitor (its IddCx swap-chain is dead)"
+                        );
+                        // SAFETY: `teardown` requires `dev` to be the live control handle; `dev` is the
+                        // cached process-lifetime `OwnedHandle` from `device_handle()` (the `Some` checked
+                        // above). `mon` was moved out of the `Active` state under the `state` lock, so it is
+                        // exclusively owned here — no aliasing.
+                        unsafe { self.teardown(dev, mon) };
+                        // Let the OS finish the ASYNC departure before the next ADD (mirrors the acquire()
+                        // Lingering-preempt settle).
+                        thread::sleep(Duration::from_millis(400));
+                    }
+                }
+            }
         }
         guard
     }
 
     /// Wait (up to `timeout`) for the active monitor to be RELEASED (the MGR is no longer `Active`).
     /// Used by the IDD-push reconnect preempt: after signalling the old session to stop, wait here so it
-    /// tears its monitor down cleanly before we acquire a fresh one.
-    pub(crate) fn wait_for_monitor_released(&self, timeout: Duration) {
+    /// tears its monitor down cleanly before we acquire a fresh one. Returns `true` if it released, `false`
+    /// on timeout (the prior session is still `Active` — the caller force-preempts it).
+    pub(crate) fn wait_for_monitor_released(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
             if !matches!(*self.state.lock().unwrap(), MgrState::Active { .. }) {
-                return;
+                return true;
             }
             if Instant::now() >= deadline {
                 tracing::warn!(
-                    "IDD-push preempt: prior session didn't release the monitor within {timeout:?} — proceeding"
+                    "IDD-push preempt: prior session didn't release the monitor within {timeout:?} — force-preempting"
                 );
-                return;
+                return false;
             }
             thread::sleep(Duration::from_millis(25));
         }

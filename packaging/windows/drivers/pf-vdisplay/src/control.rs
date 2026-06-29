@@ -133,9 +133,13 @@ unsafe fn add(request: WDFREQUEST) {
         complete(request, STATUS_INVALID_PARAMETER);
         return;
     }
-    let Some((target_id, luid_low, luid_high)) =
-        crate::monitor::create_monitor(req.session_id, req.width, req.height, req.refresh_hz)
-    else {
+    let Some((monitor_id, target_id, luid_low, luid_high)) = crate::monitor::create_monitor(
+        req.session_id,
+        req.width,
+        req.height,
+        req.refresh_hz,
+        req.preferred_monitor_id,
+    ) else {
         complete(request, STATUS_NOT_FOUND);
         return;
     };
@@ -143,7 +147,7 @@ unsafe fn add(request: WDFREQUEST) {
         adapter_luid_low: luid_low,
         adapter_luid_high: luid_high,
         target_id,
-        _reserved: 0,
+        resolved_monitor_id: monitor_id,
     };
     // SAFETY: `request` is the framework WDFREQUEST.
     unsafe { write_output_complete(request, &reply) };
