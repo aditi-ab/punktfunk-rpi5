@@ -247,6 +247,7 @@ impl SteamDeckGadget {
         }
 
         let serial = format!("PFDECK{index:04}");
+        let unit_id = 0x5046_0000u32 | index as u32; // "PF" + index — a synthetic per-instance device id
         let report = Arc::new(Mutex::new(neutral_report()));
         let feedback = Arc::new(Mutex::new(Default::default()));
         let running = Arc::new(AtomicBool::new(true));
@@ -262,7 +263,9 @@ impl SteamDeckGadget {
             let feedback = feedback.clone();
             std::thread::Builder::new()
                 .name("pf-deck-gadget-ctrl".into())
-                .spawn(move || control_loop(fd, running, ctrl_ep, configured, feedback, serial))
+                .spawn(move || {
+                    control_loop(fd, running, ctrl_ep, configured, feedback, serial, unit_id)
+                })
                 .context("spawn gadget control thread")?
         };
         // Stream thread: push the current report on the controller interrupt-IN endpoint.
@@ -336,6 +339,7 @@ fn control_loop(
     configured: Arc<AtomicBool>,
     feedback: Arc<Mutex<super::steam_proto::SteamFeedback>>,
     serial: String,
+    unit_id: u32,
 ) {
     let raw = fd.0;
     let cfg = build_config();
@@ -369,6 +373,7 @@ fn control_loop(
                     &ctrl,
                     &cfg,
                     &serial,
+                    unit_id,
                     &ctrl_ep,
                     &configured,
                     &mut last_set,
@@ -394,6 +399,7 @@ fn handle_control(
     ctrl: &Setup,
     cfg: &[u8],
     serial: &str,
+    unit_id: u32,
     ctrl_ep: &std::sync::atomic::AtomicI32,
     configured: &AtomicBool,
     last_set: &mut Vec<u8>,
@@ -450,7 +456,7 @@ fn handle_control(
         match ctrl.b_request {
             0x01 => {
                 // GET_REPORT — serve the Deck feature reply for the last requested command.
-                let resp = feature_reply(last_set, serial);
+                let resp = feature_reply(last_set, serial, unit_id);
                 let n = resp.len().min(wl);
                 ep0_write(raw, &resp[..n]);
             }
@@ -482,19 +488,54 @@ fn handle_control(
     }
 }
 
-/// Build the HID feature GET_REPORT reply for whatever the host last asked via SET_REPORT.
-fn feature_reply(last_set: &[u8], serial: &str) -> Vec<u8> {
-    // The Deck serial path: SET [0xAE,…] then GET → [0xAE,len,0x01,ascii]. For unknown commands echo
-    // the command byte with a zeroed body (enough to keep hid-steam's probe from erroring).
+/// Build the HID feature GET_REPORT reply for the host's last SET_REPORT command. Steam's
+/// `GetControllerInfo` reads the `0x83` attributes + the `0xAE` serial; **serving the real `0x83`
+/// blob is what stops Steam re-probing** (the gamepad-evdev churn). The contract (`0x83` 9-attribute
+/// layout + the `0xAE` string format) was captured from a physical Steam Deck via hidraw. `unit_id`
+/// stamps a per-instance value into the device-id attributes (`0x0a`/`0x04`) so a gadget never
+/// collides with a real Deck or another gadget.
+fn feature_reply(last_set: &[u8], serial: &str, unit_id: u32) -> [u8; 64] {
     let cmd = last_set.first().copied().unwrap_or(0xAE);
-    let mut r = vec![0u8; 64];
-    r[0] = cmd;
-    if cmd == 0xAE {
-        let b = serial.as_bytes();
-        let len = b.len().clamp(1, 21);
-        r[1] = len as u8;
-        r[2] = 0x01;
-        r[3..3 + len].copy_from_slice(&b[..len]);
+    let mut r = [0u8; 64];
+    match cmd {
+        0x83 => {
+            // GET_ATTRIBUTES_VALUES: [0x83, 0x2d, then 9× (attr-id, value u32-LE)].
+            r[0] = 0x83;
+            r[1] = 0x2d;
+            let attrs: [(u8, u32); 9] = [
+                (0x01, 0x1205), // product id
+                (0x02, 0),
+                (0x0a, unit_id), // unit serial number (per-instance)
+                (0x04, unit_id ^ 0x5555_5555),
+                (0x09, 0x2e),
+                (0x0b, 0x0fa0),
+                (0x0d, 0),
+                (0x0c, 0),
+                (0x0e, 0),
+            ];
+            let mut o = 2;
+            for (id, val) in attrs {
+                r[o] = id;
+                r[o + 1..o + 5].copy_from_slice(&val.to_le_bytes());
+                o += 5;
+            }
+        }
+        0xAE => {
+            // GET_STRING_ATTRIBUTE: [0xAE, len, attr, ascii…]. The kernel validates the serial (attr
+            // 0x01) wants reply[2]==0x01 and 1<=len<=21; for other attrs we echo the requested id.
+            let attr = last_set.get(2).copied().unwrap_or(0x01);
+            let b = serial.as_bytes();
+            let len = b.len().clamp(1, 20);
+            r[0] = 0xAE;
+            r[1] = len as u8;
+            r[2] = attr;
+            r[3..3 + len].copy_from_slice(&b[..len]);
+        }
+        _ => {
+            // Settings read-back (e.g. 0x87): echo the host's last command + data.
+            let n = last_set.len().min(64);
+            r[..n].copy_from_slice(&last_set[..n]);
+        }
     }
     r
 }

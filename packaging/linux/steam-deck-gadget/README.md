@@ -71,9 +71,27 @@ real module): it enumerates the 3-interface Deck, hid-steam binds it + reads our
 musl, `ioctl(fd, RUN)` with no third arg passes a garbage `value`, and raw_gadget's `RUN`/`CONFIGURE`/
 `EP0_STALL` reject a non-zero `value` with `EINVAL` — so the no-arg ioctls must pass an explicit `0`.
 
+## Feature contract (hardened — churn fixed)
+
+Steam's `GetControllerInfo` reads HID **feature reports**; serving the real ones is what stops Steam
+re-probing (which was destroying + recreating the gamepad evdev — the "churn"). The contract was
+captured from a physical Deck (`get_deck_attrs.c`, hidraw `HIDIOCGFEATURE`; usbmon truncates to 32B):
+
+- **`0x83` GET_ATTRIBUTES_VALUES** — `[83, 2d, 9× (attr-id, u32-LE)]`: product id `0x1205`, a unit
+  serial (`0x0a`/`0x04` — we stamp a per-instance value so a gadget never collides with a real Deck),
+  and capability attrs (`0x09=0x2e`, `0x0b=0x0fa0`, `0x02/0x0c/0x0d/0x0e=0`). **This blob is the fix.**
+- **`0xAE` GET_STRING_ATTRIBUTE** — `[ae, len, attr, ascii]`: serial (attr 1), board serial (attr 0).
+- Other commands (e.g. `0x87` settings) read back the last write (echo).
+
+Result on the Deck (`feature_reply` in `steam_gadget.rs`): **1 connect / 0 disconnect / 1 gamepad
+evdev** (was constant churn), and Steam *activates* the controller cleanly (no `GetControllerInfo
+failed`, no zombie) and emits its **X-Box 360 pad**. usbmon on the gadget's bus confirms our state
+reports (with the pressed button at byte 8) are delivered on the interrupt-IN and consumed by
+hid-steam — so the input transport is proven end-to-end.
+
 ## Remaining
 
-- **Harden the feature contract** so Steam stops re-probing + the gamepad evdev stops churning (serve
-  Steam's full `GetControllerInfo` attribute set, captured from a physical Deck) — then a clean live
-  input-flow check + defaulting the gadget on for SteamOS hosts.
+- **Glass confirmation of the XInput mapping** — Steam Input only maps the gadget's raw input onto its
+  X-Box pad while a game using Steam Input is focused; confirm a button reaches a real game, then
+  default the gadget on for SteamOS hosts (it's strictly better than the non-promoted UHID path).
 - A `punktfunk-host` build for SteamOS to exercise the integrated path end-to-end with a live client.
