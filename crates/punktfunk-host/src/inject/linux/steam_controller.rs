@@ -384,8 +384,8 @@ impl SteamControllerManager {
         if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
             return;
         }
-        // Prefer the USB gadget on SteamOS (the only transport Steam Input promotes); fall back to the
-        // universal UHID pad if the gadget is unavailable or not opted in.
+        // Prefer the USB gadget on SteamOS (default there — the only transport Steam Input promotes);
+        // fall back to the universal UHID pad if the gadget is unavailable or disabled.
         let opened = if crate::inject::steam_gadget::gadget_preferred() {
             crate::inject::steam_gadget::ensure_modules();
             match crate::inject::steam_gadget::SteamDeckGadget::open(idx as u8) {

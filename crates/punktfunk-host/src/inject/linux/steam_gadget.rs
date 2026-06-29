@@ -606,11 +606,24 @@ pub fn ensure_modules() {
     }
 }
 
-/// Whether to prefer the USB-gadget Deck over the UHID `SteamDeckPad`. SteamOS-host only (needs the
-/// gadget modules + root) and opt-in for now (`PUNKTFUNK_STEAM_GADGET=1`) while the full Steam-Input
-/// feature contract is hardened; defaults off, so the universal UHID path stays the default.
+/// Whether to prefer the USB-gadget Deck over the UHID `SteamDeckPad` — the only transport Steam Input
+/// promotes (validated glass-to-glass on a Deck). Defaults **on for SteamOS** hosts (which ship the
+/// gadget modules + run Steam Input); off elsewhere, where the universal UHID path stays the default.
+/// `PUNKTFUNK_STEAM_GADGET=1`/`0` forces it on/off. A Deck-as-host with a *physical* Deck never reaches
+/// here: `resolve_gamepad`'s conflict gate degrades `SteamDeck` → DualSense before the manager is built.
 pub fn gadget_preferred() -> bool {
-    std::env::var("PUNKTFUNK_STEAM_GADGET")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    if let Ok(v) = std::env::var("PUNKTFUNK_STEAM_GADGET") {
+        return v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    is_steamos()
+}
+
+/// True on SteamOS-class hosts (`/etc/os-release` `ID=steamos`, or `ID_LIKE` naming it).
+fn is_steamos() -> bool {
+    std::fs::read_to_string("/etc/os-release")
+        .map(|s| {
+            s.lines()
+                .any(|l| l == "ID=steamos" || (l.starts_with("ID_LIKE=") && l.contains("steamos")))
+        })
         .unwrap_or(false)
 }

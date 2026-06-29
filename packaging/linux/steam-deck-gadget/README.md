@@ -56,14 +56,17 @@ Steam Input, which exposes its own X-Box 360 pad — exactly a real Deck's behav
   `EP_WRITE` starves the control path.
 - `dummy_hcd` + `raw_gadget` must both be loaded and `/dev/raw-gadget` present before launch.
 
-## Host backend (shipped, opt-in)
+## Host backend (shipped — default on for SteamOS)
 
 The C PoC's transport is ported to a Rust host gamepad backend:
 `crates/punktfunk-host/src/inject/linux/steam_gadget.rs` (`SteamDeckGadget`), driven by the same
 `steam_proto` serializer as the UHID `SteamDeckPad`. The Steam-Deck manager
-(`inject/linux/steam_controller.rs`) now selects per-pad between **UHID** (default, universal) and the
-**USB gadget** (`PUNKTFUNK_STEAM_GADGET=1`, SteamOS-only — best-effort `modprobe dummy_hcd raw_gadget`,
-graceful fallback to UHID if `/dev/raw-gadget` is unusable).
+(`inject/linux/steam_controller.rs`) selects per-pad between **UHID** (universal) and the **USB
+gadget**: the gadget is the **default on SteamOS hosts** (`gadget_preferred()` → `ID=steamos`;
+best-effort `modprobe dummy_hcd raw_gadget`, graceful fallback to UHID if `/dev/raw-gadget` is
+unusable), and off elsewhere where UHID stays the default. `PUNKTFUNK_STEAM_GADGET=1`/`0` forces it.
+A Deck-as-host with a *physical* Deck never uses it — `resolve_gamepad`'s conflict gate degrades
+`SteamDeck` → DualSense first.
 
 The Rust transport is **validated on the Deck** (a static musl test binary that `#[path]`-includes the
 real module): it enumerates the 3-interface Deck, hid-steam binds it + reads our serial + creates the
