@@ -11,6 +11,8 @@ members = [
     "tools/latency-probe",
     "tools/loss-harness",
 ]
+# Standalone PoC (built on its own; pulls usbip/tokio/libusb we don't want in the workspace).
+exclude = ["packaging/linux/steam-deck-gadget/usbip-poc"]
 
 [workspace.package]
 version = "0.3.0"
