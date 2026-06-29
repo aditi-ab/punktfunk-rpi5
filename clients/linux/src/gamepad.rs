@@ -58,6 +58,7 @@ impl PadInfo {
             GamepadPref::DualSense => "DualSense",
             GamepadPref::DualShock4 => "DualShock 4",
             GamepadPref::XboxOne => "Xbox One",
+            GamepadPref::SteamDeck => "Steam Deck",
             _ => "",
         }
     }
@@ -188,6 +189,13 @@ fn button_bit(b: sdl3::gamepad::Button) -> Option<u32> {
         Button::DPadLeft => wire::BTN_DPAD_LEFT,
         Button::DPadRight => wire::BTN_DPAD_RIGHT,
         Button::Touchpad => wire::BTN_TOUCHPAD,
+        // Back grips / paddles (Steam Deck L4/L5/R4/R5, Xbox Elite P1–P4) + the misc/Share button.
+        // PADDLE1/2/3/4 = R4/L4/R5/L5 (see the host `input::gamepad`).
+        Button::RightPaddle1 => wire::BTN_PADDLE1,
+        Button::LeftPaddle1 => wire::BTN_PADDLE2,
+        Button::RightPaddle2 => wire::BTN_PADDLE3,
+        Button::LeftPaddle2 => wire::BTN_PADDLE4,
+        Button::Misc1 => wire::BTN_MISC1,
         _ => return None,
     })
 }
@@ -259,6 +267,10 @@ struct Worker {
     /// Wire state of the active pad — zeroed on the wire at switch/detach.
     last_axis: [i32; 6],
     held_buttons: Vec<u32>,
+    /// Touchpad contacts the host believes are down, keyed by `(surface, finger)` — lifted on pad
+    /// switch / detach so a contact held at that moment doesn't stick. surface 0 = the legacy single
+    /// touchpad, 1/2 = a Steam left/right pad.
+    held_touches: std::collections::HashSet<(u8, u8)>,
     last_accel: [i16; 3],
     /// Raises the UI escape signal; the escape chord fires it once per press.
     escape_tx: async_channel::Sender<()>,
@@ -275,13 +287,22 @@ impl Worker {
 
     fn pad_info(&self, id: u32) -> Option<PadInfo> {
         let pad = self.opened.get(&id)?;
+        let mut pref = pref_for_type(
+            self.subsystem
+                .type_for_id(sdl3::sys::joystick::SDL_JoystickID(id)),
+        );
+        // There is no SDL gamepad type for the Steam Deck / Steam Controller, so detect Valve by
+        // VID/PID (Deck 0x1205, SC wired 0x1102, SC dongle 0x1142) — the host then builds the virtual
+        // hid-steam pad with the back grips + dual trackpads and the right glyph identity.
+        if pad.vendor_id() == Some(0x28DE)
+            && matches!(pad.product_id(), Some(0x1205 | 0x1102 | 0x1142))
+        {
+            pref = GamepadPref::SteamDeck;
+        }
         Some(PadInfo {
             id,
             name: pad.name().unwrap_or_else(|| "Controller".into()),
-            pref: pref_for_type(
-                self.subsystem
-                    .type_for_id(sdl3::sys::joystick::SDL_JoystickID(id)),
-            ),
+            pref,
         })
     }
 
@@ -297,9 +318,34 @@ impl Worker {
                 }
                 *v = i32::MIN;
             }
+            // Lift any touchpad contact the host still believes is down (surface 0 = legacy pad).
+            for (surface, finger) in self.held_touches.drain() {
+                let rich = if surface == 0 {
+                    RichInput::Touchpad {
+                        pad: 0,
+                        finger,
+                        active: false,
+                        x: 0,
+                        y: 0,
+                    }
+                } else {
+                    RichInput::TouchpadEx {
+                        pad: 0,
+                        surface,
+                        finger,
+                        touch: false,
+                        click: false,
+                        x: 0,
+                        y: 0,
+                        pressure: 0,
+                    }
+                };
+                let _ = c.send_rich_input(rich);
+            }
         } else {
             self.held_buttons.clear();
             self.last_axis = [i32::MIN; 6];
+            self.held_touches.clear();
         }
     }
 
@@ -335,6 +381,56 @@ impl Worker {
             }
         }
     }
+
+    /// Forward one touchpad contact on the rich-input plane. A multi-touchpad pad (Steam Deck / Steam
+    /// Controller) sends `TouchpadEx` with the surface (SDL touchpad 0 = left → 1, 1 = right → 2) and
+    /// signed coordinates; a single-touchpad pad (DualSense) keeps the legacy `Touchpad` (unsigned).
+    fn forward_touch(
+        &mut self,
+        which: u32,
+        touchpad: u32,
+        finger: u8,
+        x: f32,
+        y: f32,
+        active: bool,
+    ) {
+        let Some(c) = self.attached.as_ref() else {
+            return;
+        };
+        let multi = self
+            .opened
+            .get(&which)
+            .map(|p| p.touchpads_count() >= 2)
+            .unwrap_or(false);
+        let (cx, cy) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+        let surface = if multi { (touchpad as u8) + 1 } else { 0 };
+        let rich = if multi {
+            RichInput::TouchpadEx {
+                pad: 0,
+                surface,
+                finger,
+                touch: active,
+                click: false,
+                x: (cx * 65535.0 - 32768.0) as i16,
+                y: (cy * 65535.0 - 32768.0) as i16,
+                pressure: 0,
+            }
+        } else {
+            RichInput::Touchpad {
+                pad: 0,
+                finger,
+                active,
+                x: (cx * 65535.0) as u16,
+                y: (cy * 65535.0) as u16,
+            }
+        };
+        let _ = c.send_rich_input(rich);
+        if active {
+            self.held_touches.insert((surface, finger));
+        } else {
+            self.held_touches.remove(&(surface, finger));
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -349,6 +445,12 @@ fn run(
     // own thread.
     sdl3::hint::set("SDL_NO_SIGNAL_HANDLERS", "1");
     sdl3::hint::set("SDL_JOYSTICK_THREAD", "1");
+    // Let SDL's HIDAPI drivers open Valve Steam Controller / Steam Deck devices directly, so the
+    // paddles, both trackpads, and gyro arrive as first-class SDL gamepad inputs. On a Deck in Game
+    // Mode, Steam Input still holds the device — the user must disable Steam Input for this app (see
+    // the Decky UX); on a desktop client (or a Deck with Steam Input off) the hints just work.
+    sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1");
+    sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAM", "1");
     let sdl = sdl3::init().map_err(|e| e.to_string())?;
     let subsystem = sdl.gamepad().map_err(|e| e.to_string())?;
     let mut pump = sdl.event_pump().map_err(|e| e.to_string())?;
@@ -361,6 +463,7 @@ fn run(
         attached: None,
         last_axis: [i32::MIN; 6],
         held_buttons: Vec::new(),
+        held_touches: std::collections::HashSet::new(),
         last_accel: [0; 3],
         escape_tx: escape_tx.clone(),
         chord_armed: false,
@@ -474,9 +577,11 @@ fn run(
                         send(w.attached.as_ref().unwrap(), InputKind::GamepadAxis, id, v);
                     }
                 }
-                // DualSense touchpad → the rich-input plane, normalized 0..=65535.
+                // Touchpad contacts → the rich-input plane. One pad (DualSense) keeps the legacy
+                // `Touchpad`; two pads (Steam Deck / Steam Controller) send `TouchpadEx` per surface.
                 Event::ControllerTouchpadDown {
                     which,
+                    touchpad,
                     finger,
                     x,
                     y,
@@ -484,41 +589,23 @@ fn run(
                 }
                 | Event::ControllerTouchpadMotion {
                     which,
+                    touchpad,
                     finger,
                     x,
                     y,
                     ..
                 } if active == Some(which) && w.attached.is_some() => {
-                    let _ = w
-                        .attached
-                        .as_ref()
-                        .unwrap()
-                        .send_rich_input(RichInput::Touchpad {
-                            pad: 0,
-                            finger: finger as u8,
-                            active: true,
-                            x: (x.clamp(0.0, 1.0) * 65535.0) as u16,
-                            y: (y.clamp(0.0, 1.0) * 65535.0) as u16,
-                        });
+                    w.forward_touch(which, touchpad as u32, finger as u8, x, y, true);
                 }
                 Event::ControllerTouchpadUp {
                     which,
+                    touchpad,
                     finger,
                     x,
                     y,
                     ..
                 } if active == Some(which) && w.attached.is_some() => {
-                    let _ = w
-                        .attached
-                        .as_ref()
-                        .unwrap()
-                        .send_rich_input(RichInput::Touchpad {
-                            pad: 0,
-                            finger: finger as u8,
-                            active: false,
-                            x: (x.clamp(0.0, 1.0) * 65535.0) as u16,
-                            y: (y.clamp(0.0, 1.0) * 65535.0) as u16,
-                        });
+                    w.forward_touch(which, touchpad as u32, finger as u8, x, y, false);
                 }
                 // Motion: accel events update the cache; each gyro event ships a sample
                 // (the DualSense reports both at ~250 Hz). Scale convention shared with
