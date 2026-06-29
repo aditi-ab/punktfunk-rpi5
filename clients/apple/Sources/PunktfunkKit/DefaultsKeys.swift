@@ -25,9 +25,19 @@ public enum DefaultsKey {
     /// Request a 10-bit BT.2020 PQ (HDR10) stream. On by default; only takes effect when the host
     /// has HDR content AND this display supports HDR — otherwise the stream stays 8-bit SDR.
     public static let hdrEnabled = "punktfunk.hdrEnabled"
+    /// Request a full-chroma 4:4:4 stream when this device can HARDWARE-decode it (`Stage444Probe`).
+    /// On by default; only takes effect when the host also opted in to 4:4:4 (otherwise the stream
+    /// stays 4:2:0). Sharper text/UI at the cost of more bandwidth.
+    public static let enable444 = "punktfunk.enable444"
     public static let hosts = "punktfunk.hosts"
     /// Client-side cursor mode: "auto" (shown only in gamescope sessions), "always", "never".
     public static let cursorMode = "punktfunk.cursorMode"
+    /// iPad: capture the mouse/trackpad pointer (pointer lock → relative movement) for games,
+    /// rather than forwarding an absolute cursor position. On by default. Only meaningful on iPad
+    /// with a hardware mouse/trackpad; the system grants the lock only to a full-screen, frontmost
+    /// scene and silently falls back to the absolute pointer when it can't (Stage Manager / Slide
+    /// Over). Read by `StreamViewController.prefersPointerLocked`.
+    public static let pointerCapture = "punktfunk.pointerCapture"
     /// Experimental: show the host's game library (browsed over the management API). Off by default.
     public static let libraryEnabled = "punktfunk.libraryEnabled"
     /// macOS: take the window fullscreen while streaming and restore it on the host list. On by default.

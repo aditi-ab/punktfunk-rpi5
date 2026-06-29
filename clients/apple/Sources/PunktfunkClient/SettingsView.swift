@@ -25,6 +25,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.presenter) private var presenter = "stage2"
     @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
+    @AppStorage(DefaultsKey.enable444) private var enable444 = true
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
@@ -36,6 +37,7 @@ struct SettingsView: View {
     @State private var showControllerTest = false
     #endif
     #if os(iOS)
+    @AppStorage(DefaultsKey.pointerCapture) private var pointerCapture = true
     // The sidebar selection drives the detail pane on iPad and the pushed sub-page on iPhone.
     // Width class decides the initial value: nil on iPhone (show the category list first),
     // General on iPad (a two-column layout should never open with an empty detail).
@@ -206,6 +208,7 @@ struct SettingsView: View {
         case .general:
             Form {
                 streamModeSection
+                pointerSection
                 compositorSection
             }
             .formStyle(.grouped)
@@ -581,6 +584,30 @@ struct SettingsView: View {
         }
     }
 
+    #if os(iOS)
+    /// iPad-only pointer-capture toggle: lock the mouse/trackpad for relative movement (games) vs
+    /// forward an absolute cursor position (desktop). Empty on iPhone (no hardware-pointer lock —
+    /// the mouse path there is always the absolute fallback).
+    @ViewBuilder private var pointerSection: some View {
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            Section {
+                Toggle("Capture pointer for games", isOn: $pointerCapture)
+            } header: {
+                Text("Pointer")
+            } footer: {
+                Text("With a mouse or trackpad connected, lock the pointer and send relative "
+                    + "movement — the expected behavior for games (mouse-look). Turn this off for "
+                    + "desktop use to keep the pointer free and send its absolute position instead. "
+                    + "The lock needs the stream full-screen and frontmost; it falls back to the "
+                    + "absolute pointer automatically (Stage Manager, Slide Over). Finger touch is "
+                    + "unaffected. Applies from the next session.")
+                    .font(.geist(12, relativeTo: .caption))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+    #endif
+
     @ViewBuilder private var compositorSection: some View {
         Section {
             Picker("Compositor", selection: $compositor) {
@@ -644,12 +671,15 @@ struct SettingsView: View {
     @ViewBuilder private var hdrSection: some View {
         Section {
             Toggle("10-bit HDR", isOn: $hdrEnabled)
+            Toggle("Full chroma (4:4:4)", isOn: $enable444)
         } header: {
-            Text("HDR")
+            Text("Video quality")
         } footer: {
-            Text("Request a 10-bit BT.2020 PQ (HDR10) stream. It only engages when the host is "
-                + "sending HDR content AND this display supports HDR — otherwise the stream stays "
-                + "8-bit SDR. Applies from the next session.")
+            Text("HDR requests a 10-bit BT.2020 PQ (HDR10) stream — it only engages when the host is "
+                + "sending HDR content AND this display supports HDR. 4:4:4 requests full chroma "
+                + "(sharper text/UI, more bandwidth) — it only engages when this device can "
+                + "hardware-decode it AND the host opted in. Otherwise the stream stays 8-bit "
+                + "4:2:0 SDR. Applies from the next session.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }

@@ -144,11 +144,25 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    `test-loopback.sh` (Swift client vs synthetic punktfunk1-hosts on loopback — runs on macOS;
    includes the pairing ceremony + `--require-pairing` gate),
    `RemoteFirstLightTests` (full pipeline over the LAN). See
-   [`clients/apple/README.md`](clients/apple/README.md). **Stage 2 presenter**
-   (`VTDecompressionSession` + `CAMetalLayer`) is built and live-validated on glass behind the opt-in
-   `punktfunk.presenter` flag (~11 ms p50 capture→present), to become the default after a few
-   resolution/HDR checks. Next: make stage 2 the default, glass-to-glass numbers via
-   `tools/latency-probe`, iOS/iPadOS/tvOS variants.
+   [`clients/apple/README.md`](clients/apple/README.md). **Stage 2 presenter is now the DEFAULT**
+   (stage-1 is the Metal-unavailable / DEBUG fallback): explicit `VTDecompressionSession` decode →
+   `CAMetalLayer`, presented from the hosting view's **main-runloop `CADisplayLink`** (`renderTick` pops
+   the newest ready frame per vsync; macOS `displaySyncEnabled = false` is the real fullscreen-judder fix,
+   ~11 ms p50). *(An off-main `CAMetalDisplayLink` and an off-main blocking-render present thread were
+   both tried and reverted — both measured slower on macOS and iPad.)* **HDR fixed**
+   (`design/apple-stage2-presenter.md`): the "too bright" bug was a missing reference-white anchor — the
+   fix keeps the PQ-passthrough shader and adds `CAEDRMetadata.hdr10(…, opticalOutputScale: 203)` +
+   `wantsExtendedDynamicRangeContent` on the layer (on all platforms; the old `#if os(macOS)` guard left
+   iOS/tvOS EDR half-engaged), routing the 0xCE mastering metadata to the layer (via `setHdrMeta`) instead
+   of a never-composited source buffer. **Mid-session SDR↔HDR** is handled: `render` reconciles the layer
+   per-frame from the decoded `frame.isHDR` (per-mode pixel format `bgra8`/`rgba16Float`), so a game
+   entering HDR mid-stream just reconfigures (last 0xCE grade cached + re-applied; pump drains 0xCE
+   unconditionally). **4:4:4 added**: decode format is a 2×2 `(chroma, HDR)` matrix
+   (`420v/x420/444v/x444`, all biplanar so the shaders are unchanged), advertised (`VIDEO_CAP_444`) only
+   behind a **hardware-required `VTDecompressionSession` probe** (`Stage444Probe`, validated on M3) with a
+   Settings opt-out + a bounded pump backstop for an undecodable 4:4:4 session. *HDR brightness + 4:4:4
+   still need on-glass validation (Windows-HDR / `PUNKTFUNK_444` host).* Next: glass-to-glass numbers via
+   `tools/latency-probe`.
    **Linux stage 1 done, first light 2026-06-12** (`clients/linux`, binary
    `punktfunk-client`): GTK4/libadwaita shell linking `punktfunk-core` directly (no C ABI;
    `NativeClient` is now `Sync` — mutexed plane receivers), mDNS host list, TOFU + SPAKE2

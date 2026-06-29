@@ -107,6 +107,23 @@ public final class InputCapture {
     /// macOS (no GCMouse handlers installed; `sendMouseAbs` is never called there). Main-queue.
     public var gcMouseForwarding = false
 
+    #if os(iOS)
+    /// Whether any device is attached as a `GCMouse` right now. The Magic Keyboard TRACKPAD does
+    /// not always register as a GCMouse on iPadOS (only a standalone mouse does) — when no GCMouse
+    /// is present the relative GCMouse path can't carry pointer motion. Main-queue.
+    public var hasGCMouse: Bool { !mice.isEmpty }
+
+    /// Diagnostic: a one-line description of every attached GCMouse (count + GCDevice identity), so
+    /// PUNKTFUNK_INPUT_DEBUG can reveal whether the trackpad showed up as a mouse at all.
+    public var attachedMiceSummary: String {
+        guard !mice.isEmpty else { return "0 mice" }
+        let parts = mice.map { mouse -> String in
+            "\(mouse.productCategory)/\(mouse.vendorName ?? "?")"
+        }
+        return "\(mice.count) mice: \(parts.joined(separator: ", "))"
+    }
+    #endif
+
     /// Fired on ⌘⎋ (the capture toggle — detected here so it works in both states; the
     /// event itself is swallowed). Main queue.
     public var onToggleCapture: (() -> Void)?
@@ -394,6 +411,12 @@ public final class InputCapture {
               !mice.contains(where: { $0 === mouse }) // re-delivered on wake — attach once
         else { return }
         mice.append(mouse)
+        #if os(iOS)
+        if inputDebug {
+            inputLog.debug(
+                "GCMouse attached: \(mouse.productCategory, privacy: .public)/\(mouse.vendorName ?? "?", privacy: .public) — now \(self.attachedMiceSummary, privacy: .public)")
+        }
+        #endif
         // macOS drives motion + buttons from NSEvent (StreamLayerView's local monitor →
         // sendMotion/sendMouseButton) because GCMouse's handlers proved unreliable there;
         // installing them too would double-send. iOS keeps GCMouse (raw deltas under

@@ -92,8 +92,8 @@ public final class StreamViewController: UIViewController {
     public private(set) var connection: PunktfunkConnection?
     private var pump: StreamPump?
     private var observers: [NSObjectProtocol] = []
-    /// Stage-2 presenter (opt-in via `punktfunk.presenter`): a CAMetalLayer sublayer driven by a
-    /// CADisplayLink instead of the StreamPump → displayLayer path. nil = stage-1 (default).
+    /// Stage-2 presenter (default): a CAMetalLayer sublayer driven by a CADisplayLink instead of the
+    /// StreamPump → displayLayer path. nil = stage-1 (Metal-unavailable fallback / DEBUG toggle).
     var presentMeter: LatencyMeter?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
@@ -155,19 +155,58 @@ public final class StreamViewController: UIViewController {
     }
 
     #if os(iOS)
-    // Pointer lock is only meaningful on iPad (iPhone has no hardware-pointer lock) and
-    // only when capture is engaged. The system additionally requires full-screen + frontmost
-    // and may drop it (Slide Over/Stage Manager/backgrounding) — verified in setCaptured().
-    public override var prefersPointerLocked: Bool {
-        captured && UIDevice.current.userInterfaceIdiom == .pad
+    /// Whether the user wants the mouse/trackpad pointer CAPTURED (pointer lock → relative
+    /// movement, the gaming default) rather than forwarded as an absolute position (desktop
+    /// use). Read live from UserDefaults so it tracks the Settings toggle; defaults to on when
+    /// unset. iPad-only — gated again in `prefersPointerLocked`.
+    private var pointerCaptureEnabled: Bool {
+        UserDefaults.standard.object(forKey: DefaultsKey.pointerCapture) as? Bool ?? true
     }
+
+    /// Whether the pointer should be CAPTURED right now: iPad, capture engaged, and the user
+    /// hasn't opted into the absolute (desktop) pointer. The system additionally requires
+    /// full-screen + frontmost and may drop the lock (Slide Over/Stage Manager/backgrounding) —
+    /// syncPointerLock() handles the actual grant/drop and falls back to absolute when unlocked.
+    private var wantsPointerLock: Bool {
+        captured && pointerCaptureEnabled && UIDevice.current.userInterfaceIdiom == .pad
+    }
+
+    public override var prefersPointerLocked: Bool { wantsPointerLock }
     public override var prefersHomeIndicatorAutoHidden: Bool { true }
 
-    // If SwiftUI's UIHostingController reparents us, a plain container parent that forwards
-    // its pointer-lock decision to its children will then reach this VC. (UIHostingController
-    // itself does not consult children, which is why GCMouse deltas can never arrive there —
-    // the touch path, always forwarded, is the unconditional fallback.)
-    public override var childViewControllerForPointerLock: UIViewController? { self }
+    // NOTE: we deliberately do NOT override `childViewControllerForPointerLock`. The default
+    // returns nil, which tells the system to use THIS controller's own `prefersPointerLocked` —
+    // exactly what we want, since `PointerLockChain` forces our SwiftUI ancestors to forward the
+    // downward walk to us and we are the terminal anchor. Returning `self` here would make the
+    // system ask the same controller forever (it keeps delegating to the returned child) →
+    // unbounded recursion → stack overflow once the chain actually reaches us.
+
+    /// (Re)build or tear down the forced pointer-lock forwarding chain from this controller to the
+    /// window root so the system actually resolves our `prefersPointerLocked`. Safe to call
+    /// repeatedly — it no-ops until the view is in a window with a parent chain, and re-runs from
+    /// the appearance/parent callbacks once SwiftUI has placed us.
+    private func updatePointerLockChain() {
+        // Engaging needs a live parent chain to the window root; disengaging is always safe and
+        // must run even after the view has left the window (session teardown) so the stamped
+        // SwiftUI ancestors are cleared.
+        if wantsPointerLock, view.window != nil {
+            PointerLockChain.engage(self)
+        } else {
+            PointerLockChain.disengage(self)
+        }
+    }
+
+    public override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // SwiftUI places us in the hierarchy AFTER start()'s setCaptured(true), and may reparent us
+        // later — re-anchor the chain here so a lock requested before we had a parent still lands.
+        updatePointerLockChain()
+    }
+
+    public override func didMove(toParent parent: UIViewController?) {
+        super.didMove(toParent: parent)
+        updatePointerLockChain() // chain shape changed — re-anchor (or no-op if not yet in a window)
+    }
     #endif
 
     func start(
@@ -200,7 +239,14 @@ public final class StreamViewController: UIViewController {
         // Indirect pointer (mouse/trackpad with no lock) → absolute cursor + buttons, routed
         // through InputCapture so the forwarding gate and release-on-blur apply uniformly.
         streamView.onPointerMoveAbs = { [weak self] p in
-            self?.inputCapture?.sendMouseAbs(
+            guard let self else { return }
+            if iosInputDebug {
+                // Whether ANY UIKit pointer movement reaches us while the scene is LOCKED tells us
+                // if the trackpad (which may not be a GCMouse) can still be captured via UIKit.
+                iosInputLog.debug(
+                    "UIKit pointer move x=\(p.x, privacy: .public) y=\(p.y, privacy: .public) locked=\(self.pointerLockEngaged() == true, privacy: .public) gcFwd=\(self.inputCapture?.gcMouseForwarding == true, privacy: .public)")
+            }
+            self.inputCapture?.sendMouseAbs(
                 x: p.x, y: p.y, surfaceWidth: p.w, surfaceHeight: p.h)
         }
         streamView.onPointerButton = { [weak self] button, down in
@@ -210,7 +256,12 @@ public final class StreamViewController: UIViewController {
         // UNLOCKED regime; while locked, GCMouse's scroll handler owns it — mirror the
         // sendMouseAbs !gcMouseForwarding gate so the two can't double-send.
         streamView.onScroll = { [weak self] dx, dy in
-            guard let self, self.inputCapture?.gcMouseForwarding == false else { return }
+            guard let self else { return }
+            if iosInputDebug {
+                iosInputLog.debug(
+                    "UIKit scroll dx=\(dx, privacy: .public) dy=\(dy, privacy: .public) locked=\(self.pointerLockEngaged() == true, privacy: .public)")
+            }
+            guard self.inputCapture?.gcMouseForwarding == false else { return }
             self.inputCapture?.sendScroll(dx: dx, dy: dy)
         }
 
@@ -315,7 +366,7 @@ public final class StreamViewController: UIViewController {
     ) {
         let metal = pipeline.layer
         // Composites OVER the idle (un-enqueued in stage-2) AVSampleBufferDisplayLayer base.
-        // (contentsScale + frame + drawableSize are all set by layoutMetalLayer() just below.)
+        // (contentsScale + frame are set by layoutMetalLayer() just below.)
         streamView.layer.addSublayer(metal)
         metalLayer = metal
         stage2 = pipeline
@@ -372,7 +423,7 @@ public final class StreamViewController: UIViewController {
     private func teardownStage2() {
         stage2Link?.invalidate()
         stage2Link = nil
-        stage2?.stop()
+        stage2?.stop() // stops the pump (synchronous join) + drops the decode session
         stage2 = nil
         metalLayer?.removeFromSuperlayer()
         metalLayer = nil
@@ -392,6 +443,7 @@ public final class StreamViewController: UIViewController {
             captured = false
         }
         setNeedsUpdateOfPrefersPointerLocked()
+        updatePointerLockChain() // (re)anchor the SwiftUI ancestors so the lock actually resolves
         syncPointerLock() // resolve cursor + GCMouse/absolute routing for the current state
         let onCaptureChange = onCaptureChange
         let captured = captured
@@ -420,7 +472,7 @@ public final class StreamViewController: UIViewController {
         pointerInteraction?.invalidate() // re-resolve the hidden/visible cursor for the state
         if iosInputDebug {
             iosInputLog.debug(
-                "pointer lock isLocked=\(locked, privacy: .public) captured=\(self.captured, privacy: .public)")
+                "pointer lock isLocked=\(locked, privacy: .public) captured=\(self.captured, privacy: .public) useGCMouse=\(useGCMouse, privacy: .public) [\(self.inputCapture?.attachedMiceSummary ?? "n/a", privacy: .public)]")
         }
     }
     #endif

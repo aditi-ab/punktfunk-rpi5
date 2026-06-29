@@ -137,8 +137,8 @@ public struct StreamView: NSViewRepresentable {
 public final class StreamLayerView: NSView {
     private let displayLayer = AVSampleBufferDisplayLayer()
     private var pump: StreamPump?
-    /// Stage-2 presenter (opt-in via `punktfunk.presenter`): a CAMetalLayer sublayer driven by a
-    /// display link instead of the StreamPump → displayLayer path. nil = stage-1 (default).
+    /// Stage-2 presenter (default): a CAMetalLayer sublayer driven by a display link instead of the
+    /// StreamPump → displayLayer path. nil = stage-1 (Metal-unavailable fallback / DEBUG toggle).
     var presentMeter: LatencyMeter?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
@@ -638,7 +638,7 @@ public final class StreamLayerView: NSView {
     private func teardownStage2() {
         stage2Link?.invalidate()
         stage2Link = nil
-        stage2?.stop()
+        stage2?.stop() // stops the pump (synchronous join) + drops the decode session
         stage2 = nil
         metalLayer?.removeFromSuperlayer()
         metalLayer = nil

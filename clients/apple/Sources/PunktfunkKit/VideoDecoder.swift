@@ -49,11 +49,10 @@ public final class VideoDecoder: @unchecked Sendable {
     /// pump can re-gate on the next IDR.
     private let onDecodeError: @Sendable (OSStatus) -> Void
 
-    /// Latest source HDR mastering metadata (from `PunktfunkConnection.nextHdrMeta`), attached to
-    /// each decoded HDR pixel buffer so the compositor tone-maps from the real grade. Guarded by its
-    /// own lock — written by the pump thread, read on the VT decode callback.
-    private let metaLock = NSLock()
-    private var hdrMeta: PunktfunkConnection.HdrMeta?
+    /// Whether the negotiated stream is full-chroma 4:4:4 (`connection.isChroma444`), set once at
+    /// session start before any decode. Selects the 4:4:4 decode pixel format (orthogonal to bit
+    /// depth / HDR). Read inside `createSessionLocked` under `lock`.
+    private var chroma444 = false
 
     public init(
         onDecoded: @escaping @Sendable (ReadyFrame) -> Void,
@@ -65,12 +64,13 @@ public final class VideoDecoder: @unchecked Sendable {
 
     deinit { teardown() }
 
-    /// Set the source HDR mastering metadata (drained from `PunktfunkConnection.nextHdrMeta`). It's
-    /// attached to subsequent decoded HDR pixel buffers. Thread-safe; cheap to call on each update.
-    public func setHdrMeta(_ meta: PunktfunkConnection.HdrMeta) {
-        metaLock.lock()
-        hdrMeta = meta
-        metaLock.unlock()
+    /// Select the chroma subsampling of the decode output (4:2:0 vs full-chroma 4:4:4). Call once at
+    /// session start, before decoding, from `connection.isChroma444`. Takes effect on the next
+    /// session (re)build. Thread-safe.
+    public func setChroma444(_ on: Bool) {
+        lock.lock()
+        chroma444 = on
+        lock.unlock()
     }
 
     /// Submit one AU for asynchronous decode, (re)creating the session if `format` changed. The
@@ -135,8 +135,10 @@ public final class VideoDecoder: @unchecked Sendable {
 
     /// True when `newFormat` carries a PQ (SMPTE ST 2084) or HLG transfer function — i.e. the host
     /// is sending HDR (BT.2020). VideoToolbox populates the transfer-function extension from the
-    /// HEVC VUI, so this tracks the *stream*, switching dynamically when the user toggles HDR
-    /// (the host re-emits parameter sets with the new VUI → a new format desc → session rebuild).
+    /// HEVC VUI, so this picks the decode bit depth (10-bit P010/x444 vs 8-bit NV12/444v) from the
+    /// stream. The present-side HDR config (colorspace/EDR/shader) is latched once per session from
+    /// the Welcome (`connection.isHDR`), which the host does NOT flip mid-session — so this predicate
+    /// and that config agree for the session (a `#if DEBUG` assert in the presenter guards it).
     static func isHDRFormat(_ format: CMVideoFormatDescription) -> Bool {
         guard
             let tf = CMFormatDescriptionGetExtension(
@@ -157,11 +159,18 @@ public final class VideoDecoder: @unchecked Sendable {
         session = nil
         format = nil
 
+        // Decode pixel format is a 2×2 of (chroma, depth/HDR), both biplanar so the presenter binds
+        // plane 0 = luma, plane 1 = interleaved chroma uniformly — 4:4:4 just delivers a full-size
+        // chroma plane. 10-bit (P010 / `x444`) for HDR (PQ/HLG), 8-bit (NV12 / `444v`) otherwise.
         let hdr = Self.isHDRFormat(newFormat)
-        let pixelFormat =
-            hdr
-            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange // P010 (10-bit)
-            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange // NV12 (8-bit)
+        let pixelFormat: OSType = {
+            switch (chroma444, hdr) {
+            case (false, false): return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange // NV12
+            case (false, true): return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange // P010
+            case (true, false): return kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange // 444v
+            case (true, true): return kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange // x444
+            }
+        }()
         let imageAttrs: [CFString: Any] = [
             kCVPixelBufferMetalCompatibilityKey: true,
             kCVPixelBufferPixelFormatTypeKey: pixelFormat,
@@ -169,11 +178,20 @@ public final class VideoDecoder: @unchecked Sendable {
         var callback = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: decoderOutputCallback,
             decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
+        // 4:4:4 sessions REQUIRE a hardware decoder: we only advertise 4:4:4 when the hardware probe
+        // passed, so a hardware-incapable mode (e.g. a resolution past the HW 4:4:4 ceiling) must fail
+        // HERE, synchronously, letting the pump's backstop end the session — rather than silently
+        // falling back to a software 4:4:4 decoder far too slow for a real-time stream. 4:2:0 keeps the
+        // software fallback (nil spec) as a robustness net.
+        let spec: CFDictionary? =
+            chroma444
+            ? [kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true] as CFDictionary
+            : nil
         var newSession: VTDecompressionSession?
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             formatDescription: newFormat,
-            decoderSpecification: nil, // hardware by default
+            decoderSpecification: spec,
             imageBufferAttributes: imageAttrs as CFDictionary,
             outputCallback: &callback,
             decompressionSessionOut: &newSession)
@@ -195,26 +213,17 @@ public final class VideoDecoder: @unchecked Sendable {
         // pts was stamped at timescale 1e9 (AnnexB.sampleBuffer); normalize defensively.
         let p = CMTimeConvertScale(pts, timescale: 1_000_000_000, method: .default)
         let ptsNs = p.value > 0 ? UInt64(p.value) : 0
-        // HDR iff the decoder produced a 10-bit P010 buffer (we only request P010 for PQ streams).
+        // HDR iff the decoder produced a 10-bit buffer (we only request a 10-bit format for PQ/HLG
+        // streams). Covers 4:2:0 (P010) and 4:4:4 (`x444`), video- and full-range, so a 10-bit 4:4:4
+        // HDR frame isn't misclassified as SDR. (The mastering metadata is applied to the presenter's
+        // CAMetalLayer via CAEDRMetadata, not to this source buffer — a separate-drawable presenter
+        // never composites the source buffer's attachments, so attaching them here would be dead.)
+        let fmt = CVPixelBufferGetPixelFormatType(imageBuffer)
         let isHDR =
-            CVPixelBufferGetPixelFormatType(imageBuffer)
-            == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-        // Attach the source's mastering display + content light level (ST.2086 / CEA-861.3) so the
-        // compositor tone-maps from the real grade rather than inferring from the PQ colourspace
-        // alone. The SEI byte payloads map 1:1 to these CVImageBuffer attachment keys.
-        if isHDR {
-            metaLock.lock()
-            let meta = hdrMeta
-            metaLock.unlock()
-            if let meta {
-                CVBufferSetAttachment(
-                    imageBuffer, kCVImageBufferMasteringDisplayColorVolumeKey,
-                    meta.masteringDisplayColorVolume() as CFData, .shouldPropagate)
-                CVBufferSetAttachment(
-                    imageBuffer, kCVImageBufferContentLightLevelInfoKey,
-                    meta.contentLightLevelInfo() as CFData, .shouldPropagate)
-            }
-        }
+            fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            || fmt == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange
+            || fmt == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
         onDecoded(
             ReadyFrame(ptsNs: ptsNs, decodedNs: decodedNs, pixelBuffer: imageBuffer, isHDR: isHDR))
     }

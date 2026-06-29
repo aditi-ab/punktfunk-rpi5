@@ -370,29 +370,32 @@ public final class GamepadFeedback {
         // Hidout traffic (lightbar / player LEDs / triggers) only exists on a PlayStation-pad
         // session — a DualSense or a DualShock 4 (lightbar only). Block briefly on it there and
         // let rumble own the wait elsewhere; on an Xbox session it stays nonblocking.
-        let hasHidout = connection.resolvedGamepad == .dualSense
-            || connection.resolvedGamepad == .dualShock4
-        let hidTimeout: UInt32 = hasHidout ? 10 : 0
         let thread = Thread { [connection, flag, drainDone, weak self] in
             while !flag.isStopped {
                 do {
-                    if let r = try connection.nextRumble(timeoutMs: 10), r.pad == 0 {
+                    // Poll the feedback planes NON-BLOCKING. A blocking poll (timeoutMs > 0) holds
+                    // the connection's shared feedback lock for its whole wait; the video pump drains
+                    // HDR mastering metadata (nextHdrMeta) on the SAME lock every frame, so a blocking
+                    // poll here starved it and throttled HDR to ~1 fps (SDR, which never drains HDR
+                    // meta, was unaffected). Pacing with a short sleep OUTSIDE the lock (below) keeps
+                    // rumble/HID latency low while leaving the lock free between polls.
+                    if let r = try connection.nextRumble(timeoutMs: 0), r.pad == 0 {
                         self?.rumble.apply(low: r.low, high: r.high)
                     }
-                    // Drain a BOUNDED burst of hidout events: only the first poll waits,
-                    // and the cap + stop check keep sustained 0xCD traffic (a game writing
-                    // per-frame LED/trigger reports) from starving the rumble poll above
-                    // or blocking stop() past one cycle.
+                    // Drain a BOUNDED burst of hidout events so sustained 0xCD traffic (a game writing
+                    // per-frame LED/trigger reports) can't spin here or block stop() past one cycle.
                     var burst = 0
                     while burst < 64, !flag.isStopped,
-                          let ev = try connection.nextHidOutput(
-                            timeoutMs: burst == 0 ? hidTimeout : 0) {
+                          let ev = try connection.nextHidOutput(timeoutMs: 0) {
                         self?.render(ev)
                         burst += 1
                     }
                 } catch {
                     break // .closed (or fatal) — the session is over
                 }
+                // ~8 ms poll cadence (≈125 Hz), slept OUTSIDE the feedback lock — low rumble/HID
+                // latency without holding the lock the HDR-meta drain needs.
+                if !flag.isStopped { Thread.sleep(forTimeInterval: 0.008) }
             }
             drainDone.signal()
         }

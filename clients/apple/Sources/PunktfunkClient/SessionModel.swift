@@ -129,6 +129,8 @@ final class SessionModel: ObservableObject {
             #endif
         }()
         let hdrCapable = hdrEnabled && displayHDR
+        // 4:4:4 opt-out (default on); the hardware-decode probe below is the real gate.
+        let want444 = (UserDefaults.standard.object(forKey: DefaultsKey.enable444) as? Bool) ?? true
         Task.detached(priority: .userInitiated) {
             // PunktfunkConnection.init blocks on the QUIC handshake — keep it off the main
             // actor. The persistent identity is presented on every connect so a paired
@@ -138,9 +140,21 @@ final class SessionModel: ObservableObject {
             // Advertise 10-bit + HDR10 when enabled: the host upgrades to a BT.2020 PQ Main10 stream
             // only for actual HDR content (its own gate); the VideoToolbox/Metal present path is
             // HDR-capable (P010 + itur_2100_PQ + EDR). 0 keeps the 8-bit BT.709 SDR stream.
-            let videoCaps: UInt8 = hdrCapable
+            var videoCaps: UInt8 = hdrCapable
                 ? (PunktfunkConnection.videoCap10Bit | PunktfunkConnection.videoCapHDR)
                 : 0
+            // Advertise full-chroma 4:4:4 only when allowed AND this device can HARDWARE-decode it
+            // (software 4:4:4 is too slow for real-time). The host content-gates depth, so an
+            // HDR-advertised session can still receive an 8-bit 4:4:4 stream (SDR content) — require
+            // BOTH depths there. Otherwise a no-op (the host emits 4:4:4 only if it too opted in);
+            // `chromaFormat` on the connection reflects what was actually resolved.
+            let canDecode444 =
+                hdrCapable
+                ? (Stage444Probe.hwDecode444_8bit && Stage444Probe.hwDecode444_10bit)
+                : Stage444Probe.hwDecode444_8bit
+            if want444, canDecode444 {
+                videoCaps |= PunktfunkConnection.videoCap444
+            }
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,

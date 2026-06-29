@@ -238,6 +238,13 @@ public final class PunktfunkConnection {
     public private(set) var colorFullRange: Bool = false
     /// Encoded bit depth (8 or 10).
     public private(set) var bitDepth: UInt8 = 8
+    /// The chroma subsampling the host resolved for this session, as the HEVC `chroma_format_idc`:
+    /// `1` = 4:2:0 (every pre-4:4:4 host, and the back-compat default) or `3` = full-chroma 4:4:4
+    /// (only when this client advertised `videoCap444` *and* the host could open a real 4:4:4
+    /// encoder). Drive the decoder's requested pixel format from this. See `isChroma444`.
+    public private(set) var chromaFormat: UInt8 = 1
+    /// Convenience: the resolved stream is full-chroma 4:4:4 (`chroma_format_idc == 3`).
+    public var isChroma444: Bool { chromaFormat == 3 }
     /// True when the negotiated stream is HDR (PQ or HLG transfer) — drive an HDR present path and
     /// drain `nextHdrMeta`.
     public var isHDR: Bool { colorTransfer == 16 || colorTransfer == 18 }
@@ -334,6 +341,9 @@ public final class PunktfunkConnection {
         colorMatrix = mtx
         colorFullRange = fullRange != 0
         bitDepth = depth
+        var cf: UInt8 = 1
+        _ = punktfunk_connection_chroma_format(handle, &cf)
+        chromaFormat = cf
         var ac: UInt8 = 2
         _ = punktfunk_connection_audio_channels(handle, &ac)
         resolvedAudioChannels = ac
@@ -605,6 +615,10 @@ public final class PunktfunkConnection {
     public static let videoCap10Bit: UInt8 = UInt8(PUNKTFUNK_VIDEO_CAP_10BIT)
     /// Video-capability bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
     public static let videoCapHDR: UInt8 = UInt8(PUNKTFUNK_VIDEO_CAP_HDR)
+    /// Video-capability bit: the client can decode a full-chroma 4:4:4 HEVC stream (Range
+    /// Extensions). Advertise only when the device can *hardware*-decode it (`Stage444Probe`);
+    /// the host then emits 4:4:4 only if it too opted in. `chromaFormat` reflects the real value.
+    public static let videoCap444: UInt8 = UInt8(PUNKTFUNK_VIDEO_CAP_444)
 
     /// Static HDR mastering metadata (SMPTE ST.2086 + content light level) the host sent for an HDR
     /// session. Mirrors the wire/ABI `PunktfunkHdrMeta`; primaries are in ST.2086 **G, B, R** order,
