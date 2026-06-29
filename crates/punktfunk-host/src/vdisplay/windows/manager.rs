@@ -327,17 +327,17 @@ impl VirtualDisplayManager {
             }
         });
 
-        // Windows defaults a new IddCx monitor into CLONE mode when a physical display is already
-        // active (a laptop panel, an attached monitor): the cloned IDD shares that display's source, so
-        // the OS never commits a distinct path for it and capture sees no frames. Force EXTEND first so
-        // the IDD comes up as its OWN active path; the resolve loop below then finds it. Idempotent /
-        // no-op on a sole-display box, so it's safe on the headless single-GPU path too.
-        // SAFETY: `force_extend_topology` only calls `SetDisplayConfig` (a CCD topology apply) with no
-        // borrowed caller memory; it runs under the manager `state` lock, the sole topology mutator.
-        unsafe { force_extend_topology() };
-
-        // Resolve the capture target. May be None on a GPU-less box (target added but not WDDM-activated);
+        // Resolve the capture target — wait for Windows to auto-activate the freshly-ADDed IDD into its
+        // OWN display path (it comes up EXTENDED alongside any existing/basic display; `set_active_mode`
+        // below then promotes it to primary and `isolate_displays_ccd` makes it the sole composited
+        // desktop — the proven flow). May be None on a GPU-less box (target added but not WDDM-activated);
         // the capture backend re-resolves once a GPU is present.
+        //
+        // We do NOT force a topology change FIRST: the bare `SDC_TOPOLOGY_EXTEND` preset is ACCESS_DENIED
+        // from our Session-0 service context on a headless box and BREAKS this auto-activate (it regressed
+        // the headless path — the IDD then never gets its own path → "not an active display path" → black).
+        // force-EXTEND is only the FALLBACK below, for an integrated-screen box where a fresh IDD is CLONED
+        // onto the panel (shares its source) instead of getting its own path.
         let mut gdi_name = None;
         for _ in 0..15 {
             thread::sleep(Duration::from_millis(200));
@@ -347,6 +347,32 @@ impl VirtualDisplayManager {
             if let Some(n) = unsafe { resolve_gdi_name(added.target_id) } {
                 gdi_name = Some(n);
                 break;
+            }
+        }
+
+        // Fallback for an integrated-screen box (e.g. a laptop panel): Windows CLONES a freshly-added
+        // IDD onto the existing display, sharing its source, so it never gets its own committed path. On
+        // the IddCx clone behaviour observed live (commit 8e87e61, an Intel-iGPU + NVIDIA-Optimus laptop)
+        // `resolve_gdi_name` then stays None — so this `is_none()` fallback fires, force-EXTENDs to
+        // de-clone, and the second resolve finds the now-committed path. Headless/extended boxes already
+        // resolved above (the IDD auto-activates with its OWN source) and skip this — which is the whole
+        // point, since force-EXTEND's bare preset is ACCESS_DENIED from our service context there.
+        //
+        // CAVEAT (unobserved for IddCx, untested across GPU/driver/OS): textbook CCD also lets a clone
+        // appear as a *shared-source ACTIVE* path (resolve → Some), which this `is_none()` gate would NOT
+        // catch. If that ever shows up, widen the gate to also fire when the IDD target's source is shared
+        // with another active path (a `target_is_cloned` helper) — needs on-laptop validation first.
+        if gdi_name.is_none() {
+            // SAFETY: as above — `force_extend_topology` only calls `SetDisplayConfig` (CCD) with no
+            // borrowed caller memory, under the `state` lock.
+            unsafe { force_extend_topology() };
+            for _ in 0..15 {
+                thread::sleep(Duration::from_millis(200));
+                // SAFETY: as the resolve loop above.
+                if let Some(n) = unsafe { resolve_gdi_name(added.target_id) } {
+                    gdi_name = Some(n);
+                    break;
+                }
             }
         }
         let mut ccd_saved: Option<SavedConfig> = None;
