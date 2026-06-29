@@ -245,8 +245,11 @@ impl SteamState {
                 self.rpad_y = ((y as i32) - 32768) as i16;
             }
             RichInput::Motion { gyro, accel, .. } => {
-                self.gyro = gyro;
-                self.accel = accel;
+                // The wire carries DualSense-convention units (what every client capture emits); the
+                // Deck's hid-steam report wants 16 LSB/°·s + 16384 LSB/g, so rescale here.
+                let (g, a) = super::steam_remap::motion_wire_to_deck(gyro, accel);
+                self.gyro = g;
+                self.accel = a;
             }
             RichInput::TouchpadEx {
                 surface,
@@ -444,13 +447,15 @@ mod tests {
         assert_ne!(s.buttons & btn::RPAD_TOUCH, 0);
         assert_eq!(s.rpad_x, 32767); // 65535-32768
         assert_eq!(s.rpad_y, -32768); // 0-32768
+                                      // Motion is rescaled from the wire (DualSense) convention into Deck units (gyro ×16/20,
+                                      // accel ×16384/10000) — see steam_remap::motion_wire_to_deck.
         s.apply_rich(RichInput::Motion {
             pad: 0,
-            gyro: [1, 2, 3],
-            accel: [4, 5, 6],
+            gyro: [1000, -2000, 0],
+            accel: [10000, -5000, 0],
         });
-        assert_eq!(s.gyro, [1, 2, 3]);
-        assert_eq!(s.accel, [4, 5, 6]);
+        assert_eq!(s.gyro, [800, -1600, 0]);
+        assert_eq!(s.accel, [16384, -8192, 0]);
     }
 
     /// M3: the wire back-button bits map to the four Deck grips + QAM, and `TouchpadEx` routes the

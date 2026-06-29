@@ -182,6 +182,9 @@ pub struct DualSenseManager {
     last_write: Vec<Instant>,
     /// Pad creation failed (e.g. /dev/uhid permissions) — warn once, drop events.
     broken: bool,
+    /// Fallback policy for the Steam back grips a client may send (the DualSense has no back-button
+    /// HID slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
+    remap: crate::inject::steam_remap::RemapConfig,
 }
 
 impl Default for DualSenseManager {
@@ -198,6 +201,7 @@ impl DualSenseManager {
             last_rumble: vec![(0, 0); MAX_PADS],
             last_write: vec![Instant::now(); MAX_PADS],
             broken: false,
+            remap: crate::inject::steam_remap::RemapConfig::from_env(),
         }
     }
 
@@ -229,8 +233,12 @@ impl DualSenseManager {
                 // Merge buttons/sticks/triggers from the frame, preserving touch + motion (those
                 // come on the rich-input plane and must survive a button-only frame).
                 let prev = self.state[idx];
+                // Steam back grips have no DualSense slot — fold them onto standard buttons per the
+                // configured policy (default drop) so they aren't silently lost.
+                let buttons =
+                    crate::inject::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
                 let mut s = DsState::from_gamepad(
-                    f.buttons,
+                    buttons,
                     f.ls_x,
                     f.ls_y,
                     f.rs_x,

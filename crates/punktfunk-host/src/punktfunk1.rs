@@ -1917,6 +1917,36 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
     }
 }
 
+/// Runtime degrade for the Linux UHID backends (DualSense / DualShock 4 / Steam Deck): if
+/// `/dev/uhid` can't be opened for write *now*, fall back to the uinput X-Box 360 pad rather than a
+/// dead controller (the UHID device-create would just fail). Cheap — opens + drops the char device,
+/// no `UHID_CREATE2`, so no device is created. A no-op on non-Linux (those backends are UMDF/uinput).
+#[cfg(target_os = "linux")]
+fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
+    let needs_uhid = matches!(
+        chosen,
+        GamepadPref::DualSense | GamepadPref::DualShock4 | GamepadPref::SteamDeck
+    );
+    if needs_uhid
+        && std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/uhid")
+            .is_err()
+    {
+        tracing::warn!(
+            wanted = chosen.as_str(),
+            "/dev/uhid not writable — falling back to the X-Box 360 pad"
+        );
+        return GamepadPref::Xbox360;
+    }
+    chosen
+}
+
+#[cfg(not(target_os = "linux"))]
+fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
+    chosen
+}
+
 /// Resolve the client's gamepad-backend preference (the env/logging shell around
 /// [`pick_gamepad`]). Always concrete — the `Welcome` reports what the session will drive.
 fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
@@ -1927,6 +1957,10 @@ fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
         cfg!(target_os = "linux"),
         cfg!(target_os = "windows"),
     );
+    // Runtime degrade (separate from the compile-time platform check above): the Linux UHID
+    // backends need `/dev/uhid` usable *now*, else creating the device just fails and the controller
+    // goes dead — fall back to the always-available uinput X-Box 360 pad instead.
+    let chosen = degrade_if_no_uhid(chosen);
     match pref {
         GamepadPref::Auto => {
             // The operator's env knob deserves a diagnostic when it didn't drive the

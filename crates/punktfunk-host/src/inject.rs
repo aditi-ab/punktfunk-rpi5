@@ -500,6 +500,10 @@ pub mod steam_controller;
 #[cfg(target_os = "linux")]
 #[path = "inject/proto/steam_proto.rs"]
 pub mod steam_proto;
+/// Pure fallback-remap policy (Steam-only inputs onto a non-Steam backend) + the Deck motion rescale.
+#[cfg(target_os = "linux")]
+#[path = "inject/proto/steam_remap.rs"]
+pub mod steam_remap;
 /// Stub — virtual gamepads need Linux uinput or the Windows UMDF drivers; events are dropped elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod gamepad {
