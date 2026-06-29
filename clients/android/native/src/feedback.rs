@@ -114,6 +114,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
                 out[2..n].copy_from_slice(&effect);
                 n
             }
+            HidOutput::TrackpadHaptic { .. } => {
+                // Steam Controller trackpad-coil haptics — no Android equivalent; drop it (motor
+                // rumble already rides the universal 0xCA plane).
+                return -1;
+            }
         };
         n as jint
     })

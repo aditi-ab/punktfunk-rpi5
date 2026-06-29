@@ -399,4 +399,27 @@ mod tests {
         c.fec.fec_percent = 15; // 250 + ceil(250*15/100)=288 > 255
         assert!(c.validate().is_err());
     }
+
+    #[test]
+    fn gamepad_pref_steam_roundtrip() {
+        use GamepadPref::*;
+        // Wire-byte round-trip for the Steam additions; an unknown byte still degrades to Auto.
+        for (p, b) in [(SteamController, 5u8), (SteamDeck, 6)] {
+            assert_eq!(p.to_u8(), b);
+            assert_eq!(GamepadPref::from_u8(b), p);
+        }
+        assert_eq!(GamepadPref::from_u8(99), Auto);
+        // Name parsing + canonical-name round-trip.
+        assert_eq!(GamepadPref::from_name("steamdeck"), Some(SteamDeck));
+        assert_eq!(GamepadPref::from_name("deck"), Some(SteamDeck));
+        assert_eq!(
+            GamepadPref::from_name("steamcontroller"),
+            Some(SteamController)
+        );
+        assert_eq!(SteamDeck.as_str(), "steamdeck");
+        assert_eq!(
+            GamepadPref::from_name(SteamController.as_str()),
+            Some(SteamController)
+        );
+    }
 }

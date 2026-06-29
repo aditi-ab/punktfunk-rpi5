@@ -221,6 +221,13 @@ impl SteamState {
         // The DualSense touchpad-click wire bit maps to the Deck's RIGHT pad click (the pad that
         // stands in for the DualSense touchpad — see apply_rich).
         set(&mut b, on(gs::BTN_TOUCHPAD), btn::RPAD_CLICK);
+        // Back grips (the whole reason for the Deck identity): the wire paddle bits map to the four
+        // Deck grips — PADDLE1/2/3/4 = R4/L4/R5/L5 (see `input::gamepad`); MISC1 = the QAM '…' button.
+        set(&mut b, on(gs::BTN_PADDLE1), btn::R4);
+        set(&mut b, on(gs::BTN_PADDLE2), btn::L4);
+        set(&mut b, on(gs::BTN_PADDLE3), btn::R5);
+        set(&mut b, on(gs::BTN_PADDLE4), btn::L5);
+        set(&mut b, on(gs::BTN_MISC1), btn::QAM);
         s.buttons = b;
         s
     }
@@ -240,6 +247,28 @@ impl SteamState {
             RichInput::Motion { gyro, accel, .. } => {
                 self.gyro = gyro;
                 self.accel = accel;
+            }
+            RichInput::TouchpadEx {
+                surface,
+                touch,
+                click,
+                x,
+                y,
+                ..
+            } => {
+                // Steam pads are natively signed (centre 0), so x/y map straight in. surface 1 =
+                // left pad, anything else (0 single / 2 right) = right pad.
+                if surface == 1 {
+                    self.press(btn::LPAD_TOUCH, touch);
+                    self.press(btn::LPAD_CLICK, click);
+                    self.lpad_x = x;
+                    self.lpad_y = y;
+                } else {
+                    self.press(btn::RPAD_TOUCH, touch);
+                    self.press(btn::RPAD_CLICK, click);
+                    self.rpad_x = x;
+                    self.rpad_y = y;
+                }
             }
         }
     }
@@ -422,6 +451,53 @@ mod tests {
         });
         assert_eq!(s.gyro, [1, 2, 3]);
         assert_eq!(s.accel, [4, 5, 6]);
+    }
+
+    /// M3: the wire back-button bits map to the four Deck grips + QAM, and `TouchpadEx` routes the
+    /// left / right surfaces to the matching pad (signed coords pass straight through).
+    #[test]
+    fn back_buttons_and_dual_trackpad_mapping() {
+        let s = SteamState::from_gamepad(
+            gs::BTN_PADDLE1 | gs::BTN_PADDLE2 | gs::BTN_PADDLE3 | gs::BTN_PADDLE4 | gs::BTN_MISC1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_ne!(s.buttons & btn::R4, 0); // PADDLE1 = R4
+        assert_ne!(s.buttons & btn::L4, 0); // PADDLE2 = L4
+        assert_ne!(s.buttons & btn::R5, 0); // PADDLE3 = R5
+        assert_ne!(s.buttons & btn::L5, 0); // PADDLE4 = L5
+        assert_ne!(s.buttons & btn::QAM, 0); // MISC1 = QAM
+
+        let mut s = SteamState::neutral();
+        s.apply_rich(RichInput::TouchpadEx {
+            pad: 0,
+            surface: 1,
+            finger: 0,
+            touch: true,
+            click: true,
+            x: -5000,
+            y: 6000,
+            pressure: 100,
+        });
+        assert_ne!(s.buttons & btn::LPAD_TOUCH, 0);
+        assert_ne!(s.buttons & btn::LPAD_CLICK, 0);
+        assert_eq!((s.lpad_x, s.lpad_y), (-5000, 6000));
+        s.apply_rich(RichInput::TouchpadEx {
+            pad: 0,
+            surface: 2,
+            finger: 0,
+            touch: true,
+            click: false,
+            x: 7000,
+            y: -8000,
+            pressure: 0,
+        });
+        assert_ne!(s.buttons & btn::RPAD_TOUCH, 0);
+        assert_eq!((s.rpad_x, s.rpad_y), (7000, -8000));
     }
 
     /// The serial reply carries the leading report-id byte the kernel strips, so the *stripped*

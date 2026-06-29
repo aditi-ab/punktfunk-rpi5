@@ -66,10 +66,24 @@ pub mod gamepad {
     pub const BTN_B: u32 = 0x2000;
     pub const BTN_X: u32 = 0x4000;
     pub const BTN_Y: u32 = 0x8000;
+    // Extended buttons in Moonlight's `buttonFlags2 << 16` namespace (see `gamestream/gamepad.rs`),
+    // so the GameStream paddle path and the native path share one host injector map. The four Steam
+    // Deck back grips (L4/L5/R4/R5) reuse the four GameStream/Xbox-Elite paddle slots — a semantic
+    // 1:1 for binding (the device identity carries the glyph distinction).
+    /// Back grip R4 — SDL `RightPaddle1` / GameStream `PADDLE1`.
+    pub const BTN_PADDLE1: u32 = 0x0001_0000;
+    /// Back grip L4 — SDL `LeftPaddle1` / GameStream `PADDLE2`.
+    pub const BTN_PADDLE2: u32 = 0x0002_0000;
+    /// Back grip R5 — SDL `RightPaddle2` / GameStream `PADDLE3`.
+    pub const BTN_PADDLE3: u32 = 0x0004_0000;
+    /// Back grip L5 — SDL `LeftPaddle2` / GameStream `PADDLE4`.
+    pub const BTN_PADDLE4: u32 = 0x0008_0000;
     /// DualSense touchpad click. Moonlight's extended-button position (`buttonFlags2`
     /// merges in at `<< 16`, see `gamestream/gamepad.rs`), so GameStream clients land on
     /// the same bit. Only the DualSense backend renders it; the xpad has no such button.
     pub const BTN_TOUCHPAD: u32 = 0x10_0000;
+    /// Misc / capture button — the Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
+    pub const BTN_MISC1: u32 = 0x0020_0000;
 
     /// Axis ids for `InputKind::GamepadAxis`.
     pub const AXIS_LS_X: u32 = 0;

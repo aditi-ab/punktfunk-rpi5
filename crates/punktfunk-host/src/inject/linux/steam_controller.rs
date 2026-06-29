@@ -315,7 +315,9 @@ impl SteamControllerManager {
     /// Apply a rich client→host event (right trackpad / motion) to an existing pad.
     pub fn apply_rich(&mut self, rich: RichInput) {
         let idx = match rich {
-            RichInput::Touchpad { pad, .. } | RichInput::Motion { pad, .. } => pad as usize,
+            RichInput::Touchpad { pad, .. }
+            | RichInput::Motion { pad, .. }
+            | RichInput::TouchpadEx { pad, .. } => pad as usize,
         };
         if idx >= MAX_PADS || self.pads[idx].is_none() {
             return;
@@ -423,6 +425,19 @@ mod tests {
         rc >= 0 && (bits[(code / 8) as usize] >> (code % 8)) & 1 == 1
     }
 
+    /// Read the current value of an absolute axis (`EVIOCGABS`) — the first `i32` of `input_absinfo`.
+    fn abs_value(node: &str, abs: u16) -> Option<i32> {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::File::open(node).ok()?;
+        let mut info = [0u8; 24]; // struct input_absinfo { value, min, max, fuzz, flat, resolution }
+        let req: libc::c_ulong =
+            (2 << 30) | (24 << 16) | (0x45 << 8) | (0x40 + abs as libc::c_ulong);
+        // SAFETY: EVIOCGABS fills the 24-byte input_absinfo for the valid evdev fd `f`; we read only
+        // the leading i32 `value`. The buffer is exactly sizeof(input_absinfo), so no overflow.
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, info.as_mut_ptr()) };
+        (rc >= 0).then(|| i32::from_ne_bytes([info[0], info[1], info[2], info[3]]))
+    }
+
     /// On-box smoke test for the real backend: a `SteamDeckPad` must bind `hid-steam` (creating both
     /// the gamepad + IMU evdevs), enter `gamepad_mode` via the creation pulse, and land a held button
     /// on the evdev (`BTN_A`, code 0x130) — proving the entry overlay + byte-exact serialize path —
@@ -431,11 +446,24 @@ mod tests {
     #[test]
     #[ignore = "creates a real /dev/uhid device; needs hid-steam + the input group"]
     fn backend_binds_and_input_flows() {
+        use punktfunk_core::input::gamepad as gs;
         const BTN_A: u16 = 0x130;
+        const ABS_HAT0X: u16 = 0x10; // left trackpad X
         let mut pad = SteamDeckPad::open(0).expect("open SteamDeckPad (/dev/uhid + input group?)");
-        // Drive past MODE_ENTER (the b9.6 pulse) then hold BTN_A, servicing the handshake.
-        let mut st = SteamState::neutral();
-        st.buttons = btn::A;
+        // Drive the full M3 wire path: build state through `from_gamepad` (BTN_A + the L4 back grip)
+        // and `apply_rich` (a left-pad TouchpadEx contact), then hold it past MODE_ENTER (the b9.6
+        // pulse), servicing the handshake.
+        let mut st = SteamState::from_gamepad(gs::BTN_A | gs::BTN_PADDLE2, 0, 0, 0, 0, 0, 0);
+        st.apply_rich(RichInput::TouchpadEx {
+            pad: 0,
+            surface: 1,
+            finger: 0,
+            touch: true,
+            click: false,
+            x: -8000,
+            y: 9000,
+            pressure: 0,
+        });
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(1200) {
             let _ = pad.service();
@@ -452,6 +480,12 @@ mod tests {
         assert!(
             key_is_down(&node, BTN_A),
             "BTN_A not down — gamepad_mode entry or serialize failed"
+        );
+        // The left trackpad contact (TouchpadEx surface 1, gated on LPAD_TOUCH) reaches ABS_HAT0X.
+        assert_eq!(
+            abs_value(&node, ABS_HAT0X),
+            Some(-8000),
+            "left trackpad (TouchpadEx surface 1) did not reach ABS_HAT0X"
         );
         drop(pad);
         std::thread::sleep(Duration::from_millis(200));

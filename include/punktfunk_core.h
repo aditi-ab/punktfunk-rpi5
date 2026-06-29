@@ -28,6 +28,11 @@
 // `PunktfunkHidOutput::kind` — one adaptive-trigger effect (`which` + `effect`/`effect_len` valid).
 #define PUNKTFUNK_HIDOUT_TRIGGER 3
 
+// `PunktfunkHidOutput::kind` — a trackpad haptic pulse (Steam Controller voice-coils). `which` =
+// side (0 = right pad, 1 = left pad); `effect[0..6]` packs `amplitude` / `period` / `count` as
+// little-endian `u16`s with `effect_len = 6`. Clients without trackpad coils drop it.
+#define PUNKTFUNK_HIDOUT_TRACKPAD_HAPTIC 4
+
 // Capacity of `PunktfunkHidOutput::effect` (the DualSense trigger parameter block).
 #define PUNKTFUNK_HID_EFFECT_MAX 11
 
@@ -36,6 +41,12 @@
 
 // `PunktfunkRichInput::kind` — a motion sample (`gyro`/`accel` valid).
 #define PUNKTFUNK_RICH_MOTION 2
+
+// `RichInput::TouchpadEx` kind on the wire — an extended trackpad contact that identifies the
+// surface (0 single / 1 Steam-left / 2 Steam-right) and carries click + pressure. The host decodes
+// it today; *sending* it from a C client needs the size-prefixed `PunktfunkRichInputEx` +
+// `punktfunk_connection_send_rich_input2` (added with client capture).
+#define PUNKTFUNK_RICH_TOUCHPAD_EX 3
 
 // Compositor preference for [`punktfunk_connect_ex`] (`compositor` arg). `AUTO` lets the host
 // pick (auto-detect from its running desktop); a concrete value is honored only if that backend
@@ -81,6 +92,28 @@
 // DualSense (minus adaptive triggers / player LEDs / mute). Honored only where available (Linux
 // hosts); otherwise the host falls back to X-Box 360.
 #define PUNKTFUNK_GAMEPAD_DUALSHOCK4 4
+
+// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`): dual trackpads, gyro,
+// two grip paddles. Reserved — currently folds to `XBOX360` until its backend lands.
+#define PUNKTFUNK_GAMEPAD_STEAMCONTROLLER 5
+
+// UHID Steam Deck controller (Valve `28DE:1205`, kernel `hid-steam`): full Deck gamepad incl. the
+// four back grips, a right trackpad, and the IMU; re-grabbed by Steam Input with native glyphs when
+// Steam runs on the host. Honored only where available (Linux hosts); else folds to X-Box 360.
+#define PUNKTFUNK_GAMEPAD_STEAMDECK 6
+
+// Extended `InputEvent` gamepad button bits for embedders building raw events: the four back grips
+// (Steam L4/L5/R4/R5 ≙ Xbox-Elite P1–P4) + the misc/capture button, in Moonlight's
+// `buttonFlags2 << 16` namespace. Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.
+#define PUNKTFUNK_GAMEPAD_BTN_PADDLE1 65536
+
+#define PUNKTFUNK_GAMEPAD_BTN_PADDLE2 131072
+
+#define PUNKTFUNK_GAMEPAD_BTN_PADDLE3 262144
+
+#define PUNKTFUNK_GAMEPAD_BTN_PADDLE4 524288
+
+#define PUNKTFUNK_GAMEPAD_BTN_MISC1 2097152
 
 // Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
 // Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
@@ -139,10 +172,25 @@
 
 #define PUNKTFUNK_BTN_Y 32768
 
+// Back grip R4 — SDL `RightPaddle1` / GameStream `PADDLE1`.
+#define BTN_PADDLE1 65536
+
+// Back grip L4 — SDL `LeftPaddle1` / GameStream `PADDLE2`.
+#define BTN_PADDLE2 131072
+
+// Back grip R5 — SDL `RightPaddle2` / GameStream `PADDLE3`.
+#define BTN_PADDLE3 262144
+
+// Back grip L5 — SDL `LeftPaddle2` / GameStream `PADDLE4`.
+#define BTN_PADDLE4 524288
+
 // DualSense touchpad click. Moonlight's extended-button position (`buttonFlags2`
 // merges in at `<< 16`, see `gamestream/gamepad.rs`), so GameStream clients land on
 // the same bit. Only the DualSense backend renders it; the xpad has no such button.
 #define PUNKTFUNK_BTN_TOUCHPAD 1048576
+
+// Misc / capture button — the Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
+#define BTN_MISC1 2097152
 
 // Axis ids for `InputKind::GamepadAxis`.
 #define PUNKTFUNK_AXIS_LS_X 0

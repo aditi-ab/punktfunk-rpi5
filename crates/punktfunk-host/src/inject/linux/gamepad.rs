@@ -69,9 +69,16 @@ const BTN_START: u16 = 0x13b;
 const BTN_MODE: u16 = 0x13c;
 const BTN_THUMBL: u16 = 0x13d;
 const BTN_THUMBR: u16 = 0x13e;
+// Xbox-Elite paddle codes (the xpad convention SDL / Steam Input recognize). A client's back grips —
+// and the GameStream `buttonFlags2` paddle bits, which were silently dropped before — land here, so
+// the virtual X-Box pad exposes paddles like an Elite controller. PADDLE1/2/3/4 = R4/L4/R5/L5.
+const BTN_TRIGGER_HAPPY5: u16 = 0x2c4;
+const BTN_TRIGGER_HAPPY6: u16 = 0x2c5;
+const BTN_TRIGGER_HAPPY7: u16 = 0x2c6;
+const BTN_TRIGGER_HAPPY8: u16 = 0x2c7;
 
 /// `(GameStream button bit, evdev key code)` — D-pad is emitted as HAT axes instead.
-const BUTTON_MAP: [(u32, u16); 11] = [
+const BUTTON_MAP: [(u32, u16); 15] = [
     (gamepad::BTN_A, BTN_SOUTH),
     (gamepad::BTN_B, BTN_EAST),
     (gamepad::BTN_X, BTN_NORTH),
@@ -83,6 +90,10 @@ const BUTTON_MAP: [(u32, u16); 11] = [
     (gamepad::BTN_GUIDE, BTN_MODE),
     (gamepad::BTN_LS_CLK, BTN_THUMBL),
     (gamepad::BTN_RS_CLK, BTN_THUMBR),
+    (gamepad::BTN_PADDLE1, BTN_TRIGGER_HAPPY5),
+    (gamepad::BTN_PADDLE2, BTN_TRIGGER_HAPPY6),
+    (gamepad::BTN_PADDLE3, BTN_TRIGGER_HAPPY7),
+    (gamepad::BTN_PADDLE4, BTN_TRIGGER_HAPPY8),
 ];
 
 /// The USB identity a virtual uinput pad presents. SDL/Steam/Proton key their built-in mapping off

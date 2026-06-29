@@ -66,6 +66,13 @@ pub const BTN_A: u32 = 0x1000;
 pub const BTN_B: u32 = 0x2000;
 pub const BTN_X: u32 = 0x4000;
 pub const BTN_Y: u32 = 0x8000;
+// Extended buttons in the `buttonFlags2 << 16` namespace (mirror `punktfunk_core::input::gamepad`):
+// the four back-grip paddles. `decode` already merges `buttonFlags2 << 16` into `buttons`, but the
+// injector map dropped these bits — Sunshine/Moonlight paddle clients were silently no-op'd.
+pub const BTN_PADDLE1: u32 = 0x0001_0000;
+pub const BTN_PADDLE2: u32 = 0x0002_0000;
+pub const BTN_PADDLE3: u32 = 0x0004_0000;
+pub const BTN_PADDLE4: u32 = 0x0008_0000;
 
 /// Decode one decrypted control plaintext into a controller event, if it is one. Mouse,
 /// keyboard, keepalives etc. yield `None` (they're handled by [`super::input::decode`]).

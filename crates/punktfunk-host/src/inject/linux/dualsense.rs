@@ -252,7 +252,9 @@ impl DualSenseManager {
     /// arrived first); they're dropped if the pad isn't present.
     pub fn apply_rich(&mut self, rich: RichInput) {
         let idx = match rich {
-            RichInput::Touchpad { pad, .. } | RichInput::Motion { pad, .. } => pad as usize,
+            RichInput::Touchpad { pad, .. }
+            | RichInput::Motion { pad, .. }
+            | RichInput::TouchpadEx { pad, .. } => pad as usize,
         };
         if idx >= MAX_PADS || self.pads[idx].is_none() {
             return;
@@ -279,6 +281,26 @@ impl DualSenseManager {
             RichInput::Motion { gyro, accel, .. } => {
                 self.state[idx].gyro = gyro;
                 self.state[idx].accel = accel;
+            }
+            RichInput::TouchpadEx {
+                surface,
+                finger,
+                touch,
+                x,
+                y,
+                ..
+            } => {
+                // A Steam right/single pad maps onto the one DualSense touchpad (signed centre-0 →
+                // 0..=65535); surface 1 (the Steam left pad) has no DualSense equivalent.
+                if surface != 1 {
+                    let slot = (finger as usize).min(1);
+                    let n = |v: i16| ((v as i32) + 32768) as u32;
+                    let t = &mut self.state[idx].touch[slot];
+                    t.active = touch;
+                    t.id = slot as u8;
+                    t.x = (n(x) * (DS_TOUCH_W - 1) as u32 / u16::MAX as u32) as u16;
+                    t.y = (n(y) * (DS_TOUCH_H - 1) as u32 / u16::MAX as u32) as u16;
+                }
             }
         }
         self.write(idx);

@@ -1218,6 +1218,7 @@ pub fn decode_mic_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
 
 const RICH_TOUCHPAD: u8 = 0x01;
 const RICH_MOTION: u8 = 0x02;
+const RICH_TOUCHPAD_EX: u8 = 0x03;
 
 /// A rich client→host controller input beyond the fixed [`InputEvent`](crate::input::InputEvent):
 /// the DualSense touchpad and motion sensors. `pad` is the gamepad index. Wire form is
@@ -1241,6 +1242,22 @@ pub enum RichInput {
         gyro: [i16; 3],
         accel: [i16; 3],
     },
+    /// A richer trackpad contact that also identifies *which* physical pad (Steam Controller / Deck
+    /// have two), carries a separate click vs touch state, and a pressure reading. `surface`:
+    /// `0` = the single / DualSense touchpad, `1` = the Steam left pad, `2` = the Steam right pad.
+    /// Coordinates are **signed** (centred at 0), matching the real Steam report; `pressure` is `0`
+    /// for a surface with no force sensor. New clients send this for every touch surface; the host
+    /// decodes both `Touchpad` (`0x01`) and `TouchpadEx` (`0x03`) indefinitely.
+    TouchpadEx {
+        pad: u8,
+        surface: u8,
+        finger: u8,
+        touch: bool,
+        click: bool,
+        x: i16,
+        y: i16,
+        pressure: u16,
+    },
 }
 
 impl RichInput {
@@ -1263,6 +1280,22 @@ impl RichInput {
                 for v in gyro.iter().chain(accel.iter()) {
                     out.extend_from_slice(&v.to_le_bytes());
                 }
+            }
+            RichInput::TouchpadEx {
+                pad,
+                surface,
+                finger,
+                touch,
+                click,
+                x,
+                y,
+                pressure,
+            } => {
+                let state = (touch as u8) | ((click as u8) << 1);
+                out.extend_from_slice(&[RICH_TOUCHPAD_EX, pad, surface, finger, state]);
+                out.extend_from_slice(&x.to_le_bytes());
+                out.extend_from_slice(&y.to_le_bytes());
+                out.extend_from_slice(&pressure.to_le_bytes());
             }
         }
         out
@@ -1288,6 +1321,16 @@ impl RichInput {
                     accel: [i16at(9), i16at(11), i16at(13)],
                 })
             }
+            RICH_TOUCHPAD_EX if b.len() >= 12 => Some(RichInput::TouchpadEx {
+                pad: b[2],
+                surface: b[3],
+                finger: b[4],
+                touch: b[5] & 0x01 != 0,
+                click: b[5] & 0x02 != 0,
+                x: i16::from_le_bytes([b[6], b[7]]),
+                y: i16::from_le_bytes([b[8], b[9]]),
+                pressure: u16::from_le_bytes([b[10], b[11]]),
+            }),
             _ => None,
         }
     }
@@ -1296,6 +1339,7 @@ impl RichInput {
 const HIDOUT_LED: u8 = 0x01;
 const HIDOUT_PLAYER_LEDS: u8 = 0x02;
 const HIDOUT_TRIGGER: u8 = 0x03;
+const HIDOUT_TRACKPAD_HAPTIC: u8 = 0x04;
 
 /// DualSense feedback flowing host → client (what a game wrote to the host's virtual pad).
 /// Wire form `[0xCD][kind][pad][fields…]`. The rich analog of the fixed rumble datagram;
@@ -1309,6 +1353,16 @@ pub enum HidOutput {
     /// One adaptive-trigger effect: `which` 0 = L2, 1 = R2; `effect` is the raw DualSense
     /// trigger parameter block (mode + params) for the client to replay on a real controller.
     Trigger { pad: u8, which: u8, effect: Vec<u8> },
+    /// A trackpad haptic pulse for a Steam Controller's voice-coil actuators (its only "rumble").
+    /// `side` 0 = right pad, 1 = left pad; `amplitude` + `period` (µs off-time) + `count` (pulses)
+    /// synthesize a buzz. A client without trackpad coils drops it (or maps it to ordinary rumble).
+    TrackpadHaptic {
+        pad: u8,
+        side: u8,
+        amplitude: u16,
+        period: u16,
+        count: u16,
+    },
 }
 
 impl HidOutput {
@@ -1324,6 +1378,18 @@ impl HidOutput {
             HidOutput::Trigger { pad, which, effect } => {
                 out.extend_from_slice(&[HIDOUT_TRIGGER, *pad, *which]);
                 out.extend_from_slice(effect);
+            }
+            HidOutput::TrackpadHaptic {
+                pad,
+                side,
+                amplitude,
+                period,
+                count,
+            } => {
+                out.extend_from_slice(&[HIDOUT_TRACKPAD_HAPTIC, *pad, *side]);
+                out.extend_from_slice(&amplitude.to_le_bytes());
+                out.extend_from_slice(&period.to_le_bytes());
+                out.extend_from_slice(&count.to_le_bytes());
             }
         }
         out
@@ -1348,6 +1414,13 @@ impl HidOutput {
                 pad: b[2],
                 which: b[3],
                 effect: b[4..].to_vec(),
+            }),
+            HIDOUT_TRACKPAD_HAPTIC if b.len() >= 10 => Some(HidOutput::TrackpadHaptic {
+                pad: b[2],
+                side: b[3],
+                amplitude: u16::from_le_bytes([b[4], b[5]]),
+                period: u16::from_le_bytes([b[6], b[7]]),
+                count: u16::from_le_bytes([b[8], b[9]]),
             }),
             _ => None,
         }
@@ -2486,6 +2559,16 @@ mod tests {
                 gyro: [-100, 200, -300],
                 accel: [16384, -8192, 1],
             },
+            RichInput::TouchpadEx {
+                pad: 2,
+                surface: 1,
+                finger: 1,
+                touch: true,
+                click: false,
+                x: -12345,
+                y: 30000,
+                pressure: 4000,
+            },
         ] {
             let d = ev.encode();
             assert_eq!(d[0], RICH_INPUT_MAGIC);
@@ -2494,7 +2577,8 @@ mod tests {
         // Disjoint from the fixed input datagram (0xC8); unknown kind + truncation → None.
         assert!(RichInput::decode(&[crate::input::INPUT_MAGIC; 18]).is_none());
         assert!(RichInput::decode(&[RICH_INPUT_MAGIC, 0x7F]).is_none()); // unknown kind
-        assert!(RichInput::decode(&[RICH_INPUT_MAGIC, RICH_TOUCHPAD, 0]).is_none());
+        assert!(RichInput::decode(&[RICH_INPUT_MAGIC, RICH_TOUCHPAD, 0]).is_none()); // short
+        assert!(RichInput::decode(&[RICH_INPUT_MAGIC, RICH_TOUCHPAD_EX, 0, 0, 0, 0]).is_none());
         // short
     }
 
@@ -2515,6 +2599,13 @@ mod tests {
                 pad: 1,
                 which: 1,
                 effect: vec![0x26, 0x90, 0xA0, 0xFF, 0x00, 0x00],
+            },
+            HidOutput::TrackpadHaptic {
+                pad: 0,
+                side: 1,
+                amplitude: 0x1234,
+                period: 0x5678,
+                count: 9,
             },
         ];
         for ev in &cases {

@@ -492,6 +492,10 @@ pub const PUNKTFUNK_HIDOUT_LED: u8 = 1;
 pub const PUNKTFUNK_HIDOUT_PLAYER_LEDS: u8 = 2;
 /// `PunktfunkHidOutput::kind` — one adaptive-trigger effect (`which` + `effect`/`effect_len` valid).
 pub const PUNKTFUNK_HIDOUT_TRIGGER: u8 = 3;
+/// `PunktfunkHidOutput::kind` — a trackpad haptic pulse (Steam Controller voice-coils). `which` =
+/// side (0 = right pad, 1 = left pad); `effect[0..6]` packs `amplitude` / `period` / `count` as
+/// little-endian `u16`s with `effect_len = 6`. Clients without trackpad coils drop it.
+pub const PUNKTFUNK_HIDOUT_TRACKPAD_HAPTIC: u8 = 4;
 /// Capacity of `PunktfunkHidOutput::effect` (the DualSense trigger parameter block).
 pub const PUNKTFUNK_HID_EFFECT_MAX: u8 = 11;
 
@@ -559,6 +563,23 @@ impl PunktfunkHidOutput {
                 out.effect[..n].copy_from_slice(&effect[..n]);
                 out.effect_len = n as u8;
             }
+            HidOutput::TrackpadHaptic {
+                pad,
+                side,
+                amplitude,
+                period,
+                count,
+            } => {
+                // No new struct (PunktfunkHidOutput has no size guard): pack into the existing
+                // `which` (side) + `effect[0..6]` (amplitude/period/count LE), `effect_len = 6`.
+                out.kind = PUNKTFUNK_HIDOUT_TRACKPAD_HAPTIC;
+                out.pad = *pad;
+                out.which = *side;
+                out.effect[0..2].copy_from_slice(&amplitude.to_le_bytes());
+                out.effect[2..4].copy_from_slice(&period.to_le_bytes());
+                out.effect[4..6].copy_from_slice(&count.to_le_bytes());
+                out.effect_len = 6;
+            }
         }
         out
     }
@@ -618,6 +639,11 @@ impl PunktfunkHdrMeta {
 pub const PUNKTFUNK_RICH_TOUCHPAD: u8 = 1;
 /// `PunktfunkRichInput::kind` — a motion sample (`gyro`/`accel` valid).
 pub const PUNKTFUNK_RICH_MOTION: u8 = 2;
+/// `RichInput::TouchpadEx` kind on the wire — an extended trackpad contact that identifies the
+/// surface (0 single / 1 Steam-left / 2 Steam-right) and carries click + pressure. The host decodes
+/// it today; *sending* it from a C client needs the size-prefixed `PunktfunkRichInputEx` +
+/// `punktfunk_connection_send_rich_input2` (added with client capture).
+pub const PUNKTFUNK_RICH_TOUCHPAD_EX: u8 = 3;
 
 /// One rich client→host input for the host's virtual DualSense
 /// ([`punktfunk_connection_send_rich_input`]): a touchpad contact or a motion sample. Set `kind`
@@ -714,6 +740,22 @@ pub const PUNKTFUNK_GAMEPAD_XBOXONE: u32 = 3;
 /// DualSense (minus adaptive triggers / player LEDs / mute). Honored only where available (Linux
 /// hosts); otherwise the host falls back to X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_DUALSHOCK4: u32 = 4;
+/// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`): dual trackpads, gyro,
+/// two grip paddles. Reserved — currently folds to `XBOX360` until its backend lands.
+pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER: u32 = 5;
+/// UHID Steam Deck controller (Valve `28DE:1205`, kernel `hid-steam`): full Deck gamepad incl. the
+/// four back grips, a right trackpad, and the IMU; re-grabbed by Steam Input with native glyphs when
+/// Steam runs on the host. Honored only where available (Linux hosts); else folds to X-Box 360.
+pub const PUNKTFUNK_GAMEPAD_STEAMDECK: u32 = 6;
+
+/// Extended `InputEvent` gamepad button bits for embedders building raw events: the four back grips
+/// (Steam L4/L5/R4/R5 ≙ Xbox-Elite P1–P4) + the misc/capture button, in Moonlight's
+/// `buttonFlags2 << 16` namespace. Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.
+pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE1: u32 = 0x0001_0000;
+pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE2: u32 = 0x0002_0000;
+pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE3: u32 = 0x0004_0000;
+pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE4: u32 = 0x0008_0000;
+pub const PUNKTFUNK_GAMEPAD_BTN_MISC1: u32 = 0x0020_0000;
 
 /// Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
 /// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
@@ -742,11 +784,28 @@ const _: () = {
 // Keep the ABI gamepad constants in lockstep with the wire enum (compile-time guard against drift).
 const _: () = {
     use crate::config::GamepadPref;
+    use crate::input::gamepad as g;
     assert!(PUNKTFUNK_GAMEPAD_AUTO == GamepadPref::Auto.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_XBOX360 == GamepadPref::Xbox360.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_DUALSENSE == GamepadPref::DualSense.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_XBOXONE == GamepadPref::XboxOne.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_DUALSHOCK4 == GamepadPref::DualShock4.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_STEAMCONTROLLER == GamepadPref::SteamController.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_STEAMDECK == GamepadPref::SteamDeck.to_u8() as u32);
+    // Extended button bits mirror the wire `input::gamepad` constants.
+    assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE1 == g::BTN_PADDLE1);
+    assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE2 == g::BTN_PADDLE2);
+    assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE3 == g::BTN_PADDLE3);
+    assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE4 == g::BTN_PADDLE4);
+    assert!(PUNKTFUNK_GAMEPAD_BTN_MISC1 == g::BTN_MISC1);
+};
+
+// The additive M3 kinds (TouchpadEx / TrackpadHaptic) must never grow the legacy ABI structs —
+// they have no `struct_size` guard, so a layout change would corrupt old-built callers' buffers.
+#[cfg(feature = "quic")]
+const _: () = {
+    assert!(core::mem::size_of::<PunktfunkRichInput>() == 20);
+    assert!(core::mem::size_of::<PunktfunkHidOutput>() == 19);
 };
 
 /// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's
