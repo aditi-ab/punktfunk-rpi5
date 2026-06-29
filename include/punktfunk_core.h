@@ -668,6 +668,44 @@ typedef struct {
 } PunktfunkRichInput;
 #endif
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Forward-compatible superset of [`PunktfunkRichInput`] that can also express the rich Steam
+// surfaces: a *second* trackpad (`surface`), a distinct `click` vs touch, signed coordinates, and
+// pressure. Sent via [`punktfunk_connection_send_rich_input2`] — the only way a C client can emit a
+// `TouchpadEx`. The caller MUST set `struct_size = sizeof(PunktfunkRichInputEx)` (the ABI-skew
+// guard, like [`PunktfunkConfig`]); the legacy [`PunktfunkRichInput`] +
+// [`punktfunk_connection_send_rich_input`] stay byte-for-byte for existing callers.
+typedef struct {
+    // MUST equal `sizeof(PunktfunkRichInputEx)`.
+    uint32_t struct_size;
+    // One of `PUNKTFUNK_RICH_*` (`TOUCHPAD` / `MOTION` / `TOUCHPAD_EX`).
+    uint8_t kind;
+    // Gamepad index.
+    uint8_t pad;
+    // Touchpad/TouchpadEx: contact id.
+    uint8_t finger;
+    // Touchpad/TouchpadEx: 1 = finger down / touching, 0 = lifted.
+    uint8_t active;
+    // TouchpadEx: which surface — 0 = single/DualSense, 1 = Steam left pad, 2 = Steam right pad.
+    uint8_t surface;
+    // TouchpadEx: 1 = the pad is physically clicked (depressed), distinct from a touch contact.
+    uint8_t click;
+    // Reserved for alignment; set to 0.
+    uint8_t _reserved[2];
+    // TouchpadEx: x coordinate — **signed**, centred at 0 (the real Steam report convention). For a
+    // legacy `TOUCHPAD` kind sent through this struct, store the unsigned `0..=65535` value's bits.
+    int16_t x;
+    // TouchpadEx: y coordinate — signed, centred at 0.
+    int16_t y;
+    // TouchpadEx: contact pressure (`0` if the surface has no force sensor).
+    uint16_t pressure;
+    // Motion: gyro (pitch, yaw, roll), raw signed-16.
+    int16_t gyro[3];
+    // Motion: accelerometer (x, y, z), raw signed-16.
+    int16_t accel[3];
+} PunktfunkRichInputEx;
+#endif
+
 // A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
 // the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
 // delivered wire throughput to drive a bitrate choice from; `loss_pct` is the link loss and
@@ -1157,6 +1195,18 @@ PunktfunkStatus punktfunk_connection_send_mic(PunktfunkConnection *c,
 // `c` is a valid connection handle; `rich` points to a valid [`PunktfunkRichInput`].
 PunktfunkStatus punktfunk_connection_send_rich_input(PunktfunkConnection *c,
                                                      const PunktfunkRichInput *rich);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Send a rich client→host input via the forward-compatible [`PunktfunkRichInputEx`] — the only way
+// a C client can emit a `TouchpadEx` (a second trackpad / signed coords / pressure). Set
+// `rich->struct_size = sizeof(PunktfunkRichInputEx)`; a smaller (older-layout) value is rejected.
+//
+// # Safety
+// `c` is a valid connection handle; `rich` is null or points to at least its declared
+// `struct_size` bytes.
+PunktfunkStatus punktfunk_connection_send_rich_input2(PunktfunkConnection *c,
+                                                      const PunktfunkRichInputEx *rich);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

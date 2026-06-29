@@ -294,7 +294,13 @@ const RESOLUTIONS: [number, number, string][] = [
   [2560, 1440, "2560 × 1440"],
 ];
 const REFRESH = [0, 30, 60, 90, 120];
-const GAMEPADS = ["auto", "xbox360", "dualsense"];
+const GAMEPADS = ["auto", "xbox360", "dualsense", "steamdeck"];
+const GAMEPAD_LABELS: Record<string, string> = {
+  auto: "Automatic",
+  xbox360: "Xbox 360",
+  dualsense: "DualSense",
+  steamdeck: "Steam Deck",
+};
 
 const SettingsSection: FC = () => {
   const [s, setS] = useState<StreamSettings | null>(null);
@@ -355,14 +361,17 @@ const SettingsSection: FC = () => {
       />
       <Field label="Gamepad type" childrenContainerWidth="max">
         <Dropdown
-          rgOptions={GAMEPADS.map((g) => ({
-            data: g,
-            label: g === "auto" ? "Automatic" : g === "xbox360" ? "Xbox 360" : "DualSense",
-          }))}
+          rgOptions={GAMEPADS.map((g) => ({ data: g, label: GAMEPAD_LABELS[g] ?? g }))}
           selectedOption={s.gamepad}
           onChange={(o) => patch({ gamepad: o.data as string })}
         />
       </Field>
+      {s.gamepad === "steamdeck" && (
+        <Field
+          label="⚠ Disable Steam Input"
+          description="Steam Deck mode forwards the paddles, both trackpads, and gyro to the host. For that, Steam Input must be OFF for punktfunk: on the game page tap ⚙ → Controller Settings → set Steam Input to Off. Otherwise Steam keeps the Deck's controls and only the sticks + buttons reach the host."
+        />
+      )}
       <ToggleField
         label="Stream microphone"
         checked={s.mic_enabled}

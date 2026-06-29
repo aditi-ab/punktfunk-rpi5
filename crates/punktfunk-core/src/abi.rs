@@ -692,6 +692,77 @@ impl PunktfunkRichInput {
     }
 }
 
+/// Forward-compatible superset of [`PunktfunkRichInput`] that can also express the rich Steam
+/// surfaces: a *second* trackpad (`surface`), a distinct `click` vs touch, signed coordinates, and
+/// pressure. Sent via [`punktfunk_connection_send_rich_input2`] — the only way a C client can emit a
+/// `TouchpadEx`. The caller MUST set `struct_size = sizeof(PunktfunkRichInputEx)` (the ABI-skew
+/// guard, like [`PunktfunkConfig`]); the legacy [`PunktfunkRichInput`] +
+/// [`punktfunk_connection_send_rich_input`] stay byte-for-byte for existing callers.
+#[cfg(feature = "quic")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PunktfunkRichInputEx {
+    /// MUST equal `sizeof(PunktfunkRichInputEx)`.
+    pub struct_size: u32,
+    /// One of `PUNKTFUNK_RICH_*` (`TOUCHPAD` / `MOTION` / `TOUCHPAD_EX`).
+    pub kind: u8,
+    /// Gamepad index.
+    pub pad: u8,
+    /// Touchpad/TouchpadEx: contact id.
+    pub finger: u8,
+    /// Touchpad/TouchpadEx: 1 = finger down / touching, 0 = lifted.
+    pub active: u8,
+    /// TouchpadEx: which surface — 0 = single/DualSense, 1 = Steam left pad, 2 = Steam right pad.
+    pub surface: u8,
+    /// TouchpadEx: 1 = the pad is physically clicked (depressed), distinct from a touch contact.
+    pub click: u8,
+    /// Reserved for alignment; set to 0.
+    pub _reserved: [u8; 2],
+    /// TouchpadEx: x coordinate — **signed**, centred at 0 (the real Steam report convention). For a
+    /// legacy `TOUCHPAD` kind sent through this struct, store the unsigned `0..=65535` value's bits.
+    pub x: i16,
+    /// TouchpadEx: y coordinate — signed, centred at 0.
+    pub y: i16,
+    /// TouchpadEx: contact pressure (`0` if the surface has no force sensor).
+    pub pressure: u16,
+    /// Motion: gyro (pitch, yaw, roll), raw signed-16.
+    pub gyro: [i16; 3],
+    /// Motion: accelerometer (x, y, z), raw signed-16.
+    pub accel: [i16; 3],
+}
+
+#[cfg(feature = "quic")]
+impl PunktfunkRichInputEx {
+    fn to_rich(self) -> Option<crate::quic::RichInput> {
+        use crate::quic::RichInput;
+        match self.kind {
+            PUNKTFUNK_RICH_TOUCHPAD_EX => Some(RichInput::TouchpadEx {
+                pad: self.pad,
+                surface: self.surface,
+                finger: self.finger,
+                touch: self.active != 0,
+                click: self.click != 0,
+                x: self.x,
+                y: self.y,
+                pressure: self.pressure,
+            }),
+            PUNKTFUNK_RICH_MOTION => Some(RichInput::Motion {
+                pad: self.pad,
+                gyro: self.gyro,
+                accel: self.accel,
+            }),
+            PUNKTFUNK_RICH_TOUCHPAD => Some(RichInput::Touchpad {
+                pad: self.pad,
+                finger: self.finger,
+                active: self.active != 0,
+                x: self.x as u16,
+                y: self.y as u16,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Read an optional NUL-terminated UTF-8 string parameter; `Err` = invalid pointer/UTF-8.
 #[cfg(feature = "quic")]
 unsafe fn opt_cstr<'a>(p: *const std::os::raw::c_char) -> std::result::Result<Option<&'a str>, ()> {
@@ -1777,6 +1848,43 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input(
             None => return PunktfunkStatus::NullPointer,
         };
         match rich.to_rich() {
+            Some(r) => match c.inner.send_rich_input(r) {
+                Ok(()) => PunktfunkStatus::Ok,
+                Err(e) => e.status(),
+            },
+            None => PunktfunkStatus::InvalidArg,
+        }
+    })
+}
+
+/// Send a rich client→host input via the forward-compatible [`PunktfunkRichInputEx`] — the only way
+/// a C client can emit a `TouchpadEx` (a second trackpad / signed coords / pressure). Set
+/// `rich->struct_size = sizeof(PunktfunkRichInputEx)`; a smaller (older-layout) value is rejected.
+///
+/// # Safety
+/// `c` is a valid connection handle; `rich` is null or points to at least its declared
+/// `struct_size` bytes.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
+    c: *mut PunktfunkConnection,
+    rich: *const PunktfunkRichInputEx,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if rich.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        // Read only the 4-byte size prefix first to bound the subsequent full read (the
+        // `PunktfunkConfig` ABI-skew precedent).
+        let declared = unsafe { std::ptr::addr_of!((*rich).struct_size).read_unaligned() } as usize;
+        if declared < std::mem::size_of::<PunktfunkRichInputEx>() {
+            return PunktfunkStatus::InvalidArg;
+        }
+        match unsafe { *rich }.to_rich() {
             Some(r) => match c.inner.send_rich_input(r) {
                 Ok(()) => PunktfunkStatus::Ok,
                 Err(e) => e.status(),

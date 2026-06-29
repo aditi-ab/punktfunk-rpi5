@@ -50,14 +50,24 @@ object Gamepad {
     const val PREF_DUALSENSE = 2
     const val PREF_XBOXONE = 3
     const val PREF_DUALSHOCK4 = 4
+    const val PREF_STEAMCONTROLLER = 5
+    const val PREF_STEAMDECK = 6
 
     // USB vendor ids of the controllers we can identify by VID/PID.
     private const val VID_SONY = 0x054C
     private const val VID_MICROSOFT = 0x045E
+    private const val VID_VALVE = 0x28DE
 
     // Sony product ids. DualSense (PS5) and DualShock 4 (PS4) map to distinct host pad types.
     private val PID_DUALSENSE = setOf(0x0CE6, 0x0DF2)
     private val PID_DUALSHOCK4 = setOf(0x05C4, 0x09CC)
+
+    // Valve: Steam Deck built-in controller (0x1205); classic Steam Controller wired (0x1102) /
+    // dongle (0x1142). The host builds the virtual hid-steam pad; rich-input capture (paddles /
+    // trackpads / gyro) is out of scope on Android (no rich-input plane yet), so only the standard
+    // buttons + sticks reach the host for now — parity with the desktop type resolution.
+    private val PID_STEAMDECK = setOf(0x1205)
+    private val PID_STEAMCONTROLLER = setOf(0x1102, 0x1142)
 
     // Microsoft Xbox One / Series product ids (wired + the common Bluetooth/dongle revisions). All
     // behave like Xbox 360 on the host minus the glyph identity, so they share one pref byte.
@@ -82,6 +92,8 @@ object Gamepad {
             vid == VID_SONY && pid in PID_DUALSENSE -> PREF_DUALSENSE
             vid == VID_SONY && pid in PID_DUALSHOCK4 -> PREF_DUALSHOCK4
             vid == VID_MICROSOFT && pid in PID_XBOXONE -> PREF_XBOXONE
+            vid == VID_VALVE && pid in PID_STEAMDECK -> PREF_STEAMDECK
+            vid == VID_VALVE && pid in PID_STEAMCONTROLLER -> PREF_STEAMCONTROLLER
             else -> PREF_XBOX360
         }
     }

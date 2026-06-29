@@ -114,11 +114,34 @@ async function ensureShortcut(): Promise<number> {
 }
 
 /**
+ * Best-effort: turn Steam Input OFF for our shortcut so SDL's HIDAPI Steam Deck driver can open the
+ * Deck's controls (paddles · trackpads · gyro) directly. There is no confirmed-stable SteamClient
+ * API for this, so it is feature-detected and MUST never block or throw into the launch — the manual
+ * toggle (game page → ⚙ → Controller Settings → Steam Input Off, surfaced in the plugin Settings) is
+ * the documented source of truth. No-op when the optional API is absent.
+ */
+function disableSteamInputForShortcut(appId: number): void {
+  try {
+    const input = (
+      SteamClient as unknown as {
+        Input?: { SetSteamInputEnabledForApp?: (appId: number, enabled: boolean) => void };
+      }
+    ).Input;
+    input?.SetSteamInputEnabledForApp?.(appId, false);
+  } catch {
+    /* a controller tweak must never break the launch */
+  }
+}
+
+/**
  * Launch a stream to `host:port` fullscreen in Gaming Mode. Encodes the target into the
  * shortcut's launch options (so one generic shortcut serves every host), then RunGame.
  */
 export async function launchStream(host: string, port: number): Promise<void> {
   const appId = await ensureShortcut();
+  // Best-effort so the Deck's rich controls reach the client; no-op if the API is absent (the user
+  // disables Steam Input manually — see the Settings instruction).
+  disableSteamInputForShortcut(appId);
   const target = port && port !== 9777 ? `${host}:${port}` : host;
   // KEY=value ... %command% — the wrapper reads PF_HOST from the environment.
   SteamClient.Apps.SetAppLaunchOptions(appId, `PF_HOST=${target} %command%`);

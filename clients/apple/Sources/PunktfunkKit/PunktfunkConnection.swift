@@ -182,6 +182,11 @@ public final class PunktfunkConnection {
         case dualSense = 2
         case xboxOne = 3
         case dualShock4 = 4
+        // Valve Steam Controller / Steam Deck (Linux UHID hid-steam hosts). Parity only on Apple —
+        // GameController never surfaces a 0x28DE HID device, so the client can't capture one; these
+        // exist so the resolved type round-trips and name parsing matches the host.
+        case steamController = 5
+        case steamDeck = 6
 
         /// Loose name parsing for env/dev hooks, mirroring the host's
         /// `GamepadPref::from_name`.
@@ -192,6 +197,8 @@ public final class PunktfunkConnection {
             case "dualsense", "ds", "ds5", "ps5": self = .dualSense
             case "xboxone", "xbox-one", "xboxseries", "series": self = .xboxOne
             case "dualshock4", "dualshock", "ds4", "ps4": self = .dualShock4
+            case "steamdeck", "steam-deck", "deck": self = .steamDeck
+            case "steamcontroller", "steam-controller", "steamcon": self = .steamController
             default: return nil
             }
         }
