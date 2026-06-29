@@ -1,8 +1,8 @@
-//! P2 direct frame push (kill DDA) — HOST side. The pf-vdisplay driver runs in a restricted WUDFHost
-//! token that canNOT create named kernel objects, so — exactly like the gamepad UMDF drivers
-//! (`inject/dualsense_windows.rs`) — the HOST (privileged) CREATES the shared header + frame-ready
-//! event + ring of keyed-mutex textures (`Global\` names, permissive `D:(A;;GA;;;WD)` SDDL) on the
-//! discrete render GPU, and the driver only OPENS them and copies frames in. We then consume the ring
+//! P2 direct frame push (kill DDA) — HOST side. The pf-vdisplay driver's WUDFHost canNOT create named
+//! kernel objects, so — exactly like the gamepad UMDF drivers (`inject/dualsense_windows.rs`) — the
+//! HOST (privileged) CREATES the shared header + frame-ready event + ring of keyed-mutex textures
+//! (`Global\` names, scoped `D:(A;;GA;;;SY)(A;;GA;;;LS)` to SYSTEM + the driver's LocalService host —
+//! see `shared_object_sa`) on the discrete render GPU, and the driver only OPENS them and copies frames in. We then consume the ring
 //! straight into the zero-copy NVENC path — no DXGI Desktop Duplication, no `win32u` hook. Gated by
 //! `PUNKTFUNK_IDD_PUSH`. Driver counterpart: `packaging/windows/drivers/pf-vdisplay/src/
 //! frame_transport.rs`. The shared `SharedHeader` layout, `MAGIC`/`VERSION`/`RING_LEN`, the
@@ -236,13 +236,17 @@ pub struct IddPushCapturer {
 // ownership to one thread at a time with NO concurrent access; we do not (and must not) claim `Sync`.
 unsafe impl Send for IddPushCapturer {}
 
-/// Build a permissive (Everyone:GenericAll) `SECURITY_ATTRIBUTES` so the restricted WUDFHost driver
-/// can OPEN the host-created objects — the same `D:(A;;GA;;;WD)` SDDL the gamepad shared section uses.
-/// The returned `psd` backing must outlive `sa`; both are dropped when the process exits.
-unsafe fn permissive_sa() -> Result<(SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR)> {
+/// Build a `SECURITY_ATTRIBUTES` granting GENERIC_ALL to **SYSTEM** (the host creates+publishes the
+/// shared event + texture ring) and **LocalService** (the account the pf_vdisplay WUDFHost runs under,
+/// which consumes them) — `D:(A;;GA;;;SY)(A;;GA;;;LS)`, the same scoping as the gamepad section. The
+/// old SDDL granted **Everyone** (`WD`), which let any local user open the `Global\pfvd-*` objects and
+/// read captured screen frames (security-review 2026-06-28 #5). Verified on the RTX box (2026-06-29):
+/// the WUDFHost token is `S-1-5-19` (LocalService), SYSTEM integrity, zero restricted SIDs — so SY+LS
+/// suffices for the driver and excludes normal user processes. `psd` must outlive `sa`.
+unsafe fn shared_object_sa() -> Result<(SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR)> {
     let mut psd = PSECURITY_DESCRIPTOR::default();
     ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        w!("D:(A;;GA;;;WD)"),
+        w!("D:(A;;GA;;;SY)(A;;GA;;;LS)"),
         SDDL_REVISION_1,
         &mut psd,
         None,
@@ -269,7 +273,7 @@ impl IddPushCapturer {
         h: u32,
         format: DXGI_FORMAT,
     ) -> Result<Vec<HostSlot>> {
-        let (sa, _psd) = permissive_sa()?;
+        let (sa, _psd) = shared_object_sa()?;
         let mut slots = Vec::new();
         for k in 0..RING_LEN {
             let desc = D3D11_TEXTURE2D_DESC {
@@ -375,7 +379,7 @@ impl IddPushCapturer {
         // SAFETY: one block over the whole ring setup; every operation in it is sound:
         // - `set_advanced_color`/`advanced_color_enabled` are `unsafe fn`s taking only a copy of the plain
         //   `u32` target id; they read/flip CCD display config and return owned values, borrowing nothing.
-        // - `CreateDXGIFactory1`, `EnumAdapterByLuid`, `make_device`, `permissive_sa`, `CreateFileMappingW`,
+        // - `CreateDXGIFactory1`, `EnumAdapterByLuid`, `make_device`, `shared_object_sa`, `CreateFileMappingW`,
         //   `MapViewOfFile`, `CreateEventW`, and `create_ring_slots` are all `?`-checked, so every returned
         //   interface/handle/view is non-error before use; `&sa`/`&adapter`/`&device`/the `&HSTRING` names
         //   are live borrows that outlive each synchronous call, and `sa.lpSecurityDescriptor` stays valid
@@ -421,7 +425,7 @@ impl IddPushCapturer {
                 .context("EnumAdapterByLuid(render adapter) for IDD push")?;
             let (device, context) = make_device(&adapter).context("make_device for IDD push")?;
 
-            let (sa, _psd) = permissive_sa()?;
+            let (sa, _psd) = shared_object_sa()?;
             let bytes = std::mem::size_of::<SharedHeader>().max(64);
 
             // Header.

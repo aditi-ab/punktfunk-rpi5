@@ -21,10 +21,18 @@ use windows::Win32::System::Memory::{
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 
-/// A named, anonymous (pagefile-backed) shared section + its mapped read/write view, created with the
-/// permissive `D:(A;;GA;;;WD)` SDDL the restricted-token driver needs to open it. RAII: drop unmaps the
-/// view, then the [`OwnedHandle`] closes the section handle (in that order). Replaces the three backends'
-/// hand-duplicated `CreateFileMappingW` + `MapViewOfFile` + manual `Drop`.
+/// A named, anonymous (pagefile-backed) shared section + its mapped read/write view. RAII: drop unmaps
+/// the view, then the [`OwnedHandle`] closes the section handle (in that order). Replaces the three
+/// backends' hand-duplicated `CreateFileMappingW` + `MapViewOfFile` + manual `Drop`.
+///
+/// SDDL `D:(A;;GA;;;SY)(A;;GA;;;LS)`: GENERIC_ALL to **SYSTEM** (the host creates the section and
+/// writes the live HID input report into it) and **LocalService** (the account the UMDF driver's
+/// WUDFHost runs under, which reads it). The old SDDL granted **Everyone** (`WD`) — on the (mistaken)
+/// assumption the driver needed a restricted token's broad access — letting any local user
+/// `OpenFileMapping` the section to inject controller input or tamper the trusted channel
+/// (security-review 2026-06-28 #5). Verified on the RTX box (2026-06-29): the WUDFHost token is
+/// `S-1-5-19` (LocalService), SYSTEM integrity, with **zero restricted SIDs** — so scoping to SY+LS is
+/// sufficient for the driver and excludes normal (medium-IL, non-service) user processes.
 pub(super) struct Shm {
     /// Owns the section handle (closed on drop). Held only for ownership — never read after construction.
     _handle: OwnedHandle,
@@ -40,7 +48,7 @@ impl Shm {
         // exit — acceptable for a host-lifetime object).
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:(A;;GA;;;WD)"),
+                w!("D:(A;;GA;;;SY)(A;;GA;;;LS)"),
                 SDDL_REVISION_1,
                 &mut psd,
                 None,
