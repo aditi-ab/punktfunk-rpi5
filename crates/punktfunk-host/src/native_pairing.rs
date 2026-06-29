@@ -282,7 +282,9 @@ impl NativePairing {
         match &arm.pin {
             None => PinAttempt::Disarmed,
             Some(pin) => match &arm.bound_fp {
-                Some(bound) if !bound.eq_ignore_ascii_case(client_fp_hex) => PinAttempt::BoundToOther,
+                Some(bound) if !bound.eq_ignore_ascii_case(client_fp_hex) => {
+                    PinAttempt::BoundToOther
+                }
                 _ => PinAttempt::Pin(pin.clone()),
             },
         }
@@ -441,7 +443,13 @@ impl NativePairing {
         // Per-source-IP cap: a single host can't occupy more than MAX_PENDING_PER_IP slots — evict its
         // own oldest entry first so it can't crowd out other devices' knocks (#13).
         if let Some(ip) = src_ip {
-            if pending.items.iter().filter(|p| p.src_ip == Some(ip)).count() >= MAX_PENDING_PER_IP {
+            if pending
+                .items
+                .iter()
+                .filter(|p| p.src_ip == Some(ip))
+                .count()
+                >= MAX_PENDING_PER_IP
+            {
                 if let Some(i) = Self::evict_index(&pending.items, Some(ip)) {
                     pending.items.remove(i);
                 }
@@ -572,7 +580,10 @@ impl NativePairing {
                 self.np.set_parked(self.fp, false);
             }
         }
-        let _park = ParkGuard { np: self, fp: fp_hex };
+        let _park = ParkGuard {
+            np: self,
+            fp: fp_hex,
+        };
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             // Arm the wakeup BEFORE re-reading state, and `enable()` it, so an approve/deny that
@@ -833,7 +844,10 @@ mod tests {
         // the caller rejects it WITHOUT consuming the window.
         let pin = np.arm_for(Duration::from_secs(60), Some("AA11".into()));
         assert!(matches!(np.pin_for_attempt("aa11"), PinAttempt::Pin(x) if x == pin));
-        assert!(matches!(np.pin_for_attempt("bb22"), PinAttempt::BoundToOther));
+        assert!(matches!(
+            np.pin_for_attempt("bb22"),
+            PinAttempt::BoundToOther
+        ));
         np.disarm();
         assert!(matches!(np.pin_for_attempt("aa11"), PinAttempt::Disarmed));
         let _ = std::fs::remove_file(&p);
