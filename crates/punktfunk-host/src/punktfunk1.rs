@@ -532,10 +532,25 @@ async fn serve_session(
         .await
         .map_err(|_| anyhow!("first message timeout"))??;
     if let Ok(req) = PairRequest::decode(&first) {
-        // Read the live arming PIN per attempt, so a window that lapsed no longer pairs.
-        let pin = np
-            .current_pin()
-            .context("pairing not armed (arm it in the console, or start with --allow-pairing)")?;
+        // The client fingerprint (cert possession is proven by the QUIC handshake) is needed to honor
+        // a fingerprint-bound PIN window (#9): a window the operator armed for a SPECIFIC device must
+        // not be consumable — or burnable — by any other fingerprint.
+        let client_fp = endpoint::peer_fingerprint(&conn)
+            .ok_or_else(|| anyhow!("pairing requires the client to present a certificate"))?;
+        let client_fp_hex = fingerprint_hex(&client_fp);
+        // Resolve the live arming PIN per attempt (so a lapsed window no longer pairs), honoring any
+        // fingerprint binding.
+        let pin = match np.pin_for_attempt(&client_fp_hex) {
+            crate::native_pairing::PinAttempt::Pin(pin) => pin,
+            crate::native_pairing::PinAttempt::Disarmed => anyhow::bail!(
+                "pairing not armed (arm it in the console, or start with --allow-pairing)"
+            ),
+            // Armed for a DIFFERENT device — reject without running the ceremony, so this attempt does
+            // NOT consume (burn) the operator's window for the device they actually selected (#9).
+            crate::native_pairing::PinAttempt::BoundToOther => anyhow::bail!(
+                "pairing is armed for a different device — this attempt does not consume the window"
+            ),
+        };
         {
             let mut last = last_pairing.lock().unwrap();
             if let Some(t) = *last {
@@ -589,7 +604,9 @@ async fn serve_session(
             );
             tracing::info!(name = %label, fingerprint = %fp_hex,
                 "unpaired device knocked — parking connection for delegated approval in the console");
-            np.note_pending(&label, &fp_hex);
+            // Record the QUIC-validated source IP so the pending queue's per-source cap can stop one
+            // host from flooding/evicting genuine knocks (#13).
+            np.note_pending(&label, &fp_hex, Some(peer.ip()));
             // Free the session slot while a human decides — a parked knock must not hold an NVENC
             // permit (a handful of parked knocks would otherwise block every real session).
             drop(permit);

@@ -394,6 +394,12 @@ struct ArmNativePairing {
     /// Window length in seconds (default 120; clamped to 15–600).
     #[schema(example = 120)]
     ttl_secs: Option<u32>,
+    /// Optional: bind the window to ONE device fingerprint (hex SHA-256, e.g. from a pending knock).
+    /// When set, only a pairing attempt from that fingerprint consumes the window — so an unpaired
+    /// LAN peer can neither pair nor burn a window armed for a specific device (security-review #9).
+    /// Omit for an unbound window (any device may use the PIN — trusted-LAN only).
+    #[schema(example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")]
+    fingerprint: Option<String>,
 }
 
 /// A paired native (punktfunk/1) client.
@@ -879,8 +885,21 @@ async fn arm_native_pairing(
         );
     };
     let ttl = req.ttl_secs.unwrap_or(120).clamp(15, 600);
-    let _pin = np.arm(std::time::Duration::from_secs(ttl as u64));
-    tracing::info!(ttl_secs = ttl, "management API: native pairing armed");
+    // A bound window (operator selected a specific device) is DoS-proof: only that fingerprint can
+    // consume it (#9). An unbound window (no fingerprint) keeps the legacy any-device behavior.
+    let bound = req
+        .fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+    let bound_to_device = bound.is_some();
+    let _pin = np.arm_for(std::time::Duration::from_secs(ttl as u64), bound);
+    tracing::info!(
+        ttl_secs = ttl,
+        bound_to_device,
+        "management API: native pairing armed"
+    );
     Json(native_status(&st)).into_response()
 }
 
@@ -1975,8 +1994,8 @@ mod tests {
         assert_eq!(b.as_array().unwrap().len(), 0);
 
         // Two devices knock (what the QUIC gate records); they appear in the list.
-        np.note_pending("Enrico's MacBook", "aa11");
-        np.note_pending("device bb22cc33", "bb22");
+        np.note_pending("Enrico's MacBook", "aa11", None);
+        np.note_pending("device bb22cc33", "bb22", None);
         let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
         assert_eq!(b.as_array().unwrap().len(), 2);
         assert_eq!(b[0]["name"], "Enrico's MacBook");

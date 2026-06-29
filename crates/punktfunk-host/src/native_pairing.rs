@@ -8,6 +8,7 @@
 //! armed on demand for a short window — rather than accepting one.
 
 use anyhow::Result;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -42,10 +43,29 @@ struct PairedState {
 
 /// The current arming window. `pin == None` ⇒ disarmed. `expires_at == None` ⇒ armed with no
 /// expiry (the CLI `--allow-pairing` flag); `Some(t)` ⇒ a web-armed window that auto-disarms.
+///
+/// `bound_fp == Some(fp)` ⇒ the window is **bound to one operator-selected device fingerprint**:
+/// only a pairing attempt from that fingerprint may consume it (security-review 2026-06-28 #9). This
+/// closes the window-burn DoS — an unpaired LAN peer cannot consume a window armed for a specific
+/// device, because the QUIC client-auth proves cert possession (it can't forge the bound fingerprint).
+/// `None` ⇒ unbound (the CLI flag / a console "arm open"): any well-formed attempt consumes it (the
+/// legacy behavior, retaining the window-burn DoS — acceptable only on a trusted LAN).
 #[derive(Default)]
 struct Armed {
     pin: Option<String>,
     expires_at: Option<Instant>,
+    bound_fp: Option<String>,
+}
+
+/// The result of resolving the armed PIN for a specific client fingerprint ([`NativePairing::pin_for_attempt`]).
+pub enum PinAttempt {
+    /// No window is armed (disarmed/expired) — reject; do not run the ceremony.
+    Disarmed,
+    /// A window IS armed but **bound to a different fingerprint** — reject WITHOUT consuming it, so
+    /// an unrelated (attacker) fingerprint can't burn the operator's armed window (#9).
+    BoundToOther,
+    /// Proceed: the PIN to run the ceremony with (the window is unbound, or bound to this fingerprint).
+    Pin(String),
 }
 
 /// An unpaired (but identified) device that knocked on a pairing-required host — held for
@@ -57,6 +77,13 @@ struct Pending {
     name: String,
     fp_hex: String,
     requested_at: Instant,
+    /// QUIC-validated source address of the knock — used for the per-source cap (#13), so one host
+    /// can't fill the queue. `None` if unknown (e.g. tests / a caller that doesn't supply it).
+    src_ip: Option<IpAddr>,
+    /// True while a connection is held open in [`NativePairing::wait_for_decision`] for this knock.
+    /// A live parked knock is a genuine device waiting for the operator — eviction skips it unless
+    /// every entry is parked, so a cert-rotating flood can't evict the device being onboarded (#13).
+    parked: bool,
 }
 
 #[derive(Default)]
@@ -94,6 +121,10 @@ pub enum PairingDecision {
 const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 /// Cap on the pending list — a LAN scanner must not grow it unboundedly. Oldest entries drop.
 const PENDING_CAP: usize = 32;
+/// Max pending knocks one source IP may occupy, so a single host can't fill the whole queue and hide
+/// / evict a genuine device's knock (security-review 2026-06-28 #13). The QUIC path is address-
+/// validated, so the source IP isn't off-path spoofable; an attacker would need that many real hosts.
+const MAX_PENDING_PER_IP: usize = 4;
 
 /// Shared native-pairing state: the arming PIN window + the persistent trust store + the
 /// pending-approval queue.
@@ -209,6 +240,7 @@ impl NativePairing {
             Armed {
                 pin: Some(fixed_pin.unwrap_or_else(random_pin)),
                 expires_at: None,
+                bound_fp: None,
             }
         } else {
             Armed::default()
@@ -221,14 +253,39 @@ impl NativePairing {
         })
     }
 
-    /// Arm pairing with a fresh random PIN, valid for `ttl`. Returns the PIN to display.
+    /// Arm pairing with a fresh random PIN, valid for `ttl`, **unbound** (any well-formed attempt
+    /// consumes it). Returns the PIN to display. Prefer [`Self::arm_for`] with a specific device
+    /// fingerprint on untrusted LANs — an unbound window is burnable by any peer (#9).
     pub fn arm(&self, ttl: Duration) -> String {
+        self.arm_for(ttl, None)
+    }
+
+    /// Arm pairing with a fresh random PIN, valid for `ttl`. If `bound_fp` is `Some`, the window is
+    /// bound to that device fingerprint: only a pairing attempt from it consumes the window, so an
+    /// unrelated (attacker) fingerprint can neither pair nor burn the window (#9). Returns the PIN.
+    pub fn arm_for(&self, ttl: Duration, bound_fp: Option<String>) -> String {
         let pin = random_pin();
         *self.arm.lock().unwrap() = Armed {
             pin: Some(pin.clone()),
             expires_at: Some(Instant::now() + ttl),
+            bound_fp,
         };
         pin
+    }
+
+    /// Resolve the PIN for an attempt from `client_fp_hex`, honoring fingerprint binding (#9):
+    /// `Disarmed` if no window is armed; `BoundToOther` if a window is armed but bound to a different
+    /// fingerprint (the caller MUST reject without consuming it); else `Pin` to run the ceremony.
+    pub fn pin_for_attempt(&self, client_fp_hex: &str) -> PinAttempt {
+        let mut arm = self.arm.lock().unwrap();
+        Self::expire(&mut arm);
+        match &arm.pin {
+            None => PinAttempt::Disarmed,
+            Some(pin) => match &arm.bound_fp {
+                Some(bound) if !bound.eq_ignore_ascii_case(client_fp_hex) => PinAttempt::BoundToOther,
+                _ => PinAttempt::Pin(pin.clone()),
+            },
+        }
     }
 
     /// Disarm pairing (no new ceremonies accepted).
@@ -342,11 +399,30 @@ impl NativePairing {
             .retain(|p| p.requested_at.elapsed() < PENDING_TTL);
     }
 
-    /// Record an unpaired device's knock for delegated approval. Re-knocks from the same
-    /// fingerprint refresh the existing entry in place (same id; a connect-retry loop must not spam
-    /// the list); a fresh fingerprint gets a new id, evicting the **least-recently-active** entry
-    /// past [`PENDING_CAP`]. The name is sanitized (untrusted; see [`sanitize_device_name`]).
-    pub fn note_pending(&self, name: &str, fp_hex: &str) {
+    /// Pick the entry to evict, optionally restricted to a single source IP: the least-recently-active
+    /// **non-parked** entry (a live parked knock is a genuine device awaiting the operator — never
+    /// evict it under load); only if every candidate is parked does it fall back to the oldest of
+    /// those (#13). Returns the index, or `None` if there's nothing to evict.
+    fn evict_index(items: &[Pending], only_ip: Option<IpAddr>) -> Option<usize> {
+        let pick = |allow_parked: bool| {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| only_ip.is_none_or(|ip| p.src_ip == Some(ip)))
+                .filter(|(_, p)| allow_parked || !p.parked)
+                .min_by_key(|(_, p)| p.requested_at)
+                .map(|(i, _)| i)
+        };
+        pick(false).or_else(|| pick(true))
+    }
+
+    /// Record an unpaired device's knock for delegated approval. Re-knocks from the same fingerprint
+    /// refresh the existing entry in place (same id; a connect-retry loop must not spam the list). A
+    /// fresh fingerprint gets a new id; the queue is bounded two ways so a flood can't crowd out a
+    /// genuine knock (#13): a **per-source-IP cap** ([`MAX_PENDING_PER_IP`]) means one host can hold at
+    /// most a few slots, and the global [`PENDING_CAP`] evicts the least-recently-active **non-parked**
+    /// entry (never a live, held-open parked knock). The name is sanitized (untrusted).
+    pub fn note_pending(&self, name: &str, fp_hex: &str, src_ip: Option<IpAddr>) {
         let name = sanitize_device_name(name, fp_hex);
         let mut pending = self.pending.lock().unwrap();
         Self::expire_pending(&mut pending);
@@ -357,19 +433,25 @@ impl NativePairing {
         {
             p.requested_at = Instant::now();
             p.name = name;
+            if p.src_ip.is_none() {
+                p.src_ip = src_ip;
+            }
             return;
         }
+        // Per-source-IP cap: a single host can't occupy more than MAX_PENDING_PER_IP slots — evict its
+        // own oldest entry first so it can't crowd out other devices' knocks (#13).
+        if let Some(ip) = src_ip {
+            if pending.items.iter().filter(|p| p.src_ip == Some(ip)).count() >= MAX_PENDING_PER_IP {
+                if let Some(i) = Self::evict_index(&pending.items, Some(ip)) {
+                    pending.items.remove(i);
+                }
+            }
+        }
+        // Global cap: evict the least-recently-active non-parked entry (Vec order no longer tracks
+        // recency after in-place refreshes, so pick explicitly).
         if pending.items.len() >= PENDING_CAP {
-            // Evict the least-recently-active entry. NOT index 0: the in-place refresh above means
-            // Vec order no longer tracks recency, so pick the minimum `requested_at` explicitly.
-            if let Some(at) = pending
-                .items
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, p)| p.requested_at)
-                .map(|(i, _)| i)
-            {
-                pending.items.remove(at);
+            if let Some(i) = Self::evict_index(&pending.items, None) {
+                pending.items.remove(i);
             }
         }
         let id = pending.next_id;
@@ -379,7 +461,22 @@ impl NativePairing {
             name,
             fp_hex: fp_hex.to_string(),
             requested_at: Instant::now(),
+            src_ip,
+            parked: false,
         });
+    }
+
+    /// Mark/unmark the pending entry for `fp_hex` as having a live parked waiter (no-op if it's gone).
+    /// A parked entry is protected from eviction under load (#13).
+    fn set_parked(&self, fp_hex: &str, parked: bool) {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(p) = pending
+            .items
+            .iter_mut()
+            .find(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex))
+        {
+            p.parked = parked;
+        }
     }
 
     /// The devices currently awaiting approval (for the management API).
@@ -462,6 +559,20 @@ impl NativePairing {
     /// to keep the knocking connection open until a human clicks Approve — so the device pairs and
     /// streams with no reconnect (delegated approval, roadmap §8b-1).
     pub async fn wait_for_decision(&self, fp_hex: &str, timeout: Duration) -> PairingDecision {
+        // Mark this knock parked so a cert-rotating flood can't evict the genuine, held-open
+        // connection out of the pending queue while the operator decides (#13). Cleared on every
+        // exit path by the guard's Drop.
+        self.set_parked(fp_hex, true);
+        struct ParkGuard<'a> {
+            np: &'a NativePairing,
+            fp: &'a str,
+        }
+        impl Drop for ParkGuard<'_> {
+            fn drop(&mut self) {
+                self.np.set_parked(self.fp, false);
+            }
+        }
+        let _park = ParkGuard { np: self, fp: fp_hex };
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             // Arm the wakeup BEFORE re-reading state, and `enable()` it, so an approve/deny that
@@ -548,8 +659,8 @@ mod tests {
 
         // A knock appears; a re-knock from the same fingerprint refreshes (same id, new name)
         // instead of duplicating.
-        np.note_pending("device aa11", "AA11");
-        np.note_pending("Bedroom TV", "aa11");
+        np.note_pending("device aa11", "AA11", None);
+        np.note_pending("Bedroom TV", "aa11", None);
         let pend = np.pending();
         assert_eq!(pend.len(), 1, "re-knock dedups by fingerprint");
         assert_eq!(pend[0].name, "Bedroom TV");
@@ -562,7 +673,7 @@ mod tests {
         assert!(!np.is_paired("aa11"));
 
         // Approve pairs the fingerprint (operator label wins) and clears the entry.
-        np.note_pending("device bb22", "BB22");
+        np.note_pending("device bb22", "BB22", None);
         let id = np.pending()[0].id;
         assert!(
             np.approve_pending(9999, None).unwrap().is_none(),
@@ -578,8 +689,11 @@ mod tests {
         assert_eq!(np.list()[0].name, "Living Room");
 
         // The cap evicts the oldest knock.
+        // Flood from many DISTINCT source IPs (so the per-IP cap doesn't kick in) → the global cap
+        // holds at PENDING_CAP, evicting the oldest non-parked entries first.
         for i in 0..(PENDING_CAP + 3) {
-            np.note_pending("flood", &format!("f{i:03}"));
+            let ip = IpAddr::from([10, 0, (i / 256) as u8, (i % 256) as u8]);
+            np.note_pending("flood", &format!("f{i:03}"), Some(ip));
         }
         let pend = np.pending();
         assert_eq!(pend.len(), PENDING_CAP);
@@ -610,7 +724,7 @@ mod tests {
         let p = temp();
         let _ = std::fs::remove_file(&p);
         let np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
-        np.note_pending("Knocker", "cc44");
+        np.note_pending("Knocker", "cc44", None);
         assert_eq!(np.pending().len(), 1);
         // Pairing the same fingerprint (e.g. via the PIN ceremony) drops the stale pending entry.
         np.add("Knocker", "CC44").unwrap();
@@ -656,7 +770,7 @@ mod tests {
         let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
 
         // TimedOut: a parked knock with no decision returns TimedOut; the entry survives.
-        np.note_pending("Knocker", "ab01");
+        np.note_pending("Knocker", "ab01", None);
         let d = np
             .wait_for_decision("ab01", Duration::from_millis(80))
             .await;
@@ -681,7 +795,7 @@ mod tests {
         assert!(np.is_paired("ab01"));
 
         // Denied: denying WHILE parked wakes the waiter with Denied (not held until timeout).
-        np.note_pending("Knock2", "cd02");
+        np.note_pending("Knock2", "cd02", None);
         let np3 = np.clone();
         let waiter =
             tokio::spawn(
@@ -701,6 +815,61 @@ mod tests {
         // Already paired before the call → immediate Approved (no waiting).
         let d = np.wait_for_decision("ab01", Duration::from_secs(5)).await;
         assert_eq!(d, PairingDecision::Approved);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #9: a window can be bound to one operator-selected fingerprint, so an unrelated (attacker)
+    /// fingerprint can neither pair nor BURN the window (it's rejected without a PIN).
+    #[test]
+    fn armed_pin_is_fingerprint_bindable() {
+        let p = temp();
+        let _ = std::fs::remove_file(&p);
+        let np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
+        // Unbound: any fingerprint resolves to the PIN (legacy behavior).
+        let pin = np.arm(Duration::from_secs(60));
+        assert!(matches!(np.pin_for_attempt("aa11"), PinAttempt::Pin(x) if x == pin));
+        assert!(matches!(np.pin_for_attempt("bb22"), PinAttempt::Pin(_)));
+        // Bound to AA11: only that fp (case-insensitive) gets the PIN; another fp is BoundToOther —
+        // the caller rejects it WITHOUT consuming the window.
+        let pin = np.arm_for(Duration::from_secs(60), Some("AA11".into()));
+        assert!(matches!(np.pin_for_attempt("aa11"), PinAttempt::Pin(x) if x == pin));
+        assert!(matches!(np.pin_for_attempt("bb22"), PinAttempt::BoundToOther));
+        np.disarm();
+        assert!(matches!(np.pin_for_attempt("aa11"), PinAttempt::Disarmed));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #13: one source IP can't exceed the per-IP cap, and a parked (held-open) genuine knock is
+    /// never evicted by a flood — even one that fills the global cap from many distinct IPs.
+    #[test]
+    fn pending_per_ip_cap_and_parked_protection() {
+        let p = temp();
+        let _ = std::fs::remove_file(&p);
+        let np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
+        // Per-IP cap: one source flooding distinct fingerprints holds at most MAX_PENDING_PER_IP.
+        let attacker = IpAddr::from([192, 168, 1, 66]);
+        for i in 0..20 {
+            np.note_pending("flood", &format!("atk{i:03}"), Some(attacker));
+        }
+        assert_eq!(
+            np.pending().len(),
+            MAX_PENDING_PER_IP,
+            "one IP can't exceed the per-IP cap"
+        );
+        // A genuine knock from a different IP, parked (a live held-open connection), survives a flood
+        // from many distinct IPs that fills the global cap.
+        let legit = IpAddr::from([192, 168, 1, 50]);
+        np.note_pending("Living Room", "legit01", Some(legit));
+        np.set_parked("legit01", true);
+        for i in 0..(PENDING_CAP * 2) {
+            let ip = IpAddr::from([10, 0, (i / 256) as u8, (i % 256) as u8]);
+            np.note_pending("flood2", &format!("g{i:04}"), Some(ip));
+        }
+        assert!(
+            np.pending_contains("legit01"),
+            "a parked, held-open knock is never evicted by a flood"
+        );
+        assert!(np.pending().len() <= PENDING_CAP, "global cap still holds");
         let _ = std::fs::remove_file(&p);
     }
 }

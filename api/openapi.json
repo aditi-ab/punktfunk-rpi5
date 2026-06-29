@@ -1354,6 +1354,14 @@
         "type": "object",
         "description": "Arm-native-pairing request body.",
         "properties": {
+          "fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional: bind the window to ONE device fingerprint (hex SHA-256, e.g. from a pending knock).\nWhen set, only a pairing attempt from that fingerprint consumes the window — so an unpaired\nLAN peer can neither pair nor burn a window armed for a specific device (security-review #9).\nOmit for an unbound window (any device may use the PIN — trusted-LAN only).",
+            "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+          },
           "ttl_secs": {
             "type": [
               "integer",
