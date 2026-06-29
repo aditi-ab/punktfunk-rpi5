@@ -364,7 +364,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Config/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
+				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunk";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
@@ -398,7 +398,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Config/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
+				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunk";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
@@ -429,7 +429,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Config/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
+				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunk";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Your microphone is streamed to the connected punktfunk host, where it appears as a virtual microphone.";
@@ -468,7 +468,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Config/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
+				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunk";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Your microphone is streamed to the connected punktfunk host, where it appears as a virtual microphone.";
@@ -506,7 +506,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Config/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
+				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunk";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -536,7 +536,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Config/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunkempfänger";
+				INFOPLIST_KEY_CFBundleDisplayName = "Punktfunk";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Punktfunk connects directly to your punktfunk host on the local network to stream video, audio, and input.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
