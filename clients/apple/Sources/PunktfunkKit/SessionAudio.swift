@@ -177,6 +177,16 @@ public final class SessionAudio {
     private var playbackEngine: AVAudioEngine?
     private var captureEngine: AVAudioEngine?
     private var drainStarted = false
+    #if !os(macOS)
+    /// AVAudioSession `setCategory`/`setActive` are synchronous and block on the audio server, so
+    /// they must not run on the main thread (UI stall — AVFoundation warns about it). PROCESS-WIDE
+    /// (static) so every SessionAudio shares one serial queue: the AVAudioSession is a process
+    /// singleton, and across a reconnect the old session's deactivate must be ordered before the
+    /// new session's activate (a per-instance queue would let them race and leave the new session's
+    /// audio deactivated). stop() enqueues its deactivate promptly so it lands before the next
+    /// session's activate.
+    private static let sessionQueue = DispatchQueue(label: "io.unom.punktfunk.audio.session")
+    #endif
 
     public init(connection: PunktfunkConnection) {
         self.connection = connection
@@ -189,37 +199,60 @@ public final class SessionAudio {
         flag.stop()
     }
 
-    /// Start playback (and, if enabled+authorized, the mic uplink). Empty UIDs = system
-    /// default device; on iOS the UIDs are ignored entirely (routes are
-    /// AVAudioSession-managed). Main thread (engine setup); returns after the engines
-    /// start — the mic may start slightly later if the permission prompt is pending.
+    /// Start playback (and, if enabled+authorized, the mic uplink). Empty UIDs = system default
+    /// device; on iOS the UIDs are ignored entirely (routes are AVAudioSession-managed). On macOS
+    /// the engines start synchronously on the caller's (main) thread. On iOS/tvOS start() is
+    /// ASYNCHRONOUS: it activates the AVAudioSession off the main thread, then starts the engines on
+    /// a later main-queue hop (gated by `!flag.isStopped`) — so playback is live shortly after, not
+    /// on return. The mic may start later still if the permission prompt is pending.
     public func start(speakerUID: String, micUID: String, micEnabled: Bool) {
-        #if os(iOS)
-        // Route + policy live in the session, not per-engine: stereo playback, mic
-        // capture when enabled, Bluetooth allowed. Failure is non-fatal (defaults).
+        #if os(macOS)
+        // No AVAudioSession on macOS — start the engines directly (caller's thread, as before).
+        startEngines(speakerUID: speakerUID, micUID: micUID, micEnabled: micEnabled)
+        #else
+        // Configure + activate the session OFF the main thread (it blocks on the audio server),
+        // then start the engines back on the main thread once it's active — engine routing/format
+        // depend on the active session. A stop() racing in between is caught by the flag guard.
+        Self.sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.activateAudioSession(micEnabled: micEnabled)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.flag.isStopped else { return }
+                self.startEngines(speakerUID: speakerUID, micUID: micUID, micEnabled: micEnabled)
+            }
+        }
+        #endif
+    }
+
+    #if !os(macOS)
+    /// Route + policy live in the session, not per-engine: stereo playback, mic capture when
+    /// enabled, Bluetooth allowed. Failure is non-fatal (defaults). Runs on `sessionQueue`.
+    private func activateAudioSession(micEnabled: Bool) {
         let session = AVAudioSession.sharedInstance()
         do {
+            #if os(iOS)
             if micEnabled {
-                // .defaultToSpeaker: .playAndRecord otherwise routes to the iPhone
-                // EARPIECE; only affects the built-in route (headphones/BT still win).
+                // .defaultToSpeaker: .playAndRecord otherwise routes to the iPhone EARPIECE; only
+                // affects the built-in route (headphones/BT still win).
                 try session.setCategory(
                     .playAndRecord, mode: .default,
                     options: [.allowBluetoothA2DP, .defaultToSpeaker])
             } else {
                 try session.setCategory(.playback, mode: .default)
             }
+            #else // tvOS — no app-accessible mic
+            try session.setCategory(.playback, mode: .default)
+            #endif
             try session.setActive(true)
         } catch {
             log.warning("AVAudioSession setup failed: \(error.localizedDescription)")
         }
-        #elseif os(tvOS)
-        do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
-            try AVAudioSession.sharedInstance().setActive(true)
-        } catch {
-            log.warning("AVAudioSession setup failed: \(error.localizedDescription)")
-        }
-        #endif
+    }
+    #endif
+
+    /// Build + start the playback engine (and the mic uplink when enabled + authorized). Main
+    /// thread (engine setup); on iOS/tvOS the session is already active by the time this runs.
+    private func startEngines(speakerUID: String, micUID: String, micEnabled: Bool) {
         startPlayback(speakerUID: speakerUID)
         #if os(tvOS)
         // No app-accessible microphone input on tvOS — playback only.
@@ -258,19 +291,24 @@ public final class SessionAudio {
             capture.stop()
         }
         playback?.stop()
+        #if !os(macOS)
+        // Release the session so audio we interrupted (Music, podcasts) gets its resume cue. Like
+        // activation, setActive is synchronous/blocking — run it on the shared serial session queue
+        // (off the main thread). Enqueued HERE — engines already stopped, and BEFORE the drain wait
+        // below — so across a reconnect it lands ahead of the next session's activate on the shared
+        // queue (otherwise a deferred deactivate could deactivate the new session). Fire-and-forget.
+        Self.sessionQueue.async {
+            do {
+                try AVAudioSession.sharedInstance().setActive(
+                    false, options: .notifyOthersOnDeactivation)
+            } catch {
+                log.warning("AVAudioSession deactivation failed: \(error.localizedDescription)")
+            }
+        }
+        #endif
         if wasDraining {
             _ = drainDone.wait(timeout: .now() + .milliseconds(400))
         }
-        #if !os(macOS)
-        // Release the session so audio we interrupted (Music, podcasts) gets its
-        // resume cue.
-        do {
-            try AVAudioSession.sharedInstance().setActive(
-                false, options: .notifyOthersOnDeactivation)
-        } catch {
-            log.warning("AVAudioSession deactivation failed: \(error.localizedDescription)")
-        }
-        #endif
     }
 
     // MARK: - Playback (host → speaker)

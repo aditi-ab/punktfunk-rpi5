@@ -146,7 +146,7 @@ private struct GameCard: View {
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay(alignment: .topLeading) { storeBadge }
             Text(game.title)
-                .font(.caption)
+                .font(.geist(12, relativeTo: .caption))
                 .lineLimit(2)
                 .foregroundStyle(.secondary)
         }
@@ -154,7 +154,7 @@ private struct GameCard: View {
 
     private var storeBadge: some View {
         Text(game.isCustom ? "Custom" : "Steam")
-            .font(.caption2.weight(.semibold))
+            .font(.geist(11, .semibold, relativeTo: .caption2))
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
             .background(.ultraThinMaterial, in: Capsule())
@@ -193,7 +193,7 @@ private struct PosterImage: View {
         ZStack {
             Rectangle().fill(.quaternary)
             Text(title)
-                .font(.headline)
+                .font(.geist(17, .semibold, relativeTo: .headline))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .padding(8)

@@ -69,19 +69,19 @@ struct StreamHUDView: View {
             Text(model.mouseCaptured
                 ? "⌘⎋ releases the mouse"
                 : "Click the stream to capture input")
-                .font(.caption2)
+                .font(.geist(11, relativeTo: .caption2))
                 .foregroundStyle(.secondary)
             // The client-side cursor (⌘⇧C) draws the local cursor over the stream instead of
             // capturing it — the only accurate cursor for gamescope, whose capture has none.
             Text("⌘⇧C toggles the on-screen cursor")
-                .font(.caption2)
+                .font(.geist(11, relativeTo: .caption2))
                 .foregroundStyle(.secondary)
             #elseif os(iOS)
             // Touch always plays directly; ⌘⎋ (hardware keyboard) toggles kb/mouse.
             Text(model.mouseCaptured
                 ? "⌘⎋ releases keyboard & mouse"
                 : "⌘⎋ captures keyboard & mouse")
-                .font(.caption2)
+                .font(.geist(11, relativeTo: .caption2))
                 .foregroundStyle(.secondary)
             #endif
             #if os(tvOS)
@@ -89,13 +89,13 @@ struct StreamHUDView: View {
             // A press (the focus engine consumes it before the host sees it). Disconnect is
             // the Siri Remote's Menu button (.onExitCommand on the stream) — just hint it.
             Text("Press Menu to disconnect")
-                .font(.caption)
+                .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
             #else
             // ⌘D lives on the app's Stream menu (so it still works when the HUD is hidden);
             // this button is the in-overlay, click-to-disconnect affordance.
             Button("Disconnect (⌘D)") { model.disconnect() }
-                .font(.caption)
+                .font(.geist(12, relativeTo: .caption))
             #endif
         }
         .padding(10)

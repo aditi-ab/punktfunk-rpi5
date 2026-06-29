@@ -136,6 +136,13 @@ public final class StreamViewController: UIViewController {
 
     public override func loadView() {
         view = StreamLayerUIView()
+        // Re-size the stage-2 drawable if the display scale changes without a bounds change (e.g.
+        // moving to an external display at a different scale) — the iOS analogue of macOS's
+        // viewDidChangeBackingProperties relayout. The handler takes the VC as its argument, so it
+        // doesn't capture self (no retain cycle with the registration).
+        registerForTraitChanges([UITraitDisplayScale.self]) { (vc: StreamViewController, _) in
+            vc.layoutMetalLayer()
+        }
         #if os(iOS)
         // Hide the iPadOS cursor while it hovers the video: the host renders its own
         // cursor from our deltas, so the local one only diverges from it. This hides the
@@ -219,10 +226,17 @@ public final class StreamViewController: UIViewController {
         inputCapture = capture
         #endif
 
-        // Presenter choice — default stage-1 (the known-good AVSampleBufferDisplayLayer). Stage-2
-        // (`punktfunk.presenter == "stage2"`) takes VTDecompressionSession decode + a
-        // CAMetalLayer/display-link present; falls back here if Metal can't be set up.
-        if UserDefaults.standard.string(forKey: DefaultsKey.presenter) == "stage2",
+        // Presenter choice — stage-2 is the DEFAULT (VTDecompressionSession decode + a
+        // CAMetalLayer/display-link present): it can detect + recover a wedged decoder, where
+        // stage-1's AVSampleBufferDisplayLayer freezes hard on a lost HEVC reference frame with no
+        // way to recover. Stage-1 is reachable only via the DEBUG presenter toggle; release always
+        // takes stage-2 (the stage-1 pump below stays the automatic fallback if Metal is missing).
+        #if DEBUG
+        let forceStage1 = UserDefaults.standard.string(forKey: DefaultsKey.presenter) == "stage1"
+        #else
+        let forceStage1 = false
+        #endif
+        if !forceStage1,
            let meter = presentMeter,
            let pipeline = Stage2Pipeline(presentMeter: meter) {
             startStage2(pipeline, connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
@@ -300,8 +314,8 @@ public final class StreamViewController: UIViewController {
         onFrame: (@Sendable (AccessUnit) -> Void)?, onSessionEnd: (@Sendable () -> Void)?
     ) {
         let metal = pipeline.layer
-        metal.contentsScale = streamView.contentScaleFactor
         // Composites OVER the idle (un-enqueued in stage-2) AVSampleBufferDisplayLayer base.
+        // (contentsScale + frame + drawableSize are all set by layoutMetalLayer() just below.)
         streamView.layer.addSublayer(metal)
         metalLayer = metal
         stage2 = pipeline
@@ -325,9 +339,20 @@ public final class StreamViewController: UIViewController {
         layoutMetalLayer()
     }
 
-    /// Aspect-fit the metal sublayer in the view (the host streams at the client's native mode,
-    /// so this is usually the full bounds). drawableSize is the layer's pixel size; the shader's
-    /// fullscreen triangle scales the decoded texture to fill it.
+    /// The display scale to render the metal drawable at. `traitCollection.displayScale` is the
+    /// canonical render scale and is reliable once the controller is in the hierarchy;
+    /// `view.contentScaleFactor` can read 1.0 before the view attaches to a window/screen, which
+    /// would size the drawable at point resolution → a pixelated, upscaled mess. Falls back to the
+    /// main screen scale if the trait is still unspecified.
+    private var renderScale: CGFloat {
+        let s = traitCollection.displayScale
+        return s > 0 ? s : UIScreen.main.scale
+    }
+
+    /// Position the metal sublayer aspect-fit in the view (the host streams at the client's native
+    /// mode, so this is usually the full bounds). Only the layer FRAME is set here — the presenter
+    /// sizes the drawable to the decoded frame and the layer's contentsGravity (.resizeAspect)
+    /// scales it to this frame via the system compositor (matching stage-1's videoGravity).
     private func layoutMetalLayer() {
         guard let metalLayer, let connection else { return }
         let mode = connection.currentMode()
@@ -337,13 +362,11 @@ public final class StreamViewController: UIViewController {
                 aspectRatio: CGSize(width: Int(mode.width), height: Int(mode.height)),
                 insideRect: bounds)
             : bounds
-        let scale = streamView.contentScaleFactor
         CATransaction.begin()
         CATransaction.setDisableActions(true) // don't animate the resize
-        metalLayer.contentsScale = scale
+        metalLayer.contentsScale = renderScale
         metalLayer.frame = fit
         CATransaction.commit()
-        stage2?.setDrawableSize(CGSize(width: fit.width * scale, height: fit.height * scale))
     }
 
     private func teardownStage2() {

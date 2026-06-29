@@ -245,6 +245,15 @@ public final class StreamLayerView: NSView {
         layoutMetalLayer() // keep the stage-2 sublayer aspect-fit to the view
     }
 
+    public override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        // `layout()` isn't guaranteed on a manual-frame (no-Auto-Layout) live resize, so the
+        // stage-2 metal sublayer's drawableSize could stay at the old size while the view grows —
+        // the compositor then upscales a too-small drawable and the video turns blocky. Resize the
+        // drawable here too so it always tracks the window's pixel size (no stale upscale).
+        layoutMetalLayer()
+    }
+
     // MARK: - Capture state machine
 
     /// Clicking into the video engages capture; that click is local (engagement), so
@@ -549,10 +558,17 @@ public final class StreamLayerView: NSView {
         cursorVisible = false
         _ = connection.resolvedCompositor // (was: Auto → gamescope; kept to document intent)
 
-        // Presenter choice — default stage-1 (the known-good AVSampleBufferDisplayLayer). Stage-2
-        // (`punktfunk.presenter == "stage2"`) takes explicit VTDecompressionSession decode + a
-        // CAMetalLayer/display-link present; it falls back here if Metal can't be set up.
-        if UserDefaults.standard.string(forKey: DefaultsKey.presenter) == "stage2",
+        // Presenter choice — stage-2 is the DEFAULT (explicit VTDecompressionSession decode + a
+        // CAMetalLayer/display-link present): it can detect + recover a wedged decoder where
+        // stage-1's AVSampleBufferDisplayLayer freezes hard on a lost HEVC reference. Stage-1 is
+        // reachable only via the DEBUG presenter toggle; release always takes stage-2 (the stage-1
+        // pump below stays the automatic fallback if Metal is missing).
+        #if DEBUG
+        let forceStage1 = UserDefaults.standard.string(forKey: DefaultsKey.presenter) == "stage1"
+        #else
+        let forceStage1 = false
+        #endif
+        if !forceStage1,
            let meter = presentMeter,
            let pipeline = Stage2Pipeline(presentMeter: meter) {
             startStage2(pipeline, connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
@@ -593,9 +609,11 @@ public final class StreamLayerView: NSView {
             targetPresentNs: Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: link.targetTimestamp))
     }
 
-    /// Aspect-fit the metal sublayer in the view (the host streams at the client's native mode,
-    /// so this is usually the full bounds; it letterboxes a resized window). drawableSize is the
-    /// layer's pixel size — the fullscreen-triangle shader scales the decoded texture to fill it.
+    /// Position the metal sublayer aspect-fit in the view (the host streams at the client's native
+    /// mode, so this is usually the full bounds; it letterboxes a resized window). Only the layer
+    /// FRAME is set here — the presenter sizes the drawable to the decoded frame and the layer's
+    /// contentsGravity (.resizeAspect) scales it to this frame via the system compositor, so a
+    /// resized window rescales through the system's filter (matching stage-1) instead of the shader.
     private func layoutMetalLayer() {
         guard let metalLayer, let connection else { return }
         let mode = connection.currentMode()
@@ -604,14 +622,12 @@ public final class StreamLayerView: NSView {
                 aspectRatio: CGSize(width: Int(mode.width), height: Int(mode.height)),
                 insideRect: bounds)
             : bounds
-        let scale = window?.backingScaleFactor ?? 1
         // No implicit resize animation; refresh contentsScale on a retina↔non-retina move.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        metalLayer.contentsScale = scale
+        metalLayer.contentsScale = window?.backingScaleFactor ?? 1
         metalLayer.frame = fit
         CATransaction.commit()
-        stage2?.setDrawableSize(CGSize(width: fit.width * scale, height: fit.height * scale))
     }
 
     public override func viewDidChangeBackingProperties() {

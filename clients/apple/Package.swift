@@ -24,6 +24,9 @@ let package = Package(
                 .copy("Resources/THIRD-PARTY-NOTICES.txt"),
                 .copy("Resources/LICENSE-MIT.txt"),
                 .copy("Resources/LICENSE-APACHE.txt"),
+                // Geist (SIL OFL 1.1) — the brand typeface, shared with punktfunk-website.
+                // Registered with Core Text at first use; see BrandFont.swift.
+                .copy("Resources/Fonts"),
             ],
             linkerSettings: [
                 // Rust staticlib system deps.

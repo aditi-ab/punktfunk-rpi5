@@ -54,7 +54,7 @@ struct ControllerTestView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Test Controller").font(.headline)
+                Text("Test Controller").font(.geist(17, .semibold, relativeTo: .headline))
                 Spacer()
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }
@@ -99,8 +99,8 @@ struct ControllerTestView: View {
                 .font(.title2)
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 2) {
-                Text(c.name).font(.headline)
-                Text(c.productCategory).font(.caption).foregroundStyle(.secondary)
+                Text(c.name).font(.geist(17, .semibold, relativeTo: .headline))
+                Text(c.productCategory).font(.geist(12, relativeTo: .caption)).foregroundStyle(.secondary)
             }
             Spacer()
         }
@@ -209,7 +209,7 @@ struct ControllerTestView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Touchpad\(tp.button.isPressed ? " — click" : "")")
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.geist(11, relativeTo: .caption2)).foregroundStyle(.secondary)
             ZStack {
                 RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3))
                 fingerDot(tp.primary, color: .accentColor)
@@ -230,7 +230,7 @@ struct ControllerTestView: View {
     private func motionReadout(_ m: GCMotion) -> some View {
         let a = Self.totalAccel(m)
         return VStack(alignment: .leading, spacing: 2) {
-            Text("Motion").font(.caption2).foregroundStyle(.secondary)
+            Text("Motion").font(.geist(11, relativeTo: .caption2)).foregroundStyle(.secondary)
             Text(String(format: "gyro  %+.2f %+.2f %+.2f",
                         m.rotationRate.x, m.rotationRate.y, m.rotationRate.z))
                 .font(.caption2.monospaced())
@@ -254,11 +254,11 @@ struct ControllerTestView: View {
                 Toggle("Heavy motor (left)", isOn: $heavyOn)
                 Toggle("Light motor (right)", isOn: $lightOn)
                 Label("Backend: \(tester.rumbleBackend)", systemImage: "waveform")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.geist(12, relativeTo: .caption)).foregroundStyle(.secondary)
                 Text("Toggle a motor to feel it. The host maps a game's low/high-frequency "
                     + "rumble onto these two. A DualSense is driven over raw HID (CoreHaptics "
                     + "can't reach its motors on macOS).")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.geist(12, relativeTo: .caption)).foregroundStyle(.secondary)
             }
             .onChange(of: heavyOn) { _, _ in applyRumble() }
             .onChange(of: lightOn) { _, _ in applyRumble() }
@@ -289,11 +289,11 @@ struct ControllerTestView: View {
                         }
                     }
                     Text("Pick an effect, then pull L2/R2 to feel the resistance.")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.geist(12, relativeTo: .caption)).foregroundStyle(.secondary)
                 }
             } else {
                 Text("Adaptive triggers need a DualSense.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.geist(12, relativeTo: .caption)).foregroundStyle(.secondary)
             }
         }
     }
@@ -348,7 +348,7 @@ struct ControllerTestView: View {
         _ title: String, @ViewBuilder _ content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title).font(.subheadline.weight(.semibold))
+            Text(title).font(.geist(15, .semibold, relativeTo: .subheadline))
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)

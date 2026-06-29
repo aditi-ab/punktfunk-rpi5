@@ -12,20 +12,36 @@ struct PunktfunkClientApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     #endif
 
+    init() {
+        #if os(iOS)
+        // Put Geist on the navigation titles before any bar is built.
+        BrandTheme.apply()
+        #endif
+    }
+
     var body: some Scene {
         WindowGroup("Punktfunk") {
-            #if DEBUG
-            // PUNKTFUNK_SHOT_SCENE=<name> → show that single mock-populated screen full-bleed for
-            // the App Store screenshot capture (tools/screenshots.sh). Normal launch otherwise;
-            // the whole path is absent from Release builds.
-            if let scene = ScreenshotMode.requestedScene {
-                ScreenshotHostView(scene: scene)
-            } else {
+            // Pin the whole app's tint to the brand purple explicitly — the asset-catalog accent
+            // resolution is environment/timing-sensitive and can fall back to system blue. Wraps the
+            // screenshot harness too, so captured screens are on-brand.
+            Group {
+                #if DEBUG
+                // PUNKTFUNK_SHOT_SCENE=<name> → show that single mock-populated screen full-bleed for
+                // the App Store screenshot capture (tools/screenshots.sh). Normal launch otherwise;
+                // the whole path is absent from Release builds.
+                if let scene = ScreenshotMode.requestedScene {
+                    ScreenshotHostView(scene: scene)
+                } else {
+                    ContentView()
+                }
+                #else
                 ContentView()
+                #endif
             }
-            #else
-            ContentView()
-            #endif
+            .tint(.brand)
+            // Geist Sans is the app's typeface. This sets the default for unstyled text and the
+            // form row labels; views that pick an explicit size/weight use `.geist(…)` directly.
+            .font(.geist(17, relativeTo: .body))
         }
         // The Stream menu (Disconnect ⌘D, Show/Hide Statistics ⌘⇧S) — a real menu bar on
         // macOS, hardware-keyboard shortcuts on iPad. tvOS has neither.
@@ -34,7 +50,10 @@ struct PunktfunkClientApp: App {
         #endif
         #if os(macOS)
         Settings {
+            // A separate scene — `.tint` does not cross scene boundaries, so re-apply the brand
+            // tint here or the Preferences window falls back to the (unreliable) asset accent.
             SettingsView()
+                .tint(.brand)
         }
         #endif
     }

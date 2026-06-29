@@ -22,6 +22,9 @@ public enum DefaultsKey {
     public static let speakerUID = "punktfunk.speakerUID"
     public static let micUID = "punktfunk.micUID"
     public static let presenter = "punktfunk.presenter"
+    /// Request a 10-bit BT.2020 PQ (HDR10) stream. On by default; only takes effect when the host
+    /// has HDR content AND this display supports HDR — otherwise the stream stays 8-bit SDR.
+    public static let hdrEnabled = "punktfunk.hdrEnabled"
     public static let hosts = "punktfunk.hosts"
     /// Client-side cursor mode: "auto" (shown only in gamescope sessions), "always", "never".
     public static let cursorMode = "punktfunk.cursorMode"

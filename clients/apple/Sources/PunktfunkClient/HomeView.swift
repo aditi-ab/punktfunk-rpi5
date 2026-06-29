@@ -127,14 +127,13 @@ struct HomeView: View {
             AddHostSheet { store.add($0) }
         }
         #if os(iOS)
+        // SettingsView owns its own NavigationSplitView (sidebar + detail) and Done button, so it
+        // is presented directly — wrapping it in a NavigationStack here would nest a split view in
+        // a stack (double title bars). `settingsSheetSizing()` widens the sheet on iPad for the
+        // two-column layout.
         .sheet(isPresented: $showSettings) {
-            NavigationStack {
-                SettingsView()
-                    .navigationTitle("Settings")
-                    .toolbar {
-                        Button("Done") { showSettings = false }
-                    }
-            }
+            SettingsView()
+                .settingsSheetSizing()
         }
         #endif
         #endif
@@ -172,7 +171,7 @@ struct HomeView: View {
     private var discoveredSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Label("On this network", systemImage: "antenna.radiowaves.left.and.right")
-                .font(.headline)
+                .font(.geist(15, .semibold, relativeTo: .headline))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal)
             LazyVGrid(columns: gridColumns, spacing: gridSpacing) {
@@ -249,8 +248,10 @@ struct HomeView: View {
     /// the width so the cards stay edge-aligned with the title and bars — sized touch-first: one
     /// column on iPhone portrait, 3–4 generous cards on iPad.
     private var gridColumns: [GridItem] {
+        // Wider than before: the monogram card is a horizontal module (tile + address line), so
+        // it needs room for a monospaced "IP:port" without truncating.
         #if os(macOS)
-        [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 16)]
+        [GridItem(.adaptive(minimum: 250, maximum: 320), spacing: 16)]
         #elseif os(tvOS)
         [GridItem(.adaptive(minimum: 320), spacing: 48)]
         #else

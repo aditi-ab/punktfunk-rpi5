@@ -28,6 +28,7 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
+    @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
@@ -68,15 +69,19 @@ struct ContentView: View {
                 // A session actually started — remember it on the card ("Connected … ago"
                 // plus the accent ring on the most recent host).
                 guard let host = model.activeHost else { break }
-                store.markConnected(host.id)
                 // Delegated approval just succeeded: the operator let this device in, so pin the
                 // host's observed fingerprint and remember it as paired — future connects are then
                 // silent (rule 1), exactly like after a PIN/TOFU success. Dismisses the wait prompt.
-                if awaitingApproval?.host.id == host.id {
-                    if let fp = model.connection?.hostFingerprint {
-                        store.pin(host.id, fingerprint: fp)
-                    }
-                    awaitingApproval = nil
+                let approvedFingerprint = awaitingApproval?.host.id == host.id
+                    ? model.connection?.hostFingerprint : nil
+                if awaitingApproval?.host.id == host.id { awaitingApproval = nil }
+                // Persist on the next runloop tick: HostStore is an ObservableObject, and mutating
+                // its @Published from inside .onChange (a view-update callback) trips SwiftUI's
+                // "Publishing changes from within view updates". A one-tick delay is imperceptible.
+                let store = store
+                DispatchQueue.main.async {
+                    store.markConnected(host.id)
+                    if let approvedFingerprint { store.pin(host.id, fingerprint: approvedFingerprint) }
                 }
             case .idle:
                 // The delegated-approval connect failed, timed out, or was cancelled — drop the
@@ -333,6 +338,7 @@ struct ContentView: View {
                     rawValue: UInt32(clamping: gamepadType)) ?? .auto),
             bitrateKbps: UInt32(clamping: bitrateKbps),
             audioChannels: UInt8(clamping: audioChannels),
+            hdrEnabled: hdrEnabled,
             launchID: launchID,
             allowTofu: allowTofu,
             requestAccess: requestAccess)
@@ -475,6 +481,7 @@ struct ContentView: View {
             gamepad: pad,
             bitrateKbps: bitrate,
             audioChannels: UInt8(clamping: audioChannels),
+            hdrEnabled: hdrEnabled,
             autoTrust: true)
     }
 }

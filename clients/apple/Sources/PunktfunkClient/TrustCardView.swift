@@ -3,6 +3,7 @@
 // or drops this and runs the PIN pairing ceremony instead.
 
 import Foundation
+import PunktfunkKit
 import SwiftUI
 
 struct TrustCardView: View {
@@ -18,11 +19,11 @@ struct TrustCardView: View {
                 .font(.system(size: 36, weight: .light))
                 .foregroundStyle(.tint)
             Text("Verify \(hostName)")
-                .font(.title3.weight(.semibold))
+                .font(.geist(20, .semibold, relativeTo: .title3))
             Text("First connection. Compare this fingerprint with the one "
                 + "punktfunk-host logged at startup (\u{201C}clients pin this "
                 + "fingerprint\u{201D}):")
-                .font(.callout)
+                .font(.geist(16, relativeTo: .callout))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             Text(Self.format(fingerprint: fingerprint))
@@ -58,7 +59,7 @@ struct TrustCardView: View {
                 #else
                 .buttonStyle(.borderless)
                 #endif
-                .font(.callout)
+                .font(.geist(16, relativeTo: .callout))
         }
         .padding(28)
         .frame(maxWidth: 440)

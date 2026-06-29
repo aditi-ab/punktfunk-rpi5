@@ -1,10 +1,12 @@
 // App settings. The host creates a native virtual output at exactly the chosen size/refresh —
 // there is no scaling anywhere in the pipeline.
 //
-// Navigation differs per platform: macOS uses a tabbed preferences window (the sections had
-// outgrown one scrolling pane); iOS uses a single grouped Form; tvOS uses a focus-native
-// pushed-picker layout. The individual sections (`streamModeSection`, `audioSection`, …) are
-// shared across all three so a setting is defined exactly once.
+// Navigation differs per platform, but all three group the same categories (General, Display,
+// Audio, Controllers, Advanced, About): macOS uses a tabbed preferences window; iOS/iPadOS uses
+// an adaptive NavigationSplitView — a category sidebar + detail pane on iPad, auto-collapsing to
+// a hierarchical push list on iPhone (the system Settings idiom on each); tvOS uses a
+// focus-native pushed-picker layout. The individual sections (`streamModeSection`,
+// `audioSection`, …) are shared across all three so a setting is defined exactly once.
 
 #if os(macOS)
 import AppKit
@@ -21,7 +23,8 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.compositor) private var compositor = 0
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
-    @AppStorage(DefaultsKey.presenter) private var presenter = "stage1"
+    @AppStorage(DefaultsKey.presenter) private var presenter = "stage2"
+    @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
@@ -32,11 +35,35 @@ struct SettingsView: View {
     #if DEBUG && !os(tvOS)
     @State private var showControllerTest = false
     #endif
+    #if os(iOS)
+    // The sidebar selection drives the detail pane on iPad and the pushed sub-page on iPhone.
+    // Width class decides the initial value: nil on iPhone (show the category list first),
+    // General on iPad (a two-column layout should never open with an empty detail).
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @State private var settingsSelection: SettingsCategory?
+    // Tracked so the detail can show its own Done whenever the sidebar (and its Done) is off screen
+    // — not just on iPhone, but on any iPad layout that collapses the sidebar to an overlay. Starts
+    // .doubleColumn so iPad reliably opens with the sidebar (and its Done) visible.
+    @State private var columnVisibility: NavigationSplitViewVisibility = .doubleColumn
+    // Sticky once the wheel lands on "Custom…", so editing a width/height that briefly equals a
+    // preset doesn't snap the wheel back off Custom. A stored non-preset value reads as custom even
+    // when this is false (see `isCustomResolution`), so it survives relaunches without persisting.
+    @State private var customMode = false
+    #endif
     #if os(macOS)
     @AppStorage(DefaultsKey.speakerUID) private var speakerUID = ""
     @AppStorage(DefaultsKey.micUID) private var micUID = ""
     @State private var outputDevices: [AudioDevice] = []
     @State private var inputDevices: [AudioDevice] = []
+    #endif
+
+    #if os(iOS)
+    /// `initialCategory` is nil in the app (the list opens un-selected on iPhone; iPad lands on
+    /// General via `onAppear`). The screenshot harness passes an explicit category so the captured
+    /// shot opens on a real settings page (a populated detail) rather than the bare category list.
+    init(initialCategory: SettingsCategory? = nil) {
+        _settingsSelection = State(initialValue: initialCategory)
+    }
     #endif
 
     var body: some View {
@@ -66,6 +93,7 @@ struct SettingsView: View {
 
             Form {
                 presenterSection
+                hdrSection
                 windowSection
                 statisticsSection
             }
@@ -106,28 +134,114 @@ struct SettingsView: View {
     }
     #endif
 
-    // MARK: - iOS: one grouped Form
+    // MARK: - iOS / iPadOS: adaptive split view
 
     #if os(iOS)
     private var iosBody: some View {
-        Form {
-            streamModeSection
-            audioSection
-            compositorSection
-            presenterSection
-            statisticsSection
-            experimentalSection
-            controllersSection
-            Section {
-                NavigationLink("Acknowledgements") { AcknowledgementsView() }
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            List(selection: $settingsSelection) {
+                ForEach(SettingsCategory.allCases) { category in
+                    // On iPhone the split view collapses to a push list, but a selection List
+                    // draws no disclosure indicator of its own — add one in compact width for the
+                    // expected drill-in affordance. On iPad the selected row highlights instead, so
+                    // the chevron is omitted there.
+                    HStack {
+                        Label(category.title, systemImage: category.symbol)
+                        if horizontalSizeClass == .compact {
+                            Spacer()
+                            Image(systemName: "chevron.forward")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                                // Purely a drill-in affordance — the row's button trait already
+                                // conveys "opens"; keep it out of the VoiceOver announcement.
+                                .accessibilityHidden(true)
+                        }
+                    }
+                    .tag(category)
+                }
             }
+            .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        } detail: {
+            // NavigationSplitView hosts the detail in its own navigation context (its title bar),
+            // so no inner NavigationStack — that would double the bar on iPad. On iPhone the split
+            // view collapses to one stack and pushes this when a row is tapped. `?? .general` only
+            // backs the brief pre-selection window; the list never auto-pushes on a nil selection.
+            settingsDetail(settingsSelection ?? .general)
+                // Keep a Done on the detail whenever the sidebar (and its Done) isn't on screen: the
+                // iPhone push, or any iPad layout that collapsed the sidebar to an overlay. When the
+                // sidebar is showing, its Done is the only one — so this stays hidden to avoid two.
+                .toolbar {
+                    if horizontalSizeClass == .compact || columnVisibility == .detailOnly {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { dismiss() }
+                        }
+                    }
+                }
         }
-        .formStyle(.grouped)
         .onAppear {
+            if horizontalSizeClass == .regular, settingsSelection == nil {
+                settingsSelection = .general
+            }
             gamepads.refresh()
             gamepads.startDiscovery()
         }
+        // A regular→regular launch sets the default above; this catches a compact→regular change
+        // (e.g. an iPad leaving narrow split-screen multitasking) so the detail pane fills in.
+        .onChange(of: horizontalSizeClass) { _, newValue in
+            if newValue == .regular, settingsSelection == nil {
+                settingsSelection = .general
+            }
+        }
         .onDisappear { gamepads.stopDiscovery() }
+    }
+
+    @ViewBuilder
+    private func settingsDetail(_ category: SettingsCategory) -> some View {
+        switch category {
+        case .general:
+            Form {
+                streamModeSection
+                compositorSection
+            }
+            .formStyle(.grouped)
+            .navigationTitle("General")
+            .navigationBarTitleDisplayMode(.inline)
+        case .display:
+            Form {
+                presenterSection
+                hdrSection
+                statisticsSection
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Display")
+            .navigationBarTitleDisplayMode(.inline)
+        case .audio:
+            Form { audioSection }
+                .formStyle(.grouped)
+                .navigationTitle("Audio")
+                .navigationBarTitleDisplayMode(.inline)
+        case .controllers:
+            Form { controllersSection }
+                .formStyle(.grouped)
+                .navigationTitle("Controllers")
+                .navigationBarTitleDisplayMode(.inline)
+        case .advanced:
+            Form { experimentalSection }
+                .formStyle(.grouped)
+                .navigationTitle("Advanced")
+                .navigationBarTitleDisplayMode(.inline)
+        case .about:
+            // Already a full scrollable view that sets its own "Acknowledgements" title; pin the
+            // display mode inline to match the five sibling detail pages (it would otherwise inherit
+            // the large title from the "Settings" sidebar root).
+            AcknowledgementsView()
+                .navigationBarTitleDisplayMode(.inline)
+        }
     }
     #endif
 
@@ -154,6 +268,10 @@ struct SettingsView: View {
 
     private var hudEnabledTag: Binding<String> {
         Binding(get: { hudEnabled ? "on" : "off" }, set: { hudEnabled = $0 == "on" })
+    }
+
+    private var hdrEnabledTag: Binding<String> {
+        Binding(get: { hdrEnabled ? "on" : "off" }, set: { hdrEnabled = $0 == "on" })
     }
 
     private var tvBody: some View {
@@ -186,20 +304,25 @@ struct SettingsView: View {
                     selection: $audioChannels)
                 if bitrateKbps > 1_000_000 {
                     Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
+                        .font(.geist(12, relativeTo: .caption))
                         .foregroundStyle(.orange)
                         .multilineTextAlignment(.center)
                 }
                 TVSelectionRow(
                     title: "Compositor", options: compositors, selection: $compositor)
+                #if DEBUG
                 TVSelectionRow(
-                    title: "Presenter",
-                    options: [("Stage 1 (default)", "stage1"), ("Stage 2 (experimental)", "stage2")],
+                    title: "Presenter (debug)",
+                    options: [("Stage 2 (default)", "stage2"), ("Stage 1 (debug)", "stage1")],
                     selection: $presenter)
+                #endif
+                TVSelectionRow(
+                    title: "10-bit HDR",
+                    options: [("On", "on"), ("Off", "off")], selection: hdrEnabledTag)
                 Text("The host creates a virtual output at exactly this mode — native "
                     + "resolution, no scaling. \(Self.bitrateFooter) A specific compositor "
                     + "is honored only if available on the host.")
-                    .font(.caption)
+                    .font(.geist(12, relativeTo: .caption))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.top, 8)
@@ -219,7 +342,7 @@ struct SettingsView: View {
                 TVSelectionRow(
                     title: "Controller type", options: Self.padTypes, selection: $gamepadType)
                 Text(Self.controllersFooter)
-                    .font(.caption)
+                    .font(.geist(12, relativeTo: .caption))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.top, 8)
@@ -243,6 +366,63 @@ struct SettingsView: View {
 
     @ViewBuilder private var streamModeSection: some View {
         Section {
+            #if os(iOS)
+            // Touch-first: a rotating wheel of common resolutions (this device's own mode first) and
+            // a segmented refresh-rate control — the same family as the Clock/Timer pickers. The host
+            // renders a virtual output at exactly the chosen mode, so these are real pixel sizes. The
+            // last wheel row, "Custom…", reveals width/height/refresh fields for an arbitrary mode.
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Resolution")
+                    .font(.geist(15, relativeTo: .subheadline))
+                    .foregroundStyle(.secondary)
+                Picker("Resolution", selection: resolutionSelection) {
+                    ForEach(resolutionChoices, id: \.tag) { choice in
+                        Text(choice.label).tag(choice.tag)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.wheel)
+                .frame(maxHeight: 140)
+            }
+            if isCustomResolution {
+                // Arbitrary entry: type the exact width × height (and refresh) the host should drive.
+                HStack {
+                    TextField("Width", value: $width, format: .number.grouping(.never))
+                        .keyboardType(.numberPad)
+                    Text("×")
+                    TextField("Height", value: $height, format: .number.grouping(.never))
+                        .labelsHidden()
+                        .keyboardType(.numberPad)
+                }
+                // A row built from an HStack of TextFields otherwise insets its bottom separator to
+                // the inner content, clipping the hairline under "Width"; pin it to the cell edge.
+                .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
+                LabeledContent("Refresh rate") {
+                    TextField("Hz", value: $hz, format: .number.grouping(.never))
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.trailing)
+                }
+            } else if refreshChoices.count > 1 {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Refresh rate")
+                        .font(.geist(15, relativeTo: .subheadline))
+                        .foregroundStyle(.secondary)
+                    Picker("Refresh rate", selection: $hz) {
+                        ForEach(refreshChoices, id: \.self) { rate in
+                            Text("\(rate) Hz").tag(rate)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                }
+            } else {
+                // A device with a single supported rate (e.g. 60 Hz) has nothing to pick.
+                LabeledContent("Refresh rate") {
+                    Text("\(hz) Hz").foregroundStyle(.secondary)
+                }
+            }
+            Button("Use this display's mode") { fillFromMainScreen() }
+            #elseif os(macOS)
             HStack {
                 TextField("Resolution", value: $width, format: .number.grouping(.never))
                 Text("×")
@@ -253,6 +433,7 @@ struct SettingsView: View {
             LabeledContent("") {
                 Button("Use this display's mode") { fillFromMainScreen() }
             }
+            #endif
             #if !os(tvOS)
             Toggle("Automatic bitrate", isOn: automaticBitrate)
             if bitrateKbps != 0 {
@@ -267,7 +448,7 @@ struct SettingsView: View {
                 }
                 if bitrateKbps > 1_000_000 {
                     Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
+                        .font(.geist(12, relativeTo: .caption))
                         .foregroundStyle(.orange)
                 }
             }
@@ -277,10 +458,84 @@ struct SettingsView: View {
         } footer: {
             Text("The host creates a virtual output at exactly this mode — "
                 + "native resolution, no scaling. \(Self.bitrateFooter)")
-                .font(.caption)
+                .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
     }
+
+    #if os(iOS)
+    // MARK: - Stream mode (iOS wheel)
+
+    /// Sentinel wheel tag for the "Custom…" row. Real tags are "WxH" (digits + "x"), so this can't
+    /// collide with a resolution.
+    private static let customResolutionTag = "custom"
+
+    /// 16:9 then ultrawide presets; the device's native mode is prepended at runtime.
+    private static let resolutionPresets: [(name: String, w: Int, h: Int)] = [
+        ("720p", 1280, 720),
+        ("1080p", 1920, 1080),
+        ("1440p", 2560, 1440),
+        ("4K", 3840, 2160),
+        ("Ultrawide 1080p", 2560, 1080),
+        ("Ultrawide 1440p", 3440, 1440),
+        ("Super ultrawide", 5120, 1440),
+    ]
+
+    /// The non-custom wheel rows: this device's native mode first, then the presets, deduped by
+    /// dimensions (native wins a tie).
+    private var resolutionModes: [(name: String, w: Int, h: Int)] {
+        let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels
+        let native = (w: Int(max(bounds.width, bounds.height)), h: Int(min(bounds.width, bounds.height)))
+        let all = [(name: "This device", w: native.w, h: native.h)] + Self.resolutionPresets
+        var seen = Set<String>()
+        return all.filter { seen.insert("\($0.w)x\($0.h)").inserted }
+    }
+
+    /// Wheel rows: the resolution modes, then a "Custom…" row that reveals the numeric fields.
+    private var resolutionChoices: [(label: String, tag: String)] {
+        resolutionModes.map { (label: "\($0.name)  ·  \($0.w) × \($0.h)", tag: "\($0.w)x\($0.h)") }
+            + [(label: "Custom…", tag: Self.customResolutionTag)]
+    }
+
+    private var presetResolutionTags: Set<String> {
+        Set(resolutionModes.map { "\($0.w)x\($0.h)" })
+    }
+
+    /// True when the editable custom fields should show: the wheel is parked on "Custom…" (sticky),
+    /// or the stored size simply isn't one of the presets (e.g. a value synced from a Mac) — so a
+    /// non-preset mode stays editable across relaunches without a persisted flag.
+    private var isCustomResolution: Bool {
+        customMode || !presetResolutionTags.contains("\(width)x\(height)")
+    }
+
+    /// The wheel works in "WxH" tags so one selection drives both width and height; the custom
+    /// sentinel toggles `customMode` instead of writing a size.
+    private var resolutionSelection: Binding<String> {
+        Binding(
+            get: { isCustomResolution ? Self.customResolutionTag : "\(width)x\(height)" },
+            set: { tag in
+                if tag == Self.customResolutionTag {
+                    customMode = true
+                    return
+                }
+                customMode = false
+                let parts = tag.split(separator: "x").compactMap { Int($0) }
+                guard parts.count == 2 else { return }
+                width = parts[0]
+                height = parts[1]
+            })
+    }
+
+    /// Refresh rates the device can actually display (no point asking the host to render frames the
+    /// screen can't show), plus any stored custom value so it stays selectable.
+    private var refreshChoices: [Int] {
+        let maxHz = UIScreen.main.maximumFramesPerSecond
+        var rates = [60, 120, 240].filter { $0 <= maxHz }
+        if rates.isEmpty { rates = [maxHz] }
+        if !rates.contains(hz) { rates.append(hz) }
+        return rates.sorted()
+    }
+    #endif
 
     @ViewBuilder private var audioSection: some View {
         Section {
@@ -321,7 +576,7 @@ struct SettingsView: View {
             Text("Host audio plays through the speaker; the microphone feeds the "
                 + "host's virtual mic. System default follows macOS device changes. "
                 + "Applies from the next session.")
-                .font(.caption)
+                .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
     }
@@ -341,7 +596,7 @@ struct SettingsView: View {
             Text("Which compositor drives the virtual output on the host. A specific "
                 + "choice is honored only if that backend is available there — "
                 + "otherwise the host falls back to auto-detection.")
-                .font(.caption)
+                .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
     }
@@ -355,26 +610,47 @@ struct SettingsView: View {
         } footer: {
             Text("Take the window fullscreen when a session starts and restore it on the host "
                 + "list, so only the stream is fullscreen — not the picker.")
-                .font(.caption)
+                .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
         #endif
     }
 
+    // Stage-2 (Metal/VTDecompressionSession) is the default and only user-visible presenter — it
+    // recovers from a wedged decoder, where stage-1's AVSampleBufferDisplayLayer freezes hard on a
+    // lost HEVC reference. Stage-1 is kept reachable as a DEBUG-only override for diagnostics, like
+    // the controller test. Empty in release builds (no presenter UI; stage-2 always).
     @ViewBuilder private var presenterSection: some View {
+        #if DEBUG
         Section {
             Picker("Presenter", selection: $presenter) {
-                Text("Stage 1 (default)").tag("stage1")
-                Text("Stage 2 (experimental)").tag("stage2")
+                Text("Stage 2 (default)").tag("stage2")
+                Text("Stage 1 (debug)").tag("stage1")
             }
         } header: {
-            Text("Video presenter")
+            Text("Video presenter · debug")
         } footer: {
-            Text("Stage 1 feeds compressed video to the system display layer (known-good). "
-                + "Stage 2 decodes explicitly and presents through Metal with a display "
-                + "link — it adds a capture→present (glass-to-glass) latency line in the HUD "
-                + "and shortens the present tail. Applies from the next session.")
-                .font(.caption)
+            Text("Stage 2 (default) decodes explicitly and presents through Metal with a display "
+                + "link — it adds a capture→present (glass-to-glass) latency line in the HUD and "
+                + "self-recovers from decode stalls. Stage 1 feeds compressed video straight to the "
+                + "system display layer; it freezes on a lost HEVC reference frame, so it's a debug "
+                + "fallback only. Applies from the next session.")
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
+        }
+        #endif
+    }
+
+    @ViewBuilder private var hdrSection: some View {
+        Section {
+            Toggle("10-bit HDR", isOn: $hdrEnabled)
+        } header: {
+            Text("HDR")
+        } footer: {
+            Text("Request a 10-bit BT.2020 PQ (HDR10) stream. It only engages when the host is "
+                + "sending HDR content AND this display supports HDR — otherwise the stream stays "
+                + "8-bit SDR. Applies from the next session.")
+                .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
     }
@@ -392,7 +668,7 @@ struct SettingsView: View {
             Text("Statistics")
         } footer: {
             Text(Self.statisticsFooter)
-                .font(.caption)
+                .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
     }
@@ -407,7 +683,7 @@ struct SettingsView: View {
                 + "(Steam + custom) via the host's management API; tap a title to launch it. "
                 + "The host must expose that API on the LAN with a token "
                 + "(serve --mgmt-bind 0.0.0.0 --mgmt-token …).")
-                .font(.caption)
+                .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
     }
@@ -441,7 +717,7 @@ struct SettingsView: View {
             Text("Controllers")
         } footer: {
             Text(Self.controllersFooter)
-                .font(.caption)
+                .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
     }
@@ -593,13 +869,13 @@ struct SettingsView: View {
                         }
                     }
                 }
-                .font(.caption2)
+                .font(.geist(11, relativeTo: .caption2))
                 .foregroundStyle(.secondary)
             }
             Spacer()
             if gamepads.active?.id == controller.id {
                 Text("In use")
-                    .font(.caption2.weight(.semibold))
+                    .font(.geist(11, .semibold, relativeTo: .caption2))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
                     .background(Capsule().fill(.green.opacity(0.2)))
@@ -621,6 +897,10 @@ struct SettingsView: View {
         width = Int(max(bounds.width, bounds.height))
         height = Int(min(bounds.width, bounds.height))
         hz = UIScreen.main.maximumFramesPerSecond
+        #if os(iOS)
+        // The native mode is the "This device" wheel row, so leave Custom mode if it was on.
+        customMode = false
+        #endif
         #endif
     }
 }
@@ -631,3 +911,52 @@ extension Double {
         Swift.min(Swift.max(self, lo), hi)
     }
 }
+
+#if os(iOS)
+/// The settings groups, mirroring the macOS preference tabs. On iPad each is a sidebar row that
+/// drives the detail pane; on iPhone the same list collapses to pushed sub-pages. Internal (not
+/// private) so the screenshot harness can open SettingsView on a specific category.
+enum SettingsCategory: String, CaseIterable, Identifiable {
+    case general, display, audio, controllers, advanced, about
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .general: return "General"
+        case .display: return "Display"
+        case .audio: return "Audio"
+        case .controllers: return "Controllers"
+        case .advanced: return "Advanced"
+        case .about: return "About"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .general: return "gearshape"
+        case .display: return "display"
+        case .audio: return "speaker.wave.2"
+        case .controllers: return "gamecontroller"
+        case .advanced: return "slider.horizontal.3"
+        case .about: return "info.circle"
+        }
+    }
+}
+
+extension View {
+    /// Present the settings sheet large on iPad so the NavigationSplitView has room for its
+    /// sidebar + detail — a default form sheet is too narrow and the split view would collapse to
+    /// the iPhone push list. No-op on iPhone (the standard sheet is already right) and on iOS 17
+    /// (no `presentationSizing` — it falls back to the default sheet, which still degrades cleanly
+    /// to the push list).
+    @ViewBuilder
+    func settingsSheetSizing() -> some View {
+        if UIDevice.current.userInterfaceIdiom == .pad, #available(iOS 18, *) {
+            presentationSizing(.page)
+        } else {
+            self
+        }
+    }
+}
+#endif

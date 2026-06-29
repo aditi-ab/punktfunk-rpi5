@@ -11,6 +11,9 @@ import CoreGraphics
 import CoreVideo
 import Metal
 import QuartzCore
+import os
+
+private let presenterLog = Logger(subsystem: "io.unom.punktfunk", category: "presenter")
 
 /// Runtime-compiled (no metallib build step needed in SwiftPM): a fullscreen triangle and a
 /// BT.709 limited-range NV12→RGB fragment shader. uv.y is flipped (1 - p.y) so the top-left-
@@ -30,11 +33,44 @@ vertex VOut pf_vtx(uint vid [[vertex_id]]) {
     return o;
 }
 
+// Bicubic (Catmull-Rom) sampling of the single-channel luma plane. When the drawable is larger
+// than the decoded frame (a window/view bigger than the host's fixed mode), a bilinear upscale
+// looks soft; Catmull-Rom keeps edges crisp — matching AVSampleBufferDisplayLayer's (stage-1)
+// scaler — and reduces to the exact texel at 1:1, so a native-resolution present stays pixel-exact.
+// Nine bilinear taps (TheRealMJP's optimisation of the 16-tap kernel); `s` MUST be a linear
+// sampler. Luma carries the perceived detail, so only it gets bicubic; chroma stays bilinear.
+float catmullRomLuma(texture2d<float> tex, sampler s, float2 uv) {
+    float2 texSize = float2(tex.get_width(), tex.get_height());
+    float2 samplePos = uv * texSize;
+    float2 tc1 = floor(samplePos - 0.5) + 0.5;
+    float2 f = samplePos - tc1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 off12 = w2 / w12;
+    float2 tc0 = (tc1 - 1.0) / texSize;
+    float2 tc3 = (tc1 + 2.0) / texSize;
+    float2 tc12 = (tc1 + off12) / texSize;
+    float r = 0.0;
+    r += tex.sample(s, float2(tc0.x,  tc0.y)).r  * (w0.x  * w0.y);
+    r += tex.sample(s, float2(tc12.x, tc0.y)).r  * (w12.x * w0.y);
+    r += tex.sample(s, float2(tc3.x,  tc0.y)).r  * (w3.x  * w0.y);
+    r += tex.sample(s, float2(tc0.x,  tc12.y)).r * (w0.x  * w12.y);
+    r += tex.sample(s, float2(tc12.x, tc12.y)).r * (w12.x * w12.y);
+    r += tex.sample(s, float2(tc3.x,  tc12.y)).r * (w3.x  * w12.y);
+    r += tex.sample(s, float2(tc0.x,  tc3.y)).r  * (w0.x  * w3.y);
+    r += tex.sample(s, float2(tc12.x, tc3.y)).r  * (w12.x * w3.y);
+    r += tex.sample(s, float2(tc3.x,  tc3.y)).r  * (w3.x  * w3.y);
+    return r;
+}
+
 fragment float4 pf_frag(VOut in [[stage_in]],
                         texture2d<float> lumaTex [[texture(0)]],
                         texture2d<float> chromaTex [[texture(1)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-    float y = lumaTex.sample(s, in.uv).r;
+    float y = catmullRomLuma(lumaTex, s, in.uv);
     float2 c = chromaTex.sample(s, in.uv).rg;
     // BT.709, 8-bit limited (video) range → full-range RGB.
     y = (y - 16.0/255.0) * (255.0/219.0);
@@ -55,7 +91,7 @@ fragment float4 pf_frag_hdr(VOut in [[stage_in]],
                             texture2d<float> lumaTex [[texture(0)]],
                             texture2d<float> chromaTex [[texture(1)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-    float y = lumaTex.sample(s, in.uv).r;
+    float y = catmullRomLuma(lumaTex, s, in.uv);
     float2 c = chromaTex.sample(s, in.uv).rg;
     // BT.2020 10-bit limited (video) range → full-range PQ R'G'B'.
     y = (y - 64.0/1023.0) * (1023.0/876.0);
@@ -81,6 +117,11 @@ public final class MetalVideoPresenter {
     private var textureCache: CVMetalTextureCache?
     /// Current layer configuration — switched lazily in `configure(hdr:)` when a frame's mode differs.
     private var hdrActive = false
+    #if DEBUG
+    /// Last logged "decoded→drawable" signature, so the diagnostic logs only when a size changes
+    /// (on first frame, a resize, or a host Reconfigure) instead of every frame.
+    private var lastSizeSig = ""
+    #endif
 
     /// nil if Metal is unavailable (no GPU / a headless CI) — the caller falls back to stage-1.
     public init?() {
@@ -113,6 +154,12 @@ public final class MetalVideoPresenter {
         layer.pixelFormat = .bgra8Unorm
         layer.framebufferOnly = true
         layer.isOpaque = true
+        // Render the drawable at the DECODED frame's resolution (set per-frame in `render`) and let
+        // the system compositor scale it to the layer's bounds — the same `.resizeAspect` path
+        // stage-1's AVSampleBufferDisplayLayer (videoGravity) uses, so stage-2 matches its sharpness.
+        // A native-resolution present is then pixel-exact (1:1, no shader scaling), and any display
+        // scaling uses the system's high-quality scaler rather than the in-shader bicubic.
+        layer.contentsGravity = .resizeAspect
         // Triple-buffer: more in-flight drawables before `nextDrawable()` (called on the
         // display-link / MAIN thread) has to block waiting for one to free.
         layer.maximumDrawableCount = 3
@@ -127,12 +174,6 @@ public final class MetalVideoPresenter {
         layer.displaySyncEnabled = false
         #endif
         self.layer = layer
-    }
-
-    /// Track the stream mode (the host can Reconfigure mid-stream). Size is in pixels.
-    public func setDrawableSize(_ size: CGSize) {
-        guard size.width > 0, size.height > 0 else { return }
-        if layer.drawableSize != size { layer.drawableSize = size }
     }
 
     /// Reconfigure the layer for SDR or HDR when the stream mode flips (HDR toggle). HDR uses an
@@ -171,12 +212,32 @@ public final class MetalVideoPresenter {
               let chroma = makeTexture(pixelBuffer, plane: 1, format: chromaFmt, cache: textureCache)
         else { return false }
 
-        // The hosting view owns drawableSize (aspect-fit to its bounds); skip until it's laid
-        // out. The fullscreen triangle scales the decoded texture to fill the drawable.
-        guard layer.drawableSize.width > 0, layer.drawableSize.height > 0,
-              let drawable = layer.nextDrawable(),
+        // Size the drawable to the decoded frame so the fullscreen triangle samples the texture 1:1
+        // (pixel-exact); the layer's contentsGravity then scales it to the on-screen bounds via the
+        // system compositor (matching stage-1). Re-set only on a change (first frame / Reconfigure).
+        let decodedSize = CGSize(
+            width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+        if layer.drawableSize != decodedSize { layer.drawableSize = decodedSize }
+        guard let drawable = layer.nextDrawable(),
               let commandBuffer = queue.makeCommandBuffer()
         else { return false }
+
+        #if DEBUG
+        // Diagnose sharpness: decoded should equal the drawable (the shader is 1:1); the layer's
+        // bounds may differ (the system scales). Logged only when a size changes.
+        let decodedW = Int(decodedSize.width)
+        let decodedH = Int(decodedSize.height)
+        let sig = "\(decodedW)x\(decodedH)|\(Int(layer.drawableSize.width))x\(Int(layer.drawableSize.height))"
+        if sig != lastSizeSig {
+            lastSizeSig = sig
+            let msg = "stage2: decoded \(decodedW)x\(decodedH) → drawable "
+                + "\(Int(layer.drawableSize.width))x\(Int(layer.drawableSize.height)) "
+                + "(texture \(drawable.texture.width)x\(drawable.texture.height), "
+                + "contentsScale \(layer.contentsScale), "
+                + "layerBounds \(Int(layer.bounds.width))x\(Int(layer.bounds.height)))"
+            presenterLog.info("\(msg, privacy: .public)")
+        }
+        #endif
 
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = drawable.texture

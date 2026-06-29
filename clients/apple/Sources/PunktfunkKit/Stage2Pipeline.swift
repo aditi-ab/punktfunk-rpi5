@@ -4,7 +4,7 @@
 // capture→present. Mirrors StreamPump's lifecycle (one per start; cancel is permanent).
 //
 // Threading: the pump runs on its own thread; the decoder callback on a VT thread; `renderTick`
-// + `setDrawableSize` + `start`/`stop` on the MAIN thread (the view's CADisplayLink fires there).
+// + `start`/`stop` on the MAIN thread (the view's CADisplayLink fires there).
 // Only the ring + decoder cross threads and both are internally locked.
 
 #if canImport(Metal) && canImport(QuartzCore)
@@ -60,7 +60,7 @@ private final class KeyframeRecovery: @unchecked Sendable {
     func request() {
         lock.lock()
         let now = DispatchTime.now().uptimeNanoseconds
-        let due = lastNs == 0 || now &- lastNs > 250_000_000 // ≥ 250 ms since the last request
+        let due = lastNs == 0 || now &- lastNs > 100_000_000 // ≥ 100 ms since the last request (matches Android)
         if due { lastNs = now }
         let conn = due ? connection : nil
         lock.unlock()
@@ -114,20 +114,24 @@ public final class Stage2Pipeline {
         let thread = Thread {
             var format: CMVideoFormatDescription?
             var lastFramesDropped = connection.framesDropped()
+            // Persistent recovery WANT, not a one-shot edge (see StreamPump for the full rationale):
+            // the old code advanced lastFramesDropped on the same edge it called recovery.request(),
+            // so a request swallowed by the throttle (the lost recovery IDR being pruned within the
+            // window) was never re-sent and the picture stayed frozen. Keep asking until an IDR lands.
+            var awaitingIDR = false
             while token.isLive {
                 do {
-                    // Loss recovery (the primary recovery path). The reassembler drops unrecoverable
-                    // AUs (framesDropped) and the decoder then conceals the reference-missing delta
-                    // frames that follow — often rendering them WITHOUT an error callback — so the
-                    // onDecodeError trigger rarely fires after a real network blip. Ask the host for
-                    // a fresh IDR whenever the drop count climbs (throttled in KeyframeRecovery).
-                    // Polled every iteration so a total-loss drought recovers the moment packets
-                    // resume and the reassembler counts the gap.
+                    // Loss recovery (the primary path). The reassembler drops unrecoverable AUs
+                    // (framesDropped) and the decoder conceals the reference-missing deltas that
+                    // follow — often WITHOUT an error callback — so key off the drop count climbing,
+                    // then keep asking (awaitingIDR) until a fresh IDR re-anchors decode. Polled every
+                    // iteration so a total-loss drought recovers the moment packets resume.
                     let dropped = connection.framesDropped()
                     if dropped > lastFramesDropped {
                         lastFramesDropped = dropped
-                        recovery.request()
+                        awaitingIDR = true
                     }
+                    if awaitingIDR { recovery.request() }
                     // Drain any HDR mastering-metadata update (0xCE) and hand it to the decoder, which
                     // attaches it to subsequent HDR frames. Non-blocking; only HDR sessions emit these.
                     if connection.isHDR, let meta = try? connection.nextHdrMeta(timeoutMs: 0) {
@@ -136,15 +140,16 @@ public final class Stage2Pipeline {
                     guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
                     onFrame?(au)
                     if let f = AnnexB.formatDescription(fromIDR: au.data) {
-                        format = f // refreshed on every IDR (mode changes included)
+                        format = f          // refreshed on every IDR (mode changes included)
+                        awaitingIDR = false // a fresh IDR re-anchored decode — recovery complete
                     }
                     guard let f = format, token.isLive else { continue }
                     if !decoder.decode(au: au, format: f) {
                         // Submit/decoder error: drop the session and re-gate on the next IDR's
-                        // in-band parameter sets (a delta frame can't recover) — stage-1's policy
-                        // — and ask the host for that IDR now (infinite GOP; throttled).
+                        // in-band parameter sets (a delta frame can't recover) — stage-1's policy —
+                        // and keep asking for that IDR (infinite GOP) until one re-anchors decode.
                         decoder.reset()
-                        recovery.request()
+                        awaitingIDR = true
                     }
                 } catch {
                     if token.isLive { onSessionEnd?() }
@@ -164,11 +169,6 @@ public final class Stage2Pipeline {
         guard let frame = ring.take() else { return }
         guard presenter.render(frame.pixelBuffer, isHDR: frame.isHDR) else { return }
         presentMeter.record(ptsNs: frame.ptsNs, atNs: targetPresentNs, offsetNs: offsetNs)
-    }
-
-    /// MAIN thread. Keep the drawable matched to the negotiated mode (host can Reconfigure).
-    public func setDrawableSize(_ size: CGSize) {
-        presenter.setDrawableSize(size)
     }
 
     /// Stop the pump (≤ one poll timeout) and drop the decode session. Does not close the

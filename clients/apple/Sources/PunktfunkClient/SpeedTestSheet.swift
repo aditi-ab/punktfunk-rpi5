@@ -52,7 +52,7 @@ struct SpeedTestSheet: View {
     var body: some View {
         VStack(spacing: 20) {
             Label("Speed test — \(host.displayName)", systemImage: "gauge.with.needle")
-                .font(.headline)
+                .font(.geist(17, .semibold, relativeTo: .headline))
                 .foregroundStyle(.tint)
 
             switch phase {
@@ -73,7 +73,7 @@ struct SpeedTestSheet: View {
                 resultView(result)
             case .failed(let message):
                 Text(message)
-                    .font(.callout)
+                    .font(.geist(16, relativeTo: .callout))
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
             }
@@ -149,13 +149,13 @@ struct SpeedTestSheet: View {
             if let rec = Self.recommendedKbps(result) {
                 Text("Recommended bitrate: \(Self.mbpsLabel(kbps: rec)) "
                     + "(~70% of measured, headroom for encoder bursts).")
-                    .font(.caption)
+                    .font(.geist(12, relativeTo: .caption))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             } else {
                 Text("Too little data made it through to recommend a bitrate — "
                     + "check the network and retry.")
-                    .font(.caption)
+                    .font(.geist(12, relativeTo: .caption))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }

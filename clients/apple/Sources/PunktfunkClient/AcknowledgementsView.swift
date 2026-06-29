@@ -17,10 +17,10 @@ struct AcknowledgementsView: View {
             LazyVStack(alignment: .leading, spacing: 0) {
                 VStack(alignment: .leading, spacing: 18) {
                     Text("punktfunk")
-                        .font(.title2).bold()
+                        .font(.geist(22, .bold, relativeTo: .title2))
                     if let version {
                         Text("Version \(version)")
-                            .font(.caption)
+                            .font(.geist(12, relativeTo: .caption))
                             .foregroundStyle(.secondary)
                     }
                     Text(Licenses.appLicense)
@@ -29,14 +29,29 @@ struct AcknowledgementsView: View {
 
                     Divider()
 
+                    Text("Bundled font")
+                        .font(.geist(17, .semibold, relativeTo: .headline))
+                    Text("punktfunk ships the Geist typeface (Geist Sans), "
+                        + "© The Geist Project Authors / Vercel, used under the SIL Open Font "
+                        + "License 1.1.")
+                        .font(.geist(12, relativeTo: .caption))
+                        .foregroundStyle(.secondary)
+                    if !Licenses.fontLicense.isEmpty {
+                        Text(Licenses.fontLicense)
+                            .font(.caption2.monospaced())
+                            .modifier(SelectableText())
+                    }
+
+                    Divider()
+
                     Text("Third-party software")
-                        .font(.headline)
+                        .font(.geist(17, .semibold, relativeTo: .headline))
                     Text(
                         "punktfunk uses the open-source components below, each under its own license. "
                             + "On some platforms FFmpeg is additionally bundled under the LGPL v2.1+ "
                             + "(dynamically linked, replaceable)."
                     )
-                    .font(.caption)
+                    .font(.geist(12, relativeTo: .caption))
                     .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

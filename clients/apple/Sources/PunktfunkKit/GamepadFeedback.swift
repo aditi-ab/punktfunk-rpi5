@@ -68,6 +68,14 @@ private final class RumbleRenderer: @unchecked Sendable {
     private var broken = false
     /// Last logged active/silent state — for a one-line transition log, not per-event spam.
     private var wasActive = false
+    // Backoff after an engine failure. A broken `gamecontrollerd.haptics` XPC connection (CoreHaptics
+    // -4811 "server connection broke") fails EVERY rebuild until the service relaunches — and that
+    // break fires neither stoppedHandler nor resetHandler, so without a cooldown the next rumble
+    // update immediately rebuilds into the same dead connection, flooding the log and never
+    // recovering. Delay the next setup() — growing 0.5→1→2→4 s on repeated failure — and clear it
+    // the moment a player runs cleanly (or the controller changes).
+    private var retryAfter = Date.distantPast
+    private var consecutiveFailures = 0
 
     /// CHHapticEvent sharpness = actuator frequency. A DualSense's voice-coil motors need a
     /// defined frequency to move at all — an intensity-only event (no sharpness) left them
@@ -91,6 +99,8 @@ private final class RumbleRenderer: @unchecked Sendable {
             self.closeHID()
             self.controller = c
             self.broken = false
+            self.consecutiveFailures = 0
+            self.retryAfter = .distantPast
             _ = self.openHIDIfDualSense(c)
             onBackend?(self.backendNote(for: c))
         }
@@ -108,7 +118,7 @@ private final class RumbleRenderer: @unchecked Sendable {
             // other pad (and for a DualSense whose HID device could not be opened).
             if self.hidRumble(low: lowAmp, high: highAmp) { return }
             guard !self.broken else { return }
-            if active, self.low == nil, self.high == nil {
+            if active, self.low == nil, self.high == nil, Date() >= self.retryAfter {
                 self.setup()
             }
             let ok: Bool
@@ -124,8 +134,15 @@ private final class RumbleRenderer: @unchecked Sendable {
             }
             // Rebuild on the next nonzero amplitude if an engine errored — and tear down OUTSIDE
             // the `inout` accesses above, so teardown() never mutates a motor that a `drive` call
-            // still holds an exclusive reference to.
-            if !ok { self.teardown() }
+            // still holds an exclusive reference to. Back off so a broken XPC isn't re-hit every
+            // update; once a player is actually running the path has recovered, so clear the backoff.
+            if !ok {
+                self.teardown()
+                self.scheduleRetryBackoff()
+            } else if self.low?.player != nil || self.high?.player != nil {
+                self.consecutiveFailures = 0
+                self.retryAfter = .distantPast
+            }
         }
     }
 
@@ -157,14 +174,29 @@ private final class RumbleRenderer: @unchecked Sendable {
             low = makeMotor(haptics, .default)
         }
         if low == nil, high == nil {
-            // Haptics present but no engine could be built right now (server busy / a transient
-            // error). Do NOT latch broken — the next nonzero amplitude retries setup().
-            log.warning("rumble: haptics present but engine setup failed — will retry on next rumble")
+            // Haptics present but no engine could be built right now (server busy / XPC broken). Do
+            // NOT latch broken — back off and the next nonzero amplitude past the cooldown retries.
+            log.warning("rumble: haptics present but engine setup failed — backing off, will retry")
+            scheduleRetryBackoff()
         }
+    }
+
+    /// Push the next engine-build attempt out after a failure (capped exponential backoff), so a
+    /// broken `gamecontrollerd.haptics` connection gets time to relaunch instead of being re-hit on
+    /// every rumble update.
+    private func scheduleRetryBackoff() {
+        consecutiveFailures += 1
+        let shift = min(consecutiveFailures - 1, 4)
+        retryAfter = Date().addingTimeInterval(min(0.5 * Double(1 << shift), 4))
     }
 
     private func makeMotor(_ haptics: GCDeviceHaptics, _ locality: GCHapticsLocality) -> Motor? {
         guard let engine = haptics.createEngine(withLocality: locality) else { return nil }
+        // A controller's motors carry no audio, so keep this engine OUT of the app's audio session
+        // (the default is to join it). Streaming keeps an AVAudioSession active the whole time;
+        // letting a haptics-only engine join it is a needless coupling that can get its
+        // gamecontrollerd XPC connection interrupted (the repeated -4811 server-connection breaks).
+        engine.playsHapticsOnly = true
         // The haptic server can stop or reset the engine out from under us — app backgrounding, an
         // audio-session interruption (a call, Siri, another audio app), or a server crash. Left
         // unhandled the players go dead and every later rumble throws, latching rumble off for the

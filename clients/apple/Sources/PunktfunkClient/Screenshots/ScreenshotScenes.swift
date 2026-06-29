@@ -103,11 +103,11 @@ private struct ShotSettings: View {
                 .shadow(radius: 40, y: 16)
         }
         #elseif os(iOS)
-        NavigationStack {
-            SettingsView()
-                .navigationTitle("Settings")
-                .navigationBarTitleDisplayMode(.inline)
-        }
+        // SettingsView owns its NavigationSplitView (sidebar + detail) and Done button, so it is
+        // rendered directly — a wrapping NavigationStack would nest a split view in a stack. Open
+        // on General so the shot lands on real controls (iPad: sidebar + General detail; iPhone:
+        // the General page) instead of the bare category list.
+        SettingsView(initialCategory: .general)
         #else
         NavigationStack { SettingsView() }
         #endif
@@ -175,10 +175,10 @@ private struct ShotHUD: View {
                 .foregroundStyle(.secondary)
             #if os(macOS)
             Text("⌘⎋ releases the mouse")
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.geist(11, relativeTo: .caption2)).foregroundStyle(.secondary)
             #elseif os(tvOS)
             Text("Press Menu to disconnect")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.geist(12, relativeTo: .caption)).foregroundStyle(.secondary)
             #endif
         }
         .padding(10)
@@ -259,7 +259,7 @@ private struct ShotDesktopFrame: View {
             HStack(spacing: 8) {
                 Image(systemName: "gamecontroller.fill")
                 Text("Streaming from Battlestation")
-                    .font(.system(.callout, weight: .semibold))
+                    .font(.geist(16, .semibold, relativeTo: .callout))
             }
             .padding(.horizontal, 14).padding(.vertical, 9)
             .glassBackground(Capsule())

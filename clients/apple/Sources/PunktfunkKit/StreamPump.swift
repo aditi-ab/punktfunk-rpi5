@@ -6,6 +6,9 @@
 
 import AVFoundation
 import Foundation
+import os
+
+private let pumpLog = Logger(subsystem: "io.unom.punktfunk", category: "video")
 
 /// Cancellation handle owned by exactly one pump thread — a restart hands the old pump
 /// its own token, so it can never be revived by a newer start().
@@ -47,44 +50,74 @@ final class StreamPump {
             var format: CMVideoFormatDescription?
             var lastKeyframeRequest = Date.distantPast
             var lastFramesDropped = connection.framesDropped()
-            // Coalesced host keyframe request: the decode stays wedged for several frames until
-            // the IDR lands, so requesting on every frame would flood the control stream.
+            // Recovery is a persistent WANT, not a one-shot edge: set it on detected loss (or a
+            // decoder reset), retry the throttled request EVERY iteration, and clear it only when a
+            // fresh IDR actually re-anchors decode. The old code advanced `lastFramesDropped` on the
+            // same edge it fired the throttled request — so a request swallowed by the throttle (a
+            // second drop within the window, e.g. the lost recovery IDR itself being pruned) was
+            // never re-sent: the counter went flat, the climb never re-fired, and the picture stayed
+            // frozen for good while audio kept playing. The iPhone's lossy Wi-Fi hits this where the
+            // Mac's Ethernet never does.
+            var awaitingIDR = false
+            var awaitingSince = Date.distantPast // when the current recovery began (for the resume log)
+            var wasFailed = false
+            // Coalesced host keyframe request. 100 ms throttle (matches the working Android path):
+            // fast enough that a lost recovery IDR is re-requested promptly, bounded so a sustained
+            // freeze can't flood the control stream.
             func requestKeyframeThrottled() {
                 let now = Date()
-                if now.timeIntervalSince(lastKeyframeRequest) > 0.25 {
+                if now.timeIntervalSince(lastKeyframeRequest) > 0.1 {
                     connection.requestKeyframe()
                     lastKeyframeRequest = now
                 }
             }
             while token.isLive {
                 do {
-                    // Loss recovery (the primary recovery path). Under the host's infinite GOP the
-                    // only recovery keyframe is one we request. The reassembler drops unrecoverable
-                    // AUs (framesDropped); the decoder then *conceals* the reference-missing delta
-                    // frames that follow — a frozen / garbage picture, WITHOUT flipping the layer to
-                    // .failed — so the .failed check below rarely fires after a real network blip.
-                    // Ask the host for a fresh IDR whenever the drop count climbs. Polled every
-                    // iteration (not just per AU) so a total-loss drought still recovers the moment
-                    // packets resume and the reassembler counts the gap.
+                    // Loss recovery (the primary path). Under the host's infinite GOP the only
+                    // recovery keyframe is one we request. The reassembler drops unrecoverable AUs
+                    // (framesDropped); the decoder then *conceals* the reference-missing deltas — a
+                    // frozen / garbage picture that never flips the layer to .failed — so key off the
+                    // drop count climbing, then keep asking (awaitingIDR) until an IDR lands. Polled
+                    // every iteration so a total-loss drought still recovers when packets resume.
                     let dropped = connection.framesDropped()
                     if dropped > lastFramesDropped {
+                        // Log only on the false→true transition (once per recovery cycle), not per
+                        // dropped AU, so heavy loss doesn't spam the log.
+                        if !awaitingIDR {
+                            awaitingSince = Date()
+                            pumpLog.notice(
+                                "video: unrecoverable drop (framesDropped=\(dropped, privacy: .public)) — requesting recovery IDR")
+                        }
                         lastFramesDropped = dropped
-                        requestKeyframeThrottled()
+                        awaitingIDR = true
                     }
+                    if awaitingIDR { requestKeyframeThrottled() }
+
                     guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
                     onFrame?(au)
-                    if let f = AnnexB.formatDescription(fromIDR: au.data) {
-                        format = f // refreshed on every IDR (mode changes included)
+                    let idrFormat = AnnexB.formatDescription(fromIDR: au.data)
+                    if let f = idrFormat {
+                        format = f          // refreshed on every IDR (mode changes included)
+                        if awaitingIDR {
+                            let ms = Int(Date().timeIntervalSince(awaitingSince) * 1000)
+                            pumpLog.notice("video: recovery IDR received — resumed after \(ms, privacy: .public) ms")
+                        }
+                        awaitingIDR = false // a fresh IDR re-anchored decode — recovery complete
                     }
-                    if layer.status == .failed {
+                    let failed = layer.status == .failed
+                    if failed {
                         // Decode wedged hard (the cold-first-connect case — a lost/corrupt opening
-                        // IDR): flush and re-gate on the next in-band parameter sets (resuming with
-                        // a delta frame can't recover), AND ask the host for a fresh IDR. Throttled:
-                        // the layer stays .failed across several polls until the IDR lands.
+                        // IDR): flush and, unless THIS AU is the recovering IDR (re-anchored above),
+                        // re-gate on the next in-band parameter sets and keep asking — enqueuing a
+                        // delta into a failed layer can't recover it.
+                        if !wasFailed { pumpLog.warning("video: display layer .failed — flushing + re-anchoring") }
                         layer.flush()
-                        format = AnnexB.formatDescription(fromIDR: au.data)
-                        requestKeyframeThrottled()
+                        if idrFormat == nil {
+                            format = nil
+                            awaitingIDR = true
+                        }
                     }
+                    wasFailed = failed
                     guard let f = format,
                           let sample = AnnexB.sampleBuffer(au: au, format: f),
                           token.isLive // don't enqueue a stale frame after a restart
