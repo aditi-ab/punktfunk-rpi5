@@ -94,6 +94,22 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
                 options = BITRATE_OPTIONS,
                 selected = s.bitrateKbps,
             ) { kbps -> update(s.copy(bitrateKbps = kbps)) }
+
+            // HDR is only meaningful on a panel that can present HDR10; on an SDR display the toggle
+            // is disabled (and HDR is never advertised regardless) so the host doesn't send PQ the
+            // panel would mis-tone-map. The capability is fixed for the device, so read it once.
+            val hdrCapable = remember { displaySupportsHdr(context) }
+            ToggleRow(
+                title = "HDR",
+                subtitle = if (hdrCapable) {
+                    "Stream 10-bit HDR (BT.2020 PQ) when the host supports it"
+                } else {
+                    "This display can't present HDR10 — streams stay SDR"
+                },
+                checked = s.hdrEnabled && hdrCapable,
+                enabled = hdrCapable,
+                onCheckedChange = { on -> update(s.copy(hdrEnabled = on)) },
+            )
         }
 
         SettingsGroup("Host") {
@@ -181,24 +197,31 @@ private fun SettingsGroup(title: String, content: @Composable ColumnScope.() -> 
     }
 }
 
-/** A title + subtitle on the left, a Switch on the right. */
+/** A title + subtitle on the left, a Switch on the right. [enabled] greys out the whole row. */
 @Composable
 private fun ToggleRow(
     title: String,
     subtitle: String,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
 ) {
+    // Dim the labels when disabled so the row reads as inactive (the Switch dims itself).
+    val labelAlpha = if (enabled) 1f else 0.38f
     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = labelAlpha),
+            )
             Text(
                 subtitle,
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = labelAlpha),
             )
         }
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
     }
 }
 

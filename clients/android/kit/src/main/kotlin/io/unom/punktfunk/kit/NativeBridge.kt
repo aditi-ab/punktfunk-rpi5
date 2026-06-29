@@ -103,9 +103,12 @@ object NativeBridge {
 
     /**
      * Drain ~1 s of live decode stats for the on-stream HUD, or `null` when no decode thread runs.
-     * Returns 10 doubles:
-     * `[fps, mbps, latP50Ms, latP95Ms, latValid, skewCorrected, width, height, refreshHz, framesDropped]`
-     * (the two flags are 1.0/0.0). Poll ~1 Hz; each call resets the measurement window.
+     * Returns 14 doubles:
+     * `[fps, mbps, latP50Ms, latP95Ms, latValid, skewCorrected, width, height, refreshHz, framesDropped,
+     * bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc]`
+     * (the two flags are 1.0/0.0; the trailing four describe the negotiated video feed — bit depth
+     * 8/10, CICP primaries/transfer, and the HEVC chroma_format_idc 1=4:2:0 / 3=4:4:4). Poll ~1 Hz;
+     * each call resets the measurement window.
      */
     external fun nativeVideoStats(handle: Long): DoubleArray?
 

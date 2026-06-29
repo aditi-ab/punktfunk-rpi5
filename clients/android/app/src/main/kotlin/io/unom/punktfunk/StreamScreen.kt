@@ -1,6 +1,7 @@
 package io.unom.punktfunk
 
 import android.Manifest
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -102,6 +103,13 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             it.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             it.hide(WindowInsetsCompat.Type.systemBars())
         }
+        // Lock to landscape while streaming — the host streams a landscape desktop, so pin the device
+        // there (either landscape direction is fine) and stop it rotating to portrait mid-session. The
+        // activity declares configChanges=orientation, so this re-lays out the surface in place without
+        // recreating the activity (no stream restart). On TV (fixed landscape) it's a harmless no-op.
+        // The prior request is captured and restored on the way out.
+        val priorOrientation = activity?.requestedOrientation
+        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         activity?.streamHandle = handle // route hardware keys to this session
         activity?.axisMapper = Gamepad.AxisMapper(handle) // route joystick axes
         // Host→client feedback (rumble + DualSense lightbar/LEDs); poll threads stopped before close.
@@ -114,6 +122,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             activity?.streamHandle = 0L
             controller?.show(WindowInsetsCompat.Type.systemBars())
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            // Release the landscape lock so the rest of the app follows the device/system again.
+            activity?.requestedOrientation =
+                priorOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             // Leaving the stream: stop the mic + audio + decode threads and tear down the session.
             NativeBridge.nativeStopMic(handle)
             NativeBridge.nativeStopAudio(handle)
@@ -314,9 +325,11 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
 }
 
 /**
- * The live stats overlay — mirrors the Apple client's HUD. Reads the 10-double layout from
+ * The live stats overlay — mirrors the Apple client's HUD. Reads the 14-double layout from
  * [NativeBridge.nativeVideoStats]:
- * `[fps, mbps, latP50Ms, latP95Ms, latValid, skew, w, h, hz, dropped]`.
+ * `[fps, mbps, latP50Ms, latP95Ms, latValid, skew, w, h, hz, dropped, bitDepth, colorPrimaries,
+ * colorTransfer, chromaFormatIdc]`. The trailing four (present on a current native lib) describe the
+ * negotiated video feed and render as a codec/depth/colour/chroma line; older layouts just omit it.
  */
 @Composable
 internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
@@ -338,6 +351,14 @@ internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
             fontFamily = FontFamily.Monospace,
             fontSize = 12.sp,
         )
+        videoFeedLine(s)?.let { feed ->
+            Text(
+                feed,
+                color = Color.White,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+            )
+        }
         if (latValid) {
             val tag = if (skew) "" else " (same-host)"
             Text(
@@ -356,4 +377,32 @@ internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
             )
         }
     }
+}
+
+/**
+ * Format the negotiated video-feed descriptor from the trailing four stats doubles
+ * `[bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc]`, e.g.
+ * `HEVC · 10-bit · HDR (BT.2020 PQ) · 4:2:0`. Returns `null` on a pre-video-feed layout (< 14 doubles)
+ * so the overlay simply omits the line. The codes are CICP / H.273: transfer 16 = PQ, 18 = HLG (else
+ * SDR); primaries 9 = BT.2020, 1 = BT.709; chroma_format_idc 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4. The
+ * Android decoder is always HEVC (`video/hevc`).
+ */
+private fun videoFeedLine(s: DoubleArray): String? {
+    if (s.size < 14) return null
+    val bitDepth = s[10].toInt()
+    val primaries = s[11].toInt()
+    val transfer = s[12].toInt()
+    val chromaIdc = s[13].toInt()
+    val depthLabel = if (bitDepth > 0) "$bitDepth-bit" else "8-bit"
+    val (dynamicRange, colorSpace) = when (transfer) {
+        16 -> "HDR" to "BT.2020 PQ"
+        18 -> "HDR" to "BT.2020 HLG"
+        else -> "SDR" to if (primaries == 9) "BT.2020" else "BT.709"
+    }
+    val chromaLabel = when (chromaIdc) {
+        3 -> "4:4:4"
+        2 -> "4:2:2"
+        else -> "4:2:0"
+    }
+    return "HEVC · $depthLabel · $dynamicRange ($colorSpace) · $chromaLabel"
 }

@@ -409,11 +409,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 }
 
 /// `NativeBridge.nativeVideoStats(handle): DoubleArray?` — drain ~1 s of decode stats for the HUD.
-/// Returns 10 doubles
-/// `[fps, mbps, latP50Ms, latP95Ms, latValid, skewCorrected, width, height, refreshHz, framesDropped]`
-/// (the two flags are 1.0/0.0), or `null` when no decode thread is running. Poll ~1 Hz from the UI;
-/// each call resets the measurement window. Not android-gated — pure `jni` + connector reads, so it
-/// links on the host build too (Kotlin only ever calls it on device).
+/// Returns 14 doubles
+/// `[fps, mbps, latP50Ms, latP95Ms, latValid, skewCorrected, width, height, refreshHz, framesDropped,
+/// bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc]`
+/// (the two flags are 1.0/0.0; the trailing four describe the negotiated video feed — see below), or
+/// `null` when no decode thread is running. Poll ~1 Hz from the UI; each call resets the measurement
+/// window. Not android-gated — pure `jni` + connector reads, so it links on the host build too
+/// (Kotlin only ever calls it on device).
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
     env: JNIEnv,
@@ -431,7 +433,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             None => return std::ptr::null_mut(), // not streaming → no stats
         };
         let mode = h.client.mode();
-        let buf: [f64; 10] = [
+        let color = h.client.color;
+        let buf: [f64; 14] = [
             snap.fps,
             snap.mbps,
             snap.lat_p50_ms,
@@ -442,6 +445,14 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             mode.height as f64,
             mode.refresh_hz as f64,
             h.client.frames_dropped() as f64,
+            // Video-feed properties the host resolved at the handshake (Welcome): encode bit depth
+            // (8 / 10), the CICP colour primaries + transfer code points (Kotlin maps these to a
+            // colour-space / HDR label — transfer 16 = PQ, 18 = HLG ⇒ HDR), and the HEVC
+            // chroma_format_idc (1 = 4:2:0, 3 = 4:4:4). Static for the session unless renegotiated.
+            h.client.bit_depth as f64,
+            color.primaries as f64,
+            color.transfer as f64,
+            h.client.chroma_format as f64,
         ];
         let arr = match env.new_double_array(buf.len() as jsize) {
             Ok(a) => a,

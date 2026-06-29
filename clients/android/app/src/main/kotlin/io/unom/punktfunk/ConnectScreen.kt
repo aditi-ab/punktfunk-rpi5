@@ -175,9 +175,9 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
         status = "Connecting to $targetHost:$targetPort…"
         discovery.stop() // free the Wi-Fi radio before the stream session
         scope.launch {
-            // Advertise HDR only when this device's display can present it (else the host sends a
-            // proper SDR stream rather than PQ the panel would mis-tone-map).
-            val hdrEnabled = displaySupportsHdr(context)
+            // Advertise HDR only when the user enabled it AND this device's display can present it
+            // (else the host sends a proper SDR stream rather than PQ the panel would mis-tone-map).
+            val hdrEnabled = settings.hdrEnabled && displaySupportsHdr(context)
             // "Automatic" resolves to a concrete pad type from the connected controller's VID/PID
             // (Android exposes no controller-type enum) — parity with the Linux/Apple clients. An
             // explicit choice is passed through unchanged.
@@ -224,7 +224,7 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
         status = null
         discovery.stop() // free the Wi-Fi radio before the (parked) stream session
         scope.launch {
-            val hdrEnabled = displaySupportsHdr(context)
+            val hdrEnabled = settings.hdrEnabled && displaySupportsHdr(context)
             val gamepadPref = Gamepad.resolvePref(settings.gamepad)
             // Pin the advertised fingerprint for a discovered host (defence against an impostor while
             // we wait); a manually-typed host has none, so trust-on-first-use.

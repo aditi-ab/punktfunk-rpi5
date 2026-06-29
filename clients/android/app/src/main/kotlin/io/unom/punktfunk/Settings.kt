@@ -14,6 +14,13 @@ data class Settings(
     val height: Int = 0,
     val hz: Int = 0,
     val bitrateKbps: Int = 0,
+    /**
+     * Advertise HDR (10-bit BT.2020 PQ) to the host. Default on, but only *effective* on a panel that
+     * can actually present HDR10 (see [displaySupportsHdr]) — on an SDR display HDR is never
+     * advertised regardless, so the host sends a proper 8-bit BT.709 stream rather than PQ the panel
+     * would mis-tone-map. Turning this off forces SDR even on a capable panel.
+     */
+    val hdrEnabled: Boolean = true,
     val compositor: Int = 0,
     val gamepad: Int = 0,
     /** Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
@@ -40,6 +47,7 @@ class SettingsStore(context: Context) {
         height = prefs.getInt(K_H, 0),
         hz = prefs.getInt(K_HZ, 0),
         bitrateKbps = prefs.getInt(K_BITRATE, 0),
+        hdrEnabled = prefs.getBoolean(K_HDR, true),
         compositor = prefs.getInt(K_COMPOSITOR, 0),
         gamepad = prefs.getInt(K_GAMEPAD, 0),
         audioChannels = prefs.getInt(K_AUDIO_CH, 2),
@@ -54,6 +62,7 @@ class SettingsStore(context: Context) {
             .putInt(K_H, s.height)
             .putInt(K_HZ, s.hz)
             .putInt(K_BITRATE, s.bitrateKbps)
+            .putBoolean(K_HDR, s.hdrEnabled)
             .putInt(K_COMPOSITOR, s.compositor)
             .putInt(K_GAMEPAD, s.gamepad)
             .putInt(K_AUDIO_CH, s.audioChannels)
@@ -68,6 +77,7 @@ class SettingsStore(context: Context) {
         const val K_H = "height"
         const val K_HZ = "hz"
         const val K_BITRATE = "bitrate_kbps"
+        const val K_HDR = "hdr_enabled"
         const val K_COMPOSITOR = "compositor"
         const val K_GAMEPAD = "gamepad"
         const val K_AUDIO_CH = "audio_channels"

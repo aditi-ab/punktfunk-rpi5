@@ -186,9 +186,11 @@ internal fun StreamScene() {
                 Brush.linearGradient(listOf(Color(0xFF2A1E5C), Color(0xFF0E1B3D), Color(0xFF06122B))),
             ),
     ) {
-        // [fps, mbps, latP50, latP95, latValid, skew, w, h, hz, dropped]
+        // [fps, mbps, latP50, latP95, latValid, skew, w, h, hz, dropped,
+        //  bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc] — the last four = a 10-bit
+        //  BT.2020 PQ (HDR) 4:2:0 feed, so the HUD renders its video-feed line.
         StatsOverlay(
-            doubleArrayOf(238.0, 921.4, 1.3, 2.1, 1.0, 1.0, 5120.0, 1440.0, 240.0, 0.0),
+            doubleArrayOf(238.0, 921.4, 1.3, 2.1, 1.0, 1.0, 5120.0, 1440.0, 240.0, 0.0, 10.0, 9.0, 16.0, 1.0),
             Modifier.align(Alignment.TopStart).padding(12.dp),
         )
     }
