@@ -101,6 +101,10 @@ struct Session {
     server_challenge: [u8; 16],
     /// The client's phase-3 hash, recomputed + checked in phase 4.
     client_hash: Vec<u8>,
+    /// Set once phase 3 has produced the RSA-signed serversecret. A repeated phase 3 is refused so a
+    /// peer past phase 1 can't loop phase2/phase3 to harvest many signing-time samples (a passive
+    /// timing-oracle amplifier vs. the rsa-crate Marvin side-channel; see `.cargo/audit.toml`).
+    responded: bool,
 }
 
 pub struct Pairing {
@@ -155,6 +159,7 @@ impl Pairing {
                 serversecret: [0; 16],
                 server_challenge: [0; 16],
                 client_hash: Vec::new(),
+                responded: false,
             },
         );
         tracing::info!(
@@ -216,6 +221,14 @@ impl Pairing {
             bail!("short challenge response");
         }
         s.client_hash = client_hash[..32].to_vec();
+        // Sign the serversecret exactly ONCE per ceremony: refuse a repeated phase 3 so a peer that
+        // cleared phase 1 (operator PIN) can't replay it to collect many RSA signing-time samples
+        // (timing-oracle amplifier vs. RUSTSEC-2023-0071; see `.cargo/audit.toml`). A legit client
+        // signs once. The session stays for phase 4 (the cert-pin step) but won't re-sign.
+        if s.responded {
+            bail!("serverchallengeresp already answered for this pairing session");
+        }
+        s.responded = true;
         let sig: Signature = id.signing_key.sign(&s.serversecret);
         let mut secret = Vec::with_capacity(16 + 256);
         secret.extend_from_slice(&s.serversecret);
