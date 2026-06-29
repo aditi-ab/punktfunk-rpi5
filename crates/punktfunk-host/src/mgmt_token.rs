@@ -36,7 +36,8 @@ pub fn load_or_generate() -> Result<String> {
     let token = hex::encode(buf);
     let dir = crate::gamestream::config_dir();
     // Owner-private dir (0700 Unix / DACL-locked Windows) so the token can't leak via the config path.
-    crate::gamestream::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
+    crate::gamestream::create_private_dir(&dir)
+        .with_context(|| format!("create {}", dir.display()))?;
     write_token(&path, &token)?;
     tracing::info!(path = %path.display(), "generated and persisted management API token (owner-only)");
     Ok(token)
