@@ -184,6 +184,9 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
         decoder,
         pin,
         identity,
+        // Headless CLI uses the normal (short) handshake budget; the long request-access wait is a
+        // GUI-only flow.
+        connect_timeout: Duration::from_secs(15),
     });
 
     let deadline = Instant::now() + Duration::from_secs(60);

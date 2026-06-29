@@ -27,6 +27,11 @@ pub struct SessionParams {
     /// Pinned host fingerprint; `None` = trust on first use (caller persists the observed one).
     pub pin: Option<[u8; 32]>,
     pub identity: (String, String),
+    /// How long to wait for the handshake. The normal path uses a short budget; the
+    /// "request access" (delegated-approval) path uses a long one, because the host PARKS the
+    /// connection until the operator clicks Approve in its console (so this must exceed the
+    /// host's approval window — see `PENDING_APPROVAL_WAIT`).
+    pub connect_timeout: Duration,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -139,7 +144,7 @@ fn pump(
         None, // launch: the Linux client has no library picker yet
         params.pin,
         Some(params.identity),
-        Duration::from_secs(15),
+        params.connect_timeout,
     ) {
         Ok(c) => Arc::new(c),
         Err(e) => {

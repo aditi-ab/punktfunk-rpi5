@@ -29,8 +29,10 @@ object NativeBridge {
      * trust-on-first-use — read [nativeHostFingerprint] after; else 64-hex host SHA-256, mismatch →
      * `0`). [width]/[height]/[refreshHz] are the requested virtual-output mode (the host streams at
      * exactly this); [bitrateKbps] 0 = host default; [compositorPref]/[gamepadPref] are the
-     * `CompositorPref`/`GamepadPref` wire bytes (0 = Auto). Returns an opaque session handle, or `0`
-     * on failure. Pair with exactly one [nativeClose].
+     * `CompositorPref`/`GamepadPref` wire bytes (0 = Auto). [timeoutMs] is the handshake budget — the
+     * normal path passes a short value, the no-PIN "request access" path a long one (≥ the host's
+     * approval-park window) so a slow operator approval lands on this same parked connection. Returns
+     * an opaque session handle, or `0` on failure. Pair with exactly one [nativeClose].
      */
     external fun nativeConnect(
         host: String,
@@ -46,6 +48,7 @@ object NativeBridge {
         gamepadPref: Int,
         hdrEnabled: Boolean,
         audioChannels: Int,
+        timeoutMs: Int,
     ): Long
 
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */

@@ -95,6 +95,13 @@ final class SessionModel: ObservableObject {
     /// field — TOFU is forbidden (rule 3b): the connect refuses rather than offering trust, and
     /// the user is routed to PIN pairing by the caller. (A pinned host connects regardless: its
     /// stored fingerprint is the trust decision.)
+    ///
+    /// `requestAccess` is the no-PIN delegated-approval path: open an identified connect the host
+    /// PARKS until the operator clicks Approve in its console, then admits the SAME connection (no
+    /// reconnect). The handshake budget is widened to exceed the host's park window, and a
+    /// successful connect streams directly (the approval IS the trust decision) — the caller pins
+    /// the observed fingerprint as paired. `host.pinnedSHA256`, when set, pins the advertised cert
+    /// for the wait; nil = trust-on-first-use.
     func connect(to host: StoredHost, width: UInt32, height: UInt32, hz: UInt32,
                  compositor: PunktfunkConnection.Compositor = .auto,
                  gamepad: PunktfunkConnection.GamepadType = .auto,
@@ -103,7 +110,8 @@ final class SessionModel: ObservableObject {
                  hdrEnabled: Bool = true,
                  launchID: String? = nil,
                  allowTofu: Bool = false,
-                 autoTrust: Bool = false) {
+                 autoTrust: Bool = false,
+                 requestAccess: Bool = false) {
         guard phase == .idle else { return }
         phase = .connecting
         activeHost = host
@@ -138,7 +146,11 @@ final class SessionModel: ObservableObject {
                 width: width, height: height, refreshHz: hz,
                 pinSHA256: pin, identity: identity, compositor: compositor,
                 gamepad: gamepad, bitrateKbps: bitrateKbps, videoCaps: videoCaps,
-                audioChannels: audioChannels, launchID: launchID) }
+                audioChannels: audioChannels, launchID: launchID,
+                // Delegated approval: the host holds this connect open until the operator approves
+                // it (~180 s) — outwait that window so a slow approval still lands here. Normal
+                // connects keep the snappy default.
+                timeoutMs: requestAccess ? 185_000 : 10_000) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 // The user may have abandoned this attempt (window closed, another host
@@ -152,7 +164,9 @@ final class SessionModel: ObservableObject {
                 }
                 switch result {
                 case .success(let conn):
-                    if pin != nil || autoTrust {
+                    if pin != nil || autoTrust || requestAccess {
+                        // requestAccess: the operator approved this device on the host, so the
+                        // session is trusted — stream directly (the caller pins it as paired).
                         self.connection = conn
                         self.startStatsTimer()
                         self.beginStreaming()
@@ -174,16 +188,25 @@ final class SessionModel: ObservableObject {
                 case .failure:
                     self.phase = .idle
                     self.activeHost = nil
-                    self.errorMessage = pin != nil
-                        ? "Could not connect to \(host.displayName) — host unreachable, "
-                            + "not running, its identity no longer matches the pinned "
-                            + "fingerprint, or it requires pairing and no longer "
-                            + "recognizes this Mac (right-click the host card to pair "
-                            + "again)."
-                        : "Could not connect to \(host.displayName) — is punktfunk-host "
-                            + "running on \(host.address):\(host.port)? If it requires "
-                            + "pairing, right-click the host card and pair with its PIN "
-                            + "first."
+                    if requestAccess {
+                        // The delegated-approval connect ended without being admitted: the
+                        // operator didn't approve it before the host's park window elapsed (or
+                        // the host was unreachable).
+                        self.errorMessage = "\(host.displayName) didn't let this device in. "
+                            + "Approve it in the host's web console (port 3000 → Pairing), then "
+                            + "request access again — the request expires after a few minutes."
+                    } else {
+                        self.errorMessage = pin != nil
+                            ? "Could not connect to \(host.displayName) — host unreachable, "
+                                + "not running, its identity no longer matches the pinned "
+                                + "fingerprint, or it requires pairing and no longer "
+                                + "recognizes this Mac (right-click the host card to pair "
+                                + "again)."
+                            : "Could not connect to \(host.displayName) — is punktfunk-host "
+                                + "running on \(host.address):\(host.port)? If it requires "
+                                + "pairing, right-click the host card and pair with its PIN "
+                                + "first."
+                    }
                 }
             }
         }

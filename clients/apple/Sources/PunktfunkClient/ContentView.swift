@@ -4,10 +4,12 @@
 // (HomeView/HostCards), the trust prompt (TrustCardView), and the HUD (StreamHUDView) live in
 // their own files.
 //
-// Two ways to establish trust on first contact: the TOFU prompt (host fingerprint over the
-// live-but-blurred stream, compared with the host's log) or the PIN pairing ceremony — pairing
-// verifies both sides at once and is the only way into hosts running --require-pairing. Once
-// pinned, reconnects are silent and a changed host identity refuses to connect.
+// Ways to establish trust on first contact: the TOFU prompt (host fingerprint over the
+// live-but-blurred stream, compared with the host's log; only for a host advertising pair=optional),
+// the PIN pairing ceremony (verifies both sides at once), or — for a host that requires pairing —
+// delegated approval ("Request Access": a plain identified connect the host parks until the operator
+// approves this device in its console, no PIN). Once pinned, reconnects are silent and a changed
+// host identity refuses to connect.
 
 #if os(macOS)
 import AppKit
@@ -31,6 +33,12 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @State private var showAddHost = false
     @State private var pairingTarget: StoredHost?
+    /// A fresh `pair=required`/unknown host the user tapped: drives the choice between no-PIN
+    /// delegated approval ("Request Access") and the SPAKE2 PIN ceremony (rule 3b).
+    @State private var approvalChoice: ApprovalRequest?
+    /// A delegated-approval connect is in flight (host parks it until the operator approves):
+    /// drives the cancelable "Waiting for approval" prompt and the pin-as-paired on success.
+    @State private var awaitingApproval: ApprovalRequest?
     @State private var speedTestTarget: StoredHost?
     @State private var libraryTarget: StoredHost?
     #if !os(macOS)
@@ -55,10 +63,27 @@ struct ContentView: View {
             autoConnectIfAsked()
         }
         .onChange(of: model.phase) { _, phase in
-            // A session actually started — remember it on the card ("Connected … ago"
-            // plus the accent ring on the most recent host).
-            if case .streaming = phase, let host = model.activeHost {
+            switch phase {
+            case .streaming:
+                // A session actually started — remember it on the card ("Connected … ago"
+                // plus the accent ring on the most recent host).
+                guard let host = model.activeHost else { break }
                 store.markConnected(host.id)
+                // Delegated approval just succeeded: the operator let this device in, so pin the
+                // host's observed fingerprint and remember it as paired — future connects are then
+                // silent (rule 1), exactly like after a PIN/TOFU success. Dismisses the wait prompt.
+                if awaitingApproval?.host.id == host.id {
+                    if let fp = model.connection?.hostFingerprint {
+                        store.pin(host.id, fingerprint: fp)
+                    }
+                    awaitingApproval = nil
+                }
+            case .idle:
+                // The delegated-approval connect failed, timed out, or was cancelled — drop the
+                // wait prompt (SessionModel surfaces any error via `errorMessage`).
+                if awaitingApproval != nil { awaitingApproval = nil }
+            default:
+                break
             }
         }
         .onDisappear { model.disconnect() } // window closed mid-session (Cmd+N spawns more)
@@ -90,6 +115,47 @@ struct ContentView: View {
             }
         }
         #endif
+        // Fresh pair=required / unknown host: offer the two ways in. An action sheet (not an
+        // alert) so it never collides with the wait alert below. "Request Access" is the no-PIN
+        // delegated-approval path; "Pair with PIN…" runs the SPAKE2 ceremony. The follow-on
+        // presentation is deferred a tick so this dialog is fully dismissed first.
+        .confirmationDialog(
+            "Pairing required",
+            isPresented: Binding(
+                get: { approvalChoice != nil },
+                set: { if !$0 { approvalChoice = nil } }),
+            titleVisibility: .visible,
+            presenting: approvalChoice
+        ) { req in
+            Button("Request Access") {
+                DispatchQueue.main.async { requestAccess(req) }
+            }
+            Button("Pair with PIN…") {
+                DispatchQueue.main.async { pairingTarget = req.host }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { req in
+            Text("\(req.host.displayName) requires pairing. Request access and approve this "
+                + "device in the host's web console (port 3000 → Pairing) — no PIN needed. Or "
+                + "pair with the 4-digit PIN it can display.")
+        }
+        // The delegated-approval wait: the host holds the connection open until the operator
+        // approves it. Cancel returns the UI at once; the in-flight connect is left to time out
+        // and its late result is discarded by SessionModel's connect guard (disconnect resets the
+        // phase/host it checks).
+        .alert(
+            "Waiting for approval",
+            isPresented: Binding(
+                get: { awaitingApproval != nil },
+                set: { if !$0 { awaitingApproval = nil } }),
+            presenting: awaitingApproval
+        ) { _ in
+            Button("Cancel", role: .cancel) { model.disconnect() }
+        } message: { req in
+            Text("Approve \u{201C}\(localDeviceName)\u{201D} in \(req.host.displayName)'s web "
+                + "console (port 3000 → Pairing). This device connects automatically once you "
+                + "approve it — no need to reconnect.")
+        }
     }
 
     private var home: some View {
@@ -230,19 +296,32 @@ struct ContentView: View {
         // A pinned host connects on its stored fingerprint; an unpinned host may only TOFU when
         // the host's LIVE advert says `pair=optional` (rule 3a). When the caller doesn't already
         // know the policy (a saved-card tap / manual entry), resolve it from the current mDNS set:
-        // an unpinned host with no matching `pair=optional` advert routes to PIN pairing instead
-        // of silently entering the trust prompt (rules 3b + 4). A pinned host ignores all of this.
+        // an unpinned host with no matching `pair=optional` advert routes to the approval choice
+        // (request access / pair with PIN) instead of silently entering the trust prompt (rules
+        // 3b + 4). A pinned host ignores all of this.
         if host.pinnedSHA256 == nil {
             let tofuOK = allowTofu ?? discovery.hosts.contains {
                 host.matches($0) && $0.allowsTofu
             }
             if !tofuOK {
-                pairingTarget = host
+                // pair=required / unknown policy / manual entry (rule 3b): never a silent
+                // connect — offer no-PIN delegated approval or the PIN ceremony.
+                approvalChoice = ApprovalRequest(
+                    host: host, advertisedFingerprint: advertisedFingerprint(for: host))
                 return
             }
         }
-        // The gamepad-type setting resolves NOW (Automatic → match the active physical
-        // controller): the host's virtual pad backend is fixed per session.
+        startSession(host, launchID: launchID, allowTofu: host.pinnedSHA256 == nil)
+    }
+
+    /// Resolve the @AppStorage stream mode + input prefs and hand off to the session model. The
+    /// gamepad-type setting resolves NOW (Automatic → match the active physical controller): the
+    /// host's virtual pad backend is fixed per session. `requestAccess` opens the no-PIN
+    /// delegated-approval connect (host parks it until the operator approves).
+    private func startSession(
+        _ host: StoredHost, launchID: String? = nil,
+        allowTofu: Bool, requestAccess: Bool = false
+    ) {
         model.connect(
             to: host,
             width: UInt32(clamping: width), height: UInt32(clamping: height),
@@ -255,7 +334,22 @@ struct ContentView: View {
             bitrateKbps: UInt32(clamping: bitrateKbps),
             audioChannels: UInt8(clamping: audioChannels),
             launchID: launchID,
-            allowTofu: host.pinnedSHA256 == nil)
+            allowTofu: allowTofu,
+            requestAccess: requestAccess)
+    }
+
+    /// The no-PIN delegated-approval flow: open an identified connect the host parks until the
+    /// operator approves it in the console, showing the cancelable "Waiting for approval" prompt
+    /// meanwhile. On success the SAME connection is admitted (no reconnect) and the host is pinned
+    /// as paired (see the `.streaming` branch of `onChange`).
+    private func requestAccess(_ req: ApprovalRequest) {
+        guard !model.isBusy else { return }
+        awaitingApproval = req
+        // Pin the advertised certificate for a discovered host (impostor defence during the long
+        // wait); a manually-typed host has no advertised fingerprint, so trust-on-first-use.
+        var host = req.host
+        host.pinnedSHA256 = req.advertisedFingerprint
+        startSession(host, allowTofu: false, requestAccess: true)
     }
 
     /// Picked a title in the (experimental) library: dismiss the browser and start a session that
@@ -268,8 +362,9 @@ struct ContentView: View {
     /// Tap a discovered host: save it (so the session has a stored identity and the trust pin
     /// persists), then connect or pair per the host's advertised policy. The host is the policy
     /// authority — TOFU is offered ONLY when it explicitly advertised `pair=optional` (rule 3a);
-    /// a `pair=required` host, or one with no/unknown `pair` field, goes straight to the PIN
-    /// pairing ceremony (rule 3b). (A pinned discovered host connects silently inside `connect`.)
+    /// a `pair=required` host, or one with no/unknown `pair` field, gets the approval choice
+    /// (request access / pair with PIN) (rule 3b). (A pinned discovered host connects silently
+    /// inside `connect`.)
     private func connectDiscovered(_ d: DiscoveredHost) {
         guard !model.isBusy else { return }
         let host = StoredHost(name: d.name, address: d.host, port: d.port)
@@ -277,7 +372,9 @@ struct ContentView: View {
         if d.allowsTofu {
             connect(host, allowTofu: true)
         } else {
-            pairingTarget = host
+            // pair=required / unknown policy (rule 3b): offer no-PIN delegated approval or PIN.
+            approvalChoice = ApprovalRequest(
+                host: host, advertisedFingerprint: pinFingerprint(d.fingerprintHex))
         }
     }
 
@@ -289,6 +386,30 @@ struct ContentView: View {
         var pinned = host
         pinned.pinnedSHA256 = fingerprint
         connect(pinned)
+    }
+
+    /// The certificate fingerprint a live mDNS advert carries for this saved host (advisory — see
+    /// `HostDiscovery`), to pin during a delegated-approval wait. nil if the host isn't currently
+    /// advertising or advertised no/invalid `fp`.
+    private func advertisedFingerprint(for host: StoredHost) -> Data? {
+        pinFingerprint(discovery.hosts.first { host.matches($0) }?.fingerprintHex)
+    }
+
+    /// Parse an advertised cert fingerprint (lowercase hex) into the 32-byte pin the connect
+    /// expects; nil unless it's exactly a 32-byte (SHA-256) value, so a malformed advert falls
+    /// back to trust-on-first-use rather than failing the connect closed.
+    private func pinFingerprint(_ hex: String?) -> Data? {
+        guard let hex, let data = Data(hexString: hex), data.count == 32 else { return nil }
+        return data
+    }
+
+    /// How the host lists this device in its approval prompt (matches PairSheet's client name).
+    private var localDeviceName: String {
+        #if os(macOS)
+        Host.current().localizedName ?? "Mac"
+        #else
+        UIDevice.current.name
+        #endif
     }
 
     // MARK: - First-run + dev hooks
@@ -378,3 +499,31 @@ private struct FullscreenController: NSViewRepresentable {
     }
 }
 #endif
+
+/// A fresh `pair=required`/unknown host pending a trust decision: drives both the "request access
+/// vs. pair with PIN" choice and the subsequent approval wait. `advertisedFingerprint` is the
+/// discovered host's advertised cert (nil for a manually-typed host → trust-on-first-use).
+private struct ApprovalRequest {
+    let host: StoredHost
+    let advertisedFingerprint: Data?
+}
+
+private extension Data {
+    /// Parse an even-length hex string into bytes; nil on any non-hex character or odd length.
+    /// Used to turn an mDNS-advertised cert fingerprint into a connect pin.
+    init?(hexString: String) {
+        let chars = Array(hexString)
+        guard chars.count.isMultiple(of: 2) else { return nil }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(chars.count / 2)
+        var i = 0
+        while i < chars.count {
+            guard let hi = chars[i].hexDigitValue, let lo = chars[i + 1].hexDigitValue else {
+                return nil
+            }
+            bytes.append(UInt8(hi << 4 | lo))
+            i += 2
+        }
+        self = Data(bytes)
+    }
+}

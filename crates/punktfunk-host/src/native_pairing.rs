@@ -11,6 +11,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 /// The host's paired punktfunk/1 clients: `~/.config/punktfunk/punktfunk1-paired.json`.
 /// (Separate from GameStream pairing, which has its own store and ceremony.)
@@ -76,6 +77,18 @@ pub struct PendingRequest {
     pub age_secs: u64,
 }
 
+/// The outcome of [`NativePairing::wait_for_decision`] — what an operator did with a parked,
+/// unpaired knock (delegated approval, roadmap §8b-1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairingDecision {
+    /// The operator clicked Approve (the fingerprint is now paired) — admit the session.
+    Approved,
+    /// The operator denied, or the pending entry was otherwise dropped without pairing — reject.
+    Denied,
+    /// No decision within the wait window — reject; the device can knock again.
+    TimedOut,
+}
+
 /// Pending knocks older than this are dropped (the device retries; a stale entry shouldn't be
 /// approvable days later when the operator no longer remembers the context).
 const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
@@ -88,6 +101,11 @@ pub struct NativePairing {
     arm: Mutex<Armed>,
     paired: Mutex<PairedState>,
     pending: Mutex<PendingState>,
+    /// Notified whenever the trust/pending state changes (a fingerprint paired, or a pending knock
+    /// denied/dropped), so a QUIC connection parked in [`NativePairing::wait_for_decision`] wakes
+    /// the instant an operator acts in the console — the substrate for delegated approval admitting
+    /// a session with no client reconnect.
+    changed: Notify,
 }
 
 /// A snapshot for the management API / web console.
@@ -199,6 +217,7 @@ impl NativePairing {
             arm: Mutex::new(arm),
             paired: Mutex::new(PairedState { path, clients }),
             pending: Mutex::new(PendingState::default()),
+            changed: Notify::new(),
         })
     }
 
@@ -276,10 +295,17 @@ impl NativePairing {
             }
         }
         // A device that knocked and is now paired shouldn't linger in the approval list.
-        let mut pending = self.pending.lock().unwrap();
-        pending
-            .items
-            .retain(|p| !p.fp_hex.eq_ignore_ascii_case(fp_hex));
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending
+                .items
+                .retain(|p| !p.fp_hex.eq_ignore_ascii_case(fp_hex));
+        }
+        // Wake any connection parked in `wait_for_decision` for this fingerprint: pairing just
+        // completed (console approve or the PIN ceremony), so it can admit the session with no
+        // reconnect. Notified AFTER the pin AND the pending-clear so a woken waiter observes the
+        // fully settled state (paired = true, no longer pending) — see `wait_for_decision`.
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -372,6 +398,17 @@ impl NativePairing {
             .collect()
     }
 
+    /// Is a knock for this fingerprint still awaiting approval? (Expired entries are dropped
+    /// first, so this also reports whether a parked knock is still live.)
+    pub fn pending_contains(&self, fp_hex: &str) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        Self::expire_pending(&mut pending);
+        pending
+            .items
+            .iter()
+            .any(|p| p.fp_hex.eq_ignore_ascii_case(fp_hex))
+    }
+
     /// Approve a pending knock: pair its fingerprint (under `name_override` if the operator
     /// labeled it, else the knock's own name) and drop it from the queue. `Ok(None)` = no such
     /// (or expired) id.
@@ -380,29 +417,78 @@ impl NativePairing {
         id: u32,
         name_override: Option<&str>,
     ) -> Result<Option<PairedClient>> {
-        let entry = {
+        // Read (do NOT pre-remove) the entry: `add()` pins the fingerprint and THEN clears its
+        // pending entry — an order `wait_for_decision` relies on so a parked waiter never observes
+        // the device as "neither pending nor paired" (which would read as a denial). Removing here
+        // first would open exactly that window.
+        let (knock_name, fp_hex) = {
             let mut pending = self.pending.lock().unwrap();
             Self::expire_pending(&mut pending);
-            let Some(at) = pending.items.iter().position(|p| p.id == id) else {
-                return Ok(None);
-            };
-            pending.items.remove(at)
-        }; // pending lock released — add() takes the paired lock
-        let name = name_override.unwrap_or(&entry.name);
-        self.add(name, &entry.fp_hex)?;
+            match pending.items.iter().find(|p| p.id == id) {
+                Some(p) => (p.name.clone(), p.fp_hex.clone()),
+                None => return Ok(None),
+            }
+        }; // pending lock released — add() takes the paired then pending locks
+        let name = name_override.unwrap_or(&knock_name).to_string();
+        self.add(&name, &fp_hex)?; // pins, clears the pending entry, and notifies waiters
         Ok(Some(PairedClient {
-            name: name.to_string(),
-            fingerprint: entry.fp_hex,
+            name,
+            fingerprint: fp_hex,
         }))
     }
 
     /// Deny (drop) a pending knock. Returns whether one was removed. The device's next knock
     /// re-creates an entry — deny is "not now", not a blocklist.
     pub fn deny_pending(&self, id: u32) -> bool {
-        let mut pending = self.pending.lock().unwrap();
-        let before = pending.items.len();
-        pending.items.retain(|p| p.id != id);
-        pending.items.len() != before
+        let removed = {
+            let mut pending = self.pending.lock().unwrap();
+            let before = pending.items.len();
+            pending.items.retain(|p| p.id != id);
+            pending.items.len() != before
+        };
+        if removed {
+            // Wake a parked waiter so it returns `Denied` at once instead of holding the
+            // connection open until the approval window lapses.
+            self.changed.notify_waiters();
+        }
+        removed
+    }
+
+    /// Park (async) until an operator decides on a knock identified by `fp_hex`, up to `timeout`.
+    /// Returns [`PairingDecision::Approved`] the instant the fingerprint is paired (console
+    /// approve or a concurrent PIN ceremony), [`PairingDecision::Denied`] if its pending entry is
+    /// dropped without pairing, or [`PairingDecision::TimedOut`] if the window lapses. Holds no
+    /// lock across the await. The QUIC accept path calls this right after [`Self::note_pending`]
+    /// to keep the knocking connection open until a human clicks Approve — so the device pairs and
+    /// streams with no reconnect (delegated approval, roadmap §8b-1).
+    pub async fn wait_for_decision(&self, fp_hex: &str, timeout: Duration) -> PairingDecision {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Arm the wakeup BEFORE re-reading state, and `enable()` it, so an approve/deny that
+            // lands between the state check and the await still wakes us (no lost notification).
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.is_paired(fp_hex) {
+                return PairingDecision::Approved;
+            }
+            if !self.pending_contains(fp_hex) {
+                // Neither pending nor paired. This is almost always a denial — but it can also be
+                // the tiny interval inside `add()` between pinning and clearing the pending entry.
+                // Re-check `is_paired` once: because `add()` pins BEFORE it clears pending, a
+                // cleared-pending observation that is really an approval will now read as paired.
+                if self.is_paired(fp_hex) {
+                    return PairingDecision::Approved;
+                }
+                return PairingDecision::Denied;
+            }
+
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = tokio::time::sleep_until(deadline) => return PairingDecision::TimedOut,
+            }
+        }
     }
 }
 
@@ -559,6 +645,62 @@ mod tests {
         assert_eq!(s.expires_in_secs, None, "CLI arming has no expiry");
         np.disarm();
         assert!(np.current_pin().is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test]
+    async fn wait_for_decision_approve_deny_timeout() {
+        use std::sync::Arc;
+        let p = temp();
+        let _ = std::fs::remove_file(&p);
+        let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
+
+        // TimedOut: a parked knock with no decision returns TimedOut; the entry survives.
+        np.note_pending("Knocker", "ab01");
+        let d = np
+            .wait_for_decision("ab01", Duration::from_millis(80))
+            .await;
+        assert_eq!(d, PairingDecision::TimedOut);
+        assert!(np.pending_contains("ab01"));
+
+        // Approved: approving WHILE parked wakes the waiter with Approved.
+        let np2 = np.clone();
+        let waiter =
+            tokio::spawn(
+                async move { np2.wait_for_decision("ab01", Duration::from_secs(5)).await },
+            );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let id = np
+            .pending()
+            .into_iter()
+            .find(|x| x.fingerprint == "ab01")
+            .unwrap()
+            .id;
+        np.approve_pending(id, Some("Approved")).unwrap().unwrap();
+        assert_eq!(waiter.await.unwrap(), PairingDecision::Approved);
+        assert!(np.is_paired("ab01"));
+
+        // Denied: denying WHILE parked wakes the waiter with Denied (not held until timeout).
+        np.note_pending("Knock2", "cd02");
+        let np3 = np.clone();
+        let waiter =
+            tokio::spawn(
+                async move { np3.wait_for_decision("cd02", Duration::from_secs(5)).await },
+            );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let id = np
+            .pending()
+            .into_iter()
+            .find(|x| x.fingerprint == "cd02")
+            .unwrap()
+            .id;
+        assert!(np.deny_pending(id));
+        assert_eq!(waiter.await.unwrap(), PairingDecision::Denied);
+        assert!(!np.is_paired("cd02"));
+
+        // Already paired before the call → immediate Approved (no waiting).
+        let d = np.wait_for_decision("ab01", Duration::from_secs(5)).await;
+        assert_eq!(d, PairingDecision::Approved);
         let _ = std::fs::remove_file(&p);
     }
 }

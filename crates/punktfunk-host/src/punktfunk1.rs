@@ -78,7 +78,7 @@ pub struct Punktfunk1Options {
 }
 
 /// The native (punktfunk/1) trust store + on-demand arming PIN, shared with the management API.
-use crate::native_pairing::NativePairing;
+use crate::native_pairing::{NativePairing, PairingDecision};
 /// The shared streaming-stats recorder (web-console capture/graph), shared with the management API
 /// and the GameStream loop; threaded into each session's `SessionContext`.
 use crate::stats_recorder::StatsRecorder;
@@ -290,8 +290,11 @@ pub(crate) async fn serve(
         let stats = stats.clone();
         let inj_tx = injector.sender();
         let mic_tx = mic_service.sender();
+        // The session permit + the pool it came from are handed to serve_session, which owns the
+        // permit's lifetime: it's released while a knock is parked for delegated approval and
+        // re-acquired on approval, so the hold is no longer a simple closure-scoped binding.
+        let sem_session = sem.clone();
         sessions.spawn(async move {
-            let _permit = permit; // held for the session's lifetime; frees a slot on completion
             match serve_session(
                 conn,
                 &opts,
@@ -302,6 +305,8 @@ pub(crate) async fn serve(
                 &np,
                 &last_pairing,
                 stats,
+                permit,
+                sem_session,
             )
             .await
             {
@@ -410,6 +415,14 @@ type AudioCapSlot = Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCaptu
 /// client), so its budget is far larger than the machine-speed session handshake.
 const PAIRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long the host keeps an unpaired knock PARKED — connection held open — waiting for the
+/// operator to click Approve in the console (delegated approval, roadmap §8b-1). The QUIC
+/// keep-alive (4 s, under the 8 s idle timeout) holds the path warm meanwhile, so on approval the
+/// device pairs and streams with NO reconnect. Bounded well under the pending entry's TTL (10 min);
+/// the client uses a comparable connect timeout, and a client that gives up first closes the
+/// connection (the host stops waiting at once).
+const PENDING_APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// The host side of the SPAKE2 pairing ceremony (see `punktfunk_core::quic::pake`):
 /// generate + display a PIN, run SPAKE2 as B binding both cert fingerprints, verify the
 /// client's key-confirmation MAC (its single online guess), and persist the client's
@@ -502,6 +515,11 @@ async fn serve_session(
     np: &NativePairing,
     last_pairing: &std::sync::Mutex<Option<std::time::Instant>>,
     stats: Arc<StatsRecorder>,
+    // The session slot. Owned here (not just held by the spawning task) because an unpaired knock
+    // RELEASES it while parked for delegated approval, then RE-ACQUIRES one on approval — so a
+    // parked knock can't hold a streaming slot. `sem` is the pool it re-acquires from.
+    mut permit: tokio::sync::OwnedSemaphorePermit,
+    sem: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     let peer = conn.remote_address();
 
@@ -531,6 +549,79 @@ async fn serve_session(
         return pair_ceremony(&conn, send, recv, req, host_fp, np, &pin).await;
     }
 
+    // Pairing gate for a session Hello (a PairRequest was handled above). Lifted OUT of the
+    // `handshake` future below for two reasons: (1) the approval wait must not be bound by the
+    // short HANDSHAKE_TIMEOUT — a human reads the console and clicks Approve; (2) the NVENC session
+    // permit is released while parked, so a knock awaiting approval can't hold a streaming slot.
+    // On approval the device is now paired, so the handshake proceeds and the session starts with
+    // NO client reconnect (delegated approval, roadmap §8b-1).
+    if opts.require_pairing {
+        // Decode just enough to gate (the Hello carries the device name for the pending label);
+        // the `handshake` future re-decodes for the real session — a few dozen bytes, negligible.
+        let gate_hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
+        anyhow::ensure!(
+            gate_hello.abi_version == punktfunk_core::ABI_VERSION,
+            "ABI mismatch: client {} host {}",
+            gate_hello.abi_version,
+            punktfunk_core::ABI_VERSION
+        );
+        let fp = endpoint::peer_fingerprint(&conn);
+        let known = fp
+            .as_ref()
+            .map(|fp| np.is_paired(&fingerprint_hex(fp)))
+            .unwrap_or(false);
+        if !known {
+            // An anonymous client (no certificate) has no identity to approve — reject outright
+            // (the PIN ceremony is its way in). Mirrors the prior behavior for anonymous knocks.
+            let Some(fp) = fp else {
+                anyhow::bail!(
+                    "unpaired anonymous client rejected (this host requires pairing — present a \
+                     client identity and approve it in the console, or run the PIN ceremony)"
+                );
+            };
+            let fp_hex = fingerprint_hex(&fp);
+            // Sanitize the wire-supplied name before it reaches the log / console (untrusted: an
+            // unpaired device could embed terminal escapes / bidi overrides); note_pending stores
+            // the same sanitized form and derives a fingerprint label when empty.
+            let label = crate::native_pairing::sanitize_device_name(
+                gate_hello.name.as_deref().unwrap_or(""),
+                &fp_hex,
+            );
+            tracing::info!(name = %label, fingerprint = %fp_hex,
+                "unpaired device knocked — parking connection for delegated approval in the console");
+            np.note_pending(&label, &fp_hex);
+            // Free the session slot while a human decides — a parked knock must not hold an NVENC
+            // permit (a handful of parked knocks would otherwise block every real session).
+            drop(permit);
+            let decision = tokio::select! {
+                d = np.wait_for_decision(&fp_hex, PENDING_APPROVAL_WAIT) => d,
+                // The client gave up (closed the connection) before a decision — stop waiting.
+                _ = conn.closed() => anyhow::bail!("client disconnected before pairing approval"),
+            };
+            match decision {
+                PairingDecision::Approved => {
+                    tracing::info!(name = %label, fingerprint = %fp_hex,
+                        "device approved in console — admitting session (no reconnect)");
+                }
+                PairingDecision::Denied => anyhow::bail!("pairing request denied in the console"),
+                PairingDecision::TimedOut => anyhow::bail!(
+                    "pairing request not approved within {PENDING_APPROVAL_WAIT:?} \
+                     — the device can knock again"
+                ),
+            }
+            // Re-acquire a session slot for the now-approved session (waits if all slots are busy,
+            // exactly like any freshly accepted client).
+            permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("session semaphore is never closed");
+        }
+    }
+    // Held for the rest of the session (RAII frees the slot on return). For an already-paired
+    // client this is the original permit; for a just-approved knock it's the re-acquired one.
+    let _permit = permit;
+
     let source = opts.source;
     let frames = opts.frames;
     let handshake = async {
@@ -541,36 +632,8 @@ async fn serve_session(
             hello.abi_version,
             punktfunk_core::ABI_VERSION
         );
-        if opts.require_pairing {
-            let fp = endpoint::peer_fingerprint(&conn);
-            let known = fp
-                .as_ref()
-                .map(|fp| np.is_paired(&fingerprint_hex(fp)))
-                .unwrap_or(false);
-            if !known {
-                // Delegated approval (§8b-1): an identified-but-unpaired knock becomes a pending
-                // request the operator can approve from the console — no PIN fetched out of band.
-                // The label is the client's Hello name, else fingerprint-derived. An anonymous
-                // client (no certificate) has no identity to approve, so nothing is recorded.
-                if let Some(fp) = &fp {
-                    let fp_hex = fingerprint_hex(fp);
-                    // Sanitize the wire-supplied name before it reaches the log (untrusted: an
-                    // unpaired device could embed terminal escapes / bidi overrides); note_pending
-                    // stores the same sanitized form and derives a fingerprint label when empty.
-                    let label = crate::native_pairing::sanitize_device_name(
-                        hello.name.as_deref().unwrap_or(""),
-                        &fp_hex,
-                    );
-                    tracing::info!(name = %label, fingerprint = %fp_hex,
-                        "unpaired device knocked — held for approval in the console");
-                    np.note_pending(&label, &fp_hex);
-                }
-                anyhow::bail!(
-                    "unpaired client rejected (this host requires pairing — approve the device \
-                     in the console, or run the PIN ceremony)"
-                );
-            }
-        }
+        // The pairing gate (require_pairing → paired? else park for delegated approval) ran above,
+        // before this future, so a client reaching here is paired (or the host is `--open`).
         crate::encode::validate_dimensions(
             crate::encode::Codec::H265,
             hello.mode.width,
@@ -4110,10 +4173,11 @@ mod tests {
         std::env::temp_dir().join(format!("punktfunk-paired-test-{}.json", std::process::id()))
     }
 
-    /// Delegated approval (§8b-1) end to end in-process: an identified-but-unpaired client's
-    /// knock on a pairing-required host is held as a pending request (fingerprint-derived label —
-    /// the connector sends no Hello name); approving it pairs the fingerprint, and the same
-    /// identity then gets a session with no PIN ceremony.
+    /// Delegated approval (§8b-1) end to end in-process, the SEAMLESS flow: an
+    /// identified-but-unpaired client's knock on a pairing-required host is PARKED (connection held
+    /// open) and shows up as a pending request (fingerprint-derived label — the connector sends no
+    /// Hello name); the operator approves it WHILE the client waits, and the SAME connection is
+    /// admitted to a session with no PIN and no reconnect.
     #[test]
     fn delegated_approval_admits_after_knock() {
         use punktfunk_core::client::NativeClient;
@@ -4136,7 +4200,7 @@ mod tests {
                     source: Punktfunk1Source::Synthetic,
                     seconds: 0,
                     frames: 25,
-                    max_sessions: 2, // the knock + the post-approval session
+                    max_sessions: 1, // the single parked-then-approved session (no reconnect)
                     max_concurrent: 1,
                     require_pairing: true,
                     allow_pairing: false,
@@ -4150,49 +4214,47 @@ mod tests {
             ))
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let timeout = std::time::Duration::from_secs(10);
         let (cert, key) = endpoint::generate_identity().unwrap();
+        let expected_fp = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
         let mode = punktfunk_core::Mode {
             width: 1280,
             height: 720,
             refresh_hz: 60,
         };
 
-        // 1: the knock — an identified-but-unpaired connect is rejected, but lands in pending.
-        assert!(
-            NativeClient::connect(
-                "127.0.0.1",
-                19779,
-                mode,
-                CompositorPref::Auto,
-                GamepadPref::Auto,
-                0,
-                0,    // video_caps
-                2,    // audio_channels (stereo)
-                None, // launch
-                None,
-                Some((cert.clone(), key.clone())),
-                timeout
-            )
-            .is_err(),
-            "unpaired knock must still be rejected"
-        );
-        let expected_fp = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
-        let pend = np.pending();
-        assert_eq!(pend.len(), 1, "the knock must be held for approval");
-        assert_eq!(pend[0].fingerprint, expected_fp);
-        assert!(
-            pend[0].name.starts_with("device "),
-            "no Hello name → fingerprint-derived label, got {:?}",
-            pend[0].name
-        );
+        // Approver thread: wait for the parked knock to register, assert its label, then APPROVE it
+        // WHILE the client is still parked — the console "click accept" flow.
+        let np_approve = np.clone();
+        let expect_fp = expected_fp.clone();
+        let approver = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let pend = loop {
+                if let Some(p) = np_approve
+                    .pending()
+                    .into_iter()
+                    .find(|p| p.fingerprint == expect_fp)
+                {
+                    break p;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the knock must register while the client is parked"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            };
+            assert!(
+                pend.name.starts_with("device "),
+                "no Hello name → fingerprint-derived label, got {:?}",
+                pend.name
+            );
+            np_approve
+                .approve_pending(pend.id, Some("Approved Device"))
+                .unwrap()
+                .expect("pending id must approve");
+        });
 
-        // 2: approve (with an operator label) → the same identity now gets a session, no PIN.
-        let approved = np
-            .approve_pending(pend[0].id, Some("Approved Device"))
-            .unwrap()
-            .expect("pending id must approve");
-        assert_eq!(approved.fingerprint, expected_fp);
+        // The knock: a SINGLE connect that parks until approved, then streams — no reconnect. The
+        // timeout is generous (it covers the park + the approver's poll latency).
         let client = NativeClient::connect(
             "127.0.0.1",
             19779,
@@ -4203,11 +4265,17 @@ mod tests {
             0,    // video_caps
             2,    // audio_channels (stereo)
             None, // launch
-            None,
+            None, // pin: TOFU — the operator's approval (not a PIN) authorizes this client
             Some((cert, key)),
-            timeout,
+            std::time::Duration::from_secs(15),
         )
-        .expect("approved identity gets a session");
+        .expect("approved mid-park → session admitted with no reconnect");
+        approver.join().unwrap();
+        assert!(
+            np.is_paired(&expected_fp),
+            "approval must pin the knocking fingerprint"
+        );
+        assert_eq!(np.list()[0].name, "Approved Device");
         drop(client);
         let _ = std::fs::remove_file(&store);
         host.join().unwrap().unwrap();

@@ -295,19 +295,21 @@ fn initiate_connect(app: Rc<App>, req: ConnectRequest) {
                 // Rule 3a: the host opted into reduced-security TOFU; offer it alongside PIN.
                 tofu_dialog(app, req);
             } else {
-                // Rule 3b: pair=required or unknown policy — PIN pairing is mandatory.
-                pin_dialog(app, req);
+                // Rule 3b: pair=required or unknown policy — offer no-PIN delegated approval
+                // (request access → approve in the console) or the PIN ceremony.
+                approval_dialog(app, req);
             }
         }
         None => {
             // Manual entry (no advertised fingerprint). A known address connects silently
-            // on its stored pin (rule 1); an unknown one must pair — never silent TOFU.
+            // on its stored pin (rule 1); an unknown one must pair — request access (approve in
+            // the console) or use a PIN; never silent TOFU.
             match known
                 .find_by_addr(&req.addr, req.port)
                 .and_then(|k| crate::trust::parse_hex32(&k.fp_hex))
             {
                 Some(pin) => start_session(app, req, Some(pin)),
-                None => pin_dialog(app, req), // rule 3b
+                None => approval_dialog(app, req), // rule 3b
             }
         }
     }
@@ -416,6 +418,83 @@ fn pin_dialog(app: Rc<App>, req: ConnectRequest) {
         });
     });
     dialog.present(Some(&parent));
+}
+
+/// A fresh host that requires pairing: offer the two ways in. "Request access" is the no-PIN
+/// path — connect and wait for the operator to click Approve in the host's console/web UI
+/// (delegated approval); "Use a PIN instead…" runs the SPAKE2 ceremony.
+fn approval_dialog(app: Rc<App>, req: ConnectRequest) {
+    let dialog = adw::AlertDialog::new(
+        Some("Pairing Required"),
+        Some(&format!(
+            "{} requires pairing.\n\nRequest access and approve this device in the host's console \
+             (or web UI) — no PIN needed. Or pair with the 4-digit PIN it can display.",
+            req.name
+        )),
+    );
+    dialog.add_responses(&[
+        ("cancel", "Cancel"),
+        ("pin", "Use a PIN instead…"),
+        ("request", "Request Access"),
+    ]);
+    dialog.set_response_appearance("request", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("request"));
+    dialog.set_close_response("cancel");
+    let parent = app.window.clone();
+    dialog.connect_response(None, move |_, response| match response {
+        "request" => request_access(app.clone(), req.clone()),
+        "pin" => pin_dialog(app.clone(), req.clone()),
+        _ => {}
+    });
+    dialog.present(Some(&parent));
+}
+
+/// The no-PIN "request access" flow: open an identified connect that the host PARKS until the
+/// operator approves it in the console, showing a cancelable "waiting" dialog meanwhile. On
+/// approval the same connection is admitted (no reconnect) and the host is saved as paired.
+fn request_access(app: Rc<App>, req: ConnectRequest) {
+    // Pin the advertised certificate for a discovered host (defence against a host impostor while
+    // we wait); a manually-typed host has no advertised fingerprint, so trust-on-first-use.
+    let pin = req.fp_hex.as_deref().and_then(crate::trust::parse_hex32);
+    let cancel = Rc::new(std::cell::Cell::new(false));
+
+    let waiting = adw::AlertDialog::new(
+        Some("Waiting for Approval"),
+        Some(&format!(
+            "Approve “{}” in {}’s console or web UI.\n\nThis device is waiting to be let in — it \
+             connects automatically once you approve it.",
+            glib::host_name(),
+            req.name
+        )),
+    );
+    waiting.add_responses(&[("cancel", "Cancel")]);
+    waiting.set_close_response("cancel");
+    {
+        let app = app.clone();
+        let cancel = cancel.clone();
+        waiting.connect_response(Some("cancel"), move |_, _| {
+            // Return the UI immediately; the in-flight connect is left to time out and is torn
+            // down silently by the event loop (see StartOpts::cancel).
+            cancel.set(true);
+            app.busy.set(false);
+            app.toast("Cancelled — the request may still be pending on the host.");
+        });
+    }
+    waiting.present(Some(&app.window));
+
+    start_session_with(
+        app,
+        req,
+        pin,
+        StartOpts {
+            // Must exceed the host's approval window (PENDING_APPROVAL_WAIT) so a slow operator
+            // approval still lands on this connection rather than timing the client out first.
+            connect_timeout: std::time::Duration::from_secs(185),
+            persist_paired: true,
+            waiting: Some(waiting),
+            cancel: Some(cancel),
+        },
+    );
 }
 
 /// Measure the path to a host over the real data plane (Swift's "Test Network Speed…"):
@@ -556,7 +635,42 @@ fn resolve_mode(app: &App) -> punktfunk_core::config::Mode {
     mode
 }
 
+/// Tunables for a session start that differ between the normal connect and the "request access"
+/// (delegated-approval) flow. `Default` is the normal connect.
+struct StartOpts {
+    /// Handshake budget. The request-access flow uses a long one because the host PARKS the
+    /// connection until the operator clicks Approve (see the host's `PENDING_APPROVAL_WAIT`).
+    connect_timeout: std::time::Duration,
+    /// Persist the host as *paired* on a successful connect. Set for request-access, where the
+    /// operator's approval IS the pairing, so future connects are silent (rule 1). Normal TOFU
+    /// persists the host *unpaired* (pinned, but not PIN/approval-verified).
+    persist_paired: bool,
+    /// A "waiting for approval" dialog to dismiss on the first session event (request-access only).
+    waiting: Option<adw::AlertDialog>,
+    /// Set by the waiting dialog's Cancel button. `NativeClient::connect` is a blocking call with
+    /// no abort, so Cancel returns the UI immediately (clears busy, closes the dialog) and leaves
+    /// the in-flight connect to time out; when it finally resolves, the event loop sees this flag
+    /// and tears down silently (drops the connector → closes the connection) without touching the
+    /// UI a new session may already own.
+    cancel: Option<Rc<std::cell::Cell<bool>>>,
+}
+
+impl Default for StartOpts {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_secs(15),
+            persist_paired: false,
+            waiting: None,
+            cancel: None,
+        }
+    }
+}
+
 fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
+    start_session_with(app, req, pin, StartOpts::default());
+}
+
+fn start_session_with(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>, opts: StartOpts) {
     if app.busy.replace(true) {
         return;
     }
@@ -577,10 +691,14 @@ fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
         audio_channels: s.audio_channels,
         pin,
         identity: app.identity.clone(),
+        connect_timeout: opts.connect_timeout,
     };
     let inhibit = s.inhibit_shortcuts;
     drop(s);
     let tofu = pin.is_none();
+    let persist_paired = opts.persist_paired;
+    let mut waiting = opts.waiting;
+    let cancel = opts.cancel;
 
     let mut handle = crate::session::start(params);
     let frames = std::mem::replace(&mut handle.frames, async_channel::bounded(1).1);
@@ -588,14 +706,41 @@ fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
         let mut frames = Some(frames);
         let mut page: Option<crate::ui_stream::StreamPage> = None;
         while let Ok(event) = handle.events.recv().await {
+            // A cancelled request-access connect resolved late: tear down silently. Don't touch
+            // app.busy — Cancel already cleared it, and a fresh session may now own it.
+            if cancel.as_ref().is_some_and(|c| c.get()) {
+                if let Some(w) = waiting.take() {
+                    w.close();
+                }
+                break;
+            }
             match event {
                 SessionEvent::Connected {
                     connector,
                     mode,
                     fingerprint,
                 } => {
-                    // A TOFU connect just observed the real fingerprint — pin it from now on.
-                    if tofu {
+                    // Dismiss the "waiting for approval" dialog (request-access flow), if any.
+                    if let Some(w) = waiting.take() {
+                        w.close();
+                    }
+                    if persist_paired {
+                        // Request-access: the operator approved this device, so record the host as
+                        // a trusted PAIRED host (pinning the fingerprint we observed) — future
+                        // connects are then silent (rule 1), exactly like after a PIN ceremony.
+                        let fp_hex = crate::trust::hex(&fingerprint);
+                        let mut known = KnownHosts::load();
+                        known.upsert(KnownHost {
+                            name: req.name.clone(),
+                            addr: req.addr.clone(),
+                            port: req.port,
+                            fp_hex,
+                            paired: true,
+                        });
+                        let _ = known.save();
+                        app.toast("Approved — connecting…");
+                    } else if tofu {
+                        // A TOFU connect just observed the real fingerprint — pin it from now on.
                         let fp_hex = crate::trust::hex(&fingerprint);
                         let mut known = KnownHosts::load();
                         known.upsert(KnownHost {
@@ -644,6 +789,9 @@ fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
                     msg,
                     trust_rejected,
                 } => {
+                    if let Some(w) = waiting.take() {
+                        w.close();
+                    }
                     tracing::warn!(%msg, trust_rejected, "connect failed");
                     app.busy.set(false);
                     // A pinned connect rejected on trust grounds means the host's cert no
@@ -658,6 +806,9 @@ fn start_session(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>) {
                     break;
                 }
                 SessionEvent::Ended(err) => {
+                    if let Some(w) = waiting.take() {
+                        w.close();
+                    }
                     app.gamepad.detach();
                     app.nav.pop_to_tag("hosts");
                     if let Some(e) = err {

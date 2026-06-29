@@ -140,13 +140,15 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIde
 }
 
 /// `NativeBridge.nativeConnect(host, port, w, h, hz, certPem, keyPem, pinHex, bitrateKbps,
-/// compositorPref, gamepadPref, hdrEnabled, audioChannels): Long`. `certPem`/`keyPem` empty =
-/// anonymous, else presented as the persistent identity. `pinHex` empty = TOFU (read
+/// compositorPref, gamepadPref, hdrEnabled, audioChannels, timeoutMs): Long`. `certPem`/`keyPem`
+/// empty = anonymous, else presented as the persistent identity. `pinHex` empty = TOFU (read
 /// `nativeHostFingerprint` after), else 64-hex SHA-256 to pin the host (mismatch → 0). `bitrateKbps`
 /// 0 = host default. `compositorPref`/`gamepadPref` are `CompositorPref`/`GamepadPref` wire bytes
 /// (0 = Auto; unknown → Auto). `audioChannels` is the requested surround layout (2/6/8; normalized,
-/// anything else → stereo) — the host clamps it and the resolved count drives playback.
-/// Returns an opaque handle, or 0 on failure (logged).
+/// anything else → stereo) — the host clamps it and the resolved count drives playback. `timeoutMs`
+/// is the handshake budget: the normal path passes a short value, the no-PIN "request access" path a
+/// long one (≥ the host's approval-park window) so a slow operator approval lands on this same parked
+/// connection rather than timing the client out first. Returns an opaque handle, or 0 on failure.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'local>(
@@ -165,6 +167,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     gamepad_pref: jint,
     hdr_enabled: jboolean,
     audio_channels: jint,
+    timeout_ms: jint,
 ) -> jlong {
     let host: String = match env.get_string(&host) {
         Ok(s) => s.into(),
@@ -224,7 +227,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         None,     // launch: default app
         pin,      // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)
-        Duration::from_secs(10),
+        // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
+        // (the host parks the connection until the operator approves the device — see ConnectScreen).
+        Duration::from_millis(timeout_ms.max(0) as u64),
     ) {
         Ok(client) => {
             let handle = SessionHandle {

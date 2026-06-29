@@ -74,9 +74,30 @@ import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.kit.security.obtainIdentity
 import io.unom.punktfunk.models.HostStatus
 import io.unom.punktfunk.models.PendingTrust
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/** Handshake budget for a normal connect (the prior hardcoded value, now passed explicitly). */
+private const val CONNECT_TIMEOUT_MS = 10_000
+
+/**
+ * Handshake budget for the no-PIN "request access" connect. Must exceed the host's approval-park
+ * window (~180 s) so a slow operator approval still lands on this same parked connection rather than
+ * timing the client out first. Mirrors the Linux client's 185 s.
+ */
+private const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
+
+/**
+ * A no-PIN "request access" connect in flight — the host being requested (drives the cancelable
+ * "Waiting for approval…" dialog) and a per-attempt flag the Cancel button trips. The connect is a
+ * blocking call with no abort, so Cancel returns the UI immediately and a late result checks
+ * [cancelled] and tears the (possibly just-approved) session down silently rather than navigating.
+ */
+private class RequestAccessState(val target: PendingTrust) {
+    val cancelled = AtomicBoolean(false)
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -128,8 +149,11 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
             .onSuccess { identity = it }
             .onFailure { status = "Identity unavailable: ${it.message} — re-pair may be required" }
     }
-    // A trust decision awaiting the user (first-connect TOFU / fp changed / PIN pairing).
+    // A trust decision awaiting the user (first-connect TOFU / fp changed / PIN pairing / the
+    // request-access-or-PIN choice).
     var pendingTrust by remember { mutableStateOf<PendingTrust?>(null) }
+    // A no-PIN "request access" connect in flight (the cancelable "Waiting for approval…" dialog).
+    var awaiting by remember { mutableStateOf<RequestAccessState?>(null) }
     // A saved host whose label is being edited (the Rename dialog).
     var renameTarget by remember { mutableStateOf<KnownHost?>(null) }
 
@@ -163,7 +187,7 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                     targetHost, targetPort, w, h, hz,
                     id.certPem, id.privateKeyPem, pinHex ?: "",
                     settings.bitrateKbps, settings.compositor, gamepadPref,
-                    hdrEnabled, settings.audioChannels,
+                    hdrEnabled, settings.audioChannels, CONNECT_TIMEOUT_MS,
                 )
             }
             connecting = false
@@ -182,10 +206,66 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
         }
     }
 
-    // Decide pinned-reconnect vs fp-changed vs TOFU vs PIN pairing before connecting. Trust state is
+    // The no-PIN "request access" path (delegated approval): open a normal identified connect that
+    // the host PARKS until the operator clicks Approve in its console/web UI, showing a cancelable
+    // "Waiting for approval…" dialog meanwhile. The SAME connection is admitted on approval (no
+    // reconnect), so on success we record the host as PAIRED — the operator's approval IS the pairing.
+    // The connect can't be aborted, so Cancel returns the UI immediately and a late result is torn
+    // down silently via the per-attempt flag (mirrors the Linux client's request-access flow).
+    fun requestAccess(target: PendingTrust) {
+        val id = identity
+        if (id == null) {
+            status = "Identity not ready yet — try again in a moment"
+            return
+        }
+        val req = RequestAccessState(target)
+        awaiting = req
+        connecting = true
+        status = null
+        discovery.stop() // free the Wi-Fi radio before the (parked) stream session
+        scope.launch {
+            val hdrEnabled = displaySupportsHdr(context)
+            val gamepadPref = Gamepad.resolvePref(settings.gamepad)
+            // Pin the advertised fingerprint for a discovered host (defence against an impostor while
+            // we wait); a manually-typed host has none, so trust-on-first-use.
+            val pinHex = target.advertisedFp ?: ""
+            val handle = withContext(Dispatchers.IO) {
+                NativeBridge.nativeConnect(
+                    target.host, target.port, w, h, hz,
+                    id.certPem, id.privateKeyPem, pinHex,
+                    settings.bitrateKbps, settings.compositor, gamepadPref,
+                    hdrEnabled, settings.audioChannels, REQUEST_ACCESS_TIMEOUT_MS,
+                )
+            }
+            // Cancelled while we were parked: tear the (possibly just-approved) session down and
+            // don't touch UI a fresh action may now own.
+            if (req.cancelled.get()) {
+                if (handle != 0L) withContext(Dispatchers.IO) { NativeBridge.nativeClose(handle) }
+                return@launch
+            }
+            awaiting = null
+            connecting = false
+            if (handle != 0L) {
+                // Approved — save the host as PAIRED, pinning the fingerprint it presented, so
+                // future connects are silent (exactly like after a PIN ceremony).
+                val fp = NativeBridge.nativeHostFingerprint(handle)
+                if (fp.isNotEmpty()) {
+                    knownHostStore.save(KnownHost(target.host, target.port, target.name, fp, paired = true))
+                    savedHosts = knownHostStore.all()
+                }
+                onConnected(handle)
+            } else {
+                status = "Request timed out — approve this device in the host's console, then retry."
+                discovery.start()
+            }
+        }
+    }
+
+    // Decide pinned-reconnect vs fp-changed vs TOFU vs pairing before connecting. Trust state is
     // keyed by address:port, so a discovered and a manually-typed connection to the same host share
     // one record. Trust-on-first-use is permitted ONLY when the host advertised pair=optional; a
-    // pair=required host, or a manual/unknown-policy host, must pair by PIN.
+    // pair=required host, or a manual/unknown-policy host, must pair — either by no-PIN request
+    // access (approve in the console) or by the SPAKE2 PIN ceremony.
     fun connect(
         targetHost: String,
         targetPort: Int,
@@ -208,9 +288,10 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
             // clearly labeled, alongside PIN pairing). Smart-cast: this branch ⇒ dh != null.
             dh?.pairingRequired == false -> pendingTrust =
                 PendingTrust(targetHost, targetPort, name, dh.fingerprint, PendingTrust.Kind.TRUST_NEW)
-            // pair=required, or a manual/unknown-policy host → PIN pairing is mandatory.
+            // pair=required, or a manual/unknown-policy host → offer the two ways in: a no-PIN
+            // "request access" (approve in the console) or the SPAKE2 PIN ceremony.
             else -> pendingTrust =
-                PendingTrust(targetHost, targetPort, name, adv, PendingTrust.Kind.PAIR)
+                PendingTrust(targetHost, targetPort, name, adv, PendingTrust.Kind.REQUEST_ACCESS)
         }
     }
 
@@ -471,6 +552,33 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                     TextButton({ pendingTrust = null }) { Text("Cancel") }
                 },
             )
+            // A fresh pair=required (or manual/unknown-policy) host: offer the two ways in. "Request
+            // access" is the no-PIN path — connect and wait for the operator to click Approve in the
+            // host's console; "Use a PIN…" switches to the SPAKE2 ceremony.
+            PendingTrust.Kind.REQUEST_ACCESS -> AlertDialog(
+                onDismissRequest = { pendingTrust = null },
+                title = { Text("Pairing required") },
+                text = {
+                    Column {
+                        Text("${pt.host}:${pt.port} requires pairing before it will stream.")
+                        Text(
+                            "Request access and approve this device in the host's console (or web " +
+                                "UI) — no PIN needed. Or pair with the 4-digit PIN the host displays.",
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton({ pendingTrust = null; requestAccess(pt) }) { Text("Request access") }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton({ pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) }) {
+                            Text("Use a PIN…")
+                        }
+                        TextButton({ pendingTrust = null }) { Text("Cancel") }
+                    }
+                },
+            )
             PendingTrust.Kind.PAIR -> {
                 var pin by remember(pt) { mutableStateOf("") }
                 var name by remember(pt) { mutableStateOf(Build.MODEL ?: "Android") }
@@ -535,6 +643,44 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                 )
             }
         }
+    }
+
+    // The no-PIN "request access" wait: the connect is parked on the host until the operator
+    // approves this device. Cancel returns the UI immediately — it trips the per-attempt flag so a
+    // late approval is torn down silently (see requestAccess) and resumes discovery.
+    awaiting?.let { req ->
+        fun cancel() {
+            req.cancelled.set(true)
+            awaiting = null
+            connecting = false
+            discovery.start() // the request may still be pending on the host; keep scanning
+        }
+        AlertDialog(
+            onDismissRequest = { cancel() },
+            title = { Text("Waiting for approval") },
+            text = {
+                val deviceName = Build.MODEL ?: "this device"
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Text("Approve this device on ${req.target.name}.")
+                    }
+                    Text(
+                        "Open the host's console (or web UI) and approve “$deviceName”. It connects " +
+                            "automatically once you approve — no PIN needed.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { cancel() }) { Text("Cancel") }
+            },
+        )
     }
 
     // Rename a saved host's label (discovered hosts are named by mDNS; this is how you give one a
