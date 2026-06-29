@@ -89,6 +89,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
+# `xdg-output` (zxdg_output_v1): the per-output *logical* geometry (post-scale size + global
+# position), used by the KWin fake_input backend to map absolute coordinates under display scaling.
+wayland-protocols = { version = "0.32", features = ["client"] }
 # Codegen for KDE's `zkde_screencast_unstable_v1` (vendored in `protocols/`): create a KWin
 # virtual output sized to the client's resolution and get its PipeWire node (KRdp's path).
 # `wayland-backend` is referenced by the generated interface tables.
@@ -119,6 +122,10 @@ ash = "0.38"
 # `libcuda.so.1` is dlopen'd at runtime (NOT link-time) so one Linux binary runs on NVIDIA
 # (zero-copy via CUDA) AND on AMD/Intel (VAAPI, no NVIDIA driver present) — see `zerocopy::cuda`.
 libloading = "0.8"
+# Vendored + trimmed `usbip` server core (no libusb) — presents a virtual Steam Deck over USB/IP
+# so the local `vhci_hcd` attaches it: the shippable, Secure-Boot-clean, Steam-Input-promotable
+# virtual-Deck transport on non-SteamOS hosts (`inject/linux/steam_usbip.rs`). See the crate's NOTICE.
+usbip-sim = { path = "vendor/usbip-sim" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows host backends. `windows` covers the Win32/CCD APIs the SudoVDA virtual-display backend

@@ -1,0 +1,23 @@
+This crate (`usbip-sim`) is a vendored, trimmed copy of:
+
+    usbip v0.8.0
+    Copyright (c) Jiajie Chen <c@jia.je> and contributors
+    https://github.com/jiegec/usbip
+    Licensed under the MIT License.
+
+Modifications by the punktfunk project:
+  - Removed the USB host modules (`src/host.rs`) and the `rusb`/`nusb` device
+    constructors in `src/lib.rs` (`with_rusb_*`, `with_nusb_*`, `new_from_host*`),
+    eliminating the libusb runtime dependency (which also broke `musl`).
+  - Removed the example helper interface handlers `src/cdc.rs` and `src/hid.rs`.
+  - Replaced the `rusb::Direction` re-export and `rusb::Version` conversions with
+    local definitions.
+  - Dropped the in-crate test modules (kept the library surface only).
+  - Paced interrupt/bulk IN endpoint transfers by bInterval in `device.rs`
+    `handle_urb` (so a simulated interrupt-IN mimics a real device's
+    NAK-until-bInterval behaviour rather than free-running over the loopback
+    link); added the tokio `time` feature for it.
+
+Only the USB/IP server *simulation* path is retained: the device model, the
+USB/IP wire protocol, and the `UsbInterfaceHandler` trait. The original MIT
+license text is reproduced in LICENSE-MIT.

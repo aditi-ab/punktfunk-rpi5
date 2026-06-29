@@ -240,11 +240,13 @@ impl Drop for SteamDeckPad {
 /// [`apply_rich`](Self::apply_rich); [`pump`](Self::pump) services the kernel handshake + routes
 /// rumble back; [`heartbeat`](Self::heartbeat) keeps the pad alive (and drives the mode-entry pulse).
 /// The transport a manager pad drives. UHID is universal but Steam Input won't promote it (a UHID
-/// device has no USB interface number); the USB gadget is SteamOS-only but Steam Input *does* promote
-/// it (it presents the controller on interface 2). Selected per-pad in [`SteamControllerManager::ensure`].
+/// device has no USB interface number, `Interface: -1`); the USB **gadget** (`raw_gadget`, SteamOS)
+/// and **usbip** (`vhci_hcd`, universal) both present the controller on USB interface 2, which Steam
+/// Input *does* promote. Selected per-pad by [`open_transport`].
 enum DeckTransport {
     Uhid(SteamDeckPad),
     Gadget(crate::inject::steam_gadget::SteamDeckGadget),
+    Usbip(crate::inject::steam_usbip::SteamDeckUsbip),
 }
 
 impl DeckTransport {
@@ -254,20 +256,65 @@ impl DeckTransport {
                 let _ = p.write_state(st);
             }
             DeckTransport::Gadget(g) => g.write_state(st),
+            DeckTransport::Usbip(u) => u.write_state(st),
         }
     }
     fn service(&mut self) -> Option<(u16, u16)> {
         match self {
             DeckTransport::Uhid(p) => p.service(),
             DeckTransport::Gadget(g) => g.service().rumble,
+            DeckTransport::Usbip(u) => u.service().rumble,
         }
     }
     fn in_mode_entry(&self) -> bool {
         match self {
+            // Only the UHID pad needs the gamepad-mode entry pulse: the promoted transports are
+            // read raw via hidraw by Steam Input, which bypasses the kernel's evdev mode gate.
             DeckTransport::Uhid(p) => p.in_mode_entry(),
-            DeckTransport::Gadget(_) => false,
+            DeckTransport::Gadget(_) | DeckTransport::Usbip(_) => false,
         }
     }
+}
+
+/// Open the best Steam-Input-promotable Deck transport available, in preference order:
+/// **`raw_gadget` (SteamOS validated fast-path) → `usbip`/`vhci_hcd` (universal, Secure-Boot-clean)
+/// → UHID (universal, but `Interface: -1` so Steam Input won't promote it).** Each rung degrades to
+/// the next on failure, so a host lacking the gadget modules still gets a *promotable* Deck via
+/// usbip, and one lacking both still gets a working (if non-promoted) UHID pad.
+fn open_transport(idx: u8) -> Result<DeckTransport> {
+    use crate::inject::{steam_gadget, steam_usbip};
+    // 1. raw_gadget — the validated SteamOS fast-path (default on there).
+    if steam_gadget::gadget_preferred() {
+        steam_gadget::ensure_modules();
+        match steam_gadget::SteamDeckGadget::open(idx) {
+            Ok(g) => {
+                tracing::info!(
+                    index = idx,
+                    "virtual Steam Deck created (USB gadget — Steam Input recognizes it)"
+                );
+                return Ok(DeckTransport::Gadget(g));
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "USB-gadget Deck unavailable — trying usbip")
+            }
+        }
+    }
+    // 2. usbip/vhci_hcd — the universal, in-tree, Secure-Boot-clean transport (default on elsewhere).
+    if steam_usbip::usbip_preferred() {
+        match steam_usbip::SteamDeckUsbip::open(idx) {
+            Ok(u) => return Ok(DeckTransport::Usbip(u)),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "usbip Deck unavailable — falling back to UHID")
+            }
+        }
+    }
+    // 3. UHID — universal fallback (works everywhere; Steam Input won't promote it).
+    let p = SteamDeckPad::open(idx)?;
+    tracing::info!(
+        index = idx,
+        "virtual Steam Deck created (UHID hid-steam — not Steam-Input-promoted)"
+    );
+    Ok(DeckTransport::Uhid(p))
 }
 
 pub struct SteamControllerManager {
@@ -384,31 +431,8 @@ impl SteamControllerManager {
         if idx >= MAX_PADS || self.pads[idx].is_some() || self.broken {
             return;
         }
-        // Prefer the USB gadget on SteamOS (default there — the only transport Steam Input promotes);
-        // fall back to the universal UHID pad if the gadget is unavailable or disabled.
-        let opened = if crate::inject::steam_gadget::gadget_preferred() {
-            crate::inject::steam_gadget::ensure_modules();
-            match crate::inject::steam_gadget::SteamDeckGadget::open(idx as u8) {
-                Ok(g) => {
-                    tracing::info!(
-                        index = idx,
-                        "virtual Steam Deck created (USB gadget — Steam Input recognizes it)"
-                    );
-                    Ok(DeckTransport::Gadget(g))
-                }
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "USB-gadget Deck unavailable — falling back to UHID");
-                    SteamDeckPad::open(idx as u8).map(DeckTransport::Uhid)
-                }
-            }
-        } else {
-            SteamDeckPad::open(idx as u8).map(DeckTransport::Uhid)
-        };
-        match opened {
+        match open_transport(idx as u8) {
             Ok(t) => {
-                if matches!(t, DeckTransport::Uhid(_)) {
-                    tracing::info!(index = idx, "virtual Steam Deck created (UHID hid-steam)");
-                }
                 self.pads[idx] = Some(t);
                 self.state[idx] = SteamState::neutral();
                 self.last_rumble[idx] = (0, 0);

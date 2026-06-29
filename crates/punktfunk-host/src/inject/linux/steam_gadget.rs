@@ -70,23 +70,12 @@ const USB_RAW_EVENT_CONNECT: u32 = 1;
 const USB_RAW_EVENT_CONTROL: u32 = 2;
 const USB_SPEED_HIGH: u8 = 3;
 
-// ---- captured-from-hardware descriptors (a real Steam Deck, 28DE:1205) ----
-#[rustfmt::skip]
-const RDESC_MOUSE: &[u8] = &[
-    0x05,0x01,0x09,0x02,0xa1,0x01,0x09,0x01,0xa1,0x00,0x05,0x09,0x19,0x01,0x29,0x02,
-    0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x02,0x81,0x02,0x75,0x06,0x95,0x01,0x81,0x01,
-    0x05,0x01,0x09,0x30,0x09,0x31,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x02,0x81,0x06,
-    0x95,0x01,0x09,0x38,0x81,0x06,0x05,0x0c,0x0a,0x38,0x02,0x95,0x01,0x81,0x06,0xc0,0xc0];
-#[rustfmt::skip]
-const RDESC_KBD: &[u8] = &[
-    0x05,0x01,0x09,0x06,0xa1,0x01,0x05,0x07,0x19,0xe0,0x29,0xe7,0x15,0x00,0x25,0x01,
-    0x75,0x01,0x95,0x08,0x81,0x02,0x81,0x01,0x19,0x00,0x29,0x65,0x15,0x00,0x25,0x65,
-    0x75,0x08,0x95,0x06,0x81,0x00,0xc0];
-#[rustfmt::skip]
-const RDESC_CTRL: &[u8] = &[ // the real Deck controller, interface 2 (Usage Page 0xFFFF)
-    0x06,0xff,0xff,0x09,0x01,0xa1,0x01,0x09,0x02,0x09,0x03,0x15,0x00,0x26,0xff,0x00,
-    0x75,0x08,0x95,0x40,0x81,0x02,0x09,0x06,0x09,0x07,0x15,0x00,0x26,0xff,0x00,0x75,
-    0x08,0x95,0x40,0xb1,0x02,0xc0];
+// Captured-from-hardware Deck descriptors + the `0x83`/`0xAE` feature contract live in the shared
+// [`super::steam_proto`] module (single source of truth, also used by the usbip transport).
+use super::steam_proto::{
+    deck_serial, deck_unit_id, feature_reply, neutral_deck_report, RDESC_DECK_CTRL as RDESC_CTRL,
+    RDESC_DECK_KBD as RDESC_KBD, RDESC_DECK_MOUSE as RDESC_MOUSE,
+};
 
 const DEV_DESC: [u8; 18] = [
     18, 1, 0x00, 0x02, // bLength, DEVICE, bcdUSB 2.00
@@ -246,9 +235,9 @@ impl SteamDeckGadget {
             bail!("raw_gadget RUN: {}", std::io::Error::last_os_error());
         }
 
-        let serial = format!("PFDECK{index:04}");
-        let unit_id = 0x5046_0000u32 | index as u32; // "PF" + index — a synthetic per-instance device id
-        let report = Arc::new(Mutex::new(neutral_report()));
+        let serial = deck_serial(index);
+        let unit_id = deck_unit_id(index); // "PF" + index — a synthetic per-instance device id
+        let report = Arc::new(Mutex::new(neutral_deck_report()));
         let feedback = Arc::new(Mutex::new(Default::default()));
         let running = Arc::new(AtomicBool::new(true));
         let ctrl_ep = Arc::new(std::sync::atomic::AtomicI32::new(-1));
@@ -317,14 +306,6 @@ impl Drop for SteamDeckGadget {
             let _ = t.join();
         }
     }
-}
-
-fn neutral_report() -> [u8; 64] {
-    let mut r = [0u8; 64];
-    r[0] = 0x01;
-    r[2] = 0x09; // ID_CONTROLLER_DECK_STATE
-    r[3] = 0x3C;
-    r
 }
 
 fn copy_cstr(dst: &mut [u8], s: &str) {
@@ -488,58 +469,6 @@ fn handle_control(
     }
 }
 
-/// Build the HID feature GET_REPORT reply for the host's last SET_REPORT command. Steam's
-/// `GetControllerInfo` reads the `0x83` attributes + the `0xAE` serial; **serving the real `0x83`
-/// blob is what stops Steam re-probing** (the gamepad-evdev churn). The contract (`0x83` 9-attribute
-/// layout + the `0xAE` string format) was captured from a physical Steam Deck via hidraw. `unit_id`
-/// stamps a per-instance value into the device-id attributes (`0x0a`/`0x04`) so a gadget never
-/// collides with a real Deck or another gadget.
-fn feature_reply(last_set: &[u8], serial: &str, unit_id: u32) -> [u8; 64] {
-    let cmd = last_set.first().copied().unwrap_or(0xAE);
-    let mut r = [0u8; 64];
-    match cmd {
-        0x83 => {
-            // GET_ATTRIBUTES_VALUES: [0x83, 0x2d, then 9× (attr-id, value u32-LE)].
-            r[0] = 0x83;
-            r[1] = 0x2d;
-            let attrs: [(u8, u32); 9] = [
-                (0x01, 0x1205), // product id
-                (0x02, 0),
-                (0x0a, unit_id), // unit serial number (per-instance)
-                (0x04, unit_id ^ 0x5555_5555),
-                (0x09, 0x2e),
-                (0x0b, 0x0fa0),
-                (0x0d, 0),
-                (0x0c, 0),
-                (0x0e, 0),
-            ];
-            let mut o = 2;
-            for (id, val) in attrs {
-                r[o] = id;
-                r[o + 1..o + 5].copy_from_slice(&val.to_le_bytes());
-                o += 5;
-            }
-        }
-        0xAE => {
-            // GET_STRING_ATTRIBUTE: [0xAE, len, attr, ascii…]. The kernel validates the serial (attr
-            // 0x01) wants reply[2]==0x01 and 1<=len<=21; for other attrs we echo the requested id.
-            let attr = last_set.get(2).copied().unwrap_or(0x01);
-            let b = serial.as_bytes();
-            let len = b.len().clamp(1, 20);
-            r[0] = 0xAE;
-            r[1] = len as u8;
-            r[2] = attr;
-            r[3..3 + len].copy_from_slice(&b[..len]);
-        }
-        _ => {
-            // Settings read-back (e.g. 0x87): echo the host's last command + data.
-            let n = last_set.len().min(64);
-            r[..n].copy_from_slice(&last_set[..n]);
-        }
-    }
-    r
-}
-
 fn hid_desc_for(cfg: &[u8], idx: u8) -> Vec<u8> {
     // The HID descriptors live right after each interface descriptor in the config blob.
     // Offsets: cfg(9) | i0(9) h0(9) e0(7) | i1(9) h1(9) e1(7) | i2(9) h2(9) e2(7)
@@ -586,7 +515,7 @@ fn stream_loop(
             let r = report
                 .lock()
                 .map(|g| *g)
-                .unwrap_or_else(|_| neutral_report());
+                .unwrap_or_else(|_| neutral_deck_report());
             let mut buf = [0u8; EPIO_HDR + 64];
             buf[0..2].copy_from_slice(&(ep as u16).to_ne_bytes());
             buf[4..8].copy_from_slice(&(64u32).to_ne_bytes());

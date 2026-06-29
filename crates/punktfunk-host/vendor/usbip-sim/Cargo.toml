@@ -1,0 +1,33 @@
+# Vendored + trimmed copy of the `usbip` crate (jiegec/usbip v0.8.0, MIT), reduced to the
+# USB/IP *server simulation* path only: we present a virtual Steam Deck and let the local
+# `vhci_hcd` attach it. The upstream crate hard-depends on `rusb`→`libusb1-sys` (for its USB
+# *host* mode, which we do not use and which would add a libusb runtime dep + break `musl`),
+# so the host modules (`host.rs`, the `rusb`/`nusb` device constructors) and the helper
+# interface handlers (`cdc.rs`/`hid.rs`) are removed. What remains — the device model, the
+# USB/IP protocol framing, and the `UsbInterfaceHandler` trait — is pure `std` + `tokio` and
+# carries no libusb dependency. See `NOTICE` for upstream attribution.
+[package]
+name = "usbip-sim"
+version = "0.8.0"
+edition = "2021"
+description = "Trimmed usbip server-simulation core (no libusb) — vendored for the virtual Steam Deck"
+license = "MIT"
+publish = false
+
+[lib]
+name = "usbip_sim"
+path = "src/lib.rs"
+
+[dependencies]
+log = "0.4"
+num-derive = "0.4"
+num-traits = "0.2"
+# `time` is for the interrupt-IN pacing added in device.rs (punktfunk modification — see NOTICE).
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time"] }
+# Upstream gated its struct derives behind a `serde` feature; kept (off by default) so the
+# `#[cfg(feature = "serde")]` attributes stay valid and the vendored diff stays minimal.
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

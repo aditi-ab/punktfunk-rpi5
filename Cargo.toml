@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/punktfunk-core",
     "crates/punktfunk-host",
+    "crates/punktfunk-host/vendor/usbip-sim",
     "crates/pf-driver-proto",
     "clients/probe",
     "clients/linux",

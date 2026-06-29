@@ -18,7 +18,7 @@ use punktfunk_core::quic::{HidOutput, RichInput};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Motion scale constants, shared convention with the Swift client (`GamepadWire`):
 /// derived from hid-playstation's math over the host's fixed calibration blob. SDL hands
@@ -33,7 +33,14 @@ const G: f32 = 9.80665;
 /// is the only way out. Four simultaneous buttons that no game uses as a deliberate
 /// combo, so it can't be triggered by normal play. Still forwarded to the host (the user
 /// is leaving anyway); we only also raise the escape signal.
+///
+/// **Escalation:** a quick press leaves fullscreen / releases capture; *holding* the same
+/// chord for [`DISCONNECT_HOLD`] ends the session. Deliberately NOT the Steam / QAM buttons —
+/// those are the marquee pass-through controls that now reach the host's game-mode UI.
 const ESCAPE_CHORD: [u32; 4] = [wire::BTN_LB, wire::BTN_RB, wire::BTN_START, wire::BTN_BACK];
+
+/// Hold the [`ESCAPE_CHORD`] at least this long to disconnect (escalates the leave-fullscreen press).
+const DISCONNECT_HOLD: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Debug)]
 pub struct PadInfo {
@@ -90,6 +97,9 @@ pub struct GamepadService {
     /// Fires once per press of the [`ESCAPE_CHORD`]; the stream page consumes it to leave
     /// fullscreen + release capture.
     escape_rx: async_channel::Receiver<()>,
+    /// Fires once when the [`ESCAPE_CHORD`] is held past [`DISCONNECT_HOLD`]; the stream page
+    /// consumes it to end the session (the controller equivalent of Ctrl+Alt+Shift+D).
+    disconnect_rx: async_channel::Receiver<()>,
 }
 
 impl GamepadService {
@@ -99,11 +109,12 @@ impl GamepadService {
         let pinned = Arc::new(Mutex::new(None));
         let (ctl, ctl_rx) = std::sync::mpsc::channel();
         let (escape_tx, escape_rx) = async_channel::unbounded();
+        let (disconnect_tx, disconnect_rx) = async_channel::unbounded();
         let (p, a, pin) = (pads.clone(), active.clone(), pinned.clone());
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-gamepad".into())
             .spawn(move || {
-                if let Err(e) = run(&p, &a, &pin, &ctl_rx, &escape_tx) {
+                if let Err(e) = run(&p, &a, &pin, &ctl_rx, &escape_tx, &disconnect_tx) {
                     tracing::warn!(error = %e, "gamepad service ended — pads disabled");
                 }
             })
@@ -116,6 +127,7 @@ impl GamepadService {
             pinned,
             ctl,
             escape_rx,
+            disconnect_rx,
         }
     }
 
@@ -123,6 +135,12 @@ impl GamepadService {
     /// A fresh clone per call (shared mpmc channel); the stream page spawns a future on it.
     pub fn escape_events(&self) -> async_channel::Receiver<()> {
         self.escape_rx.clone()
+    }
+
+    /// A receiver that yields one `()` when the escape chord is held past [`DISCONNECT_HOLD`]
+    /// (controller disconnect). A fresh clone per call; the stream page spawns a future on it.
+    pub fn disconnect_events(&self) -> async_channel::Receiver<()> {
+        self.disconnect_rx.clone()
     }
 
     pub fn pads(&self) -> Vec<PadInfo> {
@@ -274,8 +292,15 @@ struct Worker {
     last_accel: [i16; 3],
     /// Raises the UI escape signal; the escape chord fires it once per press.
     escape_tx: async_channel::Sender<()>,
+    /// Raises the UI disconnect signal when the escape chord is held past [`DISCONNECT_HOLD`].
+    disconnect_tx: async_channel::Sender<()>,
     /// The escape chord is fully held — latched so it fires once, not every poll.
     chord_armed: bool,
+    /// When the escape chord became fully held (drives the hold-to-disconnect escalation); `None`
+    /// when the chord is broken.
+    chord_since: Option<Instant>,
+    /// The disconnect signal already fired for the current hold — latched so it fires once.
+    disconnect_fired: bool,
 }
 
 impl Worker {
@@ -347,26 +372,59 @@ impl Worker {
             self.last_axis = [i32::MIN; 6];
             self.held_touches.clear();
         }
+        // A held chord doesn't survive a flush (detach / pad-switch) — clear its latches too.
+        self.reset_chord();
     }
 
     /// Raise the UI escape signal when the [`ESCAPE_CHORD`] just completed (latched so it
-    /// fires once per press). Called after each button-down updates `held_buttons`.
+    /// fires once per press) and start the hold-to-disconnect timer. Called after each
+    /// button-down updates `held_buttons`.
     fn maybe_fire_escape(&mut self) {
         if self.chord_armed {
             return;
         }
         if ESCAPE_CHORD.iter().all(|b| self.held_buttons.contains(b)) {
             self.chord_armed = true;
+            self.chord_since = Some(Instant::now());
             let _ = self.escape_tx.try_send(());
-            tracing::info!("gamepad escape chord (L1+R1+Start+Select) — leaving fullscreen");
+            tracing::info!(
+                "gamepad escape chord (L1+R1+Start+Select) — leaving fullscreen (hold to disconnect)"
+            );
+        }
+    }
+
+    /// Fire the disconnect signal once the escape chord has been continuously held past
+    /// [`DISCONNECT_HOLD`]. Polled from the main loop so the hold completes without new events.
+    fn maybe_fire_disconnect(&mut self) {
+        if self.disconnect_fired {
+            return;
+        }
+        if let Some(since) = self.chord_since {
+            if since.elapsed() >= DISCONNECT_HOLD {
+                self.disconnect_fired = true;
+                let _ = self.disconnect_tx.try_send(());
+                tracing::info!("gamepad escape chord held — disconnecting");
+            }
         }
     }
 
     /// Re-arm once the chord is broken (any of its buttons released).
     fn rearm_escape(&mut self) {
         if self.chord_armed && !ESCAPE_CHORD.iter().all(|b| self.held_buttons.contains(b)) {
-            self.chord_armed = false;
+            self.reset_chord();
         }
+    }
+
+    /// Clear the escape/disconnect chord latches. Called at every session boundary
+    /// ([`flush_held`](Self::flush_held) on detach/pad-switch + on attach): the hold-to-disconnect
+    /// path *always* ends the session while the chord is still physically held, so the matching
+    /// button-up events arrive after detach (dropped by the `attached` guard) and `rearm_escape`
+    /// never runs — without this the latched state would leak into the next session and either
+    /// swallow its first chord press or fire a stale disconnect on connect.
+    fn reset_chord(&mut self) {
+        self.chord_armed = false;
+        self.chord_since = None;
+        self.disconnect_fired = false;
     }
 
     /// Sensors stream only while a session wants them (they cost USB/BT bandwidth).
@@ -440,6 +498,7 @@ fn run(
     pinned_out: &Mutex<Option<u32>>,
     ctl: &Receiver<Ctl>,
     escape_tx: &async_channel::Sender<()>,
+    disconnect_tx: &async_channel::Sender<()>,
 ) -> Result<(), String> {
     // Off-main-thread + no video subsystem: keep SDL away from signals, poll pads on its
     // own thread.
@@ -466,7 +525,10 @@ fn run(
         held_touches: std::collections::HashSet::new(),
         last_accel: [0; 3],
         escape_tx: escape_tx.clone(),
+        disconnect_tx: disconnect_tx.clone(),
         chord_armed: false,
+        chord_since: None,
+        disconnect_fired: false,
     };
 
     let publish = |w: &Worker| {
@@ -484,6 +546,7 @@ fn run(
                 Ok(Ctl::Attach(c)) => {
                     w.attached = Some(c);
                     w.last_axis = [i32::MIN; 6];
+                    w.reset_chord(); // every session starts un-latched (Attach doesn't flush)
                     w.set_sensors(true);
                 }
                 Ok(Ctl::Detach) => {
@@ -645,6 +708,10 @@ fn run(
                 _ => {}
             }
         }
+
+        // Escalate a held escape chord to a disconnect (polled — the hold completes with no
+        // new button events; the chord itself is only detected while a session is attached).
+        w.maybe_fire_disconnect();
 
         // Feedback planes (this thread is their single consumer). The host re-sends
         // rumble state periodically, so a generous duration with refresh-on-update is

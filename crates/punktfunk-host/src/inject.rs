@@ -510,6 +510,12 @@ pub mod steam_proto;
 #[cfg(target_os = "linux")]
 #[path = "inject/proto/steam_remap.rs"]
 pub mod steam_remap;
+/// Linux: virtual Steam Deck over **USB/IP** (`vhci_hcd`) — the shippable, Secure-Boot-clean,
+/// Steam-Input-promotable virtual-Deck transport on non-SteamOS hosts (Bazzite/generic), where
+/// `dummy_hcd`/`raw_gadget` aren't built. In-tree + signed; no module build, no MOK.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/steam_usbip.rs"]
+pub mod steam_usbip;
 /// Stub — virtual gamepads need Linux uinput or the Windows UMDF drivers; events are dropped elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod gamepad {

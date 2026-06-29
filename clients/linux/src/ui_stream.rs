@@ -124,12 +124,13 @@ impl Capture {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn new(
     window: &adw::ApplicationWindow,
     connector: Arc<NativeClient>,
     frames: async_channel::Receiver<DecodedFrame>,
     escape_rx: async_channel::Receiver<()>,
+    disconnect_rx: async_channel::Receiver<()>,
     stop: Arc<AtomicBool>,
     inhibit_shortcuts: bool,
     title: &str,
@@ -152,7 +153,7 @@ pub fn new(
     stats_label.set_margin_top(12);
 
     let hint = gtk::Label::new(Some(
-        "Click the stream to capture input · Ctrl+Alt+Shift+Q releases",
+        "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+D disconnects",
     ));
     hint.add_css_class("osd");
     hint.set_halign(gtk::Align::Center);
@@ -163,7 +164,9 @@ pub fn new(
     // Flashed when entering fullscreen — the only exit affordances once the header bar is
     // hidden (F11 on a keyboard; the L1+R1+Start+Select chord on a controller, which is the
     // only way out on a Steam Deck).
-    let fs_hint = gtk::Label::new(Some("F11  ·  L1 + R1 + Start + Select  —  exit fullscreen"));
+    let fs_hint = gtk::Label::new(Some(
+        "F11  ·  L1 + R1 + Start + Select  —  exit fullscreen (hold to disconnect)",
+    ));
     fs_hint.add_css_class("osd");
     fs_hint.set_halign(gtk::Align::Center);
     fs_hint.set_valign(gtk::Align::Start);
@@ -297,6 +300,7 @@ pub fn new(
         key.set_propagation_phase(gtk::PropagationPhase::Capture);
         let cap = capture.clone();
         let window_k = window.clone();
+        let stop_kb = stop.clone();
         key.connect_key_pressed(move |_, keyval, keycode, state| {
             let chord = gdk::ModifierType::CONTROL_MASK
                 | gdk::ModifierType::ALT_MASK
@@ -307,6 +311,13 @@ pub fn new(
                 } else {
                     cap.engage();
                 }
+                return glib::Propagation::Stop;
+            }
+            // Ctrl+Alt+Shift+D — leave the session. Now that Steam / QAM pass through to the host,
+            // the capture toggle alone can't end a stream, so this is the keyboard's explicit exit.
+            if state.contains(chord) && keyval.to_lower() == gdk::Key::d {
+                cap.release();
+                stop_kb.store(true, Ordering::SeqCst);
                 return glib::Propagation::Stop;
             }
             if keyval == gdk::Key::F11 {
@@ -442,6 +453,24 @@ pub fn new(
         })
     };
 
+    // Controller disconnect (escape chord held past the hold threshold) → end the session, the
+    // controller equivalent of Ctrl+Alt+Shift+D. Setting `stop` ends the session pump, which pops
+    // this page (and fires `hidden` below). One-shot — the session is going away.
+    let disconnect_future = {
+        let window = window.clone();
+        let cap = capture.clone();
+        let stop_d = stop.clone();
+        glib::spawn_future_local(async move {
+            if disconnect_rx.recv().await.is_ok() {
+                cap.release();
+                if window.is_fullscreen() {
+                    window.unfullscreen();
+                }
+                stop_d.store(true, Ordering::SeqCst);
+            }
+        })
+    };
+
     // The page's `hidden` fires once navigation away completes (back button, pop on
     // session end) — NOT on the transient unmap/map cycle a NavigationView push performs.
     {
@@ -449,6 +478,7 @@ pub fn new(
         let stop_h = stop.clone();
         let handlers = RefCell::new(Some((fs_handler, active_handler)));
         let escape_future = RefCell::new(Some(escape_future));
+        let disconnect_future = RefCell::new(Some(disconnect_future));
         page.connect_hidden(move |_| {
             tracing::debug!("stream page hidden — ending session");
             if let Some((fs, active)) = handlers.borrow_mut().take() {
@@ -456,6 +486,9 @@ pub fn new(
                 window.disconnect(active);
             }
             if let Some(f) = escape_future.borrow_mut().take() {
+                f.abort();
+            }
+            if let Some(f) = disconnect_future.borrow_mut().take() {
                 f.abort();
             }
             if window.is_fullscreen() {

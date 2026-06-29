@@ -2332,6 +2332,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
+name = "num-derive"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "num-integer"
 version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2839,12 +2850,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "usbip-sim",
  "utoipa",
  "utoipa-axum",
  "utoipa-scalar",
  "wasapi",
  "wayland-backend",
  "wayland-client",
+ "wayland-protocols",
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
  "wayland-scanner",
@@ -4234,6 +4247,17 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "usbip-sim"
+version = "0.8.0"
+dependencies = [
+ "log",
+ "num-derive",
+ "num-traits",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
