@@ -16,6 +16,15 @@ let package = Package(
         .target(
             name: "PunktfunkKit",
             dependencies: ["PunktfunkCore"],
+            // OSS attribution shown by the app's Acknowledgements screen. Bundled here (not in the
+            // app target) so it rides along via Bundle.module in both `swift build` and the Xcode
+            // app, which links the PunktfunkKit product. Refresh with
+            // scripts/gen-third-party-notices.sh (it copies the generated file into Resources/).
+            resources: [
+                .copy("Resources/THIRD-PARTY-NOTICES.txt"),
+                .copy("Resources/LICENSE-MIT.txt"),
+                .copy("Resources/LICENSE-APACHE.txt"),
+            ],
             linkerSettings: [
                 // Rust staticlib system deps.
                 .linkedFramework("Security"),

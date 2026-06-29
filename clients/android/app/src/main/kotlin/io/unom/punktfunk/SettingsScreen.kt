@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -44,6 +45,7 @@ import androidx.core.content.ContextCompat
 fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -> Unit) {
     var s by remember { mutableStateOf(initial) }
     val context = LocalContext.current
+    var showLicenses by remember { mutableStateOf(false) }
     fun update(next: Settings) {
         s = next
         onChange(next)
@@ -55,6 +57,11 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
     val micLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted -> update(s.copy(micEnabled = granted)) }
+
+    if (showLicenses) {
+        LicensesScreen(onBack = { showLicenses = false })
+        return
+    }
 
     Column(
         modifier = Modifier
@@ -143,6 +150,14 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
                 onCheckedChange = { on -> update(s.copy(statsHudEnabled = on)) },
             )
         }
+
+        SettingsGroup("About") {
+            ClickableRow(
+                title = "Open-source licenses",
+                subtitle = "Third-party notices and credits",
+                onClick = { showLicenses = true },
+            )
+        }
     }
 }
 
@@ -184,6 +199,24 @@ private fun ToggleRow(
             )
         }
         Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
+/** A title + subtitle on the left; the whole row is clickable (opens a sub-screen). */
+@Composable
+private fun ClickableRow(title: String, subtitle: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 

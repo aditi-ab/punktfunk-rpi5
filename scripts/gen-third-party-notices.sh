@@ -19,3 +19,17 @@ else
     python3 scripts/gen-third-party-notices.py --out "$OUT"
 fi
 echo "==> wrote $OUT" >&2
+
+# Keep the per-client in-tree copies in sync (the GUI apps bundle these as resources/assets and
+# show them on their Acknowledgements / Open-source-licenses screen). The Linux/Windows Rust clients
+# embed the root file directly via include_str!, so they need no copy.
+if [ "$OUT" = "THIRD-PARTY-NOTICES.txt" ]; then
+    for dest in \
+        clients/apple/Sources/PunktfunkKit/Resources/THIRD-PARTY-NOTICES.txt \
+        clients/android/app/src/main/assets/THIRD-PARTY-NOTICES.txt; do
+        if [ -d "$(dirname "$dest")" ]; then
+            cp "$OUT" "$dest"
+            echo "==> synced $dest" >&2
+        fi
+    done
+fi

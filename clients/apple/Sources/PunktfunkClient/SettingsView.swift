@@ -98,6 +98,9 @@ struct SettingsView: View {
             }
             .formStyle(.grouped)
             .tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }
+
+            AcknowledgementsView()
+                .tabItem { Label("About", systemImage: "info.circle") }
         }
         .frame(width: 480, height: 460)
     }
@@ -115,6 +118,9 @@ struct SettingsView: View {
             statisticsSection
             experimentalSection
             controllersSection
+            Section {
+                NavigationLink("Acknowledgements") { AcknowledgementsView() }
+            }
         }
         .formStyle(.grouped)
         .onAppear {
@@ -216,6 +222,8 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
+                    .padding(.top, 8)
+                NavigationLink("Acknowledgements") { AcknowledgementsView() }
                     .padding(.top, 8)
             }
             .frame(maxWidth: 1000)
