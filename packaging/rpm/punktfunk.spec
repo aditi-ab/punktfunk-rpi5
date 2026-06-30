@@ -16,7 +16,7 @@
 # only new runtime bits are ffmpeg-libs (RPM Fusion) + opus + libei.
 ################################################################################
 
-Name:           Punktfunk
+Name:           punktfunk
 # Version/Release are overridable so CI can stamp a rolling snapshot: a canary main build passes
 #   --define "pf_version 0.3.0" --define "pf_release 0.ci42.gdeadbee"
 # (Release starting "0." sorts BEFORE the eventual "1" release; the canary base stays one minor
