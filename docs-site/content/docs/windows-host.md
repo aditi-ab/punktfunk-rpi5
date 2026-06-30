@@ -1,11 +1,11 @@
 ---
 title: "Windows Host"
-description: "Run the punktfunk streaming host on a Windows PC — a first-class, all-vendor, virtual-display host."
+description: "Run the Punktfunk streaming host on a Windows PC — a first-class, all-vendor, virtual-display host."
 ---
 
-Set up a punktfunk host on a **Windows 10/11 PC** and stream its desktop or games to any punktfunk or
+Set up a Punktfunk host on a **Windows 10/11 PC** and stream its desktop or games to any Punktfunk or
 [Moonlight](/docs/moonlight) client. A signed installer registers a Windows service that streams at the
-client's **exact resolution and refresh** via punktfunk's own **virtual display** — including
+client's **exact resolution and refresh** via Punktfunk's own **virtual display** — including
 **HDR10** (10-bit BT.2020 PQ) when your Windows desktop is in HDR mode. The virtual display is created
 on the fly, so you need **no second monitor and no dummy HDMI plug**, and capture keeps working even on
 the secure desktop (UAC prompts, the lock screen).
@@ -32,7 +32,7 @@ the secure desktop (UAC prompts, the lock screen).
 ## Install
 
 Download the signed `punktfunk-host-setup-<ver>.exe` from the
-[package registry](https://git.unom.io/unom/-/packages) and run it. The installer:
+[latest release](https://git.unom.io/unom/punktfunk/releases) and run it. The installer:
 
 - drops the host into `C:\Program Files\punktfunk` and registers + starts the **`PunktfunkHost`**
   service,
@@ -84,14 +84,14 @@ Sunshine and Apollo use. Service registration, firewall rules, and the superviso
 
 ### One core, Windows backends
 
-Most of punktfunk is platform-agnostic. `punktfunk-core` (protocol, FEC, crypto, session, transport,
+Most of Punktfunk is platform-agnostic. `punktfunk-core` (protocol, FEC, crypto, session, transport,
 the C ABI), the QUIC control plane, the GameStream wire logic, the management API, and the per-frame
 pipeline orchestration are all shared with the Linux host. The Windows host is a set of
 `#[cfg(windows)]` backends behind the same traits the Linux host uses:
 
 | Subsystem | Linux backend | Windows backend |
 |---|---|---|
-| **Capture** | xdg ScreenCast portal → PipeWire (dmabuf) | **Windows.Graphics.Capture** + **Desktop Duplication** (secure desktop), with a zero-copy path straight from the virtual-display driver; FP16/10-bit when the desktop is HDR |
+| **Capture** | xdg ScreenCast portal → PipeWire (dmabuf) | **IDD direct-push** — the `pf-vdisplay` driver copies finished frames into a host-owned shared GPU texture ring that the host consumes in-process (no Desktop Duplication, no Windows.Graphics.Capture); FP16/10-bit when the desktop is HDR |
 | **Virtual display** | KWin / Mutter / Sway / gamescope | **pf-vdisplay** signed IDD — create a `WxH@Hz` monitor per session, capture it, tear it down |
 | **Encode** | NVENC (CUDA) / VAAPI (AMD·Intel) / software | **NVENC** (NVIDIA) · **AMF** (AMD) · **QSV** (Intel) · software H.264; HEVC Main10 / BT.2020 PQ for HDR |
 | **Input — mouse/keyboard** | libei / wlr protocols | **SendInput** (Win32 VK + absolute mouse) |
@@ -99,11 +99,13 @@ pipeline orchestration are all shared with the Linux host. The Windows host is a
 | **Audio capture** | PipeWire sink-monitor | **WASAPI loopback** |
 | **Virtual mic** | PipeWire `Audio/Source` | WASAPI virtual mic |
 
-The virtual display uses **pf-vdisplay**, punktfunk's own all-Rust **Indirect Display Driver (IDD)** —
-the host pushes finished frames straight into it, so you get a real virtual display with no physical
-monitor or dummy plug. The installer bundles and stages the (self-signed) driver; if it isn't
-installed, the host falls back to capturing an existing monitor, losing the per-client native-resolution
-output.
+The virtual display is **pf-vdisplay**, Punktfunk's own all-Rust **Indirect Display Driver (IDD)**. The
+host creates a shared GPU texture ring and the driver pushes finished frames straight into it — a real
+virtual display at the client's exact `WxH@Hz`, with no physical monitor and no dummy plug, captured
+in-process from Session 0 so the secure desktop streams too. There is **no** Desktop Duplication or
+Windows.Graphics.Capture path: IDD direct-push is the only capture path. The signed driver is bundled
+and staged by the installer and is **required** — without it the host can't create a session (there is
+no monitor-capture fallback).
 
 ### HDR
 
