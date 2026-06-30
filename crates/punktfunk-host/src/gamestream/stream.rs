@@ -213,14 +213,26 @@ fn open_gs_virtual_source(
     let compositor = if let Some(c) = app.and_then(|a| a.compositor) {
         c
     } else {
-        let active = crate::vdisplay::detect_active_session();
-        crate::vdisplay::apply_session_env(&active);
-        let c = crate::vdisplay::compositor_for_kind(active.kind)
-            .map(Ok)
-            .unwrap_or_else(crate::vdisplay::detect)
-            .context("detect compositor")?;
-        crate::vdisplay::apply_input_env(c);
-        c
+        // Windows has a single virtual-display backend (pf-vdisplay); `vdisplay::open` ignores the
+        // compositor arg there, so short-circuit the Linux session-detection state machine with a
+        // placeholder — mirrors `punktfunk1::resolve_compositor`. Without this, the Linux `detect()`
+        // below bails on Windows ("could not detect compositor … XDG_CURRENT_DESKTOP=''"), which
+        // killed the GameStream video thread → black screen (the native plane was already guarded).
+        #[cfg(target_os = "windows")]
+        {
+            crate::vdisplay::Compositor::Kwin
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let active = crate::vdisplay::detect_active_session();
+            crate::vdisplay::apply_session_env(&active);
+            let c = crate::vdisplay::compositor_for_kind(active.kind)
+                .map(Ok)
+                .unwrap_or_else(crate::vdisplay::detect)
+                .context("detect compositor")?;
+            crate::vdisplay::apply_input_env(c);
+            c
+        }
     };
     let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
     // Carry the resolved launch command on the backend instance (per-session) rather than a
