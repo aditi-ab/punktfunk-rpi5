@@ -203,9 +203,15 @@ jobs:
           # Check curl's exit code ourselves — a best-effort DELETE (404 on first run) must not abort.
           $PSNativeCommandUseErrorActionPreference = $false
           function Publish-File($f, $url) {
-            curl.exe -fsS --user "enricobuehler:$($env:REGISTRY_TOKEN)" --upload-file "$f" "$url"
-            if ($LASTEXITCODE -ne 0) { throw "upload failed ($LASTEXITCODE): $url" }
-            Write-Output "published $url"
+            # The generic registry makes a versioned path immutable and 409s a re-upload, so a tag
+            # re-run re-publishing the identical artifact must be tolerated as a no-op. (The channel
+            # alias below is delete-then-reuploaded and never 409s.) No curl -f, so we can read the
+            # status code instead of aborting on it.
+            $code = [int](curl.exe -sS -o NUL -w "%{http_code}" --user "enricobuehler:$($env:REGISTRY_TOKEN)" --upload-file "$f" "$url")
+            if ($LASTEXITCODE -ne 0) { throw "upload failed (curl exit $LASTEXITCODE): $url" }
+            if ($code -eq 409) { Write-Output "already published (409, immutable): $url"; return }
+            if ($code -lt 200 -or $code -ge 300) { throw "upload failed (HTTP $code): $url" }
+            Write-Output "published ($code): $url"
           }
           $files = @($env:HOST_SETUP_PATH, $env:HOST_CER_PATH) | Where-Object { $_ -and (Test-Path $_) }
           if (-not $files) { throw "pack produced no artifacts to publish" }
