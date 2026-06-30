@@ -11,13 +11,18 @@
 // host mode, so the host's rescale is the identity).
 //
 // A hardware mouse/trackpad is a pointer, not a finger. When the scene is pointer-LOCKED
-// (full-screen + frontmost iPad) GCMouse delivers raw relative deltas and the system hides
-// the cursor — the gaming-grade path. When it CAN'T lock (Stage Manager, not frontmost,
-// iPhone) the system shows its own cursor and routes the mouse through UIKit's pointer path:
-// hover + indirect-pointer touches, which we forward as ABSOLUTE cursor position (+ buttons)
-// so the host cursor tracks the visible local one. We never forward an indirect pointer as a
-// touch — doing so hid the cursor and made the host see taps instead of a moving mouse.
-// GCMouse is gated off whenever the lock isn't held so the two paths can't double-send.
+// (full-screen + frontmost iPad, and the user hasn't disabled pointer capture in Settings —
+// see PointerLockChain, which steers the lock request through SwiftUI's hosting controllers)
+// GCMouse delivers raw relative deltas and the system hides the cursor — the gaming-grade path.
+// InputCapture handles EVERY connected mouse (GCMouse.mice), not just the current one, so a
+// trackpad + a second pointer (e.g. a Universal Control mouse) both drive. When the scene CAN'T
+// lock (Stage Manager, not frontmost, iPhone, capture disabled) the system shows its own cursor
+// and routes the mouse through UIKit's pointer path: hover + indirect-pointer touches, which we
+// forward as ABSOLUTE cursor position (+ buttons) so the host cursor tracks the visible local one.
+// We never forward an indirect pointer as a touch — doing so hid the cursor and made the host see
+// taps instead of a moving mouse. The two paths are mutually exclusive on `gcMouseForwarding`
+// (== locked): GCMouse forwards only WHILE locked, the UIKit indirect path (motion, buttons AND
+// scroll) only while NOT locked — so a pointer that emits both channels under lock can't double-send.
 // Hardware keyboard forwarding shares InputCapture with macOS — auto-engaged when streaming
 // starts, ⌘⎋ toggles (detected from the HID stream; there is no NSEvent monitor here).
 //
@@ -236,32 +241,24 @@ public final class StreamViewController: UIViewController {
             guard self?.captureEnabled == true else { return }
             connection?.send(event)
         }
-        // Indirect pointer (mouse/trackpad with no lock) → absolute cursor + buttons, routed
-        // through InputCapture so the forwarding gate and release-on-blur apply uniformly.
+        // Indirect pointer (mouse/trackpad) WITHOUT a lock → absolute cursor + buttons + scroll.
+        // While the scene is pointer-LOCKED the GCMouse path owns motion AND buttons AND scroll, so
+        // the whole UIKit indirect path is gated off here (`gcMouseForwarding`). The trackpad and a
+        // mouse BOTH report through GCMouse under lock and ALSO emit UIKit indirect-pointer events
+        // (pinned at the locked position) — without this gate a click double-sends (GCMouse + UIKit)
+        // and a second pointer (e.g. a Universal Control mouse) competes with the trackpad. The gate
+        // is the exact mirror of the GCMouse handlers, which fire only while locked.
         streamView.onPointerMoveAbs = { [weak self] p in
-            guard let self else { return }
-            if iosInputDebug {
-                // Whether ANY UIKit pointer movement reaches us while the scene is LOCKED tells us
-                // if the trackpad (which may not be a GCMouse) can still be captured via UIKit.
-                iosInputLog.debug(
-                    "UIKit pointer move x=\(p.x, privacy: .public) y=\(p.y, privacy: .public) locked=\(self.pointerLockEngaged() == true, privacy: .public) gcFwd=\(self.inputCapture?.gcMouseForwarding == true, privacy: .public)")
-            }
+            guard let self, self.inputCapture?.gcMouseForwarding == false else { return }
             self.inputCapture?.sendMouseAbs(
                 x: p.x, y: p.y, surfaceWidth: p.w, surfaceHeight: p.h)
         }
         streamView.onPointerButton = { [weak self] button, down in
-            self?.inputCapture?.sendMouseButton(button, pressed: down)
+            guard let self, self.inputCapture?.gcMouseForwarding == false else { return }
+            self.inputCapture?.sendMouseButton(button, pressed: down)
         }
-        // Trackpad two-finger / wheel scroll → host scroll. The pan recognizer is the
-        // UNLOCKED regime; while locked, GCMouse's scroll handler owns it — mirror the
-        // sendMouseAbs !gcMouseForwarding gate so the two can't double-send.
         streamView.onScroll = { [weak self] dx, dy in
-            guard let self else { return }
-            if iosInputDebug {
-                iosInputLog.debug(
-                    "UIKit scroll dx=\(dx, privacy: .public) dy=\(dy, privacy: .public) locked=\(self.pointerLockEngaged() == true, privacy: .public)")
-            }
-            guard self.inputCapture?.gcMouseForwarding == false else { return }
+            guard let self, self.inputCapture?.gcMouseForwarding == false else { return }
             self.inputCapture?.sendScroll(dx: dx, dy: dy)
         }
 
@@ -472,7 +469,7 @@ public final class StreamViewController: UIViewController {
         pointerInteraction?.invalidate() // re-resolve the hidden/visible cursor for the state
         if iosInputDebug {
             iosInputLog.debug(
-                "pointer lock isLocked=\(locked, privacy: .public) captured=\(self.captured, privacy: .public) useGCMouse=\(useGCMouse, privacy: .public) [\(self.inputCapture?.attachedMiceSummary ?? "n/a", privacy: .public)]")
+                "pointer lock isLocked=\(locked, privacy: .public) captured=\(self.captured, privacy: .public)")
         }
     }
     #endif
