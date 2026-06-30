@@ -61,7 +61,6 @@ pub fn pack_luid(luid: LUID) -> i64 {
     ((luid.HighPart as i64) << 32) | (luid.LowPart as i64 & 0xffff_ffff)
 }
 
-
 /// Create a fresh D3D11 device + context on a specific adapter (driver_type UNKNOWN with an explicit
 /// adapter). Used at open and on every ACCESS_LOST: a device created on one desktop cannot sustain a
 /// duplication on a *different* desktop (perpetual ACCESS_LOST), so the secure-desktop switch needs a
