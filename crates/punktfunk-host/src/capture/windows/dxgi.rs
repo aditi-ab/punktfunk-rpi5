@@ -34,6 +34,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice, IDXGIDevice1};
 
+#[derive(Clone)]
 pub struct WinCaptureTarget {
     /// Packed DXGI adapter LUID (`(HighPart << 32) | (LowPart & 0xffff_ffff)`).
     pub adapter_luid: i64,
