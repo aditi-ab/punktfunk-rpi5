@@ -22,7 +22,7 @@
   single cable is bundled (A+B / C+D are not redistributable).
 
   Best-effort: any failure is logged and returns a non-zero exit, but the caller (the installer) treats
-  it as non-fatal — the host still runs (mic passthrough then needs a manually-installed cable, and the
+  it as non-fatal - the host still runs (mic passthrough then needs a manually-installed cable, and the
   host falls back to auto-installing the Steam Streaming pair).
 
 .PARAMETER Dir
