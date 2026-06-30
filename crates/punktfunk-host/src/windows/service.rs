@@ -3,12 +3,12 @@
 //! for the ad-hoc PsExec / VBS / scheduled-task launch chain used during bring-up.
 //!
 //! Why a supervisor and not just "run the host as a service": the host must run **as SYSTEM in the
-//! interactive session** (session 1+). Desktop Duplication of the secure (Winlogon/UAC/lock) desktop
-//! and `SendInput` both need SYSTEM; capture and injection both need the *interactive* session, which
+//! interactive session** (session 1+). Capturing the secure (Winlogon/UAC/lock) desktop and
+//! `SendInput` both need SYSTEM; capture and injection both need the *interactive* session, which
 //! a plain session-0 service is not in. So this service (itself in session 0) never captures — it
 //! duplicates its own LocalSystem token, retargets it to the active console session, and
-//! `CreateProcessAsUserW`s the host there. This is the Sunshine/Apollo model. The host in turn spawns
-//! the WGC helper into the *user* session (see `capture::wgc_relay`) — two nested launches.
+//! `CreateProcessAsUserW`s the host there. This is the Sunshine/Apollo model. The host captures the
+//! virtual display in-process via IDD direct-push (no helper process).
 //!
 //! Subcommands (Windows only):
 //! ```text
@@ -230,8 +230,9 @@ fn run_service() -> Result<()> {
     let _ = SESSION_EVENT.set(session_owned);
 
     // The control handler captures nothing — it reaches the events through the statics, so it stays
-    // `Fn + Send + 'static`. Session lock/unlock are handled inside the host (DesktopWatcher), so we
-    // only flag console connect/disconnect/logon — the events that change the active session.
+    // `Fn + Send + 'static`. Lock/unlock is handled by the in-process IDD-push capture (the driver
+    // composes the secure desktop into the ring), so we only flag console connect/disconnect/logon —
+    // the events that change the active session.
     let handler = move |control| -> ServiceControlHandlerResult {
         match control {
             ServiceControl::Stop | ServiceControl::Preshutdown | ServiceControl::Shutdown => {
@@ -517,10 +518,10 @@ unsafe fn spawn_host(
     .context("SetTokenInformation(TokenSessionId)")?;
 
     // 2) The session's environment block, merged with this process's PUNKTFUNK_*/RUST_LOG (so the
-    //    host runs with host.env's settings, not a bare block). Same merge the WGC helper uses.
+    //    host runs with host.env's settings, not a bare block). Same merge the interactive launch uses.
     let mut env_block: *mut c_void = std::ptr::null_mut();
     let _ = CreateEnvironmentBlock(&mut env_block, Some(primary), false);
-    let merged = crate::capture::wgc_relay::merged_env_block(env_block as *const u16);
+    let merged = crate::interactive::merged_env_block(env_block as *const u16);
     if !env_block.is_null() {
         let _ = DestroyEnvironmentBlock(env_block);
     }

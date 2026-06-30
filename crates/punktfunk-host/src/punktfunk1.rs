@@ -755,14 +755,18 @@ async fn serve_session(
         // opens a tiny encoder; it runs only when both opt-ins are set and is cached after the first.
         let host_wants_444 = crate::config::config().four_four_four;
         let client_supports_444 = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
-        let single_process = crate::session_plan::resolve_topology()
-            == crate::session_plan::SessionTopology::SingleProcess;
+        // The active capturer must be able to deliver a full-chroma (RGB) source — the honest-downgrade
+        // gate. Linux's portal capturer can; the Windows IDD-push path delivers subsampled NV12/P010
+        // today (full-chroma IDD-push capture is a follow-up), so it returns false there and the host
+        // negotiates 4:2:0. (Replaces the old `single_process` gate — single-process is now the only
+        // topology, and 4:4:4 routed to DDA, which was removed.)
+        let capture_supports_444 = crate::capture::capturer_supports_444();
         // The GPU probe opens a real (tiny) encoder on first use, so run it off the reactor like the
         // compositor probe above (blocking probes → spawn_blocking). Short-circuit so it only runs when
         // the cheap gates already pass. The result is cached process-wide (a negative latches until
         // restart — acceptable: a GPU either supports HEVC 4:4:4 or it doesn't, and a transient open
         // failure here is rare since the session's own encoder isn't open yet).
-        let gpu_supports_444 = if host_wants_444 && client_supports_444 && single_process {
+        let gpu_supports_444 = if host_wants_444 && client_supports_444 && capture_supports_444 {
             tokio::task::spawn_blocking(|| {
                 crate::encode::can_encode_444(crate::encode::Codec::H265)
             })
@@ -780,7 +784,7 @@ async fn serve_session(
             chroma = ?chroma,
             host_wants_444,
             client_supports_444,
-            single_process,
+            capture_supports_444,
             "encode chroma"
         );
 
@@ -2696,7 +2700,7 @@ fn session_watcher_loop(tx: std::sync::mpsc::Sender<SessionSwitch>, stop: Arc<At
     }
 }
 
-/// All per-session inputs for [`virtual_stream`] / [`virtual_stream_relay`], bundled so the session entry
+/// All per-session inputs for [`virtual_stream`], bundled so the session entry
 /// is one moved value instead of a 13-positional-argument `#[allow(too_many_arguments)]` signature
 /// (Goal-1 stage 4, plan §2.4). Everything is **owned** — the receivers move in (`virtual_stream` is their
 /// only consumer) — so the whole context moves into the stream thread and the borrow plumbing disappears.
@@ -2744,8 +2748,9 @@ struct SessionContext {
 }
 
 fn virtual_stream(ctx: SessionContext) -> Result<()> {
-    // This thread runs the capture+encode loop (single-process: Linux / synthetic / NO_WGC DDA) — or
-    // tail-calls the relay below. Elevate it so a CPU-heavy game can't deschedule our GPU submission.
+    // This thread runs the capture+encode loop (single-process — the only topology: Linux portal /
+    // synthetic, Windows in-process IDD-push). Elevate it so a CPU-heavy game can't deschedule our GPU
+    // submission.
     boost_thread_priority(true);
     // Resolve the per-session capture / topology / encoder decision ONCE (Goal-1 stage 3): the deployed
     // path now reads this typed `SessionPlan` instead of re-deriving from config at each dispatch site
@@ -2753,14 +2758,6 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // only per-session input — capture/topology/encoder are otherwise pure functions of `HostConfig`.
     let plan = crate::session_plan::SessionPlan::resolve(ctx.bit_depth, ctx.chroma);
     tracing::info!(?plan, "resolved session plan");
-    // Windows two-process secure-desktop path: when the host runs as SYSTEM (required for the secure
-    // desktop + SendInput), WGC can't activate in-process, so we capture the normal desktop via a
-    // helper spawned in the user session and relay its AUs. (Single-process WGC/DDA is used as the
-    // user, and stays the path on Linux.) See design/archive/windows-secure-desktop.md.
-    #[cfg(target_os = "windows")]
-    if plan.topology == crate::session_plan::SessionTopology::TwoProcessRelay {
-        return virtual_stream_relay(ctx);
-    }
     // Single-process path: unpack the context into the locals the loop below uses (names unchanged, so the
     // body is byte-for-byte the same; the receivers are now owned but `try_recv()` is identical).
     let SessionContext {
@@ -2810,20 +2807,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     #[cfg(target_os = "windows")]
     drop(_idd_setup_guard);
 
-    // Windows single-process DDA path (PUNKTFUNK_NO_WGC=1): the SudoVDA virtual display, isolated as the
-    // SOLE active output, goes into fullscreen independent-flip (one plane on one display) which Desktop
-    // Duplication cannot capture → the born-lost ACCESS_LOST storm we measured on the RTX4090+iGPU box
-    // (hook verified-firing, DPI=2, yet 100% DuplicateOutput1 E_ACCESSDENIED + born-lost). A tiny topmost
-    // layered overlay disqualifies independent-flip and forces DWM composition, which DDA CAN capture.
-    // (Apollo never hits this because it runs WITH a physical monitor attached — multi-display is already
-    // DWM-composited; we isolate to sole-display, so we must force composition ourselves.) Unlike the WGC
-    // relay path — where WGC owns the normal desktop and the overlay is secure-only — here DDA owns the
-    // normal desktop too, so it must run unconditionally. Held for the session; Drop tears it down.
-    // Best-effort; disable with PUNKTFUNK_FORCE_COMPOSED=0.
-    #[cfg(target_os = "windows")]
-    let _composed_flip = crate::capture::composed_flip::ForceComposedFlip::start();
-
-    // Windows: capture is live (and composition forced) — launch the requested library title into the
+    // Windows: capture is live — launch the requested library title into the
     // interactive user session so it renders onto the captured desktop and grabs foreground. Linux
     // nests its launch in gamescope instead (the handshake `PUNKTFUNK_GAMESCOPE_APP` path). Best-effort:
     // a launch failure (no recipe for the kind, no interactive user) leaves the user on the desktop.
@@ -3292,480 +3276,6 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     drop(frame_tx);
     let _ = send_thread.join();
     tracing::info!(sent, "punktfunk/1 virtual stream complete");
-    Ok(())
-}
-
-/// Windows two-process video stream: the SYSTEM host creates the SudoVDA virtual output (and holds
-/// its keepalive = the sole topology/isolation owner), spawns the WGC helper in the user session to
-/// capture+encode the NORMAL desktop, and relays the helper's AUs onto the QUIC data plane via the
-/// same send thread as the single-process path. A [`DesktopWatcher`](crate::capture::desktop_watch)
-/// muxes the source: while the input desktop is Winlogon (UAC / lock / login — which WGC can't
-/// capture), the host captures it with its OWN DDA encoder; back on Default it resumes the relay.
-/// Every source switch latches a "wait for IDR" so the client's decoder resumes on a keyframe (the
-/// two encoders keep independent infinite-GOP state). Reconfigure rebuilds the output + re-spawns the
-/// helper at the new mode (and drops the stale-target DDA); keyframe requests forward to the active
-/// source.
-#[cfg(target_os = "windows")]
-fn virtual_stream_relay(ctx: SessionContext) -> Result<()> {
-    use crate::capture::dxgi::WinCaptureTarget;
-    use crate::capture::wgc_relay::HelperRelay;
-    use crate::capture::Capturer; // trait methods (set_active/next_frame) on the concrete DuplCapturer
-
-    // Unpack the context (names unchanged so the body is identical). The relay doesn't yet send the
-    // source's 0xCE HDR metadata — the helper's in-band SEI carries it (a Windows follow-up) — so `conn`
-    // is held unused.
-    let SessionContext {
-        session,
-        mode,
-        seconds,
-        stop,
-        reconfig,
-        keyframe,
-        compositor,
-        bitrate_kbps,
-        bit_depth,
-        // The two-process WGC relay encodes 4:2:0 in v1 — the handshake's `single_process` gate already
-        // forced `chroma` to Yuv420 for this topology, so the helper + secure-desktop DDA stay 4:2:0.
-        chroma: _,
-        probe_rx,
-        probe_result_tx,
-        fec_target,
-        conn: _conn,
-        stats,
-        client_label,
-        launch,
-    } = ctx;
-    tracing::info!(
-        ?mode,
-        bitrate_kbps,
-        bit_depth,
-        "punktfunk/1 two-process stream (SYSTEM host + user-session WGC helper)"
-    );
-
-    let mut vd = crate::vdisplay::open(compositor)?;
-
-    // Create the SudoVDA output + spawn a helper capturing it by GDI name. Returns the keepalive
-    // (held for the output's life — the sole isolation owner), the running relay, the capture target
-    // (so the host can also open DDA on it for the secure desktop), and the achieved refresh.
-    type Built = (Box<dyn Send>, HelperRelay, WinCaptureTarget, u32);
-    let build = |vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
-                 mode: punktfunk_core::Mode|
-     -> Result<Built> {
-        let vout = vd.create(mode).context("create virtual output")?;
-        let effective_hz = vout
-            .preferred_mode
-            .map(|(_, _, hz)| hz)
-            .filter(|&hz| hz > 0)
-            .unwrap_or(mode.refresh_hz);
-        let target = vout.win_capture.clone().ok_or_else(|| {
-            anyhow!("SudoVDA target not yet an active display (needs a WDDM GPU to activate it)")
-        })?;
-        // HDR is driven by the SudoVDA monitor's ACTUAL advanced-color state, not the handshake bit
-        // depth: the whole pipeline follows the monitor (WGC captures FP16 when HDR is on; NVENC forces
-        // Main10 + BT.2020 PQ from the 10-bit capture format regardless of the negotiated depth; the
-        // client auto-detects PQ from the HEVC VUI). So:
-        //   - a negotiated 10-bit session PROACTIVELY enables HDR on the monitor (below), but
-        //   - we must NEVER force HDR *off* here — that would wipe out a user's deliberate Windows HDR
-        //     toggle on the virtual display on every build (the "HDR doesn't persist" bug). Leaving the
-        //     monitor's state alone lets a user-enabled HDR session flow through end-to-end.
-        // The secure-desktop HDR drop (for the DDA leg) keys off the monitor's real state in the mux loop.
-        #[cfg(target_os = "windows")]
-        if bit_depth >= 10 {
-            // SAFETY: `set_advanced_color` is marked `unsafe` only because it drives the Win32 CCD API
-            // internally; it takes `target_id` by value (Copy `u32` — this session's live SudoVDA
-            // monitor's CCD target id) and sizes + owns every buffer it hands the OS on its own stack.
-            // We pass no pointers, so nothing must outlive the call and there is no aliasing; an
-            // unknown/absent target id simply returns false.
-            unsafe {
-                if crate::win_display::set_advanced_color(target.target_id, true) {
-                    // Let the colorspace change settle before WGC creates its capture item / detects HDR.
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
-            }
-        }
-        let relay = HelperRelay::spawn(
-            &target,
-            (mode.width, mode.height, effective_hz),
-            bitrate_kbps,
-            bit_depth,
-        )
-        .context("spawn WGC helper")?;
-        Ok((vout.keepalive, relay, target, effective_hz))
-    };
-
-    let (mut _keepalive, mut relay, mut target, mut effective_hz) = build(&mut vd, mode)?;
-    let mut cur_mode = mode;
-
-    // Capture is live (the WGC helper is relaying) — launch the requested library title into the
-    // interactive user session so it renders onto the captured desktop and grabs foreground.
-    // Best-effort: a failure (no recipe for the kind, no interactive user) leaves the user on the desktop.
-    if let Some(id) = launch.as_deref() {
-        if let Err(e) = crate::library::launch_title(id) {
-            tracing::warn!(launch_id = id, error = %e, "could not launch requested library title");
-        }
-    }
-
-    // O3.1: optionally observe the IDD-push ring alongside WGC (WGC = the presentation trigger) to
-    // confirm the 0257 driver pushes frames into a HOST-created ring. Diagnostic only; gated.
-    if std::env::var_os("PUNKTFUNK_IDD_PUSH_OBSERVE").is_some() {
-        crate::capture::idd_push::spawn_observer(
-            target.clone(),
-            Some((cur_mode.width, cur_mode.height, effective_hz)),
-        );
-    }
-
-    // The host's own DDA capturer+encoder for the SECURE (Winlogon) desktop, which WGC — and thus the
-    // helper — cannot capture. Opened lazily on the first secure transition (so a session that never
-    // hits a UAC/lock screen never pays for a second NVENC session), then kept for fast re-switch.
-    struct DdaPipe {
-        cap: Box<dyn crate::capture::Capturer>,
-        enc: Box<dyn crate::encode::Encoder>,
-        frame: crate::capture::CapturedFrame,
-    }
-    // Note: takes the dimensions as args rather than capturing `cur_mode` — `cur_mode` is reassigned
-    // on reconfig, and a closure holding a shared borrow of it for the whole fn would forbid that.
-    let open_dda =
-        |target: &WinCaptureTarget, w: u32, h: u32, hz: u32, hdr: bool| -> Result<DdaPipe> {
-            // The host already holds the real keepalive (sole isolation owner), so DDA gets a no-op one.
-            // `hdr` requests an FP16 DuplicateOutput1 so the secure desktop is captured in HDR (→ BT.2020
-            // PQ Main10) instead of black — legacy DuplicateOutput can't capture an HDR/FP16 desktop.
-            let mut cap = crate::capture::dxgi::DuplCapturer::open(
-                target.clone(),
-                Some((w, h, hz)),
-                Box::new(()),
-                // The relay's host encoder is GPU (NVENC/AMF/QSV unless software) — pass `gpu` in (Goal-1
-                // stage 5) so the DDA capturer doesn't re-derive it.
-                crate::capture::gpu_encode(),
-                hdr,
-                false, // the two-process relay path is 4:2:0 in v1
-            )
-            .context("open DDA for secure desktop")?;
-            cap.set_active(true);
-            let frame = cap.next_frame().context("DDA first frame")?;
-            let enc = crate::encode::open_video(
-                crate::encode::Codec::H265,
-                frame.format,
-                frame.width,
-                frame.height,
-                hz,
-                bitrate_kbps as u64 * 1000,
-                frame.is_cuda(),
-                bit_depth,
-                // Secure-desktop DDA on the two-process relay path: 4:2:0 in v1 (matches the helper).
-                crate::encode::ChromaFormat::Yuv420,
-            )
-            .context("open video encoder for DDA")?;
-            Ok(DdaPipe {
-                cap: Box::new(cap),
-                enc,
-                frame,
-            })
-        };
-
-    let perf = crate::config::config().perf;
-    let burst_cap = std::env::var("PUNKTFUNK_PACE_BURST_KB")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(128)
-        * 1024;
-
-    // Same encode|send split as the single-process path: this thread relays AUs, a dedicated send
-    // thread owns the Session and does FEC+seal+paced-send. The relay encodes in the helper process,
-    // so this path's FrameMsgs carry no cap/submit/encode split (those stages stay 0 in the sample);
-    // the send thread still emits fps/goodput/pacing/loss from `session.stats()`.
-    let send_stats = SendStats {
-        rec: stats,
-        width: mode.width,
-        height: mode.height,
-        fps: effective_hz,
-        codec: "hevc",
-        client: client_label,
-        bitrate_kbps,
-    };
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<FrameMsg>(3);
-    let send_thread = std::thread::Builder::new()
-        .name("punktfunk-send".into())
-        .spawn({
-            let stop = stop.clone();
-            move || {
-                send_loop(
-                    session,
-                    frame_rx,
-                    probe_rx,
-                    probe_result_tx,
-                    stop,
-                    perf,
-                    burst_cap,
-                    fec_target,
-                    send_stats,
-                )
-            }
-        })
-        .context("spawn send thread")?;
-
-    // Test hook: PUNKTFUNK_SECURE_TEST_PERIOD_MS=N drives a square-wave secure/normal toggle every N ms
-    // instead of the real watcher — exercises the mid-session helper↔DDA mux without a live UAC/lock.
-    let secure_test_ms: Option<u128> = std::env::var("PUNKTFUNK_SECURE_TEST_PERIOD_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0);
-    // Switching to the host DDA on the secure (Winlogon) desktop is OPT-IN: DDA can't reliably capture
-    // the secure desktop's HDR independent-flip (it storms ACCESS_LOST → black), whereas the WGC helper
-    // STAYS LIVE through a lock/UAC. So by default the mux keeps WGC the whole time (no DesktopWatcher
-    // switch, no overlay). Enable the experimental DDA-on-secure path with PUNKTFUNK_SECURE_DDA=1.
-    let dda_secure = crate::config::config().secure_dda || secure_test_ms.is_some();
-    // The authoritative Default↔Winlogon signal (requires SYSTEM to read the Winlogon desktop name);
-    // only needed when the DDA-on-secure path is enabled.
-    let watcher = dda_secure.then(crate::capture::desktop_watch::DesktopWatcher::start);
-    // Force-composed-flip overlay (only with DDA-on-secure): keeps the secure desktop out of fullscreen
-    // independent-flip so DDA can duplicate it. Off by default to avoid touching the normal desktop.
-    let _composed_flip = dda_secure
-        .then(crate::capture::composed_flip::ForceComposedFlip::start)
-        .flatten();
-    let start = std::time::Instant::now();
-
-    let mut interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds as u64);
-    let mut sent: u64 = 0;
-    // Mux state: which source is live, the lazily-opened DDA pipe, a DDA pacing clock, and a
-    // "wait for the next IDR before forwarding" latch set on every source switch (the client's
-    // decoder must resume on a keyframe — the two encoders keep independent infinite-GOP state).
-    let mut dda: Option<DdaPipe> = None;
-    let mut on_secure = false;
-    let mut next = std::time::Instant::now();
-    let mut await_idr = false;
-    // Step 6 relaunch watchdog: how many times in a row the helper has died without producing a frame.
-    // A console disconnect/reconnect or a helper crash kills it; we respawn (the new helper picks up
-    // the now-active session via WTSGetActiveConsoleSessionId). Reset on the first relayed frame; only
-    // give up (end the stream) after a run of failures spanning a few seconds.
-    let mut helper_fails = 0u32;
-    const MAX_HELPER_FAILS: u32 = 20;
-
-    // Build a FrameMsg + hand it to the send thread; returns false if the send thread is gone (caller
-    // breaks the loop). Kept as a macro (not a closure) so each use borrows `frame_tx`/`sent`/`interval`
-    // at its own site without a long-lived capture, and `break 'outer` stays a literal at the call site
-    // (a `break 'outer` inside the macro body risks label-hygiene resolution failures).
-    macro_rules! forward {
-        ($data:expr, $capture_ns:expr, $keyframe:expr) => {{
-            let flags = if $keyframe {
-                (FLAG_PIC | FLAG_SOF) as u32
-            } else {
-                FLAG_PIC as u32
-            };
-            let capture_ns = $capture_ns;
-            let encode_us = (now_ns().saturating_sub(capture_ns) / 1000) as u32;
-            let msg = FrameMsg {
-                data: $data,
-                capture_ns,
-                flags,
-                deadline: std::time::Instant::now() + interval,
-                encode_us,
-                cap_us: 0,
-                submit_us: 0,
-                wait_us: 0,
-                repeat: false,
-                was_measured: false,
-            };
-            let ok = frame_tx.send(msg).is_ok();
-            if ok {
-                sent += 1;
-            }
-            ok
-        }};
-    }
-
-    'outer: while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-        // Mode switch: rebuild the output + re-spawn the helper at the new mode (drop the old relay +
-        // keepalive only after the new pair is up, so a failed rebuild keeps the current stream). The
-        // DDA pipe (on the old target) is dropped — it reopens on the next secure transition.
-        let mut want = None;
-        while let Ok(m) = reconfig.try_recv() {
-            want = Some(m);
-        }
-        if let Some(new_mode) = want {
-            tracing::info!(?new_mode, "two-process: rebuilding for mode switch");
-            match build(&mut vd, new_mode) {
-                Ok((ka, rl, tg, hz)) => {
-                    relay = rl; // drops the old relay (kills old helper) ...
-                    _keepalive = ka; // ... then releases the old output
-                    target = tg;
-                    effective_hz = hz;
-                    cur_mode = new_mode;
-                    dda = None; // old-target DDA is stale; reopen on next secure
-                    interval = std::time::Duration::from_secs_f64(1.0 / hz.max(1) as f64);
-                }
-                Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), ?new_mode,
-                        "two-process mode-switch rebuild failed — staying on the current mode");
-                }
-            }
-        }
-        // Coalesce client decode-recovery keyframe requests and forward to the active source.
-        let mut want_kf = false;
-        while keyframe.try_recv().is_ok() {
-            want_kf = true;
-        }
-
-        // Source mux: capture the secure (Winlogon) desktop via the host's DDA, the normal desktop via
-        // the helper relay. On a switch, latch await_idr + force the now-active source to emit an IDR
-        // so the client resumes cleanly.
-        let secure = dda_secure
-            && match secure_test_ms {
-                Some(p) => (start.elapsed().as_millis() / p) % 2 == 1,
-                None => watcher.as_ref().is_some_and(|w| w.is_secure()),
-            };
-        if secure != on_secure {
-            on_secure = secure;
-            await_idr = true;
-            tracing::info!(
-                to = if secure {
-                    "secure(DDA)"
-                } else {
-                    "normal(WGC relay)"
-                },
-                "two-process: source switch"
-            );
-            if secure {
-                // Capture the secure (Winlogon) desktop in its NATIVE colorspace. Don't try to drop the
-                // SudoVDA out of HDR for the DDA leg — display-config changes are denied on the secure
-                // desktop (the drop just churned + still went black). Instead, if the monitor is in HDR,
-                // open DDA in HDR (FP16 DuplicateOutput1 → BT.2020 PQ Main10); the normal-desktop DDA
-                // overlay/flip issues that drove us to WGC don't apply to the composed Winlogon UI.
-                // SAFETY: `advanced_color_enabled` is `unsafe` only because it queries the Win32 CCD
-                // API; it takes `target_id` by value (the live SudoVDA monitor's CCD target id) and
-                // allocates + owns every buffer it passes the OS internally. No caller pointer is
-                // involved, so nothing must outlive the call and there is no aliasing; a missing
-                // target id just yields false.
-                let hdr = unsafe { crate::win_display::advanced_color_enabled(target.target_id) };
-                dda = None; // reopen to capture the secure desktop
-                match open_dda(&target, cur_mode.width, cur_mode.height, effective_hz, hdr) {
-                    Ok(mut p) => {
-                        tracing::info!(hdr, "two-process: opened DDA for the secure desktop");
-                        p.enc.request_keyframe();
-                        dda = Some(p);
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %format!("{e:#}"),
-                            "two-process: DDA open failed — secure desktop will freeze on last frame");
-                    }
-                }
-                next = std::time::Instant::now();
-            } else {
-                // Returning to the normal desktop: RESUME from the still-alive WGC helper. Do NOT
-                // recreate the SudoVDA monitor or respawn the helper — build()'s vd.create() is an
-                // IOCTL_REMOVE+ADD of the monitor (the audible disconnect/connect chime + the
-                // teardown/recreate kernel stress that broke DDA, now applied to the mux). The monitor +
-                // helper persist for the WHOLE session; only the host-DDA leg opens (secure) and closes
-                // (normal). Apply the DDA learning here: reuse, don't tear down.
-                dda = None; // free the secure DDA encoder; the relay (helper) is the source again
-                while relay.try_recv().is_ok() {} // drop secure-dwell backlog
-                relay.request_keyframe(); // client decoder resumes on the helper's next IDR
-                                          // Nothing to restore: we no longer toggle the SudoVDA's HDR state for the DDA leg, so the
-                                          // monitor's colorspace is unchanged and the still-alive WGC helper just resumes.
-                next = std::time::Instant::now();
-            }
-        }
-        if want_kf {
-            if secure {
-                if let Some(d) = dda.as_mut() {
-                    d.enc.request_keyframe();
-                }
-            } else {
-                relay.request_keyframe();
-            }
-            await_idr = true;
-        }
-
-        if secure {
-            // DDA capture+encode for the secure desktop, paced to the frame interval.
-            let Some(d) = dda.as_mut() else {
-                std::thread::sleep(interval);
-                continue;
-            };
-            if let Some(f) = d.cap.try_latest().context("DDA capture")? {
-                d.frame = f;
-            }
-            let capture_ns = now_ns();
-            d.enc.submit(&d.frame).context("DDA encoder submit")?;
-            next += interval;
-            while let Some(au) = d.enc.poll().context("DDA encoder poll")? {
-                if await_idr && !au.keyframe {
-                    continue;
-                }
-                await_idr = false;
-                if !forward!(au.data, capture_ns, au.keyframe) {
-                    break 'outer; // send thread gone
-                }
-            }
-            match next.checked_duration_since(std::time::Instant::now()) {
-                Some(dur) => std::thread::sleep(dur),
-                None => next = std::time::Instant::now(),
-            }
-        } else {
-            // Relay the helper's AUs for the normal desktop. Timeout → keep servicing the loop;
-            // Disconnected → the helper exited (step 6 adds the relaunch watchdog).
-            let au = match relay.recv_timeout(std::time::Duration::from_millis(500)) {
-                Ok(au) => au,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    tracing::warn!("two-process: no AU from helper within 500ms");
-                    continue;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    // The helper exited (crash, or a console disconnect killed its session). REBUILD
-                    // the whole output + helper (not just respawn on the old target): an abruptly-killed
-                    // helper leaves the SudoVDA's DXGI output briefly unresolvable ("no DXGI output for
-                    // target N yet"), and a console reconnect needs a fresh output in the new session —
-                    // `build` recreates both. Back off so a hard-failing rebuild (e.g. no active session
-                    // yet) doesn't spin; give up only after a sustained run of failures.
-                    helper_fails += 1;
-                    if helper_fails > MAX_HELPER_FAILS {
-                        tracing::error!(
-                            fails = helper_fails,
-                            "two-process: WGC helper keeps dying — ending stream"
-                        );
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    match build(&mut vd, cur_mode) {
-                        Ok((ka, rl, tg, hz)) => {
-                            tracing::warn!(
-                                fails = helper_fails,
-                                "two-process: WGC helper exited — rebuilt output + helper"
-                            );
-                            relay = rl;
-                            _keepalive = ka;
-                            target = tg;
-                            effective_hz = hz;
-                            dda = None; // old-target DDA is stale
-                            interval = std::time::Duration::from_secs_f64(1.0 / hz.max(1) as f64);
-                            await_idr = true; // resume on the new helper's opening IDR
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %format!("{e:#}"), fails = helper_fails,
-                                "two-process: helper rebuild failed — will retry");
-                        }
-                    }
-                    continue;
-                }
-            };
-            if await_idr && !au.keyframe {
-                continue; // skip stale deltas until the post-switch IDR
-            }
-            await_idr = false;
-            helper_fails = 0; // a frame flowed → the helper is healthy again
-                              // The helper's pts_ns is on this machine's monotonic clock (same `now_ns()` source).
-            if !forward!(au.data, au.pts_ns, au.keyframe) {
-                break 'outer; // send thread gone
-            }
-        }
-    }
-    drop(frame_tx);
-    let _ = send_thread.join();
-    drop(watcher);
-    tracing::info!(sent, "punktfunk/1 two-process stream complete");
     Ok(())
 }
 

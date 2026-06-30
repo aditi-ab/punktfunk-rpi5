@@ -6,8 +6,8 @@
 //!
 //! **Goal-1 stages 1–2** (`design/windows-host-rewrite.md` §2.2): stage 1 stood this up; stage 2 migrated the
 //! genuinely-constant operator/dispatch knobs onto it (the dispatch-disagreement bug class: `idd_push`,
-//! `capture_backend`, `encoder_pref`, `render_adapter`, `no_wgc`, the vdisplay backend select — plus the
-//! plan-named `secure_dda`/`idd_depth`/`zerocopy`/`ten_bit`/`four_four_four` and the multi-site `perf`/`compositor`/
+//! `encoder_pref`, `render_adapter`, the vdisplay backend select — plus the plan-named
+//! `idd_depth`/`zerocopy`/`ten_bit`/`four_four_four` and the multi-site `perf`/`compositor`/
 //! `video_source`/`gamepad`). `SessionPlan` (stage 3) consumes it as the single owner of the
 //! capture/topology/encoder decision.
 //!
@@ -36,27 +36,17 @@ use std::sync::OnceLock;
 /// derived `Debug` impl, so the parser can stay a single platform-neutral function.
 #[derive(Debug, Clone, Default)]
 pub struct HostConfig {
-    /// `PUNKTFUNK_IDD_PUSH` — capture from the pf-vdisplay driver's shared ring (in-process Session-0
-    /// capture; no WGC helper). **Value-aware** (`0`/`false`/`no`/`off`/empty ⇒ off, else on); unset ⇒ off.
-    /// The installer's default `host.env` sets it on, so a fresh install runs the validated IDD-push path
-    /// (it falls back to DDA if the driver can't attach — see [`crate::capture`]). NOT a bare presence flag
-    /// (so an operator can turn it OFF in `host.env` with `=0`, which a `var_os` presence check can't).
+    /// `PUNKTFUNK_IDD_PUSH` — IDD direct-push monitor mode (the per-session monitor + ring recreate and
+    /// the discrete-render-GPU pin in [`crate::vdisplay::manager`]). IDD-push is the sole Windows capture
+    /// path (DXGI Desktop Duplication and the WGC relay were removed), so this should stay on — the
+    /// installer's `host.env` sets it. **Value-aware** (`0`/`false`/`no`/`off`/empty ⇒ off, else on);
+    /// unset ⇒ off. NOT a bare presence flag (so an operator can turn it OFF with `=0`).
     pub idd_push: bool,
     /// `PUNKTFUNK_ENCODER` — explicit encoder-backend override (lowercased; empty = auto-detect by GPU vendor).
     pub encoder_pref: String,
-    /// `PUNKTFUNK_NO_HELPER` — never spawn the user-session WGC helper.
-    pub no_helper: bool,
-    /// `PUNKTFUNK_FORCE_HELPER` — force the WGC helper even when not running as SYSTEM.
-    pub force_helper: bool,
-    /// `PUNKTFUNK_NO_WGC` — force the pure single-process DDA path (skip WGC and the two-process relay).
-    pub no_wgc: bool,
-    /// `PUNKTFUNK_CAPTURE` — explicit Windows capture-backend override (lowercased; `dda`/`dxgi` vs the WGC default).
-    pub capture_backend: String,
     /// `PUNKTFUNK_RENDER_ADAPTER` — discrete render-GPU pin by description substring (`Some` even when empty:
     /// the empty string still counts as "set" for the presence checks, and the value reader filters it).
     pub render_adapter: Option<String>,
-    /// `PUNKTFUNK_SECURE_DDA` — enable the experimental DDA-on-secure-desktop (Winlogon/UAC) mux leg.
-    pub secure_dda: bool,
     /// `PUNKTFUNK_IDD_DEPTH` — IDD-push pipeline depth override (default 2; the call site clamps to its `OUT_RING`).
     pub idd_depth: usize,
     /// `PUNKTFUNK_ZEROCOPY` — opt into the Windows D3D11 zero-copy encode path (presence semantics; see module docs).
@@ -103,14 +93,7 @@ impl HostConfig {
             encoder_pref: std::env::var("PUNKTFUNK_ENCODER")
                 .unwrap_or_default()
                 .to_ascii_lowercase(),
-            no_helper: flag("PUNKTFUNK_NO_HELPER"),
-            force_helper: flag("PUNKTFUNK_FORCE_HELPER"),
-            no_wgc: flag("PUNKTFUNK_NO_WGC"),
-            capture_backend: std::env::var("PUNKTFUNK_CAPTURE")
-                .unwrap_or_default()
-                .to_ascii_lowercase(),
             render_adapter: val("PUNKTFUNK_RENDER_ADAPTER"),
-            secure_dda: flag("PUNKTFUNK_SECURE_DDA"),
             idd_depth: val("PUNKTFUNK_IDD_DEPTH")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(2),

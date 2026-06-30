@@ -59,7 +59,7 @@ pub struct OutputFormat {
     /// Produce GPU-resident D3D11 frames (zero-copy for a GPU encoder — NVENC/AMF/QSV) rather than CPU
     /// staging. `false` **only** for the GPU-less software encoder.
     pub gpu: bool,
-    /// HDR: the capturer converts to 10-bit (IDD-push FP16 → `Rgb10a2`; the DDA secure-desktop HDR hint).
+    /// HDR: the capturer converts to 10-bit (IDD-push FP16 → `P010`, or `Rgb10a2` for a 4:4:4 source).
     /// `false` = 8-bit SDR.
     pub hdr: bool,
     /// Full-chroma 4:4:4 session: the capturer must keep full chroma — deliver packed **RGB**
@@ -380,23 +380,12 @@ pub fn capture_virtual_output(
         .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
-/// `PUNKTFUNK_NO_WGC=1` forces the pure single-process DDA (Desktop Duplication) path everywhere: it
-/// skips WGC in [`capture_virtual_output`] AND bypasses the two-process secure-desktop relay (so even a
-/// SYSTEM host captures in-process via DDA, the way Apollo does — one capturer for the normal AND the
-/// secure desktop). For bringing DDA up to parity / validating it on its own; all the WGC code stays
-/// compiled and comes back the moment the flag is unset.
-#[cfg(target_os = "windows")]
-pub(crate) fn wgc_disabled() -> bool {
-    crate::config::config().no_wgc
-}
-
 #[cfg(target_os = "windows")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
     want: OutputFormat,
-    capture: crate::session_plan::CaptureBackend,
+    _capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
-    use crate::session_plan::CaptureBackend;
     let target = vout.win_capture.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "SudoVDA target not yet an active display (needs a WDDM GPU to activate it)"
@@ -404,97 +393,36 @@ pub fn capture_virtual_output(
     })?;
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
-    // Full-chroma 4:4:4 needs a full-chroma RGB source. The IDD-push and WGC paths emit subsampled
-    // NV12/P010 by default, which can't reconstruct 4:4:4; route a 4:4:4 session to DDA, which delivers
-    // RGB (Bgra) when its `chroma_444` flag is set. (IDD-push/WGC 4:4:4 capture is a follow-up.)
-    if want.chroma_444 && capture != CaptureBackend::Dda {
-        tracing::info!("4:4:4 session — using DDA capture (RGB source) instead of {capture:?}");
-        return dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false, want.chroma_444)
-            .map(|c| Box::new(c) as Box<dyn Capturer>);
-    }
-    // P2 direct frame push (kill DDA): consume frames straight from the pf-vdisplay driver's shared
-    // ring — no Desktop Duplication, no win32u reparenting hook. Resolved once in the `SessionPlan`
-    // (was re-derived from `config().idd_push` here); `IddPush` takes the keepalive (owns the virtual
-    // display) so there's no fall-through.
-    if capture == CaptureBackend::IddPush {
-        // Recreate the monitor + ring per session (fix-teardown): a FRESH monitor reliably gets a
-        // working IddCx swap-chain, whereas a REUSED monitor's swap-chain dies after ~2 sessions and
-        // the host can't revive it. The driver's recreate crash (target id resolved to 0) is fixed by
-        // stamping target_id onto the monitor context. The ring is always FP16 (the driver composes
-        // the IDD in FP16); `want_hdr` selects the per-frame conversion (FP16 → Rgb10a2 vs Bgra).
-        // If IDD-push can't open OR the driver doesn't attach to the ring within a few seconds (e.g. a
-        // hybrid-GPU render mismatch), fall back to DDA so the session is NEVER left black (audit §5.1).
-        // `open()` hands the keepalive back on failure so DDA can take ownership of the virtual display.
-        match idd_push::IddPushCapturer::open(target.clone(), pref, want.hdr, keep) {
-            Ok(c) => return Ok(Box::new(c) as Box<dyn Capturer>),
-            Err((e, keep)) => {
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "IDD-push open/attach failed — falling back to DDA"
-                );
-                return dxgi::DuplCapturer::open(
-                    target,
-                    pref,
-                    keep,
-                    want.gpu,
-                    false,
-                    want.chroma_444,
-                )
-                .map(|c| Box::new(c) as Box<dyn Capturer>);
-            }
-        }
-    }
-    // WGC (Windows.Graphics.Capture) is the default: it captures the COMPOSED desktop including the
-    // overlay/independent-flip planes DXGI Desktop Duplication misses (the frozen-HDR-animation bug),
-    // and has no ACCESS_LOST-on-overlay churn. DDA stays available via PUNKTFUNK_CAPTURE=dda and is
-    // the secure-desktop (lock/UAC) fallback (WGC can't capture those). `keep` is moved into the
-    // chosen backend (it owns the SudoVDA keepalive), so there's no open-time auto-fallback. The
-    // backend choice (`dda`/`dxgi`/`PUNKTFUNK_NO_WGC` → DDA, else WGC) is now resolved once in the plan.
-    if capture == CaptureBackend::Dda {
-        return dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false, want.chroma_444)
-            .map(|c| Box::new(c) as Box<dyn Capturer>);
-    }
-    // WGC default, with a watchdog'd DDA fallback. WGC's Direct3D11CaptureFramePool::CreateFreeThreaded
-    // intermittently HANGS on the headless SudoVDA (IddCx) display — a blocking call we can't error out
-    // of in place. So run WGC open on a dedicated thread and bound it: if it doesn't finish in time
-    // (hang) or errors, fall back to the reliable DDA path so the session is NEVER left black. WGC,
-    // when it opens, captures the composed desktop (overlay/MPO-correct HDR — fixes frozen animations);
-    // DDA is the safety net (+ the secure-desktop path). The encode thread is set MTA so the WGC
-    // objects built on the watchdog thread (also MTA) are usable here; the keepalive is handed to WGC
-    // only on success, else to DDA. A hung watchdog thread is abandoned (holds no keepalive).
-    // SAFETY: `RoInitialize` is a combase FFI call that initializes the WinRT apartment for the calling
-    // thread. It takes the `RO_INIT_MULTITHREADED` enum by value and borrows no memory, so there is no
-    // pointer/lifetime/aliasing obligation; it is safe on any thread and idempotent — a second call on a
-    // thread already in a compatible apartment returns S_FALSE / RPC_E_CHANGED_MODE, which we discard.
-    // Runs on the encode thread that goes on to use the WGC (WinRT) objects built by the watchdog thread.
-    unsafe {
-        let _ = windows::Win32::System::WinRT::RoInitialize(
-            windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
-        );
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    let t = target.clone();
-    let _ = std::thread::Builder::new()
-        .name("wgc-open".into())
-        .spawn(move || {
-            let _ = tx.send(wgc::WgcCapturer::open(t, pref));
-        });
-    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Ok(mut c)) => {
-            c.attach_keepalive(keep);
-            Ok(Box::new(c) as Box<dyn Capturer>)
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(error = %format!("{e:#}"), "WGC open failed — falling back to DDA");
-            dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false, want.chroma_444)
-                .map(|c| Box::new(c) as Box<dyn Capturer>)
-        }
-        Err(_) => {
-            tracing::warn!("WGC open timed out (CreateFreeThreaded hang on the virtual display) — falling back to DDA");
-            dxgi::DuplCapturer::open(target, pref, keep, want.gpu, false, want.chroma_444)
-                .map(|c| Box::new(c) as Box<dyn Capturer>)
-        }
-    }
+    // IDD direct-push is the sole Windows capture path: consume frames straight from the pf-vdisplay
+    // driver's shared ring (in-process, Session 0 — it captures the secure desktop too; no Desktop
+    // Duplication, no WGC helper). A FRESH monitor + ring is created per session: a REUSED monitor's
+    // swap-chain dies after ~2 sessions and can't be revived. The ring is always FP16 when the display
+    // is HDR (the driver composes the IDD in FP16); `want.hdr` proactively enables advanced color and
+    // selects the per-frame conversion (FP16 → P010 vs BGRA → NV12). `IddPushCapturer` takes the
+    // keepalive (it owns the virtual display). There is NO fallback (DDA + the WGC relay were removed):
+    // if it can't open or the driver doesn't attach, the session fails cleanly and the client reconnects.
+    idd_push::IddPushCapturer::open(target, pref, want.hdr, keep)
+        .map(|c| Box::new(c) as Box<dyn Capturer>)
+        .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
+}
+
+/// Whether the active capturer can deliver a full-chroma (RGB) source for a 4:4:4 HEVC encode. The
+/// negotiator gates 4:4:4 on this so the host honestly downgrades to 4:2:0 when the capturer can only
+/// produce subsampled frames. Linux (the portal capturer feeding CPU RGB → `yuv444p`) can; the Windows
+/// IDD-push path delivers subsampled NV12/P010 today, so full-chroma capture there is a follow-up.
+#[cfg(target_os = "linux")]
+pub(crate) fn capturer_supports_444() -> bool {
+    true
+}
+#[cfg(target_os = "windows")]
+pub(crate) fn capturer_supports_444() -> bool {
+    // IDD-push 4:4:4 (full-chroma RGB from the FP16 ring) is the next step; until then the sole Windows
+    // capturer delivers subsampled NV12/P010 only, so the host honestly negotiates 4:2:0.
+    false
+}
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub(crate) fn capturer_supports_444() -> bool {
+    false
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -506,14 +434,9 @@ pub fn capture_virtual_output(
     anyhow::bail!("virtual-output capture requires Linux or Windows")
 }
 
-// Goal-1 stage 6: the Windows backends live under `capture/windows/`, the Linux one under `capture/linux/`
-// (`#[path]` keeps the module names flat, so every `crate::capture::*` path is unchanged).
-#[cfg(target_os = "windows")]
-#[path = "capture/windows/composed_flip.rs"]
-pub mod composed_flip;
-#[cfg(target_os = "windows")]
-#[path = "capture/windows/desktop_watch.rs"]
-pub mod desktop_watch;
+// Goal-1 stage 6: the Windows backend lives under `capture/windows/`, the Linux one under `capture/linux/`
+// (`#[path]` keeps the module names flat, so every `crate::capture::*` path is unchanged). Windows capture
+// is IDD direct-push only — DXGI Desktop Duplication (DDA) and the WGC two-process relay were removed.
 #[cfg(target_os = "windows")]
 #[path = "capture/windows/dxgi.rs"]
 pub mod dxgi;
@@ -522,9 +445,3 @@ pub mod dxgi;
 pub mod idd_push;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "windows")]
-#[path = "capture/windows/wgc.rs"]
-pub mod wgc;
-#[cfg(target_os = "windows")]
-#[path = "capture/windows/wgc_relay.rs"]
-pub mod wgc_relay;

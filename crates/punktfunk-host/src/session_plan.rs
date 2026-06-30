@@ -26,12 +26,9 @@ pub enum CaptureBackend {
     /// Linux: the xdg ScreenCast portal → PipeWire (the only Linux capture path).
     Portal,
     /// Windows: IDD direct-push — frames pulled straight from the pf-vdisplay driver's shared ring
-    /// (in-process, Session 0; no Desktop Duplication, no WGC helper).
+    /// (in-process, Session 0; captures the secure desktop too). The sole Windows capture path —
+    /// DXGI Desktop Duplication (DDA) and the WGC two-process relay were removed.
     IddPush,
-    /// Windows: DXGI Desktop Duplication (`PUNKTFUNK_CAPTURE=dda|dxgi` or `PUNKTFUNK_NO_WGC`).
-    Dda,
-    /// Windows: Windows.Graphics.Capture (the composed-desktop default), with a DDA watchdog fallback.
-    Wgc,
 }
 
 impl CaptureBackend {
@@ -42,20 +39,10 @@ impl CaptureBackend {
         CaptureBackend::Portal
     }
 
-    /// Windows precedence (identical to the pre-stage-3 `capture_virtual_output` branch order):
-    /// IDD-push wins; else an explicit `dda`/`dxgi` request or `PUNKTFUNK_NO_WGC` selects DDA; else WGC.
+    /// Windows: IDD direct-push is the sole capture path (DDA + the WGC two-process relay were removed).
     #[cfg(target_os = "windows")]
     pub fn resolve() -> Self {
-        let cfg = crate::config::config();
-        if cfg.idd_push {
-            CaptureBackend::IddPush
-        } else if matches!(cfg.capture_backend.as_str(), "dda" | "dxgi")
-            || crate::capture::wgc_disabled()
-        {
-            CaptureBackend::Dda
-        } else {
-            CaptureBackend::Wgc
-        }
+        CaptureBackend::IddPush
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -67,11 +54,9 @@ impl CaptureBackend {
 /// How a session is structured across processes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionTopology {
-    /// One process captures + encodes (Linux; Windows non-SYSTEM / IDD-push / `NO_WGC`).
+    /// One process captures + encodes. The only topology: Linux (portal) and Windows (in-process
+    /// IDD-push in Session 0). The SYSTEM-host + user-session WGC relay was removed with DDA/WGC.
     SingleProcess,
-    /// SYSTEM host + a user-session WGC helper relay (the Windows normal-desktop path under SYSTEM,
-    /// where in-process WGC can't activate). See `virtual_stream_relay`.
-    TwoProcessRelay,
 }
 
 /// The resolved encode backend (recorded for logging / stages 4–5; the per-session encoder open still
@@ -103,8 +88,8 @@ pub struct SessionPlan {
     pub encoder: EncoderBackend,
     /// Handshake-negotiated encode bit depth (8, or 10 = HEVC Main10).
     pub bit_depth: u8,
-    /// The IDD-push HDR hint (`bit_depth >= 10`) — the want-HDR flag the capturer was passed before.
-    /// Non-IDD-push Windows backends ignore it and auto-detect HDR from the monitor; Linux is 8-bit.
+    /// The IDD-push HDR hint (`bit_depth >= 10`) — the want-HDR flag handed to the capturer so it
+    /// proactively enables advanced color on the virtual display. Linux is 8-bit (HDR blocked upstream).
     pub hdr: bool,
     /// Handshake-negotiated chroma subsampling (4:2:0, or full-chroma 4:4:4 when the client + host +
     /// GPU all support it). Resolved before the Welcome; `Yuv420` on every backend that declined it.
@@ -151,26 +136,8 @@ impl SessionPlan {
     }
 }
 
-/// Process topology. On Windows this is the former `punktfunk1::should_use_helper` logic verbatim; on
-/// every other platform the session is always single-process.
-#[cfg(target_os = "windows")]
-pub(crate) fn resolve_topology() -> SessionTopology {
-    let cfg = crate::config::config();
-    // `NO_HELPER`/`NO_WGC` force single-process; IDD-push captures in-process in Session 0 (no helper);
-    // otherwise the helper runs when forced or when we're SYSTEM (in-process WGC can't activate there).
-    let helper = if cfg.no_helper || crate::capture::wgc_disabled() || cfg.idd_push {
-        false
-    } else {
-        cfg.force_helper || crate::capture::wgc_relay::running_as_system()
-    };
-    if helper {
-        SessionTopology::TwoProcessRelay
-    } else {
-        SessionTopology::SingleProcess
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
+/// Process topology. Single-process is the only topology now: Linux (portal) and Windows (in-process
+/// IDD-push in Session 0). The Windows SYSTEM-host + user-session WGC relay was removed with DDA/WGC.
 pub(crate) fn resolve_topology() -> SessionTopology {
     SessionTopology::SingleProcess
 }

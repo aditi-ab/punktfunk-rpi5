@@ -5,9 +5,8 @@
 //! activation, and each store's auth/entitlement context resolve — the process must run in the
 //! interactive session under the **logged-in user's** token, not SYSTEM and not session 0.
 //!
-//! This is the same `WTSGetActiveConsoleSessionId → WTSQueryUserToken → DuplicateTokenEx →
-//! CreateProcessAsUserW(winsta0\\default)` primitive the WGC helper relay uses
-//! ([`crate::capture::wgc_relay`]), factored out for the library launch path
+//! This is the standard `WTSGetActiveConsoleSessionId → WTSQueryUserToken → DuplicateTokenEx →
+//! CreateProcessAsUserW(winsta0\\default)` primitive, used for the library launch path
 //! ([`crate::library::launch_title`]).
 //!
 //! IMPORTANT — use the **user** token (`WTSQueryUserToken`), NOT a session-retargeted SYSTEM token
@@ -36,7 +35,7 @@ use windows::Win32::System::Threading::{
 ///
 /// Fire-and-forget: the launched game/launcher outlives this call, so the host does not track the
 /// child — its handles are closed before returning (the process keeps running). The environment is
-/// the user's block merged with the host's `PUNKTFUNK_*`/`RUST_LOG` (same merge the WGC helper uses),
+/// the user's block merged with the host's `PUNKTFUNK_*`/`RUST_LOG` (see [`merged_env_block`]),
 /// so `host.env` settings propagate.
 ///
 /// Requires the host to run as SYSTEM (`WTSQueryUserToken` needs `SE_TCB`). Fails when no interactive
@@ -75,7 +74,7 @@ unsafe fn spawn_inner(cmdline: &str, workdir: Option<&Path>) -> Result<u32> {
     // with the host's PUNKTFUNK_*/RUST_LOG vars — same shared helper the WGC helper + service spawns use.
     let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
     let _ = CreateEnvironmentBlock(&mut env_block, Some(primary), false);
-    let merged_env = crate::capture::wgc_relay::merged_env_block(env_block as *const u16);
+    let merged_env = merged_env_block(env_block as *const u16);
     if !env_block.is_null() {
         let _ = DestroyEnvironmentBlock(env_block);
     }
@@ -123,4 +122,49 @@ unsafe fn spawn_inner(cmdline: &str, workdir: Option<&Path>) -> Result<u32> {
     let _ = CloseHandle(pi.hProcess);
     let _ = CloseHandle(pi.hThread);
     Ok(pid)
+}
+
+/// Build the environment block for a process launched into the interactive session: the target
+/// session's block (`user_block`, from `CreateEnvironmentBlock`) with this process's `PUNKTFUNK_*`
+/// vars overlaid, so the child runs with the SAME settings this process has
+/// (`PUNKTFUNK_ENCODER=nvenc`, `PUNKTFUNK_ZEROCOPY`, …) instead of the target shell's. Returns a
+/// UTF-16, double-null-terminated block suitable for `CREATE_UNICODE_ENVIRONMENT`. Shared by the
+/// interactive library launch (here) and the Windows service launching the host into the active
+/// session ([`crate::service`]).
+///
+/// # Safety
+/// `user_block` must be either null or a valid pointer to a UTF-16, double-null-terminated
+/// environment block (the `CreateEnvironmentBlock` output), readable for its whole length.
+pub(crate) unsafe fn merged_env_block(user_block: *const u16) -> Vec<u16> {
+    // Parse the user block ("VAR=VALUE\0" … "\0") into entries.
+    let mut entries: Vec<String> = Vec::new();
+    if !user_block.is_null() {
+        let mut p = user_block;
+        loop {
+            let mut len = 0isize;
+            while *p.offset(len) != 0 {
+                len += 1;
+            }
+            if len == 0 {
+                break; // the trailing empty string = end of block
+            }
+            let slice = std::slice::from_raw_parts(p, len as usize);
+            entries.push(String::from_utf16_lossy(slice));
+            p = p.offset(len + 1);
+        }
+    }
+    // Overlay "our" settings — PUNKTFUNK_* and RUST_LOG — dropping whatever the target block had.
+    let is_ours = |k: &str| k.starts_with("PUNKTFUNK_") || k == "RUST_LOG";
+    entries.retain(|e| !is_ours(e.split('=').next().unwrap_or("")));
+    for (k, v) in std::env::vars().filter(|(k, _)| is_ours(k)) {
+        entries.push(format!("{k}={v}"));
+    }
+    // Serialize back to a UTF-16 double-null-terminated block.
+    let mut block: Vec<u16> = Vec::new();
+    for e in entries {
+        block.extend(e.encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
