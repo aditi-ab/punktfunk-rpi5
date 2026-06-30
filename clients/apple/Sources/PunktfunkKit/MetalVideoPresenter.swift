@@ -223,32 +223,39 @@ public final class MetalVideoPresenter {
     }
 
     /// Set the layer's pixel format + colour config for SDR or HDR. MAIN THREAD ONLY. EDR is requested
-    /// on ALL platforms — the property is available on macOS/iOS/tvOS at our deployment floor, and the
-    /// old `#if os(macOS)` guard left iOS/tvOS EDR half-engaged.
+    /// on macOS + iOS (the old `#if os(macOS)` guard left iOS EDR half-engaged). tvOS has NO EDR API
+    /// (`wantsExtendedDynamicRangeContent`/`edrMetadata`/`CAEDRMetadata` are all unavailable there), so
+    /// it gets the PQ pixel format + colour space only — the tvOS compositor tone-maps from those.
     private func configureColor(hdr: Bool) {
         if hdr {
             layer.pixelFormat = .rgba16Float
             layer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+            #if !os(tvOS)
             layer.wantsExtendedDynamicRangeContent = true
             // Anchor reference white. Re-apply the real grade if one already arrived (0xCE before the
             // flip); otherwise the bare 203-nit anchor. Without this anchor the PQ signal is too bright.
             layer.edrMetadata = makeEDR(lastHdrMeta)
+            #endif
         } else {
             // SDR: gamma-encoded BT.709 [0,1] in an 8-bit drawable; a nil colorspace tags it device/sRGB
             // (the proven SDR path — never showed the "too bright" issue, which was HDR-only).
             layer.pixelFormat = .bgra8Unorm
             layer.colorspace = nil
+            #if !os(tvOS)
             layer.wantsExtendedDynamicRangeContent = false
             layer.edrMetadata = nil
+            #endif
         }
     }
 
+    #if !os(tvOS)
     private func makeEDR(_ meta: PunktfunkConnection.HdrMeta?) -> CAEDRMetadata {
         CAEDRMetadata.hdr10(
             displayInfo: meta?.masteringDisplayColorVolume(),
             contentInfo: meta?.contentLightLevelInfo(),
             opticalOutputScale: hdrReferenceWhiteNits)
     }
+    #endif
 
     /// Update the HDR mastering metadata (drained from the host's 0xCE datagram) to refine the system
     /// tone-map from the real grade. Called from the PUMP thread, so the layer write is hopped to MAIN
@@ -259,7 +266,11 @@ public final class MetalVideoPresenter {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.lastHdrMeta = meta
+            // tvOS has no edrMetadata — the cached grade is still kept above (harmless), it just can't
+            // be applied to the layer there. macOS/iOS refine the system tone-map from the real grade.
+            #if !os(tvOS)
             if self.hdrActive { self.layer.edrMetadata = self.makeEDR(meta) }
+            #endif
         }
     }
 
