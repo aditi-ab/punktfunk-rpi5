@@ -1133,7 +1133,9 @@ fn fetch_image(url: &str) -> Option<(Vec<u8>, String)> {
             .unwrap_or("image/jpeg")
             .to_string();
         let bytes = if meta.contains(";base64") {
-            base64::engine::general_purpose::STANDARD.decode(data).ok()?
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .ok()?
         } else {
             data.as_bytes().to_vec()
         };
@@ -1146,7 +1148,10 @@ fn fetch_image(url: &str) -> Option<(Vec<u8>, String)> {
         .timeout(std::time::Duration::from_secs(10))
         .build();
     let resp = agent.get(url).call().ok()?;
-    let ctype = resp.header("Content-Type").unwrap_or("image/jpeg").to_string();
+    let ctype = resp
+        .header("Content-Type")
+        .unwrap_or("image/jpeg")
+        .to_string();
     let mut bytes = Vec::new();
     resp.into_reader()
         .take(8 * 1024 * 1024)
