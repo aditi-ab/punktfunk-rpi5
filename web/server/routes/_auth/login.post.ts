@@ -1,12 +1,12 @@
 // POST /_auth/login {password} — verify the shared password (constant-time), then seal an
 // authenticated session cookie. Public (allowlisted in the gate) so an unauthenticated user
 // can actually log in.
-import { defineEventHandler, readBody, createError, useSession } from "h3";
+import { createError, defineEventHandler, readBody, useSession } from "h3";
 import {
+	type SessionData,
 	sessionConfig,
 	timingSafeEqual,
 	uiPassword,
-	type SessionData,
 } from "../../util/auth";
 
 export default defineEventHandler(async (event) => {

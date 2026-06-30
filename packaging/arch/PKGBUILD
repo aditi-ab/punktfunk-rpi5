@@ -30,7 +30,7 @@ license=('MIT OR Apache-2.0')
 makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pkgconf' 'git'
              'gtk4' 'libadwaita' 'sdl3' 'ffmpeg' 'pipewire' 'wayland' 'libxkbcommon' 'opus' 'libei')
 
-# Opt-in punktfunk-web: only then is bun (build tool; the console runs on plain nodejs) required.
+# Opt-in punktfunk-web: only then is bun (the build tool AND the vendored runtime) required.
 if [ "${PF_WITH_WEB:-0}" = 1 ]; then
   pkgname+=('punktfunk-web')
   makedepends+=('bun')   # `bun-bin` from the AUR if bun isn't in your configured repos
@@ -51,7 +51,8 @@ build() {
   # NVIDIA builder. On a GPU-less builder symlink the CUDA stub into the link path first (same
   # caveat the RPM documents): ln -s "$(find / -name libcuda.so -path '*stubs*'|head -1)" /usr/lib/
   cargo build --release --locked -p punktfunk-host -p punktfunk-client-linux
-  # Management web console (opt-in): the node-server .output bundle (built with bun, run with node).
+  # Management web console (opt-in): the Nitro `bun`-preset .output bundle (Bun.serve TLS),
+  # built AND run with bun.
   if [ "${PF_WITH_WEB:-0}" = 1 ]; then
     ( cd web && bun install --frozen-lockfile && bun run build )
   fi
@@ -138,19 +139,21 @@ package_punktfunk-client() {
 }
 
 package_punktfunk-web() {
-  pkgdesc="punktfunk management web console (Nitro/Node SSR) — pairing + status in the browser"
-  arch=('any')
-  # Runtime is plain node (the .output is portable JS — bun was only the build tool). Auto-wired to
-  # the host's mgmt token via the systemd --user units; enable with `systemctl --user enable --now punktfunk-web`.
-  depends=('nodejs')
+  pkgdesc="punktfunk management web console (Nitro SSR on bun, HTTPS/HTTP-1.1 over TLS) — pairing + status in the browser"
+  # bun is the runtime (Bun.serve), and it's a native binary we vendor, so this package is
+  # arch-specific (not 'any'). Auto-wired to the host's mgmt token + identity cert via the systemd
+  # --user units; enable with `systemctl --user enable --now punktfunk-web`. No nodejs/bun dependency.
   local R; R="$(_repo)"
 
-  # Pre-built node-server bundle (from build()) + a PATH-stable launcher (matches the .deb/.rpm).
+  # Pre-built bun-preset bundle (from build()) + a PATH-stable launcher (matches the .deb/.rpm).
   install -d "$pkgdir/usr/share/punktfunk-web/.output"
   cp -r "$R/web/.output/server" "$pkgdir/usr/share/punktfunk-web/.output/server"
   cp -r "$R/web/.output/public" "$pkgdir/usr/share/punktfunk-web/.output/public"
+  # Vendor the build env's bun into a private dir so it never collides with a
+  # system-wide bun on PATH.
+  install -Dm0755 "$(command -v bun)" "$pkgdir/usr/lib/punktfunk-web/bun"
   install -d "$pkgdir/usr/bin"
-  printf '%s\n' '#!/bin/sh' 'exec /usr/bin/node /usr/share/punktfunk-web/.output/server/index.mjs "$@"' \
+  printf '%s\n' '#!/bin/sh' 'exec /usr/lib/punktfunk-web/bun /usr/share/punktfunk-web/.output/server/index.mjs "$@"' \
     > "$pkgdir/usr/bin/punktfunk-web-server"
   chmod 0755 "$pkgdir/usr/bin/punktfunk-web-server"
   # systemd USER units: the console runs per-user; web-init generates the login password on first start.

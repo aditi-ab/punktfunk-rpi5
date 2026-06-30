@@ -13,4 +13,4 @@ type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {};
 
-export const Error: Story = { args: { error: true } };
+export const ErrorState: Story = { args: { error: true } };

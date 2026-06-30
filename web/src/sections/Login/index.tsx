@@ -23,8 +23,7 @@ export const SectionLogin: FC<{ next?: string }> = ({ next }) => {
 			}
 			// Full reload to the target so SSR re-runs WITH the new session cookie. Only a
 			// same-origin path — reject protocol-relative/absolute URLs (open-redirect guard).
-			const safe =
-				next && next.startsWith("/") && !next.startsWith("//") ? next : "/";
+			const safe = next?.startsWith("/") && !next.startsWith("//") ? next : "/";
 			window.location.href = safe;
 		} catch {
 			setError(true);

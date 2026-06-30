@@ -91,6 +91,20 @@ By default the host **requires PIN pairing** (secure). Two ways to pair:
 
 On a trusted home LAN you can instead install with `--open` and skip pairing entirely.
 
+### Console login password
+
+The installer generates a random console login password and writes it to
+`~/.config/punktfunk/web.env` (as `PUNKTFUNK_UI_PASSWORD=…`); it's also printed at the end of the
+install run (step 2). Read it back with:
+
+```sh
+sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web.env
+```
+
+To set your own password, edit that file and restart the console:
+`systemctl --user restart punktfunk-web`. Forgot it? This is the recovery path linked from the
+console login screen — see [Forgot your Password?](/docs/forgot-password).
+
 ## 4. Verify
 
 ```sh

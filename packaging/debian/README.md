@@ -45,7 +45,7 @@ sudo usermod -aG input "$USER"          # virtual gamepads (re-login to take eff
 mkdir -p ~/.config/punktfunk
 cp /usr/share/punktfunk-host/host.env.example ~/.config/punktfunk/host.env   # then edit
 systemctl --user enable --now punktfunk-host
-# Web console — enable it and read the auto-generated login password (then open http://<host-ip>:3000):
+# Web console — enable it and read the auto-generated login password (then open https://<host-ip>:3000):
 systemctl --user enable --now punktfunk-web
 journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
 ```

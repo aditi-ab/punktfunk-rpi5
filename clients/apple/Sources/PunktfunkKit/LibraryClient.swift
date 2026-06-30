@@ -3,10 +3,11 @@
 // /library page renders. Read-only on the client for now; launching a chosen title is a later
 // step. Gated behind `DefaultsKey.libraryEnabled` in the UI.
 //
-// The management API is HTTP on a port distinct from the punktfunk/1 data plane (default 47990),
-// binds loopback unless started with a token, and REQUIRES a bearer token for any non-loopback
-// bind. So to browse a host's library remotely the host must expose the mgmt API on the LAN with
-// `--mgmt-token`; the client carries that token per host. This mirrors the GameEntry/Artwork/
+// The management API serves HTTPS on a port distinct from the punktfunk/1 data plane (default
+// 47990, also advertised in the host's mDNS `mgmt` TXT). A paired client is authorized for the
+// read-only library route by its **mTLS certificate** — no bearer token. The host binds this read
+// surface to the LAN by DEFAULT (the bearer-gated admin surface stays loopback-only), so a paired
+// client browses a host's library with no operator step. This mirrors the GameEntry/Artwork/
 // LaunchSpec schema in `crates/punktfunk-host/src/library.rs`.
 
 import Foundation
@@ -56,8 +57,9 @@ public enum LibraryError: LocalizedError {
         case .http(let code):
             return "The management API returned HTTP \(code)."
         case .unreachable(let why):
-            return "Couldn't reach the host's management API: \(why). The host must expose it on "
-                + "the LAN (serve --mgmt-bind 0.0.0.0)."
+            return "Couldn't reach the host's management API: \(why). It binds the LAN by default, "
+                + "so check the host is updated and reachable (a host pinned to "
+                + "`--mgmt-bind 127.0.0.1` is loopback-only and can't be browsed remotely)."
         }
     }
 }

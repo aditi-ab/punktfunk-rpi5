@@ -40,19 +40,30 @@ If the host runs with `--mgmt-token`, set it under **Settings → API token** (s
 
 ## Build & run (Nitro + Bun)
 
+The console runs on **bun** (`Bun.serve` is a Bun API — node can't run it): Nitro's `bun` preset
+plus a custom entry (`nitro-entry/bun-https.mjs`) that calls `Bun.serve({ tls })`, so it serves
+**HTTPS (HTTP/1.1 over TLS)** with the **host's own identity cert** (the cert native clients already
+pin). One trust anchor across the data plane, the mgmt API, and this console. (No HTTP/2 — `Bun.serve`
+has no h2 server — and no HTTP/3, which a browser won't speak against this self-signed, no-SAN host
+cert; a browser-trusted, SAN-matching cert + a fronting server would be needed, out of scope for a
+LAN console.)
+
 ```sh
-bun run build             # → .output/  (Nitro server, `bun` preset, + .output/public assets)
+bun run build             # → .output/  (Nitro `bun` preset + our Bun.serve TLS entry)
 PORT=3000 HOST=0.0.0.0 \
   PUNKTFUNK_UI_PASSWORD=… PUNKTFUNK_MGMT_TOKEN=… \
   PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990 NODE_TLS_REJECT_UNAUTHORIZED=0 \
+  PUNKTFUNK_UI_TLS_CERT=~/.config/punktfunk/cert.pem \
+  PUNKTFUNK_UI_TLS_KEY=~/.config/punktfunk/key.pem PUNKTFUNK_UI_SECURE=1 \
   bun run start           # = bun run .output/server/index.mjs
-# (the mgmt API is HTTPS w/ the host's self-signed cert on loopback → the proxy's fetch needs
-#  NODE_TLS_REJECT_UNAUTHORIZED=0; it makes no other outbound TLS calls. See .env.example.)
+# PUNKTFUNK_UI_TLS_* unset ⇒ plain HTTP (local dev); both set ⇒ HTTPS (HTTP/1.1 over TLS).
+# NODE_TLS_REJECT_UNAUTHORIZED=0 is only for the proxy's loopback fetch to the host's self-signed
+# mgmt cert; the console makes no other outbound TLS calls. See .env.example.
 bun run lint              # tsc --noEmit
 ```
 
-The built **Nitro Bun server** SSR-renders the app and is the only thing exposed on the LAN.
-Run it on the same box as the host; it serves the console on `:3000` (or `$PORT`).
+The built **Nitro bun server** SSR-renders the app and is the only thing exposed on the LAN.
+Run it on the same box as the host; it serves the console over HTTPS on `:3000` (or `$PORT`).
 
 ## Auth (backend-for-frontend)
 
@@ -62,10 +73,14 @@ Single-user, login-gated. Config via env (see `.env.example`):
   **sealed session cookie** (h3 `useSession`, AES-GCM). `server/middleware/auth.ts` gates
   *every* request — pages redirect to `/login`, `/api` returns 401 — and **fails closed**
   (503) if `PUNKTFUNK_UI_PASSWORD` is unset, so a misconfigured LAN server admits no one.
-- The **management API stays loopback-only + token** — never LAN-exposed. The web server
+- The **bearer-token admin surface of the management API is loopback-only** — the host honors a
+  bearer token only from a loopback peer, so the admin API is never LAN-exposed. The web server
   holds `PUNKTFUNK_MGMT_TOKEN` server-side and injects it when proxying `/api/**` →
-  `PUNKTFUNK_MGMT_URL` (`server/routes/api/[...].ts`). **The token never reaches the
-  browser**; the browser only ever holds the session cookie.
+  `PUNKTFUNK_MGMT_URL` (loopback; `server/routes/api/[...].ts`). **The token never reaches the
+  browser**; the browser only ever holds the session cookie. (The host *also* binds the
+  **read-only** surface — host status + the game library — to the LAN so paired native clients can
+  fetch it directly over mTLS; that path uses client certs, not the token, and never touches this
+  console.)
 
 So: `browser ──password──▶ web server (session cookie) ──mgmt token, server-side──▶ mgmt API`.
 Run the host with a matching token: `cargo run -rp punktfunk-host -- serve` +

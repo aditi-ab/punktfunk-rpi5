@@ -4,10 +4,11 @@ import "../src/styles.css";
 // The console loads its brand typeface separately (in __root.tsx); do the same
 // here or every story falls back to system-ui and looks off.
 import "@fontsource-variable/geist";
-import { useEffect } from "react";
 import { definePreview } from "@storybook/react-vite";
-import { MaterialProvider, defaultMaterialTheme } from "@unom/ui/material";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { defaultMaterialTheme, MaterialProvider } from "@unom/ui/material";
+import Section from "@unom/ui/section";
+import { useEffect } from "react";
 
 // React Query is present so any query-backed component mounts without a real
 // host. Stories should feed mock data rather than fetch — retries are off so a
@@ -51,11 +52,13 @@ export default definePreview({
 				<QueryClientProvider client={queryClient}>
 					<MaterialProvider theme={defaultMaterialTheme}>
 						<div className={dark ? "dark" : ""}>
-							<div
-								className={`min-h-screen bg-background text-foreground ${fullscreen ? "" : "p-6"}`}
-							>
-								<Story />
-							</div>
+							<Section maxWidth={false}>
+								<div
+									className={`min-h-screen bg-background text-foreground ${fullscreen ? "" : "p-6"}`}
+								>
+									<Story />
+								</div>
+							</Section>
 						</div>
 					</MaterialProvider>
 				</QueryClientProvider>

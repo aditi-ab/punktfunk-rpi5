@@ -11,7 +11,10 @@
 //!   lets a picker show the fingerprint and pre-pin a chosen host;
 //! - `pair` — `required` or `optional`, so a client can tell up front whether it must run the PIN
 //!   pairing ceremony before it can stream;
-//! - `id` — the stable host uniqueid (dedup across IPs / re-advertises).
+//! - `id` — the stable host uniqueid (dedup across IPs / re-advertises);
+//! - `mgmt` — the management API's TCP port (when it serves one), so a client can fetch the host's
+//!   game library (`GET /api/v1/library`, mTLS) on the SAME IP without assuming the default port.
+//!   Omitted by a host with no mgmt API (the standalone `punktfunk1-host`).
 
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
@@ -30,7 +33,9 @@ pub struct Advert {
 }
 
 /// Advertise the native host on the LAN. `fingerprint` is the host cert SHA-256 (lowercase hex);
-/// `require_pairing` tells a discovering client whether it must pair before it can stream.
+/// `require_pairing` tells a discovering client whether it must pair before it can stream;
+/// `mgmt_port` is the management API's port (`Some` when this host serves one — the client browses
+/// the library there over mTLS on the advertised IP), `None` for a host with no mgmt API.
 pub fn advertise_native(
     hostname: &str,
     ip: IpAddr,
@@ -38,6 +43,7 @@ pub fn advertise_native(
     fingerprint: &str,
     require_pairing: bool,
     uniqueid: &str,
+    mgmt_port: Option<u16>,
 ) -> Result<Advert> {
     let daemon = ServiceDaemon::new().context("create mDNS daemon")?;
     let host_name = format!("{hostname}.local.");
@@ -54,6 +60,9 @@ pub fn advertise_native(
         .into(),
     );
     props.insert("id".into(), uniqueid.to_string());
+    if let Some(mgmt) = mgmt_port {
+        props.insert("mgmt".into(), mgmt.to_string());
+    }
     let service = ServiceInfo::new(NATIVE_SERVICE, hostname, &host_name, ip, port, props)
         .context("build native mDNS ServiceInfo")?;
     daemon

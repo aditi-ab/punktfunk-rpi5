@@ -9,15 +9,20 @@
 //! and a copy is checked in at `api/openapi.json` (a test fails if it drifts, like the
 //! cbindgen header).
 //!
-//! Security: binds loopback by default, serves HTTPS with the host's identity cert, and requires
-//! auth on every `/api/v1` route except `/api/v1/health` — **always**, even on loopback. A paired
-//! native client authenticates by its mTLS cert; everyone else by a bearer token (`--mgmt-token` /
-//! `PUNKTFUNK_MGMT_TOKEN`, else auto-generated + persisted to `~/.config/punktfunk/mgmt-token`). The
-//! OpenAPI document and docs UI are served unauthenticated (the spec is public — it lives in this repo).
+//! Security: serves HTTPS with the host's identity cert and requires auth on every `/api/v1` route
+//! except `/api/v1/health` — **always**, even on loopback. The listener binds **all interfaces by
+//! default** so a paired native client can reach the read-only surface (host/status/clients and the
+//! **game library**) over the LAN with no operator step — authenticated by its mTLS cert (the
+//! `cert_may_access` allowlist). The **bearer-token admin surface** (pairing, unpair, session
+//! control, library mutation, stats) is honored **only from a loopback peer**, so it is never
+//! LAN-exposed: the web console BFF — the sole token holder (`--mgmt-token` / `PUNKTFUNK_MGMT_TOKEN`,
+//! else auto-generated + persisted to `~/.config/punktfunk/mgmt-token`) — always connects over
+//! loopback. Restore the old loopback-only listener with `--mgmt-bind 127.0.0.1:47990`. The OpenAPI
+//! document and docs UI are served unauthenticated (the spec is public — it lives in this repo).
 
 use crate::encode::Codec;
 use crate::gamestream::{
-    tls::{serve_https, PeerCertFingerprint},
+    tls::{serve_https, PeerAddr, PeerCertFingerprint},
     AppState, APP_VERSION, AUDIO_PORT, CONTROL_PORT, GFE_VERSION, RTSP_PORT, VIDEO_PORT,
 };
 use crate::stats_recorder::{Capture, CaptureMeta, StatsStatus};
@@ -474,8 +479,11 @@ where
 // Auth
 // ---------------------------------------------------------------------------------------
 
-/// Auth gate on the `/api/v1` routes: a paired client cert (mTLS) or the bearer token — required
-/// always (the host runs with a token by construction). `/api/v1/health` stays open for probes.
+/// Auth gate on the `/api/v1` routes: a paired client cert (mTLS, from anywhere) or the bearer token
+/// (from a **loopback** peer only) — required always (the host runs with a token by construction).
+/// `/api/v1/health` stays open for probes. The cert path authorizes only the read-only allowlist
+/// ([`cert_may_access`]); the bearer path authorizes the full admin surface and is therefore confined
+/// to loopback so it is never LAN-exposed even when the listener binds all interfaces by default.
 async fn require_auth(State(st): State<Arc<MgmtState>>, req: Request, next: Next) -> Response {
     if req.uri().path() == "/api/v1/health" {
         return next.run(req).await; // liveness probe is always open
@@ -493,8 +501,25 @@ async fn require_auth(State(st): State<Arc<MgmtState>>, req: Request, next: Next
             return next.run(req).await;
         }
     }
-    // Otherwise require the bearer token (the web console / admin). `run` always passes a token, so
-    // no-token means a misconfigured caller (e.g. a test constructing `app` directly) — deny.
+    // Otherwise require the bearer token (the web console / admin) — but only from a LOOPBACK peer.
+    // The token authorizes the full admin surface, so confining it to loopback keeps that surface off
+    // the LAN even though the listener now binds all interfaces by default (so paired clients can
+    // browse the library). The web console BFF — the sole token holder — always connects over
+    // loopback, so nothing first-party is affected; a LAN caller must use a paired client cert and is
+    // limited to the read-only allowlist above. (No PeerAddr ⇒ a non-`serve_https` caller, e.g. a unit
+    // test → treat as loopback so handler tests still authenticate by token.)
+    let from_loopback = req
+        .extensions()
+        .get::<PeerAddr>()
+        .is_none_or(|a| a.0.ip().is_loopback());
+    if !from_loopback {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "the admin API is loopback-only — a LAN client must present a paired client certificate",
+        );
+    }
+    // `run` always passes a token, so no-token means a misconfigured caller (e.g. a test constructing
+    // `app` directly) — deny.
     let Some(expected) = st.token.as_deref() else {
         return api_error(StatusCode::UNAUTHORIZED, "authentication required");
     };
@@ -1602,6 +1627,72 @@ mod tests {
             send_cert(&app, get_req("/api/v1/status"), "not-paired").await,
             StatusCode::UNAUTHORIZED,
             "an unpaired cert must be rejected"
+        );
+    }
+
+    /// The bearer-token (admin) path is honored only from a LOOPBACK peer: the same token from a LAN
+    /// peer is rejected, so binding the listener to all interfaces (so paired clients can browse the
+    /// library by default) never LAN-exposes the admin surface. A paired *cert*, by contrast, reaches
+    /// the read-only allowlist from anywhere.
+    #[tokio::test]
+    async fn bearer_admin_is_loopback_only() {
+        let lan: SocketAddr = "192.168.1.50:54321".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:33333".parse().unwrap();
+        let bearer = |peer: SocketAddr| {
+            let mut req = get_req("/api/v1/stats/recordings"); // a bearer-only (admin) route
+            req.extensions_mut().insert(PeerAddr(peer));
+            req.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static("Bearer test-secret"),
+            );
+            req
+        };
+
+        let app = test_app(test_state(), None);
+        // A valid bearer from a LAN peer → rejected on the admin API.
+        assert_eq!(
+            app.clone()
+                .oneshot(bearer(lan))
+                .await
+                .expect("infallible")
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "a bearer token from a LAN peer must be rejected on the admin API"
+        );
+        // The SAME token from a loopback peer (the web console BFF) → accepted.
+        assert_ne!(
+            app.clone()
+                .oneshot(bearer(loopback))
+                .await
+                .expect("infallible")
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "the bearer token must be accepted from a loopback peer"
+        );
+
+        // A paired cert from a LAN peer still reaches the read-only library (the feature this enables).
+        let np = Arc::new(
+            crate::native_pairing::NativePairing::load_with(
+                Some(
+                    std::env::temp_dir()
+                        .join(format!("pf-mgmt-lanlib-{}.json", std::process::id())),
+                ),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let fp = "deadbeefcafe";
+        np.add("lan-client", fp).unwrap();
+        let app = test_app_native(test_state(), np);
+        let mut req = get_req("/api/v1/library");
+        req.extensions_mut().insert(PeerAddr(lan));
+        req.extensions_mut()
+            .insert(PeerCertFingerprint(Some(fp.to_string())));
+        assert_ne!(
+            app.clone().oneshot(req).await.expect("infallible").status(),
+            StatusCode::UNAUTHORIZED,
+            "a paired cert must reach the library from a LAN peer"
         );
     }
 

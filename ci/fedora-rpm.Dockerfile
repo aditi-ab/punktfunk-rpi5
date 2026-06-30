@@ -16,8 +16,9 @@ RUN dnf -y install \
       "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
       "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm" \
   && dnf -y install \
-      # rpmbuild + source-tarball tooling; nodejs runs the Gitea Actions JS (checkout/cache)
-      # AND the punktfunk-web .output at runtime; unzip is for the bun installer below.
+      # rpmbuild + source-tarball tooling; nodejs runs the Gitea Actions JS (checkout/cache) only
+      # — the punktfunk-web console builds AND runs on bun (installed below); unzip is for the bun
+      # installer.
       rpm-build rpmdevtools systemd-rpm-macros git tar gzip nodejs unzip \
       # build toolchain + bindgen
       gcc gcc-c++ clang clang-devel cmake nasm pkgconf-pkg-config curl ca-certificates \
@@ -28,9 +29,10 @@ RUN dnf -y install \
       gtk4-devel libadwaita-devel SDL3-devel \
   && dnf clean all
 
-# bun — the build tool for the punktfunk-web console (`bun run build` -> the node-server .output
-# the punktfunk-web RPM ships and runs with plain node). Not in Fedora repos; install the official
-# standalone binary to a system PATH dir so the rpmbuild `%build` (run as any uid) finds it.
+# bun — both the BUILD tool and the RUNTIME for the punktfunk-web console (`bun run build` -> the
+# Nitro `bun`-preset .output, served by `Bun.serve` with TLS — HTTP/1.1 over TLS). The
+# RPM vendors THIS bun binary. Not in Fedora repos; install the official standalone binary to a
+# system PATH dir so the rpmbuild `%build`/`%install` (run as any uid) find it.
 RUN curl -fsSL https://bun.sh/install | bash \
     && install -m0755 /root/.bun/bin/bun /usr/local/bin/bun \
     && bun --version

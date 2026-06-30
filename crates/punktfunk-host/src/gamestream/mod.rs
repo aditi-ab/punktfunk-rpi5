@@ -238,7 +238,7 @@ pub fn serve(
             tokio::try_join!(
                 nvhttp::run(state.clone()),
                 crate::mgmt::run(state.clone(), mgmt, Some(np.clone()), stats.clone()),
-                crate::punktfunk1::serve(native_opts, np, stats.clone()),
+                crate::punktfunk1::serve(native_opts, native.mgmt_port, np, stats.clone()),
             )?;
         } else {
             // Secure default: native punktfunk/1 + management API only (no GameStream surface).
@@ -249,7 +249,7 @@ pub fn serve(
             );
             tokio::try_join!(
                 crate::mgmt::run(state.clone(), mgmt, Some(np.clone()), stats.clone()),
-                crate::punktfunk1::serve(native_opts, np, stats.clone()),
+                crate::punktfunk1::serve(native_opts, native.mgmt_port, np, stats.clone()),
             )?;
         }
         Ok(())

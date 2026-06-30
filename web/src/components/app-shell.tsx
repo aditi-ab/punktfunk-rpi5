@@ -6,7 +6,6 @@ import {
 	LibraryBig,
 	Server,
 	Settings,
-	Users,
 } from "lucide-react";
 import { motion, stagger } from "motion/react";
 import type { ReactNode } from "react";
@@ -23,16 +22,9 @@ const NAV = [
 	{ to: "/host", icon: Server, label: () => m.nav_host() },
 	{ to: "/library", icon: LibraryBig, label: () => m.nav_library() },
 	{ to: "/stats", icon: GaugeCircle, label: () => m.nav_stats() },
-	{ to: "/clients", icon: Users, label: () => m.nav_clients() },
 	{ to: "/pairing", icon: KeyRound, label: () => m.nav_pairing() },
 	{ to: "/settings", icon: Settings, label: () => m.nav_settings() },
 ] as const;
-
-// Staggered entrance for the sidebar nav: each item fans in from the left a beat
-// after the previous. Per-item delays (rather than a parent stagger) keep every
-// item independent, so none can be left mid-orchestration / invisible.
-const NAV_ENTER_DELAY = 0.08;
-const NAV_ENTER_STEP = 0.06;
 
 export function AppShell({ children }: { children: ReactNode }) {
 	// Read the locale so the whole shell re-renders on a language switch.
@@ -58,7 +50,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 					variants={{ enter: {}, from: {} }}
 					className="flex flex-col gap-1"
 				>
-					{NAV.map(({ to, icon: Icon, label }, i) => (
+					{NAV.map(({ to, icon: Icon, label }) => (
 						<MLink
 							key={to}
 							variants={{
@@ -103,7 +95,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
 				<main className="flex-1">
 					{/* pb-24 leaves room for the fixed bottom nav on mobile. */}
-					<div className="mx-auto max-w-5xl p-6 pb-24 sm:p-10 sm:pb-10">
+					<div className="mx-auto max-w-[1700px] p-6 pb-24 sm:p-10 sm:pb-10">
 						{children}
 					</div>
 				</main>
@@ -138,10 +130,12 @@ export function AppShell({ children }: { children: ReactNode }) {
 function LanguageSwitcher() {
 	const current = useLocale();
 	return (
+		// biome-ignore lint/a11y/useSemanticElements: an aria-labelled role="group" is the right pattern for this small control cluster — no single semantic element fits.
 		<div className="flex gap-1" role="group" aria-label="Language">
 			{locales.map((l: Locale) => (
 				<button
 					key={l}
+					type="button"
 					onClick={() => changeLocale(l)}
 					className={cn(
 						"rounded px-2 py-1 text-xs uppercase transition-colors",

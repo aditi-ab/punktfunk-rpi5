@@ -1,0 +1,69 @@
+// Custom Nitro server entry for the punktfunk web console.
+//
+// It is the stock Nitro `bun` preset entry
+// (node_modules/nitropack/dist/presets/bun/runtime/bun.mjs) plus **TLS**, so the console is served
+// over **HTTPS (HTTP/1.1 over TLS)** using the HOST's own identity cert (the cert native clients
+// already pin). One trust anchor across the data plane, the management API, and this console. Wired
+// in via `entry:` in vite.config.ts on top of Nitro's `bun` preset (which bundles the handler in).
+//
+// NOTE on HTTP/2 + HTTP/3: NOT offered here, on purpose. `Bun.serve` has no HTTP/2 server, and
+// HTTP/3 (which Bun *can* do) is useless to a browser against this cert: QUIC refuses any cert error,
+// and the host identity cert is a CN-only, no-SAN, self-signed cert (correct for native fingerprint
+// PINNING, rejected by browsers). So browsers stay on HTTP/1.1 regardless — advertising h3 would just
+// dangle an `Alt-Svc` no browser can use. Real h2/h3 would need a browser-TRUSTED, SAN-matching cert
+// (a local CA installed per device) fronted by a server that speaks them (e.g. Caddy) — deliberately
+// out of scope for a LAN console; TLS (no cleartext login/session) is the win.
+//
+// Env (set by the launchers / the systemd unit — see web.env.example):
+//   PUNKTFUNK_UI_TLS_CERT / _KEY   PEM file paths (the host's cert.pem / key.pem). BOTH set ⇒ HTTPS.
+//                                  Unset ⇒ plain HTTP (local dev only).
+//   PORT / HOST                    standard Nitro bind (3000 / 0.0.0.0).
+import "#nitro-internal-pollyfills";
+import wsAdapter from "crossws/adapters/bun";
+import { useNitroApp } from "nitropack/runtime";
+import { startScheduleRunner } from "nitropack/runtime/internal";
+
+const nitroApp = useNitroApp();
+const ws = import.meta._websocket
+	? wsAdapter(nitroApp.h3App.websocket)
+	: undefined;
+
+// TLS from the host's identity cert (file PATHS → Bun.file, not PEM-in-env). Absent ⇒ plain HTTP.
+const certPath = process.env.PUNKTFUNK_UI_TLS_CERT;
+const keyPath = process.env.PUNKTFUNK_UI_TLS_KEY;
+const tls =
+	certPath && keyPath
+		? { cert: Bun.file(certPath), key: Bun.file(keyPath) }
+		: undefined;
+
+const server = Bun.serve({
+	port: process.env.NITRO_PORT || process.env.PORT || 3000,
+	host: process.env.NITRO_HOST || process.env.HOST,
+	idleTimeout:
+		Number.parseInt(process.env.NITRO_BUN_IDLE_TIMEOUT, 10) || undefined,
+	// `tls: undefined` ⇒ plain HTTP (dev); otherwise HTTPS over HTTP/1.1.
+	tls,
+	websocket: import.meta._websocket ? ws.websocket : undefined,
+	async fetch(req, server) {
+		if (import.meta._websocket && req.headers.get("upgrade") === "websocket") {
+			return ws.handleUpgrade(req, server);
+		}
+		const url = new URL(req.url);
+		let body;
+		if (req.body) {
+			body = await req.arrayBuffer();
+		}
+		return nitroApp.localFetch(url.pathname + url.search, {
+			host: url.hostname,
+			protocol: url.protocol,
+			headers: req.headers,
+			method: req.method,
+			redirect: req.redirect,
+			body,
+		});
+	},
+});
+console.log(`punktfunk web console listening on ${server.url} (tls=${!!tls})`);
+if (import.meta._tasks) {
+	startScheduleRunner();
+}

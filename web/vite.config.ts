@@ -1,11 +1,11 @@
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vite";
-import { tanstackStart } from "@tanstack/react-start/plugin/vite";
-import { nitroV2Plugin } from "@tanstack/nitro-v2-vite-plugin";
-import viteReact from "@vitejs/plugin-react";
-import viteTsConfigPaths from "vite-tsconfig-paths";
-import tailwindcss from "@tailwindcss/vite";
 import { paraglideVitePlugin } from "@inlang/paraglide-js";
+import tailwindcss from "@tailwindcss/vite";
+import { nitroV2Plugin } from "@tanstack/nitro-v2-vite-plugin";
+import { tanstackStart } from "@tanstack/react-start/plugin/vite";
+import viteReact from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+import viteTsConfigPaths from "vite-tsconfig-paths";
 
 // Absolute path to our Nitro server source (middleware + routes). Passed as a scanDir
 // because the TanStack Nitro plugin doesn't auto-scan a server/ dir.
@@ -41,11 +41,17 @@ export default defineConfig({
 		// proxies to the management host injecting the bearer token server-side) — NOT a static
 		// routeRule, so the proxy runs behind the login gate and reads env at runtime.
 		nitroV2Plugin({
-			// node-server (not bun): a STANDALONE node HTTP server (`node .output/server/index.mjs`
-			// listens — the plain `node` preset only exports a handler). Lets the bundled punktfunk-web
-			// .deb depend on apt-native `nodejs (>= 20)` instead of vendoring bun. CI still BUILDS with
-			// bun; only the runtime target changes. (dev `vite dev` is unaffected.)
-			preset: "node-server",
+			// bun + a CUSTOM entry: Nitro's `bun` preset bundles the handler, and `entry` swaps the
+			// stock self-listening entry for ours (`nitro-entry/bun-https.mjs`), which calls
+			// `Bun.serve({ tls })` so the console is served over HTTPS (HTTP/1.1 over TLS) with the
+			// host's own identity cert. (No HTTP/2 — Bun.serve has no h2 server — and no HTTP/3, which a
+			// browser won't speak against this self-signed, no-SAN host cert.) Bun is the runtime
+			// everywhere now — the Windows installer already bundles it, and the punktfunk-web .deb
+			// vendors it (it can't be `node`: `Bun.serve` is a bun API). (dev `vite dev` is unaffected.)
+			preset: "bun",
+			entry: fileURLToPath(
+				new URL("./nitro-entry/bun-https.mjs", import.meta.url),
+			),
 			// BUNDLE every dependency into the server output (no externalized node_modules). Three wins:
 			// (1) the .output tree drops from ~47k files / 730 MB (the whole untree-shaken @unom/ui dep
 			// tree — payload, lexical, date-fns…) to a handful of tree-shaken chunks; (2) the output is a

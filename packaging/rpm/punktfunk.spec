@@ -16,7 +16,7 @@
 # only new runtime bits are ffmpeg-libs (RPM Fusion) + opus + libei.
 ################################################################################
 
-Name:           punktfunk
+Name:           Punktfunk
 # Version/Release are overridable so CI can stamp a rolling snapshot: a canary main build passes
 #   --define "pf_version 0.3.0" --define "pf_release 0.ci42.gdeadbee"
 # (Release starting "0." sorts BEFORE the eventual "1" release; the canary base stays one minor
@@ -42,11 +42,11 @@ ExclusiveArch:  x86_64
 # Recommends). Drop it from the auto-Requires, mirroring the Debian package's NVIDIA filter.
 %global __requires_exclude ^libcuda\\.so.*$
 
-# Management web console subpackage (punktfunk-web). OFF by default: building the Nitro/Node SSR
-# bundle needs `bun`, which a plain rpmbuild / COPR mock chroot does NOT have. CI's builder image
-# (ci/fedora-rpm.Dockerfile) DOES have bun and builds with `--with web`, so the Gitea RPM registry
-# carries punktfunk-web. COPR (no bun) builds host+client only — use the Gitea registry for the
-# console, or enable bun + `--with web` in the COPR project. Mirrors the Debian punktfunk-web .deb.
+# Management web console subpackage (punktfunk-web). OFF by default: building the Nitro SSR bundle
+# (and running it) needs `bun`, which a plain rpmbuild / COPR mock chroot does NOT have. CI's builder
+# image (ci/fedora-rpm.Dockerfile) DOES have bun and builds with `--with web`, so the Gitea RPM
+# registry carries punktfunk-web. COPR (no bun) builds host+client only — use the Gitea registry for
+# the console, or enable bun + `--with web` in the COPR project. Mirrors the Debian punktfunk-web .deb.
 %bcond_with web
 
 # --- Build toolchain ---------------------------------------------------------
@@ -135,19 +135,19 @@ virtual output at exactly this client's resolution and refresh rate — no scali
 
 %if %{with web}
 %package web
-Summary:        punktfunk management web console (Nitro/Node SSR + React)
-BuildArch:      noarch
-# Runtime is plain node (the .output is portable JS — bun is only the build tool). Fedora 41+
-# ships nodejs >= 20, which the node-server build needs.
-Requires:       nodejs
+Summary:        punktfunk management web console (Nitro SSR on bun + React)
+# Runtime is BUN (the console uses Nitro's `bun` preset + a Bun.serve TLS entry — node can't
+# run it). Bun isn't in Fedora repos, so we VENDOR a bun binary into the package, which makes this
+# subpackage arch-specific (it can no longer be noarch). No system nodejs/bun dependency.
 
 %description web
 The browser console for a punktfunk streaming host: status, paired devices, and the SPAKE2
-PIN pairing flow every client needs. Runs as a systemd --user service on port 3000, login-gated
-(a password generated on first start), proxying the host's loopback HTTPS management API with a
-bearer token injected server-side (never sent to the browser). Auto-wired to the host on a
-packaged install — it sources the host's mgmt token and a generated login password, no env
-editing. Enable with `systemctl --user enable --now punktfunk-web`.
+PIN pairing flow every client needs. Runs as a systemd --user service on port 3000 over HTTPS
+(HTTP/1.1 over TLS, with the host's own identity cert), login-gated (a password generated on first
+start), proxying the host's loopback HTTPS management API with a bearer token injected server-side
+(never sent to the browser). Auto-wired to the host on a packaged install — it sources the host's
+mgmt token, identity cert, and a generated login password, no env editing. Bundles its own bun
+runtime. Enable with `systemctl --user enable --now punktfunk-web`.
 %endif
 
 %prep
@@ -163,11 +163,11 @@ export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 cargo build --release --locked -p punktfunk-host -p punktfunk-client-linux
 
 %if %{with web}
-# Management web console: build the Nitro/Node SSR bundle (node-server preset) with bun. The
-# .output is portable JS run at runtime by plain node; bun is only the build tool (CI image).
+# Management web console: build the Nitro SSR bundle with bun (the `bun` preset + our Bun.serve
+# TLS entry). bun is both the build tool AND the runtime (vendored in %%install below).
 (cd web && bun install --frozen-lockfile && bun run build)
-if grep -q 'Bun\.serve' web/.output/server/index.mjs; then
-  echo "ERROR: web build is a bun bundle (Bun.serve) — need the node-server preset" >&2
+if ! grep -q 'Bun\.serve' web/.output/server/index.mjs; then
+  echo "ERROR: web build is not a bun bundle — need the 'bun' preset + custom entry" >&2
   exit 1
 fi
 %endif
@@ -247,10 +247,14 @@ install -Dm0644 api/openapi.json                  %{buildroot}%{_datadir}/%{name
 install -d %{buildroot}%{_datadir}/punktfunk-web/.output
 cp -r web/.output/server %{buildroot}%{_datadir}/punktfunk-web/.output/server
 cp -r web/.output/public %{buildroot}%{_datadir}/punktfunk-web/.output/public
-# PATH-stable launcher (matches the .deb's /usr/bin/punktfunk-web-server).
+# Vendor the bun runtime (the build env's bun — the CI rpm image) into
+# a private libexec dir so it never collides with a system-wide bun on PATH. This is why the web
+# subpackage is arch-specific (above): bun is a native binary.
+install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-web/bun
+# PATH-stable launcher (matches the .deb's /usr/bin/punktfunk-web-server) — runs on the vendored bun.
 cat > %{buildroot}%{_bindir}/punktfunk-web-server <<'WRAP'
 #!/bin/sh
-exec /usr/bin/node /usr/share/punktfunk-web/.output/server/index.mjs "$@"
+exec /usr/libexec/punktfunk-web/bun /usr/share/punktfunk-web/.output/server/index.mjs "$@"
 WRAP
 chmod 0755 %{buildroot}%{_bindir}/punktfunk-web-server
 # systemd --user units: the console runs per-user; web-init generates the login password.
@@ -286,6 +290,8 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %files web
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %{_bindir}/punktfunk-web-server
+%dir %{_libexecdir}/punktfunk-web
+%{_libexecdir}/punktfunk-web/bun
 %dir %{_datadir}/punktfunk-web
 %{_datadir}/punktfunk-web/.output
 %{_datadir}/punktfunk-web/web-init.sh

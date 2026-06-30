@@ -14,8 +14,9 @@ scripts. On a **Steam Deck used as a client you want `punktfunk-client`** (it's 
 
 A third member, **`punktfunk-web`** (the browser management console — pairing + status), is
 **opt-in**: build it by setting `PF_WITH_WEB=1`, which requires **`bun`** at build time (`bun-bin`
-from the AUR if it isn't in your repos; the console then runs on plain `nodejs`). A default
-`makepkg` builds only host+client with no JS tooling — mirroring the RPM spec's `%bcond_with web`.
+from the AUR if it isn't in your repos). bun is also the **runtime** — the console serves HTTPS
+(HTTP/1.1 over TLS) via `Bun.serve`, so the package vendors the bun binary (no `nodejs` dependency). A
+default `makepkg` builds only host+client with no JS tooling — mirroring the RPM spec's `%bcond_with web`.
 
 > **Host encode: NVENC on NVIDIA, VAAPI on AMD/Intel** (`PUNKTFUNK_ENCODER=auto` picks one). The host
 > now has a VAAPI encoder + zero-copy dmabuf path alongside NVENC/CUDA, so `punktfunk-host` works on
@@ -41,7 +42,7 @@ cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env   # gamesc
 systemctl --user enable --now punktfunk-host
 # Web console (if you installed the punktfunk-web package): enable it + read the login password.
 systemctl --user enable --now punktfunk-web
-journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # open http://<host-ip>:3000
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # open https://<host-ip>:3000
 ```
 NVENC/EGL come from the NVIDIA driver: `sudo pacman -S --needed nvidia-utils`. Arch's stock
 `ffmpeg` already has NVENC built in — no RPM-Fusion-style swap needed (unlike Fedora).

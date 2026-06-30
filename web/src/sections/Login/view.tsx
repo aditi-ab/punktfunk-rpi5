@@ -1,3 +1,5 @@
+import { ease } from "@unom/style";
+import { motion } from "motion/react";
 import { type FC, useState } from "react";
 import Logo from "@/components/logo";
 import { Button } from "@/components/ui/button";
@@ -13,14 +15,28 @@ export const LoginView: FC<{
 }> = ({ onSubmit, error, busy }) => {
 	const [password, setPassword] = useState("");
 	return (
-		<div className="flex min-h-screen items-center justify-center p-6">
-			<Card className="w-full max-w-sm">
-				<CardHeader className="items-center text-center">
-					<div className="mb-2 flex w-[80px] items-center gap-2">
-						<Logo />
-					</div>
-					<CardTitle>{m.login_title()}</CardTitle>
-					<p className="text-sm text-muted-foreground">{m.login_subtitle()}</p>
+		<div className="flex flex-col min-h-screen items-center justify-center p-6">
+			<motion.div
+				transition={ease.quint(0.9).out}
+				variants={{ enter: { scale: 1, y: 0 }, from: { scale: 0, y: 100 } }}
+				className="mb-8 flex w-[120px]"
+			>
+				<Logo />
+			</motion.div>
+			<Card className="w-full max-w-sm h-fit grow-0">
+				<CardHeader className="items-start text-left">
+					<CardTitle className="text-xl">{m.login_title()}</CardTitle>
+					<p className="text-sm text-muted-foreground">
+						{m.login_subtitle()}{" "}
+						<a
+							href="https://docs.punktfunk.unom.io/docs/forgot-password"
+							target="_blank"
+							rel="noreferrer"
+							className="underline underline-offset-4 hover:text-foreground"
+						>
+							{m.login_docs_link()}
+						</a>
+					</p>
 				</CardHeader>
 				<CardContent>
 					<form
@@ -35,7 +51,6 @@ export const LoginView: FC<{
 							<Input
 								id="pw"
 								type="password"
-								// biome-ignore lint/a11y/noAutofocus: the login screen is the sole focus target.
 								autoFocus
 								autoComplete="current-password"
 								value={password}

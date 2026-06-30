@@ -711,8 +711,8 @@ struct SettingsView: View {
         } footer: {
             Text("Adds a “Browse Library…” action to each host that lists its games "
                 + "(Steam + custom) via the host's management API; tap a title to launch it. "
-                + "The host must expose that API on the LAN with a token "
-                + "(serve --mgmt-bind 0.0.0.0 --mgmt-token …).")
+                + "Works once you've paired with the host — the library is authorized by this "
+                + "device's certificate, with no extra host setup.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }

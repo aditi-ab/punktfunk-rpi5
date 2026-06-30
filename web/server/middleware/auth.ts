@@ -11,9 +11,9 @@ import {
 } from "h3";
 import {
 	isPublicPath,
+	type SessionData,
 	sessionConfig,
 	uiPassword,
-	type SessionData,
 } from "../util/auth";
 
 export default defineEventHandler(async (event) => {

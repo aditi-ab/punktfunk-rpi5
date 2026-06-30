@@ -87,12 +87,13 @@ jobs:
           git config --global --add safe.directory "$PWD"
           cargo build --release -p punktfunk-host -p punktfunk-client-linux --locked
 
-      - name: Build + smoke-boot web console (node-server preset)
-        # Gate the .deb on a real node boot: the punktfunk-web .deb runs `node .output/server`,
-        # so prove the node-server build exists, isn't a bun bundle, and actually serves /login.
+      - name: Build + smoke-boot web console (bun preset)
+        # Gate the .deb on a real bun boot: the punktfunk-web .deb runs the Nitro `bun` preset
+        # (our Bun.serve TLS entry), so prove the build IS a bun bundle and serves /login.
+        # No TLS env here, so the custom entry binds plain HTTP — the smoke curl stays simple.
         run: |
-          # bun builds the console. It's baked into the rust-ci image, but bootstrap it here too so
-          # the job stays green against the PREVIOUS image (docker.yml bootstrap lag).
+          # bun builds AND runs the console. Baked into the rust-ci image; bootstrap here too so the
+          # job stays green against the PREVIOUS image (docker.yml bootstrap lag).
           command -v bun >/dev/null || {
             apt-get install -y --no-install-recommends unzip
             curl -fsSL https://bun.sh/install | bash
@@ -101,21 +102,23 @@ jobs:
           cd web
           bun install --frozen-lockfile
           bun run build
-          if grep -q 'Bun\.serve' .output/server/index.mjs; then
-            echo "ERROR: web build is a bun bundle (Bun.serve) — need the node-server preset"; exit 1
+          if ! grep -q 'Bun\.serve' .output/server/index.mjs; then
+            echo "ERROR: web build is not a bun bundle — need the 'bun' preset + custom entry"; exit 1
           fi
-          PORT=3009 HOST=127.0.0.1 PUNKTFUNK_UI_PASSWORD=ci node .output/server/index.mjs &
+          PORT=3009 HOST=127.0.0.1 PUNKTFUNK_UI_PASSWORD=ci bun .output/server/index.mjs &
           NP=$!; sleep 3
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3009/login || echo 000)
           kill "$NP" 2>/dev/null || true
           echo "web console smoke: /login -> $code"
-          [ "$code" = 200 ] || { echo "ERROR: web console failed to boot under node"; exit 1; }
+          [ "$code" = 200 ] || { echo "ERROR: web console failed to boot under bun"; exit 1; }
 
       - name: Build .debs
         run: |
+          export PATH="$HOME/.bun/bin:$PATH"
           VERSION="$VERSION" bash packaging/debian/build-deb.sh
           VERSION="$VERSION" bash packaging/debian/build-client-deb.sh
-          VERSION="$VERSION" bash packaging/debian/build-web-deb.sh
+          # Reuse CI's bun for the vendored runtime (matches the amd64 runner) instead of downloading.
+          VERSION="$VERSION" BUN_BIN="$(command -v bun || true)" bash packaging/debian/build-web-deb.sh
 
       - name: Publish to the Gitea apt registry
         env:

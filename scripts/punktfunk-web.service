@@ -1,9 +1,10 @@
-# punktfunk management web console — systemd USER unit (Nitro/Node SSR, port 3000).
+# punktfunk management web console — systemd USER unit (Nitro SSR on bun, port 3000, HTTPS).
 #
 # Installed by the punktfunk-web .deb to /usr/lib/systemd/user/. AUTO-WIRED — no env editing:
-# it sources the host's mgmt token + the generated login password, and points at the host's
-# loopback HTTPS mgmt API (self-signed cert → NODE_TLS_REJECT_UNAUTHORIZED for the proxy's only
-# outbound hop, which is loopback). Enable per user:
+# it sources the host's mgmt token + the generated login password, serves HTTPS (HTTP/1.1 over TLS)
+# with the host's own identity cert (~/.config/punktfunk/{cert,key}.pem), and points the /api proxy
+# at the host's loopback HTTPS mgmt API (self-signed cert → NODE_TLS_REJECT_UNAUTHORIZED for the
+# proxy's only outbound hop, which is loopback). Enable per user:
 #   systemctl --user enable --now punktfunk-web
 [Unit]
 Description=punktfunk management web console
@@ -22,6 +23,12 @@ Environment=PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990
 Environment=NODE_TLS_REJECT_UNAUTHORIZED=0
 Environment=PORT=3000
 Environment=HOST=0.0.0.0
+# Serve HTTPS (HTTP/1.1 over TLS) with the host's own identity cert; mark the
+# session cookie Secure. The host's `serve` writes these PEMs; if absent at start the unit fails and
+# Restart retries (same as the mgmt-token wait above) rather than silently serving plain HTTP.
+Environment=PUNKTFUNK_UI_TLS_CERT=%h/.config/punktfunk/cert.pem
+Environment=PUNKTFUNK_UI_TLS_KEY=%h/.config/punktfunk/key.pem
+Environment=PUNKTFUNK_UI_SECURE=1
 ExecStart=/usr/bin/punktfunk-web-server
 Restart=on-failure
 RestartSec=2

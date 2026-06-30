@@ -216,6 +216,13 @@ export const pendingDevices: PendingDevice[] = [
 			"9f8e7d6c5b4a39281706f5e4d3c2b1a0998877665544332211ffeeddccbbaa00",
 		age_secs: 8,
 	},
+	{
+		id: 2,
+		name: "Mac Mini",
+		fingerprint:
+			"ff00eeddccbbaa998877665544332211009f8e7d6c5b4a39281706f5e4d3c2b1",
+		age_secs: 30,
+	},
 ];
 
 export const nativeClients: NativeClient[] = [

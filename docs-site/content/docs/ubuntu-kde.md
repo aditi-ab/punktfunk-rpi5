@@ -80,6 +80,21 @@ systemctl --user enable --now punktfunk-web
 journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
 ```
 
+#### Console login password
+
+The console is password-protected. On first start `punktfunk-web-init` generates a random login
+password and saves it to `~/.config/punktfunk/web-password` (as `PUNKTFUNK_UI_PASSWORD=…`). Read it
+back at any time — from the init service's journal, or straight from the file:
+
+```sh
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
+sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password
+```
+
+To set your own password, edit that file (`PUNKTFUNK_UI_PASSWORD=<your-password>`) and restart the
+console: `systemctl --user restart punktfunk-web`. Forgot it? This is the recovery path linked from
+the console login screen — see [Forgot your Password?](/docs/forgot-password).
+
 To run it at boot — including fully **headless**, with KWin brought up automatically and no login —
 see [Running as a Service](/docs/running-as-a-service); the headless appliance is built around KDE.
 

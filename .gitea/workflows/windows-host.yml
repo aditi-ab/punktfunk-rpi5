@@ -171,8 +171,8 @@ jobs:
           Push-Location web
           & $bun install --frozen-lockfile; if ($LASTEXITCODE) { throw "bun install failed ($LASTEXITCODE)" }
           & $bun run build; if ($LASTEXITCODE) { throw "web build failed ($LASTEXITCODE)" }
-          if (Select-String -Path .output\server\index.mjs -Pattern 'Bun\.serve' -Quiet) {
-            throw "web build is a bun bundle (Bun.serve) - need the node-server preset"
+          if (-not (Select-String -Path .output\server\index.mjs -Pattern 'Bun\.serve' -Quiet)) {
+            throw "web build is not a bun bundle - need the 'bun' preset + custom entry"
           }
           Pop-Location
           # Gate the installer on a real boot under the BUNDLED bun (the runtime it ships), serving /login.

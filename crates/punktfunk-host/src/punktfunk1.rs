@@ -121,7 +121,8 @@ pub fn run(opts: Punktfunk1Options) -> Result<()> {
     // (harmless — the loops' `is_armed()` gate is always false). The unified `serve` shares one
     // recorder across mgmt + both streaming paths instead.
     let stats = StatsRecorder::new(crate::stats_recorder::default_dir());
-    rt.block_on(serve(opts, np, stats))
+    // Standalone `punktfunk1-host` runs no management API, so advertise no `mgmt` port (0).
+    rt.block_on(serve(opts, 0, np, stats))
 }
 
 fn fingerprint_hex(fp: &[u8; 32]) -> String {
@@ -139,6 +140,9 @@ pub(crate) struct NativeServe {
     /// insecure; `serve --open` turns it off (trusted single-user setups). Pairing is armed on
     /// demand from the web console (arm → PIN); paired devices persist.
     pub require_pairing: bool,
+    /// The management API's TCP port, advertised over mDNS so a client browses the game library on
+    /// the same host IP (the unified `serve` always runs the mgmt API, so this is its bind port).
+    pub mgmt_port: u16,
 }
 
 /// Options for the native host when the unified `serve --native` runs it: real virtual capture,
@@ -166,6 +170,7 @@ pub(crate) fn native_serve_opts(cfg: &NativeServe) -> Punktfunk1Options {
 
 pub(crate) async fn serve(
     opts: Punktfunk1Options,
+    mgmt_port: u16,
     np: Arc<NativePairing>,
     stats: Arc<StatsRecorder>,
 ) -> Result<()> {
@@ -198,6 +203,8 @@ pub(crate) async fn serve(
             &fingerprint_hex(&fingerprint),
             opts.require_pairing,
             &h.uniqueid,
+            // 0 = standalone `punktfunk1-host` (no mgmt API) → don't advertise an `mgmt` port.
+            (mgmt_port != 0).then_some(mgmt_port),
         )
         .map_err(|e| tracing::warn!(error = %format!("{e:#}"), "native mDNS advertise failed (continuing)"))
         .ok(),
@@ -3864,6 +3871,7 @@ mod tests {
                     pairing_pin: None,
                     paired_store: None, // unused: the shared `np` IS the store handle
                 },
+                0, // no mgmt API in this test → advertise no `mgmt` mDNS port
                 np_host,
                 StatsRecorder::new(
                     std::env::temp_dir().join(format!("pf-approval-stats-{}", std::process::id())),

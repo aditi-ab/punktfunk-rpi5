@@ -226,7 +226,8 @@ fn web_setup(args: &[String]) -> Result<()> {
         bail!("web launcher missing: {}", cmd.display());
     }
     register_web_task(&cmd)?;
-    // 4. firewall: inbound TCP 3000
+    // 4. firewall: inbound TCP 3000. The console serves HTTPS (HTTP/1.1 over TLS) with the host's
+    //    identity cert. (No UDP/HTTP-3: browsers won't use QUIC against a self-signed/no-SAN cert.)
     if !run_quiet(
         "netsh",
         &[
@@ -251,7 +252,7 @@ fn web_setup(args: &[String]) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     run_quiet("schtasks", &["/run", "/tn", WEB_TASK]);
-    println!("web console set up + started (http://<host-ip>:3000)");
+    println!("web console set up + started (https://<host-ip>:3000)");
     Ok(())
 }
 

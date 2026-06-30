@@ -1,0 +1,43 @@
+import type { FC, ReactNode } from "react";
+import { m } from "@/paraglide/messages";
+
+/** ms → `m:ss`. */
+export function fmtDuration(ms: number): string {
+	const s = Math.max(0, Math.floor(ms / 1000));
+	return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
+}
+
+export function fmtTimestamp(unixMs: number): string {
+	if (!unixMs) return "—";
+	return new Date(unixMs).toLocaleString();
+}
+
+export function kindLabel(kind: string): string {
+	if (kind === "gamestream") return m.stats_kind_gamestream();
+	if (kind === "native") return m.stats_kind_native();
+	return kind;
+}
+
+export const Stat: FC<{ label: string; value: string }> = ({
+	label,
+	value,
+}) => (
+	<div className="flex flex-col">
+		<dt className="text-xs text-muted-foreground">{label}</dt>
+		<dd className="font-medium">{value}</dd>
+	</div>
+);
+
+export const ChartBlock: FC<{
+	title: string;
+	desc?: string;
+	children: ReactNode;
+}> = ({ title, desc, children }) => (
+	<div className="space-y-2">
+		<div>
+			<h3 className="text-sm font-medium">{title}</h3>
+			{desc && <p className="text-xs text-muted-foreground">{desc}</p>}
+		</div>
+		{children}
+	</div>
+);

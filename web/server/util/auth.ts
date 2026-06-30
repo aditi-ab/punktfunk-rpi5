@@ -87,7 +87,7 @@ export function isPublicPath(pathname: string): boolean {
 /** Validate a post-login redirect target: a same-origin path only. Rejects protocol-
  * relative (`//evil.com`) and absolute URLs to prevent an open redirect. */
 export function safeNextPath(next: string | undefined): string {
-	if (!next || !next.startsWith("/") || next.startsWith("//")) return "/";
+	if (!next?.startsWith("/") || next.startsWith("//")) return "/";
 	return next;
 }
 

@@ -1,37 +1,44 @@
-import { useQueryClient } from "@tanstack/react-query";
-import type { FC } from "react";
-import {
-	getGetLibraryQueryKey,
-	useCreateCustomGame,
-	useDeleteCustomGame,
-	useGetLibrary,
-	useUpdateCustomGame,
-} from "@/api/gen/library/library";
-import type { CustomInput } from "@/api/gen/model/customInput";
+import Section from "@unom/ui/section";
+import { Plus } from "lucide-react";
+import { type FC, useState } from "react";
+import { Button } from "@/components/ui/button";
 import { useLocale } from "@/lib/i18n";
-import { LibraryView } from "./view";
+import { m } from "@/paraglide/messages";
+import { type FormTarget, GameFormSection } from "./GameForm";
+import { LibraryGridSection } from "./LibraryGrid";
 
+// Library = an OVERVIEW grid + a SEPARATE add/edit form, deliberately split into their own files
+// (LibraryGrid / GameForm) so the two concerns never share a component. This container owns only the
+// shared "is the form open, and for what" UI state; the grid and form each own their own data.
 export const SectionLibrary: FC = () => {
 	useLocale();
-	const qc = useQueryClient();
-	const library = useGetLibrary();
-	const create = useCreateCustomGame();
-	const update = useUpdateCustomGame();
-	const remove = useDeleteCustomGame();
-
-	const invalidate = () =>
-		qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
+	// null = form hidden; "new" = adding; a GameEntry = editing that custom entry. Keying the form
+	// by the target re-seeds its fields when switching add → edit (or between entries).
+	const [target, setTarget] = useState<FormTarget | null>(null);
 
 	return (
-		<LibraryView
-			library={library}
-			onCreate={(data: CustomInput) =>
-				create.mutateAsync({ data }).then(invalidate)
-			}
-			onUpdate={(id, data) => update.mutateAsync({ id, data }).then(invalidate)}
-			onDelete={(id) => remove.mutateAsync({ id }).then(invalidate)}
-			isSaving={create.isPending || update.isPending}
-			isDeleting={remove.isPending}
-		/>
+		<Section maxWidth={false}>
+			<div className="flex flex-col gap-card">
+				<div className="flex items-center justify-between gap-4">
+					<h1 className="text-2xl font-semibold">{m.library_title()}</h1>
+					{target === null && (
+						<Button onClick={() => setTarget("new")}>
+							<Plus className="size-4" />
+							{m.library_add_button()}
+						</Button>
+					)}
+				</div>
+
+				{target !== null && (
+					<GameFormSection
+						key={target === "new" ? "new" : target.id}
+						target={target}
+						onClose={() => setTarget(null)}
+					/>
+				)}
+
+				<LibraryGridSection onEdit={(entry) => setTarget(entry)} />
+			</div>
+		</Section>
 	);
 };

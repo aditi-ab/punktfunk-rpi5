@@ -350,7 +350,17 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     let fps = parse_u("x-nv-video[0].maxFPS")
         .filter(|&f| f > 0)
         .unwrap_or(60);
-    let bitrate_kbps = parse_u("x-nv-vqos[0].bw.maximumBitrateKbps").unwrap_or(20_000);
+    // Bitrate: Moonlight caps the legacy `x-nv-vqos[0].bw.*` fields at 100 Mbps for old-GFE
+    // compatibility and carries the user's REAL (uncapped) configured bitrate in the moonlight-specific
+    // `x-ml-video.configuredBitrateKbps`. Read that first — exactly like Sunshine — so a 500 Mbps client
+    // setting isn't silently floored to 100. Fall back to the legacy max for clients that don't send it,
+    // then a conservative default; clamp to a sane ceiling (the RTSP ANNOUNCE is attacker-controlled).
+    const MAX_BITRATE_KBPS: u32 = 1_000_000; // 1 Gbps — well above Moonlight's 500 Mbps slider
+    let bitrate_kbps = parse_u("x-ml-video.configuredBitrateKbps")
+        .filter(|&b| b > 0)
+        .or_else(|| parse_u("x-nv-vqos[0].bw.maximumBitrateKbps").filter(|&b| b > 0))
+        .unwrap_or(20_000)
+        .min(MAX_BITRATE_KBPS);
     // Client codec choice (moonlight-common-c SdpGenerator.c): 0=H264, 1=HEVC, 2=AV1.
     let codec = match map.get("x-nv-vqos[0].bitStreamFormat").map(|s| s.trim()) {
         Some("1") => Codec::H265,
@@ -494,6 +504,26 @@ mod tests {
             assert_eq!((cfg.width, cfg.height, cfg.fps), (1920, 1080, 120));
             assert_eq!(cfg.bitrate_kbps, 40_000);
         }
+    }
+
+    /// Bitrate precedence: the moonlight-specific `x-ml-video.configuredBitrateKbps` (the user's real,
+    /// uncapped setting) wins over the legacy `x-nv-vqos[0].bw.maximumBitrateKbps` (which Moonlight floors
+    /// at 100 Mbps for old-GFE compat). Without this a 500 Mbps client streamed at 100.
+    #[test]
+    fn announce_prefers_configured_bitrate() {
+        // Real Moonlight shape: legacy max floored at 100 Mbps, configured carrying the true 500 Mbps.
+        let map = announce(&[
+            ("x-nv-vqos[0].bw.maximumBitrateKbps", "100000"),
+            ("x-ml-video.configuredBitrateKbps", "500000"),
+        ]);
+        assert_eq!(stream_config(&map).unwrap().bitrate_kbps, 500_000);
+        // No configured field (older client) → fall back to the legacy max (the base announce's 40 Mbps).
+        assert_eq!(stream_config(&announce(&[])).unwrap().bitrate_kbps, 40_000);
+        // A zero configured value is ignored (falls back), and an absurd value is clamped to the ceiling.
+        let zero = announce(&[("x-ml-video.configuredBitrateKbps", "0")]);
+        assert_eq!(stream_config(&zero).unwrap().bitrate_kbps, 40_000);
+        let huge = announce(&[("x-ml-video.configuredBitrateKbps", "9000000")]);
+        assert_eq!(stream_config(&huge).unwrap().bitrate_kbps, 1_000_000);
     }
 
     /// Missing required video keys → no config (the PLAY handler then refuses to stream).

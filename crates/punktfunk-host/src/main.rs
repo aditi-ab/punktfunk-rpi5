@@ -472,6 +472,10 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServ
     let mut native_port: u16 = 9777; // the native plane always runs now
     let mut open = false;
     let mut gamestream = false;
+    // Did the operator pin the mgmt bind themselves? If not, we LAN-expose the read surface below so
+    // paired clients can browse the game library out of the box (the bearer admin surface stays
+    // loopback-gated in `mgmt::require_auth` regardless of the bind).
+    let mut mgmt_bind_explicit = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -485,7 +489,8 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServ
             "--mgmt-bind" => {
                 opts.bind = next()?
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("bad --mgmt-bind (want IP:PORT)"))?
+                    .map_err(|_| anyhow::anyhow!("bad --mgmt-bind (want IP:PORT)"))?;
+                mgmt_bind_explicit = true;
             }
             "--mgmt-token" => {
                 let token = next()?;
@@ -526,9 +531,20 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServ
     if opts.token.is_none() {
         opts.token = Some(crate::mgmt_token::load_or_generate()?);
     }
+    // Default the mgmt listener to ALL interfaces (not just loopback) so a paired native client can
+    // fetch the game library over mTLS with no operator step — the whole point of "browse works by
+    // default". This only LAN-exposes the read-only cert allowlist; the bearer-token admin surface
+    // is confined to loopback peers in `mgmt::require_auth`, so binding wide adds no admin exposure.
+    // An operator who pinned `--mgmt-bind` (e.g. `127.0.0.1:47990` to restore loopback-only) keeps it.
+    if !mgmt_bind_explicit {
+        opts.bind = std::net::SocketAddr::from(([0, 0, 0, 0], mgmt::DEFAULT_PORT));
+    }
     let native = punktfunk1::NativeServe {
         port: native_port,
         require_pairing: !open,
+        // Advertise the mgmt port over mDNS so clients learn where to browse the library (rather than
+        // assuming the default). `opts.bind.port()` is the real port even if the operator moved it.
+        mgmt_port: opts.bind.port(),
     };
     Ok((opts, native, gamestream))
 }
@@ -643,9 +659,13 @@ USAGE:
     punktfunk-host spike [OPTIONS]            capture→encode→file pipeline spike (dev tool)
 
 SERVE OPTIONS:
-    --mgmt-bind <IP:PORT>        management API address (default: 127.0.0.1:47990)
-    --mgmt-token <TOKEN>         bearer token for the management API (or PUNKTFUNK_MGMT_TOKEN);
-                                 required when --mgmt-bind is not loopback
+    --mgmt-bind <IP:PORT>        management API address (default: 0.0.0.0:47990 — paired clients
+                                 reach the read-only surface, incl. the game library, over mTLS;
+                                 the bearer admin API stays loopback-only. Pin 127.0.0.1:47990 to
+                                 bind loopback only)
+    --mgmt-token <TOKEN>         bearer token for the management API (or PUNKTFUNK_MGMT_TOKEN); the
+                                 admin endpoints it guards are honored only from a loopback peer
+                                 (the co-located web console), never over the LAN
     --gamestream  (--moonlight)  ALSO run the GameStream/Moonlight-compat planes (nvhttp pairing,
                                  RTSP, ENet control, _nvstream mDNS). OFF by default — they carry
                                  inherent on-path weaknesses (plain-HTTP pairing + legacy GCM nonce
