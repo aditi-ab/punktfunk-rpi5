@@ -43,11 +43,33 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool) -> String {
     )
 }
 
-/// The `<ServerCodecModeSupport>` mask to advertise. On the VAAPI (AMD/Intel) backend it reflects
-/// what the GPU can ACTUALLY encode (probed — AV1 is narrow, and an old iGPU might lack HEVC), so a
-/// Moonlight client never negotiates a codec the encoder can't open. NVENC and Windows keep the
-/// Moonlight-validated static superset.
+/// The `<ServerCodecModeSupport>` mask to advertise: the SDR baseline ([`base_codec_mode_support`]) plus
+/// the HEVC Main10 (HDR) bit when the host can actually deliver HDR ([`apply_hdr`] /
+/// [`crate::gamestream::host_hdr_capable`]). Without the Main10 bit Moonlight never offers its HDR
+/// toggle; with it, enabling HDR client-side negotiates Main10 and the IDD-push path streams BT.2020 PQ.
 fn codec_mode_support() -> u32 {
+    apply_hdr(
+        base_codec_mode_support(),
+        crate::gamestream::host_hdr_capable(),
+    )
+}
+
+/// Add the HEVC Main10 (HDR) bit to `base` when `hdr` and HEVC is advertised — pure so the
+/// HDR-layering is unit-testable without a GPU. (HDR streaming uses HEVC Main10; AV1 Main10 is left
+/// off until the GameStream AV1 path is live-confirmed.)
+fn apply_hdr(base: u32, hdr: bool) -> u32 {
+    if hdr && base & super::SCM_HEVC != 0 {
+        base | super::SCM_HEVC_MAIN10
+    } else {
+        base
+    }
+}
+
+/// The **SDR baseline** mask. On the VAAPI (AMD/Intel) backend it reflects what the GPU can ACTUALLY
+/// encode (probed — AV1 is narrow, and an old iGPU might lack HEVC), so a Moonlight client never
+/// negotiates a codec the encoder can't open. NVENC and the GPU-less software path keep the
+/// Moonlight-validated static superset. HDR (Main10) is layered on by [`codec_mode_support`].
+fn base_codec_mode_support() -> u32 {
     #[cfg(target_os = "linux")]
     if crate::encode::linux_zero_copy_is_vaapi() {
         if let Some(m) = probed_mask(crate::encode::vaapi_codec_support()) {
@@ -106,6 +128,22 @@ mod tests {
             SERVER_CODEC_MODE_SUPPORT,
             SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8
         );
+    }
+
+    #[test]
+    fn apply_hdr_adds_main10_only_when_capable_and_hevc() {
+        // HDR-capable + HEVC advertised → Main10 added.
+        assert_eq!(
+            apply_hdr(SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8, true),
+            SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8 | SCM_HEVC_MAIN10
+        );
+        // Not HDR-capable → baseline unchanged (no HDR claim).
+        assert_eq!(
+            apply_hdr(SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8, false),
+            SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8
+        );
+        // HDR-capable but a GPU with no HEVC at all → no Main10 (you can't do Main10 without HEVC).
+        assert_eq!(apply_hdr(SCM_H264, true), SCM_H264);
     }
 
     #[test]

@@ -13,8 +13,8 @@ use super::{serverinfo, AppState, LaunchSession, HTTPS_PORT, HTTP_PORT, RTSP_POR
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Query, State},
-    http::header,
-    response::IntoResponse,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
     Extension, Router,
 };
@@ -64,6 +64,7 @@ fn router(state: Arc<AppState>, https: bool) -> Router {
         .route("/serverinfo", get(h_serverinfo))
         .route("/pair", get(h_pair))
         .route("/applist", get(h_applist))
+        .route("/appasset", get(h_appasset))
         .route("/launch", get(h_launch))
         .route("/resume", get(h_resume))
         .route("/cancel", get(h_cancel))
@@ -94,8 +95,30 @@ async fn h_applist(
         tracing::warn!("applist rejected — client is not paired");
         return xml(error_xml());
     }
-    // One app for now: the headless desktop (the wlroots virtual output).
     xml(super::apps::applist_xml())
+}
+
+/// Box-art cover proxy (`/appasset?appid=N&AssetType=2&AssetIdx=0`). Moonlight fetches per-app covers
+/// from the HOST, so we resolve the appid to its library title and proxy the cover image bytes (Steam/
+/// Epic CDN, etc.). 404 for Desktop / apps.json entries (no art) or any fetch failure — Moonlight then
+/// shows its title-only placeholder. Paired clients only (same gate as `/applist`). The resolve+fetch is
+/// blocking (disk + network), so it runs on a blocking thread off the async runtime.
+async fn h_appasset(
+    State(st): State<Arc<AppState>>,
+    peer: Option<Extension<PeerCertFingerprint>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if !peer_is_paired(&peer, &st) {
+        tracing::warn!("appasset rejected — client is not paired");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(appid) = q.get("appid").and_then(|s| s.parse::<u32>().ok()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match tokio::task::spawn_blocking(move || super::apps::appasset_bytes(appid)).await {
+        Ok(Some((bytes, ctype))) => ([(header::CONTENT_TYPE, ctype)], bytes).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn h_launch(

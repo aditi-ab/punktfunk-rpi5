@@ -28,6 +28,10 @@ pub struct StreamConfig {
     pub codec: Codec,
     /// Client's `x-nv-vqos[0].fec.minRequiredFecPackets` — parity floor per FEC block.
     pub min_fec: u8,
+    /// Client requested HDR (`dynamicRangeMode != 0`) AND the host can deliver it ([`host_hdr_capable`]).
+    /// Drives the capturer's proactive advanced-color enable; the encoder picks Main10 from the captured
+    /// (P010) frame format. Always `false` on a non-HDR host, so the SDR path is unchanged.
+    pub hdr: bool,
 }
 
 /// Slot for the persistent screen capturer, shared with the control plane and reused across
@@ -137,7 +141,15 @@ fn run(
         let launch_here = compositor != crate::vdisplay::Compositor::Gamescope;
         #[cfg(any(windows, target_os = "linux"))]
         if launch_here {
-            if let Some(cmd) = app
+            // A library title (Steam/Epic/GOG/Xbox/custom, surfaced in /applist) carries its
+            // store-qualified id — resolve + launch it against the host's OWN library (the client can
+            // only pick an existing title, never inject a command). An apps.json entry instead carries
+            // an operator-typed `cmd`. Library id wins when both are set.
+            if let Some(lib_id) = app.and_then(|a| a.library_id.as_deref()) {
+                if let Err(e) = crate::library::launch_gamestream_library(lib_id) {
+                    tracing::warn!(library_id = lib_id, error = %e, "gamestream: could not launch library title");
+                }
+            } else if let Some(cmd) = app
                 .and_then(|a| a.cmd.as_deref())
                 .filter(|c| !c.trim().is_empty())
             {
@@ -245,16 +257,31 @@ fn open_gs_virtual_source(
             refresh_hz: cfg.fps,
         })
         .context("create virtual output at client resolution")?;
-    // want_hdr=false: GameStream HDR is not negotiated into StreamConfig here (the default WGC backend
-    // still auto-detects HDR from the output colorspace; only the opt-in IDD-push path streams SDR).
+    // HDR: pass the negotiated `cfg.hdr` (client asked for HDR AND the host can deliver it). On the
+    // Windows IDD-push path this proactively enables advanced color on the virtual display so a Main10
+    // PQ stream flows even from an SDR desktop; an already-HDR desktop streams PQ regardless (the
+    // capturer follows the display). No-op on Linux (8-bit, and `cfg.hdr` is always false there).
     let capturer = capture::capture_virtual_output(
         vout,
-        capture::OutputFormat::resolve(false),
+        capture::OutputFormat::resolve(cfg.hdr),
         crate::session_plan::CaptureBackend::resolve(),
     )
     .context("capture virtual output")?;
     capturer.set_active(true);
     Ok((capturer, compositor))
+}
+
+/// The encoder bit depth implied by the captured frame's pixel format: a 10-bit (HDR) source — the
+/// Windows IDD-push capturer's `P010`/`Rgb10a2` when the desktop is HDR — opens NVENC as HEVC Main10
+/// (BT.2020 PQ); everything else is 8-bit. The encoder backends already key the real profile off the
+/// `format`, so this just keeps the `bit_depth` argument honest (the old hard-coded `8` mislabeled an
+/// HDR stream that the format had already promoted to 10-bit).
+fn gs_bit_depth(format: crate::capture::PixelFormat) -> u8 {
+    use crate::capture::PixelFormat;
+    match format {
+        PixelFormat::P010 | PixelFormat::Rgb10a2 => 10,
+        _ => 8,
+    }
 }
 
 /// One frame's packets, handed from the encode thread to the send thread.
@@ -442,9 +469,10 @@ fn stream_body(
         cfg.fps,
         cfg.bitrate_kbps as u64 * 1000,
         frame.is_cuda(),
-        8, // GameStream/Moonlight path: 8-bit (its own codec negotiation)
+        // 8-bit SDR, or 10-bit when the captured frame is HDR (P010) — see `gs_bit_depth`.
+        gs_bit_depth(frame.format),
         // GameStream/Moonlight stays 4:2:0 — stock Moonlight clients can't decode 4:4:4, and the
-        // protocol has no chroma negotiation. 4:4:4 is punktfunk/1-native only.
+        // Windows IDD-push capturer can't yet deliver full-chroma frames. 4:4:4 is punktfunk/1-native only.
         encode::ChromaFormat::Yuv420,
     )
     .context("open video encoder for stream")?;
@@ -574,7 +602,7 @@ fn stream_body(
                     cfg.fps,
                     cfg.bitrate_kbps as u64 * 1000,
                     frame.is_cuda(),
-                    8,
+                    gs_bit_depth(frame.format),
                     encode::ChromaFormat::Yuv420, // GameStream stays 4:2:0
                 )
                 .context("reopen encoder after rebuild")?;

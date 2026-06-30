@@ -1116,6 +1116,58 @@ fn fetch_json(url: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&body).ok()
 }
 
+/// Fetch one image URL for the GameStream `/appasset` cover proxy, as `(bytes, content-type)`. Handles
+/// `data:` URLs (Lutris inlines art that way) by decoding inline, and `http(s)` URLs by a bounded GET
+/// (8 MiB cap so a hostile/huge art URL can't balloon host memory). `None` on any non-image scheme,
+/// network/decoder error, or empty body. Blocking (ureq) — call off the async runtime.
+fn fetch_image(url: &str) -> Option<(Vec<u8>, String)> {
+    use base64::Engine as _;
+    use std::io::Read as _;
+    if let Some(rest) = url.strip_prefix("data:") {
+        // data:[<mediatype>][;base64],<payload>
+        let (meta, data) = rest.split_once(',')?;
+        let ctype = meta
+            .split(';')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let bytes = if meta.contains(";base64") {
+            base64::engine::general_purpose::STANDARD.decode(data).ok()?
+        } else {
+            data.as_bytes().to_vec()
+        };
+        return (!bytes.is_empty()).then_some((bytes, ctype));
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let resp = agent.get(url).call().ok()?;
+    let ctype = resp.header("Content-Type").unwrap_or("image/jpeg").to_string();
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(8 * 1024 * 1024)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (!bytes.is_empty()).then_some((bytes, ctype))
+}
+
+/// Resolve + fetch the best box-art cover for a library id (the GameStream `/appasset` proxy — Moonlight
+/// fetches per-app covers from the HOST, not the CDN, so we proxy the bytes). Tries the portrait (tall
+/// capsule Moonlight wants) → header → hero → logo, returning the first that fetches as
+/// `(bytes, content-type)`. Resolves the id against the host's OWN library. Blocking — call off the
+/// async runtime (e.g. `spawn_blocking`).
+pub fn fetch_box_art(id: &str) -> Option<(Vec<u8>, String)> {
+    let g = all_games().into_iter().find(|g| g.id == id)?;
+    [g.art.portrait, g.art.header, g.art.hero, g.art.logo]
+        .into_iter()
+        .flatten()
+        .find_map(|url| fetch_image(&url))
+}
+
 /// Make a protocol-relative URL (`//host/...`, common in GOG + MS catalog responses) absolute https.
 fn abs_url(u: &str) -> String {
     u.strip_prefix("//")
@@ -1487,6 +1539,25 @@ pub fn launch_gamestream_command(cmd: &str) -> Result<()> {
     }
 }
 
+/// Launch a library title chosen from the **GameStream `/applist`** (the store-qualified id is carried
+/// on the `AppEntry`, resolved from the numeric Moonlight appid). Windows spawns it into the interactive
+/// user session ([`launch_title`]); Linux resolves its shell command ([`launch_command`]) and runs it
+/// into the live session ([`launch_gamestream_command`]). The id is resolved against the host's OWN
+/// library, so a client can only ever pick an existing title — never inject a command.
+#[cfg(any(windows, target_os = "linux"))]
+pub fn launch_gamestream_library(id: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        launch_title(id)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cmd = launch_command(id)
+            .ok_or_else(|| anyhow::anyhow!("library id '{id}' has no launch recipe"))?;
+        launch_gamestream_command(&cmd)
+    }
+}
+
 /// The full library: every store's titles merged + the custom entries, sorted by title.
 pub fn all_games() -> Vec<GameEntry> {
     let mut games = SteamProvider.list();
@@ -1606,6 +1677,18 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn fetch_image_decodes_data_url() {
+        // "Hi" base64 == "SGk=" — the data: branch is pure (no network), so it's deterministic.
+        let (bytes, ctype) = fetch_image("data:image/png;base64,SGk=").expect("data url decodes");
+        assert_eq!(bytes, b"Hi");
+        assert_eq!(ctype, "image/png");
+        // A non-image scheme is rejected (no launcher art ever points at file://, but be defensive).
+        assert!(fetch_image("file:///etc/passwd").is_none());
+        // Empty payload → None (never serve a 0-byte cover).
+        assert!(fetch_image("data:image/png;base64,").is_none());
     }
 
     #[test]

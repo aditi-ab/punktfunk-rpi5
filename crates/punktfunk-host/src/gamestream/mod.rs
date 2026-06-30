@@ -48,12 +48,25 @@ pub const SCM_HEVC: u32 = 0x0000_0100;
 pub const SCM_HEVC_MAIN10: u32 = 0x0000_0200;
 pub const SCM_AV1_MAIN8: u32 = 0x0001_0000;
 pub const SCM_AV1_MAIN10: u32 = 0x0002_0000;
-/// What we actually encode via NVENC: H.264, HEVC Main, AV1 Main 8-bit (= 65793). The
-/// 10-bit flags are deliberately NOT advertised: Moonlight only selects Main10 profiles for
-/// HDR streaming, and our capture path is 8-bit SDR BGRx with no HDR metadata plumbing —
-/// advertising them would let clients enable an HDR mode we can't deliver. (The previous
-/// placeholder 3843 = 0xF03 wrongly claimed HEVC Main10 + 4:4:4 and *no* AV1.)
+/// The **SDR baseline** codec mask: H.264, HEVC Main, AV1 Main 8-bit (= 65793). HEVC Main10 (HDR) is
+/// layered on top of this at runtime by `serverinfo::codec_mode_support` when — and only when — the
+/// host can actually deliver it ([`host_hdr_capable`]); it is never a static claim, because a non-HDR
+/// host (Linux, or a Windows host without the `PUNKTFUNK_10BIT` opt-in) must not invite a client into
+/// an HDR mode it can't produce. (The previous placeholder 3843 = 0xF03 wrongly claimed HEVC Main10 +
+/// 4:4:4 and *no* AV1.) 4:4:4 stays off entirely: stock Moonlight is 4:2:0 and the Windows IDD-push
+/// capturer can't yet deliver full-chroma frames (`crate::capture::capturer_supports_444`).
 pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
+
+/// Whether this host can deliver an **HDR** (HEVC Main10 / BT.2020 PQ) GameStream — the single gate
+/// for advertising [`SCM_HEVC_MAIN10`] in serverinfo and `IsHdrSupported` per app, and for honoring a
+/// client's `dynamicRangeMode` request. HDR capture+encode is **Windows-only** (the Linux host is
+/// 8-bit, blocked upstream) and behind the operator's `PUNKTFUNK_10BIT` opt-in — the same policy gate
+/// the native punktfunk/1 plane honors. When this is true the IDD-push capturer streams HEVC Main10 PQ
+/// whenever the desktop is HDR, and a client HDR request makes the GameStream video path proactively
+/// enable advanced color on the per-session virtual display so PQ flows even from an SDR desktop.
+pub fn host_hdr_capable() -> bool {
+    cfg!(target_os = "windows") && crate::config::config().ten_bit
+}
 
 /// Stable host identity + advertised capabilities, shared across control-plane handlers.
 pub struct Host {
