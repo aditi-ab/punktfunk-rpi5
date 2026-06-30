@@ -73,7 +73,7 @@ jobs:
 
       - name: Version + channel
         # Tag vX.Y.Z -> X.Y.Z on the OSTree `stable` branch (a real release); a main push ->
-        # 0.3.0-ciN.g<sha> on the `canary` branch. The two branches live side-by-side in one repo
+        # 0.5.0-ciN.g<sha> on the `canary` branch. The two branches live side-by-side in one repo
         # (rsync runs without --delete), each tracked by its own .flatpakref, so `flatpak update`
         # on a stable box never jumps to a canary build. The generic-registry version string allows
         # letters/dots/hyphens.
@@ -81,7 +81,7 @@ jobs:
           SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; BRANCH=stable; ALIAS=latest ;;
-            *)            V="0.3.0-ci${GITHUB_RUN_NUMBER}.g${SHORT}"; BRANCH=canary; ALIAS=canary ;;
+            *)            V="0.5.0-ci${GITHUB_RUN_NUMBER}.g${SHORT}"; BRANCH=canary; ALIAS=canary ;;
           esac
           echo "VERSION=$V" >> "$GITHUB_ENV"
           echo "BUNDLE=punktfunk-client-${V}.flatpak" >> "$GITHUB_ENV"

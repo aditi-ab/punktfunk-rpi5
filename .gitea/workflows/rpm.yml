@@ -68,8 +68,8 @@ jobs:
           restore-keys: cargo-home-
 
       - name: Version + channel
-        # vX.Y.Z tag -> X.Y.Z-1 in the base group (a real release); main push -> 0.3.0-0.ciN.g<sha>
-        # in the `<base>-canary` group, whose "0." release sorts below the eventual 0.3.0-1 yet
+        # vX.Y.Z tag -> X.Y.Z-1 in the base group (a real release); main push -> 0.5.0-0.ciN.g<sha>
+        # in the `<base>-canary` group, whose "0." release sorts below the eventual 0.5.0-1 yet
         # climbs by run number. The canary base stays one minor ahead of the latest stable so a
         # stable->canary box re-point still moves forward. The spec %build stamps
         # PUNKTFUNK_BUILD_VERSION from these macros into the binary (--version provenance).
@@ -77,7 +77,7 @@ jobs:
           SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; R="1"; GROUP="${{ matrix.group }}" ;;
-            *)            V="0.3.0"; R="0.ci${GITHUB_RUN_NUMBER}.g${SHORT}"; GROUP="${{ matrix.group }}-canary" ;;
+            *)            V="0.5.0"; R="0.ci${GITHUB_RUN_NUMBER}.g${SHORT}"; GROUP="${{ matrix.group }}-canary" ;;
           esac
           echo "PF_VERSION=$V" >> "$GITHUB_ENV"
           echo "PF_RELEASE=$R" >> "$GITHUB_ENV"

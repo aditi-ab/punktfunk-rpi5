@@ -101,7 +101,7 @@ jobs:
         run: |
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; V="${V%%-*}" ;;  # App Store marketing version is numeric X.Y.Z (drop -rc)
-            *)            V="0.3.0" ;;                                # canary marketing version; the build number disambiguates
+            *)            V="0.5.0" ;;                                # canary marketing version; the build number disambiguates
           esac
           echo "VERSION=$V" >> "$GITHUB_ENV"
           echo "BUILD_NUM=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"

@@ -80,7 +80,7 @@ jobs:
         run: |
           case "$GITHUB_REF" in
             refs/tags/v*) VN="${GITHUB_REF_NAME#v}"; TRACK="alpha" ;;   # alpha = built-in closed testing
-            *)            VN="0.3.0-ci${GITHUB_RUN_NUMBER}"; TRACK="internal" ;;
+            *)            VN="0.5.0-ci${GITHUB_RUN_NUMBER}"; TRACK="internal" ;;
           esac
           echo "VERSION_NAME=$VN" >> "$GITHUB_ENV"
           echo "PLAY_TRACK=$TRACK" >> "$GITHUB_ENV"

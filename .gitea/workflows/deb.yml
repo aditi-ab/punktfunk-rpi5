@@ -36,8 +36,8 @@ jobs:
 
       - name: Version + channel
         # vX.Y.Z tag -> X.Y.Z, published to the `stable` apt distribution (a real release).
-        # A main push -> 0.3.0~ciN.g<sha>, published to the `canary` distribution: the '~' sorts
-        # below the eventual 0.3.0 tag, it climbs monotonically by run number, and the canary base
+        # A main push -> 0.5.0~ciN.g<sha>, published to the `canary` distribution: the '~' sorts
+        # below the eventual 0.5.0 tag, it climbs monotonically by run number, and the canary base
         # stays one minor AHEAD of the latest stable so a stable->canary box re-point still moves
         # forward (see channels.md). Computed BEFORE the build so it's stamped into the binary
         # (PUNKTFUNK_BUILD_VERSION -> build.rs -> --version).
@@ -45,7 +45,7 @@ jobs:
           SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
-            *)            V="0.3.0~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
+            *)            V="0.5.0~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
           esac
           echo "VERSION=$V" >> "$GITHUB_ENV"
           echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
