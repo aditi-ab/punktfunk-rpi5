@@ -78,6 +78,12 @@ jobs:
           # Per-arch FFmpeg import libs (provision-windows-punktfunk-extras.ps1 fetches both).
           $ff = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'C:\Users\Public\ffmpeg-arm64' } else { 'C:\Users\Public\ffmpeg' }
           "FFMPEG_DIR=$ff" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # $ff\bin on PATH too (not just FFMPEG_DIR, which only satisfies the linker): the test
+          # binary needs the actual DLLs to load at runtime. Set here rather than relying on the
+          # daemon's own env (project-env.ps1) - on a freshly cloned/registered runner the daemon
+          # starts before this job's "Ensure Windows toolchain" step ever writes that file, so its
+          # PATH doesn't include this yet on a first run (confirmed live: STATUS_DLL_NOT_FOUND).
+          "$ff\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           rustup target add ${{ matrix.target }}
           rustc --version
           cargo --version
