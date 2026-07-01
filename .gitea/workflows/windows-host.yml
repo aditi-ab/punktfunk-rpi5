@@ -1,8 +1,9 @@
 # Build the punktfunk Windows HOST as a signed Inno Setup installer and publish it to Gitea's generic
 # package registry, so a Windows GPU box can install the streaming host (SYSTEM service + bundled
 # pf-vdisplay virtual-display driver + the web management console, run by a scheduled task on a bundled
-# bun) from one signed setup.exe. Runs on the self-hosted Windows runner
-# (host mode; scripts/ci/setup-windows-runner.ps1) — same MSVC/Windows-SDK/LLVM env as windows.yml.
+# bun) from one signed setup.exe. Runs on a self-hosted windows-amd64 runner
+# (host mode; same MSVC/Windows-SDK/LLVM env as windows.yml — generic from unom/infra's
+# windows-runner/, FFmpeg/Inno Setup self-provision via the "Ensure Windows toolchain" step below).
 #
 # Why an installer and not MSIX (like the client): the host installs a LocalSystem SCM service that
 # CreateProcessAsUserW's into the interactive session for secure-desktop capture, and bundles a
@@ -57,6 +58,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Ensure Windows toolchain (WDK, FFmpeg, Inno Setup, ARM64 target)
+        shell: pwsh
+        run: ./scripts/ci/ensure-windows-toolchain.ps1
+
       - name: Locale-safety gate (installer-run scripts must be ASCII)
         shell: pwsh
         # The installer runs these via powershell.exe (Windows PowerShell 5.1) and cmd.exe on the END
@@ -82,7 +87,7 @@ jobs:
           "CARGO_TARGET_DIR=C:\t" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CARGO_WORKSPACE_DIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           # FFMPEG_DIR: the same BtbN lgpl-shared x64 tree the Windows CLIENT links against (provisioned
-          # by scripts/ci/setup-windows-runner.ps1). The host's AMD/Intel AMF/QSV encode backend
+          # by scripts/ci/provision-windows-punktfunk-extras.ps1). The host's AMD/Intel AMF/QSV encode backend
           # (--features amf-qsv) link-imports avcodec/avutil/swscale from it; pack-host-installer.ps1
           # then bundles its bin\*.dll into the installer. LIBCLANG_PATH is in the runner daemon env.
           if (-not $env:FFMPEG_DIR) {
@@ -124,14 +129,6 @@ jobs:
           cargo fmt --check; if ($LASTEXITCODE) { throw "pf-vkhdr-layer rustfmt" }
           cargo clippy --release -- -D warnings; if ($LASTEXITCODE) { throw "pf-vkhdr-layer clippy" }
           Pop-Location
-
-      - name: Ensure Inno Setup
-        shell: pwsh
-        run: |
-          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe') -and -not (Get-Command iscc -ErrorAction SilentlyContinue)) {
-            Write-Output "installing Inno Setup via choco"
-            choco install innosetup -y --no-progress
-          }
 
       - name: Fetch portable bun runtime (build tool + bundled to run the console)
         shell: pwsh

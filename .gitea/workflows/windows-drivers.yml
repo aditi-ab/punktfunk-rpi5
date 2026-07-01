@@ -1,5 +1,5 @@
-# Windows driver workspace CI — runs on the self-hosted Windows runner (home-windows-1, host mode;
-# label windows-amd64). Part of the Windows-host rewrite (design/windows-host-rewrite.md, M0).
+# Windows driver workspace CI — runs on a self-hosted Windows runner (home-windows-runner-1, host
+# mode; label windows-amd64). Part of the Windows-host rewrite (design/windows-host-rewrite.md, M0).
 #
 # Stage 1 (this file): PROBE the runner's driver toolchain (WDK / EWDK / cargo-make / LLVM / the
 # inf2cat/stampinf/devgen/signtool tools) so we know what's provisioned BEFORE writing driver code,
@@ -26,7 +26,8 @@ on:
       - 'crates/pf-driver-proto/**'
       - 'packaging/windows/drivers/**'
 
-# Driver builds need the WDK on the runner (provision once via windows-drivers-provision.yml).
+# Driver builds need the WDK on the runner - the driver-build job below self-provisions it via
+# scripts/ci/ensure-windows-toolchain.ps1, a fast no-op once already present.
 
 jobs:
   probe-and-proto:
@@ -124,11 +125,12 @@ jobs:
       # retired that — see design/windows-build-and-packaging.md.
     steps:
       - uses: actions/checkout@v4
-      - name: Ensure WDK + cargo-wdk (idempotent self-provision)
-        # Run the provisioning script here too so driver-build is self-sufficient and never races a
-        # separate provision run on the single runner. Path is relative to the job working-directory
-        # (packaging/windows/drivers). Near-noop once the toolchain is present.
-        run: ../../../scripts/ci/provision-windows-wdk.ps1
+      - name: Ensure Windows toolchain (WDK, FFmpeg, Inno Setup, ARM64 target)
+        # Shared self-provision step (also used by windows.yml/windows-msix.yml/windows-host.yml) so
+        # driver-build is self-sufficient on any windows-amd64 runner and never races a manually
+        # dispatched provisioning workflow landing on a different one. Path is relative to the job
+        # working-directory (packaging/windows/drivers). Near-noop once the toolchain is present.
+        run: ../../../scripts/ci/ensure-windows-toolchain.ps1
       - name: cargo build the driver workspace (wdk-probe + wdk-iddcx + pf-vdisplay)
         # Whole workspace: wdk-probe (toolchain/surface-assert probe) + wdk-iddcx (DDI wrappers) +
         # pf-vdisplay (the real IddCx driver). pf-vdisplay linking proves the IddCx call sites resolve

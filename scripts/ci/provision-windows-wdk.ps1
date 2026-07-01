@@ -7,8 +7,11 @@
 # Idempotent: skips the WDK install if the km/wdf headers are already present, and cargo-wdk if already
 # installed. Safe to run repeatedly. Runs non-interactively (/q /norestart) — never auto-reboots.
 #
-# Invoked by .gitea/workflows/windows-drivers-provision.yml (workflow_dispatch) and referenced by
-# scripts/ci/setup-windows-runner.ps1. Run as the runner's account (SYSTEM) with admin rights.
+# Invoked by scripts/ci/ensure-windows-toolchain.ps1, the shared self-provision step every Windows
+# CI workflow runs at job start (windows-drivers.yml, windows.yml, windows-msix.yml,
+# windows-host.yml), on top of the generic runner unom/infra provisions (windows-runner/) and
+# provision-windows-punktfunk-extras.ps1's FFmpeg/Inno Setup/ARM64-target layer. Run as the
+# runner's account (SYSTEM) with admin rights.
 [CmdletBinding()]
 param(
   # WDK 26100 standalone bootstrapper. Source: https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk

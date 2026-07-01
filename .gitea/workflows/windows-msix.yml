@@ -1,8 +1,9 @@
 # Build the punktfunk Windows client as signed MSIX packages (x64 + ARM64) and publish them to
 # Gitea's generic package registry, so Windows boxes can download + install a real package (Start
-# tile, clean install/uninstall) instead of a loose exe. Runs on the self-hosted Windows runner
-# (host mode; scripts/ci/setup-windows-runner.ps1) — the MSVC/WinUI/FFmpeg toolchain + the Windows
-# SDK's makeappx/signtool are baked into the runner's daemon env, same as windows.yml.
+# tile, clean install/uninstall) instead of a loose exe. Runs on a self-hosted windows-amd64
+# runner (host mode; the MSVC/WinUI toolchain comes from unom/infra's windows-runner/, FFmpeg
+# self-provisions via the "Ensure Windows toolchain" step below, same as windows.yml) — the
+# Windows SDK's makeappx/signtool are baked into the runner's daemon env.
 #
 # Both arches come off the ONE x64 runner: x86_64 natively, aarch64 cross-compiled (the x64 MSVC
 # toolset has the ARM64 cross compiler; the matrix points FFMPEG_DIR at the ARM64 FFmpeg tree). See
@@ -61,6 +62,10 @@ jobs:
             td: C:\t-a64
     steps:
       - uses: actions/checkout@v4
+
+      - name: Ensure Windows toolchain (WDK, FFmpeg, Inno Setup, ARM64 target)
+        shell: pwsh
+        run: ./scripts/ci/ensure-windows-toolchain.ps1
 
       - name: Configure + version
         shell: pwsh

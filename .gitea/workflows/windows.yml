@@ -1,5 +1,8 @@
-# Windows client CI — runs on the self-hosted Windows runner (home-windows-1, host mode; see
-# scripts/ci/setup-windows-runner.ps1). Build + clippy + fmt + test the WinUI 3 client
+# Windows client CI — runs on a self-hosted windows-amd64 runner (host mode; the generic runner +
+# toolchain come from unom/infra's windows-runner/; punktfunk's own extras - FFmpeg, WDK, Inno
+# Setup, the ARM64 rustup target - self-provision via the "Ensure Windows toolchain" step below, a
+# fast no-op once already present, so any runner with that label works with no manual dispatch
+# step first). Build + clippy + fmt + test the WinUI 3 client
 # (windows-reactor + D3D11/SwapChainPanel + WASAPI + SDL3).
 #
 # Two architectures from ONE x64 runner: x86_64-pc-windows-msvc natively and
@@ -61,6 +64,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Ensure Windows toolchain (WDK, FFmpeg, Inno Setup, ARM64 target)
+        shell: pwsh
+        run: ./scripts/ci/ensure-windows-toolchain.ps1
+
       - name: Configure + toolchain versions
         shell: pwsh
         run: |
@@ -68,7 +75,7 @@ jobs:
           # Per-arch short target root (dodges MAX_PATH; keeps the two legs from sharing target\).
           $td = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'C:\t-a64' } else { 'C:\t' }
           "CARGO_TARGET_DIR=$td" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          # Per-arch FFmpeg import libs (the runner provisions both — setup-windows-runner.ps1).
+          # Per-arch FFmpeg import libs (provision-windows-punktfunk-extras.ps1 fetches both).
           $ff = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'C:\Users\Public\ffmpeg-arm64' } else { 'C:\Users\Public\ffmpeg' }
           "FFMPEG_DIR=$ff" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           rustup target add ${{ matrix.target }}

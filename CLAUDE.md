@@ -285,7 +285,25 @@ clients are deliberately NOT containerized); `apple.yml` builds the xcframework 
 provisioned by `scripts/ci/setup-macos-runner.sh`). Per-client/host release workflows:
 `deb.yml`/`rpm.yml`/`flatpak.yml` (Linux client), `android.yml` (Google Play), `windows-msix.yml`
 (Windows client), `windows-host.yml` (Windows host installer), `release.yml` (Apple notarized DMG +
-TestFlight), `decky.yml` (Steam Deck plugin); Windows builds run on a self-hosted Windows runner.
+TestFlight), `decky.yml` (Steam Deck plugin); Windows builds run on a self-hosted Windows runner
+(`home-windows-runner-1`, vmid 210, `windows-amd64:host` label). The runner is reproducible and
+**owned by `unom/infra`**, not this repo, since it's shared across unom Windows projects going
+forward: `unom/infra`'s `windows-runner/` Packer template bakes a generic Windows 11 template (OS
+install + OpenSSH Server + VS Build Tools/NASM/CMake/LLVM + the act_runner/Node/rustup base, no
+registration) on Proxmox once; `proxmox/windows-runner/` (Terraform, `bpg/proxmox`) full-clones it
+(agent-based IP discovery, no pre-provisioned DHCP reservation needed) and registers the instance
+over SSH remote-exec — the same bake-once/clone-fast split `proxmox/unom-1` uses for the Linux CI
+host, just without a native Windows cloud-init (registration goes over `remote-exec`/SSH instead of
+`initialization{}`; WinRM was tried first but is deprecated in OpenTofu, so this moved to SSH via
+Windows' in-box OpenSSH Server). punktfunk layers its own extras on top of that generic runner:
+`scripts/ci/provision-windows-wdk.ps1` (WDK + cargo-wdk for the UMDF drivers) and
+`scripts/ci/provision-windows-punktfunk-extras.ps1` (FFmpeg x64/ARM64 trees, Inno Setup, the
+`aarch64-pc-windows-msvc` rustup target) — both idempotent, and both run automatically at the start
+of every Windows CI job via the shared `scripts/ci/ensure-windows-toolchain.ps1` step (a fast no-op
+once already provisioned), rather than a separate manually-dispatched provisioning workflow — that
+avoided a real footgun once there could be more than one `windows-amd64` runner: a manually
+dispatched provisioning workflow has no way to target a *specific* runner instance, so it could
+land on an already-provisioned box instead of the one that actually needed it.
 
 ## Layout
 
