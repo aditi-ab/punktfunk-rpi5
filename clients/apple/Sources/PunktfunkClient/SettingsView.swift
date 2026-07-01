@@ -38,6 +38,7 @@ struct SettingsView: View {
     #endif
     #if os(iOS)
     @AppStorage(DefaultsKey.pointerCapture) private var pointerCapture = true
+    @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
     // The sidebar selection drives the detail pane on iPad and the pushed sub-page on iPhone.
     // Width class decides the initial value: nil on iPhone (show the category list first),
     // General on iPad (a two-column layout should never open with an empty detail).
@@ -738,6 +739,9 @@ struct SettingsView: View {
                     Text(option.label).tag(option.tag)
                 }
             }
+            #if os(iOS)
+            Toggle("Gamepad-optimized browsing", isOn: $gamepadUIEnabled)
+            #endif
             #if DEBUG && !os(tvOS)
             Button("Test Controller…") { showControllerTest = true }
                 .disabled(gamepads.active == nil)
@@ -746,9 +750,17 @@ struct SettingsView: View {
         } header: {
             Text("Controllers")
         } footer: {
-            Text(Self.controllersFooter)
-                .font(.geist(12, relativeTo: .caption))
-                .foregroundStyle(.secondary)
+            // The iOS-only gamepad-UI blurb is appended here, not merged into the shared
+            // `controllersFooter` constant — tvOS's `tvBody` reuses that exact string (line ~348)
+            // for its own footer and has no such toggle to describe.
+            VStack(alignment: .leading, spacing: 6) {
+                Text(Self.controllersFooter)
+                #if os(iOS)
+                Text(Self.gamepadUIFooter)
+                #endif
+            }
+            .font(.geist(12, relativeTo: .caption))
+            .foregroundStyle(.secondary)
         }
     }
 
@@ -855,6 +867,15 @@ struct SettingsView: View {
         + "and motion; a DualShock 4 the same minus adaptive triggers), and changes apply "
         + "from the next session. Two identical controllers may swap a manual selection "
         + "after reconnecting."
+
+    #if os(iOS)
+    private static let gamepadUIFooter =
+        "When a controller is connected, the host list and game library switch to a "
+        + "controller-friendly layout — larger focus targets and a swipeable cover browser "
+        + "for the library. Turn this off to always use the touch layout. (The system may "
+        + "still move basic focus with a controller connected even with this off — that's "
+        + "outside the app's control.)"
+    #endif
 
     /// "Use controller" choices: Automatic, every forwardable controller, and — so a stale
     /// pin stays visible instead of leaving the Picker selection tag-less — any pinned id

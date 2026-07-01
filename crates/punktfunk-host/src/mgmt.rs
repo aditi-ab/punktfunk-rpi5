@@ -171,6 +171,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(get_library))
                 .routes(routes!(create_custom_game))
                 .routes(routes!(update_custom_game, delete_custom_game))
+                .routes(routes!(get_library_art))
                 .routes(routes!(stats_capture_start))
                 .routes(routes!(stats_capture_stop))
                 .routes(routes!(stats_capture_status))
@@ -544,7 +545,7 @@ async fn require_auth(State(st): State<Arc<MgmtState>>, req: Request, next: Next
 /// edit the library). `/health` is handled separately (always open).
 fn cert_may_access(method: &Method, path: &str) -> bool {
     method == Method::GET
-        && matches!(
+        && (matches!(
             path,
             "/api/v1/host"
                 | "/api/v1/compositors"
@@ -555,7 +556,7 @@ fn cert_may_access(method: &Method, path: &str) -> bool {
                 // library MUTATIONS (POST/PUT/DELETE /library/custom) stay token-only via the exact
                 // GET-path match above.
                 | "/api/v1/library"
-        )
+        ) || path.starts_with("/api/v1/library/art/"))
 }
 
 /// Compare SHA-256 digests instead of the strings — constant-time with respect to the
@@ -1276,6 +1277,45 @@ async fn delete_custom_game(Path(id): Path<String>) -> Response {
     }
 }
 
+/// Fetch one cover-art image for a library entry
+///
+/// Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams
+/// the image bytes. For a Steam title, the host's own local Steam cache is tried first (exact —
+/// it's what the user's Steam client already shows for it), the public Steam CDN's flat URL
+/// convention as a fallback (newer titles' CDN assets can live at a per-asset-hash path the host
+/// can't predict, in which case this 404s and the client falls through to its next art candidate).
+/// Only Steam ids are backed today; any other store 404s.
+#[utoipa::path(
+    get,
+    path = "/library/art/{id}/{kind}",
+    tag = "library",
+    operation_id = "getLibraryArt",
+    params(
+        ("id" = String, Path, description = "The store-qualified library id, e.g. `steam:570`"),
+        ("kind" = String, Path, description = "`portrait` | `hero` | `logo` | `header`"),
+    ),
+    responses(
+        (status = OK, description = "Image bytes", content_type = "image/jpeg"),
+        (status = UNAUTHORIZED, description = "Missing or invalid credentials", body = ApiError),
+        (status = NOT_FOUND, description = "No art of that kind for that id", body = ApiError),
+    )
+)]
+async fn get_library_art(Path((id, kind)): Path<(String, String)>) -> Response {
+    let Some(kind) = crate::library::ArtKind::parse(&kind) else {
+        return api_error(StatusCode::NOT_FOUND, "unknown art kind");
+    };
+    let Some(appid) = id
+        .strip_prefix("steam:")
+        .and_then(|s| s.parse::<u32>().ok())
+    else {
+        return api_error(StatusCode::NOT_FOUND, "no art proxy for this store");
+    };
+    match tokio::task::spawn_blocking(move || crate::library::steam_art_bytes(appid, kind)).await {
+        Ok(Some((bytes, ctype))) => ([(header::CONTENT_TYPE, ctype)], bytes).into_response(),
+        _ => api_error(StatusCode::NOT_FOUND, "no art of that kind for this title"),
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Streaming stats capture (design/stats-capture-plan.md §2)
 // ---------------------------------------------------------------------------------------
@@ -1693,6 +1733,21 @@ mod tests {
             app.clone().oneshot(req).await.expect("infallible").status(),
             StatusCode::UNAUTHORIZED,
             "a paired cert must reach the library from a LAN peer"
+        );
+
+        // The per-image art proxy (`/api/v1/library/art/{id}/{kind}`) is a prefix match in
+        // `cert_may_access`, not an exact one (dynamic id/kind segments) — exercise it directly. An
+        // unknown `kind` 404s before any disk/network I/O, so this stays a fast, deterministic check
+        // of the auth gate (not of art resolution, which `library::tests` covers).
+        let mut req = get_req("/api/v1/library/art/steam:570/not-a-real-kind");
+        req.extensions_mut().insert(PeerAddr(lan));
+        req.extensions_mut()
+            .insert(PeerCertFingerprint(Some(fp.to_string())));
+        assert_eq!(
+            app.clone().oneshot(req).await.expect("infallible").status(),
+            StatusCode::NOT_FOUND,
+            "a paired cert must reach the per-image library art proxy from a LAN peer \
+             (and an unknown kind 404s, rather than ever being rejected as unauthorized)"
         );
     }
 

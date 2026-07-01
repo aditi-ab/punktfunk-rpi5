@@ -45,6 +45,16 @@ struct ContentView: View {
     #if !os(macOS)
     @State private var showSettings = false
     #endif
+    #if os(iOS)
+    // A connected controller (+ the Settings toggle) swaps the whole home screen for
+    // GamepadHomeView instead of retrofitting HomeView's touch UI — see `home` below.
+    @ObservedObject private var gamepadManager = GamepadManager.shared
+    @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
+    private var gamepadUIActive: Bool {
+        GamepadUIEnvironment.isActive(
+            gamepadConnected: gamepadManager.active != nil, enabledSetting: gamepadUIEnabled)
+    }
+    #endif
 
     var body: some View {
         Group {
@@ -114,11 +124,23 @@ struct ContentView: View {
         .sheet(item: $speedTestTarget) { host in
             SpeedTestSheet(host: host)
         }
+        // The library is a full-screen presentation, not a sheet: on iPad a sheet is a centered page
+        // card, but the gamepad coverflow is meant to be an immersive, full-bleed screen (and the
+        // launcher behind it stops consuming the controller — see GamepadHomeView's `isActive`).
+        // macOS has no `fullScreenCover`, so it keeps the sheet there.
+        #if os(macOS)
         .sheet(item: $libraryTarget) { host in
             NavigationStack {
                 LibraryView(store: store, host: host, onLaunch: { launchTitle(host, $0) })
             }
         }
+        #else
+        .fullScreenCover(item: $libraryTarget) { host in
+            NavigationStack {
+                LibraryView(store: store, host: host, onLaunch: { launchTitle(host, $0) })
+            }
+        }
+        #endif
         #endif
         // Fresh pair=required / unknown host: offer the two ways in. An action sheet (not an
         // alert) so it never collides with the wait alert below. "Request Access" is the no-PIN
@@ -171,6 +193,23 @@ struct ContentView: View {
             speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
             connect: { connect($0) }, connectDiscovered: connectDiscovered,
             onPaired: handlePaired, onLaunchTitle: launchTitle)
+        #elseif os(iOS)
+        Group {
+            if gamepadUIActive {
+                GamepadHomeView(
+                    store: store, model: model, discovery: discovery,
+                    libraryTarget: $libraryTarget,
+                    connect: { connect($0) }, connectDiscovered: connectDiscovered)
+            } else {
+                HomeView(
+                    store: store, model: model, discovery: discovery,
+                    showAddHost: $showAddHost, pairingTarget: $pairingTarget,
+                    speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
+                    showSettings: $showSettings,
+                    connect: { connect($0) }, connectDiscovered: connectDiscovered,
+                    onPaired: handlePaired, onLaunchTitle: launchTitle)
+            }
+        }
         #else
         HomeView(
             store: store, model: model, discovery: discovery,

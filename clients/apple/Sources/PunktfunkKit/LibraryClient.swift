@@ -92,7 +92,8 @@ public enum LibraryClient {
             throw LibraryError.unreachable(
                 (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
         }
-        let delegate = LibraryTLSDelegate(identity: identity, pinnedHostFingerprint: hostFingerprint)
+        let delegate = LibraryTLSDelegate(
+            identity: identity, pinnedHostFingerprint: hostFingerprint, host: address, port: port)
         let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
 
@@ -108,11 +109,60 @@ public enum LibraryClient {
         }
         switch http.statusCode {
         case 200:
-            return try JSONDecoder().decode([GameEntry].self, from: data)
+            var games = try JSONDecoder().decode([GameEntry].self, from: data)
+            // Steam art now comes back as host-relative proxy paths (`/api/v1/library/art/...`,
+            // see the host's `library::steam_art`) so they work the same regardless of which
+            // interface/port the client reached the host on. Resolve them against THIS host now,
+            // so every other consumer just sees ordinary absolute URLs.
+            let base = url
+            for i in games.indices {
+                games[i].art = games[i].art.resolved(against: base)
+            }
+            return games
         case 401:
             throw LibraryError.unauthorized
         default:
             throw LibraryError.http(http.statusCode)
         }
+    }
+}
+
+extension Artwork {
+    /// Rewrite any host-relative field (one starting with `/`) into an absolute URL against `base`.
+    /// External CDN URLs (GOG/Heroic/Xbox) and `data:` URLs (Lutris) already don't start with `/`,
+    /// so they pass through unchanged. `internal` (not `fileprivate`) so `LibraryClientTests` can
+    /// exercise it directly without a live host.
+    func resolved(against base: URL) -> Artwork {
+        func abs(_ s: String?) -> String? {
+            guard let s, s.hasPrefix("/") else { return s }
+            return URL(string: s, relativeTo: base)?.absoluteString ?? s
+        }
+        var a = self
+        a.portrait = abs(a.portrait)
+        a.hero = abs(a.hero)
+        a.logo = abs(a.logo)
+        a.header = abs(a.header)
+        return a
+    }
+}
+
+/// Builds the authenticated `URLSession` the library UI uses to fetch cover-art images — the same
+/// paired identity + host pinning as [`LibraryClient.fetch`], reused across a whole grid's worth of
+/// poster loads (this session is NOT one-shot: callers own its lifetime and should invalidate it
+/// when the view goes away). Safe to use for every candidate URL a `GameEntry`'s `Artwork` carries:
+/// `LibraryTLSDelegate` only pins/presents-cert for the host itself, deferring to normal system
+/// trust + no client cert for any other origin (an external CDN URL).
+public enum LibraryImageLoader {
+    public static func session(
+        address: String,
+        port: UInt16 = punktfunkDefaultMgmtPort,
+        certPEM: String,
+        keyPEM: String,
+        hostFingerprint: Data?
+    ) throws -> URLSession {
+        let identity = try ClientTLS.makeIdentity(certPEM: certPEM, keyPEM: keyPEM)
+        let delegate = LibraryTLSDelegate(
+            identity: identity, pinnedHostFingerprint: hostFingerprint, host: address, port: port)
+        return URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
     }
 }

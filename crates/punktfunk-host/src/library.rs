@@ -114,16 +114,127 @@ impl LibraryProvider for SteamProvider {
     }
 }
 
-/// The Steam CDN poster/hero/logo/header for an appid (public, no auth). Not every appid has a
+/// Steam art, keyed to one of the four [`Artwork`] fields. Newer/recently-updated titles serve
+/// their CDN assets from a per-asset-hash path the client can't predict (e.g.
+/// `.../apps/<id>/<hash>/header.jpg`), so the flat legacy URL [`steam_art`] guesses 404s for them —
+/// [`steam_art_bytes`] is the robust resolver: local Steam cache (exact, no guessing) first, the
+/// flat CDN URL as a fallback (still correct for the many titles that haven't been re-hashed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtKind {
+    Portrait,
+    Hero,
+    Logo,
+    Header,
+}
+
+impl ArtKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "portrait" => Some(Self::Portrait),
+            "hero" => Some(Self::Hero),
+            "logo" => Some(Self::Logo),
+            "header" => Some(Self::Header),
+            _ => None,
+        }
+    }
+
+    /// Filenames Steam itself caches this kind under in `appcache/librarycache/<appid>/<hash>/`,
+    /// tried in order (the 2x portrait, when present, is the sharper asset).
+    fn local_filenames(self) -> &'static [&'static str] {
+        match self {
+            Self::Portrait => &["library_600x900_2x.jpg", "library_600x900.jpg"],
+            Self::Hero => &["library_hero.jpg"],
+            Self::Logo => &["logo.png"],
+            // Steam's local cache names the header asset differently from the store CDN's
+            // `header.jpg` (see `cdn_filename`).
+            Self::Header => &["library_header.jpg"],
+        }
+    }
+
+    /// The legacy flat-URL filename on the public Steam CDN (works for any title the CDN hasn't
+    /// migrated to a per-asset hash path).
+    fn cdn_filename(self) -> &'static str {
+        match self {
+            Self::Portrait => "library_600x900.jpg",
+            Self::Hero => "library_hero.jpg",
+            Self::Logo => "logo.png",
+            Self::Header => "header.jpg",
+        }
+    }
+}
+
+/// The Steam CDN poster/hero/logo/header for an appid — relative proxy paths the *client* resolves
+/// against the host it just talked to (so they work the same whichever interface/port the client
+/// reached the host on), backed by [`steam_art_bytes`] on the way out. Not every appid has a
 /// 600×900 capsule, but `header.jpg` is effectively universal — the client falls back to it.
 fn steam_art(appid: u32) -> Artwork {
-    let base = format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}");
+    let url = |kind: &str| Some(format!("/api/v1/library/art/steam:{appid}/{kind}"));
     Artwork {
-        portrait: Some(format!("{base}/library_600x900.jpg")),
-        hero: Some(format!("{base}/library_hero.jpg")),
-        logo: Some(format!("{base}/logo.png")),
-        header: Some(format!("{base}/header.jpg")),
+        portrait: url("portrait"),
+        hero: url("hero"),
+        logo: url("logo"),
+        header: url("header"),
     }
+}
+
+/// Resolve one Steam cover-art kind to bytes: the host's own local Steam cache first (exact — it's
+/// literally what the user's Steam client already shows for this title), the legacy flat CDN URL
+/// as a fallback. `None` when neither has it (the client then falls through to its next art
+/// candidate). Blocking (disk + network) — call off the async runtime.
+pub fn steam_art_bytes(appid: u32, kind: ArtKind) -> Option<(Vec<u8>, String)> {
+    steam_local_art_bytes(appid, kind).or_else(|| {
+        let url = format!(
+            "https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/{}",
+            kind.cdn_filename()
+        );
+        fetch_image(&url)
+    })
+}
+
+/// Cap on a local librarycache file we'll read into memory — generous for a Steam-quality JPEG/PNG
+/// (these run well under 2 MiB in practice) while bounding a pathological file.
+const LOCAL_ART_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// `appcache/librarycache/<appid>/<hash>/<filename>` across every Steam root, for whichever
+/// `<hash>` subdirectory actually has this kind's file (Steam reuses one hash dir per asset
+/// version, so there's normally exactly one candidate per kind).
+fn steam_local_art_bytes(appid: u32, kind: ArtKind) -> Option<(Vec<u8>, String)> {
+    steam_roots()
+        .into_iter()
+        .find_map(|root| find_local_art_file(&root, appid, kind))
+        .and_then(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            let ctype = if path.extension().is_some_and(|e| e == "png") {
+                "image/png"
+            } else {
+                "image/jpeg"
+            };
+            Some((bytes, ctype.to_string()))
+        })
+}
+
+/// Find this kind's cached file under one Steam root's `appcache/librarycache/<appid>/<hash>/`,
+/// trying each hash subdirectory (normally just one) and each candidate filename in priority
+/// order. Pure path lookup — no env/HOME dependency — so it's unit-testable against a plain
+/// directory fixture.
+fn find_local_art_file(root: &Path, appid: u32, kind: ArtKind) -> Option<PathBuf> {
+    let cache_dir = root
+        .join("appcache")
+        .join("librarycache")
+        .join(appid.to_string());
+    let hash_dirs = std::fs::read_dir(&cache_dir).ok()?;
+    for hash_dir in hash_dirs.flatten() {
+        for name in kind.local_filenames() {
+            let path = hash_dir.path().join(name);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if meta.len() > 0 && meta.len() <= LOCAL_ART_MAX_BYTES {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// Candidate Steam roots (classic, Flatpak, Deck) that actually exist, canonicalized + deduped.
@@ -1166,6 +1277,22 @@ fn fetch_image(url: &str) -> Option<(Vec<u8>, String)> {
 /// `(bytes, content-type)`. Resolves the id against the host's OWN library. Blocking — call off the
 /// async runtime (e.g. `spawn_blocking`).
 pub fn fetch_box_art(id: &str) -> Option<(Vec<u8>, String)> {
+    // Steam's `Artwork` fields are now relative proxy paths (see `steam_art`) the *client* resolves
+    // against the host — meaningless to `fetch_image`, which expects an absolute URL. Resolve
+    // those kinds directly instead of going through the URL fields.
+    if let Some(appid) = id
+        .strip_prefix("steam:")
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        return [
+            ArtKind::Portrait,
+            ArtKind::Header,
+            ArtKind::Hero,
+            ArtKind::Logo,
+        ]
+        .into_iter()
+        .find_map(|kind| steam_art_bytes(appid, kind));
+    }
     let g = all_games().into_iter().find(|g| g.id == id)?;
     [g.art.portrait, g.art.header, g.art.hero, g.art.logo]
         .into_iter()
@@ -1635,13 +1762,59 @@ mod tests {
     }
 
     #[test]
-    fn steam_art_uses_cdn_by_appid() {
+    fn steam_art_points_at_the_host_art_proxy() {
         let art = steam_art(570);
         assert_eq!(
             art.portrait.as_deref(),
-            Some("https://cdn.cloudflare.steamstatic.com/steam/apps/570/library_600x900.jpg")
+            Some("/api/v1/library/art/steam:570/portrait")
         );
-        assert!(art.header.unwrap().ends_with("/570/header.jpg"));
+        assert_eq!(
+            art.header.as_deref(),
+            Some("/api/v1/library/art/steam:570/header")
+        );
+    }
+
+    #[test]
+    fn art_kind_parses_known_names_only() {
+        assert_eq!(ArtKind::parse("portrait"), Some(ArtKind::Portrait));
+        assert_eq!(ArtKind::parse("hero"), Some(ArtKind::Hero));
+        assert_eq!(ArtKind::parse("logo"), Some(ArtKind::Logo));
+        assert_eq!(ArtKind::parse("header"), Some(ArtKind::Header));
+        assert_eq!(ArtKind::parse("background"), None);
+    }
+
+    #[test]
+    fn find_local_art_file_matches_the_hashed_librarycache_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir
+            .path()
+            .join("appcache/librarycache/3527290/480bd879ac737921bfa2529a6fea15961267ad21");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("library_600x900.jpg"), b"not really a jpeg").unwrap();
+
+        let found = find_local_art_file(dir.path(), 3527290, ArtKind::Portrait).unwrap();
+        assert_eq!(found, cache.join("library_600x900.jpg"));
+        // A kind with no cached file, and an appid with no cache dir at all, both miss cleanly.
+        assert_eq!(
+            find_local_art_file(dir.path(), 3527290, ArtKind::Hero),
+            None
+        );
+        assert_eq!(
+            find_local_art_file(dir.path(), 570, ArtKind::Portrait),
+            None
+        );
+    }
+
+    #[test]
+    fn find_local_art_file_prefers_the_2x_portrait() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("appcache/librarycache/570/somehash");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("library_600x900.jpg"), b"1x").unwrap();
+        std::fs::write(cache.join("library_600x900_2x.jpg"), b"2x").unwrap();
+
+        let found = find_local_art_file(dir.path(), 570, ArtKind::Portrait).unwrap();
+        assert_eq!(found, cache.join("library_600x900_2x.jpg"));
     }
 
     #[cfg(not(windows))]

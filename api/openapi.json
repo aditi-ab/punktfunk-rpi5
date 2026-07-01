@@ -229,6 +229,64 @@
         }
       }
     },
+    "/api/v1/library/art/{id}/{kind}": {
+      "get": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Fetch one cover-art image for a library entry",
+        "description": "Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams\nthe image bytes. For a Steam title, the host's own local Steam cache is tried first (exact —\nit's what the user's Steam client already shows for it), the public Steam CDN's flat URL\nconvention as a fallback (newer titles' CDN assets can live at a per-asset-hash path the host\ncan't predict, in which case this 404s and the client falls through to its next art candidate).\nOnly Steam ids are backed today; any other store 404s.",
+        "operationId": "getLibraryArt",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The store-qualified library id, e.g. `steam:570`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "path",
+            "description": "`portrait` | `hero` | `logo` | `header`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Image bytes",
+            "content": {
+              "image/jpeg": {}
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No art of that kind for that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/library/custom": {
       "post": {
         "tags": [

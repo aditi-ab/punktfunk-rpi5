@@ -48,4 +48,8 @@ public enum DefaultsKey {
     /// Which corner the statistics overlay sits in — a `HUDPlacement` raw value
     /// ("topLeading"/"topTrailing"/"bottomLeading"/"bottomTrailing"). Default top-trailing.
     public static let hudPlacement = "punktfunk.hudPlacement"
+    /// iOS/iPadOS: switch the host list and game library to a controller-friendly layout
+    /// (larger focus targets, a coverflow-style library) whenever a gamepad is connected. On by
+    /// default; see `GamepadUIEnvironment.isActive`.
+    public static let gamepadUIEnabled = "punktfunk.gamepadUIEnabled"
 }

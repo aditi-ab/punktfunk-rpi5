@@ -62,6 +62,8 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 # Drive the management API router in-process (no socket) in the handler tests.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Disposable directory fixtures for the Steam local-librarycache scan tests (library.rs).
+tempfile = "3"
 
 # Opus encode for the host->client audio plane — stereo (`opus::Encoder`) AND 5.1/7.1 surround
 # (`opus::MSEncoder`, the safe multistream API the crate exposes; no `audiopus_sys` needed). The

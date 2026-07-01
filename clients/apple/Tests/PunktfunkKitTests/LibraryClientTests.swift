@@ -60,4 +60,22 @@ final class LibraryClientTests: XCTestCase {
 
         XCTAssertTrue(Artwork().posterCandidates.isEmpty)
     }
+
+    func testArtworkResolvedRewritesOnlyHostRelativePaths() {
+        let base = URL(string: "https://192.168.1.70:47990/api/v1/library")!
+        // Steam art now comes back as host-relative proxy paths; external CDN URLs (GOG/Heroic/Xbox)
+        // and `data:` URLs (Lutris) are untouched.
+        let art = Artwork(
+            portrait: "/api/v1/library/art/steam:3527290/portrait",
+            hero: "https://cdn.example.com/hero.jpg",
+            logo: nil,
+            header: "/api/v1/library/art/steam:3527290/header")
+        let resolved = art.resolved(against: base)
+        XCTAssertEqual(
+            resolved.portrait, "https://192.168.1.70:47990/api/v1/library/art/steam:3527290/portrait")
+        XCTAssertEqual(
+            resolved.header, "https://192.168.1.70:47990/api/v1/library/art/steam:3527290/header")
+        XCTAssertEqual(resolved.hero, "https://cdn.example.com/hero.jpg") // unchanged
+        XCTAssertNil(resolved.logo)
+    }
 }

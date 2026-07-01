@@ -154,12 +154,17 @@ private func wireChannelLayout(channels: Int) -> AVAudioChannelLayout? {
     layout.pointee.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions
     layout.pointee.mChannelBitmap = AudioChannelBitmap(rawValue: 0)
     layout.pointee.mNumberChannelDescriptions = UInt32(labels.count)
-    let descs = UnsafeMutableBufferPointer(
-        start: &layout.pointee.mChannelDescriptions, count: labels.count)
-    for (i, lbl) in labels.enumerated() {
-        descs[i] = AudioChannelDescription(
-            mChannelLabel: lbl, mChannelFlags: AudioChannelFlags(rawValue: 0),
-            mCoordinates: (0, 0, 0))
+    // `mChannelDescriptions` is the C variable-length tail array (declared `[1]`, over-allocated
+    // above). Scope the pointer with `withUnsafeMutablePointer` — taking `&…mChannelDescriptions`
+    // inline yields a pointer valid only for that expression, so building a buffer from it that
+    // outlives the call is a dangling-pointer bug. Inside the closure it stays valid while we fill it.
+    withUnsafeMutablePointer(to: &layout.pointee.mChannelDescriptions) { tail in
+        let descs = UnsafeMutableBufferPointer(start: tail, count: labels.count)
+        for (i, lbl) in labels.enumerated() {
+            descs[i] = AudioChannelDescription(
+                mChannelLabel: lbl, mChannelFlags: AudioChannelFlags(rawValue: 0),
+                mCoordinates: (0, 0, 0))
+        }
     }
     return AVAudioChannelLayout(layout: layout)
 }
