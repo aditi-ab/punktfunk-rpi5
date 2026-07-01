@@ -200,6 +200,23 @@ fn mic_pw_thread(
             *pw::keys::NODE_DESCRIPTION  => "Punktfunk Remote Microphone",
             // ~5 ms quantum (one Opus frame) so recording apps get smooth low-latency chunks.
             *pw::keys::NODE_LATENCY      => "240/48000",
+            // Win WirePlumber's default-source election. This fixes TWO failures (both diagnosed
+            // live on a Bazzite host, PipeWire 1.4.10):
+            //   1. Apps that record the *default* input (games, Discord, arecord) get the client's
+            //      mic — the Linux analogue of the Windows host forcing the default recording
+            //      endpoint (audio/windows/audio_control.rs). Without it the source is never the
+            //      default, so default-input recorders hear silence.
+            //   2. On PipeWire 1.4.x, a *non-default* Audio/Source recorded via `--target` never
+            //      gets a driver assigned — the {source, recorder} group stays orphaned (pw-top:
+            //      QUANT/RATE 0, `driver-node None`), so the RT `process()` callback never fires and
+            //      even an explicitly-selected mic is pure silence. Making it the default source
+            //      keeps WirePlumber driving it, so `process()` runs and audio flows. (PipeWire 1.6
+            //      drives any recorded source regardless, which is why this only bit the 1.4 host.)
+            // Reproduced with a faithful standalone copy of this node: no priority.session → silent,
+            // priority.session set → audio, on the same 1.4.10 daemon. Only overrides WirePlumber's
+            // *auto* default (a user's explicit default.configured.audio.source still wins); the
+            // value clears typical real-hardware source priorities (~1000–1900).
+            "priority.session"           => "3000",
         },
     )
     .context("pw mic Stream")?;
