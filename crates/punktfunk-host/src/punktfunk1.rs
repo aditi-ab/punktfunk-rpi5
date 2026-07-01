@@ -680,36 +680,12 @@ async fn serve_session(
             Punktfunk1Source::Synthetic => None,
         };
 
-        // Resolve a requested library launch (the client sends only the store-qualified id;
-        // we look it up in OUR library so a client can't inject a command). The bare-spawn gamescope
-        // backend picks this up via the `PUNKTFUNK_GAMESCOPE_APP` env fallback in `spawn` (on a shared
-        // desktop / attach-to-existing session it's a harmless no-op). This is the process-global env
-        // path; the write is serialized via `vdisplay::with_env_lock` so concurrent native-session
-        // handshakes can't race the `set_var` (security-review 2026-06-28 #7). The remaining
-        // cross-session *value* confusion (B's launch id stomping A's pending gamescope spawn) wants
-        // the command resolved into the per-session VirtualDisplay via `set_launch_command` (as the
-        // GameStream path does) — a follow-up; the data-race UB is closed here.
-        if let Some(id) = hello.launch.as_deref() {
-            // Linux: resolve the id to a gamescope-nested command and stash it in the env the
-            // gamescope backend reads. Windows has no gamescope to nest into — the data plane launches
-            // the title into the interactive user session via `library::launch_title` once capture is
-            // live (threaded as `SessionContext.launch` below), so there is nothing to do here.
-            #[cfg(not(windows))]
-            match crate::library::launch_command(id) {
-                Some(cmd) => {
-                    tracing::info!(launch_id = id, command = %cmd, "launching library title");
-                    crate::vdisplay::with_env_lock(|| {
-                        std::env::set_var("PUNKTFUNK_GAMESCOPE_APP", &cmd)
-                    });
-                }
-                None => tracing::warn!(
-                    launch_id = id,
-                    "client requested a launch id not in this host's library — ignoring"
-                ),
-            }
-            #[cfg(windows)]
-            let _ = id;
-        }
+        // A requested library launch (the client sends only the store-qualified id; we look it up
+        // in OUR library so a client can't inject a command) is resolved below — after the Welcome,
+        // where it's threaded per-session into the data plane as `SessionContext.launch` (no
+        // process-global env: the old `PUNKTFUNK_GAMESCOPE_APP` write leaked across sessions, and
+        // only gamescope's bare-spawn path ever read it, so launches on every other backend were
+        // silently dropped).
 
         // Resolve the client's gamepad-backend preference (pure env/cfg check — no probing
         // needed; the actual pads are created lazily by the input thread).
@@ -1101,10 +1077,29 @@ async fn serve_session(
     let source = opts.source;
     let (seconds, frames) = (opts.seconds, opts.frames);
     let mode = hello.mode;
-    // Windows: the store-qualified launch id, threaded into the data plane so the title can be
-    // launched into the interactive session once capture is live (no gamescope nesting on Windows).
+    // The session's launch, threaded into the data plane. Windows carries the store-qualified id
+    // (spawned into the interactive user session once capture is live); other hosts resolve the id
+    // to its shell command HERE against the host's own library — a client can only ever pick an
+    // existing title, never send a command — and the data plane runs it per-backend (nested into a
+    // bare-spawn gamescope, or spawned into the live session once capture is up).
     #[cfg(target_os = "windows")]
     let launch_for_dp = hello.launch.clone();
+    #[cfg(not(target_os = "windows"))]
+    let launch_for_dp = hello.launch.as_deref().and_then(|id| {
+        match crate::library::launch_command(id) {
+            Some(cmd) => {
+                tracing::info!(launch_id = id, command = %cmd, "resolved library launch for this session");
+                Some(cmd)
+            }
+            None => {
+                tracing::warn!(
+                    launch_id = id,
+                    "client requested a launch id not in this host's library — ignoring"
+                );
+                None
+            }
+        }
+    });
     let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
     let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
                                        // Resolved chroma — derive the typed value back from the wire byte the Welcome carried (so the
@@ -1180,7 +1175,6 @@ async fn serve_session(
                         conn: conn_stream,
                         stats: stats_dp,
                         client_label,
-                        #[cfg(target_os = "windows")]
                         launch: launch_for_dp,
                     })
                 }
@@ -2108,7 +2102,8 @@ fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Composito
         anyhow!("no usable compositor (no live graphical session for this uid; set PUNKTFUNK_COMPOSITOR or start a desktop/gaming session)")
     })?;
         if !overridden {
-            // Point input at the same backend and select gamescope ATTACH (no churny managed restart).
+            // Point input at the same backend and resolve the gamescope sub-mode (managed where the
+            // session infra exists, attach to a foreign gamescope, else per-session bare spawn).
             crate::vdisplay::apply_input_env(chosen);
         }
         let avail_ids: Vec<&str> = available.iter().map(|c| c.id()).collect();
@@ -2747,10 +2742,10 @@ struct SessionContext {
     /// Short client label (cert-fingerprint prefix, else peer IP) seeded into the capture meta on
     /// the first armed stats registration.
     client_label: String,
-    /// Windows: the store-qualified library id to launch into the interactive user session once
-    /// capture is live (no gamescope nesting on Windows). `None` = no launch requested. Linux uses the
-    /// gamescope `PUNKTFUNK_GAMESCOPE_APP` path resolved at handshake, so this field is Windows-only.
-    #[cfg(target_os = "windows")]
+    /// The session's requested launch, `None` = none. On Windows the store-qualified library id
+    /// (spawned into the interactive user session once capture is live); on other hosts the shell
+    /// command already resolved against the host's own library — nested into gamescope's bare spawn
+    /// via `set_launch_command`, or spawned into the live session once capture is up.
     launch: Option<String>,
 }
 
@@ -2785,7 +2780,6 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         conn,
         stats,
         client_label,
-        #[cfg(target_os = "windows")]
         launch,
     } = ctx;
     tracing::info!(
@@ -2804,6 +2798,12 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // reapplies the client's saved per-monitor config (DPI scaling) on reconnect. No-op on Linux backends
     // and for anonymous/GameStream clients (no fingerprint → the driver auto-allocates).
     vd.set_client_identity(endpoint::peer_fingerprint(&conn));
+    // Per-session launch (non-Windows): hand the resolved command to the backend instance so
+    // gamescope's bare spawn nests it — per-instance, no process-global env, so concurrent sessions
+    // can't stomp each other's launch target. The other backends' default `set_launch_command` is a
+    // no-op; they get the command spawned into the live session after capture is up (below).
+    #[cfg(not(target_os = "windows"))]
+    vd.set_launch_command(launch.clone());
     // IDD-push reconnect preempt (the dance now lives in the manager, Goal-1 §2.5): serialize setup so a
     // reconnect FLOOD can't run concurrent monitor create/teardown, STOP the prior session + WAIT for it
     // to release its monitor (instead of tearing a monitor out from under a still-live session), and
@@ -2819,16 +2819,29 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     #[cfg(target_os = "windows")]
     drop(_idd_setup_guard);
 
-    // Windows: capture is live — launch the requested library title into the
-    // interactive user session so it renders onto the captured desktop and grabs foreground. Linux
-    // nests its launch in gamescope instead (the handshake `PUNKTFUNK_GAMESCOPE_APP` path). Best-effort:
-    // a launch failure (no recipe for the kind, no interactive user) leaves the user on the desktop.
+    // Capture is live — launch the requested title so it renders onto the streamed output and
+    // grabs focus. Windows spawns the library id into the interactive user session; Linux spawns
+    // the resolved command into the live session for every backend that didn't already nest it
+    // (gamescope's bare spawn ran it inside the fresh gamescope — launching again would start it
+    // twice). Best-effort: a launch failure (no recipe, launcher missing, no interactive user)
+    // leaves the user on the streamed desktop/session, never tears the stream down. Launched ONCE
+    // here — the mid-stream rebuild paths below must not re-spawn it.
     #[cfg(target_os = "windows")]
     if let Some(id) = launch.as_deref() {
         if let Err(e) = crate::library::launch_title(id) {
             tracing::warn!(launch_id = id, error = %e, "could not launch requested library title");
         }
     }
+    #[cfg(target_os = "linux")]
+    if let Some(cmd) = launch.as_deref() {
+        if crate::vdisplay::launch_is_nested(compositor) {
+            tracing::info!(command = %cmd, "launch nested into the per-session gamescope");
+        } else if let Err(e) = crate::library::launch_session_command(compositor, cmd) {
+            tracing::warn!(command = %cmd, error = %e, "could not launch requested title into the session");
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let _ = &launch;
 
     let perf = crate::config::config().perf;
     // Microburst cap (applied in send_loop/paced_submit): a frame ≤ this bursts out immediately;

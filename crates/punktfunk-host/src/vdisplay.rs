@@ -369,9 +369,10 @@ fn find_wayland_socket(runtime: &str, uid: u32) -> Option<String> {
 /// the default concurrent native sessions each running `resolve_compositor` in its own
 /// `spawn_blocking`, the per-session env retargeting would otherwise race and could crash the host
 /// (security-review 2026-06-28 #7). Every env write on the setup path takes this lock; steady-state
-/// streaming reads cached config, not env. This removes the memory-unsafety; it is NOT a full fix
-/// for cross-session env *value* confusion (that needs per-session `SessionContext` threading, as the
-/// GameStream/Windows path already does via `set_launch_command`).
+/// streaming reads cached config, not env. This removes the memory-unsafety; the launch command is
+/// additionally threaded per-session (`SessionContext.launch` → `set_launch_command`) so it never
+/// rides the process env at all — the remaining knobs here (session retarget, gamescope sub-mode)
+/// still carry a cross-session *value* confusion window inherent to a process-global env.
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Run `f` with [`ENV_LOCK`] held. Use around any `set_var`/`remove_var` on the session-setup path.
@@ -384,7 +385,7 @@ pub fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
 /// and input alike) that reads `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` /
 /// `XDG_CURRENT_DESKTOP` at open time targets the live session. Serialized via [`ENV_LOCK`] so
 /// concurrent session handshakes can't race the `set_var`s; the next connect re-detects and
-/// re-applies. Same `set_var` discipline used for `PUNKTFUNK_GAMESCOPE_APP` on the launch path.
+/// re-applies.
 #[cfg(target_os = "linux")]
 pub fn apply_session_env(active: &ActiveSession) {
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -468,14 +469,57 @@ pub fn settle_desktop_portal(chosen: Compositor) {
 #[cfg(not(target_os = "linux"))]
 pub fn settle_desktop_portal(_chosen: Compositor) {}
 
+/// How a gamescope-backed session is realized. Chosen per connect by [`pick_gamescope_mode`],
+/// written into the env knobs `GamescopeDisplay::create` dispatches on.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GamescopeMode {
+    /// Host-managed `gamescope-session-plus` / SteamOS session at the client's mode.
+    Managed,
+    /// Attach to an already-running gamescope (capture + inject, no lifecycle ownership).
+    Attach,
+    /// Bare-spawn a headless gamescope per session, nesting the session's launch command.
+    Spawn,
+}
+
+/// Pure sub-mode ladder for gamescope (unit-testable — the env/probe inputs are parameters):
+/// explicit `PUNKTFUNK_GAMESCOPE_MANAGED` forces managed; explicit ATTACH/NODE forces attach; an
+/// operator-set `PUNKTFUNK_GAMESCOPE_SESSION` keeps managed; otherwise managed only **when the box
+/// actually has the session infrastructure** (gamescope-session-plus / SteamOS — the old code
+/// defaulted to managed unconditionally and then bailed on a plain distro, killing the session);
+/// a foreign (not host-spawned) gamescope on an infra-less box is attached to; and the final
+/// default is a per-session bare spawn — the path that nests the client's launch command.
+#[cfg(target_os = "linux")]
+fn pick_gamescope_mode(
+    force_managed: bool,
+    attach_env: bool,
+    node_env: bool,
+    session_env: bool,
+    managed_infra: bool,
+    foreign_gamescope: bool,
+) -> GamescopeMode {
+    if force_managed {
+        GamescopeMode::Managed
+    } else if attach_env || node_env {
+        GamescopeMode::Attach
+    } else if session_env || managed_infra {
+        GamescopeMode::Managed
+    } else if foreign_gamescope {
+        GamescopeMode::Attach
+    } else {
+        GamescopeMode::Spawn
+    }
+}
+
 /// Route input to match the chosen video backend (they must not diverge), via the highest-priority
-/// `PUNKTFUNK_INPUT_BACKEND` knob the injector honors. For gamescope, the **default is a managed
-/// session at the client's mode** (tears the TV's autologin down on connect; restored on a debounced
-/// idle) — so the client gets ITS resolution (capture == encode == client mode), not the TV's, and a
-/// quick reconnect reuses the warm session (no churn). Opt out to **attach** (mirror the running TV
-/// session at its own mode, gaming stays live on the panel, no Steam restart) with
-/// `PUNKTFUNK_GAMESCOPE_ATTACH`; an explicit `PUNKTFUNK_GAMESCOPE_NODE` also implies attach, and
-/// `PUNKTFUNK_GAMESCOPE_MANAGED` forces managed over either.
+/// `PUNKTFUNK_INPUT_BACKEND` knob the injector honors. For gamescope the sub-mode ladder
+/// ([`pick_gamescope_mode`]) selects **managed** (a host-managed session at the client's mode —
+/// tears the TV's autologin down on connect, restored on a debounced idle; only where
+/// session-plus/SteamOS actually exists), **attach** (mirror a running gamescope at its own mode;
+/// explicit via `PUNKTFUNK_GAMESCOPE_ATTACH`/`PUNKTFUNK_GAMESCOPE_NODE`, or the fallback for a
+/// foreign gamescope on an infra-less box), or **bare spawn** (a per-session headless gamescope
+/// nesting the session's launch command — the plain-distro default). `PUNKTFUNK_GAMESCOPE_MANAGED`
+/// forces managed over all of it.
 #[cfg(target_os = "linux")]
 pub fn apply_input_env(chosen: Compositor) {
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -490,25 +534,60 @@ pub fn apply_input_env(chosen: Compositor) {
     };
     std::env::set_var("PUNKTFUNK_INPUT_BACKEND", backend);
     if chosen == Compositor::Gamescope {
-        let force_managed = std::env::var_os("PUNKTFUNK_GAMESCOPE_MANAGED").is_some();
-        let attach = !force_managed
-            && (std::env::var_os("PUNKTFUNK_GAMESCOPE_ATTACH").is_some()
-                || std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_some());
-        if attach {
-            std::env::remove_var("PUNKTFUNK_GAMESCOPE_SESSION");
-            if std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_none() {
-                std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto");
+        let mode = pick_gamescope_mode(
+            std::env::var_os("PUNKTFUNK_GAMESCOPE_MANAGED").is_some(),
+            std::env::var_os("PUNKTFUNK_GAMESCOPE_ATTACH").is_some(),
+            std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_some(),
+            std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_some(),
+            gamescope::managed_session_available(),
+            gamescope::foreign_gamescope_running(),
+        );
+        tracing::info!(?mode, "gamescope sub-mode");
+        match mode {
+            GamescopeMode::Attach => {
+                std::env::remove_var("PUNKTFUNK_GAMESCOPE_SESSION");
+                if std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_none() {
+                    std::env::set_var("PUNKTFUNK_GAMESCOPE_NODE", "auto");
+                }
             }
-        } else {
-            if std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_none() {
-                std::env::set_var("PUNKTFUNK_GAMESCOPE_SESSION", "steam");
+            GamescopeMode::Managed => {
+                if std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_none() {
+                    std::env::set_var("PUNKTFUNK_GAMESCOPE_SESSION", "steam");
+                }
+                std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE");
             }
-            std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE");
+            GamescopeMode::Spawn => {
+                // Bare spawn: `create` must fall through to the spawn path, so neither knob may
+                // linger from an earlier connect's managed/attach selection.
+                std::env::remove_var("PUNKTFUNK_GAMESCOPE_SESSION");
+                std::env::remove_var("PUNKTFUNK_GAMESCOPE_NODE");
+            }
         }
     }
 }
 #[cfg(not(target_os = "linux"))]
 pub fn apply_input_env(_chosen: Compositor) {}
+
+/// Will `vd.create` on this backend NEST the session's launch command itself (gamescope's bare
+/// spawn runs it inside the new gamescope)? When true the session must NOT also spawn the command
+/// into the session — it would start twice. Read AFTER [`apply_input_env`] resolved the gamescope
+/// sub-mode (the env knobs are that resolution's output).
+#[cfg(target_os = "linux")]
+pub fn launch_is_nested(compositor: Compositor) -> bool {
+    compositor == Compositor::Gamescope
+        && with_env_lock(|| {
+            std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_none()
+                && std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_none()
+        })
+}
+
+/// Launch `cmd` into the live gamescope session (managed/attach — see
+/// [`gamescope::launch_into_session`]). Split out so `library.rs` doesn't reach into the private
+/// backend module.
+#[cfg(target_os = "linux")]
+pub fn launch_into_gamescope_session(cmd: &str) -> Result<std::process::Child> {
+    gamescope::launch_into_session(cmd)
+}
 
 /// Detect the compositor to drive: explicit `PUNKTFUNK_COMPOSITOR` override (legacy / CI / forcing
 /// a backend for a test), else the **live session** ([`detect_active_session`] — so a Bazzite box
@@ -690,6 +769,28 @@ mod tests {
         );
         // No live session → no backend; the caller turns this into a handshake error / fallback.
         assert_eq!(compositor_for_kind(ActiveKind::None), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gamescope_mode_ladder() {
+        use GamescopeMode::*;
+        let pick = pick_gamescope_mode;
+        // (force_managed, attach_env, node_env, session_env, managed_infra, foreign_gamescope)
+        // Plain distro, nothing running: bare spawn — the path that nests the launch command.
+        assert_eq!(pick(false, false, false, false, false, false), Spawn);
+        // Bazzite/SteamOS (session infra present): managed, as validated live.
+        assert_eq!(pick(false, false, false, false, true, false), Managed);
+        assert_eq!(pick(false, false, false, false, true, true), Managed);
+        // Foreign gamescope on an infra-less box: attach and mirror it.
+        assert_eq!(pick(false, false, false, false, false, true), Attach);
+        // Operator-set PUNKTFUNK_GAMESCOPE_SESSION keeps managed even without detected infra.
+        assert_eq!(pick(false, false, false, true, false, false), Managed);
+        // Explicit attach/node wins over infra…
+        assert_eq!(pick(false, true, false, false, true, false), Attach);
+        assert_eq!(pick(false, false, true, true, true, false), Attach);
+        // …and force-managed wins over everything.
+        assert_eq!(pick(true, true, true, false, false, false), Managed);
     }
 
     #[test]

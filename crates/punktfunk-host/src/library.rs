@@ -1639,55 +1639,89 @@ fn steam_exe() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Launch a GameStream `apps.json` command (operator-typed, trusted — never client-set) into the live
-/// session, AFTER capture is up. Used by the GameStream path for the backends that DON'T nest the
-/// command via [`VirtualDisplay::set_launch_command`]: Windows (no gamescope) and Linux
-/// kwin/mutter/wlroots (which stream the existing desktop). The caller skips this for Linux gamescope,
-/// which already nested it. On Windows it runs in the interactive USER session (the host is SYSTEM);
-/// on Linux the host is already inside the user's graphical session, so a plain spawn lands the app on
-/// the streamed (primary) output.
-#[cfg(any(windows, target_os = "linux"))]
+/// Launch a GameStream `apps.json` command (operator-typed, trusted — never client-set) into the
+/// interactive Windows user session, AFTER capture is up (the host is SYSTEM). The Linux paths go
+/// through the compositor-aware [`launch_session_command`] instead.
+#[cfg(windows)]
 pub fn launch_gamestream_command(cmd: &str) -> Result<()> {
     let cmd = cmd.trim();
     anyhow::ensure!(!cmd.is_empty(), "empty command");
-    #[cfg(windows)]
-    {
-        // cmd.exe /c is fine here: the value is the host operator's own apps.json command, not a
-        // client-influenced string (same trust as the custom-store `command` kind).
-        let pid = crate::interactive::spawn_in_active_session(&format!("cmd.exe /c {cmd}"), None)
-            .context("spawn gamestream command in the interactive session")?;
-        tracing::info!(command = %cmd, pid, "gamestream: launched app in the interactive session");
-        Ok(())
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .spawn()
-            .context("spawn gamestream command")?;
-        tracing::info!(command = %cmd, pid = child.id(), "gamestream: launched app into the session");
-        Ok(())
-    }
+    // cmd.exe /c is fine here: the value is the host operator's own apps.json command, not a
+    // client-influenced string (same trust as the custom-store `command` kind).
+    let pid = crate::interactive::spawn_in_active_session(&format!("cmd.exe /c {cmd}"), None)
+        .context("spawn gamestream command in the interactive session")?;
+    tracing::info!(command = %cmd, pid, "gamestream: launched app in the interactive session");
+    Ok(())
 }
 
 /// Launch a library title chosen from the **GameStream `/applist`** (the store-qualified id is carried
-/// on the `AppEntry`, resolved from the numeric Moonlight appid). Windows spawns it into the interactive
-/// user session ([`launch_title`]); Linux resolves its shell command ([`launch_command`]) and runs it
-/// into the live session ([`launch_gamestream_command`]). The id is resolved against the host's OWN
-/// library, so a client can only ever pick an existing title — never inject a command.
-#[cfg(any(windows, target_os = "linux"))]
+/// on the `AppEntry`, resolved from the numeric Moonlight appid) into the interactive Windows user
+/// session ([`launch_title`]). The id is resolved against the host's OWN library, so a client can
+/// only ever pick an existing title — never inject a command. Linux resolves the id via
+/// [`launch_command`] and goes through [`launch_session_command`] instead.
+#[cfg(windows)]
 pub fn launch_gamestream_library(id: &str) -> Result<()> {
-    #[cfg(windows)]
-    {
-        launch_title(id)
+    launch_title(id)
+}
+
+/// Launch a resolved shell command into the **live Linux session** for the session's compositor —
+/// the one launch entry point shared by the native (punktfunk/1) and GameStream planes, called
+/// AFTER capture is up so the app renders onto the streamed output. The command is host-resolved
+/// (a library id via [`launch_command`], or an operator-typed apps.json/custom command) — never a
+/// client-sent string. Best-effort by contract: a failure leaves the user on the (streamed)
+/// desktop/session rather than tearing the stream down.
+///
+/// * **KWin / Mutter / wlroots** — the host runs inside the user's graphical session (the process
+///   env was retargeted at it by `apply_session_env`, and the per-session virtual output is
+///   promoted primary), so a plain spawn lands the app on the streamed output.
+/// * **gamescope (managed / SteamOS / attach)** — the app must open *inside* the running gamescope
+///   session: spawned with the session's own `DISPLAY`/Wayland env
+///   ([`crate::vdisplay::launch_into_gamescope_session`]). A `steam steam://…` command additionally
+///   forwards over the running Steam instance's own pipe, so the dominant Steam case is
+///   env-independent.
+/// * **gamescope (bare spawn)** — not routed here: the command was nested into the fresh gamescope
+///   via `set_launch_command` (the caller gates on `vdisplay::launch_is_nested`).
+#[cfg(target_os = "linux")]
+pub fn launch_session_command(compositor: crate::vdisplay::Compositor, cmd: &str) -> Result<()> {
+    let cmd = cmd.trim();
+    anyhow::ensure!(!cmd.is_empty(), "empty command");
+    let child = match compositor {
+        crate::vdisplay::Compositor::Gamescope => {
+            crate::vdisplay::launch_into_gamescope_session(cmd)?
+        }
+        _ => std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .spawn()
+            .context("spawn launch command")?,
+    };
+    tracing::info!(
+        command = %cmd,
+        pid = child.id(),
+        compositor = compositor.id(),
+        "launched app into the live session"
+    );
+    Ok(())
+}
+
+/// Resolve the launch command for a session app selection on Linux: a store-qualified library id
+/// (from either plane) wins, else the operator-typed command. `None` = nothing to launch (or an
+/// unknown/recipe-less id — warned, so a client picking a stale title sees why nothing started).
+#[cfg(target_os = "linux")]
+pub fn resolve_session_launch(library_id: Option<&str>, command: Option<&str>) -> Option<String> {
+    if let Some(id) = library_id {
+        match launch_command(id) {
+            Some(cmd) => return Some(cmd),
+            None => tracing::warn!(
+                launch_id = id,
+                "requested launch id not in this host's library (or no launch recipe) — ignoring"
+            ),
+        }
     }
-    #[cfg(target_os = "linux")]
-    {
-        let cmd = launch_command(id)
-            .ok_or_else(|| anyhow::anyhow!("library id '{id}' has no launch recipe"))?;
-        launch_gamestream_command(&cmd)
-    }
+    command
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
 }
 
 /// The full library: every store's titles merged + the custom entries, sorted by title.

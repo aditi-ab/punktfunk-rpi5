@@ -233,6 +233,165 @@ fn steamos_session_present() -> bool {
         && !std::path::Path::new(SESSION_PLUS_BIN).exists()
 }
 
+/// Does this box have the infrastructure the MANAGED gamescope mode drives — Bazzite's
+/// `gamescope-session-plus` or SteamOS's `gamescope-session`? The sub-mode ladder
+/// ([`crate::vdisplay::apply_input_env`]) only defaults to managed when this is true; a plain
+/// distro (neither present) falls through to the bare-spawn path instead of the old behaviour of
+/// defaulting to managed and then bailing on the missing session script.
+pub fn managed_session_available() -> bool {
+    std::path::Path::new(SESSION_PLUS_BIN).exists()
+        || std::path::Path::new(STEAMOS_SESSION_BIN).exists()
+}
+
+/// Is a gamescope WE DIDN'T SPAWN running for our uid right now? Used by the sub-mode ladder to
+/// pick ATTACH (mirror the foreign session) over a bare spawn on a box without managed-session
+/// infra. Our own per-session bare-spawn gamescopes are children of this host process — excluded by
+/// walking each candidate's ppid chain — so one client's nested gamescope never makes the next
+/// client attach to it.
+pub fn foreign_gamescope_running() -> bool {
+    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    let our_pid = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let Ok(md) = std::fs::metadata(e.path()) else {
+            continue;
+        };
+        use std::os::unix::fs::MetadataExt;
+        if md.uid() != uid {
+            continue;
+        }
+        let Ok(comm) = std::fs::read_to_string(e.path().join("comm")) else {
+            continue;
+        };
+        if !matches!(comm.trim(), "gamescope" | "gamescope-wl") {
+            continue;
+        }
+        if !descends_from(pid, our_pid) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is `pid` a descendant of (or equal to) `ancestor`? Walks the ppid chain via `/proc/<pid>/stat`
+/// with a hop cap so a racing/exiting process can't loop us.
+fn descends_from(mut pid: u32, ancestor: u32) -> bool {
+    for _ in 0..64 {
+        if pid == ancestor {
+            return true;
+        }
+        if pid <= 1 {
+            return false;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // Field 4 (ppid) follows the parenthesized comm — split after the LAST ')' since comm can
+        // itself contain parentheses.
+        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+            return false;
+        };
+        let Some(ppid) = rest.split_whitespace().nth(1).and_then(|s| s.parse().ok()) else {
+            return false;
+        };
+        pid = ppid;
+    }
+    false
+}
+
+/// Launch `cmd` INTO the live gamescope session (the managed / SteamOS / attach modes, where the
+/// session already exists and [`spawn`]'s nesting doesn't apply). The child gets the session's own
+/// `DISPLAY` (gamescope's Xwayland) and Wayland socket, discovered from a process already inside the
+/// session — so X11 and Wayland clients alike land on the streamed gamescope output. Discovery is
+/// best-effort: without it we still spawn with the host env and warn (a `steam steam://…` launch
+/// still works there — the running Steam instance picks the URI up over its own pipe, no display
+/// env needed).
+pub fn launch_into_session(cmd: &str) -> Result<std::process::Child> {
+    let mut c = Command::new("sh");
+    c.arg("-c").arg(cmd);
+    match discover_session_display_env() {
+        Some((x11, wayland)) => {
+            tracing::info!(
+                command = %cmd,
+                x11_display = x11.as_deref().unwrap_or("-"),
+                wayland = wayland.as_deref().unwrap_or("-"),
+                "gamescope: launching into the live session"
+            );
+            if let Some(d) = x11 {
+                c.env("DISPLAY", d);
+            }
+            if let Some(w) = wayland {
+                c.env("WAYLAND_DISPLAY", w);
+            }
+        }
+        None => tracing::warn!(
+            command = %cmd,
+            "gamescope: could not discover the session's display env — spawning with the host env \
+             (a `steam steam://…` launch still reaches the running Steam; other apps may not land \
+             in the session)"
+        ),
+    }
+    c.spawn()
+        .context("spawn launch command into gamescope session")
+}
+
+/// Find the live gamescope session's `(DISPLAY, WAYLAND_DISPLAY)` by scanning same-uid processes
+/// for one whose environment carries `GAMESCOPE_WAYLAND_DISPLAY` (gamescope sets it for everything
+/// it runs — Steam, the game, our own nested `sh`). The Wayland value returned is that gamescope
+/// socket; `DISPLAY` is the nested Xwayland. Either can be individually absent.
+fn discover_session_display_env() -> Option<(Option<String>, Option<String>)> {
+    // SAFETY: `getuid()` is a parameterless POSIX call that always succeeds and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    for e in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = e.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(md) = std::fs::metadata(e.path()) else {
+            continue;
+        };
+        use std::os::unix::fs::MetadataExt;
+        if md.uid() != uid {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(e.path().join("environ")) else {
+            continue;
+        };
+        let mut display = None;
+        let mut gs_wayland = None;
+        for kv in raw.split(|&b| b == 0) {
+            let kv = String::from_utf8_lossy(kv);
+            if let Some(v) = kv.strip_prefix("GAMESCOPE_WAYLAND_DISPLAY=") {
+                if !v.is_empty() {
+                    gs_wayland = Some(v.to_string());
+                }
+            } else if let Some(v) = kv.strip_prefix("DISPLAY=") {
+                if !v.is_empty() {
+                    display = Some(v.to_string());
+                }
+            }
+        }
+        // Only a process INSIDE a gamescope session (it has the marker var) is a valid source.
+        if gs_wayland.is_some() {
+            return Some((display, gs_wayland));
+        }
+    }
+    None
+}
+
 /// Run a `systemctl --user` subcommand best-effort — a failure just means the session won't change,
 /// which the caller's node-wait surfaces.
 fn systemctl_user(args: &[&str]) {

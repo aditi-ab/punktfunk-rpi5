@@ -132,19 +132,15 @@ fn run(
             "video source: virtual display (native client resolution)"
         );
         // Launch the app's command now that capture is live, for the backends that DON'T nest it via
-        // set_launch_command above: Windows (no gamescope) and Linux kwin/mutter/wlroots (which stream
-        // the existing desktop, so the app must be spawned into the session to land on the streamed
-        // output). Linux gamescope already nested it via set_launch_command, so skip it there.
+        // set_launch_command above: Windows (no gamescope) and, on Linux, everything but gamescope's
+        // bare-spawn sub-mode (kwin/mutter/wlroots stream the existing desktop; a managed/attached
+        // gamescope is a running session to launch INTO — `launch_session_command` routes both).
+        // A library title (Steam/Epic/GOG/Xbox/custom, surfaced in /applist) carries its
+        // store-qualified id — resolved against the host's OWN library (the client can only pick an
+        // existing title, never inject a command). An apps.json entry instead carries an
+        // operator-typed `cmd`. Library id wins when both are set.
         #[cfg(windows)]
-        let launch_here = true;
-        #[cfg(target_os = "linux")]
-        let launch_here = compositor != crate::vdisplay::Compositor::Gamescope;
-        #[cfg(any(windows, target_os = "linux"))]
-        if launch_here {
-            // A library title (Steam/Epic/GOG/Xbox/custom, surfaced in /applist) carries its
-            // store-qualified id — resolve + launch it against the host's OWN library (the client can
-            // only pick an existing title, never inject a command). An apps.json entry instead carries
-            // an operator-typed `cmd`. Library id wins when both are set.
+        {
             if let Some(lib_id) = app.and_then(|a| a.library_id.as_deref()) {
                 if let Err(e) = crate::library::launch_gamestream_library(lib_id) {
                     tracing::warn!(library_id = lib_id, error = %e, "gamestream: could not launch library title");
@@ -154,6 +150,17 @@ fn run(
                 .filter(|c| !c.trim().is_empty())
             {
                 if let Err(e) = crate::library::launch_gamestream_command(cmd) {
+                    tracing::warn!(command = %cmd, error = %e, "gamestream: could not launch app");
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !crate::vdisplay::launch_is_nested(compositor) {
+            if let Some(cmd) = crate::library::resolve_session_launch(
+                app.and_then(|a| a.library_id.as_deref()),
+                app.and_then(|a| a.cmd.as_deref()),
+            ) {
+                if let Err(e) = crate::library::launch_session_command(compositor, &cmd) {
                     tracing::warn!(command = %cmd, error = %e, "gamestream: could not launch app");
                 }
             }
@@ -248,7 +255,16 @@ fn open_gs_virtual_source(
     };
     let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
     // Carry the resolved launch command on the backend instance (per-session) rather than a
-    // process-global env var, so concurrent sessions can't stomp each other's launch target.
+    // process-global env var, so concurrent sessions can't stomp each other's launch target. On
+    // Linux resolve a library-id selection to its command too, so gamescope's bare spawn nests a
+    // library title exactly like an apps.json command (it previously nested only `cmd`, silently
+    // dropping library picks).
+    #[cfg(target_os = "linux")]
+    vd.set_launch_command(crate::library::resolve_session_launch(
+        app.and_then(|a| a.library_id.as_deref()),
+        app.and_then(|a| a.cmd.as_deref()),
+    ));
+    #[cfg(not(target_os = "linux"))]
     vd.set_launch_command(app.and_then(|a| a.cmd.clone()));
     let vout = vd
         .create(punktfunk_core::Mode {
