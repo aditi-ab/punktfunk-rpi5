@@ -1,26 +1,27 @@
-# pf-dualsense — virtual DualSense UMDF2 HID minidriver (M0 spike)
+# pf-dualsense — virtual DualSense UMDF2 HID minidriver
 
 A self-authored **Rust UMDF2 HID minidriver** that presents a virtual Sony **DualSense**
 (VID `054C` / PID `0CE6`) to Windows, so games drive adaptive triggers / lightbar / rumble —
-capabilities ViGEm structurally cannot deliver. This is the M0 feasibility spike for rich
-controller support in the punktfunk Windows host.
+capabilities ViGEm structurally cannot deliver. It's how the punktfunk Windows host gives a client's
+DualSense a near-native feel with **no external gamepad dependencies** (no ViGEmBus).
 
-## Status (2026-06-21)
+Shipping: the driver is one member of the in-tree driver workspace
+([`packaging/windows/drivers/`](../../README.md)), built from source in CI, and bundled +
+`pnputil`-installed by the Windows host [installer](../../README.md). The host feeds it over a shared
+memory channel from `crates/punktfunk-host/src/inject/dualsense_windows.rs`. The same UMDF driver also
+serves the **DualShock 4** identity per a `device_type` byte the host stamps.
 
-**Load + recognition: DONE.** A self-signed build **loads under Secure Boot ON** and enumerates as a
-genuine DualSense HID game controller (`Status: OK`, VID `054C`, 273-byte DualSense report descriptor,
-PID `0CE6` via `GET_DEVICE_ATTRIBUTES`). Validated live on the RTX box (`192.168.1.173`, Win11 25H2).
+This README captures the driver-authoring lore — the bugs and the signing recipe that make a
+self-signed UMDF HID driver actually load. The authoritative build/sign/package flow (CI + Inno Setup)
+lives in the [Windows host packaging README](../../README.md).
 
-**Remaining:** the real-game `0x02` adaptive-trigger gate (Cyberpunk 2077 on the interactive desktop →
-confirm `[pf-ds] *** OUTPUT ...` in the driver log), then wire into the host (M1+).
+## Build workspace
 
-## This is a reference snapshot
-
-The crate's `Cargo.toml` uses path-deps into `microsoft/windows-drivers-rs`
-(`../../crates/wdk{,-sys,-build}`), so it builds **inside a `windows-drivers-rs` checkout's
-`examples/` dir**, not standalone in this repo. On the dev box it lives at
-`C:\Users\Public\m0\windows-drivers-rs\examples\pf-dualsense`. These files are checked in for
-version control / portability of the spike.
+This crate builds as a member of the [`packaging/windows/drivers/`](../../drivers) workspace, which
+uses the published **crates.io `wdk`/`wdk-sys`/`wdk-build`** (0.4/0.5) — not the old dev-box
+`windows-drivers-rs` path-deps. It's a separate cargo workspace from the main tree because driver
+crates are cdylibs built with the WDK toolchain on Windows only; it path-deps the shared ABI crate
+[`crates/pf-driver-proto`](../../../../crates/pf-driver-proto/README.md).
 
 ## Build / sign / install recipe (the one that actually loads)
 
@@ -76,9 +77,10 @@ silently breaks them:
    zero requests → `EvtIoDeviceControl` never fires → no HID handshake → ~5 s timeout →
    `CM_PROB_FAILED_START`. Set to `u32::MAX`.
 
-## Known limitations
+## Notes
 
-- Uses **statics, not per-device WDF contexts** → only one device instance per WUDFHost works.
-  Multi-instance needs proper device contexts.
-- Port of the WDK `vhidmini2` UMDF2 sample; DualSense identity + 273-byte descriptor + feature blobs
-  `0x05`/`0x09`/`0x20` from `crates/punktfunk-host/src/inject/dualsense.rs`.
+- **Multi-pad** works via `UmdfHostProcessSharing=ProcessSharingDisabled` — each pad gets its own
+  WUDFHost (so the per-instance statics don't collide), and the driver reads its pad index from the
+  device Location (`WdfDeviceAllocAndQueryProperty`) to map its own `*-shm-<index>` channel.
+- Port of the WDK `vhidmini2` UMDF2 sample; the DualSense identity + 273-byte descriptor + feature
+  blobs `0x05`/`0x09`/`0x20` come from `crates/punktfunk-host/src/inject/dualsense.rs`.
