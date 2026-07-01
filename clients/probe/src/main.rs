@@ -231,6 +231,16 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// Human name for the negotiated `Welcome::codec` (also the natural `--out` file extension). The
+/// bitstream is dumped verbatim, so an H.264 software-host session should be saved as `.h264`.
+fn codec_ext(codec: u8) -> &'static str {
+    match codec {
+        punktfunk_core::quic::CODEC_H264 => "h264",
+        punktfunk_core::quic::CODEC_AV1 => "av1",
+        _ => "h265",
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -411,6 +421,13 @@ async fn session(args: Args) -> Result<()> {
             // `--audio-channels` (default stereo); the probe multistream-decodes + validates the
             // host's frames to exercise the surround encode path headlessly.
             audio_channels: args.audio_channels,
+            // The probe just dumps the bitstream (no decode), so it advertises every codec — HEVC
+            // (the host default) AND H.264 (so it can drive a GPU-less software host,
+            // `PUNKTFUNK_ENCODER=software`) AND AV1. The host picks one and reports it in
+            // `Welcome::codec`; the dump extension follows that.
+            video_codecs: punktfunk_core::quic::CODEC_H264
+                | punktfunk_core::quic::CODEC_HEVC
+                | punktfunk_core::quic::CODEC_AV1,
         }
         .encode(),
     )
@@ -429,6 +446,7 @@ async fn session(args: Args) -> Result<()> {
         hdr = welcome.color.is_hdr(),
         chroma_444 = welcome.chroma_format == punktfunk_core::quic::CHROMA_IDC_444,
         chroma_format_idc = welcome.chroma_format,
+        codec = codec_ext(welcome.codec),
         "session offer"
     );
 

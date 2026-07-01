@@ -94,12 +94,19 @@ pub struct SessionPlan {
     /// Handshake-negotiated chroma subsampling (4:2:0, or full-chroma 4:4:4 when the client + host +
     /// GPU all support it). Resolved before the Welcome; `Yuv420` on every backend that declined it.
     pub chroma: crate::encode::ChromaFormat,
+    /// Handshake-negotiated video codec the encoder emits — HEVC by default, H.264 for a GPU-less
+    /// software host (`resolve_codec` over the client's advertised codecs ∩ the host's capability).
+    pub codec: crate::encode::Codec,
 }
 
 impl SessionPlan {
-    /// Resolve the whole plan once from [`config`](crate::config) + the negotiated `bit_depth` and
-    /// `chroma`.
-    pub fn resolve(bit_depth: u8, chroma: crate::encode::ChromaFormat) -> Self {
+    /// Resolve the whole plan once from [`config`](crate::config) + the negotiated `bit_depth`,
+    /// `chroma`, and `codec`.
+    pub fn resolve(
+        bit_depth: u8,
+        chroma: crate::encode::ChromaFormat,
+        codec: crate::encode::Codec,
+    ) -> Self {
         SessionPlan {
             capture: CaptureBackend::resolve(),
             topology: resolve_topology(),
@@ -107,6 +114,7 @@ impl SessionPlan {
             bit_depth,
             hdr: bit_depth >= 10,
             chroma,
+            codec,
         }
     }
 
@@ -154,5 +162,12 @@ fn resolve_encoder() -> EncoderBackend {
 
 #[cfg(not(target_os = "windows"))]
 fn resolve_encoder() -> EncoderBackend {
-    EncoderBackend::PlatformAuto
+    // `PUNKTFUNK_ENCODER=software` forces the GPU-less openh264 path — which must take CPU-staged
+    // capture (`EncoderBackend::Software.is_gpu() == false` → `output_format().gpu = false`), so the
+    // portal capturer delivers CPU RGB. Everything else stays `PlatformAuto` (NVENC/VAAPI resolved
+    // inside `encode::open_video`).
+    match crate::config::config().encoder_pref.as_str() {
+        "software" | "sw" | "openh264" => EncoderBackend::Software,
+        _ => EncoderBackend::PlatformAuto,
+    }
 }

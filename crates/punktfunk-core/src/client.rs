@@ -789,6 +789,10 @@ async fn worker_main(args: WorkerArgs) {
                 video_caps,
                 // Requested surround channel count; the host echoes the resolved value in Welcome.
                 audio_channels,
+                // Phase 1: the embeddable clients decode HEVC (their decoders are still HEVC-wired),
+                // so advertise HEVC-only until Phase 2 threads real per-client codec caps through the
+                // connect ABI and switches decoders on `Welcome::codec`.
+                video_codecs: crate::quic::CODEC_HEVC,
             }
             .encode(),
         )

@@ -86,6 +86,14 @@ pub struct Hello {
     /// deterministic offset. Omitted by older clients / when `2` (decodes to `2`, i.e. stereo) so
     /// the stereo wire form stays byte-identical to the pre-surround build.
     pub audio_channels: u8,
+    /// Which video codecs the client can decode — a bitfield of [`CODEC_H264`] / [`CODEC_HEVC`] /
+    /// [`CODEC_AV1`]. The host picks one it can also produce (see [`resolve_codec`]) and reports it in
+    /// [`Welcome::codec`]; a client that only reaches a GPU-less **software** host must set
+    /// [`CODEC_H264`] (openh264 emits H.264). Appended after `audio_channels` as a single trailing
+    /// byte (forcing the video_caps/audio_channels placeholders when present). Omitted by older
+    /// clients (decodes to `0`, which [`resolve_codec`] treats as HEVC-only — every pre-negotiation
+    /// build decoded HEVC).
+    pub video_codecs: u8,
 }
 
 /// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
@@ -99,6 +107,37 @@ pub const VIDEO_CAP_HDR: u8 = 0x02;
 /// [`Welcome::chroma_format`] reflects the real resolved value. Independent of 10-bit/HDR (4:4:4 is a
 /// chroma decision, bit depth is a depth decision; the two may combine where the hardware allows).
 pub const VIDEO_CAP_444: u8 = 0x04;
+
+/// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
+/// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
+/// advertise this.
+pub const CODEC_H264: u8 = 0x01;
+/// [`Hello::video_codecs`] bit: the client can decode H.265 / HEVC — the default every existing
+/// build produces and decodes (a peer that omits [`Hello::video_codecs`] is treated as HEVC-only).
+pub const CODEC_HEVC: u8 = 0x02;
+/// [`Hello::video_codecs`] bit: the client can decode AV1.
+pub const CODEC_AV1: u8 = 0x04;
+
+/// Resolve which single codec the host will emit, from the client's advertised [`Hello::video_codecs`]
+/// bitfield (`0` = an older client, treated as HEVC-only) intersected with what the host's chosen
+/// encoder can produce (`host_capable`, also a bitfield). Precedence when several are shared:
+/// **HEVC > AV1 > H.264** (HEVC is the established, best-tested path; H.264 is the compatibility /
+/// software floor). Returns the single-bit codec value, or `None` when the two share nothing — the
+/// caller then refuses the session with a clear error rather than emitting a stream the client can't
+/// decode.
+pub fn resolve_codec(client_codecs: u8, host_capable: u8) -> Option<u8> {
+    // An older client (no codec byte) decodes HEVC — the only codec every pre-negotiation build sent.
+    let client = if client_codecs == 0 {
+        CODEC_HEVC
+    } else {
+        client_codecs
+    };
+    let shared = client & host_capable;
+    // Precedence: HEVC > AV1 > H.264.
+    [CODEC_HEVC, CODEC_AV1, CODEC_H264]
+        .into_iter()
+        .find(|&c| shared & c != 0)
+}
 
 /// HEVC `chroma_format_idc` for 4:2:0 — what every pre-4:4:4 build produced and the back-compat
 /// default when a peer omits [`Welcome::chroma_format`].
@@ -235,6 +274,12 @@ pub struct Welcome {
     /// request — so an older host that omits the byte (→ `2`) always yields working stereo. Appended
     /// after `chroma_format` as a single trailing byte.
     pub audio_channels: u8,
+    /// The single video codec the host resolved and **will** emit — [`CODEC_H264`], [`CODEC_HEVC`]
+    /// (default), or [`CODEC_AV1`] — from [`resolve_codec`] over the client's [`Hello::video_codecs`]
+    /// and the host encoder's capability. The client builds its decoder from THIS (never assuming
+    /// HEVC). Appended after `audio_channels` as a single trailing byte; an older host that omits it
+    /// decodes to [`CODEC_HEVC`] (every pre-negotiation host sent HEVC).
+    pub codec: u8,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -671,7 +716,8 @@ impl Hello {
                                                                // present (video_caps non-zero / audio_channels not stereo) the name/launch length bytes
                                                                // AND the video_caps byte must still be emitted (0 / 0) so the later byte lands at a
                                                                // deterministic offset — the same discipline `launch` already imposes on `name`.
-        let need_placeholders = self.video_caps != 0 || self.audio_channels != 2;
+        let need_placeholders =
+            self.video_caps != 0 || self.audio_channels != 2 || self.video_codecs != 0;
         match (&self.name, &self.launch) {
             (None, None) if !need_placeholders => {}
             (name, _) => {
@@ -686,14 +732,18 @@ impl Hello {
             b.push(l.len() as u8);
             b.extend_from_slice(l.as_bytes());
         }
-        // video_caps: single trailing byte. Emitted when non-zero OR when audio_channels follows
-        // (so audio_channels lands at a deterministic offset right after it).
-        if self.video_caps != 0 || self.audio_channels != 2 {
+        // video_caps: single trailing byte. Emitted when non-zero OR when a later field follows (so
+        // that field lands at a deterministic offset right after it).
+        if self.video_caps != 0 || self.audio_channels != 2 || self.video_codecs != 0 {
             b.push(self.video_caps);
         }
-        // audio_channels: single trailing byte. Last field; omitted when stereo (default).
-        if self.audio_channels != 2 {
+        // audio_channels: single trailing byte. Emitted when non-stereo OR when video_codecs follows.
+        if self.audio_channels != 2 || self.video_codecs != 0 {
             b.push(self.audio_channels);
+        }
+        // video_codecs: single trailing byte. Last field; omitted when `0` (older client → HEVC-only).
+        if self.video_codecs != 0 {
+            b.push(self.video_codecs);
         }
         b
     }
@@ -766,6 +816,15 @@ impl Hello {
                 let video_caps_off = launch_off + 1 + launch_len;
                 crate::audio::normalize_channels(b.get(video_caps_off + 1).copied().unwrap_or(2))
             },
+            // Optional trailing video-codecs byte, one past audio_channels. Absent on an older client
+            // → `0` (which `resolve_codec` treats as HEVC-only).
+            video_codecs: {
+                let name_len = b.get(26).copied().unwrap_or(0) as usize;
+                let launch_off = 27 + name_len;
+                let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
+                let video_caps_off = launch_off + 1 + launch_len;
+                b.get(video_caps_off + 2).copied().unwrap_or(0)
+            },
         })
     }
 }
@@ -803,6 +862,8 @@ impl Welcome {
         b.push(self.chroma_format);
         // Audio channel count at offset 65 — older clients stop before this → stereo (2).
         b.push(self.audio_channels);
+        // Resolved video codec at offset 66 — older clients stop before this → HEVC.
+        b.push(self.codec);
         b
     }
 
@@ -811,8 +872,8 @@ impl Welcome {
         // scheme[22] pct[23] max_data[24..26] shard[26..28] encrypt[28] key[29..45]
         // salt[45..49] frames[49..53] compositor[53] gamepad[54] bitrate_kbps[55..59]
         // bit_depth[59] color.primaries[60] color.transfer[61] color.matrix[62] color.range[63]
-        // chroma_format[64] audio_channels[65] (everything from compositor on is an optional
-        // trailing byte; an older host stops earlier).
+        // chroma_format[64] audio_channels[65] codec[66] (everything from compositor on is an
+        // optional trailing byte; an older host stops earlier).
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -878,6 +939,13 @@ impl Welcome {
             // Optional trailing audio-channel byte — absent on an older host → stereo. Any
             // non-{6,8} value normalizes to stereo so a corrupt byte never builds a bad decoder.
             audio_channels: crate::audio::normalize_channels(b.get(65).copied().unwrap_or(2)),
+            // Optional trailing codec byte — absent on an older host (or an unknown value) → HEVC,
+            // the codec every pre-negotiation host emitted.
+            codec: match b.get(66).copied() {
+                Some(CODEC_H264) => CODEC_H264,
+                Some(CODEC_AV1) => CODEC_AV1,
+                _ => CODEC_HEVC,
+            },
         })
     }
 
@@ -1950,8 +2018,91 @@ mod tests {
             color: ColorInfo::HDR10_BT2020_PQ,
             chroma_format: CHROMA_IDC_444,
             audio_channels: 2,
+            codec: CODEC_H264, // exercise a non-default codec through the roundtrip
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
+    }
+
+    #[test]
+    fn codec_negotiation_and_back_compat() {
+        // resolve_codec precedence (HEVC > AV1 > H.264) and the no-shared-codec refusal.
+        assert_eq!(
+            resolve_codec(CODEC_H264 | CODEC_HEVC, CODEC_HEVC | CODEC_AV1),
+            Some(CODEC_HEVC)
+        );
+        assert_eq!(
+            resolve_codec(CODEC_H264 | CODEC_AV1, CODEC_AV1 | CODEC_H264),
+            Some(CODEC_AV1)
+        );
+        assert_eq!(resolve_codec(CODEC_H264, CODEC_H264), Some(CODEC_H264));
+        // A software host (H.264 only) + an HEVC-only client share nothing → refuse.
+        assert_eq!(resolve_codec(CODEC_HEVC, CODEC_H264), None);
+        // An older client (0 = no codec byte) is treated as HEVC-only.
+        assert_eq!(resolve_codec(0, CODEC_HEVC | CODEC_H264), Some(CODEC_HEVC));
+        assert_eq!(resolve_codec(0, CODEC_H264), None);
+
+        // A Hello advertising codecs roundtrips, and the wire form of a codec-only Hello decodes on
+        // a build that ignores the trailing byte (back-compat: extra bytes are skipped).
+        let h = Hello {
+            abi_version: 2,
+            mode: Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+            },
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: None,
+            launch: None,
+            video_caps: 0,
+            audio_channels: 2, // stereo — forces the video_caps/audio_channels placeholders
+            video_codecs: CODEC_H264 | CODEC_HEVC,
+        };
+        let enc = h.encode();
+        assert_eq!(
+            Hello::decode(&enc).unwrap().video_codecs,
+            CODEC_H264 | CODEC_HEVC
+        );
+        // A pre-codec Hello (no trailing codec byte) decodes to 0 → HEVC-only via resolve_codec.
+        let legacy = &enc[..enc.len() - 1]; // drop the codec byte (it was the last field)
+        assert_eq!(Hello::decode(legacy).unwrap().video_codecs, 0);
+
+        // A pre-codec Welcome (no codec byte) decodes to HEVC.
+        let mut w = Welcome::decode(
+            &Welcome {
+                abi_version: 2,
+                udp_port: 1,
+                mode: h.mode,
+                fec: FecConfig {
+                    scheme: FecScheme::Gf16,
+                    fec_percent: 0,
+                    max_data_per_block: 1024,
+                },
+                shard_payload: 1024,
+                encrypt: false,
+                key: [0; 16],
+                salt: [0; 4],
+                frames: 0,
+                compositor: CompositorPref::Auto,
+                gamepad: GamepadPref::Auto,
+                bitrate_kbps: 0,
+                bit_depth: 8,
+                color: ColorInfo::SDR_BT709,
+                chroma_format: CHROMA_IDC_420,
+                audio_channels: 2,
+                codec: CODEC_H264,
+            }
+            .encode(),
+        )
+        .unwrap();
+        assert_eq!(w.codec, CODEC_H264);
+        w.codec = CODEC_HEVC;
+        let wenc = w.encode();
+        assert_eq!(
+            Welcome::decode(&wenc[..wenc.len() - 1]).unwrap().codec,
+            CODEC_HEVC
+        );
     }
 
     #[test]
@@ -1993,6 +2144,7 @@ mod tests {
             launch: Some("steam:570".into()),
             video_caps: VIDEO_CAP_10BIT,
             audio_channels: 2,
+            video_codecs: CODEC_H264 | CODEC_HEVC, // exercise the codec bitfield roundtrip
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -2073,6 +2225,7 @@ mod tests {
             launch: None,
             video_caps: 0,
             audio_channels: 2,
+            video_codecs: 0,
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -2114,9 +2267,10 @@ mod tests {
             color: ColorInfo::HDR10_BT2020_PQ,
             chroma_format: CHROMA_IDC_444,
             audio_channels: 6, // 5.1 — exercises the non-default trailing byte
+            codec: CODEC_HEVC,
         };
         let wenc = w.encode();
-        assert_eq!(wenc.len(), 66); // 60 base + 4 colour + 1 chroma + 1 audio-channels byte
+        assert_eq!(wenc.len(), 67); // 60 base + 4 colour + 1 chroma + 1 audio-channels + 1 codec byte
         let legacy_w = Welcome::decode(&wenc[..53]).unwrap();
         assert_eq!(legacy_w.compositor, CompositorPref::Auto);
         assert_eq!(legacy_w.gamepad, GamepadPref::Auto);
@@ -2177,6 +2331,7 @@ mod tests {
             launch: None,
             video_caps: 0,
             audio_channels: 2,
+            video_codecs: 0,
         };
         let enc = base.encode();
         assert_eq!(
@@ -2225,6 +2380,7 @@ mod tests {
             launch: None,
             video_caps: 0,
             audio_channels: 2,
+            video_codecs: 0,
         };
         // launch alone (no name): a zero-length name placeholder keeps the offset deterministic.
         let with_launch = Hello {
@@ -2432,6 +2588,7 @@ mod tests {
                 launch: None,
                 video_caps: 0,
                 audio_channels: 2,
+                video_codecs: 0,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");

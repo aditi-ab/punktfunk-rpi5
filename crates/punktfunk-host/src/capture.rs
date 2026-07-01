@@ -95,7 +95,13 @@ pub(crate) fn gpu_encode() -> bool {
 }
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn gpu_encode() -> bool {
-    true
+    // The GPU-less software encoder (openh264) needs CPU-staged RGB frames; every other Linux
+    // backend (NVENC/CUDA, VAAPI) is GPU-resident. Mirrors `session_plan::resolve_encoder`, for the
+    // GameStream/spike entry points that use `OutputFormat::resolve` instead of a full `SessionPlan`.
+    !matches!(
+        crate::config::config().encoder_pref.as_str(),
+        "software" | "sw" | "openh264"
+    )
 }
 
 /// A captured frame. [`format`](Self::format)/dimensions describe the pixels regardless of

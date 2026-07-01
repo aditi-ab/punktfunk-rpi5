@@ -245,6 +245,24 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
+// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
+// advertise this.
+#define CODEC_H264 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_codecs`] bit: the client can decode H.265 / HEVC — the default every existing
+// build produces and decodes (a peer that omits [`Hello::video_codecs`] is treated as HEVC-only).
+#define CODEC_HEVC 2
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_codecs`] bit: the client can decode AV1.
+#define CODEC_AV1 4
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // HEVC `chroma_format_idc` for 4:2:0 — what every pre-4:4:4 build produced and the back-compat
 // default when a peer omits [`Welcome::chroma_format`].
 #define CHROMA_IDC_420 1

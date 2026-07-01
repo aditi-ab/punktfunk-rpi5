@@ -658,12 +658,30 @@ async fn serve_session(
         );
         // The pairing gate (require_pairing → paired? else park for delegated approval) ran above,
         // before this future, so a client reaching here is paired (or the host is `--open`).
-        crate::encode::validate_dimensions(
-            crate::encode::Codec::H265,
-            hello.mode.width,
-            hello.mode.height,
-        )
-        .context("client-requested mode")?;
+
+        // Codec negotiation: pick the one codec this host will emit (its backend capability ∩ the
+        // client's advertised codecs). A GPU-less software host emits H.264, so an HEVC-only client
+        // shares nothing with it → refuse honestly rather than send a stream it can't decode.
+        let host_codecs = crate::encode::Codec::host_wire_caps();
+        let codec_bit = punktfunk_core::quic::resolve_codec(hello.video_codecs, host_codecs)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no shared video codec: client advertised 0x{:02x}, host can emit 0x{:02x} \
+                     (a software-encode host produces H.264 — the client must advertise CODEC_H264)",
+                    hello.video_codecs,
+                    host_codecs
+                )
+            })?;
+        let codec = crate::encode::Codec::from_wire(codec_bit);
+        tracing::info!(
+            ?codec,
+            client_codecs = format_args!("0x{:02x}", hello.video_codecs),
+            host_codecs = format_args!("0x{host_codecs:02x}"),
+            "video codec negotiated"
+        );
+
+        crate::encode::validate_dimensions(codec, hello.mode.width, hello.mode.height)
+            .context("client-requested mode")?;
 
         // Resolve the client's compositor preference to a concrete backend *now*, so the Welcome
         // can report what we'll actually drive. Only the Virtual source has a compositor; the
@@ -749,7 +767,11 @@ async fn serve_session(
         // the cheap gates already pass. The result is cached process-wide (a negative latches until
         // restart — acceptable: a GPU either supports HEVC 4:4:4 or it doesn't, and a transient open
         // failure here is rare since the session's own encoder isn't open yet).
-        let gpu_supports_444 = if host_wants_444 && client_supports_444 && capture_supports_444 {
+        let gpu_supports_444 = if codec == crate::encode::Codec::H265
+            && host_wants_444
+            && client_supports_444
+            && capture_supports_444
+        {
             tokio::task::spawn_blocking(|| {
                 crate::encode::can_encode_444(crate::encode::Codec::H265)
             })
@@ -826,6 +848,9 @@ async fn serve_session(
             // The resolved audio channel count the audio thread will capture + Opus-(multi)stream
             // encode (2/6/8). The client builds its decoder from this echoed value.
             audio_channels,
+            // The negotiated codec the encoder will emit (H.264 for a software host, else HEVC). The
+            // client builds its decoder from this instead of assuming HEVC.
+            codec: codec_bit,
         };
         io::write_msg(&mut send, &welcome.encode()).await?;
 
@@ -838,6 +863,9 @@ async fn serve_session(
             .await
             .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
     let (mut ctrl_send, mut ctrl_recv) = (send, recv);
+    // Negotiated codec (HEVC / H.264), derived from the Welcome. `Copy`, so the control task's
+    // `async move` captures a copy and it stays usable for the data-plane SessionContext below.
+    let codec = crate::encode::Codec::from_wire(welcome.codec);
     let client_udp = std::net::SocketAddr::new(peer.ip(), start.client_udp_port);
     tracing::info!(
         %client_udp,
@@ -874,7 +902,7 @@ async fn serve_session(
                     if let Ok(req) = Reconfigure::decode(&msg) {
                         let ok = req.mode.refresh_hz > 0
                             && crate::encode::validate_dimensions(
-                                crate::encode::Codec::H265,
+                                codec,
                                 req.mode.width,
                                 req.mode.height,
                             )
@@ -1169,6 +1197,7 @@ async fn serve_session(
                         bitrate_kbps,
                         bit_depth,
                         chroma,
+                        codec,
                         probe_rx,
                         probe_result_tx,
                         fec_target: fec_target_dp,
@@ -2727,6 +2756,9 @@ struct SessionContext {
     bit_depth: u8,
     /// Negotiated chroma subsampling (4:2:0, or 4:4:4 when the client + host + GPU all support it).
     chroma: crate::encode::ChromaFormat,
+    /// Negotiated video codec the encoder emits (HEVC by default; H.264 for a software host). Also
+    /// used to rebuild the encoder at the same codec across a mid-stream mode reconfigure.
+    codec: crate::encode::Codec,
     /// Speed-test burst requests (see [`service_probes`]).
     probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
     /// Speed-test results back to the control task.
@@ -2758,7 +2790,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     // path now reads this typed `SessionPlan` instead of re-deriving from config at each dispatch site
     // (the latent "capture and encode disagree on the backend" hazard, plan §2.4). `bit_depth` is the
     // only per-session input — capture/topology/encoder are otherwise pure functions of `HostConfig`.
-    let plan = crate::session_plan::SessionPlan::resolve(ctx.bit_depth, ctx.chroma);
+    let plan = crate::session_plan::SessionPlan::resolve(ctx.bit_depth, ctx.chroma, ctx.codec);
     tracing::info!(?plan, "resolved session plan");
     // Single-process path: unpack the context into the locals the loop below uses (names unchanged, so the
     // body is byte-for-byte the same; the receivers are now owned but `try_recv()` is identical).
@@ -2774,6 +2806,8 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         bit_depth,
         // The resolved chroma is already captured in `plan` (above); ignore the duplicate here.
         chroma: _,
+        // Likewise the codec — `plan.codec` (resolved from `ctx.codec`) is the source of truth below.
+        codec: _,
         probe_rx,
         probe_result_tx,
         fec_target,
@@ -3448,7 +3482,7 @@ fn build_pipeline(
     // `bit_depth` is the handshake-negotiated value (8, or 10 = HEVC Main10 when the client
     // advertised VIDEO_CAP_10BIT and the host opted in). Threaded down from the Welcome.
     let enc = crate::encode::open_video(
-        crate::encode::Codec::H265,
+        plan.codec,
         frame.format,
         frame.width,
         frame.height,

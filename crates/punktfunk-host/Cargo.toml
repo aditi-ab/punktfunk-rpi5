@@ -71,6 +71,10 @@ tempfile = "3"
 # MSVC too (needs CMake + NASM, both on the box). Both platforms that have an audio-capture backend.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 opus = "0.3"
+# Software H.264 encoder — the GPU-less encode path on both Linux and Windows (and a fallback when no
+# hardware encoder is available). The default `source` feature statically compiles OpenH264 (BSD-2) —
+# no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.
+openh264 = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `screencast` gates the ScreenCast portal module; `remote_desktop` adds the RemoteDesktop
@@ -198,9 +202,6 @@ winreg = "0.56"
 # Parse each Xbox/Game-Pass game's MicrosoftGame.config (GDK manifest XML) for the Xbox store
 # provider — a small read-only DOM is all we need (Identity/Executable/ShellVisuals/StoreId).
 roxmltree = "0.21"
-# Software H.264 encoder (GPU-less path + NVENC fallback). The default `source` feature statically
-# compiles OpenH264 (BSD-2) — no system lib, builds on MSVC; nasm on PATH adds the SIMD fast path.
-openh264 = "0.9"
 # WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
 wasapi = "0.23"
 # Virtual Xbox 360 gamepad: the in-tree XUSB companion UMDF driver (packaging/windows/xusb-driver),

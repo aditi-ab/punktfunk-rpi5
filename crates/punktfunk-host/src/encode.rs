@@ -57,6 +57,37 @@ impl ChromaFormat {
 }
 
 impl Codec {
+    /// Map a negotiated `quic` codec bit ([`punktfunk_core::quic::CODEC_H264`] etc.) to the encoder
+    /// [`Codec`]. Unknown / `0` → HEVC (the pre-negotiation default). Inverse of [`Codec::to_wire`].
+    pub fn from_wire(bit: u8) -> Codec {
+        match bit {
+            punktfunk_core::quic::CODEC_H264 => Codec::H264,
+            punktfunk_core::quic::CODEC_AV1 => Codec::Av1,
+            _ => Codec::H265,
+        }
+    }
+
+    /// The single `quic` codec bit for this codec (echoed in [`punktfunk_core::quic::Welcome::codec`]).
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Codec::H264 => punktfunk_core::quic::CODEC_H264,
+            Codec::H265 => punktfunk_core::quic::CODEC_HEVC,
+            Codec::Av1 => punktfunk_core::quic::CODEC_AV1,
+        }
+    }
+
+    /// The `quic` codec bitfield the host can currently **emit** on the punktfunk/1 native path,
+    /// given the resolved encode backend. The GPU-less software encoder (openh264) produces H.264
+    /// only; every GPU backend emits HEVC today (per-GPU H.264/AV1 negotiation on the native path is
+    /// future work — GameStream already negotiates codecs with Moonlight separately). Fed to
+    /// [`punktfunk_core::quic::resolve_codec`] against the client's advertised codecs.
+    pub fn host_wire_caps() -> u8 {
+        match crate::config::config().encoder_pref.as_str() {
+            "software" | "sw" | "openh264" => punktfunk_core::quic::CODEC_H264,
+            _ => punktfunk_core::quic::CODEC_HEVC,
+        }
+    }
+
     /// The FFmpeg NVENC encoder name (selected by name, not codec id — the latter would
     /// pick the software encoder).
     pub fn nvenc_name(self) -> &'static str {
@@ -283,6 +314,21 @@ pub fn open_video(
                 chroma,
             ),
             "vaapi" | "amd" | "intel" => open_vaapi(),
+            // GPU-less software H.264 (openh264) — for a headless / GPU-lost box. Explicit-only:
+            // `auto` never picks it (a box with `/dev/nvidiactl` present but a dead driver would
+            // otherwise wrongly resolve to NVENC). Needs H.264 (openh264 emits only that) and a CPU
+            // RGB frame, which the capturer delivers because the software backend resolves `gpu=false`.
+            "software" | "sw" | "openh264" => {
+                if codec != Codec::H264 {
+                    anyhow::bail!(
+                        "the software encoder emits H.264 only; the session negotiated {codec:?} \
+                         (a client must advertise CODEC_H264 to reach a software host)"
+                    );
+                }
+                let _ = (cuda, bit_depth); // software path is CPU + 8-bit only
+                sw::OpenH264Encoder::open(format, width, height, fps, bitrate_bps)
+                    .map(|e| Box::new(e) as Box<dyn Encoder>)
+            }
             "auto" | "" => {
                 // A CUDA frame can ONLY be consumed by NVENC, and a box with the NVIDIA device
                 // nodes always prefers it. Everything else (AMD/Intel) takes the VAAPI path.
@@ -303,7 +349,7 @@ pub fn open_video(
                 }
             }
             other => anyhow::bail!(
-                "unknown PUNKTFUNK_ENCODER={other:?} — use auto (default), nvenc, or vaapi"
+                "unknown PUNKTFUNK_ENCODER={other:?} — use auto (default), nvenc, vaapi, or software"
             ),
         }
     }
@@ -708,8 +754,10 @@ mod linux;
 #[cfg(all(target_os = "windows", feature = "nvenc"))]
 #[path = "encode/windows/nvenc.rs"]
 mod nvenc;
-#[cfg(target_os = "windows")]
-#[path = "encode/windows/sw.rs"]
+// Software (openh264) H.264 encoder — the GPU-less path on BOTH Windows and Linux (a headless /
+// GPU-less test box, or a fallback when no hardware encoder is available). Platform-agnostic: it
+// consumes CPU RGB `CapturedFrame`s and the statically-bundled openh264 build.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 mod sw;
 #[cfg(target_os = "linux")]
 #[path = "encode/linux/vaapi.rs"]
