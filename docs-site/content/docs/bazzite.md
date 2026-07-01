@@ -1,15 +1,23 @@
 ---
-title: Bazzite — gamescope
-description: Set up a punktfunk host on Bazzite, streaming a Steam/gamescope session at your client's mode.
+title: Bazzite
+description: Set up a punktfunk host on Bazzite — it follows the box between Steam Gaming Mode (gamescope) and the KDE Plasma desktop automatically.
 ---
 
 [Bazzite](https://bazzite.gg/) already ships everything a punktfunk host needs — the NVIDIA driver,
-NVENC, PipeWire, and **gamescope**. So a Bazzite host is the most "appliance-like" setup: the host
-launches its own gamescope session at the **client's** resolution and refresh, so your games run at
-the mode of the device you're streaming to, not the TV the box is plugged into.
+NVENC, PipeWire, **gamescope**, and the **KDE Plasma desktop**. So a Bazzite host is the most
+"appliance-like" setup, and it streams **both** of Bazzite's faces:
 
-> This is ideal for a dedicated game-streaming box. For a general desktop, prefer
-> [Ubuntu/Fedora KDE](/docs/ubuntu-kde) or [GNOME](/docs/ubuntu-gnome).
+- **Steam Gaming Mode** (gamescope) — the couch/handheld game UI.
+- **The KDE Plasma desktop** — the full desktop you get from "Switch to Desktop".
+
+The host **auto-detects which one is live and follows the box across the switch** — including
+mid-stream. You flip between Gaming Mode and Desktop with Bazzite's normal Steam UI /
+"Switch to Desktop"; the host just re-targets whatever's running and keeps streaming. Nothing in
+`host.env` forces a mode.
+
+> Ideal for a dedicated game-streaming box that you also occasionally want as a remote desktop. For a
+> pure desktop machine, [Ubuntu/Fedora KDE](/docs/ubuntu-kde) or [GNOME](/docs/ubuntu-gnome) are
+> simpler.
 
 ## Install
 
@@ -58,31 +66,65 @@ permission, not a client problem.)
 
 ## Configure
 
-The RPM ships a gamescope-ready config you can copy as your starting point:
+The RPM ships a Bazzite-tuned config you can copy as your starting point:
 
 ```sh
 mkdir -p ~/.config/punktfunk
 cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env
 ```
 
-The key settings in `~/.config/punktfunk/host.env` point the host at the gamescope backend:
+The template is deliberately minimal — it does **not** force a compositor, because the host
+auto-detects Gaming Mode (gamescope) vs Desktop (KWin) on every connect and follows the switch
+mid-stream. The only settings that matter are the session anchors plus zero-copy:
 
 ```sh
-PUNKTFUNK_COMPOSITOR=gamescope
-PUNKTFUNK_GAMESCOPE_SESSION=steam   # the host owns a Steam session at the client's mode
-PUNKTFUNK_INPUT_BACKEND=gamescope
-PUNKTFUNK_ZEROCOPY=1
+XDG_RUNTIME_DIR=/run/user/1000
+DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+PUNKTFUNK_VIDEO_SOURCE=virtual
+PUNKTFUNK_ZEROCOPY=1            # GPU zero-copy (dmabuf → CUDA → NVENC); auto-falls back to CPU
+PUNKTFUNK_GAMESCOPE_ATTACH=1    # Gaming Mode = attach to the box's own session (see below)
 ```
 
-With this, when a client connects the host starts a `gamescope-session-plus` (Steam) session at the
-client's exact resolution and refresh, and relaunches it if the client changes mode. There should be
-**no physical gaming session already running** on the box.
+### Gaming Mode: attach vs managed
+
+For Gaming Mode there are two models (pick one; the shipped default is **attach**):
+
+- **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`, the default) — the **box** owns its gamescope session
+  and decides Gaming vs Desktop via the normal Steam UI. The host just attaches to whatever's live
+  and never tears it down, so switching Desktop ↔ Game is rock-solid and disconnecting leaves the box
+  where it was. The streamed game-mode resolution is the box's gamescope mode
+  (`SCREEN_WIDTH/HEIGHT` in `/etc/gamescope-session-plus/sessions.d/steam`), not the client's.
+- **Managed** (`PUNKTFUNK_GAMESCOPE_MANAGED=1`, and remove the attach line) — the host tears the
+  box's gamescope down on connect and launches its **own** at the *client's* exact resolution and
+  refresh, restoring on idle. Client-mode-following, but it can't coexist with a box-owned game-mode
+  session, and there must be **no physical gaming session already running**.
+
+Mid-stream Gaming ↔ Desktop following (`PUNKTFUNK_SESSION_WATCH`) is **on by default** on
+Bazzite/SteamOS. See [Configuration](/docs/configuration) for the full list of knobs.
+
+### Streaming the KDE Plasma desktop
+
+The **virtual output** (video) for the Desktop session needs no config — the host package ships an
+`io.unom.Punktfunk.Host.desktop` file whose `X-KDE-Wayland-Interfaces` grants the host KWin's
+restricted screencast protocol on a normal interactive Plasma session (least-privilege, the same
+mechanism krfb/krdp use). After a **fresh host install, log out and back into the Desktop session
+once** so KWin re-reads that grant.
+
+The one thing a normal KDE login lacks is the RemoteDesktop grant for headless **input** injection.
+Seed it once (as the streaming user, no root) so the host auto-approves instead of popping an
+un-answerable dialog:
+
+```sh
+bash /usr/share/punktfunk/bazzite/kde-desktop-setup.sh
+```
+
+Gaming Mode needs none of this — it auto-attaches.
 
 ## Run as an always-on host
 
 Bazzite hosts are typically headless. Enable the host service and linger so it starts at boot — see
-[Running as a Service](/docs/running-as-a-service). Because the host launches its own gamescope
-session per client, you don't need a separate desktop-session unit.
+[Running as a Service](/docs/running-as-a-service). One host service covers both Gaming Mode and the
+Desktop; it follows whichever the box is in.
 
 ```sh
 systemctl --user enable --now punktfunk-host
@@ -109,9 +151,12 @@ the console login screen — see [Forgot your Password?](/docs/forgot-password).
 
 ## Good to know
 
+These apply to the **Gaming Mode (gamescope)** path; the KDE Desktop path is unaffected:
+
 - **gamescope 3.16.22 or newer is required.** Older versions can deadlock during capture. Bazzite's
   current gamescope is fine; this only bites if you've pinned an old one.
-- **The mouse cursor isn't included in the captured image** — a gamescope limitation for now.
+- **The mouse cursor isn't included in the captured image** — a gamescope limitation for now. (The
+  KDE Desktop path renders the cursor normally.)
 - **HDR isn't supported yet** on the gamescope path — gamescope's capture output is 8-bit. SDR streams
   normally.
 
