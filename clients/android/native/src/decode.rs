@@ -27,16 +27,23 @@ pub fn run(
 ) {
     boost_thread_priority();
     let mode = client.mode();
-    let codec = match MediaCodec::from_decoder_type("video/hevc") {
+    // The MediaCodec MIME for the codec the host resolved (`Welcome.codec`): HEVC or H.264. AMediaCodec
+    // needs no out-of-band extradata — the in-band VPS/SPS/PPS on every IDR configure it either way.
+    let mime = match client.codec {
+        punktfunk_core::quic::CODEC_H264 => "video/avc",
+        _ => "video/hevc",
+    };
+    let codec = match MediaCodec::from_decoder_type(mime) {
         Some(c) => c,
         None => {
-            log::error!("decode: no HEVC decoder on this device");
+            log::error!("decode: no {mime} decoder on this device");
             return;
         }
     };
+    log::info!("decode: codec mime = {mime}");
 
     let mut format = MediaFormat::new();
-    format.set_str("mime", "video/hevc");
+    format.set_str("mime", mime);
     format.set_i32("width", mode.width as i32);
     format.set_i32("height", mode.height as i32);
     // Generous input buffer so a large keyframe AU is never truncated.

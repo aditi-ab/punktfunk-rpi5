@@ -95,6 +95,12 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
                 selected = s.bitrateKbps,
             ) { kbps -> update(s.copy(bitrateKbps = kbps)) }
 
+            SettingDropdown(
+                label = "Video codec",
+                options = CODEC_OPTIONS,
+                selected = s.codec,
+            ) { c -> update(s.copy(codec = c)) }
+
             // HDR is only meaningful on a panel that can present HDR10; on an SDR display the toggle
             // is disabled (and HDR is never advertised regardless) so the host doesn't send PQ the
             // panel would mis-tone-map. The capability is fixed for the device, so read it once.

@@ -48,6 +48,8 @@ object NativeBridge {
         gamepadPref: Int,
         hdrEnabled: Boolean,
         audioChannels: Int,
+        /** Preferred video codec as a `quic::CODEC_*` bit (`0` = auto). Soft — the host falls back. */
+        preferredCodec: Int,
         timeoutMs: Int,
     ): Long
 

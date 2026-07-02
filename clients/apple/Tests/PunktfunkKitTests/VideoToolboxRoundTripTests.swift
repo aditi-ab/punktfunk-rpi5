@@ -28,18 +28,18 @@ final class VideoToolboxRoundTripTests: XCTestCase {
 
         // 1) Parameter-set extraction → format description.
         let rebuilt = try XCTUnwrap(
-            AnnexB.formatDescription(fromIDR: annexB),
+            AnnexB.formatDescription(fromIDR: annexB, codec: .hevc),
             "in-band VPS/SPS/PPS should yield a format description")
         let dims = CMVideoFormatDescriptionGetDimensions(rebuilt)
         XCTAssertEqual(Int(dims.width), width)
         XCTAssertEqual(Int(dims.height), height)
 
         // 2) Annex-B → AVCC re-pack must reproduce the encoder's own sample bytes.
-        XCTAssertEqual(AnnexB.avcc(from: annexB), avccSample)
+        XCTAssertEqual(AnnexB.avcc(from: annexB, codec: .hevc), avccSample)
 
         // 3) Sample buffer → real decoder → pixels.
         let au = AccessUnit(data: annexB, ptsNs: 1_000_000, frameIndex: 0, flags: 0)
-        let sample = try XCTUnwrap(AnnexB.sampleBuffer(au: au, format: rebuilt))
+        let sample = try XCTUnwrap(AnnexB.sampleBuffer(au: au, format: rebuilt, codec: .hevc))
 
         var session: VTDecompressionSession?
         XCTAssertEqual(
@@ -72,7 +72,7 @@ final class VideoToolboxRoundTripTests: XCTestCase {
     func testVideoDecoderAsyncCallbackDeliversPixels() throws {
         let (formatDesc, avccSample) = try encodeOneHEVCKeyframe()
         let annexB = try annexBAU(formatDesc: formatDesc, avccSample: avccSample)
-        let format = try XCTUnwrap(AnnexB.formatDescription(fromIDR: annexB))
+        let format = try XCTUnwrap(AnnexB.formatDescription(fromIDR: annexB, codec: .hevc))
         let au = AccessUnit(data: annexB, ptsNs: 42_000_000, frameIndex: 0, flags: 0)
 
         let box = FrameBox()

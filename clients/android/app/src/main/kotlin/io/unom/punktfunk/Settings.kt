@@ -26,6 +26,9 @@ data class Settings(
     /** Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
      * can capture; the resolved count drives the decoder + AAudio layout. */
     val audioChannels: Int = 2,
+    /** Preferred video codec: `"auto"` (host decides), `"hevc"`, or `"h264"`. A soft preference — the
+     * host emits it when it can, else falls back. AMediaCodec decodes whichever the host resolves. */
+    val codec: String = "auto",
     val micEnabled: Boolean = false,
     /** Show the live stats overlay (FPS / throughput / latency) during a stream. */
     val statsHudEnabled: Boolean = true,
@@ -51,6 +54,7 @@ class SettingsStore(context: Context) {
         compositor = prefs.getInt(K_COMPOSITOR, 0),
         gamepad = prefs.getInt(K_GAMEPAD, 0),
         audioChannels = prefs.getInt(K_AUDIO_CH, 2),
+        codec = prefs.getString(K_CODEC, "auto") ?: "auto",
         micEnabled = prefs.getBoolean(K_MIC, false),
         statsHudEnabled = prefs.getBoolean(K_HUD, true),
         trackpadMode = prefs.getBoolean(K_TRACKPAD, true),
@@ -66,6 +70,7 @@ class SettingsStore(context: Context) {
             .putInt(K_COMPOSITOR, s.compositor)
             .putInt(K_GAMEPAD, s.gamepad)
             .putInt(K_AUDIO_CH, s.audioChannels)
+            .putString(K_CODEC, s.codec)
             .putBoolean(K_MIC, s.micEnabled)
             .putBoolean(K_HUD, s.statsHudEnabled)
             .putBoolean(K_TRACKPAD, s.trackpadMode)
@@ -81,6 +86,7 @@ class SettingsStore(context: Context) {
         const val K_COMPOSITOR = "compositor"
         const val K_GAMEPAD = "gamepad"
         const val K_AUDIO_CH = "audio_channels"
+        const val K_CODEC = "codec"
         const val K_MIC = "mic_enabled"
         const val K_HUD = "stats_hud_enabled"
         const val K_TRACKPAD = "trackpad_mode"
@@ -155,6 +161,21 @@ val AUDIO_CHANNEL_OPTIONS = listOf(
     6 to "5.1 Surround",
     8 to "7.1 Surround",
 )
+
+/** (stored value, label) for the preferred video codec. `"auto"` = host decides. */
+val CODEC_OPTIONS = listOf(
+    "auto" to "Automatic",
+    "hevc" to "HEVC (H.265)",
+    "h264" to "H.264 (AVC)",
+)
+
+/** The [Settings.codec] string as a `quic::CODEC_*` preference byte (`0` = auto). H264=1, HEVC=2. */
+fun Settings.preferredCodec(): Int = when (codec) {
+    "h264" -> 1
+    "hevc" -> 2
+    "av1" -> 4
+    else -> 0
+}
 
 /** (kbps, label). `0` = host default. */
 val BITRATE_OPTIONS = listOf(

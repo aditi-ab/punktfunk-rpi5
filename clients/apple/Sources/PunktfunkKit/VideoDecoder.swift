@@ -54,6 +54,10 @@ public final class VideoDecoder: @unchecked Sendable {
     /// depth / HDR). Read inside `createSessionLocked` under `lock`.
     private var chroma444 = false
 
+    /// The negotiated codec (`connection.videoCodec`), set once at session start. Drives the AnnexB
+    /// NAL parsing (H.264 vs HEVC parameter sets). Read under `lock`.
+    private var codec: VideoCodec = .hevc
+
     public init(
         onDecoded: @escaping @Sendable (ReadyFrame) -> Void,
         onDecodeError: @escaping @Sendable (OSStatus) -> Void = { _ in }
@@ -70,6 +74,14 @@ public final class VideoDecoder: @unchecked Sendable {
     public func setChroma444(_ on: Bool) {
         lock.lock()
         chroma444 = on
+        lock.unlock()
+    }
+
+    /// Select the negotiated codec (H.264 vs HEVC). Call once at session start, before decoding,
+    /// from `connection.videoCodec`. Thread-safe.
+    public func setCodec(_ c: VideoCodec) {
+        lock.lock()
+        codec = c
         lock.unlock()
     }
 
@@ -93,7 +105,7 @@ public final class VideoDecoder: @unchecked Sendable {
         // invalidate the session between here and DecodeFrame. The VT output callback takes the
         // ring lock, not this one, so there's no re-entrancy. DecodeFrame is async — non-blocking.
         guard let session,
-              let sample = AnnexB.sampleBuffer(au: au, format: newFormat)
+              let sample = AnnexB.sampleBuffer(au: au, format: newFormat, codec: codec)
         else { lock.unlock(); return false }
         var infoOut = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(

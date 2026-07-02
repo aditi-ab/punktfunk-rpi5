@@ -108,6 +108,7 @@ final class SessionModel: ObservableObject {
                  bitrateKbps: UInt32 = 0,
                  audioChannels: UInt8 = 2,
                  hdrEnabled: Bool = true,
+                 preferredCodec: UInt8 = 0,
                  launchID: String? = nil,
                  allowTofu: Bool = false,
                  autoTrust: Bool = false,
@@ -155,12 +156,17 @@ final class SessionModel: ObservableObject {
             if want444, canDecode444 {
                 videoCaps |= PunktfunkConnection.videoCap444
             }
+            // This client's VideoToolbox path decodes H.264 and HEVC (AV1 isn't wired — hosts don't
+            // emit it on the native path yet). The host resolves the emitted codec from these + the
+            // soft `preferredCodec`; `resolvedCodec` reflects what it chose.
+            let videoCodecs = PunktfunkConnection.codecH264 | PunktfunkConnection.codecHEVC
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,
                 pinSHA256: pin, identity: identity, compositor: compositor,
                 gamepad: gamepad, bitrateKbps: bitrateKbps, videoCaps: videoCaps,
-                audioChannels: audioChannels, launchID: launchID,
+                audioChannels: audioChannels,
+                videoCodecs: videoCodecs, preferredCodec: preferredCodec, launchID: launchID,
                 // Delegated approval: the host holds this connect open until the operator approves
                 // it (~180 s) — outwait that window so a slow approval still lands here. Normal
                 // connects keep the snappy default.

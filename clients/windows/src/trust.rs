@@ -138,6 +138,26 @@ pub struct Settings {
     pub hdr_enabled: bool,
     /// Video decode backend: `auto` (D3D11VA, fall back to software), `hardware`, or `software`.
     pub decoder: String,
+    /// Preferred video codec: `"auto"` (host decides), `"hevc"`, `"h264"`, or `"av1"`. A soft
+    /// preference — the host honors it when it can emit it, else falls back to the best shared codec.
+    #[serde(default = "default_codec")]
+    pub codec: String,
+}
+
+fn default_codec() -> String {
+    "auto".into()
+}
+
+impl Settings {
+    /// The `codec` setting as a `quic::CODEC_*` preference bit (`0` = auto).
+    pub fn preferred_codec(&self) -> u8 {
+        match self.codec.as_str() {
+            "h264" | "avc" => punktfunk_core::quic::CODEC_H264,
+            "hevc" | "h265" => punktfunk_core::quic::CODEC_HEVC,
+            "av1" => punktfunk_core::quic::CODEC_AV1,
+            _ => 0,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -154,6 +174,7 @@ impl Default for Settings {
             audio_channels: 2,
             hdr_enabled: true,
             decoder: "auto".into(),
+            codec: "auto".into(),
         }
     }
 }

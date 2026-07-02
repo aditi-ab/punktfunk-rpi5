@@ -64,7 +64,7 @@ final class AnnexBTests: XCTestCase {
             au.append(n)
         }
 
-        let avcc = AnnexB.avcc(from: au)
+        let avcc = AnnexB.avcc(from: au, codec: .hevc)
         // Only the IDR survives: 4-byte BE length, then the NAL bytes.
         var expected = Data([0, 0, 0, UInt8(idr.count)])
         expected.append(idr)
@@ -74,6 +74,6 @@ final class AnnexBTests: XCTestCase {
     func testFormatDescriptionNilWithoutParameterSets() {
         let idr = nal(type: 19, payload: [0xDD])
         let au = Data(start4) + idr
-        XCTAssertNil(AnnexB.formatDescription(fromIDR: au))
+        XCTAssertNil(AnnexB.formatDescription(fromIDR: au, codec: .hevc))
     }
 }

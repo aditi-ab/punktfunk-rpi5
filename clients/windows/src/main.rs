@@ -182,6 +182,13 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
         mic_enabled: flag("--mic"),
         hdr_enabled: !flag("--no-hdr"),
         decoder,
+        // `--codec h264|hevc|av1` sets the soft preference; default auto (host decides).
+        preferred_codec: match arg("--codec").as_deref() {
+            Some("h264") | Some("avc") => punktfunk_core::quic::CODEC_H264,
+            Some("hevc") | Some("h265") => punktfunk_core::quic::CODEC_HEVC,
+            Some("av1") => punktfunk_core::quic::CODEC_AV1,
+            _ => 0,
+        },
         pin,
         identity,
         // Headless CLI uses the normal (short) handshake budget; the long request-access wait is a

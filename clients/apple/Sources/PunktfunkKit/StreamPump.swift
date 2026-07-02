@@ -95,7 +95,7 @@ final class StreamPump {
 
                     guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
                     onFrame?(au)
-                    let idrFormat = AnnexB.formatDescription(fromIDR: au.data)
+                    let idrFormat = AnnexB.formatDescription(fromIDR: au.data, codec: connection.videoCodec)
                     if let f = idrFormat {
                         format = f          // refreshed on every IDR (mode changes included)
                         if awaitingIDR {
@@ -119,7 +119,7 @@ final class StreamPump {
                     }
                     wasFailed = failed
                     guard let f = format,
-                          let sample = AnnexB.sampleBuffer(au: au, format: f),
+                          let sample = AnnexB.sampleBuffer(au: au, format: f, codec: connection.videoCodec),
                           token.isLive // don't enqueue a stale frame after a restart
                     else { continue }
                     layer.enqueue(sample)

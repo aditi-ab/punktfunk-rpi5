@@ -44,6 +44,14 @@ const BITRATES_MBPS: &[u32] = &[0, 10, 20, 30, 50, 80, 150];
 /// Audio channel presets: `(channel count, display label)`. The host clamps to what it can
 /// capture; the resolved count drives the decoder + WASAPI render layout.
 const AUDIO_CHANNELS: &[(u8, &str)] = &[(2, "Stereo"), (6, "5.1 Surround"), (8, "7.1 Surround")];
+/// Preferred-codec presets: `(stored value, display label)`. Soft — the host falls back if it can't
+/// encode the chosen codec.
+const CODECS: &[(&str, &str)] = &[
+    ("auto", "Automatic"),
+    ("hevc", "HEVC (H.265)"),
+    ("h264", "H.264 (AVC)"),
+    ("av1", "AV1"),
+];
 
 /// punktfunk's own license (MIT OR Apache-2.0), shown on the Licenses screen.
 const APP_LICENSE: &str = concat!(
@@ -681,6 +689,7 @@ fn connect_with(
         mic_enabled: s.mic_enabled,
         hdr_enabled: s.hdr_enabled,
         decoder: DecoderPref::from_name(&s.decoder),
+        preferred_codec: s.preferred_codec(),
         pin,
         identity: ctx.identity.clone(),
         connect_timeout: opts.connect_timeout,
@@ -1039,6 +1048,21 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
             })
     };
 
+    let codec_i = CODECS.iter().position(|&(v, _)| v == s.codec).unwrap_or(0) as i32;
+    let codec_names: Vec<String> = CODECS.iter().map(|&(_, l)| l.to_string()).collect();
+    let codec_combo = {
+        let ctx = ctx.clone();
+        ComboBox::new(codec_names)
+            .header("Video codec")
+            .selected_index(codec_i)
+            .on_selection_changed(move |i: i32| {
+                let (v, _) = CODECS[(i.max(0) as usize).min(CODECS.len() - 1)];
+                let mut s = ctx.settings.lock().unwrap();
+                s.codec = v.to_string();
+                s.save();
+            })
+    };
+
     let br_i = BITRATES_MBPS
         .iter()
         .position(|&m| m * 1000 == s.bitrate_kbps)
@@ -1149,6 +1173,7 @@ fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Eleme
             .font_size(12.0)
             .foreground(ThemeRef::SecondaryText),
             decoder_combo,
+            codec_combo,
             bitrate_combo,
             hdr_toggle,
         ))

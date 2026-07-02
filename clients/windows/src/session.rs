@@ -31,6 +31,9 @@ pub struct SessionParams {
     pub hdr_enabled: bool,
     /// Which video decode backend to use (auto/hardware/software).
     pub decoder: DecoderPref,
+    /// The user's preferred video codec (a `quic::CODEC_*` bit, `0` = auto). Soft — the host honors
+    /// it when it can emit it, else falls back; the resolved codec drives the decoder.
+    pub preferred_codec: u8,
     /// Pinned host fingerprint; `None` = trust on first use (caller persists the observed one).
     pub pin: Option<[u8; 32]>,
     pub identity: (String, String),
@@ -166,7 +169,9 @@ fn pump(
             0
         },
         params.audio_channels,
-        None, // launch: the Windows client has no library picker yet
+        crate::video::decodable_codecs(), // codecs FFmpeg can decode (HEVC/H.264/AV1)
+        params.preferred_codec,           // the user's soft codec preference (0 = auto)
+        None,                             // launch: the Windows client has no library picker yet
         params.pin,
         Some(params.identity),
         params.connect_timeout,
@@ -195,7 +200,14 @@ fn pump(
         fingerprint: connector.host_fingerprint,
     });
 
-    let mut decoder = match Decoder::new(params.decoder) {
+    // Build the decoder for the codec the host resolved (never assume HEVC).
+    let codec_id = crate::video::ffmpeg_codec_id(connector.codec);
+    tracing::info!(
+        ?codec_id,
+        welcome_codec = connector.codec,
+        "negotiated video codec"
+    );
+    let mut decoder = match Decoder::new(params.decoder, codec_id) {
         Ok(d) => d,
         Err(e) => {
             let _ = ev_tx.send_blocking(SessionEvent::Ended(Some(format!("video decoder: {e}"))));

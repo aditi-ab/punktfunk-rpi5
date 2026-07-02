@@ -167,6 +167,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     gamepad_pref: jint,
     hdr_enabled: jboolean,
     audio_channels: jint,
+    preferred_codec: jint,
     timeout_ms: jint,
 ) -> jlong {
     let host: String = match env.get_string(&host) {
@@ -224,6 +225,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // decoder + AAudio layout (read in `crate::audio::AudioPlayback::start`). Anything else
         // normalizes to stereo here.
         punktfunk_core::audio::normalize_channels(audio_channels.clamp(0, u8::MAX as jint) as u8),
+        // Codecs this device can decode — AMediaCodec decodes both HEVC and H.264 (AV1 isn't wired;
+        // hosts don't emit it on the native path yet). The host resolves the emitted codec from these
+        // + the soft `preferred_codec` and echoes it in `connector.codec`, which drives the mime below.
+        punktfunk_core::quic::CODEC_H264 | punktfunk_core::quic::CODEC_HEVC,
+        preferred_codec.clamp(0, u8::MAX as jint) as u8,
         None,     // launch: default app
         pin,      // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)

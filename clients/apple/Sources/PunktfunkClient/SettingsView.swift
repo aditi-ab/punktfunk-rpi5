@@ -30,6 +30,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) private var micEnabled = true
     @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
+    @AppStorage(DefaultsKey.codec) private var codec = "auto"
     @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @ObservedObject private var gamepads = GamepadManager.shared
@@ -671,16 +672,22 @@ struct SettingsView: View {
 
     @ViewBuilder private var hdrSection: some View {
         Section {
+            Picker("Video codec", selection: $codec) {
+                Text("Automatic").tag("auto")
+                Text("HEVC (H.265)").tag("hevc")
+                Text("H.264 (AVC)").tag("h264")
+            }
             Toggle("10-bit HDR", isOn: $hdrEnabled)
             Toggle("Full chroma (4:4:4)", isOn: $enable444)
         } header: {
             Text("Video quality")
         } footer: {
-            Text("HDR requests a 10-bit BT.2020 PQ (HDR10) stream — it only engages when the host is "
-                + "sending HDR content AND this display supports HDR. 4:4:4 requests full chroma "
-                + "(sharper text/UI, more bandwidth) — it only engages when this device can "
-                + "hardware-decode it AND the host opted in. Otherwise the stream stays 8-bit "
-                + "4:2:0 SDR. Applies from the next session.")
+            Text("Codec is a preference — the host falls back if it can't encode the one you pick "
+                + "(and 10-bit/4:4:4 are HEVC-only). HDR requests a 10-bit BT.2020 PQ (HDR10) stream — "
+                + "it only engages when the host is sending HDR content AND this display supports HDR. "
+                + "4:4:4 requests full chroma (sharper text/UI, more bandwidth) — it only engages when "
+                + "this device can hardware-decode it AND the host opted in. Otherwise the stream stays "
+                + "8-bit 4:2:0 SDR. Applies from the next session.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }

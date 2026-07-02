@@ -30,7 +30,7 @@ final class Stage444Tests: XCTestCase {
             Stage444Probe.hwDecode444_8bit, "no hardware 4:4:4 decode on this device")
         let data = Data(Probe444Blobs.au444_8bit)
         let format = try XCTUnwrap(
-            AnnexB.formatDescription(fromIDR: data), "the 4:4:4 blob must yield a format description")
+            AnnexB.formatDescription(fromIDR: data, codec: .hevc), "the 4:4:4 blob must yield a format description")
         let au = AccessUnit(data: data, ptsNs: 7_000_000, frameIndex: 0, flags: 0)
 
         let box = FrameBox()

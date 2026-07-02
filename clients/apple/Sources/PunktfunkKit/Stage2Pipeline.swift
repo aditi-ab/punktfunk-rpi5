@@ -119,6 +119,7 @@ public final class Stage2Pipeline {
         // chroma subsampling drives only the decode pixel format (orthogonal to HDR/depth); the HDR
         // config is the Welcome's latched value, which a mid-session flip then overrides per-frame.
         decoder.setChroma444(connection.isChroma444)
+        decoder.setCodec(connection.videoCodec)
         presenter.configure(hdr: connection.isHDR)
 
         let token = token
@@ -159,7 +160,7 @@ public final class Stage2Pipeline {
                     }
                     guard let au = try connection.nextAU(timeoutMs: 100) else { continue }
                     onFrame?(au)
-                    if let f = AnnexB.formatDescription(fromIDR: au.data) {
+                    if let f = AnnexB.formatDescription(fromIDR: au.data, codec: connection.videoCodec) {
                         format = f          // refreshed on every IDR (mode changes included)
                         awaitingIDR = false // a fresh IDR re-anchored decode — recovery complete
                     }

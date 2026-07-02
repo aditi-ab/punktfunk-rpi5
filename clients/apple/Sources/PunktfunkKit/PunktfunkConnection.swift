@@ -255,6 +255,13 @@ public final class PunktfunkConnection {
     /// PCM from `nextAudioPcm` is interleaved in the canonical wire order FL FR FC LFE RL RR SL SR.
     public private(set) var resolvedAudioChannels: UInt8 = 2
 
+    /// The video codec the host resolved for this session (`Welcome.codec`, `PUNKTFUNK_CODEC_*`):
+    /// `2` = HEVC (default / older host), `1` = H.264, `4` = AV1. Build the decoder from THIS. The
+    /// resolved value honors the client's `preferredCodec` when the host could emit it.
+    public private(set) var resolvedCodec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
+    /// The resolved codec as an `AnnexB.VideoCodec` (H.264 vs HEVC) — drives the NAL parsing.
+    public var videoCodec: VideoCodec { VideoCodec(wire: resolvedCodec) }
+
     /// Connect and start a session at the requested mode (the host creates a native virtual
     /// output at exactly this size/refresh). Blocks up to `timeoutMs`.
     ///
@@ -285,6 +292,8 @@ public final class PunktfunkConnection {
         bitrateKbps: UInt32 = 0,
         videoCaps: UInt8 = 0,
         audioChannels: UInt8 = 2,
+        videoCodecs: UInt8 = 0x02, // PUNKTFUNK_CODEC_HEVC — the codecs this client can decode
+        preferredCodec: UInt8 = 0, // 0 = auto; else PUNKTFUNK_CODEC_* soft preference
         launchID: String? = nil,
         timeoutMs: UInt32 = 10_000
     ) throws {
@@ -300,16 +309,18 @@ public final class PunktfunkConnection {
                     withOptionalCString(launchID) { launch in
                         if let pin = pinSHA256 {
                             return pin.withUnsafeBytes { p in
-                                punktfunk_connect_ex6(
+                                punktfunk_connect_ex7(
                                     cs, port, width, height, refreshHz, compositor.rawValue,
-                                    gamepad.rawValue, bitrateKbps, videoCaps, audioChannels, launch,
+                                    gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
+                                    videoCodecs, preferredCodec, launch,
                                     p.bindMemory(to: UInt8.self).baseAddress, &observed,
                                     cert, key, timeoutMs)
                             }
                         }
-                        return punktfunk_connect_ex6(
+                        return punktfunk_connect_ex7(
                             cs, port, width, height, refreshHz, compositor.rawValue,
-                            gamepad.rawValue, bitrateKbps, videoCaps, audioChannels, launch,
+                            gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
+                            videoCodecs, preferredCodec, launch,
                             nil, &observed, cert, key, timeoutMs)
                     }
                 }
@@ -347,6 +358,9 @@ public final class PunktfunkConnection {
         var ac: UInt8 = 2
         _ = punktfunk_connection_audio_channels(handle, &ac)
         resolvedAudioChannels = ac
+        var codec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
+        _ = punktfunk_connection_codec(handle, &codec)
+        resolvedCodec = codec
     }
 
     /// A bandwidth speed-test measurement (see `startSpeedTest`). Partial until `done`.
@@ -619,6 +633,11 @@ public final class PunktfunkConnection {
     /// Extensions). Advertise only when the device can *hardware*-decode it (`Stage444Probe`);
     /// the host then emits 4:4:4 only if it too opted in. `chromaFormat` reflects the real value.
     public static let videoCap444: UInt8 = UInt8(PUNKTFUNK_VIDEO_CAP_444)
+
+    /// Codec bits for `videoCodecs` / `preferredCodec` and the value `resolvedCodec` returns.
+    public static let codecH264: UInt8 = UInt8(PUNKTFUNK_CODEC_H264)
+    public static let codecHEVC: UInt8 = UInt8(PUNKTFUNK_CODEC_HEVC)
+    public static let codecAV1: UInt8 = UInt8(PUNKTFUNK_CODEC_AV1)
 
     /// Static HDR mastering metadata (SMPTE ST.2086 + content light level) the host sent for an HDR
     /// session. Mirrors the wire/ABI `PunktfunkHdrMeta`; primaries are in ST.2086 **G, B, R** order,

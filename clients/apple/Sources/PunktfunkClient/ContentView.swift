@@ -28,10 +28,20 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.gamepadType) private var gamepadType = 0
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
+    @AppStorage(DefaultsKey.codec) private var codec = "auto"
     @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.hudEnabled) private var hudEnabled = true
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
+    /// The `codec` setting as a `PUNKTFUNK_CODEC_*` soft-preference byte (`0` = auto).
+    private var preferredCodecByte: UInt8 {
+        switch codec {
+        case "h264": return PunktfunkConnection.codecH264
+        case "hevc": return PunktfunkConnection.codecHEVC
+        case "av1": return PunktfunkConnection.codecAV1
+        default: return 0
+        }
+    }
     @State private var showAddHost = false
     @State private var pairingTarget: StoredHost?
     /// A fresh `pair=required`/unknown host the user tapped: drives the choice between no-PIN
@@ -378,6 +388,7 @@ struct ContentView: View {
             bitrateKbps: UInt32(clamping: bitrateKbps),
             audioChannels: UInt8(clamping: audioChannels),
             hdrEnabled: hdrEnabled,
+            preferredCodec: preferredCodecByte,
             launchID: launchID,
             allowTofu: allowTofu,
             requestAccess: requestAccess)
@@ -521,6 +532,7 @@ struct ContentView: View {
             bitrateKbps: bitrate,
             audioChannels: UInt8(clamping: audioChannels),
             hdrEnabled: hdrEnabled,
+            preferredCodec: preferredCodecByte,
             autoTrust: true)
     }
 }

@@ -124,17 +124,46 @@ enum Backend {
 
 pub struct Decoder {
     backend: Backend,
+    /// The negotiated codec, so a mid-session D3D11VA→software demotion rebuilds for the same codec.
+    codec_id: ffmpeg::codec::Id,
+}
+
+/// Map a negotiated `quic` codec bit to the FFmpeg decoder id the client opens.
+pub fn ffmpeg_codec_id(wire: u8) -> ffmpeg::codec::Id {
+    match wire {
+        punktfunk_core::quic::CODEC_H264 => ffmpeg::codec::Id::H264,
+        punktfunk_core::quic::CODEC_AV1 => ffmpeg::codec::Id::AV1,
+        _ => ffmpeg::codec::Id::HEVC,
+    }
+}
+
+/// The `quic` codec bitfield this client can decode — whatever FFmpeg has a decoder for (HEVC/H.264
+/// always; AV1 when built in). Advertised to the host so it never emits a codec we can't decode.
+pub fn decodable_codecs() -> u8 {
+    let _ = ffmpeg::init();
+    let mut bits = 0u8;
+    for (id, bit) in [
+        (ffmpeg::codec::Id::HEVC, punktfunk_core::quic::CODEC_HEVC),
+        (ffmpeg::codec::Id::H264, punktfunk_core::quic::CODEC_H264),
+        (ffmpeg::codec::Id::AV1, punktfunk_core::quic::CODEC_AV1),
+    ] {
+        if ffmpeg::decoder::find(id).is_some() {
+            bits |= bit;
+        }
+    }
+    bits
 }
 
 impl Decoder {
-    pub fn new(pref: DecoderPref) -> Result<Decoder> {
+    pub fn new(pref: DecoderPref, codec_id: ffmpeg::codec::Id) -> Result<Decoder> {
         ffmpeg::init().context("ffmpeg init")?;
         if pref != DecoderPref::Software {
-            match D3d11vaDecoder::new() {
+            match D3d11vaDecoder::new(codec_id) {
                 Ok(d) => {
-                    tracing::info!("D3D11VA hardware decode active (zero-copy)");
+                    tracing::info!(?codec_id, "D3D11VA hardware decode active (zero-copy)");
                     return Ok(Decoder {
                         backend: Backend::D3d11va(d),
+                        codec_id,
                     });
                 }
                 Err(e) => {
@@ -146,7 +175,8 @@ impl Decoder {
             }
         }
         Ok(Decoder {
-            backend: Backend::Software(SoftwareDecoder::new()?),
+            backend: Backend::Software(SoftwareDecoder::new(codec_id)?),
+            codec_id,
         })
     }
 
@@ -164,7 +194,7 @@ impl Decoder {
                 Ok(f) => Ok(f.map(DecodedFrame::Gpu)),
                 Err(e) => {
                     tracing::warn!(error = %e, "D3D11VA decode failed — falling back to software");
-                    self.backend = Backend::Software(SoftwareDecoder::new()?);
+                    self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
                     Ok(None)
                 }
             },
@@ -183,9 +213,9 @@ struct SoftwareDecoder {
 }
 
 impl SoftwareDecoder {
-    fn new() -> Result<SoftwareDecoder> {
-        let codec =
-            ffmpeg::decoder::find(ffmpeg::codec::Id::HEVC).ok_or(anyhow!("no HEVC decoder"))?;
+    fn new(codec_id: ffmpeg::codec::Id) -> Result<SoftwareDecoder> {
+        let codec = ffmpeg::decoder::find(codec_id)
+            .ok_or_else(|| anyhow!("no {codec_id:?} decoder in libavcodec"))?;
         let mut ctx = ffmpeg::codec::Context::new_with_codec(codec);
         unsafe {
             let raw = ctx.as_mut_ptr();
@@ -194,7 +224,7 @@ impl SoftwareDecoder {
             (*raw).thread_type = ffmpeg::ffi::FF_THREAD_SLICE;
             (*raw).thread_count = 0; // auto
         }
-        let decoder = ctx.decoder().video().context("open HEVC decoder")?;
+        let decoder = ctx.decoder().video().context("open video decoder")?;
         Ok(SoftwareDecoder { decoder, sws: None })
     }
 
@@ -359,7 +389,7 @@ struct D3d11vaDecoder {
 unsafe impl Send for D3d11vaDecoder {}
 
 impl D3d11vaDecoder {
-    fn new() -> Result<D3d11vaDecoder> {
+    fn new(codec_id: ffmpeg::codec::Id) -> Result<D3d11vaDecoder> {
         use ffmpeg::ffi;
         let shared = crate::gpu::shared().ok_or_else(|| anyhow!("no shared D3D11 device"))?;
         if !shared.hardware {
@@ -387,11 +417,11 @@ impl D3d11vaDecoder {
                 bail!("av_hwdevice_ctx_init: {}", ffmpeg::Error::from(r));
             }
 
-            let codec = ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_HEVC);
+            let codec = ffi::avcodec_find_decoder(codec_id.into());
             if codec.is_null() {
                 let mut hw = hw_device;
                 ffi::av_buffer_unref(&mut hw);
-                bail!("no HEVC decoder");
+                bail!("no {codec_id:?} decoder");
             }
             let ctx = ffi::avcodec_alloc_context3(codec);
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device);

@@ -138,7 +138,7 @@ final class RemoteFirstLightTests: XCTestCase {
             if firstPtsNs == 0 { firstPtsNs = au.ptsNs }
             lastPtsNs = au.ptsNs
 
-            if let f = AnnexB.formatDescription(fromIDR: au.data) {
+            if let f = AnnexB.formatDescription(fromIDR: au.data, codec: .hevc) {
                 format = f
                 if decoder == nil {
                     let dims = CMVideoFormatDescriptionGetDimensions(f)
@@ -155,7 +155,7 @@ final class RemoteFirstLightTests: XCTestCase {
                 }
             }
             guard let f = format, let dec = decoder,
-                  let sample = AnnexB.sampleBuffer(au: au, format: f)
+                  let sample = AnnexB.sampleBuffer(au: au, format: f, codec: .hevc)
             else { continue }
 
             var gotPixels = false
