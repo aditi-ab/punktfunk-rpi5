@@ -16,10 +16,10 @@
 //! Wi-Fi `MulticastLock` + permission UX, Keystore identity).
 //!
 //! JNI symbols map to `io.unom.punktfunk.kit.NativeBridge` in the `:kit` Gradle module
-//! (`clients/android`). The current surface is the scaffold's native-link proof
-//! (`abiVersion`/`coreVersion`) plus the session handle lifecycle in [`session`]; the per-plane
-//! pumps (video → AMediaCodec, audio → Oboe), input, audio, pairing and mode renegotiation are
-//! the next milestone (see the TODOs in [`session`]).
+//! (`clients/android`). The surface: the native-link proof (`abiVersion`/`coreVersion`), mDNS host
+//! discovery ([`discovery`]), and the session lifecycle in [`session`] — connect/pair + the trust
+//! surface, the per-plane pumps (video → AMediaCodec, audio ↔ AAudio, mic uplink), input, and
+//! rumble/HID feedback ([`feedback`]). Mode renegotiation is still TODO (see [`session`]).
 
 use jni::objects::JObject;
 use jni::sys::jint;

@@ -6,11 +6,6 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,24 +22,14 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -56,7 +41,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -99,7 +83,6 @@ private class RequestAccessState(val target: PendingTrust) {
     val cancelled = AtomicBoolean(false)
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     val scope = rememberCoroutineScope()
@@ -162,6 +145,26 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     // it survives a DHCP address change; else by address:port). Mirrors the Apple client.
     val discoveredUnsaved = discovered.filter { dh -> savedHosts.none { it.matches(dh) } }
 
+    // The one place the full nativeConnect is issued (shared by the normal connect and the
+    // request-access path), including the HDR/gamepad derivation both need.
+    suspend fun connectNative(id: ClientIdentity, targetHost: String, targetPort: Int, pinHex: String, timeoutMs: Int): Long {
+        // Advertise HDR only when the user enabled it AND this device's display can present it
+        // (else the host sends a proper SDR stream rather than PQ the panel would mis-tone-map).
+        val hdrEnabled = settings.hdrEnabled && displaySupportsHdr(context)
+        // "Automatic" resolves to a concrete pad type from the connected controller's VID/PID
+        // (Android exposes no controller-type enum) — parity with the Linux/Apple clients. An
+        // explicit choice is passed through unchanged.
+        val gamepadPref = Gamepad.resolvePref(settings.gamepad)
+        return withContext(Dispatchers.IO) {
+            NativeBridge.nativeConnect(
+                targetHost, targetPort, w, h, hz,
+                id.certPem, id.privateKeyPem, pinHex,
+                settings.bitrateKbps, settings.compositor, gamepadPref,
+                hdrEnabled, settings.audioChannels, settings.preferredCodec(), timeoutMs,
+            )
+        }
+    }
+
     // Issue the actual connect with identity + (optional) pin. On a TOFU connect (pinHex null),
     // pin the fingerprint the host presented (as an unpaired known host) so the next connect goes
     // straight through and it appears in the saved-hosts list.
@@ -175,22 +178,7 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
         status = "Connecting to $targetHost:$targetPort…"
         discovery.stop() // free the Wi-Fi radio before the stream session
         scope.launch {
-            // Advertise HDR only when the user enabled it AND this device's display can present it
-            // (else the host sends a proper SDR stream rather than PQ the panel would mis-tone-map).
-            val hdrEnabled = settings.hdrEnabled && displaySupportsHdr(context)
-            // "Automatic" resolves to a concrete pad type from the connected controller's VID/PID
-            // (Android exposes no controller-type enum) — parity with the Linux/Apple clients. An
-            // explicit choice is passed through unchanged.
-            val gamepadPref = Gamepad.resolvePref(settings.gamepad)
-            val handle = withContext(Dispatchers.IO) {
-                NativeBridge.nativeConnect(
-                    targetHost, targetPort, w, h, hz,
-                    id.certPem, id.privateKeyPem, pinHex ?: "",
-                    settings.bitrateKbps, settings.compositor, gamepadPref,
-                    hdrEnabled, settings.audioChannels, settings.preferredCodec(),
-                    CONNECT_TIMEOUT_MS,
-                )
-            }
+            val handle = connectNative(id, targetHost, targetPort, pinHex ?: "", CONNECT_TIMEOUT_MS)
             connecting = false
             if (handle != 0L) {
                 if (pinHex == null) { // TOFU: pin what we observed (unpaired)
@@ -225,19 +213,10 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
         status = null
         discovery.stop() // free the Wi-Fi radio before the (parked) stream session
         scope.launch {
-            val hdrEnabled = settings.hdrEnabled && displaySupportsHdr(context)
-            val gamepadPref = Gamepad.resolvePref(settings.gamepad)
             // Pin the advertised fingerprint for a discovered host (defence against an impostor while
             // we wait); a manually-typed host has none, so trust-on-first-use.
             val pinHex = target.advertisedFp ?: ""
-            val handle = withContext(Dispatchers.IO) {
-                NativeBridge.nativeConnect(
-                    target.host, target.port, w, h, hz,
-                    id.certPem, id.privateKeyPem, pinHex,
-                    settings.bitrateKbps, settings.compositor, gamepadPref,
-                    hdrEnabled, settings.audioChannels, REQUEST_ACCESS_TIMEOUT_MS,
-                )
-            }
+            val handle = connectNative(id, target.host, target.port, pinHex, REQUEST_ACCESS_TIMEOUT_MS)
             // Cancelled while we were parked: tear the (possibly just-approved) session down and
             // don't touch UI a fresh action may now own.
             if (req.cancelled.get()) {
@@ -296,7 +275,6 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
         }
     }
 
-    val sheetState = rememberModalBottomSheetState()
     var showManualSheet by remember { mutableStateOf(false) }
 
     Box(Modifier.fillMaxSize()) {
@@ -428,291 +406,87 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
             }
         }
 
-        AnimatedVisibility(
-            visible = true, // Static for now, could be based on scroll if needed
-            enter = scaleIn() + fadeIn(),
-            exit = scaleOut() + fadeOut(),
+        ExtendedFloatingActionButton(
+            onClick = { showManualSheet = true },
+            icon = { Icon(Icons.Filled.Add, contentDescription = null) },
+            text = { Text("Add host") },
+            expanded = !connecting,
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(20.dp)
-        ) {
-            ExtendedFloatingActionButton(
-                onClick = { showManualSheet = true },
-                icon = { Icon(Icons.Filled.Add, contentDescription = null) },
-                text = { Text("Add host") },
-                expanded = !connecting,
-            )
-        }
+                .padding(20.dp),
+        )
     }
 
     if (showManualSheet) {
-        ModalBottomSheet(
-            onDismissRequest = { showManualSheet = false },
-            sheetState = sheetState,
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 24.dp)
-                    .padding(bottom = 32.dp),
-            ) {
-                Text("Add a host", style = MaterialTheme.typography.titleLarge)
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "Enter its address. You'll pair with the host's PIN on first connect.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(20.dp))
-                OutlinedTextField(
-                    value = hostName,
-                    onValueChange = { hostName = it },
-                    label = { Text("Name (optional)") },
-                    placeholder = { Text("e.g. Living Room") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(16.dp))
-                OutlinedTextField(
-                    value = host,
-                    onValueChange = { host = it },
-                    label = { Text("Host") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(16.dp))
-                OutlinedTextField(
-                    value = port,
-                    onValueChange = { v -> port = v.filter { it.isDigit() }.take(5) },
-                    label = { Text("Port") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(20.dp))
-                Button(
-                    enabled = !connecting && host.isNotBlank() && port.isNotBlank(),
-                    onClick = {
-                        val h = host.trim()
-                        val p = port.toIntOrNull() ?: 9777
-                        val n = hostName
-                        scope.launch { sheetState.hide() }.invokeOnCompletion {
-                            showManualSheet = false
-                            connect(h, p, manualName = n)
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("Connect  ($w×$h@$hz)") }
-            }
-        }
+        AddHostSheet(
+            hostName = hostName,
+            onHostNameChange = { hostName = it },
+            host = host,
+            onHostChange = { host = it },
+            port = port,
+            onPortChange = { port = it },
+            connecting = connecting,
+            modeLabel = "$w×$h@$hz",
+            onDismiss = { showManualSheet = false },
+            onConnect = { h2, p, n -> connect(h2, p, manualName = n) },
+        )
     }
 
     pendingTrust?.let { pt ->
         when (pt.kind) {
-            PendingTrust.Kind.TRUST_NEW -> AlertDialog(
-                onDismissRequest = { pendingTrust = null },
-                title = { Text("Trust this host?") },
-                text = {
-                    Column {
-                        Text("First connection to ${pt.host}:${pt.port}.")
-                        pt.advertisedFp?.let { Text("Fingerprint ${it.take(16)}…") }
-                        Text(
-                            "This host allows trust-on-first-use, but that can't tell an impostor " +
-                                "from the real host. Pairing with a PIN is stronger — it proves both sides.",
-                        )
-                    }
-                },
-                confirmButton = {
-                    TextButton({ pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null) }) {
-                        Text("Trust (TOFU)")
-                    }
-                },
-                dismissButton = {
-                    Row {
-                        TextButton({ pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) }) {
-                            Text("Pair with PIN…")
-                        }
-                        TextButton({ pendingTrust = null }) { Text("Cancel") }
-                    }
-                },
+            PendingTrust.Kind.TRUST_NEW -> TrustNewHostDialog(
+                pt = pt,
+                onTrust = { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null) },
+                onPairInstead = { pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) },
+                onDismiss = { pendingTrust = null },
             )
-            PendingTrust.Kind.FP_CHANGED -> AlertDialog(
-                onDismissRequest = { pendingTrust = null },
-                title = { Text("Host identity changed") },
-                text = {
-                    Text(
-                        "The pinned fingerprint for ${pt.host} no longer matches what it now " +
-                            "advertises. This can mean a host reinstall — or an impostor. Re-pair " +
-                            "with the host's PIN to continue.",
-                    )
-                },
-                confirmButton = {
-                    TextButton({ pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) }) { Text("Re-pair") }
-                },
-                dismissButton = {
-                    TextButton({ pendingTrust = null }) { Text("Cancel") }
-                },
+            PendingTrust.Kind.FP_CHANGED -> FingerprintChangedDialog(
+                pt = pt,
+                onRepair = { pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) },
+                onDismiss = { pendingTrust = null },
             )
-            // A fresh pair=required (or manual/unknown-policy) host: offer the two ways in. "Request
-            // access" is the no-PIN path — connect and wait for the operator to click Approve in the
-            // host's console; "Use a PIN…" switches to the SPAKE2 ceremony.
-            PendingTrust.Kind.REQUEST_ACCESS -> AlertDialog(
-                onDismissRequest = { pendingTrust = null },
-                title = { Text("Pairing required") },
-                text = {
-                    Column {
-                        Text("${pt.host}:${pt.port} requires pairing before it will stream.")
-                        Text(
-                            "Request access and approve this device in the host's console (or web " +
-                                "UI) — no PIN needed. Or pair with the 4-digit PIN the host displays.",
-                        )
-                    }
-                },
-                confirmButton = {
-                    TextButton({ pendingTrust = null; requestAccess(pt) }) { Text("Request access") }
-                },
-                dismissButton = {
-                    Row {
-                        TextButton({ pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) }) {
-                            Text("Use a PIN…")
-                        }
-                        TextButton({ pendingTrust = null }) { Text("Cancel") }
-                    }
-                },
+            PendingTrust.Kind.REQUEST_ACCESS -> RequestAccessDialog(
+                pt = pt,
+                onRequestAccess = { pendingTrust = null; requestAccess(pt) },
+                onUsePin = { pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) },
+                onDismiss = { pendingTrust = null },
             )
-            PendingTrust.Kind.PAIR -> {
-                var pin by remember(pt) { mutableStateOf("") }
-                var name by remember(pt) { mutableStateOf(Build.MODEL ?: "Android") }
-                var pairing by remember(pt) { mutableStateOf(false) }
-                var err by remember(pt) { mutableStateOf<String?>(null) }
-                AlertDialog(
-                    onDismissRequest = { if (!pairing) pendingTrust = null },
-                    title = { Text("Pair with PIN") },
-                    text = {
-                        Column {
-                            Text("Enter the 4-digit PIN shown on the host.")
-                            OutlinedTextField(
-                                value = pin,
-                                onValueChange = { v -> pin = v.filter { it.isDigit() }.take(4) },
-                                label = { Text("PIN") },
-                                singleLine = true,
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            )
-                            OutlinedTextField(
-                                value = name,
-                                onValueChange = { name = it },
-                                label = { Text("This device") },
-                                singleLine = true,
-                            )
-                            err?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                        }
-                    },
-                    confirmButton = {
-                        TextButton(
-                            enabled = !pairing && pin.length == 4 && identity != null,
-                            onClick = {
-                                val id = identity
-                                if (id != null) {
-                                    pairing = true
-                                    err = null
-                                    scope.launch {
-                                        val fp = withContext(Dispatchers.IO) {
-                                            NativeBridge.nativePair(
-                                                pt.host, pt.port, id.certPem, id.privateKeyPem, pin, name,
-                                            )
-                                        }
-                                        pairing = false
-                                        if (fp.isNotEmpty()) {
-                                            // Verified host fp — save as a paired known host.
-                                            knownHostStore.save(
-                                                KnownHost(pt.host, pt.port, pt.name, fp, paired = true),
-                                            )
-                                            savedHosts = knownHostStore.all()
-                                            pendingTrust = null
-                                            doConnect(pt.host, pt.port, pt.name, fp)
-                                        } else {
-                                            err = "Pairing failed — wrong PIN, or the host isn't armed."
-                                        }
-                                    }
-                                }
-                            },
-                        ) { Text(if (pairing) "Pairing…" else "Pair") }
-                    },
-                    dismissButton = {
-                        TextButton(enabled = !pairing, onClick = { pendingTrust = null }) { Text("Cancel") }
-                    },
-                )
-            }
+            PendingTrust.Kind.PAIR -> PairPinDialog(
+                pt = pt,
+                identity = identity,
+                onPaired = { fp ->
+                    // Verified host fp — save as a paired known host, then connect pinned.
+                    knownHostStore.save(KnownHost(pt.host, pt.port, pt.name, fp, paired = true))
+                    savedHosts = knownHostStore.all()
+                    pendingTrust = null
+                    doConnect(pt.host, pt.port, pt.name, fp)
+                },
+                onDismiss = { pendingTrust = null },
+            )
         }
     }
 
-    // The no-PIN "request access" wait: the connect is parked on the host until the operator
-    // approves this device. Cancel returns the UI immediately — it trips the per-attempt flag so a
-    // late approval is torn down silently (see requestAccess) and resumes discovery.
     awaiting?.let { req ->
-        fun cancel() {
-            req.cancelled.set(true)
-            awaiting = null
-            connecting = false
-            discovery.start() // the request may still be pending on the host; keep scanning
-        }
-        AlertDialog(
-            onDismissRequest = { cancel() },
-            title = { Text("Waiting for approval") },
-            text = {
-                val deviceName = Build.MODEL ?: "this device"
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                        Text("Approve this device on ${req.target.name}.")
-                    }
-                    Text(
-                        "Open the host's console (or web UI) and approve “$deviceName”. It connects " +
-                            "automatically once you approve — no PIN needed.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            },
-            confirmButton = {},
-            dismissButton = {
-                TextButton(onClick = { cancel() }) { Text("Cancel") }
+        AwaitingApprovalDialog(
+            hostLabel = req.target.name,
+            onCancel = {
+                req.cancelled.set(true)
+                awaiting = null
+                connecting = false
+                discovery.start() // the request may still be pending on the host; keep scanning
             },
         )
     }
 
-    // Rename a saved host's label (discovered hosts are named by mDNS; this is how you give one a
-    // friendly name like "Living Room" after pairing). Keyed by the host so reopening resets the field.
     renameTarget?.let { kh ->
-        var newName by remember(kh) { mutableStateOf(kh.name) }
-        AlertDialog(
-            onDismissRequest = { renameTarget = null },
-            title = { Text("Rename host") },
-            text = {
-                OutlinedTextField(
-                    value = newName,
-                    onValueChange = { newName = it },
-                    label = { Text("Name") },
-                    placeholder = { Text(kh.address) },
-                    singleLine = true,
-                )
+        RenameHostDialog(
+            target = kh,
+            onRename = { newName ->
+                knownHostStore.rename(kh.address, kh.port, newName)
+                savedHosts = knownHostStore.all()
+                renameTarget = null
             },
-            confirmButton = {
-                TextButton(
-                    enabled = newName.isNotBlank(),
-                    onClick = {
-                        knownHostStore.rename(kh.address, kh.port, newName.trim())
-                        savedHosts = knownHostStore.all()
-                        renameTarget = null
-                    },
-                ) { Text("Save") }
-            },
-            dismissButton = {
-                TextButton(onClick = { renameTarget = null }) { Text("Cancel") }
-            },
+            onDismiss = { renameTarget = null },
         )
     }
 }

@@ -115,6 +115,14 @@ object NativeBridge {
     external fun nativeVideoStats(handle: Long): DoubleArray?
 
     /**
+     * Gate per-frame stats sampling on the HUD being visible: while disabled the decode thread
+     * skips the per-AU clock read + lock, so toggle this with the overlay (and only poll
+     * [nativeVideoStats] while it's on). Enabling resets the measurement window — no stale data.
+     * Sticky for the session (survives video stop/start). No-op on `0`.
+     */
+    external fun nativeSetVideoStatsEnabled(handle: Long, enabled: Boolean)
+
+    /**
      * Start host→client audio: Opus decode → jitter ring → AAudio (LowLatency), all in Rust. No-op
      * if already started. Best-effort — a failure leaves video streaming.
      */

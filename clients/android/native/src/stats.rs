@@ -1,15 +1,22 @@
 //! Live decode stats for the on-stream HUD (mirrors the Apple client's stats overlay): FPS,
 //! receive throughput, and capture→client-receipt latency (p50/p95). The decode thread is the sole
 //! writer (`note` per access unit); the JNI accessor `nativeVideoStats` drains a snapshot ~1 Hz and
-//! resets the window. Pure `std` so it compiles on the host build too (the decode thread is
-//! android-only, but `VideoThread` holds the shared handle unconditionally).
+//! resets the window. Sampling is gated on the HUD actually being visible (`set_enabled`, driven by
+//! `nativeSetVideoStatsEnabled`) so the hidden steady state costs one relaxed atomic load per frame.
+//! Pure `std` so it compiles on the host build too (the decode thread is android-only, but
+//! `SessionHandle` holds the shared handle unconditionally).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
 /// Rolling per-window accumulator. Rates are computed over the actual elapsed wall-time at drain
 /// (robust to poll jitter), so a poll that lands at 0.9 s or 1.1 s still reports the right FPS.
 pub struct VideoStats {
+    /// HUD gate: `note` runs on the per-frame decode path, so while the overlay is hidden it (and
+    /// the caller's latency computation — see `enabled`) early-outs on this flag alone. Off until
+    /// Kotlin shows the HUD.
+    enabled: AtomicBool,
     inner: Mutex<Inner>,
 }
 
@@ -35,11 +42,9 @@ pub struct Snapshot {
 }
 
 impl VideoStats {
-    // `new`/`note` are driven only by the android-only decode thread; `drain` (the JNI accessor) is
-    // ungated, so on the host build these two are unreferenced — that's expected, not dead code.
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn new() -> VideoStats {
         VideoStats {
+            enabled: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 window_start: Instant::now(),
                 frames: 0,
@@ -50,10 +55,44 @@ impl VideoStats {
         }
     }
 
+    /// Whether the HUD wants samples. The decode thread checks this BEFORE building a latency
+    /// sample, so the per-frame wall-clock read is skipped too while hidden.
+    // Read only by the android-only decode thread; unreferenced on the host build — expected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Toggle sampling. Enabling resets the window, so the first HUD poll after a show never mixes
+    /// in counters (or a window start) from before the overlay was visible.
+    pub fn set_enabled(&self, on: bool) {
+        let was = self.enabled.swap(on, Ordering::Relaxed);
+        if on && !was {
+            let mut g = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.window_start = Instant::now();
+            g.frames = 0;
+            g.bytes = 0;
+            g.lat_us.clear();
+        }
+    }
+
     /// Record one decoded access unit: its wire size and (if in range) its capture→client latency.
+    // Driven only by the android-only decode thread; unreferenced on the host build — expected.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn note(&self, bytes: usize, lat_us: Option<u64>, skew_corrected: bool) {
-        let mut g = self.inner.lock().unwrap();
+        if !self.enabled.load(Ordering::Relaxed) {
+            return; // HUD hidden — skip the lock (the caller already skipped the clock read)
+        }
+        // Poison-proof: `note` runs per-frame on the decode thread, which has no catch_unwind —
+        // a panic elsewhere must not turn every later lock into a second panic (the counters
+        // stay consistent regardless).
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.frames += 1;
         g.bytes += bytes as u64;
         g.skew_corrected = skew_corrected;
@@ -64,7 +103,11 @@ impl VideoStats {
 
     /// Compute the window's rates + latency percentiles, then reset for the next window.
     pub fn drain(&self) -> Snapshot {
-        let mut g = self.inner.lock().unwrap();
+        // Poison-proof for the same reason as `note` — a poisoned window still drains fine.
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let elapsed = g.window_start.elapsed().as_secs_f64().max(1e-3);
         let fps = g.frames as f64 / elapsed;
         let mbps = g.bytes as f64 * 8.0 / 1_000_000.0 / elapsed;

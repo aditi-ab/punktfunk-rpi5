@@ -14,6 +14,7 @@ use ndk::media::media_format::MediaFormat;
 use ndk::native_window::{FrameRateCompatibility, NativeWindow};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::error::PunktfunkError;
+use punktfunk_core::session::Frame;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,6 +54,9 @@ pub fn run(
     );
     // Ask for the low-latency decode path where the decoder supports it (no reordering buffer).
     format.set_i32("low-latency", 1);
+    // Best-effort vendor twin of the standard key: older Qualcomm decoders only honor their own
+    // extension. Unknown keys are ignored by other vendors' codecs, so this is safe to set blind.
+    format.set_i32("vendor.qti-ext-dec-low-latency.enable", 1);
     // Advisory low-latency hints (KEY_PRIORITY / KEY_OPERATING_RATE), ignored where unsupported:
     // realtime priority + the target frame rate, so vendor decoders (e.g. Qualcomm) run at full
     // clocks instead of a power-saving cadence that adds dequeue latency.
@@ -102,6 +106,11 @@ pub fn run(
 
     let mut fed: u64 = 0;
     let mut rendered: u64 = 0;
+    let mut discarded: u64 = 0;
+    // The AU waiting for a free codec input buffer. `feed` is non-blocking; on transient input
+    // pressure the AU stays parked here instead of being dropped (a drop forces a keyframe
+    // round-trip) and we only pop the next one once it's queued.
+    let mut pending: Option<Frame> = None;
     // Loss recovery: watch the host→client unrecoverable-drop count and ask for an IDR when it
     // climbs.
     let mut last_dropped = client.frames_dropped();
@@ -112,29 +121,61 @@ pub fn run(
     // The dataspace we've signalled on the Surface so far (None = default/SDR). Set reactively once
     // the decoder reports an HDR stream (see `drain`); avoids re-applying every format event.
     let mut applied_ds: Option<DataSpace> = None;
+    // One thread feeds AND drains: the NDK AMediaCodec wrapper isn't documented thread-safe for
+    // cross-thread feed/drain, so instead of splitting threads the loop decouples the two — input
+    // dequeue is non-blocking (never stalls presentation of already-decoded frames) and the only
+    // blocking wait is a short output dequeue while input is backed up (decoder progress is exactly
+    // what frees the next input buffer).
     while !shutdown.load(Ordering::Relaxed) {
-        match client.next_frame(Duration::from_millis(5)) {
-            Ok(frame) => {
-                if fed == 0 {
-                    let p = &frame.data;
-                    log::info!(
-                        "decode: first AU {} bytes, head {:02x?}",
-                        p.len(),
-                        &p[..p.len().min(6)]
-                    );
+        if pending.is_none() {
+            match client.next_frame(Duration::from_millis(5)) {
+                Ok(frame) => {
+                    if fed == 0 {
+                        let p = &frame.data;
+                        log::info!(
+                            "decode: first AU {} bytes, head {:02x?}",
+                            p.len(),
+                            &p[..p.len().min(6)]
+                        );
+                    }
+                    // HUD stat: capture→client-receipt latency = client_now + (host−client) −
+                    // capture_pts. Gated on the HUD being visible — `enabled` first so the hidden
+                    // steady state skips the wall-clock read and the lock entirely.
+                    if stats.enabled() {
+                        let lat_ns =
+                            now_realtime_ns() + clock_offset as i128 - frame.pts_ns as i128;
+                        let lat_us = (lat_ns > 0 && lat_ns < 10_000_000_000)
+                            .then_some((lat_ns / 1000) as u64);
+                        stats.note(frame.data.len(), lat_us, clock_offset != 0);
+                    }
+                    pending = Some(frame);
                 }
-                fed += 1;
-                // HUD stat: capture→client-receipt latency = client_now + (host−client) − capture_pts.
-                let lat_ns = now_realtime_ns() + clock_offset as i128 - frame.pts_ns as i128;
-                let lat_us =
-                    (lat_ns > 0 && lat_ns < 10_000_000_000).then_some((lat_ns / 1000) as u64);
-                stats.note(frame.data.len(), lat_us, clock_offset != 0);
-                feed(&codec, &frame.data, frame.pts_ns / 1000);
+                Err(PunktfunkError::NoFrame) => {} // timeout — still drain output below
+                Err(_) => break,                   // session closed
             }
-            Err(PunktfunkError::NoFrame) => {} // timeout — still drain output below
-            Err(_) => break,                   // session closed
         }
-        rendered += drain(&codec, &window, &mut applied_ds);
+        if let Some(frame) = pending.take() {
+            if feed(&codec, &frame.data, frame.pts_ns / 1000) {
+                fed += 1;
+                if fed % 300 == 0 {
+                    log::info!("decode: fed={fed} rendered={rendered} discarded={discarded}");
+                }
+            } else {
+                // No input buffer free — transient back-pressure. Keep the AU and let `drain` block
+                // briefly below; a released output buffer is what recycles an input slot.
+                pending = Some(frame);
+            }
+        }
+        // Drain every iteration. When input is blocked, wait ~2 ms on output so the loop rides
+        // decoder progress instead of busy-spinning against a full input queue.
+        let wait = if pending.is_some() {
+            Duration::from_millis(2)
+        } else {
+            Duration::ZERO
+        };
+        let (r, d) = drain(&codec, &window, &mut applied_ds, wait);
+        rendered += r;
+        discarded += d;
 
         // Loss recovery: under infinite GOP the only recovery keyframe is one we request. The
         // reassembler drops unrecoverable AUs (frames_dropped); the decoder then conceals the
@@ -152,14 +193,10 @@ pub fn run(
                 log::debug!("decode: requested keyframe (loss recovery, dropped={dropped})");
             }
         }
-
-        if fed > 0 && fed % 300 == 0 {
-            log::info!("decode: fed={fed} rendered={rendered}");
-        }
     }
 
     let _ = codec.stop();
-    log::info!("decode: stopped (fed={fed} rendered={rendered})");
+    log::info!("decode: stopped (fed={fed} rendered={rendered} discarded={discarded})");
 }
 
 /// Wall-clock now in nanoseconds (CLOCK_REALTIME basis), to compare against the host-stamped
@@ -189,9 +226,12 @@ fn boost_thread_priority() {
     }
 }
 
-/// Copy one access unit into a codec input buffer and queue it.
-fn feed(codec: &MediaCodec, au: &[u8], pts_us: u64) {
-    match codec.dequeue_input_buffer(Duration::from_millis(10)) {
+/// Try to copy one access unit into a codec input buffer and queue it, without blocking. Returns
+/// `false` only on `TryAgainLater` (no input buffer free) — the caller keeps the AU pending and
+/// retries; a hard dequeue/queue error counts as consumed (retrying can't salvage the AU, and
+/// parking it forever would wedge the loop on a broken codec).
+fn feed(codec: &MediaCodec, au: &[u8], pts_us: u64) -> bool {
+    match codec.dequeue_input_buffer(Duration::ZERO) {
         Ok(DequeuedInputBufferResult::Buffer(mut buf)) => {
             let n = {
                 let dst = buf.buffer_mut();
@@ -203,41 +243,63 @@ fn feed(codec: &MediaCodec, au: &[u8], pts_us: u64) {
                         dst.len()
                     );
                 }
-                for (slot, &b) in dst.iter_mut().zip(&au[..n]) {
-                    slot.write(b);
+                // SAFETY: `au` and `dst` are distinct allocations (wire AU vs. codec buffer), both
+                // valid for `n` bytes; `MaybeUninit<u8>` is layout-identical to `u8`, so the cast
+                // write initializes exactly `dst[..n]`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(au.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n);
                 }
                 n
             };
             if let Err(e) = codec.queue_input_buffer(buf, 0, n, pts_us, 0) {
                 log::warn!("decode: queue_input_buffer: {e}");
             }
+            true
         }
-        Ok(DequeuedInputBufferResult::TryAgainLater) => {
-            // No input buffer free right now; the AU is dropped (FEC/keyframes recover).
+        Ok(DequeuedInputBufferResult::TryAgainLater) => false, // caller keeps the AU pending
+        Err(e) => {
+            log::warn!("decode: dequeue_input_buffer: {e}");
+            true
         }
-        Err(e) => log::warn!("decode: dequeue_input_buffer: {e}"),
     }
 }
 
-/// Release any ready output buffers to the surface (render = true), latency-first. Returns the
-/// number of frames presented. Also reacts to `OutputFormatChanged` to signal HDR on the Surface.
-fn drain(codec: &MediaCodec, window: &NativeWindow, applied_ds: &mut Option<DataSpace>) -> u64 {
-    let mut n = 0;
+/// Dequeue every ready output buffer and present only the NEWEST (render = true), discarding the
+/// rest (render = false) — when decode falls behind, a back-to-back burst of stale frames on glass
+/// is worse than skipping straight to the freshest one (the Apple client's 1-slot newest-ready
+/// ring, ported). `first_wait` is the timeout for the first dequeue only: zero normally, ~2 ms when
+/// the caller's input is blocked so the loop waits on decoder progress instead of busy-spinning.
+/// Returns `(rendered, discarded)`. Also reacts to `OutputFormatChanged` (which can interleave
+/// between buffers — handled without losing the held buffer) to signal HDR on the Surface.
+fn drain(
+    codec: &MediaCodec,
+    window: &NativeWindow,
+    applied_ds: &mut Option<DataSpace>,
+    first_wait: Duration,
+) -> (u64, u64) {
+    let mut held = None; // newest ready buffer so far, presented after the loop
+    let mut discarded: u64 = 0;
+    let mut wait = first_wait;
     loop {
-        match codec.dequeue_output_buffer(Duration::from_millis(0)) {
+        match codec.dequeue_output_buffer(wait) {
             Ok(DequeuedOutputBufferInfoResult::Buffer(buf)) => {
-                if let Err(e) = codec.release_output_buffer(buf, true) {
-                    log::warn!("decode: release_output_buffer: {e}");
-                    break;
+                wait = Duration::ZERO; // only the first dequeue may block
+                if let Some(stale) = held.replace(buf) {
+                    // A newer frame is ready — drop the held one without rendering.
+                    if let Err(e) = codec.release_output_buffer(stale, false) {
+                        log::warn!("decode: release_output_buffer(discard): {e}");
+                    }
+                    discarded += 1;
                 }
-                n += 1;
             }
             Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {
                 // The decoder has parsed the SPS and now reports the stream's real colour signalling
                 // (the AMediaCodec analogue of VideoToolbox's format description on the Apple client).
                 // If it's HDR (BT.2020 PQ/HLG), tell the Surface so the compositor/display switch to
                 // HDR; SDR streams leave the default dataspace alone. The decoder itself picks a
-                // Main10 path from the SPS — no profile override needed. Keep looping (buffers follow).
+                // Main10 path from the SPS — no profile override needed. Keep looping (buffers
+                // follow, and any held buffer stays held across this event).
+                wait = Duration::ZERO;
                 if let Some(ds) = hdr_dataspace(codec) {
                     if *applied_ds != Some(ds) {
                         match window.set_buffers_data_space(ds) {
@@ -252,7 +314,7 @@ fn drain(codec: &MediaCodec, window: &NativeWindow, applied_ds: &mut Option<Data
                     }
                 }
             }
-            // TryAgainLater / OutputBuffersChanged — nothing to render now.
+            // TryAgainLater / OutputBuffersChanged — nothing more to dequeue now.
             Ok(_) => break,
             Err(e) => {
                 log::warn!("decode: dequeue_output_buffer: {e}");
@@ -260,7 +322,15 @@ fn drain(codec: &MediaCodec, window: &NativeWindow, applied_ds: &mut Option<Data
             }
         }
     }
-    n
+    // Present the newest ready frame, if any.
+    let mut rendered = 0;
+    if let Some(buf) = held {
+        match codec.release_output_buffer(buf, true) {
+            Ok(()) => rendered = 1,
+            Err(e) => log::warn!("decode: release_output_buffer: {e}"),
+        }
+    }
+    (rendered, discarded)
 }
 
 /// Map the decoder's reported output colour to a BT.2020 HDR dataspace, or `None` for SDR. The

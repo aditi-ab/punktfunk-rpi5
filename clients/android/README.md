@@ -9,7 +9,7 @@ couch (D-pad / gamepad focus navigation).
 
 - **Hardware decode** — NDK `AMediaCodec` HEVC → `SurfaceView`, including **HDR10** (Main10 /
   BT.2020 PQ), with low-latency tuning and a live stats HUD.
-- **Audio both ways** — Opus + Oboe playback with a jitter ring, plus mic uplink to the host.
+- **Audio both ways** — Opus + AAudio playback with a jitter ring, plus mic uplink to the host.
 - **Controller support** — buttons + axes with rumble and HID feedback (lightbar / adaptive
   triggers); D-pad / gamepad focus navigation for TV and phone.
 - **Find hosts automatically** — native mDNS discovery; first connect does a one-time **SPAKE2 PIN
@@ -33,18 +33,19 @@ machine, trust logic) instead of re-porting it into Kotlin.
 
 | Side | Owns |
 |------|------|
-| **Rust** (`native/` → `libpunktfunk_android.so`) | the JNI seam, `NativeClient` (QUIC control + UDP data plane), AnnexB → `AMediaCodec` decode (incl. HDR10), Opus + Oboe audio + mic, controller feedback, latency math, trust/pairing, `mdns-sd` discovery |
+| **Rust** (`native/` → `libpunktfunk_android.so`) | the JNI seam, `NativeClient` (QUIC control + UDP data plane), AnnexB → `AMediaCodec` decode (incl. HDR10), Opus + AAudio audio + mic, controller feedback, latency math, trust/pairing, `mdns-sd` discovery |
 | **Kotlin** (`app/`, `kit/`) | Compose UI, `SurfaceView` lifecycle, input capture, the Wi-Fi `MulticastLock` + permission UX, Keystore identity |
 
 The single seam is `io.unom.punktfunk.kit.NativeBridge` ⇄ `Java_io_unom_punktfunk_kit_NativeBridge_*`.
 
 ```
 native/           Rust cdylib (workspace member) — links punktfunk-core directly
-  src/lib.rs        JNI seam (connect/pair, input, plane getters, versions)
-  src/session.rs    session lifecycle + plane pumps
+  src/lib.rs        crate doc · JNI_OnLoad · version probes
+  src/session/      session lifecycle: connect/pair + trust, plane start/stop, input shims
   src/decode.rs     AnnexB → AMediaCodec HEVC hardware decode → SurfaceView (incl. HDR10)
-  src/audio.rs · src/mic.rs   Opus + Oboe playback / mic uplink
+  src/audio.rs · src/mic.rs   Opus + AAudio playback / mic uplink
   src/feedback.rs · src/stats.rs   rumble + HID feedback; live video stats
+  src/discovery.rs  native mdns-sd browse of the host's _punktfunk._udp advert
 app/              :app — Compose UI: Connect / Settings / Stream (phone + TV)
 kit/              :kit — NativeBridge · native mDNS discovery · Gamepad · Keymap · Keystore identity
 ```

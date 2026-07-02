@@ -129,109 +129,140 @@ impl AudioPlayback {
         let jitter_headroom = JITTER_HEADROOM_MS * ms;
         let hard_cap_max = HARD_CAP_MS * ms;
         let counters = Arc::new(Counters::default());
-        let (tx, rx) = sync_channel::<Vec<f32>>(RING_CHUNKS);
-        // Recycle free-list: drained PCM buffers go BACK to the decode thread to be refilled, so the
-        // realtime callback never frees heap (Android's Scudo allocator has unbounded free() tail
-        // latency — a free on the audio thread is an XRun = a click) and the decode thread rarely
-        // allocates. Same depth as the data channel.
-        let (free_tx, free_rx) = sync_channel::<Vec<f32>>(RING_CHUNKS);
 
-        // Realtime consumer state, owned by the callback (FnMut) — no lock: AAudio calls it from a
-        // single high-priority thread, and the decode thread only touches `tx`/`free_rx`.
-        let cb_counters = counters.clone();
-        // Pre-reserve the ring so `extend` never reallocates on the realtime thread. Worst transient
-        // before the trim below = the hard cap plus one full channel of 5 ms (480-f32) frames — the
-        // punktfunk protocol always sends 5 ms Opus frames (host `audio_thread`); a larger frame
-        // would force a one-time realloc, asserted (not silently corrupted) in `decode_loop`.
-        let mut ring: VecDeque<f32> = VecDeque::with_capacity(hard_cap_max + RING_CHUNKS * 5 * ms);
-        let mut primed = false;
-        let mut empties: u32 = 0; // consecutive empty callbacks (de-prime hysteresis)
-        let mut cb_count: u32 = 0; // callbacks since open (throttles the XRun grow check)
-        let mut last_xrun: i32 = 0; // last AAudio XRun count we grew the buffer for
-        let callback = move |s: &AudioStream, data: *mut c_void, num_frames: i32| {
-            let want = num_frames as usize * channels;
-            // SAFETY: AAudio provides `num_frames * channel_count` F32 slots at `data`.
-            let out = unsafe { std::slice::from_raw_parts_mut(data as *mut f32, want) };
-            // Drain decoded chunks into the ring WITHOUT freeing on the RT thread: `drain(..)` empties
-            // each Vec but keeps its capacity, then the empty buffer is handed back for reuse. The
-            // only RT-thread free is the rare case where the recycle channel is momentarily full.
-            while let Ok(mut chunk) = rx.try_recv() {
-                ring.extend(chunk.drain(..));
-                let _ = free_tx.try_send(chunk);
-            }
-            // Jitter buffer: prime to ~40 ms (prime_floor) before playing and after a sustained drain;
-            // drop-oldest only above a wide ~120 ms band. Decoupled from the AAudio burst `want` (tiny
-            // on the LowLatency MMAP path) so the depth doesn't collapse to a single quantum.
-            let target = (3 * want).clamp(prime_floor, prime_ceil);
-            let hard_cap = (target + jitter_headroom).min(hard_cap_max);
-            while ring.len() > hard_cap {
-                ring.pop_front();
-            }
-            if !primed && ring.len() >= target {
-                primed = true;
-            }
-            if primed {
-                for slot in out.iter_mut() {
-                    *slot = ring.pop_front().unwrap_or(0.0);
+        // One open attempt at a given sharing mode. Everything the realtime callback captures
+        // (channels, ring, prime state) is rebuilt per attempt — `open_stream` consumes the builder
+        // AND the callback, so nothing survives a failed try to reuse.
+        let try_open = |sharing: AudioSharingMode| -> ndk::audio::Result<(
+            AudioStream,
+            SyncSender<Vec<f32>>,
+            Receiver<Vec<f32>>,
+        )> {
+            let (tx, rx) = sync_channel::<Vec<f32>>(RING_CHUNKS);
+            // Recycle free-list: drained PCM buffers go BACK to the decode thread to be refilled, so
+            // the realtime callback never frees heap (Android's Scudo allocator has unbounded free()
+            // tail latency — a free on the audio thread is an XRun = a click) and the decode thread
+            // rarely allocates. Same depth as the data channel.
+            let (free_tx, free_rx) = sync_channel::<Vec<f32>>(RING_CHUNKS);
+
+            // Realtime consumer state, owned by the callback (FnMut) — no lock: AAudio calls it from
+            // a single high-priority thread, and the decode thread only touches `tx`/`free_rx`.
+            let cb_counters = counters.clone();
+            // Pre-reserve the ring so `extend` never reallocates on the realtime thread. Worst
+            // transient before the trim below = the hard cap plus one full channel of 5 ms (480-f32)
+            // frames — the punktfunk protocol always sends 5 ms Opus frames (host `audio_thread`); a
+            // larger frame would force a one-time realloc, asserted (not silently corrupted) in
+            // `decode_loop`.
+            let mut ring: VecDeque<f32> =
+                VecDeque::with_capacity(hard_cap_max + RING_CHUNKS * 5 * ms);
+            let mut primed = false;
+            let mut empties: u32 = 0; // consecutive empty callbacks (de-prime hysteresis)
+            let mut cb_count: u32 = 0; // callbacks since open (throttles the XRun grow check)
+            let mut last_xrun: i32 = 0; // last AAudio XRun count we grew the buffer for
+            let callback = move |s: &AudioStream, data: *mut c_void, num_frames: i32| {
+                let want = num_frames as usize * channels;
+                // SAFETY: AAudio provides `num_frames * channel_count` F32 slots at `data`.
+                let out = unsafe { std::slice::from_raw_parts_mut(data as *mut f32, want) };
+                // Drain decoded chunks into the ring WITHOUT freeing on the RT thread: `drain(..)`
+                // empties each Vec but keeps its capacity, then the empty buffer is handed back for
+                // reuse. The only RT-thread free is the rare case where the recycle channel is
+                // momentarily full.
+                while let Ok(mut chunk) = rx.try_recv() {
+                    ring.extend(chunk.drain(..));
+                    let _ = free_tx.try_send(chunk);
+                }
+                // Jitter buffer: prime to ~40 ms (prime_floor) before playing and after a sustained
+                // drain; drop-oldest only above a wide ~120 ms band. Decoupled from the AAudio burst
+                // `want` (tiny on the LowLatency MMAP path) so the depth doesn't collapse to a single
+                // quantum.
+                let target = (3 * want).clamp(prime_floor, prime_ceil);
+                let hard_cap = (target + jitter_headroom).min(hard_cap_max);
+                while ring.len() > hard_cap {
+                    ring.pop_front();
+                }
+                if !primed && ring.len() >= target {
+                    primed = true;
+                }
+                if primed {
+                    for slot in out.iter_mut() {
+                        *slot = ring.pop_front().unwrap_or(0.0);
+                    }
+                    cb_counters
+                        .pcm_written
+                        .fetch_add(num_frames as u64, Ordering::Relaxed);
+                } else {
+                    out.fill(0.0);
+                    cb_counters.underruns.fetch_add(1, Ordering::Relaxed);
+                }
+                // Re-prime only after a RUN of empty callbacks, not a single transient one —
+                // otherwise every momentary drain costs a fresh 40 ms silence (the old behaviour,
+                // self-inflicted crackle on any jitter spike).
+                if ring.is_empty() {
+                    empties += 1;
+                    if empties >= DEPRIME_AFTER_CALLBACKS {
+                        primed = false;
+                    }
+                } else {
+                    empties = 0;
                 }
                 cb_counters
-                    .pcm_written
-                    .fetch_add(num_frames as u64, Ordering::Relaxed);
-            } else {
-                out.fill(0.0);
-                cb_counters.underruns.fetch_add(1, Ordering::Relaxed);
-            }
-            // Re-prime only after a RUN of empty callbacks, not a single transient one — otherwise
-            // every momentary drain costs a fresh 40 ms silence (the old behaviour, self-inflicted
-            // crackle on any jitter spike).
-            if ring.is_empty() {
-                empties += 1;
-                if empties >= DEPRIME_AFTER_CALLBACKS {
-                    primed = false;
+                    .ring_depth
+                    .store(ring.len() as u64, Ordering::Relaxed);
+                // Google's AAudio anti-glitch technique: when the device reports new XRuns, grow the
+                // HW buffer by one burst (up to capacity). getXRunCount + setBufferSizeInFrames are
+                // both callback-safe / non-blocking, and set clamps to capacity so it self-limits.
+                // Throttled.
+                cb_count = cb_count.wrapping_add(1);
+                if cb_count % XRUN_CHECK_EVERY == 0 {
+                    let xr = s.x_run_count();
+                    if xr > last_xrun {
+                        last_xrun = xr;
+                        let burst = s.frames_per_burst().max(1);
+                        let grown =
+                            (s.buffer_size_in_frames() + burst).min(s.buffer_capacity_in_frames());
+                        let _ = s.set_buffer_size_in_frames(grown);
+                    }
                 }
-            } else {
-                empties = 0;
-            }
-            cb_counters
-                .ring_depth
-                .store(ring.len() as u64, Ordering::Relaxed);
-            // Google's AAudio anti-glitch technique: when the device reports new XRuns, grow the HW
-            // buffer by one burst (up to capacity). getXRunCount + setBufferSizeInFrames are both
-            // callback-safe / non-blocking, and set clamps to capacity so it self-limits. Throttled.
-            cb_count = cb_count.wrapping_add(1);
-            if cb_count % XRUN_CHECK_EVERY == 0 {
-                let xr = s.x_run_count();
-                if xr > last_xrun {
-                    last_xrun = xr;
-                    let burst = s.frames_per_burst().max(1);
-                    let grown =
-                        (s.buffer_size_in_frames() + burst).min(s.buffer_capacity_in_frames());
-                    let _ = s.set_buffer_size_in_frames(grown);
-                }
-            }
-            AudioCallbackResult::Continue
+                AudioCallbackResult::Continue
+            };
+
+            let stream = AudioStreamBuilder::new()?
+                .direction(AudioDirection::Output)
+                .sample_rate(SAMPLE_RATE)
+                // The wire order (FL FR FC LFE RL RR SL SR) is the standard AAudio/Android channel
+                // order, so this is an IDENTITY mapping — no permute. AAudio infers the 5.1/7.1 mask
+                // from `channel_count` (the ndk crate's builder exposes no setChannelMask); the host
+                // captures + Opus-encodes in exactly this order.
+                .channel_count(channels as i32)
+                .format(AudioFormat::PCM_Float)
+                .performance_mode(AudioPerformanceMode::LowLatency)
+                .sharing_mode(sharing)
+                .data_callback(Box::new(callback))
+                .error_callback(Box::new(|_s, e| {
+                    log::warn!("audio: AAudio error (device reroute/disconnect?): {e:?}");
+                }))
+                .open_stream()?;
+            Ok((stream, tx, free_rx))
         };
 
-        let stream = AudioStreamBuilder::new()
-            .map_err(|e| log::error!("audio: AudioStreamBuilder::new: {e}"))
-            .ok()?
-            .direction(AudioDirection::Output)
-            .sample_rate(SAMPLE_RATE)
-            // The wire order (FL FR FC LFE RL RR SL SR) is the standard AAudio/Android channel
-            // order, so this is an IDENTITY mapping — no permute. AAudio infers the 5.1/7.1 mask
-            // from `channel_count` (the ndk crate's builder exposes no setChannelMask); the host
-            // captures + Opus-encodes in exactly this order.
-            .channel_count(channels as i32)
-            .format(AudioFormat::PCM_Float)
-            .performance_mode(AudioPerformanceMode::LowLatency)
-            .sharing_mode(AudioSharingMode::Shared)
-            .data_callback(Box::new(callback))
-            .error_callback(Box::new(|_s, e| {
-                log::warn!("audio: AAudio error (device reroute/disconnect?): {e:?}");
-            }))
-            .open_stream()
-            .map_err(|e| log::error!("audio: open_stream: {e}"))
-            .ok()?;
+        // Exclusive first — MMAP-exclusive is AAudio's lowest-latency path (once proven on-device it
+        // may also allow lowering the jitter-ring depths above; those stay put pending crackle
+        // testing) — and fall back to Shared when the device refuses (no MMAP, output claimed, …).
+        // The started-log below prints the mode the device actually GRANTED (`share=`): AAudio may
+        // still resolve an Exclusive request to Shared.
+        let (stream, tx, free_rx) = match try_open(AudioSharingMode::Exclusive) {
+            Ok(opened) => opened,
+            Err(e) => {
+                log::info!("audio: Exclusive open failed ({e}) — retrying Shared");
+                match try_open(AudioSharingMode::Shared) {
+                    Ok(opened) => opened,
+                    Err(e) => {
+                        log::error!("audio: open_stream: {e}");
+                        return None;
+                    }
+                }
+            }
+        };
 
         if let Err(e) = stream.request_start() {
             log::error!("audio: request_start: {e}");

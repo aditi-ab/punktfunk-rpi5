@@ -27,8 +27,8 @@ log = "0.4"
 mdns-sd = "0.20"
 
 # Android-only deps. Gated so `cargo build --workspace` on the Linux/macOS dev boxes + CI still
-# compiles this crate (as a host cdylib) — the Android-framework glue (logging now; AMediaCodec via
-# `ndk` and Oboe/Opus audio later) is only pulled in for the real `*-linux-android` targets.
+# compiles this crate (as a host cdylib) — the Android-framework glue (logging, AMediaCodec + AAudio
+# via `ndk`, the Opus codec) is only pulled in for the real `*-linux-android` targets.
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.14"
 # NDK bindings. "media" = AMediaCodec/ANativeWindow (video); "audio" = AAudio (audio playback).
