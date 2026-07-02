@@ -25,11 +25,11 @@ punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 # `build.rs` downloads the Windows App SDK NuGets and stages the bootstrap DLL + resources.pri
 # next to the exe; it requires `CARGO_WORKSPACE_DIR` to be set in the build env. Unpublished
 # (version 0.0.0) and fast-moving, so pinned to a verified commit.
-windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "b4129fcc1ae81eec8bf1217539883db821bca3a1" }
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f" }
 # Win32 / Direct3D11 / DXGI for the SwapChainPanel composition swapchain. Pulled from the SAME
 # windows-rs commit as windows-reactor so their `windows-core` unifies — the `IDXGISwapChain1`
 # we hand to `SwapChainPanelHandle::set_swap_chain` must satisfy reactor's `windows_core::Interface`.
-windows = { git = "https://github.com/microsoft/windows-rs", rev = "b4129fcc1ae81eec8bf1217539883db821bca3a1", features = [
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
@@ -69,5 +69,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Embeds the app icon as an exe resource (build.rs) — Windows hosts only (rc.exe from the SDK).
+# windows-reactor-setup stages the Windows App SDK runtime bootstrap (framework-dependent) next
+# to the exe — the new-model replacement for the old windows-reactor build.rs; same pinned rev.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "a4f7b2cb7c63c6bb7fc77a2affe57145be1d8c4f" }

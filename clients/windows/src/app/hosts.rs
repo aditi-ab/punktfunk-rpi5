@@ -10,7 +10,7 @@ use crate::discovery::DiscoveredHost;
 use crate::trust::KnownHosts;
 use windows_reactor::*;
 
-/// Overflow-menu item labels — `on_menu_item_clicked` reports the clicked item by its text.
+/// Overflow-menu item labels — `on_item_clicked` reports the clicked item by its text.
 const MENU_CONNECT: &str = "Connect";
 const MENU_SPEED: &str = "Test network speed\u{2026}";
 const MENU_RENAME: &str = "Rename\u{2026}";
@@ -42,9 +42,15 @@ pub(crate) struct HostsProps {
     /// own `use_state`: a child component's sync `SetState` marks its slot dirty but does not
     /// re-render when its props are otherwise unchanged, so the toggle wouldn't take.
     pub(crate) show_add: bool,
+    /// The modal's entrance-tween progress (0 → 1, root-driven): opacity + slide-up offset.
+    pub(crate) add_anim: f64,
+    /// The hovered tile's stable id (saved: fp_hex, discovered: `addr:port`) — root state because
+    /// the pointer enter/exit handlers bypass the reconciler flush, like the flyout clicks above.
+    pub(crate) hover: Option<String>,
     pub(crate) set_forget: AsyncSetState<Option<(String, String)>>,
     pub(crate) set_rename: AsyncSetState<Option<(String, String)>>,
     pub(crate) set_show_add: AsyncSetState<bool>,
+    pub(crate) set_hover: AsyncSetState<Option<String>>,
 }
 
 impl PartialEq for HostsProps {
@@ -56,6 +62,8 @@ impl PartialEq for HostsProps {
             && self.forget == other.forget
             && self.rename == other.rename
             && self.show_add == other.show_add
+            && self.add_anim == other.add_anim
+            && self.hover == other.hover
     }
 }
 
@@ -63,7 +71,12 @@ impl PartialEq for HostsProps {
 /// optional "…" menu button are SIBLINGS overlaid in one grid cell, never nested: WinUI bubbles
 /// `Tapped` out of buttons (reactor doesn't mark it handled), so a button inside the tap target
 /// would fire both its own click and the tile's connect (the old forget-also-connects bug).
+///
+/// Hover renders the WinUI card pointer-over look — the card background lifts to the control
+/// hover fill while the pointer is inside the tile (tracked via `hover`, see `HostsProps`).
 fn host_tile(
+    id: &str,
+    hover: &Hover,
     name: &str,
     sub: &str,
     status_row: Element,
@@ -104,7 +117,27 @@ fn host_tile(
                 .into(),
         );
     }
-    card_flush(grid(children)).into()
+    let mut tile = card_flush(grid(children));
+    if hover.current.as_deref() == Some(id) {
+        tile = tile.background(ThemeRef::ControlFillSecondary);
+    }
+    let enter = {
+        let (set, id) = (hover.set.clone(), id.to_string());
+        move |_: PointerEventInfo| set.call(Some(id.clone()))
+    };
+    let exit = {
+        let set = hover.set.clone();
+        move || set.call(None)
+    };
+    tile.on_pointer_entered(enter)
+        .on_pointer_exited(exit)
+        .into()
+}
+
+/// The hover-tracking pair `host_tile` needs: the currently hovered tile id + its root setter.
+pub(crate) struct Hover {
+    pub(crate) current: Option<String>,
+    pub(crate) set: AsyncSetState<Option<String>>,
 }
 
 /// The status row at the bottom of a tile: presence dot + Online/Offline, plus the trust chip.
@@ -179,12 +212,12 @@ fn rename_editor(
     card(
         vstack((
             text_box(draft)
-                .placeholder("Host name")
-                .on_changed(on_changed),
+                .placeholder_text("Host name")
+                .on_text_changed(on_changed),
             hstack((
                 button("Save")
                     .accent()
-                    .icon(SymbolGlyph::Accept)
+                    .icon(Symbol::Accept)
                     .on_click(commit),
                 button("Cancel")
                     .subtle()
@@ -213,6 +246,10 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     let rename = props.rename.clone();
     let set_forget = &props.set_forget;
     let set_rename = &props.set_rename;
+    let hover = Hover {
+        current: props.hover.clone(),
+        set: props.set_hover.clone(),
+    };
     let known = KnownHosts::load();
 
     // Responsive column count from the live window width (re-renders on resize): as many
@@ -235,14 +272,11 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .grid_column(0)
             .vertical_alignment(VerticalAlignment::Center),
             hstack((
-                button("Add host")
-                    .accent()
-                    .icon(SymbolGlyph::Add)
-                    .on_click({
-                        let sa = set_show_add.clone();
-                        move || sa.call(true)
-                    }),
-                button("Settings").icon(SymbolGlyph::Setting).on_click({
+                button("Add host").accent().icon(Symbol::Add).on_click({
+                    let sa = set_show_add.clone();
+                    move || sa.call(true)
+                }),
+                button("Settings").icon(Symbol::Setting).on_click({
                     let ss = set_screen.clone();
                     move || ss.call(Screen::Settings)
                 }),
@@ -293,7 +327,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 let (sf, sr) = (set_forget.clone(), set_rename.clone());
                 let (fp, name) = (k.fp_hex.clone(), k.name.clone());
                 button("")
-                    .icon(SymbolGlyph::More)
+                    .icon(Symbol::More)
                     .subtle()
                     .tooltip("More options")
                     .automation_name("More options")
@@ -304,7 +338,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         menu_separator(),
                         menu_item(MENU_FORGET),
                     ])
-                    .on_menu_item_clicked(move |item: String| match item.as_str() {
+                    .on_item_clicked(move |item: String| match item.as_str() {
                         MENU_CONNECT => {
                             initiate(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
                         }
@@ -325,6 +359,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             };
             let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
             tiles.push(host_tile(
+                &k.fp_hex,
+                &hover,
                 &k.name,
                 &format!("{}:{}", k.addr, k.port),
                 status_row(
@@ -378,6 +414,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 ("Open", Pill::Neutral)
             };
             tiles.push(host_tile(
+                &format!("{}:{}", h.addr, h.port),
+                &hover,
                 &h.name,
                 &format!("{}:{}", h.addr, h.port),
                 status_row(None, badge, kind),
@@ -466,13 +504,13 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .foreground(ThemeRef::SecondaryText),
             text_box(manual)
                 .header("Address")
-                .placeholder("192.168.1.20  or  my-pc.local")
-                .on_changed(move |s| set_manual.call(s))
+                .placeholder_text("192.168.1.20  or  my-pc.local")
+                .on_text_changed(move |s| set_manual.call(s))
                 .margin(edges(0.0, 6.0, 0.0, 0.0)),
             hstack((
                 button("Connect")
                     .accent()
-                    .icon(SymbolGlyph::Forward)
+                    .icon(Symbol::Forward)
                     .on_click(connect_manual),
                 button("Cancel").on_click({
                     let sa = set_show_add.clone();
@@ -488,10 +526,20 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     .max_width(460.0)
     .horizontal_alignment(HorizontalAlignment::Center)
     .vertical_alignment(VerticalAlignment::Center)
-    .margin(uniform(24.0));
+    // Entrance: fade + slide up, driven by the root tween (`add_anim` 0 → 1). The card starts
+    // a bit low and rises to centre — for a centred element, extra top margin shifts it down by
+    // half the difference, so the offset is doubled.
+    .opacity(props.add_anim)
+    .margin(edges(
+        24.0,
+        24.0 + (1.0 - props.add_anim) * 56.0,
+        24.0,
+        24.0,
+    ));
 
+    // The scrim fades in with the same tween.
     let scrim = border(modal).background(Color {
-        a: 140,
+        a: (140.0 * props.add_anim) as u8,
         r: 0,
         g: 0,
         b: 0,

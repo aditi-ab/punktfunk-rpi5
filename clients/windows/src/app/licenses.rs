@@ -16,7 +16,7 @@ const APP_LICENSE: &str = concat!(
 const THIRD_PARTY_NOTICES: &str = include_str!("../../../../THIRD-PARTY-NOTICES.txt");
 
 pub(crate) fn licenses_page(set_screen: &AsyncSetState<Screen>) -> Element {
-    let back_btn = button("Back").accent().icon(SymbolGlyph::Back).on_click({
+    let back_btn = button("Back").accent().icon(Symbol::Back).on_click({
         let ss = set_screen.clone();
         move || ss.call(Screen::Settings)
     });

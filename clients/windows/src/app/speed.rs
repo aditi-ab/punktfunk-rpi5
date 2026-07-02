@@ -82,7 +82,7 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
     let back_btn = {
         let ss = set_screen.clone();
         button("Close")
-            .icon(SymbolGlyph::Back)
+            .icon(Symbol::Back)
             .on_click(move || ss.call(Screen::Hosts))
             .horizontal_alignment(HorizontalAlignment::Center)
     };
@@ -126,7 +126,7 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                 let (ctx, ss, kbps) = (ctx.clone(), set_screen.clone(), *recommended_kbps);
                 button(format!("Use {recommended_mbps:.0} Mb/s"))
                     .accent()
-                    .icon(SymbolGlyph::Accept)
+                    .icon(Symbol::Accept)
                     .on_click(move || {
                         let mut s = ctx.settings.lock().unwrap();
                         s.bitrate_kbps = kbps;
@@ -154,7 +154,7 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                     hstack((apply_btn, {
                         let ss = set_screen.clone();
                         button("Close")
-                            .icon(SymbolGlyph::Cancel)
+                            .icon(Symbol::Cancel)
                             .on_click(move || ss.call(Screen::Hosts))
                     }))
                     .spacing(8.0)

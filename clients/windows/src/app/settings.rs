@@ -95,27 +95,33 @@ fn setting_toggle(
         .header(header)
         .on_content("On")
         .off_content("Off")
-        .on_changed(move |v: bool| {
+        .on_toggled(move |v: bool| {
             let mut s = ctx.settings.lock().unwrap();
             apply(&mut s, v);
             s.save();
         })
 }
 
-/// A titled settings card: bold heading, a secondary description, then the controls.
-fn settings_card(title: &str, blurb: &str, controls: Vec<Element>) -> Element {
-    let mut children: Vec<Element> = vec![
-        text_block(title).font_size(15.0).semibold().into(),
-        text_block(blurb)
-            .font_size(12.0)
-            .foreground(ThemeRef::SecondaryText)
-            .into(),
-    ];
-    children.extend(controls);
-    card(vstack(children).spacing(10.0)).into()
+/// A settings card: just the controls. No heading (the section title is the NavigationView
+/// header) and no description paragraph — per-control guidance is a `.tooltip(...)` on the
+/// control itself (a paragraph in the card reads as the first control's label).
+fn settings_card(controls: Vec<Element>) -> Element {
+    card(vstack(controls).spacing(10.0)).into()
 }
 
-pub(crate) fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Element {
+/// The settings screen: a stock WinUI `NavigationView` (the Windows-Settings sidebar pattern) —
+/// one pane item per section, the section's card as the content, the built-in back arrow
+/// returning to the host list. `section`/`set_section` are the selected pane tag, held in ROOT
+/// state (this page stays hook-free): `on_selection_changed` is wired in the reactor backend, so
+/// only a root `AsyncSetState` reliably re-renders the new section in. `progress` is the
+/// section-switch entrance tween (0 → 1), mapped onto the content column's opacity + offset.
+pub(crate) fn settings_page(
+    ctx: &Arc<AppCtx>,
+    set_screen: &AsyncSetState<Screen>,
+    section: &str,
+    set_section: &AsyncSetState<String>,
+    progress: f64,
+) -> Element {
     let s = ctx.settings.lock().unwrap().clone();
 
     // --- Display ---------------------------------------------------------------------------
@@ -138,7 +144,11 @@ pub(crate) fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen
     };
     let res_combo = setting_combo(ctx, "Resolution", res_names, res_i, |s, i| {
         (s.width, s.height) = RESOLUTIONS[i];
-    });
+    })
+    .tooltip(
+        "The host creates a virtual display at exactly this size. \u{201C}Native display\u{201D} \
+         resolves to the monitor this window is on at connect.",
+    );
     let (hz_names, hz_i) = {
         let names: Vec<String> = REFRESH
             .iter()
@@ -155,17 +165,26 @@ pub(crate) fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen
     };
     let hz_combo = setting_combo(ctx, "Refresh rate", hz_names, hz_i, |s, i| {
         s.refresh_hz = REFRESH[i];
-    });
+    })
+    .tooltip("\u{201C}Native\u{201D} resolves to this display's refresh rate at connect.");
     let (comp_names, comp_i) = presets(COMPOSITORS, |v| *v == s.compositor);
     let comp_combo = setting_combo(ctx, "Host compositor", comp_names, comp_i, |s, i| {
         s.compositor = COMPOSITORS[i].0.to_string();
-    });
+    })
+    .tooltip(
+        "Linux hosts only, and advisory \u{2014} the host falls back to auto-detect when the \
+         choice is unavailable.",
+    );
 
     // --- Video -----------------------------------------------------------------------------
     let (dec_names, dec_i) = presets(DECODERS, |v| *v == s.decoder);
     let decoder_combo = setting_combo(ctx, "Video decoder", dec_names, dec_i, |s, i| {
         s.decoder = DECODERS[i].0.to_string();
-    });
+    })
+    .tooltip(
+        "Hardware decode (D3D11VA) is far lighter than software \u{2014} keep it on Automatic \
+         unless debugging.",
+    );
     // GPU picker, only on a multi-GPU box (hybrid laptop, eGPU): which adapter decodes + presents.
     // Stored as the adapter description; empty = automatic (the window's monitor's adapter).
     let gpus = crate::gpu::adapter_names();
@@ -177,24 +196,25 @@ pub(crate) fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen
             .position(|n| *n == s.adapter)
             .map_or(0, |i| i + 1);
         let gpus = gpus.clone();
-        setting_combo(
-            ctx,
-            "GPU (decode + present, applies to the next stream)",
-            names,
-            current,
-            move |s, i| {
-                s.adapter = if i == 0 {
-                    String::new()
-                } else {
-                    gpus[i - 1].clone()
-                };
-            },
+        setting_combo(ctx, "GPU", names, current, move |s, i| {
+            s.adapter = if i == 0 {
+                String::new()
+            } else {
+                gpus[i - 1].clone()
+            };
+        })
+        .tooltip(
+            "Which adapter decodes and presents the stream. Applies to the next stream; \
+             Automatic uses the GPU driving this window's display.",
         )
     });
     let (codec_names, codec_i) = presets(CODECS, |v| *v == s.codec);
     let codec_combo = setting_combo(ctx, "Video codec", codec_names, codec_i, |s, i| {
         s.codec = CODECS[i].0.to_string();
-    });
+    })
+    .tooltip(
+        "A soft preference \u{2014} the host falls back to the best codec both sides support.",
+    );
     // Free-form Mb/s (0 = host default) instead of presets, so a speed-test recommendation
     // round-trips exactly.
     let bitrate_box = {
@@ -207,10 +227,18 @@ pub(crate) fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen
                 s.bitrate_kbps = (v.clamp(0.0, 3000.0) * 1000.0) as u32;
                 s.save();
             })
+            .tooltip(
+                "0 lets the host decide. Run a per-host speed test from the host list for a \
+                 recommendation.",
+            )
     };
     let hdr_toggle = setting_toggle(ctx, "HDR (10-bit, BT.2020 PQ)", s.hdr_enabled, |s, on| {
         s.hdr_enabled = on
-    });
+    })
+    .tooltip(
+        "Advertise 10-bit HDR10 so the host upgrades HDR content. Needs a display in HDR mode; \
+         SDR content is unaffected.",
+    );
 
     // --- Input -----------------------------------------------------------------------------
     // Which physical controller forwards as pad 0: automatic = the most recently connected;
@@ -247,87 +275,129 @@ pub(crate) fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen
                     ids.get(sel - 1).copied()
                 });
             })
+            .tooltip(
+                "Exactly one controller is forwarded to the host; \u{201C}Automatic\u{201D} \
+                 picks the most recently connected.",
+            )
     };
     let (pad_names, pad_i) = presets(GAMEPADS, |v| {
         GamepadPref::from_name(v) == GamepadPref::from_name(&s.gamepad)
     });
     let pad_combo = setting_combo(ctx, "Gamepad type", pad_names, pad_i, |s, i| {
         s.gamepad = GAMEPADS[i].0.to_string();
-    });
+    })
+    .tooltip(
+        "The virtual pad the host creates. \u{201C}Automatic\u{201D} matches your physical \
+         controller.",
+    );
     let shortcuts_toggle = setting_toggle(
         ctx,
         "Capture system shortcuts (Alt+Tab, Win, \u{2026})",
         s.inhibit_shortcuts,
         |s, on| s.inhibit_shortcuts = on,
-    );
+    )
+    .tooltip("Off: Alt+Tab, Win & co. act on this machine while the stream input is captured.");
 
     // --- Audio -----------------------------------------------------------------------------
     let (ac_names, ac_i) = presets(AUDIO_CHANNELS, |v| *v == s.audio_channels);
     let channels_combo = setting_combo(ctx, "Audio channels", ac_names, ac_i, |s, i| {
         s.audio_channels = AUDIO_CHANNELS[i].0;
-    });
+    })
+    .tooltip("The host downmixes if its output has fewer channels.");
     let mic_toggle = setting_toggle(
         ctx,
         "Stream microphone to the host",
         s.mic_enabled,
         |s, on| s.mic_enabled = on,
-    );
+    )
+    .tooltip("Sends the default microphone to the host's virtual mic source.");
 
-    let back_btn = button("Back").accent().icon(SymbolGlyph::Back).on_click({
-        let ss = set_screen.clone();
-        move || ss.call(Screen::Hosts)
-    });
+    let hud_toggle = setting_toggle(ctx, "Show the stats overlay (HUD)", s.show_hud, |s, on| {
+        s.show_hud = on
+    })
+    .tooltip("The in-stream overlay: mode, codec, fps, bitrate, latency, decode path.");
+
     let licenses_button = {
         let ss = set_screen.clone();
         button("Third-party licenses").on_click(move || ss.call(Screen::Licenses))
     };
 
-    page(vec![
-        page_header("Settings", back_btn),
-        section("DISPLAY"),
-        settings_card(
-            "Display",
-            "The host creates a virtual display at exactly this mode. The compositor choice is \
-             advisory (Linux hosts only).",
-            vec![res_combo.into(), hz_combo.into(), comp_combo.into()],
-        ),
-        section("VIDEO"),
-        settings_card(
+    // The selected section's content — per-control guidance lives on hover tooltips, so the
+    // card is just the controls.
+    let (title, card): (&str, Element) = match section {
+        "video" => (
             "Video",
-            "Hardware decode (D3D11VA) is far lighter than software — keep it on Automatic \
-             unless debugging. Run a per-host speed test (host list) before setting a high \
-             bitrate.",
-            {
+            settings_card({
                 let mut controls: Vec<Element> = vec![decoder_combo.into()];
                 if let Some(c) = gpu_combo {
                     controls.push(c.into());
                 }
-                controls.extend([codec_combo.into(), bitrate_box.into(), hdr_toggle.into()]);
+                controls.extend([
+                    codec_combo.into(),
+                    bitrate_box.into(),
+                    hdr_toggle.into(),
+                    hud_toggle.into(),
+                ]);
                 controls
-            },
+            }),
         ),
-        section("INPUT"),
-        settings_card(
+        "input" => (
             "Input",
-            "Exactly one controller is forwarded to the host; \u{201C}Automatic\u{201D} picks the \
-             most recently connected. The gamepad type is the virtual pad the host creates.",
-            vec![
+            settings_card(vec![
                 forward_combo.into(),
                 pad_combo.into(),
                 shortcuts_toggle.into(),
-            ],
+            ]),
         ),
-        section("AUDIO"),
-        settings_card(
+        "audio" => (
             "Audio",
-            "Request stereo or surround — the host downmixes if its output has fewer.",
-            vec![channels_combo.into(), mic_toggle.into()],
+            settings_card(vec![channels_combo.into(), mic_toggle.into()]),
         ),
-        section("ABOUT"),
-        settings_card(
-            "About",
-            "punktfunk is licensed under MIT OR Apache-2.0.",
-            vec![licenses_button.into()],
+        "about" => ("About", settings_card(vec![licenses_button.into()])),
+        _ => (
+            "Display",
+            settings_card(vec![res_combo.into(), hz_combo.into(), comp_combo.into()]),
         ),
-    ])
+    };
+
+    // The stock WinUI sidebar (Windows-Settings pattern): pane on the left, the section's card
+    // as content, the NavigationView's own back arrow returning to the host list. Auto display
+    // mode collapses the pane on a narrow window, exactly like Windows Settings.
+    let items = vec![
+        NavViewItem::new("Display")
+            .tag("display")
+            .icon(Symbol::FullScreen),
+        NavViewItem::new("Video").tag("video").icon(Symbol::Video),
+        NavViewItem::new("Input")
+            .tag("input")
+            .icon(Symbol::Keyboard),
+        NavViewItem::new("Audio").tag("audio").icon(Symbol::Volume),
+        NavViewItem::new("About").tag("about").icon(Symbol::Help),
+    ];
+    // The card is KEYED by section so switching panes REMOUNTS it instead of diffing one
+    // section's controls into another's: an in-place diff re-sets a reused ComboBox's items
+    // (which clears WinUI's selection) but skips `selected_index` whenever the two sections'
+    // values compare equal — the combo then renders with no selected option. A fresh mount
+    // applies every prop, so the selection always displays.
+    //
+    // The content column (not the NavigationView — the sidebar must stay put) carries the
+    // section-switch entrance: fade + slide-up from the root-driven tween.
+    let content = page_wide(vec![card.with_key(section)])
+        .opacity(progress)
+        .margin(edges(0.0, (1.0 - progress) * 22.0, 0.0, 0.0));
+    NavigationView::new(items, content)
+        .pane_title("Settings")
+        .header(title)
+        .selected_tag(section)
+        .on_selection_changed({
+            let ss = set_section.clone();
+            move |tag: String| ss.call(tag)
+        })
+        .settings_visible(false)
+        .back_enabled(true)
+        .on_back_requested({
+            let ss = set_screen.clone();
+            move || ss.call(Screen::Hosts)
+        })
+        .into()
 }

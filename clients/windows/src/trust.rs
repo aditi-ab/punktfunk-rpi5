@@ -149,10 +149,17 @@ pub struct Settings {
     /// vanished adapter (eGPU unplugged) falls back to automatic.
     #[serde(default)]
     pub adapter: String,
+    /// Show the stats/info overlay (HUD) over the stream.
+    #[serde(default = "default_true")]
+    pub show_hud: bool,
 }
 
 fn default_codec() -> String {
     "auto".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Settings {
@@ -183,6 +190,7 @@ impl Default for Settings {
             decoder: "auto".into(),
             codec: "auto".into(),
             adapter: String::new(),
+            show_hud: true,
         }
     }
 }

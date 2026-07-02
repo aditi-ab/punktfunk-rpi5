@@ -7,6 +7,10 @@ fn main() {
     // is the TARGET (both the x64 and the cross-compiled ARM64 Windows builds pass).
     #[cfg(windows)]
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
+        // Stage the Windows App SDK runtime bootstrap + resources.pri next to the exe
+        // (framework-dependent deployment; `main` calls `windows_reactor::bootstrap()`).
+        windows_reactor_setup::as_framework_dependent();
+
         let icon = "../../packaging/windows/branding/punktfunk.ico";
         println!("cargo:rerun-if-changed={icon}");
         winresource::WindowsResource::new()

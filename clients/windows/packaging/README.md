@@ -22,7 +22,7 @@ stamps the manifest `ProcessorArchitecture` and names the output. See
 | File | Source |
 |---|---|
 | `punktfunk-client.exe` | the release build |
-| `Microsoft.WindowsAppRuntime.Bootstrap.dll`, `resources.pri` | auto-staged by windows-reactor's `build.rs` |
+| `Microsoft.WindowsAppRuntime.Bootstrap.dll`, `resources.pri` | staged by the client's `build.rs` via `windows-reactor-setup::as_framework_dependent()` |
 | `SDL3.dll` | auto-staged by the `sdl3` crate |
 | `avcodec/avformat/avutil/swscale/swresample/...-*.dll` | `FFMPEG_DIR\bin` |
 | `Assets\*.png` | checked-in tile/store logos (rasterized from `packaging/flatpak/io.unom.Punktfunk.svg`) |
@@ -30,12 +30,13 @@ stamps the manifest `ProcessorArchitecture` and names the output. See
 
 ### Why an "unpackaged" WinUI app packages cleanly
 
-windows-reactor calls `MddBootstrapInitialize2` with `OnPackageIdentity_NOOP`
-(`crates/libs/reactor/src/app.rs`), so under MSIX **package identity** the App SDK bootstrapper is
-a no-op and the runtime is resolved from the manifest's `<PackageDependency>` on
-`Microsoft.WindowsAppRuntime.2` instead (reactor pins `WINDOWSAPPSDK_RELEASE_MAJORMINOR = 0x20000`
-= 2.0). It's a full-trust Win32 app (`EntryPoint="Windows.FullTrustApplication"` + `runFullTrust`)
-because it owns raw D3D11, Win32 low-level input hooks, WASAPI and SDL3.
+`main` calls `windows_reactor::bootstrap()`, which runs `MddBootstrapInitialize2` with
+`OnPackageIdentity_NOOP` (`crates/libs/reactor/src/bootstrap.rs`), so under MSIX **package
+identity** the App SDK bootstrapper is a no-op and the runtime is resolved from the manifest's
+`<PackageDependency>` on `Microsoft.WindowsAppRuntime.2` instead (reactor pins
+`WINDOWSAPPSDK_RELEASE_MAJORMINOR = 0x20000` = 2.0). It's a full-trust Win32 app
+(`EntryPoint="Windows.FullTrustApplication"` + `runFullTrust`) because it owns raw D3D11, Win32
+low-level input hooks, WASAPI and SDL3.
 
 ## Versioning
 

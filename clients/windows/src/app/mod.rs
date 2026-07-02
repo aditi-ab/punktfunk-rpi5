@@ -200,6 +200,12 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (forget, set_forget) = cx.use_async_state(Option::<(String, String)>::None);
     let (rename, set_rename) = cx.use_async_state(Option::<(String, String)>::None);
     let (show_add, set_show_add) = cx.use_async_state(false);
+    // Hovered host tile (its stable id), driving the WinUI-style card hover fill. Root state for
+    // the same reason as `forget`/`rename`: pointer enter/exit handlers are wired straight in the
+    // reactor backend, so only a root `AsyncSetState` reliably re-renders the page.
+    let (hover, set_hover) = cx.use_async_state(Option::<String>::None);
+    // Which Settings section the NavigationView shows (persists across visits this run).
+    let (settings_nav, set_settings_nav) = cx.use_async_state("display".to_string());
 
     // Continuous LAN discovery (spawned once).
     cx.use_effect((), {
@@ -279,6 +285,70 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         0.0
     };
 
+    // Settings-section entrance: the same tween again, keyed on the selected section, so
+    // switching panes slides the CONTENT column up (the sidebar stays put — this must not wrap
+    // the NavigationView, so it can't ride the screen-level tween above). Entering Settings
+    // fresh leaves it settled at 1 (only the screen tween plays; no double animation).
+    let nav_gen = cx.use_ref(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+    let (nav_anim, set_nav_anim) = cx.use_async_state((String::new(), 1.0f64));
+    cx.use_effect(settings_nav.clone(), {
+        let (s, set_nav_anim, gen) = (
+            settings_nav.clone(),
+            set_nav_anim.clone(),
+            nav_gen.borrow().clone(),
+        );
+        move || {
+            use std::sync::atomic::Ordering::SeqCst;
+            let mine = gen.fetch_add(1, SeqCst) + 1;
+            std::thread::spawn(move || {
+                const STEPS: u32 = 14;
+                for i in 0..=STEPS {
+                    if gen.load(SeqCst) != mine {
+                        return; // a newer section switch superseded this tween
+                    }
+                    let p = f64::from(i) / f64::from(STEPS);
+                    let eased = 1.0 - (1.0 - p).powi(3);
+                    set_nav_anim.call((s.clone(), eased));
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                }
+            });
+        }
+    });
+    let nav_progress = if nav_anim.0 == settings_nav {
+        nav_anim.1
+    } else {
+        0.0
+    };
+
+    // "Add host" modal entrance: the same manual tween as the screen navigation (see above for
+    // why it can't be a composition animation), stepping 0 → 1 when the modal opens. The hosts
+    // page maps it to the modal's opacity + a downward start offset (the slide-up) and the
+    // scrim's fade. Closing resets to 0 instantly — the modal unmounts, nothing to animate.
+    let add_gen = cx.use_ref(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+    let (add_anim, set_add_anim) = cx.use_async_state(0.0f64);
+    cx.use_effect(show_add, {
+        let (set_add_anim, gen) = (set_add_anim.clone(), add_gen.borrow().clone());
+        move || {
+            use std::sync::atomic::Ordering::SeqCst;
+            let mine = gen.fetch_add(1, SeqCst) + 1;
+            if !show_add {
+                set_add_anim.call(0.0);
+                return;
+            }
+            std::thread::spawn(move || {
+                const STEPS: u32 = 12;
+                for i in 0..=STEPS {
+                    if gen.load(SeqCst) != mine {
+                        return; // reopened/closed mid-tween — a newer run owns the value
+                    }
+                    let p = f64::from(i) / f64::from(STEPS);
+                    set_add_anim.call(1.0 - (1.0 - p).powi(3)); // ease-out cubic
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                }
+            });
+        }
+    });
+
     // Each hook-using screen is mounted as its own component so its hooks are isolated from
     // root's (root's own hooks above stay a stable prefix regardless of which screen renders).
     let svc = Svc {
@@ -297,16 +367,25 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 forget,
                 rename,
                 show_add,
+                add_anim,
+                hover,
                 set_forget,
                 set_rename,
                 set_show_add,
+                set_hover,
             },
         ),
         // connecting_page / request_access_page / settings_page / licenses_page use no hooks
         // (they never touch `cx`), so calling them inline is sound.
         Screen::Connecting => connect::connecting_page(ctx, &status),
         Screen::RequestAccess => connect::request_access_page(ctx, &set_screen),
-        Screen::Settings => settings::settings_page(ctx, &set_screen),
+        Screen::Settings => settings::settings_page(
+            ctx,
+            &set_screen,
+            &settings_nav,
+            &set_settings_nav,
+            nav_progress,
+        ),
         Screen::Licenses => licenses::licenses_page(&set_screen),
         Screen::Pair => component(pair::pair_page, svc),
         Screen::SpeedTest => component(speed::speed_page, SpeedProps { svc, state: speed }),

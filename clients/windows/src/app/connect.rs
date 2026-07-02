@@ -270,7 +270,9 @@ fn connect_with(
                 break;
             }
             SessionEvent::Ended(err) => {
-                st.call(err.unwrap_or_else(|| "Session ended".into()));
+                // `None` = the user ended the session themselves (the disconnect shortcut) —
+                // return to the host list silently; an error banner would read as a failure.
+                st.call(err.unwrap_or_default());
                 gamepad.detach();
                 ss.call(Screen::Hosts);
                 break;
@@ -343,7 +345,7 @@ pub(crate) fn request_access_page(
     let cancel_btn = {
         let (ctx, ss) = (ctx.clone(), set_screen.clone());
         button("Cancel")
-            .icon(SymbolGlyph::Cancel)
+            .icon(Symbol::Cancel)
             .on_click(move || {
                 // Return the UI immediately; the parked connect is blocking with no abort, so trip
                 // the flag this request's event loop captured — it then tears down silently when

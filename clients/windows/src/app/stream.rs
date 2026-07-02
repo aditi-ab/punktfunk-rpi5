@@ -41,8 +41,8 @@ impl PartialEq for StreamProps {
 }
 
 thread_local! {
-    /// Frames + host clock offset, stashed by the mount effect for `on_ready` (which fires later,
-    /// once the native panel exists).
+    /// Frames + host clock offset, stashed by the mount effect for `on_mounted` (which fires
+    /// later, once the native panel exists).
     static PENDING: RefCell<Option<(crate::session::FrameRx, i64)>> = const { RefCell::new(None) };
     /// The live render thread; stopped + joined by the unmount cleanup (before panel teardown).
     static RENDER: RefCell<Option<RenderThread>> = const { RefCell::new(None) };
@@ -65,7 +65,7 @@ fn window_dpi() -> u32 {
 pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
     let ctx = &props.svc.ctx;
     // Take the connector + frames handoff once on mount; keep the connector alive (and for input)
-    // in a use_ref, stash frames for `on_ready`, install the input hooks. The cleanup stops the
+    // in a use_ref, stash frames for `on_mounted`, install the input hooks. The cleanup stops the
     // render thread FIRST (it must not present into a panel that's tearing down), then removes
     // the input hooks.
     let connector_ref = cx.use_ref::<Option<Arc<NativeClient>>>(None);
@@ -95,46 +95,48 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
 
     let mode = connector_ref.borrow().as_ref().map(|c| c.mode());
     let host = ctx.shared.target.lock().unwrap().name.clone();
-    grid((
-        swap_chain_panel()
-            .on_ready(|panel| {
-                // Placeholder size — the first `on_resize` (fired after the first layout pass)
-                // resizes to the panel's real pixel size.
-                let dpi = window_dpi();
-                match Presenter::new(1280, 720, dpi) {
-                    Ok(p) => {
-                        if let Err(e) = panel.set_swap_chain(p.swap_chain()) {
-                            tracing::error!(error = %e, "set_swap_chain");
-                            return;
-                        }
-                        if let Some((frames, clock_offset)) =
-                            PENDING.with(|c| c.borrow_mut().take())
-                        {
-                            let shared = render::RenderShared::new(1280, 720, dpi);
-                            RENDER.with(|cell| {
-                                *cell.borrow_mut() =
-                                    Some(render::spawn(p, frames, shared, clock_offset));
-                            });
-                            tracing::info!(dpi, "stream presenter bound — render thread started");
-                        }
+    // Read per render: this page re-renders on every HUD sample (~400 ms), so toggling the
+    // overlay in Settings takes effect mid-stream.
+    let show_hud = ctx.settings.lock().unwrap().show_hud;
+    let mut layers: Vec<Element> = vec![swap_chain_panel()
+        .on_mounted(|panel| {
+            // Placeholder size — the first `on_resize` (fired after the first layout pass)
+            // resizes to the panel's real pixel size.
+            let dpi = window_dpi();
+            match Presenter::new(1280, 720, dpi) {
+                Ok(p) => {
+                    if let Err(e) = panel.set_swap_chain(p.swap_chain()) {
+                        tracing::error!(error = %e, "set_swap_chain");
+                        return;
                     }
-                    Err(e) => tracing::error!(error = %e, "create presenter"),
+                    if let Some((frames, clock_offset)) = PENDING.with(|c| c.borrow_mut().take()) {
+                        let shared = render::RenderShared::new(1280, 720, dpi);
+                        RENDER.with(|cell| {
+                            *cell.borrow_mut() =
+                                Some(render::spawn(p, frames, shared, clock_offset));
+                        });
+                        tracing::info!(dpi, "stream presenter bound — render thread started");
+                    }
                 }
-            })
-            .on_resize(|w, h| {
-                // DIPs → physical pixels; the presenter maps back via SetMatrixTransform.
-                let dpi = window_dpi();
-                let px = |v: f64| (v * f64::from(dpi) / 96.0).round() as u32;
-                RENDER.with(|cell| {
-                    if let Some(rt) = cell.borrow().as_ref() {
-                        rt.shared().set_dpi(dpi);
-                        rt.shared().set_size(px(w), px(h));
-                    }
-                });
-            }),
-        hud_overlay(&props.hud, mode, &host),
-    ))
-    .into()
+                Err(e) => tracing::error!(error = %e, "create presenter"),
+            }
+        })
+        .on_resize(|w, h| {
+            // DIPs → physical pixels; the presenter maps back via SetMatrixTransform.
+            let dpi = window_dpi();
+            let px = |v: f64| (v * f64::from(dpi) / 96.0).round() as u32;
+            RENDER.with(|cell| {
+                if let Some(rt) = cell.borrow().as_ref() {
+                    rt.shared().set_dpi(dpi);
+                    rt.shared().set_size(px(w), px(h));
+                }
+            });
+        })
+        .into()];
+    if show_hud {
+        layers.push(hud_overlay(&props.hud, mode, &host));
+    }
+    grid(layers).into()
 }
 
 /// A small chip for the dark HUD: coloured text on a translucent dark fill.

@@ -26,7 +26,7 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
         );
         button("Pair & Connect")
             .accent()
-            .icon(SymbolGlyph::Accept)
+            .icon(Symbol::Accept)
             .on_click(move || {
                 let pin = code2.trim().to_string();
                 let (ctx3, ss, st, target3) =
@@ -65,7 +65,7 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
     let cancel_btn = {
         let ss = set_screen.clone();
         button("Cancel")
-            .icon(SymbolGlyph::Cancel)
+            .icon(Symbol::Cancel)
             .on_click(move || ss.call(Screen::Hosts))
     };
     // The no-PIN alternative offered alongside the PIN ceremony: open an identified connect that
@@ -73,7 +73,7 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
     let request_btn = {
         let (svc, target2) = (props.clone(), target.clone());
         button("Request access without a PIN")
-            .icon(SymbolGlyph::Send)
+            .icon(Symbol::Send)
             .on_click(move || request_access(&svc, &target2))
             .horizontal_alignment(HorizontalAlignment::Stretch)
     };
@@ -105,9 +105,9 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
             .informational()
             .is_closable(false),
         text_box(code)
-            .placeholder("PIN")
+            .placeholder_text("PIN")
             .font_size(28.0)
-            .on_changed(move |s| set_code.call(s)),
+            .on_text_changed(move |s| set_code.call(s)),
         hstack((pair_btn, cancel_btn)).spacing(8.0),
         text_block(
             "Don\u{2019}t have a PIN? Request access instead and approve this device on the host \

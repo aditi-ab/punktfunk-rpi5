@@ -82,6 +82,12 @@ fn main() {
     }
 
     // Windowed (default): the WinUI 3 app owns host selection, settings, and pairing.
+    // Framework-dependent deployment: initialize the Windows App SDK runtime before any WinUI
+    // call (build.rs stages the bootstrap DLL via windows-reactor-setup).
+    if let Err(e) = windows_reactor::bootstrap() {
+        tracing::error!(error = %e, "Windows App SDK bootstrap failed");
+        std::process::exit(1);
+    }
     let gamepad = gamepad::GamepadService::start();
     if let Err(e) = app::run(identity, gamepad) {
         tracing::error!(error = %e, "WinUI app failed");

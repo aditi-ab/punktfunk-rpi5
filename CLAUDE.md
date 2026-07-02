@@ -274,9 +274,17 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    compiler + a per-arch `FFMPEG_DIR` ARM64 tree, SDL3/libopus build-from-source cross-compile
    cleanly), and both ship as signed MSIX (`windows-msix.yml` matrix → `..._x64.msix`/`..._arm64.msix`,
    verified: ARM64 binaries + manifest arch). **windows-reactor is unpublished** (git
-   dep pinned to commit `b4129fcc`; `windows` pinned to the SAME commit so `IDXGISwapChain1` unifies
-   with `set_swap_chain`); its `build.rs` downloads the Win App SDK NuGets + needs `CARGO_WORKSPACE_DIR`
-   set (in the VM build env; `/temp`+`/winmd` gitignored). Gotcha: `CARGO_HOME` must be an ASCII path
+   dep pinned to commit `a4f7b2cb`, bumped 2026-07-02 from `b4129fcc` for `on_pointer_entered`/
+   `on_pointer_exited` hover events — mechanical renames only: `SymbolGlyph`→`Symbol`,
+   `placeholder`→`placeholder_text`, TextBox `on_changed`→`on_text_changed`, ToggleSwitch
+   `on_changed`→`on_toggled`, `on_menu_item_clicked`→`on_item_clicked`, SwapChainPanel
+   `on_ready`→`on_mounted`; `windows` pinned to the SAME commit so `IDXGISwapChain1` unifies with
+   `set_swap_chain`). New-model runtime staging: reactor has NO build.rs anymore — the app's own
+   `build.rs` calls `windows_reactor_setup::as_framework_dependent()` (same-rev build-dep, stages
+   the bootstrap DLL + resources.pri that pack-msix expects) and `main` calls
+   `windows_reactor::bootstrap()` before `App` (packaged MSIX: a no-op, the manifest's
+   `Microsoft.WindowsAppRuntime.2` dependency resolves the runtime). `CARGO_WORKSPACE_DIR` is no
+   longer required (harmless where still set). Gotcha: `CARGO_HOME` must be an ASCII path
    — the `ü` in the dev box's username breaks SDL3's MSVC precompiled-header build. **Parity/cleanup
    batch (2026-07-02)**: `app.rs` split into per-screen `app/` modules (mod=root/router · hosts ·
    connect · pair · speed · settings · licenses · stream · style; thread-driven state lives in ROOT
@@ -294,7 +302,19 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    loopback E2E (TOFU connect → clock skew → HEVC negotiate → shared-D3D11 + D3D11VA init → WASAPI →
    session end; synthetic payload isn't decodable so decode output stays unvalidated), speed-test
    E2E. The WinUI window itself CANNOT be launched from SSH (session-0 → WinAppSDK 0x80070005,
-   pre-existing; needs the console session, e.g. PsExec -i 1).
+   pre-existing; needs the console session, e.g. PsExec -i 1). **UX batch (2026-07-02 evening,
+   UIA-smoke-tested on the hybrid laptop)**: host tiles get the WinUI pointer-over fill
+   (`on_pointer_entered`/`exited` → root hover state → `ControlFillSecondary`), Settings is a stock
+   **NavigationView** sidebar (Windows-Settings pattern: Display/Video/Input/Audio/About panes,
+   built-in back arrow, section in root state; the section card is **keyed by section** — an
+   in-place diff across sections re-sets a reused ComboBox's items, clearing WinUI's selection,
+   but skips `selected_index` when the values compare equal → blank selection; the key forces a
+   remount — and the content column rides its own section-switch slide-up tween), new
+   **"Show the stats overlay (HUD)"** toggle
+   (`Settings::show_hud`, applies mid-stream via the 400 ms HUD re-render), the Add-host modal
+   slides up + fades in (root margin/opacity tween, same pattern as screen navigation), and a
+   self-initiated disconnect (Ctrl+Alt+Shift+D → `Ended(None)`) returns to the host list silently
+   instead of raising the error banner.
    Next: **HDR on-glass validation** (Windows host with `PUNKTFUNK_10BIT` → the HDR laptop
    display), then RAWINPUT relative-mouse pointer-lock.
    **Android stage 1 done** (`clients/android`, Kotlin app + `native/` Rust JNI core linking
