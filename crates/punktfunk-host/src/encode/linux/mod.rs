@@ -168,6 +168,9 @@ pub struct NvencEncoder {
     frame_idx: i64,
     /// Force the next submitted frame to be an IDR (set by [`request_keyframe`]).
     force_kf: bool,
+    /// Opened in intra-refresh mode (surfaced via [`caps`](Encoder::caps) so the session glue
+    /// rate-limits forced IDRs — the wave heals loss without them).
+    intra_refresh: bool,
 }
 
 // `CudaHw` holds raw `AVBufferRef`s and `sws_444` a raw `SwsContext`; the encoder lives on a single
@@ -182,6 +185,36 @@ pub struct NvencEncoder {
 // ownership across threads is sound. This asserts `Send` (transfer) only, extending ffmpeg-next's
 // existing `Send` to the raw CUDA fields; `Sync` (shared `&`) is deliberately NOT implemented.
 unsafe impl Send for NvencEncoder {}
+
+/// Latched true once an intra-refresh open failed with the device-capability error (ENOSYS from
+/// `NV_ENC_CAPS_SUPPORT_INTRA_REFRESH`), so later sessions skip the doomed attempt. Never set by
+/// other open failures (a bitrate EINVAL must not permanently disable the feature).
+static IR_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this open should run the NVENC **intra-refresh** loss-recovery mode
+/// (`PUNKTFUNK_INTRA_REFRESH` truthy, opt-in until on-glass validated): a moving intra band +
+/// recovery-point SEI refreshes the whole picture every [`intra_refresh_period`] frames, so
+/// FEC-unrecoverable loss heals without the 20-40× full-IDR spike (which under loss causes more
+/// loss — the cascade). The session glue then rate-limits client keyframe requests
+/// ([`EncoderCaps::intra_refresh`](super::EncoderCaps)).
+fn intra_refresh_requested() -> bool {
+    std::env::var("PUNKTFUNK_INTRA_REFRESH")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+        && !IR_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The intra-refresh wave length in frames — ffmpeg derives `intraRefreshPeriod`/`Cnt` from
+/// `gop_size` before forcing the real GOP infinite, so this is what `gop_size` is set to in IR
+/// mode. Default = half a second of frames (heals fast, spreads the intra cost to ~2-3% per
+/// frame); `PUNKTFUNK_IR_PERIOD_FRAMES` overrides.
+fn intra_refresh_period(fps: u32) -> i32 {
+    std::env::var("PUNKTFUNK_IR_PERIOD_FRAMES")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|v| *v >= 2)
+        .unwrap_or_else(|| (fps.max(16) / 2) as i32)
+}
 
 impl NvencEncoder {
     #[allow(clippy::too_many_arguments)]
@@ -277,11 +310,20 @@ impl NvencEncoder {
         // "freeze". NVENC emits one IDR at stream start, then P-frames only; `forced-idr` (below)
         // turns a client recovery request (RFI, via `request_keyframe`) into an IDR on demand.
         // This is the Moonlight/Sunshine low-latency model.
+        // In intra-refresh mode the GOP is still infinite — ffmpeg reads `gop_size` as the refresh
+        // WAVE length (`intraRefreshPeriod`/`Cnt`) and then forces `gopLength` infinite itself, so
+        // a positive `gop_size` here does NOT reintroduce periodic IDRs.
+        let intra_refresh = intra_refresh_requested();
         // SAFETY: same `video` builder as above — a non-null, properly-aligned, sole-owned, not-yet-
-        // opened `AVCodecContext`. We write the plain `gop_size` int field (= -1, infinite GOP) before
-        // `open_with`, which ffmpeg-next has no setter for. No aliasing; synchronous scalar write.
+        // opened `AVCodecContext`. We write the plain `gop_size` int field (-1 = infinite GOP, or the
+        // intra-refresh wave length) before `open_with`, which ffmpeg-next has no setter for. No
+        // aliasing; synchronous scalar write.
         unsafe {
-            (*video.as_mut_ptr()).gop_size = -1;
+            (*video.as_mut_ptr()).gop_size = if intra_refresh {
+                intra_refresh_period(fps)
+            } else {
+                -1
+            };
         }
 
         // NV12 / 4:4:4 paths: we do the RGB→YUV conversion ourselves as BT.709 *limited* range
@@ -377,6 +419,11 @@ impl NvencEncoder {
         opts.set("bf", "0");
         opts.set("delay", "0");
         opts.set("forced-idr", "1"); // RFI/request_keyframe → real IDR under the infinite GOP
+        if intra_refresh {
+            // Moving intra band + recovery-point SEI (period set via gop_size above). Loss now
+            // self-heals within the wave; forced IDRs remain available (rate-limited by the glue).
+            opts.set("intra-refresh", "1");
+        }
         if want_444 {
             // HEVC Range Extensions — the profile that carries chroma_format_idc=3. With a YUV444P
             // input `hevc_nvenc` auto-selects it, but pin it explicitly so the chroma is never silently
@@ -403,9 +450,45 @@ impl NvencEncoder {
             None => {}
         }
 
-        let enc = video
-            .open_with(opts)
-            .with_context(|| format!("open {name} ({width}x{height}@{fps}, {bitrate_bps} bps)"))?;
+        let enc = match video.open_with(opts) {
+            Ok(enc) => enc,
+            // The GPU lacks NV_ENC_CAPS_SUPPORT_INTRA_REFRESH — ffmpeg fails the open with
+            // ENOSYS ("Function not implemented"). Latch it (skip the doomed attempt on later
+            // sessions) and reopen this session without intra-refresh; any other failure — and
+            // any failure when IR wasn't requested — propagates untouched (the bitrate probe
+            // keys on EINVAL, which must not trip the latch).
+            Err(e) if intra_refresh && format!("{e:#}").contains("Function not implemented") => {
+                tracing::warn!(
+                    encoder = name,
+                    "NVENC intra-refresh not supported by this GPU — falling back to IDR-only \
+                     recovery"
+                );
+                IR_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Self::open(
+                    codec,
+                    format,
+                    width,
+                    height,
+                    fps,
+                    bitrate_bps,
+                    cuda,
+                    bit_depth,
+                    chroma,
+                );
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("open {name} ({width}x{height}@{fps}, {bitrate_bps} bps)")
+                })
+            }
+        };
+        if intra_refresh {
+            tracing::info!(
+                encoder = name,
+                period_frames = intra_refresh_period(fps),
+                "NVENC intra-refresh recovery active (no periodic IDR; wave heals loss)"
+            );
+        }
 
         let frame = if cuda {
             None
@@ -424,6 +507,7 @@ impl NvencEncoder {
             fps,
             frame_idx: 0,
             force_kf: false,
+            intra_refresh,
         })
     }
 }
@@ -434,6 +518,7 @@ impl Encoder for NvencEncoder {
             // 4:4:4 iff this session opened the RGB→YUV444P swscale path (FREXT). RFI/HDR-SEI stay
             // unsupported on libavcodec NVENC (the trait defaults).
             chroma_444: self.sws_444.is_some(),
+            intra_refresh: self.intra_refresh,
             ..super::EncoderCaps::default()
         }
     }

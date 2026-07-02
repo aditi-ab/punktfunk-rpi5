@@ -154,6 +154,12 @@ pub struct EncoderCaps {
     /// the encoder's real chroma disagrees with what was negotiated (the in-band SPS is authoritative
     /// for the decoder either way).
     pub chroma_444: bool,
+    /// The encoder runs a periodic **intra-refresh wave** (a moving band of intra blocks +
+    /// recovery-point SEI, no periodic IDR): FEC-unrecoverable loss self-heals within one wave, so
+    /// the session glue rate-limits client keyframe requests instead of answering each with a full
+    /// IDR (the 20-40× frame-size spike that cascades under loss). Linux NVENC sets it when
+    /// `PUNKTFUNK_INTRA_REFRESH` opened the encoder in that mode; VAAPI/software never do.
+    pub intra_refresh: bool,
 }
 
 /// A hardware encoder. One per session; runs on the encode thread.
