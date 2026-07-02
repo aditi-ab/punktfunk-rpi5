@@ -3,7 +3,7 @@ rem punktfunk web console launcher - DEV layout (in-repo tree). The PunktfunkWeb
 rem (boot trigger, SYSTEM, restart-on-failure) runs this at startup. It sources the host's mgmt bearer
 rem token + the console login password from %ProgramData%\punktfunk\, points the /api proxy at the
 rem host's loopback HTTPS mgmt API, and serves the self-contained (no-node_modules) Nitro console over
-rem HTTPS (HTTP/1.1 over TLS) on :3000 with the host's identity cert. %~dp0 = <repo>\web\ .
+rem HTTPS (HTTP/1.1 over TLS) on :47992 with the host's identity cert. %~dp0 = <repo>\web\ .
 rem
 rem DEV vs the installed launcher (scripts\windows\web-run.cmd): the dev host service runs from
 rem target\release (not the installed {app} tree), so this runs the in-repo web\.output. The console
@@ -35,7 +35,7 @@ for /f "usebackq tokens=1* delims==" %%A in ("%TOKENFILE%") do set "%%A=%%B"
 if exist "%PWFILE%" for /f "usebackq tokens=1* delims==" %%A in ("%PWFILE%") do set "%%A=%%B"
 
 rem Fixed deployment wiring (the Windows analogue of scripts/punktfunk-web.service).
-set "PORT=3000"
+set "PORT=47992"
 set "HOST=0.0.0.0"
 set "PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990"
 set "NODE_TLS_REJECT_UNAUTHORIZED=0"

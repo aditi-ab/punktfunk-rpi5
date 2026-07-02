@@ -44,7 +44,7 @@ cargo run -rp punktfunk-host -- serve                 # native-only (secure defa
 cargo run -rp punktfunk-host -- serve --gamestream    # + Moonlight compatibility
 ```
 
-Then pair from the web console (`https://<host-ip>:3000`) or the client app.
+Then pair from the web console (`https://<host-ip>:47992`) or the client app.
 
 Most people should install a **package** rather than run from source — see
 [`packaging/`](../../packaging/README.md) (apt · rpm/COPR/bootc · Arch/sysext · Windows installer) and

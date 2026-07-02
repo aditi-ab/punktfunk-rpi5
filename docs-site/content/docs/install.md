@@ -73,7 +73,7 @@ fallback without one. More detail — including the CLI `punktfunk-host service 
    Bare `serve` is the secure native-only default (native `punktfunk/1` + the web console). On a
    trusted LAN, add `--gamestream` to also serve stock [Moonlight](/docs/moonlight) clients.
 
-3. Enable the web console and read its login password, then open `http://<host-ip>:3000`:
+3. Enable the web console and read its login password, then open `http://<host-ip>:47992`:
 
    ```sh
    systemctl --user enable --now punktfunk-web

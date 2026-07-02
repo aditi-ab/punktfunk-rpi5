@@ -114,7 +114,7 @@ mDNS. It requires **PIN pairing** by default (secure on a LAN); pair once from y
 ### Web console
 
 The console (status, paired devices, arm pairing) ships as `punktfunk-web` — enable it, then open
-`http://<host-ip>:3000`:
+`http://<host-ip>:47992`:
 
 ```sh
 systemctl --user enable --now punktfunk-web

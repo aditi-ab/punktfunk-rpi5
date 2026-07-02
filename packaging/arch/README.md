@@ -42,7 +42,7 @@ cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env   # gamesc
 systemctl --user enable --now punktfunk-host
 # Web console (if you installed the punktfunk-web package): enable it + read the login password.
 systemctl --user enable --now punktfunk-web
-journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # open https://<host-ip>:3000
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # open https://<host-ip>:47992
 ```
 NVENC/EGL come from the NVIDIA driver: `sudo pacman -S --needed nvidia-utils`. Arch's stock
 `ffmpeg` already has NVENC built in — no RPM-Fusion-style swap needed (unlike Fedora).

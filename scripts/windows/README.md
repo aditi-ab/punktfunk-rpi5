@@ -38,9 +38,9 @@ On an **installed** host (the `setup.exe`) the console is set up automatically �
 The installer bundles the built (self-contained, no-`node_modules`) `.output` server + a portable
 bun and runs `punktfunk-host.exe web setup`, which registers the **`PunktfunkWeb`** scheduled task
 (at boot, as SYSTEM, restart-on-failure) running `{app}\web\web-run.cmd` →
-`bun …\.output\server\index.mjs` on `:3000`, opens inbound TCP 3000, and writes the login password to
+`bun …\.output\server\index.mjs` on `:47992`, opens inbound TCP 47992, and writes the login password to
 `%ProgramData%\punktfunk\web-password` (ACL'd to Administrators + SYSTEM). The mgmt bearer token it
-proxies with is the host's own `%ProgramData%\punktfunk\mgmt-token`. Browse `http://<host-ip>:3000`
+proxies with is the host's own `%ProgramData%\punktfunk\mgmt-token`. Browse `http://<host-ip>:47992`
 and log in with the password the installer shows on its final page. To change it, edit
 `web-password` and re-run the task: `schtasks /run /tn PunktfunkWeb`.
 

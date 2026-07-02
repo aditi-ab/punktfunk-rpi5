@@ -223,7 +223,7 @@ systemctl --user enable --now punktfunk-host
 # Management web console (pairing + status), if you installed punktfunk-web (it ships in the Gitea
 # RPM registry / bootc image — COPR can't build it; see ../rpm/README.md). Read the login password:
 systemctl --user enable --now punktfunk-web
-journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # then open https://<host-ip>:3000
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # then open https://<host-ip>:47992
 ```
 
 Check health and logs:

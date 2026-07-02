@@ -338,7 +338,7 @@ fn web_setup(args: &[String]) -> Result<()> {
 
     // 1. login password
     set_web_password(&pw_path, pw_file.as_deref());
-    // 2. (upgrade-safe) stop any running console so the new task binds :3000 + the files unlock
+    // 2. (upgrade-safe) stop any running console so the new task binds :47992 + the files unlock
     stop_web_console();
     // 3. register the PunktfunkWeb scheduled task
     let cmd = app_dir.join("web").join("web-run.cmd");
@@ -346,7 +346,7 @@ fn web_setup(args: &[String]) -> Result<()> {
         bail!("web launcher missing: {}", cmd.display());
     }
     register_web_task(&cmd)?;
-    // 4. firewall: inbound TCP 3000. The console serves HTTPS (HTTP/1.1 over TLS) with the host's
+    // 4. firewall: inbound TCP 47992. The console serves HTTPS (HTTP/1.1 over TLS) with the host's
     //    identity cert. (No UDP/HTTP-3: browsers won't use QUIC against a self-signed/no-SAN cert.)
     if !run_quiet(
         "netsh",
@@ -355,14 +355,14 @@ fn web_setup(args: &[String]) -> Result<()> {
             "firewall",
             "add",
             "rule",
-            "name=punktfunk web console (TCP 3000)",
+            "name=punktfunk web console (TCP 47992)",
             "dir=in",
             "action=allow",
             "protocol=TCP",
-            "localport=3000",
+            "localport=47992",
         ],
     ) {
-        eprintln!("warning: could not add the firewall rule for TCP 3000");
+        eprintln!("warning: could not add the firewall rule for TCP 47992");
     }
     // 5. wait briefly for the host's mgmt token, then start (restart-on-failure picks it up otherwise)
     for _ in 0..30 {
@@ -372,7 +372,7 @@ fn web_setup(args: &[String]) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     run_quiet("schtasks", &["/run", "/tn", WEB_TASK]);
-    println!("web console set up + started (https://<host-ip>:3000)");
+    println!("web console set up + started (https://<host-ip>:47992)");
     Ok(())
 }
 
@@ -432,7 +432,7 @@ fn random_password() -> String {
         .collect()
 }
 
-/// Stop + reap a running console before re-registering (upgrade-safe): end the task AND kill the :3000
+/// Stop + reap a running console before re-registering (upgrade-safe): end the task AND kill the :47992
 /// listener owner (runtime-agnostic - a prior install may have run node vs the current bun). The listener
 /// is identified by the wildcard foreign address (`0.0.0.0:0`/`[::]:0`), so the localized state word
 /// ("LISTENING"/"ABHOEREN"/...) is never parsed.
@@ -442,7 +442,7 @@ fn stop_web_console() {
         let toks: Vec<&str> = line.split_whitespace().collect();
         if toks.len() >= 5
             && toks[0].eq_ignore_ascii_case("tcp")
-            && toks[1].ends_with(":3000")
+            && toks[1].ends_with(":47992")
             && (toks[2] == "0.0.0.0:0" || toks[2] == "[::]:0")
         {
             let pid = toks[toks.len() - 1];
@@ -460,7 +460,7 @@ fn register_web_task(cmd: &Path) -> Result<()> {
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
-  <RegistrationInfo><Description>punktfunk web management console (Nitro SSR on bun, :3000)</Description></RegistrationInfo>\n\
+  <RegistrationInfo><Description>punktfunk web management console (Nitro SSR on bun, :47992)</Description></RegistrationInfo>\n\
   <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>\n\
   <Principals><Principal id=\"Author\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n\
   <Settings>\n\

@@ -18,7 +18,7 @@ The `@unom` registry mapping lives in [`.npmrc`](.npmrc); the auth token comes f
 ```sh
 # from web/  — Bun is the toolchain (https://bun.sh)
 bun install               # runs `prepare` → codegen (orval + paraglide)
-bun run dev               # http://localhost:3000
+bun run dev               # http://localhost:47992
 
 # The dev server proxies /api → https://127.0.0.1:47990 (the host's mgmt API; it serves HTTPS
 # with the host's self-signed identity cert — the dev proxy uses `secure: false`).
@@ -50,7 +50,7 @@ LAN console.)
 
 ```sh
 bun run build             # → .output/  (Nitro `bun` preset + our Bun.serve TLS entry)
-PORT=3000 HOST=0.0.0.0 \
+PORT=47992 HOST=0.0.0.0 \
   PUNKTFUNK_UI_PASSWORD=… PUNKTFUNK_MGMT_TOKEN=… \
   PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990 NODE_TLS_REJECT_UNAUTHORIZED=0 \
   PUNKTFUNK_UI_TLS_CERT=~/.config/punktfunk/cert.pem \
@@ -63,7 +63,7 @@ bun run lint              # tsc --noEmit
 ```
 
 The built **Nitro bun server** SSR-renders the app and is the only thing exposed on the LAN.
-Run it on the same box as the host; it serves the console over HTTPS on `:3000` (or `$PORT`).
+Run it on the same box as the host; it serves the console over HTTPS on `:47992` (or `$PORT`).
 
 ## Auth (backend-for-frontend)
 

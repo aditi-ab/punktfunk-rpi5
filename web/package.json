@@ -7,7 +7,7 @@
 		"prepare": "bun run codegen",
 		"codegen": "orval --config orval.config.ts && paraglide-js compile --project ./project.inlang --outdir ./src/paraglide",
 		"predev": "orval --config orval.config.ts",
-		"dev": "vite dev --port 3000",
+		"dev": "vite dev --port 47992",
 		"prebuild": "orval --config orval.config.ts",
 		"build": "vite build",
 		"start": "bun run .output/server/index.mjs",

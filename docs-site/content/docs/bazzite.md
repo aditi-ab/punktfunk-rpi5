@@ -129,7 +129,7 @@ Desktop; it follows whichever the box is in.
 ```sh
 systemctl --user enable --now punktfunk-host
 # Web console (pairing + status) — enable it and read the auto-generated login password,
-# then open http://<host-ip>:3000:
+# then open http://<host-ip>:47992:
 systemctl --user enable --now punktfunk-web
 journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
 ```

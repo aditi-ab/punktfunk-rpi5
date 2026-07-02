@@ -52,7 +52,7 @@ Packaging internals live in
 
 The installer also sets up the **web management console** (status, paired devices, the PIN pairing
 flow): it bundles the console plus its own runtime and runs it as the **`PunktfunkWeb`** task on
-**`http://<this-PC>:3000`**, starting at boot.
+**`http://<this-PC>:47992`**, starting at boot.
 
 #### Console login password
 

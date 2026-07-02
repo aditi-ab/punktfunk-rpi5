@@ -4,7 +4,7 @@
 #
 #   docker build -f web/Dockerfile -t punktfunk-web .
 #
-# Runtime: PORT (default 3000) and PUNKTFUNK_MGMT_URL (upstream management API the Nitro
+# Runtime: PORT (default 47992) and PUNKTFUNK_MGMT_URL (upstream management API the Nitro
 # server proxies /api to; see web/server/routes).
 FROM oven/bun:1 AS build
 WORKDIR /repo/web
@@ -24,6 +24,6 @@ FROM oven/bun:1-slim
 WORKDIR /app
 COPY --from=build /repo/web/.output ./.output
 USER bun
-ENV PORT=3000
-EXPOSE 3000
+ENV PORT=47992
+EXPOSE 47992
 CMD ["bun", "run", ".output/server/index.mjs"]

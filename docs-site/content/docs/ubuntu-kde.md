@@ -76,7 +76,7 @@ your [client](/docs/clients).
 
 ```sh
 systemctl --user enable --now punktfunk-web
-# read the auto-generated login password, then open http://<host-ip>:3000
+# read the auto-generated login password, then open http://<host-ip>:47992
 journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
 ```
 

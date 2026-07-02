@@ -45,7 +45,7 @@ parse breakage that silently failed installs on non-English boxes.
   password (pre-filled with a secure random default, shown again on the final page; kept on upgrade),
   then `punktfunk-host.exe web setup` writes the ACL'd `%ProgramData%\punktfunk\web-password`, registers the
   **`PunktfunkWeb`** scheduled task (boot, SYSTEM, restart-on-failure → `web-run.cmd` → `bun` on
-  `:3000`), opens TCP 3000, and starts it. It proxies the host's loopback mgmt API with the host's
+  `:47992`), opens TCP 47992, and starts it. It proxies the host's loopback mgmt API with the host's
   own `%ProgramData%\punktfunk\mgmt-token`.
 - **GameStream (Moonlight) compatibility is a wizard task** (checked by default): the choice is passed
   to `service install --gamestream=on|off`, which writes `PUNKTFUNK_HOST_CMD=serve --gamestream` (or
@@ -108,7 +108,7 @@ fresh install uses the generated random console password — read it from
 | `install-vbcable.ps1` | On-target: seed VB-Audio's cert into `TrustedPublisher`, silently install the bundled VB-CABLE (`-i -h`). Run by the installer's *Install VB-CABLE virtual audio* task; idempotent + always exits 0 (non-fatal). |
 | `clear-force-integrity.ps1` | Clear the `/INTEGRITYCHECK` PE bit so a self-signed driver loads (reused by every driver build). |
 | `stage-pf-vdisplay.ps1` | Stage the just-built pf-vdisplay bundle + fetch/verify the **pinned** nefcon release. |
-| `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `bun` on the Nitro server (`:3000`). |
+| `../../scripts/windows/web-run.cmd` | The `PunktfunkWeb` task action: loads the mgmt token + login password env, runs the bundled `bun` on the Nitro server (`:47992`). |
 | `drivers/` | The all-Rust IddCx **driver source** workspace: the `pf-vdisplay` crate on `wdk-sys` / windows-drivers-rs + the owned `pf-driver-proto` ABI + `wdk-iddcx` / `wdk-probe`, plus `deploy-dev.ps1` (build/sign/install for dev). |
 | `reset-pf-vdisplay.ps1` | **Dev:** recover a wedged driver — stop host → reap ghost monitor nodes → reload the adapter → start host (no reboot). See *Dev iteration* below. |
 | `redeploy-pf-vdisplay.ps1` | **Dev:** one-shot redeploy — (optional) build → stop host → `deploy-dev.ps1 -Install` → reload adapter → start host. |

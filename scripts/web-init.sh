@@ -15,5 +15,5 @@ if [ ! -s "$PWFILE" ]; then
     (umask 077; printf 'PUNKTFUNK_UI_PASSWORD=%s\n' "$PW" > "$PWFILE")
     chmod 600 "$PWFILE" 2>/dev/null || true
     echo "punktfunk web console login password generated: $PW"
-    echo "(stored in $PWFILE — open http://<host-ip>:3000 and log in)"
+    echo "(stored in $PWFILE — open http://<host-ip>:47992 and log in)"
 fi

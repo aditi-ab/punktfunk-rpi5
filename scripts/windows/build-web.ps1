@@ -5,7 +5,7 @@
 
   bun is both the build tool AND the runtime: vite.config's Nitro noExternals bundles every dep
   into the self-contained .output (no node_modules, nothing for bun to fail to resolve), so the
-  PunktfunkWeb task runs web\web-run.cmd -> bun .output\server\index.mjs on :3000.
+  PunktfunkWeb task runs web\web-run.cmd -> bun .output\server\index.mjs on :47992.
 #>
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot)
@@ -30,6 +30,6 @@ Start-Sleep 2
 & schtasks /run /tn $task | Out-Null
 Start-Sleep 5
 try {
-  $r = Invoke-WebRequest 'http://127.0.0.1:3000/login' -UseBasicParsing -TimeoutSec 10
+  $r = Invoke-WebRequest 'http://127.0.0.1:47992/login' -UseBasicParsing -TimeoutSec 10
   Write-Host "DONE - web /login -> HTTP $($r.StatusCode)"
 } catch { Write-Warning "web restarted but /login check failed: $($_.Exception.Message)" }

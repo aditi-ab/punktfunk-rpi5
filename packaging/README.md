@@ -101,11 +101,11 @@ systemctl --user enable --now punktfunk-host
 # Management web console (pairing + status) — pulled in by default (the host RPM Recommends it;
 # `--no-install-recommends` / headless-only boxes can skip it). Enable it and read the login password:
 systemctl --user enable --now punktfunk-web
-journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # then open https://<host-ip>:3000
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # then open https://<host-ip>:47992
 ```
 
 Pair a stock Moonlight client (mDNS-discovered), or connect the native punktfunk/1 client — via the
-web console at `https://<host-ip>:3000` or directly.
+web console at `https://<host-ip>:47992` or directly.
 
 > ⚠️ **COPR caveat:** COPR's mock chroot has no `bun`, so a COPR build produces only
 > `punktfunk` + `punktfunk-client` — **not** `punktfunk-web`. For the console on a COPR/bootc host,

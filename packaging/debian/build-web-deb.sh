@@ -111,7 +111,7 @@ Homepage: https://git.unom.io/unom/punktfunk
 Description: punktfunk management web console (Nitro SSR on bun + React)
  The browser console for a punktfunk streaming host: status, paired devices, and the
  SPAKE2 PIN pairing flow every client needs. Runs as a systemd --user service on port
- 3000 over HTTPS (HTTP/1.1 over TLS, with the host's own identity cert), login-gated (a
+ 47992 over HTTPS (HTTP/1.1 over TLS, with the host's own identity cert), login-gated (a
  password generated on first start), proxying the host's loopback HTTPS management API
  with a bearer token injected server-side (never sent to the browser). Bundles its own
  bun runtime (no system nodejs/bun dependency).
@@ -130,7 +130,7 @@ if [ "$1" = "configure" ]; then
     echo "A login password is generated on first start — read it with:"
     echo "    journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'"
     echo "    (or: sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password)"
-    echo "Then open https://<host-ip>:3000 (self-signed host cert — trust it once)"
+    echo "Then open https://<host-ip>:47992 (self-signed host cert — trust it once)"
 fi
 exit 0
 EOF

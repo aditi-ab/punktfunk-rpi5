@@ -34,7 +34,7 @@ for /f "usebackq tokens=1* delims==" %%A in ("%TOKENFILE%") do set "%%A=%%B"
 if exist "%PWFILE%" for /f "usebackq tokens=1* delims==" %%A in ("%PWFILE%") do set "%%A=%%B"
 
 rem Fixed deployment wiring (the Windows analogue of scripts/punktfunk-web.service).
-set "PORT=3000"
+set "PORT=47992"
 set "HOST=0.0.0.0"
 set "PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990"
 set "NODE_TLS_REJECT_UNAUTHORIZED=0"
