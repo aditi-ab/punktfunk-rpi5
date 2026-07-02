@@ -3,9 +3,10 @@
 // THE LAUNCH MECHANISM (verified against MoonDeck): gamescope only gives focus/fullscreen to
 // the window tree Steam launched via `reaper` (it detects the "current app" by AppID — see
 // gamescope#484). So we cannot launch the flatpak from the plugin backend; we register ONE
-// hidden non-Steam shortcut that points at our wrapper script (bin/punktfunkrun.sh), pass the
-// per-session host as the shortcut's Steam launch options, and start it with RunGame. The
-// wrapper then execs `flatpak run io.unom.Punktfunk --connect <host>` as a reaper descendant.
+// hidden non-Steam shortcut whose exe is `/bin/sh` running our wrapper script
+// (bin/punktfunkrun.sh), pass the per-session host as the shortcut's Steam launch options,
+// and start it with RunGame. The wrapper then execs
+// `flatpak run io.unom.Punktfunk --connect <host>` as a reaper descendant.
 
 import { runnerInfo } from "./backend";
 
@@ -49,7 +50,15 @@ function hideShortcut(appId: number): void {
   setTimeout(attempt, 2500); // fresh shortcut: retry once its app overview lands
 }
 
-const SHORTCUT_NAME = "punktfunk";
+// The shortcut name is user-visible (Steam overlay + library while streaming) — brand-case it.
+const SHORTCUT_NAME = "Punktfunk";
+
+// The shortcut's exe is /bin/sh, NOT the script itself: Decky extracts plugin zips without
+// preserving the exec bit, and ~/homebrew/plugins is root-owned so the unprivileged plugin
+// backend can't chmod it back on. Passing the script as an argument to the always-executable
+// shell removes the +x dependency entirely. SteamOS /bin/sh is bash; the wrapper is plain
+// POSIX sh regardless.
+const SHELL = "/bin/sh";
 
 // The 64-bit "gameid" RunGame wants, derived from a 32-bit non-Steam shortcut appId: the
 // standard non-Steam-game encoding (appid << 32 | 0x02000000). MoonDeck/decky tools use this.
@@ -78,39 +87,34 @@ function recallAppId(): number | null {
 }
 
 /**
- * Ensure exactly one hidden "punktfunk" shortcut exists pointing at the wrapper script, and
- * return its appId. Reuses the remembered one when its exe still matches the current runner
- * path (the plugin dir can change across reinstalls).
+ * Ensure exactly one hidden "Punktfunk" shortcut exists (exe = /bin/sh; the wrapper script is
+ * appended per-launch via the launch options), and return its appId + the current runner path.
+ * Reuses the remembered shortcut, re-pointing it each time — the plugin dir can change across
+ * reinstalls, and pre-0.4 shortcuts pointed at the script directly and relied on its exec bit.
  */
-async function ensureShortcut(): Promise<number> {
+async function ensureShortcut(): Promise<{ appId: number; runner: string }> {
   const info = await runnerInfo();
   if (!info.exists) {
     throw new Error(`launch wrapper missing at ${info.runner}`);
   }
+  const startDir = info.runner.replace(/\/[^/]*$/, ""); // the plugin's bin/ dir
 
   const remembered = recallAppId();
   if (remembered != null) {
-    // Re-point the existing shortcut at the current runner path (cheap + idempotent).
-    SteamClient.Apps.SetShortcutExe(remembered, info.runner);
-    SteamClient.Apps.SetShortcutStartDir(
-      remembered,
-      info.runner.replace(/\/[^/]*$/, ""),
-    );
-    return remembered;
+    // Re-point + rename the existing shortcut (cheap + idempotent — migrates old installs).
+    SteamClient.Apps.SetShortcutExe(remembered, SHELL);
+    SteamClient.Apps.SetShortcutStartDir(remembered, startDir);
+    SteamClient.Apps.SetShortcutName(remembered, SHORTCUT_NAME);
+    return { appId: remembered, runner: info.runner };
   }
 
-  const appId = await SteamClient.Apps.AddShortcut(
-    SHORTCUT_NAME,
-    info.runner,
-    info.runner.replace(/\/[^/]*$/, ""), // start dir = the bin/ dir
-    "",
-  );
+  const appId = await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, "");
   SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
   // Hide it from the library — it's an implementation detail, launched programmatically.
   // Best-effort + deferred (see hideShortcut); never let it block the launch.
   hideShortcut(appId);
   rememberAppId(appId);
-  return appId;
+  return { appId, runner: info.runner };
 }
 
 /**
@@ -138,13 +142,14 @@ function disableSteamInputForShortcut(appId: number): void {
  * shortcut's launch options (so one generic shortcut serves every host), then RunGame.
  */
 export async function launchStream(host: string, port: number): Promise<void> {
-  const appId = await ensureShortcut();
+  const { appId, runner } = await ensureShortcut();
   // Best-effort so the Deck's rich controls reach the client; no-op if the API is absent (the user
   // disables Steam Input manually — see the Settings instruction).
   disableSteamInputForShortcut(appId);
   const target = port && port !== 9777 ? `${host}:${port}` : host;
-  // KEY=value ... %command% — the wrapper reads PF_HOST from the environment.
-  SteamClient.Apps.SetAppLaunchOptions(appId, `PF_HOST=${target} %command%`);
+  // KEY=value ... %command% args — %command% expands to the shortcut exe (/bin/sh); the wrapper
+  // script rides behind it as an argument and reads PF_HOST from the environment.
+  SteamClient.Apps.SetAppLaunchOptions(appId, `PF_HOST=${target} %command% "${runner}"`);
   SteamClient.Apps.RunGame(gameIdFromAppId(appId), "", -1, 100);
 }
 

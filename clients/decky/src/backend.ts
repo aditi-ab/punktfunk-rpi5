@@ -6,7 +6,8 @@ export interface Host {
   host: string;
   port: number;
   pair: string; // "required" | "optional" — the HOST's policy
-  fp: string;
+  fp: string; // host cert SHA-256 fingerprint (lowercase hex) from the mDNS advert
+  proto: string; // advertised protocol, e.g. "punktfunk/1"
   paired: boolean; // whether THIS device has already PIN-paired this host (by fingerprint)
 }
 
@@ -22,12 +23,15 @@ export interface RunnerInfo {
   exists: boolean;
 }
 
+// The slice of the flatpak client's settings JSON this UI surfaces. The file can hold more
+// keys (codec, decoder, … set from the desktop client's own UI) — they round-trip untouched
+// because get_settings returns the whole parsed file and patches are object spreads.
 export interface StreamSettings {
   width: number; // 0 = native
   height: number; // 0 = native
   refresh_hz: number; // 0 = native
   bitrate_kbps: number; // 0 = host default
-  gamepad: string; // "auto" | "xbox360" | "dualsense"
+  gamepad: string; // "auto" | "xbox360" | "xboxone" | "dualsense" | "dualshock4" | "steamdeck"
   compositor: string; // "auto" | "kwin" | "wlroots" | "mutter" | "gamescope"
   inhibit_shortcuts: boolean;
   mic_enabled: boolean;

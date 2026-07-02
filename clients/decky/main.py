@@ -29,7 +29,6 @@ import json
 import os
 import shutil
 import ssl
-import stat
 import time
 import urllib.request
 from pathlib import Path
@@ -125,13 +124,68 @@ def _semver_tuple(v: str) -> tuple[int, int, int]:
     return (parts[0], parts[1], parts[2])
 
 
+# Decky Loader ships its own embedded (PyInstaller) Python whose compiled-in OpenSSL default
+# verify paths don't exist on SteamOS — ``ssl.create_default_context()`` then trusts NOTHING
+# and every HTTPS fetch dies with CERTIFICATE_VERIFY_FAILED (seen live on the Deck). Fix: find
+# a real CA bundle on disk and load it explicitly. Verification is NEVER disabled — if no
+# bundle exists the fetch just fails, and check_update() is non-fatal by design.
+_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",  # SteamOS / Arch / Debian / Ubuntu
+    "/etc/ssl/cert.pem",  # Arch/openssl compat symlink
+    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora / Bazzite
+    "/etc/ssl/ca-bundle.pem",  # openSUSE
+)
+_ssl_context_cache: ssl.SSLContext | None = None
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """A verifying SSLContext that actually has CA roots under Decky's embedded Python."""
+    ctx = ssl.create_default_context()  # honors SSL_CERT_FILE / SSL_CERT_DIR when set
+    if ctx.cert_store_stats().get("x509_ca", 0):
+        return ctx  # the interpreter found its own roots (e.g. a system python)
+
+    dvp = ssl.get_default_verify_paths()
+    candidates: list[str | None] = [dvp.cafile, dvp.openssl_cafile, *_CA_BUNDLES]
+    try:  # not shipped by Decky's runtime, but honor it when importable
+        import certifi
+
+        candidates.append(certifi.where())
+    except ImportError:
+        pass
+
+    tried: set[str] = set()
+    for cafile in candidates:
+        if not cafile or cafile in tried or not Path(cafile).is_file():
+            continue
+        tried.add(cafile)
+        try:
+            ctx.load_verify_locations(cafile=cafile)
+        except (ssl.SSLError, OSError):
+            continue
+        if ctx.cert_store_stats().get("x509_ca", 0):
+            decky.logger.info("TLS roots loaded from %s", cafile)
+            return ctx
+
+    decky.logger.warning(
+        "no CA bundle found — HTTPS update checks will fail certificate verification"
+    )
+    return ctx
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """The (cached) context for registry fetches; building it scans disk, so do it once."""
+    global _ssl_context_cache
+    if _ssl_context_cache is None:
+        _ssl_context_cache = _build_ssl_context()
+    return _ssl_context_cache
+
+
 def _fetch_json(url: str, timeout: float = 8.0) -> dict:
     """Blocking HTTPS GET of a small JSON document (run in an executor)."""
     req = urllib.request.Request(
         url, headers={"Accept": "application/json", "User-Agent": "punktfunk-decky"}
     )
-    ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
@@ -319,13 +373,10 @@ class Plugin:
 
     async def runner_info(self) -> dict:
         """The wrapper-script path + flatpak app id the frontend needs to create the Steam
-        shortcut. Also (re)asserts the script's exec bit — packaging can drop it."""
+        shortcut. The shortcut invokes the script through ``/bin/sh`` (see steam.ts), so no
+        exec bit is needed — Decky's zip extraction drops it, and the root-owned plugins dir
+        means this unprivileged backend couldn't chmod it back on anyway."""
         path = _runner_path()
-        try:
-            st = os.stat(path)
-            os.chmod(path, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        except OSError:
-            decky.logger.warning("could not chmod runner %s", path)
         return {"runner": path, "app_id": APP_ID, "exists": Path(path).exists()}
 
     async def get_settings(self) -> dict:

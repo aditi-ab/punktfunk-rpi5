@@ -18,6 +18,11 @@
 #
 # Runs as the `deck` user (Steam launched it), so the --user flatpak install is visible and
 # WAYLAND_DISPLAY / XDG_RUNTIME_DIR are already correct for gamescope.
+#
+# NO EXEC BIT REQUIRED: the Steam shortcut's exe is `/bin/sh` and this script rides behind
+# `%command%` as an argument (see src/steam.ts). Decky extracts plugin zips without preserving
+# permission bits and ~/homebrew/plugins is root-owned (the unprivileged plugin backend can't
+# chmod), so the launch path must never depend on +x. Keep this script POSIX-sh clean.
 set -u
 
 APPID="${PF_APPID:-io.unom.Punktfunk}"

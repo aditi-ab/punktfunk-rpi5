@@ -1,14 +1,15 @@
 {
   "name": "punktfunk-decky",
   "version": "0.0.1",
-  "description": "SteamOS / Steam Deck Gaming-Mode launcher for the punktfunk streaming client.",
+  "description": "SteamOS / Steam Deck Gaming-Mode launcher for the Punktfunk streaming client.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
+    "typecheck": "tsc --noEmit --skipLibCheck",
     "package": "pnpm build && bash scripts/package.sh",
     "deploy": "bash scripts/deploy.sh",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "pnpm typecheck"
   },
   "keywords": [
     "decky",
