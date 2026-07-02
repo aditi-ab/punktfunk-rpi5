@@ -16,6 +16,23 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The last 1-second render window, published for the HUD (one render thread at a time):
+/// presents/s, frames skipped by the newest-wins drain, and the capture→presented p50 in µs.
+/// Zeroed when a render thread starts so a new session never shows the previous one's numbers.
+static PRESENT_FPS: AtomicU32 = AtomicU32::new(0);
+static PRESENT_SKIPPED: AtomicU32 = AtomicU32::new(0);
+static PRESENT_P50_US: AtomicU64 = AtomicU64::new(0);
+
+/// `(presents/s, skipped/s, capture→presented p50 ms)` of the last render window — the HUD's
+/// display-side line.
+pub fn present_stats() -> (u32, u32, f32) {
+    (
+        PRESENT_FPS.load(Ordering::Relaxed),
+        PRESENT_SKIPPED.load(Ordering::Relaxed),
+        PRESENT_P50_US.load(Ordering::Relaxed) as f32 / 1000.0,
+    )
+}
+
 /// UI-thread → render-thread state. Size is packed into ONE atomic (w<<32|h) so a resize never
 /// tears into a (new-width, old-height) pair.
 pub struct RenderShared {
@@ -133,6 +150,9 @@ fn run(presenter: SendPresenter, frames: FrameRx, shared: Arc<RenderShared>, clo
     let mut lat_us: Vec<u64> = Vec::with_capacity(256);
     let mut window_start = Instant::now();
     let mut last_dpi_poll = Instant::now();
+    PRESENT_FPS.store(0, Ordering::Relaxed);
+    PRESENT_SKIPPED.store(0, Ordering::Relaxed);
+    PRESENT_P50_US.store(0, Ordering::Relaxed);
 
     loop {
         if shared.stop.load(Ordering::SeqCst) {
@@ -194,6 +214,9 @@ fn run(presenter: SendPresenter, frames: FrameRx, shared: Arc<RenderShared>, clo
             lat_us.sort_unstable();
             let p50 = lat_us.get(lat_us.len() / 2).copied().unwrap_or(0);
             tracing::debug!(presented, dropped, present_p50_us = p50, "render window");
+            PRESENT_FPS.store(presented, Ordering::Relaxed);
+            PRESENT_SKIPPED.store(dropped, Ordering::Relaxed);
+            PRESENT_P50_US.store(p50, Ordering::Relaxed);
             window_start = Instant::now();
             presented = 0;
             dropped = 0;

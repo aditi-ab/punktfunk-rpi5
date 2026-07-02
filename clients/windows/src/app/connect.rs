@@ -250,7 +250,8 @@ fn connect_with(
                 }
                 gamepad.attach(connector.clone());
                 *shared.stats.lock().unwrap() = Stats::default(); // clear any prior session's numbers
-                *shared.handoff.lock().unwrap() = Some((connector, handle.frames.clone()));
+                *shared.handoff.lock().unwrap() =
+                    Some((connector, handle.frames.clone(), handle.stop.clone()));
                 ss.call(Screen::Stream);
             }
             SessionEvent::Failed {

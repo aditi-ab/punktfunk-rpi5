@@ -15,12 +15,15 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use windows_reactor::*;
 
-/// One HUD refresh: the latest session stats plus the input hooks' capture state. Mirrored into
-/// root state by the poll thread (`pf-hud`) and passed down as a prop.
+/// One HUD refresh: the latest session stats, the input hooks' capture state, and the render
+/// thread's display-side window. Mirrored into root state by the poll thread (`pf-hud`) and
+/// passed down as a prop.
 #[derive(Clone, Copy, Default, PartialEq)]
 pub(crate) struct HudSample {
     pub(crate) stats: Stats,
     pub(crate) captured: bool,
+    /// `(presents/s, skipped/s, capture→presented p50 ms)` — see [`crate::render::present_stats`].
+    pub(crate) present: (u32, u32, f32),
 }
 
 /// Props for the stream page: the services plus the live HUD sample that drives the overlay
@@ -71,12 +74,12 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
         let inhibit = ctx.settings.lock().unwrap().inhibit_shortcuts;
         let connector_ref = connector_ref.clone();
         move || {
-            if let Some((connector, frames)) = shared.handoff.lock().unwrap().take() {
+            if let Some((connector, frames, stop)) = shared.handoff.lock().unwrap().take() {
                 let mode = connector.mode();
                 let clock_offset = connector.clock_offset_ns;
                 connector_ref.set(Some(connector.clone()));
                 PENDING.with(|c| *c.borrow_mut() = Some((frames, clock_offset)));
-                crate::input::install(connector, mode, inhibit);
+                crate::input::install(connector, mode, inhibit, stop);
             }
             Some(|| {
                 RENDER.with(|c| {
@@ -91,6 +94,7 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
     });
 
     let mode = connector_ref.borrow().as_ref().map(|c| c.mode());
+    let host = ctx.shared.target.lock().unwrap().name.clone();
     grid((
         swap_chain_panel()
             .on_ready(|panel| {
@@ -128,7 +132,7 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
                     }
                 });
             }),
-        hud_overlay(&props.hud, mode),
+        hud_overlay(&props.hud, mode, &host),
     ))
     .into()
 }
@@ -146,15 +150,39 @@ fn hud_chip(text: &str, color: Color) -> Border {
     .padding(edges(8.0, 2.0, 8.0, 2.0))
 }
 
-/// The streaming HUD overlay (top-right), mirroring the Apple client: a chip row (mode · decode
-/// path · HDR), the fps/throughput/latency line, and the capture-state hint. Layered over the
-/// `SwapChainPanel` in the same grid cell.
-fn hud_overlay(hud: &HudSample, mode: Option<Mode>) -> Element {
+/// The negotiated wire codec's display name (`quic::CODEC_*` bit → label).
+fn codec_name(bits: u8) -> &'static str {
+    match bits {
+        punktfunk_core::quic::CODEC_H264 => "H.264",
+        punktfunk_core::quic::CODEC_AV1 => "AV1",
+        _ => "HEVC",
+    }
+}
+
+/// `mm:ss` (or `h:mm:ss`) session time.
+fn fmt_uptime(secs: u32) -> String {
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// The streaming HUD overlay (top-right), mirroring the Apple client: a chip row (mode · codec ·
+/// decode path · HDR), a stream line (decode fps / bitrate / decode time), a glass line (display
+/// presents + end-to-end latency decoded vs on-glass), a session line (host · time · loss), and
+/// the shortcut hints. Layered over the `SwapChainPanel` in the same grid cell.
+fn hud_overlay(hud: &HudSample, mode: Option<Mode>, host: &str) -> Element {
     let stats = &hud.stats;
+    let (pfps, skipped, glass_ms) = hud.present;
     let res = mode
         .map(|m| format!("{}\u{00D7}{}@{}", m.width, m.height, m.refresh_hz))
         .unwrap_or_else(|| "\u{2014}".into());
-    let mut chips: Vec<Element> = vec![hud_chip(&res, Color::rgb(235, 235, 235)).into()];
+    let mut chips: Vec<Element> = vec![
+        hud_chip(&res, Color::rgb(235, 235, 235)).into(),
+        hud_chip(codec_name(stats.codec), Color::rgb(180, 190, 255)).into(),
+    ];
     chips.push(if stats.hardware {
         hud_chip("GPU decode", Color::rgb(120, 220, 150)).into()
     } else {
@@ -163,21 +191,43 @@ fn hud_overlay(hud: &HudSample, mode: Option<Mode>) -> Element {
     if stats.hdr {
         chips.push(hud_chip("HDR", Color::rgb(255, 205, 90)).into());
     }
-    let line = format!(
-        "{:.0} fps \u{00B7} {:.1} Mb/s \u{00B7} {:.1} ms p50 \u{00B7} decode {:.1} ms",
-        stats.fps, stats.mbps, stats.latency_ms, stats.decode_ms
+    let stream_line = format!(
+        "{:.0} fps \u{00B7} {:.1} Mb/s \u{00B7} decode {:.1} ms",
+        stats.fps, stats.mbps, stats.decode_ms
     );
+    // End-to-end latency (host-clock corrected): capture→decoded from the pump, capture→on-glass
+    // from the render thread's post-Present stamp. `skipped` = newest-wins drops (expected when
+    // the stream outpaces the display); `lost` = unrecoverable network drops.
+    let glass_line = format!(
+        "display {pfps} fps \u{00B7} latency {:.1} ms decoded / {glass_ms:.1} ms on-glass",
+        stats.latency_ms
+    );
+    let mut session_bits: Vec<String> = Vec::new();
+    if !host.is_empty() {
+        session_bits.push(host.to_string());
+    }
+    session_bits.push(fmt_uptime(stats.uptime_secs));
+    session_bits.push(format!("{} lost", stats.dropped));
+    if skipped > 0 {
+        session_bits.push(format!("{skipped} skipped"));
+    }
+    let session_line = session_bits.join(" \u{00B7} ");
     let hint = if hud.captured {
-        "Ctrl+Alt+Shift+Q releases the mouse"
+        "Ctrl+Alt+Shift+Q releases the mouse \u{00B7} Ctrl+Alt+Shift+D disconnects"
     } else {
-        "Click the stream to capture the mouse"
+        "Click the stream to capture \u{00B7} Ctrl+Alt+Shift+D disconnects"
+    };
+    let dim = |t: &str| {
+        text_block(t)
+            .font_size(11.0)
+            .foreground(Color::rgb(210, 210, 210))
     };
     border(
         vstack((
             hstack(chips).spacing(6.0),
-            text_block(line)
-                .font_size(11.0)
-                .foreground(Color::rgb(210, 210, 210)),
+            dim(&stream_line),
+            dim(&glass_line),
+            dim(&session_line),
             text_block(hint)
                 .font_size(11.0)
                 .foreground(Color::rgb(150, 150, 150)),

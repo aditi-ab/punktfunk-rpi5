@@ -95,10 +95,14 @@ impl PartialEq for Svc {
     }
 }
 
-/// Cross-thread handoff from the session pump (off-thread) to the stream page (UI thread).
+/// Cross-thread handoff from the session pump (off-thread) to the stream page (UI thread):
+/// the connector (input sends), the decoded-frame channel (render thread), and the session's
+/// stop flag (the disconnect shortcut trips it).
 #[derive(Default)]
 pub(crate) struct Shared {
-    pub(crate) handoff: Mutex<Option<(Arc<NativeClient>, crate::session::FrameRx)>>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) handoff:
+        Mutex<Option<(Arc<NativeClient>, crate::session::FrameRx, Arc<AtomicBool>)>>,
     pub(crate) target: Mutex<Target>,
     /// Latest stream stats, written by the session's event loop and mirrored into reactor state
     /// by the HUD poll thread to drive the overlay.
@@ -231,6 +235,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                     set_hud.call(stream::HudSample {
                         stats: *shared.stats.lock().unwrap(),
                         captured: crate::input::is_captured(),
+                        present: crate::render::present_stats(),
                     });
                 })
                 .ok();

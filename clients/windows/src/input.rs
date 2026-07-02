@@ -23,7 +23,9 @@
 //! **click on the stream** re-engages it. Losing foreground also releases the lock so the cursor
 //! is never stranded; regaining it while still captured re-locks. When "capture system
 //! shortcuts" is off in Settings, Alt+Tab / Alt+Esc / Ctrl+Esc / the Win keys act on the local
-//! desktop instead of being forwarded.
+//! desktop instead of being forwarded. **Ctrl+Alt+Shift+D disconnects** the session (consumed
+//! locally, works captured or released while our window is foreground): it trips the session's
+//! stop flag, the pump winds down, and the event loop navigates back to the host list.
 
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::Mode;
@@ -34,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_Q;
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_D, VK_Q};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, ClipCursor, GetClientRect, GetForegroundWindow, SetCursorPos,
     SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
@@ -46,6 +48,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 struct State {
     connector: Arc<NativeClient>,
     mode: Mode,
+    /// The session's stop flag (Ctrl+Alt+Shift+D trips it; the pump then ends the session).
+    stop: Arc<AtomicBool>,
     /// Our window handle, stored as the raw `isize` so `State` is `Send` (`HWND` is not).
     hwnd: isize,
     /// User intent: forward input to the host (toggled by Ctrl+Alt+Shift+Q / click-to-capture).
@@ -99,11 +103,18 @@ fn set_captured(st: &mut State, on: bool) {
 
 /// Install the hooks for a streaming session. Call from the UI thread once the window is shown.
 /// `inhibit_shortcuts` forwards system shortcuts (Alt+Tab, Win, …) to the host; off = local.
-pub fn install(connector: Arc<NativeClient>, mode: Mode, inhibit_shortcuts: bool) {
+/// `stop` is the session's stop flag, tripped by the disconnect shortcut.
+pub fn install(
+    connector: Arc<NativeClient>,
+    mode: Mode,
+    inhibit_shortcuts: bool,
+    stop: Arc<AtomicBool>,
+) {
     let hwnd = unsafe { GetForegroundWindow() };
     let mut st = State {
         connector,
         mode,
+        stop,
         hwnd: hwnd.0 as isize,
         captured: false,
         inhibit_shortcuts,
@@ -264,6 +275,14 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     let on = !st.captured;
                     set_captured(st, on);
                     tracing::info!(captured = on, "capture toggled (Ctrl+Alt+Shift+Q)");
+                    return LRESULT(1);
+                }
+                // Disconnect: Ctrl+Alt+Shift+D (consumed locally). Release capture immediately so
+                // the cursor is free while the session winds down and the UI navigates home.
+                if !up && vk == VK_D.0 && st.ctrl && st.alt && st.shift {
+                    set_captured(st, false);
+                    st.stop.store(true, Ordering::SeqCst);
+                    tracing::info!("disconnect requested (Ctrl+Alt+Shift+D)");
                     return LRESULT(1);
                 }
                 if st.captured {

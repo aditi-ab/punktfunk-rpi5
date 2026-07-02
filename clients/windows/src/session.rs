@@ -51,10 +51,17 @@ pub struct Stats {
     pub decode_ms: f32,
     /// Median capture→decoded latency over the last window (host-clock corrected).
     pub latency_ms: f32,
-    /// True when decoding on the GPU (D3D11VA zero-copy) vs. CPU (software).
+    /// True when decoding on the GPU (D3D11VA) vs. CPU (software).
     pub hardware: bool,
     /// True when the stream is BT.2020 PQ HDR10 (last decoded frame).
     pub hdr: bool,
+    /// The negotiated wire codec (a `quic::CODEC_*` bit) — the HUD's codec chip.
+    pub codec: u8,
+    /// Frames lost to unrecoverable network drops since session start (reassembler count; each
+    /// triggers a keyframe re-request).
+    pub dropped: u64,
+    /// Seconds since the stream started.
+    pub uptime_secs: u32,
 }
 
 pub enum SessionEvent {
@@ -299,6 +306,7 @@ fn pump(
 
     let clock_offset = connector.clock_offset_ns;
     let mut total_frames = 0u64;
+    let session_start = Instant::now();
     let mut window_start = Instant::now();
     let mut frames_n = 0u32;
     let mut bytes_n = 0u64;
@@ -424,6 +432,9 @@ fn pump(
                 latency_ms: p50 as f32 / 1000.0,
                 hardware,
                 hdr,
+                codec: connector.codec,
+                dropped: last_dropped,
+                uptime_secs: session_start.elapsed().as_secs() as u32,
             }));
             window_start = Instant::now();
             frames_n = 0;

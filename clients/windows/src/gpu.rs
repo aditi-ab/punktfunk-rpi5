@@ -8,11 +8,15 @@
 //! session pump when it builds the decoder, or the UI thread when it builds the presenter).
 //!
 //! **Adapter selection** (matters on hybrid boxes — e.g. an Intel iGPU driving the panel next to
-//! an NVIDIA dGPU): `PUNKTFUNK_ADAPTER` (index or case-insensitive name substring) wins; else the
-//! adapter whose output owns the monitor our window is on — that's the adapter DWM composes that
-//! monitor with, so presents are copy-free and decode runs on the near GPU; else the default
-//! adapter. Deliberately NOT "the adapter with the best decoder": if the monitor's adapter can't
-//! decode the codec we demote to software, which beats a per-frame cross-adapter present copy.
+//! an NVIDIA dGPU): `PUNKTFUNK_ADAPTER` (index or case-insensitive name substring, a debugging
+//! override) wins; else the persisted Settings GPU pick ([`crate::trust::Settings::adapter`], the
+//! Settings-page selector on multi-GPU boxes); else the adapter whose output owns the monitor our
+//! window is on — that's the adapter DWM composes that monitor with, so presents are copy-free
+//! and decode runs on the near GPU; else the default adapter. Deliberately NOT "the adapter with
+//! the best decoder": if the monitor's adapter can't decode the codec we demote to software,
+//! which beats a per-frame cross-adapter present copy. The device is cached **keyed by the
+//! resolved preference**, so a Settings change takes effect at the next session (the pump and the
+//! presenter both resolve at session start and read the same value) without an app restart.
 //!
 //! `PUNKTFUNK_D3D_DEBUG=1` adds the D3D11 debug layer (validation messages in the debugger /
 //! DebugView) — invaluable for present-path bugs, which D3D11 otherwise drops silently.
@@ -27,7 +31,7 @@
 //! state. That makes the `unsafe impl Send + Sync` below sound for exactly this usage.
 
 use anyhow::{anyhow, Result};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP,
@@ -55,17 +59,38 @@ pub struct SharedDevice {
 unsafe impl Send for SharedDevice {}
 unsafe impl Sync for SharedDevice {}
 
-static SHARED: OnceLock<Option<SharedDevice>> = OnceLock::new();
+/// The shared device, cached with the GPU preference it was resolved from (empty = automatic).
+/// Re-created when the preference changes — in practice only between sessions: within one session
+/// the decoder and the presenter both call [`shared`] at session start with the same value.
+static SHARED: Mutex<Option<(String, Arc<SharedDevice>)>> = Mutex::new(None);
 
-/// The process-wide shared D3D11 device, created on first call. `None` only if D3D11 device
-/// creation fails for both a hardware adapter and WARP (effectively never — WARP is always present).
-pub fn shared() -> Option<&'static SharedDevice> {
-    SHARED.get_or_init(create).as_ref()
+/// The user's decode/present GPU preference: the `PUNKTFUNK_ADAPTER` env (debugging override)
+/// wins, else the persisted Settings pick; empty = automatic.
+fn adapter_pref() -> String {
+    std::env::var("PUNKTFUNK_ADAPTER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::trust::Settings::load().adapter)
 }
 
-fn create() -> Option<SharedDevice> {
-    match create_device() {
-        Ok(d) => Some(d),
+/// The process-shared D3D11 device for the current GPU preference, created (or re-created after
+/// a preference change) on demand. `None` only if D3D11 device creation fails for both a hardware
+/// adapter and WARP (effectively never — WARP is always present).
+pub fn shared() -> Option<Arc<SharedDevice>> {
+    let pref = adapter_pref();
+    let mut cached = SHARED.lock().unwrap();
+    if let Some((key, dev)) = cached.as_ref() {
+        if *key == pref {
+            return Some(dev.clone());
+        }
+    }
+    match create_device(&pref) {
+        Ok(d) => {
+            let d = Arc::new(d);
+            *cached = Some((pref, d.clone()));
+            Some(d)
+        }
         Err(e) => {
             tracing::error!(error = %e, "shared D3D11 device creation failed — no present/decode");
             None
@@ -87,25 +112,46 @@ fn adapter_name(adapter: &IDXGIAdapter) -> String {
     }
 }
 
-/// Resolve an explicit adapter: `PUNKTFUNK_ADAPTER` (index or case-insensitive name substring)
-/// wins; else the adapter whose output owns the monitor the app window is on (see module docs);
-/// else `None` → the default adapter (also the headless-CLI path, where no window exists).
-fn resolve_adapter() -> Option<IDXGIAdapter> {
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
-    let adapters: Vec<IDXGIAdapter> = {
-        let mut v = Vec::new();
-        let mut i = 0u32;
-        while let Ok(a) = unsafe { factory.EnumAdapters1(i) } {
-            i += 1;
-            if let Ok(a) = a.cast::<IDXGIAdapter>() {
-                v.push(a);
-            }
-        }
-        v
+/// Every DXGI adapter, in enumeration order (`PUNKTFUNK_ADAPTER=<index>` uses these indices).
+fn all_adapters() -> Vec<IDXGIAdapter> {
+    let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
     };
+    let mut v = Vec::new();
+    let mut i = 0u32;
+    while let Ok(a) = unsafe { factory.EnumAdapters1(i) } {
+        i += 1;
+        if let Ok(a) = a.cast::<IDXGIAdapter>() {
+            v.push(a);
+        }
+    }
+    v
+}
 
-    if let Ok(pref) = std::env::var("PUNKTFUNK_ADAPTER") {
-        let pref = pref.trim();
+/// Descriptions of the real (hardware, non-WARP) GPUs — the Settings GPU picker's option list.
+/// The picker only shows when this has more than one entry.
+pub fn adapter_names() -> Vec<String> {
+    const DXGI_ADAPTER_FLAG_SOFTWARE: u32 = 2; // dxgi.h; not in this windows-rs feature set
+    all_adapters()
+        .iter()
+        .filter(|a| {
+            a.cast::<windows::Win32::Graphics::Dxgi::IDXGIAdapter1>()
+                .and_then(|a1| unsafe { a1.GetDesc1() })
+                .map(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE == 0)
+                .unwrap_or(true)
+        })
+        .map(adapter_name)
+        .collect()
+}
+
+/// Resolve an explicit adapter: a non-empty `pref` (index or case-insensitive name substring, from
+/// env or Settings) wins; else the adapter whose output owns the monitor the app window is on (see
+/// module docs); else `None` → the default adapter (also the headless-CLI path with no window).
+fn resolve_adapter(pref: &str) -> Option<IDXGIAdapter> {
+    let adapters = all_adapters();
+
+    if !pref.is_empty() {
         let found = if let Ok(idx) = pref.parse::<usize>() {
             adapters.get(idx).cloned()
         } else {
@@ -116,10 +162,8 @@ fn resolve_adapter() -> Option<IDXGIAdapter> {
                 .cloned()
         };
         match &found {
-            Some(a) => {
-                tracing::info!(pref, adapter = %adapter_name(a), "PUNKTFUNK_ADAPTER matched")
-            }
-            None => tracing::warn!(pref, "PUNKTFUNK_ADAPTER matched no adapter — using default"),
+            Some(a) => tracing::info!(pref, adapter = %adapter_name(a), "GPU preference matched"),
+            None => tracing::warn!(pref, "GPU preference matched no adapter — using automatic"),
         }
         if found.is_some() {
             return found;
@@ -153,12 +197,12 @@ fn resolve_adapter() -> Option<IDXGIAdapter> {
     None
 }
 
-fn create_device() -> Result<SharedDevice> {
+fn create_device(pref: &str) -> Result<SharedDevice> {
     // Preference order: the resolved adapter (or the default hardware adapter) with video support
     // (enables D3D11VA); the same without the VIDEO flag (a driver that rejects it still presents +
     // software-decodes); finally WARP for the GPU-less box. BGRA_SUPPORT is required for the
     // composition swapchain in every case. An explicit adapter requires D3D_DRIVER_TYPE_UNKNOWN.
-    let adapter = resolve_adapter();
+    let adapter = resolve_adapter(pref);
     let attempts: [(Option<&IDXGIAdapter>, D3D_DRIVER_TYPE, bool, bool); 3] = match &adapter {
         Some(a) => [
             (Some(a), D3D_DRIVER_TYPE_UNKNOWN, true, true),

@@ -144,6 +144,11 @@ pub struct Settings {
     /// preference — the host honors it when it can emit it, else falls back to the best shared codec.
     #[serde(default = "default_codec")]
     pub codec: String,
+    /// Decode/present GPU: the DXGI adapter description to prefer on a multi-GPU box; empty =
+    /// automatic (the adapter driving the window's monitor). Applies from the next session; a
+    /// vanished adapter (eGPU unplugged) falls back to automatic.
+    #[serde(default)]
+    pub adapter: String,
 }
 
 fn default_codec() -> String {
@@ -177,6 +182,7 @@ impl Default for Settings {
             hdr_enabled: true,
             decoder: "auto".into(),
             codec: "auto".into(),
+            adapter: String::new(),
         }
     }
 }

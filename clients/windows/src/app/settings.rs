@@ -166,6 +166,31 @@ pub(crate) fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen
     let decoder_combo = setting_combo(ctx, "Video decoder", dec_names, dec_i, |s, i| {
         s.decoder = DECODERS[i].0.to_string();
     });
+    // GPU picker, only on a multi-GPU box (hybrid laptop, eGPU): which adapter decodes + presents.
+    // Stored as the adapter description; empty = automatic (the window's monitor's adapter).
+    let gpus = crate::gpu::adapter_names();
+    let gpu_combo = (gpus.len() > 1).then(|| {
+        let mut names = vec!["Automatic (the display's GPU)".to_string()];
+        names.extend(gpus.iter().cloned());
+        let current = gpus
+            .iter()
+            .position(|n| *n == s.adapter)
+            .map_or(0, |i| i + 1);
+        let gpus = gpus.clone();
+        setting_combo(
+            ctx,
+            "GPU (decode + present, applies to the next stream)",
+            names,
+            current,
+            move |s, i| {
+                s.adapter = if i == 0 {
+                    String::new()
+                } else {
+                    gpus[i - 1].clone()
+                };
+            },
+        )
+    });
     let (codec_names, codec_i) = presets(CODECS, |v| *v == s.codec);
     let codec_combo = setting_combo(ctx, "Video codec", codec_names, codec_i, |s, i| {
         s.codec = CODECS[i].0.to_string();
@@ -269,15 +294,17 @@ pub(crate) fn settings_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen
         section("VIDEO"),
         settings_card(
             "Video",
-            "Hardware decode (D3D11VA) is zero-copy and far lighter than software — keep it on \
-             Automatic unless debugging. Run a per-host speed test (host list) before setting a \
-             high bitrate.",
-            vec![
-                decoder_combo.into(),
-                codec_combo.into(),
-                bitrate_box.into(),
-                hdr_toggle.into(),
-            ],
+            "Hardware decode (D3D11VA) is far lighter than software — keep it on Automatic \
+             unless debugging. Run a per-host speed test (host list) before setting a high \
+             bitrate.",
+            {
+                let mut controls: Vec<Element> = vec![decoder_combo.into()];
+                if let Some(c) = gpu_combo {
+                    controls.push(c.into());
+                }
+                controls.extend([codec_combo.into(), bitrate_box.into(), hdr_toggle.into()]);
+                controls
+            },
         ),
         section("INPUT"),
         settings_card(
