@@ -93,6 +93,13 @@ jobs:
           if (-not $env:FFMPEG_DIR) {
             "FFMPEG_DIR=C:\Users\Public\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
+          # VBCABLE_DIR: the pinned official VB-CABLE package (provisioned by
+          # provision-windows-punktfunk-extras.ps1) -> pack-host-installer.ps1 bundles the
+          # streaming virtual microphone. Same daemon-env-or-fallback pattern as FFMPEG_DIR
+          # (the daemon env only refreshes on a runner-task restart).
+          if (-not $env:VBCABLE_DIR) {
+            "VBCABLE_DIR=C:\Users\Public\vbcable" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
           $v = if ($env:GITHUB_REF -like 'refs/tags/v*') {
             $env:GITHUB_REF_NAME -replace '^v', ''
           } else {

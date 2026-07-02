@@ -132,6 +132,13 @@ $issLocal = Join-Path $OutDir 'punktfunk-host.iss'
 Copy-Item -LiteralPath $hostEnvSrc -Destination $hostEnv -Force
 Copy-Item -LiteralPath $readmeSrc -Destination $readme -Force
 Copy-Item -LiteralPath $iss -Destination $issLocal -Force
+# Branding (wizard BMPs + punktfunk.ico, committed outputs of branding/gen-branding.ps1): the .iss
+# references them as "branding\" relative to itself, so stage the dir next to the staged .iss.
+$brandStage = Join-Path $OutDir 'branding'
+if (Test-Path $brandStage) { Remove-Item $brandStage -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $brandStage | Out-Null
+Copy-Item (Join-Path $here 'branding\*.bmp') $brandStage -Force
+Copy-Item (Join-Path $here 'branding\punktfunk.ico') $brandStage -Force
 
 # License/attribution payload bundled into {app}\licenses: the project's own MIT/Apache texts and the
 # generated third-party crate notices. The FFmpeg LGPL notice + license text are added to this same
@@ -198,7 +205,13 @@ if (-not $NoDriver) {
 # shipped intact); supply it via -VbCableDir / $env:VBCABLE_DIR pointing at the extracted official
 # package (must contain VBCABLE_Setup_x64.exe). Absent -> installer built WITHOUT the bundled cable; the
 # host then auto-installs the Steam Streaming pair as a fallback and mic passthrough needs a manual cable.
-if ($VbCableDir -and (Test-Path $VbCableDir) -and (Get-ChildItem -Path $VbCableDir -Filter 'VBCABLE_Setup*.exe' -ErrorAction SilentlyContinue)) {
+if ($VbCableDir -and -not ((Test-Path $VbCableDir) -and (Get-ChildItem -Path $VbCableDir -Filter 'VBCABLE_Setup*.exe' -ErrorAction SilentlyContinue))) {
+    # An explicitly-supplied dir that doesn't hold the package is a broken provisioning, not an
+    # opt-out - fail loudly instead of silently shipping an installer without the virtual mic
+    # (exactly the field regression this bundling fixes). Opt out by leaving VBCABLE_DIR unset.
+    throw "VbCableDir '$VbCableDir' has no VBCABLE_Setup*.exe - re-run scripts/ci/provision-windows-punktfunk-extras.ps1 (or unset VBCABLE_DIR to build without the virtual mic)"
+}
+if ($VbCableDir) {
     $vbStage = Join-Path $OutDir 'vbcable'
     if (Test-Path $vbStage) { Remove-Item -Recurse -Force $vbStage }
     New-Item -ItemType Directory -Force -Path $vbStage | Out-Null
@@ -211,7 +224,7 @@ if ($VbCableDir -and (Test-Path $VbCableDir) -and (Get-ChildItem -Path $VbCableD
     Copy-Item (Join-Path $here 'licenses\VB-CABLE-NOTICE.txt') -Destination $licStage -Force
     Write-Host "==> bundling VB-CABLE (virtual mic) from $VbCableDir -> $vbStage"
 }
-else { Write-Host "no -VbCableDir/`$env:VBCABLE_DIR (or no VBCABLE_Setup*.exe in it) -> installer built WITHOUT the bundled VB-CABLE virtual mic" }
+else { Write-Host "no -VbCableDir/`$env:VBCABLE_DIR -> installer built WITHOUT the bundled VB-CABLE virtual mic (CI always bundles it; see provision-windows-punktfunk-extras.ps1)" }
 
 # --- stage the FFmpeg shared DLLs (AMD/Intel AMF/QSV build) ------------------------------------
 # A host built with --features amf-qsv link-imports avcodec/avutil/swscale/... so the shared DLLs

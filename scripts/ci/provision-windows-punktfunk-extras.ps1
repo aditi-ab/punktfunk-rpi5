@@ -52,13 +52,38 @@ Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg"       -ZipTag 'win64'
 Get-BtbnFfmpeg -Dir "C:\Users\Public\ffmpeg-arm64" -ZipTag 'winarm64'
 
 # --- Inno Setup (ISCC.exe) for the host installer build (windows-host.yml). pack-host-installer.ps1
-# locates it at its fixed Program Files path, so it need not be on PATH - just present. ---
-if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+# locates it at its fixed Program Files path, so it need not be on PATH - just present. The .iss
+# uses the 6.6+ styling (WizardStyle dark/dynamic + the windows11 style); an older 6.x compiles a
+# plain-modern fallback, so upgrade a pre-6.6 install rather than silently shipping the old look. ---
+$isccPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+$innoVer = (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1' -ErrorAction SilentlyContinue).DisplayVersion
+if (-not (Test-Path $isccPath) -or ($innoVer -and [version]$innoVer -lt [version]'6.6.0')) {
   if (Get-Command choco -ErrorAction SilentlyContinue) {
-    info "installing Inno Setup (ISCC)"
-    choco install innosetup -y --no-progress
-  } else { Write-Warning "Inno Setup not found and choco unavailable - install it for windows-host.yml." }
+    info "installing/upgrading Inno Setup (ISCC; found: $innoVer)"
+    choco upgrade innosetup -y --no-progress
+  } else { Write-Warning "Inno Setup missing or pre-6.6 ($innoVer) and choco unavailable - install/upgrade it for windows-host.yml." }
 }
+
+# --- VB-CABLE (the streaming virtual microphone the host installer bundles). Pinned official
+# package, SHA-256 verified - a silent hash change means VB-Audio shipped a new pack: verify it,
+# then update BOTH the pin here and the notice if terms changed (packaging/windows/licenses/
+# VB-CABLE-NOTICE.txt). Donationware by VB-Audio (https://vb-audio.com), redistributed under
+# VB-Audio's bundling grant; only the base cable, never A+B/C+D. windows-host.yml points
+# VBCABLE_DIR here so pack-host-installer.ps1 bundles it. ---
+$vbDir = "C:\Users\Public\vbcable"
+$vbUrl = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip"
+$vbSha = "B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB"
+if (-not (Test-Path (Join-Path $vbDir 'VBCABLE_Setup_x64.exe'))) {
+  info "fetching VB-CABLE (official base package, pinned)"
+  $vbZip = "$vbDir.zip"
+  Invoke-WebRequest -Uri $vbUrl -OutFile $vbZip -UseBasicParsing
+  $got = (Get-FileHash $vbZip -Algorithm SHA256).Hash
+  if ($got -ne $vbSha) { Remove-Item $vbZip -Force; throw "VB-CABLE download hash mismatch (got $got, pinned $vbSha) - vendor package changed; re-verify before re-pinning." }
+  if (Test-Path $vbDir) { Remove-Item -Recurse -Force $vbDir }
+  Expand-Archive -Path $vbZip -DestinationPath $vbDir -Force   # flat zip (setup exes + signed drivers)
+  Remove-Item $vbZip -Force
+  info "VB-CABLE staged at $vbDir"
+} else { info "VB-CABLE already present at $vbDir" }
 
 # --- Drop punktfunk's env vars into the generic runner's daemon wrapper extension point (see
 # unom/infra's scripts/setup-gitea-runner-base.ps1) so the act_runner daemon - and therefore every
@@ -66,8 +91,9 @@ if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
 $projectEnv = "C:\Users\Public\act-runner\project-env.ps1"
 @'
 $env:FFMPEG_DIR = "C:\Users\Public\ffmpeg"
+$env:VBCABLE_DIR = "C:\Users\Public\vbcable"
 $env:PATH = "C:\Users\Public\ffmpeg\bin;" + $env:PATH
 '@ | Set-Content -Encoding UTF8 $projectEnv
-info "wrote $projectEnv (FFMPEG_DIR) - restart the gitea-act-runner scheduled task to pick it up"
+info "wrote $projectEnv (FFMPEG_DIR, VBCABLE_DIR) - restart the gitea-act-runner scheduled task to pick it up"
 
 info "punktfunk extras provisioned OK."

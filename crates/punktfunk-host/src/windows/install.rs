@@ -1,5 +1,6 @@
-//! `punktfunk-host driver install` / `web setup` - the install-time work the Windows installer's Inno
-//! `[Run]` section delegates to the host EXE instead of locale-parsed PowerShell *files*.
+//! `punktfunk-host driver install|uninstall` / `web setup` - the install-time work the Windows
+//! installer's Inno `[Run]`/`[UninstallRun]` sections delegate to the host EXE instead of
+//! locale-parsed PowerShell *files*.
 //!
 //! Why: Windows PowerShell 5.1 reads a BOM-less `.ps1` *file* in the machine's ANSI codepage, so on a
 //! non-English locale a stray non-ASCII byte mis-decodes and the script aborts "unterminated string" -
@@ -45,11 +46,15 @@ fn run_capture(cmd: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-// ── `driver install [--gamepad] --dir <stage>` ─────────────────────────────────────────────────
+// ── `driver install [--gamepad] --dir <stage>` / `driver uninstall [--gamepad]` ────────────────
 pub fn driver_main(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("install") => driver_install(&args[1..]),
-        _ => bail!("usage: punktfunk-host driver install --dir <stage> [--gamepad]"),
+        Some("uninstall") => driver_uninstall(&args[1..]),
+        _ => bail!(
+            "usage: punktfunk-host driver install --dir <stage> [--gamepad]\n\
+             \x20      punktfunk-host driver uninstall [--gamepad]"
+        ),
     }
 }
 
@@ -158,6 +163,121 @@ fn install_gamepad(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ── `driver uninstall [--gamepad]` ──────────────────────────────────────────────────────────────
+// The uninstaller's cleanup counterpart (Inno [UninstallRun]) — the field report was that our
+// virtual-device drivers survived an uninstall. Removes the pf-vdisplay device node(s) + driver
+// package, or (--gamepad) the pf-dualsense/pf-xusb driver packages (their devnodes are per-session
+// SwDeviceCreate'd and are already gone once the service stopped). Locale-safe by construction: we
+// never parse pnputil's localized LABELS — devices are matched on the un-localized VALUE side
+// (instance IDs / device IDs), and driver packages are found by scanning %WINDIR%\INF\oem*.inf
+// CONTENT for our driver names, then passed to pnputil by file name.
+
+fn driver_uninstall(args: &[String]) -> Result<()> {
+    let gamepad = flag_present(args, "--gamepad");
+    let (what, res) = if gamepad {
+        ("gamepad", uninstall_gamepad())
+    } else {
+        ("pf-vdisplay", uninstall_pf_vdisplay())
+    };
+    if let Err(e) = res {
+        // Same best-effort contract as install: never abort the (un)installer over a driver.
+        eprintln!("warning: {what} driver uninstall: {e:#}");
+    }
+    Ok(())
+}
+
+fn uninstall_pf_vdisplay() -> Result<()> {
+    // 1. Remove the ROOT device node(s) the installer created via nefconc (leaving them would keep
+    //    a ghost "punktfunk virtual display" in Device Manager forever — the exact complaint).
+    for id in pf_vdisplay_instance_ids() {
+        if run_quiet("pnputil", &["/remove-device", &id]) {
+            println!("removed device node {id}");
+        } else {
+            eprintln!("warning: pnputil /remove-device {id} failed");
+        }
+    }
+    // 2. Delete the driver package from the driver store.
+    delete_store_drivers(&["pf_vdisplay"]);
+    Ok(())
+}
+
+fn uninstall_gamepad() -> Result<()> {
+    delete_store_drivers(&["pf_dualsense", "pf_dualshock4", "pf_xusb"]);
+    Ok(())
+}
+
+/// Instance IDs of enumerated punktfunk virtual-display devices. Parses `pnputil /enum-devices`
+/// per-device blocks (blank-line separated); a block is ours if it mentions the pf_vdisplay
+/// hardware id / description, and its instance ID is the first line's VALUE (never the localized
+/// label) — pnputil prints "Instance ID:" (or its translation) first in every block.
+fn pf_vdisplay_instance_ids() -> Vec<String> {
+    let out = run_capture("pnputil", &["/enum-devices", "/class", "Display"]);
+    let mut ids = Vec::new();
+    for block in out.split("\r\n\r\n").flat_map(|b| b.split("\n\n")) {
+        let lo = block.to_ascii_lowercase();
+        if !lo.contains("pf_vdisplay") && !lo.contains("punktfunk virtual display") {
+            continue;
+        }
+        let Some(first) = block.lines().find(|l| !l.trim().is_empty()) else {
+            continue;
+        };
+        let Some((_, value)) = first.split_once(':') else {
+            continue;
+        };
+        let id = value.trim();
+        // Sanity: an instance ID is a backslashed path with no spaces (e.g. ROOT\DISPLAY\0000).
+        if !id.is_empty() && id.contains('\\') && !id.contains(' ') {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+/// Delete every driver-store package (`%WINDIR%\INF\oem*.inf`) whose INF text mentions one of
+/// `needles` — our driver names are unique enough that a content match identifies the package
+/// without parsing `pnputil /enum-drivers`' localized output. `/uninstall /force` also unbinds it
+/// from any remaining devnodes.
+fn delete_store_drivers(needles: &[&str]) {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+    let inf_dir = Path::new(&windir).join("INF");
+    let Ok(entries) = std::fs::read_dir(&inf_dir) else {
+        eprintln!("warning: cannot read {}", inf_dir.display());
+        return;
+    };
+    for path in entries.flatten().map(|e| e.path()) {
+        let name = file_name(&path).to_ascii_lowercase();
+        if !name.starts_with("oem") || !name.ends_with(".inf") {
+            continue;
+        }
+        let text = read_inf_text(&path).to_ascii_lowercase();
+        if !needles.iter().any(|n| text.contains(n)) {
+            continue;
+        }
+        if run_quiet(
+            "pnputil",
+            &["/delete-driver", &name, "/uninstall", "/force"],
+        ) {
+            println!("deleted driver package {name}");
+        } else {
+            eprintln!("warning: pnputil /delete-driver {name} /uninstall /force failed");
+        }
+    }
+}
+
+/// INF files in %WINDIR%\INF are ANSI or UTF-16LE(+BOM); decode either so content matching works.
+fn read_inf_text(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 /// Is a punktfunk virtual-display device already enumerated? Matches the device ID / description, which

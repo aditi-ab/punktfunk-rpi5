@@ -87,7 +87,7 @@ fn event_handle(ev: &OnceLock<OwnedHandle>) -> Option<HANDLE> {
 pub fn main(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("run") => run(),
-        Some("install") => install(),
+        Some("install") => install(&args[1..]),
         Some("uninstall") => uninstall(),
         Some("start") => sc(&["start", SERVICE_NAME]),
         Some("stop") => sc(&["stop", SERVICE_NAME]),
@@ -96,7 +96,9 @@ pub fn main(args: &[String]) -> Result<()> {
             eprintln!(
                 "punktfunk-host service — Windows service control\n\n\
                  USAGE:\n\
-                 \x20   punktfunk-host service install     register the auto-start service + firewall rules\n\
+                 \x20   punktfunk-host service install [--gamestream=on|off]\n\
+                 \x20                                      register the auto-start service + firewall rules\n\
+                 \x20                                      (--gamestream sets host.env's PUNKTFUNK_HOST_CMD)\n\
                  \x20   punktfunk-host service uninstall   stop + remove the service + firewall rules\n\
                  \x20   punktfunk-host service start       start the service now\n\
                  \x20   punktfunk-host service stop        stop the service\n\
@@ -606,11 +608,19 @@ unsafe fn open_log_handle(path: &std::path::Path) -> Result<HANDLE> {
 
 // ── install / uninstall ──────────────────────────────────────────────────────────────────────────
 
-fn install() -> Result<()> {
+fn install(args: &[String]) -> Result<()> {
     use windows_service::service::{
         ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    // `--gamestream=on|off` (the installer's wizard task): None = flag absent, keep host.env as-is.
+    let gamestream = match args.iter().find_map(|a| a.strip_prefix("--gamestream=")) {
+        Some("on") => Some(true),
+        Some("off") => Some(false),
+        Some(v) => bail!("--gamestream must be 'on' or 'off' (got '{v}')"),
+        None => None,
+    };
 
     let exe = std::env::current_exe().context("current_exe")?;
     let manager = ServiceManager::local_computer(
@@ -653,6 +663,9 @@ fn install() -> Result<()> {
     }
 
     ensure_default_host_env()?;
+    if let Some(on) = gamestream {
+        apply_gamestream_choice(on);
+    }
     add_firewall_rules();
 
     println!(
@@ -719,6 +732,58 @@ fn ensure_default_host_env() -> Result<()> {
         .with_context(|| format!("write {}", path.display()))?;
     println!("Wrote default config: {}", path.display());
     Ok(())
+}
+
+/// Write the installer's GameStream choice into host.env's `PUNKTFUNK_HOST_CMD`. Upgrade-safe:
+/// only an absent line or one of the two canonical values (`serve` / `serve --gamestream`) is
+/// rewritten — a hand-customized command line is the user's, and stays. Best-effort (warns).
+fn apply_gamestream_choice(enable: bool) {
+    let path = host_env_path();
+    let desired = if enable {
+        "serve --gamestream"
+    } else {
+        "serve"
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!(
+            "warning: could not read {} to apply the GameStream choice",
+            path.display()
+        );
+        return;
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let current = lines.iter().position(|l| {
+        let t = l.trim_start();
+        !t.starts_with('#') && t.starts_with("PUNKTFUNK_HOST_CMD=")
+    });
+    match current {
+        Some(i) => {
+            let value = lines[i].trim_start()["PUNKTFUNK_HOST_CMD=".len()..].trim();
+            if value == desired {
+                return; // already what the installer chose
+            }
+            if value != "serve" && value != "serve --gamestream" {
+                println!(
+                    "host.env has a customized PUNKTFUNK_HOST_CMD ({value}) - leaving it \
+                     (installer GameStream choice not applied)"
+                );
+                return;
+            }
+            lines[i] = format!("PUNKTFUNK_HOST_CMD={desired}");
+        }
+        None => lines.push(format!("PUNKTFUNK_HOST_CMD={desired}")),
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    // Rewrite through write_secret_file so the SYSTEM/Administrators DACL is re-asserted.
+    if let Err(e) = crate::gamestream::write_secret_file(&path, out.as_bytes()) {
+        eprintln!("warning: could not write {}: {e}", path.display());
+        return;
+    }
+    println!(
+        "GameStream (Moonlight) compatibility: {} (PUNKTFUNK_HOST_CMD={desired})",
+        if enable { "enabled" } else { "disabled" }
+    );
 }
 
 // ── firewall + sc helpers ────────────────────────────────────────────────────────────────────────

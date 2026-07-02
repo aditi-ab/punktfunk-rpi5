@@ -28,6 +28,13 @@
 #ifndef Readme
   #define Readme "README.md"
 #endif
+; Branding assets (wizard side panel + header tile BMPs, setup/app icon), generated + committed by
+; branding/gen-branding.ps1 from the canonical brand-mark geometry. Relative to this script's dir:
+; works from the repo checkout AND from the staged copy (pack-host-installer.ps1 stages branding\
+; next to the staged .iss).
+#ifndef BrandingDir
+  #define BrandingDir "branding"
+#endif
 ; The web console launcher (the PunktfunkWeb task action) + its post-install provisioner - committed
 ; scripts staged next to the .iss by pack-host-installer.ps1 (absolute paths passed in).
 #ifndef WebRunCmd
@@ -85,9 +92,23 @@ OutputDir={#OutputDir}
 OutputBaseFilename=punktfunk-host-setup-{#MyAppVersion}
 Compression=lzma2/max
 SolidCompression=yes
+; Modern branded wizard: Windows-11-style controls that follow the system light/dark theme
+; (Inno Setup >= 6.6; CI provisions current 6.x via choco). An older local compiler falls back
+; to the plain modern style so a dev pack still builds.
+#if VER >= EncodeVer(6,6,0)
+WizardStyle=modern dynamic windows11
+#else
 WizardStyle=modern
+#endif
+; Brand assets (branding/gen-branding.ps1): the violet lens mark on a dark panel/tile - self-
+; contained dark art, so it reads correctly in both the light and dark wizard appearance. The
+; wildcard names carry 100..200% DPI variants; Setup picks the closest.
+SetupIconFile={#BrandingDir}\punktfunk.ico
+WizardImageFile={#BrandingDir}\wizard-image-*.bmp
+WizardSmallImageFile={#BrandingDir}\wizard-small-*.bmp
 UninstallDisplayName=punktfunk host {#MyAppVersion}
-UninstallDisplayIcon={app}\punktfunk-host.exe
+; The branded multi-size .ico (installed below) - the host exe embeds no icon resource.
+UninstallDisplayIcon={app}\punktfunk.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -100,17 +121,26 @@ Name: "installdriver"; Description: "Install the pf-vdisplay virtual display dri
 Name: "installgamepad"; Description: "Install the virtual gamepad drivers (DualSense / DualShock 4 / Xbox 360 - no ViGEmBus needed)"
 #endif
 #ifdef WithAudioCable
-Name: "installaudiocable"; Description: "Install VB-CABLE virtual audio (microphone passthrough - VB-Audio donationware, www.vb-cable.com)"
+; VB-Audio's bundling grant requires the end user to see VB-CABLE's origin + donationware status
+; at install time - keep the vendor, URL, and donationware wording in this visible task text (the
+; full notice ships in {app}\licenses\VB-CABLE-NOTICE.txt).
+Name: "installaudiocable"; Description: "Install VB-CABLE virtual audio for microphone passthrough (VB-CABLE by VB-Audio, www.vb-cable.com - donationware, all participations welcome)"
 #endif
 #ifdef WithVkLayer
 Name: "installhdrlayer"; Description: "Install the HDR Vulkan layer (lets Vulkan games like Doom use HDR on the virtual display)"
 #endif
+; Host-config choice, applied via `service install --gamestream=on|off` (writes PUNKTFUNK_HOST_CMD
+; in host.env; a hand-customized value is left alone). Checked = the Moonlight-compatible unified
+; host (the common Windows setup); unchecked = the secure native-only host (punktfunk clients only).
+Name: "gamestream"; Description: "Enable GameStream (Moonlight) compatibility - lets stock Moonlight clients connect (uses legacy plain-HTTP pairing; for trusted LANs)"
 Name: "startservice"; Description: "Start the punktfunk host service now (also starts on every boot)"
 
 [Files]
 Source: "{#BinDir}\punktfunk-host.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#HostEnv}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Readme}"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
+; The branded icon, referenced by UninstallDisplayIcon (Apps & features shows it for the entry).
+Source: "{#BrandingDir}\punktfunk.ico"; DestDir: "{app}"; Flags: ignoreversion
 #ifdef LicensesDir
 ; License/attribution payload -> {app}\licenses: the project's MIT/Apache texts, the generated
 ; THIRD-PARTY-NOTICES (permissive crate attributions), and (on an amf-qsv build) the FFmpeg LGPL
@@ -184,7 +214,8 @@ Filename: "powershell.exe"; \
 #endif
 ; Register (or re-point, on upgrade - idempotent) the SYSTEM service from its FINAL {app} location:
 ; service install records current_exe() as the SCM binPath, so it must run from {app}, not {tmp}.
-Filename: "{app}\punktfunk-host.exe"; Parameters: "service install"; WorkingDir: "{app}"; \
+; --gamestream=on|off carries the wizard's GameStream task choice into host.env's PUNKTFUNK_HOST_CMD.
+Filename: "{app}\punktfunk-host.exe"; Parameters: "service install {code:GamestreamParam}"; WorkingDir: "{app}"; \
   StatusMsg: "Registering the punktfunk host service..."; Flags: runhidden waituntilterminated
 Filename: "{app}\punktfunk-host.exe"; Parameters: "service start"; WorkingDir: "{app}"; \
   StatusMsg: "Starting the punktfunk host service..."; Flags: runhidden waituntilterminated; Tasks: startservice
@@ -198,6 +229,14 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParam
 
 [UninstallRun]
 Filename: "{app}\punktfunk-host.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkHostServiceUninstall"
+; Remove the punktfunk drivers we installed (pf-vdisplay devnode + driver package, then the gamepad
+; driver packages). AFTER service uninstall so the host no longer holds the devices. Unconditional
+; (not #ifdef'd on this build's bundled payload - an upgrade may have dropped a payload the original
+; install laid down); `driver uninstall` is best-effort and no-ops when nothing is installed.
+; VB-CABLE is deliberately NOT removed: it is a third-party shared component the user may use
+; elsewhere - see licenses\VB-CABLE-NOTICE.txt for its own uninstall.
+Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkVdisplayDriverUninstall"
+Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall --gamepad"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkGamepadDriverUninstall"
 #ifdef WithWeb
 ; Stop + remove the PunktfunkWeb task and its firewall rule (leaves %ProgramData%\punktfunk config,
 ; like the host uninstall does).
@@ -207,6 +246,17 @@ Filename: "powershell.exe"; \
 #endif
 
 [Code]
+{ The GameStream task choice, forwarded to `service install` (which writes host.env's
+  PUNKTFUNK_HOST_CMD - only if it is unset or still one of the two canonical values, so a
+  hand-customized command line survives upgrades). }
+function GamestreamParam(Param: String): String;
+begin
+  if WizardIsTaskSelected('gamestream') then
+    Result := '--gamestream=on'
+  else
+    Result := '--gamestream=off';
+end;
+
 #ifdef WithWeb
 var
   WebPwPage: TInputQueryWizardPage;

@@ -47,16 +47,31 @@ parse breakage that silently failed installs on non-English boxes.
   **`PunktfunkWeb`** scheduled task (boot, SYSTEM, restart-on-failure → `web-run.cmd` → `bun` on
   `:3000`), opens TCP 3000, and starts it. It proxies the host's loopback mgmt API with the host's
   own `%ProgramData%\punktfunk\mgmt-token`.
+- **GameStream (Moonlight) compatibility is a wizard task** (checked by default): the choice is passed
+  to `service install --gamestream=on|off`, which writes `PUNKTFUNK_HOST_CMD=serve --gamestream` (or
+  `serve`, the secure native-only host) into `host.env`. Upgrade-safe: a hand-customized
+  `PUNKTFUNK_HOST_CMD` is never overwritten.
+- **Branded, modern wizard**: `WizardStyle=modern dynamic windows11` (Inno ≥ 6.6 — Windows-11-style
+  controls following the system light/dark theme; pre-6.6 compilers fall back to plain `modern`), with
+  the punktfunk lens mark on the side panel / header tile and a multi-size `punktfunk.ico`
+  (`SetupIconFile` + the Apps & features entry). Assets are generated **and committed** by
+  `branding/gen-branding.ps1` from the canonical brand geometry (`web/src/components/brand-mark.tsx`);
+  re-run it only when the brand changes.
 - **Upgrade:** stops a running `PunktfunkHost` service and waits for `STOPPED` before replacing files
   (otherwise the locked exe / respawning supervisor would block the copy), then re-points the service;
   the existing console password is kept (the wizard page is skipped).
 - **Uninstall** (Add/Remove Programs): runs `service uninstall` (stop + delete service + remove
-  firewall rules) and removes the `PunktfunkWeb` task + its firewall rule. The pf-vdisplay driver and the
-  `%ProgramData%\punktfunk` config (incl. `web-password`) are intentionally left in place.
+  firewall rules), removes the `PunktfunkWeb` task + its firewall rule, then `driver uninstall` (+
+  `--gamepad`) removes the punktfunk virtual-device drivers — the pf-vdisplay device node(s) and the
+  pf-vdisplay / pf-dualsense / pf-xusb driver-store packages (the field report was that they survived
+  uninstall). **VB-CABLE is intentionally NOT removed** (a third-party shared component the user may
+  use elsewhere — its own uninstaller is `VBCABLE_Setup_x64.exe -u -h`); the `%ProgramData%\punktfunk`
+  config (incl. `web-password`) is also left in place.
 
 Silent install: `punktfunk-host-setup-<ver>.exe /VERYSILENT` (omit the driver with
-`/MERGETASKS="!installdriver"`). A silent fresh install uses the generated random console password —
-read it from `%ProgramData%\punktfunk\web-password`.
+`/MERGETASKS="!installdriver"`; disable Moonlight compat with `/MERGETASKS="!gamestream"`). A silent
+fresh install uses the generated random console password — read it from
+`%ProgramData%\punktfunk\web-password`.
 
 ## Prerequisites on the target box
 
@@ -70,18 +85,24 @@ read it from `%ProgramData%\punktfunk\web-password`.
   Output` capture endpoint surfaces as a host mic. A Windows audio device can only be created by a
   **kernel-mode** driver (no UMDF path exists), so unlike our self-signed UMDF drivers we cannot ship our
   own — VB-CABLE is a vendor-signed cable that loads with no test-signing. It is **donationware** by
-  VB-Audio, redistributed under VB-Audio's bundling grant (only the single base cable); see
-  `licenses/VB-CABLE-NOTICE.txt`. The package binary is **not** in the repo — supply it to the packer via
-  `-VbCableDir` / `$env:VBCABLE_DIR` (the extracted official package, containing `VBCABLE_Setup_x64.exe`).
-  Absent → the installer is built without it and the host falls back to auto-installing the Steam
-  Streaming pair. *(Endgame: attestation-sign our own MIT virtual-audio driver to drop this dependency.)*
+  VB-Audio, redistributed under VB-Audio's bundling grant (only the single base cable) — the grant
+  requires the end user to see VB-CABLE's origin + donationware status, which the wizard task text and
+  `licenses/VB-CABLE-NOTICE.txt` surface. The package binary is **not** in the repo — CI provisions the
+  **pinned, SHA-256-verified official package** onto the runner (`scripts/ci/provision-windows-punktfunk-extras.ps1`
+  → `C:\Users\Public\vbcable`) and `windows-host.yml` passes it via `$env:VBCABLE_DIR`, so **published
+  installers always bundle it**; locally supply `-VbCableDir` / `$env:VBCABLE_DIR` (the extracted
+  official package, containing `VBCABLE_Setup_x64.exe`). Unset → the installer is built without it and
+  the host falls back to auto-installing the Steam Streaming pair; set-but-invalid → the pack **fails**
+  (a broken provisioning must not silently ship a mic-less installer again). *(Endgame:
+  attestation-sign our own MIT virtual-audio driver to drop this dependency.)*
 
 ## Files here
 
 | File | Role |
 |------|------|
 | `punktfunk-host.iss` | Inno Setup script (the installer definition). |
-| `pack-host-installer.ps1` | Orchestrator: cert + sign exe, **build + sign the drivers from source**, stage them + FFmpeg + the **web console** (`.output` + bun) + the HDR layer, run ISCC, sign setup.exe. |
+| `branding/` | Wizard branding: `gen-branding.ps1` renders the brand mark into the committed `wizard-image-*.bmp` / `wizard-small-*.bmp` (100–200% DPI) + `punktfunk.ico`. Re-run only on a brand change. |
+| `pack-host-installer.ps1` | Orchestrator: cert + sign exe, **build + sign the drivers from source**, stage them + FFmpeg + VB-CABLE + the **web console** (`.output` + bun) + the HDR layer + branding, run ISCC, sign setup.exe. |
 | `build-pf-vdisplay.ps1` | Build pf-vdisplay from source (the `drivers/` workspace) + clear FORCE_INTEGRITY + sign `.dll`/`.cat` + export `.cer`. |
 | `build-gamepad-drivers.ps1` | Sign + catalog the gamepad drivers (`pf-dualsense` + `pf-xusb`) from the same workspace build (`-SkipBuild`), one shared cert. |
 | `install-vbcable.ps1` | On-target: seed VB-Audio's cert into `TrustedPublisher`, silently install the bundled VB-CABLE (`-i -h`). Run by the installer's *Install VB-CABLE virtual audio* task; idempotent + always exits 0 (non-fatal). |
