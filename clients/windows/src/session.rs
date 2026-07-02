@@ -74,9 +74,13 @@ pub enum SessionEvent {
     Stats(Stats),
 }
 
+/// Decoded frames + their host-capture `pts_ns`, session pump → render thread (crossbeam so that
+/// thread can block with a timeout — async-channel has no `recv_timeout`).
+pub type FrameRx = crossbeam_channel::Receiver<(DecodedFrame, u64)>;
+
 pub struct SessionHandle {
     pub events: async_channel::Receiver<SessionEvent>,
-    pub frames: async_channel::Receiver<DecodedFrame>,
+    pub frames: FrameRx,
     pub stop: Arc<AtomicBool>,
 }
 
@@ -131,13 +135,15 @@ pub fn run_speed_probe(
 
 pub fn start(params: SessionParams) -> SessionHandle {
     let (ev_tx, ev_rx) = async_channel::unbounded();
-    // Tiny frame queue, newest wins: force_send displaces the oldest when the UI lags.
-    let (frame_tx, frame_rx) = async_channel::bounded(2);
+    // Tiny frame queue, newest wins: the pump displaces the oldest when the renderer lags (it
+    // keeps a Receiver clone for exactly that).
+    let (frame_tx, frame_rx) = crossbeam_channel::bounded(2);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_w = stop.clone();
+    let frame_rx_pump = frame_rx.clone();
     std::thread::Builder::new()
         .name("punktfunk-session".into())
-        .spawn(move || pump(params, ev_tx, frame_tx, stop_w))
+        .spawn(move || pump(params, ev_tx, frame_tx, frame_rx_pump, stop_w))
         .expect("spawn session thread");
     SessionHandle {
         events: ev_rx,
@@ -192,7 +198,8 @@ impl AudioDec {
 fn pump(
     params: SessionParams,
     ev_tx: async_channel::Sender<SessionEvent>,
-    frame_tx: async_channel::Sender<DecodedFrame>,
+    frame_tx: crossbeam_channel::Sender<(DecodedFrame, u64)>,
+    frame_rx: FrameRx,
     stop: Arc<AtomicBool>,
 ) {
     let connector = match NativeClient::connect(
@@ -285,6 +292,11 @@ fn pump(
         })
         .flatten();
 
+    // Force an immediate IDR (with in-band parameter sets) rather than waiting for the host's own
+    // first keyframe — under infinite GOP a late/missed IDR means the decoder sits on
+    // "PPS id out of range" (a black screen) until one arrives.
+    let _ = connector.request_keyframe();
+
     let clock_offset = connector.clock_offset_ns;
     let mut total_frames = 0u64;
     let mut window_start = Instant::now();
@@ -304,7 +316,17 @@ fn pump(
         match connector.next_frame(Duration::from_millis(4)) {
             Ok(frame) => {
                 let t0 = Instant::now();
-                match decoder.decode(&frame.data) {
+                // A D3D11VA→software demotion (see `Decoder::decode`) starts a FRESH decoder that
+                // has none of the stream's parameter sets; under infinite GOP it would sit on
+                // "PPS id out of range" forever. Detect the transition and force a new IDR so the
+                // rebuilt decoder resynchronizes immediately.
+                let was_hw = decoder.is_hardware();
+                let decoded = decoder.decode(&frame.data);
+                if was_hw && !decoder.is_hardware() {
+                    tracing::info!("decoder demoted to software — requesting keyframe to resync");
+                    let _ = connector.request_keyframe();
+                }
+                match decoded {
                     Ok(Some(decoded)) => {
                         total_frames += 1;
                         hdr = decoded.hdr();
@@ -330,7 +352,13 @@ fn pump(
                         decode_us_sum += t0.elapsed().as_micros() as u64;
                         frames_n += 1;
                         bytes_n += frame.data.len() as u64;
-                        let _ = frame_tx.force_send(decoded);
+                        // Newest wins: displace the oldest queued frame when the renderer lags.
+                        if let Err(crossbeam_channel::TrySendError::Full(item)) =
+                            frame_tx.try_send((decoded, frame.pts_ns))
+                        {
+                            let _ = frame_rx.try_recv();
+                            let _ = frame_tx.try_send(item);
+                        }
                     }
                     Ok(None) => {}
                     // Survivable (loss until the next IDR/RFI recovery) — keep feeding.

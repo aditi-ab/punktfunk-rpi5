@@ -102,7 +102,17 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   **pf-vdisplay** virtual display (`capture/windows/idd_push.rs`, `vdisplay/windows/pf_vdisplay.rs`;
   DXGI Desktop Duplication / WGC as fallbacks, `capture/windows/dxgi.rs`), GPU encode (NVENC
   `--features nvenc`; AMD/Intel `--features amf-qsv`), SendInput + the in-house UMDF gamepad drivers
-  (`inject/windows/`), WASAPI loopback + virtual mic (`audio/windows/wasapi_*`). Ships as a **signed
+  (`inject/windows/`), WASAPI loopback + virtual mic (`audio/windows/wasapi_*`). **Keyboard wire
+  convention: US-positional VKs** (every first-party client sends the physical key's US-layout VK;
+  the Windows client derives it from the scancode, NOT the layout-resolved `vkCode`) — the Windows
+  injector resolves them via a fixed table mirroring the Linux `vk_to_evdev` (never through a
+  keyboard layout: the SYSTEM service thread's layout re-reads positions as characters — the
+  German y↔z / ö→ü scramble), while GameStream/Moonlight VKs are layout-semantic
+  (`KEY_FLAG_SEMANTIC_VK`, resolved under the foreground app's layout, Sunshine's model). Linux
+  renders positions under the session compositor's layout (libei) or the virtual keyboard's
+  uploaded keymap (Sway/wlroots — honors `XKB_DEFAULT_LAYOUT` et al., default US); the Android
+  client reads `KeyEvent.scanCode` first so a user-selected physical-keyboard layout can't
+  re-map keycodes semantically. Ships as a **signed
   Inno Setup installer** that registers a `LocalSystem` SCM service launching into the interactive
   session for secure-desktop (UAC/lock-screen) capture (`windows/service.rs`), bundles the
   pf-vdisplay driver + the FFmpeg DLLs (+ VB-CABLE for the virtual mic), and is published by
@@ -224,23 +234,39 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    **Windows stage 1 done 2026-06-15** (`clients/windows`, binary
    `punktfunk-client`): pure-Rust **WinUI 3** UI via **windows-reactor** (a declarative React-like
    framework backed by WinUI; PR #4499 added the `SwapChainPanel` widget + `set_swap_chain`). The
-   video is a **`SwapChainPanel`** bound to a **D3D11 composition swapchain** (WARP fallback for
-   the GPU-less dev box; runtime-compiled fullscreen-triangle shaders, Contain-fit letterbox),
-   driven by reactor's per-frame `on_rendering`. **FFmpeg HEVC decode with a D3D11VA
-   zero-copy hardware path** (`gpu.rs` shares one D3D11 device — hardware+`VIDEO_SUPPORT`, WARP
-   fallback, multithread-protected — between the decoder and presenter; the decoder outputs
-   NV12/P010 `ID3D11Texture2D` array slices with `BIND_SHADER_RESOURCE` and the presenter samples
-   them via per-plane SRVs + YUV→RGB shaders — NV12/BT.709, P010/BT.2020-PQ; **software CPU decode
-   stays as the robust fallback**, auto-selected with a `DecoderPref` override). **HDR10**: the
-   client advertises 10-bit/HDR (Settings toggle), detects PQ in-band (`transfer == SMPTE2084`),
-   and flips the swapchain to `R10G10B10A2` + ST.2084 with HDR10 metadata. **WASAPI** render + mic
-   capture, **SDL3** gamepads (rumble/lightbar/DualSense), `mdns-sd` discovery, and the full trust
-   surface — all **in-app**: a polished WinUI shell (host cards w/ monogram + status pills,
+   video is a **`SwapChainPanel`** bound to a **D3D11 composition swapchain**, presented from a
+   **dedicated render thread** (`render.rs`, 2026-07-02 rewrite — presenting never touches or is
+   stalled by the XAML thread): frame-latency-waitable swapchain + `SetMaximumFrameLatency(1)`
+   (≤1 queued present, newest-wins drain after the wait, so a stream faster than the display drops
+   backlog before any GPU work), **HiDPI-correct** (pixel-sized buffers + `SetMatrixTransform`
+   96/DPI — DIP-sized buffers were blurry at 125/150 %), Contain-fit letterbox, WARP fallback.
+   **FFmpeg decode with a D3D11VA hardware path on all vendors** (`gpu.rs` shares one D3D11 device
+   between decoder + presenter, adapter picked by console pref `PUNKTFUNK_ADAPTER` > the window's
+   monitor's adapter > default; `PUNKTFUNK_D3D_DEBUG=1` adds the debug layer): the decode pool is
+   **decoder-only bind, sized/aligned by libavcodec itself** (get_format returns `AV_PIX_FMT_D3D11`
+   and lets `hw_device_ctx` drive — three hand-built-frames-context strikes are why: NVIDIA rejects
+   `DECODER|SHADER_RESOURCE` arrays, `BindFlags=0` fails texture creation, and Intel rejects
+   non-128-aligned HEVC surfaces at the first `SubmitDecoderBuffers`), a DXVA **profile probe**
+   before the hwdevice commits software-vs-hardware up front (no burned first IDR), and the
+   presenter copies the decoded slice with ONE display-size-boxed `CopySubresourceRegion` (a planar
+   slice is a single subresource in D3D11 — the old two-copy D3D12-style code silently no-opped =
+   the black screen) into its sampleable NV12/P010 texture → per-plane SRVs + YUV→RGB shaders
+   (NV12/BT.709, P010/BT.2020-PQ). **Software CPU decode is the fallback** (auto-selected,
+   `DecoderPref` override, mid-session demotion + keyframe re-request) and now feeds the SAME
+   shaders (swscale → NV12/P010 planes → two dynamic plane textures) so hw/sw colour math is
+   identical. **HDR10**: the client advertises 10-bit/HDR (Settings toggle, gated on an HDR
+   display), detects PQ in-band (`transfer == SMPTE2084`), and flips the swapchain to
+   `R10G10B10A2` + ST.2084 with HDR10 metadata (0xCE mastering metadata plumbed). **WASAPI** render
+   + mic capture, **SDL3** gamepads (rumble/lightbar/DualSense), `mdns-sd` discovery, and the full
+   trust surface — all **in-app**: a polished WinUI shell (host tiles w/ monogram + status pills,
    `InfoBar` errors/hints, `ToggleSwitch` settings, status-chip stream HUD showing GPU/CPU decode +
    HDR), host list (live mDNS + saved + manual), settings (resolution/refresh/decoder/bitrate/HDR/
-   mic), SPAKE2 PIN pairing screen, TOFU, pinned-fp-mismatch re-pair. **(D3D11VA + HDR present + the
-   GUI polish are written against the windows-rs/reactor APIs but not yet on-glass validated — the
-   dev VM is headless/WARP; needs the RTX box.)** **Stream input** is Win32 low-level hooks (`WH_KEYBOARD_LL`/`WH_MOUSE_LL`) — reactor
+   mic), SPAKE2 PIN pairing screen, TOFU, pinned-fp-mismatch re-pair. **Live-validated 2026-07-02
+   on the hybrid laptop (Intel Arc Pro iGPU + RTX 3500 Ada) against the local Windows host**:
+   D3D11VA hardware decode 60 fps on BOTH vendors (headless, `PUNKTFUNK_ADAPTER`-forced; NVIDIA
+   0.2 ms decode, Intel 0.2 ms), software path, and the GUI on glass (real decoded desktop pixels,
+   GPU-decode HUD chip, ~18 ms capture→decoded p50 over loopback — dominated by the host's 60 Hz
+   virtual-display capture cadence). HDR-on-glass still pending. **Stream input** is Win32 low-level hooks (`WH_KEYBOARD_LL`/`WH_MOUSE_LL`) — reactor
    exposes no raw key/pointer events; native Windows VK + absolute mouse (client-rect Contain-fit) +
    wheel, Ctrl+Alt+Shift+Q capture toggle. `--headless`/`--discover` keep CLI paths. Builds + clippy
    + fmt green on **`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`** — the latter
@@ -268,9 +294,9 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    loopback E2E (TOFU connect → clock skew → HEVC negotiate → shared-D3D11 + D3D11VA init → WASAPI →
    session end; synthetic payload isn't decodable so decode output stays unvalidated), speed-test
    E2E. The WinUI window itself CANNOT be launched from SSH (session-0 → WinAppSDK 0x80070005,
-   pre-existing) — GUI on-glass validation still pending (needs the console session, e.g. PsExec -i 1).
-   Next: **on-glass validation** of the D3D11VA decode + HDR present + GUI (console session on the
-   RTX box), then RAWINPUT relative-mouse pointer-lock.
+   pre-existing; needs the console session, e.g. PsExec -i 1).
+   Next: **HDR on-glass validation** (Windows host with `PUNKTFUNK_10BIT` → the HDR laptop
+   display), then RAWINPUT relative-mouse pointer-lock.
    **Android stage 1 done** (`clients/android`, Kotlin app + `native/` Rust JNI core linking
    `punktfunk-core`; phone + Android TV): NDK `AMediaCodec` hardware HEVC decode → `SurfaceView` incl.
    **HDR10** (Main10/BT.2020 PQ) with low-latency tuning + a live stats HUD (`decode.rs`/`stats.rs`),

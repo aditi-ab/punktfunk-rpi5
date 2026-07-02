@@ -771,6 +771,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2760,6 +2769,7 @@ version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-channel",
+ "crossbeam-channel",
  "ffmpeg-next",
  "mdns-sd",
  "opus",
@@ -2772,6 +2782,7 @@ dependencies = [
  "wasapi",
  "windows 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=b4129fcc1ae81eec8bf1217539883db821bca3a1)",
  "windows-reactor",
+ "winresource",
 ]
 
 [[package]]
@@ -5104,6 +5115,16 @@ checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+dependencies = [
+ "toml 1.1.2+spec-1.1.0",
+ "version_check",
 ]
 
 [[package]]

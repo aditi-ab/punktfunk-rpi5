@@ -106,6 +106,25 @@ Copy-Item (Join-Path $assets '*') (Join-Path $layout 'Assets') -Force
 $manifest = (Get-Content -Raw $manifestTemplate).Replace('{VERSION}', $Version).Replace('{PUBLISHER}', $Publisher).Replace('{ARCH}', $Arch)
 Set-Content -Path (Join-Path $layout 'AppxManifest.xml') -Value $manifest -Encoding UTF8
 
+# --- resource index (resources.pri) ---
+# The shell resolves the manifest's logo assets through MRT, so the qualified variants
+# (Square44x44Logo.targetsize-*_altform-unplated.png — the alpha-transparent taskbar icons) only
+# take effect if a pri indexes them; without one the taskbar falls back to plating the base
+# 44x44 onto a solid square (the white-cornered icon). makepri's default config indexes the
+# layout's asset files AND merges any existing .pri it finds (reactor's staged WinUI resources)
+# via its PRI indexer, yielding one combined resources.pri. Output lands outside the layout
+# first — the reactor pri is an input while indexing — then replaces it.
+$makepri = Find-SdkTool 'makepri.exe'
+$priconfig = Join-Path $OutDir 'priconfig.xml'
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+& $makepri createconfig /cf $priconfig /dq en-US /o
+if ($LASTEXITCODE -ne 0) { throw "makepri createconfig failed ($LASTEXITCODE)" }
+$priOut = Join-Path $OutDir 'resources.pri'
+if (Test-Path $priOut) { Remove-Item $priOut -Force }
+& $makepri new /pr $layout /cf $priconfig /mn (Join-Path $layout 'AppxManifest.xml') /of $priOut /o
+if ($LASTEXITCODE -ne 0) { throw "makepri new failed ($LASTEXITCODE)" }
+Move-Item $priOut (Join-Path $layout 'resources.pri') -Force
+
 Write-Host "layout assembled at $layout :"
 Get-ChildItem $layout -Recurse -File | ForEach-Object { "  $($_.FullName.Substring($layout.Length + 1))" }
 

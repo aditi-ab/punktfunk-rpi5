@@ -35,7 +35,6 @@ use crate::discovery::{self, DiscoveredHost};
 use crate::gamepad::GamepadService;
 use crate::session::Stats;
 use crate::trust::Settings;
-use crate::video::DecodedFrame;
 use hosts::HostsProps;
 use punktfunk_core::client::NativeClient;
 use speed::{SpeedProps, SpeedState};
@@ -99,7 +98,7 @@ impl PartialEq for Svc {
 /// Cross-thread handoff from the session pump (off-thread) to the stream page (UI thread).
 #[derive(Default)]
 pub(crate) struct Shared {
-    pub(crate) handoff: Mutex<Option<(Arc<NativeClient>, async_channel::Receiver<DecodedFrame>)>>,
+    pub(crate) handoff: Mutex<Option<(Arc<NativeClient>, crate::session::FrameRx)>>,
     pub(crate) target: Mutex<Target>,
     /// Latest stream stats, written by the session's event loop and mirrored into reactor state
     /// by the HUD poll thread to drive the overlay.
@@ -129,11 +128,59 @@ pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_react
         gamepad,
         shared: Arc::new(Shared::default()),
     });
+    apply_window_icon_when_ready();
     App::new()
         .title("Punktfunk")
         .inner_size(1000.0, 720.0)
         .backdrop(Backdrop::Mica)
         .render(move |cx| root(cx, &ctx))
+}
+
+/// Stamp the embedded app icon (build.rs, resource ordinal 1) onto the top-level window once it
+/// exists: `WM_SETICON` drives the title bar and Alt-Tab (plus the taskbar for unpackaged runs;
+/// the MSIX taskbar/Start icons come from the package assets). windows-reactor creates its
+/// window icon-less and exposes no handle before `App::render` blocks, so a short background
+/// poll finds our own window by its (unique) title.
+fn apply_window_icon_when_ready() {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON,
+        LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, WM_SETICON,
+    };
+    let _ = std::thread::Builder::new()
+        .name("pf-window-icon".into())
+        .spawn(|| unsafe {
+            for _ in 0..100 {
+                if let Ok(hwnd) = FindWindowW(None, windows::core::w!("Punktfunk")) {
+                    let Ok(module) = GetModuleHandleW(None) else {
+                        return;
+                    };
+                    // Small (title bar) and big (Alt-Tab) at their native metrics, both from
+                    // the multi-size .ico so nothing is scaled at draw time.
+                    for (which, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
+                        let px = GetSystemMetrics(metric);
+                        if let Ok(icon) = LoadImageW(
+                            Some(module.into()),
+                            windows::core::PCWSTR(1 as *const u16),
+                            IMAGE_ICON,
+                            px,
+                            px,
+                            LR_DEFAULTCOLOR,
+                        ) {
+                            SendMessageW(
+                                hwnd,
+                                WM_SETICON,
+                                Some(WPARAM(which as usize)),
+                                Some(LPARAM(icon.0 as isize)),
+                            );
+                        }
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
 }
 
 fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
@@ -142,6 +189,13 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (status, set_status) = cx.use_async_state(String::new());
     let (hud, set_hud) = cx.use_async_state(stream::HudSample::default());
     let (speed, set_speed) = cx.use_async_state(SpeedState::Running);
+    // Per-host action state for the hosts page. Root, not page-local: the "…" overflow is a WinUI
+    // MenuFlyout whose item clicks are wired straight in the reactor backend, bypassing the normal
+    // event-dispatch flush — a sync page-local setter marks state dirty but never re-renders. See
+    // `hosts::HostsProps`.
+    let (forget, set_forget) = cx.use_async_state(Option::<(String, String)>::None);
+    let (rename, set_rename) = cx.use_async_state(Option::<(String, String)>::None);
+    let (show_add, set_show_add) = cx.use_async_state(false);
 
     // Continuous LAN discovery (spawned once).
     cx.use_effect((), {
@@ -183,6 +237,43 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         }
     });
 
+    // Screen-entrance animation: each navigation slides the new screen up a few px while fading it
+    // in (the Windows-Settings drill-in). It's a manual tween, not a composition animation, because
+    // reactor's DSL exposes no static transform/translation setter and its one-shot animations run
+    // from the visual's CURRENT value (a shown element is already at opacity 1, so nothing to fade
+    // from). So a worker thread steps a 0 → 1 `progress` after each navigation; the wrapper maps it
+    // to opacity (= progress) and a top margin (= (1-progress)·offset). The page components are
+    // memoised on unchanged props, so each step is just a cheap root re-render updating two props.
+    // A generation guard (bumped per navigation) stops a superseded tween so rapid nav can't fight.
+    let anim_gen = cx.use_ref(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+    let (anim, set_anim) = cx.use_async_state((Option::<Screen>::None, 1.0f64));
+    cx.use_effect(screen.clone(), {
+        let (s, set_anim, gen) = (screen.clone(), set_anim.clone(), anim_gen.borrow().clone());
+        move || {
+            use std::sync::atomic::Ordering::SeqCst;
+            let mine = gen.fetch_add(1, SeqCst) + 1;
+            std::thread::spawn(move || {
+                const STEPS: u32 = 14;
+                for i in 0..=STEPS {
+                    if gen.load(SeqCst) != mine {
+                        return; // a newer navigation superseded this tween
+                    }
+                    let p = f64::from(i) / f64::from(STEPS);
+                    let eased = 1.0 - (1.0 - p).powi(3); // ease-out cubic
+                    set_anim.call((Some(s.clone()), eased));
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                }
+            });
+        }
+    });
+    // Progress for THIS screen: 0 until the tween for it starts (fresh navigation starts hidden +
+    // offset, no flash), 1 once settled. A stale value for another screen reads as 0.
+    let progress = if anim.0.as_ref() == Some(&screen) {
+        anim.1
+    } else {
+        0.0
+    };
+
     // Each hook-using screen is mounted as its own component so its hooks are isolated from
     // root's (root's own hooks above stay a stable prefix regardless of which screen renders).
     let svc = Svc {
@@ -191,8 +282,21 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         set_status: set_status.clone(),
         set_speed: set_speed.clone(),
     };
-    match screen {
-        Screen::Hosts => component(hosts::hosts_page, HostsProps { svc, hosts, status }),
+    let body = match &screen {
+        Screen::Hosts => component(
+            hosts::hosts_page,
+            HostsProps {
+                svc,
+                hosts,
+                status,
+                forget,
+                rename,
+                show_add,
+                set_forget,
+                set_rename,
+                set_show_add,
+            },
+        ),
         // connecting_page / request_access_page / settings_page / licenses_page use no hooks
         // (they never touch `cx`), so calling them inline is sound.
         Screen::Connecting => connect::connecting_page(ctx, &status),
@@ -202,5 +306,21 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         Screen::Pair => component(pair::pair_page, svc),
         Screen::SpeedTest => component(speed::speed_page, SpeedProps { svc, state: speed }),
         Screen::Stream => component(stream::stream_page, StreamProps { svc, hud }),
+    };
+
+    // The Stream screen owns the SwapChainPanel + per-frame present; never wrap it in an animated
+    // opacity/offset layer. Everything else slides + fades in on navigation.
+    if matches!(screen, Screen::Stream) {
+        return body;
     }
+    let offset = (1.0 - progress) * 22.0;
+    border(body)
+        .opacity(progress)
+        .margin(Thickness {
+            left: 0.0,
+            top: offset,
+            right: 0.0,
+            bottom: 0.0,
+        })
+        .into()
 }

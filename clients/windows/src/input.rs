@@ -13,7 +13,10 @@
 //! sub-pixel remainder carried so slow drags aren't lost), then warp the cursor back to centre so
 //! it never reaches a screen edge. This is why the old absolute path froze: swallowing
 //! `WM_MOUSEMOVE` pinned the OS cursor, so `pt` never travelled and the absolute coordinate
-//! snapped to one point. Keys carry the native Windows VK directly (the wire contract).
+//! snapped to one point. Keys carry the **US-positional VK** for the pressed physical key (the
+//! punktfunk wire contract shared by every first-party client — see [`scan_to_positional_vk`]):
+//! the hook's layout-resolved `vkCode` must NOT go on the wire, or a non-US pair re-maps
+//! positions through two layouts (German: y↔z swapped, ü lands on ö).
 //!
 //! **Capture state machine** (parity with the GTK/Swift clients): capture engages at stream
 //! start, **Ctrl+Alt+Shift+Q** releases it (handing the cursor back to the local desktop), and a
@@ -35,9 +38,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_Q;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, ClipCursor, GetClientRect, GetForegroundWindow, SetCursorPos,
     SetWindowsHookExW, ShowCursor, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
-    LLMHF_INJECTED, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    LLKHF_EXTENDED, LLMHF_INJECTED, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 struct State {
@@ -269,7 +272,17 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                     if !st.inhibit_shortcuts && is_system_shortcut(st, vk) {
                         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
                     }
-                    let v = vk as u8;
+                    // Wire key: the US-positional VK for this physical key (module docs), derived
+                    // from the scancode. `vkCode` is layout-semantic and only passes through for
+                    // keys the table doesn't cover — extended keys and everything outside the
+                    // typing area, where positional == semantic (plus injected events with
+                    // scanCode 0 from remapping tools, best-effort).
+                    let ext = (kb.flags.0 & LLKHF_EXTENDED.0) != 0;
+                    let v = if ext {
+                        vk as u8
+                    } else {
+                        scan_to_positional_vk(kb.scanCode as u16).unwrap_or(vk as u8)
+                    };
                     if up {
                         if st.held_keys.remove(&v) {
                             send(&st.connector, InputKind::KeyUp, v as u32, 0, 0, 0);
@@ -395,5 +408,97 @@ fn button(st: &mut State, id: u32, down: bool) {
         send(&c, InputKind::MouseButtonDown, id, 0, 0, 0);
     } else if st.held_buttons.remove(&id) {
         send(&c, InputKind::MouseButtonUp, id, 0, 0, 0);
+    }
+}
+
+/// Set-1 make scancode → US-positional VK for the layout-**variant** typing area (letters, digit
+/// row, OEM punctuation, the ISO 102nd key) — the exact inverse of the host injector's positional
+/// table and the Windows analogue of the Linux client's `evdev_to_vk`. Keys not listed (F-row,
+/// nav cluster, numpad, modifiers — plus every E0-extended key, which the caller filters out)
+/// have layout-invariant VKs, so the hook's `vkCode` is already correct for them.
+fn scan_to_positional_vk(scan: u16) -> Option<u8> {
+    Some(match scan {
+        0x02..=0x0A => (scan - 0x02) as u8 + 0x31, // 1..9
+        0x0B => 0x30,                              // 0
+        0x0C => 0xBD,                              // -_  VK_OEM_MINUS (DE: ß)
+        0x0D => 0xBB,                              // =+  VK_OEM_PLUS
+        0x10 => 0x51,                              // Q
+        0x11 => 0x57,                              // W
+        0x12 => 0x45,                              // E
+        0x13 => 0x52,                              // R
+        0x14 => 0x54,                              // T
+        0x15 => 0x59,                              // Y position (QWERTZ: the Z key)
+        0x16 => 0x55,                              // U
+        0x17 => 0x49,                              // I
+        0x18 => 0x4F,                              // O
+        0x19 => 0x50,                              // P
+        0x1A => 0xDB,                              // [{  VK_OEM_4 (DE: ü)
+        0x1B => 0xDD,                              // ]}  VK_OEM_6
+        0x1E => 0x41,                              // A
+        0x1F => 0x53,                              // S
+        0x20 => 0x44,                              // D
+        0x21 => 0x46,                              // F
+        0x22 => 0x47,                              // G
+        0x23 => 0x48,                              // H
+        0x24 => 0x4A,                              // J
+        0x25 => 0x4B,                              // K
+        0x26 => 0x4C,                              // L
+        0x27 => 0xBA,                              // ;:  VK_OEM_1 (DE: ö)
+        0x28 => 0xDE,                              // '"  VK_OEM_7 (DE: ä)
+        0x29 => 0xC0,                              // `~  VK_OEM_3 (DE: ^)
+        0x2B => 0xDC,                              // \|  VK_OEM_5
+        0x2C => 0x5A,                              // Z position (QWERTZ: the Y key)
+        0x2D => 0x58,                              // X
+        0x2E => 0x43,                              // C
+        0x2F => 0x56,                              // V
+        0x30 => 0x42,                              // B
+        0x31 => 0x4E,                              // N
+        0x32 => 0x4D,                              // M
+        0x33 => 0xBC,                              // ,<  VK_OEM_COMMA
+        0x34 => 0xBE,                              // .>  VK_OEM_PERIOD
+        0x35 => 0xBF,                              // /?  VK_OEM_2
+        0x56 => 0xE2,                              // <>| VK_OEM_102 (ISO)
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The German-scramble regression pins: the physical keys a QWERTZ board labels Z/Y/ö/ü must
+    /// leave this client as their US-position VKs, regardless of the local layout's vkCode.
+    #[test]
+    fn positional_pins_for_the_qwertz_scramble() {
+        assert_eq!(scan_to_positional_vk(0x15), Some(0x59)); // QWERTZ Z key → VK_Y (US position)
+        assert_eq!(scan_to_positional_vk(0x2C), Some(0x5A)); // QWERTZ Y key → VK_Z (US position)
+        assert_eq!(scan_to_positional_vk(0x27), Some(0xBA)); // ö key → VK_OEM_1 (US ;: position)
+        assert_eq!(scan_to_positional_vk(0x1A), Some(0xDB)); // ü key → VK_OEM_4 (US [{ position)
+        assert_eq!(scan_to_positional_vk(0x28), Some(0xDE)); // ä key → VK_OEM_7 (US '" position)
+        assert_eq!(scan_to_positional_vk(0x0C), Some(0xBD)); // ß key → VK_OEM_MINUS (US -_ position)
+    }
+
+    /// Keys outside the layout-variant typing area stay un-mapped (vkCode passes through).
+    #[test]
+    fn invariant_keys_fall_through() {
+        for scan in [
+            0x01u16, 0x0E, 0x0F, 0x1C, 0x1D, 0x2A, 0x36, 0x38, 0x39, 0x3B, 0x45, 0x57,
+        ] {
+            assert_eq!(scan_to_positional_vk(scan), None, "scan 0x{scan:02X}");
+        }
+    }
+
+    /// Exactly the 48 typing-area keys are covered (10 digits + 26 letters + 12 OEM), and every
+    /// mapping is unique — two physical keys must never collapse onto one wire VK.
+    #[test]
+    fn table_covers_the_typing_area_bijectively() {
+        let mapped: Vec<(u16, u8)> = (0u16..=0xFF)
+            .filter_map(|sc| scan_to_positional_vk(sc).map(|vk| (sc, vk)))
+            .collect();
+        assert_eq!(mapped.len(), 48);
+        let mut vks: Vec<u8> = mapped.iter().map(|&(_, vk)| vk).collect();
+        vks.sort_unstable();
+        vks.dedup();
+        assert_eq!(vks.len(), 48, "duplicate wire VK in the positional table");
     }
 }

@@ -1,12 +1,14 @@
-//! The stream page: a `SwapChainPanel` bound to the D3D11 composition swapchain in
-//! [`crate::present`], driven by reactor's per-frame `on_rendering`, with a status-chip HUD
-//! overlay (mode · decode path · HDR · fps/throughput/latency · capture hint).
+//! The stream page: a `SwapChainPanel` whose composition swapchain is created (and bound) once on
+//! the UI thread, then handed — presenter and all — to the dedicated render thread
+//! ([`crate::render`]), which presents decoded frames at stream cadence. The page itself only
+//! forwards panel size/DPI changes and draws the status-chip HUD overlay (mode · decode path ·
+//! HDR · fps/throughput/latency · capture hint).
 
 use super::style::{edges, uniform};
 use super::Svc;
 use crate::present::Presenter;
+use crate::render::{self, RenderThread};
 use crate::session::Stats;
-use crate::video::DecodedFrame;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::Mode;
 use std::cell::RefCell;
@@ -35,37 +37,34 @@ impl PartialEq for StreamProps {
     }
 }
 
-/// UI-thread-only present context: the D3D11 presenter plus the decoded-frame receiver.
-struct PresentCtx {
-    presenter: Presenter,
-    frames: async_channel::Receiver<DecodedFrame>,
-}
-
 thread_local! {
-    static PRESENT: RefCell<Option<PresentCtx>> = const { RefCell::new(None) };
-    static PENDING_FRAMES: RefCell<Option<async_channel::Receiver<DecodedFrame>>> =
-        const { RefCell::new(None) };
+    /// Frames + host clock offset, stashed by the mount effect for `on_ready` (which fires later,
+    /// once the native panel exists).
+    static PENDING: RefCell<Option<(crate::session::FrameRx, i64)>> = const { RefCell::new(None) };
+    /// The live render thread; stopped + joined by the unmount cleanup (before panel teardown).
+    static RENDER: RefCell<Option<RenderThread>> = const { RefCell::new(None) };
 }
 
-fn present_newest(ctx: &mut PresentCtx) {
-    // Apply the latest source HDR mastering metadata (from the session pump's 0xCE drain) before
-    // presenting — a cheap no-op in the presenter when unchanged.
-    if let Some(meta) = *crate::present::LATEST_HDR_META.lock().unwrap() {
-        ctx.presenter.set_hdr_metadata(meta);
+/// The app window's DPI (96 when the window can't be found — then DIPs == pixels). Reactor's
+/// `on_resize` reports DIPs and exposes no CompositionScale, so the window DPI is the scale.
+fn window_dpi() -> u32 {
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    unsafe {
+        FindWindowW(None, windows::core::w!("Punktfunk"))
+            .ok()
+            .map(|h| GetDpiForWindow(h))
+            .filter(|d| *d > 0)
+            .unwrap_or(96)
     }
-    // Drain to the newest decoded frame (drop any backlog) and hand it to the presenter by value —
-    // the GPU zero-copy path retains the decoder surface across re-presents, so ownership matters.
-    let mut newest = None;
-    while let Ok(f) = ctx.frames.try_recv() {
-        newest = Some(f);
-    }
-    ctx.presenter.present(newest);
 }
 
 pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
     let ctx = &props.svc.ctx;
     // Take the connector + frames handoff once on mount; keep the connector alive (and for input)
-    // in a use_ref, stash frames for `on_ready`, install the input hooks (and remove on unmount).
+    // in a use_ref, stash frames for `on_ready`, install the input hooks. The cleanup stops the
+    // render thread FIRST (it must not present into a panel that's tearing down), then removes
+    // the input hooks.
     let connector_ref = cx.use_ref::<Option<Arc<NativeClient>>>(None);
     cx.use_effect_with_cleanup((), {
         let shared = ctx.shared.clone();
@@ -74,54 +73,58 @@ pub(crate) fn stream_page(props: &StreamProps, cx: &mut RenderCx) -> Element {
         move || {
             if let Some((connector, frames)) = shared.handoff.lock().unwrap().take() {
                 let mode = connector.mode();
+                let clock_offset = connector.clock_offset_ns;
                 connector_ref.set(Some(connector.clone()));
-                PENDING_FRAMES.with(|c| *c.borrow_mut() = Some(frames));
+                PENDING.with(|c| *c.borrow_mut() = Some((frames, clock_offset)));
                 crate::input::install(connector, mode, inhibit);
             }
-            Some(crate::input::uninstall)
-        }
-    });
-
-    let rendering = cx.use_ref::<Option<Rendering>>(None);
-    cx.use_effect((), {
-        let rendering = rendering.clone();
-        move || {
-            if let Ok(r) = on_rendering(move || {
-                PRESENT.with(|cell| {
-                    if let Some(ctx) = cell.borrow_mut().as_mut() {
-                        present_newest(ctx);
+            Some(|| {
+                RENDER.with(|c| {
+                    if let Some(mut rt) = c.borrow_mut().take() {
+                        rt.stop_and_join();
                     }
                 });
-            }) {
-                rendering.set(Some(r));
-            }
+                PENDING.with(|c| c.borrow_mut().take());
+                crate::input::uninstall();
+            })
         }
     });
 
     let mode = connector_ref.borrow().as_ref().map(|c| c.mode());
     grid((
         swap_chain_panel()
-            .on_ready(|panel| match Presenter::new(1280, 720) {
-                Ok(p) => {
-                    if let Err(e) = panel.set_swap_chain(p.swap_chain()) {
-                        tracing::error!(error = %e, "set_swap_chain");
-                    }
-                    if let Some(frames) = PENDING_FRAMES.with(|c| c.borrow_mut().take()) {
-                        PRESENT.with(|cell| {
-                            *cell.borrow_mut() = Some(PresentCtx {
-                                presenter: p,
-                                frames,
+            .on_ready(|panel| {
+                // Placeholder size — the first `on_resize` (fired after the first layout pass)
+                // resizes to the panel's real pixel size.
+                let dpi = window_dpi();
+                match Presenter::new(1280, 720, dpi) {
+                    Ok(p) => {
+                        if let Err(e) = panel.set_swap_chain(p.swap_chain()) {
+                            tracing::error!(error = %e, "set_swap_chain");
+                            return;
+                        }
+                        if let Some((frames, clock_offset)) =
+                            PENDING.with(|c| c.borrow_mut().take())
+                        {
+                            let shared = render::RenderShared::new(1280, 720, dpi);
+                            RENDER.with(|cell| {
+                                *cell.borrow_mut() =
+                                    Some(render::spawn(p, frames, shared, clock_offset));
                             });
-                        });
-                        tracing::info!("stream presenter bound to SwapChainPanel");
+                            tracing::info!(dpi, "stream presenter bound — render thread started");
+                        }
                     }
+                    Err(e) => tracing::error!(error = %e, "create presenter"),
                 }
-                Err(e) => tracing::error!(error = %e, "create presenter"),
             })
             .on_resize(|w, h| {
-                PRESENT.with(|cell| {
-                    if let Some(ctx) = cell.borrow_mut().as_mut() {
-                        ctx.presenter.resize(w as u32, h as u32);
+                // DIPs → physical pixels; the presenter maps back via SetMatrixTransform.
+                let dpi = window_dpi();
+                let px = |v: f64| (v * f64::from(dpi) / 96.0).round() as u32;
+                RENDER.with(|cell| {
+                    if let Some(rt) = cell.borrow().as_ref() {
+                        rt.shared().set_dpi(dpi);
+                        rt.shared().set_size(px(w), px(h));
                     }
                 });
             }),

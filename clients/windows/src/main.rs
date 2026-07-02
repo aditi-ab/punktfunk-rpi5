@@ -35,6 +35,8 @@ mod input;
 #[cfg(windows)]
 mod present;
 #[cfg(windows)]
+mod render;
+#[cfg(windows)]
 mod session;
 #[cfg(windows)]
 mod trust;

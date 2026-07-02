@@ -1,17 +1,29 @@
 //! Direct3D11 presenter for a WinUI 3 `SwapChainPanel`. It draws a decoded frame Contain-fit into a
 //! **composition** flip-model swapchain, which the reactor stream page binds to the panel via
-//! `SwapChainPanelHandle::set_swap_chain`.
+//! `SwapChainPanelHandle::set_swap_chain`. After that one UI-thread bind, the presenter lives on
+//! the dedicated render thread ([`crate::render`]) — presenting never touches (or is stalled by)
+//! the XAML thread.
 //!
-//! Two frame sources, one swapchain:
+//! Two frame sources, one pair of YUV shaders (identical colour math for both):
 //!
-//! * **GPU (zero-copy)** — [`crate::video::GpuFrame`] is a decoder-owned NV12/P010 `ID3D11Texture2D`
-//!   array slice (D3D11VA). We create per-plane shader-resource views over the slice and convert
-//!   YUV→RGB in a pixel shader: NV12 via BT.709 (`ps_nv12`), P010 via BT.2020 with the PQ transfer
-//!   left intact (`ps_p010`). No CPU copy. The decoder uses the **same** shared device
-//!   ([`crate::gpu`]) so the texture is bindable here.
-//! * **CPU upload** — [`crate::video::CpuFrame`] is packed RGBA (SDR) or X2BGR10 (HDR) from the
-//!   software decoder; we upload it into a dynamic texture and draw it with a passthrough shader
-//!   (`ps_rgba`). The fallback path.
+//! * **GPU (D3D11VA)** — [`crate::video::GpuFrame`] is a slice of the decoder-only NV12/P010
+//!   texture array. One `CopySubresourceRegion` with a display-size box moves the slice — **both
+//!   planes; in D3D11 a planar slice is a single subresource** (unlike D3D12) — into our
+//!   sampleable texture, which per-plane SRVs (R8/R8G8, R16/R16G16) expose to the shaders. The
+//!   source box is mandatory: the decode array is coded-size (e.g. 1920×1088), the target
+//!   display-size (1920×1080), and D3D11 silently drops size-mismatched full-resource copies.
+//! * **CPU upload** — [`crate::video::CpuFrame`] carries NV12/P010 planes from the software
+//!   decoder; they upload into two dynamic plane textures feeding the same SRV slots/shaders.
+//!
+//! **Pacing**: the swapchain is created with `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`
+//! and `SetMaximumFrameLatency(1)` (flagless fallback for odd drivers). The render thread waits
+//! on the latency waitable before drawing, so at most one present is ever queued (minimum compose
+//! latency) and a stream faster than the display drops frames *before* any GPU work. Every
+//! `ResizeBuffers` must re-pass the creation flags — that's `swap_flags`.
+//!
+//! **HiDPI**: buffers are sized in physical pixels and `IDXGISwapChain2::SetMatrixTransform`
+//! (scale 96/DPI) maps them to the panel's DIP coordinate space — without it XAML samples a
+//! DIP-sized buffer up and the video is blurry at 125/150 % scaling.
 //!
 //! **HDR10**: when a frame is BT.2020 PQ the swapchain flips to `R10G10B10A2` +
 //! `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` (+ HDR10 metadata) via `ResizeBuffers`/
@@ -21,21 +33,23 @@
 //! All `windows` types here come from the same windows-rs commit as `windows-reactor`, so the
 //! `IDXGISwapChain1` handed to `set_swap_chain` satisfies reactor's `windows_core::Interface`.
 
-use crate::video::{DecodedFrame, GpuFrame};
+use crate::video::{CpuFrame, DecodedFrame, GpuFrame};
 use anyhow::{anyhow, Context, Result};
 use windows::core::{Interface, PCSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
 use windows::Win32::Graphics::Direct3D::{
-    ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2DARRAY,
+    ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::System::Threading::WaitForSingleObject;
 
-// One vertex shader (fullscreen triangle) + three pixel shaders, selected per frame source. tex0 is
-// RGBA (passthrough) or the luma plane; tex1 is the chroma plane. The YUV→RGB matrices fold the
-// limited→full range scale into the coefficients; for P010 the R16 sample is rescaled (×65535/65472)
-// to undo the 10-bits-in-the-high-bits packing, then converted with BT.2020 NCL, PQ preserved.
+// One vertex shader (fullscreen triangle) + two pixel shaders, selected per frame colour space.
+// tex0 is the luma plane, tex1 the chroma plane. The YUV→RGB matrices fold the limited→full range
+// scale into the coefficients; for P010 the R16 sample is rescaled (×65535/65472) to undo the
+// 10-bits-in-the-high-bits packing, then converted with BT.2020 NCL, PQ preserved.
 const SHADER_HLSL: &str = r#"
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut vs_main(uint vid : SV_VertexID) {
@@ -48,8 +62,6 @@ VSOut vs_main(uint vid : SV_VertexID) {
 Texture2D tex0 : register(t0);
 Texture2D tex1 : register(t1);
 SamplerState smp : register(s0);
-
-float4 ps_rgba(VSOut i) : SV_Target { return tex0.Sample(smp, i.uv); }
 
 float4 ps_nv12(VSOut i) : SV_Target {
     float  y  = tex0.Sample(smp, i.uv).r;
@@ -77,46 +89,53 @@ float4 ps_p010(VSOut i) : SV_Target {
 }
 "#;
 
-/// A bound GPU frame: per-plane SRVs over the decoder's texture-array slice, plus the `GpuFrame`
-/// itself kept alive so the decoder won't recycle the slice while we re-present it.
-struct GpuView {
+/// The currently bound frame: per-plane SRVs (over the GPU sample texture or the CPU plane
+/// textures) + the colour space that picks the shader. Redraws (resize, letterbox) re-present it.
+struct Bound {
     y: ID3D11ShaderResourceView,
     c: ID3D11ShaderResourceView,
-    /// Held only for its `Drop` (returns the decoder surface to the reuse pool) — never read.
-    #[allow(dead_code)]
-    frame: GpuFrame,
-}
-
-/// Current draw source.
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
-    Empty,
-    Rgba,
-    Nv12,
-    P010,
+    hdr: bool,
 }
 
 pub struct Presenter {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     vs: ID3D11VertexShader,
-    ps_rgba: ID3D11PixelShader,
     ps_nv12: ID3D11PixelShader,
     ps_p010: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     swap: IDXGISwapChain1,
+    /// Creation flags — MUST be re-passed to every `ResizeBuffers` or it fails.
+    swap_flags: u32,
+    /// The frame-latency waitable (owned; closed in `Drop`), `None` on the flagless fallback.
+    waitable: Option<HANDLE>,
     rtv: Option<ID3D11RenderTargetView>,
-    /// CPU-upload texture + SRV + dimensions; recreated when the decoded size/format changes.
-    cpu_tex: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, u32, u32)>,
-    /// Bound zero-copy GPU frame (held to keep its decoder surface alive).
-    gpu: Option<GpuView>,
-    mode: Mode,
+    /// GPU path: sampleable copy target for the decoded slice — `(tex, w, h, ten_bit)`, recreated
+    /// when the decoded size/bit depth changes. Format must equal the decode array's (NV12/P010).
+    sample_tex: Option<(ID3D11Texture2D, u32, u32, bool)>,
+    /// The last GPU frame, held until the NEXT bind so its decode surface stays out of the reuse
+    /// pool at least until this frame's copy has been queued ahead of any later decoder write.
+    gpu_frame: Option<GpuFrame>,
+    /// CPU path: dynamic luma + chroma plane textures + their SRVs — `(y, uv, y_srv, uv_srv, w, h,
+    /// ten_bit)`, recreated when the decoded size/bit depth changes.
+    #[allow(clippy::type_complexity)]
+    plane_tex: Option<(
+        ID3D11Texture2D,
+        ID3D11Texture2D,
+        ID3D11ShaderResourceView,
+        ID3D11ShaderResourceView,
+        u32,
+        u32,
+        bool,
+    )>,
+    bound: Option<Bound>,
     /// Source frame dimensions, for the Contain-fit letterbox.
     src_w: u32,
     src_h: u32,
-    /// Panel (swapchain) size in pixels, updated on resize.
+    /// Panel (swapchain) size in physical pixels + the window DPI, updated on resize.
     panel_w: u32,
     panel_h: u32,
+    dpi: u32,
     /// Whether the swapchain is currently in 10-bit HDR10 (R10G10B10A2 + ST.2084) mode.
     hdr: bool,
     /// The source's static HDR mastering metadata received over the protocol (`0xCE`), applied via
@@ -126,45 +145,71 @@ pub struct Presenter {
 }
 
 /// Latest source HDR mastering metadata, written by the session pump (`session.rs`, the sole
-/// `next_hdr_meta` consumer) and read by `present_newest` on the UI thread — decoupled so the
+/// `next_hdr_meta` consumer) and read by the render thread before each present — decoupled so the
 /// presenter doesn't need the connector. One session at a time on the client, so a single slot.
 pub static LATEST_HDR_META: std::sync::Mutex<Option<punktfunk_core::quic::HdrMeta>> =
     std::sync::Mutex::new(None);
 
 impl Presenter {
     /// Create the presenter on the process-wide shared D3D11 device (the one the decoder uses), plus
-    /// the composition swapchain + shaders, sized to the panel.
-    pub fn new(width: u32, height: u32) -> Result<Presenter> {
+    /// the composition swapchain + shaders, sized to the panel in physical pixels at `dpi`.
+    pub fn new(width: u32, height: u32, dpi: u32) -> Result<Presenter> {
         let shared = crate::gpu::shared().ok_or_else(|| anyhow!("no shared D3D11 device"))?;
         let device = shared.device.clone();
         let context = shared.context.clone();
-        let (vs, ps_rgba, ps_nv12, ps_p010, sampler) = build_pipeline(&device)?;
-        let swap = create_composition_swapchain(&device, width.max(1), height.max(1))?;
-        Ok(Presenter {
+        let (vs, ps_nv12, ps_p010, sampler) = build_pipeline(&device)?;
+        let (swap, swap_flags) =
+            create_composition_swapchain(&device, width.max(1), height.max(1))?;
+        // ≤1 queued present: the render thread blocks on the waitable, so a frame is only drawn
+        // when the compositor is ready to take it — the newest-wins drain happens after the wait.
+        let waitable = (swap_flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32
+            != 0)
+            .then(|| unsafe {
+                let sc2: IDXGISwapChain2 = swap.cast().ok()?;
+                sc2.SetMaximumFrameLatency(1).ok()?;
+                let h = sc2.GetFrameLatencyWaitableObject();
+                (!h.is_invalid()).then_some(h)
+            })
+            .flatten();
+        let p = Presenter {
             device,
             context,
             vs,
-            ps_rgba,
             ps_nv12,
             ps_p010,
             sampler,
             swap,
+            swap_flags,
+            waitable,
             rtv: None,
-            cpu_tex: None,
-            gpu: None,
-            mode: Mode::Empty,
+            sample_tex: None,
+            gpu_frame: None,
+            plane_tex: None,
+            bound: None,
             src_w: 1,
             src_h: 1,
             panel_w: width.max(1),
             panel_h: height.max(1),
+            dpi: dpi.max(96),
             hdr: false,
             hdr_meta: None,
-        })
+        };
+        p.apply_dpi_matrix();
+        Ok(p)
+    }
+
+    /// Block until the swapchain can take another present (≤ `timeout_ms`). True when a present
+    /// slot is free; also true on the flagless fallback (no throttle available, just present).
+    pub fn wait_present_slot(&self, timeout_ms: u32) -> bool {
+        match self.waitable {
+            Some(h) => unsafe { WaitForSingleObject(h, timeout_ms) == WAIT_OBJECT_0 },
+            None => true,
+        }
     }
 
     /// Update the source HDR mastering metadata (from the `0xCE` plane). Stored for the next HDR
     /// swapchain switch, and applied immediately if already presenting HDR. A no-op when unchanged
-    /// (so it's cheap to call every frame from the present loop).
+    /// (so it's cheap to call every frame from the render loop).
     pub fn set_hdr_metadata(&mut self, meta: punktfunk_core::quic::HdrMeta) {
         if self.hdr_meta == Some(meta) {
             return;
@@ -180,28 +225,54 @@ impl Presenter {
         &self.swap
     }
 
-    /// Resize the back buffers to the panel's new size (drops the stale RTV).
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 || (width == self.panel_w && height == self.panel_h) {
+    /// Resize the back buffers to the panel's new size in physical pixels at `dpi` (drops the
+    /// stale RTV, re-applies the DIP↔pixel matrix).
+    pub fn resize(&mut self, width: u32, height: u32, dpi: u32) {
+        let dpi = dpi.max(96);
+        if width == 0
+            || height == 0
+            || (width == self.panel_w && height == self.panel_h && dpi == self.dpi)
+        {
             return;
         }
         self.rtv = None; // release all back-buffer refs before ResizeBuffers
         unsafe {
-            let _ = self.swap.ResizeBuffers(
+            if let Err(e) = self.swap.ResizeBuffers(
                 0,
                 width,
                 height,
                 DXGI_FORMAT_UNKNOWN,
-                DXGI_SWAP_CHAIN_FLAG(0),
-            );
+                DXGI_SWAP_CHAIN_FLAG(self.swap_flags as i32),
+            ) {
+                tracing::warn!(error = %e, "ResizeBuffers failed");
+                return;
+            }
         }
         self.panel_w = width;
         self.panel_h = height;
+        self.dpi = dpi;
+        self.apply_dpi_matrix();
     }
 
-    /// Present one decoded frame (Contain-fit) — or, when `frame` is `None`, re-present the last one
-    /// (or black). Called from the reactor `on_rendering` per-frame callback on the UI thread. Takes
-    /// the frame by value so the GPU path can retain the decoder surface across re-presents.
+    /// Map the pixel-sized buffers into the panel's DIP coordinate space (scale 96/DPI) — XAML
+    /// otherwise stretches whatever size the buffers are to the panel's DIP bounds (blurry).
+    fn apply_dpi_matrix(&self) {
+        let s = 96.0 / self.dpi as f32;
+        if let Ok(sc2) = self.swap.cast::<IDXGISwapChain2>() {
+            let m = DXGI_MATRIX_3X2_F {
+                _11: s,
+                _22: s,
+                ..Default::default()
+            };
+            if let Err(e) = unsafe { sc2.SetMatrixTransform(&m) } {
+                tracing::warn!(error = %e, "SetMatrixTransform failed");
+            }
+        }
+    }
+
+    /// Present one decoded frame (Contain-fit) — or, when `frame` is `None`, re-present the last
+    /// one (or black). Called from the render thread. Takes the frame by value: the GPU path
+    /// retains the decoder surface until the next bind.
     pub fn present(&mut self, frame: Option<DecodedFrame>) {
         match frame {
             Some(DecodedFrame::Cpu(c)) => {
@@ -210,20 +281,14 @@ impl Presenter {
                 }
                 if let Err(e) = self.upload(&c) {
                     tracing::warn!(error = %e, "frame upload failed");
-                } else {
-                    self.mode = Mode::Rgba;
-                    self.src_w = c.width;
-                    self.src_h = c.height;
-                    self.gpu = None; // drop any held GPU frame
                 }
             }
             Some(DecodedFrame::Gpu(g)) => {
                 if g.hdr != self.hdr {
                     self.set_hdr(g.hdr);
                 }
-                match self.bind_gpu(g) {
-                    Ok(()) => {}
-                    Err(e) => tracing::warn!(error = %e, "GPU frame bind failed"),
+                if let Err(e) = self.bind_gpu(g) {
+                    tracing::warn!(error = %e, "GPU frame bind failed");
                 }
             }
             None => {}
@@ -231,46 +296,102 @@ impl Presenter {
         self.draw();
     }
 
-    /// Build per-plane SRVs over the decoded texture-array slice and retain the frame.
+    /// Copy the decoded slice into our sampleable texture and build per-plane SRVs over it. The
+    /// decode array is decoder-only (NVIDIA won't bind a decoder array as a shader resource), so
+    /// it can't be sampled directly — one GPU-to-GPU copy makes the frame sampleable on every
+    /// vendor. D3D11 planar semantics: the slice is ONE subresource (both planes copy together),
+    /// and the source box is display-size (the array is coded-size; a full-resource copy would
+    /// size-mismatch and be silently dropped).
     fn bind_gpu(&mut self, g: GpuFrame) -> Result<()> {
-        let tex: ID3D11Texture2D = unsafe {
+        let src: ID3D11Texture2D = unsafe {
             let raw = g.texture_ptr();
             ID3D11Texture2D::from_raw_borrowed(&raw)
                 .ok_or_else(|| anyhow!("null D3D11 texture"))?
                 .clone()
         };
-        // NV12: R8 luma + R8G8 chroma. P010: R16 luma + R16G16 chroma (10 bits in the high bits).
-        let (fy, fc) = if g.hdr {
-            (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM)
-        } else {
-            (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM)
+        self.ensure_sample_tex(g.width, g.height, g.ten_bit)?;
+        let dst = self.sample_tex.as_ref().unwrap().0.clone();
+        // Even-aligned luma coordinates (NV12/P010 chroma is 2×2 subsampled).
+        let src_box = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: g.width & !1,
+            bottom: g.height & !1,
+            back: 1,
         };
-        let y = self.array_srv(&tex, fy, g.index)?;
-        let c = self.array_srv(&tex, fc, g.index)?;
-        self.mode = if g.hdr { Mode::P010 } else { Mode::Nv12 };
+        unsafe {
+            self.context
+                .CopySubresourceRegion(&dst, 0, 0, 0, 0, &src, g.index, Some(&src_box));
+        }
+        let (fy, fc) = plane_formats(g.ten_bit);
+        let y = self.plane_srv(&dst, fy)?;
+        let c = self.plane_srv(&dst, fc)?;
+        if g.ten_bit != g.hdr {
+            warn_bitdepth_mismatch_once(g.ten_bit, g.hdr);
+        }
         self.src_w = g.width;
         self.src_h = g.height;
-        self.gpu = Some(GpuView { y, c, frame: g });
+        self.bound = Some(Bound { y, c, hdr: g.hdr });
+        // Hold the frame until the next bind: its decode surface stays out of the reuse pool
+        // until this copy is queued ahead of any later decoder write (previous frame drops here).
+        self.gpu_frame = Some(g);
         Ok(())
     }
 
-    /// A shader-resource view over a single slice of a texture array, reinterpreting the plane
-    /// format (the NV12/P010 sub-format trick D3D11 allows on video textures).
-    fn array_srv(
+    /// Ensure the sampleable copy texture matches the decoded frame's size + bit depth (NV12 for
+    /// 8-bit, P010 for 10-bit — the same format as the decode array, a `CopySubresourceRegion`
+    /// requirement), recreating it on a change.
+    fn ensure_sample_tex(&mut self, w: u32, h: u32, ten_bit: bool) -> Result<()> {
+        if matches!(&self.sample_tex, Some((_, tw, th, tb)) if *tw == w && *th == h && *tb == ten_bit)
+        {
+            return Ok(());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: if ten_bit {
+                DXGI_FORMAT_P010
+            } else {
+                DXGI_FORMAT_NV12
+            },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let tex = unsafe {
+            let mut t = None;
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut t))
+                .context("CreateTexture2D (sample target)")?;
+            t.ok_or_else(|| anyhow!("null sample texture"))?
+        };
+        self.sample_tex = Some((tex, w, h, ten_bit));
+        Ok(())
+    }
+
+    /// A shader-resource view over one plane of a single (non-array) NV12/P010 texture — the
+    /// R8/R8G8 (or R16/R16G16) format selects the luma vs. chroma plane (the D3D11 video
+    /// sub-format trick).
+    fn plane_srv(
         &self,
         tex: &ID3D11Texture2D,
         format: DXGI_FORMAT,
-        slice: u32,
     ) -> Result<ID3D11ShaderResourceView> {
         let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
             Format: format,
-            ViewDimension: D3D_SRV_DIMENSION_TEXTURE2DARRAY,
+            ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
             Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                Texture2D: D3D11_TEX2D_SRV {
                     MostDetailedMip: 0,
                     MipLevels: 1,
-                    FirstArraySlice: slice,
-                    ArraySize: 1,
                 },
             },
         };
@@ -278,9 +399,98 @@ impl Presenter {
             let mut srv = None;
             self.device
                 .CreateShaderResourceView(tex, Some(&desc), Some(&mut srv))
-                .context("CreateShaderResourceView (array slice)")?;
+                .context("CreateShaderResourceView (plane)")?;
             srv.ok_or_else(|| anyhow!("null SRV"))
         }
+    }
+
+    /// Upload a software-decoded frame's two planes into the dynamic plane textures (created to
+    /// match size/bit depth), feeding the same SRV slots + shaders as the GPU path.
+    fn upload(&mut self, frame: &CpuFrame) -> Result<()> {
+        let (w, h) = (frame.width, frame.height);
+        let rebuild = !matches!(&self.plane_tex,
+            Some((.., tw, th, tb)) if *tw == w && *th == h && *tb == frame.ten_bit);
+        if rebuild {
+            let (fy, fc) = plane_formats(frame.ten_bit);
+            let y = self.dynamic_tex(w, h, fy)?;
+            let uv = self.dynamic_tex(w.div_ceil(2), h.div_ceil(2), fc)?;
+            let y_srv = self.plane_srv(&y, fy)?;
+            let uv_srv = self.plane_srv(&uv, fc)?;
+            self.plane_tex = Some((y, uv, y_srv, uv_srv, w, h, frame.ten_bit));
+        }
+        let (y, uv, y_srv, uv_srv, ..) = self.plane_tex.as_ref().unwrap();
+        let bytes = if frame.ten_bit { 2 } else { 1 };
+        self.map_rows(y, &frame.y, frame.y_stride, w as usize * bytes, h as usize)?;
+        self.map_rows(
+            uv,
+            &frame.uv,
+            frame.uv_stride,
+            w.div_ceil(2) as usize * 2 * bytes,
+            h.div_ceil(2) as usize,
+        )?;
+        self.src_w = w;
+        self.src_h = h;
+        self.bound = Some(Bound {
+            y: y_srv.clone(),
+            c: uv_srv.clone(),
+            hdr: frame.hdr,
+        });
+        self.gpu_frame = None; // drop any held GPU frame
+        Ok(())
+    }
+
+    fn dynamic_tex(&self, w: u32, h: u32, format: DXGI_FORMAT) -> Result<ID3D11Texture2D> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DYNAMIC,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+            MiscFlags: 0,
+        };
+        unsafe {
+            let mut t = None;
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut t))
+                .context("CreateTexture2D (plane)")?;
+            t.ok_or_else(|| anyhow!("null plane texture"))
+        }
+    }
+
+    /// Map-discard `tex` and copy `rows` rows of `row_bytes` from `src` (stride `src_pitch`).
+    fn map_rows(
+        &self,
+        tex: &ID3D11Texture2D,
+        src: &[u8],
+        src_pitch: usize,
+        row_bytes: usize,
+        rows: usize,
+    ) -> Result<()> {
+        unsafe {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .context("Map plane texture")?;
+            let dst = mapped.pData as *mut u8;
+            let dst_pitch = mapped.RowPitch as usize;
+            let n = row_bytes.min(src_pitch);
+            for r in 0..rows {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(r * src_pitch),
+                    dst.add(r * dst_pitch),
+                    n,
+                );
+            }
+            self.context.Unmap(tex, 0);
+        }
+        Ok(())
     }
 
     fn draw(&mut self) {
@@ -288,27 +498,10 @@ impl Presenter {
             return;
         };
         let (pw, ph) = (self.panel_w, self.panel_h);
-        // Resolve the current source's shader + the (up to two) SRVs to bind — cheap interface
-        // clones. Each arm yields `Option<(&pixel_shader, [Option<SRV>; 2])>`.
-        let binding = match self.mode {
-            Mode::Rgba => self
-                .cpu_tex
-                .as_ref()
-                .map(|(_, srv, _, _)| (&self.ps_rgba, [Some(srv.clone()), None])),
-            Mode::Nv12 => self
-                .gpu
-                .as_ref()
-                .map(|g| (&self.ps_nv12, [Some(g.y.clone()), Some(g.c.clone())])),
-            Mode::P010 => self
-                .gpu
-                .as_ref()
-                .map(|g| (&self.ps_p010, [Some(g.y.clone()), Some(g.c.clone())])),
-            Mode::Empty => None,
-        };
         unsafe {
             let c = &self.context;
             c.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]);
-            if let Some((ps, srvs)) = binding {
+            if let Some(bound) = &self.bound {
                 // Contain-fit viewport: scale to the smaller axis, centre, letterbox the rest.
                 let (ww, wh, vfw, vfh) = (
                     pw as f32,
@@ -332,8 +525,15 @@ impl Presenter {
                 c.IASetInputLayout(None);
                 c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 c.VSSetShader(&self.vs, None);
-                c.PSSetShader(ps, None);
-                c.PSSetShaderResources(0, Some(&srvs));
+                c.PSSetShader(
+                    if bound.hdr {
+                        &self.ps_p010
+                    } else {
+                        &self.ps_nv12
+                    },
+                    None,
+                );
+                c.PSSetShaderResources(0, Some(&[Some(bound.y.clone()), Some(bound.c.clone())]));
                 c.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
                 c.Draw(3, 0);
             }
@@ -347,7 +547,6 @@ impl Presenter {
     /// PQ-encoded BT.2020 for HDR, so the colour space is all the compositor needs.
     fn set_hdr(&mut self, on: bool) {
         self.rtv = None; // release back-buffer refs before ResizeBuffers
-        self.cpu_tex = None; // CPU texture format changes (R10G10B10A2 vs R8G8B8A8)
         let format = if on {
             DXGI_FORMAT_R10G10B10A2_UNORM
         } else {
@@ -359,7 +558,7 @@ impl Presenter {
                 self.panel_w,
                 self.panel_h,
                 format,
-                DXGI_SWAP_CHAIN_FLAG(0),
+                DXGI_SWAP_CHAIN_FLAG(self.swap_flags as i32),
             ) {
                 tracing::warn!(error = %e, "ResizeBuffers for HDR switch failed");
                 return;
@@ -389,6 +588,7 @@ impl Presenter {
                 self.apply_hdr_metadata();
             }
         }
+        self.apply_dpi_matrix(); // belt-and-braces: keep the DIP mapping across the format switch
         tracing::info!(hdr = on, "swapchain colour mode switched");
     }
 
@@ -410,68 +610,6 @@ impl Presenter {
         }
     }
 
-    fn upload(&mut self, frame: &crate::video::CpuFrame) -> Result<()> {
-        let (w, h) = (frame.width, frame.height);
-        let need_new = !matches!(&self.cpu_tex, Some((_, _, tw, th)) if *tw == w && *th == h);
-        if need_new {
-            let format = if self.hdr {
-                DXGI_FORMAT_R10G10B10A2_UNORM
-            } else {
-                DXGI_FORMAT_R8G8B8A8_UNORM
-            };
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: w,
-                Height: h,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: format,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DYNAMIC,
-                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-                MiscFlags: 0,
-            };
-            let texture = unsafe {
-                let mut t = None;
-                self.device
-                    .CreateTexture2D(&desc, None, Some(&mut t))
-                    .context("CreateTexture2D")?;
-                t.unwrap()
-            };
-            let srv = unsafe {
-                let mut s = None;
-                self.device
-                    .CreateShaderResourceView(&texture, None, Some(&mut s))
-                    .context("CreateShaderResourceView")?;
-                s.unwrap()
-            };
-            self.cpu_tex = Some((texture, srv, w, h));
-        }
-        let (texture, _, _, _) = self.cpu_tex.as_ref().unwrap();
-        unsafe {
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
-                .Map(texture, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
-                .context("Map video texture")?;
-            let dst = mapped.pData as *mut u8;
-            let dst_pitch = mapped.RowPitch as usize;
-            let src_pitch = frame.stride;
-            let row_bytes = (w as usize) * 4;
-            for y in 0..h as usize {
-                std::ptr::copy_nonoverlapping(
-                    frame.pixels.as_ptr().add(y * src_pitch),
-                    dst.add(y * dst_pitch),
-                    row_bytes.min(src_pitch),
-                );
-            }
-            self.context.Unmap(texture, 0);
-        }
-        Ok(())
-    }
-
     fn rtv(&mut self) -> Result<ID3D11RenderTargetView> {
         if self.rtv.is_none() {
             let back: ID3D11Texture2D = unsafe { self.swap.GetBuffer(0).context("GetBuffer")? };
@@ -488,18 +626,53 @@ impl Presenter {
     }
 }
 
-/// A composition flip-model swapchain (no HWND) for binding to a XAML `SwapChainPanel`.
+impl Drop for Presenter {
+    fn drop(&mut self) {
+        if let Some(h) = self.waitable.take() {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+}
+
+/// Luma + chroma plane view formats for NV12 (8-bit) vs P010 (10-in-16-bit).
+fn plane_formats(ten_bit: bool) -> (DXGI_FORMAT, DXGI_FORMAT) {
+    if ten_bit {
+        (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM)
+    } else {
+        (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM)
+    }
+}
+
+/// The host couples 10-bit ⟺ HDR today; a mismatch means the shader's transfer/matrix assumption
+/// is off for this stream (rendered anyway — approximate colour beats no picture).
+fn warn_bitdepth_mismatch_once(ten_bit: bool, hdr: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(true);
+    if ONCE.swap(false, Ordering::Relaxed) {
+        tracing::warn!(
+            ten_bit,
+            hdr,
+            "bit depth / HDR mismatch — colour may be approximate"
+        );
+    }
+}
+
+/// A composition flip-model swapchain (no HWND) for binding to a XAML `SwapChainPanel`, with the
+/// frame-latency waitable when the driver allows it. Returns the swapchain + the flags it was
+/// created with (every `ResizeBuffers` must re-pass them).
 fn create_composition_swapchain(
     device: &ID3D11Device,
     width: u32,
     height: u32,
-) -> Result<IDXGISwapChain1> {
+) -> Result<(IDXGISwapChain1, u32)> {
     let dxdev: IDXGIDevice = device.cast().context("IDXGIDevice cast")?;
     let factory: IDXGIFactory2 = unsafe {
         let adapter = dxdev.GetAdapter().context("GetAdapter")?;
         adapter.GetParent().context("GetParent (IDXGIFactory2)")?
     };
-    let desc = DXGI_SWAP_CHAIN_DESC1 {
+    let mut desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: width,
         Height: height,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -512,16 +685,24 @@ fn create_composition_swapchain(
         BufferCount: 2,
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-        // IGNORE (opaque), not PREMULTIPLIED: the video fills the panel and the HDR `X2BGR10`
-        // upload leaves the 2 padding/alpha bits 0 — premultiplied alpha would then make HDR frames
-        // transparent. Opaque is correct for a full-frame video surface either way.
+        // IGNORE (opaque), not PREMULTIPLIED: the video fills the panel with opaque RGB either way.
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-        Flags: 0,
+        Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
     };
     unsafe {
-        factory
-            .CreateSwapChainForComposition(device, &desc, None)
-            .context("CreateSwapChainForComposition")
+        match factory.CreateSwapChainForComposition(device, &desc, None) {
+            Ok(sc) => Ok((sc, desc.Flags)),
+            Err(e) => {
+                // Odd driver/WARP combinations can reject the waitable — fall back to plain
+                // Present(1) pacing rather than failing the stream page.
+                tracing::warn!(error = %e, "waitable swapchain rejected — creating without");
+                desc.Flags = 0;
+                let sc = factory
+                    .CreateSwapChainForComposition(device, &desc, None)
+                    .context("CreateSwapChainForComposition")?;
+                Ok((sc, 0))
+            }
+        }
     }
 }
 
@@ -531,11 +712,9 @@ fn build_pipeline(
     ID3D11VertexShader,
     ID3D11PixelShader,
     ID3D11PixelShader,
-    ID3D11PixelShader,
     ID3D11SamplerState,
 )> {
     let vs_blob = compile(SHADER_HLSL, "vs_main", "vs_5_0")?;
-    let rgba_blob = compile(SHADER_HLSL, "ps_rgba", "ps_5_0")?;
     let nv12_blob = compile(SHADER_HLSL, "ps_nv12", "ps_5_0")?;
     let p010_blob = compile(SHADER_HLSL, "ps_p010", "ps_5_0")?;
     unsafe {
@@ -543,10 +722,6 @@ fn build_pipeline(
         device
             .CreateVertexShader(blob_bytes(&vs_blob), None, Some(&mut vs))
             .context("CreateVertexShader")?;
-        let mut ps_rgba = None;
-        device
-            .CreatePixelShader(blob_bytes(&rgba_blob), None, Some(&mut ps_rgba))
-            .context("CreatePixelShader (rgba)")?;
         let mut ps_nv12 = None;
         device
             .CreatePixelShader(blob_bytes(&nv12_blob), None, Some(&mut ps_nv12))
@@ -569,7 +744,6 @@ fn build_pipeline(
             .context("CreateSamplerState")?;
         Ok((
             vs.unwrap(),
-            ps_rgba.unwrap(),
             ps_nv12.unwrap(),
             ps_p010.unwrap(),
             sampler.unwrap(),

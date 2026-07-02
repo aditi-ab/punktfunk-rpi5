@@ -27,23 +27,64 @@ pub(crate) fn card(child: impl Into<Element>) -> Border {
         .padding(uniform(16.0))
 }
 
+/// Card chrome with no padding — for cards whose interactive regions (tap-to-connect area vs.
+/// action buttons) must own their padding so hit areas reach the card edges.
+pub(crate) fn card_flush(child: impl Into<Element>) -> Border {
+    card(child).padding(uniform(0.0))
+}
+
+/// An OPAQUE modal/dialog surface. `card`'s `CardBackground` is a translucent acrylic brush — fine
+/// layered on the page, but a floating dialog over a scrim needs a solid fill or the content behind
+/// bleeds through (looks "transparent"). `SolidBackground` is the opaque base-layer brush.
+pub(crate) fn dialog_surface(child: impl Into<Element>) -> Border {
+    border(child.into())
+        .background(ThemeRef::SolidBackground)
+        .border_brush(ThemeRef::SurfaceStroke)
+        .border_thickness(uniform(1.0))
+        .corner_radius(8.0)
+        .padding(uniform(20.0))
+}
+
+/// A fully transparent brush: paints nothing but (unlike a null background) makes the whole
+/// element hit-testable, so a tap region catches clicks in its blank space too.
+pub(crate) fn hit_test_backstop() -> Color {
+    Color {
+        a: 0,
+        r: 0,
+        g: 0,
+        b: 0,
+    }
+}
+
 /// A small all-caps section label above a group of cards.
 pub(crate) fn section(label: &str) -> Element {
     text_block(label)
         .font_size(12.0)
         .semibold()
         .foreground(ThemeRef::SecondaryText)
-        .margin(edges(2.0, 10.0, 0.0, 0.0))
+        .margin(edges(2.0, 14.0, 0.0, 2.0))
         .into()
 }
 
-/// Wrap a screen's children in a scrollable, centred, max-width column.
+/// Wrap a screen's children in a scrollable, centred, max-width column. Alignment stays the
+/// default Stretch: with a MaxWidth that still centres the column, but the children get the
+/// column's REAL width — an explicit Center would size the column to its content and leave
+/// every card at its minimum width no matter how large the window is.
 pub(crate) fn page(children: Vec<Element>) -> Element {
     let col = vstack(children)
         .spacing(10.0)
         .max_width(640.0)
-        .horizontal_alignment(HorizontalAlignment::Center)
         .margin(edges(24.0, 24.0, 24.0, 40.0));
+    scroll_view(col).into()
+}
+
+/// Like [`page`], but wide and airier — for screens whose cards lay out in a responsive grid
+/// and should use the window instead of a narrow settings column.
+pub(crate) fn page_wide(children: Vec<Element>) -> Element {
+    let col = vstack(children)
+        .spacing(14.0)
+        .max_width(1120.0)
+        .margin(edges(32.0, 28.0, 32.0, 48.0));
     scroll_view(col).into()
 }
 
@@ -103,7 +144,9 @@ pub(crate) fn avatar(name: &str) -> Border {
         text_block(initial)
             .font_size(17.0)
             .semibold()
-            .foreground(ThemeRef::AccentText)
+            // NOT ThemeRef::AccentText — that's accent-COLOURED text for normal surfaces;
+            // on an accent fill it's accent-on-accent (unreadable). This is the on-accent brush.
+            .foreground(ThemeRef::custom("TextOnAccentFillColorPrimaryBrush"))
             .horizontal_alignment(HorizontalAlignment::Center)
             .vertical_alignment(VerticalAlignment::Center),
     )
@@ -116,20 +159,39 @@ pub(crate) fn avatar(name: &str) -> Border {
 /// Pill chip colour intent.
 #[derive(Clone, Copy)]
 pub(crate) enum Pill {
-    Accent,
+    Info,
     Good,
     Neutral,
 }
 
-/// A small rounded status chip (paired/PIN/HDR/etc.).
+/// A small rounded status chip (paired/PIN/HDR/etc.) — subtle tinted fills with matching
+/// system foregrounds (the InfoBar palette), never solid accent (white-on-bright is unreadable).
 pub(crate) fn pill(text: &str, kind: Pill) -> Border {
     let (bg, fg) = match kind {
-        Pill::Accent => (ThemeRef::Accent, ThemeRef::AccentText),
+        Pill::Info => (
+            ThemeRef::SystemAttentionBackground,
+            ThemeRef::SystemAttention,
+        ),
         Pill::Good => (ThemeRef::SystemSuccessBackground, ThemeRef::SystemSuccess),
         Pill::Neutral => (ThemeRef::SubtleFill, ThemeRef::SecondaryText),
     };
     border(text_block(text).font_size(11.0).semibold().foreground(fg))
         .background(bg)
+        .border_brush(ThemeRef::CardStroke)
+        .border_thickness(uniform(1.0))
         .corner_radius(10.0)
-        .padding(edges(9.0, 3.0, 9.0, 3.0))
+        .padding(edges(9.0, 2.0, 9.0, 2.0))
+}
+
+/// A small presence dot (host online/offline).
+pub(crate) fn presence_dot(online: bool) -> Border {
+    border(vstack(Vec::<Element>::new()))
+        .background(if online {
+            ThemeRef::SystemSuccess
+        } else {
+            ThemeRef::SystemNeutral
+        })
+        .corner_radius(4.0)
+        .width(8.0)
+        .height(8.0)
 }

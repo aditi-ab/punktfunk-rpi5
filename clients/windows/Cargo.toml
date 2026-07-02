@@ -39,6 +39,8 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "b4129fcc1ae8
     "Win32_Graphics_Gdi",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -57,8 +59,15 @@ sdl3 = { version = "0.18", features = ["build-from-source", "hidapi"] }
 
 mdns-sd = "0.20"
 async-channel = "2"
+# The decoded-frame channel (session pump → render thread): crossbeam because the render loop
+# blocks with `recv_timeout`, which async-channel has no sync analogue of.
+crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Embeds the app icon as an exe resource (build.rs) — Windows hosts only (rc.exe from the SDK).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

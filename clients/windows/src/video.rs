@@ -2,15 +2,24 @@
 //!
 //! Two backends, picked at session start (override via [`DecoderPref`] / the Settings UI):
 //!
-//! * **D3D11VA** (any GPU): libavcodec decodes on the GPU straight into `ID3D11Texture2D`s that
-//!   carry `D3D11_BIND_SHADER_RESOURCE`, so the presenter samples the decoded NV12/P010 surface
-//!   directly — **zero copy** (no swscale, no CPU readback, no per-frame upload). The textures are
-//!   created by the process-wide shared device ([`crate::gpu`]) the presenter also draws with, which
-//!   is what makes them bindable there. This is the big latency/throughput win over software decode.
-//! * **Software**: libavcodec on the CPU + swscale to a packed 4-byte format the presenter uploads
-//!   (`RGBA` for SDR, `X2BGR10` for HDR). The fallback on a GPU-less box (WARP), when D3D11VA init
-//!   fails, or when a mid-session hardware error demotes us — the host's IDR/RFI recovery
-//!   resynchronizes on the next keyframe either way.
+//! * **D3D11VA** (any GPU — the vendor-agnostic DXVA path on NVIDIA/AMD/Intel): libavcodec decodes
+//!   on the GPU into an `ID3D11Texture2D` decode array (decoder-only bind — NVIDIA rejects a
+//!   decoder array that is also a shader resource). The presenter copies each decoded slice into
+//!   its own sampleable NV12/P010 texture and converts YUV→RGB in a shader — one cheap GPU-to-GPU
+//!   copy per frame (no swscale, no CPU readback). The decode array is created by the process-wide
+//!   shared device ([`crate::gpu`]) the presenter also draws with, so the copy stays on-GPU. This
+//!   is the big latency/throughput win over software.
+//! * **Software**: libavcodec on the CPU + swscale to the same planar layout the hardware path
+//!   produces (NV12, or P010 for 10-bit) — the presenter uploads the two planes and runs the SAME
+//!   YUV→RGB shaders, so hw/sw color math is identical. The fallback on a GPU-less box (WARP),
+//!   when D3D11VA init fails, or when a mid-session hardware error demotes us — the host's
+//!   IDR/RFI recovery resynchronizes on the next keyframe either way.
+//!
+//! D3D11VA viability is settled **before the session's first frame** by two probes: the adapter
+//! must expose the negotiated codec's DXVA decode profile ([`decode_profile_supported`] — hwaccel
+//! init otherwise only fails at the first AU, burning the IDR), and it must be able to create the
+//! decode surface pool ([`d3d11va_decode_supported`]). Either failing commits to software decode
+//! from frame one (a clean, gap-free stream) instead of dying mid-stream.
 //!
 //! Both run `AV_CODEC_FLAG_LOW_DELAY`; the host encodes zero-reorder streams (no B-frames, in-band
 //! parameter sets on every IDR), so decode is strictly one-in/one-out.
@@ -25,7 +34,9 @@ use ffmpeg::util::frame::Video as AvFrame;
 use ffmpeg_next as ffmpeg;
 use std::ffi::c_void;
 use std::ptr;
-use windows::core::Interface; // ID3D11Device::clone().into_raw() for the FFmpeg hwdevice ctx
+use windows::core::{Interface, GUID};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11VideoDevice};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_P010};
 
 /// Which decode backend to use; the Settings UI persists this as a string.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -69,21 +80,27 @@ impl DecodedFrame {
     }
 }
 
-/// Packed 4-byte-per-pixel frame for a D3D11 dynamic-texture upload (which takes a row pitch). The
-/// bytes are `R8G8B8A8` for SDR and `X2BGR10` (== DXGI `R10G10B10A2`, R in the low 10 bits) for HDR.
+/// A software-decoded frame in the same planar layout the hardware path produces: an NV12 (or
+/// P010 for 10-bit) luma plane + interleaved chroma plane, each with its swscale row stride
+/// (≥ the row bytes — swscale pads rows for SIMD). The presenter uploads them into two dynamic
+/// plane textures sampled by the same shaders as the D3D11VA path.
 pub struct CpuFrame {
     pub width: u32,
     pub height: u32,
-    /// Row stride in bytes (≥ width*4 — swscale pads rows for SIMD).
-    pub stride: usize,
-    pub pixels: Vec<u8>,
-    /// BT.2020 PQ HDR10 frame: `pixels` is `X2BGR10` and the presenter switches to a 10-bit
-    /// R10G10B10A2 + ST.2084 swapchain. `false` = ordinary 8-bit BT.709 SDR.
+    /// Luma plane (`W×H` samples, 1 byte each; 2 for 10-bit) + its row stride in bytes.
+    pub y: Vec<u8>,
+    pub y_stride: usize,
+    /// Interleaved chroma plane (`⌈W/2⌉×⌈H/2⌉` UV pairs) + its row stride in bytes.
+    pub uv: Vec<u8>,
+    pub uv_stride: usize,
+    /// P010 sample layout (10 bits in the high bits of 16) vs NV12. Selects texture/SRV formats.
+    pub ten_bit: bool,
+    /// BT.2020 PQ HDR10 vs ordinary BT.709 SDR. Selects shader + swapchain colour space.
     pub hdr: bool,
 }
 
 /// A decoded frame still on the GPU: a D3D11 texture **array** plus the slice index the decoder
-/// wrote this frame into. The presenter creates per-plane shader-resource views over the slice and
+/// wrote this frame into. The presenter copies the slice into its own sampleable texture and
 /// converts YUV→RGB in a pixel shader. The underlying surface stays alive — and out of the decoder's
 /// reuse pool — for exactly as long as `guard` (an `av_frame_clone` of the decoded frame) lives.
 pub struct GpuFrame {
@@ -91,16 +108,20 @@ pub struct GpuFrame {
     pub height: u32,
     /// Texture-array slice this frame occupies (`AVFrame::data[1]`).
     pub index: u32,
-    /// BT.2020 PQ HDR10 (P010, ST.2084) vs ordinary 8-bit BT.709 SDR (NV12). The present path keys
-    /// SRV format + shader off this (the host couples 10-bit ⟺ HDR).
+    /// The decode pool is P010 (10 bits in the high bits) vs NV12 — from the frames context's
+    /// `sw_format`. The presenter keys its copy-texture/SRV formats off this: they must match the
+    /// source array exactly for `CopySubresourceRegion`.
+    pub ten_bit: bool,
+    /// BT.2020 PQ HDR10 (ST.2084 transfer) vs ordinary BT.709 SDR. Selects shader + swapchain
+    /// colour space only (the host couples 10-bit ⟺ HDR today, but formats key off `ten_bit`).
     pub hdr: bool,
     guard: D3d11FrameGuard,
 }
 
 impl GpuFrame {
     /// The decoder's D3D11 texture array holding this frame's slice, borrowed from the live cloned
-    /// `AVFrame`. Construct the windows-rs interface on the thread that will use it (the presenter /
-    /// UI thread): COM interfaces are `!Send`, but the raw pointer is fine to carry across threads.
+    /// `AVFrame`. Construct the windows-rs interface on the thread that will use it (the render
+    /// thread): COM interfaces are `!Send`, but the raw pointer is fine to carry across threads.
     pub fn texture_ptr(&self) -> *mut c_void {
         unsafe { (*self.guard.0).data[0] as *mut c_void }
     }
@@ -108,7 +129,7 @@ impl GpuFrame {
 
 /// Owns a cloned decoded `AVFrame` (which refs the D3D11 surface in the decoder pool). Dropping it
 /// releases the surface back for reuse. The clone is plain refcounted data; freeing it from the
-/// presenter thread is fine.
+/// render thread is fine.
 pub struct D3d11FrameGuard(*mut ffmpeg::ffi::AVFrame);
 unsafe impl Send for D3d11FrameGuard {}
 impl Drop for D3d11FrameGuard {
@@ -139,6 +160,7 @@ pub fn ffmpeg_codec_id(wire: u8) -> ffmpeg::codec::Id {
 
 /// The `quic` codec bitfield this client can decode — whatever FFmpeg has a decoder for (HEVC/H.264
 /// always; AV1 when built in). Advertised to the host so it never emits a codec we can't decode.
+/// Deliberately NOT gated on the DXVA profiles: software decode covers anything FFmpeg can.
 pub fn decodable_codecs() -> u8 {
     let _ = ffmpeg::init();
     let mut bits = 0u8;
@@ -160,7 +182,7 @@ impl Decoder {
         if pref != DecoderPref::Software {
             match D3d11vaDecoder::new(codec_id) {
                 Ok(d) => {
-                    tracing::info!(?codec_id, "D3D11VA hardware decode active (zero-copy)");
+                    tracing::info!(?codec_id, "D3D11VA hardware decode active");
                     return Ok(Decoder {
                         backend: Backend::D3d11va(d),
                         codec_id,
@@ -180,7 +202,7 @@ impl Decoder {
         })
     }
 
-    /// True for the zero-copy hardware backend (shown in the stream HUD).
+    /// True for the GPU hardware backend (shown in the stream HUD).
     pub fn is_hardware(&self) -> bool {
         matches!(self.backend, Backend::D3d11va(_))
     }
@@ -203,12 +225,73 @@ impl Decoder {
     }
 }
 
+// --- DXVA decode-profile probe --------------------------------------------------------
+
+/// DXVA decode-profile GUIDs (`dxva.h`), defined locally so no extra windows-rs feature or
+/// metadata surface is pulled in for four constants.
+const PROFILE_H264_VLD_NOFGT: GUID = GUID::from_u128(0x1b81be68_a0c7_11d3_b984_00c04f2e73c5);
+const PROFILE_HEVC_VLD_MAIN: GUID = GUID::from_u128(0x5b11d51b_2f4c_4452_bcc3_09f2a1160cc0);
+const PROFILE_HEVC_VLD_MAIN10: GUID = GUID::from_u128(0x107af0e0_ef1a_4d19_aba8_67a163073d13);
+const PROFILE_AV1_VLD_PROFILE0: GUID = GUID::from_u128(0xb8be4ccb_cf53_46ba_8d59_d6b8a6da5d2a);
+
+/// Does the shared device's adapter expose a DXVA decode profile for `codec_id`? Checked before
+/// building the FFmpeg hwdevice because hwaccel selection (`get_format`) only runs on the FIRST
+/// access unit — an unsupported profile would otherwise burn the opening IDR and recover through
+/// the mid-stream demotion path instead of committing to software up front. Also logs (once) the
+/// adapter's full profile list plus Main10 availability — the forensics for a new GPU/driver.
+fn decode_profile_supported(device: &ID3D11Device, codec_id: ffmpeg::codec::Id) -> Result<()> {
+    let video: ID3D11VideoDevice = device
+        .cast()
+        .context("device lacks ID3D11VideoDevice (created without VIDEO_SUPPORT)")?;
+    let profiles: Vec<GUID> = unsafe {
+        let n = video.GetVideoDecoderProfileCount();
+        (0..n)
+            .filter_map(|i| video.GetVideoDecoderProfile(i).ok())
+            .collect()
+    };
+    log_profiles_once(&profiles);
+
+    let (wanted, format, name): (GUID, DXGI_FORMAT, &str) = match codec_id {
+        ffmpeg::codec::Id::H264 => (PROFILE_H264_VLD_NOFGT, DXGI_FORMAT_NV12, "H.264 VLD NoFGT"),
+        ffmpeg::codec::Id::HEVC => (PROFILE_HEVC_VLD_MAIN, DXGI_FORMAT_NV12, "HEVC Main"),
+        ffmpeg::codec::Id::AV1 => (PROFILE_AV1_VLD_PROFILE0, DXGI_FORMAT_NV12, "AV1 Profile 0"),
+        other => bail!("no DXVA profile known for {other:?}"),
+    };
+    let ok = profiles.contains(&wanted)
+        && unsafe { video.CheckVideoDecoderFormat(&wanted, format) }
+            .map(|b| b.as_bool())
+            .unwrap_or(false);
+    if !ok {
+        bail!("adapter exposes no {name} decode profile");
+    }
+    // 10-bit (a mid-session HDR upgrade needs Main10): informational — if it's missing the
+    // decode error → software demotion + keyframe re-request path covers the switch.
+    if codec_id == ffmpeg::codec::Id::HEVC {
+        let main10 = profiles.contains(&PROFILE_HEVC_VLD_MAIN10)
+            && unsafe { video.CheckVideoDecoderFormat(&PROFILE_HEVC_VLD_MAIN10, DXGI_FORMAT_P010) }
+                .map(|b| b.as_bool())
+                .unwrap_or(false);
+        tracing::info!(main10, "HEVC Main10 (10-bit/HDR) decode profile");
+    }
+    Ok(())
+}
+
+/// One-time dump of the adapter's DXVA decode profiles.
+fn log_profiles_once(profiles: &[GUID]) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(true);
+    if ONCE.swap(false, Ordering::Relaxed) {
+        let list: Vec<String> = profiles.iter().map(|g| format!("{g:?}")).collect();
+        tracing::info!(count = profiles.len(), profiles = ?list, "adapter DXVA decode profiles");
+    }
+}
+
 // --- software backend ---------------------------------------------------------------
 
 struct SoftwareDecoder {
     decoder: ffmpeg::decoder::Video,
     /// Rebuilt whenever the decoded format/size **or output format** changes (mid-stream
-    /// `Reconfigure`, or an SDR↔HDR flip): `(ctx, src_fmt, w, h, dst_fmt)`.
+    /// `Reconfigure`, or an 8↔10-bit flip): `(ctx, src_fmt, w, h, dst_fmt)`.
     sws: Option<(scaling::Context, Pixel, u32, u32, Pixel)>,
 }
 
@@ -241,36 +324,24 @@ impl SoftwareDecoder {
         Ok(out)
     }
 
-    /// Convert the decoded YUV frame to a packed 4-byte format the presenter uploads directly:
-    /// SDR → `RGBA` (BT.709), HDR (SMPTE ST.2084 / PQ transfer) → `X2BGR10` (== DXGI R10G10B10A2)
-    /// using the BT.2020 matrix. For HDR the PQ-encoded values pass through unchanged (swscale only
-    /// applies the YUV→RGB matrix + range, never the transfer) — exactly what an HDR10 swapchain wants.
+    /// Convert the decoded planar YUV to the hardware path's layout: NV12 for 8-bit, P010 for
+    /// 10-bit — a chroma interleave (and 10→16-high-bits shift), NOT a colour conversion. The
+    /// matrix/range/transfer handling all lives in the presenter's shaders, shared with the
+    /// D3D11VA path, so software frames are bit-comparable with hardware ones.
     fn convert(&mut self, frame: &AvFrame) -> Result<CpuFrame> {
         use ffmpeg::color::TransferCharacteristic;
         let (fmt, w, h) = (frame.format(), frame.width(), frame.height());
         let hdr = frame.color_transfer_characteristic() == TransferCharacteristic::SMPTE2084;
-        let dst = if hdr { Pixel::X2BGR10LE } else { Pixel::RGBA };
+        // Source bit depth from the pix-fmt descriptor (stable FFmpeg public API).
+        let ten_bit = unsafe {
+            let desc = ffmpeg::ffi::av_pix_fmt_desc_get(fmt.into());
+            !desc.is_null() && (*desc).comp[0].depth > 8
+        };
+        let dst = if ten_bit { Pixel::P010LE } else { Pixel::NV12 };
         let rebuild = !matches!(&self.sws, Some((_, f, sw, sh, d)) if *f == fmt && *sw == w && *sh == h && *d == dst);
         if rebuild {
-            let mut ctx = scaling::Context::get(fmt, w, h, dst, w, h, scaling::Flags::POINT)
+            let ctx = scaling::Context::get(fmt, w, h, dst, w, h, scaling::Flags::POINT)
                 .context("swscale context")?;
-            if hdr {
-                // BT.2020 non-constant-luminance YUV (limited range) → full-range RGB. swscale
-                // applies only the matrix + range here, so the samples stay PQ-encoded.
-                unsafe {
-                    let coef = ffmpeg::ffi::sws_getCoefficients(ffmpeg::ffi::SWS_CS_BT2020);
-                    ffmpeg::ffi::sws_setColorspaceDetails(
-                        ctx.as_mut_ptr(),
-                        coef,
-                        0, // src range: limited (video)
-                        coef,
-                        1, // dst range: full
-                        0,
-                        1 << 16,
-                        1 << 16, // brightness / contrast / saturation defaults (16.16)
-                    );
-                }
-            }
             self.sws = Some((ctx, fmt, w, h, dst));
         }
         let (sws, ..) = self.sws.as_mut().unwrap();
@@ -279,8 +350,11 @@ impl SoftwareDecoder {
         Ok(CpuFrame {
             width: w,
             height: h,
-            stride: conv.stride(0),
-            pixels: conv.data(0).to_vec(),
+            y: conv.data(0).to_vec(),
+            y_stride: conv.stride(0),
+            uv: conv.data(1).to_vec(),
+            uv_stride: conv.stride(1),
+            ten_bit,
             hdr,
         })
     }
@@ -295,11 +369,16 @@ impl SoftwareDecoder {
 // decoded surfaces transfer out through D3d11FrameGuard.
 
 const AVERROR_EAGAIN: i32 = -11; // -EAGAIN
-const D3D11_BIND_SHADER_RESOURCE: u32 = 0x8; // <d3d11.h>; FFmpeg ORs D3D11_BIND_DECODER itself
+
+/// D3D11VA decode surface pool depth: the zero-reorder DPB (1–2 refs) + the bounded decoded channel
+/// (2) + the frame the presenter currently holds (until its copy flushes) + one in-flight decode —
+/// 12 is comfortable. A GPU that can't create the pool at all is gated out by
+/// `d3d11va_decode_supported` and the session uses software decode.
+const DECODE_POOL_SIZE: i32 = 12;
 
 /// `hwcontext_d3d11va.h` — `AVHWDeviceContext::hwctx`. Leaving `lock` null makes FFmpeg install an
 /// `ID3D11Multithread` default lock + set multithread protection on `device_context` during init,
-/// which is what lets the presenter share this device's immediate context from the UI thread.
+/// which is what lets the presenter share this device's immediate context from the render thread.
 #[repr(C)]
 struct AVD3D11VADeviceContext {
     device: *mut c_void,         // ID3D11Device*
@@ -311,70 +390,79 @@ struct AVD3D11VADeviceContext {
     lock_ctx: *mut c_void,
 }
 
-/// `hwcontext_d3d11va.h` — `AVHWFramesContext::hwctx`. `BindFlags` lets us add
-/// `D3D11_BIND_SHADER_RESOURCE` so the decoded array texture is sampleable (zero copy).
+/// `hwcontext_d3d11va.h` — `AVHWFramesContext::hwctx`. The header is explicit: "The user must at
+/// least set D3D11_BIND_DECODER if the frames context is to be used for video decoding" — a
+/// user-built frames context gets NO default (BindFlags 0 → `CreateTexture2D` E_INVALIDARG); the
+/// automatic OR-in lives only in libavcodec's own frames-param path, which we bypass.
 #[repr(C)]
 struct AVD3D11VAFramesContext {
     texture: *mut c_void, // ID3D11Texture2D* (null → FFmpeg allocates the pool)
     bind_flags: u32,      // UINT BindFlags
     misc_flags: u32,      // UINT MiscFlags
+    texture_infos: *mut c_void, // AVD3D11FrameDescriptor* (FFmpeg-managed)
 }
+
+/// `D3D11_BIND_DECODER` — the decode pool's ONLY bind flag. Adding `D3D11_BIND_SHADER_RESOURCE`
+/// is what NVIDIA rejects on a decoder texture ARRAY; the presenter samples via its own copy.
+const BIND_DECODER: u32 = 0x200;
 
 fn averr(what: &str, code: i32) -> anyhow::Error {
     anyhow!("{what}: {}", ffmpeg::Error::from(code))
 }
 
-/// libavcodec's `get_format` callback: accept the D3D11 hw surface, building a frames context whose
-/// textures carry `BIND_SHADER_RESOURCE` (so the presenter can sample them). Returning anything but
-/// `AV_PIX_FMT_D3D11` aborts hardware decode → the session demotes to software.
+/// libavcodec's `get_format` callback: pick the D3D11 hw surface format and nothing else.
+/// Deliberately does NOT build a frames context — with `hw_device_ctx` set and `hw_frames_ctx`
+/// left null, libavcodec derives the decode pool itself (`ff_decode_get_hw_frames_ctx`), applying
+/// every vendor quirk: DXVA surface alignment (128 for HEVC/AV1), DPB-based pool sizing, and the
+/// decoder-only `D3D11_BIND_DECODER` flags. A hand-built context validated on NVIDIA was rejected
+/// by Intel at the first `SubmitDecoderBuffers` (E_INVALIDARG) — the vendor-proof path is the one
+/// the ffmpeg CLI/mpv ship. Returning anything but `AV_PIX_FMT_D3D11` aborts hardware decode →
+/// the session demotes to software.
 unsafe extern "C" fn get_format_d3d11(
     avctx: *mut ffmpeg::ffi::AVCodecContext,
     mut list: *const ffmpeg::ffi::AVPixelFormat,
 ) -> ffmpeg::ffi::AVPixelFormat {
     use ffmpeg::ffi::*;
     unsafe {
-        let mut found = false;
+        if (*avctx).hw_device_ctx.is_null() {
+            return AVPixelFormat::AV_PIX_FMT_NONE;
+        }
         while *list != AVPixelFormat::AV_PIX_FMT_NONE {
             if *list == AVPixelFormat::AV_PIX_FMT_D3D11 {
-                found = true;
-                break;
+                return AVPixelFormat::AV_PIX_FMT_D3D11;
             }
             list = list.add(1);
         }
-        if !found {
-            return AVPixelFormat::AV_PIX_FMT_NONE;
-        }
-        let device_ref = (*avctx).hw_device_ctx;
-        if device_ref.is_null() {
-            return AVPixelFormat::AV_PIX_FMT_NONE;
-        }
-        let frames_ref = av_hwframe_ctx_alloc(device_ref);
+        AVPixelFormat::AV_PIX_FMT_NONE
+    }
+}
+
+/// Predict whether D3D11VA decode will work by doing EXACTLY what the decoder's `get_format` does —
+/// allocate an `AVHWFramesContext` (decoder-only pool, no shader-resource bind) and initialize it,
+/// which creates the real NV12 decode surface array. On a GPU/driver that can't create the pool this
+/// fails here, up front, so the session commits to software decode from the first frame (a clean,
+/// gap-free stream) rather than decoding the IDR then dying mid-stream on a texture error that a
+/// software demotion can't reliably recover from (the host's infinite GOP won't re-send an IDR).
+unsafe fn d3d11va_decode_supported(hw_device: *mut ffmpeg::ffi::AVBufferRef) -> bool {
+    use ffmpeg::ffi::*;
+    unsafe {
+        let frames_ref = av_hwframe_ctx_alloc(hw_device);
         if frames_ref.is_null() {
-            return AVPixelFormat::AV_PIX_FMT_NONE;
+            return false;
         }
         let frames = (*frames_ref).data as *mut AVHWFramesContext;
         (*frames).format = AVPixelFormat::AV_PIX_FMT_D3D11;
-        let sw = if (*avctx).sw_pix_fmt != AVPixelFormat::AV_PIX_FMT_NONE {
-            (*avctx).sw_pix_fmt
-        } else {
-            AVPixelFormat::AV_PIX_FMT_NV12
-        };
-        (*frames).sw_format = sw;
-        (*frames).width = (*avctx).coded_width;
-        (*frames).height = (*avctx).coded_height;
-        // DPB + a few in-flight (decoded channel + the presenter's held frame); the host's
-        // zero-reorder stream needs only a small DPB, so 20 is comfortable headroom.
-        (*frames).initial_pool_size = 20;
+        (*frames).sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
+        (*frames).width = 1920;
+        (*frames).height = 1152; // 128-aligned 1080p surface (the HEVC DXVA alignment, see get_format)
+        (*frames).initial_pool_size = DECODE_POOL_SIZE;
+        // Decoder-only — matches get_format exactly.
         let fhw = (*frames).hwctx as *mut AVD3D11VAFramesContext;
-        (*fhw).bind_flags = D3D11_BIND_SHADER_RESOURCE;
+        (*fhw).bind_flags = BIND_DECODER;
         let r = av_hwframe_ctx_init(frames_ref);
-        if r < 0 {
-            let mut fr = frames_ref;
-            av_buffer_unref(&mut fr);
-            return AVPixelFormat::AV_PIX_FMT_NONE;
-        }
-        (*avctx).hw_frames_ctx = frames_ref; // decoder takes ownership
-        AVPixelFormat::AV_PIX_FMT_D3D11
+        let mut fr = frames_ref;
+        av_buffer_unref(&mut fr);
+        r >= 0
     }
 }
 
@@ -395,6 +483,8 @@ impl D3d11vaDecoder {
         if !shared.hardware {
             bail!("shared device is WARP (no hardware video decode)");
         }
+        // The adapter must expose the codec's DXVA profile — checked here, not at the first AU.
+        decode_profile_supported(&shared.device, codec_id)?;
         unsafe {
             // Build a D3D11VA hwdevice context around the *shared* device, so decoded textures live
             // on the same device the presenter samples + draws with.
@@ -417,6 +507,15 @@ impl D3d11vaDecoder {
                 bail!("av_hwdevice_ctx_init: {}", ffmpeg::Error::from(r));
             }
 
+            // Up-front viability probe (see `d3d11va_decode_supported`): a GPU/driver that can't
+            // create the decode surface pool commits to software NOW, so it decodes cleanly from the
+            // first frame instead of failing mid-stream (which a demotion can't reliably recover).
+            if !d3d11va_decode_supported(hw_device) {
+                let mut hw = hw_device;
+                ffi::av_buffer_unref(&mut hw);
+                bail!("GPU can't create the D3D11VA decode surface pool — using software decode");
+            }
+
             let codec = ffi::avcodec_find_decoder(codec_id.into());
             if codec.is_null() {
                 let mut hw = hw_device;
@@ -427,7 +526,11 @@ impl D3d11vaDecoder {
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device);
             (*ctx).get_format = Some(get_format_d3d11);
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
-            (*ctx).thread_count = 1; // hwaccel: threads only add latency
+            // hwaccel: threads only add latency.
+            (*ctx).thread_count = 1;
+            // On top of the DPB-based pool libavcodec sizes for us: the bounded decoded channel
+            // (2) + the frame the presenter holds until its copy flushes + margin.
+            (*ctx).extra_hw_frames = 4;
             let r = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if r < 0 {
                 let mut ctx = ctx;
@@ -499,6 +602,7 @@ impl D3d11vaDecoder {
                 width: (*self.frame).width as u32,
                 height: (*self.frame).height as u32,
                 index: (*self.frame).data[1] as usize as u32,
+                ten_bit,
                 hdr,
                 guard: D3d11FrameGuard(cloned),
             };
@@ -532,7 +636,7 @@ fn log_layout_once(width: u32, height: u32, index: u32, hdr: bool, ten_bit: bool
             slice = index,
             hdr,
             ten_bit,
-            "D3D11VA first frame (zero-copy)"
+            "D3D11VA first frame"
         );
     }
 }

@@ -1,5 +1,6 @@
-//! The hosts page: saved (trusted/paired) hosts with per-host actions (speed test, forget),
-//! live mDNS discovery, and a manual connect entry.
+//! The hosts page: saved (trusted/paired) hosts and live mDNS discovery as tap-to-connect
+//! tiles in a responsive grid, with a per-host "…" menu (connect / speed test / rename /
+//! forget) and a manual connect entry — the same card layout as the Linux and Apple clients.
 
 use super::connect::initiate;
 use super::speed::SpeedState;
@@ -9,74 +10,190 @@ use crate::discovery::DiscoveredHost;
 use crate::trust::KnownHosts;
 use windows_reactor::*;
 
+/// Overflow-menu item labels — `on_menu_item_clicked` reports the clicked item by its text.
+const MENU_CONNECT: &str = "Connect";
+const MENU_SPEED: &str = "Test network speed\u{2026}";
+const MENU_RENAME: &str = "Rename\u{2026}";
+const MENU_FORGET: &str = "Forget\u{2026}";
+
+/// Tile-grid metrics: minimum tile width before dropping a column, and the gap between tiles.
+const TILE_MIN_WIDTH: f64 = 320.0;
+const TILE_GAP: f64 = 12.0;
+
 /// Props for the hosts page: the services plus the changing discovery/status data that must
 /// drive its re-render (compared by value, so a new host list or error refreshes the page).
+///
+/// `forget` and `rename` are the per-host action state, and they live in ROOT (not this page's
+/// own `use_state`) on purpose: the "…" overflow is a WinUI `MenuFlyout`, whose item clicks are
+/// wired directly in the reactor backend (`add_Click`) and so bypass the normal event-dispatch
+/// flush — a *sync* child `SetState` from that handler marks state dirty but never pumps the
+/// reconciler, so nothing re-renders. Root `AsyncSetState` re-renders the whole tree; because
+/// these values are props, the changed value propagates back into this page (a child's own async
+/// state would be memoised away when its props are unchanged). `(fp_hex, _)` in each identifies
+/// the target saved host; `rename`'s second field is the in-progress draft name.
 #[derive(Clone)]
 pub(crate) struct HostsProps {
     pub(crate) svc: Svc,
     pub(crate) hosts: Vec<DiscoveredHost>,
     pub(crate) status: String,
+    pub(crate) forget: Option<(String, String)>,
+    pub(crate) rename: Option<(String, String)>,
+    /// Whether the "Add host" modal is open. Root state (like `forget`/`rename`), not the page's
+    /// own `use_state`: a child component's sync `SetState` marks its slot dirty but does not
+    /// re-render when its props are otherwise unchanged, so the toggle wouldn't take.
+    pub(crate) show_add: bool,
+    pub(crate) set_forget: AsyncSetState<Option<(String, String)>>,
+    pub(crate) set_rename: AsyncSetState<Option<(String, String)>>,
+    pub(crate) set_show_add: AsyncSetState<bool>,
 }
 
 impl PartialEq for HostsProps {
     fn eq(&self, other: &Self) -> bool {
-        self.svc == other.svc && self.hosts == other.hosts && self.status == other.status
+        // Setters are identity-stable; only the value fields drive re-render.
+        self.svc == other.svc
+            && self.hosts == other.hosts
+            && self.status == other.status
+            && self.forget == other.forget
+            && self.rename == other.rename
+            && self.show_add == other.show_add
     }
 }
 
-/// A clickable host row: monogram + name/address + optional action buttons + status pill +
-/// chevron. `actions` land between the text and the pill (saved hosts: speed test / forget).
-fn host_card(
+/// A host tile. The tap-to-connect summary (monogram, name, address, status row) and the
+/// optional "…" menu button are SIBLINGS overlaid in one grid cell, never nested: WinUI bubbles
+/// `Tapped` out of buttons (reactor doesn't mark it handled), so a button inside the tap target
+/// would fire both its own click and the tile's connect (the old forget-also-connects bug).
+fn host_tile(
     name: &str,
     sub: &str,
-    badge: &str,
-    actions: Vec<Element>,
-    on_tap: impl Fn() + 'static,
+    status_row: Element,
+    menu: Option<Button>,
+    on_tap: Option<Box<dyn Fn()>>,
 ) -> Element {
-    let kind = match badge {
-        "Paired" => Pill::Good,
-        "Open" => Pill::Neutral,
-        _ => Pill::Accent, // Trusted / PIN
+    let mut summary = border(
+        vstack((
+            avatar(name)
+                .width(44.0)
+                .height(44.0)
+                .horizontal_alignment(HorizontalAlignment::Left),
+            text_block(name)
+                .font_size(15.0)
+                .semibold()
+                .margin(edges(0.0, 12.0, 0.0, 0.0)),
+            text_block(sub)
+                .font_size(12.0)
+                .font_family("Consolas")
+                .foreground(ThemeRef::SecondaryText)
+                .margin(edges(0.0, 2.0, 0.0, 0.0)),
+            status_row,
+        ))
+        .spacing(0.0),
+    )
+    .background(hit_test_backstop())
+    .padding(uniform(18.0));
+    if let Some(f) = on_tap {
+        summary = summary.on_tapped(f);
+    }
+
+    let mut children: Vec<Element> = vec![summary.into()];
+    if let Some(m) = menu {
+        children.push(
+            m.horizontal_alignment(HorizontalAlignment::Right)
+                .vertical_alignment(VerticalAlignment::Top)
+                .margin(edges(0.0, 8.0, 8.0, 0.0))
+                .into(),
+        );
+    }
+    card_flush(grid(children)).into()
+}
+
+/// The status row at the bottom of a tile: presence dot + Online/Offline, plus the trust chip.
+fn status_row(online: Option<bool>, badge: &str, kind: Pill) -> Element {
+    let mut items: Vec<Element> = Vec::new();
+    if let Some(online) = online {
+        items.push(
+            presence_dot(online)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        );
+        items.push(
+            text_block(if online { "Online" } else { "Offline" })
+                .font_size(11.0)
+                .foreground(ThemeRef::SecondaryText)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        );
+    }
+    items.push(
+        pill(badge, kind)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into(),
+    );
+    hstack(items)
+        .spacing(6.0)
+        .margin(edges(0.0, 12.0, 0.0, 0.0))
+        .into()
+}
+
+/// Lay tiles into a `cols`-wide grid of equal-width star columns (rows share the height of
+/// their tallest tile, so a grid row always lines up).
+fn tile_grid(tiles: Vec<Element>, cols: usize) -> Element {
+    let rows = tiles.len().div_ceil(cols);
+    let mut children = Vec::with_capacity(tiles.len());
+    for (i, t) in tiles.into_iter().enumerate() {
+        children.push(t.grid_row((i / cols) as i32).grid_column((i % cols) as i32));
+    }
+    grid(children)
+        .columns(vec![GridLength::Star(1.0); cols])
+        .rows(vec![GridLength::Auto; rows])
+        .column_spacing(TILE_GAP)
+        .row_spacing(TILE_GAP)
+        .into()
+}
+
+/// The in-tile rename editor (ContentDialog can't hold a text field): name box + save/cancel.
+/// No tap-to-connect while editing — a click into the box would bubble `Tapped` to the region.
+fn rename_editor(
+    draft: &str,
+    fp: String,
+    set_rename: AsyncSetState<Option<(String, String)>>,
+) -> Element {
+    let commit = {
+        let (fp, draft, sr) = (fp.clone(), draft.to_string(), set_rename.clone());
+        move || {
+            let name = draft.trim();
+            if !name.is_empty() {
+                let mut known = KnownHosts::load();
+                if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp) {
+                    h.name = name.to_string();
+                }
+                let _ = known.save();
+            }
+            sr.call(None);
+        }
+    };
+    let on_changed = {
+        let sr = set_rename.clone();
+        move |s: String| sr.call(Some((fp.clone(), s)))
     };
     card(
-        grid((
-            avatar(name)
-                .grid_column(0)
-                .vertical_alignment(VerticalAlignment::Center),
-            vstack((
-                text_block(name).font_size(15.0).semibold(),
-                text_block(sub)
-                    .font_size(12.0)
-                    .foreground(ThemeRef::SecondaryText),
+        vstack((
+            text_box(draft)
+                .placeholder("Host name")
+                .on_changed(on_changed),
+            hstack((
+                button("Save")
+                    .accent()
+                    .icon(SymbolGlyph::Accept)
+                    .on_click(commit),
+                button("Cancel")
+                    .subtle()
+                    .on_click(move || set_rename.call(None)),
             ))
-            .spacing(2.0)
-            .grid_column(1)
-            .vertical_alignment(VerticalAlignment::Center)
-            .margin(edges(12.0, 0.0, 0.0, 0.0)),
-            hstack(actions)
-                .spacing(4.0)
-                .grid_column(2)
-                .vertical_alignment(VerticalAlignment::Center)
-                .margin(edges(0.0, 0.0, 10.0, 0.0)),
-            pill(badge, kind)
-                .grid_column(3)
-                .vertical_alignment(VerticalAlignment::Center)
-                .margin(edges(0.0, 0.0, 10.0, 0.0)),
-            text_block("\u{203A}")
-                .font_size(18.0)
-                .foreground(ThemeRef::SecondaryText)
-                .grid_column(4)
-                .vertical_alignment(VerticalAlignment::Center),
+            .spacing(4.0),
         ))
-        .columns([
-            GridLength::Auto,
-            GridLength::Star(1.0),
-            GridLength::Auto,
-            GridLength::Auto,
-            GridLength::Auto,
-        ]),
+        .spacing(10.0),
     )
-    .on_tapped(on_tap)
     .into()
 }
 
@@ -87,10 +204,22 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     let set_screen = &props.svc.set_screen;
     let set_status = &props.svc.set_status;
     let (manual, set_manual) = cx.use_state(String::new());
-    // Pending "forget host" confirmation: `(fp_hex, name)` of the saved host to drop. Drives the
-    // ContentDialog below; sync state, so setting it re-renders this page.
-    let (forget, set_forget) = cx.use_state(Option::<(String, String)>::None);
+    // "Add host" modal open state lives in ROOT (see `HostsProps`).
+    let show_add = props.show_add;
+    let set_show_add = &props.set_show_add;
+    // Forget confirmation and in-progress rename live in ROOT state (see `HostsProps`) — the
+    // overflow menu's flyout clicks can't re-render off a sync setter. Both are `(fp_hex, _)`.
+    let forget = props.forget.clone();
+    let rename = props.rename.clone();
+    let set_forget = &props.set_forget;
+    let set_rename = &props.set_rename;
     let known = KnownHosts::load();
+
+    // Responsive column count from the live window width (re-renders on resize): as many
+    // TILE_MIN_WIDTH columns as fit the page's content width, at least one.
+    let window = cx.use_inner_size();
+    let content_w = (window.width - 64.0).clamp(TILE_MIN_WIDTH, 1120.0);
+    let cols = (((content_w + TILE_GAP) / (TILE_MIN_WIDTH + TILE_GAP)).floor() as usize).max(1);
 
     let mut body: Vec<Element> = Vec::new();
 
@@ -105,17 +234,25 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .spacing(2.0)
             .grid_column(0)
             .vertical_alignment(VerticalAlignment::Center),
-            button("Settings")
-                .icon(SymbolGlyph::Setting)
-                .on_click({
+            hstack((
+                button("Add host")
+                    .accent()
+                    .icon(SymbolGlyph::Add)
+                    .on_click({
+                        let sa = set_show_add.clone();
+                        move || sa.call(true)
+                    }),
+                button("Settings").icon(SymbolGlyph::Setting).on_click({
                     let ss = set_screen.clone();
                     move || ss.call(Screen::Settings)
-                })
-                .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Center),
+                }),
+            ))
+            .spacing(8.0)
+            .grid_column(1)
+            .vertical_alignment(VerticalAlignment::Center),
         ))
         .columns([GridLength::Star(1.0), GridLength::Auto])
-        .margin(edges(0.0, 0.0, 0.0, 6.0))
+        .margin(edges(0.0, 0.0, 0.0, 10.0))
         .into(),
     );
 
@@ -129,10 +266,18 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         );
     }
 
-    // Saved (trusted/paired) hosts — reachable even when mDNS isn't.
+    // Saved (trusted/paired) hosts — reachable even when mDNS isn't. A saved host that's also
+    // being advertised right now shows as Online (and is deduped out of the discovery section).
     if !known.hosts.is_empty() {
         body.push(section("SAVED HOSTS"));
+        let mut tiles: Vec<Element> = Vec::new();
         for k in &known.hosts {
+            // Rust 2021 (no let-chains): match the "this tile is being renamed" case explicitly.
+            if matches!(&rename, Some((fp, _)) if fp == &k.fp_hex) {
+                let (fp, draft) = rename.clone().unwrap();
+                tiles.push(rename_editor(&draft, fp, set_rename.clone()));
+                continue;
+            }
             let target = Target {
                 name: k.name.clone(),
                 addr: k.addr.clone(),
@@ -140,45 +285,72 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 fp_hex: Some(k.fp_hex.clone()),
                 pair_optional: false,
             };
-            // Per-host actions: measure the path (probe burst → recommended bitrate) and forget
-            // (drops the pinned fingerprint — a later connect re-pairs).
-            let speed_btn = {
+            let online = hosts
+                .iter()
+                .any(|h| h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port));
+            let menu = {
                 let (svc, target) = (props.svc.clone(), target.clone());
-                button("Test")
-                    .icon(SymbolGlyph::Sync)
+                let (sf, sr) = (set_forget.clone(), set_rename.clone());
+                let (fp, name) = (k.fp_hex.clone(), k.name.clone());
+                button("")
+                    .icon(SymbolGlyph::More)
                     .subtle()
-                    .on_click(move || {
-                        *svc.ctx.shared.target.lock().unwrap() = target.clone();
-                        // New run: invalidate any still-in-flight probe and reset the screen.
-                        svc.ctx
-                            .shared
-                            .speed_gen
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        svc.set_speed.call(SpeedState::Running);
-                        svc.set_screen.call(Screen::SpeedTest);
+                    .tooltip("More options")
+                    .automation_name("More options")
+                    .menu_flyout(vec![
+                        menu_item(MENU_CONNECT),
+                        menu_item(MENU_SPEED),
+                        menu_item(MENU_RENAME),
+                        menu_separator(),
+                        menu_item(MENU_FORGET),
+                    ])
+                    .on_menu_item_clicked(move |item: String| match item.as_str() {
+                        MENU_CONNECT => {
+                            initiate(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
+                        }
+                        MENU_SPEED => {
+                            *svc.ctx.shared.target.lock().unwrap() = target.clone();
+                            // New run: invalidate any still-in-flight probe, reset the screen.
+                            svc.ctx
+                                .shared
+                                .speed_gen
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            svc.set_speed.call(SpeedState::Running);
+                            svc.set_screen.call(Screen::SpeedTest);
+                        }
+                        MENU_RENAME => sr.call(Some((fp.clone(), name.clone()))),
+                        MENU_FORGET => sf.call(Some((fp.clone(), name.clone()))),
+                        _ => {}
                     })
             };
-            let forget_btn = {
-                let (sf, fp, name) = (set_forget.clone(), k.fp_hex.clone(), k.name.clone());
-                button("Forget")
-                    .icon(SymbolGlyph::Delete)
-                    .subtle()
-                    .on_click(move || sf.call(Some((fp.clone(), name.clone()))))
-            };
             let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
-            body.push(host_card(
+            tiles.push(host_tile(
                 &k.name,
                 &format!("{}:{}", k.addr, k.port),
-                if k.paired { "Paired" } else { "Trusted" },
-                vec![speed_btn.into(), forget_btn.into()],
-                move || initiate(&ctx2, target.clone(), &ss, &st),
+                status_row(
+                    Some(online),
+                    if k.paired { "Paired" } else { "Trusted" },
+                    if k.paired { Pill::Good } else { Pill::Info },
+                ),
+                Some(menu),
+                Some(Box::new(move || initiate(&ctx2, target.clone(), &ss, &st))),
             ));
         }
+        body.push(tile_grid(tiles, cols));
     }
 
-    // Discovered hosts.
-    body.push(section("ON YOUR NETWORK"));
-    if hosts.is_empty() {
+    // Discovered hosts not already saved above.
+    body.push(section("ON THIS NETWORK"));
+    let discovered: Vec<&DiscoveredHost> = hosts
+        .iter()
+        .filter(|h| {
+            !known.hosts.iter().any(|k| {
+                (!h.fp_hex.is_empty() && k.fp_hex == h.fp_hex)
+                    || (k.addr == h.addr && k.port == h.port)
+            })
+        })
+        .collect();
+    if discovered.is_empty() {
         body.push(
             card(
                 hstack((
@@ -190,7 +362,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .into(),
         );
     } else {
-        for h in hosts {
+        let mut tiles: Vec<Element> = Vec::new();
+        for h in discovered {
             let target = Target {
                 name: h.name.clone(),
                 addr: h.addr.clone(),
@@ -199,68 +372,21 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 pair_optional: h.pair == "optional",
             };
             let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
-            let badge = if h.pair == "required" { "PIN" } else { "Open" };
-            body.push(host_card(
+            let (badge, kind) = if h.pair == "required" {
+                ("PIN", Pill::Info)
+            } else {
+                ("Open", Pill::Neutral)
+            };
+            tiles.push(host_tile(
                 &h.name,
                 &format!("{}:{}", h.addr, h.port),
-                badge,
-                Vec::new(),
-                move || initiate(&ctx2, target.clone(), &ss, &st),
+                status_row(None, badge, kind),
+                None,
+                Some(Box::new(move || initiate(&ctx2, target.clone(), &ss, &st))),
             ));
         }
+        body.push(tile_grid(tiles, cols));
     }
-
-    // Manual connection.
-    body.push(section("CONNECT MANUALLY"));
-    let connect_manual = {
-        let (ctx2, ss, st, text) = (
-            ctx.clone(),
-            set_screen.clone(),
-            set_status.clone(),
-            manual.clone(),
-        );
-        move || {
-            let text = text.trim();
-            if text.is_empty() {
-                return;
-            }
-            let (addr, port) = match text.rsplit_once(':') {
-                Some((a, p)) => (a.to_string(), p.parse().unwrap_or(9777)),
-                None => (text.to_string(), 9777),
-            };
-            initiate(
-                &ctx2,
-                Target {
-                    name: addr.clone(),
-                    addr,
-                    port,
-                    fp_hex: None,
-                    pair_optional: false,
-                },
-                &ss,
-                &st,
-            );
-        }
-    };
-    body.push(
-        card(
-            grid((
-                text_box(manual)
-                    .placeholder("host or host:port")
-                    .on_changed(move |s| set_manual.call(s))
-                    .grid_column(0)
-                    .vertical_alignment(VerticalAlignment::Center),
-                button("Connect")
-                    .accent()
-                    .icon(SymbolGlyph::Forward)
-                    .on_click(connect_manual)
-                    .grid_column(1)
-                    .margin(edges(8.0, 0.0, 0.0, 0.0)),
-            ))
-            .columns([GridLength::Star(1.0), GridLength::Auto]),
-        )
-        .into(),
-    );
 
     // Forget confirmation (modal; shown while `forget` holds a pending host). Confirmed first,
     // since it's destructive and re-establishing trust needs a fresh pairing.
@@ -287,5 +413,88 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         );
     }
 
-    page(body)
+    let page = page_wide(body);
+    if !show_add {
+        return page;
+    }
+
+    // "Add host" modal: a scrim + centered card. It's an in-tree overlay, not a WinUI
+    // ContentDialog, because ContentDialog is text-only in windows-reactor (no room for a text
+    // field). The scrim border fills the cell and is hit-testable, so it blocks the page behind;
+    // it closes only via Cancel/Connect (a scrim tap would bubble `Tapped` up from the card too).
+    let connect_manual = {
+        let (ctx2, ss, st, text, sa) = (
+            ctx.clone(),
+            set_screen.clone(),
+            set_status.clone(),
+            manual.clone(),
+            set_show_add.clone(),
+        );
+        move || {
+            let text = text.trim();
+            if text.is_empty() {
+                return;
+            }
+            let (addr, port) = match text.rsplit_once(':') {
+                Some((a, p)) => (a.to_string(), p.parse().unwrap_or(9777)),
+                None => (text.to_string(), 9777),
+            };
+            sa.call(false);
+            initiate(
+                &ctx2,
+                Target {
+                    name: addr.clone(),
+                    addr,
+                    port,
+                    fp_hex: None,
+                    pair_optional: false,
+                },
+                &ss,
+                &st,
+            );
+        }
+    };
+    let modal = dialog_surface(
+        vstack((
+            text_block("Add a host").font_size(20.0).bold(),
+            text_block(
+                "Enter the host's IP address or name. Append :port only for a non-standard port \
+                 (the default is 9777).",
+            )
+            .font_size(13.0)
+            .wrap()
+            .foreground(ThemeRef::SecondaryText),
+            text_box(manual)
+                .header("Address")
+                .placeholder("192.168.1.20  or  my-pc.local")
+                .on_changed(move |s| set_manual.call(s))
+                .margin(edges(0.0, 6.0, 0.0, 0.0)),
+            hstack((
+                button("Connect")
+                    .accent()
+                    .icon(SymbolGlyph::Forward)
+                    .on_click(connect_manual),
+                button("Cancel").on_click({
+                    let sa = set_show_add.clone();
+                    move || sa.call(false)
+                }),
+            ))
+            .spacing(8.0)
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .margin(edges(0.0, 6.0, 0.0, 0.0)),
+        ))
+        .spacing(12.0),
+    )
+    .max_width(460.0)
+    .horizontal_alignment(HorizontalAlignment::Center)
+    .vertical_alignment(VerticalAlignment::Center)
+    .margin(uniform(24.0));
+
+    let scrim = border(modal).background(Color {
+        a: 140,
+        r: 0,
+        g: 0,
+        b: 0,
+    });
+    grid(vec![page, scrim.into()]).into()
 }
