@@ -35,7 +35,11 @@ listed, the host still needs one of these compositor backends to create a virtua
 - **`nvidia-drm modeset=1`** must be enabled (Wayland on NVIDIA needs it). The setup guides cover this.
 - **AMD / Intel GPUs** encode via **VAAPI** instead (install `mesa-va-drivers` or
   `intel-media-driver`; validated live on AMD RDNA3). The NVIDIA-specific notes above don't apply
-  there. A GPU-less software H.264 encoder also exists (`PUNKTFUNK_ENCODER=software`), meant as a
+  there. On modern Intel (Gen12/Tiger Lake and newer, including Arc) the driver only offers the
+  **low-power (VDEnc)** encode entrypoint — the host detects this and falls back automatically
+  (`PUNKTFUNK_VAAPI_LOW_POWER=1|0` pins it) — and low-power encode needs the **HuC firmware**
+  loaded (the kernel default on those platforms; check `dmesg | grep -i huc` if encoding fails).
+  A GPU-less software H.264 encoder also exists (`PUNKTFUNK_ENCODER=software`), meant as a
   fallback rather than a daily driver.
 
 > Consumer GeForce cards historically cap the number of **concurrent** NVENC sessions (a few at once);

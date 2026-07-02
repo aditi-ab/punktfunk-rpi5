@@ -32,6 +32,7 @@ use std::ffi::{CStr, CString};
 use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
 use std::ptr;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
@@ -75,9 +76,38 @@ fn vaapi_sws_src(format: PixelFormat) -> Result<Pixel> {
     })
 }
 
-/// Build the FFmpeg encoder context (shared by both inner paths): name, mode, low-latency RC,
-/// infinite GOP, BT.709-limited VUI, `pix_fmt=VAAPI`, and the given hw device + frames contexts.
-/// Returns the opened encoder. `device_ref`/`frames_ref` are borrowed (ref'd into the context).
+/// Which VAAPI entrypoint mode opened successfully, cached per codec (index = [`lp_idx`]):
+/// 0 = unknown, 1 = default (full-feature `EncSlice`), 2 = low-power (`EncSliceLP`/VDEnc).
+/// Modern Intel (Gen12+/Arc) removed the full-feature encode entrypoints, so the default open
+/// fails there and only `low_power=1` works; AMD (radeonsi) is the reverse. Caching the resolved
+/// mode lets later sessions/probes skip the known-failing attempt (and its libav error spew).
+static LP_MODE: [AtomicU8; 3] = [AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0)];
+
+fn lp_idx(codec: Codec) -> usize {
+    match codec {
+        Codec::H264 => 0,
+        Codec::H265 => 1,
+        Codec::Av1 => 2,
+    }
+}
+
+/// `PUNKTFUNK_VAAPI_LOW_POWER` pins the entrypoint mode (`1` = low-power only, `0` = full-feature
+/// only); unset → try full-feature first, fall back to low-power.
+fn low_power_override() -> Option<bool> {
+    match std::env::var("PUNKTFUNK_VAAPI_LOW_POWER").ok()?.trim() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Open the VAAPI encoder, resolving the entrypoint mode: try the full-feature entrypoint first
+/// and, if the driver rejects it, retry with `low_power=1` — modern Intel (Gen12+/Arc) exposes
+/// ONLY the low-power VDEnc entrypoint (ffmpeg's `vaapi_encode` defaults `low_power=0` and errors
+/// "no usable encoding entrypoint" there; LP additionally needs the HuC firmware, loaded by
+/// default on those kernels). AMD keeps its first-try full-feature open byte-for-byte unchanged.
+/// The resolved mode is cached per codec; `PUNKTFUNK_VAAPI_LOW_POWER` pins it.
+/// Safety contract is [`open_vaapi_encoder_mode`]'s (borrowed `device_ref`/`frames_ref`).
 unsafe fn open_vaapi_encoder(
     codec: Codec,
     width: u32,
@@ -86,6 +116,67 @@ unsafe fn open_vaapi_encoder(
     bitrate_bps: u64,
     device_ref: *mut ffi::AVBufferRef,
     frames_ref: *mut ffi::AVBufferRef,
+) -> Result<encoder::video::Encoder> {
+    let idx = lp_idx(codec);
+    let modes: &[bool] = match low_power_override() {
+        Some(true) => &[true],
+        Some(false) => &[false],
+        None => match LP_MODE[idx].load(Ordering::Relaxed) {
+            1 => &[false],
+            2 => &[true],
+            _ => &[false, true],
+        },
+    };
+    let mut first_err = None;
+    for &lp in modes {
+        match open_vaapi_encoder_mode(
+            codec,
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            device_ref,
+            frames_ref,
+            lp,
+        ) {
+            Ok(enc) => {
+                LP_MODE[idx].store(if lp { 2 } else { 1 }, Ordering::Relaxed);
+                if lp {
+                    tracing::info!(
+                        encoder = codec.vaapi_name(),
+                        "VAAPI using the low-power (VDEnc) entrypoint"
+                    );
+                }
+                return Ok(enc);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    encoder = codec.vaapi_name(),
+                    low_power = lp,
+                    "VAAPI encoder open failed: {e:#}"
+                );
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    // `modes` is never empty, so at least one attempt ran and recorded its error. The first
+    // (full-feature) error is the informative one — "no VA display" etc.
+    Err(first_err.unwrap())
+}
+
+/// Build the FFmpeg encoder context (shared by both inner paths): name, mode, low-latency RC,
+/// infinite GOP, BT.709-limited VUI, `pix_fmt=VAAPI`, and the given hw device + frames contexts.
+/// Returns the opened encoder. `device_ref`/`frames_ref` are borrowed (ref'd into the context).
+#[allow(clippy::too_many_arguments)]
+unsafe fn open_vaapi_encoder_mode(
+    codec: Codec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u64,
+    device_ref: *mut ffi::AVBufferRef,
+    frames_ref: *mut ffi::AVBufferRef,
+    low_power: bool,
 ) -> Result<encoder::video::Encoder> {
     let name = codec.vaapi_name();
     let av_codec = encoder::find_by_name(name).ok_or_else(|| {
@@ -125,9 +216,12 @@ unsafe fn open_vaapi_encoder(
 
     let mut opts = Dictionary::new();
     opts.set("async_depth", "1"); // one-in/one-out — minimal encode-pipeline latency
-    video
-        .open_with(opts)
-        .with_context(|| format!("open {name} ({width}x{height}@{fps}, {bitrate_bps} bps)"))
+    if low_power {
+        opts.set("low_power", "1"); // VDEnc — the only encode entrypoint on modern Intel
+    }
+    video.open_with(opts).with_context(|| {
+        format!("open {name} ({width}x{height}@{fps}, {bitrate_bps} bps, low_power={low_power})")
+    })
 }
 
 /// Probe whether THIS GPU can VAAPI-encode `codec`, by opening a tiny encoder: the driver rejects
