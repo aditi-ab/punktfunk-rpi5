@@ -1174,17 +1174,13 @@ impl Encoder for NvencD3d11Encoder {
         // the oldest ready AU. `None` = nothing completed yet — the session loop keeps the frame
         // in flight and re-polls next tick, capture never blocks on the WDDM scheduling wait.
         if self.async_rt.is_some() {
-            loop {
-                let done = match self
-                    .async_rt
-                    .as_mut()
-                    .expect("checked just above")
-                    .done_rx
-                    .try_recv()
-                {
-                    Ok(d) => d,
-                    Err(_) => break,
-                };
+            while let Ok(done) = self
+                .async_rt
+                .as_mut()
+                .expect("checked just above")
+                .done_rx
+                .try_recv()
+            {
                 self.absorb_done(done)?;
             }
             return Ok(self
