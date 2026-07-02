@@ -578,6 +578,62 @@
         }
       }
     },
+    "/api/v1/logs": {
+      "get": {
+        "tags": [
+          "logs"
+        ],
+        "summary": "Host logs",
+        "description": "The host's recent log entries — an in-memory ring of the newest few thousand, captured at\nDEBUG and above regardless of `RUST_LOG`. Follow live by polling with `after` set to the last\nresponse's `next` cursor; a `dropped: true` means entries were evicted between polls (the ring\nwrapped). Bearer-only: logs can reference client identities and host paths, so this is part of\nthe loopback-only admin surface, never the LAN-readable mTLS one.",
+        "operationId": "logsGet",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Return entries with seq greater than this (omitted/0 = oldest retained)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max entries per response (default and cap 1000)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Entries after the cursor, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/native/clients": {
       "get": {
         "tags": [
@@ -2027,6 +2083,70 @@
           }
         }
       },
+      "LogEntry": {
+        "type": "object",
+        "description": "One captured log event.",
+        "required": [
+          "seq",
+          "ts_ms",
+          "level",
+          "target",
+          "msg"
+        ],
+        "properties": {
+          "level": {
+            "type": "string",
+            "description": "`ERROR` | `WARN` | `INFO` | `DEBUG` | `TRACE`."
+          },
+          "msg": {
+            "type": "string",
+            "description": "The formatted message, structured fields appended as `key=value`."
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonic sequence number (1-based) — pass the last one back as the `after` cursor.",
+            "minimum": 0
+          },
+          "target": {
+            "type": "string",
+            "description": "The emitting module path (tracing target)."
+          },
+          "ts_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp in milliseconds.",
+            "minimum": 0
+          }
+        }
+      },
+      "LogPage": {
+        "type": "object",
+        "description": "One poll's worth of log entries.",
+        "required": [
+          "entries",
+          "next",
+          "dropped"
+        ],
+        "properties": {
+          "dropped": {
+            "type": "boolean",
+            "description": "True when entries between `after` and the first returned one were already evicted."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogEntry"
+            }
+          },
+          "next": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cursor for the next poll (the last returned seq, or the request's `after` when empty).",
+            "minimum": 0
+          }
+        }
+      },
       "NativeClient": {
         "type": "object",
         "description": "A paired native (punktfunk/1) client.",
@@ -2571,6 +2691,10 @@
     {
       "name": "stats",
       "description": "Streaming performance-stats capture: arm/stop a recording, read the live + saved time-series for graphing"
+    },
+    {
+      "name": "logs",
+      "description": "Host log stream: the newest in-memory log entries, cursor-paged for live following"
     }
   ]
 }

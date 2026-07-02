@@ -45,6 +45,7 @@ mod install;
 #[path = "windows/interactive.rs"]
 mod interactive;
 mod library;
+mod log_capture;
 mod mgmt;
 mod mgmt_token;
 mod native_pairing;
@@ -92,9 +93,20 @@ fn main() {
         service::init_file_logging(filter);
     } else {
         // Logs go to stderr so stdout stays machine-readable (`punktfunk-host openapi > spec.json`).
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
+        // A second layer tees DEBUG-and-up into the in-memory ring served by GET /api/v1/logs —
+        // deliberately not gated by RUST_LOG, so console-side debugging never needs a restart.
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer;
+        tracing_subscriber::registry()
+            .with(
+                log_capture::RingLayer.with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_filter(filter),
+            )
             .init();
     }
 

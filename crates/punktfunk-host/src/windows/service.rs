@@ -130,23 +130,38 @@ fn host_log_path() -> PathBuf {
 
 /// Initialise tracing to the service log file (the SCM gives the service no console/stderr). Falls
 /// back to stderr if the file can't be opened. Called from `main()` only for `service run`.
+/// Also tees into the in-memory log ring (`log_capture`), like the stderr path in `main()` — the
+/// supervisor serves no mgmt API itself, but the layer is harmless and keeps both inits uniform.
 pub fn init_file_logging(filter: tracing_subscriber::EnvFilter) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    let ring =
+        crate::log_capture::RingLayer.with_filter(tracing_subscriber::filter::LevelFilter::DEBUG);
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(service_log_path())
     {
         Ok(file) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_ansi(false)
-                .with_writer(move || file.try_clone().expect("clone service log handle"))
+            tracing_subscriber::registry()
+                .with(ring)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(move || file.try_clone().expect("clone service log handle"))
+                        .with_filter(filter),
+                )
                 .init();
         }
         Err(_) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::io::stderr)
+            tracing_subscriber::registry()
+                .with(ring)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_filter(filter),
+                )
                 .init();
         }
     }

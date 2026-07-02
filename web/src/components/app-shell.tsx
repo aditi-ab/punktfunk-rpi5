@@ -4,6 +4,7 @@ import {
 	GaugeCircle,
 	KeyRound,
 	LibraryBig,
+	ScrollText,
 	Server,
 	Settings,
 } from "lucide-react";
@@ -22,6 +23,7 @@ const NAV = [
 	{ to: "/host", icon: Server, label: () => m.nav_host() },
 	{ to: "/library", icon: LibraryBig, label: () => m.nav_library() },
 	{ to: "/stats", icon: GaugeCircle, label: () => m.nav_stats() },
+	{ to: "/logs", icon: ScrollText, label: () => m.nav_logs() },
 	{ to: "/pairing", icon: KeyRound, label: () => m.nav_pairing() },
 	{ to: "/settings", icon: Settings, label: () => m.nav_settings() },
 ] as const;

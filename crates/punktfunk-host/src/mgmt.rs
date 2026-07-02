@@ -25,10 +25,11 @@ use crate::gamestream::{
     tls::{serve_https, PeerAddr, PeerCertFingerprint},
     AppState, APP_VERSION, AUDIO_PORT, CONTROL_PORT, GFE_VERSION, RTSP_PORT, VIDEO_PORT,
 };
+use crate::log_capture::LogPage;
 use crate::stats_recorder::{Capture, CaptureMeta, StatsStatus};
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{header, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -179,7 +180,8 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(stats_capture_status))
                 .routes(routes!(stats_capture_live))
                 .routes(routes!(stats_recordings_list))
-                .routes(routes!(stats_recording_get, stats_recording_delete)),
+                .routes(routes!(stats_recording_get, stats_recording_delete))
+                .routes(routes!(logs_get)),
         )
         .split_for_parts()
 }
@@ -213,6 +215,7 @@ pub fn openapi_json() -> String {
         (name = "session", description = "Active streaming session control"),
         (name = "library", description = "Game library: installed-store titles (Steam) plus user-curated custom entries"),
         (name = "stats", description = "Streaming performance-stats capture: arm/stop a recording, read the live + saved time-series for graphing"),
+        (name = "logs", description = "Host log stream: the newest in-memory log entries, cursor-paged for live following"),
     )
 )]
 struct ApiDoc;
@@ -1730,6 +1733,39 @@ async fn stats_recording_delete(
     }
 }
 
+/// Query for `GET /logs` — a cursor poll.
+#[derive(Deserialize)]
+struct LogsQuery {
+    after: Option<u64>,
+    limit: Option<u32>,
+}
+
+/// Host logs
+///
+/// The host's recent log entries — an in-memory ring of the newest few thousand, captured at
+/// DEBUG and above regardless of `RUST_LOG`. Follow live by polling with `after` set to the last
+/// response's `next` cursor; a `dropped: true` means entries were evicted between polls (the ring
+/// wrapped). Bearer-only: logs can reference client identities and host paths, so this is part of
+/// the loopback-only admin surface, never the LAN-readable mTLS one.
+#[utoipa::path(
+    get,
+    path = "/logs",
+    tag = "logs",
+    operation_id = "logsGet",
+    params(
+        ("after" = Option<u64>, Query, description = "Return entries with seq greater than this (omitted/0 = oldest retained)"),
+        ("limit" = Option<u32>, Query, description = "Max entries per response (default and cap 1000)"),
+    ),
+    responses(
+        (status = OK, description = "Entries after the cursor, oldest first", body = LogPage),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn logs_get(Query(q): Query<LogsQuery>) -> Json<LogPage> {
+    let limit = q.limit.map_or(crate::log_capture::MAX_PAGE, |l| l as usize);
+    Json(crate::log_capture::ring().since(q.after.unwrap_or(0), limit))
+}
+
 // ---------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------
@@ -2508,5 +2544,35 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn logs_endpoint_pages_by_cursor() {
+        let app = test_app(test_state(), None);
+
+        // The ring is a process-wide singleton — start from wherever its cursor currently is.
+        let (s, json) = send(&app, get_req("/api/v1/logs")).await;
+        assert_eq!(s, StatusCode::OK);
+        let start = json["next"].as_u64().unwrap();
+
+        let ring = crate::log_capture::ring();
+        ring.push(&tracing::Level::WARN, "mgmt::tests", "first".into());
+        ring.push(&tracing::Level::INFO, "mgmt::tests", "second".into());
+
+        let (s, json) = send(&app, get_req(&format!("/api/v1/logs?after={start}"))).await;
+        assert_eq!(s, StatusCode::OK);
+        let entries = json["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["msg"], "first");
+        assert_eq!(entries[0]["level"], "WARN");
+        assert_eq!(json["next"].as_u64().unwrap(), start + 2);
+        assert_eq!(json["dropped"], false);
+
+        // Nothing newer → empty page, cursor unchanged.
+        let after = start + 2;
+        let (s, json) = send(&app, get_req(&format!("/api/v1/logs?after={after}"))).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(json["entries"].as_array().unwrap().is_empty());
+        assert_eq!(json["next"].as_u64().unwrap(), after);
     }
 }
