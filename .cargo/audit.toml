@@ -34,4 +34,17 @@ ignore = [
     # a constant-time rsa ships (then drop this), the host ever signs an attacker-chosen message with
     # this key, or any RSA decryption / key-transport using the private key is added.
     "RUSTSEC-2023-0071",
+
+    # quick-xml DoS advisories (RUSTSEC-2026-0194 quadratic-time duplicate-attribute check;
+    # RUSTSEC-2026-0195 unbounded namespace-declaration allocation in NsReader). Both are
+    # exploited by feeding attacker-controlled XML to a running parser. In this tree quick-xml is
+    # a BUILD-TIME-ONLY, transitive dependency of `wayland-scanner` (a proc-macro that parses the
+    # TRUSTED wayland protocol XML files shipped with the wayland-rs crates at compile time). It is
+    # never linked into any shipped binary and never parses runtime/attacker-controlled input, so
+    # neither DoS is reachable. There is no fix to bump to: wayland-scanner 0.31.10 (latest) pins
+    # `quick-xml ^0.39`, and the fixes only exist in quick-xml >=0.41. Revisit (drop these) when
+    # wayland-scanner releases against quick-xml >=0.41, or if quick-xml is ever pulled onto a
+    # runtime path that parses untrusted XML.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
