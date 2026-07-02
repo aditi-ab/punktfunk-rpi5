@@ -26,6 +26,14 @@ class MainActivity : ComponentActivity() {
     /** Joystick-axis state mapper for the active session (built/reset by StreamScreen). */
     var axisMapper: Gamepad.AxisMapper? = null
 
+    /**
+     * Input observers for the Controllers debug screen (set while it is shown, like [streamHandle]).
+     * Called for every key/motion event while not streaming; a `true` return consumes the event —
+     * the screen's "test inputs" mode uses that to keep pad input from also driving focus navigation.
+     */
+    var padKeyProbe: ((KeyEvent) -> Boolean)? = null
+    var padMotionProbe: ((MotionEvent) -> Boolean)? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Dark, transparent system bars regardless of the system theme — our UI is always dark, so
@@ -81,16 +89,20 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
-        } else if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
-            // Not streaming: a game controller drives the Compose UI (TV + phone). Map the face
-            // buttons to the navigation keys the focus system understands; D-pad *keys* already move
-            // focus on their own, so they fall through to super untouched.
-            val mapped = when (event.keyCode) {
-                KeyEvent.KEYCODE_BUTTON_A -> KeyEvent.KEYCODE_DPAD_CENTER // activate focused element
-                KeyEvent.KEYCODE_BUTTON_B -> KeyEvent.KEYCODE_BACK // back / dismiss
-                else -> 0
+        } else {
+            // The Controllers debug screen sees pad events before the navigation remap below.
+            padKeyProbe?.let { if (it(event)) return true }
+            if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
+                // Not streaming: a game controller drives the Compose UI (TV + phone). Map the face
+                // buttons to the navigation keys the focus system understands; D-pad *keys* already
+                // move focus on their own, so they fall through to super untouched.
+                val mapped = when (event.keyCode) {
+                    KeyEvent.KEYCODE_BUTTON_A -> KeyEvent.KEYCODE_DPAD_CENTER // activate focused element
+                    KeyEvent.KEYCODE_BUTTON_B -> KeyEvent.KEYCODE_BACK // back / dismiss
+                    else -> 0
+                }
+                if (mapped != 0) return super.dispatchKeyEvent(KeyEvent(event.action, mapped))
             }
-            if (mapped != 0) return super.dispatchKeyEvent(KeyEvent(event.action, mapped))
         }
         return super.dispatchKeyEvent(event)
     }
@@ -103,6 +115,8 @@ class MainActivity : ComponentActivity() {
             if (axisMapper?.onMotion(event) == true) return true
             return super.dispatchGenericMotionEvent(event)
         }
+        // The Controllers debug screen sees pad motion before the stick→D-pad synthesis below.
+        padMotionProbe?.let { if (it(event)) return true }
         // Not streaming: turn the gamepad HAT / left stick into discrete D-pad focus moves, so a
         // controller navigates the menus even when its D-pad reports as axes (not key events) and
         // for stick-based navigation. Edge-detected so a held direction moves focus exactly once.

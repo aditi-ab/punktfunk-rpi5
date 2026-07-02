@@ -98,19 +98,19 @@ object Gamepad {
         }
     }
 
-    /** First connected gamepad/joystick [InputDevice], or null when none is attached. */
-    fun firstPad(): InputDevice? {
-        for (id in InputDevice.getDeviceIds()) {
-            val d = InputDevice.getDevice(id) ?: continue
-            val s = d.sources
-            if (s and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
-                s and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
-            ) {
-                return d
-            }
-        }
-        return null
+    /** True when [dev]'s source classes include gamepad or joystick. */
+    fun isPad(dev: InputDevice?): Boolean {
+        val s = dev?.sources ?: return false
+        return s and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
+            s and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
     }
+
+    /** All connected gamepad/joystick [InputDevice]s, in system enumeration order. */
+    fun pads(): List<InputDevice> =
+        InputDevice.getDeviceIds().toList().mapNotNull { InputDevice.getDevice(it) }.filter { isPad(it) }
+
+    /** First connected gamepad/joystick [InputDevice], or null when none is attached. */
+    fun firstPad(): InputDevice? = pads().firstOrNull()
 
     /**
      * The [GamepadPref] wire byte to send for the user's [setting] (the persisted gamepad index). A

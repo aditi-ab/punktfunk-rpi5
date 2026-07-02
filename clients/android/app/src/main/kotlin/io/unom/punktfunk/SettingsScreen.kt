@@ -46,6 +46,7 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
     var s by remember { mutableStateOf(initial) }
     val context = LocalContext.current
     var showLicenses by remember { mutableStateOf(false) }
+    var showControllers by remember { mutableStateOf(false) }
     fun update(next: Settings) {
         s = next
         onChange(next)
@@ -60,6 +61,10 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
 
     if (showLicenses) {
         LicensesScreen(onBack = { showLicenses = false })
+        return
+    }
+    if (showControllers) {
+        ControllersScreen(gamepadSetting = s.gamepad, onBack = { showControllers = false })
         return
     }
 
@@ -130,6 +135,12 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
                 options = GAMEPAD_OPTIONS.mapIndexed { i, lbl -> i to lbl },
                 selected = s.gamepad,
             ) { g -> update(s.copy(gamepad = g)) }
+
+            ClickableRow(
+                title = "Connected controllers",
+                subtitle = "What the app detects, with a live input test",
+                onClick = { showControllers = true },
+            )
         }
 
         SettingsGroup("Audio") {
