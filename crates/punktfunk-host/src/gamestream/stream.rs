@@ -57,6 +57,9 @@ pub fn start(
     let _ = std::thread::Builder::new()
         .name("punktfunk-video".into())
         .spawn(move || {
+            // Same scheduling posture as the native path's capture/encode thread (Linux nice -10 /
+            // Windows HIGHEST + session tuning) — GameStream previously ran unboosted on Linux.
+            crate::punktfunk1::boost_thread_priority(true);
             tracing::info!(?cfg, "video stream starting");
             if let Err(e) = run(
                 cfg,
@@ -391,8 +394,9 @@ fn spawn_sender(
     std::thread::Builder::new()
         .name("punktfunk-send".into())
         .spawn(move || {
-            // GameStream send thread: Windows session tuning + MMCSS (no-op off Windows).
-            crate::session_tuning::on_hot_thread();
+            // Transmit thread: above-normal, matching the native path's send thread (includes the
+            // Windows session tuning/MMCSS this used to call directly; adds the Linux nice -5).
+            crate::punktfunk1::boost_thread_priority(false);
             // Chunk pacing: 16 packets per burst, bursts spread across the send budget.
             const PACE_CHUNK: usize = 16;
             let budget = frame_interval.mul_f32(0.75);
