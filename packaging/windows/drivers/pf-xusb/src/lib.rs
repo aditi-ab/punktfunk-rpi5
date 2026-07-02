@@ -70,13 +70,16 @@ const XUSB_VERSION: u16 = 0x0103;
 const WdfIoQueueDispatchParallel: i32 = 2;
 const WdfUseDefault: i32 = 2; // WDF_TRI_STATE
 
-// ---- shared-memory layout (host ↔ driver), must match the host's xbox_xusb_windows backend ----
+// ---- shared-memory layout (host ↔ driver), must match pf_driver_proto::gamepad::XusbShm ----
 // magic u32 @0 ("PFXU"); packet u32 @4 (host bumps on state change → dwPacketNumber); the XUSB_REPORT
 // payload @8: wButtons u16 @8, bLeftTrigger @10, bRightTrigger @11, sThumbLX i16 @12, LY @14, RX @16,
-// RY @18; rumble_seq u32 @24 (driver bumps on SET_STATE); rumble large @28, small @29.
+// RY @18; rumble_seq u32 @24 (driver bumps on SET_STATE); rumble large @28, small @29;
+// driver_proto u32 @32 (we stamp GAMEPAD_PROTO_VERSION = attach signal for the host's health check);
+// driver_heartbeat u32 @36 (we bump per serviced IOCTL = the game-visible polling path moves).
 const FILE_MAP_RW: u32 = 0x0002 | 0x0004;
 const SHM_MAGIC: u32 = 0x5558_4650; // "PFXU" little-endian
 const SHM_SIZE: usize = 64;
+const GAMEPAD_PROTO_VERSION: u32 = 1; // must match pf_driver_proto::gamepad::GAMEPAD_PROTO_VERSION
 
 unsafe extern "system" {
     fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> *mut c_void;
@@ -234,6 +237,9 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         return st;
     }
 
+    // Tell the host we're alive on the section (its driver-attach health check keys off this).
+    touch_driver_marks();
+
     log("[pf-xusb] device ready (XUSB interface registered)");
     STATUS_SUCCESS
 }
@@ -283,6 +289,22 @@ fn read_state() -> (u32, u16, u8, u8, i16, i16, i16, i16) {
         }
     });
     out
+}
+
+/// Stamp the driver health marks the host watches: `driver_proto` @32 (the attach signal,
+/// idempotent) and `driver_heartbeat` @36 (+1). Called at device add and on every serviced IOCTL,
+/// so the host can tell "driver bound and alive" apart from "driver package missing/failed to
+/// bind" and see the game-visible polling path advance. No-op until the host's section exists
+/// (with_shm re-opens per access, so a section created after we started still gets marked).
+fn touch_driver_marks() {
+    with_shm(|v| {
+        // SAFETY: v points at a mapped SHM_SIZE section with valid magic; proto @32, heartbeat @36.
+        unsafe {
+            core::ptr::write_unaligned(v.add(32) as *mut u32, GAMEPAD_PROTO_VERSION);
+            let hb = v.add(36) as *mut u32;
+            core::ptr::write_unaligned(hb, core::ptr::read_unaligned(hb).wrapping_add(1));
+        }
+    });
 }
 
 /// Publish a game's rumble (from SET_STATE) into shared memory for the host to forward.
@@ -352,6 +374,9 @@ extern "C" fn evt_io_device_control(
     input_len: usize,
     ioctl: ULONG,
 ) {
+    // Health marks first: attach signal + heartbeat (also covers a section the host created after
+    // this device started — the marks land on the next XInput poll).
+    touch_driver_marks();
     let status: NTSTATUS = match ioctl {
         IOCTL_XUSB_GET_INFORMATION => copy_to_output(request, &build_information()),
         IOCTL_XUSB_GET_INFORMATION_EX => {

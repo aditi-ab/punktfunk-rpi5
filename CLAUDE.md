@@ -36,6 +36,15 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   boundary, and finished captures are saved as on-disk recordings
   (`~/.config/punktfunk/captures/*.json`) browsable/exportable from the console's **Performance** page
   (recharts). Endpoints `/api/v1/stats/*` (bearer-only). *Implemented; not yet on-glass validated.*
+  **Web-console log view** (`log_capture.rs`): a `tracing` layer tees DEBUG-and-up (independent of
+  `RUST_LOG`) into a 4096-entry in-memory ring, served cursor-paged at `GET /api/v1/logs`
+  (bearer-only) → the console's **Logs** page (follow/pause · level filter · search). The Windows
+  gamepad drivers now stamp attach/heartbeat marks into their shm sections and the host's
+  `DriverAttach` watcher turns silence into a one-shot diagnosis WARN (driver-store check + CM
+  devnode problem code) — failure-mode table: [`design/gamepad-driver-health.md`](design/gamepad-driver-health.md).
+  The Android client gained Settings → **Connected controllers** (device list + VID/PID + resolved
+  pad type + live input test) for the client end of the same chain. *Log view + driver health:
+  Linux-tested; Windows/Android sides CI/device-validation pending.*
 - **Native protocol (`punktfunk/1`): full session planes, validated live.** QUIC
   control plane (`punktfunk-core` `quic` feature: Hello{mode}/Welcome{full Config}/Start), data
   plane = the hardened core `Session` over raw UDP with **GF(2¹⁶) Leopard FEC + AES-GCM**

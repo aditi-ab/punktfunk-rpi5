@@ -311,6 +311,13 @@ pub mod gamepad {
     /// `device_type` = DualShock 4 (`VID_054C&PID_09CC` HID identity).
     pub const DEVTYPE_DUALSHOCK4: u8 = 1;
 
+    /// The value a gamepad driver writes into its section's `driver_proto` field once it attaches —
+    /// the host's positive "driver is alive on this section" signal (health check + version audit).
+    /// The section starts zeroed, so `0` always means "no driver has attached (yet)"; a pre-health
+    /// driver never writes the field and reads as not-attached, which the host log line calls out
+    /// (the remedy is the same: reinstall the drivers). Bump on a gamepad-layout change.
+    pub const GAMEPAD_PROTO_VERSION: u32 = 1;
+
     /// `Global\pfxusb-shm-<index>` — the virtual Xbox 360 (XInput) shared section.
     pub fn xusb_shm_name(index: u8) -> String {
         alloc::format!("Global\\pfxusb-shm-{index}")
@@ -342,7 +349,14 @@ pub mod gamepad {
         pub rumble_seq: u32,
         pub rumble_large: u8,
         pub rumble_small: u8,
-        pub _reserved1: [u8; 34],
+        pub _pad0: [u8; 2],
+        /// Written by the driver when it binds (device add) and on every serviced IOCTL:
+        /// [`GAMEPAD_PROTO_VERSION`]. `0` = no driver attached — the host health check keys off it.
+        pub driver_proto: u32,
+        /// Bumped by the driver on every serviced XInput IOCTL — proves the game-visible path (it
+        /// only advances while something polls the slot, so a static value is not an error).
+        pub driver_heartbeat: u32,
+        pub _reserved1: [u8; 24],
     }
 
     /// Virtual DualSense / DualShock 4 shared section (256 B). The host writes the `0x01`-style HID
@@ -363,7 +377,14 @@ pub mod gamepad {
         pub output: [u8; 64],
         /// HID identity selector — see [`DEVTYPE_DUALSENSE`] / [`DEVTYPE_DUALSHOCK4`].
         pub device_type: u8,
-        pub _reserved1: [u8; 115],
+        pub _pad0: [u8; 3],
+        /// Written by the driver's timer while it has the section mapped: [`GAMEPAD_PROTO_VERSION`].
+        /// `0` = no driver attached — the host health check keys off it.
+        pub driver_proto: u32,
+        /// Bumped by the driver's ~125 Hz timer each tick — a true liveness heartbeat (unlike the
+        /// XUSB one, this advances whenever the driver is loaded, game or not).
+        pub driver_heartbeat: u32,
+        pub _reserved1: [u8; 104],
     }
 
     // Offsets are the wire contract the shipped drivers already read by hand — pin every one. A failing
@@ -385,6 +406,8 @@ pub mod gamepad {
         assert!(offset_of!(XusbShm, rumble_seq) == 24);
         assert!(offset_of!(XusbShm, rumble_large) == 28);
         assert!(offset_of!(XusbShm, rumble_small) == 29);
+        assert!(offset_of!(XusbShm, driver_proto) == 32);
+        assert!(offset_of!(XusbShm, driver_heartbeat) == 36);
 
         assert!(size_of::<PadShm>() == 256);
         assert!(offset_of!(PadShm, magic) == 0);
@@ -392,6 +415,8 @@ pub mod gamepad {
         assert!(offset_of!(PadShm, out_seq) == 72);
         assert!(offset_of!(PadShm, output) == 76);
         assert!(offset_of!(PadShm, device_type) == 140);
+        assert!(offset_of!(PadShm, driver_proto) == 144);
+        assert!(offset_of!(PadShm, driver_heartbeat) == 148);
     };
 }
 

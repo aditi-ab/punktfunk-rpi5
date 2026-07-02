@@ -9,8 +9,8 @@
 
 use super::dualsense_proto::DsState;
 use super::dualsense_windows::{
-    create_swdevice, SwDeviceProfile, DEVTYPE_DUALSHOCK4, OFF_DEVTYPE, OFF_INPUT, OFF_OUTPUT,
-    OFF_OUT_SEQ, SHM_MAGIC, SHM_SIZE,
+    create_swdevice, SwDeviceProfile, DEVTYPE_DUALSHOCK4, OFF_DEVTYPE, OFF_DRIVER_PROTO, OFF_INPUT,
+    OFF_OUTPUT, OFF_OUT_SEQ, SHM_MAGIC, SHM_SIZE,
 };
 use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
@@ -28,6 +28,8 @@ struct Ds4WinPad {
     _sw: Option<super::gamepad_raii::SwDevice>,
     /// The named shared section the driver maps (RAII — unmapped + closed on drop).
     shm: super::gamepad_raii::Shm,
+    /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
+    attach: super::gamepad_raii::DriverAttach,
     counter: u8,
     ts: u16,
     last_out_seq: u32,
@@ -37,10 +39,8 @@ impl Ds4WinPad {
     /// Create + map the section, stamp `device_type = DualShock 4` + a neutral report + the magic,
     /// then spawn the `pf_ds4_<index>` devnode (the driver loads on it and maps the section).
     fn open(index: u8) -> Result<Ds4WinPad> {
-        let shm = super::gamepad_raii::Shm::create(
-            &HSTRING::from(pf_driver_proto::gamepad::pad_shm_name(index)),
-            SHM_SIZE,
-        )?;
+        let shm_name = pf_driver_proto::gamepad::pad_shm_name(index);
+        let shm = super::gamepad_raii::Shm::create(&HSTRING::from(shm_name.as_str()), SHM_SIZE)?;
         let base = shm.base();
         // device-type FIRST (so it's visible the moment magic is), neutral report, magic LAST.
         // SAFETY: base points at SHM_SIZE writable bytes; OFF_DEVTYPE/OFF_INPUT are in range.
@@ -54,23 +54,30 @@ impl Ds4WinPad {
             std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
         }
         let inst = format!("pf_ds4_{index}");
-        let hsw = match create_swdevice(&SwDeviceProfile {
+        let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
             instance: &inst,
             container_index: index,
             hwid: "pf_dualshock4",
             usb_vid_pid: "VID_054C&PID_09CC",
             description: "punktfunk Virtual DualShock 4",
         }) {
-            Ok(h) => Some(h),
+            Ok((h, id)) => (Some(h), id),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; DualShock 4 devnode unavailable");
-                None
+                (None, None)
             }
         };
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         Ok(Ds4WinPad {
             _sw,
             shm,
+            attach: super::gamepad_raii::DriverAttach::new(
+                "pf_dualshock4",
+                "pf_dualsense.inf", // one driver package serves both HID identities
+                "C:\\Users\\Public\\pfds-driver.log",
+                shm_name,
+                instance_id,
+            ),
             counter: 0,
             ts: 0,
             last_out_seq: 0,
@@ -90,9 +97,15 @@ impl Ds4WinPad {
     }
 
     /// Poll the section's output slot; parse a new `0x05` report (rumble / lightbar) into a
-    /// [`Ds4Feedback`]. Returns empty feedback if the driver hasn't published anything new.
+    /// [`Ds4Feedback`]. Returns empty feedback if the driver hasn't published anything new. Also
+    /// feeds the driver-attach health watcher (the driver's ~125 Hz timer stamps `driver_proto`).
     fn service(&mut self) -> Ds4Feedback {
         let mut fb = Ds4Feedback::default();
+        // SAFETY: base points at SHM_SIZE bytes.
+        let proto = unsafe {
+            std::ptr::read_unaligned(self.shm.base().add(OFF_DRIVER_PROTO) as *const u32)
+        };
+        self.attach.observe(proto);
         // SAFETY: base points at SHM_SIZE bytes.
         let seq =
             unsafe { std::ptr::read_unaligned(self.shm.base().add(OFF_OUT_SEQ) as *const u32) };
@@ -272,7 +285,7 @@ impl DualShock4WindowsManager {
                 self.last_write[idx] = Instant::now();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualShock 4 creation failed — controller input disabled");
+                tracing::error!(error = %format!("{e:#}"), "virtual DualShock 4 creation failed — controller input disabled until the next client connect (install/repair: punktfunk-host.exe driver install --gamepad)");
                 self.broken = true;
             }
         }

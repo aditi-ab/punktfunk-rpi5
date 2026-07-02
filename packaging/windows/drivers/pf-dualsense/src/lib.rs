@@ -229,11 +229,14 @@ static INPUT_REPORT: std::sync::Mutex<[u8; 64]> = std::sync::Mutex::new(NEUTRAL_
 // UMDF runs in WUDFHost.exe (user-mode) and hidclass blocks a control channel on the device stack
 // (custom interface CreateFile → err 31; custom IOCTL on the HID handle → err 1) and UMDF has no
 // control device, so the host channel is a named section the (privileged) host CREATES and the driver
-// OPENS. Layout (256 B): magic u32 @0 ("PFDS"), input_seq u32 @4, input_report[64] @8,
-// output_seq u32 @72, output_report[64] @76.
+// OPENS. Layout (256 B, must match pf_driver_proto::gamepad::PadShm): magic u32 @0 ("PFDS"),
+// input_seq u32 @4, input_report[64] @8, output_seq u32 @72, output_report[64] @76,
+// device_type u8 @140, driver_proto u32 @144 (we stamp GAMEPAD_PROTO_VERSION = the host's
+// driver-attach health signal), driver_heartbeat u32 @148 (we bump per timer tick = liveness).
 const FILE_MAP_RW: u32 = 0x0002 | 0x0004; // FILE_MAP_WRITE | FILE_MAP_READ
 const SHM_MAGIC: u32 = 0x5046_4453; // "PFDS" little-endian
 const SHM_SIZE: usize = 256;
+const GAMEPAD_PROTO_VERSION: u32 = 1; // must match pf_driver_proto::gamepad::GAMEPAD_PROTO_VERSION
 static LOGGED_SHM: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 // kernel32 file-mapping APIs (resolved via std's kernel32 import; UMDF permits file mapping).
@@ -769,6 +772,15 @@ extern "C" fn evt_timer(timer: WDFTIMER) {
             if let Ok(mut g) = INPUT_REPORT.lock() {
                 *g = buf;
             }
+        }
+        // Health marks the host watches: driver_proto @144 (attach signal, idempotent) and
+        // driver_heartbeat @148 (+1 per ~8 ms tick = liveness). Lets the host tell "driver bound
+        // and alive" apart from "driver package missing/failed to bind".
+        // SAFETY: view points at a mapped 256-byte section; proto @144, heartbeat @148.
+        unsafe {
+            core::ptr::write_unaligned(view.add(144) as *mut u32, GAMEPAD_PROTO_VERSION);
+            let hb = view.add(148) as *mut u32;
+            core::ptr::write_unaligned(hb, core::ptr::read_unaligned(hb).wrapping_add(1));
         }
     });
     // SAFETY: timer valid; parent is the manual queue.

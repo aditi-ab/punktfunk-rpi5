@@ -29,7 +29,7 @@ use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
 /// Shared-section layout — the single source of truth is [`pf_driver_proto::gamepad::PadShm`] (offset
@@ -47,6 +47,8 @@ pub(super) const OFF_OUTPUT: usize =
 /// DualSense (the default — the section is zeroed), 1 = DualShock 4.
 pub(super) const OFF_DEVTYPE: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, device_type);
+pub(super) const OFF_DRIVER_PROTO: usize =
+    core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, driver_proto);
 pub(super) const DEVTYPE_DUALSHOCK4: u8 = pf_driver_proto::gamepad::DEVTYPE_DUALSHOCK4;
 
 /// A single virtual DualSense: the SwDeviceCreate'd `pf_pad_<index>` software devnode (the driver
@@ -58,16 +60,20 @@ struct DsWinPad {
     _sw: Option<super::gamepad_raii::SwDevice>,
     /// The named shared section the driver maps (RAII — unmapped + closed on drop).
     shm: super::gamepad_raii::Shm,
+    /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
+    attach: super::gamepad_raii::DriverAttach,
     seq: u8,
     ts: u32,
     last_out_seq: u32,
 }
 
-/// Context for the `SwDeviceCreate` completion callback: an event to signal + the HRESULT it reports.
+/// Context for the `SwDeviceCreate` completion callback: an event to signal, the HRESULT it reports,
+/// and the PnP instance id PnP assigned (captured for devnode health diagnostics).
 #[repr(C)]
 struct SwCreateCtx {
     event: HANDLE,
     result: HRESULT,
+    instance_id: [u16; 128],
 }
 
 /// `SwDeviceCreate` fires this once PnP has enumerated the device; stash the result and wake the
@@ -76,15 +82,32 @@ unsafe extern "system" fn sw_create_cb(
     _dev: HSWDEVICE,
     result: HRESULT,
     ctx: *const c_void,
-    _id: PCWSTR,
+    id: PCWSTR,
 ) {
     if !ctx.is_null() {
-        // SAFETY: ctx is the &mut SwCreateCtx the creator passed; it outlives this callback.
+        // SAFETY: ctx is the &mut SwCreateCtx the creator passed; it outlives this callback (the
+        // creator blocks on the event). `id` is a NUL-terminated string for the callback's duration.
         unsafe {
             let c = ctx as *mut SwCreateCtx;
             (*c).result = result;
+            if !id.is_null() {
+                for i in 0..(*c).instance_id.len() - 1 {
+                    let ch = *id.0.add(i);
+                    (*c).instance_id[i] = ch;
+                    if ch == 0 {
+                        break;
+                    }
+                }
+            }
             let _ = SetEvent((*c).event);
         }
+    }
+}
+
+impl SwCreateCtx {
+    fn instance_id(&self) -> Option<String> {
+        let len = self.instance_id.iter().position(|&c| c == 0)?;
+        (len > 0).then(|| String::from_utf16_lossy(&self.instance_id[..len]))
     }
 }
 
@@ -131,7 +154,7 @@ pub(super) struct SwDeviceProfile<'a> {
 /// (hence `punktfunk`, not `pf_dualsense`), and the completion callback is mandatory (the docs mark
 /// `pCallback` as `[in]`, not optional — a NULL callback is rejected). The caller must be
 /// Administrator (the host service runs as LocalSystem).
-pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<HSWDEVICE> {
+pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(HSWDEVICE, Option<String>)> {
     // Build a double-NUL-terminated UTF-16 multi-sz from a list of ids.
     let multi_sz = |ids: &[&str]| -> Vec<u16> {
         ids.iter()
@@ -189,9 +212,12 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<HSWDEVICE> {
 
     // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
     let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
+    // `result` starts as E_FAIL, NOT S_OK: if the wait below times out, a zero-initialised HRESULT
+    // would read as success and mask the failure (found by the 2026-07 driver-health audit).
     let mut ctx = SwCreateCtx {
         event,
-        result: HRESULT(0),
+        result: E_FAIL,
+        instance_id: [0; 128],
     };
     // SAFETY: info + the buffers + ctx outlive the call (we wait on the event before returning);
     // windows-rs returns the HSWDEVICE (the C out-param) as the Result value.
@@ -216,9 +242,17 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<HSWDEVICE> {
     };
     // Block until PnP finishes enumerating (the callback signals), then check its result.
     // SAFETY: event is valid.
+    let wait = unsafe { WaitForSingleObject(event, 10_000) };
+    // SAFETY: event is valid.
     unsafe {
-        WaitForSingleObject(event, 10_000);
         let _ = CloseHandle(event);
+    }
+    if wait != WAIT_OBJECT_0 {
+        // SAFETY: hsw is the handle SwDeviceCreate returned.
+        unsafe { SwDeviceClose(hsw) };
+        return Err(anyhow!(
+            "SwDeviceCreate enumeration callback never fired (10s) — PnP may be wedged"
+        ));
     }
     if ctx.result.is_err() {
         // SAFETY: hsw is the handle SwDeviceCreate returned.
@@ -228,7 +262,7 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<HSWDEVICE> {
             ctx.result
         ));
     }
-    Ok(hsw)
+    Ok((hsw, ctx.instance_id()))
 }
 
 impl DsWinPad {
@@ -236,10 +270,8 @@ impl DsWinPad {
     /// `root\pf_dualsense` devnode (the driver loads on it and maps the section). The devnode lives
     /// for the pad's lifetime — dropping the pad removes it (`SwDeviceClose`).
     fn open(index: u8) -> Result<DsWinPad> {
-        let shm = super::gamepad_raii::Shm::create(
-            &HSTRING::from(pf_driver_proto::gamepad::pad_shm_name(index)),
-            SHM_SIZE,
-        )?;
+        let shm_name = pf_driver_proto::gamepad::pad_shm_name(index);
+        let shm = super::gamepad_raii::Shm::create(&HSTRING::from(shm_name.as_str()), SHM_SIZE)?;
         let base = shm.base();
         // Stamp the neutral input report, then the magic LAST (the driver only accepts the section
         // once magic is set). The device-type stays 0 (DualSense — the section is already zeroed).
@@ -256,23 +288,30 @@ impl DsWinPad {
         // rare failure we keep the section + data plane and fall back to an out-of-band `pf_dualsense`
         // devnode (installer / dev-box devgen).
         let inst = format!("pf_pad_{index}");
-        let hsw = match create_swdevice(&SwDeviceProfile {
+        let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
             instance: &inst,
             container_index: index,
             hwid: "pf_dualsense",
             usb_vid_pid: "VID_054C&PID_0CE6",
             description: "punktfunk Virtual DualSense",
         }) {
-            Ok(h) => Some(h),
+            Ok((h, id)) => (Some(h), id),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; falling back to an out-of-band pf_dualsense devnode");
-                None
+                (None, None)
             }
         };
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         Ok(DsWinPad {
             _sw,
             shm,
+            attach: super::gamepad_raii::DriverAttach::new(
+                "pf_dualsense",
+                "pf_dualsense.inf",
+                "C:\\Users\\Public\\pfds-driver.log",
+                shm_name,
+                instance_id,
+            ),
             seq: 0,
             ts: 0,
             last_out_seq: 0,
@@ -292,9 +331,16 @@ impl DsWinPad {
     }
 
     /// Poll the section's output slot; parse a new `0x02` report (rumble / LEDs / triggers) into a
-    /// [`DsFeedback`] for pad `pad`. Returns empty feedback if the driver hasn't published anything new.
+    /// [`DsFeedback`] for pad `pad`. Returns empty feedback if the driver hasn't published anything
+    /// new. Also feeds the driver-attach health watcher (the driver's ~125 Hz timer stamps
+    /// `driver_proto` while it has the section mapped).
     fn service(&mut self, pad: u8) -> DsFeedback {
         let mut fb = DsFeedback::default();
+        // SAFETY: base points at SHM_SIZE bytes.
+        let proto = unsafe {
+            std::ptr::read_unaligned(self.shm.base().add(OFF_DRIVER_PROTO) as *const u32)
+        };
+        self.attach.observe(proto);
         // SAFETY: base points at SHM_SIZE bytes.
         let seq =
             unsafe { std::ptr::read_unaligned(self.shm.base().add(OFF_OUT_SEQ) as *const u32) };
@@ -471,7 +517,7 @@ impl DualSenseWindowsManager {
                 self.last_write[idx] = Instant::now();
             }
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — controller input disabled");
+                tracing::error!(error = %format!("{e:#}"), "virtual DualSense creation failed — controller input disabled until the next client connect (install/repair: punktfunk-host.exe driver install --gamepad)");
                 self.broken = true;
             }
         }
