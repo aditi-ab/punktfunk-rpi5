@@ -1,9 +1,18 @@
 //! Windows input injection via `SendInput` (Win32 KeyboardAndMouse) — the Windows analogue of
 //! [`super::wlr`]: absolute mouse normalized to the virtual desktop, relative mouse for games,
-//! scancode keyboard, scroll, buttons. The client already sends Windows VK codes, so there is no
-//! keycode table. Survives UAC/lock desktop switches with Sunshine's retry-on-failure model: the
-//! thread stays bound to its desktop and only reattaches (`OpenInputDesktop`/`SetThreadDesktop`) when
-//! `SendInput` reports a short write (the input desktop switched) — no per-event reattach overhead.
+//! scancode keyboard, scroll, buttons. Survives UAC/lock desktop switches with Sunshine's
+//! retry-on-failure model: the thread stays bound to its desktop and only reattaches
+//! (`OpenInputDesktop`/`SetThreadDesktop`) when `SendInput` reports a short write (the input
+//! desktop switched) — no per-event reattach overhead.
+//!
+//! **Keyboard conventions** (see [`crate::inject::KEY_FLAG_SEMANTIC_VK`]): first-party punktfunk
+//! clients send **US-positional** VKs (the physical key's US-layout VK — layout-independent by
+//! construction, the mirror of the Linux host's `vk_to_evdev`), resolved here through the fixed
+//! [`positional_vk_to_scan`] table. GameStream/Moonlight clients send **layout-semantic** VKs
+//! (Sunshine's model), resolved under the foreground app's layout. Never resolve a positional VK
+//! through a layout: this thread runs in the SYSTEM service, whose layout is unrelated to the
+//! user's, and any layout re-reads a *position* as a *character* — on a German host that is
+//! exactly the y↔z swap / ü-on-ö scramble.
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -16,15 +25,16 @@ use windows::Win32::System::StationsAndDesktops::{
     HDESK,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyExW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX,
-    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    GetKeyboardLayout, MapVirtualKeyExW, SendInput, HKL, INPUT, INPUT_0, INPUT_KEYBOARD,
+    INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+    MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 use super::InputInjector;
@@ -238,17 +248,39 @@ impl InputInjector for SendInputInjector {
             }
             InputKind::KeyDown | InputKind::KeyUp => {
                 let down = event.kind == InputKind::KeyDown;
-                // client sends Windows VK
                 let vk = (event.code & 0xff) as u16;
-                // SAFETY: `MapVirtualKeyExW` is a pure value translation (VK → scancode); all three
-                // args are by-value (`u32`, the `MAPVK_VK_TO_VSC_EX` map-type constant, a `None`
-                // HKL). It dereferences no pointer and returns a `u32` — FFI-`unsafe` only.
-                let sc_ex = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, None) };
-                if sc_ex == 0 {
-                    return Ok(()); // unmappable -> drop
-                }
-                let extended = (sc_ex & 0xe000) == 0xe000 || forced_extended(vk);
-                let scan = (sc_ex & 0xff) as u16;
+                let semantic = (event.flags & crate::inject::KEY_FLAG_SEMANTIC_VK) != 0;
+                // Positional wire VKs (first-party clients) resolve through the fixed US table —
+                // never through a layout (module docs). The table covers only the layout-VARIANT
+                // typing area; everything else (F-row, nav, numpad, modifiers) is layout-invariant
+                // and falls through to `MapVirtualKeyExW` (same result under any layout, and it
+                // keeps the proven extended-bit handling). Semantic VKs (Moonlight) skip the table
+                // and resolve under the FOREGROUND app's layout — the layout the receiving app
+                // will decode our scancode with (Sunshine's model; the service thread's own layout
+                // is not the user's).
+                let table = if semantic {
+                    None
+                } else {
+                    positional_vk_to_scan(vk)
+                };
+                let (scan, extended) = match table {
+                    Some(scan) => (scan, forced_extended(vk)), // typing area: never E0-extended
+                    None => {
+                        let hkl = if semantic { foreground_hkl() } else { None };
+                        // SAFETY: `MapVirtualKeyExW` is a pure value translation (VK → scancode);
+                        // all three args are by-value (`u32`, the `MAPVK_VK_TO_VSC_EX` map-type
+                        // constant, an optional `HKL` handle used only as a lookup key). It
+                        // dereferences no pointer and returns a `u32` — FFI-`unsafe` only.
+                        let sc_ex = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, hkl) };
+                        if sc_ex == 0 {
+                            return Ok(()); // unmappable -> drop
+                        }
+                        (
+                            (sc_ex & 0xff) as u16,
+                            (sc_ex & 0xe000) == 0xe000 || forced_extended(vk),
+                        )
+                    }
+                };
                 let mut flags = KEYEVENTF_SCANCODE;
                 if extended {
                     flags |= KEYEVENTF_EXTENDEDKEY;
@@ -311,4 +343,116 @@ fn forced_extended(vk: u16) -> bool {
         vk,
         0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0xA3 | 0xA5 | 0x90
     )
+}
+
+/// US-positional VK → set-1 make scancode for the layout-**variant** typing area (letters, the
+/// digit row, OEM punctuation, the ISO 102nd key). The exact mirror of the Linux host's
+/// `crate::inject::vk_to_evdev` — for these keys the evdev code IS the set-1 scancode — and of
+/// every first-party client's capture table, so the positional round trip is
+/// identity-by-construction. Layout-invariant keys are deliberately absent (the
+/// `MapVirtualKeyExW` fallback resolves them identically under any layout, with its proven
+/// extended-key handling). All listed keys are plain make codes — never E0-extended.
+fn positional_vk_to_scan(vk: u16) -> Option<u16> {
+    Some(match vk {
+        0x30 => 0x0B,                    // VK_0
+        0x31..=0x39 => vk - 0x31 + 0x02, // VK_1..VK_9 → 0x02..0x0A
+        0x41 => 0x1E,                    // A
+        0x42 => 0x30,                    // B
+        0x43 => 0x2E,                    // C
+        0x44 => 0x20,                    // D
+        0x45 => 0x12,                    // E
+        0x46 => 0x21,                    // F
+        0x47 => 0x22,                    // G
+        0x48 => 0x23,                    // H
+        0x49 => 0x17,                    // I
+        0x4A => 0x24,                    // J
+        0x4B => 0x25,                    // K
+        0x4C => 0x26,                    // L
+        0x4D => 0x32,                    // M
+        0x4E => 0x31,                    // N
+        0x4F => 0x18,                    // O
+        0x50 => 0x19,                    // P
+        0x51 => 0x10,                    // Q
+        0x52 => 0x13,                    // R
+        0x53 => 0x1F,                    // S
+        0x54 => 0x14,                    // T
+        0x55 => 0x16,                    // U
+        0x56 => 0x2F,                    // V
+        0x57 => 0x11,                    // W
+        0x58 => 0x2D,                    // X
+        0x59 => 0x15,                    // Y (US position — a QWERTZ host renders it as Z)
+        0x5A => 0x2C,                    // Z (US position)
+        0xBA => 0x27,                    // VK_OEM_1      ;:  (DE: ö)
+        0xBB => 0x0D,                    // VK_OEM_PLUS   =+
+        0xBC => 0x33,                    // VK_OEM_COMMA  ,<
+        0xBD => 0x0C,                    // VK_OEM_MINUS  -_  (DE: ß)
+        0xBE => 0x34,                    // VK_OEM_PERIOD .>
+        0xBF => 0x35,                    // VK_OEM_2      /?
+        0xC0 => 0x29,                    // VK_OEM_3      `~  (DE: ^)
+        0xDB => 0x1A,                    // VK_OEM_4      [{  (DE: ü)
+        0xDC => 0x2B,                    // VK_OEM_5      \|
+        0xDD => 0x1B,                    // VK_OEM_6      ]}
+        0xDE => 0x28,                    // VK_OEM_7      '"  (DE: ä)
+        0xE2 => 0x56,                    // VK_OEM_102    <>| (ISO key next to left shift)
+        _ => return None,
+    })
+}
+
+/// The keyboard layout of the thread owning the foreground window — the layout the app receiving
+/// our injected scancodes will decode them under (Sunshine's model for semantic Moonlight VKs).
+/// `None` when there is no foreground window (secure desktop, transient) — the caller then falls
+/// back to the current thread's layout, today's behavior.
+fn foreground_hkl() -> Option<HKL> {
+    // SAFETY: three read-only queries. `GetForegroundWindow` takes nothing and returns a possibly
+    // null `HWND` (checked). `GetWindowThreadProcessId` reads the window's owning thread id (the
+    // process-id out-param is `None`, allowed). `GetKeyboardLayout` maps a thread id to its input
+    // locale by value. No pointer we own is dereferenced; a stale/foreign `tid` yields a null HKL,
+    // which is filtered.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let tid = GetWindowThreadProcessId(hwnd, None);
+        let hkl = GetKeyboardLayout(tid);
+        (!hkl.is_invalid()).then_some(hkl)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The positional table must mirror the Linux host's `vk_to_evdev` exactly — for the typing
+    /// area the evdev code IS the set-1 scancode, so any divergence would make the same wire VK
+    /// land on different physical keys on the two hosts.
+    #[test]
+    fn positional_table_mirrors_linux_vk_to_evdev() {
+        let mut checked = 0;
+        for vk in 0x01..=0xFEu16 {
+            if let Some(scan) = positional_vk_to_scan(vk) {
+                assert_eq!(
+                    Some(scan),
+                    crate::inject::vk_to_evdev(vk as u8),
+                    "vk 0x{vk:02X}: sendinput scancode diverges from vk_to_evdev"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 48, "typing-area coverage changed unexpectedly");
+    }
+
+    /// The German-scramble regression pins: the US-position VKs the first-party clients send for
+    /// the physical Y/Z/ö/ü keys must resolve to those physical positions, not through a layout.
+    #[test]
+    fn positional_pins_for_the_qwertz_scramble() {
+        assert_eq!(positional_vk_to_scan(0x59), Some(0x15)); // VK_Y → US-Y position (QWERTZ: Z key)
+        assert_eq!(positional_vk_to_scan(0x5A), Some(0x2C)); // VK_Z → US-Z position (QWERTZ: Y key)
+        assert_eq!(positional_vk_to_scan(0xBA), Some(0x27)); // VK_OEM_1 → ;: position (QWERTZ: ö)
+        assert_eq!(positional_vk_to_scan(0xDB), Some(0x1A)); // VK_OEM_4 → [{ position (QWERTZ: ü)
+                                                             // Layout-invariant keys stay out of the table (resolved via MapVirtualKeyExW).
+        assert_eq!(positional_vk_to_scan(0x70), None); // VK_F1
+        assert_eq!(positional_vk_to_scan(0x0D), None); // VK_RETURN
+        assert_eq!(positional_vk_to_scan(0xA0), None); // VK_LSHIFT
+    }
 }

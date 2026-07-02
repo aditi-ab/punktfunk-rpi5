@@ -71,6 +71,9 @@ fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
         MAGIC_KEY_DOWN | MAGIC_KEY_UP => {
             // char flags, short keyCode (LE), char modifiers, short zero2. The client stuffs a
             // 0x80 high byte on key-down; Sunshine masks to the low-byte VK (`& 0xFF`).
+            // Moonlight VKs are LAYOUT-SEMANTIC (the client's layout already resolved them) —
+            // tag them so the Windows injector maps them under the receiving app's layout
+            // instead of the fixed US-positional table the first-party clients use.
             let key_code = (u16::from_le_bytes([*b.get(1)?, *b.get(2)?]) & 0x00FF) as u32;
             let modifiers = *b.get(3)? as u32;
             let kind = if magic == MAGIC_KEY_DOWN {
@@ -78,7 +81,13 @@ fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
             } else {
                 InputKind::KeyUp
             };
-            ev(kind, key_code, 0, 0, modifiers)
+            ev(
+                kind,
+                key_code,
+                0,
+                0,
+                modifiers | crate::inject::KEY_FLAG_SEMANTIC_VK,
+            )
         }
         // UTF-8 text, gamepad, pen, touch, haptics — not yet injected.
         _ => return None,
@@ -125,13 +134,14 @@ mod tests {
 
     #[test]
     fn decodes_key_down_masking_high_byte() {
-        // keyCode 0x80A4 (LE a4 80) → VK 0xA4 (VK_LMENU); modifiers 0x04 (Alt).
+        // keyCode 0x80A4 (LE a4 80) → VK 0xA4 (VK_LMENU); modifiers 0x04 (Alt). GameStream keys
+        // are additionally tagged layout-semantic (Moonlight resolved the VK under its layout).
         let pt = wrap(MAGIC_KEY_DOWN, &[0x00, 0xa4, 0x80, 0x04, 0x00, 0x00]);
         let ev = decode(&pt);
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].kind, InputKind::KeyDown);
         assert_eq!(ev[0].code, 0xA4);
-        assert_eq!(ev[0].flags, 0x04);
+        assert_eq!(ev[0].flags, 0x04 | crate::inject::KEY_FLAG_SEMANTIC_VK);
     }
 
     #[test]

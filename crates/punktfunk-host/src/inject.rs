@@ -5,12 +5,22 @@
 //! protocols — `zwlr_virtual_pointer_manager_v1` + `zwp_virtual_keyboard_manager_v1` — which
 //! Sway always advertises. We connect as an ordinary Wayland client (the host process
 //! inherits Sway's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`), bind the two managers, and translate
-//! events into virtual pointer/keyboard requests. Keyboard codes are Linux evdev; we upload a
-//! standard evdev/US xkb keymap and track modifier state so the compositor resolves shifted
-//! keysyms correctly.
+//! events into virtual pointer/keyboard requests. Keyboard codes are Linux evdev; we upload an
+//! xkb keymap (the host's layout via `XKB_DEFAULT_LAYOUT` et al., defaulting to evdev/US) and
+//! track modifier state so the compositor resolves shifted keysyms correctly.
 
 use anyhow::Result;
 use punktfunk_core::input::{InputEvent, InputKind};
+
+/// In-process tag on a key event's `flags`: the VK in `code` is **layout-semantic** (already
+/// resolved under the sending client's keyboard layout — the GameStream/Moonlight convention)
+/// rather than the punktfunk-native **US-positional** convention (the physical key's US-layout VK,
+/// which every first-party client sends — the client's local layout never touches the wire).
+/// The Windows injector maps semantic VKs through the foreground app's layout and positional VKs
+/// through a fixed table; conflating the two is exactly the German y↔z / ö→ü scramble.
+/// Set ONLY by `gamestream::input::decode`; the punktfunk/1 ingest strips it from wire events, so
+/// a network client can never flip the host's key-decoding convention.
+pub const KEY_FLAG_SEMANTIC_VK: u32 = 0x8000_0000;
 
 /// Injects input events into the host session. Not `Send`: an injector owns compositor
 /// resources (a Wayland connection, an xkb state) and lives entirely on the control thread

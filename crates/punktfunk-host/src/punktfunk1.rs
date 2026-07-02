@@ -1015,8 +1015,19 @@ async fn serve_session(
                 if rich_tx.send(rich).is_err() {
                     break;
                 }
-            } else if let Some(ev) = InputEvent::decode(&d) {
+            } else if let Some(mut ev) = InputEvent::decode(&d) {
                 input_count += 1;
+                // Wire hygiene: KEY_FLAG_SEMANTIC_VK is an in-process tag (GameStream ingest
+                // only) — strip it from network events so a client can't flip the host's
+                // key-decoding convention. Other kinds keep flags verbatim (MouseMoveAbs packs
+                // its reference extent there).
+                if matches!(
+                    ev.kind,
+                    punktfunk_core::input::InputKind::KeyDown
+                        | punktfunk_core::input::InputKind::KeyUp
+                ) {
+                    ev.flags &= !crate::inject::KEY_FLAG_SEMANTIC_VK;
+                }
                 if input_tx.send(ev).is_err() {
                     break;
                 }
