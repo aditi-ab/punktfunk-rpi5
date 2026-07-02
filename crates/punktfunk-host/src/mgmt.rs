@@ -2310,11 +2310,17 @@ mod tests {
         );
 
         let checked_in = include_str!("../../../api/openapi.json");
-        // Compare content, not line-ending style: the generated `json` is LF (serde_json), but git
-        // may check the file out CRLF on Windows.
+        // Compare STRUCTURALLY with `info.version` normalized on both sides: the served document
+        // stamps the live crate version, but a version bump alone must never invalidate the
+        // snapshot — the API *surface* is what drift-control protects (the 0.5.0 release tripped
+        // on exactly this). Structural comparison also makes line endings a non-issue (git may
+        // check the file out CRLF on Windows).
+        let mut generated = doc;
+        let mut snapshot: serde_json::Value = serde_json::from_str(checked_in).unwrap();
+        generated["info"]["version"] = serde_json::json!("<any>");
+        snapshot["info"]["version"] = serde_json::json!("<any>");
         assert_eq!(
-            json.trim().replace('\r', ""),
-            checked_in.trim().replace('\r', ""),
+            generated, snapshot,
             "api/openapi.json is stale — regenerate with: \
              cargo run -p punktfunk-host -- openapi > api/openapi.json"
         );
