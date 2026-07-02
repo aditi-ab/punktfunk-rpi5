@@ -16,5 +16,10 @@
 	     compliance question. -->
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<!-- Allow CADisplayLink above 60 Hz on ProMotion iPhones: without this key the system
+	     silently caps the link at 60 even when SessionPresenter asks for the stream's rate
+	     via preferredFrameRateRange, so a 120 fps stream would present at half rate. -->
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
 </dict>
 </plist>

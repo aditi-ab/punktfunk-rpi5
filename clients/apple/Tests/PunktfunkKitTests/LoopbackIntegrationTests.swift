@@ -131,40 +131,49 @@ final class LoopbackIntegrationTests: XCTestCase {
     }
 
     /// The PIN pairing ceremony + the --require-pairing gate through the Swift wrapper:
-    /// anonymous rejection, the single wrong-PIN online guess, the real ceremony, and a
-    /// paired + pinned session. Driven by test-loopback.sh, which arms a second host with
-    /// --require-pairing and parses its random PIN out of the log.
+    /// no session while unpaired, the single wrong-PIN online guess, the real ceremony, and a
+    /// paired + pinned session. Driven by test-loopback.sh, which arms TWO --require-pairing
+    /// hosts and parses their random PINs out of the logs: a pairing attempt — right or wrong —
+    /// consumes the host's one-shot arming window (SPAKE2's "one online guess"), so the wrong-PIN
+    /// assertion burns the GUESS host's window and the real ceremony runs against the PAIRING
+    /// host's untouched one.
     func testPairingCeremonyAndRequirePairingGate() throws {
         let env = ProcessInfo.processInfo.environment
         guard let portStr = env["PUNKTFUNK_PAIRING_PORT"], let port = UInt16(portStr),
-              let pin = env["PUNKTFUNK_PAIRING_PIN"]
+              let pin = env["PUNKTFUNK_PAIRING_PIN"],
+              let guessPortStr = env["PUNKTFUNK_GUESS_PORT"], let guessPort = UInt16(guessPortStr),
+              let guessPin = env["PUNKTFUNK_GUESS_PIN"]
         else {
-            throw XCTSkip("needs an armed punktfunk1-host — use clients/apple/test-loopback.sh")
+            throw XCTSkip("needs armed punktfunk1-hosts — use clients/apple/test-loopback.sh")
         }
 
         let identity = try generateIdentity()
 
-        // 1. Unpaired clients don't get sessions from a --require-pairing host.
+        // 1. Unpaired clients don't get sessions from a require-pairing host. The host PARKS the
+        //    identified knock for delegated console approval (§8b-1) rather than rejecting it
+        //    outright — nobody approves here, so the connect times out client-side. Either way:
+        //    no session while unpaired.
         XCTAssertThrowsError(
             try PunktfunkConnection(
                 host: "127.0.0.1", port: port, width: 1280, height: 720, refreshHz: 60,
                 identity: identity, timeoutMs: 5000),
-            "unpaired client must be rejected")
+            "unpaired client must not get a session")
 
-        // 2. A wrong PIN is exactly one failed online guess — distinguishable from
-        //    transport errors so the UI can say "try again".
+        // 2. A wrong PIN is exactly one failed online guess — distinguishable from transport
+        //    errors so the UI can say "try again". The attempt consumes the GUESS host's arming
+        //    window (that is the point of the one-guess design), which is why it gets its own host.
         XCTAssertThrowsError(
             try pair(
-                host: "127.0.0.1", port: port, identity: identity,
-                pin: pin == "0000" ? "9999" : "0000", name: "wrong-pin", timeoutMs: 5000)
+                host: "127.0.0.1", port: guessPort, identity: identity,
+                pin: guessPin == "0000" ? "9999" : "0000", name: "wrong-pin", timeoutMs: 5000)
         ) { error in
             guard case PunktfunkClientError.wrongPIN = error else {
                 return XCTFail("expected .wrongPIN, got \(error)")
             }
         }
 
-        // 3. The real ceremony (after the host's 2 s pairing cooldown).
-        Thread.sleep(forTimeInterval: 2.2)
+        // 3. The real ceremony — the PAIRING host's first attempt, so neither its one-shot window
+        //    nor the per-host pairing cooldown has been touched.
         let fingerprint = try pair(
             host: "127.0.0.1", port: port, identity: identity,
             pin: pin, name: "loopback-test", timeoutMs: 5000)

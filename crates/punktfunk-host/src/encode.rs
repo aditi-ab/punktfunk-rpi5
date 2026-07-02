@@ -623,6 +623,13 @@ pub fn can_encode_444(codec: Codec) -> bool {
     })
 }
 
+/// Non-Linux/Windows (the macOS dev/test build of the host — synthetic-source loopback only):
+/// no GPU encode backend exists here, so 4:4:4 is never advertised.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn can_encode_444(_codec: Codec) -> bool {
+    false
+}
+
 // ---------------------------------------------------------------------------------------------
 // Windows backend selection (the analogue of the Linux nvidia_present / linux_zero_copy_is_vaapi
 // logic). NVIDIA → NVENC, AMD → AMF, Intel → QSV; `auto` (default) reads the DXGI adapter vendor.

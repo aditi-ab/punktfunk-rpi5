@@ -84,6 +84,17 @@ PUNKTFUNK_AUTOCONNECT=<box-ip> PUNKTFUNK_MODE=1280x720x60 swift run PunktfunkCli
   the two trust flows (TOFU prompt + SPAKE2 `PairSheet`), the stream view with the HUD, a
   tabbed Settings pane (General / Display / Audio / Controllers / Advanced), and the network speed
   test. A Scene-level **Stream** menu carries Disconnect (⌘D) and the HUD toggle (⌘⇧S).
+  On iOS/iPadOS **and macOS** a connected controller swaps the whole home for the **gamepad UI**
+  (`Home/Gamepad*`, `Settings/GamepadSettingsView`): a console-style host carousel (A connect · Y
+  library · X settings), a controller-navigable settings screen, an add-host flow with an
+  on-screen controller keyboard (no touch required anywhere), and the coverflow library browser —
+  all driven by the shared `GamepadMenuInput` poller + `GamepadCarousel`/`GamepadMenuList` focus
+  machinery, with dual-channel haptics (device Taptic + controller `MenuHaptics`), over an
+  animated "aurora" backdrop (`GamepadScreenBackground` — TimelineView-driven drifting color
+  blobs; deliberately pure SwiftUI, since a .metal library only reliably bundles in one of the
+  two build systems these sources compile under). macOS presents the settings/add-host screens as
+  sheets (no `fullScreenCover` there); `PUNKTFUNK_FORCE_GAMEPAD_UI=1` forces the mode without a
+  physical pad (dev/screenshots).
 - **Tests** (`swift test`) — Annex-B units, a real-codec VideoToolbox round trip, DualSense
   trigger-effect and gamepad-wire conversions, loopback integration against real local hosts, and the
   remote first-light test.

@@ -55,9 +55,9 @@ struct ContentView: View {
     #if !os(macOS)
     @State private var showSettings = false
     #endif
-    #if os(iOS)
+    #if os(iOS) || os(macOS)
     // A connected controller (+ the Settings toggle) swaps the whole home screen for
-    // GamepadHomeView instead of retrofitting HomeView's touch UI — see `home` below.
+    // GamepadHomeView instead of retrofitting HomeView's touch/desktop UI — see `home` below.
     @ObservedObject private var gamepadManager = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
     private var gamepadUIActive: Bool {
@@ -137,12 +137,16 @@ struct ContentView: View {
         // The library is a full-screen presentation, not a sheet: on iPad a sheet is a centered page
         // card, but the gamepad coverflow is meant to be an immersive, full-bleed screen (and the
         // launcher behind it stops consuming the controller — see GamepadHomeView's `isActive`).
-        // macOS has no `fullScreenCover`, so it keeps the sheet there.
+        // macOS has no `fullScreenCover`, so it keeps the sheet there — with an explicit size: a
+        // macOS sheet takes its content's IDEAL size, and both library layouts are geometry-driven
+        // (the coverflow is a GeometryReader, ideal ≈ zero), so without a frame it collapses to a
+        // tiny panel.
         #if os(macOS)
         .sheet(item: $libraryTarget) { host in
             NavigationStack {
                 LibraryView(store: store, host: host, onLaunch: { launchTitle(host, $0) })
             }
+            .frame(minWidth: 940, minHeight: 620)
         }
         #else
         .fullScreenCover(item: $libraryTarget) { host in
@@ -176,6 +180,18 @@ struct ContentView: View {
                 + "device in the host's web console (port 3000 → Pairing) — no PIN needed. Or "
                 + "pair with the 4-digit PIN it can display.")
         }
+        // One "Connection failed" surface for every home screen (touch grid, gamepad launcher) and
+        // platform — SessionModel funnels all connect/session errors into `errorMessage`.
+        .alert(
+            "Connection failed",
+            isPresented: Binding(
+                get: { model.errorMessage != nil },
+                set: { if !$0 { model.errorMessage = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(model.errorMessage ?? "")
+        }
         // The delegated-approval wait: the host holds the connection open until the operator
         // approves it. Cancel returns the UI at once; the in-flight connect is left to time out
         // and its late result is discarded by SessionModel's connect guard (disconnect resets the
@@ -197,12 +213,21 @@ struct ContentView: View {
 
     private var home: some View {
         #if os(macOS)
-        HomeView(
-            store: store, model: model, discovery: discovery,
-            showAddHost: $showAddHost, pairingTarget: $pairingTarget,
-            speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
-            connect: { connect($0) }, connectDiscovered: connectDiscovered,
-            onPaired: handlePaired, onLaunchTitle: launchTitle)
+        Group {
+            if gamepadUIActive {
+                GamepadHomeView(
+                    store: store, model: model, discovery: discovery,
+                    libraryTarget: $libraryTarget,
+                    connect: { connect($0) }, connectDiscovered: connectDiscovered)
+            } else {
+                HomeView(
+                    store: store, model: model, discovery: discovery,
+                    showAddHost: $showAddHost, pairingTarget: $pairingTarget,
+                    speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
+                    connect: { connect($0) }, connectDiscovered: connectDiscovered,
+                    onPaired: handlePaired, onLaunchTitle: launchTitle)
+            }
+        }
         #elseif os(iOS)
         Group {
             if gamepadUIActive {
@@ -308,7 +333,8 @@ struct ContentView: View {
                     onSessionEnd: { [weak model] in
                         Task { @MainActor in model?.sessionEnded() }
                     },
-                    presentMeter: model.presentLatency
+                    presentMeter: model.presentLatency,
+                    presentTailMeter: model.presentTail
                 )
                 .overlay(alignment: placement.alignment) {
                     if captureEnabled && hudEnabled {
@@ -564,24 +590,4 @@ private struct FullscreenController: NSViewRepresentable {
 private struct ApprovalRequest {
     let host: StoredHost
     let advertisedFingerprint: Data?
-}
-
-private extension Data {
-    /// Parse an even-length hex string into bytes; nil on any non-hex character or odd length.
-    /// Used to turn an mDNS-advertised cert fingerprint into a connect pin.
-    init?(hexString: String) {
-        let chars = Array(hexString)
-        guard chars.count.isMultiple(of: 2) else { return nil }
-        var bytes = [UInt8]()
-        bytes.reserveCapacity(chars.count / 2)
-        var i = 0
-        while i < chars.count {
-            guard let hi = chars[i].hexDigitValue, let lo = chars[i + 1].hexDigitValue else {
-                return nil
-            }
-            bytes.append(UInt8(hi << 4 | lo))
-            i += 2
-        }
-        self = Data(bytes)
-    }
 }
