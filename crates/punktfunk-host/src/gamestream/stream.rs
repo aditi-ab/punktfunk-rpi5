@@ -820,8 +820,10 @@ mod tests {
     #[test]
     fn sender_delivers_batches() {
         let rx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Generous: on a CI host saturated by parallel release builds, this thread can be
+        // starved for whole seconds between recv() wakeups.
         rx_sock
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let tx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         tx_sock.connect(rx_sock.local_addr().unwrap()).unwrap();
@@ -837,10 +839,15 @@ mod tests {
         )
         .unwrap();
 
-        // 3 frames of 100 packets, content-tagged for verification.
+        // 3 frames of 20 packets, content-tagged for verification. The TOTAL burst must fit
+        // the receive socket's DEFAULT buffer even if this thread never drains concurrently
+        // (a starved CI runner): a 1200 B datagram costs ~2.5 KB kernel truesize, and the
+        // default rmem (~212 KB) holds only ~80 — a bigger burst gets silently dropped by
+        // the kernel and the test can never complete (the old 3×100 flaked exactly there).
+        const PER_FRAME: usize = 20;
         let mut sent = Vec::new();
         for f in 0..3u8 {
-            let batch: PacketBatch = (0..100u8)
+            let batch: PacketBatch = (0..PER_FRAME as u8)
                 .map(|i| {
                     let mut p = vec![0u8; 1200];
                     p[0] = f;
@@ -859,10 +866,10 @@ mod tests {
             let n = rx_sock.recv(&mut buf).expect("packet within timeout");
             assert_eq!(n, 1200);
             let (f, i) = (buf[0] as usize, buf[1] as usize);
-            assert_eq!(&buf[..n], &sent[f * 100 + i][..], "payload intact");
+            assert_eq!(&buf[..n], &sent[f * PER_FRAME + i][..], "payload intact");
             got += 1;
         }
-        assert_eq!(got, 300);
+        assert_eq!(got, 3 * PER_FRAME);
         assert!(running.load(Ordering::SeqCst), "no spurious client-gone");
     }
 }
