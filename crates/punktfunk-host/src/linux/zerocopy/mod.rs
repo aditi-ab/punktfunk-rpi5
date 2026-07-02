@@ -1,7 +1,10 @@
 //! Zero-copy capture→encode (plan §9): the PipeWire dmabuf is imported into CUDA via EGL and
 //! handed straight to NVENC, eliminating the per-frame CPU copies (at 5K the CPU-copy path
-//! moves ~3.5 GB/s). Opt in with `PUNKTFUNK_ZEROCOPY=1`; the CPU-copy path stays the default and
-//! the runtime fallback (foreign-allocator / no-dmabuf / import failure).
+//! moves ~3.5 GB/s). On NVENC opt in with `PUNKTFUNK_ZEROCOPY=1` (the CPU-copy path stays that
+//! backend's default and the runtime fallback: foreign-allocator / no-dmabuf / import failure).
+//! On the VAAPI (AMD/Intel) backend zero-copy is the **default** — its LINEAR-dmabuf passthrough
+//! replaces a triple CPU touch (mmap de-pad + swscale CSC + surface upload) — with a one-shot
+//! downgrade to the CPU path if the compositor never accepts the dmabuf offer.
 //!
 //! Pieces: [`cuda`] (driver-API FFI + the shared `CUcontext` + device buffers), [`egl`] (the
 //! headless EGLDisplay + dmabuf→`EGLImage`→CUDA import). The encoder's CUDA-frame path lives in
@@ -11,19 +14,53 @@ pub mod cuda;
 pub mod egl;
 pub mod vulkan;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub use cuda::DeviceBuffer;
 pub use egl::{DmabufPlane, EglImporter};
 
-/// Whether a `PUNKTFUNK_*` flag is truthy (`1`/`true`/`yes`/`on`).
-fn flag(name: &str) -> bool {
+/// Whether a `PUNKTFUNK_*` flag is truthy (`1`/`true`/`yes`/`on`), or `None` when unset.
+fn flag_opt(name: &str) -> Option<bool> {
     std::env::var(name)
+        .ok()
         .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
 }
 
-/// Whether the zero-copy path is opted in (`PUNKTFUNK_ZEROCOPY` truthy).
+/// Whether a `PUNKTFUNK_*` flag is truthy (`1`/`true`/`yes`/`on`); unset ⇒ false.
+fn flag(name: &str) -> bool {
+    flag_opt(name).unwrap_or(false)
+}
+
+/// One-shot downgrade latch: a VAAPI-passthrough capture whose dmabuf-only offer never negotiated
+/// (the compositor can't allocate a LINEAR BGRx dmabuf) flips this, so the encode loop's pipeline
+/// rebuild lands on the CPU offer instead of failing the same negotiation forever. Only consulted
+/// when `PUNKTFUNK_ZEROCOPY` is unset — an explicit `=1` keeps forcing the dmabuf offer.
+static VAAPI_DMABUF_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Record that the VAAPI LINEAR-dmabuf offer failed negotiation (see [`VAAPI_DMABUF_FAILED`]).
+pub fn note_vaapi_dmabuf_failed() {
+    VAAPI_DMABUF_FAILED.store(true, Ordering::Relaxed);
+}
+
+/// True when `PUNKTFUNK_ZEROCOPY` is explicitly truthy — the operator forced the dmabuf offer, so
+/// a failed negotiation keeps erroring loudly instead of silently downgrading to the CPU path.
+pub fn vaapi_dmabuf_forced() -> bool {
+    flag_opt("PUNKTFUNK_ZEROCOPY") == Some(true)
+}
+
+/// Whether the zero-copy path is on. `PUNKTFUNK_ZEROCOPY` decides when set (truthy = on, else
+/// off). Unset defaults **on for the VAAPI (AMD/Intel) backend** — the stock AMD/Intel install
+/// gets the GPU dmabuf path, not three full-frame CPU touches — unless a failed negotiation
+/// downgraded it ([`note_vaapi_dmabuf_failed`]); and **off for NVENC**, whose EGL→CUDA import
+/// stays opt-in (Mutter+NVIDIA has known dmabuf-capture races; see `PUNKTFUNK_FORCE_SHM`).
 pub fn enabled() -> bool {
-    flag("PUNKTFUNK_ZEROCOPY")
+    match flag_opt("PUNKTFUNK_ZEROCOPY") {
+        Some(v) => v,
+        None => {
+            crate::encode::linux_zero_copy_is_vaapi()
+                && !VAAPI_DMABUF_FAILED.load(Ordering::Relaxed)
+        }
+    }
 }
 
 /// Whether the NV12 convert path is opted in (`PUNKTFUNK_NV12` truthy). When set AND the zero-copy

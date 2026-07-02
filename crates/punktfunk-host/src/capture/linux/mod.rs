@@ -47,6 +47,11 @@ pub struct PortalCapturer {
     /// renegotiation before declaring the source lost. Cleared whenever a frame arrives or the stream
     /// is `Streaming`.
     stall_since: Option<std::time::Instant>,
+    /// True when this capture runs the VAAPI dmabuf passthrough (a LINEAR-dmabuf-only offer). If
+    /// that offer never negotiates, [`next_frame`](Capturer::next_frame)'s timeout branch latches
+    /// the process-wide downgrade ([`crate::zerocopy::note_vaapi_dmabuf_failed`]) so the pipeline
+    /// rebuild retries on the CPU offer instead of failing identically forever.
+    vaapi_dmabuf: bool,
     /// The PipeWire node this capturer consumes — surfaced in error messages for diagnosis.
     node_id: u32,
     /// Stops the PipeWire loop on teardown (sent in `Drop`). Without it a dropped or failed
@@ -125,6 +130,9 @@ struct PwHandles {
     active: Arc<AtomicBool>,
     negotiated: Arc<AtomicBool>,
     streaming: Arc<AtomicBool>,
+    /// This capture will offer LINEAR-dmabuf-only for the VAAPI passthrough (see
+    /// [`PortalCapturer::vaapi_dmabuf`]).
+    vaapi_dmabuf: bool,
     quit: ::pipewire::channel::Sender<()>,
     join: thread::JoinHandle<()>,
 }
@@ -139,6 +147,7 @@ impl PwHandles {
             negotiated: self.negotiated,
             streaming: self.streaming,
             stall_since: None,
+            vaapi_dmabuf: self.vaapi_dmabuf,
             node_id,
             quit: Some(self.quit),
             join: Some(self.join),
@@ -174,6 +183,12 @@ fn spawn_pipewire(
     // inner `mod pipewire` shadows the crate name at this scope.
     let (quit_tx, quit_rx) = ::pipewire::channel::channel::<()>();
     let zerocopy = allow_zerocopy && crate::zerocopy::enabled();
+    // Mirror of the thread's `vaapi_passthrough` decision (deterministic from here: on a VAAPI
+    // backend the EGL→CUDA importer is never built) — kept on the capturer so `next_frame`'s
+    // negotiation-timeout branch knows a failed negotiation was the LINEAR-dmabuf offer.
+    let vaapi_dmabuf = zerocopy
+        && std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() != Ok("1")
+        && crate::encode::linux_zero_copy_is_vaapi();
     let join = thread::Builder::new()
         .name("punktfunk-pipewire".into())
         .spawn(move || {
@@ -197,6 +212,7 @@ fn spawn_pipewire(
         active,
         negotiated,
         streaming,
+        vaapi_dmabuf,
         quit: quit_tx,
         join,
     })
@@ -216,6 +232,17 @@ impl Capturer for PortalCapturer {
                         "no PipeWire frame within 10s (node {}): format negotiated but no buffers \
                          arrived — the compositor produced no frames (virtual output idle/unmapped, \
                          or capture never started)",
+                        self.node_id
+                    ))
+                } else if self.vaapi_dmabuf && !crate::zerocopy::vaapi_dmabuf_forced() {
+                    // The LINEAR-dmabuf-only offer (VAAPI passthrough default) was never accepted.
+                    // Latch the process-wide downgrade so the encode loop's pipeline rebuild
+                    // retries on the CPU offer instead of failing this same negotiation forever.
+                    crate::zerocopy::note_vaapi_dmabuf_failed();
+                    Err(anyhow!(
+                        "no PipeWire frame within 10s (node {}): the compositor never accepted \
+                         the LINEAR-dmabuf offer (VAAPI zero-copy) — downgrading this host to the \
+                         CPU capture path; the pipeline rebuild will renegotiate without dmabuf",
                         self.node_id
                     ))
                 } else {
@@ -1139,8 +1166,12 @@ mod pipewire {
         };
 
         // Build the EGL→CUDA importer up front; if it fails, log and fall back to the CPU path
-        // (we simply won't request dmabuf below).
-        let importer = if zerocopy {
+        // (we simply won't request dmabuf below). Skipped entirely when the encode backend is
+        // VAAPI: those frames go to the raw-dmabuf passthrough, and building the importer there
+        // would waste a CUDA probe — or worse, on an NVIDIA box forced to PUNKTFUNK_ENCODER=vaapi,
+        // succeed and produce CUDA payloads the VAAPI encoder must reject.
+        let backend_is_vaapi = crate::encode::linux_zero_copy_is_vaapi();
+        let importer = if zerocopy && !backend_is_vaapi {
             match crate::zerocopy::EglImporter::new() {
                 Ok(i) => Some(i),
                 Err(e) => {
@@ -1157,10 +1188,7 @@ mod pipewire {
         let force_shm = std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() == Ok("1");
         // VAAPI zero-copy passthrough: zero-copy on, no EGL→CUDA importer (any non-NVIDIA host), and
         // the encoder backend is VAAPI → hand the raw dmabuf to the encoder (it imports + GPU-CSCs).
-        let vaapi_passthrough = zerocopy
-            && !force_shm
-            && importer.is_none()
-            && crate::encode::linux_zero_copy_is_vaapi();
+        let vaapi_passthrough = zerocopy && !force_shm && importer.is_none() && backend_is_vaapi;
         // Modifiers our import stack handles for BGRx: the EGL-importable (tiled) set, plus LINEAR
         // (0) — NVIDIA's EGL won't list it, but LINEAR dmabufs (gamescope's only offer) import via
         // CUDA external memory instead. For the VAAPI passthrough path we advertise LINEAR only:
@@ -1189,6 +1217,19 @@ mod pipewire {
                 count = modifiers.len(),
                 sample = ?&modifiers[..modifiers.len().min(6)],
                 "zero-copy: advertising EGL-importable dmabuf modifiers"
+            );
+        } else if backend_is_vaapi && crate::capture::gpu_encode() {
+            // A VAAPI session on the CPU path pays three full-frame CPU touches (mmap de-pad +
+            // swscale RGB→NV12 + surface upload) — make the silent fallback visible.
+            tracing::warn!(
+                "VAAPI encode with the CPU capture path (per-frame de-pad + swscale CSC + \
+                 upload) — zero-copy was disabled ({}); clear PUNKTFUNK_ZEROCOPY to restore \
+                 the dmabuf default",
+                if std::env::var_os("PUNKTFUNK_ZEROCOPY").is_some() {
+                    "PUNKTFUNK_ZEROCOPY is set falsy"
+                } else {
+                    "downgraded after a failed dmabuf negotiation"
+                }
             );
         }
         if want_dmabuf && !vaapi_passthrough && crate::zerocopy::nv12_enabled() {
