@@ -8,6 +8,10 @@
 //!
 //! The ring keeps the *newest* [`CAPACITY`] entries (a log tail — unlike the stats recorder,
 //! which keeps the head of a capture). Readers poll with an `after` sequence cursor.
+//!
+//! `log`-crate events (arriving via the tracing-log bridge) are normalized to their real module
+//! path, and known-chatty third-party targets ([`NOISY_DEBUG_TARGETS`]) are demoted to
+//! INFO-and-up so ambient LAN noise can't evict the tail the ring exists to preserve.
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -121,6 +125,21 @@ pub fn ring() -> &'static LogRing {
     RING.get_or_init(LogRing::new)
 }
 
+/// Targets whose DEBUG/TRACE output is steady-state per-packet chatter, not diagnostics — left
+/// in, they evict the entire ring tail (mdns-sd DEBUG-logs every multicast packet it can't parse,
+/// so one chatty AirPlay/HomePod device on the LAN floods thousands of entries per hour). The
+/// ring keeps their INFO-and-up; stderr under `RUST_LOG` is unaffected. Prefix-matched on module
+/// path boundaries.
+const NOISY_DEBUG_TARGETS: &[&str] = &["mdns_sd"];
+
+fn is_noisy_debug(target: &str) -> bool {
+    NOISY_DEBUG_TARGETS.iter().any(|t| {
+        target
+            .strip_prefix(t)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
+}
+
 /// The tee: a `tracing_subscriber` layer pushing every event into [`ring`]. Install with a
 /// per-layer `LevelFilter::DEBUG` so the ring sees DEBUG even when `RUST_LOG` keeps stderr at
 /// `info` (remote debugging must not require a restart with a different env).
@@ -132,7 +151,15 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let meta = event.metadata();
+        // Events from `log`-crate dependencies arrive through the tracing-log bridge under the
+        // shim target "log"; normalize back to the record's real module path so the console's
+        // target column and the noise gate below see `mdns_sd::…`.
+        use tracing_log::NormalizeEvent;
+        let normalized = event.normalized_metadata();
+        let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
+        if *meta.level() > tracing::Level::INFO && is_noisy_debug(meta.target()) {
+            return;
+        }
         let mut fields = FieldFmt::default();
         event.record(&mut fields);
         ring().push(meta.level(), meta.target(), fields.finish());
@@ -152,7 +179,9 @@ impl tracing::field::Visit for FieldFmt {
         use std::fmt::Write;
         if field.name() == "message" {
             let _ = write!(self.msg, "{value:?}");
-        } else {
+        } else if !field.name().starts_with("log.") {
+            // `log.target`/`log.file`/… are tracing-log bridge bookkeeping (already surfaced via
+            // the normalized target), same suppression as the stderr fmt layer.
             let _ = write!(self.fields, " {}={:?}", field.name(), value);
         }
     }
@@ -161,7 +190,7 @@ impl tracing::field::Visit for FieldFmt {
         use std::fmt::Write;
         if field.name() == "message" {
             self.msg.push_str(value);
-        } else {
+        } else if !field.name().starts_with("log.") {
             let _ = write!(self.fields, " {}={value}", field.name());
         }
     }
@@ -236,20 +265,24 @@ mod tests {
         assert_eq!(head.entries.first().map(|e| e.seq), Some(page.next + 1));
     }
 
-    #[test]
-    fn layer_captures_events_into_the_singleton_ring() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        // The singleton ring is process-wide — find its current tail first (parallel tests may
-        // interleave, so only assert on OUR event appearing after it).
+    /// The singleton ring is process-wide — tests find its current tail first (parallel tests
+    /// may interleave, so they only assert on THEIR events appearing after it).
+    fn tail_seq() -> u64 {
         let mut cur = 0;
         loop {
             let page = ring().since(cur, MAX_PAGE);
             if page.entries.is_empty() {
-                break;
+                return cur;
             }
             cur = page.next;
         }
+    }
+
+    #[test]
+    fn layer_captures_events_into_the_singleton_ring() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let cur = tail_seq();
 
         let subscriber = tracing_subscriber::registry().with(RingLayer);
         tracing::subscriber::with_default(subscriber, || {
@@ -270,6 +303,41 @@ mod tests {
         );
         assert!(hit.target.contains("log_capture"), "target: {}", hit.target);
         assert!(hit.ts_ms > 0);
+    }
+
+    #[test]
+    fn log_bridge_events_normalize_target_and_noisy_debug_is_dropped() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // Route `log` records into tracing (what SubscriberInitExt::init does in main). Global,
+        // so tolerate a prior install; max_level explicit so debug! records reach the bridge.
+        let _ = tracing_log::LogTracer::init();
+        log::set_max_level(log::LevelFilter::Trace);
+
+        let cur = tail_seq();
+
+        let subscriber = tracing_subscriber::registry().with(RingLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            log::debug!(target: "mdns_sd::service_daemon", "Invalid incoming DNS message: flood");
+            log::warn!(target: "mdns_sd::service_daemon", "a real mdns problem");
+            log::debug!(target: "mdns_sdx", "not actually mdns-sd");
+        });
+
+        let page = ring().since(cur, MAX_PAGE);
+        assert!(
+            !page.entries.iter().any(|e| e.msg.contains("flood")),
+            "noisy-target DEBUG must not reach the ring"
+        );
+        let warn = page
+            .entries
+            .iter()
+            .find(|e| e.msg.contains("a real mdns problem"))
+            .expect("noisy-target WARN kept");
+        // Normalized off the bridge's "log" shim, and the log.* bookkeeping fields are hidden.
+        assert_eq!(warn.target, "mdns_sd::service_daemon");
+        assert!(!warn.msg.contains("log.target"), "msg: {}", warn.msg);
+        // Prefix match respects module-path boundaries.
+        assert!(page.entries.iter().any(|e| e.target == "mdns_sdx"));
     }
 
     #[test]
