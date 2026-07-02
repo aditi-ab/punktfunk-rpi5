@@ -37,13 +37,30 @@ def call(method, url, token=None, data=None, content_type=None, want_json=True):
         headers["Authorization"] = f"Bearer {token}"
     if content_type:
         headers["Content-Type"] = content_type
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=300) as r:
-            body = r.read()
-    except urllib.error.HTTPError as e:
-        raise ApiError(e.code, method, url, e.read().decode("utf-8", "replace"))
-    return json.loads(body) if (want_json and body) else body
+    # Transient-fault retries: googleapis.com occasionally drops the TLS session ("EOF
+    # occurred in violation of protocol" — failed two release uploads on 2026-07-02) or
+    # answers 5xx. Retry those with backoff; 4xx raises immediately (a real API error).
+    # The edits API is transactional until commit, so re-sending any of these is safe.
+    last = None
+    for attempt in range(4):
+        if attempt:
+            delay = 3**attempt
+            print(f"transient Play API failure ({last}); retry {attempt}/3 in {delay}s")
+            time.sleep(delay)
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                body = r.read()
+            return json.loads(body) if (want_json and body) else body
+        except urllib.error.HTTPError as e:
+            if e.code >= 500:
+                last = f"HTTP {e.code}"
+                continue
+            raise ApiError(e.code, method, url, e.read().decode("utf-8", "replace"))
+        except urllib.error.URLError as e:
+            last = str(getattr(e, "reason", e))
+            continue
+    sys.exit(f"ERROR: {method} {url} still failing after retries: {last}")
 
 
 def load_sa():
