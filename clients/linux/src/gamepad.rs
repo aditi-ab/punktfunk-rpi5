@@ -236,7 +236,6 @@ fn axis_value(axis: sdl3::gamepad::Axis, v: i16) -> (u32, i32) {
 /// host parses off its virtual pad; the wire's 11-byte trigger blocks drop in verbatim.
 /// Enable bits select only the fields each update touches, so rumble (driven separately
 /// through SDL) and untouched fields keep their state.
-#[derive(Default)]
 struct Ds5Feedback;
 
 impl Ds5Feedback {
@@ -275,8 +274,12 @@ impl Ds5Feedback {
     }
 }
 
-struct Worker {
+struct Worker<'a> {
     subsystem: sdl3::GamepadSubsystem,
+    /// UI-facing state (the `GamepadService` accessors): pad list, active pad, pin.
+    pads_out: &'a Mutex<Vec<PadInfo>>,
+    active_out: &'a Mutex<Option<PadInfo>>,
+    pinned_out: &'a Mutex<Option<u32>>,
     opened: HashMap<u32, sdl3::gamepad::Gamepad>,
     /// Connection order; the most recently connected is the auto selection.
     order: Vec<u32>,
@@ -303,7 +306,7 @@ struct Worker {
     disconnect_fired: bool,
 }
 
-impl Worker {
+impl Worker<'_> {
     fn active_id(&self) -> Option<u32> {
         self.pinned
             .filter(|id| self.opened.contains_key(id))
@@ -489,9 +492,245 @@ impl Worker {
             self.held_touches.remove(&(surface, finger));
         }
     }
+
+    /// Publish the pad list, active pad, and pin to the UI-facing mutexes.
+    fn publish(&self) {
+        let mut list: Vec<PadInfo> = self
+            .order
+            .iter()
+            .filter_map(|&id| self.pad_info(id))
+            .collect();
+        list.reverse(); // most recent first — the Settings list order
+        *self.pads_out.lock().unwrap() = list;
+        *self.active_out.lock().unwrap() = self.active_id().and_then(|id| self.pad_info(id));
+        *self.pinned_out.lock().unwrap() = self.pinned;
+    }
+
+    /// Apply queued control-plane messages from the UI thread. Returns false when the
+    /// app side is gone and the worker should exit.
+    fn drain_ctl(&mut self, ctl: &Receiver<Ctl>) -> bool {
+        loop {
+            match ctl.try_recv() {
+                Ok(Ctl::Attach(c)) => {
+                    self.attached = Some(c);
+                    self.last_axis = [i32::MIN; 6];
+                    self.reset_chord(); // every session starts un-latched (Attach doesn't flush)
+                    self.set_sensors(true);
+                }
+                Ok(Ctl::Detach) => {
+                    self.flush_held();
+                    self.set_sensors(false);
+                    self.attached = None;
+                }
+                Ok(Ctl::Pin(id)) => {
+                    let before = self.active_id();
+                    self.pinned = id;
+                    if self.active_id() != before {
+                        self.flush_held();
+                        if self.attached.is_some() {
+                            self.set_sensors(true);
+                        }
+                    }
+                    self.publish();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false, // app gone
+            }
+        }
+    }
+
+    /// Route one SDL event: pad hotplug bookkeeping, and — while a session is attached —
+    /// buttons/axes/touchpads/motion of the active pad onto the wire.
+    fn handle_event(&mut self, event: sdl3::event::Event) {
+        use sdl3::event::Event;
+        let active = self.active_id();
+        match event {
+            Event::ControllerDeviceAdded { which, .. } => {
+                if !self.opened.contains_key(&which) {
+                    match self
+                        .subsystem
+                        .open(sdl3::sys::joystick::SDL_JoystickID(which))
+                    {
+                        Ok(pad) => {
+                            tracing::info!(
+                                name = pad.name().unwrap_or_default(),
+                                "gamepad attached"
+                            );
+                            self.opened.insert(which, pad);
+                            self.order.push(which);
+                            if self.attached.is_some() && self.active_id() == Some(which) {
+                                self.set_sensors(true);
+                            }
+                            self.publish();
+                        }
+                        Err(e) => tracing::warn!(error = %e, "gamepad open failed"),
+                    }
+                }
+            }
+            Event::ControllerDeviceRemoved { which, .. } => {
+                if self.opened.remove(&which).is_some() {
+                    self.order.retain(|&id| id != which);
+                    if active == Some(which) {
+                        self.flush_held();
+                    }
+                    tracing::info!("gamepad detached");
+                    self.publish();
+                }
+            }
+            Event::ControllerButtonDown { which, button, .. } if active == Some(which) => {
+                let Some(c) = self.attached.clone() else {
+                    return;
+                };
+                if let Some(bit) = button_bit(button) {
+                    self.held_buttons.push(bit);
+                    send(&c, InputKind::GamepadButton, bit, 1);
+                    self.maybe_fire_escape();
+                }
+            }
+            Event::ControllerButtonUp { which, button, .. } if active == Some(which) => {
+                let Some(c) = self.attached.clone() else {
+                    return;
+                };
+                if let Some(bit) = button_bit(button) {
+                    self.held_buttons.retain(|&b| b != bit);
+                    send(&c, InputKind::GamepadButton, bit, 0);
+                    self.rearm_escape();
+                }
+            }
+            Event::ControllerAxisMotion {
+                which, axis, value, ..
+            } if active == Some(which) => {
+                let Some(c) = self.attached.clone() else {
+                    return;
+                };
+                let (id, v) = axis_value(axis, value);
+                if self.last_axis[id as usize] != v {
+                    self.last_axis[id as usize] = v;
+                    send(&c, InputKind::GamepadAxis, id, v);
+                }
+            }
+            // Touchpad contacts → the rich-input plane. One pad (DualSense) keeps the legacy
+            // `Touchpad`; two pads (Steam Deck / Steam Controller) send `TouchpadEx` per surface.
+            Event::ControllerTouchpadDown {
+                which,
+                touchpad,
+                finger,
+                x,
+                y,
+                ..
+            }
+            | Event::ControllerTouchpadMotion {
+                which,
+                touchpad,
+                finger,
+                x,
+                y,
+                ..
+            } if active == Some(which) && self.attached.is_some() => {
+                self.forward_touch(which, touchpad as u32, finger as u8, x, y, true);
+            }
+            Event::ControllerTouchpadUp {
+                which,
+                touchpad,
+                finger,
+                x,
+                y,
+                ..
+            } if active == Some(which) && self.attached.is_some() => {
+                self.forward_touch(which, touchpad as u32, finger as u8, x, y, false);
+            }
+            // Motion: accel events update the cache; each gyro event ships a sample
+            // (the DualSense reports both at ~250 Hz). Scale convention shared with
+            // the Swift client — sign/scale derived, not yet live-verified.
+            Event::ControllerSensorUpdated {
+                which,
+                sensor,
+                data,
+                ..
+            } if active == Some(which) => {
+                let Some(c) = self.attached.clone() else {
+                    return;
+                };
+                use sdl3::sensor::SensorType;
+                match sensor {
+                    SensorType::Accelerometer => {
+                        for (i, v) in data.iter().enumerate() {
+                            self.last_accel[i] =
+                                (v / G * ACCEL_LSB_PER_G).clamp(-32768.0, 32767.0) as i16;
+                        }
+                    }
+                    SensorType::Gyroscope => {
+                        let mut gyro = [0i16; 3];
+                        for (i, v) in data.iter().enumerate() {
+                            gyro[i] = (v * GYRO_LSB_PER_RAD_S).clamp(-32768.0, 32767.0) as i16;
+                        }
+                        let _ = c.send_rich_input(RichInput::Motion {
+                            pad: 0,
+                            gyro,
+                            accel: self.last_accel,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Drain and render the feedback planes — rumble plus HID output (lightbar /
+    /// player LEDs / adaptive triggers) — on the active pad; this thread is their single
+    /// consumer. The host re-sends rumble state periodically, so a generous duration with
+    /// refresh-on-update is safe — a dropped stop heals within ~500 ms.
+    fn render_feedback(&mut self) {
+        let Some(connector) = self.attached.clone() else {
+            return;
+        };
+        while let Ok((pad, low, high)) = connector.next_rumble(Duration::ZERO) {
+            if pad == 0 {
+                if let Some(p) = self.active_id().and_then(|id| self.opened.get_mut(&id)) {
+                    // Surface a failed SDL rumble write: a swallowed error here (DualSense not in
+                    // the right HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The
+                    // host logs the send side on 0xCA, so the two together pinpoint host-game vs
+                    // client-render.
+                    if let Err(e) = p.set_rumble(low, high, 5_000) {
+                        tracing::warn!(low, high, error = %e, "rumble: SDL set_rumble failed");
+                    } else {
+                        tracing::debug!(low, high, "rumble: rendered");
+                    }
+                } else {
+                    tracing::debug!(low, high, "rumble: received but no active pad to render");
+                }
+            }
+        }
+        while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
+            let Some(id) = self.active_id() else { continue };
+            let is_ds = self.pad_info(id).is_some_and(|p| p.is_dualsense());
+            let Some(pad) = self.opened.get_mut(&id) else {
+                continue;
+            };
+            match hid {
+                HidOutput::Led { pad: 0, r, g, b } if is_ds => {
+                    let _ = pad.send_effect(&Ds5Feedback::lightbar_packet(r, g, b));
+                }
+                HidOutput::Led { pad: 0, r, g, b } => {
+                    let _ = pad.set_led(r, g, b);
+                }
+                HidOutput::PlayerLeds { pad: 0, bits } if is_ds => {
+                    let _ = pad.send_effect(&Ds5Feedback::player_packet(bits));
+                }
+                HidOutput::Trigger {
+                    pad: 0,
+                    which,
+                    ref effect,
+                } if is_ds => {
+                    let _ = pad.send_effect(&Ds5Feedback::trigger_packet(which, effect));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
-#[allow(clippy::too_many_lines)]
 fn run(
     pads_out: &Mutex<Vec<PadInfo>>,
     active_out: &Mutex<Option<PadInfo>>,
@@ -516,6 +755,9 @@ fn run(
 
     let mut w = Worker {
         subsystem,
+        pads_out,
+        active_out,
+        pinned_out,
         opened: HashMap::new(),
         order: Vec::new(),
         pinned: None,
@@ -531,181 +773,25 @@ fn run(
         disconnect_fired: false,
     };
 
-    let publish = |w: &Worker| {
-        let mut list: Vec<PadInfo> = w.order.iter().filter_map(|&id| w.pad_info(id)).collect();
-        list.reverse(); // most recent first — the Settings list order
-        *pads_out.lock().unwrap() = list;
-        *active_out.lock().unwrap() = w.active_id().and_then(|id| w.pad_info(id));
-        *pinned_out.lock().unwrap() = w.pinned;
-    };
-
     loop {
         // Control plane from the UI thread.
-        loop {
-            match ctl.try_recv() {
-                Ok(Ctl::Attach(c)) => {
-                    w.attached = Some(c);
-                    w.last_axis = [i32::MIN; 6];
-                    w.reset_chord(); // every session starts un-latched (Attach doesn't flush)
-                    w.set_sensors(true);
-                }
-                Ok(Ctl::Detach) => {
-                    w.flush_held();
-                    w.set_sensors(false);
-                    w.attached = None;
-                }
-                Ok(Ctl::Pin(id)) => {
-                    let before = w.active_id();
-                    w.pinned = id;
-                    if w.active_id() != before {
-                        w.flush_held();
-                        if w.attached.is_some() {
-                            w.set_sensors(true);
-                        }
-                    }
-                    publish(&w);
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(()), // app gone
-            }
+        if !w.drain_ctl(ctl) {
+            return Ok(());
         }
 
-        while let Some(event) = pump.poll_event() {
-            use sdl3::event::Event;
-            let active = w.active_id();
-            match event {
-                Event::ControllerDeviceAdded { which, .. } => {
-                    if !w.opened.contains_key(&which) {
-                        match w.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(which)) {
-                            Ok(pad) => {
-                                tracing::info!(
-                                    name = pad.name().unwrap_or_default(),
-                                    "gamepad attached"
-                                );
-                                w.opened.insert(which, pad);
-                                w.order.push(which);
-                                if w.attached.is_some() && w.active_id() == Some(which) {
-                                    w.set_sensors(true);
-                                }
-                                publish(&w);
-                            }
-                            Err(e) => tracing::warn!(error = %e, "gamepad open failed"),
-                        }
-                    }
-                }
-                Event::ControllerDeviceRemoved { which, .. } => {
-                    if w.opened.remove(&which).is_some() {
-                        w.order.retain(|&id| id != which);
-                        if active == Some(which) {
-                            w.flush_held();
-                        }
-                        tracing::info!("gamepad detached");
-                        publish(&w);
-                    }
-                }
-                Event::ControllerButtonDown { which, button, .. }
-                    if active == Some(which) && w.attached.is_some() =>
-                {
-                    if let Some(bit) = button_bit(button) {
-                        w.held_buttons.push(bit);
-                        send(
-                            w.attached.as_ref().unwrap(),
-                            InputKind::GamepadButton,
-                            bit,
-                            1,
-                        );
-                        w.maybe_fire_escape();
-                    }
-                }
-                Event::ControllerButtonUp { which, button, .. }
-                    if active == Some(which) && w.attached.is_some() =>
-                {
-                    if let Some(bit) = button_bit(button) {
-                        w.held_buttons.retain(|&b| b != bit);
-                        send(
-                            w.attached.as_ref().unwrap(),
-                            InputKind::GamepadButton,
-                            bit,
-                            0,
-                        );
-                        w.rearm_escape();
-                    }
-                }
-                Event::ControllerAxisMotion {
-                    which, axis, value, ..
-                } if active == Some(which) && w.attached.is_some() => {
-                    let (id, v) = axis_value(axis, value);
-                    if w.last_axis[id as usize] != v {
-                        w.last_axis[id as usize] = v;
-                        send(w.attached.as_ref().unwrap(), InputKind::GamepadAxis, id, v);
-                    }
-                }
-                // Touchpad contacts → the rich-input plane. One pad (DualSense) keeps the legacy
-                // `Touchpad`; two pads (Steam Deck / Steam Controller) send `TouchpadEx` per surface.
-                Event::ControllerTouchpadDown {
-                    which,
-                    touchpad,
-                    finger,
-                    x,
-                    y,
-                    ..
-                }
-                | Event::ControllerTouchpadMotion {
-                    which,
-                    touchpad,
-                    finger,
-                    x,
-                    y,
-                    ..
-                } if active == Some(which) && w.attached.is_some() => {
-                    w.forward_touch(which, touchpad as u32, finger as u8, x, y, true);
-                }
-                Event::ControllerTouchpadUp {
-                    which,
-                    touchpad,
-                    finger,
-                    x,
-                    y,
-                    ..
-                } if active == Some(which) && w.attached.is_some() => {
-                    w.forward_touch(which, touchpad as u32, finger as u8, x, y, false);
-                }
-                // Motion: accel events update the cache; each gyro event ships a sample
-                // (the DualSense reports both at ~250 Hz). Scale convention shared with
-                // the Swift client — sign/scale derived, not yet live-verified.
-                Event::ControllerSensorUpdated {
-                    which,
-                    sensor,
-                    data,
-                    ..
-                } if active == Some(which) && w.attached.is_some() => {
-                    use sdl3::sensor::SensorType;
-                    match sensor {
-                        SensorType::Accelerometer => {
-                            for (i, v) in data.iter().enumerate() {
-                                w.last_accel[i] =
-                                    (v / G * ACCEL_LSB_PER_G).clamp(-32768.0, 32767.0) as i16;
-                            }
-                        }
-                        SensorType::Gyroscope => {
-                            let mut gyro = [0i16; 3];
-                            for (i, v) in data.iter().enumerate() {
-                                gyro[i] = (v * GYRO_LSB_PER_RAD_S).clamp(-32768.0, 32767.0) as i16;
-                            }
-                            let _ =
-                                w.attached
-                                    .as_ref()
-                                    .unwrap()
-                                    .send_rich_input(RichInput::Motion {
-                                        pad: 0,
-                                        gyro,
-                                        accel: w.last_accel,
-                                    });
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
+        // Block in SDL's own event wait instead of a fixed-interval sleep+poll: input
+        // events are handled the moment they arrive (the old 2 ms sleep added up to 2 ms
+        // per event), while the timeout bounds the polled work below — ctl messages,
+        // rumble/HID feedback, and the escape-chord hold check all run once per wakeup,
+        // so their worst case is one timeout (~10 ms attached, imperceptible for
+        // haptics; DISCONNECT_HOLD is 1500 ms, so 10 ms hold-check granularity is far
+        // inside tolerance). Idle (no session) wakes lazily at 30 ms for hotplug + ctl.
+        let timeout = Duration::from_millis(if w.attached.is_some() { 10 } else { 30 });
+        if let Some(event) = pump.wait_event_timeout(timeout) {
+            w.handle_event(event);
+            // Drain whatever else queued while we were waiting or handling.
+            while let Some(event) = pump.poll_event() {
+                w.handle_event(event);
             }
         }
 
@@ -713,59 +799,6 @@ fn run(
         // new button events; the chord itself is only detected while a session is attached).
         w.maybe_fire_disconnect();
 
-        // Feedback planes (this thread is their single consumer). The host re-sends
-        // rumble state periodically, so a generous duration with refresh-on-update is
-        // safe — a dropped stop heals within ~500 ms.
-        if let Some(connector) = w.attached.clone() {
-            while let Ok((pad, low, high)) = connector.next_rumble(Duration::ZERO) {
-                if pad == 0 {
-                    if let Some(p) = w.active_id().and_then(|id| w.opened.get_mut(&id)) {
-                        // Surface a failed SDL rumble write: a swallowed error here (DualSense not in
-                        // the right HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The
-                        // host logs the send side on 0xCA, so the two together pinpoint host-game vs
-                        // client-render.
-                        if let Err(e) = p.set_rumble(low, high, 5_000) {
-                            tracing::warn!(low, high, error = %e, "rumble: SDL set_rumble failed");
-                        } else {
-                            tracing::debug!(low, high, "rumble: rendered");
-                        }
-                    } else {
-                        tracing::debug!(low, high, "rumble: received but no active pad to render");
-                    }
-                }
-            }
-            while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
-                let Some(id) = w.active_id() else { continue };
-                let is_ds = w.pad_info(id).is_some_and(|p| p.is_dualsense());
-                let Some(pad) = w.opened.get_mut(&id) else {
-                    continue;
-                };
-                match hid {
-                    HidOutput::Led { pad: 0, r, g, b } if is_ds => {
-                        let _ = pad.send_effect(&Ds5Feedback::lightbar_packet(r, g, b));
-                    }
-                    HidOutput::Led { pad: 0, r, g, b } => {
-                        let _ = pad.set_led(r, g, b);
-                    }
-                    HidOutput::PlayerLeds { pad: 0, bits } if is_ds => {
-                        let _ = pad.send_effect(&Ds5Feedback::player_packet(bits));
-                    }
-                    HidOutput::Trigger {
-                        pad: 0,
-                        which,
-                        ref effect,
-                    } if is_ds => {
-                        let _ = pad.send_effect(&Ds5Feedback::trigger_packet(which, effect));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        std::thread::sleep(Duration::from_millis(if w.attached.is_some() {
-            2
-        } else {
-            30
-        }));
+        w.render_feedback();
     }
 }

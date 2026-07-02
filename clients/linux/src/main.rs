@@ -10,11 +10,17 @@ mod app;
 #[cfg(target_os = "linux")]
 mod audio;
 #[cfg(target_os = "linux")]
+mod cli;
+#[cfg(target_os = "linux")]
 mod discovery;
 #[cfg(target_os = "linux")]
 mod gamepad;
 #[cfg(target_os = "linux")]
 mod keymap;
+#[cfg(target_os = "linux")]
+mod launch;
+#[cfg(target_os = "linux")]
+mod library;
 #[cfg(target_os = "linux")]
 mod session;
 #[cfg(target_os = "linux")]
@@ -22,9 +28,13 @@ mod trust;
 #[cfg(target_os = "linux")]
 mod ui_hosts;
 #[cfg(target_os = "linux")]
+mod ui_library;
+#[cfg(target_os = "linux")]
 mod ui_settings;
 #[cfg(target_os = "linux")]
 mod ui_stream;
+#[cfg(target_os = "linux")]
+mod ui_trust;
 #[cfg(target_os = "linux")]
 mod video;
 

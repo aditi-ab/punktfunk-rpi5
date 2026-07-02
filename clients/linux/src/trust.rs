@@ -4,6 +4,7 @@
 //! so a box pairs once whichever client it uses.
 
 use anyhow::{anyhow, Context, Result};
+use punktfunk_core::client::NativeClient;
 use punktfunk_core::quic::endpoint;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -55,6 +56,10 @@ pub struct KnownHost {
     pub fp_hex: String,
     /// True if trust came from the SPAKE2 PIN ceremony (vs. trust-on-first-use).
     pub paired: bool,
+    /// Unix seconds of the last successful connect — the hosts page marks the
+    /// most-recent card with the accent bar. `default` so pre-existing stores load.
+    #[serde(default)]
+    pub last_used: Option<u64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -106,10 +111,62 @@ impl KnownHosts {
             h.addr = entry.addr;
             h.port = entry.port;
             h.paired |= entry.paired;
+            // A refresh without a timestamp must not erase the stored one.
+            if entry.last_used.is_some() {
+                h.last_used = entry.last_used;
+            }
         } else {
             self.hosts.push(entry);
         }
     }
+}
+
+/// Load-upsert-save in one step — the pin every trust decision (TOFU accept, PIN
+/// ceremony, delegated approval, headless pairing) ends in.
+pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: bool) {
+    let mut known = KnownHosts::load();
+    known.upsert(KnownHost {
+        name: name.to_string(),
+        addr: addr.to_string(),
+        port,
+        fp_hex: fp_hex.to_string(),
+        paired,
+        last_used: None,
+    });
+    let _ = known.save();
+}
+
+/// Stamp "now" as this host's last successful connect (drives the hosts page's
+/// most-recent accent). No-op when the fingerprint isn't stored.
+pub fn touch_last_used(fp_hex: &str) {
+    let mut known = KnownHosts::load();
+    if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp_hex) {
+        h.last_used = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
+        let _ = known.save();
+    }
+}
+
+/// Run the SPAKE2 PIN ceremony against a host. `device_name` is the label the HOST
+/// stores this client under (its paired-devices list); the 90 s budget covers a
+/// human-typed PIN. Returns the host's now-verified certificate fingerprint to pin.
+pub fn pair_with_host(
+    addr: &str,
+    port: u16,
+    identity: &(String, String),
+    pin: &str,
+    device_name: &str,
+) -> std::result::Result<[u8; 32], punktfunk_core::PunktfunkError> {
+    NativeClient::pair(
+        addr,
+        port,
+        (&identity.0, &identity.1),
+        pin.trim(),
+        device_name,
+        std::time::Duration::from_secs(90),
+    )
 }
 
 /// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file
@@ -139,6 +196,14 @@ pub struct Settings {
     /// preference — the host honors it when it can emit it, else falls back to the best shared codec.
     #[serde(default = "default_codec")]
     pub codec: String,
+    /// Video decoder preference: `"auto"` (VAAPI → software), `"vaapi"`, `"software"`.
+    /// The `PUNKTFUNK_DECODER` env var overrides this (see `video::Decoder::new`).
+    pub decoder: String,
+    /// Show the on-stream statistics overlay (toggle live with Ctrl+Alt+Shift+S).
+    pub show_stats: bool,
+    /// Experimental: the game-library browser ("Browse library…" on saved cards) —
+    /// mirrors the Apple client's "Show game library" toggle, default off.
+    pub library_enabled: bool,
 }
 
 fn default_codec() -> String {
@@ -170,6 +235,9 @@ impl Default for Settings {
             mic_enabled: false,
             audio_channels: 2,
             codec: "auto".into(),
+            decoder: "auto".into(),
+            show_stats: true,
+            library_enabled: false,
         }
     }
 }

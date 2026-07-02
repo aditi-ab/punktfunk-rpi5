@@ -22,6 +22,9 @@ struct Terminate;
 
 pub struct AudioPlayer {
     pcm_tx: SyncSender<Vec<f32>>,
+    /// Drained chunk Vecs coming back from the PipeWire consumer for reuse (the pool half
+    /// of the pcm channel — see [`AudioPlayer::take_buffer`]).
+    recycle_rx: Receiver<Vec<f32>>,
     quit_tx: pipewire::channel::Sender<Terminate>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -33,20 +36,32 @@ impl AudioPlayer {
     pub fn spawn(channels: u32) -> Result<AudioPlayer> {
         // 64 × 5 ms = 320 ms of slack between the pump and the PipeWire loop.
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
+        // Return path: the process callback sends each drained Vec back for reuse, so
+        // steady-state playback stops allocating (~200 chunks/s otherwise). Same capacity
+        // as the data channel; a full pool just drops the Vec (plain deallocation).
+        let (recycle_tx, recycle_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) = pw_thread(pcm_rx, quit_rx, channels as usize) {
+                if let Err(e) = pw_thread(pcm_rx, recycle_tx, quit_rx, channels as usize) {
                     tracing::warn!(error = %e, "audio playback thread ended");
                 }
             })
             .context("spawn audio thread")?;
         Ok(AudioPlayer {
             pcm_tx,
+            recycle_rx,
             quit_tx,
             thread: Some(thread),
         })
+    }
+
+    /// A recycled chunk Vec from the pool, empty but with its capacity intact — fill it
+    /// and hand it back through [`push`](Self::push). Allocates only when the pool is dry
+    /// (startup, or after the PipeWire side dropped chunks).
+    pub fn take_buffer(&self) -> Vec<f32> {
+        self.recycle_rx.try_recv().unwrap_or_default()
     }
 
     /// Queue one interleaved f32 chunk (in the session's channel layout). Drops the chunk if the
@@ -70,6 +85,8 @@ impl Drop for AudioPlayer {
 /// Producer-side state: incoming decoded PCM and the ring the process callback drains.
 struct PlayerData {
     rx: Receiver<Vec<f32>>,
+    /// Drained chunk Vecs go back here for the decode side to refill (allocation pool).
+    recycle: SyncSender<Vec<f32>>,
     ring: VecDeque<f32>,
     primed: bool,
     /// Interleaved channel count this stream was opened with (2/6/8).
@@ -78,6 +95,7 @@ struct PlayerData {
 
 fn pw_thread(
     pcm_rx: Receiver<Vec<f32>>,
+    recycle_tx: SyncSender<Vec<f32>>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
     channels: usize,
 ) -> Result<()> {
@@ -117,6 +135,7 @@ fn pw_thread(
 
     let ud = PlayerData {
         rx: pcm_rx,
+        recycle: recycle_tx,
         ring: VecDeque::new(),
         primed: false,
         channels,
@@ -132,8 +151,11 @@ fn pw_thread(
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
                 };
-                while let Ok(chunk) = ud.rx.try_recv() {
-                    ud.ring.extend(chunk);
+                while let Ok(mut chunk) = ud.rx.try_recv() {
+                    ud.ring.extend(chunk.iter().copied());
+                    // Return the drained Vec to the pool; a full/closed pool drops it.
+                    chunk.clear();
+                    let _ = ud.recycle.try_send(chunk);
                 }
                 let stride = 4 * ud.channels; // F32LE interleaved
                 let datas = buffer.datas_mut();

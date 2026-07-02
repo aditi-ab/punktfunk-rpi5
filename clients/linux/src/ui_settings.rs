@@ -21,6 +21,7 @@ const COMPOSITORS: &[&str] = &["auto", "kwin", "wlroots", "mutter", "gamescope"]
 /// Codec setting values (persisted) paired with their display labels below.
 const CODECS: &[&str] = &["auto", "hevc", "h264", "av1"];
 const CODEC_LABELS: &[&str] = &["Automatic", "HEVC (H.265)", "H.264 (AVC)", "AV1"];
+const DECODERS: &[&str] = &["auto", "vaapi", "software"];
 
 /// punktfunk's own license (MIT OR Apache-2.0), shown on the About dialog's Legal page.
 const APP_LICENSE: &str = concat!(
@@ -34,8 +35,9 @@ const APP_LICENSE: &str = concat!(
 /// scripts/gen-third-party-notices.sh; shown as a Legal section in the About dialog).
 const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD-PARTY-NOTICES.txt");
 
-/// Show the About dialog (app license + the third-party-software Legal section).
-fn show_about(parent: &impl IsA<gtk::Widget>) {
+/// Show the About dialog (app license + the third-party-software Legal section) — reached
+/// from the primary menu (app.rs `win.about`).
+pub fn show_about(parent: &impl IsA<gtk::Widget>) {
     let about = adw::AboutDialog::builder()
         .application_name("punktfunk")
         .developer_name("unom")
@@ -65,10 +67,13 @@ fn show_about(parent: &impl IsA<gtk::Widget>) {
     about.present(Some(parent));
 }
 
+/// `on_closed` runs after the settings are saved (the app shell refreshes the hosts grid
+/// there so the experimental library toggle takes effect without a nav round-trip).
 pub fn show(
     parent: &impl IsA<gtk::Widget>,
     settings: Rc<RefCell<Settings>>,
     gamepads: &crate::gamepad::GamepadService,
+    on_closed: impl Fn() + 'static,
 ) {
     let page = adw::PreferencesPage::new();
 
@@ -120,10 +125,25 @@ pub fn show(
             "gamescope",
         ]))
         .build();
+    let decoder_row = adw::ComboRow::builder()
+        .title("Video decoder")
+        .subtitle("Automatic tries VAAPI hardware decode, then software")
+        .model(&gtk::StringList::new(&[
+            "Automatic (VAAPI → software)",
+            "Hardware (VAAPI)",
+            "Software",
+        ]))
+        .build();
+    let stats_row = adw::SwitchRow::builder()
+        .title("Show statistics overlay")
+        .subtitle("fps · bitrate · latency on the stream — Ctrl+Alt+Shift+S toggles live")
+        .build();
     stream.add(&res_row);
     stream.add(&hz_row);
     stream.add(&bitrate_row);
     stream.add(&compositor_row);
+    stream.add(&decoder_row);
+    stream.add(&stats_row);
 
     let input = adw::PreferencesGroup::builder().title("Input").build();
     // Which physical controller forwards as pad 0: automatic = the most recently
@@ -208,23 +228,24 @@ pub fn show(
         .build();
     audio.add(&mic_row);
 
-    let about = adw::PreferencesGroup::builder().title("About").build();
-    let licenses_row = adw::ActionRow::builder()
-        .title("Third-party licenses")
-        .subtitle("Open-source software used by punktfunk")
-        .activatable(true)
+    // Experimental — mirrors the Apple client's Experimental section (wording included).
+    let experimental = adw::PreferencesGroup::builder()
+        .title("Experimental")
         .build();
-    licenses_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    {
-        let about_parent: gtk::Widget = parent.clone().upcast();
-        licenses_row.connect_activated(move |_| show_about(&about_parent));
-    }
-    about.add(&licenses_row);
+    let library_row = adw::SwitchRow::builder()
+        .title("Show game library")
+        .subtitle(
+            "Adds a “Browse library…” action to each saved host that lists its games \
+             (Steam + custom) via the host's management API — works once you've paired",
+        )
+        .build();
+    experimental.add(&library_row);
 
+    // About (with the license/third-party Legal pages) lives in the primary menu now.
     page.add(&stream);
     page.add(&input);
     page.add(&audio);
-    page.add(&about);
+    page.add(&experimental);
 
     // Seed from the current settings.
     {
@@ -244,8 +265,12 @@ pub fn show(
             .position(|&c| c == s.compositor)
             .unwrap_or(0);
         compositor_row.set_selected(comp_i as u32);
+        let dec_i = DECODERS.iter().position(|&d| d == s.decoder).unwrap_or(0);
+        decoder_row.set_selected(dec_i as u32);
+        stats_row.set_active(s.show_stats);
         inhibit_row.set_active(s.inhibit_shortcuts);
         mic_row.set_active(s.mic_enabled);
+        library_row.set_active(s.library_enabled);
         surround_row.set_selected(match s.audio_channels {
             6 => 1,
             8 => 2,
@@ -267,6 +292,8 @@ pub fn show(
         s.gamepad = GAMEPADS[(pad_row.selected() as usize).min(GAMEPADS.len() - 1)].to_string();
         s.compositor = COMPOSITORS[(compositor_row.selected() as usize).min(COMPOSITORS.len() - 1)]
             .to_string();
+        s.decoder = DECODERS[(decoder_row.selected() as usize).min(DECODERS.len() - 1)].to_string();
+        s.show_stats = stats_row.is_active();
         s.inhibit_shortcuts = inhibit_row.is_active();
         s.mic_enabled = mic_row.is_active();
         s.audio_channels = match surround_row.selected() {
@@ -275,7 +302,10 @@ pub fn show(
             _ => 2,
         };
         s.codec = CODECS[(codec_row.selected() as usize).min(CODECS.len() - 1)].to_string();
+        s.library_enabled = library_row.is_active();
         s.save();
+        drop(s);
+        on_closed();
     });
     dialog.present(Some(parent));
 }

@@ -16,7 +16,7 @@
 
 use crate::keymap;
 use crate::session::Stats;
-use crate::video::DecodedFrame;
+use crate::video::{DecodedFrame, DecodedImage};
 use adw::prelude::*;
 use gtk::{gdk, glib};
 use punktfunk_core::client::NativeClient;
@@ -26,19 +26,53 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub struct StreamPage {
     pub page: adw::NavigationPage,
     stats_label: gtk::Label,
+    /// Median capture→paintable-set latency (ms) over the frame consumer's last 1 s
+    /// window — written there, folded into the OSD on each `Stats` event.
+    present_ms: Rc<Cell<f32>>,
 }
 
 impl StreamPage {
     pub fn update_stats(&self, s: Stats) {
-        self.stats_label.set_text(&format!(
-            "{:.0} fps · {:.1} Mbit/s · dec {:.1} ms · lat {:.1} ms",
-            s.fps, s.mbps, s.decode_ms, s.latency_ms
-        ));
+        let mut line = format!(
+            "{:.0} fps · {:.1} Mbit/s · dec {:.1} ms · lat {:.1} ms · present {:.1} ms",
+            s.fps,
+            s.mbps,
+            s.decode_ms,
+            s.latency_ms,
+            self.present_ms.get()
+        );
+        // Which decoder actually ran this window (vaapi/software) — tracks a fallback.
+        if !s.decoder.is_empty() {
+            line.push_str(" · ");
+            line.push_str(s.decoder);
+        }
+        self.stats_label.set_text(&line);
     }
+}
+
+/// Everything the stream page needs from the app + session that own it.
+pub struct StreamPageArgs {
+    pub window: adw::ApplicationWindow,
+    pub connector: Arc<NativeClient>,
+    pub frames: async_channel::Receiver<DecodedFrame>,
+    /// Host-clock offset from the session's clock handshake — added to the local wall
+    /// clock to express paintable-set time in the host's capture clock (present latency).
+    pub clock_offset_ns: i64,
+    /// Controller escape chord — leave fullscreen + release capture.
+    pub escape_rx: async_channel::Receiver<()>,
+    /// Escape chord held past the hold threshold — end the session.
+    pub disconnect_rx: async_channel::Receiver<()>,
+    pub stop: Arc<AtomicBool>,
+    /// Grab compositor shortcuts (Alt+Tab, Super…) while input is captured.
+    pub inhibit_shortcuts: bool,
+    /// Show the stats OSD initially (Settings); Ctrl+Alt+Shift+S toggles it live.
+    pub show_stats: bool,
+    pub title: String,
 }
 
 fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, flags: u32) {
@@ -77,12 +111,26 @@ struct Capture {
     hint: gtk::Label,
     inhibit_shortcuts: bool,
     captured: Cell<bool>,
+    /// Newest absolute pointer position not yet on the wire. Motion events only store
+    /// here; a frame-clock tick flushes at most one `MouseMoveAbs` per tick (a 1000 Hz
+    /// mouse would otherwise send a datagram — and take the connector's mode lock — per
+    /// event). Button/scroll/key sends flush it first so they land at the latest
+    /// position. This client has no relative-motion capture to coalesce — absolute only
+    /// (pointer-lock is the stage-2 presenter's job).
+    pending_abs: Cell<Option<(f64, f64)>>,
     /// VKs / GameStream button ids currently held — flushed up on release.
     held_keys: RefCell<HashSet<u8>>,
     held_buttons: RefCell<HashSet<u32>>,
 }
 
 impl Capture {
+    /// Send the coalesced pointer position, if any — one datagram, one fresh mode read.
+    fn flush_pending_motion(&self) {
+        if let Some((x, y)) = self.pending_abs.take() {
+            send_abs(&self.overlay, &self.connector, x, y);
+        }
+    }
+
     fn engage(&self) {
         if self.captured.replace(true) {
             return;
@@ -107,6 +155,7 @@ impl Capture {
         }
         self.overlay.set_cursor(None);
         self.hint.set_visible(true);
+        self.pending_abs.set(None); // never flush motion gathered while captured
         if let Some(tl) = self
             .window
             .surface()
@@ -124,17 +173,72 @@ impl Capture {
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-pub fn new(
-    window: &adw::ApplicationWindow,
-    connector: Arc<NativeClient>,
-    frames: async_channel::Receiver<DecodedFrame>,
-    escape_rx: async_channel::Receiver<()>,
-    disconnect_rx: async_channel::Receiver<()>,
-    stop: Arc<AtomicBool>,
-    inhibit_shortcuts: bool,
-    title: &str,
-) -> StreamPage {
+pub fn new(args: StreamPageArgs) -> StreamPage {
+    let StreamPageArgs {
+        window,
+        connector,
+        frames,
+        clock_offset_ns,
+        escape_rx,
+        disconnect_rx,
+        stop,
+        inhibit_shortcuts,
+        show_stats,
+        title,
+    } = args;
+    let w = build_widgets(&window, &title);
+    w.stats_label.set_visible(show_stats);
+
+    let capture = Rc::new(Capture {
+        connector,
+        window: window.clone(),
+        overlay: w.overlay.clone(),
+        hint: w.hint.clone(),
+        inhibit_shortcuts,
+        captured: Cell::new(false),
+        pending_abs: Cell::new(None),
+        held_keys: RefCell::new(HashSet::new()),
+        held_buttons: RefCell::new(HashSet::new()),
+    });
+
+    let present_ms = Rc::new(Cell::new(0.0f32));
+    spawn_frame_consumer(&w.picture, frames, clock_offset_ns, present_ms.clone());
+    attach_keyboard(&w.overlay, &window, &capture, &stop, &w.stats_label);
+    attach_mouse(&w.overlay, &capture);
+    attach_scroll(&w.overlay, &capture);
+    let active_handler = attach_capture_lifecycle(&w.overlay, &window, &capture);
+    let escape_future = spawn_escape_watch(&window, &capture, escape_rx);
+    let disconnect_future = spawn_disconnect_watch(&window, &capture, &stop, disconnect_rx);
+    wire_teardown(
+        &w.page,
+        &window,
+        &stop,
+        (w.fs_handler, active_handler),
+        escape_future,
+        disconnect_future,
+    );
+
+    StreamPage {
+        page: w.page,
+        stats_label: w.stats_label,
+        present_ms,
+    }
+}
+
+/// The page's widget tree, built in one place so `new` reads as assembly.
+struct PageWidgets {
+    picture: gtk::Picture,
+    stats_label: gtk::Label,
+    hint: gtk::Label,
+    overlay: gtk::Overlay,
+    page: adw::NavigationPage,
+    /// Fullscreen-notify handler on the shared window — disconnected on page teardown.
+    fs_handler: glib::SignalHandlerId,
+}
+
+/// The offloaded picture under an overlay (stats HUD, capture hint, fullscreen hint), a
+/// header bar with the fullscreen toggle, and the window's fullscreen behavior.
+fn build_widgets(window: &adw::ApplicationWindow, title: &str) -> PageWidgets {
     let picture = gtk::Picture::new();
     picture.set_content_fit(gtk::ContentFit::Contain);
 
@@ -153,7 +257,7 @@ pub fn new(
     stats_label.set_margin_top(12);
 
     let hint = gtk::Label::new(Some(
-        "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+D disconnects",
+        "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats",
     ));
     hint.add_css_class("osd");
     hint.set_halign(gtk::Align::Center);
@@ -179,17 +283,6 @@ pub fn new(
     overlay.add_overlay(&hint);
     overlay.add_overlay(&fs_hint);
     overlay.set_focusable(true);
-
-    let capture = Rc::new(Capture {
-        connector: connector.clone(),
-        window: window.clone(),
-        overlay: overlay.clone(),
-        hint: hint.clone(),
-        inhibit_shortcuts,
-        captured: Cell::new(false),
-        held_keys: RefCell::new(HashSet::new()),
-        held_buttons: RefCell::new(HashSet::new()),
-    });
 
     let header = adw::HeaderBar::new();
     let fullscreen_btn = gtk::Button::from_icon_name("view-fullscreen-symbolic");
@@ -233,270 +326,379 @@ pub fn new(
         .child(&toolbar)
         .build();
 
-    // --- Frame consumer: newest texture wins, set on the GTK frame clock's cadence. ---
-    {
-        let picture = picture.downgrade();
-        // The host encodes BT.709 limited-range; without an explicit color state GDK
-        // would convert NV12 dmabufs with the (BT.601) dmabuf default.
-        let rec709 = {
-            let cicp = gdk::CicpParams::new();
-            cicp.set_color_primaries(1);
-            cicp.set_transfer_function(1);
-            cicp.set_matrix_coefficients(1);
-            cicp.set_range(gdk::CicpRange::Narrow);
-            cicp.build_color_state().ok()
-        };
-        glib::spawn_future_local(async move {
-            while let Ok(f) = frames.recv().await {
-                let Some(picture) = picture.upgrade() else {
-                    break;
-                };
-                match f {
-                    DecodedFrame::Cpu(c) => {
-                        let bytes = glib::Bytes::from_owned(c.rgba);
-                        let tex = gdk::MemoryTexture::new(
-                            c.width as i32,
-                            c.height as i32,
-                            gdk::MemoryFormat::R8g8b8a8,
-                            &bytes,
-                            c.stride,
-                        );
-                        picture.set_paintable(Some(&tex));
-                    }
-                    DecodedFrame::Dmabuf(d) => {
-                        let mut b = gdk::DmabufTextureBuilder::new()
-                            .set_display(&picture.display())
-                            .set_width(d.width)
-                            .set_height(d.height)
-                            .set_fourcc(d.fourcc)
-                            .set_modifier(d.modifier)
-                            .set_n_planes(d.planes.len() as u32)
-                            .set_color_state(rec709.as_ref());
-                        for (i, p) in d.planes.iter().enumerate() {
-                            b = unsafe { b.set_fd(i as u32, p.fd) }
-                                .set_offset(i as u32, p.offset)
-                                .set_stride(i as u32, p.stride);
-                        }
-                        let guard = d.guard;
-                        // GDK runs the release func whether the import succeeds or not.
-                        match unsafe { b.build_with_release_func(move || drop(guard)) } {
-                            Ok(tex) => picture.set_paintable(Some(&tex)),
-                            Err(e) => {
-                                // Import rejected (format/modifier) — surfaces once per
-                                // session in practice; the stream continues on the next
-                                // frame, and PUNKTFUNK_DECODER=software is the escape.
-                                tracing::warn!(error = %e, "dmabuf texture import failed");
-                            }
-                        }
-                    }
-                }
-            }
-        });
+    PageWidgets {
+        picture,
+        stats_label,
+        hint,
+        overlay,
+        page,
+        fs_handler,
     }
+}
 
-    // --- Keyboard ---
-    {
-        let key = gtk::EventControllerKey::new();
-        key.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let cap = capture.clone();
-        let window_k = window.clone();
-        let stop_kb = stop.clone();
-        key.connect_key_pressed(move |_, keyval, keycode, state| {
-            let chord = gdk::ModifierType::CONTROL_MASK
-                | gdk::ModifierType::ALT_MASK
-                | gdk::ModifierType::SHIFT_MASK;
-            if state.contains(chord) && keyval.to_lower() == gdk::Key::q {
-                if cap.captured.get() {
-                    cap.release();
-                } else {
-                    cap.engage();
+/// Frame consumer: each decoded frame becomes the picture's paintable as soon as it
+/// arrives (the session's tiny `force_send` queue already dropped anything older); GTK
+/// then draws whatever paintable is current on its own frame clock. Ends itself when the
+/// channel closes or the picture is gone.
+///
+/// Also the capture→present-ish measurement point: at each paintable set the frame's
+/// host capture pts is compared against the local wall clock expressed in the host clock
+/// (`clock_offset_ns`, same math as the session's decode latency). This is
+/// capture→paintable-SET — GTK's own present adds one compositor cycle after this. The
+/// 1 s p50 lands on the stats OSD (via `present_ms`) and in a "present window" debug
+/// line for headless validation.
+fn spawn_frame_consumer(
+    picture: &gtk::Picture,
+    frames: async_channel::Receiver<DecodedFrame>,
+    clock_offset_ns: i64,
+    present_ms: Rc<Cell<f32>>,
+) {
+    let picture = picture.downgrade();
+    // The host encodes BT.709 limited-range; without an explicit color state GDK
+    // would convert NV12 dmabufs with the (BT.601) dmabuf default.
+    let rec709 = {
+        let cicp = gdk::CicpParams::new();
+        cicp.set_color_primaries(1);
+        cicp.set_transfer_function(1);
+        cicp.set_matrix_coefficients(1);
+        cicp.set_range(gdk::CicpRange::Narrow);
+        cicp.build_color_state().ok()
+    };
+    glib::spawn_future_local(async move {
+        let mut win_lat_us: Vec<u64> = Vec::with_capacity(256);
+        let mut win_start = Instant::now();
+        while let Ok(f) = frames.recv().await {
+            let Some(picture) = picture.upgrade() else {
+                break;
+            };
+            let mut presented = false;
+            match f.image {
+                DecodedImage::Cpu(c) => {
+                    let bytes = glib::Bytes::from_owned(c.rgba);
+                    let tex = gdk::MemoryTexture::new(
+                        c.width as i32,
+                        c.height as i32,
+                        gdk::MemoryFormat::R8g8b8a8,
+                        &bytes,
+                        c.stride,
+                    );
+                    picture.set_paintable(Some(&tex));
+                    presented = true;
                 }
-                return glib::Propagation::Stop;
-            }
-            // Ctrl+Alt+Shift+D — leave the session. Now that Steam / QAM pass through to the host,
-            // the capture toggle alone can't end a stream, so this is the keyboard's explicit exit.
-            if state.contains(chord) && keyval.to_lower() == gdk::Key::d {
-                cap.release();
-                stop_kb.store(true, Ordering::SeqCst);
-                return glib::Propagation::Stop;
-            }
-            if keyval == gdk::Key::F11 {
-                if window_k.is_fullscreen() {
-                    window_k.unfullscreen();
-                } else {
-                    window_k.fullscreen();
-                }
-                return glib::Propagation::Stop;
-            }
-            if !cap.captured.get() {
-                return glib::Propagation::Proceed;
-            }
-            if let Some(vk) = keycode
-                .checked_sub(8)
-                .and_then(|c| keymap::evdev_to_vk(c as u16))
-            {
-                cap.held_keys.borrow_mut().insert(vk);
-                send(&cap.connector, InputKind::KeyDown, vk as u32, 0, 0, 0);
-            }
-            glib::Propagation::Stop
-        });
-        let cap = capture.clone();
-        key.connect_key_released(move |_, _keyval, keycode, _state| {
-            if let Some(vk) = keycode
-                .checked_sub(8)
-                .and_then(|c| keymap::evdev_to_vk(c as u16))
-            {
-                // Flush-on-release may have beaten us to it — only forward if still held.
-                if cap.held_keys.borrow_mut().remove(&vk) {
-                    send(&cap.connector, InputKind::KeyUp, vk as u32, 0, 0, 0);
+                DecodedImage::Dmabuf(d) => {
+                    let mut b = gdk::DmabufTextureBuilder::new()
+                        .set_display(&picture.display())
+                        .set_width(d.width)
+                        .set_height(d.height)
+                        .set_fourcc(d.fourcc)
+                        .set_modifier(d.modifier)
+                        .set_n_planes(d.planes.len() as u32)
+                        .set_color_state(rec709.as_ref());
+                    for (i, p) in d.planes.iter().enumerate() {
+                        b = unsafe { b.set_fd(i as u32, p.fd) }
+                            .set_offset(i as u32, p.offset)
+                            .set_stride(i as u32, p.stride);
+                    }
+                    let guard = d.guard;
+                    // GDK runs the release func whether the import succeeds or not.
+                    match unsafe { b.build_with_release_func(move || drop(guard)) } {
+                        Ok(tex) => {
+                            picture.set_paintable(Some(&tex));
+                            presented = true;
+                        }
+                        Err(e) => {
+                            // Import rejected (format/modifier) — surfaces once per
+                            // session in practice; the stream continues on the next
+                            // frame, and PUNKTFUNK_DECODER=software is the escape.
+                            tracing::warn!(error = %e, "dmabuf texture import failed");
+                        }
+                    }
                 }
             }
-        });
-        overlay.add_controller(key);
-    }
+            // Capture→paintable-set latency, host-clock corrected (same math and sanity
+            // bound as the session's decode-latency window).
+            if presented {
+                let lat = (crate::session::now_ns() as i128 + clock_offset_ns as i128
+                    - f.pts_ns as i128)
+                    .max(0) as u64;
+                if lat > 0 && lat < 10_000_000_000 {
+                    win_lat_us.push(lat / 1000);
+                }
+            }
+            if win_start.elapsed() >= Duration::from_secs(1) {
+                win_lat_us.sort_unstable();
+                let p50 = win_lat_us.get(win_lat_us.len() / 2).copied().unwrap_or(0);
+                tracing::debug!(
+                    frames = win_lat_us.len(),
+                    present_p50_us = p50,
+                    "present window"
+                );
+                present_ms.set(p50 as f32 / 1000.0);
+                win_lat_us.clear();
+                win_start = Instant::now();
+            }
+        }
+    });
+}
 
-    // --- Mouse: absolute motion, buttons, wheel — forwarded only while captured ---
-    {
-        let motion = gtk::EventControllerMotion::new();
-        let cap = capture.clone();
-        motion.connect_motion(move |_, x, y| {
+/// Keyboard, capture-phase: the release (Ctrl+Alt+Shift+Q) / disconnect (Ctrl+Alt+Shift+D)
+/// / stats (Ctrl+Alt+Shift+S) chords and F11 are handled locally; everything else becomes
+/// a VK on the wire while captured.
+fn attach_keyboard(
+    overlay: &gtk::Overlay,
+    window: &adw::ApplicationWindow,
+    capture: &Rc<Capture>,
+    stop: &Arc<AtomicBool>,
+    stats: &gtk::Label,
+) {
+    let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let cap = capture.clone();
+    let window_k = window.clone();
+    let stop_kb = stop.clone();
+    let stats = stats.clone();
+    key.connect_key_pressed(move |_, keyval, keycode, state| {
+        let chord = gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::ALT_MASK
+            | gdk::ModifierType::SHIFT_MASK;
+        if state.contains(chord) && keyval.to_lower() == gdk::Key::q {
             if cap.captured.get() {
-                send_abs(&cap.overlay, &cap.connector, x, y);
+                cap.release();
+            } else {
+                cap.engage();
             }
-        });
-        overlay.add_controller(motion);
-    }
-    {
-        let click = gtk::GestureClick::builder().button(0).build();
-        let cap = capture.clone();
-        click.connect_pressed(move |g, _n, x, y| {
-            cap.overlay.grab_focus();
-            if !cap.captured.get() {
-                cap.engage(); // the engaging click is suppressed toward the host
-                return;
+            return glib::Propagation::Stop;
+        }
+        // Ctrl+Alt+Shift+D — leave the session. Now that Steam / QAM pass through to the host,
+        // the capture toggle alone can't end a stream, so this is the keyboard's explicit exit.
+        if state.contains(chord) && keyval.to_lower() == gdk::Key::d {
+            cap.release();
+            stop_kb.store(true, Ordering::SeqCst);
+            return glib::Propagation::Stop;
+        }
+        // Ctrl+Alt+Shift+S — toggle the stats OSD live (initial state = Settings).
+        if state.contains(chord) && keyval.to_lower() == gdk::Key::s {
+            stats.set_visible(!stats.is_visible());
+            return glib::Propagation::Stop;
+        }
+        if keyval == gdk::Key::F11 {
+            if window_k.is_fullscreen() {
+                window_k.unfullscreen();
+            } else {
+                window_k.fullscreen();
             }
-            send_abs(&cap.overlay, &cap.connector, x, y);
-            if let Some(gs) = keymap::gdk_button_to_gs(g.current_button()) {
-                cap.held_buttons.borrow_mut().insert(gs);
-                send(&cap.connector, InputKind::MouseButtonDown, gs, 0, 0, 0);
+            return glib::Propagation::Stop;
+        }
+        if !cap.captured.get() {
+            return glib::Propagation::Proceed;
+        }
+        if let Some(vk) = keycode
+            .checked_sub(8)
+            .and_then(|c| keymap::evdev_to_vk(c as u16))
+        {
+            // Keep the wire ordered: the host must see the cursor where the user does
+            // when the key lands (e.g. "press E at the crosshair").
+            cap.flush_pending_motion();
+            cap.held_keys.borrow_mut().insert(vk);
+            send(&cap.connector, InputKind::KeyDown, vk as u32, 0, 0, 0);
+        }
+        glib::Propagation::Stop
+    });
+    let cap = capture.clone();
+    key.connect_key_released(move |_, _keyval, keycode, _state| {
+        if let Some(vk) = keycode
+            .checked_sub(8)
+            .and_then(|c| keymap::evdev_to_vk(c as u16))
+        {
+            // Flush-on-release may have beaten us to it — only forward if still held.
+            if cap.held_keys.borrow_mut().remove(&vk) {
+                send(&cap.connector, InputKind::KeyUp, vk as u32, 0, 0, 0);
             }
-        });
-        let cap = capture.clone();
-        click.connect_released(move |g, _n, _x, _y| {
-            if let Some(gs) = keymap::gdk_button_to_gs(g.current_button()) {
-                if cap.held_buttons.borrow_mut().remove(&gs) {
-                    send(&cap.connector, InputKind::MouseButtonUp, gs, 0, 0, 0);
-                }
-            }
-        });
-        overlay.add_controller(click);
-    }
-    {
-        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
-        let cap = capture.clone();
-        scroll.connect_scroll(move |_, dx, dy| {
-            if !cap.captured.get() {
-                return glib::Propagation::Proceed;
-            }
-            // The wire carries WHEEL_DELTA(120) units, positive = up / right; GTK's dy is
-            // positive = down. Smooth fractions survive — libei's discrete scroll is
-            // 120-based too.
-            let vy = (-dy * 120.0) as i32;
-            if vy != 0 {
-                send(&cap.connector, InputKind::MouseScroll, 0, vy, 0, 0);
-            }
-            let vx = (dx * 120.0) as i32;
-            if vx != 0 {
-                send(&cap.connector, InputKind::MouseScroll, 1, vx, 0, 0);
-            }
-            glib::Propagation::Stop
-        });
-        overlay.add_controller(scroll);
-    }
+        }
+    });
+    overlay.add_controller(key);
+}
 
-    // --- Capture lifecycle ---
+/// Mouse: absolute motion + buttons — forwarded only while captured; the click that
+/// engages capture is suppressed toward the host. Motion is COALESCED: each event only
+/// stores the newest position; the overlay's frame-clock tick flushes at most one
+/// `MouseMoveAbs` per tick (the paintable set on every stream frame keeps the clock
+/// ticking while streaming). Buttons flush the pending position first so a click lands
+/// exactly where the cursor last was.
+fn attach_mouse(overlay: &gtk::Overlay, capture: &Rc<Capture>) {
+    let motion = gtk::EventControllerMotion::new();
+    let cap = capture.clone();
+    motion.connect_motion(move |_, x, y| {
+        if cap.captured.get() {
+            cap.pending_abs.set(Some((x, y)));
+        }
+    });
+    overlay.add_controller(motion);
+
+    // The per-tick flush. (The tick callback dies with the overlay, so no teardown.)
+    let cap = capture.clone();
+    overlay.add_tick_callback(move |_, _| {
+        cap.flush_pending_motion();
+        glib::ControlFlow::Continue
+    });
+
+    let click = gtk::GestureClick::builder().button(0).build();
+    let cap = capture.clone();
+    click.connect_pressed(move |g, _n, x, y| {
+        cap.overlay.grab_focus();
+        if !cap.captured.get() {
+            cap.engage(); // the engaging click is suppressed toward the host
+            return;
+        }
+        // The click's own coordinates are the freshest position — supersede any pending
+        // motion, then flush so the button-down lands there.
+        cap.pending_abs.set(Some((x, y)));
+        cap.flush_pending_motion();
+        if let Some(gs) = keymap::gdk_button_to_gs(g.current_button()) {
+            cap.held_buttons.borrow_mut().insert(gs);
+            send(&cap.connector, InputKind::MouseButtonDown, gs, 0, 0, 0);
+        }
+    });
+    let cap = capture.clone();
+    click.connect_released(move |g, _n, _x, _y| {
+        cap.flush_pending_motion(); // the release must not beat the motion before it
+        if let Some(gs) = keymap::gdk_button_to_gs(g.current_button()) {
+            if cap.held_buttons.borrow_mut().remove(&gs) {
+                send(&cap.connector, InputKind::MouseButtonUp, gs, 0, 0, 0);
+            }
+        }
+    });
+    overlay.add_controller(click);
+}
+
+/// Wheel — forwarded only while captured.
+fn attach_scroll(overlay: &gtk::Overlay, capture: &Rc<Capture>) {
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    let cap = capture.clone();
+    scroll.connect_scroll(move |_, dx, dy| {
+        if !cap.captured.get() {
+            return glib::Propagation::Proceed;
+        }
+        cap.flush_pending_motion(); // scroll happens at the latest cursor position
+                                    // The wire carries WHEEL_DELTA(120) units, positive = up / right; GTK's dy is
+                                    // positive = down. Smooth fractions survive — libei's discrete scroll is
+                                    // 120-based too.
+        let vy = (-dy * 120.0) as i32;
+        if vy != 0 {
+            send(&cap.connector, InputKind::MouseScroll, 0, vy, 0, 0);
+        }
+        let vx = (dx * 120.0) as i32;
+        if vx != 0 {
+            send(&cap.connector, InputKind::MouseScroll, 1, vx, 0, 0);
+        }
+        glib::Propagation::Stop
+    });
+    overlay.add_controller(scroll);
+}
+
+/// Capture lifecycle: engaged when the page maps (the stream just started — trust is
+/// already confirmed by then), released on focus loss (Alt-Tab away, another window —
+/// Swift does the same) and on unmap. Returns the window-level focus handler for
+/// teardown (the window outlives the page).
+fn attach_capture_lifecycle(
+    overlay: &gtk::Overlay,
+    window: &adw::ApplicationWindow,
+    capture: &Rc<Capture>,
+) -> glib::SignalHandlerId {
     {
-        // Engaged when the stream starts (trust is already confirmed by then).
         let cap = capture.clone();
         overlay.connect_map(move |w| {
             w.grab_focus();
             cap.engage();
         });
     }
-    // Focus loss releases (Alt-Tab away, another window) — Swift does the same.
-    let active_handler = {
-        let cap = capture.clone();
-        window.connect_is_active_notify(move |w| {
-            if !w.is_active() {
-                cap.release();
-            }
-        })
-    };
     {
         let cap = capture.clone();
         overlay.connect_unmap(move |_| cap.release());
     }
+    let cap = capture.clone();
+    window.connect_is_active_notify(move |w| {
+        if !w.is_active() {
+            cap.release();
+        }
+    })
+}
 
-    // Controller escape chord (gamepad service) → leave fullscreen + release capture. The
-    // chord is the only fullscreen exit a controller has (no F11 key; fullscreen hides the
-    // chrome). Aborted on page-hidden so a stale future can't act on the shared window.
-    let escape_future = {
-        let window = window.clone();
-        let cap = capture.clone();
-        glib::spawn_future_local(async move {
-            while escape_rx.recv().await.is_ok() {
-                if window.is_fullscreen() {
-                    window.unfullscreen();
-                }
-                cap.release();
-            }
-        })
-    };
-
-    // Controller disconnect (escape chord held past the hold threshold) → end the session, the
-    // controller equivalent of Ctrl+Alt+Shift+D. Setting `stop` ends the session pump, which pops
-    // this page (and fires `hidden` below). One-shot — the session is going away.
-    let disconnect_future = {
-        let window = window.clone();
-        let cap = capture.clone();
-        let stop_d = stop.clone();
-        glib::spawn_future_local(async move {
-            if disconnect_rx.recv().await.is_ok() {
-                cap.release();
-                if window.is_fullscreen() {
-                    window.unfullscreen();
-                }
-                stop_d.store(true, Ordering::SeqCst);
-            }
-        })
-    };
-
-    // The page's `hidden` fires once navigation away completes (back button, pop on
-    // session end) — NOT on the transient unmap/map cycle a NavigationView push performs.
-    {
-        let window = window.clone();
-        let stop_h = stop.clone();
-        let handlers = RefCell::new(Some((fs_handler, active_handler)));
-        let escape_future = RefCell::new(Some(escape_future));
-        let disconnect_future = RefCell::new(Some(disconnect_future));
-        page.connect_hidden(move |_| {
-            tracing::debug!("stream page hidden — ending session");
-            if let Some((fs, active)) = handlers.borrow_mut().take() {
-                window.disconnect(fs);
-                window.disconnect(active);
-            }
-            if let Some(f) = escape_future.borrow_mut().take() {
-                f.abort();
-            }
-            if let Some(f) = disconnect_future.borrow_mut().take() {
-                f.abort();
-            }
+/// Controller escape chord (gamepad service) → leave fullscreen + release capture. The
+/// chord is the only fullscreen exit a controller has (no F11 key; fullscreen hides the
+/// chrome). Aborted on page-hidden so a stale future can't act on the shared window.
+fn spawn_escape_watch(
+    window: &adw::ApplicationWindow,
+    capture: &Rc<Capture>,
+    escape_rx: async_channel::Receiver<()>,
+) -> glib::JoinHandle<()> {
+    let window = window.clone();
+    let cap = capture.clone();
+    glib::spawn_future_local(async move {
+        while escape_rx.recv().await.is_ok() {
             if window.is_fullscreen() {
                 window.unfullscreen();
             }
-            stop_h.store(true, Ordering::SeqCst);
-        });
-    }
+            cap.release();
+        }
+    })
+}
 
-    StreamPage { page, stats_label }
+/// Controller disconnect (escape chord held past the hold threshold) → end the session,
+/// the controller equivalent of Ctrl+Alt+Shift+D. Setting `stop` ends the session pump,
+/// which pops this page (and fires `hidden` — see `wire_teardown`). One-shot — the
+/// session is going away.
+fn spawn_disconnect_watch(
+    window: &adw::ApplicationWindow,
+    capture: &Rc<Capture>,
+    stop: &Arc<AtomicBool>,
+    disconnect_rx: async_channel::Receiver<()>,
+) -> glib::JoinHandle<()> {
+    let window = window.clone();
+    let cap = capture.clone();
+    let stop_d = stop.clone();
+    glib::spawn_future_local(async move {
+        if disconnect_rx.recv().await.is_ok() {
+            cap.release();
+            if window.is_fullscreen() {
+                window.unfullscreen();
+            }
+            stop_d.store(true, Ordering::SeqCst);
+        }
+    })
+}
+
+/// The page's `hidden` fires once navigation away completes (back button, pop on
+/// session end) — NOT on the transient unmap/map cycle a NavigationView push performs:
+/// disconnect the window-level handlers, abort the chord futures, and stop the session.
+fn wire_teardown(
+    page: &adw::NavigationPage,
+    window: &adw::ApplicationWindow,
+    stop: &Arc<AtomicBool>,
+    handlers: (glib::SignalHandlerId, glib::SignalHandlerId),
+    escape_future: glib::JoinHandle<()>,
+    disconnect_future: glib::JoinHandle<()>,
+) {
+    let window = window.clone();
+    let stop_h = stop.clone();
+    let handlers = RefCell::new(Some(handlers));
+    let escape_future = RefCell::new(Some(escape_future));
+    let disconnect_future = RefCell::new(Some(disconnect_future));
+    page.connect_hidden(move |_| {
+        tracing::debug!("stream page hidden — ending session");
+        if let Some((fs, active)) = handlers.borrow_mut().take() {
+            window.disconnect(fs);
+            window.disconnect(active);
+        }
+        if let Some(f) = escape_future.borrow_mut().take() {
+            f.abort();
+        }
+        if let Some(f) = disconnect_future.borrow_mut().take() {
+            f.abort();
+        }
+        if window.is_fullscreen() {
+            window.unfullscreen();
+        }
+        stop_h.store(true, Ordering::SeqCst);
+    });
 }

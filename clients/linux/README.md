@@ -22,6 +22,10 @@ Built in Rust, it links the shared **`punktfunk-core`** directly (no C ABI) and 
   First connect does a one-time **SPAKE2 PIN pairing** (or TOFU on trusted LANs), then reconnects on
   a pinned identity.
 - **Per-host speed test** to pick a bitrate, plus compositor and mode preferences in Settings.
+- **Game library browser** *(experimental, off by default)* — "Browse library…" on a saved host
+  shows its games (Steam + custom) as a poster grid; click one to launch it in the session.
+  Fetched from the host's management API over mTLS — paired devices are authorized by their
+  certificate, no extra host setup.
 
 ## Get it
 
@@ -51,23 +55,28 @@ cargo run -p punktfunk-client-linux -- --connect HOST[:PORT]   # skip the host l
 
 The binary is named **`punktfunk-client`**. Handy flags: `--connect host[:port]` (start a session
 immediately — for scripting and the Steam Deck launcher), `--discover [secs]`, and
-`--pair <PIN> --connect host[:port]` (run the pairing ceremony headlessly). Force a decoder with
+`--pair <PIN> --connect host[:port]` (run the pairing ceremony headlessly), and
+`--library host[:mgmt_port]` (print a host's game library headlessly). Force a decoder with
 `PUNKTFUNK_DECODER=software|vaapi`.
 
 ## Layout
 
 ```
 src/
-  main.rs · app.rs        entry point, GTK application, CLI paths
-  ui_hosts.rs             host list (mDNS + saved), pairing / trust dialogs
+  main.rs · app.rs        entry point, GTK application, primary menu, CSS
+  cli.rs                  CLI paths (--connect, headless --pair, screenshot scenes)
+  ui_hosts.rs             host card grids (saved + discovered) · add-host dialog · banner
+  ui_library.rs           game-library poster grid (per-host, launches titles)
+  ui_trust.rs             TOFU / PIN-pairing / request-access dialogs
   ui_settings.rs          resolution · refresh · decoder · bitrate · compositor · mic
   ui_stream.rs            the stream window (GtkGraphicsOffload present) + input capture
-  session.rs              session lifecycle over the NativeClient connector
+  launch.rs · session.rs  session launch/UI glue; lifecycle over the NativeClient connector
   video.rs                FFmpeg VAAPI / software decode → dmabuf / texture
   audio.rs                PipeWire playback + mic uplink
   gamepad.rs · keymap.rs  SDL3 controllers + feedback; keyboard VK mapping
-  trust.rs · discovery.rs persistent identity, TOFU/PIN pairing, mDNS browse
-tools/screenshots.sh      store screenshot capture
+  trust.rs · discovery.rs persistent identity, known hosts + settings, mDNS browse
+  library.rs              mgmt-API library client (mTLS + pinned fingerprint, art proxy)
+tools/screenshots.sh      store screenshot capture (app self-capture; Xvfb fallback)
 ```
 
 ## Related

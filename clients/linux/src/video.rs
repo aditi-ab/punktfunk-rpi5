@@ -23,7 +23,16 @@ use ffmpeg_next as ffmpeg;
 use std::os::fd::RawFd;
 use std::ptr;
 
-pub enum DecodedFrame {
+/// One decoded frame headed for the presenter, carrying the host capture timestamp so the
+/// UI can measure capture→paintable-set latency at the moment it presents.
+pub struct DecodedFrame {
+    /// Host-clock capture pts (ns) of the AU this image decoded from — compare against
+    /// the local wall clock + `clock_offset_ns` at paintable-set time.
+    pub pts_ns: u64,
+    pub image: DecodedImage,
+}
+
+pub enum DecodedImage {
     Cpu(CpuFrame),
     Dmabuf(DmabufFrame),
 }
@@ -108,9 +117,17 @@ pub fn decodable_codecs() -> u8 {
 }
 
 impl Decoder {
-    pub fn new(codec_id: ffmpeg::codec::Id) -> Result<Decoder> {
+    /// `codec_id` is the codec the host resolved in the Welcome (never assume HEVC).
+    /// `pref` is the Settings "Video decoder" value (`auto`/`vaapi`/`software`).
+    /// Precedence: the `PUNKTFUNK_DECODER` env override wins (support/debug escape
+    /// hatch, and the documented knob), then the setting; both default to auto
+    /// (VAAPI → software).
+    pub fn new(codec_id: ffmpeg::codec::Id, pref: &str) -> Result<Decoder> {
         ffmpeg::init().context("ffmpeg init")?;
-        let choice = std::env::var("PUNKTFUNK_DECODER").unwrap_or_default();
+        let choice = std::env::var("PUNKTFUNK_DECODER")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| pref.to_string());
         if choice != "software" {
             match VaapiDecoder::new(codec_id) {
                 Ok(v) => {
@@ -138,17 +155,17 @@ impl Decoder {
     /// one-in/one-out). A software decode error after packet loss is survivable — log
     /// upstream and keep feeding. A VAAPI error demotes to software for the rest of the
     /// session (broken driver, e.g. nvidia-vaapi-driver) — the next IDR resynchronizes.
-    pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedFrame>> {
+    pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedImage>> {
         match &mut self.backend {
             Backend::Vaapi(v) => match v.decode(au) {
-                Ok(f) => Ok(f.map(DecodedFrame::Dmabuf)),
+                Ok(f) => Ok(f.map(DecodedImage::Dmabuf)),
                 Err(e) => {
                     tracing::warn!(error = %e, "VAAPI decode failed — falling back to software");
                     self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
                     Ok(None)
                 }
             },
-            Backend::Software(s) => Ok(s.decode(au)?.map(DecodedFrame::Cpu)),
+            Backend::Software(s) => Ok(s.decode(au)?.map(DecodedImage::Cpu)),
         }
     }
 }
@@ -219,13 +236,60 @@ impl SoftwareDecoder {
             self.sws = Some((ctx, fmt, w, h));
         }
         let (sws, ..) = self.sws.as_mut().unwrap();
-        let mut rgba = AvFrame::empty();
-        sws.run(frame, &mut rgba).map_err(|e| anyhow!("sws: {e}"))?;
+        // Single-pass conversion: swscale writes straight into the Vec the texture will
+        // wrap. (The old path scaled into a scratch AVFrame and then copied `data(0)` out
+        // — a second full-frame pass per frame.) 64-byte row alignment keeps swscale on
+        // aligned SIMD stores; `GdkMemoryTexture` takes the resulting stride explicitly.
+        const ALIGN: i32 = 64;
+        use ffmpeg::ffi;
+        let dst_fmt = ffi::AVPixelFormat::AV_PIX_FMT_RGBA;
+        // SAFETY: pure size computation from format/dimensions; no pointers involved.
+        let size = unsafe { ffi::av_image_get_buffer_size(dst_fmt, w as i32, h as i32, ALIGN) };
+        if size < 0 {
+            return Err(averr("av_image_get_buffer_size", size));
+        }
+        let rgba = vec![0u8; size as usize];
+        let mut dst_data: [*mut u8; 4] = [ptr::null_mut(); 4];
+        let mut dst_linesize: [i32; 4] = [0; 4];
+        // SAFETY: fill_arrays only derives plane pointers/strides into `rgba` (sized by
+        // av_image_get_buffer_size above, same format/align) — no allocation, no
+        // ownership transfer; `rgba` outlives the scale below.
+        let r = unsafe {
+            ffi::av_image_fill_arrays(
+                dst_data.as_mut_ptr(),
+                dst_linesize.as_mut_ptr(),
+                rgba.as_ptr(),
+                dst_fmt,
+                w as i32,
+                h as i32,
+                ALIGN,
+            )
+        };
+        if r < 0 {
+            return Err(averr("av_image_fill_arrays", r));
+        }
+        // SAFETY: src pointers/strides belong to the decoder-owned `frame` (alive for the
+        // call); dst pointers were just filled over `rgba`, and sws_scale writes rows
+        // [0, h) only — exactly the buffer fill_arrays sized.
+        let r = unsafe {
+            ffi::sws_scale(
+                sws.as_mut_ptr(),
+                (*frame.as_ptr()).data.as_ptr() as *const *const u8,
+                (*frame.as_ptr()).linesize.as_ptr(),
+                0,
+                h as i32,
+                dst_data.as_ptr(),
+                dst_linesize.as_ptr(),
+            )
+        };
+        if r < 0 {
+            return Err(averr("sws_scale", r));
+        }
         Ok(CpuFrame {
             width: w,
             height: h,
-            stride: rgba.stride(0),
-            rgba: rgba.data(0).to_vec(),
+            stride: dst_linesize[0] as usize,
+            rgba,
         })
     }
 }
