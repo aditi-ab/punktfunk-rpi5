@@ -2290,6 +2290,9 @@ const PACE_CHUNK: usize = 16;
 /// it's needed (an unpaced line-rate burst overruns the kernel tx buffer → EAGAIN drop → under
 /// infinite GOP, a freeze until the next keyframe). With no slack (encode ≈ interval) the budget
 /// collapses to 0 and even the overflow goes out immediately, so this is never slower than unpaced.
+/// Parsed-once `PUNKTFUNK_VIDEO_DROP` percentage for the native data plane (see `paced_submit`).
+static NATIVE_VIDEO_DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
 fn paced_submit(
     session: &mut Session,
     data: &[u8],
@@ -2301,7 +2304,29 @@ fn paced_submit(
     let wires = session
         .seal_frame(data, pts_ns, flags)
         .map_err(|e| anyhow!("seal_frame: {e:?}"))?;
-    let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+    let mut refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+    // FEC/recovery test knob: PUNKTFUNK_VIDEO_DROP=N discards N% of the sealed wire packets
+    // before send — controlled loss injection with no netem/root, same knob the GameStream video
+    // path honors. Parsed once; 0/unset = off (the normal path is untouched).
+    let drop_pct = *NATIVE_VIDEO_DROP.get_or_init(|| {
+        let pct = std::env::var("PUNKTFUNK_VIDEO_DROP")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|p| (1..=90).contains(p))
+            .unwrap_or(0);
+        if pct > 0 {
+            tracing::warn!(
+                pct,
+                "PUNKTFUNK_VIDEO_DROP: injecting wire-packet loss (FEC test)"
+            );
+        }
+        pct
+    });
+    if drop_pct > 0 {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        refs.retain(|_| rng.gen_range(0..100) >= drop_pct);
+    }
     let start = std::time::Instant::now();
 
     // Split at the microburst cap: packets [0..split] burst out immediately, [split..] are paced.

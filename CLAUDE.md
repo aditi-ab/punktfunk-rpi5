@@ -479,7 +479,7 @@ fallback for modern Intel), `PUNKTFUNK_NV12=0` (opt OUT of the default GPU RGBâ†
 NVIDIA tiled zero-copy path), `PUNKTFUNK_INTRA_REFRESH=1` (opt-in NVENC intra-refresh loss recovery),
 `PUNKTFUNK_PIN_CLOCKS=1` (opt-in NVML GPU clock floor, root-gated), `PUNKTFUNK_GAMESCOPE_APP=...`,
 `PUNKTFUNK_INPUT_BACKEND=...`, `PUNKTFUNK_PERF=1` (per-stage timing), `PUNKTFUNK_VIDEO_DROP=N` (FEC
-test), `PUNKTFUNK_FEC_PCT=N`, `PUNKTFUNK_DSCP=1` (opt-in DSCP/SO_PRIORITY media QoS on the data +
+test â€” injects N% wire-packet loss on BOTH the GameStream and native video paths, no netem needed), `PUNKTFUNK_FEC_PCT=N`, `PUNKTFUNK_DSCP=1` (opt-in DSCP/SO_PRIORITY media QoS on the data +
 GameStream video/audio sockets; no-op on the wire on Windows without a qWAVE policy),
 `PUNKTFUNK_444=1` (full-chroma HEVC 4:4:4, see below).
 
