@@ -80,6 +80,55 @@ pub struct SessionHandle {
     pub stop: Arc<AtomicBool>,
 }
 
+/// Blocking speed-test probe (the GUI's per-host "Test" and the `--headless --speed-test` CLI):
+/// a minimal identified connect (720p60 — the host builds a virtual output, but nothing is
+/// decoded), then `request_probe` (a 2 s burst up to the host's 3 Gbps ceiling) polled to
+/// completion. Run on a worker thread.
+pub fn run_speed_probe(
+    addr: &str,
+    port: u16,
+    fp_hex: Option<&str>,
+    identity: (String, String),
+) -> Result<punktfunk_core::client::ProbeOutcome, String> {
+    // Pin the saved/advertised fingerprint when we have one; a manual host measures over TOFU.
+    let pin = fp_hex.and_then(crate::trust::parse_hex32);
+    let c = NativeClient::connect(
+        addr,
+        port,
+        Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        },
+        CompositorPref::Auto,
+        GamepadPref::Auto,
+        0, // bitrate_kbps: host default
+        0, // video_caps: probe connect, nothing is decoded
+        2, // audio_channels: stereo baseline
+        crate::video::decodable_codecs(),
+        0,    // preferred_codec: no preference
+        None, // launch: no game
+        pin,
+        Some(identity),
+        Duration::from_secs(15),
+    )
+    .map_err(|e| format!("connect: {e:?}"))?;
+    c.request_probe(3_000_000, 2_000)
+        .map_err(|e| format!("probe: {e:?}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        if c.probe_result().done {
+            // Let the last UDP shards land before tearing down.
+            std::thread::sleep(Duration::from_millis(400));
+            return Ok(c.probe_result());
+        }
+        if Instant::now() > deadline {
+            return Err("probe timed out".to_string());
+        }
+    }
+}
+
 pub fn start(params: SessionParams) -> SessionHandle {
     let (ev_tx, ev_rx) = async_channel::unbounded();
     // Tiny frame queue, newest wins: force_send displaces the oldest when the UI lags.

@@ -138,6 +138,7 @@ fn render_thread(
         // Adaptive jitter buffer, in f32-byte units (same shape as the host's virtual mic).
         let mut ring: VecDeque<u8> = VecDeque::new();
         let mut primed = false;
+        let mut out = Vec::new(); // per-quantum scratch, reused across iterations
 
         while !stop.load(Ordering::Relaxed) {
             if h_event.wait_for_event(100).is_err() {
@@ -159,14 +160,16 @@ fn render_thread(
 
             // Prime to ~3 quanta; cap at ~1 quantum of slack beyond that; re-prime on drain.
             let target = (3 * want_bytes).clamp(720 * block_align, 9600 * block_align);
-            while ring.len() > target.max(want_bytes) + want_bytes {
-                ring.pop_front();
+            let cap = target.max(want_bytes) + want_bytes;
+            if ring.len() > cap {
+                ring.drain(..ring.len() - cap);
             }
             if !primed && ring.len() >= target {
                 primed = true;
             }
 
-            let mut out = vec![0u8; want_bytes];
+            out.clear();
+            out.resize(want_bytes, 0);
             if primed {
                 let n = ring.len().min(want_bytes);
                 for (dst, b) in out.iter_mut().zip(ring.drain(..n)) {

@@ -1,0 +1,135 @@
+//! Shared styling primitives for every screen, following the windows-reactor gallery's look:
+//! theme brushes (`ThemeRef`), rounded `border` cards, small all-caps section labels, and a
+//! centred max-width column per page.
+
+use windows_reactor::*;
+
+pub(crate) fn uniform(v: f64) -> Thickness {
+    Thickness::uniform(v)
+}
+
+pub(crate) fn edges(left: f64, top: f64, right: f64, bottom: f64) -> Thickness {
+    Thickness {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
+
+/// A rounded, bordered surface in the theme's card colours.
+pub(crate) fn card(child: impl Into<Element>) -> Border {
+    border(child.into())
+        .background(ThemeRef::CardBackground)
+        .border_brush(ThemeRef::CardStroke)
+        .border_thickness(uniform(1.0))
+        .corner_radius(8.0)
+        .padding(uniform(16.0))
+}
+
+/// A small all-caps section label above a group of cards.
+pub(crate) fn section(label: &str) -> Element {
+    text_block(label)
+        .font_size(12.0)
+        .semibold()
+        .foreground(ThemeRef::SecondaryText)
+        .margin(edges(2.0, 10.0, 0.0, 0.0))
+        .into()
+}
+
+/// Wrap a screen's children in a scrollable, centred, max-width column.
+pub(crate) fn page(children: Vec<Element>) -> Element {
+    let col = vstack(children)
+        .spacing(10.0)
+        .max_width(640.0)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .margin(edges(24.0, 24.0, 24.0, 40.0));
+    scroll_view(col).into()
+}
+
+/// A page header: a large bold title on the left, one action button on the right.
+pub(crate) fn page_header(title: &str, action: Button) -> Element {
+    grid((
+        text_block(title)
+            .font_size(30.0)
+            .bold()
+            .grid_column(0)
+            .vertical_alignment(VerticalAlignment::Center),
+        action
+            .grid_column(1)
+            .vertical_alignment(VerticalAlignment::Center),
+    ))
+    .columns([GridLength::Star(1.0), GridLength::Auto])
+    .margin(edges(0.0, 0.0, 0.0, 6.0))
+    .into()
+}
+
+/// A full-screen centred "busy" scene: spinner, headline, secondary detail line, and optional
+/// trailing elements (e.g. a Cancel button). Shared by Connecting / RequestAccess / SpeedTest.
+pub(crate) fn busy_page(headline: &str, detail: &str, extra: Vec<Element>) -> Element {
+    let mut children: Vec<Element> = vec![
+        ProgressRing::indeterminate()
+            .width(48.0)
+            .height(48.0)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .into(),
+        text_block(headline)
+            .font_size(18.0)
+            .semibold()
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .into(),
+        text_block(detail)
+            .foreground(ThemeRef::SecondaryText)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .into(),
+    ];
+    children.extend(extra);
+    vstack(children)
+        .spacing(16.0)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .vertical_alignment(VerticalAlignment::Center)
+        .into()
+}
+
+/// A rounded square "monogram" for a host, the first letter on an accent fill — a clean leading
+/// visual that avoids depending on an icon font being installed.
+pub(crate) fn avatar(name: &str) -> Border {
+    let initial = name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
+    border(
+        text_block(initial)
+            .font_size(17.0)
+            .semibold()
+            .foreground(ThemeRef::AccentText)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center),
+    )
+    .background(ThemeRef::Accent)
+    .corner_radius(10.0)
+    .width(40.0)
+    .height(40.0)
+}
+
+/// Pill chip colour intent.
+#[derive(Clone, Copy)]
+pub(crate) enum Pill {
+    Accent,
+    Good,
+    Neutral,
+}
+
+/// A small rounded status chip (paired/PIN/HDR/etc.).
+pub(crate) fn pill(text: &str, kind: Pill) -> Border {
+    let (bg, fg) = match kind {
+        Pill::Accent => (ThemeRef::Accent, ThemeRef::AccentText),
+        Pill::Good => (ThemeRef::SystemSuccessBackground, ThemeRef::SystemSuccess),
+        Pill::Neutral => (ThemeRef::SubtleFill, ThemeRef::SecondaryText),
+    };
+    border(text_block(text).font_size(11.0).semibold().foreground(fg))
+        .background(bg)
+        .corner_radius(10.0)
+        .padding(edges(9.0, 3.0, 9.0, 3.0))
+}

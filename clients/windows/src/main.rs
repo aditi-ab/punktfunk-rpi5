@@ -12,6 +12,8 @@
 //!   punktfunk-client --headless --connect host[:port] [--pin HEX] [--pair PIN] [--mode WxHxHz]
 //!                    [--bitrate MBPS] [--mic] [--decoder auto|hardware|software] [--no-hdr]
 //!                    (no window; count frames + print stats)
+//!   punktfunk-client --headless --speed-test --connect host[:port]
+//!                    (measure the path: probe burst → goodput / loss / recommended bitrate)
 
 // Link as a GUI (windows) subsystem binary so the default windowed launch (MSIX / double-click)
 // does NOT pop a console window. The CLI paths (--headless/--discover) reattach to the launching
@@ -108,6 +110,30 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
         Some((a, p)) => (a.to_string(), p.parse().unwrap_or(9777)),
         None => (target.clone(), 9777u16),
     };
+
+    // Speed test: measure the path over the real data plane, print the outcome, exit. The saved
+    // fingerprint for this address (if any) pins the connect, like the GUI's per-host test.
+    if flag("--speed-test") {
+        let fp = trust::KnownHosts::load()
+            .find_by_addr(&host, port)
+            .map(|k| k.fp_hex.clone());
+        match session::run_speed_probe(&host, port, fp.as_deref(), identity) {
+            Ok(r) => {
+                let mbps = f64::from(r.throughput_kbps) / 1000.0;
+                let recommended = f64::from(r.throughput_kbps / 10 * 7) / 1000.0;
+                println!(
+                    "{mbps:.0} Mbit/s measured · {:.1} % loss · recommended bitrate {recommended:.0} Mbit/s (--bitrate {:.0})",
+                    r.loss_pct,
+                    recommended
+                );
+            }
+            Err(e) => {
+                eprintln!("speed test failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let mode = arg("--mode")
         .and_then(|m| {
             let mut it = m.split(['x', 'X']);

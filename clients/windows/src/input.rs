@@ -15,15 +15,18 @@
 //! `WM_MOUSEMOVE` pinned the OS cursor, so `pt` never travelled and the absolute coordinate
 //! snapped to one point. Keys carry the native Windows VK directly (the wire contract).
 //!
-//! **Ctrl+Alt+Shift+Q** toggles capture — releasing the lock hands the cursor back to the local
-//! desktop (and re-grabs on the next toggle). Losing foreground also releases the lock so the
-//! cursor is never stranded.
+//! **Capture state machine** (parity with the GTK/Swift clients): capture engages at stream
+//! start, **Ctrl+Alt+Shift+Q** releases it (handing the cursor back to the local desktop), and a
+//! **click on the stream** re-engages it. Losing foreground also releases the lock so the cursor
+//! is never stranded; regaining it while still captured re-locks. When "capture system
+//! shortcuts" is off in Settings, Alt+Tab / Alt+Esc / Ctrl+Esc / the Win keys act on the local
+//! desktop instead of being forwarded.
 
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::Mode;
 use punktfunk_core::input::{InputEvent, InputKind};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -42,14 +45,21 @@ struct State {
     mode: Mode,
     /// Our window handle, stored as the raw `isize` so `State` is `Send` (`HWND` is not).
     hwnd: isize,
-    /// User intent: forward input to the host (toggled by Ctrl+Alt+Shift+Q).
+    /// User intent: forward input to the host (toggled by Ctrl+Alt+Shift+Q / click-to-capture).
     captured: bool,
+    /// Forward system shortcuts (Alt+Tab, Win, …) to the host; off = they act locally.
+    inhibit_shortcuts: bool,
     /// The OS pointer is currently locked (hidden + confined + recentering). Tracks the real
     /// `ClipCursor`/`ShowCursor` state so we engage/disengage exactly once per transition.
     locked: bool,
-    /// Lock centre in screen coordinates (the cursor is warped here after every move).
+    /// Lock geometry, captured when the lock engages: the confinement rect (screen coordinates,
+    /// also the click-to-capture hit test), its centre (the cursor is warped here after every
+    /// move), and the screen→host scale (the Contain-fit display scale's inverse). Stable while
+    /// locked — the window can't be moved or resized with the cursor confined inside it.
+    clip: RECT,
     center_x: i32,
     center_y: i32,
+    scale: f32,
     /// Sub-pixel remainder of the screen→host scale, carried so slow drags aren't truncated away.
     acc_x: f32,
     acc_y: f32,
@@ -66,18 +76,39 @@ struct State {
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static KBD_HOOK: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
+/// Mirror of `State::captured` for lock-free reads off the UI thread (the HUD poll).
+static CAPTURED: AtomicBool = AtomicBool::new(false);
+
+/// Whether stream input is currently captured (drives the HUD's release/capture hint).
+pub fn is_captured() -> bool {
+    CAPTURED.load(Ordering::Relaxed)
+}
+
+/// Set the capture intent and engage/release the pointer lock to match.
+fn set_captured(st: &mut State, on: bool) {
+    st.captured = on;
+    CAPTURED.store(on, Ordering::Relaxed);
+    set_locked(st, on);
+    if !on {
+        flush_held(st); // release held keys/buttons so nothing sticks on the host
+    }
+}
 
 /// Install the hooks for a streaming session. Call from the UI thread once the window is shown.
-pub fn install(connector: Arc<NativeClient>, mode: Mode) {
+/// `inhibit_shortcuts` forwards system shortcuts (Alt+Tab, Win, …) to the host; off = local.
+pub fn install(connector: Arc<NativeClient>, mode: Mode, inhibit_shortcuts: bool) {
     let hwnd = unsafe { GetForegroundWindow() };
     let mut st = State {
         connector,
         mode,
         hwnd: hwnd.0 as isize,
-        captured: true,
+        captured: false,
+        inhibit_shortcuts,
         locked: false,
+        clip: RECT::default(),
         center_x: 0,
         center_y: 0,
+        scale: 1.0,
         acc_x: 0.0,
         acc_y: 0.0,
         ctrl: false,
@@ -86,8 +117,9 @@ pub fn install(connector: Arc<NativeClient>, mode: Mode) {
         held_keys: HashSet::new(),
         held_buttons: HashSet::new(),
     };
-    // Lock immediately (the window is foreground at mount, like Moonlight grabbing on stream start).
-    set_locked(&mut st, true);
+    // Capture immediately (the window is foreground at mount, like Moonlight grabbing on stream
+    // start).
+    set_captured(&mut st, true);
     *STATE.lock().unwrap() = Some(st);
     unsafe {
         let hinst = GetModuleHandleW(None).ok();
@@ -99,6 +131,7 @@ pub fn install(connector: Arc<NativeClient>, mode: Mode) {
         }
     }
     tracing::info!(
+        inhibit_shortcuts,
         "stream input hooks installed — pointer locked (Ctrl+Alt+Shift+Q toggles capture)"
     );
 }
@@ -117,8 +150,7 @@ pub fn uninstall() {
         }
     }
     if let Some(mut st) = STATE.lock().unwrap().take() {
-        set_locked(&mut st, false); // hand the cursor back to the desktop
-        flush_held(&mut st);
+        set_captured(&mut st, false); // hand the cursor back + flush held state
     }
 }
 
@@ -136,6 +168,7 @@ fn flush_held(st: &mut State) {
 
 /// Engage or release the pointer lock: confine + hide + recentre on, free + show on off.
 /// Guarded so the `ClipCursor`/`ShowCursor` calls stay balanced (one each per transition).
+/// Engaging captures the lock geometry (rect, centre, screen→host scale) — see `State::clip`.
 fn set_locked(st: &mut State, on: bool) {
     if on == st.locked {
         return;
@@ -155,15 +188,20 @@ fn set_locked(st: &mut State, on: bool) {
                 };
                 let _ = ClientToScreen(hwnd, &mut tl);
                 let _ = ClientToScreen(hwnd, &mut br);
-                let clip = RECT {
+                st.clip = RECT {
                     left: tl.x,
                     top: tl.y,
                     right: br.x,
                     bottom: br.y,
                 };
-                let _ = ClipCursor(Some(&clip as *const RECT));
+                let _ = ClipCursor(Some(&st.clip as *const RECT));
                 st.center_x = (tl.x + br.x) / 2;
                 st.center_y = (tl.y + br.y) / 2;
+                // Screen px → host px: the Contain-fit display scale's inverse, so the host
+                // cursor tracks the physical mouse 1:1 on screen at any window size.
+                let (ww, wh) = ((br.x - tl.x).max(1) as f32, (br.y - tl.y).max(1) as f32);
+                let (vw, vh) = (st.mode.width.max(1) as f32, st.mode.height.max(1) as f32);
+                st.scale = (ww / vw).min(wh / vh).max(0.01);
                 let _ = SetCursorPos(st.center_x, st.center_y);
             }
             let _ = ShowCursor(false);
@@ -188,6 +226,17 @@ fn send(c: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, flags: u32
     });
 }
 
+/// System shortcuts that act on the LOCAL desktop when "capture system shortcuts" is off:
+/// the Win keys, Alt+Tab, and Alt/Ctrl+Esc.
+fn is_system_shortcut(st: &State, vk: u16) -> bool {
+    match vk {
+        0x5B | 0x5C => true,       // L/R Win
+        0x09 => st.alt,            // Alt+Tab
+        0x1B => st.alt || st.ctrl, // Alt+Esc / Ctrl+Esc
+        _ => false,
+    }
+}
+
 unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
@@ -210,15 +259,16 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                 // Capture toggle: Ctrl+Alt+Shift+Q (consumed locally, never forwarded).
                 if !up && vk == VK_Q.0 && st.ctrl && st.alt && st.shift {
                     let on = !st.captured;
-                    st.captured = on;
-                    set_locked(st, on); // grab/release the cursor immediately
-                    if !on {
-                        flush_held(st); // release held keys/buttons so nothing sticks on the host
-                    }
+                    set_captured(st, on);
                     tracing::info!(captured = on, "capture toggled (Ctrl+Alt+Shift+Q)");
                     return LRESULT(1);
                 }
                 if st.captured {
+                    // With shortcut capture off, hand Alt+Tab & co. to the local desktop —
+                    // neither forwarded nor swallowed.
+                    if !st.inhibit_shortcuts && is_system_shortcut(st, vk) {
+                        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+                    }
                     let v = vk as u8;
                     if up {
                         if st.held_keys.remove(&v) {
@@ -236,17 +286,27 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-/// Client-area size in pixels (for the screen→host relative-motion scale).
-fn client_size(hwnd: isize) -> (f32, f32) {
+/// Whether a screen point lies inside the window's CURRENT client area (the click-to-capture
+/// hit test — computed fresh per click, since the window can move/resize while released).
+fn in_client_area(hwnd: isize, pt: POINT) -> bool {
+    let hwnd = HWND(hwnd as *mut _);
     let mut rc = RECT::default();
-    if unsafe { GetClientRect(HWND(hwnd as *mut _), &mut rc) }.is_ok() {
-        (
-            (rc.right - rc.left).max(1) as f32,
-            (rc.bottom - rc.top).max(1) as f32,
-        )
-    } else {
-        (1.0, 1.0)
+    if unsafe { GetClientRect(hwnd, &mut rc) }.is_err() {
+        return false;
     }
+    let mut tl = POINT {
+        x: rc.left,
+        y: rc.top,
+    };
+    let mut br = POINT {
+        x: rc.right,
+        y: rc.bottom,
+    };
+    unsafe {
+        let _ = ClientToScreen(hwnd, &mut tl);
+        let _ = ClientToScreen(hwnd, &mut br);
+    }
+    pt.x >= tl.x && pt.x < br.x && pt.y >= tl.y && pt.y < br.y
 }
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -261,6 +321,18 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             if want_lock != st.locked {
                 set_locked(st, want_lock); // sync to focus changes (e.g. lost foreground)
             }
+            // Click-to-capture: after a Ctrl+Alt+Shift+Q release, a primary click on the stream
+            // re-engages capture. The click is consumed — it starts the grab, it isn't gameplay.
+            if !st.captured
+                && foreground
+                && msg == WM_LBUTTONDOWN
+                && !injected
+                && in_client_area(st.hwnd, ms.pt)
+            {
+                set_captured(st, true);
+                tracing::info!("capture re-engaged (click on stream)");
+                return LRESULT(1);
+            }
             if st.locked {
                 // Skip the synthetic move our own SetCursorPos recentre generates.
                 if injected {
@@ -272,14 +344,8 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                         let dx = (ms.pt.x - st.center_x) as f32;
                         let dy = (ms.pt.y - st.center_y) as f32;
                         if dx != 0.0 || dy != 0.0 {
-                            // screen px → host px: the Contain-fit display scale's inverse, so the
-                            // host cursor tracks the physical mouse 1:1 on screen at any window size.
-                            let (ww, wh) = client_size(st.hwnd);
-                            let (vw, vh) =
-                                (st.mode.width.max(1) as f32, st.mode.height.max(1) as f32);
-                            let s = (ww / vw).min(wh / vh).max(0.01);
-                            st.acc_x += dx / s;
-                            st.acc_y += dy / s;
+                            st.acc_x += dx / st.scale;
+                            st.acc_y += dy / st.scale;
                             let (hx, hy) = (st.acc_x.trunc() as i32, st.acc_y.trunc() as i32);
                             st.acc_x -= hx as f32;
                             st.acc_y -= hy as f32;

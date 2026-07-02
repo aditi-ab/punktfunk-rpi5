@@ -18,12 +18,17 @@ the fast **`punktfunk/1`** protocol.
 - **Your display's native mode** — the host builds a virtual display at exactly your WxH@Hz.
 - **Audio both ways** — WASAPI render + mic capture.
 - **Full controller support** — SDL3 gamepads with rumble, lightbar, and DualSense feedback.
+- **Your display's native mode, really** — "Native display" resolves the actual size + refresh of
+  the monitor the window is on at connect time.
 - **Find hosts automatically** — mDNS discovery lists hosts on your LAN, alongside saved and manual
   entries. First connect does a one-time **SPAKE2 PIN pairing** (or TOFU on trusted LANs), then
-  reconnects on a pinned identity.
-- **Polished shell** — host cards, settings (resolution / refresh / decoder / bitrate / HDR / mic),
-  a status-chip stream HUD, and the full trust surface. Stream input uses Win32 low-level hooks with
-  a Ctrl+Alt+Shift+Q capture toggle.
+  reconnects on a pinned identity. Saved hosts carry per-host actions: a **network speed test**
+  (probe burst over the real data plane → recommended bitrate, applied in one tap) and **forget**.
+- **Polished shell** — host cards, settings (resolution / refresh / host compositor / decoder /
+  codec / bitrate / HDR / forwarded controller / gamepad type / system shortcuts / audio channels /
+  mic), a status-chip stream HUD, and the full trust surface. Stream input uses Win32 low-level
+  hooks with Moonlight-style capture: Ctrl+Alt+Shift+Q releases the pointer, a click on the stream
+  re-captures it, and system shortcuts (Alt+Tab, Win, …) can act locally or forward to the host.
 
 Builds and ships for both **x64** and **ARM64** as a signed **MSIX**.
 
@@ -45,6 +50,7 @@ cargo build -p punktfunk-client-windows --target x86_64-pc-windows-msvc
 # CLI paths for testing (no window):
 punktfunk-client --discover                                   # list hosts on the LAN
 punktfunk-client --headless --connect host[:port] [--pin HEX] # connect, count frames, print stats
+punktfunk-client --headless --speed-test --connect host[:port]  # probe burst → recommended bitrate
 ```
 
 > `CARGO_HOME` must be an ASCII path — non-ASCII characters break SDL3's MSVC precompiled-header
@@ -54,13 +60,16 @@ punktfunk-client --headless --connect host[:port] [--pin HEX] # connect, count f
 
 ```
 src/
-  main.rs · app.rs        entry point + CLI paths; WinUI 3 shell (windows-reactor)
+  main.rs                 entry point + CLI paths (--discover · --headless · --speed-test)
+  app/                    WinUI 3 shell (windows-reactor), one module per screen:
+                          mod (root/router) · hosts · connect · pair · speed · settings ·
+                          licenses · stream · style (shared cards/pills/monograms)
   present.rs · gpu.rs      SwapChainPanel D3D11 composition swapchain; shared D3D11 device
   video.rs                FFmpeg HEVC decode (D3D11VA zero-copy + software fallback)
   audio.rs                WASAPI render + mic capture
   gamepad.rs              SDL3 controllers + rumble/lightbar/DualSense feedback
-  input.rs                Win32 low-level keyboard/mouse hooks → host input
-  session.rs              session lifecycle over the NativeClient connector
+  input.rs                Win32 low-level hooks → host input (pointer lock · click-to-capture)
+  session.rs              session lifecycle over the NativeClient connector (+ speed probe)
   trust.rs · discovery.rs persistent identity, TOFU/PIN pairing, mDNS browse
 packaging/                MSIX manifest, signing, pack script
 ```

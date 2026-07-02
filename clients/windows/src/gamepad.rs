@@ -31,11 +31,8 @@ const G: f32 = 9.80665;
 
 #[derive(Clone, Debug)]
 pub struct PadInfo {
-    // `id`/`name` feed the settings GUI's pad list (a follow-up); the windowed client only
-    // reads `pref` (via `auto_pref`), so they're unused in reachable code for now.
-    #[allow(dead_code)]
+    /// SDL joystick instance id — the settings GUI's pin key.
     pub id: u32,
-    #[allow(dead_code)]
     pub name: String,
     /// The virtual pad "Automatic" resolves to for this physical controller (DualSense → DualSense,
     /// DS4 → DualShock 4, Xbox One/Series → Xbox One, else → Xbox 360).
@@ -47,6 +44,19 @@ impl PadInfo {
     /// feedback we replay as raw DS5 HID effect packets (a DS4 uses SDL's generic `set_led`).
     fn is_dualsense(&self) -> bool {
         self.pref == GamepadPref::DualSense
+    }
+
+    /// A short human label for the detected pad family, shown next to the name in the settings
+    /// GUI's controller list ("" for a generic pad the name already describes).
+    pub fn kind_label(&self) -> &'static str {
+        match self.pref {
+            GamepadPref::DualSense => "DualSense",
+            GamepadPref::DualShock4 => "DualShock 4",
+            GamepadPref::XboxOne => "Xbox One",
+            GamepadPref::SteamDeck => "Steam Deck",
+            GamepadPref::SteamController => "Steam Controller",
+            _ => "",
+        }
     }
 }
 
@@ -102,7 +112,7 @@ impl GamepadService {
         }
     }
 
-    #[allow(dead_code)] // consumed by the settings GUI (follow-up)
+    /// Connected controllers, most recently attached first (the settings GUI's list order).
     pub fn pads(&self) -> Vec<PadInfo> {
         self.pads.lock().unwrap().clone()
     }
@@ -111,12 +121,11 @@ impl GamepadService {
         self.active.lock().unwrap().clone()
     }
 
-    #[allow(dead_code)] // consumed by the settings GUI (follow-up)
+    /// The user-pinned controller (settings GUI), if any — else auto (most recent).
     pub fn pinned(&self) -> Option<u32> {
         *self.pinned.lock().unwrap()
     }
 
-    #[allow(dead_code)] // consumed by the settings GUI (follow-up)
     pub fn set_pinned(&self, id: Option<u32>) {
         let _ = self.ctl.lock().unwrap().send(Ctl::Pin(id));
     }

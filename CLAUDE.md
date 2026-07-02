@@ -241,10 +241,26 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    dep pinned to commit `b4129fcc`; `windows` pinned to the SAME commit so `IDXGISwapChain1` unifies
    with `set_swap_chain`); its `build.rs` downloads the Win App SDK NuGets + needs `CARGO_WORKSPACE_DIR`
    set (in the VM build env; `/temp`+`/winmd` gitignored). Gotcha: `CARGO_HOME` must be an ASCII path
-   — the `ü` in the dev box's username breaks SDL3's MSVC precompiled-header build. Next: **on-glass
-   validation** of the D3D11VA decode + HDR present + GUI on the RTX box (the dev VM is
-   headless/Session-0/WARP → the WinUI window + hardware decode need a real display+GPU: RDP or the
-   RTX box), then RAWINPUT relative-mouse pointer-lock and a per-host speed test in the UI.
+   — the `ü` in the dev box's username breaks SDL3's MSVC precompiled-header build. **Parity/cleanup
+   batch (2026-07-02)**: `app.rs` split into per-screen `app/` modules (mod=root/router · hosts ·
+   connect · pair · speed · settings · licenses · stream · style; thread-driven state lives in ROOT
+   `use_async_state` and flows down as props — a child's own async-state write does NOT re-render it);
+   "Native display" now resolves the real monitor mode at connect (`MonitorFromWindow` →
+   `EnumDisplaySettingsW`, was hardcoded 1080p60); per-host **speed test** (saved-host card button +
+   `--headless --speed-test`, probe burst → recommended ≈70 % bitrate applied in one tap; bitrate
+   setting is now a free-form NumberBox); **forget host** (ContentDialog confirm →
+   `KnownHosts::remove_by_fp`); settings gained forwarded-controller picker + gamepad type + host
+   compositor + capture-system-shortcuts — the previously-dead `Settings.compositor`/
+   `inhibit_shortcuts` are now honored (off = Alt+Tab/Alt+Esc/Ctrl+Esc/Win act locally);
+   **click-to-recapture** after a Ctrl+Alt+Shift+Q release with the HUD hint tracking capture state;
+   input hook caches lock geometry (no per-move `GetClientRect`), audio jitter-ring trims via
+   `drain`. Validated on the bare-metal RTX box: `--discover` (3 live LAN hosts), synthetic-host
+   loopback E2E (TOFU connect → clock skew → HEVC negotiate → shared-D3D11 + D3D11VA init → WASAPI →
+   session end; synthetic payload isn't decodable so decode output stays unvalidated), speed-test
+   E2E. The WinUI window itself CANNOT be launched from SSH (session-0 → WinAppSDK 0x80070005,
+   pre-existing) — GUI on-glass validation still pending (needs the console session, e.g. PsExec -i 1).
+   Next: **on-glass validation** of the D3D11VA decode + HDR present + GUI (console session on the
+   RTX box), then RAWINPUT relative-mouse pointer-lock.
    **Android stage 1 done** (`clients/android`, Kotlin app + `native/` Rust JNI core linking
    `punktfunk-core`; phone + Android TV): NDK `AMediaCodec` hardware HEVC decode → `SurfaceView` incl.
    **HDR10** (Main10/BT.2020 PQ) with low-latency tuning + a live stats HUD (`decode.rs`/`stats.rs`),
