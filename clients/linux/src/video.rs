@@ -37,6 +37,43 @@ pub enum DecodedImage {
     Dmabuf(DmabufFrame),
 }
 
+/// The stream's colour signaling, read PER-FRAME from the decoder (HEVC VUI → the
+/// `AVFrame` CICP fields). The Windows host switches an HDR desktop to Main10 BT.2020 PQ
+/// **in-band** (the Welcome still says SDR — clients are expected to follow the VUI, as
+/// the Windows/Apple/Android clients do), so rendering must follow the frames, not the
+/// handshake — else PQ content drawn as BT.709 comes out washed out and desaturated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ColorDesc {
+    /// H.273 code points as signaled (2 = unspecified → the renderer picks the SDR default).
+    pub primaries: u8,
+    pub transfer: u8,
+    pub matrix: u8,
+    pub full_range: bool,
+}
+
+impl ColorDesc {
+    /// Read the CICP fields off a raw decoded frame.
+    ///
+    /// # Safety
+    /// `frame` must point to a valid `AVFrame` (alive for the duration of the call).
+    unsafe fn from_raw(frame: *const ffmpeg::ffi::AVFrame) -> ColorDesc {
+        // SAFETY: caller guarantees a live AVFrame; these are plain enum field reads.
+        unsafe {
+            ColorDesc {
+                primaries: (*frame).color_primaries as u32 as u8,
+                transfer: (*frame).color_trc as u32 as u8,
+                matrix: (*frame).colorspace as u32 as u8,
+                full_range: (*frame).color_range == ffmpeg::ffi::AVColorRange::AVCOL_RANGE_JPEG,
+            }
+        }
+    }
+
+    /// PQ (SMPTE ST.2084) transfer — the HDR10 signal.
+    pub fn is_pq(&self) -> bool {
+        self.transfer == 16
+    }
+}
+
 /// RGBA pixels for `GdkMemoryTexture` (which takes a stride).
 pub struct CpuFrame {
     pub width: u32,
@@ -44,6 +81,10 @@ pub struct CpuFrame {
     /// RGBA row stride in bytes (≥ width*4 — swscale pads rows for SIMD).
     pub stride: usize,
     pub rgba: Vec<u8>,
+    /// Signaling of the source frame. swscale already undid the YUV matrix + range (the
+    /// pixels are full-range RGB), but a PQ/BT.2020 stream keeps its transfer + primaries
+    /// baked in — the presenter tags the texture so GTK tone-maps it.
+    pub color: ColorDesc,
 }
 
 /// A decoded frame still on the GPU: dmabuf fds + plane layout for
@@ -57,6 +98,9 @@ pub struct DmabufFrame {
     pub fourcc: u32,
     pub modifier: u64,
     pub planes: Vec<DmabufPlane>,
+    /// Signaling of the source frame — drives the `GdkDmabufTexture` color state (BT.709
+    /// narrow for SDR, BT.2020 PQ for an HDR stream).
+    pub color: ColorDesc,
     pub guard: DrmFrameGuard,
 }
 
@@ -174,8 +218,9 @@ impl Decoder {
 
 struct SoftwareDecoder {
     decoder: ffmpeg::decoder::Video,
-    /// Rebuilt whenever the decoded format/size changes (mid-stream `Reconfigure`).
-    sws: Option<(scaling::Context, Pixel, u32, u32)>,
+    /// Rebuilt whenever the decoded format/size — or the colour signaling (a mid-stream
+    /// SDR↔HDR flip) — changes.
+    sws: Option<(scaling::Context, Pixel, u32, u32, ColorDesc)>,
 }
 
 impl SoftwareDecoder {
@@ -209,31 +254,41 @@ impl SoftwareDecoder {
 
     fn convert_rgba(&mut self, frame: &AvFrame) -> Result<CpuFrame> {
         let (fmt, w, h) = (frame.format(), frame.width(), frame.height());
-        let rebuild =
-            !matches!(&self.sws, Some((_, f, sw, sh)) if *f == fmt && *sw == w && *sh == h);
+        // SAFETY: `frame.as_ptr()` is the decoder-owned live AVFrame for this call.
+        let color = unsafe { ColorDesc::from_raw(frame.as_ptr()) };
+        let rebuild = !matches!(&self.sws,
+            Some((_, f, sw, sh, c)) if *f == fmt && *sw == w && *sh == h && *c == color);
         if rebuild {
             let mut ctx =
                 scaling::Context::get(fmt, w, h, Pixel::RGBA, w, h, scaling::Flags::POINT)
                     .context("swscale context")?;
-            // swscale defaults to BT.601 coefficients, but our SDR HEVC stream is BT.709 limited
-            // range (the host signals BT.709 in the VUI). Without this, YUV→RGB decodes with BT.601
-            // and SDR colours shift (greens/reds off). Source = limited/studio YUV, destination =
-            // full-range RGB. Inverse of the host's RGB→YUV CSC (encode/vaapi.rs).
+            // swscale defaults to BT.601 coefficients — set them from the FRAME's signaling
+            // (unspecified → BT.709 limited, the host's SDR default; a Windows HDR desktop
+            // streams BT.2020 in-band). Without this, YUV→RGB decodes with the wrong matrix
+            // and colours shift. Destination = full-range RGB; the transfer function stays
+            // baked in (the presenter tags PQ textures so GTK applies the EOTF).
             const SWS_CS_ITU709: i32 = 1;
+            const SWS_CS_ITU601: i32 = 5;
+            const SWS_CS_BT2020: i32 = 9;
+            let cs = match color.matrix {
+                9 | 10 => SWS_CS_BT2020,
+                5 | 6 => SWS_CS_ITU601,
+                _ => SWS_CS_ITU709,
+            };
             unsafe {
-                let cs709 = ffmpeg::ffi::sws_getCoefficients(SWS_CS_ITU709);
+                let coeffs = ffmpeg::ffi::sws_getCoefficients(cs);
                 ffmpeg::ffi::sws_setColorspaceDetails(
                     ctx.as_mut_ptr(),
-                    cs709, // inv_table: source (YUV) coefficients — BT.709
-                    0,     // srcRange: 0 = limited/studio (MPEG)
-                    cs709, // table: destination coefficients (ignored for RGB output)
-                    1,     // dstRange: 1 = full-range RGB
+                    coeffs, // inv_table: source (YUV) coefficients per the VUI
+                    color.full_range as i32, // srcRange: 0 = limited/studio (MPEG)
+                    coeffs, // table: destination coefficients (ignored for RGB output)
+                    1,      // dstRange: 1 = full-range RGB
                     0,
                     1 << 16,
                     1 << 16, // brightness, contrast, saturation (defaults)
                 );
             }
-            self.sws = Some((ctx, fmt, w, h));
+            self.sws = Some((ctx, fmt, w, h, color));
         }
         let (sws, ..) = self.sws.as_mut().unwrap();
         // Single-pass conversion: swscale writes straight into the Vec the texture will
@@ -290,6 +345,7 @@ impl SoftwareDecoder {
             height: h,
             stride: dst_linesize[0] as usize,
             rgba,
+            color,
         })
     }
 }
@@ -474,6 +530,9 @@ impl VaapiDecoder {
                 fourcc,
                 modifier,
                 planes,
+                // SAFETY: `self.frame` is the live decoded AVFrame (unref'd only after
+                // this returns); plain CICP field reads.
+                color: ColorDesc::from_raw(self.frame),
                 guard,
             })
         }
@@ -554,5 +613,37 @@ mod tests {
             drm_fourcc_for(ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGBA),
             None
         );
+    }
+
+    /// The wire → `ColorDesc` plumbing: an HDR10 stream's VUI (BT.2020 primaries, PQ
+    /// transfer, BT.2020-NCL matrix, limited range) must arrive on the decoded frame —
+    /// this is what the Windows host emits in-band for an HDR desktop, and mis-rendering
+    /// it as BT.709 is the washed-out-colors bug. Fixture: one 64×64 Main10 IDR
+    /// (`tests/pq-frame.h265`, x265 with explicit VUI).
+    #[test]
+    fn software_decode_carries_pq_signaling() {
+        let au = include_bytes!("../tests/pq-frame.h265");
+        let mut dec = SoftwareDecoder::new(ffmpeg::codec::Id::HEVC).expect("hevc decoder");
+        let mut got = dec.decode(au).expect("decode");
+        if got.is_none() {
+            // Low-delay decoders may still hold the frame until a flush — send EOF.
+            dec.decoder.send_eof().ok();
+            let mut frame = AvFrame::empty();
+            if dec.decoder.receive_frame(&mut frame).is_ok() {
+                got = Some(dec.convert_rgba(&frame).expect("convert"));
+            }
+        }
+        let f = got.expect("no frame decoded from the PQ fixture");
+        assert_eq!(
+            f.color,
+            ColorDesc {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9,
+                full_range: false
+            }
+        );
+        assert!(f.color.is_pq());
+        assert_eq!((f.width, f.height), (64, 64));
     }
 }

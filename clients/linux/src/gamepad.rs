@@ -2,12 +2,21 @@
 //! `GamepadCapture`/`GamepadFeedback`).
 //!
 //! One worker thread owns SDL for the process lifetime: it tracks connected pads for the
-//! Settings UI, selects the ONE controller forwarded as pad 0 (user pin, else the most
-//! recently connected), and — while a session is attached — forwards buttons/axes,
-//! DualSense touchpad contacts and motion samples (0xCC), and renders feedback: rumble on
-//! every pad, lightbar via SDL, and on a real DualSense the raw effects packet
-//! (adaptive-trigger blocks replayed verbatim, player LEDs). Held state is zeroed on the
-//! wire when the active pad switches or the session detaches, so nothing sticks down.
+//! Settings UI (metadata only — see below), selects the ONE controller forwarded as pad 0
+//! (the user pin — persisted in Settings by stable `vid:pid:name` key — else the most
+//! recently connected real pad; Steam Input's virtual pad is skipped), and — while a
+//! session is attached — forwards buttons/axes, DualSense touchpad contacts and motion
+//! samples (0xCC), and renders feedback: rumble, lightbar via SDL, and on a real DualSense
+//! the raw effects packet (adaptive-trigger blocks replayed verbatim, player LEDs). Held
+//! state is zeroed on the wire when the active pad switches or the session detaches, so
+//! nothing sticks down.
+//!
+//! **Idle means hands off the hardware.** Outside an attached session the worker never
+//! opens a device and keeps SDL's Valve HIDAPI drivers disabled ([`set_valve_hidapi`]):
+//! the Steam Deck driver clears the built-in controller's "lizard mode" (trackpad-mouse,
+//! clicky pads) the moment the device *enumerates* and keeps feeding that watchdog — so an
+//! idle host-list window would kill the Deck's system input. The pad list for Settings is
+//! built from SDL's ID-based metadata getters, which need no open.
 //!
 //! This thread is also the single consumer of the rumble and HID-output pull planes.
 
@@ -15,7 +24,6 @@ use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::GamepadPref;
 use punktfunk_core::input::{gamepad as wire, InputEvent, InputKind};
 use punktfunk_core::quic::{HidOutput, RichInput};
-use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,12 +52,18 @@ const DISCONNECT_HOLD: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Debug)]
 pub struct PadInfo {
-    pub id: u32,
     pub name: String,
+    /// Stable identity (`vid:pid:name`) for pinning across restarts — SDL instance ids are
+    /// per-run, so [`Settings::forward_pad`](crate::trust::Settings) persists this instead.
+    pub key: String,
     /// The virtual pad "Automatic" resolves to for this physical controller (so the host creates a
     /// matching pad: DualSense → DualSense, DS4 → DualShock 4, Xbox One/Series → Xbox One, anything
     /// else → Xbox 360). Drives [`GamepadService::auto_pref`] and the rich-feedback render path.
     pub pref: GamepadPref,
+    /// Steam Input's emulated pad ("Steam Virtual Gamepad", Valve 28de:11ff). It shadows the
+    /// physical controller and has no sensors/touchpad, so auto-selection skips it while a real
+    /// pad is connected — otherwise gyro silently dies on Bazzite/Deck game mode.
+    pub steam_virtual: bool,
 }
 
 impl PadInfo {
@@ -71,6 +85,24 @@ impl PadInfo {
     }
 }
 
+/// Enable/disable SDL's Valve HIDAPI drivers at runtime. The Steam Deck driver sends
+/// `ID_CLEAR_DIGITAL_MAPPINGS` + `TRACKPAD_NONE` in `InitDevice` — at *enumeration*, before
+/// any open — and its `UpdateDevice` keeps feeding the firmware's lizard-mode watchdog
+/// (`SDL_hidapi_steamdeck.c`), so a Deck's built-in trackpad-mouse dies for the whole
+/// system while the driver merely runs. These drivers therefore run ONLY while a session
+/// is attached (input is captured then anyway, and streaming wants the paddles, both
+/// trackpads, and gyro first-class). SDL3 applies the hint changes live: disabling detaches
+/// the driver and the firmware watchdog restores lizard mode within seconds.
+///
+/// On a Deck in Game Mode, Steam Input still holds the device — the user must disable
+/// Steam Input for this app (see the Decky UX); on a desktop client (or a Deck with Steam
+/// Input off) the in-session enable just works.
+fn set_valve_hidapi(enabled: bool) {
+    let v = if enabled { "1" } else { "0" };
+    sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAMDECK", v);
+    sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAM", v);
+}
+
 /// Map the SDL-reported controller type to the virtual pad we'd ask the host to create.
 fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
     use sdl3::gamepad::GamepadType as T;
@@ -85,14 +117,13 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
 enum Ctl {
     Attach(Arc<NativeClient>),
     Detach,
-    Pin(Option<u32>),
+    Pin(Option<String>),
 }
 
 #[derive(Clone)]
 pub struct GamepadService {
     pads: Arc<Mutex<Vec<PadInfo>>>,
     active: Arc<Mutex<Option<PadInfo>>>,
-    pinned: Arc<Mutex<Option<u32>>>,
     ctl: Sender<Ctl>,
     /// Fires once per press of the [`ESCAPE_CHORD`]; the stream page consumes it to leave
     /// fullscreen + release capture.
@@ -106,15 +137,14 @@ impl GamepadService {
     pub fn start() -> GamepadService {
         let pads = Arc::new(Mutex::new(Vec::new()));
         let active = Arc::new(Mutex::new(None));
-        let pinned = Arc::new(Mutex::new(None));
         let (ctl, ctl_rx) = std::sync::mpsc::channel();
         let (escape_tx, escape_rx) = async_channel::unbounded();
         let (disconnect_tx, disconnect_rx) = async_channel::unbounded();
-        let (p, a, pin) = (pads.clone(), active.clone(), pinned.clone());
+        let (p, a) = (pads.clone(), active.clone());
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-gamepad".into())
             .spawn(move || {
-                if let Err(e) = run(&p, &a, &pin, &ctl_rx, &escape_tx, &disconnect_tx) {
+                if let Err(e) = run(&p, &a, &ctl_rx, &escape_tx, &disconnect_tx) {
                     tracing::warn!(error = %e, "gamepad service ended — pads disabled");
                 }
             })
@@ -124,7 +154,6 @@ impl GamepadService {
         GamepadService {
             pads,
             active,
-            pinned,
             ctl,
             escape_rx,
             disconnect_rx,
@@ -151,12 +180,11 @@ impl GamepadService {
         self.active.lock().unwrap().clone()
     }
 
-    pub fn pinned(&self) -> Option<u32> {
-        *self.pinned.lock().unwrap()
-    }
-
-    pub fn set_pinned(&self, id: Option<u32>) {
-        let _ = self.ctl.send(Ctl::Pin(id));
+    /// Pin the forwarded controller by stable key (`PadInfo::key`) — `None` = automatic.
+    /// The pin persists as `Settings::forward_pad` (the UI's source of truth) and survives
+    /// the pad disconnecting: it re-applies the moment a matching controller shows up again.
+    pub fn set_pinned(&self, key: Option<String>) {
+        let _ = self.ctl.send(Ctl::Pin(key));
     }
 
     pub fn attach(&self, connector: Arc<NativeClient>) {
@@ -279,11 +307,16 @@ struct Worker<'a> {
     /// UI-facing state (the `GamepadService` accessors): pad list, active pad, pin.
     pads_out: &'a Mutex<Vec<PadInfo>>,
     active_out: &'a Mutex<Option<PadInfo>>,
-    pinned_out: &'a Mutex<Option<u32>>,
-    opened: HashMap<u32, sdl3::gamepad::Gamepad>,
-    /// Connection order; the most recently connected is the auto selection.
+    /// The ONE device held open — the active pad while a session is attached, `None`
+    /// otherwise. Opening is what grabs the hardware (SDL's HIDAPI drivers take the
+    /// hidraw device away from the system), so idle keeps this empty; see the module doc.
+    open: Option<(u32, sdl3::gamepad::Gamepad)>,
+    /// Connected pad ids in connection order (metadata only, no device open); the most
+    /// recently connected is the auto selection.
     order: Vec<u32>,
-    pinned: Option<u32>,
+    /// Stable key of the user-pinned controller (persisted in Settings) — matched against
+    /// connected pads, so it survives restarts and disconnects.
+    pinned: Option<String>,
     attached: Option<Arc<NativeClient>>,
     /// Wire state of the active pad — zeroed on the wire at switch/detach.
     last_axis: [i32; 6],
@@ -308,30 +341,93 @@ struct Worker<'a> {
 
 impl Worker<'_> {
     fn active_id(&self) -> Option<u32> {
-        self.pinned
-            .filter(|id| self.opened.contains_key(id))
+        // The pin matches by stable key (most recently connected wins if two identical pads
+        // share one); an unmatched pin falls through to automatic without being cleared.
+        if let Some(key) = &self.pinned {
+            if let Some(id) = self
+                .order
+                .iter()
+                .rev()
+                .copied()
+                .find(|&id| self.pad_info(id).is_some_and(|p| &p.key == key))
+            {
+                return Some(id);
+            }
+        }
+        // Automatic: the most recently connected pad — but never Steam Input's virtual pad
+        // while a real controller is present (see `PadInfo::steam_virtual`).
+        self.order
+            .iter()
+            .rev()
+            .copied()
+            .find(|&id| self.pad_info(id).is_some_and(|p| !p.steam_virtual))
             .or_else(|| self.order.last().copied())
     }
 
+    /// Pad metadata from SDL's ID-based getters — deliberately NO device open (see the
+    /// module doc; an open would grab the hardware).
     fn pad_info(&self, id: u32) -> Option<PadInfo> {
-        let pad = self.opened.get(&id)?;
-        let mut pref = pref_for_type(
-            self.subsystem
-                .type_for_id(sdl3::sys::joystick::SDL_JoystickID(id)),
+        if !self.order.contains(&id) {
+            return None;
+        }
+        let jid = sdl3::sys::joystick::SDL_JoystickID(id);
+        let mut pref = pref_for_type(self.subsystem.type_for_id(jid));
+        let (vid, pid) = (
+            self.subsystem.vendor_for_id(jid).unwrap_or(0),
+            self.subsystem.product_for_id(jid).unwrap_or(0),
         );
         // There is no SDL gamepad type for the Steam Deck / Steam Controller, so detect Valve by
         // VID/PID (Deck 0x1205, SC wired 0x1102, SC dongle 0x1142) — the host then builds the virtual
         // hid-steam pad with the back grips + dual trackpads and the right glyph identity.
-        if pad.vendor_id() == Some(0x28DE)
-            && matches!(pad.product_id(), Some(0x1205 | 0x1102 | 0x1142))
-        {
+        if vid == 0x28DE && matches!(pid, 0x1205 | 0x1102 | 0x1142) {
             pref = GamepadPref::SteamDeck;
         }
+        let name = self
+            .subsystem
+            .name_for_id(jid)
+            .unwrap_or_else(|_| "Controller".into());
         Some(PadInfo {
-            id,
-            name: pad.name().unwrap_or_else(|| "Controller".into()),
+            key: format!("{vid:04x}:{pid:04x}:{name}"),
+            steam_virtual: (vid == 0x28DE && pid == 0x11FF)
+                || name.starts_with("Steam Virtual Gamepad"),
+            name,
             pref,
         })
+    }
+
+    /// Hold exactly the right device: the active pad while a session is attached, nothing
+    /// otherwise. The single place that decides to open (= grab) hardware; dropping the
+    /// old handle closes it (`SDL_CloseGamepad`) — on a Deck the firmware watchdog then
+    /// restores lizard mode.
+    fn sync_open(&mut self) {
+        let want = if self.attached.is_some() {
+            self.active_id()
+        } else {
+            None
+        };
+        if self.open.as_ref().map(|(id, _)| *id) == want {
+            return;
+        }
+        self.open = None;
+        let Some(id) = want else { return };
+        match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
+            Ok(pad) => {
+                self.open = Some((id, pad));
+                self.set_sensors(true);
+            }
+            Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
+        }
+    }
+
+    /// React to anything that may have moved the active-pad selection (hotplug, pin
+    /// change): flush held wire state if it did, then re-sync the opened device and the
+    /// UI-facing snapshot.
+    fn refresh_active(&mut self, before: Option<u32>) {
+        if self.active_id() != before {
+            self.flush_held();
+        }
+        self.sync_open();
+        self.publish();
     }
 
     /// Zero everything the host believes is held — on pad switch and detach.
@@ -432,8 +528,7 @@ impl Worker<'_> {
 
     /// Sensors stream only while a session wants them (they cost USB/BT bandwidth).
     fn set_sensors(&mut self, enabled: bool) {
-        let Some(id) = self.active_id() else { return };
-        if let Some(pad) = self.opened.get_mut(&id) {
+        if let Some((_, pad)) = self.open.as_mut() {
             use sdl3::sensor::SensorType;
             for s in [SensorType::Gyroscope, SensorType::Accelerometer] {
                 if unsafe { pad.has_sensor(s) } {
@@ -459,9 +554,10 @@ impl Worker<'_> {
             return;
         };
         let multi = self
-            .opened
-            .get(&which)
-            .map(|p| p.touchpads_count() >= 2)
+            .open
+            .as_ref()
+            .filter(|(id, _)| *id == which)
+            .map(|(_, p)| p.touchpads_count() >= 2)
             .unwrap_or(false);
         let (cx, cy) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
         let surface = if multi { (touchpad as u8) + 1 } else { 0 };
@@ -503,7 +599,6 @@ impl Worker<'_> {
         list.reverse(); // most recent first — the Settings list order
         *self.pads_out.lock().unwrap() = list;
         *self.active_out.lock().unwrap() = self.active_id().and_then(|id| self.pad_info(id));
-        *self.pinned_out.lock().unwrap() = self.pinned;
     }
 
     /// Apply queued control-plane messages from the UI thread. Returns false when the
@@ -515,23 +610,22 @@ impl Worker<'_> {
                     self.attached = Some(c);
                     self.last_axis = [i32::MIN; 6];
                     self.reset_chord(); // every session starts un-latched (Attach doesn't flush)
-                    self.set_sensors(true);
+                                        // The Valve HIDAPI drivers run only in-session (see set_valve_hidapi);
+                                        // enabling them re-enumerates a Deck's built-in pad with paddles/
+                                        // trackpads/gyro first-class — sync_open follows the churn events.
+                    set_valve_hidapi(true);
+                    self.sync_open();
                 }
                 Ok(Ctl::Detach) => {
                     self.flush_held();
-                    self.set_sensors(false);
                     self.attached = None;
+                    self.sync_open(); // closes the held device
+                    set_valve_hidapi(false);
                 }
-                Ok(Ctl::Pin(id)) => {
+                Ok(Ctl::Pin(key)) => {
                     let before = self.active_id();
-                    self.pinned = id;
-                    if self.active_id() != before {
-                        self.flush_held();
-                        if self.attached.is_some() {
-                            self.set_sensors(true);
-                        }
-                    }
-                    self.publish();
+                    self.pinned = key;
+                    self.refresh_active(before);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return true,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return false, // app gone
@@ -546,35 +640,22 @@ impl Worker<'_> {
         let active = self.active_id();
         match event {
             Event::ControllerDeviceAdded { which, .. } => {
-                if !self.opened.contains_key(&which) {
-                    match self
-                        .subsystem
-                        .open(sdl3::sys::joystick::SDL_JoystickID(which))
-                    {
-                        Ok(pad) => {
-                            tracing::info!(
-                                name = pad.name().unwrap_or_default(),
-                                "gamepad attached"
-                            );
-                            self.opened.insert(which, pad);
-                            self.order.push(which);
-                            if self.attached.is_some() && self.active_id() == Some(which) {
-                                self.set_sensors(true);
-                            }
-                            self.publish();
-                        }
-                        Err(e) => tracing::warn!(error = %e, "gamepad open failed"),
+                if !self.order.contains(&which) {
+                    self.order.push(which);
+                    if let Some(p) = self.pad_info(which) {
+                        tracing::info!(name = p.name, "gamepad attached");
                     }
+                    self.refresh_active(active);
                 }
             }
             Event::ControllerDeviceRemoved { which, .. } => {
-                if self.opened.remove(&which).is_some() {
+                if self.order.contains(&which) {
                     self.order.retain(|&id| id != which);
-                    if active == Some(which) {
-                        self.flush_held();
+                    if self.open.as_ref().map(|(id, _)| *id) == Some(which) {
+                        self.open = None; // the device is gone; drop our handle
                     }
                     tracing::info!("gamepad detached");
-                    self.publish();
+                    self.refresh_active(active);
                 }
             }
             Event::ControllerButtonDown { which, button, .. } if active == Some(which) => {
@@ -687,7 +768,7 @@ impl Worker<'_> {
         };
         while let Ok((pad, low, high)) = connector.next_rumble(Duration::ZERO) {
             if pad == 0 {
-                if let Some(p) = self.active_id().and_then(|id| self.opened.get_mut(&id)) {
+                if let Some((_, p)) = self.open.as_mut() {
                     // Surface a failed SDL rumble write: a swallowed error here (DualSense not in
                     // the right HIDAPI mode, etc.) reads exactly like "rumble doesn't work". The
                     // host logs the send side on 0xCA, so the two together pinpoint host-game vs
@@ -703,9 +784,12 @@ impl Worker<'_> {
             }
         }
         while let Ok(hid) = connector.next_hidout(Duration::ZERO) {
-            let Some(id) = self.active_id() else { continue };
-            let is_ds = self.pad_info(id).is_some_and(|p| p.is_dualsense());
-            let Some(pad) = self.opened.get_mut(&id) else {
+            let is_ds = self
+                .open
+                .as_ref()
+                .and_then(|(id, _)| self.pad_info(*id))
+                .is_some_and(|p| p.is_dualsense());
+            let Some((_, pad)) = self.open.as_mut() else {
                 continue;
             };
             match hid {
@@ -734,7 +818,6 @@ impl Worker<'_> {
 fn run(
     pads_out: &Mutex<Vec<PadInfo>>,
     active_out: &Mutex<Option<PadInfo>>,
-    pinned_out: &Mutex<Option<u32>>,
     ctl: &Receiver<Ctl>,
     escape_tx: &async_channel::Sender<()>,
     disconnect_tx: &async_channel::Sender<()>,
@@ -743,12 +826,10 @@ fn run(
     // own thread.
     sdl3::hint::set("SDL_NO_SIGNAL_HANDLERS", "1");
     sdl3::hint::set("SDL_JOYSTICK_THREAD", "1");
-    // Let SDL's HIDAPI drivers open Valve Steam Controller / Steam Deck devices directly, so the
-    // paddles, both trackpads, and gyro arrive as first-class SDL gamepad inputs. On a Deck in Game
-    // Mode, Steam Input still holds the device — the user must disable Steam Input for this app (see
-    // the Decky UX); on a desktop client (or a Deck with Steam Input off) the hints just work.
-    sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1");
-    sdl3::hint::set("SDL_JOYSTICK_HIDAPI_STEAM", "1");
+    // The Valve HIDAPI drivers start DISABLED (SDL defaults the Deck one ON, and its mere
+    // enumeration kills the Deck's trackpad-mouse system-wide — see set_valve_hidapi);
+    // they are enabled for the duration of an attached session only.
+    set_valve_hidapi(false);
     let sdl = sdl3::init().map_err(|e| e.to_string())?;
     let subsystem = sdl.gamepad().map_err(|e| e.to_string())?;
     let mut pump = sdl.event_pump().map_err(|e| e.to_string())?;
@@ -757,8 +838,7 @@ fn run(
         subsystem,
         pads_out,
         active_out,
-        pinned_out,
-        opened: HashMap::new(),
+        open: None,
         order: Vec::new(),
         pinned: None,
         attached: None,

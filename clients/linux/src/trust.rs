@@ -182,6 +182,10 @@ pub struct Settings {
     /// Requested encoder bitrate (kbps); 0 = host default.
     pub bitrate_kbps: u32,
     pub gamepad: String,
+    /// Stable identity (`vid:pid:name`, see `PadInfo::key`) of the physical controller
+    /// forwarded as pad 0; empty = automatic (most recently connected). Applied to the
+    /// gamepad service at startup so the choice survives restarts.
+    pub forward_pad: String,
     /// Which host compositor backend to request (advisory; the host falls back to
     /// auto-detect when unavailable).
     pub compositor: String,
@@ -201,6 +205,9 @@ pub struct Settings {
     pub decoder: String,
     /// Show the on-stream statistics overlay (toggle live with Ctrl+Alt+Shift+S).
     pub show_stats: bool,
+    /// Enter fullscreen when a stream starts (F11 / the controller chord / the top-edge
+    /// header reveal exit it). Gaming-Mode launches (`--fullscreen`) fullscreen regardless.
+    pub fullscreen_on_stream: bool,
     /// Experimental: the game-library browser ("Browse library…" on saved cards) —
     /// mirrors the Apple client's "Show game library" toggle, default off.
     pub library_enabled: bool,
@@ -230,6 +237,7 @@ impl Default for Settings {
             refresh_hz: 0,
             bitrate_kbps: 0,
             gamepad: "auto".into(),
+            forward_pad: String::new(),
             compositor: "auto".into(),
             inhibit_shortcuts: true,
             mic_enabled: false,
@@ -237,6 +245,7 @@ impl Default for Settings {
             codec: "auto".into(),
             decoder: "auto".into(),
             show_stats: true,
+            fullscreen_on_stream: true,
             library_enabled: false,
         }
     }
@@ -261,5 +270,21 @@ impl Settings {
         if let Ok(s) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(&p, s);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pre-`forward_pad` settings file (≤ 0.5.0) loads with the pin on automatic.
+    #[test]
+    fn settings_forward_pad_defaults_empty() {
+        let old = r#"{"width":1280,"height":720,"refresh_hz":60,"bitrate_kbps":0,
+            "gamepad":"auto","compositor":"auto","inhibit_shortcuts":true,"mic_enabled":true}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.forward_pad, "");
+        let round: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(round.forward_pad, "");
     }
 }

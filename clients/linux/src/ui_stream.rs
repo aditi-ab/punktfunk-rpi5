@@ -34,6 +34,9 @@ pub struct StreamPage {
     /// Median capture→paintable-set latency (ms) over the frame consumer's last 1 s
     /// window — written there, folded into the OSD on each `Stats` event.
     present_ms: Rc<Cell<f32>>,
+    /// The stream is HDR (PQ) right now — set by the frame consumer from each frame's
+    /// signaling (the host can flip SDR↔HDR mid-session, in-band).
+    hdr: Rc<Cell<bool>>,
 }
 
 impl StreamPage {
@@ -50,6 +53,9 @@ impl StreamPage {
         if !s.decoder.is_empty() {
             line.push_str(" · ");
             line.push_str(s.decoder);
+        }
+        if self.hdr.get() {
+            line.push_str(" · HDR");
         }
         self.stats_label.set_text(&line);
     }
@@ -72,6 +78,12 @@ pub struct StreamPageArgs {
     pub inhibit_shortcuts: bool,
     /// Show the stats OSD initially (Settings); Ctrl+Alt+Shift+S toggles it live.
     pub show_stats: bool,
+    /// Gaming-Mode launch (`--fullscreen` / Deck env): build the page with NO header bar
+    /// at all. gamescope displays the window fullscreen but does not reliably ACK the
+    /// xdg_toplevel fullscreen state back, so anything keyed on `is_fullscreen()` (the
+    /// reveal-on-notify chrome hiding) may never fire — the title bar would stay drawn
+    /// over the stream. Chrome-less by construction cannot regress that way.
+    pub chromeless: bool,
     pub title: String,
 }
 
@@ -184,9 +196,10 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
         stop,
         inhibit_shortcuts,
         show_stats,
+        chromeless,
         title,
     } = args;
-    let w = build_widgets(&window, &title);
+    let w = build_widgets(&window, &title, chromeless);
     w.stats_label.set_visible(show_stats);
 
     let capture = Rc::new(Capture {
@@ -202,10 +215,20 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
     });
 
     let present_ms = Rc::new(Cell::new(0.0f32));
-    spawn_frame_consumer(&w.picture, frames, clock_offset_ns, present_ms.clone());
+    let hdr = Rc::new(Cell::new(false));
+    spawn_frame_consumer(
+        &w.picture,
+        frames,
+        clock_offset_ns,
+        present_ms.clone(),
+        hdr.clone(),
+    );
     attach_keyboard(&w.overlay, &window, &capture, &stop, &w.stats_label);
     attach_mouse(&w.overlay, &capture);
     attach_scroll(&w.overlay, &capture);
+    if !chromeless {
+        attach_edge_reveal(&w.toolbar, &w.overlay, &window, &capture);
+    }
     let active_handler = attach_capture_lifecycle(&w.overlay, &window, &capture);
     let escape_future = spawn_escape_watch(&window, &capture, escape_rx);
     let disconnect_future = spawn_disconnect_watch(&window, &capture, &stop, disconnect_rx);
@@ -222,6 +245,7 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
         page: w.page,
         stats_label: w.stats_label,
         present_ms,
+        hdr,
     }
 }
 
@@ -231,6 +255,7 @@ struct PageWidgets {
     stats_label: gtk::Label,
     hint: gtk::Label,
     overlay: gtk::Overlay,
+    toolbar: adw::ToolbarView,
     page: adw::NavigationPage,
     /// Fullscreen-notify handler on the shared window — disconnected on page teardown.
     fs_handler: glib::SignalHandlerId,
@@ -238,7 +263,8 @@ struct PageWidgets {
 
 /// The offloaded picture under an overlay (stats HUD, capture hint, fullscreen hint), a
 /// header bar with the fullscreen toggle, and the window's fullscreen behavior.
-fn build_widgets(window: &adw::ApplicationWindow, title: &str) -> PageWidgets {
+/// `chromeless` (Gaming Mode) builds NO header bar at all — see `StreamPageArgs`.
+fn build_widgets(window: &adw::ApplicationWindow, title: &str, chromeless: bool) -> PageWidgets {
     let picture = gtk::Picture::new();
     picture.set_content_fit(gtk::ContentFit::Contain);
 
@@ -265,12 +291,15 @@ fn build_widgets(window: &adw::ApplicationWindow, title: &str) -> PageWidgets {
     hint.set_margin_bottom(24);
     hint.set_visible(false);
 
-    // Flashed when entering fullscreen — the only exit affordances once the header bar is
-    // hidden (F11 on a keyboard; the L1+R1+Start+Select chord on a controller, which is the
-    // only way out on a Steam Deck).
-    let fs_hint = gtk::Label::new(Some(
-        "F11  ·  L1 + R1 + Start + Select  —  exit fullscreen (hold to disconnect)",
-    ));
+    // Flashed when entering fullscreen — the exit affordances once the header bar is
+    // hidden (F11 on a keyboard; the top-edge pointer reveal for mouse/trackpad-only
+    // devices; the L1+R1+Start+Select chord on a controller). Gaming Mode has no F11,
+    // no header to reveal, and Steam owns window management — only the chord applies.
+    let fs_hint = gtk::Label::new(Some(if chromeless {
+        "L1 + R1 + Start + Select  —  leave the stream (hold to disconnect)"
+    } else {
+        "F11  ·  mouse to the top edge  ·  L1 + R1 + Start + Select  —  exit fullscreen (hold to disconnect)"
+    }));
     fs_hint.add_css_class("osd");
     fs_hint.set_halign(gtk::Align::Center);
     fs_hint.set_valign(gtk::Align::Start);
@@ -284,23 +313,33 @@ fn build_widgets(window: &adw::ApplicationWindow, title: &str) -> PageWidgets {
     overlay.add_overlay(&fs_hint);
     overlay.set_focusable(true);
 
-    let header = adw::HeaderBar::new();
-    let fullscreen_btn = gtk::Button::from_icon_name("view-fullscreen-symbolic");
-    fullscreen_btn.set_tooltip_text(Some("Fullscreen (F11)"));
-    {
-        let window = window.clone();
-        fullscreen_btn.connect_clicked(move |_| {
-            if window.is_fullscreen() {
-                window.unfullscreen();
-            } else {
-                window.fullscreen();
-            }
+    let toolbar = adw::ToolbarView::new();
+    if !chromeless {
+        let header = adw::HeaderBar::new();
+        let fullscreen_btn = gtk::Button::from_icon_name("view-fullscreen-symbolic");
+        fullscreen_btn.set_tooltip_text(Some("Fullscreen (F11)"));
+        {
+            let window = window.clone();
+            fullscreen_btn.connect_clicked(move |_| {
+                if window.is_fullscreen() {
+                    window.unfullscreen();
+                } else {
+                    window.fullscreen();
+                }
+            });
+        }
+        header.pack_end(&fullscreen_btn);
+        toolbar.add_top_bar(&header);
+    } else {
+        // No header exists to hide, and gamescope may never ACK fullscreen — flash the
+        // chord hint when the stream maps instead of on the fullscreened notify.
+        let fs_hint = fs_hint.clone();
+        overlay.connect_map(move |_| {
+            fs_hint.set_visible(true);
+            let fs_hint = fs_hint.clone();
+            glib::timeout_add_seconds_local_once(4, move || fs_hint.set_visible(false));
         });
     }
-    header.pack_end(&fullscreen_btn);
-
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&overlay));
     // Fullscreen = the stream and nothing else. (Window handlers are disconnected when
     // the page dies — the window outlives every session.)
@@ -310,6 +349,9 @@ fn build_widgets(window: &adw::ApplicationWindow, title: &str) -> PageWidgets {
         window.connect_fullscreened_notify(move |w| {
             let fs = w.is_fullscreen();
             toolbar.set_reveal_top_bars(!fs);
+            if chromeless {
+                return; // the map handler above owns the hint; there is no bar to reveal
+            }
             if fs {
                 fs_hint.set_visible(true);
                 let fs_hint = fs_hint.clone();
@@ -331,9 +373,46 @@ fn build_widgets(window: &adw::ApplicationWindow, title: &str) -> PageWidgets {
         stats_label,
         hint,
         overlay,
+        toolbar,
         page,
         fs_handler,
     }
+}
+
+/// Fullscreen chrome recovery for pointer-only devices (a Deck desktop has no F11): while
+/// fullscreen and NOT captured, bumping the pointer against the top edge reveals the header
+/// bar (back button, fullscreen toggle); moving back into the stream hides it again. While
+/// captured the pointer belongs to the host — nothing reveals, and a still-revealed bar is
+/// re-hidden on the first captured movement (release capture first: Ctrl+Alt+Shift+Q).
+fn attach_edge_reveal(
+    toolbar: &adw::ToolbarView,
+    overlay: &gtk::Overlay,
+    window: &adw::ApplicationWindow,
+    capture: &Rc<Capture>,
+) {
+    let motion = gtk::EventControllerMotion::new();
+    let toolbar = toolbar.clone();
+    let window = window.clone();
+    let cap = capture.clone();
+    motion.connect_motion(move |_, _x, y| {
+        if !window.is_fullscreen() {
+            return; // windowed chrome is the fullscreened-notify handler's business
+        }
+        if cap.captured.get() {
+            if toolbar.reveals_top_bars() {
+                toolbar.set_reveal_top_bars(false);
+            }
+            return;
+        }
+        if y <= 2.0 {
+            toolbar.set_reveal_top_bars(true);
+        } else if y > 4.0 && toolbar.reveals_top_bars() {
+            // Once revealed the content sits below the bar, so y stays small while the
+            // pointer hovers the boundary; anything deeper means the user moved back in.
+            toolbar.set_reveal_top_bars(false);
+        }
+    });
+    overlay.add_controller(motion);
 }
 
 /// Frame consumer: each decoded frame becomes the picture's paintable as soon as it
@@ -347,23 +426,67 @@ fn build_widgets(window: &adw::ApplicationWindow, title: &str) -> PageWidgets {
 /// capture→paintable-SET — GTK's own present adds one compositor cycle after this. The
 /// 1 s p50 lands on the stats OSD (via `present_ms`) and in a "present window" debug
 /// line for headless validation.
+/// One-entry cache of `ColorDesc` → `GdkColorState` (signaling changes at most on an
+/// SDR↔HDR flip, never per frame).
+#[derive(Default)]
+struct ColorStateCache(Option<(crate::video::ColorDesc, Option<gdk::ColorState>)>);
+
+impl ColorStateCache {
+    /// The color state for a frame's signaling. `rgb` = the pixels are already full-range
+    /// RGB (the CPU path — only transfer + primaries remain meaningful); else YUV, where
+    /// H.273 "unspecified" (2) fills in as BT.709 limited, the host's SDR default. `None`
+    /// = GDK can't represent the combo — the caller's default (sRGB) applies, which
+    /// matches the pre-color-management behavior.
+    fn get(&mut self, desc: crate::video::ColorDesc, rgb: bool) -> Option<gdk::ColorState> {
+        if let Some((cached, state)) = &self.0 {
+            if *cached == desc {
+                return state.clone();
+            }
+        }
+        let def = |v: u8, d: u32| if v == 2 { d } else { u32::from(v) };
+        let cicp = gdk::CicpParams::new();
+        if rgb {
+            cicp.set_color_primaries(def(desc.primaries, 1));
+            cicp.set_transfer_function(def(desc.transfer, 13)); // 13 = sRGB
+            cicp.set_matrix_coefficients(0); // identity — the matrix is already undone
+            cicp.set_range(gdk::CicpRange::Full);
+        } else {
+            cicp.set_color_primaries(def(desc.primaries, 1));
+            cicp.set_transfer_function(def(desc.transfer, 1));
+            cicp.set_matrix_coefficients(def(desc.matrix, 1));
+            cicp.set_range(if desc.full_range {
+                gdk::CicpRange::Full
+            } else {
+                gdk::CicpRange::Narrow
+            });
+        }
+        let state = cicp.build_color_state().ok();
+        if state.is_none() {
+            tracing::warn!(
+                ?desc,
+                "GDK can't represent this colour signaling — using default"
+            );
+        }
+        self.0 = Some((desc, state.clone()));
+        state
+    }
+}
+
 fn spawn_frame_consumer(
     picture: &gtk::Picture,
     frames: async_channel::Receiver<DecodedFrame>,
     clock_offset_ns: i64,
     present_ms: Rc<Cell<f32>>,
+    hdr: Rc<Cell<bool>>,
 ) {
     let picture = picture.downgrade();
-    // The host encodes BT.709 limited-range; without an explicit color state GDK
-    // would convert NV12 dmabufs with the (BT.601) dmabuf default.
-    let rec709 = {
-        let cicp = gdk::CicpParams::new();
-        cicp.set_color_primaries(1);
-        cicp.set_transfer_function(1);
-        cicp.set_matrix_coefficients(1);
-        cicp.set_range(gdk::CicpRange::Narrow);
-        cicp.build_color_state().ok()
-    };
+    // The colour state follows the FRAMES' own signaling (the Windows host switches an HDR
+    // desktop to BT.2020 PQ in-band while the Welcome still says SDR): unspecified falls
+    // back to BT.709 limited — without an explicit state GDK would convert NV12 dmabufs
+    // with the (BT.601) dmabuf default. Cached per distinct signaling; a change mid-stream
+    // (SDR↔HDR flip) just rebuilds once.
+    let mut yuv_state = ColorStateCache::default();
+    let mut rgb_state = ColorStateCache::default();
     glib::spawn_future_local(async move {
         let mut win_lat_us: Vec<u64> = Vec::with_capacity(256);
         let mut win_start = Instant::now();
@@ -372,16 +495,39 @@ fn spawn_frame_consumer(
                 break;
             };
             let mut presented = false;
+            match &f.image {
+                DecodedImage::Cpu(c) => hdr.set(c.color.is_pq()),
+                DecodedImage::Dmabuf(d) => hdr.set(d.color.is_pq()),
+            }
             match f.image {
                 DecodedImage::Cpu(c) => {
                     let bytes = glib::Bytes::from_owned(c.rgba);
-                    let tex = gdk::MemoryTexture::new(
-                        c.width as i32,
-                        c.height as i32,
-                        gdk::MemoryFormat::R8g8b8a8,
-                        &bytes,
-                        c.stride,
-                    );
+                    // swscale undid the YUV matrix (full-range RGB) — but a PQ/BT.2020
+                    // stream keeps transfer + primaries baked in, so tag the texture and
+                    // let GTK tone-map. Plain SDR keeps the untagged (sRGB) fast path.
+                    let tagged = (c.color.is_pq() || c.color.primaries == 9)
+                        .then(|| rgb_state.get(c.color, true))
+                        .flatten();
+                    let tex: gdk::Texture = if let Some(state) = tagged {
+                        gdk::MemoryTextureBuilder::new()
+                            .set_width(c.width as i32)
+                            .set_height(c.height as i32)
+                            .set_format(gdk::MemoryFormat::R8g8b8a8)
+                            .set_bytes(Some(&bytes))
+                            .set_stride(c.stride)
+                            .set_color_state(&state)
+                            .build()
+                            .upcast()
+                    } else {
+                        gdk::MemoryTexture::new(
+                            c.width as i32,
+                            c.height as i32,
+                            gdk::MemoryFormat::R8g8b8a8,
+                            &bytes,
+                            c.stride,
+                        )
+                        .upcast()
+                    };
                     picture.set_paintable(Some(&tex));
                     presented = true;
                 }
@@ -393,7 +539,7 @@ fn spawn_frame_consumer(
                         .set_fourcc(d.fourcc)
                         .set_modifier(d.modifier)
                         .set_n_planes(d.planes.len() as u32)
-                        .set_color_state(rec709.as_ref());
+                        .set_color_state(yuv_state.get(d.color, false).as_ref());
                     for (i, p) in d.planes.iter().enumerate() {
                         b = unsafe { b.set_fd(i as u32, p.fd) }
                             .set_offset(i as u32, p.offset)

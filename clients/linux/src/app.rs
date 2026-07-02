@@ -128,6 +128,16 @@ fn build_ui(gtk_app: &adw::Application) {
         hosts: RefCell::new(None),
     });
 
+    // Re-apply the persisted forwarded-controller pin (stable key; the service matches it
+    // whenever such a pad connects) — without this the pin silently resets to Automatic on
+    // every launch, and Automatic may resolve to a gyro-less pad (Steam's virtual gamepad).
+    {
+        let forward = app.settings.borrow().forward_pad.clone();
+        if !forward.is_empty() {
+            app.gamepad.set_pinned(Some(forward));
+        }
+    }
+
     let hosts_ui = Rc::new(crate::ui_hosts::new(
         app.settings.clone(),
         HostsCallbacks {

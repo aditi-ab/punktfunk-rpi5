@@ -265,13 +265,16 @@ impl SessionUi {
             stop: self.stop.clone(),
             inhibit_shortcuts: self.inhibit,
             show_stats: self.show_stats,
+            chromeless: self.app.fullscreen,
             title,
         });
         self.app.nav.push(&p.page);
-        // Steam Deck / Gaming Mode: gamescope fullscreens the window but GTK doesn't
-        // know it, so its header bar stays drawn. Enter GTK fullscreen explicitly —
-        // the stream page's `connect_fullscreened_notify` then hides all chrome.
-        if self.app.fullscreen {
+        // Streams start fullscreen by default (Settings toggle) — a streaming window with
+        // chrome is never what anyone wants mid-game; F11 / the controller chord / the
+        // top-edge header reveal lead back out. Gaming-Mode launches (`--fullscreen`)
+        // fullscreen regardless: gamescope fullscreens the window at its level but GTK
+        // doesn't know it, so the header bar would stay drawn.
+        if self.app.fullscreen || self.app.settings.borrow().fullscreen_on_stream {
             self.app.window.fullscreen();
         }
         self.page = Some(p);

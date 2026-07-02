@@ -3,7 +3,7 @@
 
 use crate::trust::Settings;
 use adw::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// `(0, 0)` = the native size of the monitor the window is on, resolved at connect.
@@ -25,7 +25,7 @@ const DECODERS: &[&str] = &["auto", "vaapi", "software"];
 
 /// punktfunk's own license (MIT OR Apache-2.0), shown on the About dialog's Legal page.
 const APP_LICENSE: &str = concat!(
-    "punktfunk is licensed under MIT OR Apache-2.0, at your option.\n\n",
+    "Punktfunk is licensed under MIT OR Apache-2.0, at your option.\n\n",
     "================================ MIT ================================\n\n",
     include_str!("../../../LICENSE-MIT"),
     "\n\n=============================== Apache-2.0 ===============================\n\n",
@@ -39,7 +39,7 @@ const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD-PARTY-NOTICES.txt
 /// from the primary menu (app.rs `win.about`).
 pub fn show_about(parent: &impl IsA<gtk::Widget>) {
     let about = adw::AboutDialog::builder()
-        .application_name("punktfunk")
+        .application_name("Punktfunk")
         .developer_name("unom")
         .version(env!("CARGO_PKG_VERSION"))
         .website("https://git.unom.io/unom/punktfunk")
@@ -67,6 +67,179 @@ pub fn show_about(parent: &impl IsA<gtk::Widget>) {
     about.present(Some(parent));
 }
 
+/// True inside a gamescope session (Steam game mode on the Deck / Bazzite): GTK popovers
+/// are xdg_popups, which gamescope never maps for nested apps — a ComboRow's dropdown
+/// flashes the row but no list ever appears. Selection UI must stay inside the toplevel.
+fn gamescope_session() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.eq_ignore_ascii_case("gamescope"))
+        || std::env::var("GAMESCOPE_WAYLAND_DISPLAY").is_ok()
+}
+
+type ChangedFn = Rc<RefCell<Option<Box<dyn Fn(u32)>>>>;
+
+/// A titled single-choice preference row. On a desktop this is a stock popover
+/// [`adw::ComboRow`]; under gamescope (see [`gamescope_session`]) it becomes an activatable
+/// row that pushes an in-window selection subpage onto the preferences dialog instead.
+struct ChoiceRow {
+    row: adw::PreferencesRow,
+    selected: Rc<Cell<u32>>,
+    /// Fires on user changes only — [`connect_changed`](Self::connect_changed) is installed
+    /// after seeding, so programmatic `set_selected` during setup never fires it.
+    changed: ChangedFn,
+    /// Subpage mode only: the current value rendered as the row's suffix.
+    value_label: Option<gtk::Label>,
+    options: Rc<Vec<String>>,
+}
+
+impl ChoiceRow {
+    /// `inline` = subpage mode (gamescope): computed once per dialog via
+    /// [`gamescope_session`] and passed in so tests can drive both modes directly.
+    fn new(
+        dialog: &adw::PreferencesDialog,
+        inline: bool,
+        title: &str,
+        subtitle: &str,
+        options: &[&str],
+    ) -> ChoiceRow {
+        let options: Rc<Vec<String>> = Rc::new(options.iter().map(|s| s.to_string()).collect());
+        let selected = Rc::new(Cell::new(0u32));
+        let changed: ChangedFn = Rc::new(RefCell::new(None));
+
+        if !inline {
+            let row = adw::ComboRow::builder()
+                .title(title)
+                .subtitle(subtitle)
+                .model(&gtk::StringList::new(
+                    &options.iter().map(String::as_str).collect::<Vec<_>>(),
+                ))
+                .build();
+            let (sel, chg) = (selected.clone(), changed.clone());
+            row.connect_selected_notify(move |r| {
+                if sel.replace(r.selected()) != r.selected() {
+                    if let Some(f) = chg.borrow().as_ref() {
+                        f(r.selected());
+                    }
+                }
+            });
+            return ChoiceRow {
+                row: row.upcast(),
+                selected,
+                changed,
+                value_label: None,
+                options,
+            };
+        }
+
+        let value = gtk::Label::builder().css_classes(["dim-label"]).build();
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .activatable(true)
+            .build();
+        row.add_suffix(&value);
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        {
+            let dialog = dialog.downgrade();
+            let (options, sel, chg, value) = (
+                options.clone(),
+                selected.clone(),
+                changed.clone(),
+                value.clone(),
+            );
+            let title = title.to_string();
+            row.connect_activated(move |_| {
+                let Some(dialog) = dialog.upgrade() else {
+                    return;
+                };
+                let list = gtk::ListBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    .css_classes(["boxed-list"])
+                    .build();
+                for (i, opt) in options.iter().enumerate() {
+                    let check = gtk::Image::from_icon_name("object-select-symbolic");
+                    check.set_visible(i as u32 == sel.get());
+                    let opt_row = adw::ActionRow::builder()
+                        .title(opt)
+                        .use_markup(false)
+                        .activatable(true)
+                        .build();
+                    opt_row.add_suffix(&check);
+                    let idx = i as u32;
+                    let dlg = dialog.downgrade();
+                    let (sel, chg, value, label) =
+                        (sel.clone(), chg.clone(), value.clone(), opt.clone());
+                    opt_row.connect_activated(move |_| {
+                        let user_change = sel.replace(idx) != idx;
+                        value.set_text(&label);
+                        if user_change {
+                            if let Some(f) = chg.borrow().as_ref() {
+                                f(idx);
+                            }
+                        }
+                        if let Some(d) = dlg.upgrade() {
+                            d.pop_subpage();
+                        }
+                    });
+                    list.append(&opt_row);
+                }
+                let clamp = adw::Clamp::builder()
+                    .child(&list)
+                    .margin_top(24)
+                    .margin_bottom(24)
+                    .margin_start(12)
+                    .margin_end(12)
+                    .build();
+                let scroll = gtk::ScrolledWindow::builder()
+                    .hscrollbar_policy(gtk::PolicyType::Never)
+                    .child(&clamp)
+                    .build();
+                let view = adw::ToolbarView::new();
+                view.add_top_bar(&adw::HeaderBar::new());
+                view.set_content(Some(&scroll));
+                dialog.push_subpage(&adw::NavigationPage::new(&view, &title));
+            });
+        }
+        let cr = ChoiceRow {
+            row: row.upcast(),
+            selected,
+            changed,
+            value_label: Some(value),
+            options,
+        };
+        cr.sync_value();
+        cr
+    }
+
+    /// Subpage mode: reflect the current selection in the row's suffix label.
+    fn sync_value(&self) {
+        if let Some(l) = &self.value_label {
+            let i = self.selected.get() as usize;
+            l.set_text(self.options.get(i).map(String::as_str).unwrap_or(""));
+        }
+    }
+
+    fn widget(&self) -> &adw::PreferencesRow {
+        &self.row
+    }
+
+    fn selected(&self) -> u32 {
+        self.selected.get()
+    }
+
+    fn set_selected(&self, i: u32) {
+        if let Some(combo) = self.row.downcast_ref::<adw::ComboRow>() {
+            combo.set_selected(i); // the notify handler syncs the cell
+        } else {
+            self.selected.set(i);
+            self.sync_value();
+        }
+    }
+
+    fn connect_changed(&self, f: impl Fn(u32) + 'static) {
+        *self.changed.borrow_mut() = Some(Box::new(f));
+    }
+}
+
 /// `on_closed` runs after the settings are saved (the app shell refreshes the hosts grid
 /// there so the experimental library toggle takes effect without a nav round-trip).
 pub fn show(
@@ -75,6 +248,11 @@ pub fn show(
     gamepads: &crate::gamepad::GamepadService,
     on_closed: impl Fn() + 'static,
 ) {
+    // The dialog exists before the rows: ChoiceRow's gamescope mode pushes its selection
+    // subpage onto it.
+    let dialog = adw::PreferencesDialog::new();
+    dialog.set_title("Preferences");
+    let inline = gamescope_session();
     let page = adw::PreferencesPage::new();
 
     let stream = adw::PreferencesGroup::builder().title("Stream").build();
@@ -88,13 +266,13 @@ pub fn show(
             }
         })
         .collect();
-    let res_row = adw::ComboRow::builder()
-        .title("Resolution")
-        .subtitle("The host creates a virtual output at exactly this size")
-        .model(&gtk::StringList::new(
-            &res_names.iter().map(String::as_str).collect::<Vec<_>>(),
-        ))
-        .build();
+    let res_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Resolution",
+        "The host creates a virtual output at exactly this size",
+        &res_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
     let hz_names: Vec<String> = REFRESH
         .iter()
         .map(|&r| {
@@ -105,123 +283,153 @@ pub fn show(
             }
         })
         .collect();
-    let hz_row = adw::ComboRow::builder()
-        .title("Refresh rate")
-        .model(&gtk::StringList::new(
-            &hz_names.iter().map(String::as_str).collect::<Vec<_>>(),
-        ))
-        .build();
+    let hz_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Refresh rate",
+        "",
+        &hz_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
     let bitrate_row = adw::SpinRow::with_range(0.0, 3000.0, 5.0);
     bitrate_row.set_title("Bitrate");
     bitrate_row.set_subtitle("Mbit/s · 0 = host default · run a speed test before going high");
-    let compositor_row = adw::ComboRow::builder()
-        .title("Host compositor")
-        .subtitle("Advisory — the host falls back to auto-detect when unavailable")
-        .model(&gtk::StringList::new(&[
+    let compositor_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Host compositor",
+        "Advisory — the host falls back to auto-detect when unavailable",
+        &[
             "Automatic",
             "KWin",
             "wlroots (Sway/Hyprland)",
             "Mutter (GNOME)",
             "gamescope",
-        ]))
-        .build();
-    let decoder_row = adw::ComboRow::builder()
-        .title("Video decoder")
-        .subtitle("Automatic tries VAAPI hardware decode, then software")
-        .model(&gtk::StringList::new(&[
+        ],
+    );
+    let decoder_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Video decoder",
+        "Automatic tries VAAPI hardware decode, then software",
+        &[
             "Automatic (VAAPI → software)",
             "Hardware (VAAPI)",
             "Software",
-        ]))
-        .build();
+        ],
+    );
     let stats_row = adw::SwitchRow::builder()
         .title("Show statistics overlay")
         .subtitle("fps · bitrate · latency on the stream — Ctrl+Alt+Shift+S toggles live")
         .build();
-    stream.add(&res_row);
-    stream.add(&hz_row);
+    let fullscreen_row = adw::SwitchRow::builder()
+        .title("Start streams in fullscreen")
+        .subtitle("F11, the mouse at the top edge, or L1+R1+Start+Select lead back out")
+        .build();
+    stream.add(res_row.widget());
+    stream.add(hz_row.widget());
     stream.add(&bitrate_row);
-    stream.add(&compositor_row);
-    stream.add(&decoder_row);
+    stream.add(compositor_row.widget());
+    stream.add(decoder_row.widget());
+    stream.add(&fullscreen_row);
     stream.add(&stats_row);
 
     let input = adw::PreferencesGroup::builder().title("Input").build();
-    // Which physical controller forwards as pad 0: automatic = the most recently
-    // connected; pinning survives until the app exits (Swift parity).
+    // Which physical controller forwards as pad 0: automatic = the most recently connected
+    // real pad (Steam's virtual pad skipped). A pin is persisted by stable key
+    // (`Settings::forward_pad`), so it survives restarts — and disconnects: an offline
+    // pinned pad keeps its entry here instead of silently snapping back to Automatic.
     let pads = gamepads.pads();
+    let saved_pin = settings.borrow().forward_pad.clone();
     let mut pad_names = vec!["Automatic (most recent)".to_string()];
-    pad_names.extend(pads.iter().map(|p| {
+    let mut pad_keys: Vec<String> = Vec::new();
+    for p in &pads {
         let kind = p.kind_label();
-        if kind.is_empty() {
+        pad_names.push(if kind.is_empty() {
             p.name.clone()
         } else {
             format!("{} · {kind}", p.name)
-        }
-    }));
-    let forward_row = adw::ComboRow::builder()
-        .title("Forwarded controller")
-        .subtitle(if pads.is_empty() {
+        });
+        pad_keys.push(p.key.clone());
+    }
+    if !saved_pin.is_empty() && !pad_keys.contains(&saved_pin) {
+        let name = saved_pin
+            .splitn(3, ':')
+            .nth(2)
+            .unwrap_or("Saved controller");
+        pad_names.push(format!("{name} (not connected)"));
+        pad_keys.push(saved_pin.clone());
+    }
+    let forward_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Forwarded controller",
+        if pads.is_empty() {
             "No controllers detected"
         } else {
             "Exactly one controller is forwarded to the host"
-        })
-        .model(&gtk::StringList::new(
-            &pad_names.iter().map(String::as_str).collect::<Vec<_>>(),
-        ))
-        .build();
-    let pinned_i = gamepads
-        .pinned()
-        .and_then(|id| pads.iter().position(|p| p.id == id))
+        },
+        &pad_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let pinned_i = pad_keys
+        .iter()
+        .position(|k| k == &saved_pin)
         .map_or(0, |i| i + 1);
     forward_row.set_selected(pinned_i as u32);
+    // The dialog-local choice, written into Settings on close (reading the service back
+    // would race its worker thread applying the Pin message).
+    let chosen_pin: Rc<RefCell<String>> = Rc::new(RefCell::new(saved_pin));
     {
         let svc = gamepads.clone();
-        let ids: Vec<u32> = pads.iter().map(|p| p.id).collect();
-        forward_row.connect_selected_notify(move |row| {
-            let sel = row.selected() as usize;
-            svc.set_pinned(if sel == 0 {
+        let keys = pad_keys.clone();
+        let chosen = chosen_pin.clone();
+        forward_row.connect_changed(move |sel| {
+            let key = if sel == 0 {
                 None
             } else {
-                ids.get(sel - 1).copied()
-            });
+                keys.get(sel as usize - 1).cloned()
+            };
+            *chosen.borrow_mut() = key.clone().unwrap_or_default();
+            svc.set_pinned(key);
         });
     }
-    let pad_row = adw::ComboRow::builder()
-        .title("Gamepad type")
-        .subtitle("The virtual pad the host creates — Automatic matches the physical pad")
-        .model(&gtk::StringList::new(&[
+    let pad_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Gamepad type",
+        "The virtual pad the host creates — Automatic matches the physical pad",
+        &[
             "Automatic",
             "Xbox 360",
             "DualSense",
             "Xbox One",
             "DualShock 4",
-        ]))
-        .build();
+        ],
+    );
     let inhibit_row = adw::SwitchRow::builder()
         .title("Capture system shortcuts")
         .subtitle("Forward Alt+Tab, Super, … to the host while input is captured")
         .build();
-    input.add(&forward_row);
-    input.add(&pad_row);
+    input.add(forward_row.widget());
+    input.add(pad_row.widget());
     input.add(&inhibit_row);
 
     let audio = adw::PreferencesGroup::builder().title("Audio").build();
-    let surround_row = adw::ComboRow::builder()
-        .title("Audio channels")
-        .subtitle("Request stereo or surround (the host downmixes if its output has fewer)")
-        .model(&gtk::StringList::new(&[
-            "Stereo",
-            "5.1 Surround",
-            "7.1 Surround",
-        ]))
-        .build();
-    audio.add(&surround_row);
-    let codec_row = adw::ComboRow::builder()
-        .title("Video codec")
-        .subtitle("Preferred codec — the host falls back if it can't encode this one")
-        .model(&gtk::StringList::new(CODEC_LABELS))
-        .build();
-    stream.add(&codec_row);
+    let surround_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Audio channels",
+        "Request stereo or surround (the host downmixes if its output has fewer)",
+        &["Stereo", "5.1 Surround", "7.1 Surround"],
+    );
+    audio.add(surround_row.widget());
+    let codec_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Video codec",
+        "Preferred codec — the host falls back if it can't encode this one",
+        CODEC_LABELS,
+    );
+    stream.add(codec_row.widget());
     let mic_row = adw::SwitchRow::builder()
         .title("Stream microphone")
         .subtitle("Send the default input device to the host's virtual microphone")
@@ -268,6 +476,7 @@ pub fn show(
         let dec_i = DECODERS.iter().position(|&d| d == s.decoder).unwrap_or(0);
         decoder_row.set_selected(dec_i as u32);
         stats_row.set_active(s.show_stats);
+        fullscreen_row.set_active(s.fullscreen_on_stream);
         inhibit_row.set_active(s.inhibit_shortcuts);
         mic_row.set_active(s.mic_enabled);
         library_row.set_active(s.library_enabled);
@@ -280,8 +489,6 @@ pub fn show(
         codec_row.set_selected(codec_i as u32);
     }
 
-    let dialog = adw::PreferencesDialog::new();
-    dialog.set_title("Preferences");
     dialog.add(&page);
     dialog.connect_closed(move |_| {
         let mut s = settings.borrow_mut();
@@ -290,10 +497,12 @@ pub fn show(
         s.refresh_hz = REFRESH[(hz_row.selected() as usize).min(REFRESH.len() - 1)];
         s.bitrate_kbps = (bitrate_row.value() * 1000.0) as u32;
         s.gamepad = GAMEPADS[(pad_row.selected() as usize).min(GAMEPADS.len() - 1)].to_string();
+        s.forward_pad = chosen_pin.borrow().clone();
         s.compositor = COMPOSITORS[(compositor_row.selected() as usize).min(COMPOSITORS.len() - 1)]
             .to_string();
         s.decoder = DECODERS[(decoder_row.selected() as usize).min(DECODERS.len() - 1)].to_string();
         s.show_stats = stats_row.is_active();
+        s.fullscreen_on_stream = fullscreen_row.is_active();
         s.inhibit_shortcuts = inhibit_row.is_active();
         s.mic_enabled = mic_row.is_active();
         s.audio_channels = match surround_row.selected() {
@@ -308,4 +517,98 @@ pub fn show(
         on_closed();
     });
     dialog.present(Some(parent));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Depth-first search for an [`adw::ActionRow`] with the given title.
+    fn find_action_row(root: &gtk::Widget, title: &str) -> Option<adw::ActionRow> {
+        if let Some(row) = root.downcast_ref::<adw::ActionRow>() {
+            if row.title() == title {
+                return Some(row.clone());
+            }
+        }
+        let mut child = root.first_child();
+        while let Some(c) = child {
+            if let Some(hit) = find_action_row(&c, title) {
+                return Some(hit);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    fn pump() {
+        let ctx = gtk::glib::MainContext::default();
+        while ctx.iteration(false) {}
+    }
+
+    /// Both ChoiceRow modes in ONE test (GTK is thread-affine and libtest gives every test
+    /// its own thread, so the display tests can't be split). Gamescope mode: activating the
+    /// row pushes the in-window selection subpage; activating an option updates the
+    /// selection + suffix label, fires the change callback, and pops the subpage. Combo
+    /// mode: cell sync + change callback. Needs a display — run manually with
+    /// `cargo test -p punktfunk-client-linux -- --ignored` on a session box.
+    #[test]
+    #[ignore = "needs a Wayland/X display"]
+    fn choice_row_modes() {
+        assert!(gtk::init().is_ok() && adw::init().is_ok(), "no display");
+        let win = adw::Window::new();
+        let dialog = adw::PreferencesDialog::new();
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::new();
+        let row = ChoiceRow::new(&dialog, true, "Resolution", "sub", &["A", "B", "C"]);
+        group.add(row.widget());
+        page.add(&group);
+        dialog.add(&page);
+        let fired = Rc::new(Cell::new(u32::MAX));
+        {
+            let f = fired.clone();
+            row.connect_changed(move |i| f.set(i));
+        }
+        win.present();
+        dialog.present(Some(&win));
+        pump();
+
+        // Suffix label reflects the seed.
+        assert_eq!(row.value_label.as_ref().unwrap().text(), "A");
+
+        // Row activation → subpage with the options list.
+        row.widget()
+            .downcast_ref::<adw::ActionRow>()
+            .unwrap()
+            .emit_by_name::<()>("activated", &[]);
+        pump();
+        let opt_b = find_action_row(dialog.upcast_ref(), "B").expect("subpage option missing");
+
+        // Option activation → state + label + callback, subpage popped.
+        opt_b.emit_by_name::<()>("activated", &[]);
+        pump();
+        assert_eq!(row.selected(), 1);
+        assert_eq!(fired.get(), 1);
+        assert_eq!(row.value_label.as_ref().unwrap().text(), "B");
+
+        // Re-activating shows the check on the new selection (fresh subpage each time).
+        row.widget()
+            .downcast_ref::<adw::ActionRow>()
+            .unwrap()
+            .emit_by_name::<()>("activated", &[]);
+        pump();
+        assert!(find_action_row(dialog.upcast_ref(), "B").is_some());
+
+        // Desktop (ComboRow) mode: cell sync + change callback on selection change.
+        let combo = ChoiceRow::new(&dialog, false, "Codec", "", &["X", "Y"]);
+        combo.set_selected(1);
+        assert_eq!(combo.selected(), 1);
+        let combo_fired = Rc::new(Cell::new(u32::MAX));
+        {
+            let f = combo_fired.clone();
+            combo.connect_changed(move |i| f.set(i));
+        }
+        combo.set_selected(0);
+        assert_eq!(combo.selected(), 0);
+        assert_eq!(combo_fired.get(), 0);
+    }
 }
