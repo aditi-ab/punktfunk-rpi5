@@ -122,8 +122,13 @@ jobs:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
           BASE="https://$REGISTRY/api/packages/$OWNER/generic/$PACKAGE"
-          # 1) Immutable, versioned URL + its update manifest (the manifest's `artifact` points
-          #    here, so the published sha256 keeps matching what Decky later downloads).
+          # 1) Versioned URL + its update manifest (the manifest's `artifact` points here, so the
+          #    published sha256 keeps matching what Decky later downloads). A re-tagged release
+          #    re-fires this workflow and the registry 409s on duplicate uploads — delete any
+          #    prior copy of this version first (404 on the first publish is fine).
+          for f in punktfunk.zip manifest.json; do
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE "$BASE/$VERSION/$f" || true
+          done
           curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/punktfunk.zip" \
             "$BASE/$VERSION/punktfunk.zip"
           curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/manifest.json" \

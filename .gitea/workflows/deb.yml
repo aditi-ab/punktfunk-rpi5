@@ -126,6 +126,14 @@ jobs:
         run: |
           for DEB in dist/*.deb; do
             echo "uploading $DEB"
+            # A re-tagged release re-fires this workflow and the apt registry 409s on duplicate
+            # package versions — delete any prior copy of this exact name/version/arch first
+            # (404 on the first publish is fine).
+            NAME=$(dpkg-deb -f "$DEB" Package)
+            VER=$(dpkg-deb -f "$DEB" Version)
+            ARCH=$(dpkg-deb -f "$DEB" Architecture)
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/$NAME/$VER/$ARCH" || true
             # PAT owner (enricobuehler), not the push actor — matches docker.yml's registry login.
             curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$DEB" \
               "https://$REGISTRY/api/packages/$OWNER/debian/pool/$DISTRIBUTION/$COMPONENT/upload"

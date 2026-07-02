@@ -103,6 +103,14 @@ jobs:
           for rpm in dist/*.rpm; do
             case "$rpm" in *debuginfo*|*debugsource*) echo "skip $rpm"; continue;; esac
             echo "uploading $rpm"
+            # A re-tagged release re-fires this workflow and the rpm registry 409s on duplicate
+            # package versions — delete any prior copy of this exact name/version-release/arch
+            # first (404 on the first publish is fine).
+            NAME=$(rpm -qp --qf '%{NAME}' "$rpm" 2>/dev/null)
+            VR=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$rpm" 2>/dev/null)
+            ARCH=$(rpm -qp --qf '%{ARCH}' "$rpm" 2>/dev/null)
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/rpm/$GROUP/package/$NAME/$VR/$ARCH" || true
             curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$rpm" \
               "https://$REGISTRY/api/packages/$OWNER/rpm/$GROUP/upload"
           done
