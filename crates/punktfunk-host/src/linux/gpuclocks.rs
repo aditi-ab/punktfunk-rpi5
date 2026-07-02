@@ -1,6 +1,15 @@
-//! NVIDIA clock / P-state hygiene for the Linux host — the "easy-scene p99" lever (host-latency
+//! GPU clock / P-state hygiene for the Linux host — the "easy-scene p99" lever (host-latency
 //! plan Tier 1B): the driver's adaptive P-state ramps clocks down between bursty encode frames,
-//! so every frame re-pays a spin-up. Two independent halves, both no-ops off NVIDIA:
+//! so every frame re-pays a spin-up. This is NOT theoretical — measured on the 780M (VCN 4),
+//! a 1440p HEVC encode takes ~4.4 ms/frame with the clocks hot (120 fps pacing) but ~8 ms/frame
+//! at a 60 fps duty cycle: the sag doubles per-frame encode latency.
+//!
+//! **AMD** (`PUNKTFUNK_PIN_CLOCKS=1`, root-gated by sysfs ownership): write `high` into each
+//! amdgpu card's `power_dpm_force_performance_level` for the host lifetime, restoring the prior
+//! value on exit. Non-root gets EACCES → logged once with the privilege recipe. Deliberately
+//! opt-in: it defeats power management box-wide and is wrong on battery (Steam Deck!).
+//!
+//! **NVIDIA** — two independent halves, both no-ops off NVIDIA:
 //!
 //! 1. **`CudaNoStablePerfLimit` application profile** (no root needed): a CUDA/NVENC context
 //!    clamps GeForce into the P2 performance state — reduced *memory* clock — for the process
@@ -111,52 +120,148 @@ fn flag_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Host-lifetime guard: holds the NVML clock floor (when armed) and resets it on drop.
-pub struct ClockGuard {
+/// An NVML session holding locked-clock floors on one or more NVIDIA devices.
+struct NvmlPin {
     nvml: Nvml,
     pinned: Vec<NvmlDevice>,
 }
 
+/// One amdgpu card whose `power_dpm_force_performance_level` we forced to `high`; `restore` is
+/// the pre-pin value written back on drop.
+struct AmdPin {
+    path: std::path::PathBuf,
+    restore: String,
+}
+
+/// Host-lifetime guard: holds the armed clock pins (NVML floor and/or amdgpu perf level) and
+/// undoes them on drop.
+pub struct ClockGuard {
+    nvml: Option<NvmlPin>,
+    amd: Vec<AmdPin>,
+}
+
 // SAFETY: `ClockGuard` holds opaque NVML device handles + resolved fn pointers from the loaded
-// driver library. NVML is documented thread-safe, the handles are plain driver tokens with no
-// thread affinity, and the guard is only ever *moved* (held in `main`, dropped once at exit) and
-// used through `&mut`/ownership — never shared. Transfer across threads is therefore sound.
+// driver library (plus plain sysfs paths/strings). NVML is documented thread-safe, the handles are
+// plain driver tokens with no thread affinity, and the guard is only ever *moved* (held in `main`,
+// dropped once at exit) and used through `&mut`/ownership — never shared. Transfer across threads
+// is therefore sound.
 unsafe impl Send for ClockGuard {}
 
 impl Drop for ClockGuard {
     fn drop(&mut self) {
-        // SAFETY: each handle in `pinned` came from `nvmlDeviceGetHandleByIndex_v2` on this live
-        // NVML session (init'd in `pin_clocks`, shut down only here, after the resets). The calls
-        // take the handle by value and return an int status — no Rust memory is borrowed.
-        unsafe {
-            for &dev in &self.pinned {
-                let _ = (self.nvml.reset_locked_clocks)(dev);
+        if let Some(pin) = &self.nvml {
+            // SAFETY: each handle in `pinned` came from `nvmlDeviceGetHandleByIndex_v2` on this
+            // live NVML session (init'd in `pin_nvidia`, shut down only here, after the resets).
+            // The calls take the handle by value and return an int status — no Rust memory is
+            // borrowed.
+            unsafe {
+                for &dev in &pin.pinned {
+                    let _ = (pin.nvml.reset_locked_clocks)(dev);
+                }
+                let _ = (pin.nvml.shutdown)();
             }
-            let _ = (self.nvml.shutdown)();
+            if !pin.pinned.is_empty() {
+                tracing::info!("NVIDIA clock floor released (locked clocks reset)");
+            }
         }
-        if !self.pinned.is_empty() {
-            tracing::info!("GPU clock floor released (locked clocks reset)");
+        for pin in &self.amd {
+            match std::fs::write(&pin.path, &pin.restore) {
+                Ok(()) => tracing::info!(
+                    card = %pin.path.display(),
+                    restored = %pin.restore,
+                    "amdgpu performance level restored"
+                ),
+                Err(e) => tracing::warn!(
+                    card = %pin.path.display(),
+                    error = %e,
+                    "could not restore amdgpu performance level"
+                ),
+            }
         }
     }
 }
 
-/// Startup hook for the host subcommands (`serve` / `punktfunk1-host`): install the P2-cap
-/// application profile and, when `PUNKTFUNK_PIN_CLOCKS` is set, arm the NVML core-clock floor.
-/// Returns the guard keeping the floor for the host lifetime. No-op (`None`) off NVIDIA.
+/// Startup hook for the host subcommands (`serve` / `punktfunk1-host`): install the NVIDIA P2-cap
+/// application profile and, when `PUNKTFUNK_PIN_CLOCKS` is set, arm the vendor clock pin (NVML
+/// core-clock floor / amdgpu `high` performance level). Returns the guard keeping the pins for
+/// the host lifetime. `None` when nothing was armed.
 pub fn on_host_start() -> Option<ClockGuard> {
-    if !nvidia_present() {
-        return None;
+    if nvidia_present() {
+        ensure_cuda_perf_profile();
     }
-    ensure_cuda_perf_profile();
     if !flag_truthy("PUNKTFUNK_PIN_CLOCKS") {
         return None;
     }
-    pin_clocks()
+    let nvml = if nvidia_present() { pin_nvidia() } else { None };
+    let amd = pin_amdgpu();
+    if nvml.is_none() && amd.is_empty() {
+        return None;
+    }
+    Some(ClockGuard { nvml, amd })
+}
+
+/// Force every amdgpu card's DPM performance level to `high` for the session — the encode-latency
+/// lever on AMD: the VCN's per-frame time tracks the clock sag (measured 8 → 4.4 ms/frame at
+/// 1440p on the 780M once clocks stay hot). Remembers the prior level for restore-on-drop.
+/// Root-gated by sysfs ownership; non-root warns once with the recipe, the host runs unpinned.
+fn pin_amdgpu() -> Vec<AmdPin> {
+    let mut pins = Vec::new();
+    let mut denied = false;
+    let Ok(cards) = std::fs::read_dir("/sys/class/drm") else {
+        return pins;
+    };
+    for entry in cards.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy().into_owned();
+        // Cards only (card0, card1, …) — not connectors (card0-DP-1) or render nodes.
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let dev = entry.path().join("device");
+        let is_amdgpu = std::fs::read_link(dev.join("driver"))
+            .map(|t| t.to_string_lossy().ends_with("amdgpu"))
+            .unwrap_or(false);
+        if !is_amdgpu {
+            continue;
+        }
+        let path = dev.join("power_dpm_force_performance_level");
+        let Ok(prev) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let prev = prev.trim().to_string();
+        if prev == "high" {
+            continue; // already pinned (externally) — nothing to do or restore
+        }
+        match std::fs::write(&path, "high") {
+            Ok(()) => {
+                tracing::info!(
+                    card = %name,
+                    was = %prev,
+                    "amdgpu performance level pinned to high (encode clock sag removed) — \
+                     restored on host exit"
+                );
+                pins.push(AmdPin {
+                    path,
+                    restore: prev,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => denied = true,
+            Err(e) => tracing::debug!(card = %name, error = %e, "amdgpu perf-level write failed"),
+        }
+    }
+    if denied {
+        tracing::warn!(
+            "PUNKTFUNK_PIN_CLOCKS: writing power_dpm_force_performance_level requires root — \
+             grant it via a boot oneshot / udev rule chowning the attribute, or run the host as \
+             a system service. The host keeps running unpinned"
+        );
+    }
+    pins
 }
 
 /// Floor the core clock at TDP/base on every NVIDIA device (reset first, so a stale pin from a
 /// crashed previous run is replaced rather than compounded).
-fn pin_clocks() -> Option<ClockGuard> {
+fn pin_nvidia() -> Option<NvmlPin> {
     let nvml = match Nvml::load() {
         Some(n) => n,
         None => {
@@ -222,9 +327,9 @@ fn pin_clocks() -> Option<ClockGuard> {
         }
         tracing::info!(
             devices = pinned.len(),
-            "GPU core-clock floor armed (min=TDP/base, max=boost) — released on host exit"
+            "NVIDIA core-clock floor armed (min=TDP/base, max=boost) — released on host exit"
         );
-        Some(ClockGuard { nvml, pinned })
+        Some(NvmlPin { nvml, pinned })
     }
 }
 

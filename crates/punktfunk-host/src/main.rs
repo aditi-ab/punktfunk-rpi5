@@ -33,6 +33,9 @@ mod drm_sync;
 mod encode;
 mod gamestream;
 mod gpu;
+#[cfg(target_os = "linux")]
+#[path = "linux/gpuclocks.rs"]
+mod gpuclocks;
 mod hdr;
 mod inject;
 #[cfg(target_os = "windows")]
@@ -45,9 +48,6 @@ mod library;
 mod mgmt;
 mod mgmt_token;
 mod native_pairing;
-#[cfg(target_os = "linux")]
-#[path = "linux/nvclocks.rs"]
-mod nvclocks;
 mod pipeline;
 mod punktfunk1;
 mod pwinit;
@@ -135,7 +135,7 @@ fn real_main() -> Result<()> {
     // exit via the guard's Drop). No-op off NVIDIA / on the tool subcommands.
     #[cfg(target_os = "linux")]
     let _nv_clocks = match args.first().map(String::as_str) {
-        Some("serve") | Some("punktfunk1-host") => nvclocks::on_host_start(),
+        Some("serve") | Some("punktfunk1-host") => gpuclocks::on_host_start(),
         _ => None,
     };
 
