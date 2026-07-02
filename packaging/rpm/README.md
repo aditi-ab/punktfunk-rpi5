@@ -3,7 +3,7 @@
 `punktfunk-host` is published as an RPM to **Gitea's RPM package registry** in the public `unom`
 org (stable groups `bazzite`/`fedora-44`, canary groups `bazzite-canary`/`fedora-44-canary`), so
 Bazzite / Fedora Atomic hosts layer and update it with `rpm-ostree`. CI (`.gitea/workflows/rpm.yml`)
-builds and publishes on every push to `main` (a rolling `0.3.0-0.ciN.<sha>` build to the `*-canary`
+builds and publishes on every push to `main` (a rolling `0.5.0-0.ciN.g<sha>` build to the `*-canary`
 groups) and on `vX.Y.Z` tags (a clean `X.Y.Z-1` to the base groups, plus attached to the unified
 Gitea Release) — separate repos, so a stable box never jumps to a canary build (see
 [Release Channels](https://punktfunk.unom.io/docs/channels)). The `baseurl` below subscribes to the
@@ -107,8 +107,9 @@ tracking: `rpm-ostree override` / `rpm-ostree uninstall punktfunk`.
 
 ```sh
 PF_VERSION=0.0.1 bash packaging/rpm/build-rpm.sh                # host + client
-PF_VERSION=0.0.1 PF_WITH_WEB=1 bash packaging/rpm/build-rpm.sh  # + the noarch punktfunk-web (needs bun on PATH)
-# -> dist/punktfunk-0.0.1-1.fcNN.x86_64.rpm  (+ punktfunk-web-0.0.1-1.fcNN.noarch.rpm with PF_WITH_WEB=1)
+PF_VERSION=0.0.1 PF_WITH_WEB=1 bash packaging/rpm/build-rpm.sh  # + punktfunk-web (needs bun on PATH)
+# -> dist/punktfunk-0.0.1-1.fcNN.x86_64.rpm  (+ punktfunk-web-0.0.1-1.fcNN.x86_64.rpm with PF_WITH_WEB=1;
+#    the web subpackage vendors a bun binary, so it's arch-specific, not noarch)
 ```
 
 Run it inside the Fedora 43 builder image so the deps resolve and match Bazzite:
@@ -119,4 +120,5 @@ docker run --rm -v "$PWD:/src" -w /src punktfunk-fedora-rpm \
   bash -lc 'git config --global --add safe.directory /src && PF_VERSION=0.0.1 bash packaging/rpm/build-rpm.sh'
 ```
 
-A plain `rpmbuild`/COPR build with no `pf_version`/`pf_release` defines produces `0.0.1-1`.
+A plain `rpmbuild`/COPR build with no `pf_version`/`pf_release` defines produces `0.3.0-1` (the
+spec defaults).

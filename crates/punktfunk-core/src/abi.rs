@@ -844,12 +844,23 @@ pub const PUNKTFUNK_VIDEO_CAP_HDR: u8 = 0x02;
 /// [`punktfunk_connection_chroma_format`] reports the real value. (Mirrors `quic::VIDEO_CAP_444`.)
 pub const PUNKTFUNK_VIDEO_CAP_444: u8 = 0x04;
 
+/// Codec bit for [`punktfunk_connect_ex7`] (`video_codecs` / `preferred_codec`) and the value
+/// [`punktfunk_connection_codec`] returns: H.264 / AVC. (Mirrors `quic::CODEC_H264`.)
+pub const PUNKTFUNK_CODEC_H264: u8 = 0x01;
+/// Codec bit: H.265 / HEVC — the default codec. (Mirrors `quic::CODEC_HEVC`.)
+pub const PUNKTFUNK_CODEC_HEVC: u8 = 0x02;
+/// Codec bit: AV1. (Mirrors `quic::CODEC_AV1`.)
+pub const PUNKTFUNK_CODEC_AV1: u8 = 0x04;
+
 // Keep the ABI cap bits in lockstep with the wire constants (compile-time guard against drift).
 #[cfg(feature = "quic")]
 const _: () = {
     assert!(PUNKTFUNK_VIDEO_CAP_10BIT == crate::quic::VIDEO_CAP_10BIT);
     assert!(PUNKTFUNK_VIDEO_CAP_HDR == crate::quic::VIDEO_CAP_HDR);
     assert!(PUNKTFUNK_VIDEO_CAP_444 == crate::quic::VIDEO_CAP_444);
+    assert!(PUNKTFUNK_CODEC_H264 == crate::quic::CODEC_H264);
+    assert!(PUNKTFUNK_CODEC_HEVC == crate::quic::CODEC_HEVC);
+    assert!(PUNKTFUNK_CODEC_AV1 == crate::quic::CODEC_AV1);
 };
 
 // Keep the ABI gamepad constants in lockstep with the wire enum (compile-time guard against drift).
@@ -1160,8 +1171,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex5(
 /// Like [`punktfunk_connect_ex5`], but additionally requests the audio channel count:
 /// `2` (stereo, the default behaviour of every earlier variant), `6` (5.1) or `8` (7.1). The host
 /// clamps the request to what it can actually capture and echoes the resolved count via
-/// [`punktfunk_connection_audio_channels`]; the `0xC9` audio frames are Opus-(multi)stream encoded
-/// for that layout. A client that wants surround calls this; everything else inherits stereo.
+/// [`punktfunk_connection_audio_channels`]. Advertises HEVC-only with no codec preference (call
+/// [`punktfunk_connect_ex7`] to negotiate the codec).
 ///
 /// # Safety
 /// Same as [`punktfunk_connect`].
@@ -1179,6 +1190,62 @@ pub unsafe extern "C" fn punktfunk_connect_ex6(
     bitrate_kbps: u32,
     video_caps: u8,
     audio_channels: u8,
+    launch_id: *const std::os::raw::c_char,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    timeout_ms: u32,
+) -> *mut PunktfunkConnection {
+    unsafe {
+        punktfunk_connect_ex7(
+            host,
+            port,
+            width,
+            height,
+            refresh_hz,
+            compositor,
+            gamepad,
+            bitrate_kbps,
+            video_caps,
+            audio_channels,
+            PUNKTFUNK_CODEC_HEVC, // pre-negotiation default: HEVC-only, no preference
+            0,
+            launch_id,
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            timeout_ms,
+        )
+    }
+}
+
+/// Like [`punktfunk_connect_ex6`], but additionally advertises the codecs the client can decode
+/// (`video_codecs` — a bitfield of [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] /
+/// [`PUNKTFUNK_CODEC_AV1`]) and a soft `preferred_codec` (a single codec bit, `0` = no preference).
+/// The host resolves the codec it emits from these (preference honored when it can also produce it,
+/// else best shared codec) and reports it via [`punktfunk_connection_codec`]. A client that omits
+/// this (calls `ex6`) advertises HEVC-only, no preference — the pre-negotiation behaviour.
+///
+/// # Safety
+/// Same as [`punktfunk_connect`].
+#[cfg(feature = "quic")]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn punktfunk_connect_ex7(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    gamepad: u32,
+    bitrate_kbps: u32,
+    video_caps: u8,
+    audio_channels: u8,
+    video_codecs: u8,
+    preferred_codec: u8,
     launch_id: *const std::os::raw::c_char,
     pin_sha256: *const u8,
     observed_sha256_out: *mut u8,
@@ -1235,6 +1302,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex6(
             bitrate_kbps,
             video_caps,
             crate::audio::normalize_channels(audio_channels),
+            video_codecs,
+            preferred_codec,
             launch,
             pin,
             identity,
@@ -1758,6 +1827,33 @@ pub unsafe extern "C" fn punktfunk_connection_chroma_format(
         if !out.is_null() {
             // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
             unsafe { *out = c.inner.chroma_format };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// Read the video codec the host resolved for this session (from its Welcome): one of
+/// [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] / [`PUNKTFUNK_CODEC_AV1`]. The embedder builds
+/// its decoder from THIS (never assuming HEVC). `*out` is filled when non-NULL. Available
+/// immediately after a successful connect (it doesn't change without a reconfigure). An older host
+/// that didn't negotiate a codec reports [`PUNKTFUNK_CODEC_HEVC`].
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_codec(
+    c: *mut PunktfunkConnection,
+    out: *mut u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if !out.is_null() {
+            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
+            unsafe { *out = c.inner.codec };
         }
         PunktfunkStatus::Ok
     })

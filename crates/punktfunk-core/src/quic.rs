@@ -94,6 +94,13 @@ pub struct Hello {
     /// clients (decodes to `0`, which [`resolve_codec`] treats as HEVC-only — every pre-negotiation
     /// build decoded HEVC).
     pub video_codecs: u8,
+    /// The client's *preferred* codec (a single [`CODEC_H264`] / [`CODEC_HEVC`] / [`CODEC_AV1`] bit),
+    /// or `0` = no preference (host decides by its own precedence). A **soft** hint: the host emits
+    /// it when it can also produce it (and the client advertised it in `video_codecs`), else falls
+    /// back to the best shared codec — see [`resolve_codec`]. Mirrors the [`Hello::compositor`] /
+    /// [`Hello::gamepad`] preference pattern; the resolved codec is echoed in [`Welcome::codec`].
+    /// Appended after `video_codecs` as a single trailing byte. Omitted by older clients (→ `0`).
+    pub preferred_codec: u8,
 }
 
 /// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
@@ -120,12 +127,13 @@ pub const CODEC_AV1: u8 = 0x04;
 
 /// Resolve which single codec the host will emit, from the client's advertised [`Hello::video_codecs`]
 /// bitfield (`0` = an older client, treated as HEVC-only) intersected with what the host's chosen
-/// encoder can produce (`host_capable`, also a bitfield). Precedence when several are shared:
-/// **HEVC > AV1 > H.264** (HEVC is the established, best-tested path; H.264 is the compatibility /
-/// software floor). Returns the single-bit codec value, or `None` when the two share nothing — the
-/// caller then refuses the session with a clear error rather than emitting a stream the client can't
-/// decode.
-pub fn resolve_codec(client_codecs: u8, host_capable: u8) -> Option<u8> {
+/// encoder can produce (`host_capable`, also a bitfield). `preferred` is the client's soft preference
+/// ([`Hello::preferred_codec`], `0` = none): when it's in the shared set it wins; otherwise the tie is
+/// broken by **HEVC > AV1 > H.264** (HEVC is the established, best-tested path; H.264 is the
+/// compatibility / software floor). Returns the single-bit codec value, or `None` when client and host
+/// share nothing — the caller then refuses the session with a clear error rather than emitting a
+/// stream the client can't decode.
+pub fn resolve_codec(client_codecs: u8, host_capable: u8, preferred: u8) -> Option<u8> {
     // An older client (no codec byte) decodes HEVC — the only codec every pre-negotiation build sent.
     let client = if client_codecs == 0 {
         CODEC_HEVC
@@ -133,6 +141,13 @@ pub fn resolve_codec(client_codecs: u8, host_capable: u8) -> Option<u8> {
         client_codecs
     };
     let shared = client & host_capable;
+    if shared == 0 {
+        return None;
+    }
+    // Honor the client's preference when the host can also emit it; else fall back to precedence.
+    if preferred != 0 && shared & preferred != 0 {
+        return Some(preferred);
+    }
     // Precedence: HEVC > AV1 > H.264.
     [CODEC_HEVC, CODEC_AV1, CODEC_H264]
         .into_iter()
@@ -716,8 +731,13 @@ impl Hello {
                                                                // present (video_caps non-zero / audio_channels not stereo) the name/launch length bytes
                                                                // AND the video_caps byte must still be emitted (0 / 0) so the later byte lands at a
                                                                // deterministic offset — the same discipline `launch` already imposes on `name`.
+                                                               // Trailing single-byte fields, in wire order. Each is emitted when it (or ANY later field)
+                                                               // carries a non-default value, so a present field always lands at a deterministic offset.
+        let ac_present = self.audio_channels != 2;
+        let vcodecs_present = self.video_codecs != 0;
+        let pref_present = self.preferred_codec != 0;
         let need_placeholders =
-            self.video_caps != 0 || self.audio_channels != 2 || self.video_codecs != 0;
+            self.video_caps != 0 || ac_present || vcodecs_present || pref_present;
         match (&self.name, &self.launch) {
             (None, None) if !need_placeholders => {}
             (name, _) => {
@@ -734,16 +754,20 @@ impl Hello {
         }
         // video_caps: single trailing byte. Emitted when non-zero OR when a later field follows (so
         // that field lands at a deterministic offset right after it).
-        if self.video_caps != 0 || self.audio_channels != 2 || self.video_codecs != 0 {
+        if self.video_caps != 0 || ac_present || vcodecs_present || pref_present {
             b.push(self.video_caps);
         }
-        // audio_channels: single trailing byte. Emitted when non-stereo OR when video_codecs follows.
-        if self.audio_channels != 2 || self.video_codecs != 0 {
+        // audio_channels: emitted when non-stereo OR a later field follows.
+        if ac_present || vcodecs_present || pref_present {
             b.push(self.audio_channels);
         }
-        // video_codecs: single trailing byte. Last field; omitted when `0` (older client → HEVC-only).
-        if self.video_codecs != 0 {
+        // video_codecs: emitted when non-zero OR preferred_codec follows.
+        if vcodecs_present || pref_present {
             b.push(self.video_codecs);
+        }
+        // preferred_codec: single trailing byte. Last field; omitted when `0` (no preference).
+        if pref_present {
+            b.push(self.preferred_codec);
         }
         b
     }
@@ -824,6 +848,15 @@ impl Hello {
                 let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
                 let video_caps_off = launch_off + 1 + launch_len;
                 b.get(video_caps_off + 2).copied().unwrap_or(0)
+            },
+            // Optional trailing preferred-codec byte, one past video_codecs. Absent on an older
+            // client → `0` (no preference; the host decides by precedence).
+            preferred_codec: {
+                let name_len = b.get(26).copied().unwrap_or(0) as usize;
+                let launch_off = 27 + name_len;
+                let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
+                let video_caps_off = launch_off + 1 + launch_len;
+                b.get(video_caps_off + 3).copied().unwrap_or(0)
             },
         })
     }
@@ -2025,21 +2058,41 @@ mod tests {
 
     #[test]
     fn codec_negotiation_and_back_compat() {
-        // resolve_codec precedence (HEVC > AV1 > H.264) and the no-shared-codec refusal.
+        // resolve_codec precedence (HEVC > AV1 > H.264), no preference (0).
         assert_eq!(
-            resolve_codec(CODEC_H264 | CODEC_HEVC, CODEC_HEVC | CODEC_AV1),
+            resolve_codec(CODEC_H264 | CODEC_HEVC, CODEC_HEVC | CODEC_AV1, 0),
             Some(CODEC_HEVC)
         );
         assert_eq!(
-            resolve_codec(CODEC_H264 | CODEC_AV1, CODEC_AV1 | CODEC_H264),
+            resolve_codec(CODEC_H264 | CODEC_AV1, CODEC_AV1 | CODEC_H264, 0),
             Some(CODEC_AV1)
         );
-        assert_eq!(resolve_codec(CODEC_H264, CODEC_H264), Some(CODEC_H264));
+        assert_eq!(resolve_codec(CODEC_H264, CODEC_H264, 0), Some(CODEC_H264));
         // A software host (H.264 only) + an HEVC-only client share nothing → refuse.
-        assert_eq!(resolve_codec(CODEC_HEVC, CODEC_H264), None);
+        assert_eq!(resolve_codec(CODEC_HEVC, CODEC_H264, 0), None);
         // An older client (0 = no codec byte) is treated as HEVC-only.
-        assert_eq!(resolve_codec(0, CODEC_HEVC | CODEC_H264), Some(CODEC_HEVC));
-        assert_eq!(resolve_codec(0, CODEC_H264), None);
+        assert_eq!(
+            resolve_codec(0, CODEC_HEVC | CODEC_H264, 0),
+            Some(CODEC_HEVC)
+        );
+        assert_eq!(resolve_codec(0, CODEC_H264, 0), None);
+
+        // Soft preference: honored when the host can also emit it, overriding precedence...
+        assert_eq!(
+            resolve_codec(CODEC_H264 | CODEC_HEVC, CODEC_H264 | CODEC_HEVC, CODEC_H264),
+            Some(CODEC_H264)
+        );
+        assert_eq!(
+            resolve_codec(CODEC_HEVC | CODEC_AV1, CODEC_HEVC | CODEC_AV1, CODEC_AV1),
+            Some(CODEC_AV1)
+        );
+        // ...but falls back to precedence when the preferred codec isn't in the shared set.
+        assert_eq!(
+            resolve_codec(CODEC_HEVC | CODEC_H264, CODEC_HEVC | CODEC_H264, CODEC_AV1),
+            Some(CODEC_HEVC)
+        );
+        // A preference the host can't emit still can't rescue a no-shared-codec case.
+        assert_eq!(resolve_codec(CODEC_HEVC, CODEC_H264, CODEC_HEVC), None);
 
         // A Hello advertising codecs roundtrips, and the wire form of a codec-only Hello decodes on
         // a build that ignores the trailing byte (back-compat: extra bytes are skipped).
@@ -2058,15 +2111,23 @@ mod tests {
             video_caps: 0,
             audio_channels: 2, // stereo — forces the video_caps/audio_channels placeholders
             video_codecs: CODEC_H264 | CODEC_HEVC,
+            preferred_codec: CODEC_H264,
         };
         let enc = h.encode();
+        let dec = Hello::decode(&enc).unwrap();
+        assert_eq!(dec.video_codecs, CODEC_H264 | CODEC_HEVC);
+        assert_eq!(dec.preferred_codec, CODEC_H264);
+        // Drop the preferred_codec byte → still decodes, video_codecs intact, preference gone.
+        let no_pref = &enc[..enc.len() - 1];
         assert_eq!(
-            Hello::decode(&enc).unwrap().video_codecs,
+            Hello::decode(no_pref).unwrap().video_codecs,
             CODEC_H264 | CODEC_HEVC
         );
-        // A pre-codec Hello (no trailing codec byte) decodes to 0 → HEVC-only via resolve_codec.
-        let legacy = &enc[..enc.len() - 1]; // drop the codec byte (it was the last field)
+        assert_eq!(Hello::decode(no_pref).unwrap().preferred_codec, 0);
+        // A pre-codec Hello (no video_codecs/preferred bytes) decodes to 0 → HEVC-only.
+        let legacy = &enc[..enc.len() - 2];
         assert_eq!(Hello::decode(legacy).unwrap().video_codecs, 0);
+        assert_eq!(Hello::decode(legacy).unwrap().preferred_codec, 0);
 
         // A pre-codec Welcome (no codec byte) decodes to HEVC.
         let mut w = Welcome::decode(
@@ -2145,6 +2206,7 @@ mod tests {
             video_caps: VIDEO_CAP_10BIT,
             audio_channels: 2,
             video_codecs: CODEC_H264 | CODEC_HEVC, // exercise the codec bitfield roundtrip
+            preferred_codec: CODEC_HEVC,
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -2226,6 +2288,7 @@ mod tests {
             video_caps: 0,
             audio_channels: 2,
             video_codecs: 0,
+            preferred_codec: 0,
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -2332,6 +2395,7 @@ mod tests {
             video_caps: 0,
             audio_channels: 2,
             video_codecs: 0,
+            preferred_codec: 0,
         };
         let enc = base.encode();
         assert_eq!(
@@ -2381,6 +2445,7 @@ mod tests {
             video_caps: 0,
             audio_channels: 2,
             video_codecs: 0,
+            preferred_codec: 0,
         };
         // launch alone (no name): a zero-length name placeholder keeps the offset deterministic.
         let with_launch = Hello {
@@ -2589,6 +2654,7 @@ mod tests {
                 video_caps: 0,
                 audio_channels: 2,
                 video_codecs: 0,
+                preferred_codec: 0,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");

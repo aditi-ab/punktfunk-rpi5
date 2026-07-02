@@ -73,39 +73,43 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   `send_rich_input`. **Client-negotiated virtual pad type**: the Hello carries a gamepad
   preference byte (same trailing-byte back-compat pattern as the compositor), the Welcome
   echoes the resolved backend — precedence: explicit client choice > `PUNKTFUNK_GAMEPAD`
-  env > uinput Xbox 360. Backends: **Xbox 360** (uinput / ViGEm), **Xbox One/Series** (the same
+  env > uinput Xbox 360. Backends: **Xbox 360** (uinput on Linux / the pf-xusb UMDF driver on
+  Windows), **Xbox One/Series** (the same
   XInput backend with the One/Series USB identity for matching glyphs — no extra game-visible
   capability; impulse-trigger rumble is unreachable through a virtual pad), and the UHID
   `hid-playstation` pads — **DualSense** (adaptive triggers, lightbar, touchpad, motion) and
   **DualShock 4** (lightbar, touchpad, motion, rumble; DualSense minus adaptive triggers / player
   LEDs / mute). DualSense and DualShock 4 each have a Linux (UHID `hid-playstation`) **and a Windows
-  (UMDF minidriver)** backend — `inject/dualsense_windows.rs` + `inject/dualshock4_windows.rs`, one
+  (UMDF minidriver)** backend — `inject/windows/dualsense_windows.rs` + `inject/windows/dualshock4_windows.rs`, one
   driver serving either identity per a `device_type` byte the host stamps into shared memory (the DS4
   reuses the same SwDeviceCreate game-detection identity fix as the DualSense). One/Series stays
   Linux-only and folds into Xbox 360 off it. Clients auto-resolve the type from the physical controller
   (DS5→DualSense, DS4→DualShock 4, Xbox One→Xbox One). **Windows uses ZERO external gamepad
   dependencies — ViGEmBus is gone.** Xbox 360 (XInput) runs on a UMDF2 **XUSB companion** driver
-  (`packaging/windows/xusb-driver/`, `inject/gamepad_windows.rs`) that registers `GUID_DEVINTERFACE_XUSB`
+  (`packaging/windows/drivers/pf-xusb/`, `inject/windows/gamepad_windows.rs`) that registers `GUID_DEVINTERFACE_XUSB`
   and answers the buffered XInput IOCTLs from a shared section, so classic `XInputGetState`/`SetState`
   work with no kernel bus driver (validated live: slot connected, state + rumble round-trip; Xbox One
-  folds to this 360 path). All three UMDF drivers (DualSense/DS4 + XUSB) are bundled + pnputil-installed
-  by the Inno Setup installer (`packaging/windows/gamepad-drivers/` + `install-gamepad-drivers.ps1`).
+  folds to this 360 path). All three UMDF drivers (DualSense/DS4 + XUSB) are built from source in CI
+  (`packaging/windows/drivers/`) and installed by the Inno Setup installer via
+  `punktfunk-host.exe driver install --gamepad`.
   **Multi-pad ready**: the host stamps each pad's index into the device Location (`pszDeviceLocation`),
   the driver reads it (`WdfDeviceAllocAndQueryProperty`) to map its own `*-shm-<index>`, and
   `UmdfHostProcessSharing=ProcessSharingDisabled` gives each pad its own host (per-pad statics) —
   validated live with 2 distinct XInput slots + 2 DualSense pads. (Client-side multi-pad forwarding is
   the remaining piece.)
 - **Windows host: implemented and shipping (all-vendor, x64-only).** `#[cfg(windows)]` backends
-  behind the same traits as Linux — DXGI Desktop Duplication capture (`capture/dxgi.rs`), **SudoVDA**
-  virtual display per session (`vdisplay/sudovda.rs`), GPU encode (NVENC `--features nvenc`; AMD/Intel
-  `--features amf-qsv`), SendInput + **ViGEm** gamepads (`inject/gamepad_windows.rs`), WASAPI loopback
-  + virtual mic (`audio/wasapi_*`). Ships as a **signed Inno Setup installer** that registers a
-  `LocalSystem` SCM service launching into the interactive session for secure-desktop (UAC/lock-screen)
-  capture (`service.rs`), bundles the SudoVDA driver + the FFmpeg DLLs, and is published by
+  behind the same traits as Linux — **IDD-push capture** straight into the in-house all-Rust IddCx
+  **pf-vdisplay** virtual display (`capture/windows/idd_push.rs`, `vdisplay/windows/pf_vdisplay.rs`;
+  DXGI Desktop Duplication / WGC as fallbacks, `capture/windows/dxgi.rs`), GPU encode (NVENC
+  `--features nvenc`; AMD/Intel `--features amf-qsv`), SendInput + the in-house UMDF gamepad drivers
+  (`inject/windows/`), WASAPI loopback + virtual mic (`audio/windows/wasapi_*`). Ships as a **signed
+  Inno Setup installer** that registers a `LocalSystem` SCM service launching into the interactive
+  session for secure-desktop (UAC/lock-screen) capture (`windows/service.rs`), bundles the
+  pf-vdisplay driver + the FFmpeg DLLs (+ VB-CABLE for the virtual mic), and is published by
   `windows-host.yml`. **Encoder is GPU-aware** (`encode.rs` `open_video` + `windows_resolved_backend`):
   `PUNKTFUNK_ENCODER=auto` (the host.env default) detects the DXGI adapter vendor → **NVENC** (NVIDIA,
-  direct SDK, `encode/nvenc.rs`), **AMF** (AMD) / **QSV** (Intel) via libavcodec
-  (`encode/ffmpeg_win.rs`, the Windows analogue of the Linux VAAPI backend — `WinVendor{Amf,Qsv}`,
+  direct SDK, `encode/windows/nvenc.rs`), **AMF** (AMD) / **QSV** (Intel) via libavcodec
+  (`encode/windows/ffmpeg_win.rs`, the Windows analogue of the Linux VAAPI backend — `WinVendor{Amf,Qsv}`,
   system-memory NV12/P010 readback default + opt-in zero-copy D3D11 behind `PUNKTFUNK_ZEROCOPY` with a
   system fallback), or software H.264 (`encode/sw.rs`, GPU-less). GameStream codec advertisement is
   probed per-GPU on AMF/QSV (`windows_codec_support` → `serverinfo`, AV1 gated). **HDR (10-bit)**: WGC
@@ -311,18 +315,22 @@ land on an already-provisioned box instead of the one that actually needed it.
 crates/punktfunk-core/        protocol · FEC · crypto · quic (punktfunk/1 control plane, feature-gated)
 crates/punktfunk-host/
   gamestream/             Moonlight compat: nvhttp · pairing · rtsp · control · stream · gamepad · apps
-  vdisplay/{kwin,gamescope,mutter,wlroots}.rs   per-compositor client-sized virtual outputs
-  zerocopy/{egl,cuda,vulkan}.rs         dmabuf → CUDA → NVENC (tiled via EGL/GL, LINEAR via Vulkan)
-  inject/{libei,wlr,gamepad,dualsense}.rs   input backends (uinput xpad + UHID DualSense)
-  encode/{nvenc,linux,vaapi,ffmpeg_win,sw}.rs   per-GPU encoders (NVENC · Linux NVENC/CUDA · VAAPI · AMF/QSV · openh264)
-  capture.rs · encode.rs · audio.rs · spike.rs · punktfunk1.rs · mgmt.rs · native_pairing.rs · stats_recorder.rs
+  vdisplay/linux/{kwin,gamescope,mutter,wlroots}.rs   per-compositor client-sized virtual outputs
+  vdisplay/windows/{pf_vdisplay,manager,identity}.rs  all-Rust IddCx virtual display (pf-vdisplay)
+  linux/zerocopy/{egl,cuda,vulkan}.rs   dmabuf → CUDA → NVENC (tiled via EGL/GL, LINEAR via Vulkan)
+  inject/linux/{libei,wlr,gamepad,dualsense,dualshock4,steam_*}.rs   Linux input (uinput xpad · UHID pads · virtual Deck)
+  inject/windows/{sendinput,gamepad_windows,dualsense_windows,dualshock4_windows}.rs   Windows input (UMDF shared-mem pads)
+  encode/linux/{mod,vaapi}.rs · encode/windows/{nvenc,ffmpeg_win}.rs · encode/sw.rs   per-GPU encoders (NVENC/CUDA · VAAPI · AMF/QSV) + GPU-less openh264
+  capture/{linux/,windows/{dxgi,idd_push}}.rs · audio/{linux/,windows/wasapi_*}.rs
+  windows/{service,install,interactive}.rs   SCM service + in-binary driver/web install
+  capture.rs · encode.rs · audio.rs · spike.rs · punktfunk1.rs · mgmt.rs · native_pairing.rs · stats_recorder.rs · library.rs
 clients/probe/    punktfunk/1 reference/probe client (headless test/measurement tool)
 clients/linux/    native Linux client (GTK4/libadwaita · FFmpeg · PipeWire · SDL3)
 clients/windows/  native Windows client (WinUI 3 via windows-reactor · D3D11 · WASAPI · SDL3)
 clients/apple/    native macOS/iOS/tvOS client (Swift · VideoToolbox · GameController)
 clients/android/  native Android client (Kotlin app + native/ Rust JNI core over punktfunk-core)
 clients/decky/    Steam Deck Decky plugin
-crates/punktfunk-host/src/{capture/dxgi,vdisplay/sudovda,encode/ffmpeg_win,inject/gamepad_windows,audio/wasapi_*,service}.rs   Windows host backends
+packaging/windows/drivers/{pf-vdisplay,pf-dualsense,pf-xusb}/   in-house UMDF drivers (built from source in CI)
 web/                          TanStack web console over the mgmt API (status · devices · pairing · performance graphs)
 packaging/                    apt(deb) · RPM/COPR · Arch/sysext · Flatpak · Bazzite bootc · Windows host installer (per-dir READMEs)
 tools/{loss-harness,latency-probe}/     measurement (plan §10)

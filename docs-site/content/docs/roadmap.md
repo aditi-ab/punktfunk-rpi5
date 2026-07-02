@@ -52,8 +52,8 @@ see [Status & Progress](/docs/status).
 
 - **Windows client on-glass validation.** The hardware (D3D11VA) decode, HDR present, and GUI are
   built and ship as a signed MSIX — they just need verification on real GPU hardware.
-- **Apple stage-2 presenter as the default.** The lower-latency `VTDecompressionSession` →
-  `CAMetalLayer` path is live behind an opt-in flag and graduating to the default.
+- **Apple presenter polish.** The lower-latency `VTDecompressionSession` → `CAMetalLayer` stage-2
+  path is now the default; HDR brightness and 4:4:4 still need on-glass validation.
 - **Web console parity.** Surfacing the speed test and bitrate picker the apps already have.
 - **Windows host hardening.** Broader real-world testing — especially on-glass validation of the
   AMD (AMF) and Intel (QSV) encode paths, which are CI-green but newer than NVENC.

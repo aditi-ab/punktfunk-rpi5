@@ -36,7 +36,7 @@ won't start. The service is down only for the build duration.
 
 On an **installed** host (the `setup.exe`) the console is set up automatically — no manual steps.
 The installer bundles the built (self-contained, no-`node_modules`) `.output` server + a portable
-bun and runs `scripts\windows\web-setup.ps1`, which registers the **`PunktfunkWeb`** scheduled task
+bun and runs `punktfunk-host.exe web setup`, which registers the **`PunktfunkWeb`** scheduled task
 (at boot, as SYSTEM, restart-on-failure) running `{app}\web\web-run.cmd` →
 `bun …\.output\server\index.mjs` on `:3000`, opens inbound TCP 3000, and writes the login password to
 `%ProgramData%\punktfunk\web-password` (ACL'd to Administrators + SYSTEM). The mgmt bearer token it
@@ -52,8 +52,8 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\build-web.ps1
 
 `bun install && bun run build` (Nitro `noExternals` -> a self-contained `.output`, no
 `node_modules`/`.npmrc`), then restarts the `PunktfunkWeb` task and checks `:3000/login`. Use
-this to iterate on the console against an installed host - `web-setup.ps1` (or a fresh install) is
-what creates the task in the first place.
+this to iterate on the console against an installed host - `punktfunk-host.exe web setup` (or a
+fresh install) is what creates the task in the first place.
 
 ## Typical flow after pulling new code
 

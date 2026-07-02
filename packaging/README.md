@@ -1,8 +1,9 @@
 # Packaging punktfunk for Fedora / Bazzite
 
-The punktfunk host is Linux-only and links system FFmpeg (NVENC), PipeWire, Opus and
-the NVIDIA driver. This directory packages it for the **Fedora Atomic / Bazzite** world
-(rpm-ostree + bootc), where most of those deps are already present.
+The punktfunk host links system FFmpeg (NVENC on NVIDIA, VAAPI on AMD/Intel, with a GPU-less
+software-H.264 fallback), PipeWire and Opus. This page covers packaging it for the
+**Fedora Atomic / Bazzite** world (rpm-ostree + bootc), where most of those deps are already
+present; the NVIDIA-specific notes below apply to the NVENC path.
 
 > 👉 **Ubuntu/Debian hosts** install via `apt` from Gitea's package registry — see
 > [`debian/README.md`](debian/README.md) (`apt update && apt upgrade` for new builds).
@@ -19,6 +20,10 @@ packaging/
   bootc/Containerfile     # bake punktfunk into a Bazzite-based atomic image
   copr/                   # COPR build-from-SCM settings
 ```
+
+The other packaging targets have their own READMEs: [`debian/`](debian/README.md) (apt),
+[`arch/`](arch/README.md) (PKGBUILD + sysext), [`flatpak/`](flatpak/README.md) (the client),
+[`windows/`](windows/README.md) (host installer + drivers), plus `kde/` and `linux/` helpers.
 
 ## What's needed beyond base Fedora
 
@@ -121,7 +126,8 @@ An RPM (or the bootc layer) installs into the host system where those just work.
 ## Building the SRPM/RPM locally (Fedora only)
 
 ```sh
-git archive --format=tar.gz --prefix=punktfunk-0.0.1/ -o ~/rpmbuild/SOURCES/punktfunk-0.0.1.tar.gz HEAD
+git archive --format=tar.gz --prefix=punktfunk-0.3.0/ -o ~/rpmbuild/SOURCES/punktfunk-0.3.0.tar.gz HEAD
 rpmbuild -ba packaging/rpm/punktfunk.spec     # needs the BuildRequires from the spec
+# (0.3.0 = the spec's default %{pf_version}; the prefix and tarball name must match it)
 ```
 (Not buildable on Debian/Ubuntu — use a Fedora toolbox/container or COPR.)

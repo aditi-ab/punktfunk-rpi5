@@ -96,5 +96,3 @@ The check follows the [channel](/docs/channels) you installed from: a plugin ins
 
 The plugin source lives in
 [`clients/decky`](https://git.unom.io/unom/punktfunk/src/branch/main/clients/decky/README.md).
-</content>
-</invoke>

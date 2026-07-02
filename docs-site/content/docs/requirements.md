@@ -5,7 +5,8 @@ description: What you need to run a punktfunk host — GPU, driver, desktop, and
 
 ## Supported setups
 
-A punktfunk host runs primarily on a Linux machine with an NVIDIA GPU (a native
+A punktfunk host runs primarily on a Linux machine with a dedicated GPU — NVIDIA (NVENC) is the
+most-exercised path, and AMD/Intel GPUs work via VAAPI (a native
 [Windows host](/docs/windows-host) is also available — see below). These are the Linux desktop
 environments it supports today, each with its own guide:
 
@@ -32,6 +33,10 @@ listed, the host still needs one of these compositor backends to create a virtua
   not just `nvidia-utils` — without it the compositor can't initialise the GPU and capture fails. Each
   setup guide installs the right package (e.g. `libnvidia-gl-<version>` on Ubuntu).
 - **`nvidia-drm modeset=1`** must be enabled (Wayland on NVIDIA needs it). The setup guides cover this.
+- **AMD / Intel GPUs** encode via **VAAPI** instead (install `mesa-va-drivers` or
+  `intel-media-driver`; validated live on AMD RDNA3). The NVIDIA-specific notes above don't apply
+  there. A GPU-less software H.264 encoder also exists (`PUNKTFUNK_ENCODER=software`), meant as a
+  fallback rather than a daily driver.
 
 > Consumer GeForce cards historically cap the number of **concurrent** NVENC sessions (a few at once);
 > workstation cards don't. This only matters if you stream to many devices simultaneously.

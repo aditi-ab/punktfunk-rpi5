@@ -22,6 +22,9 @@ pub struct SessionParams {
     pub bitrate_kbps: u32,
     /// Requested audio channel count (2/6/8); the host echoes the resolved value.
     pub audio_channels: u8,
+    /// The user's preferred video codec (a `quic::CODEC_*` bit, `0` = auto). Soft — the host honors
+    /// it when it can emit it, else falls back; the resolved codec drives the decoder.
+    pub preferred_codec: u8,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
     /// Pinned host fingerprint; `None` = trust on first use (caller persists the observed one).
@@ -141,7 +144,9 @@ fn pump(
         params.bitrate_kbps,
         0, // video_caps: the Linux client has no 10-bit/HDR present path yet
         params.audio_channels,
-        None, // launch: the Linux client has no library picker yet
+        crate::video::decodable_codecs(), // codecs FFmpeg can decode (HEVC/H.264/AV1)
+        params.preferred_codec,           // the user's soft codec preference (0 = auto)
+        None,                             // launch: the Linux client has no library picker yet
         params.pin,
         Some(params.identity),
         params.connect_timeout,
@@ -170,7 +175,14 @@ fn pump(
         fingerprint: connector.host_fingerprint,
     });
 
-    let mut decoder = match Decoder::new() {
+    // Build the decoder for the codec the host resolved (never assume HEVC).
+    let codec_id = crate::video::ffmpeg_codec_id(connector.codec);
+    tracing::info!(
+        ?codec_id,
+        welcome_codec = connector.codec,
+        "negotiated video codec"
+    );
+    let mut decoder = match Decoder::new(codec_id) {
         Ok(d) => d,
         Err(e) => {
             let _ = ev_tx.send_blocking(SessionEvent::Ended(Some(format!("video decoder: {e}"))));

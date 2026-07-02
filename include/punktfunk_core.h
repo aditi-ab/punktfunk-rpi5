@@ -133,6 +133,16 @@
 // [`punktfunk_connection_chroma_format`] reports the real value. (Mirrors `quic::VIDEO_CAP_444`.)
 #define PUNKTFUNK_VIDEO_CAP_444 4
 
+// Codec bit for [`punktfunk_connect_ex7`] (`video_codecs` / `preferred_codec`) and the value
+// [`punktfunk_connection_codec`] returns: H.264 / AVC. (Mirrors `quic::CODEC_H264`.)
+#define PUNKTFUNK_CODEC_H264 1
+
+// Codec bit: H.265 / HEVC — the default codec. (Mirrors `quic::CODEC_HEVC`.)
+#define PUNKTFUNK_CODEC_HEVC 2
+
+// Codec bit: AV1. (Mirrors `quic::CODEC_AV1`.)
+#define PUNKTFUNK_CODEC_AV1 4
+
 // 16-byte AEAD authentication tag appended by GCM.
 #define TAG_LEN 16
 
@@ -986,8 +996,8 @@ PunktfunkConnection *punktfunk_connect_ex5(const char *host,
 // Like [`punktfunk_connect_ex5`], but additionally requests the audio channel count:
 // `2` (stereo, the default behaviour of every earlier variant), `6` (5.1) or `8` (7.1). The host
 // clamps the request to what it can actually capture and echoes the resolved count via
-// [`punktfunk_connection_audio_channels`]; the `0xC9` audio frames are Opus-(multi)stream encoded
-// for that layout. A client that wants surround calls this; everything else inherits stereo.
+// [`punktfunk_connection_audio_channels`]. Advertises HEVC-only with no codec preference (call
+// [`punktfunk_connect_ex7`] to negotiate the codec).
 //
 // # Safety
 // Same as [`punktfunk_connect`].
@@ -1001,6 +1011,36 @@ PunktfunkConnection *punktfunk_connect_ex6(const char *host,
                                            uint32_t bitrate_kbps,
                                            uint8_t video_caps,
                                            uint8_t audio_channels,
+                                           const char *launch_id,
+                                           const uint8_t *pin_sha256,
+                                           uint8_t *observed_sha256_out,
+                                           const char *client_cert_pem,
+                                           const char *client_key_pem,
+                                           uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect_ex6`], but additionally advertises the codecs the client can decode
+// (`video_codecs` — a bitfield of [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] /
+// [`PUNKTFUNK_CODEC_AV1`]) and a soft `preferred_codec` (a single codec bit, `0` = no preference).
+// The host resolves the codec it emits from these (preference honored when it can also produce it,
+// else best shared codec) and reports it via [`punktfunk_connection_codec`]. A client that omits
+// this (calls `ex6`) advertises HEVC-only, no preference — the pre-negotiation behaviour.
+//
+// # Safety
+// Same as [`punktfunk_connect`].
+PunktfunkConnection *punktfunk_connect_ex7(const char *host,
+                                           uint16_t port,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t refresh_hz,
+                                           uint32_t compositor,
+                                           uint32_t gamepad,
+                                           uint32_t bitrate_kbps,
+                                           uint8_t video_caps,
+                                           uint8_t audio_channels,
+                                           uint8_t video_codecs,
+                                           uint8_t preferred_codec,
                                            const char *launch_id,
                                            const uint8_t *pin_sha256,
                                            uint8_t *observed_sha256_out,
@@ -1177,6 +1217,19 @@ PunktfunkStatus punktfunk_connection_color_info(PunktfunkConnection *c,
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
 PunktfunkStatus punktfunk_connection_chroma_format(PunktfunkConnection *c, uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Read the video codec the host resolved for this session (from its Welcome): one of
+// [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] / [`PUNKTFUNK_CODEC_AV1`]. The embedder builds
+// its decoder from THIS (never assuming HEVC). `*out` is filled when non-NULL. Available
+// immediately after a successful connect (it doesn't change without a reconfigure). An older host
+// that didn't negotiate a codec reports [`PUNKTFUNK_CODEC_HEVC`].
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+PunktfunkStatus punktfunk_connection_codec(PunktfunkConnection *c,
+                                           uint8_t *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

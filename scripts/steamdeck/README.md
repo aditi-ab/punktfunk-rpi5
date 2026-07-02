@@ -39,8 +39,12 @@ git clone https://git.unom.io/unom/punktfunk ~/punktfunk
 bash ~/punktfunk/scripts/steamdeck/install.sh            # PIN pairing required (secure default)
 bash ~/punktfunk/scripts/steamdeck/install.sh --open     # trusted LAN: accept unpaired clients
 bash ~/punktfunk/scripts/steamdeck/install.sh --no-web   # host only, no web console
+bash ~/punktfunk/scripts/steamdeck/install.sh --no-gamestream  # native punktfunk/1 only, no Moonlight surface
 bash ~/punktfunk/scripts/steamdeck/update.sh             # after pulling new source
 ```
+
+Note: unlike a bare `serve` (native-only by default), the Deck install enables `--gamestream` by
+default so stock Moonlight clients work out of the box; `--no-gamestream` turns that surface off.
 
 Env overrides: `PUNKTFUNK_SRC` (source dir, default `~/punktfunk`), `PUNKTFUNK_BOX` (container name,
 default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (3000).

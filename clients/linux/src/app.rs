@@ -529,9 +529,11 @@ fn speed_test(app: Rc<App>, req: ConnectRequest) {
                 },
                 CompositorPref::Auto,
                 GamepadPref::Auto,
-                0,    // bitrate_kbps (host default)
-                0,    // video_caps: the Linux client has no 10-bit/HDR present path yet
-                2,    // audio_channels: speed-test probe, stereo
+                0,                                // bitrate_kbps (host default)
+                0, // video_caps: the Linux client has no 10-bit/HDR present path yet
+                2, // audio_channels: speed-test probe, stereo
+                crate::video::decodable_codecs(), // codecs (unused by the probe, but honest)
+                0, // preferred_codec: no preference for a speed-test probe
                 None, // launch: speed-test probe connect, no game
                 pin,
                 Some(identity),
@@ -689,6 +691,7 @@ fn start_session_with(app: Rc<App>, req: ConnectRequest, pin: Option<[u8; 32]>, 
         bitrate_kbps: s.bitrate_kbps,
         mic_enabled: s.mic_enabled,
         audio_channels: s.audio_channels,
+        preferred_codec: s.preferred_codec(),
         pin,
         identity: app.identity.clone(),
         connect_timeout: opts.connect_timeout,

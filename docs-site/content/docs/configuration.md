@@ -38,7 +38,7 @@ On Linux the host **rewrites `WAYLAND_DISPLAY` / `XDG_CURRENT_DESKTOP` / `XDG_RU
 | `PUNKTFUNK_VIDEO_SOURCE` | `virtual` · `portal` | `virtual` creates a per-client display at the client's exact mode (the normal choice). `portal` captures an existing monitor instead. |
 | `PUNKTFUNK_ZEROCOPY` | `1` · `0` | GPU zero-copy capture→encode (dmabuf → CUDA → NVENC, or D3D11 on Windows). Leave on; it falls back to a CPU path automatically. |
 | `PUNKTFUNK_INPUT_BACKEND` | `libei` · `gamescope` · `wlr` · `uinput` | How input is injected. `libei` for GNOME/KDE, `gamescope` for Bazzite/gamescope, `wlr` for Sway/wlroots. Auto-detected with the compositor. |
-| `PUNKTFUNK_ENCODER` | `auto` · `nvenc` · `vaapi` (Linux) · `amf` · `qsv` · `sw` (Windows) | Encoder backend. `auto` (default) detects the GPU vendor: NVIDIA→NVENC, AMD→VAAPI/AMF, Intel→VAAPI/QSV, else software. |
+| `PUNKTFUNK_ENCODER` | `auto` · `nvenc` · `vaapi` (Linux) · `amf` · `qsv` (Windows) · `software` | Encoder backend. `auto` (default) detects the GPU vendor: NVIDIA→NVENC, AMD→VAAPI/AMF, Intel→VAAPI/QSV. `software` (aliases `sw`/`openh264`) is the GPU-less H.264 path on both platforms — on Windows `auto` falls back to it when no GPU is found; on Linux it is **explicit-only** (`auto` never picks it). |
 | `PUNKTFUNK_RENDER_NODE` | path | Linux DRM render node for zero-copy (default `/dev/dri/renderD128`). Set on multi-GPU boxes to pick the right GPU. |
 
 Resolution and refresh are **not** set here — **the client chooses them.** When a device connects,
@@ -76,6 +76,7 @@ picture.
 | `PUNKTFUNK_10BIT` | `1` | HEVC Main10 / HDR. Honored only when the client also advertises 10-bit. **Windows host only** (the Linux host stays 8-bit). |
 | `PUNKTFUNK_444` | `1` | Full-chroma HEVC 4:4:4 (Range Extensions) — sharper text/desktop, no chroma loss. **punktfunk/1 native only** (Moonlight stays 4:2:0), HEVC-only, honored only when the client advertises 4:4:4 **and** the GPU supports it (probed; NVENC is the validated path — VAAPI/AMF/QSV decline). Independent of 10-bit. |
 | `PUNKTFUNK_DSCP` | `1` | Opt-in DSCP / `SO_PRIORITY` QoS tagging on the media sockets. No-op on the wire on Windows without a qWAVE policy. |
+| `PUNKTFUNK_OH264_THREADS` / `PUNKTFUNK_OH264_GOP` | `N` | Software (openh264) encoder tuning: encode threads (default 2 — latency over throughput) and GOP length (default 0 = encoder-auto). Only relevant with `PUNKTFUNK_ENCODER=software`. |
 
 ## Gamepads
 
@@ -151,13 +152,14 @@ good value:
 
 ## Multiple devices at once
 
-Today the native `punktfunk/1` host (`serve`) streams **one session at a time** — additional clients
-wait in the accept queue until the active session ends. Each session gets its own virtual display at
-the client's exact resolution; concurrent native sessions are on the roadmap. (`punktfunk1-host`, the
-standalone test host, has a `--max-concurrent N` knob — see the [Host CLI](/docs/host-cli) reference —
-but `serve` does not take that flag.)
+The native `punktfunk/1` host (`serve`) streams up to **4 sessions at once** by default (an encoder
+bound); further clients wait in the accept queue until a slot frees up. Each session gets its own
+virtual display at the client's exact resolution, sharing the host's input/audio/mic services. The
+limit isn't settable from `serve`'s command line yet — `punktfunk1-host`, the standalone test host,
+exposes it as `--max-concurrent N` (see the [Host CLI](/docs/host-cli) reference).
 
 ## Codec and FEC
 
-- The host encodes **HEVC (H.265)** by default; **AV1** is available for clients that support it.
+- Client and host **negotiate the codec**: **HEVC (H.265)** by default, **AV1** for clients that
+  support it, and **H.264** when the session runs on the GPU-less software encoder.
 - The native protocol adds forward error correction for lossy links — see `PUNKTFUNK_FEC_PCT` above.

@@ -18,6 +18,9 @@ const RESOLUTIONS: &[(u32, u32)] = &[
 const REFRESH: &[u32] = &[0, 30, 60, 90, 120, 144, 165, 240];
 const GAMEPADS: &[&str] = &["auto", "xbox360", "dualsense", "xboxone", "dualshock4"];
 const COMPOSITORS: &[&str] = &["auto", "kwin", "wlroots", "mutter", "gamescope"];
+/// Codec setting values (persisted) paired with their display labels below.
+const CODECS: &[&str] = &["auto", "hevc", "h264", "av1"];
+const CODEC_LABELS: &[&str] = &["Automatic", "HEVC (H.265)", "H.264 (AVC)", "AV1"];
 
 /// punktfunk's own license (MIT OR Apache-2.0), shown on the About dialog's Legal page.
 const APP_LICENSE: &str = concat!(
@@ -193,6 +196,12 @@ pub fn show(
         ]))
         .build();
     audio.add(&surround_row);
+    let codec_row = adw::ComboRow::builder()
+        .title("Video codec")
+        .subtitle("Preferred codec — the host falls back if it can't encode this one")
+        .model(&gtk::StringList::new(CODEC_LABELS))
+        .build();
+    stream.add(&codec_row);
     let mic_row = adw::SwitchRow::builder()
         .title("Stream microphone")
         .subtitle("Send the default input device to the host's virtual microphone")
@@ -242,6 +251,8 @@ pub fn show(
             8 => 2,
             _ => 0,
         });
+        let codec_i = CODECS.iter().position(|&c| c == s.codec).unwrap_or(0);
+        codec_row.set_selected(codec_i as u32);
     }
 
     let dialog = adw::PreferencesDialog::new();
@@ -263,6 +274,7 @@ pub fn show(
             2 => 8,
             _ => 2,
         };
+        s.codec = CODECS[(codec_row.selected() as usize).min(CODECS.len() - 1)].to_string();
         s.save();
     });
     dialog.present(Some(parent));

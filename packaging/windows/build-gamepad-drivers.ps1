@@ -10,8 +10,8 @@
   `cargo build --release` builds the whole workspace (this shares wdk-sys/wdk-build + the bindgen pin with
   pf-vdisplay). Then, per driver: CLEAR the FORCE_INTEGRITY PE bit, sign the .dll, stampinf a DriverVer
   into the INF; then Inf2Cat both catalogs and sign them. Both drivers share ONE self-signed cert (or a
-  supplied DRIVER_CERT secret) + ONE exported .cer - the layout install-gamepad-drivers.ps1 consumes
-  (per-driver .inf/.cat/.dll + one shared punktfunk-driver.cer).
+  supplied DRIVER_CERT secret) + ONE exported .cer - the layout `punktfunk-host.exe driver install
+  --gamepad` consumes (per-driver .inf/.cat/.dll + one shared punktfunk-driver.cer).
 
   Output (-Out): pf_dualsense.{dll,inf,cat} + pf_xusb.{dll,inf,cat} + punktfunk-driver.cer.
 

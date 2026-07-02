@@ -1,10 +1,12 @@
-//! `punktfunk-probe` — the reference client for `punktfunk/1` (M3): QUIC control plane, UDP data
+//! `punktfunk-probe` — the reference client for `punktfunk/1`: QUIC control plane, UDP data
 //! plane, input over QUIC datagrams. Two modes, decided by the host's Welcome:
 //!
 //! * **verification** (`frames > 0`, synthetic host): byte-checks deterministic test frames;
-//! * **stream** (`frames == 0`, virtual host): receives real NVENC AUs, writes a playable
-//!   `.h265`, and reports per-frame **capture→…→reassembled latency** percentiles (the host
-//!   stamps each frame with its capture wall clock; same-host runs share that clock).
+//! * **stream** (`frames == 0`, virtual host): receives real encoded AUs, writes a playable
+//!   elementary stream (the dump extension follows the negotiated codec — `.h265`/`.h264`/`.av1`;
+//!   the probe advertises all three), and reports per-frame **capture→…→reassembled latency**
+//!   percentiles (the host stamps each frame with its capture wall clock; same-host runs share
+//!   that clock).
 //!
 //! `--input-test` exercises the input plane: scripted mouse/keyboard datagrams during the
 //! stream (watch them land in the host session, e.g. xev inside gamescope). `--mic-test`
@@ -36,9 +38,12 @@
 //! over mDNS, prints each (name, addr:port, pairing requirement, cert fingerprint to pin), and
 //! exits without connecting.
 //!
-//! Usage: `punktfunk-probe [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE] [--input-test]
-//!         [--pin HEX] [--compositor NAME] [--gamepad NAME] | --discover [SECS]`
-//! (M4 adds VAAPI decode + wgpu present on this skeleton.)
+//! Usage: `punktfunk-probe [--connect HOST:PORT] [--mode WxHxFPS] [--remode WxHxFPS:SECS]
+//!         [--out FILE] [--bitrate KBPS] [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8]
+//!         [--launch APP] [--name NAME] [--speed-test KBPS:MS]
+//!         [--input-test | --mic-test | --touch-test | --rich-input-test]
+//!         [--pin HEX | --pair PIN] [--compositor NAME] [--gamepad NAME] | --discover [SECS]`
+//! Env: `PUNKTFUNK_CLIENT_10BIT=1` / `PUNKTFUNK_CLIENT_444=1` advertise the 10-bit / 4:4:4 caps.
 
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::config::GamepadPref;
@@ -82,6 +87,10 @@ struct Args {
     /// multistream-decodes the host's frames and asserts the per-channel sample count, so it's the
     /// headless validator for the surround encode path.
     audio_channels: u8,
+    /// `--codec h264|hevc|av1|auto` — the preferred video codec (soft; the host honors it when it can
+    /// emit it, else falls back). The probe always advertises it can decode all three; this just sets
+    /// the preference byte. `auto` (default) = no preference (host decides). `0` = auto.
+    preferred_codec: u8,
     /// `--launch ID` — ask the host to launch a library title in this session (a store-qualified
     /// id from the host's `GET /api/v1/library`, e.g. `steam:570`). Host resolves it; `None` = none.
     launch: Option<String>,
@@ -210,6 +219,12 @@ fn parse_args() -> Args {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),
         ),
+        preferred_codec: match get("--codec").unwrap_or("auto") {
+            "h264" | "avc" => punktfunk_core::quic::CODEC_H264,
+            "hevc" | "h265" => punktfunk_core::quic::CODEC_HEVC,
+            "av1" => punktfunk_core::quic::CODEC_AV1,
+            _ => 0, // auto — no preference
+        },
         launch: get("--launch").map(str::to_string),
         speed_test: get("--speed-test").and_then(|s| {
             let (kbps, ms) = s.split_once(':')?;
@@ -428,6 +443,8 @@ async fn session(args: Args) -> Result<()> {
             video_codecs: punktfunk_core::quic::CODEC_H264
                 | punktfunk_core::quic::CODEC_HEVC
                 | punktfunk_core::quic::CODEC_AV1,
+            // `--codec` soft preference (0 = auto). The host honors it when it can emit it.
+            preferred_codec: args.preferred_codec,
         }
         .encode(),
     )

@@ -404,8 +404,8 @@ Debian/Ubuntu — the host links system FFmpeg/PipeWire and won't build there), 
 `packaging/README.md`:
 
 ```sh
-git archive --format=tar.gz --prefix=punktfunk-0.0.1/ \
-  -o ~/rpmbuild/SOURCES/punktfunk-0.0.1.tar.gz HEAD
+git archive --format=tar.gz --prefix=punktfunk-0.3.0/ \
+  -o ~/rpmbuild/SOURCES/punktfunk-0.3.0.tar.gz HEAD    # 0.3.0 = the spec's default version
 rpmbuild -ba packaging/rpm/punktfunk.spec    # needs the spec's BuildRequires + RPM Fusion
 ```
 

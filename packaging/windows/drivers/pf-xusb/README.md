@@ -43,19 +43,21 @@ Y `0x8000`). `dwPacketNumber` (GET_STATE `[5]`) must increment whenever the payl
 @8` · `LT @10` · `RT @11` · `LX/LY/RX/RY i16 @12/@14/@16/@18` · `rumble_seq u32 @24` (driver bumps) ·
 `large @28` · `small @29`.
 
-## Validated live on `.173` (2026-06-22)
+## Validated live (2026-06-22, maintainer's RTX test box)
 
 `XInputGetState(0)` returns **CONNECTED** with the pushed buttons/sticks and an incrementing
 `dwPacketNumber`; `XInputSetState(0xC000, 0x4000)` reaches the driver as `00 00 c0 40 02` → host sees
-`large=192 small=64`. Test tools: `C:\Users\Public\giprobe\xusbtest.exe` (creates the `pf_xusb`
+`large=192 small=64`. Test tools (on that box): `xusbtest.exe` (creates the `pf_xusb`
 devnode + cycling state via shm) and `xinputtest.exe` (`XInputGetState`/`SetState` harness).
 
 ## Build / sign / install (same recipe as the DualSense driver)
 
-Built from `C:\Users\Public\m0\windows-drivers-rs\examples\pf-xusb` (the `../../crates` paths resolve
-there); these repo files are the canonical copies — keep them in sync.
+Built as a member of the in-tree [`packaging/windows/drivers/`](../) workspace — one
+`cargo build --release` builds all three drivers; `build-gamepad-drivers.ps1` (one level up) wraps
+the whole build/sign/stage flow in CI. The manual steps:
 
-1. `cargo make` (env `LIBCLANG_PATH`, `Version_Number=10.0.26100.0`) → `target\debug\pf_xusb_package\`.
+1. `cargo build --release` in the workspace (env `LIBCLANG_PATH`, `Version_Number=10.0.26100.0`) →
+   `target\x86_64-pc-windows-msvc\release\pf_xusb.dll`.
 2. Clear the FORCE_INTEGRITY PE bit (bit `0x80` at `e_lfanew+0x5e` of `pf_xusb.dll`).
 3. `signtool sign /fd SHA256 /sha1 6A52984E54376C45A1C236B1A2C8A746C5AB6131 pf_xusb.dll`.
 4. `Inf2Cat /driver:<pkg> /os:10_X64` → re-sign `pf_xusb.cat` with the same thumbprint.
@@ -63,11 +65,12 @@ there); these repo files are the canonical copies — keep them in sync.
 
 ## Host integration (done)
 
-`crates/punktfunk-host/src/inject/gamepad_windows.rs` is the Windows `GamepadManager` (used by
+`crates/punktfunk-host/src/inject/windows/gamepad_windows.rs` is the Windows `GamepadManager` (used by
 `PadBackend::Xbox360`): it SwDeviceCreate's the `pf_xusb` companion, maps `pfxusb-shm-<index>`, writes
 the XInput state from the client's gamepad frame (already XInput-convention) and forwards rumble. There
-is **no ViGEmBus dependency** anymore. The driver is built from source (`packaging/windows/drivers/pf-xusb`),
-signed, and pnputil-installed by the Inno Setup installer (via `install-gamepad-drivers.ps1`).
+is **no ViGEmBus dependency** anymore. The driver is built + signed from source in CI
+(`build-gamepad-drivers.ps1`) and installed by the Inno Setup installer via
+`punktfunk-host.exe driver install --gamepad`.
 
 ## Multi-pad
 

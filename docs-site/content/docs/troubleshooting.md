@@ -69,9 +69,9 @@ Then log out and back in. On other distros this is `sudo usermod -aG input $USER
   clients' [speed test](/docs/configuration#bitrate) picks a safe value; with Moonlight, set it
   manually.
 - Prefer a **wired** connection or 5 GHz Wi-Fi between host and client.
-- Streaming to **many devices at once** shares the GPU encoder. The production host
-  (`serve`) handles one native session at a time, with extra clients queued; heavy load is
-  usually bitrate-bound, so lower the bitrate first.
+- Streaming to **many devices at once** shares the GPU encoder. The host serves several
+  concurrent native sessions (up to 4 by default); heavy load is usually bitrate-bound, so
+  lower the bitrate first.
 
 ## Still stuck?
 

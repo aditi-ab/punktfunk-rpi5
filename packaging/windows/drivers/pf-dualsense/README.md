@@ -8,7 +8,7 @@ DualSense a near-native feel with **no external gamepad dependencies** (no ViGEm
 Shipping: the driver is one member of the in-tree driver workspace
 ([`packaging/windows/drivers/`](../../README.md)), built from source in CI, and bundled +
 `pnputil`-installed by the Windows host [installer](../../README.md). The host feeds it over a shared
-memory channel from `crates/punktfunk-host/src/inject/dualsense_windows.rs`. The same UMDF driver also
+memory channel from `crates/punktfunk-host/src/inject/windows/dualsense_windows.rs`. The same UMDF driver also
 serves the **DualShock 4** identity per a `device_type` byte the host stamps.
 
 This README captures the driver-authoring lore — the bugs and the signing recipe that make a
@@ -37,7 +37,9 @@ $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
 $env:Version_Number = '10.0.26100.0'   # else wdk-build picks 10.0.28000.0 (no km/crt) and bindgen fails
 ```
 
-Then, in the example dir:
+The shipping flow is `build-gamepad-drivers.ps1` (one level up): workspace `cargo build --release`
+plus the sign steps below, staged for the installer. The original manual dev-box recipe, kept as
+lore (paths reflect that era's cargo-make layout):
 
 ```powershell
 cargo make                              # -> target\debug\pf_dualsense_package\ (.inf/.cat/.dll)
@@ -45,7 +47,8 @@ cargo make                              # -> target\debug\pf_dualsense_package\ 
 # *** CRITICAL: clear the PE FORCE_INTEGRITY bit ***
 # windows-drivers-rs links the DLL with /INTEGRITYCHECK, which forces a CI-trusted page-hash
 # signature a self-signed cert cannot satisfy (CodeIntegrity 3004 "hash not found" /
-# 3089 VerificationError 7). SudoVDA.dll has this bit OFF. Clear bit 0x80 at PE-header offset +0x5e:
+# 3089 VerificationError 7). SudoVDA.dll (third-party VDD prior art, not used by punktfunk) has
+# this bit OFF. Clear bit 0x80 at PE-header offset +0x5e:
 $f = 'target\debug\pf_dualsense_package\pf_dualsense.dll'
 $b = [IO.File]::ReadAllBytes($f); $pe = [BitConverter]::ToInt32($b,0x3c); $off = $pe + 0x5e
 $dc = [BitConverter]::ToUInt16($b,$off); $bb = [BitConverter]::GetBytes([uint16]($dc -band 0xFF7F))
@@ -60,9 +63,10 @@ pnputil /add-driver target\debug\pf_dualsense_package\pf_dualsense.inf /install
 devgen /add /hardwareid "root\pf_dualsense"     # creates the (transient, SWD) device node
 ```
 
-`devgen` is at `...\Windows Kits\10\Tools\10.0.26100.0\x64\devgen.exe`. SWD devgen devices clear on
-reboot (recreate after each boot). TODO: drop the post-build PE patch by stopping wdk-build emitting
-`/INTEGRITYCHECK`.
+`devgen` (under `Windows Kits\10\Tools\<ver>\x64\`) is only for manual testing — the shipping
+install is `punktfunk-host.exe driver install --gamepad`, and the host SwDeviceCreate's the device
+per session (no persistent devnode). SWD devgen devices clear on reboot. TODO: drop the post-build
+PE patch by stopping wdk-build emitting `/INTEGRITYCHECK`.
 
 ## The three bugs that made it work (porting a WDK C sample to Rust)
 

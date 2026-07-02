@@ -107,7 +107,7 @@ PUNKTFUNK_AUTOCONNECT=<box-ip> PUNKTFUNK_MODE=1280x720x60 swift run PunktfunkCli
 - **App Store screenshots** are automated — `tools/screenshots.sh all` renders the real UI at the
   required pixel sizes via a DEBUG-only shot mode; the `apple` CI workflow captures the iOS sizes on
   every main push. See the script header for details.
-- Deeper design notes live in `docs-site/content/docs/apple-stage2-presenter.md`.
+- Deeper design notes live in [`design/apple-stage2-presenter.md`](../../design/apple-stage2-presenter.md).
 
 ## Related
 

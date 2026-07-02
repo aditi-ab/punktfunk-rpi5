@@ -41,8 +41,8 @@ enum CtrlRequest {
 /// certificate fingerprint, the resolved encoder bitrate (kbps), and the host↔client clock offset
 /// (ns, host minus client; 0 = no skew correction / an old host that didn't answer the handshake).
 /// The trailing `u8`s are the resolved encode bit depth (8/10), the chroma `chroma_format_idc`
-/// (1 = 4:2:0, 3 = 4:4:4), and the resolved audio channel count (2/6/8), with [`ColorInfo`] the
-/// resolved colour signalling — all from the [`Welcome`].
+/// (1 = 4:2:0, 3 = 4:4:4), the resolved audio channel count (2/6/8), and the resolved video codec
+/// (`quic::CODEC_*`), with [`ColorInfo`] the resolved colour signalling — all from the [`Welcome`].
 type Negotiated = (
     Mode,
     CompositorPref,
@@ -52,6 +52,7 @@ type Negotiated = (
     i64,
     u8,
     ColorInfo,
+    u8,
     u8,
     u8,
 );
@@ -216,6 +217,10 @@ pub struct NativeClient {
     /// host that omits it (→ `2`) yields working stereo. The `0xC9` audio frames are encoded with the
     /// matching layout.
     pub audio_channels: u8,
+    /// The video codec the host resolved and will emit ([`Welcome::codec`]) — [`quic::CODEC_H264`],
+    /// [`quic::CODEC_HEVC`] (default / older host), or [`quic::CODEC_AV1`]. The client builds its
+    /// decoder from THIS, never assuming HEVC.
+    pub codec: u8,
 }
 
 /// Pin the calling thread to the user-interactive QoS class on Apple targets.
@@ -263,6 +268,11 @@ impl NativeClient {
         // Requested audio channel count (2 = stereo / 6 = 5.1 / 8 = 7.1); the host clamps to what it
         // can capture and echoes the result in [`NativeClient::audio_channels`].
         audio_channels: u8,
+        // The codecs this client can decode (bitfield of quic::CODEC_H264 / CODEC_HEVC / CODEC_AV1)
+        // and the user's soft preference (a single codec bit, 0 = auto). The host resolves the codec
+        // it emits from these and echoes it in [`NativeClient::codec`].
+        video_codecs: u8,
+        preferred_codec: u8,
         launch: Option<String>,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
@@ -316,6 +326,8 @@ impl NativeClient {
                     bitrate_kbps,
                     video_caps,
                     audio_channels,
+                    video_codecs,
+                    preferred_codec,
                     launch,
                     pin,
                     identity,
@@ -349,6 +361,7 @@ impl NativeClient {
             color,
             chroma_format,
             audio_channels,
+            codec,
         ) = match ready_rx.recv_timeout(timeout) {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => return Err(e),
@@ -382,6 +395,7 @@ impl NativeClient {
             color,
             chroma_format,
             audio_channels,
+            codec,
         })
     }
 
@@ -689,6 +703,8 @@ struct WorkerArgs {
     bitrate_kbps: u32,
     video_caps: u8,
     audio_channels: u8,
+    video_codecs: u8,
+    preferred_codec: u8,
     launch: Option<String>,
     pin: Option<[u8; 32]>,
     identity: Option<(String, String)>,
@@ -721,6 +737,8 @@ async fn worker_main(args: WorkerArgs) {
         bitrate_kbps,
         video_caps,
         audio_channels,
+        video_codecs,
+        preferred_codec,
         launch,
         pin,
         identity,
@@ -789,10 +807,10 @@ async fn worker_main(args: WorkerArgs) {
                 video_caps,
                 // Requested surround channel count; the host echoes the resolved value in Welcome.
                 audio_channels,
-                // Phase 1: the embeddable clients decode HEVC (their decoders are still HEVC-wired),
-                // so advertise HEVC-only until Phase 2 threads real per-client codec caps through the
-                // connect ABI and switches decoders on `Welcome::codec`.
-                video_codecs: crate::quic::CODEC_HEVC,
+                // The codecs this client can decode + its soft preference (0 = auto). The host
+                // resolves the emitted codec from these and reports it in `Welcome::codec`.
+                video_codecs,
+                preferred_codec,
             }
             .encode(),
         )
@@ -866,6 +884,7 @@ async fn worker_main(args: WorkerArgs) {
             welcome.color,
             welcome.chroma_format,
             welcome.audio_channels,
+            welcome.codec,
         ))
     };
 
@@ -884,6 +903,7 @@ async fn worker_main(args: WorkerArgs) {
         color,
         chroma_format,
         audio_channels,
+        codec,
     ) = match setup.await {
         Ok(t) => t,
         Err(e) => {
@@ -902,6 +922,7 @@ async fn worker_main(args: WorkerArgs) {
         color,
         chroma_format,
         audio_channels,
+        codec,
     )));
 
     // Input task: embedder events → QUIC datagrams.

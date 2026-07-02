@@ -285,8 +285,9 @@ end;
 
 function WebSetupParams(Param: String): String;
 begin
-  { Pass the password to web-setup.ps1 via a temp file, not the cmdline (which lands in the install
-    log). Only on a fresh install - on upgrade web-setup keeps the existing file. }
+  { Pass the password to `punktfunk-host.exe web setup` via a temp file, not the cmdline (which
+    lands in the install log). Only on a fresh install - on upgrade web setup keeps the existing
+    file. }
   Result := '--app-dir "' + ExpandConstant('{app}') + '"';
   if FreshWebInstall then
     Result := Result + ' --password-file "' + ExpandConstant('{tmp}\webpw.txt') + '"';
@@ -312,7 +313,7 @@ end;
 #ifdef WithWeb
 { Stop a running web console + free :3000 BEFORE the file copy, so the old server doesn't lock
   .output / web-run.cmd / bun.exe and the new task can bind. Killing the :3000 listener owner is
-  runtime-agnostic (an early install may have run node, the current one runs bun). web-setup.ps1
+  runtime-agnostic (an early install may have run node, the current one runs bun). `web setup`
   repeats this idempotently after the copy. Best-effort; a fresh install is a no-op. }
 procedure StopWebConsole;
 var
@@ -334,7 +335,7 @@ begin
     StopHostServiceAndWait;
 #ifdef WithWeb
     StopWebConsole;   { upgrade-safe: free :3000 + unlock the web files before the copy }
-    { Stash the chosen password for web-setup.ps1 (fresh install only); the temp copy is auto-cleaned. }
+    { Stash the chosen password for `web setup` (fresh install only); the temp copy is auto-cleaned. }
     if FreshWebInstall then
       SaveStringToFile(ExpandConstant('{tmp}\webpw.txt'), Trim(WebPwPage.Values[0]), False);
 #endif

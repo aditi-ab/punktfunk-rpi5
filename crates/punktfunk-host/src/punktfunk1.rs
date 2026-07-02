@@ -663,8 +663,9 @@ async fn serve_session(
         // client's advertised codecs). A GPU-less software host emits H.264, so an HEVC-only client
         // shares nothing with it → refuse honestly rather than send a stream it can't decode.
         let host_codecs = crate::encode::Codec::host_wire_caps();
-        let codec_bit = punktfunk_core::quic::resolve_codec(hello.video_codecs, host_codecs)
-            .ok_or_else(|| {
+        let codec_bit =
+            punktfunk_core::quic::resolve_codec(hello.video_codecs, host_codecs, hello.preferred_codec)
+                .ok_or_else(|| {
                 anyhow!(
                     "no shared video codec: client advertised 0x{:02x}, host can emit 0x{:02x} \
                      (a software-encode host produces H.264 — the client must advertise CODEC_H264)",
@@ -3976,6 +3977,8 @@ mod tests {
             0,
             0,    // video_caps
             2,    // audio_channels (stereo)
+            0,    // video_codecs (0 → HEVC-only)
+            0,    // preferred_codec (auto)
             None, // launch
             None, // pin: TOFU — the operator's approval (not a PIN) authorizes this client
             Some((cert, key)),
@@ -4036,6 +4039,8 @@ mod tests {
                 0,
                 0,    // video_caps
                 2,    // audio_channels (stereo)
+                0,    // video_codecs
+                0,    // preferred_codec
                 None, // launch
                 None,
                 None,
@@ -4062,6 +4067,8 @@ mod tests {
             0,
             0,    // video_caps
             2,    // audio_channels (stereo)
+            0,    // video_codecs
+            0,    // preferred_codec
             None, // launch
             Some(host_fp),
             Some((cert.clone(), key.clone())),

@@ -76,18 +76,48 @@ enum Backend {
 
 pub struct Decoder {
     backend: Backend,
+    /// The negotiated codec (from the host's Welcome), so a mid-session VAAPI→software demotion
+    /// rebuilds the software decoder for the SAME codec.
+    codec_id: ffmpeg::codec::Id,
+}
+
+/// Map a negotiated `quic` codec bit to the FFmpeg decoder id the client opens.
+pub fn ffmpeg_codec_id(wire: u8) -> ffmpeg::codec::Id {
+    match wire {
+        punktfunk_core::quic::CODEC_H264 => ffmpeg::codec::Id::H264,
+        punktfunk_core::quic::CODEC_AV1 => ffmpeg::codec::Id::AV1,
+        _ => ffmpeg::codec::Id::HEVC,
+    }
+}
+
+/// The `quic` codec bitfield this client can decode — whatever FFmpeg has a decoder for (HEVC/H.264
+/// always; AV1 when built in). Advertised to the host so it never emits a codec we can't decode.
+pub fn decodable_codecs() -> u8 {
+    let _ = ffmpeg::init();
+    let mut bits = 0u8;
+    for (id, bit) in [
+        (ffmpeg::codec::Id::HEVC, punktfunk_core::quic::CODEC_HEVC),
+        (ffmpeg::codec::Id::H264, punktfunk_core::quic::CODEC_H264),
+        (ffmpeg::codec::Id::AV1, punktfunk_core::quic::CODEC_AV1),
+    ] {
+        if ffmpeg::decoder::find(id).is_some() {
+            bits |= bit;
+        }
+    }
+    bits
 }
 
 impl Decoder {
-    pub fn new() -> Result<Decoder> {
+    pub fn new(codec_id: ffmpeg::codec::Id) -> Result<Decoder> {
         ffmpeg::init().context("ffmpeg init")?;
         let choice = std::env::var("PUNKTFUNK_DECODER").unwrap_or_default();
         if choice != "software" {
-            match VaapiDecoder::new() {
+            match VaapiDecoder::new(codec_id) {
                 Ok(v) => {
-                    tracing::info!("VAAPI hardware decode active (zero-copy dmabuf)");
+                    tracing::info!(?codec_id, "VAAPI hardware decode active (zero-copy dmabuf)");
                     return Ok(Decoder {
                         backend: Backend::Vaapi(v),
+                        codec_id,
                     });
                 }
                 Err(e) => {
@@ -99,7 +129,8 @@ impl Decoder {
             }
         }
         Ok(Decoder {
-            backend: Backend::Software(SoftwareDecoder::new()?),
+            backend: Backend::Software(SoftwareDecoder::new(codec_id)?),
+            codec_id,
         })
     }
 
@@ -113,7 +144,7 @@ impl Decoder {
                 Ok(f) => Ok(f.map(DecodedFrame::Dmabuf)),
                 Err(e) => {
                     tracing::warn!(error = %e, "VAAPI decode failed — falling back to software");
-                    self.backend = Backend::Software(SoftwareDecoder::new()?);
+                    self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
                     Ok(None)
                 }
             },
@@ -131,9 +162,9 @@ struct SoftwareDecoder {
 }
 
 impl SoftwareDecoder {
-    fn new() -> Result<SoftwareDecoder> {
-        let codec =
-            ffmpeg::decoder::find(ffmpeg::codec::Id::HEVC).ok_or(anyhow!("no HEVC decoder"))?;
+    fn new(codec_id: ffmpeg::codec::Id) -> Result<SoftwareDecoder> {
+        let codec = ffmpeg::decoder::find(codec_id)
+            .ok_or_else(|| anyhow!("no {codec_id:?} decoder in libavcodec"))?;
         let mut ctx = ffmpeg::codec::Context::new_with_codec(codec);
         unsafe {
             let raw = ctx.as_mut_ptr();
@@ -142,7 +173,7 @@ impl SoftwareDecoder {
             (*raw).thread_type = ffmpeg::ffi::FF_THREAD_SLICE;
             (*raw).thread_count = 0; // auto
         }
-        let decoder = ctx.decoder().video().context("open HEVC decoder")?;
+        let decoder = ctx.decoder().video().context("open video decoder")?;
         Ok(SoftwareDecoder { decoder, sws: None })
     }
 
@@ -240,7 +271,7 @@ struct VaapiDecoder {
 unsafe impl Send for VaapiDecoder {}
 
 impl VaapiDecoder {
-    fn new() -> Result<VaapiDecoder> {
+    fn new(codec_id: ffmpeg::codec::Id) -> Result<VaapiDecoder> {
         use ffmpeg::ffi;
         unsafe {
             let mut hw_device: *mut ffi::AVBufferRef = ptr::null_mut();
@@ -254,10 +285,11 @@ impl VaapiDecoder {
             if r < 0 {
                 bail!("no VAAPI device ({})", ffmpeg::Error::from(r));
             }
-            let codec = ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_HEVC);
+            // The negotiated codec's decoder id (av_codec_id maps 1:1 from ffmpeg::codec::Id).
+            let codec = ffi::avcodec_find_decoder(codec_id.into());
             if codec.is_null() {
                 ffi::av_buffer_unref(&mut hw_device);
-                bail!("no HEVC decoder");
+                bail!("no {codec_id:?} decoder");
             }
             let ctx = ffi::avcodec_alloc_context3(codec);
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device);

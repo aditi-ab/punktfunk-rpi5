@@ -15,7 +15,7 @@ A high-level view of where punktfunk stands. The ordered plan of work is on the
 | **GameStream host** (Moonlight-compatible) | ✅ working end-to-end; HDR/surround-audio polish open |
 | **Native protocol** — `punktfunk/1` (QUIC control + UDP data, GF(2¹⁶) Leopard FEC + AES-GCM) | ✅ full session planes, validated live |
 | **Windows host** (x64) | 🟡 implemented & shipping as a signed installer; NVIDIA/AMD/Intel encode, newer than the Linux host |
-| **macOS / iOS / iPadOS / tvOS client** | ✅ full client; on-glass stage-2 presenter behind an opt-in flag, becoming the default |
+| **macOS / iOS / iPadOS / tvOS client** | ✅ full client; on-glass-validated stage-2 presenter is the default |
 | **Linux client** (`punktfunk-client`, GTK4/libadwaita) | ✅ full client; VAAPI zero-copy decode + software fallback |
 | **Windows client** (`punktfunk-client`, WinUI 3) | ✅ stage 1 complete; ships as signed MSIX; on-glass hardware validation pending |
 | **Android client** (phone + Android TV) | ✅ full client; hardware HEVC decode + HDR10 |
@@ -35,7 +35,7 @@ host is newer than the Linux host.)
   **gamescope**, **Mutter**, and **Sway/wlroots**.
 - **Zero-copy GPU pipeline.** Captured frames stay on the GPU (dmabuf → CUDA → NVENC) with
   automatic split-encode at very high resolutions. Stable 240 fps at 5120×1440 has been
-  measured.
+  measured. A GPU-less software H.264 encoder exists as an explicit fallback.
 - **HDR (10-bit), on the Windows host.** An HDR Windows desktop is captured and encoded as HEVC
   Main10 (BT.2020 PQ) to HDR-capable clients (Windows, Android). Linux hosts stream 8-bit for now —
   HDR there is blocked upstream at the compositor.
@@ -55,7 +55,7 @@ host is newer than the Linux host.)
 
 | Client | Highlights |
 |---|---|
-| **macOS / iOS / iPadOS / tvOS** | VideoToolbox HEVC decode, GameController capture, full DualSense feedback, mDNS discovery, PIN pairing + TOFU, network speed test, latency HUD. Stage-2 presenter (`VTDecompressionSession` → `CAMetalLayer`, ~11 ms p50 capture→present) is built and validated on glass behind an opt-in flag, becoming the default. Ships as one universal TestFlight build / App Store listing. |
+| **macOS / iOS / iPadOS / tvOS** | VideoToolbox HEVC decode, GameController capture, full DualSense feedback, mDNS discovery, PIN pairing + TOFU, network speed test, latency HUD. Stage-2 presenter (`VTDecompressionSession` → `CAMetalLayer`, ~11 ms p50 capture→present) is validated on glass and is the default (stage 1 remains the fallback when Metal is unavailable). Ships as one universal TestFlight build / App Store listing. |
 | **Linux** (`punktfunk-client`) | GTK4/libadwaita. FFmpeg decode with VAAPI → DRM-PRIME dmabuf zero-copy (Intel/AMD; software fallback on NVIDIA), PipeWire audio + mic, SDL3 gamepads incl. DualSense, mDNS discovery, PIN pairing + TOFU, speed test. Ships as Flatpak, apt, rpm, and Arch packages. |
 | **Windows** (`punktfunk-client`) | WinUI 3. D3D11VA zero-copy decode, HDR10, WASAPI audio + mic, SDL3 gamepads incl. DualSense, mDNS discovery, and the full PIN/TOFU trust surface are all implemented. Ships as a signed MSIX (x86_64 + ARM64). **Stage 1 complete; D3D11VA decode, HDR present, and the GUI are pending on-glass validation on real GPU hardware.** |
 | **Android** (phone + Android TV) | Kotlin app with a Rust core over JNI. NDK `AMediaCodec` hardware HEVC decode + HDR10 (Main10/BT.2020 PQ), Opus/Oboe audio + mic, gamepad input with rumble/HID feedback, mDNS discovery, PIN pairing + TOFU (Keystore identity), live stats HUD, and D-pad/controller focus navigation for TV. Ships to the Google Play Internal Testing track. |
@@ -113,7 +113,6 @@ See the [Roadmap](/docs/roadmap) for the ordered list. Near-term:
 
 - **True glass-to-glass latency** — combine the client present-stamp (decode → present)
   with the host render → capture term for a complete end-to-end number.
-- **Make the Apple stage-2 presenter the default** after a few more resolution/HDR checks.
 - **On-glass validation of the Windows client** (D3D11VA decode, HDR present, GUI) on real
   GPU hardware.
 - **gamescope multi-user isolation** — per-session input/audio so concurrent sessions can

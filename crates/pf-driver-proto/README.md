@@ -4,7 +4,7 @@ The shared **host ↔ driver binary contract** for punktfunk's Windows **pf-vdis
 the control IOCTLs and the IDD-push frame transport, defined exactly once.
 
 It's a path dependency of **both** the host workspace ([`crates/punktfunk-host`](../punktfunk-host))
-and the out-of-workspace driver workspace ([`packaging/windows/drivers/`](../../packaging/windows)),
+and the out-of-workspace driver workspace ([`packaging/windows/drivers/`](../../packaging/windows/drivers)),
 so it must resolve identically from either build graph. That's why it's deliberately self-contained:
 `no_std` (+ alloc), platform-neutral (GUID/LUID are plain integers each side converts to its own OS
 type), and free of `*.workspace = true` inheritance.

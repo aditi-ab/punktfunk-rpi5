@@ -12,8 +12,10 @@ example of driving the protocol end to end: QUIC control plane, UDP data plane, 
 
 ## What it does
 
-- **Receives a real stream**, writes a playable `.h265`, and reports per-frame
-  **capture→…→reassembled latency** percentiles (the host stamps each frame with its capture clock).
+- **Receives a real stream**, writes a playable elementary stream (`.h265`/`.h264`/`.av1` — the
+  extension tracks the **negotiated codec**; the probe advertises all three and the host picks), and
+  reports per-frame **capture→…→reassembled latency** percentiles (the host stamps each frame with
+  its capture clock).
 - **Verification mode** against a synthetic host — byte-checks deterministic test frames.
 - **Exercises every plane** with scripted test traffic:
   `--input-test` (mouse/keyboard), `--mic-test` (a 440 Hz Opus tone up to the host mic),
@@ -25,7 +27,10 @@ example of driving the protocol end to end: QUIC control plane, UDP data plane, 
 - **Discovery** — `--discover [secs]` browses the LAN for `_punktfunk._udp` hosts and prints each
   (name, addr:port, pairing requirement, cert fingerprint), then exits.
 - **Negotiation knobs** — `--mode WxHxFPS`, `--remode` (mid-stream mode change), `--bitrate`,
-  `--audio-channels` (stereo / 5.1 / 7.1), `--compositor`, `--gamepad`, `--launch`, `--speed-test`.
+  `--codec auto|h264|hevc|av1` (preference; the host resolves), `--audio-channels`
+  (stereo / 5.1 / 7.1), `--compositor`, `--gamepad`, `--launch`, `--speed-test`.
+  Env: `PUNKTFUNK_CLIENT_10BIT=1` / `PUNKTFUNK_CLIENT_444=1` advertise the 10-bit / 4:4:4 client
+  caps (for testing a host's `PUNKTFUNK_10BIT`/`PUNKTFUNK_444`).
 
 ## Usage
 

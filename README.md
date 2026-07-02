@@ -33,7 +33,9 @@ protocol, FEC, and crypto, linked into the host and every client over a stable C
   a screen — tight, push-based integration that's unusual for a Windows streaming host.
 - **Low latency, GPU end to end.** Frames go straight from the compositor to the NVENC encoder with
   zero CPU copies (dmabuf → CUDA/Vulkan → NVENC), over a transport tuned for responsiveness rather
-  than throughput. Stable 240 fps at 5120×1440; sub-millisecond capture-to-reassembly on a LAN.
+  than throughput. Stable 240 fps at 5120×1440; sub-millisecond capture-to-reassembly on-box,
+  ~1.3 ms cross-machine on a LAN. (AMD/Intel encode via VAAPI, and a GPU-less software H.264
+  encoder exists as a fallback.)
 - **Works with what you already have.** Any Moonlight/Artemis client connects over GameStream — and
   native apps for macOS, Linux, Windows, and Android use the lower-latency `punktfunk/1` protocol.
 - **Secure by default.** Hosts require a one-time SPAKE2 **PIN pairing**; after that, devices
@@ -47,7 +49,7 @@ protocol, FEC, and crypto, linked into the host and every client over a stable C
 | **Core** — `punktfunk-core` + C ABI (protocol · FEC · crypto · QUIC) | ✅ Complete & hardened |
 | **GameStream host** → stock Moonlight | ✅ Live end-to-end: pairing, RTSP, audio, per-client virtual output at native resolution, GPU zero-copy NVENC, gamepads |
 | **Native protocol** — `punktfunk/1` | ✅ Validated live: QUIC control + GF(2¹⁶) FEC/AES-GCM data plane, PIN pairing, mDNS discovery, mid-stream mode renegotiation |
-| **Windows host** (x64) | 🟡 Implemented & shipping as a signed installer: DXGI/WGC capture · its own all-Rust IddCx **virtual display** (secure-desktop capable) · GPU encode (NVENC on NVIDIA, AMF/QSV on AMD/Intel) · WASAPI audio · bundled virtual-gamepad drivers (no ViGEmBus) · HDR incl. Vulkan-game HDR. NVIDIA live-validated; AMD/Intel CI-green |
+| **Windows host** (x64) | 🟡 Implemented & shipping as a signed installer: DXGI/WGC capture · its own all-Rust IddCx **virtual display** (secure-desktop capable) · GPU encode (NVENC on NVIDIA, AMF/QSV on AMD/Intel, software H.264 without a GPU) · WASAPI audio · bundled virtual-gamepad drivers (no ViGEmBus) · HDR incl. Vulkan-game HDR. NVIDIA live-validated; AMD/Intel CI-green |
 | **macOS / iOS / tvOS client** (`clients/apple`) | ✅ Streaming live: VideoToolbox decode, controllers incl. DualSense, discovery, pairing, speed test |
 | **Linux client** (`clients/linux`, GTK4) | ✅ Streaming live: FFmpeg + VAAPI zero-copy decode, PipeWire audio, SDL3 controllers; ships as Flatpak/apt/rpm/Arch |
 | **Android client** (`clients/android`, phone + TV) | ✅ Streaming live: AMediaCodec decode + HDR10, Oboe audio, controllers, discovery, pairing |
