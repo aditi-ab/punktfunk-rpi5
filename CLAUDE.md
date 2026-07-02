@@ -475,7 +475,9 @@ FFI also link-needs `libGL`/`libgbm`/`libcuda` at build time). Env knobs: `PUNKT
 `PUNKTFUNK_COMPOSITOR=kwin|gamescope|mutter`, `PUNKTFUNK_ZEROCOPY=1|0` (Linux default: ON for
 VAAPI/AMD/Intel with a one-shot CPU downgrade if the dmabuf offer never negotiates, OFF/opt-in for
 NVENC), `PUNKTFUNK_VAAPI_LOW_POWER=1|0` (pin the VAAPI entrypoint; auto = full-feature then VDEnc
-fallback for modern Intel), `PUNKTFUNK_GAMESCOPE_APP=...`,
+fallback for modern Intel), `PUNKTFUNK_NV12=0` (opt OUT of the default GPU RGB→NV12 convert on the
+NVIDIA tiled zero-copy path), `PUNKTFUNK_INTRA_REFRESH=1` (opt-in NVENC intra-refresh loss recovery),
+`PUNKTFUNK_PIN_CLOCKS=1` (opt-in NVML GPU clock floor, root-gated), `PUNKTFUNK_GAMESCOPE_APP=...`,
 `PUNKTFUNK_INPUT_BACKEND=...`, `PUNKTFUNK_PERF=1` (per-stage timing), `PUNKTFUNK_VIDEO_DROP=N` (FEC
 test), `PUNKTFUNK_FEC_PCT=N`, `PUNKTFUNK_DSCP=1` (opt-in DSCP/SO_PRIORITY media QoS on the data +
 GameStream video/audio sockets; no-op on the wire on Windows without a qWAVE policy),

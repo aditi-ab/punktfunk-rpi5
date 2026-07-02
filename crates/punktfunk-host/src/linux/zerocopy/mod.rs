@@ -63,12 +63,14 @@ pub fn enabled() -> bool {
     }
 }
 
-/// Whether the NV12 convert path is opted in (`PUNKTFUNK_NV12` truthy). When set AND the zero-copy
-/// tiled-GL path is active, the capturer produces native NV12 (BT.709 limited range) on the GPU and
-/// feeds NVENC YUV directly — deleting NVENC's internal RGB→YUV CSC (Tier 2A). Off by default: the
-/// existing RGB/BGRx path is then 100% unchanged.
+/// Whether the tiled-GL zero-copy path converts to NV12 on the GPU and feeds NVENC native YUV —
+/// deleting NVENC's internal RGB→YUV CSC, which otherwise runs on the SM/3D engine the game
+/// saturates (Tier 2A). **Default ON** (validated color-correct on the RTX 5070 Ti via
+/// `nv12-selftest` + live decode on dev + Bazzite/KWin boxes; latency- and CPU-neutral idle,
+/// frees SM headroom under load — the same default the Windows host ships). `PUNKTFUNK_NV12=0`
+/// restores the RGB/BGRx feed. LINEAR (gamescope/Vulkan-bridge) captures are unaffected either way.
 pub fn nv12_enabled() -> bool {
-    flag("PUNKTFUNK_NV12")
+    flag_opt("PUNKTFUNK_NV12").unwrap_or(true)
 }
 
 /// DRM FourCC for a packed 32-bit format name (little-endian, e.g. `b"XR24"`).
