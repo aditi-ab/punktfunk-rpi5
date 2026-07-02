@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "latency-probe"
-version = "0.4.2"
+version = "0.5.0"
 
 [[package]]
 name = "lazy_static"
@@ -2136,7 +2136,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "loss-harness"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "punktfunk-core",
 ]
@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-android"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "android_logger",
  "jni",
@@ -2743,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-linux"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2765,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-windows"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2788,7 +2788,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-core"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-host"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2885,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-probe"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "mdns-sd",
