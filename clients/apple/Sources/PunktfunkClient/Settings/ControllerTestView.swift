@@ -255,6 +255,10 @@ struct ControllerTestView: View {
                 Toggle("Light motor (right)", isOn: $lightOn)
                 Label("Backend: \(tester.rumbleBackend)", systemImage: "waveform")
                     .font(.geist(12, relativeTo: .caption)).foregroundStyle(.secondary)
+                if let problem = tester.rumbleHealth {
+                    Label(problem, systemImage: "exclamationmark.triangle.fill")
+                        .font(.geist(12, relativeTo: .caption)).foregroundStyle(.orange)
+                }
                 Text("Toggle a motor to feel it. The host maps a game's low/high-frequency "
                     + "rumble onto these two. A DualSense is driven over raw HID (CoreHaptics "
                     + "can't reach its motors on macOS).")

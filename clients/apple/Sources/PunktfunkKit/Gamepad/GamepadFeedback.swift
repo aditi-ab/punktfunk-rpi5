@@ -25,7 +25,7 @@ public final class GamepadFeedback {
     private let flag = StopFlag()
     private let drainDone = DispatchSemaphore(value: 0)
     private var drainStarted = false
-    private let rumble = RumbleRenderer()
+    private let rumble = RumbleRenderer(policy: .session)
     private var activeSub: AnyCancellable?
 
     // Last applied feedback (main-actor) — replayed when the active controller changes.
@@ -82,8 +82,21 @@ public final class GamepadFeedback {
                     // poll here starved it and throttled HDR to ~1 fps (SDR, which never drains HDR
                     // meta, was unaffected). Pacing with a short sleep OUTSIDE the lock (below) keeps
                     // rumble/HID latency low while leaving the lock free between polls.
-                    if let r = try connection.nextRumble(timeoutMs: 0), r.pad == 0 {
-                        self?.rumble.apply(low: r.low, high: r.high)
+                    //
+                    // Rumble is idempotent state, so drain the plane DRY and apply only the newest
+                    // level. The old one-datagram-per-cycle shape let a burst outpace the ~125 Hz
+                    // drain: levels rendered up to ~130 ms late through the core's 16-deep queue,
+                    // and its drop-newest overflow could shed a stop while stale nonzero states
+                    // queued ahead of it — buzzing until the host's next 500 ms refresh.
+                    var newest: (low: UInt16, high: UInt16)?
+                    var rumbleBurst = 0
+                    while rumbleBurst < 64, !flag.isStopped,
+                          let r = try connection.nextRumble(timeoutMs: 0) {
+                        if r.pad == 0 { newest = (r.low, r.high) }
+                        rumbleBurst += 1
+                    }
+                    if let n = newest {
+                        self?.rumble.apply(low: n.low, high: n.high)
                     }
                     // Drain a BOUNDED burst of hidout events so sustained 0xCD traffic (a game writing
                     // per-frame LED/trigger reports) can't spin here or block stop() past one cycle.

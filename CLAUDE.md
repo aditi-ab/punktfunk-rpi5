@@ -172,7 +172,19 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    player LEDs / adaptive triggers → `GCDeviceLight`/`playerIndex`/
    `GCDualSenseAdaptiveTrigger` via the table-driven `DualSenseTriggerEffect` parser).
    Loopback-tested end to end (`PUNKTFUNK_TEST_FEEDBACK=1` scripted burst); DualSense
-   motion sign/scale derived, not yet live-verified. **Gamepad UI (iOS/iPadOS + macOS,
+   motion sign/scale derived, not yet live-verified. **Rumble renderer rewritten
+   (2026-07-02, `RumbleRenderer.swift`)** around "rumble is idempotent state, divergence
+   must be bounded": the old per-datagram infinite-duration CoreHaptics players could leak
+   one dropped async `stop` into a forever-buzzing motor (the stuck-rumble-after-menu bug)
+   — now finite self-expiring segments with seamless engine-timeline re-arm, newest-wins
+   dry drain of the 0xCA plane (was 1 datagram/8 ms), dedupe of the host's 500 ms state
+   refreshes, zero-immediate/ramp-throttled rebakes, escalation to `engine.stop()` on a
+   throwing player stop, and a 1.6 s staleness watchdog (`Policy.session`; the settings
+   test panel uses `.manual` = hold). Controller engines use **plain `makePlayer` — never
+   `makeAdvancedPlayer`**: the controller haptics server (gamecontrollerd) advertises
+   `adv players: 0`, and iOS 27 beta 2 hard-drops advanced-player loads (XPC decode fault →
+   CoreHaptics -4811/4097, rumble silently dead). Unit-tested (`RumbleTuningTests`);
+   stuck-rumble repro on-glass revalidation pending. **Gamepad UI (iOS/iPadOS + macOS,
    2026-07-02 rework):** a connected pad swaps the home for a console-style launcher
    (`Home/Gamepad*` + `Settings/GamepadSettingsView`) — host carousel with a trailing Add
    Host tile (A connect · Y library · X settings · B back), a controller-navigable

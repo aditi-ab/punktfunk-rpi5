@@ -10,12 +10,19 @@ import GameController
 /// a passing test exercises the exact code a session runs.
 @MainActor
 public final class ControllerTester: ObservableObject {
-    private let renderer = RumbleRenderer()
+    // `.manual`: the panel's toggles hold a level until changed — no session wire refreshes
+    // exist here to keep the renderer's staleness watchdog fed.
+    private let renderer = RumbleRenderer(policy: .manual)
     private weak var controller: GCController?
 
     /// The rumble backend now in use — "DualSense HID · USB/Bluetooth", "CoreHaptics", or "—" —
     /// for the test panel to display so it's obvious which path a given pad takes.
     @Published public private(set) var rumbleBackend = "—"
+
+    /// Why rumble structurally cannot work right now (nil = healthy) — e.g. the device's
+    /// haptics service refusing every connection, or a pad with no rumble engine. Shown by the
+    /// test panel so silence diagnoses itself instead of reading as an app bug.
+    @Published public private(set) var rumbleHealth: String?
 
     public init() {}
 
@@ -24,9 +31,14 @@ public final class ControllerTester: ObservableObject {
     public func target(_ c: GCController?) {
         guard c !== controller else { return }
         controller = c
-        renderer.retarget(c) { [weak self] note in
-            Task { @MainActor in self?.rumbleBackend = note }
-        }
+        renderer.retarget(
+            c,
+            onBackend: { [weak self] note in
+                Task { @MainActor in self?.rumbleBackend = note }
+            },
+            onHealth: { [weak self] problem in
+                Task { @MainActor in self?.rumbleHealth = problem }
+            })
     }
 
     /// Drive both motors at 0...1 amplitudes — low = left/heavy, high = right/light — mapped to
