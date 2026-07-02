@@ -53,8 +53,8 @@ protocol, FEC, and crypto, linked into the host and every client over a stable C
 | **macOS / iOS / tvOS client** (`clients/apple`) | ✅ Streaming live: VideoToolbox decode, controllers incl. DualSense, discovery, pairing, speed test |
 | **Linux client** (`clients/linux`, GTK4) | ✅ Streaming live: FFmpeg + VAAPI zero-copy decode, PipeWire audio, SDL3 controllers; ships as Flatpak/apt/rpm/Arch |
 | **Android client** (`clients/android`, phone + TV) | ✅ Streaming live: AMediaCodec decode + HDR10, AAudio audio, controllers, discovery, pairing |
-| **Windows client** (`clients/windows`, WinUI 3) | 🟡 Stage 1 complete, ships as signed MSIX (x64 + ARM64); D3D11VA decode + HDR present pending on-glass validation |
-| **Web console + management API** (`web/`) | ✅ TanStack console over the OpenAPI mgmt API: host status, paired devices, on-demand PIN pairing |
+| **Windows client** (`clients/windows`, WinUI 3) | ✅ Streaming live: D3D11VA hardware decode on all GPU vendors (NVIDIA + Intel validated on glass) with software fallback, WASAPI audio, SDL3 controllers, discovery, pairing; ships as signed MSIX (x64 + ARM64). HDR10 implemented, on-glass validation pending |
+| **Web console + management API** (`web/`) | ✅ TanStack console over the OpenAPI mgmt API: host status, paired devices, on-demand PIN pairing, GPU selection, performance capture graphs, live host logs |
 
 The **GameStream host works with a stock Moonlight client** — validated live on NVIDIA hardware
 (RTX 5070 Ti, RTX 4090): PIN pairing that persists across restarts, an app catalog, RTSP/ENet/audio,
@@ -135,7 +135,7 @@ clients/
   android/  Android phone + TV app (Kotlin · Rust JNI core · AMediaCodec · AAudio)
   probe/    headless reference / measurement client for punktfunk/1
   decky/    Steam Deck Decky plugin
-web/                         web console (TanStack) over the management API — status · devices · pairing
+web/                         web console (TanStack) over the management API — status · devices · pairing · GPUs · performance · logs
 packaging/                   apt · rpm / COPR · Arch · Flatpak · Bazzite bootc image
 docs-site/                   public documentation site (Fumadocs) — https://docs.punktfunk.unom.io
 design/                        design notes & deep-dive plans (index: design/README.md)
