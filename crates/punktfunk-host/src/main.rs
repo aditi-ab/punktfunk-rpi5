@@ -45,6 +45,9 @@ mod library;
 mod mgmt;
 mod mgmt_token;
 mod native_pairing;
+#[cfg(target_os = "linux")]
+#[path = "linux/nvclocks.rs"]
+mod nvclocks;
 mod pipeline;
 mod punktfunk1;
 mod pwinit;
@@ -126,6 +129,15 @@ fn real_main() -> Result<()> {
     // capture GPU — the ACCESS_LOST churn fix. Idempotent (Once); harmless on non-hybrid boxes.
     #[cfg(target_os = "windows")]
     crate::capture::dxgi::install_gpu_pref_hook();
+
+    // NVIDIA clock hygiene (Linux, host subcommands only): install the P2-cap driver profile and,
+    // under PUNKTFUNK_PIN_CLOCKS, hold the NVML core-clock floor for the host lifetime (reset on
+    // exit via the guard's Drop). No-op off NVIDIA / on the tool subcommands.
+    #[cfg(target_os = "linux")]
+    let _nv_clocks = match args.first().map(String::as_str) {
+        Some("serve") | Some("punktfunk1-host") => nvclocks::on_host_start(),
+        _ => None,
+    };
 
     match args.first().map(String::as_str) {
         // The host: the native punktfunk/1 plane + management API by default (secure), and — with
