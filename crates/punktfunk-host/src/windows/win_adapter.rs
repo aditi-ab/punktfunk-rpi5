@@ -5,58 +5,35 @@
 //! (IDD-push) and the pf-vdisplay backend depend on it as a *peer* instead of reaching into the SudoVDA
 //! module — breaking that circular reach-in, which let the SudoVDA backend be dropped without losing this
 //! helper (audit §9 / Goal 2 — done). This is the plan's `windows/adapter.rs`.
+//!
+//! The selection logic itself now lives in [`crate::gpu`] (shared with the mgmt API's GPU
+//! endpoints): **operator preference (web console) > `PUNKTFUNK_RENDER_ADAPTER` substring > max
+//! `DedicatedVideoMemory`**, WARP/Basic-Render always excluded. This wrapper is the LUID-shaped
+//! view of it, plus the per-decision logging (call sites are per-session, never per-frame).
 
 use windows::Win32::Foundation::LUID;
 
-/// Pick the discrete render GPU LUID: the adapter with the most `DedicatedVideoMemory`, skipping
-/// WARP / Basic-Render and the SudoVDA software adapter (≈0 VRAM). `PUNKTFUNK_RENDER_ADAPTER=<substring>`
-/// forces a match by Description (Apollo's `adapter_name`). Used by the IDD direct-push capturer (to
-/// create its shared textures on the same discrete GPU it pins, where NVENC runs) and SET_RENDER_ADAPTER.
-///
-/// # Safety
-/// Creates + enumerates a DXGI factory; the COM calls run in the caller's apartment (the existing callers
-/// already satisfy this).
-pub(crate) unsafe fn resolve_render_adapter_luid() -> Option<LUID> {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
-    let want = crate::config::config()
-        .render_adapter
-        .clone()
-        .filter(|s| !s.is_empty());
-    let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-    let mut best: Option<(LUID, u64, String)> = None;
-    let mut i = 0u32;
-    while let Ok(a) = factory.EnumAdapters1(i) {
-        i += 1;
-        let Ok(d) = a.GetDesc1() else { continue };
-        let name = String::from_utf16_lossy(&d.Description);
-        let name = name.trim_end_matches('\u{0}').to_string();
-        let lname = name.to_ascii_lowercase();
-        if lname.contains("basic render") || lname.contains("warp") {
-            continue; // never pin to the software rasterizer
-        }
-        if let Some(w) = &want {
-            if lname.contains(&w.to_ascii_lowercase()) {
-                tracing::info!(
-                    adapter = name,
-                    "render adapter chosen by PUNKTFUNK_RENDER_ADAPTER"
-                );
-                return Some(d.AdapterLuid);
-            }
-            continue;
-        }
-        let vram = d.DedicatedVideoMemory as u64; // SudoVDA software adapter ≈ 0 → loses to the dGPU
-        if best.as_ref().is_none_or(|(_, v, _)| vram > *v) {
-            best = Some((d.AdapterLuid, vram, name));
-        }
-    }
-    match best {
-        Some((luid, vram, name)) => {
+/// Pick the render GPU LUID the pipeline is created on: the IDD-push capturer's shared-texture
+/// ring, the IddCx SET_RENDER_ADAPTER pin, and (via the captured frame's device) NVENC/AMF/QSV all
+/// follow this one decision — see [`crate::gpu::selected_gpu`] for the precedence. A configured
+/// preference that doesn't match a present GPU falls back to auto selection (with a warning)
+/// rather than returning `None`, so a stale preference never stops the host from streaming.
+pub(crate) fn resolve_render_adapter_luid() -> Option<LUID> {
+    match crate::gpu::selected_gpu() {
+        Some(sel) => {
             tracing::info!(
-                adapter = name,
-                vram_mb = vram / (1024 * 1024),
-                "render adapter chosen (max VRAM)"
+                adapter = sel.info.name,
+                vram_mb = sel.info.vram_bytes / (1024 * 1024),
+                source = sel.source.tag(),
+                "render adapter selected"
             );
-            Some(luid)
+            if sel.source == crate::gpu::PickSource::PreferenceMissing {
+                tracing::warn!(
+                    "the preferred GPU is not present — auto-selected the adapter above \
+                     (fix or clear the preference in the web console)"
+                );
+            }
+            Some(sel.info.luid())
         }
         None => {
             tracing::warn!("no suitable render adapter found for SET_RENDER_ADAPTER");

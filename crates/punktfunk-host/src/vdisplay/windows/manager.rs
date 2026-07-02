@@ -672,15 +672,14 @@ fn idd_push_mode() -> bool {
 /// on a hybrid box). `None` = let the IDD use its natural adapter (Apollo parity — avoids the cross-GPU
 /// ACCESS_LOST storm SudoVDA hit when pinned).
 fn resolve_render_pin() -> Option<LUID> {
-    if crate::config::config().render_adapter.is_some() {
-        // SAFETY: `resolve_render_adapter_luid` is `unsafe` only for its DXGI factory FFI; it takes no
-        // arguments and returns an `Option<LUID>` by value, so there is no input/borrow to keep valid.
-        unsafe { crate::win_adapter::resolve_render_adapter_luid() }
+    // A web-console manual GPU preference pins exactly like PUNKTFUNK_RENDER_ADAPTER: the whole
+    // pipeline (driver render device, capture ring, encoder) must sit on the chosen adapter.
+    let manual_pref = crate::gpu::prefs().get().mode == crate::gpu::GpuMode::Manual;
+    if crate::config::config().render_adapter.is_some() || manual_pref {
+        crate::win_adapter::resolve_render_adapter_luid()
     } else if crate::config::config().idd_push {
         tracing::info!("IDD push: pinning the discrete render GPU (SET_RENDER_ADAPTER)");
-        // SAFETY: as above — `resolve_render_adapter_luid` takes no arguments and returns an
-        // `Option<LUID>` by value; the `unsafe` covers only its DXGI factory enumeration FFI.
-        unsafe { crate::win_adapter::resolve_render_adapter_luid() }
+        crate::win_adapter::resolve_render_adapter_luid()
     } else {
         tracing::info!(
             "SET_RENDER_ADAPTER skipped (Apollo-parity: no render pin; set PUNKTFUNK_RENDER_ADAPTER=<name> to force one)"

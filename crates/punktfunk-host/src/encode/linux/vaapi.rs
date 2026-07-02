@@ -50,10 +50,13 @@ const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
 }
 
-/// The render node a VAAPI/DRM device should open. `PUNKTFUNK_RENDER_NODE` pins it on a multi-GPU
-/// box; the default is correct on a single-GPU host.
+/// The render node a VAAPI/DRM device should open, from [`crate::gpu::linux_render_node`]: a
+/// matched web-console GPU preference pins it, else `PUNKTFUNK_RENDER_NODE`, else the single-GPU
+/// default.
 fn render_node() -> CString {
-    let p = std::env::var("PUNKTFUNK_RENDER_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+    let p = crate::gpu::linux_render_node()
+        .to_string_lossy()
+        .into_owned();
     CString::new(p).unwrap_or_else(|_| CString::new("/dev/dri/renderD128").unwrap())
 }
 

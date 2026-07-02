@@ -254,6 +254,11 @@ pub fn probe_can_encode_444(_vendor: WinVendor, _codec: Codec) -> bool {
 }
 
 pub fn probe_can_encode(vendor: WinVendor, codec: Codec) -> bool {
+    // Deliberately NOT pinned to the selected render adapter (unlike `nvenc::probe_can_encode_444`):
+    // the system-input probe passes no hwdevice, and the AMF/QSV runtimes only ever bind their own
+    // vendor's silicon — on a mixed-vendor box the probe lands on the right GPU by construction.
+    // Only a two-same-vendor-GPU box could probe the wrong card (accepted; results are cached per
+    // selected GPU in `windows_codec_support`, so a fix here slots in without churn).
     if ffmpeg::init().is_err() {
         return false;
     }

@@ -1,5 +1,5 @@
 import Section from "@unom/ui/section";
-import type { FC } from "react";
+import type { FC, ReactNode } from "react";
 import type { AvailableCompositor } from "@/api/gen/model/availableCompositor";
 import type { HostInfo } from "@/api/gen/model/hostInfo";
 import { QueryState } from "@/components/query-state";
@@ -11,7 +11,9 @@ import { m } from "@/paraglide/messages";
 export const HostView: FC<{
 	host: Loadable<HostInfo>;
 	compositors: Loadable<AvailableCompositor[]>;
-}> = ({ host, compositors }) => {
+	/** The GPU inventory/selection card (a self-contained container — see `GpuCard.tsx`). */
+	gpu?: ReactNode;
+}> = ({ host, compositors, gpu }) => {
 	const h = host.data;
 	return (
 		<Section maxWidth={false}>
@@ -76,6 +78,8 @@ export const HostView: FC<{
 						</div>
 					)}
 				</QueryState>
+
+				{gpu}
 
 				<Card>
 					<CardHeader>

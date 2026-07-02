@@ -1020,11 +1020,9 @@ pub fn spawn_observer(target: WinCaptureTarget, preferred: Option<(u32, u32, u32
     });
 }
 
-/// The discrete render GPU LUID (where NVENC runs), falling back to the monitor's `OsAdapterLuid`.
+/// The selected render GPU LUID (where the encoder runs), falling back to the monitor's `OsAdapterLuid`.
 fn resolve_render_adapter_luid_or(fallback_packed: i64) -> LUID {
-    // SAFETY: `resolve_render_adapter_luid` is an `unsafe fn` (it enumerates DXGI adapters) that takes no
-    // arguments and returns an owned `Option<LUID>`, borrowing nothing.
-    if let Some(l) = unsafe { crate::win_adapter::resolve_render_adapter_luid() } {
+    if let Some(l) = crate::win_adapter::resolve_render_adapter_luid() {
         return l;
     }
     LUID {

@@ -260,6 +260,127 @@ pub fn open_video(
     bit_depth: u8,
     chroma: ChromaFormat,
 ) -> Result<Box<dyn Encoder>> {
+    let inner = open_video_backend(
+        codec,
+        format,
+        width,
+        height,
+        fps,
+        bitrate_bps,
+        cuda,
+        bit_depth,
+        chroma,
+    )?;
+    // Record what this session encodes on (the mgmt API's "currently used GPU"): the backend label
+    // mirrors the dispatch `open_video_backend` just took, the GPU identity is the same selection
+    // the capturer was created on ([`crate::gpu::selected_gpu`]). Dropping the returned encoder
+    // ends the record, so the live count is correct by construction.
+    let backend = resolved_backend_label(cuda);
+    let gpu = if backend == "software" {
+        crate::gpu::ActiveGpu {
+            id: String::new(),
+            name: "CPU (openh264)".into(),
+            vendor_id: 0,
+            backend,
+        }
+    } else {
+        match crate::gpu::selected_gpu() {
+            Some(sel) => crate::gpu::ActiveGpu {
+                id: sel.info.id,
+                name: sel.info.name,
+                vendor_id: sel.info.vendor_id,
+                backend,
+            },
+            None => crate::gpu::ActiveGpu {
+                id: String::new(),
+                name: "GPU".into(),
+                vendor_id: 0,
+                backend,
+            },
+        }
+    };
+    Ok(Box::new(TrackedEncoder {
+        inner,
+        _session: crate::gpu::session_begin(gpu),
+    }))
+}
+
+/// The display label of the backend [`open_video_backend`] resolves — kept in lockstep with its
+/// dispatch (`windows_resolved_backend` on Windows; the `PUNKTFUNK_ENCODER`/auto match on Linux).
+#[cfg(target_os = "windows")]
+fn resolved_backend_label(_cuda: bool) -> &'static str {
+    match windows_resolved_backend() {
+        WindowsBackend::Nvenc => "nvenc",
+        WindowsBackend::Amf => "amf",
+        WindowsBackend::Qsv => "qsv",
+        WindowsBackend::Software => "software",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolved_backend_label(cuda: bool) -> &'static str {
+    match crate::config::config().encoder_pref.as_str() {
+        "nvenc" | "nvidia" | "cuda" => "nvenc",
+        "vaapi" | "amd" | "intel" => "vaapi",
+        "software" | "sw" | "openh264" => "software",
+        _ => {
+            if cuda || !linux_auto_is_vaapi() {
+                "nvenc"
+            } else {
+                "vaapi"
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn resolved_backend_label(_cuda: bool) -> &'static str {
+    "none"
+}
+
+/// Ties the [`crate::gpu`] live-session record to the encoder's lifetime; pure delegation
+/// otherwise.
+struct TrackedEncoder {
+    inner: Box<dyn Encoder>,
+    _session: crate::gpu::ActiveSession,
+}
+
+impl Encoder for TrackedEncoder {
+    fn submit(&mut self, frame: &CapturedFrame) -> Result<()> {
+        self.inner.submit(frame)
+    }
+    fn caps(&self) -> EncoderCaps {
+        self.inner.caps()
+    }
+    fn request_keyframe(&mut self) {
+        self.inner.request_keyframe()
+    }
+    fn set_hdr_meta(&mut self, meta: Option<punktfunk_core::quic::HdrMeta>) {
+        self.inner.set_hdr_meta(meta)
+    }
+    fn invalidate_ref_frames(&mut self, first_frame: i64, last_frame: i64) -> bool {
+        self.inner.invalidate_ref_frames(first_frame, last_frame)
+    }
+    fn poll(&mut self) -> Result<Option<EncodedFrame>> {
+        self.inner.poll()
+    }
+    fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_video_backend(
+    codec: Codec,
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u64,
+    cuda: bool,
+    bit_depth: u8,
+    chroma: ChromaFormat,
+) -> Result<Box<dyn Encoder>> {
     validate_dimensions(codec, width, height)?;
     // Refresh/fps must be positive and sane: fps feeds the encoder time_base (`Rational(1, fps)`)
     // and the pts→ns conversion (`pts * 1e9 / fps`), so 0 builds a 1/0 rational / divides by zero.
@@ -330,9 +451,10 @@ pub fn open_video(
                     .map(|e| Box::new(e) as Box<dyn Encoder>)
             }
             "auto" | "" => {
-                // A CUDA frame can ONLY be consumed by NVENC, and a box with the NVIDIA device
-                // nodes always prefers it. Everything else (AMD/Intel) takes the VAAPI path.
-                if cuda || nvidia_present() {
+                // A CUDA frame can ONLY be consumed by NVENC. Otherwise the shared auto decision
+                // (manual web-console GPU preference, else the NVIDIA-presence probe) picks the
+                // backend — see `linux_auto_is_vaapi`.
+                if cuda || !linux_auto_is_vaapi() {
                     open_nvenc_probed(
                         codec,
                         format,
@@ -357,8 +479,30 @@ pub fn open_video(
     {
         let _ = cuda; // always false on Windows (no Cuda payload)
                       // NVIDIA → NVENC (direct SDK), AMD → AMF, Intel → QSV (both libavcodec), else → software
-                      // H.264. `auto` (the default) resolves from the DXGI adapter vendor.
-        match windows_resolved_backend() {
+                      // H.264. `auto` (the default) resolves from the selected render adapter's vendor.
+        let backend = windows_resolved_backend();
+        // With `auto` the backend is derived from the selected GPU, so this can only fire when an
+        // explicit PUNKTFUNK_ENCODER contradicts the GPU the pipeline sits on (e.g. `nvenc` forced
+        // while the web-console preference pins the Intel iGPU) — the open below will then fail on
+        // a wrong-vendor device; say why up front instead of leaving an opaque encoder error.
+        if let Some(sel) = crate::gpu::selected_gpu() {
+            let mismatched = match backend {
+                WindowsBackend::Nvenc => sel.info.vendor_id != crate::gpu::VENDOR_NVIDIA,
+                WindowsBackend::Amf => sel.info.vendor_id != crate::gpu::VENDOR_AMD,
+                WindowsBackend::Qsv => sel.info.vendor_id != crate::gpu::VENDOR_INTEL,
+                WindowsBackend::Software => false,
+            };
+            if mismatched {
+                tracing::warn!(
+                    adapter = sel.info.name,
+                    ?backend,
+                    "encoder backend does not match the selected GPU's vendor (explicit \
+                     PUNKTFUNK_ENCODER conflicting with the GPU preference?) — the encoder \
+                     open will likely fail on this device"
+                );
+            }
+        }
+        match backend {
             WindowsBackend::Nvenc => {
                 // Hardware path: NVENC over D3D11. The DXGI capturer switches to its zero-copy
                 // FramePayload::D3d11 output under the same env var so capture + encode share textures.
@@ -422,8 +566,8 @@ pub fn open_video(
                     "the Windows software encoder supports H.264 only; client negotiated {codec:?} \
                      (build a GPU backend: --features nvenc or amf-qsv, or request H264)"
                 );
-                let _ = bit_depth; // the software H.264 path is 8-bit only
-                                   // Software H.264 realistically caps far below the negotiated hardware rates.
+                let _ = (bit_depth, chroma); // the software H.264 path is 8-bit 4:2:0 only
+                                             // Software H.264 realistically caps far below the negotiated hardware rates.
                 const SW_BITRATE_CEIL: u64 = 100_000_000;
                 sw::OpenH264Encoder::open(
                     format,
@@ -518,6 +662,22 @@ fn nvidia_present() -> bool {
     std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/nvidia0").exists()
 }
 
+/// The `auto` Linux backend decision, shared by [`open_video`] and [`linux_zero_copy_is_vaapi`]:
+/// a manual web-console GPU preference (when that GPU is present — [`crate::gpu::manual_selection`])
+/// picks its vendor's backend — AMD/Intel → VAAPI on that GPU's render node, NVIDIA → NVENC (still
+/// requiring the proprietary driver's device nodes; a nouveau NVIDIA GPU can't NVENC) — otherwise
+/// today's NVIDIA-presence probe, unchanged.
+#[cfg(target_os = "linux")]
+fn linux_auto_is_vaapi() -> bool {
+    if let Some(g) = crate::gpu::manual_selection() {
+        if g.vendor_id == crate::gpu::VENDOR_NVIDIA {
+            return !nvidia_present();
+        }
+        return true;
+    }
+    !nvidia_present()
+}
+
 /// True if the Linux GPU encode backend resolves to VAAPI (AMD/Intel) rather than NVENC — mirrors
 /// [`open_video`]'s dispatch so the capturer can choose the matching zero-copy path (raw dmabuf
 /// passthrough for VAAPI vs the EGL→CUDA import for NVENC).
@@ -526,7 +686,7 @@ pub fn linux_zero_copy_is_vaapi() -> bool {
     match crate::config::config().encoder_pref.as_str() {
         "nvenc" | "nvidia" | "cuda" => false,
         "vaapi" | "amd" | "intel" => true,
-        _ => !nvidia_present(),
+        _ => linux_auto_is_vaapi(),
     }
 }
 
@@ -571,56 +731,63 @@ pub fn vaapi_codec_support() -> CodecSupport {
 /// so it must be probed, never assumed). Non-HEVC codecs are always `false`.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn can_encode_444(codec: Codec) -> bool {
-    use std::sync::OnceLock;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
     if codec != Codec::H265 {
         return false;
     }
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        let supported = {
-            #[cfg(target_os = "linux")]
-            {
-                // Mirror open_video's backend dispatch: VAAPI (AMD/Intel) vs NVENC (NVIDIA).
-                if linux_zero_copy_is_vaapi() {
-                    vaapi::probe_can_encode_444(codec)
-                } else {
-                    linux::probe_can_encode_444(codec)
-                }
+    // Cached per selected GPU (was a process-lifetime OnceLock): a web-console preference change
+    // re-probes on the newly selected adapter before the next Welcome.
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let key = crate::gpu::selection_key();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return *v;
+    }
+    let supported = {
+        #[cfg(target_os = "linux")]
+        {
+            // Mirror open_video's backend dispatch: VAAPI (AMD/Intel) vs NVENC (NVIDIA).
+            if linux_zero_copy_is_vaapi() {
+                vaapi::probe_can_encode_444(codec)
+            } else {
+                linux::probe_can_encode_444(codec)
             }
-            #[cfg(target_os = "windows")]
-            {
-                match windows_resolved_backend() {
-                    WindowsBackend::Nvenc => {
-                        #[cfg(feature = "nvenc")]
-                        {
-                            nvenc::probe_can_encode_444(codec)
-                        }
-                        #[cfg(not(feature = "nvenc"))]
-                        {
-                            false
-                        }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            match windows_resolved_backend() {
+                WindowsBackend::Nvenc => {
+                    #[cfg(feature = "nvenc")]
+                    {
+                        nvenc::probe_can_encode_444(codec)
                     }
-                    WindowsBackend::Amf | WindowsBackend::Qsv => {
-                        #[cfg(feature = "amf-qsv")]
-                        {
-                            let vendor = match windows_resolved_backend() {
-                                WindowsBackend::Qsv => ffmpeg_win::WinVendor::Qsv,
-                                _ => ffmpeg_win::WinVendor::Amf,
-                            };
-                            ffmpeg_win::probe_can_encode_444(vendor, codec)
-                        }
-                        #[cfg(not(feature = "amf-qsv"))]
-                        {
-                            false
-                        }
+                    #[cfg(not(feature = "nvenc"))]
+                    {
+                        false
                     }
-                    WindowsBackend::Software => false,
                 }
+                WindowsBackend::Amf | WindowsBackend::Qsv => {
+                    #[cfg(feature = "amf-qsv")]
+                    {
+                        let vendor = match windows_resolved_backend() {
+                            WindowsBackend::Qsv => ffmpeg_win::WinVendor::Qsv,
+                            _ => ffmpeg_win::WinVendor::Amf,
+                        };
+                        ffmpeg_win::probe_can_encode_444(vendor, codec)
+                    }
+                    #[cfg(not(feature = "amf-qsv"))]
+                    {
+                        false
+                    }
+                }
+                WindowsBackend::Software => false,
             }
-        };
-        tracing::info!(supported, "HEVC 4:4:4 encode capability probed");
-        supported
-    })
+        }
+    };
+    tracing::info!(supported, "HEVC 4:4:4 encode capability probed");
+    cache.lock().unwrap().insert(key, supported);
+    supported
 }
 
 /// Non-Linux/Windows (the macOS dev/test build of the host — synthetic-source loopback only):
@@ -632,7 +799,9 @@ pub fn can_encode_444(_codec: Codec) -> bool {
 
 // ---------------------------------------------------------------------------------------------
 // Windows backend selection (the analogue of the Linux nvidia_present / linux_zero_copy_is_vaapi
-// logic). NVIDIA → NVENC, AMD → AMF, Intel → QSV; `auto` (default) reads the DXGI adapter vendor.
+// logic). NVIDIA → NVENC, AMD → AMF, Intel → QSV; `auto` (default) reads the vendor of the
+// SELECTED render adapter (crate::gpu — web-console preference / env pin / max VRAM), so the
+// backend always matches the GPU the capture ring and virtual display sit on.
 // ---------------------------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
@@ -652,8 +821,9 @@ enum GpuVendor {
     Intel,
 }
 
-/// Resolve the active Windows encode backend from `PUNKTFUNK_ENCODER` (`auto` → the DXGI adapter
-/// vendor). Shared by [`open_video`] and the GameStream codec advertisement so both agree.
+/// Resolve the active Windows encode backend from `PUNKTFUNK_ENCODER` (`auto` → the selected
+/// render adapter's vendor). Shared by [`open_video`] and the GameStream codec advertisement so
+/// both agree.
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_resolved_backend() -> WindowsBackend {
     // Resolved ONCE in HostConfig (Goal-1) — was re-read from PUNKTFUNK_ENCODER on every call.
@@ -683,72 +853,66 @@ pub fn windows_backend_is_ffmpeg() -> bool {
         )
 }
 
-/// Detect the host GPU vendor from the first hardware DXGI adapter (Windows has no `/dev/nvidia*`
-/// probe). Cached. NVIDIA=0x10DE, AMD=0x1002, Intel=0x8086; the software/WARP adapter is skipped.
+/// Detect the encode-GPU vendor from the **selected render adapter** ([`crate::gpu::selected_gpu`]:
+/// web-console preference > `PUNKTFUNK_RENDER_ADAPTER` > max VRAM) — the same adapter the capture
+/// ring and the IddCx render pin sit on, so the encoder backend can never disagree with where the
+/// captured frames live. The old first-DXGI-adapter scan did exactly that on hybrid boxes: adapter
+/// 0 is often the iGPU (e.g. Intel Arc) while capture/encode pin the dGPU — resolving QSV for a
+/// pipeline whose textures sit on the NVIDIA card. Uncached: selection is preference-dependent and
+/// only consulted at session setup / serverinfo time, never per-frame. Falls back to the first
+/// known-vendor adapter when the selected one is an unknown vendor.
 #[cfg(target_os = "windows")]
 fn windows_gpu_vendor() -> Option<GpuVendor> {
-    use std::sync::OnceLock;
-    use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
-    };
-    static CACHE: OnceLock<Option<GpuVendor>> = OnceLock::new();
-    // SAFETY: `CreateDXGIFactory1` returns a fresh owned `IDXGIFactory1` COM object (refcounted by the
-    // windows-rs wrapper, Released when the local drops); `.ok()?` bails on failure so `factory` is a
-    // valid interface before any use. `EnumAdapters1(i)` hands back the i-th adapter as an owned
-    // `IDXGIAdapter1` (or an error past the last adapter, which ends the loop). `GetDesc1()` returns the
-    // `DXGI_ADAPTER_DESC1` by value (no out-pointer), so reading `desc.Flags`/`desc.VendorId` is plain
-    // field access. Every call only touches COM objects this closure owns; the `OnceLock` runs the
-    // closure once (no data race) and all interfaces are Released as the locals drop. No raw pointer is
-    // dereferenced and nothing is aliased.
-    *CACHE.get_or_init(|| unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let mut i = 0u32;
-        while let Ok(adapter) = factory.EnumAdapters1(i) {
-            i += 1;
-            // windows-rs 0.62: GetDesc1 returns the desc by value (no out-param).
-            let Ok(desc) = adapter.GetDesc1() else {
-                continue;
-            };
-            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
-                continue; // skip the Microsoft Basic Render / WARP adapter
-            }
-            match desc.VendorId {
-                0x10DE => return Some(GpuVendor::Nvidia),
-                0x1002 => return Some(GpuVendor::Amd),
-                0x8086 => return Some(GpuVendor::Intel),
-                _ => continue,
-            }
+    fn by_id(vendor_id: u32) -> Option<GpuVendor> {
+        match vendor_id {
+            crate::gpu::VENDOR_NVIDIA => Some(GpuVendor::Nvidia),
+            crate::gpu::VENDOR_AMD => Some(GpuVendor::Amd),
+            crate::gpu::VENDOR_INTEL => Some(GpuVendor::Intel),
+            _ => None,
         }
-        None
+    }
+    let sel = crate::gpu::selected_gpu()?;
+    by_id(sel.info.vendor_id).or_else(|| {
+        crate::gpu::enumerate()
+            .iter()
+            .find_map(|g| by_id(g.vendor_id))
     })
 }
 
-/// Probe the active Windows AMF/QSV backend for its encodable codecs (cached; opens a tiny encoder
-/// per codec, once). Mirrors [`vaapi_codec_support`]; called only when [`windows_backend_is_ffmpeg`]
-/// is true. AV1 is narrow (AMD RDNA3+, Intel Arc/Xe2+), so it must be probed, not assumed.
+/// Probe the active Windows AMF/QSV backend for its encodable codecs (opens a tiny encoder per
+/// codec; cached **per (backend, selected GPU)** — a web-console preference change re-probes on the
+/// newly selected adapter instead of serving the old GPU's answer for the process lifetime).
+/// Mirrors [`vaapi_codec_support`]; called only when [`windows_backend_is_ffmpeg`] is true. AV1 is
+/// narrow (AMD RDNA3+, Intel Arc/Xe2+), so it must be probed, not assumed.
 #[cfg(all(target_os = "windows", feature = "amf-qsv"))]
 pub fn windows_codec_support() -> CodecSupport {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<CodecSupport> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        let vendor = match windows_resolved_backend() {
-            WindowsBackend::Qsv => ffmpeg_win::WinVendor::Qsv,
-            _ => ffmpeg_win::WinVendor::Amf,
-        };
-        let caps = CodecSupport {
-            h264: ffmpeg_win::probe_can_encode(vendor, Codec::H264),
-            h265: ffmpeg_win::probe_can_encode(vendor, Codec::H265),
-            av1: ffmpeg_win::probe_can_encode(vendor, Codec::Av1),
-        };
-        tracing::info!(
-            backend = ?vendor,
-            h264 = caps.h264,
-            h265 = caps.h265,
-            av1 = caps.av1,
-            "Windows AMF/QSV encode capabilities probed"
-        );
-        caps
-    })
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, CodecSupport>>> = OnceLock::new();
+    let vendor = match windows_resolved_backend() {
+        WindowsBackend::Qsv => ffmpeg_win::WinVendor::Qsv,
+        _ => ffmpeg_win::WinVendor::Amf,
+    };
+    let key = format!("{vendor:?}:{}", crate::gpu::selection_key());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(c) = cache.lock().unwrap().get(&key) {
+        return *c;
+    }
+    let caps = CodecSupport {
+        h264: ffmpeg_win::probe_can_encode(vendor, Codec::H264),
+        h265: ffmpeg_win::probe_can_encode(vendor, Codec::H265),
+        av1: ffmpeg_win::probe_can_encode(vendor, Codec::Av1),
+    };
+    tracing::info!(
+        backend = ?vendor,
+        h264 = caps.h264,
+        h265 = caps.h265,
+        av1 = caps.av1,
+        "Windows AMF/QSV encode capabilities probed"
+    );
+    // A concurrent first call may double-probe; both arrive at the same answer, last insert wins.
+    cache.lock().unwrap().insert(key, caps);
+    caps
 }
 
 // Goal-1 stage 6: GPU/CPU encoders confined to `encode/windows/` (NVENC, AMF/QSV ffmpeg, software) and

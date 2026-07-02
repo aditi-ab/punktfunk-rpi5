@@ -138,6 +138,100 @@
         }
       }
     },
+    "/api/v1/gpus": {
+      "get": {
+        "tags": [
+          "gpu"
+        ],
+        "summary": "GPU inventory and selection",
+        "description": "Lists the host's hardware GPUs, the persisted auto/manual preference, the GPU the next session\nwill use (and why), and the GPU live sessions encode on right now.",
+        "operationId": "listGpus",
+        "responses": {
+          "200": {
+            "description": "GPU inventory + selection state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GpuState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/gpus/preference": {
+      "put": {
+        "tags": [
+          "gpu"
+        ],
+        "summary": "Set the GPU preference",
+        "description": "`auto` restores automatic selection (`PUNKTFUNK_RENDER_ADAPTER` pin, else max dedicated VRAM);\n`manual` pins capture + encode to the given GPU. Persisted across restarts; applies to the\n**next** session (a running session keeps its GPU). If the preferred GPU is absent at session\nstart the host falls back to automatic selection rather than failing.",
+        "operationId": "setGpuPreference",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetGpuPreference"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Preference stored; the new selection state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GpuState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown mode, or `gpu_id` missing / not a listed GPU",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Preference could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/health": {
       "get": {
         "tags": [
@@ -1373,6 +1467,40 @@
   },
   "components": {
     "schemas": {
+      "ApiActiveGpu": {
+        "type": "object",
+        "description": "The GPU live sessions are encoding on right now.",
+        "required": [
+          "id",
+          "name",
+          "vendor",
+          "backend",
+          "sessions"
+        ],
+        "properties": {
+          "backend": {
+            "type": "string",
+            "description": "The encode backend in use (`nvenc` | `amf` | `qsv` | `vaapi` | `software`)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable id matching an entry of `gpus` (empty for the CPU/software encoder)."
+          },
+          "name": {
+            "type": "string"
+          },
+          "sessions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of live encode sessions on it.",
+            "minimum": 0
+          },
+          "vendor": {
+            "type": "string",
+            "description": "`nvidia` | `amd` | `intel` | `other`."
+          }
+        }
+      },
       "ApiCodec": {
         "type": "string",
         "description": "Video codec identifier.",
@@ -1391,6 +1519,64 @@
         "properties": {
           "error": {
             "type": "string"
+          }
+        }
+      },
+      "ApiGpu": {
+        "type": "object",
+        "description": "One hardware GPU on the host (software/WARP adapters are never listed).",
+        "required": [
+          "id",
+          "name",
+          "vendor",
+          "vram_mb"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable identifier (`vendorid-deviceid-occurrence`, hex PCI ids) — pass to `setGpuPreference`.\nStable across reboots and driver updates, unlike an adapter index or LUID.",
+            "example": "10de-2c05-0"
+          },
+          "name": {
+            "type": "string",
+            "description": "Adapter/marketing name.",
+            "example": "NVIDIA GeForce RTX 5070 Ti"
+          },
+          "vendor": {
+            "type": "string",
+            "description": "`nvidia` | `amd` | `intel` | `other`."
+          },
+          "vram_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Dedicated VRAM in MiB (0 where the platform doesn't expose it).",
+            "minimum": 0
+          }
+        }
+      },
+      "ApiSelectedGpu": {
+        "type": "object",
+        "description": "The GPU the **next** session's pipeline will be created on, and why. (A preference change\napplies to the next session; a running session keeps the GPU it opened on.)",
+        "required": [
+          "id",
+          "name",
+          "vendor",
+          "source"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "Why this GPU was selected: `preference` (the manual choice), `env`\n(`PUNKTFUNK_RENDER_ADAPTER`), `auto` (max dedicated VRAM / platform default), or\n`preference_missing` (a manual choice is set but that GPU is absent — auto-selected\ninstead so the host keeps streaming)."
+          },
+          "vendor": {
+            "type": "string",
+            "description": "`nvidia` | `amd` | `intel` | `other`."
           }
         }
       },
@@ -1668,6 +1854,75 @@
           },
           "title": {
             "type": "string"
+          }
+        }
+      },
+      "GpuState": {
+        "type": "object",
+        "description": "Full GPU-selection state for the console: inventory, the persisted preference, what the next\nsession will use, and what is in use right now.",
+        "required": [
+          "gpus",
+          "mode",
+          "preferred_available"
+        ],
+        "properties": {
+          "active": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApiActiveGpu",
+                "description": "The GPU live sessions use right now (absent while nothing is streaming)."
+              }
+            ]
+          },
+          "env_override": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`PUNKTFUNK_RENDER_ADAPTER` (the host.env pin), when set — it applies while `mode` is\n`auto`; a manual preference overrides it."
+          },
+          "gpus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiGpu"
+            },
+            "description": "The host's hardware GPUs."
+          },
+          "mode": {
+            "type": "string",
+            "description": "`auto` or `manual`."
+          },
+          "preferred_available": {
+            "type": "boolean",
+            "description": "Whether the preferred GPU is currently present."
+          },
+          "preferred_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The manually preferred GPU's stable id, when one is stored (kept while `mode` is `auto` so\na console can offer returning to it). May reference a GPU that is currently absent."
+          },
+          "preferred_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The stored name of the preferred GPU (a usable label even when it is absent)."
+          },
+          "selected": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApiSelectedGpu",
+                "description": "The GPU the next session will use."
+              }
+            ]
           }
         }
       },
@@ -2047,6 +2302,28 @@
           }
         }
       },
+      "SetGpuPreference": {
+        "type": "object",
+        "description": "Request body for `setGpuPreference`.",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "gpu_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required when `mode` is `manual`: the stable `id` of a currently listed GPU\n(see `listGpus`).",
+            "example": "10de-2c05-0"
+          },
+          "mode": {
+            "type": "string",
+            "description": "`auto` (env pin, else max dedicated VRAM — the default) or `manual`.",
+            "example": "manual"
+          }
+        }
+      },
       "StageTiming": {
         "type": "object",
         "description": "One pipeline stage's latency in an aggregation window (microseconds).",
@@ -2266,6 +2543,10 @@
     {
       "name": "host",
       "description": "Host identity, capabilities, and liveness"
+    },
+    {
+      "name": "gpu",
+      "description": "GPU inventory and selection: list the host's GPUs, choose automatic or a preferred GPU, see the one in use"
     },
     {
       "name": "clients",

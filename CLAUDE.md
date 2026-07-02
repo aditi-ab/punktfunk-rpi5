@@ -107,12 +107,22 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   session for secure-desktop (UAC/lock-screen) capture (`windows/service.rs`), bundles the
   pf-vdisplay driver + the FFmpeg DLLs (+ VB-CABLE for the virtual mic), and is published by
   `windows-host.yml`. **Encoder is GPU-aware** (`encode.rs` `open_video` + `windows_resolved_backend`):
-  `PUNKTFUNK_ENCODER=auto` (the host.env default) detects the DXGI adapter vendor → **NVENC** (NVIDIA,
-  direct SDK, `encode/windows/nvenc.rs`), **AMF** (AMD) / **QSV** (Intel) via libavcodec
+  `PUNKTFUNK_ENCODER=auto` (the host.env default) reads the **selected render adapter's** vendor →
+  **NVENC** (NVIDIA, direct SDK, `encode/windows/nvenc.rs`), **AMF** (AMD) / **QSV** (Intel) via libavcodec
   (`encode/windows/ffmpeg_win.rs`, the Windows analogue of the Linux VAAPI backend — `WinVendor{Amf,Qsv}`,
   system-memory NV12/P010 readback default + opt-in zero-copy D3D11 behind `PUNKTFUNK_ZEROCOPY` with a
   system fallback), or software H.264 (`encode/sw.rs`, GPU-less). GameStream codec advertisement is
-  probed per-GPU on AMF/QSV (`windows_codec_support` → `serverinfo`, AV1 gated). **HDR (10-bit)**: WGC
+  probed per-GPU on AMF/QSV (`windows_codec_support` → `serverinfo`, AV1 gated; cached per selected
+  GPU). **Multi-GPU is first-class** (`gpu.rs`): GPU inventory + a persisted auto/manual preference
+  (`<config>/gpu-settings.json`, stored by stable PCI identity — LUIDs are per-boot) exposed over
+  `GET /api/v1/gpus` + `PUT /api/v1/gpus/preference` and a web-console GPU card (Host page: list,
+  Automatic/Prefer, "In use · backend" badge). One selection — precedence **console preference >
+  `PUNKTFUNK_RENDER_ADAPTER` > max VRAM**, graceful fallback when the preferred GPU is absent —
+  feeds `win_adapter::resolve_render_adapter_luid` (capture ring + IddCx render pin), the encoder
+  vendor auto-detect (previously DXGI adapter 0 — wrong on hybrid boxes like NVIDIA dGPU + Intel
+  Arc iGPU), and the NVENC 4:4:4 probe; a preference change applies to the next session. On Linux a
+  matched manual preference picks the VAAPI render node / NVENC-vs-VAAPI auto choice (auto mode
+  unchanged). *Implemented + unit-tested; not yet on-glass validated on the hybrid box.* **HDR (10-bit)**: WGC
   captures the HDR desktop as FP16/Rgb10a2 (DDA FP16 for the secure desktop), the encoder forces HEVC
   Main10 + BT.2020 PQ (NVENC ABGR10/P010; AMF/QSV P010 + a swscale Rgb10a2→P010 fallback), the client
   auto-detects PQ from the HEVC VUI — gated by `PUNKTFUNK_10BIT` + client `VIDEO_CAP_10BIT`; **Windows
@@ -356,7 +366,7 @@ crates/punktfunk-host/
   encode/linux/{mod,vaapi}.rs · encode/windows/{nvenc,ffmpeg_win}.rs · encode/sw.rs   per-GPU encoders (NVENC/CUDA · VAAPI · AMF/QSV) + GPU-less openh264
   capture/{linux/,windows/{dxgi,idd_push}}.rs · audio/{linux/,windows/wasapi_*}.rs
   windows/{service,install,interactive}.rs   SCM service + in-binary driver/web install
-  capture.rs · encode.rs · audio.rs · spike.rs · punktfunk1.rs · mgmt.rs · native_pairing.rs · stats_recorder.rs · library.rs
+  capture.rs · encode.rs · audio.rs · gpu.rs · spike.rs · punktfunk1.rs · mgmt.rs · native_pairing.rs · stats_recorder.rs · library.rs
 clients/probe/    punktfunk/1 reference/probe client (headless test/measurement tool)
 clients/linux/    native Linux client (GTK4/libadwaita · FFmpeg · PipeWire · SDL3)
 clients/windows/  native Windows client (WinUI 3 via windows-reactor · D3D11 · WASAPI · SDL3)
@@ -364,7 +374,7 @@ clients/apple/    native macOS/iOS/tvOS client (Swift · VideoToolbox · GameCon
 clients/android/  native Android client (Kotlin app + native/ Rust JNI core over punktfunk-core)
 clients/decky/    Steam Deck Decky plugin
 packaging/windows/drivers/{pf-vdisplay,pf-dualsense,pf-xusb}/   in-house UMDF drivers (built from source in CI)
-web/                          TanStack web console over the mgmt API (status · devices · pairing · performance graphs)
+web/                          TanStack web console over the mgmt API (status · devices · pairing · GPU selection · performance graphs)
 packaging/                    apt(deb) · RPM/COPR · Arch/sysext · Flatpak · Bazzite bootc · Windows host installer (per-dir READMEs)
 tools/{loss-harness,latency-probe}/     measurement (plan §10)
 scripts/                  60-punktfunk.rules · punktfunk-host.service · host.env.example · headless/

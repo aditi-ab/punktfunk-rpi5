@@ -32,6 +32,7 @@ mod dmabuf_fence;
 mod drm_sync;
 mod encode;
 mod gamestream;
+mod gpu;
 mod hdr;
 mod inject;
 #[cfg(target_os = "windows")]

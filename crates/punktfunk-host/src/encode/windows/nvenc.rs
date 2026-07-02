@@ -958,34 +958,59 @@ impl Drop for NvencD3d11Encoder {
 /// so the host advertises the chroma it can really encode (honest downgrade to 4:2:0 on a card without it).
 pub fn probe_can_encode_444(codec: Codec) -> bool {
     use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
+    };
     use windows::Win32::Graphics::Direct3D11::{
         D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
     };
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
     if codec != Codec::H265 {
         return false;
     }
-    // SAFETY: a self-contained probe owning every handle it creates. `D3D11CreateDevice` (HARDWARE
-    // driver, NULL adapter) fills `device` or returns Err (→ false). `open_encode_session_ex` opens an
-    // NVENC session against that device's raw pointer (valid while `device` is held) or errors (→ false,
-    // tearing nothing down). `get_encode_caps` reads one scalar cap into `val` via the loaded API table.
-    // `destroy_encoder` frees the session exactly once; `device`/its context drop with the COM wrappers.
-    // No handle escapes this call and nothing runs concurrently.
+    // SAFETY: a self-contained probe owning every handle it creates. `CreateDXGIFactory1`/
+    // `EnumAdapterByLuid` return owned COM objects or err (→ default-adapter fallback).
+    // `D3D11CreateDevice` (explicit adapter + UNKNOWN driver type, or NULL adapter + HARDWARE)
+    // fills `device` or returns Err (→ false). `open_encode_session_ex` opens an NVENC session
+    // against that device's raw pointer (valid while `device` is held) or errors (→ false, tearing
+    // nothing down). `get_encode_caps` reads one scalar cap into `val` via the loaded API table.
+    // `destroy_encoder` frees the session exactly once; `device`/its context drop with the COM
+    // wrappers. No handle escapes this call and nothing runs concurrently.
     unsafe {
+        // Probe on the SELECTED render adapter — the GPU the session will actually encode on
+        // (web-console preference / PUNKTFUNK_RENDER_ADAPTER / max VRAM). The OS default adapter
+        // (NULL) can be the *other* GPU on a hybrid box, answering for hardware we won't use.
+        let adapter: Option<IDXGIAdapter1> = crate::win_adapter::resolve_render_adapter_luid()
+            .and_then(|luid| {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+                factory.EnumAdapterByLuid(luid).ok()
+            });
         let mut device: Option<ID3D11Device> = None;
-        if D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            Some(&[D3D_FEATURE_LEVEL_11_0]),
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            None,
-        )
-        .is_err()
-        {
+        let created = match &adapter {
+            Some(a) => D3D11CreateDevice(
+                a,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            ),
+            None => D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            ),
+        };
+        if created.is_err() {
             return false;
         }
         let Some(device) = device else { return false };
