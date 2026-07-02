@@ -72,7 +72,9 @@ class MainActivity : ComponentActivity() {
                         KeyEvent.ACTION_UP -> false
                         else -> return super.dispatchKeyEvent(event)
                     }
-                    val vk = Keymap.toVk(event.keyCode)
+                    // Full-event overload: evdev scancode first (positional under ANY selected
+                    // physical-keyboard layout), keycode fallback — see Keymap docs.
+                    val vk = Keymap.toVk(event)
                     if (vk != 0) {
                         NativeBridge.nativeSendKey(handle, vk, down, 0)
                         return true // consumed — don't let the system also act on it

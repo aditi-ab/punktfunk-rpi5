@@ -1,9 +1,10 @@
 //! Input injection through the wlroots virtual-input Wayland protocols
 //! (`zwlr_virtual_pointer_manager_v1` + `zwp_virtual_keyboard_manager_v1`) — the headless-Sway
 //! path. We connect as an ordinary Wayland client (the host inherits Sway's
-//! `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`), bind the two managers, upload a standard evdev/US xkb
-//! keymap, and translate events into virtual pointer/keyboard requests, tracking modifier state
-//! so the compositor resolves shifted keysyms correctly.
+//! `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`), bind the two managers, upload an xkb keymap for the
+//! virtual keyboard (the host's layout via the standard `XKB_DEFAULT_LAYOUT` et al., defaulting
+//! to evdev/US), and translate events into virtual pointer/keyboard requests, tracking modifier
+//! state so the compositor resolves shifted keysyms correctly.
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -133,18 +134,20 @@ impl WlrootsInjector {
         );
         let keyboard = keyboard_mgr.create_virtual_keyboard(&seat, &qh, ());
 
-        // A standard evdev/US keymap so raw evdev keycodes resolve to the right keysyms.
+        // The keymap the compositor resolves our raw evdev keycodes with. Empty names defer to
+        // the standard `XKB_DEFAULT_RULES/MODEL/LAYOUT/VARIANT/OPTIONS` env vars, then to
+        // libxkbcommon's built-ins (evdev/pc105/us) — so a non-US host sets e.g.
+        // `XKB_DEFAULT_LAYOUT=de` and the positional wire keys render as its layout (parity with
+        // the libei path, where the session compositor's own keymap applies). Previously this
+        // hardcoded "us", which forced US characters for the OEM/umlaut keys on every layout.
         let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let keymap = xkb::Keymap::new_from_names(
-            &ctx,
-            "evdev",
-            "pc105",
-            "us",
-            "",
-            None,
-            xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .context("compile xkb keymap")?;
+        let keymap =
+            xkb::Keymap::new_from_names(&ctx, "", "", "", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS)
+                .context("compile xkb keymap (check XKB_DEFAULT_LAYOUT/VARIANT/RULES if set)")?;
+        tracing::info!(
+            layout = %std::env::var("XKB_DEFAULT_LAYOUT").unwrap_or_else(|_| "us (default)".into()),
+            "virtual keyboard keymap compiled"
+        );
         let keymap_str = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
         let xkb_state = xkb::State::new(&keymap);
 
