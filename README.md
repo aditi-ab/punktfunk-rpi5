@@ -52,7 +52,7 @@ protocol, FEC, and crypto, linked into the host and every client over a stable C
 | **Windows host** (x64) | 🟡 Implemented & shipping as a signed installer: DXGI/WGC capture · its own all-Rust IddCx **virtual display** (secure-desktop capable) · GPU encode (NVENC on NVIDIA, AMF/QSV on AMD/Intel, software H.264 without a GPU) · WASAPI audio · bundled virtual-gamepad drivers (no ViGEmBus) · HDR incl. Vulkan-game HDR. NVIDIA live-validated; AMD/Intel CI-green |
 | **macOS / iOS / tvOS client** (`clients/apple`) | ✅ Streaming live: VideoToolbox decode, controllers incl. DualSense, discovery, pairing, speed test |
 | **Linux client** (`clients/linux`, GTK4) | ✅ Streaming live: FFmpeg + VAAPI zero-copy decode, PipeWire audio, SDL3 controllers; ships as Flatpak/apt/rpm/Arch |
-| **Android client** (`clients/android`, phone + TV) | ✅ Streaming live: AMediaCodec decode + HDR10, Oboe audio, controllers, discovery, pairing |
+| **Android client** (`clients/android`, phone + TV) | ✅ Streaming live: AMediaCodec decode + HDR10, AAudio audio, controllers, discovery, pairing |
 | **Windows client** (`clients/windows`, WinUI 3) | 🟡 Stage 1 complete, ships as signed MSIX (x64 + ARM64); D3D11VA decode + HDR present pending on-glass validation |
 | **Web console + management API** (`web/`) | ✅ TanStack console over the OpenAPI mgmt API: host status, paired devices, on-demand PIN pairing |
 
@@ -132,7 +132,7 @@ clients/
   apple/    macOS / iOS / tvOS app (Swift · VideoToolbox · Metal · GameController)
   linux/    Linux desktop app (Rust · GTK4/libadwaita · FFmpeg/VAAPI · PipeWire · SDL3)
   windows/  Windows desktop app (Rust · WinUI 3 · D3D11 · WASAPI · SDL3)
-  android/  Android phone + TV app (Kotlin · Rust JNI core · AMediaCodec · Oboe)
+  android/  Android phone + TV app (Kotlin · Rust JNI core · AMediaCodec · AAudio)
   probe/    headless reference / measurement client for punktfunk/1
   decky/    Steam Deck Decky plugin
 web/                         web console (TanStack) over the management API — status · devices · pairing

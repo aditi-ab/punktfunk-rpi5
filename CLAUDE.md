@@ -143,7 +143,24 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    player LEDs / adaptive triggers → `GCDeviceLight`/`playerIndex`/
    `GCDualSenseAdaptiveTrigger` via the table-driven `DualSenseTriggerEffect` parser).
    Loopback-tested end to end (`PUNKTFUNK_TEST_FEEDBACK=1` scripted burst); DualSense
-   motion sign/scale derived, not yet live-verified. Tests: `swift test` in
+   motion sign/scale derived, not yet live-verified. **Gamepad UI (iOS/iPadOS + macOS,
+   2026-07-02 rework):** a connected pad swaps the home for a console-style launcher
+   (`Home/Gamepad*` + `Settings/GamepadSettingsView`) — host carousel with a trailing Add
+   Host tile (A connect · Y library · X settings · B back), a controller-navigable
+   settings screen (vertical `GamepadMenuList`, left/right steps values), an add-host
+   flow with an on-screen controller keyboard (`GamepadKeyboard` — no touch needed
+   anywhere), and the coverflow library, all over an animated aurora backdrop
+   (`GamepadScreenBackground`, TimelineView-driven drifting blobs — pure SwiftUI ON
+   PURPOSE: a .metal lib only reliably bundles in one of the two build systems (SPM vs
+   xcodeproj synced folders) these sources compile under). Input is the polled
+   `GamepadMenuInput` (handlers don't fire outside a stream; on (re)start it SNAPSHOTS
+   held buttons so a handoff press never double-fires), haptics dual-channel (device +
+   `MenuHaptics` on the pad). macOS: same screens, settings/add-host as sheets (no
+   fullScreenCover), NSScreen-based mode lists, scroll indicators `.never` (macOS
+   "always show scroll bars" overrides `.hidden`); launcher/settings/add-host/keyboard
+   render-verified live on this Mac via `PUNKTFUNK_FORCE_GAMEPAD_UI=1` (dev hook, forces
+   the mode without a pad). Controller-in-hand on-glass validation still pending on all
+   platforms. Tests: `swift test` in
    `clients/apple` (unit + real-codec round trip),
    `test-loopback.sh` (Swift client vs synthetic punktfunk1-hosts on loopback — runs on macOS;
    includes the pairing ceremony + `--require-pairing` gate),
@@ -231,7 +248,7 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    **Android stage 1 done** (`clients/android`, Kotlin app + `native/` Rust JNI core linking
    `punktfunk-core`; phone + Android TV): NDK `AMediaCodec` hardware HEVC decode → `SurfaceView` incl.
    **HDR10** (Main10/BT.2020 PQ) with low-latency tuning + a live stats HUD (`decode.rs`/`stats.rs`),
-   Opus/Oboe audio + mic uplink (`audio.rs`/`mic.rs`), gamepad input with rumble/HID feedback
+   Opus/AAudio audio + mic uplink (`audio.rs`/`mic.rs`), gamepad input with rumble/HID feedback
    (`feedback.rs`), **native `mdns-sd` mDNS discovery** (`discovery.rs`, polled over JNI — the same
    browse the Linux/Windows clients use, replacing the flaky per-OEM `NsdManager`; Kotlin keeps only
    the `MulticastLock` + permission UX), SPAKE2 PIN pairing + TOFU (Keystore identity +
