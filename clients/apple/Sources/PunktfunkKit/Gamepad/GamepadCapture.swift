@@ -102,6 +102,13 @@ public final class GamepadCapture {
             tp?.primary.valueChangedHandler = nil
             tp?.secondary.valueChangedHandler = nil
         }
+        // Hand the system gestures back to the OS before letting the old pad go — outside a
+        // stream the share button's screenshot and the Home overlay are the user's, not ours.
+        if let old = bound {
+            for element in old.physicalInputProfile.elements.values {
+                element.preferredSystemGestureState = .enabled
+            }
+        }
         if let motion = bound?.motion {
             motion.valueChangedHandler = nil
             // Power the sensors back down — left active they keep the pad streaming
@@ -114,14 +121,21 @@ public final class GamepadCapture {
         ext.valueChangedHandler = { [weak self] g, _ in
             MainActor.assumeIsolated { self?.sync(g) }
         }
-        // The Home/PS button (→ guide; the host maps it to the DualSense PS / Xbox guide bit). On
-        // macOS the SYSTEM grabs it by default (opens Launchpad's Games folder), so it never reached
-        // the app — `preferredSystemGestureState = .disabled` on the element is what hands it to us.
-        // We drive `guide` DIRECTLY from this handler's pressed value (not via buttonMask), because
-        // the legacy `extendedGamepad.buttonHome` is unreliable/often nil even when the physical
-        // element exists. On tvOS the element is absent (reserved) → nil, the whole block no-ops.
+        // Claim EVERY element's system gesture while this pad drives a stream. The OS attaches
+        // gestures to several controller buttons — share/create → local screenshot/recording,
+        // Home → Game Center overlay (iOS) / Launchpad's Games folder (macOS) — and with a
+        // gesture attached the press is the system's, not the game's. During capture the remote
+        // session IS the game: the share button must reach the host (e.g. Steam screenshots),
+        // the PS button must open the host's Steam overlay. Restored to .enabled on unbind.
+        for element in c.physicalInputProfile.elements.values {
+            element.preferredSystemGestureState = .disabled
+        }
+        // The Home/PS button (→ guide; the host maps it to the DualSense PS / Xbox guide bit,
+        // BTN_MODE on the virtual xpad — the Steam-overlay button). Driven DIRECTLY from this
+        // handler's pressed value (not via buttonMask), because the legacy
+        // `extendedGamepad.buttonHome` is unreliable/often nil even when the physical element
+        // exists. On tvOS the element is absent (reserved) → nil, the whole block no-ops.
         if let home = c.physicalInputProfile.buttons[GCInputButtonHome] {
-            home.preferredSystemGestureState = .disabled
             home.pressedChangedHandler = { [weak self] _, _, pressed in
                 MainActor.assumeIsolated { self?.sendGuide(down: pressed) }
             }
@@ -192,6 +206,11 @@ public final class GamepadCapture {
         if g.dpad.right.isPressed { b |= GamepadWire.dpadRight }
         if g.buttonMenu.isPressed { b |= GamepadWire.start }
         if g.buttonOptions?.isPressed == true { b |= GamepadWire.back }
+        // The share/create/capture element (Xbox Series share, a clone pad's screenshot button —
+        // e.g. the GameSir G8's, below its d-pad) folds into back/select too. On pads that expose
+        // the create button BOTH as buttonOptions and as the share element this OR is harmless —
+        // same wire bit.
+        if g.buttons[GCInputButtonShare]?.isPressed == true { b |= GamepadWire.back }
         if g.leftThumbstickButton?.isPressed == true { b |= GamepadWire.leftStickClick }
         if g.rightThumbstickButton?.isPressed == true { b |= GamepadWire.rightStickClick }
         if g.leftShoulder.isPressed { b |= GamepadWire.leftShoulder }

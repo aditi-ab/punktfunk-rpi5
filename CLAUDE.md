@@ -168,7 +168,10 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    controller discovery + selection in Settings (`GamepadManager` — exactly one pad
    forwarded as pad 0, auto or pinned; pad TYPE auto-resolves from the physical
    controller, user-overridable), capture incl. DualSense touchpad/motion
-   (`GamepadCapture`/`GamepadWire`), feedback rendering (rumble → CoreHaptics; lightbar /
+   (`GamepadCapture`/`GamepadWire`; while streaming, EVERY element's
+   `preferredSystemGestureState` is claimed `.disabled` — share/create reaches the host as
+   select instead of screenshotting locally, PS/Home reaches the host as guide/`BTN_MODE` =
+   the Steam-overlay button — restored `.enabled` on unbind), feedback rendering (rumble → CoreHaptics; lightbar /
    player LEDs / adaptive triggers → `GCDeviceLight`/`playerIndex`/
    `GCDualSenseAdaptiveTrigger` via the table-driven `DualSenseTriggerEffect` parser).
    Loopback-tested end to end (`PUNKTFUNK_TEST_FEEDBACK=1` scripted burst); DualSense
