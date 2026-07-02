@@ -215,7 +215,20 @@ unsafe fn open_vaapi_encoder_mode(
     (*raw).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
 
     let mut opts = Dictionary::new();
-    opts.set("async_depth", "1"); // one-in/one-out — minimal encode-pipeline latency
+    // async_depth=1: `send_frame` blocks until THIS frame's ASIC encode completes — the lowest
+    // latency structure libavcodec's vaapi_encode offers. Measured on the 780M at 1440p60: depth 1
+    // = 8.3 ms end-to-end p50 vs depth 2 = 18 ms, because with depth ≥ 2 frame N's packet only
+    // materializes once frame N+1 is queued (a structural +1-frame delay no poll can beat). The
+    // knob exists for pixel rates beyond the ASIC's serial budget (e.g. 1440p120+ on an iGPU),
+    // where depth 2 restores throughput at that one-frame cost. NOTE: the per-frame block tracks
+    // GPU CLOCKS — a paced 60 fps trickle lets the VCN downclock (~8 ms/frame vs ~4.4 ms hot);
+    // see `gpuclocks` for the session clock pin that removes the ramp tax.
+    let depth = std::env::var("PUNKTFUNK_VAAPI_ASYNC_DEPTH")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|d| (1..=8).contains(d))
+        .unwrap_or(1);
+    opts.set("async_depth", &depth.to_string());
     if low_power {
         opts.set("low_power", "1"); // VDEnc — the only encode entrypoint on modern Intel
     }
@@ -574,6 +587,10 @@ struct DmabufInner {
     width: u32,
     height: u32,
     fourcc: u32,
+    /// Frames submitted — drives the sampled `PUNKTFUNK_PERF` breakdown of the synchronous
+    /// submit (import+push vs CSC pull vs encoder send), the stage that dominates AMD/Intel
+    /// host latency (7.9 ms p50 at 1440p on the 780M).
+    frames: u64,
 }
 
 impl DmabufInner {
@@ -804,6 +821,7 @@ impl DmabufInner {
                 width,
                 height,
                 fourcc: drm_fourcc,
+                frames: 0,
             })
         }
     }
@@ -815,6 +833,14 @@ impl DmabufInner {
             dmabuf.fourcc,
             self.fourcc
         );
+        // Sampled breakdown of this synchronous submit under PUNKTFUNK_PERF: push = descriptor
+        // build + buffersrc (the per-frame DRM→VA import happens inside hwmap on the pull path),
+        // pull = buffersink (VPP CSC + any sync), send = avcodec_send_frame. One line per ~2 s.
+        let sample = crate::config::config().perf && self.frames % 120 == 0;
+        self.frames += 1;
+        let t0 = std::time::Instant::now();
+        let t_push: std::time::Duration;
+        let t_pull: std::time::Duration;
         // SAFETY: The `ensure!` above checked `dmabuf.fourcc == self.fourcc`.
         //  * `std::mem::zeroed::<AVDRMFrameDescriptor>()` is sound: it is a `#[repr(C)]` POD of ints and
         //    nested int-struct arrays (no `NonNull`/refs), for which all-zero is a valid bit pattern;
@@ -883,6 +909,7 @@ impl DmabufInner {
             if r < 0 {
                 bail!("av_buffersrc_add_frame failed ({r})");
             }
+            t_push = t0.elapsed();
             let mut nv12 = ffi::av_frame_alloc();
             if nv12.is_null() {
                 bail!("av_frame_alloc(nv12) failed");
@@ -892,6 +919,7 @@ impl DmabufInner {
                 ffi::av_frame_free(&mut nv12);
                 bail!("av_buffersink_get_frame failed ({r})");
             }
+            t_pull = t0.elapsed() - t_push;
             (*nv12).pts = pts;
             (*nv12).pict_type = if idr {
                 ffi::AVPictureType::AV_PICTURE_TYPE_I
@@ -903,6 +931,16 @@ impl DmabufInner {
             if r < 0 {
                 bail!("avcodec_send_frame(VAAPI) failed ({r})");
             }
+        }
+        if sample {
+            let t_send = t0.elapsed() - t_push - t_pull;
+            tracing::info!(
+                push_us = t_push.as_micros() as u64,
+                pull_us = t_pull.as_micros() as u64,
+                send_us = t_send.as_micros() as u64,
+                "VAAPI submit split (sampled): push=desc+buffersrc pull=hwmap-import+VPP-CSC \
+                 send=avcodec_send_frame"
+            );
         }
         Ok(())
     }
@@ -944,6 +982,10 @@ pub struct VaapiEncoder {
     inner: Option<Inner>,
     frame_idx: i64,
     force_kf: bool,
+    /// Frames sent to the encoder but not yet returned as packets. Gates [`poll`](Encoder::poll)'s
+    /// bounded wait: with `async_depth > 1` a submitted frame's AU lands ~ASIC-time later, so poll
+    /// briefly waits for it (same-tick delivery) — but only when something is actually in flight.
+    in_flight: u32,
 }
 
 // Raw FFI pointers; the encoder lives on a single thread (same contract as `NvencEncoder`).
@@ -997,6 +1039,7 @@ impl VaapiEncoder {
             inner: None,
             frame_idx: 0,
             force_kf: false,
+            in_flight: 0,
         })
     }
 
@@ -1054,7 +1097,9 @@ impl Encoder for VaapiEncoder {
                 "VAAPI encoder received a CUDA frame — that payload is NVENC-only; \
                  unset PUNKTFUNK_ZEROCOPY or don't force PUNKTFUNK_ENCODER=vaapi on an NVIDIA host"
             ),
-        }
+        }?;
+        self.in_flight += 1;
+        Ok(())
     }
 
     fn request_keyframe(&mut self) {
@@ -1062,10 +1107,30 @@ impl Encoder for VaapiEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        match &mut self.inner {
-            Some(Inner::Cpu(c)) => poll_encoder(&mut c.enc, self.fps),
-            Some(Inner::Dmabuf(d)) => poll_encoder(&mut d.enc, self.fps),
-            None => Ok(None),
+        // With `async_depth > 1`, `submit` no longer waits for the ASIC — the AU for the frame we
+        // just sent lands ~one hardware-encode-time later. Wait for it (bounded) so it still ships
+        // this tick: the same blocking-retrieve model as NVENC's lock_bitstream, at the ASIC's
+        // real per-frame latency instead of send_frame's synchronous ~2× wait. The budget is 3/4
+        // of a frame interval (capped 12 ms); on expiry return None — the AU rides the next poll.
+        let enc = match &mut self.inner {
+            Some(Inner::Cpu(c)) => &mut c.enc,
+            Some(Inner::Dmabuf(d)) => &mut d.enc,
+            None => return Ok(None),
+        };
+        let budget = std::time::Duration::from_micros(750_000 / self.fps.max(1) as u64)
+            .min(std::time::Duration::from_millis(12));
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if let Some(au) = poll_encoder(enc, self.fps)? {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                return Ok(Some(au));
+            }
+            // Nothing ready: only wait when a frame is actually in flight (a drained/EOF'd
+            // encoder must not spin the budget), and give the ASIC ~250 µs between checks.
+            if self.in_flight == 0 || std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(250));
         }
     }
 
