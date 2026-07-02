@@ -57,7 +57,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     var stats by remember { mutableStateOf<DoubleArray?>(null) }
     var showStats by remember { mutableStateOf(initialSettings.statsHudEnabled) }
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
-    val trackpad = initialSettings.trackpadMode
+    val touchMode = initialSettings.touchMode
     LaunchedEffect(handle, showStats) {
         NativeBridge.nativeSetVideoStatsEnabled(handle, showStats)
         if (showStats) {
@@ -148,11 +148,18 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         if (showStats) {
             stats?.let { StatsOverlay(it, Modifier.align(Alignment.TopStart).padding(12.dp)) }
         }
-        // Touch → mouse (trackpad vs. direct pointing + the shared gesture vocabulary — see
-        // streamTouchInput in TouchInput.kt).
+        // Touch input per the Settings model: trackpad/direct-pointer mouse (the shared gesture
+        // vocabulary) or real multi-touch passthrough — see TouchInput.kt.
         Box(
-            Modifier.fillMaxSize().pointerInput(handle, trackpad) {
-                streamTouchInput(handle, trackpad, onToggleStats = { showStats = !showStats })
+            Modifier.fillMaxSize().pointerInput(handle, touchMode) {
+                when (touchMode) {
+                    TouchMode.TOUCH -> streamTouchPassthrough(handle)
+                    else -> streamTouchInput(
+                        handle,
+                        trackpad = touchMode == TouchMode.TRACKPAD,
+                        onToggleStats = { showStats = !showStats },
+                    )
+                }
             },
         )
     }

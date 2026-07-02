@@ -27,6 +27,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import io.unom.punktfunk.BrandDark
 import io.unom.punktfunk.Settings
+import io.unom.punktfunk.TouchMode
 import io.unom.punktfunk.SettingsScreen
 import io.unom.punktfunk.StatsOverlay
 import io.unom.punktfunk.components.HostCard
@@ -109,7 +110,7 @@ internal fun SettingsScene() {
                 gamepad = 2,
                 micEnabled = true,
                 statsHudEnabled = true,
-                trackpadMode = true,
+                touchMode = TouchMode.TRACKPAD,
             ),
             onChange = {},
             onBack = {},

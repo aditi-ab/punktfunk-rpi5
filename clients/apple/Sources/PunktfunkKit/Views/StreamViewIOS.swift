@@ -339,6 +339,9 @@ public final class StreamViewController: UIViewController {
         setCaptured(false)
         inputCapture?.stop()
         inputCapture = nil
+        // Release anything the touch-driven mouse still holds (a mid-drag session end) while
+        // onTouchEvent can still deliver the button-up.
+        streamView.resetTouchInput()
         streamView.onTouchEvent = nil
         streamView.onPointerMoveAbs = nil
         streamView.onPointerButton = nil
@@ -454,7 +457,8 @@ final class StreamLayerUIView: UIView {
 
     /// Reads the LIVE negotiated mode in pixels (the touch/pointer coordinate space).
     var currentHostMode: (() -> CGSize)?
-    /// Direct fingers / Pencil → wire touch events.
+    /// Direct fingers / Pencil → wire events: real touches in passthrough mode, or the
+    /// touch-driven mouse events (`TouchMouse`) in the trackpad/pointer modes.
     var onTouchEvent: ((PunktfunkInputEvent) -> Void)?
     /// Indirect pointer (mouse/trackpad with no lock) → absolute cursor moves.
     var onPointerMoveAbs: ((HostPoint) -> Void)?
@@ -468,6 +472,22 @@ final class StreamLayerUIView: UIView {
     /// GameStream button held per active indirect-pointer touch (one click/drag session);
     /// released when that touch ends.
     private var pointerButtons: [ObjectIdentifier: UInt32] = [:]
+    /// Touch-driven mouse for the trackpad/pointer `TouchInputMode`s (see TouchMouse.swift).
+    private lazy var touchMouse: TouchMouse = {
+        let mouse = TouchMouse()
+        mouse.send = { [weak self] event in self?.onTouchEvent?(event) }
+        mouse.hostPoint = { [weak self] point in self?.hostPoint(from: point) }
+        return mouse
+    }()
+    /// The finger route latched at gesture start — a Settings change mid-gesture applies to
+    /// the NEXT touch, so one gesture never splits across input models.
+    private var fingerRoute: TouchInputMode?
+
+    /// Release anything the touch-driven mouse holds and forget gesture state — session stop.
+    func resetTouchInput() {
+        touchMouse.reset()
+        fingerRoute = nil
+    }
     #endif
 
     override init(frame: CGRect) {
@@ -504,10 +524,10 @@ final class StreamLayerUIView: UIView {
         route(touches, event: event, kind: .up)
     }
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        route(touches, event: event, kind: .up)
+        route(touches, event: event, kind: .cancel)
     }
 
-    private enum TouchKind { case down, move, up }
+    private enum TouchKind { case down, move, up, cancel }
 
     /// Split a touch batch by kind: an INDIRECT POINTER (mouse/trackpad with no lock) drives
     /// the host cursor as an absolute mouse; everything else (direct finger, Pencil) is a host
@@ -521,7 +541,28 @@ final class StreamLayerUIView: UIView {
                 fingers.insert(touch)
             }
         }
-        if !fingers.isEmpty { forwardTouches(fingers, kind: kind) }
+        if !fingers.isEmpty { forwardFingers(fingers, kind: kind) }
+    }
+
+    /// Route direct fingers by the touch-input model, latched for the whole gesture:
+    /// passthrough → real wire touches; trackpad/pointer → the TouchMouse gesture engine.
+    private func forwardFingers(_ touches: Set<UITouch>, kind: TouchKind) {
+        let mode = fingerRoute ?? TouchInputMode.current
+        fingerRoute = mode
+        switch mode {
+        case .touch:
+            // A cancellation lifts the wire touch like a normal up — the host just sees the
+            // contact end.
+            forwardTouches(touches, kind: kind == .cancel ? .up : kind)
+        case .trackpad, .pointer:
+            switch kind {
+            case .down: touchMouse.began(touches, in: self, trackpad: mode == .trackpad)
+            case .move: touchMouse.moved(touches, in: self)
+            case .up: touchMouse.ended(touches, in: self)
+            case .cancel: touchMouse.cancelled(touches)
+            }
+        }
+        if touchIDs.isEmpty, touchMouse.isIdle { fingerRoute = nil }
     }
 
     /// An indirect-pointer touch is a button-held click/drag session: forward its position as
@@ -537,7 +578,7 @@ final class StreamLayerUIView: UIView {
             onPointerButton?(button, true)
         case .move:
             if let host { onPointerMoveAbs?(host) }
-        case .up:
+        case .up, .cancel:
             if let host { onPointerMoveAbs?(host) }
             if let button = pointerButtons.removeValue(forKey: key) {
                 onPointerButton?(button, false)
@@ -554,7 +595,7 @@ final class StreamLayerUIView: UIView {
             case .down:
                 id = nextFreeID()
                 touchIDs[key] = id
-            case .move, .up:
+            case .move, .up, .cancel:
                 guard let known = touchIDs[key] else { continue }
                 id = known
             }

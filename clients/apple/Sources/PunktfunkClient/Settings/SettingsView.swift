@@ -43,6 +43,7 @@ struct SettingsView: View {
     #endif
     #if os(iOS)
     @AppStorage(DefaultsKey.pointerCapture) var pointerCapture = true
+    @AppStorage(DefaultsKey.touchMode) var touchMode = TouchInputMode.trackpad.rawValue
     // The sidebar selection drives the detail pane on iPad and the pushed sub-page on iPhone.
     // Width class decides the initial value: nil on iPhone (show the category list first),
     // General on iPad (a two-column layout should never open with an empty detail).

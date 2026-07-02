@@ -2,7 +2,11 @@ package io.unom.punktfunk
 
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputScope
+import androidx.compose.ui.input.pointer.changedToDownIgnoreConsumed
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
+import androidx.compose.ui.input.pointer.positionChanged
 import io.unom.punktfunk.kit.NativeBridge
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -38,6 +42,54 @@ private const val ACCEL_MAX = 3.0f
  * two-finger drag = scroll; tap-then-press-and-drag = left-drag (text selection / moving
  * windows); three-finger tap = [onToggleStats] (the stats HUD).
  */
+/**
+ * Real multi-touch passthrough ([TouchMode.TOUCH]): every finger forwards as a host touchscreen
+ * contact (down/move/up with a stable per-finger id), with NO gesture interpretation — taps,
+ * drags and multi-finger input mean whatever the remote app decides. Coordinates are overlay
+ * pixels with the overlay size as the surface, exactly like the absolute-mouse path (the host
+ * normalizes and maps into the output). On teardown (stream leaves composition) every still-held
+ * contact is lifted so nothing stays stuck on the host.
+ */
+internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long) {
+    val ids = mutableMapOf<PointerId, Int>()
+    fun alloc(p: PointerId): Int {
+        var id = 0
+        while (ids.containsValue(id)) id++
+        ids[p] = id
+        return id
+    }
+    try {
+        awaitPointerEventScope {
+            while (true) {
+                val ev = awaitPointerEvent()
+                val sw = size.width
+                val sh = size.height
+                if (sw <= 0 || sh <= 0) continue
+                for (c in ev.changes) {
+                    val x = c.position.x.roundToInt().coerceIn(0, sw - 1)
+                    val y = c.position.y.roundToInt().coerceIn(0, sh - 1)
+                    when {
+                        c.changedToDownIgnoreConsumed() ->
+                            NativeBridge.nativeSendTouch(handle, alloc(c.id), 0, x, y, sw, sh)
+                        c.changedToUpIgnoreConsumed() ->
+                            ids.remove(c.id)?.let {
+                                NativeBridge.nativeSendTouch(handle, it, 2, 0, 0, sw, sh)
+                            }
+                        c.positionChanged() ->
+                            ids[c.id]?.let {
+                                NativeBridge.nativeSendTouch(handle, it, 1, x, y, sw, sh)
+                            }
+                    }
+                    c.consume()
+                }
+            }
+        }
+    } finally {
+        // Lift anything still down (composition/session teardown mid-touch).
+        ids.values.forEach { NativeBridge.nativeSendTouch(handle, it, 2, 0, 0, 1, 1) }
+    }
+}
+
 internal suspend fun PointerInputScope.streamTouchInput(
     handle: Long,
     trackpad: Boolean,

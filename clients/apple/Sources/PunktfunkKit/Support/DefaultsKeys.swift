@@ -41,6 +41,11 @@ public enum DefaultsKey {
     /// scene and silently falls back to the absolute pointer when it can't (Stage Manager / Slide
     /// Over). Read by `StreamViewController.prefersPointerLocked`.
     public static let pointerCapture = "punktfunk.pointerCapture"
+    /// iPhone/iPad: how touchscreen fingers drive the host — a `TouchInputMode` raw value:
+    /// "trackpad" (default: relative cursor with tap-click / two-finger-scroll gestures),
+    /// "pointer" (the cursor jumps to the finger), or "touch" (real multi-touch passthrough).
+    /// Read live per gesture by `StreamLayerUIView`.
+    public static let touchMode = "punktfunk.touchMode"
     /// Experimental: show the host's game library (browsed over the management API). Off by default.
     public static let libraryEnabled = "punktfunk.libraryEnabled"
     /// macOS: take the window fullscreen while streaming and restore it on the host list. On by default.

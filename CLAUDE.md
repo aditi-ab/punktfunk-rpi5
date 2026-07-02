@@ -204,7 +204,13 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    "always show scroll bars" overrides `.hidden`); launcher/settings/add-host/keyboard
    render-verified live on this Mac via `PUNKTFUNK_FORCE_GAMEPAD_UI=1` (dev hook, forces
    the mode without a pad). Controller-in-hand on-glass validation still pending on all
-   platforms. Tests: `swift test` in
+   platforms. **Touch input (iOS/iPadOS, 2026-07-02):** a 3-way model in Settings —
+   **Trackpad** (default; the Android client's gesture vocabulary ported 1:1 in
+   `Input/TouchMouse.swift`: tap=click · two-finger tap=right-click · two-finger drag=scroll ·
+   tap-then-drag=held drag · three-finger tap=HUD toggle, relative ballistics with the same
+   px-based acceleration curve), **Direct pointer** (cursor jumps to the finger), **Touch
+   passthrough** (the previous always-on behavior — real wire touches). Latched per gesture
+   from `DefaultsKey.touchMode`; not yet on-glass validated. Tests: `swift test` in
    `clients/apple` (unit + real-codec round trip),
    `test-loopback.sh` (Swift client vs synthetic punktfunk1-hosts on loopback — runs on macOS;
    includes the pairing ceremony + `--require-pairing` gate),
@@ -350,7 +356,11 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
    the `MulticastLock` + permission UX), SPAKE2 PIN pairing + TOFU (Keystore identity +
    known-host store), Compose UI (Connect/Settings/Stream) with D-pad/controller focus nav. Built for
    `arm64-v8a` + `x86_64`; published to Google Play (Internal Testing) via `android.yml`
-   (`ci/play-upload.py`). Next: real-device gamepad/HDR live-verify, presenter/latency polish.
+   (`ci/play-upload.py`). Touch input is the same 3-way model as iOS (2026-07-02): the existing
+   Trackpad/Direct mouse modes plus new **real multi-touch passthrough**
+   (`streamTouchPassthrough` → `nativeSendTouch` → wire TouchDown/Move/Up), a `TouchMode`
+   Settings dropdown replacing the old trackpad Boolean (migrated on load); not yet
+   on-device validated. Next: real-device gamepad/HDR live-verify, presenter/latency polish.
 2. **Sub-frame pipelining**: overlap encode and transmit within a frame. Requires a direct
    NVENC SDK wrapper (libavcodec only emits whole AUs) — the next big latency lever (~2–4 ms
    at high res).

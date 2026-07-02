@@ -159,6 +159,22 @@ object NativeBridge {
     /** One scroll step. axis: 0=vertical 1=horizontal. delta: signed, 120-scaled, +=up/right. */
     external fun nativeSendScroll(handle: Long, axis: Int, delta: Int)
 
+    /**
+     * One REAL touchscreen transition (the touch-passthrough input mode). [kind]: 0=down 1=move
+     * 2=up. [id] distinguishes fingers and is reusable after up; coordinates are pixels on the
+     * client's touch surface — the host rescales against [surfaceWidth]×[surfaceHeight] and
+     * injects a real touch contact. On up only [id] matters.
+     */
+    external fun nativeSendTouch(
+        handle: Long,
+        id: Int,
+        kind: Int,
+        x: Int,
+        y: Int,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+    )
+
     /** One key transition. vk: Windows VK (0 = dropped by Rust). mods: VK modifier mask (0 for now). */
     external fun nativeSendKey(handle: Long, vk: Int, down: Boolean, mods: Int)
 

@@ -201,25 +201,36 @@ extension SettingsView {
     }
 
     #if os(iOS)
-    /// iPad-only pointer-capture toggle: lock the mouse/trackpad for relative movement (games) vs
-    /// forward an absolute cursor position (desktop). Empty on iPhone (no hardware-pointer lock —
-    /// the mouse path there is always the absolute fallback).
+    /// Touch-input model (iPhone + iPad) plus the iPad-only pointer-capture toggle: lock the
+    /// mouse/trackpad for relative movement (games) vs forward an absolute cursor position.
     @ViewBuilder var pointerSection: some View {
-        if UIDevice.current.userInterfaceIdiom == .pad {
-            Section {
-                Toggle("Capture pointer for games", isOn: $pointerCapture)
-            } header: {
-                Text("Pointer")
-            } footer: {
-                Text("With a mouse or trackpad connected, lock the pointer and send relative "
-                    + "movement — the expected behavior for games (mouse-look). Turn this off for "
-                    + "desktop use to keep the pointer free and send its absolute position instead. "
-                    + "The lock needs the stream full-screen and frontmost; it falls back to the "
-                    + "absolute pointer automatically (Stage Manager, Slide Over). Finger touch is "
-                    + "unaffected. Applies from the next session.")
-                    .font(.geist(12, relativeTo: .caption))
-                    .foregroundStyle(.secondary)
+        let isPad = UIDevice.current.userInterfaceIdiom == .pad
+        Section {
+            Picker("Touch input", selection: $touchMode) {
+                Text("Trackpad").tag(TouchInputMode.trackpad.rawValue)
+                Text("Direct pointer").tag(TouchInputMode.pointer.rawValue)
+                Text("Touch passthrough").tag(TouchInputMode.touch.rawValue)
             }
+            if isPad {
+                Toggle("Capture pointer for games", isOn: $pointerCapture)
+            }
+        } header: {
+            Text("Touch & pointer")
+        } footer: {
+            Text("Trackpad: your finger nudges the host cursor like a laptop touchpad — tap to "
+                + "click, two-finger tap for a right click, two-finger drag to scroll, "
+                + "tap-then-drag to hold the button, three-finger tap for the stats overlay. "
+                + "Direct pointer: the cursor jumps to your finger. Touch passthrough: real "
+                + "multi-touch reaches the host, for apps that understand touch. Applies from "
+                + "the next touch."
+                + (isPad
+                    ? " Pointer capture locks a hardware mouse/trackpad for relative movement "
+                        + "(mouse-look); off keeps the pointer free and sends absolute positions. "
+                        + "The lock needs the stream full-screen and frontmost, and falls back "
+                        + "automatically (Stage Manager, Slide Over)."
+                    : ""))
+                .font(.geist(12, relativeTo: .caption))
+                .foregroundStyle(.secondary)
         }
     }
     #endif

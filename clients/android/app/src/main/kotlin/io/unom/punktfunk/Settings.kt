@@ -33,12 +33,18 @@ data class Settings(
     /** Show the live stats overlay (FPS / throughput / latency) during a stream. */
     val statsHudEnabled: Boolean = true,
     /**
-     * Touch input model. `true` (default) = trackpad: the cursor stays put on touch-down and moves
-     * by the finger's relative delta (swipe to nudge, lift and re-swipe to walk it across), tap to
-     * click where it is. `false` = direct pointing: the cursor jumps to the finger (the old behaviour).
+     * Touch input model — how touchscreen fingers drive the host. [TouchMode.TRACKPAD] (default):
+     * the cursor stays put on touch-down and moves by the finger's relative delta (swipe to nudge,
+     * lift and re-swipe to walk it across), tap to click where it is. [TouchMode.POINTER]: the
+     * cursor jumps to the finger (direct pointing). [TouchMode.TOUCH]: real multi-touch
+     * passthrough — every finger reaches the host as a touchscreen contact, for apps/games that
+     * understand touch. Mirrors the Apple client's TouchInputMode.
      */
-    val trackpadMode: Boolean = true,
+    val touchMode: TouchMode = TouchMode.TRACKPAD,
 )
+
+/** [Settings.touchMode] values; persisted by name. */
+enum class TouchMode { TRACKPAD, POINTER, TOUCH }
 
 /** Loads/saves [Settings] in the app-private `punktfunk_settings` prefs. */
 class SettingsStore(context: Context) {
@@ -57,7 +63,10 @@ class SettingsStore(context: Context) {
         codec = prefs.getString(K_CODEC, "auto") ?: "auto",
         micEnabled = prefs.getBoolean(K_MIC, false),
         statsHudEnabled = prefs.getBoolean(K_HUD, true),
-        trackpadMode = prefs.getBoolean(K_TRACKPAD, true),
+        touchMode = prefs.getString(K_TOUCH_MODE, null)
+            ?.let { name -> TouchMode.entries.firstOrNull { it.name == name } }
+            // Migration: the pre-enum Boolean "trackpad_mode" (true = trackpad, false = direct).
+            ?: if (prefs.getBoolean(K_TRACKPAD, true)) TouchMode.TRACKPAD else TouchMode.POINTER,
     )
 
     fun save(s: Settings) {
@@ -73,7 +82,7 @@ class SettingsStore(context: Context) {
             .putString(K_CODEC, s.codec)
             .putBoolean(K_MIC, s.micEnabled)
             .putBoolean(K_HUD, s.statsHudEnabled)
-            .putBoolean(K_TRACKPAD, s.trackpadMode)
+            .putString(K_TOUCH_MODE, s.touchMode.name)
             .apply()
     }
 
@@ -89,6 +98,9 @@ class SettingsStore(context: Context) {
         const val K_CODEC = "codec"
         const val K_MIC = "mic_enabled"
         const val K_HUD = "stats_hud_enabled"
+        const val K_TOUCH_MODE = "touch_mode"
+
+        /** Legacy Boolean the enum replaced — read once as the migration default, never written. */
         const val K_TRACKPAD = "trackpad_mode"
     }
 }
@@ -193,6 +205,13 @@ val COMPOSITOR_OPTIONS = listOf(
     "wlroots (Sway / Hyprland)",
     "Mutter (GNOME)",
     "gamescope",
+)
+
+/** (mode, label) for the touch-input model. */
+val TOUCH_MODE_OPTIONS = listOf(
+    TouchMode.TRACKPAD to "Trackpad",
+    TouchMode.POINTER to "Direct pointer",
+    TouchMode.TOUCH to "Touch passthrough",
 )
 
 /** index = GamepadPref wire byte (0=Auto 1=Xbox360 2=DualSense 3=XboxOne 4=DualShock4). */

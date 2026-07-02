@@ -93,6 +93,34 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendScroll(
     send_event(handle, InputKind::MouseScroll, axis as u32, delta, 0, 0);
 }
 
+/// `NativeBridge.nativeSendTouch(handle, id, kind, x, y, surfaceWidth, surfaceHeight)` — one REAL
+/// touchscreen transition (`kind`: 0=down 1=move 2=up), for the touch-passthrough input mode. `id`
+/// distinguishes fingers (reusable after up); coordinates are pixels on the client's touch
+/// surface, whose size rides in `flags` so the host can rescale into the output (identical
+/// packing to MouseMoveAbs). On up only the id matters. The host injects a real touch contact
+/// (libei touchscreen / wlroots / SendInput).
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendTouch(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+    id: jint,
+    kind: jint,
+    x: jint,
+    y: jint,
+    surface_width: jint,
+    surface_height: jint,
+) {
+    let kind = match kind {
+        0 => InputKind::TouchDown,
+        1 => InputKind::TouchMove,
+        _ => InputKind::TouchUp,
+    };
+    let w = (surface_width.max(0) as u32) & 0xffff;
+    let h = (surface_height.max(0) as u32) & 0xffff;
+    send_event(handle, kind, id as u32, x, y, (w << 16) | h);
+}
+
 /// `NativeBridge.nativeSendKey(handle, vk, down, mods)` — one key transition. `vk`: Windows
 /// Virtual-Key code (0 = unmapped → dropped). `down`: 1=press, 0=release. `mods`: VK modifier
 /// bitmask (0 for now — the host folds modifiers from the L/R modifier key events themselves).

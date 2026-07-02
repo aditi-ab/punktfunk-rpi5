@@ -165,13 +165,21 @@ fun SettingsScreen(initial: Settings, onChange: (Settings) -> Unit, onBack: () -
             )
         }
 
-        SettingsGroup("Pointer") {
-            ToggleRow(
-                title = "Trackpad mode",
-                subtitle = "Relative cursor like a laptop touchpad — swipe to nudge, tap to click. " +
-                    "Off = the cursor jumps to your finger.",
-                checked = s.trackpadMode,
-                onCheckedChange = { on -> update(s.copy(trackpadMode = on)) },
+        SettingsGroup("Touch input") {
+            SettingDropdown(
+                label = "Touch input",
+                options = TOUCH_MODE_OPTIONS,
+                selected = s.touchMode,
+                onSelect = { mode -> update(s.copy(touchMode = mode)) },
+            )
+            Text(
+                "Trackpad: relative cursor like a laptop touchpad — tap to click, two-finger " +
+                    "tap right-clicks, two fingers scroll, tap-then-drag holds the button. " +
+                    "Direct pointer: the cursor jumps to your finger. Touch passthrough: real " +
+                    "multi-touch reaches the host, for apps that understand touch.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp),
             )
         }
 
