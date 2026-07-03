@@ -41,7 +41,7 @@
 //! Usage: `punktfunk-probe [--connect HOST:PORT] [--mode WxHxFPS] [--remode WxHxFPS:SECS]
 //!         [--out FILE] [--bitrate KBPS] [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8]
 //!         [--launch APP] [--name NAME] [--speed-test KBPS:MS]
-//!         [--input-test | --mic-test | --touch-test | --rich-input-test]
+//!         [--input-test | --mic-test [--mic-burst] | --touch-test | --rich-input-test]
 //!         [--pin HEX | --pair PIN] [--compositor NAME] [--gamepad NAME] | --discover [SECS]`
 //! Env: `PUNKTFUNK_CLIENT_10BIT=1` / `PUNKTFUNK_CLIENT_444=1` advertise the 10-bit / 4:4:4 caps.
 
@@ -65,6 +65,9 @@ struct Args {
     input_test: bool,
     /// `--mic-test` — stream a synthetic 440 Hz tone as the mic uplink (proves the mic path).
     mic_test: bool,
+    /// `--mic-burst` — pace the mic-test like a real client's input tap (2× 20 ms per 40 ms),
+    /// the arrival shape that exercises host-side jitter buffering.
+    mic_burst: bool,
     /// `--touch-test` — drag a synthetic finger in a circle (proves the touch path).
     touch_test: bool,
     /// `--rich-input-test` — drive the DualSense touchpad + motion over 0xCC (host needs
@@ -205,6 +208,7 @@ fn parse_args() -> Args {
         out: get("--out").map(String::from),
         input_test: argv.iter().any(|a| a == "--input-test"),
         mic_test: argv.iter().any(|a| a == "--mic-test"),
+        mic_burst: argv.iter().any(|a| a == "--mic-burst"),
         touch_test: argv.iter().any(|a| a == "--touch-test"),
         rich_input_test: argv.iter().any(|a| a == "--rich-input-test"),
         pin,
@@ -740,9 +744,16 @@ async fn session(args: Args) -> Result<()> {
         });
     }
 
-    // Mic plane: stream a synthetic 440 Hz tone as the mic uplink (0xCB), Opus-encoded 5 ms
-    // stereo frames — proves client→host mic passthrough end to end without a real microphone
-    // (the host decodes it into its virtual PipeWire source; record that source to hear the tone).
+    // Mic plane: stream a synthetic 440 Hz tone as the mic uplink (0xCB) — proves client→host
+    // mic passthrough end to end without a real microphone (the host decodes it into its virtual
+    // source; record that source to hear the tone). Two pacing modes:
+    //   default      — Opus 5 ms frames on a steady 5 ms tick (smooth arrival).
+    //   --mic-burst  — two 20 ms Opus frames back-to-back every 40 ms, replicating a real
+    //                  client's input-tap cadence (the Mac client's AVAudioEngine tap yields
+    //                  ~2048-frame buffers → two packets per ~42 ms). This is the arrival
+    //                  pattern that exposed the Windows host's missing jitter buffer (constant
+    //                  crackle, 2026-07-03): a steady 5 ms stream never trips it. Record the
+    //                  host mic and count silence gaps to regression-test host-side buffering.
     #[cfg(not(target_os = "linux"))]
     if args.mic_test {
         tracing::warn!("--mic-test requires Linux (libopus) — skipped");
@@ -750,6 +761,7 @@ async fn session(args: Args) -> Result<()> {
     #[cfg(target_os = "linux")]
     if args.mic_test {
         let conn2 = conn.clone();
+        let burst = args.mic_burst;
         tokio::spawn(async move {
             let mut enc =
                 match opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip) {
@@ -760,28 +772,38 @@ async fn session(args: Args) -> Result<()> {
                     }
                 };
             let _ = enc.set_bitrate(opus::Bitrate::Bits(64_000));
-            tracing::info!("mic-test: streaming a 440 Hz tone as the mic uplink");
+            // Frame size + tick per pacing mode; `per_tick` packets are sent back-to-back.
+            let (frame, tick_ms, per_tick) = if burst {
+                (960usize, 40u64, 2u32) // 2× 20 ms every 40 ms — the bursty real-client shape
+            } else {
+                (240usize, 5u64, 1u32) // 5 ms frames on a smooth tick
+            };
+            tracing::info!(burst, "mic-test: streaming a 440 Hz tone as the mic uplink");
             let mut phase = 0.0f32;
             let step = 2.0 * std::f32::consts::PI * 440.0 / 48_000.0;
-            let mut pcm = [0f32; 240 * 2]; // 5 ms stereo
+            let mut pcm = vec![0f32; frame * 2];
             let mut out = [0u8; 4000];
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
-            for seq in 0u32.. {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(tick_ms));
+            let mut seq = 0u32;
+            'stream: loop {
                 interval.tick().await;
-                for f in 0..240 {
-                    let s = (phase.sin()) * 0.25;
-                    phase += step;
-                    if phase > std::f32::consts::PI * 2.0 {
-                        phase -= std::f32::consts::PI * 2.0;
+                for _ in 0..per_tick {
+                    for f in 0..frame {
+                        let s = (phase.sin()) * 0.25;
+                        phase += step;
+                        if phase > std::f32::consts::PI * 2.0 {
+                            phase -= std::f32::consts::PI * 2.0;
+                        }
+                        pcm[f * 2] = s;
+                        pcm[f * 2 + 1] = s;
                     }
-                    pcm[f * 2] = s;
-                    pcm[f * 2 + 1] = s;
-                }
-                if let Ok(n) = enc.encode_float(&pcm, &mut out) {
-                    let d = punktfunk_core::quic::encode_mic_datagram(seq, now_ns(), &out[..n]);
-                    if conn2.send_datagram(d.into()).is_err() {
-                        break;
+                    if let Ok(n) = enc.encode_float(&pcm, &mut out) {
+                        let d = punktfunk_core::quic::encode_mic_datagram(seq, now_ns(), &out[..n]);
+                        if conn2.send_datagram(d.into()).is_err() {
+                            break 'stream;
+                        }
                     }
+                    seq = seq.wrapping_add(1);
                 }
             }
             tracing::info!("mic-test: done");
