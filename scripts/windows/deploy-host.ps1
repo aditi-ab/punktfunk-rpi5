@@ -43,7 +43,7 @@ foreach ($k in 'LIBCLANG_PATH','CMAKE_POLICY_VERSION_MINIMUM') {
 
 # All-vendor build when an FFmpeg dev tree is available (BtbN lgpl-shared: include/ + lib/ + bin/):
 # nvenc alone otherwise. Without amf-qsv a GPU preference pointing at an AMD/Intel adapter makes
-# every session die at encoder open (NV_ENC_ERR_NO_ENCODE_DEVICE) — the exact "can't connect"
+# every session die at encoder open (NV_ENC_ERR_NO_ENCODE_DEVICE) - the exact "can't connect"
 # field failure on hybrid boxes.
 $features = 'nvenc'
 if (-not $env:FFMPEG_DIR) {
@@ -78,7 +78,7 @@ if (-not $built) {
   throw "build failed; previous binary restored and service restarted."
 }
 
-# 3b. the AMF/QSV backend link-imports the FFmpeg DLLs — lay them next to the exe (the installer
+# 3b. the AMF/QSV backend link-imports the FFmpeg DLLs - lay them next to the exe (the installer
 # does the same into {app}); idempotent, and harmless for the NVENC path.
 if ($features -like '*amf-qsv*') {
   Copy-Item (Join-Path $env:FFMPEG_DIR 'bin\*.dll') (Split-Path $exe) -Force
