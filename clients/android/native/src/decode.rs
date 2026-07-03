@@ -25,6 +25,11 @@ use std::time::{Duration, Instant};
 /// flight, so anything beyond this is stale (codec flushed / HUD toggled) and gets evicted.
 const IN_FLIGHT_CAP: usize = 64;
 
+/// Cap on received AUs awaiting their 0xCF host timing (Phase 2 host/network split): the timing
+/// datagram trails its AU by at most the wire, so a match lands within a frame or two — anything
+/// this deep is a lost datagram (or an old host that never sends any) and gets evicted.
+const PENDING_SPLIT_CAP: usize = 256;
+
 /// The decode loop. Runs on the `pf-decode` thread until `shutdown` is set or the session closes.
 pub fn run(
     client: Arc<NativeClient>,
@@ -155,6 +160,11 @@ pub fn run(
     // point (output-buffer dequeue — MediaCodec round-trips presentationTimeUs) can be paired back
     // to its receipt for the `decode` stage. Only fed while the HUD is visible.
     let mut in_flight: VecDeque<(u64, i128)> = VecDeque::new();
+    // Phase-2 host/network split (design/stats-unification.md): received AUs awaiting their 0xCF
+    // host timing, as (pts_ns, capture→received µs). The timings are drained non-blockingly right
+    // where receipts are recorded and matched by pts; `network = hostnet − host` (saturating).
+    // Only fed while the HUD is visible; an old host never sends a 0xCF, so entries just age out.
+    let mut pending_split: VecDeque<(u64, u64)> = VecDeque::new();
     // The dataspace we've signalled on the Surface so far (None = default/SDR). Set reactively once
     // the decoder reports an HDR stream (see `drain`); avoids re-applying every format event.
     let mut applied_ds: Option<DataSpace> = None;
@@ -189,6 +199,26 @@ pub fn run(
                         in_flight.push_back((frame.pts_ns / 1000, received_ns));
                         if in_flight.len() > IN_FLIGHT_CAP {
                             in_flight.pop_front(); // stale — codec never echoed it back
+                        }
+                        // Phase-2 split: park this AU's capture→received sample, then match any
+                        // 0xCF host timings that have arrived — host = the host's own
+                        // capture→sent, network = our capture→received minus it (per-frame
+                        // tiling; saturating in case of clock jitter).
+                        if let Some(hostnet_us) = lat_us {
+                            pending_split.push_back((frame.pts_ns, hostnet_us));
+                            if pending_split.len() > PENDING_SPLIT_CAP {
+                                pending_split.pop_front(); // 0xCF lost / old host — evict
+                            }
+                        }
+                        while let Ok(t) = client.next_host_timing(Duration::ZERO) {
+                            if let Some(i) = pending_split.iter().position(|&(p, _)| p == t.pts_ns)
+                            {
+                                let (_, hostnet_us) = pending_split.remove(i).unwrap();
+                                stats.note_host_split(
+                                    t.host_us as u64,
+                                    hostnet_us.saturating_sub(t.host_us as u64),
+                                );
+                            }
                         }
                     }
                     pending = Some(frame);

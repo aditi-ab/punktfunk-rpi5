@@ -238,6 +238,18 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
                 session::SessionEvent::Connected {
                     mode, fingerprint, ..
                 } => tracing::info!(?mode, fp = %trust::hex(&fingerprint), "connected"),
+                // With per-AU 0xCF host timings the combined host+network stage splits into
+                // host (capture→sent on the host) + net; an old host emits none → combined only.
+                session::SessionEvent::Stats(s) if s.split => tracing::info!(
+                    fps = format!("{:.0}", s.fps),
+                    mbps = format!("{:.1}", s.mbps),
+                    decode_p50_ms = format!("{:.2}", s.decode_ms),
+                    hostnet_p50_ms = format!("{:.2}", s.hostnet_ms),
+                    host_p50_ms = format!("{:.2}", s.host_ms),
+                    net_p50_ms = format!("{:.2}", s.net_ms),
+                    frames_seen,
+                    "stats"
+                ),
                 session::SessionEvent::Stats(s) => tracing::info!(
                     fps = format!("{:.0}", s.fps),
                     mbps = format!("{:.1}", s.mbps),

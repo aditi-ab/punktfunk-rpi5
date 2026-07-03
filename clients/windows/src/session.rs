@@ -55,6 +55,15 @@ pub struct Stats {
     /// `host+network` stage p50 over the last 1 s window: capture (`pts_ns`) → received,
     /// host-clock corrected via `clock_offset_ns`.
     pub hostnet_ms: f32,
+    /// `host` stage p50 (host capture→sent, from the per-AU 0xCF host-timing plane). Valid only
+    /// when `split` — an old host emits no 0xCF and the HUD keeps the combined stage.
+    pub host_ms: f32,
+    /// `network` stage p50 (`hostnet − host`, tiled per frame before taking the percentile).
+    /// Valid only when `split`.
+    pub net_ms: f32,
+    /// True when any 0xCF host timings matched received AUs this window — the HUD then renders
+    /// `host + network` instead of the combined `host+network` term.
+    pub split: bool,
     /// True when `clock_offset_ns == 0` (host didn't answer the skew handshake / same host) —
     /// the HUD appends `(same-host clock)` to the end-to-end line.
     pub same_host: bool,
@@ -330,6 +339,12 @@ fn pump(
     // 1 s tumbling stage windows (spec: design/stats-unification.md — percentiles, never means).
     let mut hostnet_us: Vec<u64> = Vec::with_capacity(256);
     let mut decode_us: Vec<u64> = Vec::with_capacity(256);
+    // Host/network split (Phase 2): received AUs awaiting their 0xCF host timing, `(pts_ns,
+    // hostnet_us)`, matched as the datagrams arrive. Bounded — an old host never sends any.
+    let mut pending_split: std::collections::VecDeque<(u64, u64)> =
+        std::collections::VecDeque::with_capacity(256);
+    let mut host_us_w: Vec<u64> = Vec::with_capacity(256);
+    let mut net_us_w: Vec<u64> = Vec::with_capacity(256);
     let mut pcm = vec![0f32; 5760 * channels as usize]; // scratch: max Opus frame (120 ms) × channels
                                                         // Loss recovery: watch the host→client unrecoverable-drop count and ask for an IDR when it climbs.
     let mut last_dropped = connector.frames_dropped();
@@ -352,6 +367,11 @@ fn pump(
                     .max(0) as u64;
                 if hostnet > 0 && hostnet < 10_000_000_000 {
                     hostnet_us.push(hostnet / 1000);
+                    // Remember this AU for the 0xCF match below (host/network split).
+                    pending_split.push_back((frame.pts_ns, hostnet / 1000));
+                    if pending_split.len() > 256 {
+                        pending_split.pop_front();
+                    }
                 }
                 // A D3D11VA→software demotion (see `Decoder::decode`) starts a FRESH decoder that
                 // has none of the stream's parameter sets; under infinite GOP it would sit on
@@ -440,15 +460,34 @@ fn pump(
             *crate::present::LATEST_HDR_META.lock().unwrap() = Some(meta);
         }
 
+        // Drain the per-AU host-timing plane (0xCF) and match by pts: `host` = the host's own
+        // capture→sent, `network` = our capture→received minus it — the two tile per frame
+        // (design/stats-unification.md Phase 2). An old host never emits any; `split` stays false
+        // and the HUD keeps the combined `host+network` stage.
+        while let Ok(t) = connector.next_host_timing(Duration::ZERO) {
+            if let Some(i) = pending_split.iter().position(|(p, _)| *p == t.pts_ns) {
+                let (_, hn_us) = pending_split.remove(i).unwrap();
+                host_us_w.push(t.host_us as u64);
+                net_us_w.push(hn_us.saturating_sub(t.host_us as u64));
+            }
+        }
+
         if window_start.elapsed() >= Duration::from_secs(1) {
             let secs = window_start.elapsed().as_secs_f32();
             hostnet_us.sort_unstable();
             decode_us.sort_unstable();
+            host_us_w.sort_unstable();
+            net_us_w.sort_unstable();
             let p50 = |v: &[u64]| v.get(v.len() / 2).copied().unwrap_or(0);
             let (hostnet_p50, decode_p50) = (p50(&hostnet_us), p50(&decode_us));
+            let (host_p50, net_p50) = (p50(&host_us_w), p50(&net_us_w));
+            let split = !host_us_w.is_empty();
             tracing::debug!(
                 fps = frames_n,
                 hostnet_p50_us = hostnet_p50,
+                host_p50_us = host_p50,
+                net_p50_us = net_p50,
+                split,
                 decode_p50_us = decode_p50,
                 total_frames,
                 "stream window"
@@ -458,6 +497,9 @@ fn pump(
                 mbps: bytes_n as f32 * 8.0 / 1e6 / secs,
                 decode_ms: decode_p50 as f32 / 1000.0,
                 hostnet_ms: hostnet_p50 as f32 / 1000.0,
+                host_ms: host_p50 as f32 / 1000.0,
+                net_ms: net_p50 as f32 / 1000.0,
+                split,
                 same_host: clock_offset == 0,
                 hardware,
                 hdr,
@@ -470,6 +512,8 @@ fn pump(
             bytes_n = 0;
             hostnet_us.clear();
             decode_us.clear();
+            host_us_w.clear();
+            net_us_w.clear();
         }
     };
 

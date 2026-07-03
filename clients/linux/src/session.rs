@@ -56,6 +56,16 @@ pub struct Stats {
     pub mbps: f32,
     /// p50 `host+network` stage: capture → received, host-clock corrected (ms).
     pub host_net_ms: f32,
+    /// p50 `host` stage: the host's own capture→fully-sent, from the per-AU 0xCF host
+    /// timings (design/stats-unification.md Phase 2). Valid only when `split`.
+    pub host_ms: f32,
+    /// p50 `network` stage: capture→received minus the host-reported share
+    /// (`hostnet − host`, per-frame, saturating). Valid only when `split`.
+    pub net_ms: f32,
+    /// The window had matched host timings — the OSD splits `host+network` into
+    /// `host + network`. An old host never emits 0xCF, so this stays false and the
+    /// combined stage renders unchanged.
+    pub split: bool,
     /// p50 `decode` stage: received → decoded, single-clock client-local (ms).
     pub decode_ms: f32,
     /// Unrecoverable network frame drops this window, and their share of
@@ -66,6 +76,11 @@ pub struct Stats {
     /// until the first frame) — the OSD's trailing tag; tracks a mid-session fallback.
     pub decoder: &'static str,
 }
+
+/// Frames the pump keeps waiting for their 0xCF host timing (pts → capture→received µs).
+/// ~2 s at 120 Hz — a timing arrives within a frame or two of its AU, and against an old
+/// host (no 0xCF at all) this just caps the dead-weight ring.
+const PENDING_SPLIT_CAP: usize = 256;
 
 /// Sort a window of µs samples in place and return `(p50, p95)` per the spec's index
 /// rules (`sorted[len/2]`, `sorted[min(len*95/100, len-1)]`); an empty window reads 0.
@@ -245,6 +260,12 @@ fn pump(
     // corrected), `decode` = received→decoded (client-local). p50 per 1 s window.
     let mut hostnet_us: Vec<u64> = Vec::with_capacity(256);
     let mut decode_us: Vec<u64> = Vec::with_capacity(256);
+    // Host/network split (Phase 2): frames awaiting their per-AU 0xCF host timing,
+    // correlated by pts_ns. Bounded — an old host never sends any, so entries just age out.
+    let mut pending_split: std::collections::VecDeque<(u64, u64)> =
+        std::collections::VecDeque::with_capacity(PENDING_SPLIT_CAP);
+    let mut host_us_win: Vec<u64> = Vec::with_capacity(256);
+    let mut net_us_win: Vec<u64> = Vec::with_capacity(256);
     // What actually decoded the last frame — a VAAPI failure demotes mid-session, so
     // this is read off each frame's image variant rather than fixed at startup.
     let mut dec_path: &'static str = "";
@@ -291,6 +312,12 @@ fn pump(
                             .max(0) as u64;
                         if hn > 0 && hn < 10_000_000_000 {
                             hostnet_us.push(hn / 1000);
+                            // Remember the sample for the host/network split — matched
+                            // against the AU's 0xCF host timing when it arrives.
+                            if pending_split.len() >= PENDING_SPLIT_CAP {
+                                pending_split.pop_front();
+                            }
+                            pending_split.push_back((frame.pts_ns, hn / 1000));
                         }
                         // `decode` stage: received→decoded, single clock, no skew.
                         decode_us.push(decoded_ns.saturating_sub(received_ns) / 1000);
@@ -308,6 +335,19 @@ fn pump(
             Err(PunktfunkError::NoFrame) => {}
             Err(PunktfunkError::Closed) => break Some("Host ended the session".to_string()),
             Err(e) => break Some(format!("session: {e:?}")),
+        }
+
+        // Drain the per-AU host timings (0xCF) non-blockingly and match them to received
+        // frames by pts: host = the host's own capture→sent, network = our
+        // capture→received minus it (the two tile per frame by construction). An old
+        // host never emits any — the deque fills to its cap and the OSD keeps the
+        // combined `host+network` stage.
+        while let Ok(t) = connector.next_host_timing(Duration::ZERO) {
+            if let Some(i) = pending_split.iter().position(|(p, _)| *p == t.pts_ns) {
+                let (_, hn_us) = pending_split.remove(i).unwrap();
+                host_us_win.push(t.host_us as u64);
+                net_us_win.push(hn_us.saturating_sub(t.host_us as u64));
+            }
         }
 
         // Loss recovery: under infinite GOP the only recovery keyframe is one we request. The
@@ -330,11 +370,17 @@ fn pump(
             let secs = window_start.elapsed().as_secs_f32();
             let (hn_p50, _) = window_percentiles(&mut hostnet_us);
             let (dec_p50, _) = window_percentiles(&mut decode_us);
+            // Host/network split — present only when this window matched 0xCF timings.
+            let split = !host_us_win.is_empty();
+            let (host_p50, _) = window_percentiles(&mut host_us_win);
+            let (net_p50, _) = window_percentiles(&mut net_us_win);
             let lost = dropped.saturating_sub(window_dropped) as u32;
             window_dropped = dropped;
             tracing::debug!(
                 fps = frames_n,
                 hostnet_p50_us = hn_p50,
+                host_p50_us = host_p50,
+                net_p50_us = net_p50,
                 decode_p50_us = dec_p50,
                 lost,
                 total_frames,
@@ -344,6 +390,9 @@ fn pump(
                 fps: frames_n as f32 / secs,
                 mbps: bytes_n as f32 * 8.0 / 1e6 / secs,
                 host_net_ms: hn_p50 as f32 / 1000.0,
+                host_ms: host_p50 as f32 / 1000.0,
+                net_ms: net_p50 as f32 / 1000.0,
+                split,
                 decode_ms: dec_p50 as f32 / 1000.0,
                 lost,
                 lost_pct: if lost > 0 {
@@ -358,6 +407,8 @@ fn pump(
             bytes_n = 0;
             hostnet_us.clear();
             decode_us.clear();
+            host_us_win.clear();
+            net_us_win.clear();
         }
     };
 

@@ -69,6 +69,14 @@ final class SessionModel: ObservableObject {
     @Published var hostNetworkP95Ms = 0.0
     @Published var hostNetworkValid = false
     @Published var hostNetworkSkewCorrected = false
+    /// Phase 2 of the same stage: `host+network` split into its two terms via the host's per-AU
+    /// 0xCF timing reports (host = capture→fully-sent as the host measured it, network = the
+    /// remainder), matched to receipts by pts in `latencySplit`. `splitValid` is false whenever
+    /// no timing matched in the window — an old host that never emits the plane, or heavy 0xCF
+    /// loss — and the HUD then falls back to the combined `host+network` term.
+    @Published var hostP50Ms = 0.0
+    @Published var networkP50Ms = 0.0
+    @Published var splitValid = false
     /// End-to-end = capture→on-glass, measured directly per frame (never summed from the stages) —
     /// the HUD headline. Only the stage-2 presenter can stamp it (it owns decode + a
     /// CAMetalLayer/display-link present); stays invalid under stage-1, where the layer presents
@@ -96,6 +104,10 @@ final class SessionModel: ObservableObject {
     /// Capture→received (the host+network stage), fed per AU at receipt by the stream view's
     /// onFrame — under both presenters.
     let latency = LatencyMeter()
+    /// The host/network split of that same stage: onFrame also records (pts, interval) receipts
+    /// here, and the 1 s stats tick drains the connection's 0xCF host timings into it — under
+    /// both presenters (the receipt path is presenter-independent).
+    let latencySplit = HostNetworkSplitter()
     /// The stage-2 meters, passed to StreamView: end-to-end (capture→on-glass, stamped at
     /// present), decode (received→decoded), display (decoded→on-glass).
     let endToEnd = LatencyMeter()
@@ -296,6 +308,7 @@ final class SessionModel: ObservableObject {
         fps = 0
         mbps = 0
         hostNetworkValid = false
+        splitValid = false
         endToEndValid = false
         decodeValid = false
         displayValid = false
@@ -341,6 +354,7 @@ final class SessionModel: ObservableObject {
 
     private func startStatsTimer() {
         lastFramesDropped = 0 // a fresh connection's cumulative drop counter starts at 0
+        latencySplit.reset() // no stale receipts/samples from a previous session
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
@@ -363,6 +377,25 @@ final class SessionModel: ObservableObject {
                     self.hostNetworkValid = true
                 } else {
                     self.hostNetworkValid = false
+                }
+                // Phase 2: drain the window's per-AU host timings (0xCF) into the splitter —
+                // non-blocking, bounded (a 240 fps window is ~240 reports; the cap only guards
+                // a pathological burst). `try?` flattens (SE-0230); a throw (.closed during
+                // teardown) just ends the drain. An old host never emits any → splitValid stays
+                // false and the HUD keeps the combined host+network term.
+                if let conn = self.connection {
+                    var burst = 0
+                    while burst < 1024, let t = try? conn.nextHostTiming(timeoutMs: 0) {
+                        self.latencySplit.noteHostTiming(ptsNs: t.ptsNs, hostUs: t.hostUs)
+                        burst += 1
+                    }
+                }
+                if let s = self.latencySplit.drain() {
+                    self.hostP50Ms = s.hostP50Ms
+                    self.networkP50Ms = s.networkP50Ms
+                    self.splitValid = true
+                } else {
+                    self.splitValid = false
                 }
                 if let e = self.endToEnd.drain() {
                     self.endToEndP50Ms = e.p50Ms

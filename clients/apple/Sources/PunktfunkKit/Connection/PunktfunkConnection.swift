@@ -83,6 +83,9 @@ public final class PunktfunkConnection {
     /// Same role for the feedback drain thread (rumble + HID-output — two core planes,
     /// drained sequentially by one thread).
     private let feedbackLock = NSLock()
+    /// Same role for the host-timing (0xCF) puller — its own plane in the core, drained
+    /// non-blockingly by the app's 1 s stats tick (never contends with the blocking pullers).
+    private let statsLock = NSLock()
 
     /// Negotiated session mode (host-confirmed).
     public private(set) var width: UInt32 = 0
@@ -665,6 +668,40 @@ public final class PunktfunkConnection {
         }
     }
 
+    /// One per-AU host-timing report (0xCF): the host's capture→fully-sent duration for the
+    /// access unit whose `AccessUnit.ptsNs` equals `ptsNs` exactly. The stats consumer derives
+    /// `network = (receivedNs + clockOffsetNs − ptsNs) − hostUs` — the host/network split of the
+    /// HUD's `host+network` stage (design/stats-unification.md Phase 2).
+    public struct HostTiming: Sendable, Equatable {
+        /// The AU's capture stamp (host capture clock — matches the AU's `ptsNs`).
+        public let ptsNs: UInt64
+        /// Host capture→sent duration, µs.
+        public let hostUs: UInt32
+    }
+
+    /// Pull the next per-AU host timing; nil on timeout, throws `.closed` once the session
+    /// ended. Best-effort plane: an older host never emits any — keep showing the combined
+    /// `host+network` stage then. Drain non-blockingly (`timeoutMs: 0`) from ONE stats
+    /// consumer (its own core plane, safe alongside the other pullers).
+    public func nextHostTiming(timeoutMs: UInt32 = 0) throws -> HostTiming? {
+        statsLock.lock()
+        defer { statsLock.unlock() }
+        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
+
+        var out = PunktfunkHostTiming()
+        let rc = punktfunk_connection_next_host_timing(h, &out, timeoutMs)
+        switch rc {
+        case statusOK:
+            return HostTiming(ptsNs: out.pts_ns, hostUs: out.host_us)
+        case statusNoFrame:
+            return nil
+        case statusClosed:
+            throw PunktfunkClientError.closed
+        default:
+            throw PunktfunkClientError.status(rc)
+        }
+    }
+
     /// Send one input event (delivered to the host as a QUIC datagram). Thread-safe;
     /// silently dropped after close.
     public func send(_ event: PunktfunkInputEvent) {
@@ -684,10 +721,12 @@ public final class PunktfunkConnection {
         pumpLock.lock() // pullers exit at their next poll boundary, releasing these
         audioLock.lock()
         feedbackLock.lock()
+        statsLock.lock()
         abiLock.lock()
         let h = handle
         handle = nil
         abiLock.unlock()
+        statsLock.unlock()
         feedbackLock.unlock()
         audioLock.unlock()
         pumpLock.unlock()

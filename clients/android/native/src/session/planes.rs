@@ -73,13 +73,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 }
 
 /// `NativeBridge.nativeVideoStats(handle): DoubleArray?` — drain ~1 s of decode stats for the HUD
-/// (unified stats spec, `design/stats-unification.md`). Returns 16 doubles
+/// (unified stats spec, `design/stats-unification.md`). Returns 18 doubles
 /// `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
-/// bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms]`
-/// (the two flags are 1.0/0.0; indexes 0–13 match the previous 14-double layout with the latency
-/// pair re-based from capture→received to the end-to-end capture→decoded headline; the two stage
-/// p50s tiling it — `host+network` = capture→received, `decode` = received→decoded — are appended
-/// at the end), or `null` when no decode thread is running. Poll ~1 Hz from the UI; each call
+/// bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
+/// netP50Ms]`
+/// (the two flags are 1.0/0.0; indexes 0–15 match the previous 16-double layout — 0–13 the original
+/// 14-double one with the latency pair re-based to the end-to-end capture→decoded headline, 14/15
+/// the stage p50s tiling it: `host+network` = capture→received, `decode` = received→decoded; 16/17
+/// are the Phase-2 split of the `host+network` term from the per-AU 0xCF host timings — `host` =
+/// the host's capture→sent, `network` = the remainder — both 0.0 when no timing matched this
+/// window, i.e. an old host), or `null` when no decode thread is running. Poll ~1 Hz from the UI; each call
 /// resets the measurement window. Not android-gated — pure `jni` + connector reads, so it links on
 /// the host build too (Kotlin only ever calls it on device).
 #[no_mangle]
@@ -100,7 +103,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
         let snap = h.stats.drain();
         let mode = h.client.mode();
         let color = h.client.color;
-        let buf: [f64; 16] = [
+        let buf: [f64; 18] = [
             snap.fps,
             snap.mbps,
             snap.e2e_p50_ms,
@@ -122,6 +125,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             // Stage p50s tiling the end-to-end headline (appended to keep 0–13 index-compatible).
             snap.hostnet_p50_ms,
             snap.decode_p50_ms,
+            // Phase-2 host/network split of the `host+network` stage (0xCF host timings): 0.0
+            // when no timing matched this window (old host) — the HUD keeps the combined term.
+            snap.host_p50_ms,
+            snap.net_p50_ms,
         ];
         let arr = match env.new_double_array(buf.len() as jsize) {
             Ok(a) => a,

@@ -326,9 +326,14 @@ struct ContentView: View {
                     onCaptureChange: { [weak model] captured in
                         model?.mouseCaptured = captured
                     },
-                    onFrame: { [meter = model.meter, latency = model.latency, offset = conn.clockOffsetNs] au in
+                    onFrame: { [meter = model.meter, latency = model.latency,
+                                split = model.latencySplit, offset = conn.clockOffsetNs] au in
                         meter.note(byteCount: au.data.count)
                         latency.record(ptsNs: au.ptsNs, offsetNs: offset)
+                        // The same receipt, keyed by pts, awaiting its 0xCF host timing (the
+                        // host/network split — drained by the 1 s stats tick).
+                        split.recordReceipt(
+                            ptsNs: au.ptsNs, receivedNs: au.receivedNs, offsetNs: offset)
                     },
                     onSessionEnd: { [weak model] in
                         Task { @MainActor in model?.sessionEnded() }

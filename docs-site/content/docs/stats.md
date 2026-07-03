@@ -25,7 +25,7 @@ life:
 ```
 1920×1080@120 · 119 fps · 38.2 Mb/s · HEVC 10-bit HDR · GPU decode
 end-to-end 14.2 ms p50 · 19.8 p95 · capture→on-glass
-= host+network 9.8 + decode 2.1 + display 2.3
+= host 3.1 + network 6.7 + decode 2.1 + display 2.3
 lost 3 (0.1%) · skipped 1 · FEC 12
 ```
 
@@ -35,13 +35,17 @@ lost 3 (0.1%) · skipped 1 · FEC 12
   capture to the endpoint named at the end of the line (`capture→on-glass` here).
   `p50` = the typical frame (median), `p95` = the slow outliers. This is the one
   number that summarizes your stream.
-- **Line 3 — where the time goes.** The three stages **tile the end-to-end interval**
-  — each starts where the previous one ends, so they add up to the headline:
-  - `host+network` — capture → received: the host's capture/encode/send pipeline
-    *plus* the network flight and reassembly, in one number.
+- **Line 3 — where the time goes.** The stages **tile the end-to-end interval** —
+  each starts where the previous one ends, so they add up to the headline:
+  - `host` — capture → sent: the host's own share (capture read, encode, error
+    coding, the paced send), reported by the host itself once per frame.
+  - `network` — sent → received: the network flight plus reassembly on your device.
   - `decode` — received → decoded, on your device.
   - `display` — decoded → displayed: waiting for the right screen refresh, rendering,
     and vsync.
+
+  Against an **older host** that doesn't report its share yet, the first two terms
+  merge into a single `host+network` number — same total, one split fewer.
 
   (Stage values are per-stage medians, so they sum only *approximately* to the
   headline median — percentiles aren't perfectly additive. The headline is measured
@@ -109,10 +113,10 @@ stands in for a one-way frame flight that Moonlight doesn't measure.)
 | `Incoming frame rate from network` | Frames reassembled from the network per second | `fps` (line 1) | **Yes — direct** |
 | `Decoding frame rate` (desktop only) | Frames leaving the decoder per second | not shown separately (equals `fps` unless the decoder is falling behind) | — |
 | `Rendering frame rate` (desktop only) | Frames actually presented per second | `fps` minus `skipped` | Approximately |
-| `Host processing latency min/max/avg` (Sunshine hosts) | Host capture → just-before-send, reported by Sunshine per frame | contained inside `host+network`; the host-side breakdown lives in the punktfunk web console (capture/encode/send stages) | Indirect — punktfunk's `host+network` additionally includes the network flight |
+| `Host processing latency min/max/avg` (Sunshine hosts) | Host capture → just-before-send, reported by Sunshine per frame | `host` (line 3) — the host reports capture→fully-sent per frame the same way | **Yes — direct** (punktfunk's includes the paced send itself, Sunshine's stops just before it; avg vs p50) |
 | `Frames dropped by your network connection` | Frame-sequence gaps ÷ total frames | `lost` (line 4) | **Yes — direct** |
 | `Frames dropped due to network jitter` | Decoded frames the *client's pacer* chose to drop ÷ decoded frames | `skipped` (line 4) | Approximately (both are client-side pacing decisions, despite Moonlight's name) |
-| `Average network latency` | The **control connection's round-trip time** (ENet RTT + variance) — not video frame latency | none, on purpose | **No.** An RTT is not a frame latency; punktfunk measures the actual per-frame path instead |
+| `Average network latency` | The **control connection's round-trip time** (ENet RTT + variance) — not video frame latency | `network` (line 3) is the closest concept, but it's the *actual one-way frame path* (flight + reassembly), not an RTT | **No direct comparison.** Roughly, punktfunk's `network` ≈ ½ × an idle RTT plus serialization time of the frame |
 | `Average decoding time` | Mean time from decoder enqueue to picture out | `decode` (p50) | Yes (mean vs median; both include decoder queueing) |
 | `Average frame queue delay` | Mean time a decoded frame waits for its vsync slot | inside `display` | Sum the two Moonlight lines → |
 | `Average rendering time (incl. V-sync latency)` | Mean duration of the present call | inside `display` | …and compare against punktfunk's `display` |

@@ -175,7 +175,8 @@ fn fmt_uptime(secs: u32) -> String {
 /// The streaming HUD overlay (top-right), unified stats vocabulary (design/stats-unification.md):
 /// a chip row (mode · codec · decode path · HDR), a stream line (received fps · goodput ·
 /// presenter fps), the end-to-end headline (capture→on-glass p50/p95, host-clock corrected), the
-/// stage equation (= host+network + decode + display, stage p50s), a session line
+/// stage equation (= host + network + decode + display when the host reports 0xCF timings, else
+/// the combined = host+network + decode + display; stage p50s), a session line
 /// (host · time · loss/skips), and the shortcut hints. Layered over the `SwapChainPanel` in the
 /// same grid cell.
 fn hud_overlay(hud: &HudSample, mode: Option<Mode>, host: &str) -> Element {
@@ -212,12 +213,21 @@ fn hud_overlay(hud: &HudSample, mode: Option<Mode>, host: &str) -> Element {
     if stats.same_host {
         e2e_line.push_str(" (same-host clock)");
     }
-    // The equation: the three stages tile the headline interval per frame; the window p50s only
-    // approximately sum (percentiles aren't additive).
-    let stage_line = format!(
-        "= host+network {:.1} + decode {:.1} + display {:.1}",
-        stats.hostnet_ms, stats.decode_ms, present.display_p50_ms
-    );
+    // The equation: the stages tile the headline interval per frame; the window p50s only
+    // approximately sum (percentiles aren't additive). With per-AU 0xCF host timings the opaque
+    // `host+network` term splits into `host` (host capture→sent) + `network` (the remainder);
+    // an old host emits none and the combined term stays.
+    let stage_line = if stats.split {
+        format!(
+            "= host {:.1} + network {:.1} + decode {:.1} + display {:.1}",
+            stats.host_ms, stats.net_ms, stats.decode_ms, present.display_p50_ms
+        )
+    } else {
+        format!(
+            "= host+network {:.1} + decode {:.1} + display {:.1}",
+            stats.hostnet_ms, stats.decode_ms, present.display_p50_ms
+        )
+    };
     let mut session_bits: Vec<String> = Vec::new();
     if !host.is_empty() {
         session_bits.push(host.to_string());

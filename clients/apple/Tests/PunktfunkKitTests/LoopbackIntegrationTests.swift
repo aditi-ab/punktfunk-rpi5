@@ -25,12 +25,18 @@ final class LoopbackIntegrationTests: XCTestCase {
         XCTAssertEqual(conn.resolvedBitrateKbps, 50_000)
 
         // Pull 25 synthetic frames and byte-verify the documented pattern:
-        // u32 LE frame index, then data[i] = (idx as u8) &+ (i as u8).
+        // u32 LE frame index, then data[i] = (idx as u8) &+ (i as u8). Alongside, drain the
+        // per-AU host-timing plane (0xCF) the way the app's stats tick does — the connector
+        // ORs VIDEO_CAP_HOST_TIMING in unconditionally and the synthetic host stamps one
+        // report per AU, so the pts correlation must hold end to end through the xcframework.
         var got = 0
         var lastIndex: UInt32 = 0
+        var receivedPts = Set<UInt64>()
+        var timings: [PunktfunkConnection.HostTiming] = []
         let deadline = Date().addingTimeInterval(30)
         while got < 25 {
             XCTAssertLessThan(Date(), deadline, "timed out after \(got) frames")
+            while let t = try conn.nextHostTiming(timeoutMs: 0) { timings.append(t) }
             guard let au = try conn.nextAU(timeoutMs: 2000) else { continue }
             let idx = au.data.prefix(4).reversed().reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
             for (i, byte) in au.data.enumerated().dropFirst(4) {
@@ -41,10 +47,22 @@ final class LoopbackIntegrationTests: XCTestCase {
                 }
             }
             XCTAssertGreaterThan(au.ptsNs, 0)
+            receivedPts.insert(au.ptsNs)
             lastIndex = idx
             got += 1
         }
         XCTAssertGreaterThanOrEqual(lastIndex, 24)
+        // Belt-and-braces: the last frame's timing lands just after its AU — give it a bounded
+        // grace drain (the stream keeps running, so this must not loop on fresh timings).
+        var grace = 0
+        while grace < 64, !timings.contains(where: { receivedPts.contains($0.ptsNs) }),
+              let t = try conn.nextHostTiming(timeoutMs: 100) {
+            timings.append(t)
+            grace += 1
+        }
+        XCTAssertTrue(
+            timings.contains { receivedPts.contains($0.ptsNs) },
+            "no 0xCF host timing matched a received AU's pts (got \(timings.count) timings)")
 
         // Input goes the other way (enqueue-only; the host logs the count on close) —
         // including the touch kinds, gamepad events, the rich-input plane (DualSense

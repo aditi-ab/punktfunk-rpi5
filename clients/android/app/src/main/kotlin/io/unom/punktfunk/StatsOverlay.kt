@@ -16,12 +16,15 @@ import kotlin.math.roundToInt
 
 /**
  * The live stats overlay — the unified HUD (`design/stats-unification.md`, Android v1: headline is
- * `capture→decoded`, tiled by `host+network` + `decode`). Reads the 16-double layout from
+ * `capture→decoded`, tiled by `host+network` + `decode`). Reads the 18-double layout from
  * [NativeBridge.nativeVideoStats]:
  * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skew, w, h, hz, lost, bitDepth, colorPrimaries,
- * colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms]`. Indexes 10–13 (present on a current
- * native lib) describe the negotiated video feed and render as a codec/depth/colour/chroma line;
- * 14/15 render as the stage equation; older layouts just omit those lines.
+ * colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms, netP50Ms]`. Indexes 10–13
+ * (present on a current native lib) describe the negotiated video feed and render as a
+ * codec/depth/colour/chroma line; 14/15 render as the stage equation — split into
+ * `host + network + decode` when the Phase-2 terms at 16/17 are nonzero (a current host sends
+ * per-AU 0xCF timings; an old host leaves them 0 and the combined `host+network` term stands);
+ * older layouts just omit those lines.
  */
 @Composable
 internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
@@ -60,8 +63,16 @@ internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
                 fontSize = 12.sp,
             )
             if (s.size >= 16) {
+                // Phase-2 split (s[16]/s[17]): render `host + network` separately when the host
+                // reported its share this window; otherwise the combined term (old host / no
+                // matched 0xCF timing).
+                val equation = if (s.size >= 18 && s[16] > 0) {
+                    "= host ${"%.1f".format(s[16])} + network ${"%.1f".format(s[17])} + decode ${"%.1f".format(s[15])}"
+                } else {
+                    "= host+network ${"%.1f".format(s[14])} + decode ${"%.1f".format(s[15])}"
+                }
                 Text(
-                    "= host+network ${"%.1f".format(s[14])} + decode ${"%.1f".format(s[15])}",
+                    equation,
                     color = Color.White,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.sp,

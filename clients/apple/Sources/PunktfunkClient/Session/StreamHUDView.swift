@@ -26,20 +26,34 @@ struct StreamHUDView: View {
                 Text("end-to-end \(model.endToEndP50Ms, specifier: "%.1f") ms p50 · \(model.endToEndP95Ms, specifier: "%.1f") p95 · capture→on-glass\(model.endToEndSkewCorrected ? "" : " (same-host clock)")")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
-                // The equation: the three stages tiling the headline interval (per-window p50s —
-                // they only approximately sum to the directly-measured total).
+                // The equation: the stages tiling the headline interval (per-window p50s —
+                // they only approximately sum to the directly-measured total). With a host
+                // that reports per-AU timings (0xCF) the first term splits into host + network
+                // (phase 2); an old host keeps the combined term.
                 if model.hostNetworkValid && model.decodeValid && model.displayValid {
-                    Text("= host+network \(model.hostNetworkP50Ms, specifier: "%.1f") + decode \(model.decodeP50Ms, specifier: "%.1f") + display \(model.displayP50Ms, specifier: "%.1f")")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                    if model.splitValid {
+                        Text("= host \(model.hostP50Ms, specifier: "%.1f") + network \(model.networkP50Ms, specifier: "%.1f") + decode \(model.decodeP50Ms, specifier: "%.1f") + display \(model.displayP50Ms, specifier: "%.1f")")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("= host+network \(model.hostNetworkP50Ms, specifier: "%.1f") + decode \(model.decodeP50Ms, specifier: "%.1f") + display \(model.displayP50Ms, specifier: "%.1f")")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
                 }
             } else if model.hostNetworkValid {
                 // Stage-1 fallback presenter: the layer decodes + presents internally with no
-                // per-frame stamp, so the honest headline ends at receipt — and there is no
-                // equation line (host+network is the whole measured interval).
+                // per-frame stamp, so the honest headline ends at receipt. The host/network
+                // split still applies there (receipt is presenter-independent) — it becomes the
+                // only equation line; without it, host+network IS the whole measured interval.
                 Text("capture→received \(model.hostNetworkP50Ms, specifier: "%.1f") ms p50 · \(model.hostNetworkP95Ms, specifier: "%.1f") p95\(model.hostNetworkSkewCorrected ? "" : " (same-host clock)")")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
+                if model.splitValid {
+                    Text("= host \(model.hostP50Ms, specifier: "%.1f") + network \(model.networkP50Ms, specifier: "%.1f")")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
             }
             if model.lostFrames > 0 {
                 // Unrecoverable network drops this window; hidden while the link is clean.

@@ -68,10 +68,28 @@ impl StreamPage {
         if self.hdr.get() {
             line1.push_str(" · HDR");
         }
+        // The equation line: split `host+network` into `host + network` when the host
+        // reported per-AU timings (0xCF, stats Phase 2); the combined stage otherwise.
+        let equation = if s.split {
+            format!(
+                "= host {:.1} + network {:.1} + decode {:.1} + display {:.1}",
+                s.host_ms,
+                s.net_ms,
+                s.decode_ms,
+                self.presented.display_ms.get(),
+            )
+        } else {
+            format!(
+                "= host+network {:.1} + decode {:.1} + display {:.1}",
+                s.host_net_ms,
+                s.decode_ms,
+                self.presented.display_ms.get(),
+            )
+        };
         let mut text = format!(
             "{line1}\n\
              end-to-end {:.1} ms p50 · {:.1} p95 · capture→displayed{}\n\
-             = host+network {:.1} + decode {:.1} + display {:.1}",
+             {equation}",
             self.presented.e2e_p50_ms.get(),
             self.presented.e2e_p95_ms.get(),
             if self.same_host {
@@ -79,9 +97,6 @@ impl StreamPage {
             } else {
                 ""
             },
-            s.host_net_ms,
-            s.decode_ms,
-            self.presented.display_ms.get(),
         );
         // Counters — only rendered when nonzero this window.
         if s.lost > 0 {
