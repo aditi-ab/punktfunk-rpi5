@@ -269,6 +269,23 @@ fn open_gs_virtual_source(
     ));
     #[cfg(not(target_os = "linux"))]
     vd.set_launch_command(app.and_then(|a| a.cmd.clone()));
+    // Serialize with the punktfunk/1 plane's IDD-push setup dance (Goal-1 §2.5). A GameStream
+    // connect used to skip it entirely, so it could ADD/reconfigure the shared monitor while a
+    // native session was mid-build (and vice versa), and its sealed-channel delivery would replace
+    // the native session's ring (newest-wins) — each plane could freeze the other. GameStream has
+    // no cooperative stop-flag plumbing, so it registers a flag nobody reads: a LATER session that
+    // preempts this one signals it, waits the 3 s release grace, then force-preempts the monitor —
+    // this session then fails on capture and tears down cleanly (the intended handover).
+    #[cfg(target_os = "windows")]
+    let _idd_setup_guard = matches!(
+        crate::session_plan::CaptureBackend::resolve(),
+        crate::session_plan::CaptureBackend::IddPush
+    )
+    .then(|| {
+        crate::vdisplay::manager::vdm().begin_idd_setup(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ))
+    });
     let vout = vd
         .create(punktfunk_core::Mode {
             width: cfg.width,

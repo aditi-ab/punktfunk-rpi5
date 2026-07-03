@@ -16,15 +16,20 @@
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it (unsafe-proof program).
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+use anyhow::{Context, Result};
+use windows::core::w;
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, LUID, WAIT_OBJECT_0,
+};
+use windows::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+};
 
 use super::{Mode, VirtualOutput};
 use crate::win_display::{
@@ -144,6 +149,9 @@ struct DeviceSlot {
     /// `CLEAR_ALL` (crashed-host orphan reap) runs only on the FIRST open of the process; a reopen
     /// races sessions this process still considers live and must not raze them.
     opened_once: bool,
+    /// The cross-process single-instance mutex (`Global\punktfunk-vdisplay-manager`), acquired on
+    /// the first open and held — never released — for the process lifetime.
+    instance_guard: Option<OwnedHandle>,
 }
 
 /// The host-lifetime virtual-display manager: the single owner of the monitor lifecycle.
@@ -208,6 +216,33 @@ pub(crate) fn control_device_handle() -> Option<HANDLE> {
 /// next use reopens. The root `windows` error survives anyhow `.context` chains via `downcast_ref`.
 /// NOTE: 0x80070490 (ERROR_NOT_FOUND, the ADD slot-exhaustion wedge) is deliberately NOT here — it
 /// has its own reap-and-retry handling and the device is alive when it fires.
+/// The cross-process single-instance guard for pf-vdisplay management. A SECOND host process's
+/// first device open used to fire `IOCTL_CLEAR_ALL` and raze the live host's monitors mid-stream —
+/// an admin footgun (run `punktfunk-host serve` while the SCM service streams), masked afterwards
+/// because both processes' pings satisfy the shared driver watchdog. The named mutex makes the
+/// second process fail its vdisplay open LOUDLY instead. Held, never released, for the process
+/// lifetime; the OS reclaims it (and frees the name) when the process exits, however it exits.
+fn acquire_single_instance() -> Result<OwnedHandle> {
+    // SAFETY: plain FFI create of a named mutex; the returned handle (checked by `?`) is solely
+    // owned by the `OwnedHandle`, and `GetLastError` is read immediately after the create — the
+    // documented ERROR_ALREADY_EXISTS protocol for pre-existing named objects.
+    unsafe {
+        let h = CreateMutexW(None, false, w!("Global\\punktfunk-vdisplay-manager"))
+            .context("CreateMutexW(punktfunk-vdisplay single-instance guard)")?;
+        let already = GetLastError() == ERROR_ALREADY_EXISTS;
+        let owned = OwnedHandle::from_raw_handle(h.0 as _);
+        if already {
+            anyhow::bail!(
+                "another punktfunk-host process is already managing pf-vdisplay on this machine — \
+                 refusing to touch the driver (a second manager's startup CLEAR_ALL would raze the \
+                 live host's monitors mid-stream). Stop the other instance (e.g. `punktfunk-host \
+                 service stop`) first."
+            );
+        }
+        Ok(owned)
+    }
+}
+
 /// Best-effort "is this WUDFHost pid still alive?" — the monitor-liveness probe for the JOIN path.
 /// `OpenProcess` failing (pid reaped) or the process being signaled ⇒ dead. Pid reuse could
 /// theoretically alias a fresh process and read "alive"; the joining session then just retries into
@@ -261,6 +296,9 @@ impl VirtualDisplayManager {
             return Ok(HANDLE(d.as_raw_handle()));
         }
         let reap = !slot.opened_once;
+        if slot.instance_guard.is_none() {
+            slot.instance_guard = Some(acquire_single_instance()?);
+        }
         // SAFETY: `VdisplayDriver::open` is `unsafe` only because it issues SetupAPI + `DeviceIoControl`
         // FFI in the caller's apartment; the `device` mutex (held here) serializes it, so there is no
         // concurrent open. `open` has no handle precondition to uphold, and the `OwnedHandle` it
@@ -770,35 +808,29 @@ impl VirtualDisplayManager {
                 .name("vdisplay-linger".into())
                 .spawn(move || loop {
                     thread::sleep(Duration::from_millis(500));
-                    let due = {
-                        let g = self.state.lock().unwrap();
-                        matches!(&*g, MgrState::Lingering { until, .. } if Instant::now() >= *until)
-                    };
-                    if !due {
-                        continue;
-                    }
                     let Some(dev) = self.device_handle() else {
                         continue;
                     };
-                    let taken = {
-                        let mut g = self.state.lock().unwrap();
-                        if matches!(&*g, MgrState::Lingering { until, .. } if Instant::now() >= *until) {
-                            if let MgrState::Lingering { mon, .. } =
-                                std::mem::replace(&mut *g, MgrState::Idle)
-                            {
-                                Some(mon)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(mon) = taken {
-                        // SAFETY: `teardown` requires `dev` to be the live control handle; `dev` is from
-                        // `self.device_handle()` (the `Some` checked just above), i.e. the cached
-                        // `OwnedHandle` live for the process lifetime. `mon` was moved out of the
-                        // `Lingering` state under the `state` lock, so it is exclusively owned here.
+                    let mut g = self.state.lock().unwrap();
+                    if !matches!(&*g, MgrState::Lingering { until, .. } if Instant::now() >= *until)
+                    {
+                        continue;
+                    }
+                    if let MgrState::Lingering { mon, .. } =
+                        std::mem::replace(&mut *g, MgrState::Idle)
+                    {
+                        // Teardown UNDER the state lock. Dropping the lock first (the old shape) let a
+                        // concurrent `acquire` see Idle and run its ADD + CCD isolate while this
+                        // monitor's pinger-join / CCD-restore / REMOVE were still in flight — the late
+                        // restore then de-isolated (or the REMOVE churn-rejected) the fresh session at
+                        // the linger-expiry boundary. Holding the lock makes the racing acquire WAIT
+                        // the few teardown seconds instead of failing its session. Lock order stays
+                        // state → device (teardown's invalidate path), same as every other holder; the
+                        // pinger takes only the device lock — no inversion.
+                        // SAFETY: `teardown` requires a valid control handle; `dev` is from
+                        // `self.device_handle()` (cached handles are never closed — a dead one is
+                        // retired, kept alive; see `DeviceSlot`). `mon` was moved out of the replaced
+                        // state under the lock, so it is exclusively owned here.
                         unsafe { self.teardown(dev, mon) };
                     }
                 })
