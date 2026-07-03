@@ -3027,6 +3027,7 @@ dependencies = [
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "windows-service",
  "winreg",
+ "winresource",
  "x509-parser",
  "xkbcommon",
 ]
