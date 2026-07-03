@@ -130,6 +130,23 @@ fn host_log_path() -> PathBuf {
     dir.join("host.log")
 }
 
+/// One-generation size cap for the append-forever logs: at each (re)open, a file over this size is
+/// renamed to `<name>.old` (replacing the previous generation) — so a crash-restart loop or a
+/// `RUST_LOG=debug` left in host.env can't grow them without bound.
+const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Rotate `path` to `path.old` when it has outgrown [`LOG_ROTATE_BYTES`]. Only called right before
+/// an open (service start for service.log, each host (re)launch for host.log) — never while a live
+/// handle appends: renaming under an appender would silently redirect its writes into the `.old`
+/// file. Best-effort; a failed rename just means one more un-rotated run.
+fn rotate_if_large(path: &std::path::Path) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() >= LOG_ROTATE_BYTES) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".old");
+        let _ = std::fs::rename(path, std::path::Path::new(&old));
+    }
+}
+
 /// Initialise tracing to the service log file (the SCM gives the service no console/stderr). Falls
 /// back to stderr if the file can't be opened. Called from `main()` only for `service run`.
 /// Also tees into the in-memory log ring (`log_capture`), like the stderr path in `main()` — the
@@ -140,10 +157,12 @@ pub fn init_file_logging(filter: tracing_subscriber::EnvFilter) {
     use tracing_subscriber::Layer;
     let ring =
         crate::log_capture::RingLayer.with_filter(tracing_subscriber::filter::LevelFilter::DEBUG);
+    let log_path = service_log_path();
+    rotate_if_large(&log_path);
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(service_log_path())
+        .open(log_path)
     {
         Ok(file) => {
             tracing_subscriber::registry()
@@ -549,8 +568,12 @@ unsafe fn spawn_host(
         let _ = DestroyEnvironmentBlock(env_block);
     }
 
-    // 3) Redirect the host's stdout+stderr to host.log (inheritable handle).
-    let log = open_log_handle(&host_log_path())?;
+    // 3) Redirect the host's stdout+stderr to host.log (inheritable handle). The previous child has
+    //    exited by the time the supervise loop relaunches, so its handle can't be live here — safe
+    //    to rotate. (A leaked orphan's handle lacks FILE_SHARE_DELETE, so the rename just fails.)
+    let host_log = host_log_path();
+    rotate_if_large(&host_log);
+    let log = open_log_handle(&host_log)?;
 
     let mut si = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,

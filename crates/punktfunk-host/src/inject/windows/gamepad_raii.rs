@@ -534,7 +534,9 @@ impl DriverAttach {
             driver_log = self.driver_log,
             "gamepad driver has not attached to the shared section — the virtual pad exists but no \
              driver is serving it (games will not see it); an old (pre-sealed-channel) driver also \
-             reads as not-attached: update with punktfunk-host.exe driver install --gamepad"
+             reads as not-attached: update with punktfunk-host.exe driver install --gamepad \
+             (driver_log is only written by debug driver builds, or with the PFXUSB_DEBUG_LOG / \
+             PFDS_DEBUG_LOG system env var set + the device restarted)"
         );
     }
 }

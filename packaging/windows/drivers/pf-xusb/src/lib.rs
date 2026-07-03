@@ -104,16 +104,45 @@ fn channel_cfg() -> ChannelConfig {
     }
 }
 
+/// Whether the world-writable bring-up file log is enabled (resolved once). OPT-IN — debug builds,
+/// or the `PFXUSB_DEBUG_LOG` (system-wide) env var — the same treatment pf-vdisplay got in audit
+/// §4.4: a RELEASE driver never writes the Public file (info-leak/DoS surface), and the per-rumble
+/// SET_STATE hex dumps stop being a sustained disk-write path during gameplay. DebugView can't see
+/// the UMDF host across session 0, so the file stays the bring-up diagnostic when enabled.
+fn file_log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cfg!(debug_assertions) || std::env::var_os("PFXUSB_DEBUG_LOG").is_some())
+}
+
+/// Process-lifetime append handle to the bring-up log, opened ONCE and shared via a `Mutex`
+/// (pf-vdisplay's pattern) — no per-line open/close.
+fn file_appender() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    use std::sync::OnceLock;
+    static APPENDER: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+    APPENDER
+        .get_or_init(|| {
+            if !file_log_enabled() {
+                return None;
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("C:\\Users\\Public\\pfxusb-driver.log")
+                .ok()
+                .map(std::sync::Mutex::new)
+        })
+        .as_ref()
+}
+
 fn log(s: &str) {
     if let Ok(c) = std::ffi::CString::new(s) {
         // SAFETY: `c` is a valid NUL-terminated string for the duration of the call.
         unsafe { OutputDebugStringA(c.as_ptr().cast()) };
     }
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("C:\\Users\\Public\\pfxusb-driver.log")
+    if let Some(m) = file_appender()
+        && let Ok(mut f) = m.lock()
     {
         let _ = writeln!(f, "{s}");
     }
