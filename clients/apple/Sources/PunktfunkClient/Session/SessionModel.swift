@@ -59,36 +59,50 @@ final class SessionModel: ObservableObject {
     @Published var fps = 0
     @Published var mbps = 0.0
     @Published var totalFrames = 0
-    /// Capture→client-receipt latency (ms), skew-corrected across machines via the connect-time
-    /// clock offset — p50/p95 for the HUD. `latencyValid` is false until the first sample drains
-    /// (and whenever no host frames arrived in the last interval). `latencySkewCorrected` = the host
+    /// The unified latency stages (design/stats-unification.md), ms per 1 s window. `host+network`
+    /// = capture→received, skew-corrected across machines via the connect-time clock offset: the
+    /// stage-2 HUD shows its p50 in the equation line; the stage-1 fallback shows p50/p95 as its
+    /// `capture→received` headline. `hostNetworkValid` is false until the first sample drains (and
+    /// whenever no host frames arrived in the last interval). `hostNetworkSkewCorrected` = the host
     /// answered the skew handshake (the number is cross-machine valid, not just same-host).
-    @Published var latencyP50Ms = 0.0
-    @Published var latencyP95Ms = 0.0
-    @Published var latencyValid = false
-    @Published var latencySkewCorrected = false
-    /// Capture→present (glass-to-glass, modulo the host render→capture term) — only the stage-2
-    /// presenter can stamp this (it owns decode + a CAMetalLayer/display-link present). Stays
-    /// invalid under stage-1, where the layer presents internally with no per-frame callback.
-    @Published var presentLatencyP50Ms = 0.0
-    @Published var presentLatencyP95Ms = 0.0
-    @Published var presentLatencyValid = false
-    @Published var presentLatencySkewCorrected = false
-    /// Decode-completion→present (the "present tail": ring wait + render + vsync) — the term the
-    /// stage-2 presenter exists to shorten. Both instants are client-side, so no skew applies.
-    @Published var presentTailP50Ms = 0.0
-    @Published var presentTailP95Ms = 0.0
-    @Published var presentTailValid = false
+    @Published var hostNetworkP50Ms = 0.0
+    @Published var hostNetworkP95Ms = 0.0
+    @Published var hostNetworkValid = false
+    @Published var hostNetworkSkewCorrected = false
+    /// End-to-end = capture→on-glass, measured directly per frame (never summed from the stages) —
+    /// the HUD headline. Only the stage-2 presenter can stamp it (it owns decode + a
+    /// CAMetalLayer/display-link present); stays invalid under stage-1, where the layer presents
+    /// internally with no per-frame callback.
+    @Published var endToEndP50Ms = 0.0
+    @Published var endToEndP95Ms = 0.0
+    @Published var endToEndValid = false
+    @Published var endToEndSkewCorrected = false
+    /// The client-local stage terms of the HUD's equation line (single clock, no skew; p50 only):
+    /// decode = received→decoded, display = decoded→on-glass (ring wait + render + vsync — the
+    /// term the stage-2 presenter exists to shorten).
+    @Published var decodeP50Ms = 0.0
+    @Published var decodeValid = false
+    @Published var displayP50Ms = 0.0
+    @Published var displayValid = false
+    /// Unrecoverable network frame drops in the last window (FEC couldn't rebuild them) and their
+    /// share of frames offered, `lost/(received+lost)`. The HUD hides the line while zero.
+    @Published var lostFrames = 0
+    @Published var lostPct = 0.0
     /// Mirrors StreamView's capture state (it owns the input capture; this drives the
     /// HUD's "click to capture" / "⌘⎋ releases" hint).
     @Published var mouseCaptured = false
 
     let meter = FrameMeter()
+    /// Capture→received (the host+network stage), fed per AU at receipt by the stream view's
+    /// onFrame — under both presenters.
     let latency = LatencyMeter()
-    /// Fed by the stage-2 presenter's display link (capture→present). Passed to StreamView.
-    let presentLatency = LatencyMeter()
-    /// Fed by the same present stamp (decode-completion→present). Passed to StreamView.
-    let presentTail = LatencyMeter()
+    /// The stage-2 meters, passed to StreamView: end-to-end (capture→on-glass, stamped at
+    /// present), decode (received→decoded), display (decoded→on-glass).
+    let endToEnd = LatencyMeter()
+    let decodeStage = LatencyMeter()
+    let displayStage = LatencyMeter()
+    /// Cumulative reassembler-drop counter at the last stats drain (per-window `lost` delta).
+    private var lastFramesDropped: UInt64 = 0
     private var statsTimer: Timer?
     private var audio: SessionAudio?
     private var gamepadCapture: GamepadCapture?
@@ -281,7 +295,12 @@ final class SessionModel: ObservableObject {
         phase = .idle
         fps = 0
         mbps = 0
-        latencyValid = false
+        hostNetworkValid = false
+        endToEndValid = false
+        decodeValid = false
+        displayValid = false
+        lostFrames = 0
+        lostPct = 0
         mouseCaptured = false
     }
 
@@ -321,6 +340,7 @@ final class SessionModel: ObservableObject {
     }
 
     private func startStatsTimer() {
+        lastFramesDropped = 0 // a fresh connection's cumulative drop counter starts at 0
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
@@ -328,28 +348,41 @@ final class SessionModel: ObservableObject {
                 self.fps = frames
                 self.mbps = Double(bytes) * 8 / 1_000_000
                 self.totalFrames = total
+                // Per-window `lost` = the delta of the connector's cumulative reassembler-drop
+                // counter (0 after close — treat a rewind as no loss rather than underflowing).
+                let dropped = self.connection?.framesDropped() ?? 0
+                let lost = dropped >= self.lastFramesDropped
+                    ? Int(dropped - self.lastFramesDropped) : 0
+                self.lastFramesDropped = dropped
+                self.lostFrames = lost
+                self.lostPct = lost > 0 ? Double(lost) / Double(frames + lost) * 100 : 0
                 if let lat = self.latency.drain() {
-                    self.latencyP50Ms = lat.p50Ms
-                    self.latencyP95Ms = lat.p95Ms
-                    self.latencySkewCorrected = lat.skewCorrected
-                    self.latencyValid = true
+                    self.hostNetworkP50Ms = lat.p50Ms
+                    self.hostNetworkP95Ms = lat.p95Ms
+                    self.hostNetworkSkewCorrected = lat.skewCorrected
+                    self.hostNetworkValid = true
                 } else {
-                    self.latencyValid = false
+                    self.hostNetworkValid = false
                 }
-                if let p = self.presentLatency.drain() {
-                    self.presentLatencyP50Ms = p.p50Ms
-                    self.presentLatencyP95Ms = p.p95Ms
-                    self.presentLatencySkewCorrected = p.skewCorrected
-                    self.presentLatencyValid = true
+                if let e = self.endToEnd.drain() {
+                    self.endToEndP50Ms = e.p50Ms
+                    self.endToEndP95Ms = e.p95Ms
+                    self.endToEndSkewCorrected = e.skewCorrected
+                    self.endToEndValid = true
                 } else {
-                    self.presentLatencyValid = false
+                    self.endToEndValid = false
                 }
-                if let t = self.presentTail.drain() {
-                    self.presentTailP50Ms = t.p50Ms
-                    self.presentTailP95Ms = t.p95Ms
-                    self.presentTailValid = true
+                if let d = self.decodeStage.drain() {
+                    self.decodeP50Ms = d.p50Ms
+                    self.decodeValid = true
                 } else {
-                    self.presentTailValid = false
+                    self.decodeValid = false
+                }
+                if let d = self.displayStage.drain() {
+                    self.displayP50Ms = d.p50Ms
+                    self.displayValid = true
+                } else {
+                    self.displayValid = false
                 }
             }
         }

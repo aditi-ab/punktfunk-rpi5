@@ -46,11 +46,18 @@ pub struct SessionParams {
 
 #[derive(Clone, Copy, Default, PartialEq)]
 pub struct Stats {
+    /// AUs received (reassembled) per second — actual-elapsed-time denominator.
     pub fps: f32,
+    /// Received payload goodput (excludes FEC overhead).
     pub mbps: f32,
+    /// `decode` stage p50 over the last 1 s window: received → decoded, client-local clock.
     pub decode_ms: f32,
-    /// Median capture→decoded latency over the last window (host-clock corrected).
-    pub latency_ms: f32,
+    /// `host+network` stage p50 over the last 1 s window: capture (`pts_ns`) → received,
+    /// host-clock corrected via `clock_offset_ns`.
+    pub hostnet_ms: f32,
+    /// True when `clock_offset_ns == 0` (host didn't answer the skew handshake / same host) —
+    /// the HUD appends `(same-host clock)` to the end-to-end line.
+    pub same_host: bool,
     /// True when decoding on the GPU (D3D11VA) vs. CPU (software).
     pub hardware: bool,
     /// True when the stream is BT.2020 PQ HDR10 (last decoded frame).
@@ -81,9 +88,19 @@ pub enum SessionEvent {
     Stats(Stats),
 }
 
-/// Decoded frames + their host-capture `pts_ns`, session pump → render thread (crossbeam so that
+/// Per-frame measurement points carried with a decoded frame to the render thread: the host
+/// capture clock (`pts_ns`) and our local `decoded` stamp (wall-clock ns). Post-`Present()` the
+/// render thread derives the `display` stage (displayed − decoded, single-clock) and the
+/// end-to-end headline (displayed + clock_offset − pts) from them.
+#[derive(Clone, Copy)]
+pub struct FrameTimes {
+    pub pts_ns: u64,
+    pub decoded_ns: u64,
+}
+
+/// Decoded frames + their measurement points, session pump → render thread (crossbeam so that
 /// thread can block with a timeout — async-channel has no `recv_timeout`).
-pub type FrameRx = crossbeam_channel::Receiver<(DecodedFrame, u64)>;
+pub type FrameRx = crossbeam_channel::Receiver<(DecodedFrame, FrameTimes)>;
 
 pub struct SessionHandle {
     pub events: async_channel::Receiver<SessionEvent>,
@@ -205,7 +222,7 @@ impl AudioDec {
 fn pump(
     params: SessionParams,
     ev_tx: async_channel::Sender<SessionEvent>,
-    frame_tx: crossbeam_channel::Sender<(DecodedFrame, u64)>,
+    frame_tx: crossbeam_channel::Sender<(DecodedFrame, FrameTimes)>,
     frame_rx: FrameRx,
     stop: Arc<AtomicBool>,
 ) {
@@ -310,8 +327,9 @@ fn pump(
     let mut window_start = Instant::now();
     let mut frames_n = 0u32;
     let mut bytes_n = 0u64;
-    let mut decode_us_sum = 0u64;
-    let mut lat_us: Vec<u64> = Vec::with_capacity(256);
+    // 1 s tumbling stage windows (spec: design/stats-unification.md — percentiles, never means).
+    let mut hostnet_us: Vec<u64> = Vec::with_capacity(256);
+    let mut decode_us: Vec<u64> = Vec::with_capacity(256);
     let mut pcm = vec![0f32; 5760 * channels as usize]; // scratch: max Opus frame (120 ms) × channels
                                                         // Loss recovery: watch the host→client unrecoverable-drop count and ask for an IDR when it climbs.
     let mut last_dropped = connector.frames_dropped();
@@ -323,7 +341,18 @@ fn pump(
         }
         match connector.next_frame(Duration::from_millis(4)) {
             Ok(frame) => {
-                let t0 = Instant::now();
+                // The `received` point: AU fully reassembled, handed to us, before decode.
+                let received_ns = now_ns();
+                // fps = AUs received per second, Mb/s = received goodput (spec: counted at the
+                // received point, not the decoded one).
+                frames_n += 1;
+                bytes_n += frame.data.len() as u64;
+                // `host+network` stage: capture → received, host-clock corrected. Clamped (0, 10 s).
+                let hostnet = (received_ns as i128 + clock_offset as i128 - frame.pts_ns as i128)
+                    .max(0) as u64;
+                if hostnet > 0 && hostnet < 10_000_000_000 {
+                    hostnet_us.push(hostnet / 1000);
+                }
                 // A D3D11VA→software demotion (see `Decoder::decode`) starts a FRESH decoder that
                 // has none of the stream's parameter sets; under infinite GOP it would sit on
                 // "PPS id out of range" forever. Detect the transition and force a new IDR so the
@@ -336,6 +365,8 @@ fn pump(
                 }
                 match decoded {
                     Ok(Some(decoded)) => {
+                        // The `decoded` point: decoder output frame available.
+                        let decoded_ns = now_ns();
                         total_frames += 1;
                         hdr = decoded.hdr();
                         // The backend can demote D3D11VA → software mid-session on a hardware error.
@@ -350,19 +381,17 @@ fn pump(
                                 "first frame decoded"
                             );
                         }
-                        // Latency: our wall clock expressed in the host's capture clock,
-                        // minus the host-stamped capture pts (same math as client-rs).
-                        let lat = (now_ns() as i128 + clock_offset as i128 - frame.pts_ns as i128)
-                            .max(0) as u64;
-                        if lat > 0 && lat < 10_000_000_000 {
-                            lat_us.push(lat / 1000);
-                        }
-                        decode_us_sum += t0.elapsed().as_micros() as u64;
-                        frames_n += 1;
-                        bytes_n += frame.data.len() as u64;
+                        // `decode` stage: received → decoded, single-clock client-local.
+                        decode_us.push(decoded_ns.saturating_sub(received_ns) / 1000);
                         // Newest wins: displace the oldest queued frame when the renderer lags.
                         if let Err(crossbeam_channel::TrySendError::Full(item)) =
-                            frame_tx.try_send((decoded, frame.pts_ns))
+                            frame_tx.try_send((
+                                decoded,
+                                FrameTimes {
+                                    pts_ns: frame.pts_ns,
+                                    decoded_ns,
+                                },
+                            ))
                         {
                             let _ = frame_rx.try_recv();
                             let _ = frame_tx.try_send(item);
@@ -413,23 +442,23 @@ fn pump(
 
         if window_start.elapsed() >= Duration::from_secs(1) {
             let secs = window_start.elapsed().as_secs_f32();
-            lat_us.sort_unstable();
-            let p50 = lat_us.get(lat_us.len() / 2).copied().unwrap_or(0);
+            hostnet_us.sort_unstable();
+            decode_us.sort_unstable();
+            let p50 = |v: &[u64]| v.get(v.len() / 2).copied().unwrap_or(0);
+            let (hostnet_p50, decode_p50) = (p50(&hostnet_us), p50(&decode_us));
             tracing::debug!(
                 fps = frames_n,
-                lat_p50_us = p50,
+                hostnet_p50_us = hostnet_p50,
+                decode_p50_us = decode_p50,
                 total_frames,
                 "stream window"
             );
             let _ = ev_tx.try_send(SessionEvent::Stats(Stats {
                 fps: frames_n as f32 / secs,
                 mbps: bytes_n as f32 * 8.0 / 1e6 / secs,
-                decode_ms: if frames_n > 0 {
-                    decode_us_sum as f32 / frames_n as f32 / 1000.0
-                } else {
-                    0.0
-                },
-                latency_ms: p50 as f32 / 1000.0,
+                decode_ms: decode_p50 as f32 / 1000.0,
+                hostnet_ms: hostnet_p50 as f32 / 1000.0,
+                same_host: clock_offset == 0,
                 hardware,
                 hdr,
                 codec: connector.codec,
@@ -439,8 +468,8 @@ fn pump(
             window_start = Instant::now();
             frames_n = 0;
             bytes_n = 0;
-            decode_us_sum = 0;
-            lat_us.clear();
+            hostnet_us.clear();
+            decode_us.clear();
         }
     };
 

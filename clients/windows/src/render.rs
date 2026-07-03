@@ -10,27 +10,46 @@
 //! draw (and redraws the held frame after a resize — fresh back buffers are blank).
 
 use crate::present::Presenter;
-use crate::session::FrameRx;
+use crate::session::{FrameRx, FrameTimes};
 use crossbeam_channel::RecvTimeoutError;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The last 1-second render window, published for the HUD (one render thread at a time):
-/// presents/s, frames skipped by the newest-wins drain, and the capture→presented p50 in µs.
+/// presents/s, frames skipped by the newest-wins drain, the end-to-end (capture→on-glass)
+/// p50/p95 and the `display` stage (decoded→displayed) p50, all stamped post-`Present()`, in µs.
 /// Zeroed when a render thread starts so a new session never shows the previous one's numbers.
 static PRESENT_FPS: AtomicU32 = AtomicU32::new(0);
 static PRESENT_SKIPPED: AtomicU32 = AtomicU32::new(0);
-static PRESENT_P50_US: AtomicU64 = AtomicU64::new(0);
+static E2E_P50_US: AtomicU64 = AtomicU64::new(0);
+static E2E_P95_US: AtomicU64 = AtomicU64::new(0);
+static DISPLAY_P50_US: AtomicU64 = AtomicU64::new(0);
 
-/// `(presents/s, skipped/s, capture→presented p50 ms)` of the last render window — the HUD's
-/// display-side line.
-pub fn present_stats() -> (u32, u32, f32) {
-    (
-        PRESENT_FPS.load(Ordering::Relaxed),
-        PRESENT_SKIPPED.load(Ordering::Relaxed),
-        PRESENT_P50_US.load(Ordering::Relaxed) as f32 / 1000.0,
-    )
+/// The last render window's glass-side numbers (see the statics above) — the HUD's headline
+/// (end-to-end) and trailing stage (display) come from here.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct PresentStats {
+    /// Presents per second (includes resize redraws of a held frame).
+    pub fps: u32,
+    /// Frames dropped by the newest-wins drain this window (client-side pacing skips).
+    pub skipped: u32,
+    /// End-to-end capture→displayed p50, ms (host-clock corrected, measured directly).
+    pub e2e_p50_ms: f32,
+    /// End-to-end capture→displayed p95, ms.
+    pub e2e_p95_ms: f32,
+    /// `display` stage p50, ms: decoded → displayed, single-clock client-local.
+    pub display_p50_ms: f32,
+}
+
+pub fn present_stats() -> PresentStats {
+    PresentStats {
+        fps: PRESENT_FPS.load(Ordering::Relaxed),
+        skipped: PRESENT_SKIPPED.load(Ordering::Relaxed),
+        e2e_p50_ms: E2E_P50_US.load(Ordering::Relaxed) as f32 / 1000.0,
+        e2e_p95_ms: E2E_P95_US.load(Ordering::Relaxed) as f32 / 1000.0,
+        display_p50_ms: DISPLAY_P50_US.load(Ordering::Relaxed) as f32 / 1000.0,
+    }
 }
 
 /// UI-thread → render-thread state. Size is packed into ONE atomic (w<<32|h) so a resize never
@@ -101,8 +120,9 @@ impl Drop for RenderThread {
 struct SendPresenter(Presenter);
 unsafe impl Send for SendPresenter {}
 
-/// Spawn the render thread. `frames` carries `(frame, capture pts_ns)`; `clock_offset_ns` maps our
-/// wall clock onto the host's so the logged present latency is end-to-end (same math as the pump).
+/// Spawn the render thread. `frames` carries `(frame, FrameTimes)`; `clock_offset_ns` maps our
+/// wall clock onto the host's so the end-to-end (capture→on-glass) number is cross-machine valid
+/// (same math as the pump's host+network stage).
 pub fn spawn(
     presenter: Presenter,
     frames: FrameRx,
@@ -147,12 +167,17 @@ fn run(presenter: SendPresenter, frames: FrameRx, shared: Arc<RenderShared>, clo
     let mut applied = (0u32, 0u32, 0u32); // last (w, h, dpi) handed to the presenter
     let mut presented = 0u32;
     let mut dropped = 0u32;
-    let mut lat_us: Vec<u64> = Vec::with_capacity(256);
+    // 1 s tumbling windows: end-to-end (capture→displayed) and the display stage
+    // (decoded→displayed), sampled post-Present. Percentiles only (spec: stats-unification.md).
+    let mut e2e_us: Vec<u64> = Vec::with_capacity(256);
+    let mut display_us: Vec<u64> = Vec::with_capacity(256);
     let mut window_start = Instant::now();
     let mut last_dpi_poll = Instant::now();
     PRESENT_FPS.store(0, Ordering::Relaxed);
     PRESENT_SKIPPED.store(0, Ordering::Relaxed);
-    PRESENT_P50_US.store(0, Ordering::Relaxed);
+    E2E_P50_US.store(0, Ordering::Relaxed);
+    E2E_P95_US.store(0, Ordering::Relaxed);
+    DISPLAY_P50_US.store(0, Ordering::Relaxed);
 
     loop {
         if shared.stop.load(Ordering::SeqCst) {
@@ -198,29 +223,55 @@ fn run(presenter: SendPresenter, frames: FrameRx, shared: Arc<RenderShared>, clo
             p.set_hdr_metadata(meta);
         }
 
-        let pts_ns = newest.as_ref().map(|(_, pts)| *pts);
+        let times: Option<FrameTimes> = newest.as_ref().map(|(_, t)| *t);
         p.present(newest.map(|(f, _)| f));
         presented += 1;
-        if let Some(pts) = pts_ns {
-            // Capture→presented, host-clock corrected — the glass-side companion to the pump's
-            // capture→decoded p50.
-            let lat = (now_ns() as i128 + clock_offset_ns as i128 - pts as i128).max(0) as u64;
-            if lat > 0 && lat < 10_000_000_000 {
-                lat_us.push(lat / 1000);
+        if let Some(t) = times {
+            // The `displayed` point: post-Present() on this thread (the honest best-effort
+            // presentation instant on Windows — endpoint label `capture→on-glass`).
+            let displayed_ns = now_ns();
+            // End-to-end = capture → displayed, host-clock corrected, measured directly
+            // (never the sum of stage percentiles). Clamped (0, 10 s).
+            let e2e =
+                (displayed_ns as i128 + clock_offset_ns as i128 - t.pts_ns as i128).max(0) as u64;
+            if e2e > 0 && e2e < 10_000_000_000 {
+                e2e_us.push(e2e / 1000);
+            }
+            // `display` stage = decoded → displayed, single-clock client-local.
+            let disp = displayed_ns.saturating_sub(t.decoded_ns);
+            if disp < 10_000_000_000 {
+                display_us.push(disp / 1000);
             }
         }
 
         if window_start.elapsed() >= Duration::from_secs(1) {
-            lat_us.sort_unstable();
-            let p50 = lat_us.get(lat_us.len() / 2).copied().unwrap_or(0);
-            tracing::debug!(presented, dropped, present_p50_us = p50, "render window");
+            e2e_us.sort_unstable();
+            display_us.sort_unstable();
+            let p50 = |v: &[u64]| v.get(v.len() / 2).copied().unwrap_or(0);
+            // p95 = sorted[min(len*95/100, len-1)] — the empty-window case falls to 0 via `get`.
+            let p95 = |v: &[u64]| {
+                v.get((v.len() * 95 / 100).min(v.len().saturating_sub(1)))
+                    .copied()
+                    .unwrap_or(0)
+            };
+            tracing::debug!(
+                presented,
+                dropped,
+                e2e_p50_us = p50(&e2e_us),
+                e2e_p95_us = p95(&e2e_us),
+                display_p50_us = p50(&display_us),
+                "render window"
+            );
             PRESENT_FPS.store(presented, Ordering::Relaxed);
             PRESENT_SKIPPED.store(dropped, Ordering::Relaxed);
-            PRESENT_P50_US.store(p50, Ordering::Relaxed);
+            E2E_P50_US.store(p50(&e2e_us), Ordering::Relaxed);
+            E2E_P95_US.store(p95(&e2e_us), Ordering::Relaxed);
+            DISPLAY_P50_US.store(p50(&display_us), Ordering::Relaxed);
             window_start = Instant::now();
             presented = 0;
             dropped = 0;
-            lat_us.clear();
+            e2e_us.clear();
+            display_us.clear();
         }
     }
     tracing::info!("render thread exiting");

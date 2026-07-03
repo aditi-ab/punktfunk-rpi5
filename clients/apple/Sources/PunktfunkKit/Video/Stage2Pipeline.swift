@@ -1,7 +1,8 @@
 // Stage-2 presenter orchestrator: a pump thread pulls AUs → VideoDecoder; the decoder's async output
 // drops the newest decoded frame into a 1-slot ring; the hosting view's display link calls `renderTick`
-// once per vsync to draw + present the newest ready frame and stamp capture→present. Mirrors
-// StreamPump's lifecycle (one per start; cancel is permanent).
+// once per vsync to draw + present the newest ready frame and stamp the unified latency stages
+// (end-to-end capture→on-glass, plus the decode and display stage terms —
+// design/stats-unification.md). Mirrors StreamPump's lifecycle (one per start; cancel is permanent).
 //
 // Threading: the pump runs on its own thread; the decoder callback on a VT thread; `renderTick` +
 // `start`/`stop` on the MAIN thread (the view's CADisplayLink fires there). Only the ring (lock-guarded)
@@ -40,8 +41,8 @@ public final class Stage2Pipeline {
     private let ring = ReadyRing()
     private let presenter: MetalVideoPresenter
     private let decoder: VideoDecoder
-    private let presentMeter: LatencyMeter?
-    private let presentTailMeter: LatencyMeter?
+    private let endToEndMeter: LatencyMeter?
+    private let displayMeter: LatencyMeter?
     private let recovery = KeyframeRecovery()
     private var token = StopFlag()
     private var offsetNs: Int64 = 0
@@ -56,28 +57,41 @@ public final class Stage2Pipeline {
     /// The Metal layer the hosting view installs + sizes.
     public var layer: CAMetalLayer { presenter.layer }
 
-    /// `presentMeter` records capture→present (the glass-to-glass term); `presentTailMeter`
-    /// records decode-completion→present (the ring wait + render — the tail stage-2 exists to
-    /// shorten). Both optional: metering never gates the presenter choice. Returns nil if Metal
-    /// can't be set up (headless / no GPU) — caller falls back to the stage-1 presenter.
-    public init?(presentMeter: LatencyMeter?, presentTailMeter: LatencyMeter? = nil) {
+    /// Unified-stats meters (design/stats-unification.md): `endToEndMeter` records the headline
+    /// end-to-end (capture→on-glass, skew-corrected); `decodeMeter` the decode stage
+    /// (received→decoded); `displayMeter` the display stage (decoded→on-glass, the ring wait +
+    /// render + vsync — the tail stage-2 exists to shorten). All optional: metering never gates
+    /// the presenter choice. Returns nil if Metal can't be set up (headless / no GPU) — caller
+    /// falls back to the stage-1 presenter.
+    public init?(
+        endToEndMeter: LatencyMeter?,
+        decodeMeter: LatencyMeter? = nil,
+        displayMeter: LatencyMeter? = nil
+    ) {
         guard let presenter = MetalVideoPresenter.make() else { return nil }
         self.presenter = presenter
-        self.presentMeter = presentMeter
-        self.presentTailMeter = presentTailMeter
+        self.endToEndMeter = endToEndMeter
+        self.displayMeter = displayMeter
         let ring = ring
         let recovery = recovery
         self.decoder = VideoDecoder(
-            onDecoded: { ring.submit($0) },
+            onDecoded: { frame in
+                // Decode stage = received→decoded, both client CLOCK_REALTIME (offset 0 — no
+                // skew applies). Stamped at decode completion, so it covers every decoded frame,
+                // including ones the newest-wins ring drops before present.
+                decodeMeter?.record(
+                    ptsNs: UInt64(frame.receivedNs), atNs: frame.decodedNs, offsetNs: 0)
+                ring.submit(frame)
+            },
             // Async decode failure (a bad P-frame referencing a lost/corrupt IDR): the pump resets to
             // re-gate on the next IDR, and we ask the host to send one now (infinite GOP — it wouldn't
             // otherwise come soon). Throttled in KeyframeRecovery.
             onDecodeError: { _ in recovery.request() })
     }
 
-    /// Start pulling AUs into the decoder. MAIN THREAD. `onFrame` fires per AU at receipt (capture→client
-    /// meter, exactly as stage-1); `onSessionEnd` on close. `clockOffsetNs` (host minus client) makes the
-    /// present stamp cross-machine valid.
+    /// Start pulling AUs into the decoder. MAIN THREAD. `onFrame` fires per AU at receipt (the
+    /// host+network / capture→received meter, exactly as stage-1); `onSessionEnd` on close.
+    /// `clockOffsetNs` (host minus client) makes the end-to-end stamp cross-machine valid.
     public func start(
         connection: PunktfunkConnection,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
@@ -174,14 +188,16 @@ public final class Stage2Pipeline {
     public func renderTick(targetPresentNs: Int64) {
         guard let frame = ring.take() else { return }
         let offsetNs = offsetNs
-        let presentMeter = presentMeter
-        let presentTailMeter = presentTailMeter
+        let endToEndMeter = endToEndMeter
+        let displayMeter = displayMeter
         let rendered = presenter.render(frame.pixelBuffer, isHDR: frame.isHDR) { presentedNs in
             let atNs = presentedNs ?? targetPresentNs
-            presentMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: offsetNs)
-            // Present tail = decode-completion → on-glass. Both instants are client
-            // CLOCK_REALTIME, so no skew offset applies.
-            presentTailMeter?.record(ptsNs: UInt64(frame.decodedNs), atNs: atNs, offsetNs: 0)
+            // End-to-end = capture→on-glass, measured directly (skew-corrected via the
+            // connect-time clock offset) — the HUD headline.
+            endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: offsetNs)
+            // Display stage = decoded → on-glass. Both instants are client CLOCK_REALTIME,
+            // so no skew offset applies.
+            displayMeter?.record(ptsNs: UInt64(frame.decodedNs), atNs: atNs, offsetNs: 0)
         }
         if !rendered { ring.putBack(frame) }
     }

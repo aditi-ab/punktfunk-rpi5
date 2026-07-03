@@ -38,8 +38,9 @@ final class SessionPresenter {
     func start(
         connection: PunktfunkConnection,
         baseLayer: AVSampleBufferDisplayLayer,
-        presentMeter: LatencyMeter?,
-        presentTailMeter: LatencyMeter? = nil,
+        endToEndMeter: LatencyMeter?,
+        decodeMeter: LatencyMeter? = nil,
+        displayMeter: LatencyMeter? = nil,
         makeDisplayLink: (AnyObject, Selector) -> CADisplayLink,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?
@@ -59,7 +60,8 @@ final class SessionPresenter {
         #endif
         if !forceStage1,
            let pipeline = Stage2Pipeline(
-               presentMeter: presentMeter, presentTailMeter: presentTailMeter) {
+               endToEndMeter: endToEndMeter, decodeMeter: decodeMeter,
+               displayMeter: displayMeter) {
             let metal = pipeline.layer
             // The opaque metal layer composites OVER the AVSampleBufferDisplayLayer base, which
             // sits idle (un-enqueued) in stage-2. contentsScale + frame are set in layout().

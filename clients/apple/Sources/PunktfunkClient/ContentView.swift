@@ -333,8 +333,9 @@ struct ContentView: View {
                     onSessionEnd: { [weak model] in
                         Task { @MainActor in model?.sessionEnded() }
                     },
-                    presentMeter: model.presentLatency,
-                    presentTailMeter: model.presentTail
+                    endToEndMeter: model.endToEnd,
+                    decodeMeter: model.decodeStage,
+                    displayMeter: model.displayStage
                 )
                 .overlay(alignment: placement.alignment) {
                     if captureEnabled && hudEnabled {

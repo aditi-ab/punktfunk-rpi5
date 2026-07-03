@@ -1,23 +1,25 @@
-// Per-frame latency sampler for the live HUD: records capture->client-receipt latency and drains
-// percentiles on demand. NSLock rather than an actor — the writer is the non-async pump/arrival
-// path (same pattern as the app's FrameMeter).
+// Per-frame latency-stage sampler for the live HUD: records one interval per frame (an end
+// instant minus a start instant, both CLOCK_REALTIME ns) and drains percentiles on demand.
+// NSLock rather than an actor — the writers are the non-async pump/decode/present paths (same
+// pattern as the app's FrameMeter).
 
 import Foundation
 
-/// Samples the **capture->client-receipt** latency of each access unit and reports percentiles.
+/// Samples one **latency stage** per frame and reports percentiles. One instance per stage of the
+/// unified stats model (design/stats-unification.md):
 ///
-/// The latency is `now - pts_ns`, where `pts_ns` is the host's capture wall clock (the AU's pts) and
-/// `now` is the client's `CLOCK_REALTIME` instant the AU was received, shifted by the connect-time
-/// **clock-skew offset** (`PunktfunkConnection.clockOffsetNs`, host minus client) so the difference
-/// is valid across machines. `offsetNs == 0` means an old host that didn't answer the skew handshake
-/// (or genuinely synced clocks) — the number is then only meaningful same-host.
+/// - `host+network` = capture→received: `record(ptsNs:offsetNs:)` at AU receipt.
+/// - `decode` = received→decoded and `display` = decoded→displayed: client-local single-clock
+///   stages — `record(ptsNs:atNs:offsetNs:)` with the start instant as `ptsNs` and `offsetNs: 0`.
+/// - `end-to-end` = capture→displayed, measured directly (never summed from the stages):
+///   `record(ptsNs:atNs:offsetNs:)` at present.
 ///
-/// SCOPE (stage-1 presenter): this covers host capture -> encode -> FEC -> network -> reassembly ->
-/// decrypt -> handed to the presenter. It does **not** include the on-device VideoToolbox decode or
-/// the `AVSampleBufferDisplayLayer` present — that layer decodes and presents compressed samples
-/// internally with no per-frame callback. True decode->present (the full glass-to-glass) needs the
-/// stage-2 presenter (`VTDecompressionSession` decode-completion + `CAMetalLayer`/display-link
-/// present); this meter is the substrate it will extend.
+/// For the host-anchored intervals (capture→…) the sample is `end + offset - pts_ns`, where
+/// `pts_ns` is the host's capture wall clock (the AU's pts) and the connect-time **clock-skew
+/// offset** (`PunktfunkConnection.clockOffsetNs`, host minus client) makes the difference valid
+/// across machines. `offsetNs == 0` means an old host that didn't answer the skew handshake (or
+/// genuinely synced clocks) — the number is then only meaningful same-host, and the HUD tags the
+/// end-to-end line `(same-host clock)`.
 public final class LatencyMeter: @unchecked Sendable {
     private let lock = NSLock()
     private var samplesUs: [Int64] = []
@@ -34,12 +36,16 @@ public final class LatencyMeter: @unchecked Sendable {
         record(ptsNs: ptsNs, atNs: nowNs, offsetNs: offsetNs)
     }
 
-    /// Record one frame whose latency is `atNs + offsetNs - ptsNs` — an EXPLICIT client instant
-    /// rather than now. The stage-2 presenter uses this to stamp capture→present at the display
-    /// link's target present time (not the moment the present call ran). All in `CLOCK_REALTIME`.
+    /// Record one frame whose sample is `atNs + offsetNs - ptsNs` — an EXPLICIT end instant
+    /// rather than now. `ptsNs` is the stage's start point: the AU pts for the host-anchored
+    /// intervals, or a client stamp (receivedNs / decodedNs, with `offsetNs: 0`) for the local
+    /// decode/display stages. The stage-2 presenter stamps its present-side samples at the
+    /// display link's target present time (not the moment the present call ran). All in
+    /// `CLOCK_REALTIME`.
     public func record(ptsNs: UInt64, atNs: Int64, offsetNs: Int64) {
         let latNs = atNs &+ offsetNs &- Int64(bitPattern: ptsNs)
-        // Drop absurd values (a clock step, a wildly wrong offset, or garbage pts).
+        // Drop absurd values (a clock step, a wildly wrong offset, garbage pts, or a stage whose
+        // start stamp is missing/after its end) — samples are clamped to (0, 10 s).
         guard latNs > 0, latNs < 10_000_000_000 else { return }
         lock.lock()
         samplesUs.append(latNs / 1000)

@@ -52,3 +52,6 @@ it. Mouse, keyboard, and controllers flow back to the host.
   clients](/docs/clients) have a built-in speed test; with Moonlight, set the bitrate manually.
 - Moonlight uses the GameStream protocol, not punktfunk's native FEC/encryption extensions. On a
   solid LAN this is fine; on a lossy link a [native client](/docs/clients) holds up better.
+- Comparing Moonlight's performance overlay with a punktfunk client's stats HUD? The numbers
+  measure different slices of the pipeline — see [Understanding the Stats Overlay](/docs/stats)
+  for a line-by-line comparison matrix before drawing conclusions.

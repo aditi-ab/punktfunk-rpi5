@@ -45,16 +45,38 @@ pub struct SessionParams {
     pub connect_timeout: Duration,
 }
 
+/// The session pump's share of the unified stats window (design/stats-unification.md):
+/// stream facts plus the two stages measured before the presenter. The frame consumer in
+/// `ui_stream` contributes the `display` stage and the end-to-end percentiles.
 #[derive(Clone, Copy, Default)]
 pub struct Stats {
+    /// AUs received (reassembled) per second, actual-elapsed-time denominator.
     pub fps: f32,
+    /// Received payload bytes × 8 / elapsed (goodput, excludes FEC overhead).
     pub mbps: f32,
+    /// p50 `host+network` stage: capture → received, host-clock corrected (ms).
+    pub host_net_ms: f32,
+    /// p50 `decode` stage: received → decoded, single-clock client-local (ms).
     pub decode_ms: f32,
-    /// Median capture→decoded latency over the last window (host-clock corrected).
-    pub latency_ms: f32,
+    /// Unrecoverable network frame drops this window, and their share of
+    /// received+lost (%). The OSD renders the counter line only when nonzero.
+    pub lost: u32,
+    pub lost_pct: f32,
     /// The decode path frames actually took this window (`"vaapi"`/`"software"`, empty
     /// until the first frame) — the OSD's trailing tag; tracks a mid-session fallback.
     pub decoder: &'static str,
+}
+
+/// Sort a window of µs samples in place and return `(p50, p95)` per the spec's index
+/// rules (`sorted[len/2]`, `sorted[min(len*95/100, len-1)]`); an empty window reads 0.
+pub fn window_percentiles(samples: &mut [u64]) -> (u64, u64) {
+    if samples.is_empty() {
+        return (0, 0);
+    }
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+    (p50, p95)
 }
 
 pub enum SessionEvent {
@@ -219,13 +241,17 @@ fn pump(
     let mut window_start = Instant::now();
     let mut frames_n = 0u32;
     let mut bytes_n = 0u64;
-    let mut decode_us_sum = 0u64;
-    let mut lat_us: Vec<u64> = Vec::with_capacity(256);
+    // Stage windows (µs samples): `host+network` = capture→received (host-clock
+    // corrected), `decode` = received→decoded (client-local). p50 per 1 s window.
+    let mut hostnet_us: Vec<u64> = Vec::with_capacity(256);
+    let mut decode_us: Vec<u64> = Vec::with_capacity(256);
     // What actually decoded the last frame — a VAAPI failure demotes mid-session, so
     // this is read off each frame's image variant rather than fixed at startup.
     let mut dec_path: &'static str = "";
     // Loss recovery: watch the host→client unrecoverable-drop count and ask for an IDR when it climbs.
     let mut last_dropped = connector.frames_dropped();
+    // The stats window keeps its own drop cursor — the OSD shows the per-window delta.
+    let mut window_dropped = last_dropped;
     let mut last_kf_req: Option<Instant> = None;
 
     let end: Option<String> = loop {
@@ -237,7 +263,11 @@ fn pump(
         // every ~8–16 ms at 60–120 Hz anyway, so this rarely times out mid-stream).
         match connector.next_frame(Duration::from_millis(20)) {
             Ok(frame) => {
-                let t0 = Instant::now();
+                // The `received` point: AU fully reassembled, in hand, before decode.
+                let received_ns = now_ns();
+                // fps / goodput count every received AU (spec), decoded or not.
+                frames_n += 1;
+                bytes_n += frame.data.len() as u64;
                 match decoder.decode(&frame.data) {
                     Ok(Some(image)) => {
                         total_frames += 1;
@@ -252,18 +282,21 @@ fn pump(
                             };
                             tracing::info!(width = w, height = h, path, "first frame decoded");
                         }
-                        // Latency: our wall clock expressed in the host's capture clock,
-                        // minus the host-stamped capture pts (same math as client-rs).
-                        let lat = (now_ns() as i128 + clock_offset as i128 - frame.pts_ns as i128)
+                        // The `decoded` point — travels with the frame so the presenter
+                        // can measure its `display` stage against it.
+                        let decoded_ns = now_ns();
+                        // `host+network` stage: received expressed in the host's capture
+                        // clock, minus the host-stamped capture pts (clamped (0, 10 s)).
+                        let hn = (received_ns as i128 + clock_offset as i128 - frame.pts_ns as i128)
                             .max(0) as u64;
-                        if lat > 0 && lat < 10_000_000_000 {
-                            lat_us.push(lat / 1000);
+                        if hn > 0 && hn < 10_000_000_000 {
+                            hostnet_us.push(hn / 1000);
                         }
-                        decode_us_sum += t0.elapsed().as_micros() as u64;
-                        frames_n += 1;
-                        bytes_n += frame.data.len() as u64;
+                        // `decode` stage: received→decoded, single clock, no skew.
+                        decode_us.push(decoded_ns.saturating_sub(received_ns) / 1000);
                         let _ = frame_tx.force_send(DecodedFrame {
                             pts_ns: frame.pts_ns,
+                            decoded_ns,
                             image,
                         });
                     }
@@ -295,30 +328,36 @@ fn pump(
 
         if window_start.elapsed() >= Duration::from_secs(1) {
             let secs = window_start.elapsed().as_secs_f32();
-            lat_us.sort_unstable();
-            let p50 = lat_us.get(lat_us.len() / 2).copied().unwrap_or(0);
+            let (hn_p50, _) = window_percentiles(&mut hostnet_us);
+            let (dec_p50, _) = window_percentiles(&mut decode_us);
+            let lost = dropped.saturating_sub(window_dropped) as u32;
+            window_dropped = dropped;
             tracing::debug!(
                 fps = frames_n,
-                lat_p50_us = p50,
+                hostnet_p50_us = hn_p50,
+                decode_p50_us = dec_p50,
+                lost,
                 total_frames,
                 "stream window"
             );
             let _ = ev_tx.try_send(SessionEvent::Stats(Stats {
                 fps: frames_n as f32 / secs,
                 mbps: bytes_n as f32 * 8.0 / 1e6 / secs,
-                decode_ms: if frames_n > 0 {
-                    decode_us_sum as f32 / frames_n as f32 / 1000.0
+                host_net_ms: hn_p50 as f32 / 1000.0,
+                decode_ms: dec_p50 as f32 / 1000.0,
+                lost,
+                lost_pct: if lost > 0 {
+                    lost as f32 * 100.0 / (frames_n + lost) as f32
                 } else {
                     0.0
                 },
-                latency_ms: p50 as f32 / 1000.0,
                 decoder: dec_path,
             }));
             window_start = Instant::now();
             frames_n = 0;
             bytes_n = 0;
-            decode_us_sum = 0;
-            lat_us.clear();
+            hostnet_us.clear();
+            decode_us.clear();
         }
     };
 

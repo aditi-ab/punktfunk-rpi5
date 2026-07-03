@@ -390,7 +390,7 @@ pub struct ProbeResult {
 /// `client → host`, right after [`Start`]: one round of the wall-clock skew handshake. The client
 /// stamps `t1_ns` (its monotonic-since-epoch clock) and sends; the host echoes it in [`ClockEcho`]
 /// with its own receive/send stamps. A few rounds let the client estimate the host↔client clock
-/// offset, so the per-frame `capture→reassembled` latency (the AU `pts_ns` is the host's capture
+/// offset, so the per-frame `capture→received` latency (the AU `pts_ns` is the host's capture
 /// clock) is meaningful across machines, not just same-host. An old host ignores it (the client
 /// times out and assumes a shared clock).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

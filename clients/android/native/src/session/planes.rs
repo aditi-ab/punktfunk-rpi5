@@ -72,14 +72,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
     })
 }
 
-/// `NativeBridge.nativeVideoStats(handle): DoubleArray?` — drain ~1 s of decode stats for the HUD.
-/// Returns 14 doubles
-/// `[fps, mbps, latP50Ms, latP95Ms, latValid, skewCorrected, width, height, refreshHz, framesDropped,
-/// bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc]`
-/// (the two flags are 1.0/0.0; the trailing four describe the negotiated video feed — see below), or
-/// `null` when no decode thread is running. Poll ~1 Hz from the UI; each call resets the measurement
-/// window. Not android-gated — pure `jni` + connector reads, so it links on the host build too
-/// (Kotlin only ever calls it on device).
+/// `NativeBridge.nativeVideoStats(handle): DoubleArray?` — drain ~1 s of decode stats for the HUD
+/// (unified stats spec, `design/stats-unification.md`). Returns 16 doubles
+/// `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
+/// bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms]`
+/// (the two flags are 1.0/0.0; indexes 0–13 match the previous 14-double layout with the latency
+/// pair re-based from capture→received to the end-to-end capture→decoded headline; the two stage
+/// p50s tiling it — `host+network` = capture→received, `decode` = received→decoded — are appended
+/// at the end), or `null` when no decode thread is running. Poll ~1 Hz from the UI; each call
+/// resets the measurement window. Not android-gated — pure `jni` + connector reads, so it links on
+/// the host build too (Kotlin only ever calls it on device).
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
     env: JNIEnv,
@@ -98,11 +100,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
         let snap = h.stats.drain();
         let mode = h.client.mode();
         let color = h.client.color;
-        let buf: [f64; 14] = [
+        let buf: [f64; 16] = [
             snap.fps,
             snap.mbps,
-            snap.lat_p50_ms,
-            snap.lat_p95_ms,
+            snap.e2e_p50_ms,
+            snap.e2e_p95_ms,
             if snap.lat_valid { 1.0 } else { 0.0 },
             if snap.skew_corrected { 1.0 } else { 0.0 },
             mode.width as f64,
@@ -117,6 +119,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats(
             color.primaries as f64,
             color.transfer as f64,
             h.client.chroma_format as f64,
+            // Stage p50s tiling the end-to-end headline (appended to keep 0–13 index-compatible).
+            snap.hostnet_p50_ms,
+            snap.decode_p50_ms,
         ];
         let arr = match env.new_double_array(buf.len() as jsize) {
             Ok(a) => a,

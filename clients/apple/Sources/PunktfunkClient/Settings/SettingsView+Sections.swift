@@ -310,10 +310,11 @@ extension SettingsView {
             Text("Video presenter · debug")
         } footer: {
             Text("Stage 2 (default) decodes explicitly and presents through Metal with a display "
-                + "link — it adds a capture→present (glass-to-glass) latency line in the HUD and "
-                + "self-recovers from decode stalls. Stage 1 feeds compressed video straight to the "
-                + "system display layer; it freezes on a lost HEVC reference frame, so it's a debug "
-                + "fallback only. Applies from the next session.")
+                + "link — it gives the HUD the end-to-end (capture→on-glass) headline with the "
+                + "host+network/decode/display stage equation and self-recovers from decode "
+                + "stalls. Stage 1 feeds compressed video straight to the system display layer; "
+                + "it freezes on a lost HEVC reference frame, so it's a debug fallback only. "
+                + "Applies from the next session.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }

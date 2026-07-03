@@ -64,7 +64,7 @@ The **GameStream host works with a stock Moonlight client** — validated live o
 and **video at the client's exact resolution and refresh** via a per-session virtual output (KWin,
 gamescope, Mutter, and Sway/wlroots backends), encoded with GPU **zero-copy** (dmabuf → CUDA/Vulkan →
 NVENC) up to 5120×1440@240. The native **`punktfunk/1`** protocol adds a QUIC control plane and a
-GF(2¹⁶) Leopard-FEC + AES-GCM data plane (p50 ~0.8 ms capture→reassembled at 720p120), with
+GF(2¹⁶) Leopard-FEC + AES-GCM data plane (p50 ~0.8 ms capture→received at 720p120), with
 mid-stream mode renegotiation and a wall-clock skew handshake so latency stays valid across machines.
 Both run from **one process**: bare `punktfunk-host serve` is the **secure native-only default**
 (`punktfunk/1` + the management API/web console), and `serve --gamestream` additionally enables the

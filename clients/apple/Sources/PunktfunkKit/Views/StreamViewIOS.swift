@@ -50,8 +50,9 @@ public struct StreamView: UIViewControllerRepresentable {
     private let onCaptureChange: ((Bool) -> Void)?
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
     private let onSessionEnd: (@Sendable () -> Void)?
-    private let presentMeter: LatencyMeter?
-    private let presentTailMeter: LatencyMeter?
+    private let endToEndMeter: LatencyMeter?
+    private let decodeMeter: LatencyMeter?
+    private let displayMeter: LatencyMeter?
 
     public init(
         connection: PunktfunkConnection,
@@ -59,24 +60,27 @@ public struct StreamView: UIViewControllerRepresentable {
         onCaptureChange: ((Bool) -> Void)? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
         onSessionEnd: (@Sendable () -> Void)? = nil,
-        presentMeter: LatencyMeter? = nil,
-        presentTailMeter: LatencyMeter? = nil
+        endToEndMeter: LatencyMeter? = nil,
+        decodeMeter: LatencyMeter? = nil,
+        displayMeter: LatencyMeter? = nil
     ) {
         self.connection = connection
         self.captureEnabled = captureEnabled
         self.onCaptureChange = onCaptureChange
         self.onFrame = onFrame
         self.onSessionEnd = onSessionEnd
-        self.presentMeter = presentMeter
-        self.presentTailMeter = presentTailMeter
+        self.endToEndMeter = endToEndMeter
+        self.decodeMeter = decodeMeter
+        self.displayMeter = displayMeter
     }
 
     public func makeUIViewController(context: Context) -> StreamViewController {
         let controller = StreamViewController()
         controller.onCaptureChange = onCaptureChange
         controller.captureEnabled = captureEnabled
-        controller.presentMeter = presentMeter
-        controller.presentTailMeter = presentTailMeter
+        controller.endToEndMeter = endToEndMeter
+        controller.decodeMeter = decodeMeter
+        controller.displayMeter = displayMeter
         controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         return controller
     }
@@ -84,8 +88,9 @@ public struct StreamView: UIViewControllerRepresentable {
     public func updateUIViewController(_ controller: StreamViewController, context: Context) {
         controller.onCaptureChange = onCaptureChange
         controller.captureEnabled = captureEnabled
-        controller.presentMeter = presentMeter
-        controller.presentTailMeter = presentTailMeter
+        controller.endToEndMeter = endToEndMeter
+        controller.decodeMeter = decodeMeter
+        controller.displayMeter = displayMeter
         if controller.connection !== connection {
             controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         }
@@ -101,10 +106,11 @@ public struct StreamView: UIViewControllerRepresentable {
 public final class StreamViewController: UIViewController {
     public private(set) var connection: PunktfunkConnection?
     private var observers: [NSObjectProtocol] = []
-    /// Record capture→present / decode→present when the stage-2 presenter is active.
-    /// Consulted at start().
-    var presentMeter: LatencyMeter?
-    var presentTailMeter: LatencyMeter?
+    /// Record the unified latency stages (end-to-end / decode / display) when the stage-2
+    /// presenter is active. Consulted at start().
+    var endToEndMeter: LatencyMeter?
+    var decodeMeter: LatencyMeter?
+    var displayMeter: LatencyMeter?
     /// The shared presenter stack: stage-2 (CAMetalLayer sublayer + display link) with the
     /// stage-1 StreamPump → displayLayer path as the Metal-unavailable / DEBUG fallback.
     private let presenter = SessionPresenter()
@@ -285,8 +291,9 @@ public final class StreamViewController: UIViewController {
         presenter.start(
             connection: connection,
             baseLayer: streamView.displayLayer,
-            presentMeter: presentMeter,
-            presentTailMeter: presentTailMeter,
+            endToEndMeter: endToEndMeter,
+            decodeMeter: decodeMeter,
+            displayMeter: displayMeter,
             makeDisplayLink: { CADisplayLink(target: $0, selector: $1) },
             onFrame: onFrame,
             onSessionEnd: onSessionEnd)

@@ -89,7 +89,7 @@ Notable capabilities that have landed, newest first:
   limit), each with its own virtual output and encoder — e.g. stream the same desktop to a
   laptop and a TV simultaneously.
 - **Cross-machine latency HUD + wall-clock skew handshake.** A short NTP-style handshake
-  aligns client and host clocks, making capture-to-reassembled latency valid across
+  aligns client and host clocks, making capture-to-received latency valid across
   machines; the Apple client surfaces a skew-corrected capture-to-receipt p50/p95 in its
   HUD.
 - **Native LAN auto-discovery.** Hosts advertise `_punktfunk._udp` over mDNS (with TXT

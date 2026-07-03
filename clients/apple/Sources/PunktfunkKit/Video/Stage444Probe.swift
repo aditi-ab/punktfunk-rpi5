@@ -61,7 +61,7 @@ public enum Stage444Probe {
         guard created == noErr, let session else { return false }
         defer { VTDecompressionSessionInvalidate(session) }
 
-        let au = AccessUnit(data: data, ptsNs: 0, frameIndex: 0, flags: 0)
+        let au = AccessUnit(data: data, ptsNs: 0, frameIndex: 0, flags: 0, receivedNs: 0)
         guard let sample = AnnexB.sampleBuffer(au: au, format: format, codec: .hevc) else { return false }
 
         var produced: OSType = 0

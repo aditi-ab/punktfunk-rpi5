@@ -2,7 +2,7 @@
 //! the UI thread, then handed — presenter and all — to the dedicated render thread
 //! ([`crate::render`]), which presents decoded frames at stream cadence. The page itself only
 //! forwards panel size/DPI changes and draws the status-chip HUD overlay (mode · decode path ·
-//! HDR · fps/throughput/latency · capture hint).
+//! HDR · fps/goodput · end-to-end latency + stage equation · capture hint).
 
 use super::style::{edges, uniform};
 use super::Svc;
@@ -22,8 +22,9 @@ use windows_reactor::*;
 pub(crate) struct HudSample {
     pub(crate) stats: Stats,
     pub(crate) captured: bool,
-    /// `(presents/s, skipped/s, capture→presented p50 ms)` — see [`crate::render::present_stats`].
-    pub(crate) present: (u32, u32, f32),
+    /// The render thread's glass-side window (presents/s, skips, end-to-end p50/p95, display
+    /// stage p50) — see [`crate::render::present_stats`].
+    pub(crate) present: crate::render::PresentStats,
 }
 
 /// Props for the stream page: the services plus the live HUD sample that drives the overlay
@@ -171,13 +172,15 @@ fn fmt_uptime(secs: u32) -> String {
     }
 }
 
-/// The streaming HUD overlay (top-right), mirroring the Apple client: a chip row (mode · codec ·
-/// decode path · HDR), a stream line (decode fps / bitrate / decode time), a glass line (display
-/// presents + end-to-end latency decoded vs on-glass), a session line (host · time · loss), and
-/// the shortcut hints. Layered over the `SwapChainPanel` in the same grid cell.
+/// The streaming HUD overlay (top-right), unified stats vocabulary (design/stats-unification.md):
+/// a chip row (mode · codec · decode path · HDR), a stream line (received fps · goodput ·
+/// presenter fps), the end-to-end headline (capture→on-glass p50/p95, host-clock corrected), the
+/// stage equation (= host+network + decode + display, stage p50s), a session line
+/// (host · time · loss/skips), and the shortcut hints. Layered over the `SwapChainPanel` in the
+/// same grid cell.
 fn hud_overlay(hud: &HudSample, mode: Option<Mode>, host: &str) -> Element {
     let stats = &hud.stats;
-    let (pfps, skipped, glass_ms) = hud.present;
+    let present = &hud.present;
     let res = mode
         .map(|m| format!("{}\u{00D7}{}@{}", m.width, m.height, m.refresh_hz))
         .unwrap_or_else(|| "\u{2014}".into());
@@ -193,25 +196,38 @@ fn hud_overlay(hud: &HudSample, mode: Option<Mode>, host: &str) -> Element {
     if stats.hdr {
         chips.push(hud_chip("HDR", Color::rgb(255, 205, 90)).into());
     }
+    // Received fps + goodput, plus the presenter's own rate (Moonlight's "Rendering frame rate"
+    // analog — how often the display actually gets a new frame).
     let stream_line = format!(
-        "{:.0} fps \u{00B7} {:.1} Mb/s \u{00B7} decode {:.1} ms",
-        stats.fps, stats.mbps, stats.decode_ms
+        "{:.0} fps \u{00B7} {:.1} Mb/s \u{00B7} display {} fps",
+        stats.fps, stats.mbps, present.fps
     );
-    // End-to-end latency (host-clock corrected): capture→decoded from the pump, capture→on-glass
-    // from the render thread's post-Present stamp. `skipped` = newest-wins drops (expected when
-    // the stream outpaces the display); `lost` = unrecoverable network drops.
-    let glass_line = format!(
-        "display {pfps} fps \u{00B7} latency {:.1} ms decoded / {glass_ms:.1} ms on-glass",
-        stats.latency_ms
+    // The headline: end-to-end capture→displayed, measured directly post-Present (never the sum
+    // of the stage percentiles). `(same-host clock)` flags an uncorrected clock (offset == 0:
+    // same host, or the host skipped the skew handshake).
+    let mut e2e_line = format!(
+        "end-to-end {:.1} ms p50 \u{00B7} {:.1} p95 \u{00B7} capture\u{2192}on-glass",
+        present.e2e_p50_ms, present.e2e_p95_ms
+    );
+    if stats.same_host {
+        e2e_line.push_str(" (same-host clock)");
+    }
+    // The equation: the three stages tile the headline interval per frame; the window p50s only
+    // approximately sum (percentiles aren't additive).
+    let stage_line = format!(
+        "= host+network {:.1} + decode {:.1} + display {:.1}",
+        stats.hostnet_ms, stats.decode_ms, present.display_p50_ms
     );
     let mut session_bits: Vec<String> = Vec::new();
     if !host.is_empty() {
         session_bits.push(host.to_string());
     }
+    // `lost` = unrecoverable network drops (session-cumulative); `skipped` = the render thread's
+    // newest-wins drops last window (expected when the stream outpaces the display).
     session_bits.push(fmt_uptime(stats.uptime_secs));
     session_bits.push(format!("{} lost", stats.dropped));
-    if skipped > 0 {
-        session_bits.push(format!("{skipped} skipped"));
+    if present.skipped > 0 {
+        session_bits.push(format!("{} skipped", present.skipped));
     }
     let session_line = session_bits.join(" \u{00B7} ");
     let hint = if hud.captured {
@@ -228,7 +244,8 @@ fn hud_overlay(hud: &HudSample, mode: Option<Mode>, host: &str) -> Element {
         vstack((
             hstack(chips).spacing(6.0),
             dim(&stream_line),
-            dim(&glass_line),
+            dim(&e2e_line),
+            dim(&stage_line),
             dim(&session_line),
             text_block(hint)
                 .font_size(11.0)

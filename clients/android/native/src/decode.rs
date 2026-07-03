@@ -9,15 +9,21 @@
 use ndk::data_space::DataSpace;
 use ndk::media::media_codec::{
     DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
+    OutputBuffer,
 };
 use ndk::media::media_format::MediaFormat;
 use ndk::native_window::{FrameRateCompatibility, NativeWindow};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::session::Frame;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Cap on the pts→received-timestamp map below: MediaCodec holds only a handful of frames in
+/// flight, so anything beyond this is stale (codec flushed / HUD toggled) and gets evicted.
+const IN_FLIGHT_CAP: usize = 64;
 
 /// The decode loop. Runs on the `pf-decode` thread until `shutdown` is set or the session closes.
 pub fn run(
@@ -141,9 +147,14 @@ pub fn run(
     // climbs.
     let mut last_dropped = client.frames_dropped();
     let mut last_kf_req: Option<Instant> = None;
-    // Capture→client-receipt latency uses the negotiated host-minus-client clock offset (0 if the
-    // host didn't answer the skew handshake — then the HUD flags it "same-host").
+    // Skew-corrected latency stats (spec: design/stats-unification.md) use the negotiated
+    // host-minus-client clock offset (0 if the host didn't answer the skew handshake — then the
+    // HUD flags it "(same-host clock)").
     let clock_offset = client.clock_offset_ns;
+    // HUD stage split: receipt timestamps keyed by the pts we queue into the codec, so the decoded
+    // point (output-buffer dequeue — MediaCodec round-trips presentationTimeUs) can be paired back
+    // to its receipt for the `decode` stage. Only fed while the HUD is visible.
+    let mut in_flight: VecDeque<(u64, i128)> = VecDeque::new();
     // The dataspace we've signalled on the Surface so far (None = default/SDR). Set reactively once
     // the decoder reports an HDR stream (see `drain`); avoids re-applying every format event.
     let mut applied_ds: Option<DataSpace> = None;
@@ -164,15 +175,21 @@ pub fn run(
                             &p[..p.len().min(6)]
                         );
                     }
-                    // HUD stat: capture→client-receipt latency = client_now + (host−client) −
+                    // HUD stat, `received` point: host+network = client_now + (host−client) −
                     // capture_pts. Gated on the HUD being visible — `enabled` first so the hidden
-                    // steady state skips the wall-clock read and the lock entirely.
+                    // steady state skips the wall-clock read and the lock entirely. The receipt
+                    // stamp is also parked in `in_flight` (keyed by the pts the codec will echo on
+                    // the output buffer) for the decoded-point pairing in `drain`.
                     if stats.enabled() {
-                        let lat_ns =
-                            now_realtime_ns() + clock_offset as i128 - frame.pts_ns as i128;
+                        let received_ns = now_realtime_ns();
+                        let lat_ns = received_ns + clock_offset as i128 - frame.pts_ns as i128;
                         let lat_us = (lat_ns > 0 && lat_ns < 10_000_000_000)
                             .then_some((lat_ns / 1000) as u64);
-                        stats.note(frame.data.len(), lat_us, clock_offset != 0);
+                        stats.note_received(frame.data.len(), lat_us, clock_offset != 0);
+                        in_flight.push_back((frame.pts_ns / 1000, received_ns));
+                        if in_flight.len() > IN_FLIGHT_CAP {
+                            in_flight.pop_front(); // stale — codec never echoed it back
+                        }
                     }
                     pending = Some(frame);
                 }
@@ -202,7 +219,15 @@ pub fn run(
         } else {
             Duration::ZERO
         };
-        let (r, d) = drain(&codec, &window, &mut applied_ds, wait);
+        let (r, d) = drain(
+            &codec,
+            &window,
+            &mut applied_ds,
+            wait,
+            &stats,
+            &mut in_flight,
+            clock_offset,
+        );
         rendered += r;
         discarded += d;
 
@@ -330,11 +355,19 @@ fn feed(codec: &MediaCodec, au: &[u8], pts_us: u64) -> bool {
 /// the caller's input is blocked so the loop waits on decoder progress instead of busy-spinning.
 /// Returns `(rendered, discarded)`. Also reacts to `OutputFormatChanged` (which can interleave
 /// between buffers — handled without losing the held buffer) to signal HDR on the Surface.
+///
+/// Each dequeued buffer is also the HUD's `decoded` measurement point (rendered or not — the frame
+/// finished decoding either way): end-to-end = decoded + clock_offset − capture pts, and the
+/// `decode` stage pairs the buffer's echoed presentationTimeUs back to the receipt stamp in
+/// `in_flight` (single-clock local difference, no skew involved).
 fn drain(
     codec: &MediaCodec,
     window: &NativeWindow,
     applied_ds: &mut Option<DataSpace>,
     first_wait: Duration,
+    stats: &crate::stats::VideoStats,
+    in_flight: &mut VecDeque<(u64, i128)>,
+    clock_offset: i64,
 ) -> (u64, u64) {
     let mut held = None; // newest ready buffer so far, presented after the loop
     let mut discarded: u64 = 0;
@@ -343,6 +376,9 @@ fn drain(
         match codec.dequeue_output_buffer(wait) {
             Ok(DequeuedOutputBufferInfoResult::Buffer(buf)) => {
                 wait = Duration::ZERO; // only the first dequeue may block
+                if stats.enabled() {
+                    note_decoded(stats, in_flight, clock_offset, &buf);
+                }
                 if let Some(stale) = held.replace(buf) {
                     // A newer frame is ready — drop the held one without rendering.
                     if let Err(e) = codec.release_output_buffer(stale, false) {
@@ -390,6 +426,40 @@ fn drain(
         }
     }
     (rendered, discarded)
+}
+
+/// HUD `decoded` point for one dequeued output buffer: build the end-to-end (capture→decoded,
+/// skew-corrected, clamped to (0, 10 s)) and `decode` (received→decoded, single-clock local, ≥ 0)
+/// samples and hand them to [`crate::stats::VideoStats::note_decoded`]. The codec echoes the input
+/// `presentationTimeUs` on the output buffer, which keys the receipt stamp in `in_flight`; entries
+/// older than the echoed pts are evicted (decode order == input order here — low-latency, no
+/// B-frames — so anything before it was dropped inside the codec or stamped before a flush).
+fn note_decoded(
+    stats: &crate::stats::VideoStats,
+    in_flight: &mut VecDeque<(u64, i128)>,
+    clock_offset: i64,
+    buf: &OutputBuffer<'_>,
+) {
+    let pts_us = buf.info().presentation_time_us().max(0) as u64;
+    let decoded_ns = now_realtime_ns();
+    // Pair the echoed pts back to its receipt stamp, evicting stale (older) entries as we go.
+    let mut received_ns = None;
+    while let Some(&(p, r)) = in_flight.front() {
+        if p > pts_us {
+            break; // future frame — leave it for its own output buffer
+        }
+        in_flight.pop_front();
+        if p == pts_us {
+            received_ns = Some(r);
+            break;
+        }
+    }
+    // pts_us is the truncated frame.pts_ns/1000 we queued, so ×1000 re-approximates capture time
+    // to < 1 µs — negligible against the ms-scale figures shown.
+    let e2e_ns = decoded_ns + clock_offset as i128 - pts_us as i128 * 1000;
+    let e2e_us = (e2e_ns > 0 && e2e_ns < 10_000_000_000).then_some((e2e_ns / 1000) as u64);
+    let decode_us = received_ns.map(|r| ((decoded_ns - r).max(0) / 1000) as u64);
+    stats.note_decoded(e2e_us, decode_us);
 }
 
 /// Map the decoder's reported output colour to a BT.2020 HDR dataspace, or `None` for SDR. The

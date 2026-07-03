@@ -35,6 +35,10 @@ public struct AccessUnit: Sendable {
     public let ptsNs: UInt64
     public let frameIndex: UInt32
     public let flags: UInt32
+    /// Client `CLOCK_REALTIME` instant the AU was handed over by the core (post-FEC, decrypted)
+    /// — the **received** measurement point of design/stats-unification.md. The decode stage is
+    /// `decodedNs - receivedNs`, both client-local (no skew offset applies).
+    public let receivedNs: Int64
 }
 
 /// One Opus audio packet (48 kHz stereo, 5 ms frames) — decode with AVAudioConverter
@@ -419,9 +423,13 @@ public final class PunktfunkConnection {
         case statusOK:
             guard let base = frame.data, frame.len > 0 else { return nil }
             let data = Data(bytes: base, count: Int(frame.len)) // copy: ptr valid only until next call
+            var ts = timespec()
+            clock_gettime(CLOCK_REALTIME, &ts)
+            let receivedNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
             return AccessUnit(
                 data: data, ptsNs: frame.pts_ns,
-                frameIndex: frame.frame_index, flags: frame.flags)
+                frameIndex: frame.frame_index, flags: frame.flags,
+                receivedNs: receivedNs)
         case statusNoFrame:
             return nil
         case statusClosed:

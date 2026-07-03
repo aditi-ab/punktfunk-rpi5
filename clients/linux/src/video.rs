@@ -24,11 +24,15 @@ use std::os::fd::RawFd;
 use std::ptr;
 
 /// One decoded frame headed for the presenter, carrying the host capture timestamp so the
-/// UI can measure capture→paintable-set latency at the moment it presents.
+/// UI can measure capture→displayed latency at the moment it presents.
 pub struct DecodedFrame {
     /// Host-clock capture pts (ns) of the AU this image decoded from — compare against
     /// the local wall clock + `clock_offset_ns` at paintable-set time.
     pub pts_ns: u64,
+    /// Local wall clock (ns) when the decoder emitted this image — the `decoded`
+    /// measurement point (design/stats-unification.md); the presenter subtracts it from
+    /// its paintable-set stamp for the client-local `display` stage.
+    pub decoded_ns: u64,
     pub image: DecodedImage,
 }
 

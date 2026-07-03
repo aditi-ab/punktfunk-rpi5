@@ -241,8 +241,8 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
                 session::SessionEvent::Stats(s) => tracing::info!(
                     fps = format!("{:.0}", s.fps),
                     mbps = format!("{:.1}", s.mbps),
-                    decode_ms = format!("{:.2}", s.decode_ms),
-                    lat_ms = format!("{:.2}", s.latency_ms),
+                    decode_p50_ms = format!("{:.2}", s.decode_ms),
+                    hostnet_p50_ms = format!("{:.2}", s.hostnet_ms),
                     frames_seen,
                     "stats"
                 ),

@@ -14,7 +14,7 @@ example of driving the protocol end to end: QUIC control plane, UDP data plane, 
 
 - **Receives a real stream**, writes a playable elementary stream (`.h265`/`.h264`/`.av1` — the
   extension tracks the **negotiated codec**; the probe advertises all three and the host picks), and
-  reports per-frame **capture→…→reassembled latency** percentiles (the host stamps each frame with
+  reports per-frame **capture→received latency** percentiles (the host stamps each frame with
   its capture clock).
 - **Verification mode** against a synthetic host — byte-checks deterministic test frames.
 - **Exercises every plane** with scripted test traffic:

@@ -15,6 +15,10 @@ import VideoToolbox
 public struct ReadyFrame: @unchecked Sendable {
     /// Host capture clock (the AU's pts), in nanoseconds.
     public let ptsNs: UInt64
+    /// Client `CLOCK_REALTIME` instant the AU was received (`AccessUnit.receivedNs`, threaded
+    /// through the decode via the frame refcon), in nanoseconds. 0 when unknown (a caller that
+    /// didn't stamp receipt) — the decode-stage meter then drops the sample via its sanity guard.
+    public let receivedNs: Int64
     /// Client `CLOCK_REALTIME` instant decode completed, in nanoseconds.
     public let decodedNs: Int64
     /// The decoded image — 8-bit NV12 biplanar (SDR) or 10-bit P010 biplanar (HDR), Metal-compatible.
@@ -25,13 +29,16 @@ public struct ReadyFrame: @unchecked Sendable {
 }
 
 /// The C output callback can't capture context, so VideoToolbox hands it the refcon we set at
-/// session creation — a pointer back to the owning `VideoDecoder`.
+/// session creation — a pointer back to the owning `VideoDecoder`. The per-frame refcon carries
+/// the AU's `receivedNs` as a pointer bit pattern (a scalar smuggled through the C void*, never
+/// dereferenced) so the decode stage can be computed against decode-completion.
 private let decoderOutputCallback: VTDecompressionOutputCallback = {
-    refcon, _, status, _, imageBuffer, pts, _ in
+    refcon, frameRefcon, status, _, imageBuffer, pts, _ in
     guard let refcon else { return }
+    let receivedNs = frameRefcon.map { Int64(Int(bitPattern: $0)) } ?? 0
     Unmanaged<VideoDecoder>.fromOpaque(refcon)
         .takeUnretainedValue()
-        .handleDecoded(status: status, imageBuffer: imageBuffer, pts: pts)
+        .handleDecoded(status: status, imageBuffer: imageBuffer, pts: pts, receivedNs: receivedNs)
 }
 
 /// Owns a `VTDecompressionSession` rebuilt whenever the format description changes (every IDR /
@@ -112,7 +119,9 @@ public final class VideoDecoder: @unchecked Sendable {
             session,
             sampleBuffer: sample,
             flags: [._EnableAsynchronousDecompression],
-            frameRefcon: nil,
+            // The AU's receipt instant rides through as a bit pattern (nil for 0 — the output
+            // callback maps that back to 0); the callback needs it to stamp the decode stage.
+            frameRefcon: UnsafeMutableRawPointer(bitPattern: Int(au.receivedNs)),
             infoFlagsOut: &infoOut)
         lock.unlock()
         if status != noErr {
@@ -218,8 +227,11 @@ public final class VideoDecoder: @unchecked Sendable {
         return true
     }
 
-    /// VT thread. Stamp decode-completion and enqueue, or report the error.
-    fileprivate func handleDecoded(status: OSStatus, imageBuffer: CVImageBuffer?, pts: CMTime) {
+    /// VT thread. Stamp decode-completion and enqueue, or report the error. `receivedNs` is the
+    /// AU's receipt instant threaded through the frame refcon (0 = unknown).
+    fileprivate func handleDecoded(
+        status: OSStatus, imageBuffer: CVImageBuffer?, pts: CMTime, receivedNs: Int64
+    ) {
         guard status == noErr, let imageBuffer else {
             onDecodeError(status)
             return
@@ -242,6 +254,8 @@ public final class VideoDecoder: @unchecked Sendable {
             || fmt == kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange
             || fmt == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
         onDecoded(
-            ReadyFrame(ptsNs: ptsNs, decodedNs: decodedNs, pixelBuffer: imageBuffer, isHDR: isHDR))
+            ReadyFrame(
+                ptsNs: ptsNs, receivedNs: receivedNs, decodedNs: decodedNs,
+                pixelBuffer: imageBuffer, isHDR: isHDR))
     }
 }

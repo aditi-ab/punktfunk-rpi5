@@ -1,8 +1,11 @@
-//! Live decode stats for the on-stream HUD (mirrors the Apple client's stats overlay): FPS,
-//! receive throughput, and capture→client-receipt latency (p50/p95). The decode thread is the sole
-//! writer (`note` per access unit); the JNI accessor `nativeVideoStats` drains a snapshot ~1 Hz and
-//! resets the window. Sampling is gated on the HUD actually being visible (`set_enabled`, driven by
-//! `nativeSetVideoStatsEnabled`) so the hidden steady state costs one relaxed atomic load per frame.
+//! Live decode stats for the on-stream HUD, following the unified stats spec
+//! (`design/stats-unification.md`): FPS, receive throughput, and the Android v1 stage split —
+//! headline `end-to-end` = capture→decoded (p50/p95) tiled by `host+network` = capture→received
+//! and `decode` = received→decoded (stage p50s). The decode thread is the sole writer
+//! (`note_received` per access unit at receipt, `note_decoded` per decoder output buffer); the JNI
+//! accessor `nativeVideoStats` drains a snapshot ~1 Hz and resets the window. Sampling is gated on
+//! the HUD actually being visible (`set_enabled`, driven by `nativeSetVideoStatsEnabled`) so the
+//! hidden steady state costs one relaxed atomic load per frame.
 //! Pure `std` so it compiles on the host build too (the decode thread is android-only, but
 //! `SessionHandle` holds the shared handle unconditionally).
 
@@ -13,9 +16,9 @@ use std::time::Instant;
 /// Rolling per-window accumulator. Rates are computed over the actual elapsed wall-time at drain
 /// (robust to poll jitter), so a poll that lands at 0.9 s or 1.1 s still reports the right FPS.
 pub struct VideoStats {
-    /// HUD gate: `note` runs on the per-frame decode path, so while the overlay is hidden it (and
-    /// the caller's latency computation — see `enabled`) early-outs on this flag alone. Off until
-    /// Kotlin shows the HUD.
+    /// HUD gate: the samplers run on the per-frame decode path, so while the overlay is hidden
+    /// they (and the caller's latency computation — see `enabled`) early-out on this flag alone.
+    /// Off until Kotlin shows the HUD.
     enabled: AtomicBool,
     inner: Mutex<Inner>,
 }
@@ -24,21 +27,40 @@ struct Inner {
     window_start: Instant,
     frames: u64,
     bytes: u64,
-    /// capture→client-receipt latency samples for this window, in microseconds.
-    lat_us: Vec<u64>,
+    /// `end-to-end` = capture→decoded latency samples for this window, in microseconds
+    /// (skew-corrected clock base).
+    e2e_us: Vec<u64>,
+    /// `host+network` stage = capture→received samples, in microseconds (skew-corrected).
+    hostnet_us: Vec<u64>,
+    /// `decode` stage = received→decoded samples, in microseconds (client-local, single clock).
+    decode_us: Vec<u64>,
     /// Whether the host answered the clock-skew handshake (latency is cross-machine valid).
     skew_corrected: bool,
 }
 
-/// A drained, computed view of one window. `lat_valid` is false when no in-range latency sample
-/// landed (then p50/p95 are 0 and the HUD hides the latency line, exactly like the Apple client).
+/// A drained, computed view of one window. `lat_valid` is false when no in-range end-to-end sample
+/// landed (then the latency figures are 0 and the HUD hides the latency lines, exactly like the
+/// Apple client).
 pub struct Snapshot {
     pub fps: f64,
     pub mbps: f64,
-    pub lat_p50_ms: f64,
-    pub lat_p95_ms: f64,
+    /// Headline `end-to-end` (capture→decoded) percentiles, ms.
+    pub e2e_p50_ms: f64,
+    pub e2e_p95_ms: f64,
+    /// Stage p50s (ms): `host+network` (capture→received) and `decode` (received→decoded).
+    pub hostnet_p50_ms: f64,
+    pub decode_p50_ms: f64,
     pub lat_valid: bool,
     pub skew_corrected: bool,
+}
+
+/// Percentile over a sorted-in-place µs sample vec, in ms. 0.0 when empty.
+fn pctl_ms(sorted_us: &[u64], p: f64) -> f64 {
+    if sorted_us.is_empty() {
+        return 0.0;
+    }
+    let n = sorted_us.len();
+    sorted_us[((n as f64 * p) as usize).min(n - 1)] as f64 / 1000.0
 }
 
 impl VideoStats {
@@ -49,14 +71,16 @@ impl VideoStats {
                 window_start: Instant::now(),
                 frames: 0,
                 bytes: 0,
-                lat_us: Vec::with_capacity(256),
+                e2e_us: Vec::with_capacity(256),
+                hostnet_us: Vec::with_capacity(256),
+                decode_us: Vec::with_capacity(256),
                 skew_corrected: false,
             }),
         }
     }
 
     /// Whether the HUD wants samples. The decode thread checks this BEFORE building a latency
-    /// sample, so the per-frame wall-clock read is skipped too while hidden.
+    /// sample, so the per-frame wall-clock reads are skipped too while hidden.
     // Read only by the android-only decode thread; unreferenced on the host build — expected.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn enabled(&self) -> bool {
@@ -75,18 +99,21 @@ impl VideoStats {
             g.window_start = Instant::now();
             g.frames = 0;
             g.bytes = 0;
-            g.lat_us.clear();
+            g.e2e_us.clear();
+            g.hostnet_us.clear();
+            g.decode_us.clear();
         }
     }
 
-    /// Record one decoded access unit: its wire size and (if in range) its capture→client latency.
+    /// Record one received access unit: its wire size and (if in range) its capture→received
+    /// `host+network` stage sample. Receipt is the fps/goodput counting point per the spec.
     // Driven only by the android-only decode thread; unreferenced on the host build — expected.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    pub fn note(&self, bytes: usize, lat_us: Option<u64>, skew_corrected: bool) {
+    pub fn note_received(&self, bytes: usize, hostnet_us: Option<u64>, skew_corrected: bool) {
         if !self.enabled.load(Ordering::Relaxed) {
             return; // HUD hidden — skip the lock (the caller already skipped the clock read)
         }
-        // Poison-proof: `note` runs per-frame on the decode thread, which has no catch_unwind —
+        // Poison-proof: this runs per-frame on the decode thread, which has no catch_unwind —
         // a panic elsewhere must not turn every later lock into a second panic (the counters
         // stay consistent regardless).
         let mut g = self
@@ -96,14 +123,37 @@ impl VideoStats {
         g.frames += 1;
         g.bytes += bytes as u64;
         g.skew_corrected = skew_corrected;
-        if let Some(l) = lat_us {
-            g.lat_us.push(l);
+        if let Some(l) = hostnet_us {
+            g.hostnet_us.push(l);
+        }
+    }
+
+    /// Record one decoded output frame: its capture→decoded `end-to-end` sample and its
+    /// received→decoded `decode` stage sample (either may be absent — e.g. the receipt stamp for
+    /// this pts predates the HUD being shown).
+    // Driven only by the android-only decode thread; unreferenced on the host build — expected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn note_decoded(&self, e2e_us: Option<u64>, decode_us: Option<u64>) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return; // HUD hidden — skip the lock (the caller already skipped the clock read)
+        }
+        // Poison-proof for the same reason as `note_received`.
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(l) = e2e_us {
+            g.e2e_us.push(l);
+        }
+        if let Some(l) = decode_us {
+            g.decode_us.push(l);
         }
     }
 
     /// Compute the window's rates + latency percentiles, then reset for the next window.
     pub fn drain(&self) -> Snapshot {
-        // Poison-proof for the same reason as `note` — a poisoned window still drains fine.
+        // Poison-proof for the same reason as `note_received` — a poisoned window still drains
+        // fine.
         let mut g = self
             .inner
             .lock()
@@ -111,26 +161,25 @@ impl VideoStats {
         let elapsed = g.window_start.elapsed().as_secs_f64().max(1e-3);
         let fps = g.frames as f64 / elapsed;
         let mbps = g.bytes as f64 * 8.0 / 1_000_000.0 / elapsed;
-        let (p50, p95, valid) = if g.lat_us.is_empty() {
-            (0.0, 0.0, false)
-        } else {
-            g.lat_us.sort_unstable();
-            let n = g.lat_us.len();
-            let at = |p: f64| g.lat_us[((n as f64 * p) as usize).min(n - 1)] as f64 / 1000.0;
-            (at(0.50), at(0.95), true)
+        g.e2e_us.sort_unstable();
+        g.hostnet_us.sort_unstable();
+        g.decode_us.sort_unstable();
+        let snap = Snapshot {
+            fps,
+            mbps,
+            e2e_p50_ms: pctl_ms(&g.e2e_us, 0.50),
+            e2e_p95_ms: pctl_ms(&g.e2e_us, 0.95),
+            hostnet_p50_ms: pctl_ms(&g.hostnet_us, 0.50),
+            decode_p50_ms: pctl_ms(&g.decode_us, 0.50),
+            lat_valid: !g.e2e_us.is_empty(),
+            skew_corrected: g.skew_corrected,
         };
-        let skew = g.skew_corrected;
         g.window_start = Instant::now();
         g.frames = 0;
         g.bytes = 0;
-        g.lat_us.clear();
-        Snapshot {
-            fps,
-            mbps,
-            lat_p50_ms: p50,
-            lat_p95_ms: p95,
-            lat_valid: valid,
-            skew_corrected: skew,
-        }
+        g.e2e_us.clear();
+        g.hostnet_us.clear();
+        g.decode_us.clear();
+        snap
     }
 }

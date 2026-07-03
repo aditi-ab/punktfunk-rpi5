@@ -170,7 +170,10 @@ private struct ShotHUD: View {
                 Text("5120×1440@240  240 fps  812.4 Mb/s")
                     .font(.system(.caption, design: .monospaced))
             }
-            Text("capture→client 1.3/2.1 ms p50/p95")
+            Text("end-to-end 2.9 ms p50 · 3.8 p95 · capture→on-glass")
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+            Text("= host+network 1.3 + decode 0.7 + display 0.9")
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(.secondary)
             #if os(macOS)

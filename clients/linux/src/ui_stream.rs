@@ -31,33 +31,63 @@ use std::time::{Duration, Instant};
 pub struct StreamPage {
     pub page: adw::NavigationPage,
     stats_label: gtk::Label,
-    /// Median capture→paintable-set latency (ms) over the frame consumer's last 1 s
-    /// window — written there, folded into the OSD on each `Stats` event.
-    present_ms: Rc<Cell<f32>>,
+    /// The frame consumer's share of the stats window (end-to-end percentiles + the
+    /// `display` stage) — written there each 1 s window, folded into the OSD on each
+    /// `Stats` event.
+    presented: Rc<PresentedStats>,
     /// The stream is HDR (PQ) right now — set by the frame consumer from each frame's
     /// signaling (the host can flip SDR↔HDR mid-session, in-band).
     hdr: Rc<Cell<bool>>,
+    /// `clock_offset_ns == 0`: the skew handshake didn't run (or same host) — the
+    /// end-to-end line carries the `(same-host clock)` flag (spec clock rules).
+    same_host: bool,
+    /// `W×H@Hz` for the OSD's first line — fixed at connect, per-session.
+    mode_line: String,
+}
+
+/// Presenter-side window results (design/stats-unification.md): end-to-end =
+/// capture→displayed measured directly (p50 + p95), `display` stage = decoded→displayed
+/// p50. All ms, refreshed once per 1 s window by the frame consumer.
+#[derive(Default)]
+struct PresentedStats {
+    e2e_p50_ms: Cell<f32>,
+    e2e_p95_ms: Cell<f32>,
+    display_ms: Cell<f32>,
 }
 
 impl StreamPage {
+    /// Render the canonical unified-stats OSD (design/stats-unification.md — Linux
+    /// endpoint is paintable-set, headline reads `capture→displayed`).
     pub fn update_stats(&self, s: Stats) {
-        let mut line = format!(
-            "{:.0} fps · {:.1} Mbit/s · dec {:.1} ms · lat {:.1} ms · present {:.1} ms",
-            s.fps,
-            s.mbps,
-            s.decode_ms,
-            s.latency_ms,
-            self.present_ms.get()
-        );
+        let mut line1 = format!("{} · {:.0} fps · {:.1} Mb/s", self.mode_line, s.fps, s.mbps);
         // Which decoder actually ran this window (vaapi/software) — tracks a fallback.
         if !s.decoder.is_empty() {
-            line.push_str(" · ");
-            line.push_str(s.decoder);
+            line1.push_str(" · ");
+            line1.push_str(s.decoder);
         }
         if self.hdr.get() {
-            line.push_str(" · HDR");
+            line1.push_str(" · HDR");
         }
-        self.stats_label.set_text(&line);
+        let mut text = format!(
+            "{line1}\n\
+             end-to-end {:.1} ms p50 · {:.1} p95 · capture→displayed{}\n\
+             = host+network {:.1} + decode {:.1} + display {:.1}",
+            self.presented.e2e_p50_ms.get(),
+            self.presented.e2e_p95_ms.get(),
+            if self.same_host {
+                " (same-host clock)"
+            } else {
+                ""
+            },
+            s.host_net_ms,
+            s.decode_ms,
+            self.presented.display_ms.get(),
+        );
+        // Counters — only rendered when nonzero this window.
+        if s.lost > 0 {
+            text.push_str(&format!("\nlost {} ({:.1}%)", s.lost, s.lost_pct));
+        }
+        self.stats_label.set_text(&text);
     }
 }
 
@@ -206,6 +236,13 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
     let w = build_widgets(&window, &title, chromeless, pad_connected);
     w.stats_label.set_visible(show_stats);
 
+    // OSD line-1 facts, fixed for the session (the mode is negotiated per-session).
+    let mode = connector.mode();
+    let mode_line = format!("{}×{}@{}", mode.width, mode.height, mode.refresh_hz);
+    // Offset 0 = the host didn't answer the skew handshake / same host — flagged on the
+    // end-to-end line so an uncorrected cross-machine number is never shown silently.
+    let same_host = clock_offset_ns == 0;
+
     let capture = Rc::new(Capture {
         connector,
         window: window.clone(),
@@ -218,13 +255,13 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
         held_buttons: RefCell::new(HashSet::new()),
     });
 
-    let present_ms = Rc::new(Cell::new(0.0f32));
+    let presented = Rc::new(PresentedStats::default());
     let hdr = Rc::new(Cell::new(false));
     spawn_frame_consumer(
         &w.picture,
         frames,
         clock_offset_ns,
-        present_ms.clone(),
+        presented.clone(),
         hdr.clone(),
     );
     attach_keyboard(&w.overlay, &window, &capture, &stop, &w.stats_label);
@@ -248,8 +285,10 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
     StreamPage {
         page: w.page,
         stats_label: w.stats_label,
-        present_ms,
+        presented,
         hdr,
+        same_host,
+        mode_line,
     }
 }
 
@@ -456,12 +495,13 @@ fn attach_edge_reveal(
 /// then draws whatever paintable is current on its own frame clock. Ends itself when the
 /// channel closes or the picture is gone.
 ///
-/// Also the capture→present-ish measurement point: at each paintable set the frame's
-/// host capture pts is compared against the local wall clock expressed in the host clock
-/// (`clock_offset_ns`, same math as the session's decode latency). This is
-/// capture→paintable-SET — GTK's own present adds one compositor cycle after this. The
-/// 1 s p50 lands on the stats OSD (via `present_ms`) and in a "present window" debug
-/// line for headless validation.
+/// Also the `displayed` measurement point (design/stats-unification.md): each paintable
+/// set stamps the local wall clock, yielding end-to-end = capture→displayed (host-clock
+/// corrected via `clock_offset_ns`, p50+p95, measured directly) and the client-local
+/// `display` stage = decoded→displayed. This is capture→paintable-SET — GTK's own
+/// present adds one compositor cycle after this. The 1 s window results land on the
+/// stats OSD (via `PresentedStats`) and in a "present window" debug line for headless
+/// validation.
 /// One-entry cache of `ColorDesc` → `GdkColorState` (signaling changes at most on an
 /// SDR↔HDR flip, never per frame).
 #[derive(Default)]
@@ -516,7 +556,7 @@ fn spawn_frame_consumer(
     picture: &gtk::Picture,
     frames: async_channel::Receiver<DecodedFrame>,
     clock_offset_ns: i64,
-    present_ms: Rc<Cell<f32>>,
+    presented_stats: Rc<PresentedStats>,
     hdr: Rc<Cell<bool>>,
 ) {
     let picture = picture.downgrade();
@@ -528,7 +568,10 @@ fn spawn_frame_consumer(
     let mut yuv_state = ColorStateCache::default();
     let mut rgb_state = ColorStateCache::default();
     glib::spawn_future_local(async move {
-        let mut win_lat_us: Vec<u64> = Vec::with_capacity(256);
+        // Window samples (µs): end-to-end capture→displayed (host-clock corrected) and
+        // the client-local display stage decoded→displayed.
+        let mut win_e2e_us: Vec<u64> = Vec::with_capacity(256);
+        let mut win_disp_us: Vec<u64> = Vec::with_capacity(256);
         let mut win_start = Instant::now();
         while let Ok(f) = frames.recv().await {
             let Some(picture) = picture.upgrade() else {
@@ -601,26 +644,34 @@ fn spawn_frame_consumer(
                     }
                 }
             }
-            // Capture→paintable-set latency, host-clock corrected (same math and sanity
-            // bound as the session's decode-latency window).
+            // The `displayed` stamp: end-to-end = capture→displayed host-clock corrected
+            // (same clamp as the session's stage windows); display = decoded→displayed,
+            // single clock, no skew.
             if presented {
-                let lat = (crate::session::now_ns() as i128 + clock_offset_ns as i128
-                    - f.pts_ns as i128)
-                    .max(0) as u64;
-                if lat > 0 && lat < 10_000_000_000 {
-                    win_lat_us.push(lat / 1000);
+                let displayed_ns = crate::session::now_ns();
+                let e2e = (displayed_ns as i128 + clock_offset_ns as i128 - f.pts_ns as i128).max(0)
+                    as u64;
+                if e2e > 0 && e2e < 10_000_000_000 {
+                    win_e2e_us.push(e2e / 1000);
                 }
+                win_disp_us.push(displayed_ns.saturating_sub(f.decoded_ns) / 1000);
             }
             if win_start.elapsed() >= Duration::from_secs(1) {
-                win_lat_us.sort_unstable();
-                let p50 = win_lat_us.get(win_lat_us.len() / 2).copied().unwrap_or(0);
+                let frames = win_e2e_us.len();
+                let (e2e_p50, e2e_p95) = crate::session::window_percentiles(&mut win_e2e_us);
+                let (disp_p50, _) = crate::session::window_percentiles(&mut win_disp_us);
                 tracing::debug!(
-                    frames = win_lat_us.len(),
-                    present_p50_us = p50,
+                    frames,
+                    e2e_p50_us = e2e_p50,
+                    e2e_p95_us = e2e_p95,
+                    display_p50_us = disp_p50,
                     "present window"
                 );
-                present_ms.set(p50 as f32 / 1000.0);
-                win_lat_us.clear();
+                presented_stats.e2e_p50_ms.set(e2e_p50 as f32 / 1000.0);
+                presented_stats.e2e_p95_ms.set(e2e_p95 as f32 / 1000.0);
+                presented_stats.display_ms.set(disp_p50 as f32 / 1000.0);
+                win_e2e_us.clear();
+                win_disp_us.clear();
                 win_start = Instant::now();
             }
         }

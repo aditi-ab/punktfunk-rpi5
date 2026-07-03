@@ -4,7 +4,7 @@
 //! * **verification** (`frames > 0`, synthetic host): byte-checks deterministic test frames;
 //! * **stream** (`frames == 0`, virtual host): receives real encoded AUs, writes a playable
 //!   elementary stream (the dump extension follows the negotiated codec — `.h265`/`.h264`/`.av1`;
-//!   the probe advertises all three), and reports per-frame **capture→…→reassembled latency**
+//!   the probe advertises all three), and reports per-frame **capture→received latency**
 //!   percentiles (the host stamps each frame with its capture wall clock; same-host runs share
 //!   that clock).
 //!
@@ -481,7 +481,7 @@ async fn session(args: Args) -> Result<()> {
     .await?;
 
     // Wall-clock skew handshake on the still-private control stream (before --remode/--speed-test
-    // take it): align our clock to the host's so the per-frame capture→reassembled latency is valid
+    // take it): align our clock to the host's so the per-frame capture→received latency is valid
     // across machines. `None` ⇒ an old host that doesn't answer — fall back to a shared clock (0).
     let clock_offset_ns = match punktfunk_core::quic::clock_sync(&mut send, &mut recv).await {
         Some(skew) => {
@@ -1051,7 +1051,7 @@ async fn session(args: Args) -> Result<()> {
                         continue;
                     }
                     bytes += frame.data.len() as u64;
-                    // capture→reassembled: our receive instant in the host clock (now + offset)
+                    // capture→received: our receive instant in the host clock (now + offset)
                     // minus the host's capture pts. offset is 0 same-host / old host.
                     let lat = (now_ns() as i128 + clock_offset as i128 - frame.pts_ns as i128)
                         .max(0) as u64;
@@ -1100,7 +1100,7 @@ async fn session(args: Args) -> Result<()> {
             lat_p99_us = pct(0.99),
             lat_max_us = latencies_us.last().copied().unwrap_or(0),
             skew_corrected,
-            "punktfunk/1 stream complete (capture→reassembled latency; skew_corrected=true ⇒ \
+            "punktfunk/1 stream complete (capture→received latency; skew_corrected=true ⇒ \
              cross-machine valid, false ⇒ same-host clock)"
         );
         if expected > 0 {

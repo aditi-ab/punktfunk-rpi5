@@ -8,7 +8,7 @@
 #   scripts/bench/gpu-stream.sh 1920x1080x120 12 --update   # (re)write scripts/bench/gpu-baseline.json
 #
 # Metrics (host PUNKTFUNK_PERF + client report): encode_us_p50/p99, tx_mbps, send_dropped, and the
-# client's capture→reassembled lat_p50/p95/p99_us. Lower is better for latency/encode/drops, higher
+# client's capture→received lat_p50/p95/p99_us. Lower is better for latency/encode/drops, higher
 # for throughput. Regressions are flagged ⚠ but the script exits 0 (gate decisions stay human).
 set -uo pipefail
 

@@ -38,7 +38,8 @@ final class VideoToolboxRoundTripTests: XCTestCase {
         XCTAssertEqual(AnnexB.avcc(from: annexB, codec: .hevc), avccSample)
 
         // 3) Sample buffer → real decoder → pixels.
-        let au = AccessUnit(data: annexB, ptsNs: 1_000_000, frameIndex: 0, flags: 0)
+        let au = AccessUnit(
+            data: annexB, ptsNs: 1_000_000, frameIndex: 0, flags: 0, receivedNs: 0)
         let sample = try XCTUnwrap(AnnexB.sampleBuffer(au: au, format: rebuilt, codec: .hevc))
 
         var session: VTDecompressionSession?
@@ -67,13 +68,14 @@ final class VideoToolboxRoundTripTests: XCTestCase {
     }
 
     /// Stage-2 decode half: the same known IDR through `VideoDecoder` — assert its async output
-    /// callback fires with a CVPixelBuffer of the right dimensions, the pts round-trips, and
-    /// decode-completion is stamped.
+    /// callback fires with a CVPixelBuffer of the right dimensions, the pts and the receipt stamp
+    /// round-trip (the latter rides the frame refcon), and decode-completion is stamped.
     func testVideoDecoderAsyncCallbackDeliversPixels() throws {
         let (formatDesc, avccSample) = try encodeOneHEVCKeyframe()
         let annexB = try annexBAU(formatDesc: formatDesc, avccSample: avccSample)
         let format = try XCTUnwrap(AnnexB.formatDescription(fromIDR: annexB, codec: .hevc))
-        let au = AccessUnit(data: annexB, ptsNs: 42_000_000, frameIndex: 0, flags: 0)
+        let au = AccessUnit(
+            data: annexB, ptsNs: 42_000_000, frameIndex: 0, flags: 0, receivedNs: 41_000_000)
 
         let box = FrameBox()
         let done = DispatchSemaphore(value: 0)
@@ -100,6 +102,8 @@ final class VideoToolboxRoundTripTests: XCTestCase {
         XCTAssertEqual(CVPixelBufferGetWidth(ready.pixelBuffer), width)
         XCTAssertEqual(CVPixelBufferGetHeight(ready.pixelBuffer), height)
         XCTAssertEqual(ready.ptsNs, 42_000_000, "pts round-trips through the decoder")
+        XCTAssertEqual(
+            ready.receivedNs, 41_000_000, "receivedNs round-trips through the frame refcon")
         XCTAssertGreaterThan(ready.decodedNs, 0, "decode-completion is stamped")
     }
 

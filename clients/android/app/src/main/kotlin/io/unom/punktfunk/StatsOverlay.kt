@@ -15,11 +15,13 @@ import io.unom.punktfunk.kit.NativeBridge
 import kotlin.math.roundToInt
 
 /**
- * The live stats overlay — mirrors the Apple client's HUD. Reads the 14-double layout from
+ * The live stats overlay — the unified HUD (`design/stats-unification.md`, Android v1: headline is
+ * `capture→decoded`, tiled by `host+network` + `decode`). Reads the 16-double layout from
  * [NativeBridge.nativeVideoStats]:
- * `[fps, mbps, latP50Ms, latP95Ms, latValid, skew, w, h, hz, dropped, bitDepth, colorPrimaries,
- * colorTransfer, chromaFormatIdc]`. The trailing four (present on a current native lib) describe the
- * negotiated video feed and render as a codec/depth/colour/chroma line; older layouts just omit it.
+ * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skew, w, h, hz, lost, bitDepth, colorPrimaries,
+ * colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms]`. Indexes 10–13 (present on a current
+ * native lib) describe the negotiated video feed and render as a codec/depth/colour/chroma line;
+ * 14/15 render as the stage equation; older layouts just omit those lines.
  */
 @Composable
 internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
@@ -29,7 +31,7 @@ internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
     val hz = s[8].toInt()
     val latValid = s[4] != 0.0
     val skew = s[5] != 0.0
-    val dropped = s[9].toLong()
+    val lost = s[9].toLong()
     Column(
         modifier = modifier
             .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
@@ -50,17 +52,25 @@ internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
             )
         }
         if (latValid) {
-            val tag = if (skew) "" else " (same-host)"
+            val tag = if (skew) "" else " (same-host clock)"
             Text(
-                "capture→client ${"%.1f".format(s[2])}/${"%.1f".format(s[3])} ms p50/p95$tag",
+                "end-to-end ${"%.1f".format(s[2])} ms p50 · ${"%.1f".format(s[3])} p95 · capture→decoded$tag",
                 color = Color.White,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 12.sp,
             )
+            if (s.size >= 16) {
+                Text(
+                    "= host+network ${"%.1f".format(s[14])} + decode ${"%.1f".format(s[15])}",
+                    color = Color.White,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                )
+            }
         }
-        if (dropped > 0) {
+        if (lost > 0) {
             Text(
-                "dropped $dropped",
+                "lost $lost",
                 color = Color(0xFFFFB0B0),
                 fontFamily = FontFamily.Monospace,
                 fontSize = 12.sp,

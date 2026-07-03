@@ -1,6 +1,10 @@
-// Unit tests for LatencyMeter: percentiles, the skew-corrected flag, reset-on-drain, and the
-// absurd-value guard. Latencies are constructed by stamping a pts a known interval in the past, so
-// the result is that interval plus the (tiny) clock advance between reads — asserted with tolerance.
+// Unit tests for LatencyMeter (one instance per unified-stats stage — see
+// design/stats-unification.md): percentiles, the skew-corrected flag, reset-on-drain, the
+// absurd-value guard, and the explicit-instant stage form (record(ptsNs:atNs:offsetNs:), used for
+// the client-local decode/display stages and the at-present end-to-end stamp). Receipt-path
+// latencies are constructed by stamping a pts a known interval in the past, so the result is that
+// interval plus the (tiny) clock advance between reads — asserted with tolerance; the explicit
+// form is exact.
 
 import Foundation
 import XCTest
@@ -36,6 +40,26 @@ final class LatencyMeterTests: XCTestCase {
         let now = nowRealtimeNs()
         m.record(ptsNs: now - 1_000_000, offsetNs: 250_000) // 1 ms ago, +0.25 ms offset
         XCTAssertEqual(m.drain()?.skewCorrected, true)
+    }
+
+    func testExplicitStageRecordIsExact() {
+        let m = LatencyMeter()
+        // A client-local stage (decode: received→decoded) — start instant as ptsNs, offset 0.
+        let receivedNs: Int64 = 1_000_000_000_000
+        m.record(ptsNs: UInt64(receivedNs), atNs: receivedNs + 3_000_000, offsetNs: 0)
+        guard let s = m.drain() else { return XCTFail("expected a sample") }
+        XCTAssertEqual(s.count, 1)
+        XCTAssertEqual(s.p50Ms, 3.0, "explicit instants make the sample exact")
+        XCTAssertFalse(s.skewCorrected, "local stages record with offset 0")
+    }
+
+    func testExplicitStageDropsNonPositiveInterval() {
+        let m = LatencyMeter()
+        // A stage whose start stamp is missing (0) or after its end must not pollute the window.
+        let decodedNs: Int64 = 1_000_000_000_000
+        m.record(ptsNs: 0, atNs: decodedNs, offsetNs: 0) // "start unknown" → > 10 s → dropped
+        m.record(ptsNs: UInt64(decodedNs + 1), atNs: decodedNs, offsetNs: 0) // negative → dropped
+        XCTAssertNil(m.drain())
     }
 
     func testDropsAbsurdValues() {

@@ -1,5 +1,7 @@
-// The streaming overlay HUD: mode + fps/throughput, the capture→client (and, under the stage-2
-// presenter, capture→present) latency lines, the platform input hint, and disconnect.
+// The streaming overlay HUD: mode + fps/throughput, the unified latency lines
+// (design/stats-unification.md — end-to-end headline + the stage equation under stage-2, the
+// capture→received headline under the stage-1 fallback), the loss counter, the platform input
+// hint, and disconnect.
 
 import PunktfunkKit
 import SwiftUI
@@ -18,24 +20,32 @@ struct StreamHUDView: View {
                 Text("\(connection.width)×\(connection.height)@\(connection.refreshHz)  \(model.fps) fps  \(model.mbps, specifier: "%.1f") Mb/s")
                     .font(.system(.caption, design: .monospaced))
             }
-            if model.latencyValid {
-                // Capture→client-receipt (skew-corrected); excludes the layer's decode+present —
-                // see LatencyMeter. "(same-host)" when the host didn't answer the skew handshake.
-                Text("capture→client \(model.latencyP50Ms, specifier: "%.1f")/\(model.latencyP95Ms, specifier: "%.1f") ms p50/p95\(model.latencySkewCorrected ? "" : " (same-host)")")
+            if model.endToEndValid {
+                // Stage-2: the end-to-end headline (capture→on-glass, measured directly, skew-
+                // corrected) — "(same-host clock)" when the host didn't answer the skew handshake.
+                Text("end-to-end \(model.endToEndP50Ms, specifier: "%.1f") ms p50 · \(model.endToEndP95Ms, specifier: "%.1f") p95 · capture→on-glass\(model.endToEndSkewCorrected ? "" : " (same-host clock)")")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                // The equation: the three stages tiling the headline interval (per-window p50s —
+                // they only approximately sum to the directly-measured total).
+                if model.hostNetworkValid && model.decodeValid && model.displayValid {
+                    Text("= host+network \(model.hostNetworkP50Ms, specifier: "%.1f") + decode \(model.decodeP50Ms, specifier: "%.1f") + display \(model.displayP50Ms, specifier: "%.1f")")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            } else if model.hostNetworkValid {
+                // Stage-1 fallback presenter: the layer decodes + presents internally with no
+                // per-frame stamp, so the honest headline ends at receipt — and there is no
+                // equation line (host+network is the whole measured interval).
+                Text("capture→received \(model.hostNetworkP50Ms, specifier: "%.1f") ms p50 · \(model.hostNetworkP95Ms, specifier: "%.1f") p95\(model.hostNetworkSkewCorrected ? "" : " (same-host clock)")")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
-            if model.presentLatencyValid {
-                // Capture→present (glass-to-glass, modulo host render→capture) — stage-2 presenter
-                // only; stage-1's layer presents internally with no per-frame stamp.
-                Text("capture→present \(model.presentLatencyP50Ms, specifier: "%.1f")/\(model.presentLatencyP95Ms, specifier: "%.1f") ms p50/p95\(model.presentLatencySkewCorrected ? "" : " (same-host)")")
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-            if model.presentTailValid {
-                // Decode→present (the client-local "present tail": ring wait + render + vsync) —
-                // the term the stage-2 presenter shortens; no skew applies (one clock).
-                Text("decode→present \(model.presentTailP50Ms, specifier: "%.1f")/\(model.presentTailP95Ms, specifier: "%.1f") ms p50/p95")
+            if model.lostFrames > 0 {
+                // Unrecoverable network drops this window; hidden while the link is clean.
+                // String(format:) rather than specifier interpolation: the literal % would
+                // otherwise land in the LocalizedStringKey's format string as a bogus conversion.
+                Text(String(format: "lost %d (%.1f%%)", model.lostFrames, model.lostPct))
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
