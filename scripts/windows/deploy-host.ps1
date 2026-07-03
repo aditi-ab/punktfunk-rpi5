@@ -41,6 +41,23 @@ foreach ($k in 'LIBCLANG_PATH','CMAKE_POLICY_VERSION_MINIMUM') {
   else { Write-Warning "env $k not set (run setup-build-env.ps1)" }
 }
 
+# All-vendor build when an FFmpeg dev tree is available (BtbN lgpl-shared: include/ + lib/ + bin/):
+# nvenc alone otherwise. Without amf-qsv a GPU preference pointing at an AMD/Intel adapter makes
+# every session die at encoder open (NV_ENC_ERR_NO_ENCODE_DEVICE) — the exact "can't connect"
+# field failure on hybrid boxes.
+$features = 'nvenc'
+if (-not $env:FFMPEG_DIR) {
+  $v = [Environment]::GetEnvironmentVariable('FFMPEG_DIR', 'Machine')
+  if ($v) { [Environment]::SetEnvironmentVariable('FFMPEG_DIR', $v, 'Process') }
+  elseif (Test-Path 'C:\Users\Public\ffmpeg\include') { $env:FFMPEG_DIR = 'C:\Users\Public\ffmpeg' }
+}
+if ($env:FFMPEG_DIR -and (Test-Path (Join-Path $env:FFMPEG_DIR 'include'))) {
+  $features = 'nvenc,amf-qsv'
+  Write-Host "env    : FFMPEG_DIR=$env:FFMPEG_DIR (AMF/QSV enabled)"
+} else {
+  Write-Warning "no FFMPEG_DIR dev tree - building NVENC-only (AMD/Intel GPU selection will not encode)"
+}
+
 # 1. stop the service so the .exe is writable
 Write-Host "stopping $svc ..."
 & sc.exe stop $svc | Out-Null
@@ -49,9 +66,9 @@ for ($i=0; $i -lt 30 -and (Svc-Running); $i++) { Start-Sleep 1 }
 # 2. back up the current binary for rollback
 if (Test-Path $exe) { Copy-Item $exe $bak -Force; Write-Host "backup : $bak" }
 
-# 3. build (release + nvenc); build env is inherited from Machine scope (setup-build-env.ps1)
-Write-Host "building: cargo build --release -p punktfunk-host --features nvenc"
-& cmd.exe /c "call `"$vcvars`" >nul && cargo build --release -p punktfunk-host --features nvenc"
+# 3. build (release); build env is inherited from Machine scope (setup-build-env.ps1)
+Write-Host "building: cargo build --release -p punktfunk-host --features $features"
+& cmd.exe /c "call `"$vcvars`" >nul && cargo build --release -p punktfunk-host --features $features"
 $built = ($LASTEXITCODE -eq 0)
 
 if (-not $built) {
@@ -59,6 +76,13 @@ if (-not $built) {
   if (Test-Path $bak) { Copy-Item $bak $exe -Force }
   & sc.exe start $svc | Out-Null
   throw "build failed; previous binary restored and service restarted."
+}
+
+# 3b. the AMF/QSV backend link-imports the FFmpeg DLLs — lay them next to the exe (the installer
+# does the same into {app}); idempotent, and harmless for the NVENC path.
+if ($features -like '*amf-qsv*') {
+  Copy-Item (Join-Path $env:FFMPEG_DIR 'bin\*.dll') (Split-Path $exe) -Force
+  Write-Host "ffmpeg : runtime DLLs copied next to the exe"
 }
 
 # 4. start on the new binary and confirm it stays up
