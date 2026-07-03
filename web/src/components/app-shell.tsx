@@ -33,8 +33,11 @@ export function AppShell({ children }: { children: ReactNode }) {
 	useLocale();
 	return (
 		<div className="flex min-h-screen">
-			{/* Desktop sidebar (≥ sm). */}
-			<aside className="hidden w-60 shrink-0 flex-col border-r bg-card/40 p-4 sm:flex">
+			{/* Desktop sidebar (≥ sm). Sticky at viewport height: the page (body) scrolls with
+			    long content, but the sidebar stays pinned — the explicit h-dvh stops the flex
+			    stretch that would otherwise grow it (and push the language switcher) below the
+			    fold. overflow-y-auto lets the nav itself scroll on very short viewports. */}
+			<aside className="sticky top-0 hidden h-dvh w-60 shrink-0 flex-col overflow-y-auto border-r bg-card/40 p-4 sm:flex">
 				<Link
 					to="/"
 					aria-label="punktfunk"
