@@ -298,7 +298,9 @@ end;
 
 { Firewall scope: the "allowpublicfw" task opens the streaming + console ports on Public networks too
   (default = Private/Domain only). Forwarded to both `service install` and `web setup`. Returns a
-  LEADING SPACE so it concatenates after the preceding {code:...} param without a gap. }
+  LEADING SPACE so it concatenates after the preceding code-substitution param without a gap.
+  (Do NOT write a literal code-constant token in this comment: Inno's brace comments do not nest,
+  so its closing brace would end the comment early and break the [Code] parse.) }
 function PublicFwParam(Param: String): String;
 begin
   if WizardIsTaskSelected('allowpublicfw') then
