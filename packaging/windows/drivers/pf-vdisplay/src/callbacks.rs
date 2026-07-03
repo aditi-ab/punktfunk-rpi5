@@ -25,13 +25,23 @@ pub unsafe extern "C" fn device_d0_entry(
     crate::adapter::init_adapter(device)
 }
 
-/// Async completion of `IddCxAdapterInitAsync`: stash the adapter for later DDIs. STEP 4 also starts the
-/// watchdog here.
+/// Async completion of `IddCxAdapterInitAsync`: stash the adapter for later DDIs — IFF the init
+/// actually SUCCEEDED. STEP 4 also starts the watchdog here.
 pub unsafe extern "C" fn adapter_init_finished(
     adapter: iddcx::IDDCX_ADAPTER,
-    _p_in: *const iddcx::IDARG_IN_ADAPTER_INIT_FINISHED,
+    p_in: *const iddcx::IDARG_IN_ADAPTER_INIT_FINISHED,
 ) -> NTSTATUS {
-    dbglog!("[pf-vd] adapter_init_finished");
+    // SAFETY: the framework supplies a valid, live input-args pointer for the call.
+    let status = unsafe { (*p_in).AdapterInitStatus };
+    dbglog!("[pf-vd] adapter_init_finished (AdapterInitStatus={status:#010x})");
+    // The MS sample gates on NT_SUCCESS(AdapterInitStatus). An adapter whose async init FAILED is a
+    // husk the contract forbids using: monitors created on it arrive but are never activated (no
+    // swap-chain ever assigned) — every session then black-screens with no visible cause. Leaving
+    // the ADAPTER unset makes `create_monitor` fail the ADD cleanly (host-visible + retryable), and
+    // a re-entrant D0 retries the init (`init_adapter` only short-circuits once the stash is set).
+    if status < 0 {
+        return STATUS_SUCCESS; // the callback itself succeeded; the failure is in NOT adopting
+    }
     crate::adapter::set_adapter(adapter);
     crate::control::start_watchdog();
     STATUS_SUCCESS

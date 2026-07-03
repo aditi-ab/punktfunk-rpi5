@@ -117,9 +117,18 @@ impl SwapChainProcessor {
             // SAFETY: `w!("Distribution")` is a 'static null-terminated UTF-16 task name; `av_task` is a
             // valid local out-param. The returned handle is reverted with AvRevertMmThreadCharacteristics.
             let res = unsafe { AvSetMmThreadCharacteristicsW(w!("Distribution"), &mut av_task) };
-            let Ok(av_handle) = res else {
-                dbglog!("[pf-vd] swap-chain: failed to prioritize thread: {res:?}");
-                return;
+            // MMCSS can fail under the restricted WUDFHost token ('Distribution' task unregistered /
+            // service unavailable). The MS sample CONTINUES unprioritized — never abort: returning
+            // here would leave the assigned swap-chain undrained (the monitor stalls, DWM blocks on
+            // it) and leak the WDF swap-chain object until device teardown.
+            let av_handle = match res {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    dbglog!(
+                        "[pf-vd] swap-chain: MMCSS prioritization failed ({e:?}) — continuing unprioritized"
+                    );
+                    None
+                }
             };
 
             Self::run_core(
@@ -144,12 +153,14 @@ impl SwapChainProcessor {
                 call_unsafe_wdf_function_binding!(WdfObjectDelete, swap_chain.0 as WDFOBJECT);
             }
 
-            // Revert the thread to normal once it's done.
-            // SAFETY: `av_handle` is the live characteristics handle returned by AvSetMmThreadCharacteristicsW
-            // above, reverted exactly once here at thread exit.
-            let res = unsafe { AvRevertMmThreadCharacteristics(av_handle) };
-            if let Err(e) = res {
-                dbglog!("[pf-vd] swap-chain: failed to revert prioritized thread: {e:?}");
+            // Revert the thread to normal once it's done (only if MMCSS was actually engaged).
+            if let Some(h) = av_handle {
+                // SAFETY: `h` is the live characteristics handle returned by
+                // AvSetMmThreadCharacteristicsW above, reverted exactly once here at thread exit.
+                let res = unsafe { AvRevertMmThreadCharacteristics(h) };
+                if let Err(e) = res {
+                    dbglog!("[pf-vd] swap-chain: failed to revert prioritized thread: {e:?}");
+                }
             }
         });
 

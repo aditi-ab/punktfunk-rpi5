@@ -150,7 +150,16 @@ pub fn pooled_device(luid: LUID) -> Option<Arc<Direct3DDevice>> {
     if let Some((k, dev)) = pool.as_ref()
         && *k == key
     {
-        return Some(dev.clone());
+        // A TDR / driver reset REMOVES the pooled device permanently; handing it out again gives
+        // every future swap-chain a dead device (SetDevice fail-loop → black virtual display until
+        // device teardown). Detect and fall through to a fresh create instead.
+        // SAFETY: plain status query on the live pooled device.
+        match unsafe { dev.device.GetDeviceRemovedReason() } {
+            Ok(()) => return Some(dev.clone()),
+            Err(e) => {
+                dbglog!("[pf-vd] pooled D3D device was REMOVED ({e:?}) — recreating on {key:#x}");
+            }
+        }
     }
     match Direct3DDevice::init(luid) {
         Ok(d) => {
