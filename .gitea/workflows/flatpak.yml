@@ -73,15 +73,17 @@ jobs:
 
       - name: Version + channel
         # Tag vX.Y.Z -> X.Y.Z on the OSTree `stable` branch (a real release); a main push ->
-        # 0.5.0-ciN.g<sha> on the `canary` branch. The two branches live side-by-side in one repo
+        # <next-minor>-ciN.g<sha> on the `canary` branch (base one minor ahead of the latest stable
+        # tag via scripts/ci/pf-version.sh). The two branches live side-by-side in one repo
         # (rsync runs without --delete), each tracked by its own .flatpakref, so `flatpak update`
         # on a stable box never jumps to a canary build. The generic-registry version string allows
         # letters/dots/hyphens.
         run: |
+          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of the latest stable tag)
           SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; BRANCH=stable; ALIAS=latest ;;
-            *)            V="0.5.0-ci${GITHUB_RUN_NUMBER}.g${SHORT}"; BRANCH=canary; ALIAS=canary ;;
+            *)            V="${PF_BASE}-ci${GITHUB_RUN_NUMBER}.g${SHORT}"; BRANCH=canary; ALIAS=canary ;;
           esac
           echo "VERSION=$V" >> "$GITHUB_ENV"
           echo "BUNDLE=punktfunk-client-${V}.flatpak" >> "$GITHUB_ENV"
@@ -105,6 +107,40 @@ jobs:
           python3 packaging/flatpak/prune-windows-lock.py Cargo.lock /tmp/Cargo.flatpak.lock
           python3 /tmp/flatpak-cargo-generator.py /tmp/Cargo.flatpak.lock \
             -o packaging/flatpak/cargo-sources.json
+
+      - name: Seed the local OSTree repo from the live server (keep BOTH channels in the summary)
+        # Each CI run builds only ONE branch (canary on main, stable on a tag). The deploy step's
+        # `flatpak build-update-repo` regenerates the repo SUMMARY from whatever refs are in the
+        # LOCAL repo, and the rsync publishes it (without --delete). A fresh single-branch local
+        # repo therefore produces a single-branch summary that CLOBBERS the other channel on the
+        # server — the exact bug that made `app/io.unom.Punktfunk/x86_64/stable` unresolvable
+        # ("No such ref") after a canary main-push overwrote the post-release summary, even though
+        # the stable commit's objects were still on disk. Fix: mirror the published repo DOWN first,
+        # so the local repo carries every existing branch; the build below then only ADDS this run's
+        # commit and the regenerated+signed summary keeps both channels. No-op on a fresh repo (first
+        # publish) or when the deploy secrets aren't set (the build still produces a valid bundle).
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_HOST:-}" ] || [ -z "${DEPLOY_SSH_KEY:-}" ]; then
+            echo "::warning::DEPLOY_* not set — no seed; building a fresh single-branch repo."
+            exit 0
+          fi
+          install -d -m700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy; chmod 600 ~/.ssh/deploy
+          SSH="ssh -i $HOME/.ssh/deploy -p ${DEPLOY_PORT:-22} -o StrictHostKeyChecking=accept-new"
+          DEST="${DEPLOY_USER}@${DEPLOY_HOST}"
+          mkdir -p "$PWD/repo"
+          # Pull the currently-published repo (all channels' objects + refs) into the repo the build
+          # will extend. No --delete: the local repo starts empty, so this only ADDS. A missing
+          # server repo (very first publish) is fine — we continue with a fresh repo.
+          rsync -az --info=stats1 -e "$SSH" "$DEST:$DEPLOY_DIR/site/repo/" "$PWD/repo/" \
+            || echo "::warning::no published repo to seed (first publish?) — continuing fresh"
+          echo "seeded refs:"; ls "$PWD/repo/refs/heads/app/$APP_ID/x86_64/" 2>/dev/null || echo "  (none)"
 
       - name: Build the flatpak (install deps from Flathub, offline build)
         run: |
@@ -177,6 +213,10 @@ jobs:
             --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME"
           flatpak build-update-repo --generate-static-deltas \
             --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" "$PWD/repo"
+          # The regenerated summary advertises exactly these refs — must include EVERY channel that
+          # has ever published (the seed step ensures the other channel's commit is present). If this
+          # ever shows only one branch on a repo that had two, the seed didn't run — investigate.
+          echo "published summary advertises:"; ls "$PWD/repo/refs/heads/app/$APP_ID/x86_64/" 2>/dev/null || echo "  (none)"
           # 2) Build the install descriptors (GPGKey = the committed public key, base64).
           GPGKEY="$(base64 -w0 packaging/flatpak/unom-flatpak.gpg)"
           rm -rf site && mkdir -p site
@@ -188,9 +228,12 @@ jobs:
           Comment=unom Flatpak applications
           GPGKey=$GPGKEY
           EOF
-          # Two refs, one per channel — both regenerated every run and rsync'd without --delete, so
-          # the server always offers both (the stable ref only resolves once a release has built the
-          # `stable` branch). A box installs ONE; `flatpak update` then tracks that channel's branch.
+          # Two refs, one per channel. Both descriptor files are regenerated every run and rsync'd
+          # without --delete; the repo SUMMARY carries both branches because the build was seeded
+          # from the live repo above (so build-update-repo below re-signs a summary listing every
+          # published channel, not just this run's). The stable ref resolves for good once any
+          # release has built the `stable` branch. A box installs ONE; `flatpak update` then tracks
+          # that channel's branch.
           write_ref() {  # <filename> <branch> <title>
             cat > "site/$1" <<EOF
           [Flatpak Ref]
