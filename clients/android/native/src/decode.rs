@@ -61,7 +61,14 @@ pub fn run(
     // realtime priority + the target frame rate, so vendor decoders (e.g. Qualcomm) run at full
     // clocks instead of a power-saving cadence that adds dequeue latency.
     format.set_i32("priority", 0); // 0 = realtime
-    format.set_i32("operating-rate", mode.refresh_hz as i32);
+                                   // Operating rate = the codec's clock hint. Setting it to the display rate merely asks the
+                                   // decoder to *sustain* that cadence — a Qualcomm decoder can meet 60/120 fps at a power-saving
+                                   // clock that adds a millisecond-plus of decode latency per frame. Setting it to the AOSP
+                                   // "unbounded" sentinel (Short.MAX) instead asks the decoder to run each frame at max clocks and
+                                   // finish ASAP, minimising per-frame decode latency — the right trade for a real-time stream
+                                   // (costs power/heat; the dial to lower if a device thermally throttles over a long session).
+                                   // Ignored where unsupported.
+    format.set_i32("operating-rate", i16::MAX as i32); // 32767 = "as fast as possible"
 
     // HDR static metadata (ST.2086 mastering + content light level): when an HDR session was
     // negotiated, set KEY_HDR_STATIC_INFO so the display tone-maps from the source's real grade.
@@ -103,6 +110,25 @@ pub fn run(
             mode.refresh_hz
         );
     }
+
+    // ADPF: hint the platform that the whole video pipeline — this pf-decode feed/drain/present
+    // loop, the core's data-plane pump (UDP receive + FEC reassembly), and the audio thread — runs a
+    // per-frame real-time workload, so the CPU governor keeps those threads on fast cores at high
+    // clocks instead of down-clocking between frames or parking them on a little core. Snapdragon's
+    // ADPF backend responds well to this. We register this thread now but create the session lazily
+    // on the first presented frame: by then the pump + audio threads have registered their ids too,
+    // and ADPF `createSession` rejects a set with any not-yet-live/dead tid. No-op below API 33.
+    let frame_period_ns = if mode.refresh_hz > 0 {
+        1_000_000_000i64 / mode.refresh_hz as i64
+    } else {
+        0
+    };
+    client.register_hot_thread(); // this decode thread → the pipeline's hot-thread set
+    let mut hint: Option<crate::adpf::HintSession> = None;
+    let mut hint_tried = false;
+    // Accumulates the loop's productive (feed+drain) time between displayed frames; reported to ADPF
+    // once per rendered frame against the frame-period target.
+    let mut work_accum_ns: i64 = 0;
 
     let mut fed: u64 = 0;
     let mut rendered: u64 = 0;
@@ -154,6 +180,9 @@ pub fn run(
                 Err(_) => break,                   // session closed
             }
         }
+        // Time the productive work (feed + drain) only — the `next_frame` poll wait above is idle
+        // and excluded, so ADPF sees this thread's real per-frame CPU cost, not the poll timeout.
+        let work_t0 = Instant::now();
         if let Some(frame) = pending.take() {
             if feed(&codec, &frame.data, frame.pts_ns / 1000) {
                 fed += 1;
@@ -176,6 +205,36 @@ pub fn run(
         let (r, d) = drain(&codec, &window, &mut applied_ds, wait);
         rendered += r;
         discarded += d;
+
+        // ADPF: attribute this iteration's feed+drain time to the frame being produced, and report
+        // the accumulated per-frame work once one is actually presented (r > 0). Under back-pressure
+        // the short output-dequeue wait is included in the tally — for a latency-first client,
+        // biasing the governor toward "boost" is the desired behaviour. Cheap when `hint` is None
+        // (one `Instant` diff, no report).
+        work_accum_ns += work_t0.elapsed().as_nanos() as i64;
+        if r > 0 {
+            if !hint_tried {
+                // First presented frame: the pump + audio threads have registered their ids by now.
+                // Build one ADPF session over the whole pipeline's thread set (empty below API 33,
+                // or where the platform declines → `None`, and the loop runs unhinted).
+                hint_tried = true;
+                let tids = client.hot_thread_ids();
+                hint = crate::adpf::HintSession::create(frame_period_ns, &tids);
+                log::info!(
+                    "decode: ADPF hint session {} — {} hot thread(s), target {frame_period_ns} ns",
+                    if hint.is_some() {
+                        "active"
+                    } else {
+                        "unavailable"
+                    },
+                    tids.len(),
+                );
+            }
+            if let Some(h) = &hint {
+                h.report_actual(work_accum_ns);
+            }
+            work_accum_ns = 0;
+        }
 
         // Loss recovery: under infinite GOP the only recovery keyframe is one we request. The
         // reassembler drops unrecoverable AUs (frames_dropped); the decoder then conceals the

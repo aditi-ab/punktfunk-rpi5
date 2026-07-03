@@ -26,6 +26,8 @@ use jni::sys::jint;
 use jni::JNIEnv;
 
 #[cfg(target_os = "android")]
+mod adpf;
+#[cfg(target_os = "android")]
 mod audio;
 #[cfg(target_os = "android")]
 mod decode;

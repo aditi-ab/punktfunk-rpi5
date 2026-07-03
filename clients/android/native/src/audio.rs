@@ -324,6 +324,10 @@ fn decode_loop(
     counters: Arc<Counters>,
     channels: usize,
 ) {
+    // Fold this Opus→AAudio thread into the client's hot-thread set so the ADPF session the decode
+    // thread opens also keeps audio decode on a fast core (registered before the video pump's first
+    // frame arrives, so it's captured when that session is created). No-op below API 33.
+    client.register_hot_thread();
     // Interleaved f32 samples per millisecond at this layout — the ring's 5 ms reserve check below.
     let ms = (SAMPLE_RATE as usize / 1000) * channels;
     // Opus decode scratch: worst-case 120 ms frame (5760 samples/ch) × channels.

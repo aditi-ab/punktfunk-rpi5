@@ -176,6 +176,12 @@ pub struct NativeClient {
     /// a recovery keyframe under infinite GOP — the correct loss trigger, since unrecoverable loss
     /// yields reference-missing frames the decoder silently conceals (a decode-error trigger misses them).
     frames_dropped: Arc<AtomicU64>,
+    /// Kernel ids of the client's latency-critical native threads: the internal data-plane pump
+    /// (UDP receive + FEC reassembly) plus any embedder plane threads registered via
+    /// [`NativeClient::register_hot_thread`]. The Android client feeds these to an ADPF hint session
+    /// so the CPU governor keeps the whole video pipeline on fast cores. Empty on platforms without
+    /// `gettid` (see [`current_hot_tid`]).
+    hot_tids: Arc<Mutex<Vec<i32>>>,
     worker: Option<std::thread::JoinHandle<()>>,
     /// The currently active session mode (the Welcome's, then updated by every accepted
     /// [`NativeClient::request_mode`]).
@@ -242,6 +248,32 @@ fn pin_thread_user_interactive() {
 #[cfg(not(target_vendor = "apple"))]
 fn pin_thread_user_interactive() {}
 
+/// The calling thread's kernel id, for hot-thread performance hints (the Android client's ADPF
+/// session today; the consumer is platform-specific). Linux/Android expose `gettid`; elsewhere
+/// there's nothing to hint with, so registration is a no-op.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn current_hot_tid() -> Option<i32> {
+    // SAFETY: `gettid` reads the calling thread's kernel id — an always-safe syscall, no args.
+    Some(unsafe { libc::gettid() })
+}
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn current_hot_tid() -> Option<i32> {
+    None
+}
+
+/// Record the calling thread's id in the shared hot-thread registry (deduped). Best-effort: a
+/// platform without `gettid` or a poisoned lock just skips it — a missed performance hint, not an
+/// error on the data path.
+fn register_hot_tid(reg: &Mutex<Vec<i32>>) {
+    if let Some(t) = current_hot_tid() {
+        if let Ok(mut v) = reg.lock() {
+            if !v.contains(&t) {
+                v.push(t);
+            }
+        }
+    }
+}
+
 impl NativeClient {
     /// Connect to a `punktfunk/1` host and start the session at (up to) `mode`. Blocks until the
     /// handshake completes or `timeout` elapses.
@@ -292,12 +324,14 @@ impl NativeClient {
         let mode_slot = Arc::new(std::sync::Mutex::new(mode));
         let probe = Arc::new(Mutex::new(ProbeState::default()));
         let frames_dropped = Arc::new(AtomicU64::new(0));
+        let hot_tids = Arc::new(Mutex::new(Vec::new()));
 
         let host = host.to_string();
         let shutdown_w = shutdown.clone();
         let mode_slot_w = mode_slot.clone();
         let probe_w = probe.clone();
         let frames_dropped_w = frames_dropped.clone();
+        let hot_tids_w = hot_tids.clone();
         let ctrl_tx_pump = ctrl_tx.clone(); // the data-plane pump sends adaptive-FEC LossReports
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
@@ -346,6 +380,7 @@ impl NativeClient {
                     mode_slot: mode_slot_w,
                     probe: probe_w,
                     frames_dropped: frames_dropped_w,
+                    hot_tids: hot_tids_w,
                 }));
             })
             .map_err(PunktfunkError::Io)?;
@@ -385,6 +420,7 @@ impl NativeClient {
             shutdown,
             worker: Some(worker),
             frames_dropped,
+            hot_tids,
             mode: mode_slot,
             host_fingerprint: fingerprint,
             resolved_compositor,
@@ -524,6 +560,25 @@ impl NativeClient {
     /// trigger would rarely fire). Monotonic for the session; compare against the last observed value.
     pub fn frames_dropped(&self) -> u64 {
         self.frames_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Register the calling thread as latency-critical so a later
+    /// [`hot_thread_ids`](Self::hot_thread_ids) includes it. An embedder calls this from its own
+    /// plane threads (e.g. the Android client's decode + audio threads) to fold them into the same
+    /// performance-hint session as the internal data-plane pump. Idempotent per thread; a no-op on
+    /// platforms without `gettid`.
+    pub fn register_hot_thread(&self) {
+        register_hot_tid(&self.hot_tids);
+    }
+
+    /// Kernel ids of the client's latency-critical threads: the internal data-plane pump (UDP
+    /// receive + FEC reassembly) plus any registered via
+    /// [`register_hot_thread`](Self::register_hot_thread). The Android client feeds these to an ADPF
+    /// hint session so the CPU governor keeps the whole video pipeline on fast cores. Empty where
+    /// thread ids aren't available (platforms without `gettid`); call after the first frame so the
+    /// pump has registered.
+    pub fn hot_thread_ids(&self) -> Vec<i32> {
+        self.hot_tids.lock().map(|v| v.clone()).unwrap_or_default()
     }
 
     /// Start a bandwidth speed test: ask the host to burst filler over the data plane at
@@ -723,6 +778,7 @@ struct WorkerArgs {
     mode_slot: Arc<std::sync::Mutex<Mode>>,
     probe: Arc<Mutex<ProbeState>>,
     frames_dropped: Arc<AtomicU64>,
+    hot_tids: Arc<Mutex<Vec<i32>>>,
 }
 
 /// The worker: QUIC handshake, then the input/datagram/control tasks + the blocking
@@ -757,6 +813,7 @@ async fn worker_main(args: WorkerArgs) {
         mode_slot,
         probe,
         frames_dropped,
+        hot_tids,
     } = args;
     let setup = async {
         let remote: std::net::SocketAddr = format!("{host}:{port}")
@@ -1063,11 +1120,13 @@ async fn worker_main(args: WorkerArgs) {
     // decoder queue — it isn't video.
     let pump_shutdown = shutdown.clone();
     let pump_probe = probe.clone();
+    let pump_hot_tids = hot_tids.clone();
     let _ = tokio::task::spawn_blocking(move || {
         pin_thread_user_interactive(); // feeds frame_tx → the client's user-interactive video pump
-                                       // Adaptive-FEC loss reporting: every ADAPT_REPORT_INTERVAL, report the loss observed over the
-                                       // window (shards FEC recovered, plus a bump if any frame went unrecoverable) so the host can
-                                       // size FEC to the link. Suppressed during a speed test (its FLAG_PROBE filler would skew it).
+        register_hot_tid(&pump_hot_tids); // this thread does UDP receive + FEC reassembly — hint it
+                                          // Adaptive-FEC loss reporting: every ADAPT_REPORT_INTERVAL, report the loss observed over the
+                                          // window (shards FEC recovered, plus a bump if any frame went unrecoverable) so the host can
+                                          // size FEC to the link. Suppressed during a speed test (its FLAG_PROBE filler would skew it).
         const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
         let mut last_report = Instant::now();
         let (mut last_recovered, mut last_received, mut last_dropped) = (0u64, 0u64, 0u64);
