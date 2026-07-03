@@ -1,0 +1,274 @@
+//! Windows audio endpoint assignment — the PURE planning logic behind
+//! [`audio_control`](super::audio_control), split out so it compiles (and its unit tests run) on
+//! every platform: the precedence rules here encode the hard-won field knowledge, and regressing
+//! them must fail CI on Linux too, not only on a Windows box.
+//!
+//! Two jobs share the render endpoints and must never collide:
+//!
+//! * the **virtual mic** writes the client's decoded mic PCM into a virtual cable's render
+//!   endpoint (its capture side surfaces as a host microphone), and
+//! * the **desktop-audio loopback** captures a render endpoint's mix for the host→client
+//!   audio stream.
+//!
+//! WASAPI loopback captures *everything* an endpoint renders — including what the virtual mic
+//! writes — so if both land on the same device the client's voice echoes straight back into the
+//! client's own audio stream. The plan therefore assigns the mic its endpoint FIRST (VB-CABLE is
+//! bundled by the installer for exactly this) and gives the loopback a *different* one; when only
+//! the cable exists (headless box, no other output), the MIC wins and the loopback is honestly
+//! unavailable. The old code did the opposite — the mic refused the cable because it was the
+//! default render endpoint — which permanently killed mic passthrough in the exact configuration
+//! the installer ships (VB-CABLE as the only render device).
+
+/// A `(friendly_name, endpoint_id)` pair as enumerated from WASAPI.
+pub(crate) type Endpoint = (String, String);
+
+/// The coherent endpoint assignment for one wiring pass. Computed fresh on every mic/capture
+/// (re)open — Windows endpoints churn (boot-time registration, hotplug, driver installs), so a
+/// once-per-process plan goes stale.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Wiring {
+    /// Render endpoint RESERVED for the virtual mic (the write target). The loopback must never
+    /// capture this device.
+    pub mic_render: Option<Endpoint>,
+    /// The mic device's CAPTURE side — host apps record this; made the default recording device.
+    pub mic_capture: Option<Endpoint>,
+    /// Render endpoint for the desktop-audio loopback; made the default playback device.
+    pub loopback_render: Option<Endpoint>,
+}
+
+/// Render-endpoint friendly-name substrings (lowercased) usable as the virtual-mic write target,
+/// ordered by preference. VB-CABLE first: the installer bundles it for this exact purpose.
+const MIC_CANDIDATES: &[&str] = &[
+    "cable input", // VB-Audio Virtual Cable — bundled by the installer
+    "steam streaming microphone",
+    "voicemeeter input",
+    "voicemeeter aux input",
+    "virtual",
+];
+
+/// `(mic render substring, matching capture substring)` — which capture endpoint surfaces the
+/// audio written to a given mic render target.
+fn capture_for(mic_render_lname: &str) -> &'static [&'static str] {
+    if mic_render_lname.contains("cable") {
+        &["cable output"]
+    } else if mic_render_lname.contains("steam streaming microphone") {
+        &["steam streaming microphone"]
+    } else if mic_render_lname.contains("voicemeeter") {
+        &["voicemeeter out", "voicemeeter"]
+    } else {
+        &["virtual"]
+    }
+}
+
+/// A render endpoint no loopback should capture: the VB-CABLE (reserved for the mic even when it
+/// isn't the chosen target — capturing a cable someone else feeds echoes too) and the Steam
+/// Streaming Speakers, whose loopback is silent (validated live).
+fn excluded_from_loopback(lname: &str) -> bool {
+    lname.contains("cable") || lname.contains("steam streaming speakers")
+}
+
+/// A known-virtual device (cables/streaming endpoints). A render WITHOUT these markers is real
+/// hardware — the best loopback source (apps render there by default and the operator can also
+/// hear it).
+fn virtualish(lname: &str) -> bool {
+    lname.contains("virtual")
+        || lname.contains("cable")
+        || lname.contains("steam streaming")
+        || lname.contains("voicemeeter")
+}
+
+/// Compute the assignment. `mic_want` is the operator override (`PUNKTFUNK_MIC_DEVICE`,
+/// lowercased): when set it beats the built-in candidate order for the mic target.
+pub(crate) fn plan(renders: &[Endpoint], captures: &[Endpoint], mic_want: Option<&str>) -> Wiring {
+    let find_render = |needle: &str| {
+        renders
+            .iter()
+            .find(|(n, _)| n.to_lowercase().contains(needle))
+            .cloned()
+    };
+
+    // 1. Mic target first — it has the narrower requirements (must be a virtual cable).
+    let mic_render = match mic_want {
+        Some(w) => find_render(w),
+        None => MIC_CANDIDATES.iter().find_map(|c| find_render(c)),
+    };
+
+    // 2. Its capture side (what host apps record).
+    let mic_capture = mic_render.as_ref().and_then(|(name, _)| {
+        capture_for(&name.to_lowercase()).iter().find_map(|c| {
+            captures
+                .iter()
+                .find(|(n, _)| n.to_lowercase().contains(c))
+                .cloned()
+        })
+    });
+
+    // 3. Loopback from the REMAINING renders: real hardware > Steam Streaming Microphone (its
+    //    loopback works, unlike the Speakers') > any non-excluded leftover.
+    let not_mic = |id: &str| mic_render.as_ref().is_none_or(|(_, mid)| mid != id);
+    let loopback_render = renders
+        .iter()
+        .find(|(n, id)| {
+            let ln = n.to_lowercase();
+            not_mic(id) && !excluded_from_loopback(&ln) && !virtualish(&ln)
+        })
+        .or_else(|| {
+            renders.iter().find(|(n, id)| {
+                not_mic(id) && n.to_lowercase().contains("steam streaming microphone")
+            })
+        })
+        .or_else(|| {
+            renders
+                .iter()
+                .find(|(n, id)| not_mic(id) && !excluded_from_loopback(&n.to_lowercase()))
+        })
+        .cloned();
+
+    Wiring {
+        mic_render,
+        mic_capture,
+        loopback_render,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ep(name: &str) -> Endpoint {
+        (name.to_string(), format!("id-{}", name.to_lowercase()))
+    }
+
+    /// The shipped configuration: real output + VB-CABLE. Mic gets the cable, loopback the
+    /// speakers, recording default = CABLE Output.
+    #[test]
+    fn gaming_pc_with_cable() {
+        let renders = [
+            ep("Speakers (Realtek HD Audio)"),
+            ep("CABLE Input (VB-Audio Virtual Cable)"),
+        ];
+        let captures = [
+            ep("Microphone (Webcam)"),
+            ep("CABLE Output (VB-Audio Virtual Cable)"),
+        ];
+        let w = plan(&renders, &captures, None);
+        assert_eq!(
+            w.mic_render.unwrap().0,
+            "CABLE Input (VB-Audio Virtual Cable)"
+        );
+        assert_eq!(
+            w.mic_capture.unwrap().0,
+            "CABLE Output (VB-Audio Virtual Cable)"
+        );
+        assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
+    }
+
+    /// THE historical dead-end: headless box where VB-CABLE is the ONLY render endpoint (and
+    /// therefore the default). The mic must WIN the cable; the loopback is honestly absent.
+    /// (The old anti-echo guard rejected the cable here → mic permanently dead.)
+    #[test]
+    fn headless_cable_only_mic_wins() {
+        let renders = [ep("CABLE Input (VB-Audio Virtual Cable)")];
+        let captures = [ep("CABLE Output (VB-Audio Virtual Cable)")];
+        let w = plan(&renders, &captures, None);
+        assert!(w.mic_render.is_some(), "mic must claim the only cable");
+        assert!(w.loopback_render.is_none(), "no echo-safe loopback exists");
+    }
+
+    /// Headless with the Steam pair installed: cable = mic, Steam Streaming Microphone = the
+    /// loopback (its loopback works; the Speakers' is silent — validated live).
+    #[test]
+    fn headless_with_steam_pair() {
+        let renders = [
+            ep("CABLE Input (VB-Audio Virtual Cable)"),
+            ep("Speakers (Steam Streaming Speakers)"),
+            ep("Speakers (Steam Streaming Microphone)"),
+        ];
+        let captures = [
+            ep("CABLE Output (VB-Audio Virtual Cable)"),
+            ep("Microphone (Steam Streaming Microphone)"),
+        ];
+        let w = plan(&renders, &captures, None);
+        assert_eq!(
+            w.mic_render.unwrap().0,
+            "CABLE Input (VB-Audio Virtual Cable)"
+        );
+        assert_eq!(
+            w.loopback_render.unwrap().0,
+            "Speakers (Steam Streaming Microphone)"
+        );
+        assert_eq!(
+            w.mic_capture.unwrap().0,
+            "CABLE Output (VB-Audio Virtual Cable)"
+        );
+    }
+
+    /// No cable: the Steam Streaming Microphone doubles as the mic target, and the loopback
+    /// must NOT then pick the same endpoint (real hardware wins).
+    #[test]
+    fn steam_mic_as_target_never_doubles_as_loopback() {
+        let renders = [
+            ep("Speakers (Steam Streaming Microphone)"),
+            ep("Speakers (Realtek HD Audio)"),
+        ];
+        let captures = [ep("Microphone (Steam Streaming Microphone)")];
+        let w = plan(&renders, &captures, None);
+        assert_eq!(
+            w.mic_render.unwrap().0,
+            "Speakers (Steam Streaming Microphone)"
+        );
+        assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
+    }
+
+    /// No cable and ONLY the Steam mic: mic wins it, loopback honestly absent (never the same
+    /// device — that would echo).
+    #[test]
+    fn steam_mic_only_no_echo() {
+        let renders = [ep("Speakers (Steam Streaming Microphone)")];
+        let captures = [ep("Microphone (Steam Streaming Microphone)")];
+        let w = plan(&renders, &captures, None);
+        assert!(w.mic_render.is_some());
+        assert!(w.loopback_render.is_none());
+    }
+
+    /// Steam Streaming Speakers never become the loopback (silent loopback, validated live) —
+    /// even when they're the only non-mic endpoint.
+    #[test]
+    fn steam_speakers_never_loopback() {
+        let renders = [
+            ep("CABLE Input (VB-Audio Virtual Cable)"),
+            ep("Speakers (Steam Streaming Speakers)"),
+        ];
+        let w = plan(&renders, &[], None);
+        assert!(w.loopback_render.is_none());
+    }
+
+    /// Operator override beats the candidate order.
+    #[test]
+    fn env_override_wins() {
+        let renders = [
+            ep("CABLE Input (VB-Audio Virtual Cable)"),
+            ep("Voicemeeter Input (VB-Audio Voicemeeter VAIO)"),
+        ];
+        let captures = [ep("Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)")];
+        let w = plan(&renders, &captures, Some("voicemeeter input"));
+        assert_eq!(
+            w.mic_render.unwrap().0,
+            "Voicemeeter Input (VB-Audio Voicemeeter VAIO)"
+        );
+        assert_eq!(
+            w.mic_capture.unwrap().0,
+            "Voicemeeter Out B1 (VB-Audio Voicemeeter VAIO)"
+        );
+    }
+
+    /// No virtual device anywhere: no mic target (open fails with guidance), loopback = the
+    /// real output — desktop audio unaffected.
+    #[test]
+    fn no_virtual_device() {
+        let renders = [ep("Speakers (Realtek HD Audio)")];
+        let w = plan(&renders, &[], None);
+        assert!(w.mic_render.is_none());
+        assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
+    }
+}

@@ -3,22 +3,21 @@
 //! device and write the client's decoded mic PCM into that device's **render** endpoint; the device's
 //! **capture** endpoint then surfaces as a microphone that host apps can record from.
 //!
-//! Target device, by friendly-name substring (first match wins; override with `PUNKTFUNK_MIC_DEVICE`):
-//! VB-Audio "CABLE Input" (bundled by the installer — the preferred, dedicated mic target), the
-//! "Steam Streaming Microphone", VoiceMeeter, or anything with "virtual" in the name.
-//! [`super::audio_control`] sets the default playback to a DIFFERENT loopback-capable device so the
-//! chosen mic is never the endpoint the loopback captures. If no candidate is present we auto-install
-//! the Steam Streaming audio pair (see [`install_steam_audio_pair`]); failing that we return an error
-//! with install guidance and the host runs without mic passthrough.
+//! The target comes from the [`audio_control::wire_now`] plan (recomputed on every open): VB-Audio
+//! "CABLE Input" (bundled by the installer — the dedicated mic target), the Steam Streaming
+//! Microphone, VoiceMeeter, or anything with "virtual" in the name; `PUNKTFUNK_MIC_DEVICE` overrides.
+//! The plan reserves the mic target and points the desktop-audio loopback at a DIFFERENT endpoint, so
+//! injecting here can never echo into the host→client audio stream (see
+//! [`wiring_plan`](super::wiring_plan) for the precedence rules and the headless cable-only case).
+//! If no candidate is present we auto-install the Steam Streaming audio pair (see
+//! [`install_steam_audio_pair`]); failing that we return an error with install guidance and the
+//! caller (the mic pump) retries with backoff — a cable that appears later (driver install finishing
+//! after boot) is picked up without a host restart.
 //!
-//! **Anti-echo guard (the whole point of this being non-trivial).** The desktop-audio plane
-//! ([`super::wasapi_cap`]) loopback-captures the **default render endpoint**. WASAPI loopback
-//! captures the *mixed* output of an endpoint — i.e. everything any app renders to it, including
-//! what THIS module writes. So if the virtual-mic target is the same device the loopback captures,
-//! the client's uplinked mic is captured straight back into the host→client audio stream: an
-//! infinite echo. [`find_device`] therefore **excludes the default render endpoint** from the
-//! candidates — the mic is guaranteed to land on a different device. (Linux gets this for free: its
-//! mic is a dedicated `Audio/Source` node, structurally separate from the monitored sink.)
+//! **Liveness.** Any WASAPI error in the render loop (endpoint invalidated/removed, audio engine
+//! restart) exits the worker thread, which flips the `alive` flag — [`VirtualMic::push`] then
+//! returns `false` and the pump reopens (re-planning, so endpoint churn re-resolves). Before this
+//! existed, the first device change silently killed mic passthrough for the rest of the host's life.
 //!
 //! `push` enqueues decoded interleaved-f32 PCM into a bounded ring (drop-oldest beyond ~80 ms so mic
 //! latency stays bounded); a dedicated COM-apartment thread renders it event-driven, filling silence
@@ -28,7 +27,7 @@
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use super::{VirtualMic, SAMPLE_RATE};
+use super::{audio_control, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,19 +43,11 @@ const BLOCK_ALIGN: usize = 2 * 4;
 /// Bound the inject queue at ~80 ms so the passed-through mic stays low-latency (drop oldest beyond).
 const MAX_QUEUE_BYTES: usize = (SAMPLE_RATE as usize * 80 / 1000) * BLOCK_ALIGN;
 
-/// Render-endpoint friendly-name substrings (lowercased) we can write into so the device's capture
-/// endpoint becomes a host mic. Ordered by preference.
-const CANDIDATES: &[&str] = &[
-    "cable input", // VB-Audio Virtual Cable — bundled by the installer; the preferred dedicated mic target
-    "steam streaming microphone",
-    "voicemeeter input",
-    "voicemeeter aux input",
-    "virtual",
-];
-
 pub struct WasapiVirtualMic {
     queue: Arc<Mutex<VecDeque<u8>>>,
     stop: Arc<AtomicBool>,
+    /// False once the render thread has exited (device error or stop) — the pump's reopen signal.
+    alive: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -68,25 +59,29 @@ impl WasapiVirtualMic {
         );
         let queue = Arc::new(Mutex::new(VecDeque::<u8>::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
         // Bring-up handshake: report the resolved device (or the error) before returning, so a missing
         // virtual-mic device surfaces as Err (the caller retries with backoff) not a silent dead thread.
         let (ready_tx, ready_rx) = sync_channel::<Result<String>>(1);
-        let (q, st) = (queue.clone(), stop.clone());
+        let (q, st, al) = (queue.clone(), stop.clone(), alive.clone());
         let join = thread::Builder::new()
             .name("punktfunk-wasapi-mic".into())
             .spawn(move || {
                 if let Err(e) = render_thread(q, st, ready_tx) {
                     tracing::error!(error = %format!("{e:#}"), "wasapi virtual-mic thread failed");
                 }
+                // Normal stop or device error alike: this instance is done — the pump reopens.
+                al.store(false, Ordering::Release);
             })
             .context("spawn wasapi mic thread")?;
-        match ready_rx.recv_timeout(Duration::from_secs(3)) {
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(name)) => {
                 tracing::info!(device = %name,
                     "WASAPI virtual mic ready (client mic → this device's render endpoint)");
                 Ok(WasapiVirtualMic {
                     queue,
                     stop,
+                    alive,
                     join: Some(join),
                 })
             }
@@ -106,9 +101,12 @@ impl Drop for WasapiVirtualMic {
 }
 
 impl VirtualMic for WasapiVirtualMic {
-    fn push(&self, pcm: &[f32]) {
+    fn push(&self, pcm: &[f32]) -> bool {
+        if !self.alive.load(Ordering::Acquire) {
+            return false;
+        }
         let Ok(mut q) = self.queue.lock() else {
-            return;
+            return false;
         };
         q.reserve(pcm.len() * 4);
         for &s in pcm {
@@ -119,109 +117,50 @@ impl VirtualMic for WasapiVirtualMic {
             let excess = q.len() - MAX_QUEUE_BYTES;
             q.drain(..excess);
         }
+        true
     }
+
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    fn discard(&self) {
+        if let Ok(mut q) = self.queue.lock() {
+            q.clear();
+        }
+    }
+
     fn channels(&self) -> u32 {
         CHANNELS
     }
 }
 
-/// The endpoint ID of the device the desktop-audio loopback records (the **default render
-/// endpoint**, see [`super::wasapi_cap`]). The virtual mic must never target this device — injecting
-/// there echoes the client's mic back into the host→client audio stream. `None` if it can't be
-/// resolved (then [`find_device`] can't prove a candidate is safe and falls back to name-only
-/// matching — no worse than before the guard existed).
-fn default_render_id() -> Option<String> {
-    wasapi::DeviceEnumerator::new()
-        .ok()?
-        .get_default_device(&Direction::Render)
-        .ok()?
-        .get_id()
-        .ok()
-}
-
-/// Resolve the virtual-mic target among render endpoints by friendly-name, **excluding the endpoint
-/// the loopback captures** (the [`default_render_id`] anti-echo guard). Logs all candidates so a
-/// missing/skipped device is diagnosable.
-fn find_device() -> Result<wasapi::Device> {
-    let enumerator = wasapi::DeviceEnumerator::new().context("DeviceEnumerator")?;
-    let collection = enumerator
-        .get_device_collection(&Direction::Render)
-        .context("render device collection")?;
-    let n = collection.get_nbr_devices().context("device count")?;
-    let want = std::env::var("PUNKTFUNK_MIC_DEVICE")
-        .ok()
-        .map(|s| s.to_lowercase());
-    // The device the loopback captures — a name match on it is rejected below (would echo).
-    let loopback_id = default_render_id();
-    let mut names = Vec::new();
-    let mut found = None;
-    let mut skipped_loopback = false;
-    for i in 0..n {
-        let Ok(dev) = collection.get_device_at_index(i) else {
-            continue;
-        };
-        let name = dev.get_friendlyname().unwrap_or_default();
-        let lname = name.to_lowercase();
-        let hit = match &want {
-            Some(w) => lname.contains(w),
-            None => CANDIDATES.iter().any(|c| lname.contains(c)),
-        };
-        if hit && found.is_none() {
-            // Anti-echo guard: never inject into the endpoint the loopback captures.
-            let is_loopback = match (dev.get_id().ok(), loopback_id.as_deref()) {
-                (Some(id), Some(lb)) => id == lb,
-                _ => false,
-            };
-            if is_loopback {
-                skipped_loopback = true;
-                tracing::warn!(device = %name,
-                    "virtual-mic candidate is the loopback (default render) endpoint — skipping; \
-                     injecting there would echo the client's mic into the desktop-audio stream");
-            } else {
-                found = Some(dev);
-            }
-        }
-        names.push(name);
-    }
-    found.ok_or_else(|| {
-        if skipped_loopback {
-            anyhow!(
-                "the only virtual-mic candidate among render endpoints {names:?} is the default \
-                 playback device the host loopback-captures — injecting there would echo the mic \
-                 back to the client. Add a SEPARATE virtual audio device for the mic (e.g. the Steam \
-                 Streaming Microphone) or set a different default playback device, then reconnect."
-            )
-        } else {
-            anyhow!(
-                "no virtual-mic device among render endpoints {names:?}. Install VB-Audio Virtual \
-                 Cable or enable Steam Remote Play's microphone (Steam Streaming Microphone), or set \
-                 PUNKTFUNK_MIC_DEVICE=<friendly-name substring>."
-            )
-        }
-    })
-}
-
-/// Find the virtual-mic device, and if none exists, try to AUTO-INSTALL one so mic passthrough works
-/// out of the box (then re-find). Falls back to the guidance error if nothing can be installed.
-fn find_or_install_device() -> Result<wasapi::Device> {
-    match find_device() {
-        Ok(d) => Ok(d),
-        Err(e) => {
-            tracing::info!("no usable virtual mic device present — attempting auto-install");
-            // SAFETY: `install_steam_audio_pair` is `unsafe` only because it `LoadLibraryExW`s
-            // `newdev.dll` and calls `DiInstallDriverW` through a `transmute`d function pointer;
-            // calling it imposes no extra precondition here (it takes no args and aliases nothing).
-            // Its internal contract holds: the `DiInstall` type matches the documented
-            // `BOOL DiInstallDriverW(HWND, PCWSTR, DWORD, PBOOL)` ABI, and it passes a
-            // NUL-terminated UTF-16 INF path with null/zero optional args. Invoked once on the
-            // dedicated mic thread.
-            if unsafe { install_steam_audio_pair() } {
-                find_device()
-            } else {
-                Err(e)
-            }
+/// Resolve the mic inject target from the wiring plan, auto-installing the Steam Streaming pair
+/// when nothing usable exists (then re-planning). Runs on the COM-initialized render thread.
+fn resolve_target() -> Result<(wasapi::Device, String)> {
+    let mut wiring = audio_control::wire_now();
+    if wiring.mic_render.is_none() {
+        tracing::info!("no usable virtual mic device present — attempting auto-install");
+        // SAFETY: `install_steam_audio_pair` is `unsafe` only because it `LoadLibraryExW`s
+        // `newdev.dll` and calls `DiInstallDriverW` through a `transmute`d function pointer;
+        // calling it imposes no extra precondition here (it takes no args and aliases nothing).
+        // Its internal contract holds: the `DiInstall` type matches the documented
+        // `BOOL DiInstallDriverW(HWND, PCWSTR, DWORD, PBOOL)` ABI, and it passes a
+        // NUL-terminated UTF-16 INF path with null/zero optional args. Invoked once on the
+        // dedicated mic thread.
+        if unsafe { install_steam_audio_pair() } {
+            wiring = audio_control::wire_now();
         }
     }
+    let Some(ep) = wiring.mic_render else {
+        anyhow::bail!(
+            "no virtual-mic render endpoint on this box. Install VB-Audio Virtual Cable (the host \
+             installer bundles it) or enable Steam Remote Play's microphone (Steam Streaming \
+             Microphone), or set PUNKTFUNK_MIC_DEVICE=<friendly-name substring>."
+        );
+    };
+    let name = ep.0.clone();
+    Ok((audio_control::open_endpoint(&ep)?, name))
 }
 
 /// Best-effort: install BOTH Steam Streaming audio devices (the "Steam pair") so mic passthrough
@@ -229,9 +168,9 @@ fn find_or_install_device() -> Result<wasapi::Device> {
 /// Play ships `SteamStreamingMicrophone.inf` + `SteamStreamingSpeakers.inf`: the microphone gives the
 /// virtual mic a target whose **capture** endpoint apps record from, and the speakers give a
 /// **render** endpoint a headless box can loopback-capture that is NOT the mic — so the loopback and
-/// the mic land on different devices and never echo (see [`find_device`]). Returns true if either
-/// installed. No-op when Steam isn't installed (INFs absent), the install is denied (needs admin —
-/// the host runs as SYSTEM), or `PUNKTFUNK_NO_MIC_INSTALL` is set.
+/// the mic land on different devices and never echo (see [`super::wiring_plan`]). Returns true if
+/// either installed. No-op when Steam isn't installed (INFs absent), the install is denied (needs
+/// admin — the host runs as SYSTEM), or `PUNKTFUNK_NO_MIC_INSTALL` is set.
 unsafe fn install_steam_audio_pair() -> bool {
     // Microphone first (the mic's actual target); speakers second (the distinct desktop-audio sink).
     let mic = try_install_steam_audio("SteamStreamingMicrophone.inf");
@@ -320,8 +259,7 @@ fn render_thread(
     // Open + start the render stream. The WASAPI objects must outlive the loop, so build them here and
     // keep them (a closure that *returned* them would drop them); on any failure report Err and exit.
     let setup = (|| -> Result<(wasapi::AudioClient, wasapi::AudioRenderClient, wasapi::Handle, String)> {
-        let device = find_or_install_device()?;
-        let name = device.get_friendlyname().unwrap_or_else(|_| "virtual mic".into());
+        let (device, name) = resolve_target()?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
         // 48 kHz stereo f32; autoconvert lets WASAPI shared-mode SRC match the device mix format.
         let desired = WaveFormat::new(
@@ -359,6 +297,8 @@ fn render_thread(
     };
     let _ = ready.send(Ok(name));
 
+    // Any error below (endpoint invalidated/removed, engine restart) propagates out of the loop,
+    // ending the thread — the `alive` flag flips in the spawn wrapper and the pump reopens.
     let mut buf: Vec<u8> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         // The device signals when it wants more data; finite timeout keeps `stop` responsive.

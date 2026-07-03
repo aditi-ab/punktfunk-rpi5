@@ -6,7 +6,7 @@
 //! COM-apartment-bound and not `Send`, so they live on a dedicated thread (mirrors
 //! `linux::PwAudioCapturer`); only the channel + stop flag + join handle are in the struct.
 
-use super::{AudioCapturer, SAMPLE_RATE};
+use super::{audio_control, AudioCapturer, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,14 +109,36 @@ fn capture_thread(
     }
     let res = (|| -> Result<()> {
         // Loopback = capture the RENDER endpoint: get the default render device, but open a CAPTURE
-        // client with loopback=true over it. NOTE: the virtual mic (`super::wasapi_mic`) is guarded
-        // to NEVER target this same endpoint — otherwise the client's injected mic would be captured
-        // here and streamed back to the client (infinite echo). Keep that guard in sync if this
-        // device selection ever changes.
-        let device = DeviceEnumerator::new()
+        // client with loopback=true over it. ECHO GUARD: the wiring plan reserves one endpoint for
+        // the virtual mic (`super::wasapi_mic` writes the client's voice there) — capturing THAT
+        // endpoint would stream the client's own mic straight back to it. Normally the plan has
+        // already moved the default playback elsewhere; if the default still IS the mic target
+        // (PUNKTFUNK_KEEP_DEFAULT, or the cable is the only endpoint), capture the plan's loopback
+        // endpoint explicitly, or refuse — no desktop audio beats an echo loop.
+        let wiring = audio_control::wire_now();
+        let default = DeviceEnumerator::new()
             .context("DeviceEnumerator")?
             .get_default_device(&Direction::Render)
             .context("default render endpoint (loopback needs a render device)")?;
+        let default_is_mic = match (&wiring.mic_render, default.get_id()) {
+            (Some((_, mic_id)), Ok(id)) => *mic_id == id,
+            _ => false,
+        };
+        let device = if default_is_mic {
+            let Some(lb) = &wiring.loopback_render else {
+                anyhow::bail!(
+                    "the only render endpoint is reserved for the virtual mic (capturing it would \
+                     echo the client's voice back) — attach another output device or install the \
+                     Steam Streaming pair to get desktop audio"
+                );
+            };
+            tracing::warn!(mic = %wiring.mic_render.as_ref().unwrap().0, loopback = %lb.0,
+                "default render endpoint is the virtual-mic target — loopback-capturing the plan's \
+                 endpoint instead");
+            audio_control::open_endpoint(lb)?
+        } else {
+            default
+        };
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
         // 48 kHz f32 interleaved in the requested channel layout; autoconvert lets WASAPI's
         // shared-mode SRC match the engine mix format to ours (incl. up/downmix to the requested

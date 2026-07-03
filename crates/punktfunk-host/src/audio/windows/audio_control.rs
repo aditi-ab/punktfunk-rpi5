@@ -6,64 +6,39 @@
 //! ones, or the loopback re-captures the injected mic (an infinite echo). The installer bundles
 //! VB-Audio Virtual Cable (the mic target: its "CABLE Input" render endpoint → "CABLE Output" capture)
 //! and the host auto-installs the Steam Streaming pair (a loopback-capable render). This module wires
-//! them up at startup so no manual Sound-settings fiddling is ever needed:
+//! them up so no manual Sound-settings fiddling is ever needed:
 //!
-//! * default **PLAYBACK**  → a loopback-capable render that is NOT the mic cable (a real output device
+//! * the **mic inject target** is assigned FIRST (VB-Cable "CABLE Input" preferred) — mic passthrough
+//!   is what the cable is bundled for, so it wins the cable even when the cable is the only render
+//!   endpoint on the box (the loopback then reports itself unavailable instead of echoing);
+//! * default **PLAYBACK** → a loopback-capable render that is NOT the mic target (a real output device
 //!   if one exists, else the Steam Streaming Microphone; **never** the Steam Streaming Speakers, whose
-//!   loopback is silent — validated live). This is the endpoint [`super::wasapi_cap`] loopback-captures
-//!   for desktop audio.
-//! * default **RECORDING** → the virtual mic's capture endpoint (VB-Cable "CABLE Output") so host apps
+//!   loopback is silent — validated live). This is the endpoint [`super::wasapi_cap`] captures;
+//! * default **RECORDING** → the mic target's capture endpoint (VB-Cable "CABLE Output") so host apps
 //!   record the client's mic by default.
 //!
-//! [`super::wasapi_mic::find_device`] then resolves the mic INJECT target to "CABLE Input" — a render
-//! candidate that is NOT the default playback — guaranteeing loopback ≠ mic, so there is no echo.
+//! The assignment rules are the PURE [`wiring_plan`](super::wiring_plan) module (unit-tested on every
+//! platform); this module only enumerates endpoints, applies the plan, and logs. [`wire_now`] runs on
+//! every mic/capture (re)open — NOT once per process — because endpoints churn (boot-time
+//! registration, hotplug, driver installs) and a stale plan was one of the ways mic passthrough died
+//! permanently.
 //!
 //! Setting a default endpoint uses the undocumented `IPolicyConfig` COM interface (the only way to set
 //! a default device programmatically — neither the `windows` nor `wasapi` crate exposes it; it is the
 //! same call `mmsys.cpl` makes). Opt out with `PUNKTFUNK_KEEP_DEFAULT` to leave the user's chosen
-//! defaults untouched.
+//! defaults untouched (the plan is still computed — the mic must still pick a target).
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+use super::wiring_plan::{plan, Endpoint, Wiring};
 use anyhow::{anyhow, bail, Result};
 use std::ffi::c_void;
-use std::sync::Once;
+use std::sync::Mutex;
 use wasapi::Direction;
 
-/// Run the audio device auto-wiring exactly once per process, before the first capturer/mic opens.
-/// Blocks until done so the default playback is set before the loopback captures it. Best-effort:
-/// every failure is logged, never fatal (the host then falls back to whatever the current defaults
-/// are — exactly the pre-wiring behaviour).
-pub(crate) fn ensure_wired_once() {
-    static WIRED: Once = Once::new();
-    WIRED.call_once(|| {
-        if std::env::var_os("PUNKTFUNK_KEEP_DEFAULT").is_some() {
-            tracing::info!("PUNKTFUNK_KEEP_DEFAULT set — leaving the audio default devices untouched");
-            return;
-        }
-        // Run on a dedicated COM-MTA thread so we never collide with the caller's apartment mode
-        // (the capture/mic threads each initialize their own COM separately).
-        let handle = std::thread::Builder::new()
-            .name("pf-audio-wiring".into())
-            .spawn(|| {
-                if wasapi::initialize_mta().ok().is_err() {
-                    tracing::warn!("audio wiring: COM init (MTA) failed — skipping");
-                    return;
-                }
-                if let Err(e) = ensure_audio_wiring() {
-                    tracing::warn!(error = %format!("{e:#}"),
-                        "audio auto-wiring failed — mic/desktop audio may need manual device defaults");
-                }
-            });
-        if let Ok(h) = handle {
-            let _ = h.join();
-        }
-    });
-}
-
 /// `(friendly_name, endpoint_id)` for every ACTIVE endpoint in direction `dir`.
-fn list_endpoints(dir: Direction) -> Vec<(String, String)> {
+fn list_endpoints(dir: Direction) -> Vec<Endpoint> {
     let mut out = Vec::new();
     let Ok(en) = wasapi::DeviceEnumerator::new() else {
         return out;
@@ -86,79 +61,85 @@ fn list_endpoints(dir: Direction) -> Vec<(String, String)> {
     out
 }
 
-/// Pick the loopback + mic-capture devices and set them as the default playback/recording.
-fn ensure_audio_wiring() -> Result<()> {
+/// Enumerate endpoints, compute the assignment, apply the default-device changes (unless
+/// `PUNKTFUNK_KEEP_DEFAULT`), and return the plan for the caller to act on (mic target / loopback
+/// echo guard). Must run on a COM-initialized thread (the WASAPI worker threads all
+/// `initialize_mta` first). Logged only when the assignment changes, so per-open recomputation
+/// stays quiet in the steady state.
+pub(crate) fn wire_now() -> Wiring {
     let renders = list_endpoints(Direction::Render);
     let captures = list_endpoints(Direction::Capture);
-    if renders.is_empty() {
-        bail!("no active render endpoints to wire");
-    }
+    let want = std::env::var("PUNKTFUNK_MIC_DEVICE")
+        .ok()
+        .map(|s| s.to_lowercase());
+    let wiring = plan(&renders, &captures, want.as_deref());
 
-    // A render is unusable as the desktop-audio loopback if it is a VB-Cable endpoint (reserved for
-    // the mic inject) or the Steam Streaming Speakers (its loopback is silent — validated live).
-    let excluded_loopback =
-        |ln: &str| ln.contains("cable") || ln.contains("steam streaming speakers");
-    // "virtual-ish" = a known virtual cable; a render WITHOUT these markers is a real output device,
-    // the best loopback source (apps render there and the operator can also hear it).
-    let virtualish = |ln: &str| {
-        ln.contains("virtual")
-            || ln.contains("cable")
-            || ln.contains("steam streaming")
-            || ln.contains("voicemeeter")
+    // Log assignment changes exactly once (first plan included).
+    static LAST: Mutex<Option<Wiring>> = Mutex::new(None);
+    let changed = {
+        let mut last = LAST.lock().unwrap();
+        let changed = last.as_ref() != Some(&wiring);
+        *last = Some(wiring.clone());
+        changed
     };
-    let loopback = renders
-        .iter()
-        .find(|(n, _)| {
-            let ln = n.to_lowercase();
-            !excluded_loopback(&ln) && !virtualish(&ln)
-        })
-        .or_else(|| {
-            renders
-                .iter()
-                .find(|(n, _)| n.to_lowercase().contains("steam streaming microphone"))
-        })
-        .or_else(|| {
-            renders
-                .iter()
-                .find(|(n, _)| !excluded_loopback(&n.to_lowercase()))
-        });
-
-    // The virtual mic's CAPTURE endpoint host apps record from — VB-Cable "CABLE Output" preferred.
-    let mic_capture = captures
-        .iter()
-        .find(|(n, _)| n.to_lowercase().contains("cable output"))
-        .or_else(|| {
-            captures
-                .iter()
-                .find(|(n, _)| n.to_lowercase().contains("steam streaming microphone"))
-        })
-        .or_else(|| {
-            captures.iter().find(|(n, _)| {
-                let ln = n.to_lowercase();
-                ln.contains("voicemeeter") || ln.contains("virtual")
-            })
-        });
-
-    match loopback {
-        Some((name, id)) => match set_default_endpoint(id) {
-            Ok(()) => tracing::info!(device = %name,
-                "audio wiring: default playback = desktop-audio loopback source"),
-            Err(e) => tracing::warn!(device = %name, error = %format!("{e:#}"),
-                "audio wiring: failed to set the default playback device"),
-        },
-        None => {
-            tracing::warn!("audio wiring: no usable desktop-audio loopback render endpoint found")
+    if changed {
+        tracing::info!(
+            mic_render = wiring.mic_render.as_ref().map(|(n, _)| n.as_str()),
+            mic_capture = wiring.mic_capture.as_ref().map(|(n, _)| n.as_str()),
+            loopback_render = wiring.loopback_render.as_ref().map(|(n, _)| n.as_str()),
+            renders = ?renders.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            "audio wiring plan"
+        );
+        if wiring.mic_render.is_some() && wiring.loopback_render.is_none() {
+            tracing::warn!(
+                "the virtual mic reserved the only usable render endpoint — desktop audio will be \
+                 unavailable until another output device exists (attach one, or let the host \
+                 install the Steam Streaming pair)"
+            );
         }
     }
-    if let Some((name, id)) = mic_capture {
+
+    if std::env::var_os("PUNKTFUNK_KEEP_DEFAULT").is_some() {
+        if changed {
+            tracing::info!(
+                "PUNKTFUNK_KEEP_DEFAULT set — leaving the audio default devices untouched"
+            );
+        }
+        return wiring;
+    }
+    if let Some((name, id)) = &wiring.loopback_render {
         match set_default_endpoint(id) {
-            Ok(()) => tracing::info!(device = %name,
-                "audio wiring: default recording = virtual mic (apps record the client's mic)"),
+            Ok(()) => {
+                if changed {
+                    tracing::info!(device = %name,
+                        "audio wiring: default playback = desktop-audio loopback source");
+                }
+            }
+            Err(e) => tracing::warn!(device = %name, error = %format!("{e:#}"),
+                "audio wiring: failed to set the default playback device"),
+        }
+    }
+    if let Some((name, id)) = &wiring.mic_capture {
+        match set_default_endpoint(id) {
+            Ok(()) => {
+                if changed {
+                    tracing::info!(device = %name,
+                        "audio wiring: default recording = virtual mic (apps record the client's mic)");
+                }
+            }
             Err(e) => tracing::warn!(device = %name, error = %format!("{e:#}"),
                 "audio wiring: failed to set the default recording device"),
         }
     }
-    Ok(())
+    wiring
+}
+
+/// Open a device by endpoint id, with a name for error context.
+pub(crate) fn open_endpoint(ep: &Endpoint) -> Result<wasapi::Device> {
+    wasapi::DeviceEnumerator::new()
+        .map_err(|e| anyhow!("DeviceEnumerator: {e}"))?
+        .get_device(&ep.1)
+        .map_err(|e| anyhow!("open endpoint {:?}: {e}", ep.0))
 }
 
 // --- IPolicyConfig (undocumented): set a default audio endpoint by id, for all three roles. ---

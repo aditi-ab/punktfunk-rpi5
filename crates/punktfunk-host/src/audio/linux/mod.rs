@@ -16,7 +16,9 @@
 use super::{AudioCapturer, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -111,10 +113,28 @@ fn spa_positions(channels: u32) -> [u32; 64] {
 /// Virtual microphone: a PipeWire `Audio/Source` node host apps can record from. The host pushes
 /// decoded client-mic PCM in; the loop thread's producer callback drains it (silence on
 /// underrun) into PipeWire buffers. Mirrors [`PwAudioCapturer`] but inverted (Direction::Output).
+///
+/// **Why a stream node and not a `support.null-audio-sink` adapter** (the canonical
+/// virtual-mic recipe): tested live on this project's headless graph (PipeWire 1.6.2,
+/// 2026-07-03), an adapter with `media.class=Audio/Source/Virtual` never gets a clock — the
+/// {source, recorder} group runs with QUANT/RATE 0 and delivers pure silence — and WirePlumber
+/// rerouted a feeder stream targeting it to the *default sink* instead (which would play the
+/// client's voice out of the speakers, straight into the desktop-audio capture: echo). The
+/// stream node below, with `RT_PROCESS` + `priority.session` (see the property comments), is
+/// validated working on PipeWire 1.4 (Bazzite) and 1.6 (this box) in both attach orderings.
+/// Do not "modernize" this to the adapter recipe without re-running that validation.
+///
+/// **Liveness contract** (see [`VirtualMic`]): the loop thread exits on a core error (PipeWire
+/// daemon restart — the node is gone) or a stream error, which flips `alive` — `push` then
+/// returns `false` and the owning pump reopens against the new daemon, recreating the node.
 pub struct PwMicSource {
-    pcm: std::sync::mpsc::SyncSender<Vec<f32>>,
+    pcm: std::sync::mpsc::SyncSender<(std::time::Instant, Vec<f32>)>,
     channels: u32,
     quit: pipewire::channel::Sender<Terminate>,
+    /// False once the loop thread has exited (daemon/stream death or teardown).
+    alive: Arc<AtomicBool>,
+    /// One-shot flush request, consumed by the process callback (clears the jitter ring).
+    flush: Arc<AtomicBool>,
 }
 
 impl PwMicSource {
@@ -123,20 +143,27 @@ impl PwMicSource {
             matches!(channels, 1 | 2),
             "virtual mic supports 1 or 2 channels, got {channels}"
         );
-        let (pcm_tx, pcm_rx) = sync_channel::<Vec<f32>>(64);
+        let (pcm_tx, pcm_rx) = sync_channel::<(std::time::Instant, Vec<f32>)>(64);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
+        let alive = Arc::new(AtomicBool::new(true));
+        let flush = Arc::new(AtomicBool::new(false));
+        let (alive_t, flush_t) = (alive.clone(), flush.clone());
         thread::Builder::new()
             .name("punktfunk-pw-mic".into())
             .spawn(move || {
-                if let Err(e) = mic_pw_thread(pcm_rx, quit_rx, channels) {
+                if let Err(e) = mic_pw_thread(pcm_rx, quit_rx, channels, flush_t) {
                     tracing::error!(error = %format!("{e:#}"), "pipewire virtual-mic thread failed");
                 }
+                // Whether a clean quit or a daemon death: this instance is done — the pump reopens.
+                alive_t.store(false, Ordering::Release);
             })
             .context("spawn pipewire virtual-mic thread")?;
         Ok(PwMicSource {
             pcm: pcm_tx,
             channels,
             quit: quit_tx,
+            alive,
+            flush,
         })
     }
 }
@@ -148,8 +175,24 @@ impl Drop for PwMicSource {
 }
 
 impl VirtualMic for PwMicSource {
-    fn push(&self, pcm: &[f32]) {
-        let _ = self.pcm.try_send(pcm.to_vec()); // drop if the PipeWire side is behind
+    fn push(&self, pcm: &[f32]) -> bool {
+        if !self.alive.load(Ordering::Acquire) {
+            return false;
+        }
+        // Timestamped so the process callback can age out chunks that sat in the channel while
+        // no recorder was attached (see the staleness logic there).
+        match self.pcm.try_send((std::time::Instant::now(), pcm.to_vec())) {
+            Ok(()) => true,
+            // Behind is fine (drop the chunk); a gone receiver means the loop thread exited.
+            Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+    fn discard(&self) {
+        self.flush.store(true, Ordering::Release);
     }
     fn channels(&self) -> u32 {
         self.channels
@@ -160,16 +203,27 @@ impl VirtualMic for PwMicSource {
 /// the process callback drains into PipeWire buffers (capped, so latency stays bounded).
 /// `primed` is a jitter buffer gate — see the process callback.
 struct MicUserData {
-    rx: Receiver<Vec<f32>>,
+    rx: Receiver<(std::time::Instant, Vec<f32>)>,
     ring: VecDeque<f32>,
     channels: usize,
     primed: bool,
+    /// One-shot flush request from [`PwMicSource::discard`] (stale-audio drop after a gap).
+    flush: Arc<AtomicBool>,
+    /// When the process callback last ran — a long gap means the ring content predates the
+    /// current consumer (the stream idles with no recorder attached) and must be dropped.
+    last_run: Option<std::time::Instant>,
 }
 
+/// PCM older than this never reaches a recorder: chunks that aged in the channel while no
+/// recorder was attached, and ring content from before a consumer gap, are dropped instead of
+/// bursting out as stale audio when recording (re)starts.
+const MIC_STALE: Duration = Duration::from_secs(1);
+
 fn mic_pw_thread(
-    pcm_rx: Receiver<Vec<f32>>,
+    pcm_rx: Receiver<(std::time::Instant, Vec<f32>)>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
     channels: u32,
+    flush: Arc<AtomicBool>,
 ) -> Result<()> {
     use pipewire as pw;
     use pw::{properties::properties, spa};
@@ -187,6 +241,26 @@ fn mic_pw_thread(
         let mainloop = mainloop.clone();
         move |_| mainloop.quit()
     });
+
+    // Death detection: a core error (the daemon restarted/went away — our remote node no longer
+    // exists) ends this thread, flipping the owner's `alive` flag so the pump reopens against the
+    // new daemon. Without this, a PipeWire restart left the loop idling on a dead connection and
+    // the mic silently broken for the rest of the host's life.
+    let _core_listener = core
+        .add_listener_local()
+        .error({
+            let mainloop = mainloop.clone();
+            move |id, _seq, res, message| {
+                tracing::warn!(
+                    id,
+                    res,
+                    message,
+                    "pipewire core error — virtual mic reopening"
+                );
+                mainloop.quit();
+            }
+        })
+        .register();
 
     // media.class=Audio/Source advertises us as a microphone (a recordable source), NOT a
     // playback stream — without it, Direction::Output + Playback would route to the speakers.
@@ -226,12 +300,21 @@ fn mic_pw_thread(
         ring: VecDeque::new(),
         channels: channels as usize,
         primed: false,
+        flush,
+        last_run: None,
     };
 
     let _listener = stream
         .add_local_listener_with_user_data(ud)
-        .state_changed(|_s, _ud, old, new| {
-            tracing::info!(?old, ?new, "pipewire virtual-mic stream state");
+        .state_changed({
+            let mainloop = mainloop.clone();
+            move |_s, _ud, old, new| {
+                tracing::info!(?old, ?new, "pipewire virtual-mic stream state");
+                // A stream error is unrecoverable for this instance — exit so the pump reopens.
+                if matches!(new, pw::stream::StreamState::Error(_)) {
+                    mainloop.quit();
+                }
+            }
         })
         .param_changed(|_s, _ud, id, param| {
             let Some(param) = param else { return };
@@ -253,9 +336,25 @@ fn mic_pw_thread(
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
                 };
-                // Pull all newly-decoded PCM into the ring.
-                while let Ok(frame) = ud.rx.try_recv() {
-                    ud.ring.extend(frame);
+                // Stale-audio guard, BEFORE pulling new frames: drop the ring when a flush was
+                // requested (uplink gap — see the pump) or when this callback itself hasn't run
+                // for a while (the stream idled with no recorder attached; whatever the ring
+                // holds predates the consumer). A recorder must never hear a burst of old audio.
+                let now = std::time::Instant::now();
+                let idled = ud
+                    .last_run
+                    .is_some_and(|t| now.duration_since(t) > MIC_STALE);
+                if ud.flush.swap(false, std::sync::atomic::Ordering::AcqRel) || idled {
+                    ud.ring.clear();
+                    ud.primed = false;
+                }
+                ud.last_run = Some(now);
+                // Pull all newly-decoded PCM into the ring, aging out chunks that sat in the
+                // channel while nothing consumed them (same staleness rule).
+                while let Ok((t, frame)) = ud.rx.try_recv() {
+                    if now.duration_since(t) <= MIC_STALE {
+                        ud.ring.extend(frame);
+                    }
                 }
                 let stride = 4 * ud.channels; // F32LE interleaved
                 let datas = buffer.datas_mut();

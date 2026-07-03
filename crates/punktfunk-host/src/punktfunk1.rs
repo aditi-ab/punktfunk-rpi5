@@ -222,10 +222,13 @@ pub(crate) async fn serve(
     // session — which, under rapid client reconnects, raced a prior session's portal teardown and
     // wedged KWin's EIS setup ("EIS setup timed out"). Gamepads stay per-session (uinput).
     let injector = crate::inject::InjectorService::start();
-    // One virtual microphone for the whole host lifetime (see MicService): the client's mic uplink
-    // (0xCB) is Opus-decoded and fed into a persistent virtual mic host apps record from (Linux
-    // PipeWire Audio/Source; Windows a virtual audio device's render endpoint).
-    let mic_service = MicService::start();
+    // One virtual microphone for the whole host lifetime (see [`crate::audio::MicPump`]): the
+    // client's mic uplink (0xCB) is Opus-decoded and fed into a persistent virtual mic host apps
+    // record from (Linux PipeWire Audio/Source; Windows a virtual audio device's render endpoint).
+    // The pump opens the backend EAGERLY (the mic device exists before any game launches and
+    // binds its capture device) and self-heals when the backend dies (PipeWire restart, Windows
+    // endpoint churn).
+    let mic_service = crate::audio::MicPump::start();
     // Host-lifetime worker that fires debounced TV-session restores (the managed gamescope path
     // restores the box's autologin gaming session on idle, not per-disconnect — see
     // `vdisplay::restore_managed_session`). Held for serve()'s lifetime; dropping it stops it.
@@ -1310,118 +1313,10 @@ impl PadState {
 /// actual pad creation at its own MAX_PADS.
 const MAX_WIRE_PADS: usize = 16;
 
-/// Backoff between reopen attempts after a host-lifetime service's backend (the mic source, a
-/// capturer) fails to open or its worker dies, so a persistently-unavailable resource isn't hammered.
+/// Backoff between reopen attempts after a host-lifetime service's backend (a capturer) fails
+/// to open or its worker dies, so a persistently-unavailable resource isn't hammered. (The
+/// virtual mic has its own tuning — see [`crate::audio::MicPump`].)
 const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Mic is 48 kHz stereo — matches the Opus stereo decoder and the host→client audio layout.
-const MIC_CHANNELS: u32 = 2;
-/// Bound for the shared mic frame queue (drop-newest when full). See [`MicService::start`].
-const MIC_QUEUE_CAP: usize = 64;
-
-/// Host-lifetime virtual microphone, shared across punktfunk/1 sessions (mirror of
-/// [`InjectorService`]). One thread owns the PipeWire `Audio/Source` + an Opus decoder; sessions
-/// forward the client's Opus mic frames over a clonable `Send` channel, the thread decodes and
-/// feeds the source. Opened lazily on the first frame, the source node persists across sessions
-/// (no per-session registration churn), and reopens after a backoff if the source/decoder fails.
-struct MicService {
-    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
-}
-
-impl MicService {
-    fn start() -> MicService {
-        // Bounded so the host-lifetime mic queue (shared across all concurrent sessions) can't grow
-        // without limit under a near-line-rate flood; the producer drops the newest frame when full
-        // (audio is lossy by design) rather than buffering unboundedly (security-review 2026-06-28
-        // S6). 64 × 5–10 ms frames ≈ 0.3–0.6 s of slack, far more than the decode loop ever lags.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(MIC_QUEUE_CAP);
-        if let Err(e) = std::thread::Builder::new()
-            .name("punktfunk1-mic".into())
-            .spawn(move || mic_service_thread(rx))
-        {
-            tracing::error!(error = %e, "mic service thread spawn failed — mic passthrough disabled");
-        }
-        MicService { tx }
-    }
-
-    /// A sender a session forwards the client's Opus mic frames to. Cloned per session; dropping a
-    /// clone does NOT stop the service (it holds the original sender for the host life).
-    fn sender(&self) -> std::sync::mpsc::SyncSender<Vec<u8>> {
-        self.tx.clone()
-    }
-}
-
-/// Stub — mic passthrough needs a virtual-mic backend (Linux PipeWire source / Windows virtual audio
-/// device); other platforms drain and drop the frames (sessions still count the datagrams).
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
-    tracing::warn!("punktfunk/1 mic passthrough unsupported on this platform — frames dropped");
-    for _ in rx {}
-}
-
-/// The host-lifetime mic worker: lazily open the virtual mic + decoder, then Opus-decode each
-/// forwarded frame and push the PCM into the source. Reopen (after [`INJECTOR_REOPEN_BACKOFF`])
-/// only on a backend OPEN failure; a per-frame Opus DECODE error is just a dropped frame (it must
-/// not tear down this mic, which is shared across every concurrent session — otherwise one paired
-/// client's junk frames would deny everyone's mic; security-review 2026-06-28 S2). Exits when every
-/// session sender and the service's own sender drop (host shutdown), tearing the virtual mic down.
-/// Linux = PipeWire `Audio/Source`; Windows = a virtual audio device's render endpoint.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn mic_service_thread(rx: std::sync::mpsc::Receiver<Vec<u8>>) {
-    let mut mic: Option<Box<dyn crate::audio::VirtualMic>> = None;
-    let mut decoder: Option<opus::Decoder> = None;
-    let mut last_failed: Option<std::time::Instant> = None;
-    let mut decode_fails: u64 = 0;
-    let mut pcm = vec![0f32; 5760 * MIC_CHANNELS as usize]; // up to 120 ms scratch
-    for opus_frame in rx {
-        if opus_frame.is_empty() {
-            continue; // DTX silence — the source underruns to silence on its own
-        }
-        if mic.is_none() || decoder.is_none() {
-            if last_failed.is_some_and(|t| t.elapsed() < INJECTOR_REOPEN_BACKOFF) {
-                continue; // still within the reopen backoff window
-            }
-            let opened = crate::audio::open_virtual_mic(MIC_CHANNELS).and_then(|m| {
-                let d = opus::Decoder::new(48_000, opus::Channels::Stereo)
-                    .map_err(|e| anyhow!("opus decoder: {e}"))?;
-                Ok((m, d))
-            });
-            match opened {
-                Ok((m, d)) => {
-                    tracing::info!("punktfunk/1 virtual mic ready (host-lifetime)");
-                    mic = Some(m);
-                    decoder = Some(d);
-                    last_failed = None;
-                }
-                Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), "virtual mic unavailable — will retry");
-                    last_failed = Some(std::time::Instant::now());
-                    continue;
-                }
-            }
-        }
-        let (Some(m), Some(dec)) = (mic.as_ref(), decoder.as_mut()) else {
-            continue;
-        };
-        match dec.decode_float(&opus_frame, &mut pcm, false) {
-            Ok(samples_per_ch) => {
-                let total = (samples_per_ch * MIC_CHANNELS as usize).min(pcm.len());
-                m.push(&pcm[..total]);
-                decode_fails = 0;
-            }
-            Err(e) => {
-                // Malformed/garbage frame: drop it and keep the (shared) mic + decoder open. The
-                // next valid frame decodes normally; only a backend OPEN failure reopens. Throttle
-                // the log (1, 2, 4, … fails) so a junk flood can't spam.
-                decode_fails += 1;
-                if decode_fails.is_power_of_two() {
-                    tracing::warn!(error = %e, fails = decode_fails, "mic opus decode failed — dropping frame");
-                }
-            }
-        }
-    }
-    tracing::debug!("mic service stopped (host shutting down)");
-}
 
 /// The session's virtual-gamepad backend, resolved once per session (sessions run serially).
 ///
