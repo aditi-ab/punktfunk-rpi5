@@ -646,8 +646,10 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
         // The pf-vdisplay all-Rust IddCx driver is the sole virtual-display backend (the legacy SudoVDA
         // fallback was removed — its driver is no longer shipped). The compositor arg is moot on Windows.
         let _ = compositor;
+        // `ensure_available` self-heals the hostless-zombie state a WUDFHost crash leaves (adapter
+        // devnode present, interface gone): one device cycle + re-probe before giving up.
         anyhow::ensure!(
-            pf_vdisplay::is_available(),
+            pf_vdisplay::ensure_available(),
             "pf-vdisplay driver interface not found — the pf-vdisplay IddCx driver is not installed or \
              not loaded (the host installer bundles it; reinstall or check the driver state)"
         );

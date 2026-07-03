@@ -127,6 +127,56 @@ fn reap_ghost_monitors() -> u32 {
     }
 }
 
+/// Kick the pf-vdisplay ADAPTER device (disable → enable) — the in-process equivalent of
+/// `reset-pf-vdisplay.ps1` step 3. A crashed/killed WUDFHost can leave the devnode "started" yet
+/// HOSTLESS (PnP Status OK, no WUDFHost process, zero device-interface instances) — a zombie no
+/// session can open until the stack reloads; on-glass, only a device cycle recovered it. Called by
+/// [`VdisplayDriver::open`] when `open_device` finds no openable interface; the caller retries the
+/// open afterwards. Best-effort + bounded (~7 s inside the script). Returns whether a punktfunk
+/// adapter devnode was found (and therefore cycled) — `false` means the driver genuinely is not
+/// installed and a retry is pointless.
+fn restart_vdisplay_device() -> bool {
+    // Mirrors reset-pf-vdisplay.ps1's Get-PfAdapter selector ('punktfunk Virtual Display' is the INF
+    // device description — locale-invariant). Same spawn shape as `reap_ghost_monitors` above.
+    const CYCLE_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
+        $ad = Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' } | Select-Object -First 1; \
+        if ($ad) { \
+            Disable-PnpDevice -InstanceId $ad.InstanceId -Confirm:$false; Start-Sleep -Seconds 3; \
+            Enable-PnpDevice -InstanceId $ad.InstanceId -Confirm:$false; Start-Sleep -Seconds 3; \
+            $st = (Get-PnpDevice -InstanceId $ad.InstanceId).Status; \
+            if ($st -ne 'OK') { Enable-PnpDevice -InstanceId $ad.InstanceId -Confirm:$false; Start-Sleep -Seconds 2; \
+                $st = (Get-PnpDevice -InstanceId $ad.InstanceId).Status }; \
+            Write-Output $st \
+        } else { Write-Output 'ABSENT' }";
+    let ps = std::env::var("SystemRoot")
+        .map(|r| format!(r"{r}\System32\WindowsPowerShell\v1.0\powershell.exe"))
+        .unwrap_or_else(|_| "powershell.exe".to_string());
+    match std::process::Command::new(&ps)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            CYCLE_PS,
+        ])
+        .output()
+    {
+        Ok(o) => {
+            let status = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            tracing::warn!(
+                %status,
+                "pf-vdisplay: cycled the adapter device (hostless-zombie recovery)"
+            );
+            status != "ABSENT"
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "pf-vdisplay: adapter cycle could not spawn powershell");
+            false
+        }
+    }
+}
+
 /// True if `e`'s chain carries the IddCx monitor-slot-exhaustion wedge HRESULT (0x80070490,
 /// `ERROR_NOT_FOUND`) — the `IOCTL_ADD` failure that ghost-PDO accumulation produces. The hex code is
 /// locale-invariant (the OS message text is not), so we match on it.
@@ -294,7 +344,30 @@ impl VdisplayDriver for PfVdisplayDriver {
         // SAFETY: `open_device` is `unsafe` only because it issues SetupAPI enumeration + `CreateFileW`
         // FFI; it takes no arguments and returns an owned raw `HANDLE` (or `Err`). Called here on the
         // backend-init thread, with no precondition beyond a valid thread context.
-        let device = unsafe { open_device()? };
+        let device = match unsafe { open_device() } {
+            Ok(d) => d,
+            Err(first) => {
+                // No openable interface. If a WUDFHost crash left the devnode a hostless zombie
+                // (validated on-glass: PnP Status OK, zero interface instances), a device cycle
+                // reloads the stack — kick it once and retry the open over a short arrival window.
+                if !restart_vdisplay_device() {
+                    return Err(first); // no adapter devnode at all — genuinely not installed
+                }
+                let mut reopened = Err(first);
+                for _ in 0..8 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    // SAFETY: as above — plain SetupAPI + CreateFileW FFI, no preconditions.
+                    match unsafe { open_device() } {
+                        Ok(d) => {
+                            reopened = Ok(d);
+                            break;
+                        }
+                        Err(e) => reopened = Err(e),
+                    }
+                }
+                reopened.context("pf-vdisplay interface still absent after an adapter cycle")?
+            }
+        };
         // Wrap IMMEDIATELY: every `?` below must close the device exactly once — the old
         // wrap-on-success-only shape leaked the raw handle whenever GET_INFO itself failed.
         // SAFETY: `device` is the valid handle `open_device` just returned; ownership transfers into
@@ -564,6 +637,27 @@ pub fn is_available() -> bool {
     // closure (sole owner) and closed exactly once via `CloseHandle`, on `Err` there is nothing to
     // close — so no double-close and no leak of an opened handle. The `unsafe` covers both FFI calls.
     unsafe { open_device().map(|h| CloseHandle(h)).is_ok() }
+}
+
+/// [`is_available`], with self-heal: an interface-less driver whose adapter devnode EXISTS is the
+/// hostless-zombie state a WUDFHost crash leaves behind (validated on-glass — PnP reports Status OK
+/// with no WUDFHost process and zero interface instances, and every session fails at this gate until
+/// the device reloads). Cycle the adapter once and re-probe over a short arrival window. A genuinely
+/// uninstalled driver (no adapter devnode) fails fast without the wait.
+pub fn ensure_available() -> bool {
+    if is_available() {
+        return true;
+    }
+    if !restart_vdisplay_device() {
+        return false;
+    }
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if is_available() {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
