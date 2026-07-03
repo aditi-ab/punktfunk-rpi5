@@ -99,13 +99,14 @@ jobs:
 
       - name: Version from tag
         run: |
+          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE, PF_CHANNEL, PF_STABLE_TAG (single source of truth)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; V="${V%%-*}" ;;  # App Store marketing version is numeric X.Y.Z (drop -rc)
-            *)            V="0.5.0" ;;                                # canary marketing version; the build number disambiguates
+            *)            V="$PF_BASE" ;;                             # canary marketing version = one minor ahead of the latest stable tag; the build number disambiguates
           esac
           echo "VERSION=$V" >> "$GITHUB_ENV"
           echo "BUILD_NUM=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
-          echo "version $V build $GITHUB_RUN_NUMBER"
+          echo "version $V build $GITHUB_RUN_NUMBER (channel $PF_CHANNEL, latest stable ${PF_STABLE_TAG})"
 
       - name: Rust toolchain (mac + iOS + tvOS slices)
         run: |

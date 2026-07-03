@@ -63,7 +63,8 @@ jobs:
           pnpm run build          # rollup -> clients/decky/dist/index.js
 
       - name: Version + channel + stamp
-        # Tag vX.Y.Z -> X.Y.Z (stable `latest/` alias + Gitea Release); main push -> 0.3.<run>
+        # Tag vX.Y.Z -> X.Y.Z (stable `latest/` alias + Gitea Release); main push -> <next-minor>.<run>
+        # (base one minor ahead of the latest stable tag via scripts/ci/pf-version.sh)
         # (`canary/` alias). Decky reads a plugin's INSTALLED version from package.json (NOT
         # plugin.json), and the plugin's own update check (clients/decky/main.py check_update)
         # compares against it — so the build version is STAMPED into package.json here (mirrored
@@ -72,9 +73,12 @@ jobs:
         # (ci10 < ci9), which would break update detection; the run number is monotonic.
         working-directory: ${{ gitea.workspace }}
         run: |
+          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_MAJOR/PF_MINOR (base one minor ahead of latest stable)
           case "$GITHUB_REF" in
             refs/tags/v*) V="${GITHUB_REF_NAME#v}"; ALIAS=latest ;;
-            *)            V="0.3.${GITHUB_RUN_NUMBER}"; ALIAS=canary ;;
+            # Canary MUST be a plain monotonic numeric semver (see the note above): <major>.<minor>.<run>,
+            # where major.minor track one minor ahead of the latest stable and the run number climbs.
+            *)            V="${PF_MAJOR}.${PF_MINOR}.${GITHUB_RUN_NUMBER}"; ALIAS=canary ;;
           esac
           BASE="https://$REGISTRY/api/packages/$OWNER/generic/$PACKAGE"
           echo "VERSION=$V" >> "$GITHUB_ENV"

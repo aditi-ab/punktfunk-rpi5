@@ -16,7 +16,8 @@
 # Versioning (free-form; not MSIX's 4-part rule) — single project version:
 #   vX.Y.Z tag -> X.Y.Z   (THE release; published + stable `latest/` alias + attached to the
 #                          unified Gitea Release).
-#   main push / dispatch -> 0.3.<run_number>  (canary; `canary/` alias; climbs by run number).
+#   main push / dispatch -> <next-minor>.<run_number>  (canary; `canary/` alias; base one minor
+#                          ahead of the latest stable tag via scripts/ci/pf-version.ps1, run climbs).
 #
 # Signing reuses the client's MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD secrets (CN=unom). Without them
 # an ephemeral self-signed cert is generated and its public .cer published next to the installer
@@ -102,10 +103,12 @@ jobs:
           if (-not $env:VBCABLE_DIR) {
             "VBCABLE_DIR=C:\Users\Public\vbcable" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
+          $pf = & "$env:GITHUB_WORKSPACE/scripts/ci/pf-version.ps1"   # single source of truth: base is one minor ahead of the latest stable tag
           $v = if ($env:GITHUB_REF -like 'refs/tags/v*') {
             $env:GITHUB_REF_NAME -replace '^v', ''
           } else {
-            "0.3.$($env:GITHUB_RUN_NUMBER)"
+            # Canary: <major>.<minor>.<run> — major.minor track one minor ahead of stable, run climbs monotonically.
+            "$($pf.PF_MAJOR).$($pf.PF_MINOR).$($env:GITHUB_RUN_NUMBER)"
           }
           "HOST_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "PUNKTFUNK_BUILD_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

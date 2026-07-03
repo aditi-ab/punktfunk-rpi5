@@ -57,9 +57,25 @@ one-line edit of `/etc/apt/sources.list.d/punktfunk.list` (`stable` ↔ `canary`
    attaches its artifact to the `v0.2.0` Gitea Release. Concurrent attaches are safe — the shared
    `scripts/ci/gitea-release.{sh,ps1}` helper creates the release once and the rest reuse it.
 5. **Promote the app stores manually** (CI only uploads to testing tracks — see below).
-6. After a release reaches the current canary base, bump the canary base one minor ahead in
-   `deb.yml` / `rpm.yml` (and the `0.3.<run>` strings in the other workflows) so a stable→canary
-   re-point still moves forward. Rule: **canary base = one minor ahead of the latest stable.**
+
+That's the whole ritual: **push a tag, done.** There is nothing else to hand-edit.
+
+### Versioning is derived — never hand-edited
+
+Every workflow gets its version number from one place, `scripts/ci/pf-version.{sh,ps1}`
+(the pwsh twin is for the Windows runners), so the number can never drift out of sync:
+
+- **stable** (a `vX.Y.Z` tag) → the tag version (`-rc`/`+meta` dropped where a strictly-numeric
+  version is required — MSIX, the App Store marketing version).
+- **canary** (a `main` push) → **exactly one minor ahead of the latest stable tag** (latest
+  `v0.6.0` → canary base `0.7.0`), with each channel's own build suffix (`-ciN`, `~ciN`,
+  `<major>.<minor>.<run>`, …). Cutting `v0.7.0` automatically advances canary to `0.8.0` on the
+  next `main` push.
+
+This means canary is **always ahead of stable** with zero maintenance — the old footgun where a
+canary showed up on TestFlight as `0.5.0` while `0.6.0` was already published is structurally
+impossible now. If you ever need the next release to be something other than the next minor (a
+major bump, or a patch), just tag it — the canary base re-derives from whatever the latest tag is.
 
 Pre-release tags work too: `v0.2.0-rc1` builds a real release (the `-rc1` suffix is dropped where a
 strictly-numeric version is required — MSIX, the App Store marketing version).

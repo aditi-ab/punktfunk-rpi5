@@ -16,7 +16,8 @@
 #   vX.Y.Z tag -> X.Y.Z.0  (THE release; any -rc/+meta pre-release suffix is dropped for MSIX).
 #                Published to the generic registry + the stable `latest/` alias + attached to the
 #                unified Gitea Release alongside every other platform's artifact.
-#   main push / dispatch -> 0.3.<run_number>.0  (canary; climbs monotonically by run number).
+#   main push / dispatch -> <next-minor>.<run_number>.0  (canary; base is one minor ahead of the
+#                latest stable tag via scripts/ci/pf-version.ps1, run number climbs monotonically).
 #                Published to the generic registry + the `canary/` alias.
 # Both arches share the version; artifacts are arch-suffixed (..._x64.msix / ..._arm64.msix).
 #
@@ -78,11 +79,13 @@ jobs:
           "CARGO_TARGET_DIR=${{ matrix.td }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "FFMPEG_DIR=${{ matrix.ffmpeg }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           rustup target add ${{ matrix.target }}
+          $pf = & "$env:GITHUB_WORKSPACE/scripts/ci/pf-version.ps1"   # single source of truth: base is one minor ahead of the latest stable tag
           $parts = if ($env:GITHUB_REF -like 'refs/tags/v*') {
             # MSIX needs a purely-numeric 4-part version: drop any -rc/+meta pre-release suffix.
             (($env:GITHUB_REF_NAME -replace '^v', '') -replace '[-+].*$', '').Split('.')
           } else {
-            @('0', '3', $env:GITHUB_RUN_NUMBER)
+            # Canary: <major>.<minor>.<run>.0 — major.minor track one minor ahead of stable, run climbs monotonically.
+            @($pf.PF_MAJOR, $pf.PF_MINOR, $env:GITHUB_RUN_NUMBER)
           }
           while ($parts.Count -lt 4) { $parts += '0' }
           $v = ($parts[0..3] -join '.')
