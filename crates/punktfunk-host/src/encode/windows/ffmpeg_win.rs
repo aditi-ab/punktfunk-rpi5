@@ -1307,14 +1307,18 @@ impl Encoder for FfmpegWinEncoder {
         self.force_kf = true;
     }
 
-    /// Poll-contract note: the session encode loop's pipelining treats a `None` from `poll` as
-    /// "come back next tick" and was designed around direct NVENC, whose poll BLOCKS in
-    /// `lock_bitstream` until the owed AU is done. libavcodec's AMF wrapper is truly async
-    /// (EAGAIN until the ASIC finishes), so a single non-blocking try quantizes AU retrieval to
-    /// the submit cadence — measured +1–2 frame periods (~43 ms p50 at 720p60 on the Ryzen iGPU,
-    /// vs ~3.5 ms of actual encode). While an AU is owed (`in_flight > 0`), spin-poll with short
-    /// sleeps like NVENC's blocking wait, bounded to ~2 frame periods so an overloaded encoder
-    /// degrades back to next-tick pickup instead of stalling capture.
+    /// Poll for the next finished AU (single non-blocking `receive_packet`).
+    ///
+    /// libavcodec's `hevc_amf`/`av1_amf` wrapper holds ~2 frames before releasing the oldest
+    /// (it needs frame N+2 submitted to flush N), so the encode→retrieve latency floors at
+    /// **~2 frame periods** — measured dead-stable at 36 ms p50 for 720p60 on the Ryzen 7000
+    /// iGPU across depth 1/2, every `usage` preset, and any spin (a spin between submits provably
+    /// never produces the owed AU — verified with a 150 ms cap pegging at exactly 150 ms). So the
+    /// buffer is inherent to the libavcodec path, NOT host scheduling: the real fix is a direct
+    /// AMF SDK encoder (the AMF analogue of `encode/windows/nvenc.rs`, whose delay=0 gives NVENC
+    /// its ~1–2 ms) — tracked as the next AMD latency lever. `PUNKTFUNK_FFWIN_POLL_MS` keeps a
+    /// bounded spin available for a future VCN/driver where the AU can land mid-spin (0 = off,
+    /// the default and correct choice on measured hardware).
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         let fps = self.fps;
         let enc = match &mut self.inner {
@@ -1322,14 +1326,12 @@ impl Encoder for FfmpegWinEncoder {
             Some(Inner::ZeroCopy(z)) => &mut z.enc,
             None => return Ok(None),
         };
-        // Default cap: ~2 frame periods. `PUNKTFUNK_FFWIN_POLL_MS` overrides for on-box latency
-        // forensics (e.g. 150 to see WHEN the AU really lands vs. being gated on the next submit).
         let cap_us = std::env::var("PUNKTFUNK_FFWIN_POLL_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .map(|ms| ms * 1000)
-            .unwrap_or_else(|| (2_000_000 / fps.max(1) as u64).max(10_000));
-        let deadline = (self.in_flight > 0)
+            .unwrap_or(0); // default: no spin — the libavcodec AMF buffer can't be spun out
+        let deadline = (cap_us > 0 && self.in_flight > 0)
             .then(|| std::time::Instant::now() + std::time::Duration::from_micros(cap_us));
         loop {
             match poll_encoder(enc, fps)? {
