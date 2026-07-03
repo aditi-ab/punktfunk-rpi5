@@ -223,21 +223,28 @@ pub(crate) fn control_device_handle() -> Option<HANDLE> {
 /// second process fail its vdisplay open LOUDLY instead. Held, never released, for the process
 /// lifetime; the OS reclaims it (and frees the name) when the process exits, however it exits.
 fn acquire_single_instance() -> Result<OwnedHandle> {
-    // SAFETY: plain FFI create of a named mutex; the returned handle (checked by `?`) is solely
-    // owned by the `OwnedHandle`, and `GetLastError` is read immediately after the create — the
-    // documented ERROR_ALREADY_EXISTS protocol for pre-existing named objects.
+    const IN_USE: &str = "another punktfunk-host process is already managing pf-vdisplay on this \
+         machine — refusing to touch the driver (a second manager's startup CLEAR_ALL would raze \
+         the live host's monitors mid-stream). Stop the other instance (e.g. `punktfunk-host \
+         service stop`) first.";
+    // SAFETY: plain FFI create of a named mutex; the returned handle (checked) is solely owned by
+    // the `OwnedHandle`, and `GetLastError` is read immediately after the create — the documented
+    // ERROR_ALREADY_EXISTS protocol for pre-existing named objects.
     unsafe {
-        let h = CreateMutexW(None, false, w!("Global\\punktfunk-vdisplay-manager"))
-            .context("CreateMutexW(punktfunk-vdisplay single-instance guard)")?;
+        let h = match CreateMutexW(None, false, w!("Global\\punktfunk-vdisplay-manager")) {
+            Ok(h) => h,
+            // The name exists but its creator's DACL denies this token the implicit OPEN (the SCM
+            // service creates it as SYSTEM; a second elevated-admin host lands here instead of in
+            // the ALREADY_EXISTS branch — validated on-glass). Same meaning: an instance is live.
+            Err(e) if e.code().0 == 0x8007_0005u32 as i32 => anyhow::bail!("{IN_USE}"),
+            Err(e) => {
+                return Err(e).context("CreateMutexW(punktfunk-vdisplay single-instance guard)");
+            }
+        };
         let already = GetLastError() == ERROR_ALREADY_EXISTS;
         let owned = OwnedHandle::from_raw_handle(h.0 as _);
         if already {
-            anyhow::bail!(
-                "another punktfunk-host process is already managing pf-vdisplay on this machine — \
-                 refusing to touch the driver (a second manager's startup CLEAR_ALL would raze the \
-                 live host's monitors mid-stream). Stop the other instance (e.g. `punktfunk-host \
-                 service stop`) first."
-            );
+            anyhow::bail!("{IN_USE}");
         }
         Ok(owned)
     }
