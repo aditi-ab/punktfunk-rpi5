@@ -42,6 +42,10 @@ pub struct WinCaptureTarget {
     pub gdi_name: String,
     /// Stable SudoVDA target id — re-resolved to the current GDI name on every recovery.
     pub target_id: u32,
+    /// The pf-vdisplay driver's WUDFHost pid (from the ADD reply) — the process the IDD-push capturer
+    /// duplicates the sealed frame channel's handles INTO (`idd_push::ChannelBroker`). `0` = unknown
+    /// (a pre-v2 pairing can't occur — the version handshake is hard — so this only guards misuse).
+    pub wudf_pid: u32,
 }
 
 /// A GPU-resident captured texture (future NVENC-D3D11 zero-copy path).

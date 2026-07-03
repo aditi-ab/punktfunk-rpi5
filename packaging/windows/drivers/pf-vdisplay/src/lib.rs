@@ -10,9 +10,12 @@
 
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 // P0 lint (audit §8): an unsafe op inside an `unsafe fn` must be in an explicit `unsafe {}` block, so the
-// fn-level `unsafe` never silently blesses the whole body. (The per-site `// SAFETY:` discipline already
-// landed in STEP 8.)
+// fn-level `unsafe` never silently blesses the whole body, AND every `unsafe {}` must carry a `// SAFETY:`
+// proof. An IddCx display driver is inherently FFI-bound (D3D11 / IddCx DDIs / cross-process shared
+// textures), so it can't be unsafe-FREE the way the gamepad drivers now are (their logic moved onto the
+// safe `pf_umdf_util` layer); these gates make it unsafe-AUDITED instead, and stop it regressing.
 #![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 #[macro_use]
 mod log;

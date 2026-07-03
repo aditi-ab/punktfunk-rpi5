@@ -93,6 +93,8 @@ pub unsafe fn dispatch(request: WDFREQUEST, ioctl_code: u32) {
         }
         // SAFETY: `request` is the framework WDFREQUEST.
         control::IOCTL_SET_RENDER_ADAPTER => unsafe { set_render_adapter(request) },
+        // SAFETY: `request` is the framework WDFREQUEST.
+        control::IOCTL_SET_FRAME_CHANNEL => unsafe { set_frame_channel(request) },
         _ => complete(request, STATUS_NOT_FOUND),
     }
 }
@@ -148,9 +150,47 @@ unsafe fn add(request: WDFREQUEST) {
         adapter_luid_high: luid_high,
         target_id,
         resolved_monitor_id: monitor_id,
+        // This WUDFHost's pid — where the host duplicates the sealed frame channel's handles INTO
+        // (`ProcessSharingDisabled`: this process is exclusively ours and dies with the device).
+        wudf_pid: std::process::id(),
     };
     // SAFETY: `request` is the framework WDFREQUEST.
     unsafe { write_output_complete(request, &reply) };
+}
+
+/// `IOCTL_SET_FRAME_CHANNEL`: adopt the handle values the host duplicated into this process and stash
+/// them on the target monitor for the swap-chain worker to attach with. The ownership contract with
+/// the host is **adopt-on-success only**: this driver owns (and eventually closes) the handles iff the
+/// IOCTL completes successfully; on ANY error completion it leaves them untouched, because the host
+/// reaps its remote duplicates whenever the IOCTL fails — a close on both sides would double-close
+/// values the OS may already have reused for unrelated handles.
+///
+/// # Safety
+/// `request` is the framework `WDFREQUEST`.
+unsafe fn set_frame_channel(request: WDFREQUEST) {
+    // SAFETY: `request` is the framework WDFREQUEST.
+    let Some(req) = (unsafe { read_input::<control::SetFrameChannelRequest>(request) }) else {
+        complete(request, STATUS_INVALID_PARAMETER);
+        return;
+    };
+    // A malformed request adopts nothing (no FrameChannel is built, so no Drop can close anything).
+    let Some(ch) = crate::frame_transport::FrameChannel::from_request(&req) else {
+        complete(request, STATUS_INVALID_PARAMETER);
+        return;
+    };
+    match crate::monitor::set_frame_channel(req.target_id, ch) {
+        Ok(()) => complete(request, STATUS_SUCCESS),
+        Err(ch) => {
+            dbglog!(
+                "[pf-vd] SET_FRAME_CHANNEL: no monitor with target_id {} — rejecting (host reaps the handles)",
+                req.target_id
+            );
+            // NOT adopted: disarm the channel so its Drop does NOT close the handles (see the contract
+            // above — the host's error path reaps them remotely).
+            ch.into_unowned();
+            complete(request, STATUS_NOT_FOUND);
+        }
+    }
 }
 
 /// `IOCTL_REMOVE`: depart + drop the monitor for the given session id.

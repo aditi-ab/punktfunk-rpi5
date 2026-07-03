@@ -162,7 +162,26 @@ fn install_gamepad(dir: &Path) -> Result<()> {
             eprintln!("warning: pnputil /add-driver {} failed", inf.display());
         }
     }
+    // Sweep pad devnodes, INCLUDING phantoms a host crash / service stop left behind: a re-created
+    // SwDevice with a known instance id REVIVES the existing devnode with its previously-bound
+    // driver — it never re-ranks against the store — so after an upgrade the old driver keeps
+    // serving (or, across the v1→v2 sealed-channel fence, fails closed and the pad plays dead).
+    // Proven in the field on the RTX box: a v1 phantom pinned the old package through a v2
+    // install. The devnodes are per-session objects the host recreates on demand, so removing
+    // them at driver-install time is always safe; the next pad binds the fresh package.
+    remove_pad_devnodes();
     Ok(())
+}
+
+/// `pnputil /remove-device` every punktfunk virtual-pad devnode (live or phantom).
+fn remove_pad_devnodes() {
+    for id in pad_instance_ids() {
+        if run_quiet("pnputil", &["/remove-device", &id]) {
+            println!("removed stale pad devnode {id}");
+        } else {
+            eprintln!("warning: pnputil /remove-device {id} failed");
+        }
+    }
 }
 
 // ── `driver uninstall [--gamepad]` ──────────────────────────────────────────────────────────────
@@ -204,6 +223,9 @@ fn uninstall_pf_vdisplay() -> Result<()> {
 }
 
 fn uninstall_gamepad() -> Result<()> {
+    // Devnodes first (incl. phantoms — the same ghost-device complaint the vdisplay uninstall
+    // fixed), then the store packages.
+    remove_pad_devnodes();
     delete_store_drivers(&["pf_dualsense", "pf_dualshock4", "pf_xusb"]);
     Ok(())
 }
@@ -229,6 +251,28 @@ fn pf_vdisplay_instance_ids() -> Vec<String> {
         let id = value.trim();
         // Sanity: an instance ID is a backslashed path with no spaces (e.g. ROOT\DISPLAY\0000).
         if !id.is_empty() && id.contains('\\') && !id.contains(' ') {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+/// Instance IDs of punktfunk virtual-pad devnodes (`SWD\PUNKTFUNK\…`), INCLUDING phantoms left by
+/// a host crash / service stop (`pnputil /enum-devices` lists disconnected devnodes too). Same
+/// un-localized VALUE-side parsing as [`pf_vdisplay_instance_ids`]; matched on the instance-id
+/// prefix itself — the pads span two device classes (HIDClass + System), so no `/class` filter.
+fn pad_instance_ids() -> Vec<String> {
+    let out = run_capture("pnputil", &["/enum-devices"]);
+    let mut ids = Vec::new();
+    for block in out.split("\r\n\r\n").flat_map(|b| b.split("\n\n")) {
+        let Some(first) = block.lines().find(|l| !l.trim().is_empty()) else {
+            continue;
+        };
+        let Some((_, value)) = first.split_once(':') else {
+            continue;
+        };
+        let id = value.trim();
+        if id.to_ascii_uppercase().starts_with("SWD\\PUNKTFUNK\\") && !id.contains(' ') {
             ids.push(id.to_string());
         }
     }

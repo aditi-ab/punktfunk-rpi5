@@ -10,8 +10,10 @@
 //! code — handled at the call site in STEP 5).
 #![no_std]
 #![allow(non_snake_case, clippy::missing_safety_doc)]
-// P0 lint (audit §8): require explicit `unsafe {}` blocks inside `unsafe fn`s.
+// P0 lint (audit §8): require explicit `unsafe {}` blocks inside `unsafe fn`s + a `// SAFETY:` proof on
+// each (this crate is the IddCx DDI dispatch layer — inherently unsafe, so audited, not unsafe-free).
 #![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 pub use wdk_sys::iddcx;
 
@@ -36,6 +38,7 @@ unsafe fn ddi<T: Copy>(index: i32) -> T {
     let table = (&raw const iddcx::IddFunctions).cast::<iddcx::PFN_IDD_CX>();
     // SAFETY: `index` is a valid IddCx table slot; the slot holds a `PFN_*` whose layout is `T`.
     let slot = unsafe { table.add(index as usize) };
+    // SAFETY: `slot` points at the `index`th (in-bounds) populated table entry, a `PFN_*` of layout `T`.
     unsafe { slot.cast::<T>().read() }
 }
 
@@ -62,7 +65,10 @@ macro_rules! iddcx_ddi {
         /// Call only after the driver is loaded by IddCx; pointers must satisfy the IddCx contract.
         #[inline]
         pub unsafe fn $name( $( $arg: $aty ),* ) -> NTSTATUS {
+            // SAFETY: `$idx`/`$pfn` are the matched IddCx table index + PFN type (pinned by this macro
+            // invocation), and the table is populated once the driver is loaded (this fn's contract).
             let f: iddcx::$pfn = unsafe { ddi(iddcx::_IDDFUNCENUM::$idx) };
+            // SAFETY: only reads the stub-provided globals pointer; valid post-load per the contract.
             let g = unsafe { globals() };
             // SAFETY: dispatching a populated DDI with the stub globals and caller-valid args.
             unsafe { (f.unwrap())(g, $( $arg ),* ) }
@@ -79,7 +85,10 @@ macro_rules! iddcx_ddi {
         /// Call only after the driver is loaded by IddCx; pointers must satisfy the IddCx contract.
         #[inline]
         pub unsafe fn $name( $( $arg: $aty ),* ) {
+            // SAFETY: `$idx`/`$pfn` are the matched IddCx table index + PFN type (pinned by this macro
+            // invocation), and the table is populated once the driver is loaded (this fn's contract).
             let f: iddcx::$pfn = unsafe { ddi(iddcx::_IDDFUNCENUM::$idx) };
+            // SAFETY: only reads the stub-provided globals pointer; valid post-load per the contract.
             let g = unsafe { globals() };
             // SAFETY: dispatching a populated DDI with the stub globals and caller-valid args.
             unsafe { (f.unwrap())(g, $( $arg ),* ) }

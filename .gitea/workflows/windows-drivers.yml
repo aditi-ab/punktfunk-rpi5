@@ -131,11 +131,21 @@ jobs:
         # dispatched provisioning workflow landing on a different one. Path is relative to the job
         # working-directory (packaging/windows/drivers). Near-noop once the toolchain is present.
         run: ../../../scripts/ci/ensure-windows-toolchain.ps1
-      - name: cargo build the driver workspace (wdk-probe + wdk-iddcx + pf-vdisplay)
+      - name: cargo build the driver workspace (wdk-probe + wdk-iddcx + pf-vdisplay + gamepad drivers)
         # Whole workspace: wdk-probe (toolchain/surface-assert probe) + wdk-iddcx (DDI wrappers) +
-        # pf-vdisplay (the real IddCx driver). pf-vdisplay linking proves the IddCx call sites resolve
-        # against IddCxStub end-to-end (M1 step 2 gate).
+        # pf-vdisplay (the real IddCx driver) + pf-umdf-util (the safe UMDF primitive layer) + the two
+        # gamepad drivers. pf-vdisplay linking proves the IddCx call sites resolve against IddCxStub
+        # end-to-end (M1 step 2 gate); the gamepad drivers prove pf-umdf-util's WDF dispatch links.
         run: cargo build -v
+      - name: cargo clippy the shipped drivers (-D warnings — enforces the unsafe-audit gates)
+        # The gamepad drivers' business logic is 100% safe (it moved onto pf-umdf-util, the audited
+        # unsafe layer); pf-vdisplay + wdk-iddcx are inherently FFI-bound but every `unsafe {}` carries a
+        # `// SAFETY:` proof. Both invariants are lint-gated (`unsafe_op_in_unsafe_fn` +
+        # `undocumented_unsafe_blocks`); this step keeps them from regressing. (wdk-probe is a
+        # toolchain-only probe crate and is excluded.)
+        run: cargo clippy -p pf-umdf-util -p pf-xusb -p pf-dualsense -p wdk-iddcx -p pf-vdisplay --all-targets -- -D warnings
+      - name: cargo fmt --check the safe-layer + gamepad drivers
+        run: cargo fmt -p pf-umdf-util -p pf-xusb -p pf-dualsense --check
       - name: Inspect /INTEGRITYCHECK (before) — expect FORCE_INTEGRITY set by wdk-build
         run: |
           # explicit --target (.cargo/config.toml) -> output under the triple subdir.

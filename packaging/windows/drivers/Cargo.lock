@@ -405,8 +405,18 @@ dependencies = [
 name = "pf-dualsense"
 version = "0.0.1"
 dependencies = [
+ "pf-driver-proto",
+ "pf-umdf-util",
  "wdk",
  "wdk-build",
+ "wdk-sys",
+]
+
+[[package]]
+name = "pf-umdf-util"
+version = "0.0.1"
+dependencies = [
+ "pf-driver-proto",
  "wdk-sys",
 ]
 
@@ -427,6 +437,8 @@ dependencies = [
 name = "pf-xusb"
 version = "0.0.1"
 dependencies = [
+ "pf-driver-proto",
+ "pf-umdf-util",
  "wdk",
  "wdk-build",
  "wdk-sys",

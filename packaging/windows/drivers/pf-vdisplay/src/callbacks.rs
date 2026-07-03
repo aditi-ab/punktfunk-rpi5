@@ -51,8 +51,9 @@ pub unsafe extern "C" fn parse_monitor_description(
     p_in: *const iddcx::IDARG_IN_PARSEMONITORDESCRIPTION,
     p_out: *mut iddcx::IDARG_OUT_PARSEMONITORDESCRIPTION,
 ) -> NTSTATUS {
-    // SAFETY: framework-provided in/out args, valid for the call.
+    // SAFETY: the framework supplies a valid, live input-args pointer for the call.
     let in_args = unsafe { &*p_in };
+    // SAFETY: the framework supplies a valid, live output-args pointer for the call.
     let out_args = unsafe { &mut *p_out };
     // SAFETY: the framework supplies a valid EDID buffer of `DataSize` bytes.
     let edid = unsafe {
@@ -100,8 +101,9 @@ pub unsafe extern "C" fn parse_monitor_description2(
     p_in: *const iddcx::IDARG_IN_PARSEMONITORDESCRIPTION2,
     p_out: *mut iddcx::IDARG_OUT_PARSEMONITORDESCRIPTION,
 ) -> NTSTATUS {
-    // SAFETY: framework-provided in/out args, valid for the call.
+    // SAFETY: the framework supplies a valid, live input-args pointer for the call.
     let in_args = unsafe { &*p_in };
+    // SAFETY: the framework supplies a valid, live output-args pointer for the call.
     let out_args = unsafe { &mut *p_out };
     // SAFETY: the framework supplies a valid EDID buffer of `DataSize` bytes.
     let edid = unsafe {
@@ -156,8 +158,9 @@ pub unsafe extern "C" fn monitor_query_modes(
     p_in: *const iddcx::IDARG_IN_QUERYTARGETMODES,
     p_out: *mut iddcx::IDARG_OUT_QUERYTARGETMODES,
 ) -> NTSTATUS {
-    // SAFETY: framework-provided in/out args, valid for the call.
+    // SAFETY: the framework supplies a valid, live input-args pointer for the call.
     let in_args = unsafe { &*p_in };
+    // SAFETY: the framework supplies a valid, live output-args pointer for the call.
     let out_args = unsafe { &mut *p_out };
     let Some(modes) = crate::monitor::modes_for_object(monitor) else {
         return STATUS_NOT_FOUND;
@@ -183,8 +186,9 @@ pub unsafe extern "C" fn monitor_query_modes2(
     p_in: *const iddcx::IDARG_IN_QUERYTARGETMODES2,
     p_out: *mut iddcx::IDARG_OUT_QUERYTARGETMODES,
 ) -> NTSTATUS {
-    // SAFETY: framework-provided in/out args, valid for the call.
+    // SAFETY: the framework supplies a valid, live input-args pointer for the call.
     let in_args = unsafe { &*p_in };
+    // SAFETY: the framework supplies a valid, live output-args pointer for the call.
     let out_args = unsafe { &mut *p_out };
     let Some(modes) = crate::monitor::modes_for_object(monitor) else {
         return STATUS_NOT_FOUND;
@@ -279,7 +283,8 @@ pub unsafe extern "C" fn assign_swap_chain(
     drop(crate::monitor::take_swap_chain_processor(monitor));
 
     // The OS target id (stamped on the monitor at creation, after IddCxMonitorArrival) keys the
-    // per-monitor objects STEP 6's host opens. 0 (default) if the monitor isn't found.
+    // frame-channel stash STEP 6's worker attaches from (the host addresses its IOCTL_SET_FRAME_CHANNEL
+    // delivery by this id). 0 (default) if the monitor isn't found — the worker then never attaches.
     let target_id = crate::monitor::target_id_for_object(monitor).unwrap_or(0);
 
     if let Some(device) = crate::direct_3d_device::pooled_device(luid) {

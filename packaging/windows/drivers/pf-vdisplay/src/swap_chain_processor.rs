@@ -78,6 +78,8 @@ pub struct SwapChainProcessor {
 // SAFETY: Raw ptr is managed by external library; access is serialised by the worker thread + the
 // terminate flag.
 unsafe impl Send for SwapChainProcessor {}
+// SAFETY: as above — the raw pointer is only touched by the serialised worker, so a shared
+// `&SwapChainProcessor` reference exposes no unsynchronised access.
 unsafe impl Sync for SwapChainProcessor {}
 
 impl SwapChainProcessor {
@@ -223,10 +225,11 @@ impl SwapChainProcessor {
             return;
         }
 
-        // STEP 6 IDD-push: lazily ATTACH to the HOST-created shared ring. The restricted UMDF token can't
-        // create named objects, so the host creates the header + event + textures and we only OPEN them
-        // once they appear (`try_open`). Until then we just drain — exactly the STEP-5 behaviour — so a
-        // non-IDD-push session never stalls. Retried every ~30 loop iterations.
+        // STEP 6 IDD-push: lazily ATTACH to the HOST-created shared ring over the SEALED channel. The
+        // frame objects are unnamed — the host duplicates their handles into this process and delivers
+        // the values via IOCTL_SET_FRAME_CHANNEL, which the control plane stashes on our monitor
+        // (`monitor::take_frame_channel`). Until a delivery lands we just drain — exactly the STEP-5
+        // behaviour — so a non-IDD-push session never stalls. The stash is polled every ~30 iterations.
         let mut publisher: Option<FramePublisher> = None;
         let mut frames_since_try: u32 = u32::MAX; // attach attempt on the first loop iteration
 
@@ -243,31 +246,41 @@ impl SwapChainProcessor {
                 break;
             }
 
-            // The host recreates the shared ring (new format) mid-session when the display's HDR mode
-            // flips — it bumps the header generation. Detect that and drop the publisher so we re-attach to
-            // the new-format textures below; otherwise we'd keep CopyResource'ing into the stale ring, whose
-            // format now mismatches the surface → the publish() format-guard drops every frame and the
-            // stream freezes until the next swap-chain recreate.
-            if publisher.as_ref().is_some_and(FramePublisher::is_stale) {
+            // Re-attach triggers, either of:
+            // * `is_stale` — the host recreated the ring mid-session (HDR flip): it bumps OUR header's
+            //   generation and re-delivers; without dropping here we'd keep CopyResource'ing into the
+            //   stale ring, whose format now mismatches the surface → the publish() format-guard drops
+            //   every frame and the stream freezes until the next swap-chain recreate.
+            // * a PENDING delivery (newest-wins) — a host build-retry creates a whole NEW ring with a
+            //   DIFFERENT header mapping; the old publisher's header never changes, so `is_stale` can't
+            //   fire. The host only delivers after fully (re)creating a ring, so a pending delivery
+            //   always supersedes whatever we're attached to.
+            if publisher.as_ref().is_some_and(FramePublisher::is_stale)
+                || (publisher.is_some() && crate::monitor::has_frame_channel(target_id))
+            {
                 publisher = None;
                 frames_since_try = u32::MAX; // re-attach immediately
             }
             // Lazy-attach (rate-limited) at the loop TOP so we keep trying even while the display is idle
-            // (E_PENDING / no frames presented yet), not only when a frame is acquired. `try_open` is a
-            // cheap OpenFileMapping that fails fast until the host has created the ring.
+            // (E_PENDING / no frames presented yet), not only when a frame is acquired. Checking the
+            // stash is a cheap mutex peek that stays empty until the host's channel delivery lands; a
+            // taken delivery is consumed whether the attach succeeds or not (on failure its handles are
+            // closed, the host's wait-for-attach reads the status code, and any retry is a NEW delivery).
             if publisher.is_none() {
                 if frames_since_try >= 30 {
                     frames_since_try = 0;
-                    // `if let Ok` (not a `match` with an empty `Err` arm) keeps clippy's `single_match`
-                    // happy under `-D warnings`; semantics are identical — attach on success, retry on Err.
-                    if let Ok(p) = FramePublisher::try_open(
-                        target_id,
-                        render_luid_low,
-                        render_luid_high,
-                        &device.device,
-                        &device.device_context,
-                    ) {
-                        publisher = Some(p);
+                    if let Some(channel) = crate::monitor::take_frame_channel(target_id) {
+                        // `if let Ok` (not a `match` with an empty `Err` arm) keeps clippy's `single_match`
+                        // happy under `-D warnings`; attach on success, drop the delivery on Err.
+                        if let Ok(p) = FramePublisher::from_channel(
+                            channel,
+                            render_luid_low,
+                            render_luid_high,
+                            &device.device,
+                            &device.device_context,
+                        ) {
+                            publisher = Some(p);
+                        }
                     }
                 } else {
                     frames_since_try += 1;
@@ -337,10 +350,10 @@ impl SwapChainProcessor {
                     if !raw.is_null() {
                         // SAFETY: `raw` is IddCx's live surface pointer (valid until the next
                         // ReleaseAndAcquire); `from_raw_borrowed` does not consume the refcount.
-                        if let Some(res) = unsafe { IDXGIResource::from_raw_borrowed(&raw) } {
-                            if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
-                                p.publish(&tex);
-                            }
+                        if let Some(res) = unsafe { IDXGIResource::from_raw_borrowed(&raw) }
+                            && let Ok(tex) = res.cast::<ID3D11Texture2D>()
+                        {
+                            p.publish(&tex);
                         }
                     }
                 }

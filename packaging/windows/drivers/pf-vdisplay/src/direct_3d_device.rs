@@ -123,10 +123,10 @@ static DEVICE_POOL: Mutex<Option<(i64, Arc<Direct3DDevice>)>> = Mutex::new(None)
 pub fn pooled_device(luid: LUID) -> Option<Arc<Direct3DDevice>> {
     let key = (i64::from(luid.HighPart) << 32) | i64::from(luid.LowPart);
     let mut pool = DEVICE_POOL.lock().ok()?;
-    if let Some((k, dev)) = pool.as_ref() {
-        if *k == key {
-            return Some(dev.clone());
-        }
+    if let Some((k, dev)) = pool.as_ref()
+        && *k == key
+    {
+        return Some(dev.clone());
     }
     match Direct3DDevice::init(luid) {
         Ok(d) => {

@@ -1,23 +1,23 @@
 //! Windows virtual Xbox 360 gamepad via the punktfunk **XUSB companion** UMDF driver
-//! (`packaging/windows/xusb-driver`) — the in-tree replacement for ViGEmBus. One virtual Xbox 360
+//! (`packaging/windows/drivers/pf-xusb`) — the in-tree replacement for ViGEmBus. One virtual Xbox 360
 //! controller per client pad index, visible to classic **XInput** (`XInputGetState`) with no kernel
 //! bus driver: each pad `SwDeviceCreate`s a `pf_xusb_<index>` devnode (the driver loads on it and
-//! registers `GUID_DEVINTERFACE_XUSB`) and the host pushes the XInput state into the shared section
-//! `Global\pfxusb-shm-<index>`. GameStream/Moonlight already speak the XInput conventions (low-16
-//! button bits, sticks −32768..32767 +Y up, triggers 0..255), so the state copy is ~1:1.
+//! registers `GUID_DEVINTERFACE_XUSB`) and the host pushes the XInput state into an **unnamed** shared
+//! DATA section the driver reaches over the **sealed channel** ([`PadChannel`] — handle duplicated
+//! into its WUDFHost, bootstrapped via `Global\pfxusb-boot-<index>`; see
+//! `design/gamepad-channel-sealing.md`). GameStream/Moonlight already speak the XInput conventions
+//! (low-16 button bits, sticks −32768..32767 +Y up, triggers 0..255), so the state copy is ~1:1.
 //!
 //! Rumble flows back the other way: a game writes force-feedback via `XInputSetState`, the driver
 //! parses the `SET_STATE` packet into the shared section, and [`GamepadManager::pump_rumble`] relays
 //! level changes to the client (the universal 0xCA plane), mirroring the Linux `EV_FF` read path.
-//!
-//! NB: the driver currently maps `Global\pfxusb-shm-0` (hardcoded), so a single pad (index 0) is
-//! fully correct; mixed multi-pad needs the driver to read its own index first (same limitation as
-//! the DualSense backend).
 
+use super::gamepad_raii::PadChannel;
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
-use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
+use std::time::Duration;
+use windows::core::{w, GUID, HRESULT, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
@@ -41,6 +41,7 @@ const OFF_RY: usize = core::mem::offset_of!(XusbShm, thumb_ry);
 const OFF_RUMBLE_SEQ: usize = core::mem::offset_of!(XusbShm, rumble_seq);
 const OFF_RUMBLE: usize = core::mem::offset_of!(XusbShm, rumble_large); // large @28, small @29
 const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(XusbShm, driver_proto);
+const OFF_PAD_INDEX: usize = core::mem::offset_of!(XusbShm, pad_index);
 
 /// Context for the `SwDeviceCreate` completion callback: an event to signal, the HRESULT it reports,
 /// and the PnP instance id PnP assigned (captured for devnode health diagnostics).
@@ -100,7 +101,7 @@ fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    // The pad index, stamped into the device Location — the driver reads it to map `pfxusb-shm-<index>`
+    // The pad index, stamped into the device Location — the driver reads it to poll `pfxusb-boot-<index>`
     // (multi-pad). The buffer must outlive the SwDeviceCreate call (it does; we wait on the event).
     let loc: Vec<u16> = format!("{index}")
         .encode_utf16()
@@ -171,12 +172,13 @@ fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
     Ok((hsw, ctx.instance_id()))
 }
 
-/// A single virtual Xbox 360 pad: the `pf_xusb_<index>` devnode plus the mapped shared section.
+/// A single virtual Xbox 360 pad: the `pf_xusb_<index>` devnode plus the sealed shared-memory channel.
 struct XusbWinPad {
     /// Owns the `pf_xusb_<index>` devnode (dropped → `SwDeviceClose`). `None` if `SwDeviceCreate` failed.
     _sw: Option<super::gamepad_raii::SwDevice>,
-    /// Owns `Global\pfxusb-shm-<index>` (the section + its mapped view; drop unmaps + closes).
-    shm: super::gamepad_raii::Shm,
+    /// The sealed channel: the unnamed DATA section (the `XusbShm`) + the bootstrap mailbox + the
+    /// handle-delivery state machine (drop closes both sections).
+    channel: PadChannel,
     /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
     attach: super::gamepad_raii::DriverAttach,
     packet: u32,
@@ -184,17 +186,18 @@ struct XusbWinPad {
 }
 
 impl XusbWinPad {
-    /// Create + map `Global\pfxusb-shm-<index>`, stamp the magic, then spawn the devnode.
+    /// Create the sealed channel (unnamed DATA section + `Global\pfxusb-boot-<index>` mailbox), stamp
+    /// the pad index then the magic LAST, spawn the devnode, and eagerly deliver the DATA handle once
+    /// the driver publishes its pid.
     fn open(index: u8) -> Result<XusbWinPad> {
-        // Permissive-DACL named section the WUDFHost (whatever account) can open; `Shm` owns the
-        // section handle + its mapped view (zero-filled) and unmaps/closes on drop.
-        let shm_name = pf_driver_proto::gamepad::xusb_shm_name(index);
-        let shm = super::gamepad_raii::Shm::create(&HSTRING::from(shm_name.as_str()), SHM_SIZE)?;
-        let base = shm.base();
-        // Zero the section then stamp the magic LAST (the driver only accepts it once magic is set).
-        // SAFETY: base points at SHM_SIZE writable bytes.
+        let boot_name = pf_driver_proto::gamepad::xusb_boot_name(index);
+        let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
+        let base = channel.data_base();
+        // The section arrives zeroed; stamp the pad index (the driver validates it against its own
+        // devnode index on attach) then the magic LAST (the driver only accepts it once magic is set).
+        // SAFETY: base points at SHM_SIZE writable bytes; OFF_PAD_INDEX is in range.
         unsafe {
-            std::ptr::write_bytes(base, 0, SHM_SIZE);
+            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
             std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
         }
         let (hsw, instance_id) = match create_swdevice(index) {
@@ -205,14 +208,18 @@ impl XusbWinPad {
             }
         };
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
+        // Bounded eager delivery: the driver's EvtDeviceAdd publishes its pid right away; handing it
+        // the DATA handle before we return means the pad is live for the game's first XInput poll.
+        // On a missing/old driver this waits out the window once and the service pump takes over.
+        channel.deliver_eager(Duration::from_millis(1500));
         Ok(XusbWinPad {
             _sw,
-            shm,
+            channel,
             attach: super::gamepad_raii::DriverAttach::new(
                 "pf_xusb",
                 "pf_xusb.inf",
                 "C:\\Users\\Public\\pfxusb-driver.log",
-                shm_name,
+                boot_name,
                 instance_id,
             ),
             packet: 0,
@@ -225,7 +232,7 @@ impl XusbWinPad {
     #[allow(clippy::too_many_arguments)]
     fn write_state(&mut self, buttons: u16, lt: u8, rt: u8, lx: i16, ly: i16, rx: i16, ry: i16) {
         self.packet = self.packet.wrapping_add(1);
-        let base = self.shm.base();
+        let base = self.channel.data_base();
         // SAFETY: `base` is the start of the mapped section (`SHM_SIZE` bytes, owned by `Shm`); every
         // `OFF_*` is a fixed in-range offset into it and `write_unaligned` handles the unaligned field
         // writes. Single owner (`&mut self`), so no concurrent writer races these stores.
@@ -242,10 +249,12 @@ impl XusbWinPad {
     }
 
     /// Poll the section for a game's rumble (the driver bumps `rumble_seq` on each SET_STATE). Returns
-    /// `(large, small)` motor levels (0..=255) when a new one arrived. Also feeds the driver-attach
-    /// health watcher (the driver stamps `driver_proto` at device add + on every serviced IOCTL).
+    /// `(large, small)` motor levels (0..=255) when a new one arrived. Also ticks the sealed-channel
+    /// delivery (a late-binding driver gets its handle here) and feeds the driver-attach health
+    /// watcher (the driver stamps `driver_proto` once it maps the delivered section + per IOCTL).
     fn service(&mut self) -> Option<(u8, u8)> {
-        let base = self.shm.base();
+        self.channel.pump();
+        let base = self.channel.data_base();
         // SAFETY: base points at SHM_SIZE bytes.
         let proto = unsafe { std::ptr::read_unaligned(base.add(OFF_DRIVER_PROTO) as *const u32) };
         self.attach.observe(proto);

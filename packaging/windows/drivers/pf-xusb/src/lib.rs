@@ -3,42 +3,39 @@
 //
 // xinput1_4.dll enumerates GUID_DEVINTERFACE_XUSB, opens the Nth instance (= player slot), and polls
 // it with buffered IOCTLs. We register the interface and answer those IOCTLs from controller state the
-// host publishes into a shared-memory section (`Global\pfxusb-shm-0`); a game's rumble (SET_STATE) is
-// published back for the host to forward. Byte formats are the source-verified xusb22 wire layout
-// (HIDMaestro driver/companion.c + nefarius/XInputHooker XUSB.h + ViGEm XUSB_REPORT).
+// host publishes into a shared DATA section; a game's rumble (SET_STATE) is published back for the
+// host to forward. Byte formats are the source-verified xusb22 wire layout (HIDMaestro
+// driver/companion.c + nefarius/XInputHooker XUSB.h + ViGEm XUSB_REPORT).
+//
+// The host channel is the **sealed pad channel** (design/gamepad-channel-sealing.md, proto v2): the
+// DATA section (`pf_driver_proto::gamepad::XusbShm`) is UNNAMED — we reach it only through a handle
+// the SYSTEM host duplicated into this WUDFHost, bootstrapped over the named `Global\pfxusb-boot-<i>`
+// mailbox. The whole handshake + all shared-memory access lives in `pf_umdf_util` (audited unsafe
+// layer): this crate's channel/IOCTL/state logic is 100% SAFE Rust. The only `unsafe` here is the
+// unavoidable WDF setup FFI in DriverEntry/EvtDeviceAdd, each with a `// SAFETY:` proof.
 //
 // We answer the WAIT_* IOCTLs with STATUS_INVALID_DEVICE_REQUEST, which makes xinput1_4 fall back to
 // synchronous GET_STATE polling — so no manual queue / timer is needed for classic XInput.
 
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
+// Every remaining `unsafe {}` (all WDF setup FFI) must carry a `// SAFETY:` proof.
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
-use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, Ordering};
+use pf_driver_proto::gamepad::XusbShm;
+use pf_umdf_util::channel::{ChannelClient, ChannelConfig};
+use pf_umdf_util::nt_success;
+use pf_umdf_util::section::MappedView;
+use pf_umdf_util::wdf::{self, Request};
 use wdk_sys::{
-    call_unsafe_wdf_function_binding, windows::OutputDebugStringA, GUID, NTSTATUS, PCUNICODE_STRING,
-    PDRIVER_OBJECT, PWDFDEVICE_INIT, ULONG, WDFDEVICE, WDFDRIVER, WDFMEMORY, WDFQUEUE, WDFREQUEST,
-    WDF_DRIVER_CONFIG, WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
+    GUID, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PWDFDEVICE_INIT, ULONG, WDF_DRIVER_CONFIG,
+    WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDFDEVICE, WDFDRIVER, WDFQUEUE,
+    WDFREQUEST, call_unsafe_wdf_function_binding, windows::OutputDebugStringA,
 };
-
-// DEVICE_REGISTRY_PROPERTY: DevicePropertyLocationInformation (the const isn't re-exported at the
-// wdk_sys root; the value is stable WDM).
-const DEVICE_PROPERTY_LOCATION_INFORMATION: i32 = 10;
-
-/// The pad index this device serves (which `pfxusb-shm-<index>` section to map). The host stamps it
-/// into the device Location (`pszDeviceLocation`); the driver reads it in EvtDeviceAdd. With
-/// `UmdfHostProcessSharing=ProcessSharingDisabled` (the INF) each pad gets its own WUDFHost, so this
-/// static is per-pad — the basis for multi-pad.
-static SHM_INDEX: AtomicU32 = AtomicU32::new(0);
 
 // ---- NTSTATUS ----
 const STATUS_SUCCESS: NTSTATUS = 0;
 const STATUS_INVALID_DEVICE_REQUEST: NTSTATUS = 0xC000_0010u32 as NTSTATUS;
-const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206u32 as NTSTATUS;
-
-#[inline]
-fn nt_success(s: NTSTATUS) -> bool {
-    s >= 0
-}
 
 // GUID_DEVINTERFACE_XUSB {EC87F1E3-C13B-4100-B5F7-8B84D54260CB} — what xinput1_4 enumerates + opens.
 const GUID_DEVINTERFACE_XUSB: GUID = GUID {
@@ -70,27 +67,46 @@ const XUSB_VERSION: u16 = 0x0103;
 const WdfIoQueueDispatchParallel: i32 = 2;
 const WdfUseDefault: i32 = 2; // WDF_TRI_STATE
 
-// ---- shared-memory layout (host ↔ driver), must match pf_driver_proto::gamepad::XusbShm ----
-// magic u32 @0 ("PFXU"); packet u32 @4 (host bumps on state change → dwPacketNumber); the XUSB_REPORT
-// payload @8: wButtons u16 @8, bLeftTrigger @10, bRightTrigger @11, sThumbLX i16 @12, LY @14, RX @16,
-// RY @18; rumble_seq u32 @24 (driver bumps on SET_STATE); rumble large @28, small @29;
-// driver_proto u32 @32 (we stamp GAMEPAD_PROTO_VERSION = attach signal for the host's health check);
-// driver_heartbeat u32 @36 (we bump per serviced IOCTL = the game-visible polling path moves).
-const FILE_MAP_RW: u32 = 0x0002 | 0x0004;
-const SHM_MAGIC: u32 = 0x5558_4650; // "PFXU" little-endian
-const SHM_SIZE: usize = 64;
-const GAMEPAD_PROTO_VERSION: u32 = 1; // must match pf_driver_proto::gamepad::GAMEPAD_PROTO_VERSION
+// ---- the sealed host channel: layouts + offsets from pf_driver_proto (drift = compile error) ----
+const SHM_MAGIC: u32 = pf_driver_proto::gamepad::XUSB_MAGIC; // "PFXU"
+const SHM_SIZE: usize = core::mem::size_of::<XusbShm>();
+const GAMEPAD_PROTO_VERSION: u32 = pf_driver_proto::gamepad::GAMEPAD_PROTO_VERSION;
 
-unsafe extern "system" {
-    fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> *mut c_void;
-    fn MapViewOfFile(h: *mut c_void, access: u32, hi: u32, lo: u32, len: usize) -> *mut c_void;
-    fn UnmapViewOfFile(addr: *const c_void) -> i32;
-    fn CloseHandle(h: *mut c_void) -> i32;
+// XusbShm field offsets (host writes state, we answer XInput; we write rumble + health marks).
+const OFF_PACKET: usize = core::mem::offset_of!(XusbShm, packet);
+const OFF_BUTTONS: usize = core::mem::offset_of!(XusbShm, buttons);
+const OFF_LT: usize = core::mem::offset_of!(XusbShm, left_trigger);
+const OFF_RT: usize = core::mem::offset_of!(XusbShm, right_trigger);
+const OFF_LX: usize = core::mem::offset_of!(XusbShm, thumb_lx);
+const OFF_LY: usize = core::mem::offset_of!(XusbShm, thumb_ly);
+const OFF_RX: usize = core::mem::offset_of!(XusbShm, thumb_rx);
+const OFF_RY: usize = core::mem::offset_of!(XusbShm, thumb_ry);
+const OFF_RUMBLE_SEQ: usize = core::mem::offset_of!(XusbShm, rumble_seq);
+const OFF_RUMBLE_LARGE: usize = core::mem::offset_of!(XusbShm, rumble_large);
+const OFF_RUMBLE_SMALL: usize = core::mem::offset_of!(XusbShm, rumble_small);
+const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(XusbShm, driver_proto);
+const OFF_DRIVER_HEARTBEAT: usize = core::mem::offset_of!(XusbShm, driver_heartbeat);
+const OFF_PAD_INDEX: usize = core::mem::offset_of!(XusbShm, pad_index);
+
+/// The sealed-channel client (per-pad: `ProcessSharingDisabled` gives each pad its own WUDFHost, so
+/// this static is per-pad). All shared-memory access + the bootstrap handshake live in `pf_umdf_util`.
+static CHANNEL: ChannelClient = ChannelClient::new();
+
+/// This pad's channel config (magic/size/pad_index offset + our logger).
+fn channel_cfg() -> ChannelConfig {
+    ChannelConfig {
+        tag: "pf-xusb",
+        boot_name_prefix: "Global\\pfxusb-boot-",
+        data_magic: SHM_MAGIC,
+        data_size: SHM_SIZE,
+        pad_index_off: OFF_PAD_INDEX,
+        log,
+    }
 }
 
 fn log(s: &str) {
     if let Ok(c) = std::ffi::CString::new(s) {
-        // SAFETY: c is a valid null-terminated string for the duration of the call.
+        // SAFETY: `c` is a valid NUL-terminated string for the duration of the call.
         unsafe { OutputDebugStringA(c.as_ptr().cast()) };
     }
     use std::io::Write;
@@ -110,11 +126,11 @@ pub unsafe extern "system" fn driver_entry(
     registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
     log("[pf-xusb] DriverEntry");
-    // SAFETY: zeroed config then Size + callback set.
+    // SAFETY: a zeroed WDF_DRIVER_CONFIG is a valid all-null config; we then set Size + the callback.
     let mut config: WDF_DRIVER_CONFIG = unsafe { core::mem::zeroed() };
     config.Size = core::mem::size_of::<WDF_DRIVER_CONFIG>() as ULONG;
     config.EvtDriverDeviceAdd = Some(evt_device_add);
-    // SAFETY: all pointers valid; provided by the loader.
+    // SAFETY: `driver`/`registry_path` are the loader-provided pointers; the config is valid.
     unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDriverCreate,
@@ -127,56 +143,11 @@ pub unsafe extern "system" fn driver_entry(
     }
 }
 
-/// Read the pad index the host stamped into the device Location (`pszDeviceLocation`), a NUL-terminated
-/// UTF-16 decimal string. Defaults to 0 (single-pad) if absent.
-fn query_shm_index(device: WDFDEVICE) -> u32 {
-    let mut mem: WDFMEMORY = core::ptr::null_mut();
-    // SAFETY: device valid; property = LocationInformation; pool ignored in UMDF; mem receives the handle.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceAllocAndQueryProperty,
-            device,
-            DEVICE_PROPERTY_LOCATION_INFORMATION,
-            0,
-            WDF_NO_OBJECT_ATTRIBUTES,
-            &mut mem
-        )
-    };
-    if !nt_success(st) || mem.is_null() {
-        return 0;
-    }
-    let mut len: usize = 0;
-    // SAFETY: mem valid.
-    let buf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, mem, &mut len) }
-        as *const u16;
-    if buf.is_null() {
-        return 0;
-    }
-    let mut idx: u32 = 0;
-    let mut any = false;
-    for i in 0..(len / 2).min(8) {
-        // SAFETY: buf valid for len bytes; i < len/2.
-        let c = unsafe { *buf.add(i) };
-        if c == 0 {
-            break;
-        }
-        if (0x30..=0x39).contains(&c) {
-            idx = idx.wrapping_mul(10).wrapping_add((c - 0x30) as u32);
-            any = true;
-        }
-    }
-    if any {
-        idx
-    } else {
-        0
-    }
-}
-
 extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INIT) -> NTSTATUS {
     log("[pf-xusb] EvtDeviceAdd");
 
     let mut device: WDFDEVICE = core::ptr::null_mut();
-    // SAFETY: device_init valid; attributes null; device receives the handle.
+    // SAFETY: `device_init` is the framework-provided init; attributes null; `device` receives it.
     let st = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreate,
@@ -190,12 +161,14 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         return st;
     }
 
-    let idx = query_shm_index(device);
-    SHM_INDEX.store(idx, Ordering::Relaxed);
+    // SAFETY: `device` is the live device just created — the exact contract `query_location_index`
+    // requires.
+    let idx = unsafe { wdf::query_location_index(device) };
+    CHANNEL.set_index(idx);
     dbglog!("[pf-xusb] shm index = {idx}");
 
     // Register the XUSB device interface (no reference string) — what xinput1_4 enumerates + opens.
-    // SAFETY: device valid; GUID static; null reference string.
+    // SAFETY: `device` is live; the GUID is a static; null reference string.
     let st = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreateDeviceInterface,
@@ -213,7 +186,7 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     }
 
     // Default parallel queue: all the XUSB IOCTLs land here.
-    // SAFETY: zeroed config then fields set; Size matches the struct.
+    // SAFETY: a zeroed WDF_IO_QUEUE_CONFIG is valid; we then set Size + the fields we use.
     let mut qcfg: WDF_IO_QUEUE_CONFIG = unsafe { core::mem::zeroed() };
     qcfg.Size = core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG;
     qcfg.DispatchType = WdfIoQueueDispatchParallel;
@@ -222,7 +195,7 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     qcfg.EvtIoDeviceControl = Some(evt_io_device_control);
     qcfg.Settings.Parallel.NumberOfPresentedRequests = u32::MAX;
     let mut queue: WDFQUEUE = core::ptr::null_mut();
-    // SAFETY: device + config valid; attributes null; queue receives the handle.
+    // SAFETY: `device` + `qcfg` are valid; attributes null; `queue` receives the handle.
     let st = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfIoQueueCreate,
@@ -237,93 +210,69 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         return st;
     }
 
-    // Tell the host we're alive on the section (its driver-attach health check keys off this).
-    touch_driver_marks();
+    // Run the sealed-channel handshake on a worker (must NOT block EvtDeviceAdd): publish our pid in
+    // the bootstrap mailbox and poll for the host's delivered DATA handle, so the pad attaches (and
+    // the host's driver-attach health check goes green) even before any game polls XInput. Bounded;
+    // a later host (or a re-delivery) is still picked up by the per-IOCTL pump. This closure is 100%
+    // safe — the whole channel state machine lives in pf_umdf_util.
+    std::thread::spawn(|| {
+        let cfg = channel_cfg();
+        for _ in 0..500 {
+            if let Some(v) = CHANNEL.pump(&cfg) {
+                touch_driver_marks(v);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        log(
+            "[pf-xusb] no sealed-channel delivery within 10s (host absent, or host/driver version mismatch — see above)",
+        );
+    });
 
     log("[pf-xusb] device ready (XUSB interface registered)");
     STATUS_SUCCESS
 }
 
-// Open + map the host's shared section and run `f` against the mapped base if magic is valid, then
-// unmap. Re-mapped per access (the host may recreate the section across restarts).
-fn with_shm<F: FnOnce(*mut u8)>(f: F) {
-    let name: Vec<u16> = format!("Global\\pfxusb-shm-{}", SHM_INDEX.load(Ordering::Relaxed))
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: name is a valid NUL-terminated UTF-16 string.
-    let h = unsafe { OpenFileMappingW(FILE_MAP_RW, 0, name.as_ptr()) };
-    if h.is_null() {
-        return;
-    }
-    // SAFETY: h is a valid mapping handle; map the whole section; the view keeps it alive.
-    let view = unsafe { MapViewOfFile(h, FILE_MAP_RW, 0, 0, SHM_SIZE) } as *mut u8;
-    unsafe { CloseHandle(h) };
-    if view.is_null() {
-        return;
-    }
-    // SAFETY: view points at >= 4 mapped bytes.
-    let magic = unsafe { core::ptr::read_unaligned(view as *const u32) };
-    if magic == SHM_MAGIC {
-        f(view);
-    }
-    // SAFETY: view came from MapViewOfFile.
-    unsafe { UnmapViewOfFile(view as *const c_void) };
-}
-
-/// The current controller state from shared memory (zeros / neutral if the host hasn't connected).
+/// The current controller state from the attached DATA section (zeros / neutral when unattached).
 /// Returns `(dwPacketNumber, wButtons, lt, rt, lx, ly, rx, ry)`.
-fn read_state() -> (u32, u16, u8, u8, i16, i16, i16, i16) {
-    let mut out = (0u32, 0u16, 0u8, 0u8, 0i16, 0i16, 0i16, 0i16);
-    with_shm(|v| {
-        // SAFETY: v points at a mapped SHM_SIZE section with valid magic.
-        unsafe {
-            out.0 = core::ptr::read_unaligned(v.add(4) as *const u32);
-            out.1 = core::ptr::read_unaligned(v.add(8) as *const u16);
-            out.2 = *v.add(10);
-            out.3 = *v.add(11);
-            out.4 = core::ptr::read_unaligned(v.add(12) as *const i16);
-            out.5 = core::ptr::read_unaligned(v.add(14) as *const i16);
-            out.6 = core::ptr::read_unaligned(v.add(16) as *const i16);
-            out.7 = core::ptr::read_unaligned(v.add(18) as *const i16);
-        }
-    });
-    out
+fn read_state(data: Option<&MappedView>) -> (u32, u16, u8, u8, i16, i16, i16, i16) {
+    match data {
+        Some(v) => (
+            v.read_u32(OFF_PACKET),
+            v.read_u16(OFF_BUTTONS),
+            v.read_u8(OFF_LT),
+            v.read_u8(OFF_RT),
+            v.read_i16(OFF_LX),
+            v.read_i16(OFF_LY),
+            v.read_i16(OFF_RX),
+            v.read_i16(OFF_RY),
+        ),
+        None => (0, 0, 0, 0, 0, 0, 0, 0),
+    }
 }
 
-/// Stamp the driver health marks the host watches: `driver_proto` @32 (the attach signal,
-/// idempotent) and `driver_heartbeat` @36 (+1). Called at device add and on every serviced IOCTL,
-/// so the host can tell "driver bound and alive" apart from "driver package missing/failed to
-/// bind" and see the game-visible polling path advance. No-op until the host's section exists
-/// (with_shm re-opens per access, so a section created after we started still gets marked).
-fn touch_driver_marks() {
-    with_shm(|v| {
-        // SAFETY: v points at a mapped SHM_SIZE section with valid magic; proto @32, heartbeat @36.
-        unsafe {
-            core::ptr::write_unaligned(v.add(32) as *mut u32, GAMEPAD_PROTO_VERSION);
-            let hb = v.add(36) as *mut u32;
-            core::ptr::write_unaligned(hb, core::ptr::read_unaligned(hb).wrapping_add(1));
-        }
-    });
+/// Stamp the driver health marks the host watches: `driver_proto` (the attach signal, idempotent)
+/// and `driver_heartbeat` (+1). Called once the channel attaches and on every serviced IOCTL, so the
+/// host can tell "driver bound and alive" apart from "driver package missing/failed to bind" and see
+/// the game-visible polling path advance.
+fn touch_driver_marks(data: &MappedView) {
+    data.write_u32(OFF_DRIVER_PROTO, GAMEPAD_PROTO_VERSION);
+    let hb = data.read_u32(OFF_DRIVER_HEARTBEAT).wrapping_add(1);
+    data.write_u32(OFF_DRIVER_HEARTBEAT, hb);
 }
 
-/// Publish a game's rumble (from SET_STATE) into shared memory for the host to forward.
-fn publish_rumble(large: u8, small: u8) {
-    with_shm(|v| {
-        // SAFETY: v points at a mapped SHM_SIZE section; rumble_seq @24, large @28, small @29.
-        unsafe {
-            *v.add(28) = large;
-            *v.add(29) = small;
-            let seqp = v.add(24) as *mut u32;
-            let seq = core::ptr::read_unaligned(seqp).wrapping_add(1);
-            core::ptr::write_unaligned(seqp, seq);
-        }
-    });
+/// Publish a game's rumble (from SET_STATE) into the DATA section for the host to forward.
+fn publish_rumble(data: Option<&MappedView>, large: u8, small: u8) {
+    let Some(v) = data else { return };
+    v.write_u8(OFF_RUMBLE_LARGE, large);
+    v.write_u8(OFF_RUMBLE_SMALL, small);
+    let seq = v.read_u32(OFF_RUMBLE_SEQ).wrapping_add(1);
+    v.write_u32(OFF_RUMBLE_SEQ, seq);
 }
 
 // Build the 29-byte GET_STATE buffer (the layout xinput1_4 parses).
-fn build_get_state() -> [u8; 29] {
-    let (packet, buttons, lt, rt, lx, ly, rx, ry) = read_state();
+fn build_get_state(data: Option<&MappedView>) -> [u8; 29] {
+    let (packet, buttons, lt, rt, lx, ly, rx, ry) = read_state(data);
     let mut s = [0u8; 29];
     s[0..2].copy_from_slice(&XUSB_VERSION.to_le_bytes());
     s[2] = 0x01; // device count
@@ -374,11 +323,20 @@ extern "C" fn evt_io_device_control(
     input_len: usize,
     ioctl: ULONG,
 ) {
-    // Health marks first: attach signal + heartbeat (also covers a section the host created after
-    // this device started — the marks land on the next XInput poll).
-    touch_driver_marks();
+    // SAFETY: `request` is the live request for THIS EvtIoDeviceControl invocation — exactly the
+    // contract `Request::new` requires. From here everything is safe (the token owns completion).
+    let request = unsafe { Request::new(request) };
+
+    // Sealed-channel pump + health marks first: adopt a (late) delivery, detach when the host's
+    // mailbox is gone, and stamp the attach/heartbeat marks the host watches (also covers a host
+    // started after this device — the pump attaches on the next XInput poll).
+    let data = CHANNEL.pump(&channel_cfg());
+    if let Some(v) = data {
+        touch_driver_marks(v);
+    }
+
     let status: NTSTATUS = match ioctl {
-        IOCTL_XUSB_GET_INFORMATION => copy_to_output(request, &build_information()),
+        IOCTL_XUSB_GET_INFORMATION => request.copy_to_output(&build_information()),
         IOCTL_XUSB_GET_INFORMATION_EX => {
             let mut ex = [0u8; 64];
             ex[0..2].copy_from_slice(&XUSB_VERSION.to_le_bytes());
@@ -387,21 +345,19 @@ extern "C" fn evt_io_device_control(
             ex[8..10].copy_from_slice(&XUSB_VID.to_le_bytes());
             ex[10..12].copy_from_slice(&XUSB_PID.to_le_bytes());
             let n = output_len.min(64);
-            copy_to_output(request, &ex[..n])
+            request.copy_to_output(&ex[..n])
         }
         IOCTL_XUSB_GET_CAPABILITIES => {
             if output_len >= 36 {
-                copy_to_output(request, &build_caps_v2())
+                request.copy_to_output(&build_caps_v2())
             } else {
-                copy_to_output(request, &CAPS_V1)
+                request.copy_to_output(&CAPS_V1)
             }
         }
-        IOCTL_XUSB_GET_STATE => copy_to_output(request, &build_get_state()),
-        IOCTL_XUSB_GET_LED_STATE => copy_to_output(request, &[0x00, 0x00, 0x06]),
-        IOCTL_XUSB_GET_BATTERY_INFORMATION => {
-            copy_to_output(request, &[0x00, 0x01, 0x03, 0x00])
-        }
-        IOCTL_XUSB_SET_STATE => on_set_state(request),
+        IOCTL_XUSB_GET_STATE => request.copy_to_output(&build_get_state(data)),
+        IOCTL_XUSB_GET_LED_STATE => request.copy_to_output(&[0x00, 0x00, 0x06]),
+        IOCTL_XUSB_GET_BATTERY_INFORMATION => request.copy_to_output(&[0x00, 0x01, 0x03, 0x00]),
+        IOCTL_XUSB_SET_STATE => on_set_state(&request, data),
         IOCTL_XUSB_POWER_DOWN | IOCTL_XUSB_GET_XINPUT_MANAGEMENT_DRIVER => STATUS_SUCCESS,
         // Decline the async waits → xinput1_4 falls back to synchronous GET_STATE polling.
         IOCTL_XUSB_WAIT_GUIDE_BUTTON | IOCTL_XUSB_WAIT_FOR_INPUT => STATUS_INVALID_DEVICE_REQUEST,
@@ -410,78 +366,29 @@ extern "C" fn evt_io_device_control(
             STATUS_INVALID_DEVICE_REQUEST
         }
     };
-    // SAFETY: request valid and not forwarded.
-    unsafe { call_unsafe_wdf_function_binding!(WdfRequestComplete, request, status) };
+    request.complete(status);
 }
 
 // SET_STATE: the rumble packet. Classic xusb22 layout is small; the motor bytes sit near the end.
-// We publish a best-effort (large = byte 3, small = byte 4 for the 5-byte form) and log the raw bytes
+// We publish a best-effort (large = byte 2, small = byte 3 for the 5-byte form) and log the raw bytes
 // so the exact offsets can be confirmed against a real pad.
-fn on_set_state(request: WDFREQUEST) -> NTSTATUS {
-    let mut inmem: WDFMEMORY = core::ptr::null_mut();
-    // SAFETY: request valid.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestRetrieveInputMemory, request, &mut inmem)
-    };
-    if nt_success(st) {
-        let mut len: usize = 0;
-        // SAFETY: inmem valid.
-        let p = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, inmem, &mut len) }
-            as *const u8;
-        if !p.is_null() && len >= 2 {
-            let n = len.min(8);
-            // SAFETY: p valid for len bytes; read at most n.
-            let bytes = unsafe { core::slice::from_raw_parts(p, n) };
-            let mut hex = String::new();
-            for b in bytes {
-                hex.push_str(&format!("{b:02x} "));
-            }
-            dbglog!("[pf-xusb] SET_STATE len={len} data: {hex}");
-            // Observed 5-byte form {00, led, largeMotor, smallMotor, subcmd}: subcmd 0x02 = rumble
-            // (large/low-freq at [2], small/high-freq at [3]); 0x01 = player-LED set (ignored).
-            // 4-byte = raw XINPUT_VIBRATION → the two motor hi bytes.
-            if len >= 5 && bytes[4] == 0x02 {
-                publish_rumble(bytes[2], bytes[3]);
-            } else if len == 4 {
-                publish_rumble(bytes[1], bytes[3]);
-            }
+fn on_set_state(request: &Request, data: Option<&MappedView>) -> NTSTATUS {
+    if let Ok((bytes, len)) = request.input_bytes(8)
+        && len >= 2
+    {
+        let mut hex = String::new();
+        for b in &bytes {
+            hex.push_str(&format!("{b:02x} "));
+        }
+        dbglog!("[pf-xusb] SET_STATE len={len} data: {hex}");
+        // Observed 5-byte form {00, led, largeMotor, smallMotor, subcmd}: subcmd 0x02 = rumble
+        // (large/low-freq at [2], small/high-freq at [3]); 0x01 = player-LED set (ignored).
+        // 4-byte = raw XINPUT_VIBRATION → the two motor hi bytes.
+        if len >= 5 && bytes[4] == 0x02 {
+            publish_rumble(data, bytes[2], bytes[3]);
+        } else if len == 4 {
+            publish_rumble(data, bytes[1], bytes[3]);
         }
     }
-    STATUS_SUCCESS
-}
-
-// Copy `src` into the request's (buffered) output buffer and set the completed byte count.
-fn copy_to_output(request: WDFREQUEST, src: &[u8]) -> NTSTATUS {
-    let mut mem: WDFMEMORY = core::ptr::null_mut();
-    // SAFETY: request valid; mem receives the memory handle.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestRetrieveOutputMemory, request, &mut mem)
-    };
-    if !nt_success(st) {
-        return st;
-    }
-    let mut outlen: usize = 0;
-    // SAFETY: mem valid; outlen receives the buffer size.
-    let _ = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, mem, &mut outlen) };
-    if outlen < src.len() {
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
-    // SAFETY: mem valid; src is a valid buffer of src.len() bytes.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfMemoryCopyFromBuffer,
-            mem,
-            0usize,
-            src.as_ptr() as *mut c_void,
-            src.len()
-        )
-    };
-    if !nt_success(st) {
-        return st;
-    }
-    // SAFETY: request valid.
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestSetInformation, request, src.len() as u64)
-    };
     STATUS_SUCCESS
 }

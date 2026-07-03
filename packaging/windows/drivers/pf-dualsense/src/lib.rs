@@ -1,36 +1,39 @@
-// punktfunk virtual DualSense — UMDF2 HID minidriver (M0 spike).
+// punktfunk virtual DualSense / DualShock 4 — UMDF2 HID minidriver.
 //
 // A Rust port of the WDK `vhidmini2` UMDF2 sample, reconfigured to present a Sony DualSense
-// (VID 054C / PID 0CE6) using the inputtino report descriptor + feature blobs punktfunk already
-// ships in `inject/dualsense.rs`. Its purpose for M0(b) is to (1) enumerate as a genuine DualSense
-// and (2) LOG every output report the game writes — the adaptive-trigger `0x02` gate.
+// (VID 054C / PID 0CE6) or DualShock 4 (device_type=1) using the inputtino report descriptor +
+// feature blobs punktfunk already ships in `inject/{dualsense,dualshock4}.rs`. Games see a genuine
+// HID PS controller; the host streams input in / reads output (rumble/lightbar/triggers) back.
 //
 // No WDF object contexts: this is a singleton virtual device, so per-device state lives in statics.
-// All WDF calls go through `call_unsafe_wdf_function_binding!`; HID/WDF structs are hand-built.
+// The host channel is the **sealed pad channel** (design/gamepad-channel-sealing.md, proto v2): the
+// whole handshake + all shared-memory access lives in `pf_umdf_util` (the audited unsafe layer), so
+// this crate's channel/HID/IOCTL logic is 100% SAFE Rust. The only `unsafe` here is the unavoidable
+// WDF setup FFI in DriverEntry/EvtDeviceAdd/the timer, each with a `// SAFETY:` proof.
 
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
+// Every remaining `unsafe {}` (all WDF setup FFI) must carry a `// SAFETY:` proof.
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
-use core::ffi::c_void;
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
+use pf_driver_proto::gamepad::PadShm;
+use pf_umdf_util::channel::{ChannelClient, ChannelConfig};
+use pf_umdf_util::wdf::{self, Request};
 use wdk_sys::{
     NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, PWDFDEVICE_INIT, ULONG, WDF_DRIVER_CONFIG,
     WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES,
-    WDF_TIMER_CONFIG, WDFDEVICE, WDFDRIVER, WDFMEMORY, WDFQUEUE, WDFQUEUE__, WDFREQUEST, WDFTIMER,
+    WDF_TIMER_CONFIG, WDFDEVICE, WDFDRIVER, WDFQUEUE, WDFQUEUE__, WDFREQUEST, WDFTIMER,
     call_unsafe_wdf_function_binding, windows::OutputDebugStringA,
 };
 
 // ---- NTSTATUS values ----
 const STATUS_SUCCESS: NTSTATUS = 0;
-const STATUS_UNSUCCESSFUL: NTSTATUS = 0xC000_0001u32 as NTSTATUS;
 const STATUS_NOT_IMPLEMENTED: NTSTATUS = 0xC000_0002u32 as NTSTATUS;
 const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000_000Du32 as NTSTATUS;
-const STATUS_INVALID_BUFFER_SIZE: NTSTATUS = 0xC000_0206u32 as NTSTATUS;
 
-#[inline]
-fn nt_success(s: NTSTATUS) -> bool {
-    s >= 0
-}
+use pf_umdf_util::nt_success;
 
 // ---- HID minidriver IOCTLs: CTL_CODE(FILE_DEVICE_KEYBOARD=0x0b, id, METHOD_NEITHER=3, ANY) ----
 const fn hid_ctl(id: u32) -> u32 {
@@ -225,26 +228,45 @@ static MANUAL_QUEUE: AtomicPtr<WDFQUEUE__> = AtomicPtr::new(core::ptr::null_mut(
 /// to pended game READ_REPORTs. Defaults to neutral until the host connects.
 static INPUT_REPORT: std::sync::Mutex<[u8; 64]> = std::sync::Mutex::new(NEUTRAL_REPORT);
 
-// ---- user-mode shared-memory IPC with the punktfunk host ----
+// ---- the sealed pad channel: layouts + offsets from pf_driver_proto (drift = compile error) ----
 // UMDF runs in WUDFHost.exe (user-mode) and hidclass blocks a control channel on the device stack
 // (custom interface CreateFile → err 31; custom IOCTL on the HID handle → err 1) and UMDF has no
-// control device, so the host channel is a named section the (privileged) host CREATES and the driver
-// OPENS. Layout (256 B, must match pf_driver_proto::gamepad::PadShm): magic u32 @0 ("PFDS"),
-// input_seq u32 @4, input_report[64] @8, output_seq u32 @72, output_report[64] @76,
-// device_type u8 @140, driver_proto u32 @144 (we stamp GAMEPAD_PROTO_VERSION = the host's
-// driver-attach health signal), driver_heartbeat u32 @148 (we bump per timer tick = liveness).
-const FILE_MAP_RW: u32 = 0x0002 | 0x0004; // FILE_MAP_WRITE | FILE_MAP_READ
-const SHM_MAGIC: u32 = 0x5046_4453; // "PFDS" little-endian
-const SHM_SIZE: usize = 256;
-const GAMEPAD_PROTO_VERSION: u32 = 1; // must match pf_driver_proto::gamepad::GAMEPAD_PROTO_VERSION
-static LOGGED_SHM: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// control device. So the DATA section (`PadShm`, 256 B — input report @8, output seq @72, output
+// report @76, device_type @140, health marks @144/@148, pad_index @152) is UNNAMED and reached only
+// through a handle the SYSTEM host duplicated into this WUDFHost, bootstrapped over the named mailbox
+// `Global\pfds-boot-<index>`. The handshake + all shared-memory access live in `pf_umdf_util`.
+const SHM_MAGIC: u32 = pf_driver_proto::gamepad::PAD_MAGIC; // "PFDS"
+const SHM_SIZE: usize = core::mem::size_of::<PadShm>();
+const GAMEPAD_PROTO_VERSION: u32 = pf_driver_proto::gamepad::GAMEPAD_PROTO_VERSION;
 
-// kernel32 file-mapping APIs (resolved via std's kernel32 import; UMDF permits file mapping).
-unsafe extern "system" {
-    fn OpenFileMappingW(access: u32, inherit: i32, name: *const u16) -> *mut c_void;
-    fn MapViewOfFile(h: *mut c_void, access: u32, hi: u32, lo: u32, len: usize) -> *mut c_void;
-    fn UnmapViewOfFile(addr: *const c_void) -> i32;
-    fn CloseHandle(h: *mut c_void) -> i32;
+// PadShm field offsets (the driver reads input + device_type, writes output + health marks).
+const OFF_INPUT: usize = core::mem::offset_of!(PadShm, input);
+const OFF_OUT_SEQ: usize = core::mem::offset_of!(PadShm, out_seq);
+const OFF_OUTPUT: usize = core::mem::offset_of!(PadShm, output);
+const OFF_DEVICE_TYPE: usize = core::mem::offset_of!(PadShm, device_type);
+const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(PadShm, driver_proto);
+const OFF_DRIVER_HEARTBEAT: usize = core::mem::offset_of!(PadShm, driver_heartbeat);
+const OFF_PAD_INDEX: usize = core::mem::offset_of!(PadShm, pad_index);
+
+/// The sealed-channel client (per-pad: `ProcessSharingDisabled` gives each pad its own WUDFHost, so
+/// this static is per-pad). The handshake/adoption/validation state machine lives in `pf_umdf_util`.
+static CHANNEL: ChannelClient = ChannelClient::new();
+/// The last observed `device_type` (0 = DualSense, 1 = DualShock 4) — the neutral-report shape when
+/// the channel detaches, and the fallback identity while unattached.
+static LAST_DEVTYPE: AtomicU32 = AtomicU32::new(0);
+/// device_type()'s bounded first-read wait fires at most once (see its docs).
+static DEVTYPE_WAITED: AtomicBool = AtomicBool::new(false);
+
+/// This pad's channel config (magic/size/pad_index offset + our logger).
+fn channel_cfg() -> ChannelConfig {
+    ChannelConfig {
+        tag: "pf-ds",
+        boot_name_prefix: "Global\\pfds-boot-",
+        data_magic: SHM_MAGIC,
+        data_size: SHM_SIZE,
+        pad_index_off: OFF_PAD_INDEX,
+        log,
+    }
 }
 
 fn log(s: &str) {
@@ -289,59 +311,6 @@ pub unsafe extern "system" fn driver_entry(
     }
 }
 
-/// The pad index this device serves (which `pfds-shm-<index>` section to map). The host stamps it into
-/// the device Location (`pszDeviceLocation`); the driver reads it in EvtDeviceAdd. With
-/// `UmdfHostProcessSharing=ProcessSharingDisabled` (the INF) each pad gets its own WUDFHost, so this
-/// static is per-pad — the basis for multi-pad.
-static SHM_INDEX: AtomicU32 = AtomicU32::new(0);
-/// DEVICE_REGISTRY_PROPERTY: DevicePropertyLocationInformation (not re-exported at the wdk_sys root).
-const DEVICE_PROPERTY_LOCATION_INFORMATION: i32 = 10;
-
-/// Read the pad index the host stamped into the device Location (a NUL-terminated UTF-16 decimal
-/// string). Defaults to 0 (single-pad) if absent.
-fn query_shm_index(device: WDFDEVICE) -> u32 {
-    let mut mem: WDFMEMORY = core::ptr::null_mut();
-    // SAFETY: device valid; property = LocationInformation; pool ignored in UMDF; mem receives the handle.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceAllocAndQueryProperty,
-            device,
-            DEVICE_PROPERTY_LOCATION_INFORMATION,
-            0,
-            WDF_NO_OBJECT_ATTRIBUTES,
-            &mut mem
-        )
-    };
-    if !nt_success(st) || mem.is_null() {
-        return 0;
-    }
-    let mut len: usize = 0;
-    // SAFETY: mem valid.
-    let buf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, mem, &mut len) }
-        as *const u16;
-    if buf.is_null() {
-        return 0;
-    }
-    let mut idx: u32 = 0;
-    let mut any = false;
-    for i in 0..(len / 2).min(8) {
-        // SAFETY: buf valid for len bytes; i < len/2.
-        let c = unsafe { *buf.add(i) };
-        if c == 0 {
-            break;
-        }
-        if (0x30..=0x39).contains(&c) {
-            idx = idx.wrapping_mul(10).wrapping_add((c - 0x30) as u32);
-            any = true;
-        }
-    }
-    if any {
-        idx
-    } else {
-        0
-    }
-}
-
 extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INIT) -> NTSTATUS {
     log("[pf-ds] EvtDeviceAdd");
 
@@ -364,8 +333,9 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         return st;
     }
 
-    let shm_idx = query_shm_index(device);
-    SHM_INDEX.store(shm_idx, Ordering::Relaxed);
+    // SAFETY: `device` is the live device just created — the exact contract this fn requires.
+    let shm_idx = unsafe { wdf::query_location_index(device) };
+    CHANNEL.set_index(shm_idx);
     dbglog!("[pf-ds] shm index = {shm_idx}");
 
     // Default parallel queue handling all IOCTLs.
@@ -428,6 +398,8 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     tcfg.EvtTimerFunc = Some(evt_timer);
     tcfg.Period = 8; // ms
     tcfg.AutomaticSerialization = 1; // TRUE — UMDF requires a serialized timer (vhidmini2 pattern)
+    // SAFETY: a zeroed WDF_OBJECT_ATTRIBUTES is a valid all-null attributes struct; we set Size + the
+    // fields we use below.
     let mut tattr: WDF_OBJECT_ATTRIBUTES = unsafe { core::mem::zeroed() };
     tattr.Size = core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG;
     tattr.ParentObject = manual_queue.cast();
@@ -458,140 +430,72 @@ extern "C" fn evt_io_device_control(
     _input_len: usize,
     ioctl: ULONG,
 ) {
-    let mut complete = true;
+    // SAFETY: `request` is the live request for THIS EvtIoDeviceControl invocation — exactly the
+    // contract `Request::new` requires. Everything after is safe (the token owns completion).
+    let request = unsafe { Request::new(request) };
+
     // Skip the 8ms READ_REPORT cadence so the log stays readable during a game test;
     // the 0x02 OUTPUT report (the gate) and the descriptor handshake still log.
     if ioctl != IOCTL_HID_READ_REPORT {
         dbglog!("[pf-ds] ioctl 0x{ioctl:08x} out={_output_len} in={_input_len}");
     }
+
+    // READ_REPORT forwards to the manual queue (the timer completes it) — this CONSUMES the request
+    // token, so it's handled apart from the status-and-complete paths below.
+    if ioctl == IOCTL_HID_READ_REPORT {
+        let mq: WDFQUEUE = MANUAL_QUEUE.load(Ordering::SeqCst);
+        // SAFETY: `mq` is the manual queue created in EvtDeviceAdd (a live WDFQUEUE of this device).
+        match unsafe { request.forward_to_queue(mq) } {
+            Ok(()) => {}                        // framework owns it now (completed by the timer)
+            Err((req, st)) => req.complete(st), // forward failed → complete with the error
+        }
+        return;
+    }
+
     let status: NTSTATUS = match ioctl {
-        IOCTL_HID_GET_DEVICE_DESCRIPTOR => {
-            copy_to_output(request, if device_type() == 1 { &DS4_HID_DESC } else { &HID_DESC })
-        }
-        IOCTL_HID_GET_DEVICE_ATTRIBUTES => copy_to_output(request, &hid_attrs(device_type() == 1)),
-        IOCTL_HID_GET_REPORT_DESCRIPTOR => copy_to_output(
-            request,
-            if device_type() == 1 {
-                &DS4_RDESC[..]
-            } else {
-                &DUALSENSE_RDESC[..]
-            },
-        ),
-        IOCTL_HID_READ_REPORT => {
-            let mq: WDFQUEUE = MANUAL_QUEUE.load(Ordering::SeqCst);
-            // SAFETY: request valid; mq is the manual queue created in EvtDeviceAdd.
-            let st = unsafe {
-                call_unsafe_wdf_function_binding!(WdfRequestForwardToIoQueue, request, mq)
-            };
-            if nt_success(st) {
-                complete = false;
-                STATUS_SUCCESS
-            } else {
-                st
-            }
-        }
+        IOCTL_HID_GET_DEVICE_DESCRIPTOR => request.copy_to_output(if device_type() == 1 {
+            &DS4_HID_DESC
+        } else {
+            &HID_DESC
+        }),
+        IOCTL_HID_GET_DEVICE_ATTRIBUTES => request.copy_to_output(&hid_attrs(device_type() == 1)),
+        IOCTL_HID_GET_REPORT_DESCRIPTOR => request.copy_to_output(if device_type() == 1 {
+            &DS4_RDESC[..]
+        } else {
+            &DUALSENSE_RDESC[..]
+        }),
         IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => {
-            on_output_report(request, ioctl)
+            on_output_report(&request, ioctl)
         }
         IOCTL_UMDF_HID_SET_FEATURE => {
             log("[pf-ds] SET_FEATURE (stub ok)");
             STATUS_SUCCESS
         }
-        IOCTL_UMDF_HID_GET_FEATURE => on_get_feature(request),
+        IOCTL_UMDF_HID_GET_FEATURE => on_get_feature(&request),
         IOCTL_UMDF_HID_GET_INPUT_REPORT => {
-            copy_to_output(request, &neutral_report(device_type() == 1))
+            request.copy_to_output(&neutral_report(device_type() == 1))
         }
-        IOCTL_HID_GET_STRING => on_get_string(request),
+        IOCTL_HID_GET_STRING => on_get_string(&request),
         _ => STATUS_NOT_IMPLEMENTED,
     };
 
-    if ioctl != IOCTL_HID_READ_REPORT {
-        dbglog!(
-            "[pf-ds] ioctl 0x{ioctl:08x} -> 0x{:08x} complete={complete}",
-            status as u32
-        );
-    }
-    if complete {
-        // SAFETY: request valid and not forwarded.
-        unsafe { call_unsafe_wdf_function_binding!(WdfRequestComplete, request, status) };
-    }
-}
-
-// Copy `src` into the request's output memory and set the completed byte count.
-fn copy_to_output(request: WDFREQUEST, src: &[u8]) -> NTSTATUS {
-    let mut mem: WDFMEMORY = core::ptr::null_mut();
-    // SAFETY: request valid; mem receives the memory handle.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestRetrieveOutputMemory, request, &mut mem)
-    };
-    if !nt_success(st) {
-        return st;
-    }
-    let mut outlen: usize = 0;
-    // SAFETY: mem valid; outlen receives the buffer size.
-    let _ = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, mem, &mut outlen) };
-    if outlen < src.len() {
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
-    // SAFETY: mem valid; src is a valid buffer of src.len() bytes.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfMemoryCopyFromBuffer,
-            mem,
-            0usize,
-            src.as_ptr() as *mut c_void,
-            src.len()
-        )
-    };
-    if !nt_success(st) {
-        return st;
-    }
-    // SAFETY: request valid.
-    unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestSetInformation, request, src.len() as u64)
-    };
-    STATUS_SUCCESS
+    dbglog!("[pf-ds] ioctl 0x{ioctl:08x} -> 0x{:08x}", status as u32);
+    request.complete(status);
 }
 
 // The 0x02 gate: a game writing an output report (rumble / lightbar / ADAPTIVE TRIGGERS). Per the
 // UMDF marshalling convention the report data is the *input* buffer and the report id is carried in
-// the *output* buffer length. We log it.
-fn on_output_report(request: WDFREQUEST, ioctl: ULONG) -> NTSTATUS {
-    let mut inmem: WDFMEMORY = core::ptr::null_mut();
-    // SAFETY: request valid.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestRetrieveInputMemory, request, &mut inmem)
+// the *output* buffer length. We log it, then publish it to the DATA section for the host.
+fn on_output_report(request: &Request, ioctl: ULONG) -> NTSTATUS {
+    let (bytes, inlen) = match request.input_bytes(64) {
+        Ok(v) => v,
+        Err(st) => return st,
     };
-    if !nt_success(st) {
-        return st;
-    }
-    let mut inlen: usize = 0;
-    // SAFETY: inmem valid.
-    let inbuf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, inmem, &mut inlen) }
-        as *const u8;
+    let report_id = request.output_buffer_len() as u32; // report id, UMDF convention
 
-    // report id from output-buffer length (UMDF convention).
-    let mut report_id: u32 = 0;
-    let mut outmem: WDFMEMORY = core::ptr::null_mut();
-    // SAFETY: request valid; output memory is optional here.
-    if nt_success(unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestRetrieveOutputMemory, request, &mut outmem)
-    }) {
-        let mut outlen: usize = 0;
-        // SAFETY: outmem valid.
-        let _ =
-            unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, outmem, &mut outlen) };
-        report_id = outlen as u32;
-    }
-
-    let n = inlen.min(48);
     let mut hex = String::new();
-    if !inbuf.is_null() {
-        // SAFETY: inbuf valid for inlen bytes; we read at most n.
-        let bytes = unsafe { core::slice::from_raw_parts(inbuf, n) };
-        for b in bytes {
-            hex.push_str(&format!("{b:02x} "));
-        }
+    for b in bytes.iter().take(48) {
+        hex.push_str(&format!("{b:02x} "));
     }
     let kind = if ioctl == IOCTL_HID_WRITE_REPORT {
         "WRITE_REPORT"
@@ -600,45 +504,29 @@ fn on_output_report(request: WDFREQUEST, ioctl: ULONG) -> NTSTATUS {
     };
     dbglog!("[pf-ds] *** OUTPUT {kind} reportId={report_id} len={inlen} data: {hex}");
 
-    // Publish the game's 0x02 output report to shared memory for the host (rumble / lightbar /
-    // player-LEDs / adaptive triggers). output_report @76, output_seq @72.
-    if !inbuf.is_null() && inlen > 0 {
-        let n = inlen.min(64);
-        with_shm(|view| {
-            // SAFETY: view is a mapped 256-byte section; write the report then bump the host-polled seq.
-            unsafe {
-                core::ptr::copy_nonoverlapping(inbuf, view.add(76), n);
-                let seqp = view.add(72) as *mut u32;
-                let seq = core::ptr::read_unaligned(seqp).wrapping_add(1);
-                core::ptr::write_unaligned(seqp, seq);
-            }
-        });
+    // Publish the game's 0x02 output report to the sealed DATA section for the host (rumble /
+    // lightbar / player-LEDs / adaptive triggers), then bump the host-polled output seq.
+    if !bytes.is_empty()
+        && let Some(view) = CHANNEL.data()
+    {
+        view.write_bytes(OFF_OUTPUT, &bytes);
+        let seq = view.read_u32(OFF_OUT_SEQ).wrapping_add(1);
+        view.write_u32(OFF_OUT_SEQ, seq);
     }
 
-    // SAFETY: request valid.
-    unsafe { call_unsafe_wdf_function_binding!(WdfRequestSetInformation, request, inlen as u64) };
+    request.set_information(inlen as u64);
     STATUS_SUCCESS
 }
 
-// GET_FEATURE: report id from the input buffer; reply with the matching DualSense feature blob.
-fn on_get_feature(request: WDFREQUEST) -> NTSTATUS {
-    let mut inmem: WDFMEMORY = core::ptr::null_mut();
-    // SAFETY: request valid.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestRetrieveInputMemory, request, &mut inmem)
+// GET_FEATURE: report id from the input buffer; reply with the matching DualSense/DualShock 4 blob.
+fn on_get_feature(request: &Request) -> NTSTATUS {
+    let (bytes, _) = match request.input_bytes(1) {
+        Ok(v) => v,
+        Err(st) => return st,
     };
-    if !nt_success(st) {
-        return st;
-    }
-    let mut inlen: usize = 0;
-    // SAFETY: inmem valid.
-    let inbuf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, inmem, &mut inlen) }
-        as *const u8;
-    if inbuf.is_null() || inlen < 1 {
+    let Some(&report_id) = bytes.first() else {
         return STATUS_INVALID_PARAMETER;
-    }
-    // SAFETY: inbuf valid for >=1 byte.
-    let report_id = unsafe { *inbuf };
+    };
     // DualSense uses feature ids 0x05/0x09/0x20; DualShock 4 uses 0x02/0x12/0xa3.
     let blob: &[u8] = match (device_type() == 1, report_id) {
         (false, 0x05) => &DS_FEATURE_CALIBRATION,
@@ -652,31 +540,21 @@ fn on_get_feature(request: WDFREQUEST) -> NTSTATUS {
             return STATUS_INVALID_PARAMETER;
         }
     };
-    copy_to_output(request, blob)
+    request.copy_to_output(blob)
 }
 
 // IOCTL_HID_GET_STRING: the input is a ULONG whose low word is the string id and whose high word is
 // the language id. Reply with the requested device string as a NUL-terminated UTF-16 buffer. Native
 // PS5 / Steam code reads these (HidD_GetProductString / HidD_GetSerialNumberString — the serial is one
-// way they tell USB from BT); the old default returned STATUS_NOT_IMPLEMENTED, leaving them blank.
-// Observed live on this device, Windows polls ids 0x0E/0x0F/0x10 (lang 0x0409) cyclically — the
-// manufacturer/product/serial slots — NOT the 0/1/2 HID_STRING_ID_* constants; we map both forms.
-fn on_get_string(request: WDFREQUEST) -> NTSTATUS {
-    let mut inmem: WDFMEMORY = core::ptr::null_mut();
-    // SAFETY: request valid.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestRetrieveInputMemory, request, &mut inmem)
+// way they tell USB from BT). Observed live: Windows polls ids 0x0E/0x0F/0x10 (lang 0x0409)
+// cyclically — the manufacturer/product/serial slots — NOT the 0/1/2 HID_STRING_ID_* constants; both.
+fn on_get_string(request: &Request) -> NTSTATUS {
+    let (bytes, _) = match request.input_bytes(4) {
+        Ok(v) => v,
+        Err(st) => return st,
     };
-    if !nt_success(st) {
-        return st;
-    }
-    let mut inlen: usize = 0;
-    // SAFETY: inmem valid.
-    let inbuf = unsafe { call_unsafe_wdf_function_binding!(WdfMemoryGetBuffer, inmem, &mut inlen) }
-        as *const u8;
-    // SAFETY: inbuf is valid for inlen bytes; read the 4-byte id value when present.
-    let id_val: u32 = if !inbuf.is_null() && inlen >= 4 {
-        unsafe { core::ptr::read_unaligned(inbuf as *const u32) }
+    let id_val: u32 = if bytes.len() >= 4 {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     } else {
         0
     };
@@ -706,96 +584,81 @@ fn on_get_string(request: WDFREQUEST) -> NTSTATUS {
             }
         }
     };
-    let mut wide: Vec<u16> = s.encode_utf16().collect();
-    wide.push(0); // NUL terminator
-    // SAFETY: reinterpret the UTF-16 buffer as bytes for the byte-oriented copy_to_output.
-    let bytes = unsafe { core::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
-    copy_to_output(request, bytes)
+    let mut wide: Vec<u8> = Vec::with_capacity(s.len() * 2 + 2);
+    for u in s.encode_utf16() {
+        wide.extend_from_slice(&u.to_le_bytes());
+    }
+    wide.extend_from_slice(&[0, 0]); // NUL terminator (UTF-16)
+    request.copy_to_output(&wide)
 }
 
-// Open + map the host's shared-memory section (Global\pfds-shm-0) and run `f` against the mapped base
-// if it exists with a valid magic, then unmap. NOT cached: re-mapped per access so the driver always
-// sees the current section (UMDF groups all devices in one WUDFHost, and the host may recreate the
-// section across restarts — a cached view would go stale). ~125 maps/s from the timer = negligible.
-fn with_shm<F: FnOnce(*mut u8)>(f: F) {
-    let name: Vec<u16> = format!("Global\\pfds-shm-{}", SHM_INDEX.load(Ordering::Relaxed))
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: name is a valid NUL-terminated UTF-16 string.
-    let h = unsafe { OpenFileMappingW(FILE_MAP_RW, 0, name.as_ptr()) };
-    if h.is_null() {
-        return;
-    }
-    // SAFETY: h is a valid mapping handle; map the whole section. The view keeps the section alive,
-    // so the handle can be closed right away.
-    let view = unsafe { MapViewOfFile(h, FILE_MAP_RW, 0, 0, SHM_SIZE) } as *mut u8;
-    unsafe { CloseHandle(h) };
-    if view.is_null() {
-        return;
-    }
-    // SAFETY: view points at >= 4 mapped bytes.
-    let magic = unsafe { core::ptr::read_unaligned(view as *const u32) };
-    if magic == SHM_MAGIC {
-        if !LOGGED_SHM.swap(true, Ordering::Relaxed) {
-            dbglog!(
-                "[pf-ds] control: shared memory mapped (Global\\pfds-shm-{})",
-                SHM_INDEX.load(Ordering::Relaxed)
-            );
-        }
-        f(view);
-    }
-    // SAFETY: view came from MapViewOfFile.
-    unsafe { UnmapViewOfFile(view as *const c_void) };
-}
-
-/// The host's device-type selector from shared memory (`device_type` byte @140): 0 = DualSense
-/// (default), 1 = DualShock 4. Read fresh on each enumeration query — cheap, and the host stamps the
-/// section before `SwDeviceCreate`, so it's set by the time hidclass asks for the descriptor /
-/// attributes. Defaults to DualSense if the section isn't mapped yet (magic absent).
+/// The host's device-type selector from the sealed DATA section (`device_type` @140): 0 = DualSense
+/// (default), 1 = DualShock 4. Read fresh on each enumeration query — cheap. If the channel hasn't
+/// attached when hidclass first asks (the host stamps the section + eager-delivers before
+/// `SwDeviceCreate` returns, but the handshake can be a few ms behind), pump the channel briefly —
+/// ONCE — for the delivery: a DS4 pad must not enumerate with the default DualSense identity because
+/// of a lost race. After that one bounded wait, fall back to the last observed type.
 fn device_type() -> u8 {
-    let mut t = 0u8;
-    with_shm(|view| {
-        // SAFETY: view points at a mapped 256-byte section; the device-type byte is at offset 140.
-        t = unsafe { *view.add(140) };
-    });
-    t
+    if let Some(view) = CHANNEL.data() {
+        let t = view.read_u8(OFF_DEVICE_TYPE);
+        LAST_DEVTYPE.store(t as u32, Ordering::Relaxed);
+        return t;
+    }
+    if !DEVTYPE_WAITED.swap(true, Ordering::SeqCst) {
+        let cfg = channel_cfg();
+        for _ in 0..100 {
+            if let Some(view) = CHANNEL.pump(&cfg) {
+                let t = view.read_u8(OFF_DEVICE_TYPE);
+                LAST_DEVTYPE.store(t as u32, Ordering::Relaxed);
+                return t;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        dbglog!(
+            "[pf-ds] device_type: sealed channel not attached within 1s — defaulting to the last observed identity"
+        );
+    }
+    LAST_DEVTYPE.load(Ordering::Relaxed) as u8
 }
 
 extern "C" fn evt_timer(timer: WDFTIMER) {
-    // Pull the latest host input report from shared memory (if the host has connected).
-    with_shm(|view| {
-        let mut buf = [0u8; 64];
-        // SAFETY: view points at a mapped 256-byte section; input lives at offset 8..72.
-        unsafe { core::ptr::copy_nonoverlapping(view.add(8), buf.as_mut_ptr(), 64) };
-        if buf[0] == 0x01 {
-            if let Ok(mut g) = INPUT_REPORT.lock() {
+    // One sealed-channel tick: publish our pid / adopt a delivery / detect host-gone, then pull the
+    // latest host input report from the attached DATA section (all safe, via pf_umdf_util).
+    match CHANNEL.pump(&channel_cfg()) {
+        Some(view) => {
+            let mut buf = [0u8; 64];
+            view.read_bytes(OFF_INPUT, &mut buf);
+            if buf[0] == 0x01
+                && let Ok(mut g) = INPUT_REPORT.lock()
+            {
                 *g = buf;
             }
+            // Health marks the host watches: driver_proto (attach signal, idempotent) and
+            // driver_heartbeat (+1 per ~8 ms tick = liveness). Lets the host tell "driver bound
+            // and alive" apart from "driver package missing/failed to bind".
+            view.write_u32(OFF_DRIVER_PROTO, GAMEPAD_PROTO_VERSION);
+            let hb = view.read_u32(OFF_DRIVER_HEARTBEAT).wrapping_add(1);
+            view.write_u32(OFF_DRIVER_HEARTBEAT, hb);
         }
-        // Health marks the host watches: driver_proto @144 (attach signal, idempotent) and
-        // driver_heartbeat @148 (+1 per ~8 ms tick = liveness). Lets the host tell "driver bound
-        // and alive" apart from "driver package missing/failed to bind".
-        // SAFETY: view points at a mapped 256-byte section; proto @144, heartbeat @148.
-        unsafe {
-            core::ptr::write_unaligned(view.add(144) as *mut u32, GAMEPAD_PROTO_VERSION);
-            let hb = view.add(148) as *mut u32;
-            core::ptr::write_unaligned(hb, core::ptr::read_unaligned(hb).wrapping_add(1));
+        None => {
+            // Host gone (mailbox name vanished) or channel not attached yet: feed games the neutral
+            // report instead of a frozen last state (matters for the persistent out-of-band devnode,
+            // which outlives host sessions).
+            if let Ok(mut g) = INPUT_REPORT.lock() {
+                *g = neutral_report(LAST_DEVTYPE.load(Ordering::Relaxed) == 1);
+            }
         }
-    });
-    // SAFETY: timer valid; parent is the manual queue.
+    }
+
+    // Complete the next pended READ_REPORT with the current input report (safe queue/request API).
+    // SAFETY: the timer's parent object is the manual queue (set in EvtDeviceAdd); the framework
+    // guarantees a live handle here.
     let queue =
         unsafe { call_unsafe_wdf_function_binding!(WdfTimerGetParentObject, timer) } as WDFQUEUE;
-    let mut request: WDFREQUEST = core::ptr::null_mut();
-    // SAFETY: queue valid; request receives the next pended request if any.
-    let st = unsafe {
-        call_unsafe_wdf_function_binding!(WdfIoQueueRetrieveNextRequest, queue, &mut request)
-    };
-    if nt_success(st) {
+    // SAFETY: `queue` is that live manual queue — the exact contract `retrieve_next_request` needs.
+    if let Some(request) = unsafe { wdf::retrieve_next_request(queue) } {
         let report = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
-        let s = copy_to_output(request, &report);
-        // SAFETY: request valid and dequeued.
-        unsafe { call_unsafe_wdf_function_binding!(WdfRequestComplete, request, s) };
+        let st = request.copy_to_output(&report);
+        request.complete(st);
     }
-    let _ = STATUS_UNSUCCESSFUL; // keep the const referenced
 }

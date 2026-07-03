@@ -42,8 +42,10 @@ AddReg=pf_vdisplay_HardwareDeviceSettings
 [pf_vdisplay_HardwareDeviceSettings]
 HKR, , "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
 HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "pfVDisplayGroup"
-; Let the host (LocalSystem service) + admins open the control device for the ADD/REMOVE/PING IOCTLs.
-HKR, , "Security", , "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
+; Only the host (LocalSystem service) + admins may open the control device. Deliberately NO Everyone
+; ACE (SudoVDA ships one for its user-mode host): the control plane creates/removes monitors and
+; bootstraps the sealed frame channel (IOCTL_SET_FRAME_CHANNEL), so it is not for unprivileged callers.
+HKR, , "Security", , "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
 
 [pf_vdisplay_Install.NT.Services]
 AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall

@@ -53,6 +53,11 @@ pub struct MonitorObject {
     /// The live swap-chain drain worker, set by `assign_swap_chain` and dropped (RAII-joins the worker
     /// thread) by `unassign_swap_chain` / departure (STEP 5).
     pub swap_chain_processor: Option<crate::swap_chain_processor::SwapChainProcessor>,
+    /// The host's sealed-channel delivery (`IOCTL_SET_FRAME_CHANNEL`) awaiting pickup by the swap-chain
+    /// worker ([`take_frame_channel`]). Exactly one owner per delivery: replacing or dropping the entry
+    /// closes an unconsumed channel's handles via [`FrameChannel`]'s `Drop`, so no delivery can leak
+    /// handles in the WUDFHost table whatever the monitor's fate.
+    pub frame_channel: Option<crate::frame_transport::FrameChannel>,
     /// When the entry was created — the watchdog skips still-initializing monitors.
     pub created_at: Instant,
 }
@@ -256,8 +261,8 @@ pub fn modes_for_object(object: iddcx::IDDCX_MONITOR) -> Option<Vec<Mode>> {
         .map(|m| m.modes.clone())
 }
 
-/// The OS target id stamped on the monitor whose handle matches (used by `assign_swap_chain` to name the
-/// shared-ring objects). `None` if the monitor isn't found.
+/// The OS target id stamped on the monitor whose handle matches (used by `assign_swap_chain` to key the
+/// frame-channel stash for its worker). `None` if the monitor isn't found.
 pub fn target_id_for_object(object: iddcx::IDDCX_MONITOR) -> Option<u32> {
     MONITOR_MODES
         .lock()
@@ -265,6 +270,52 @@ pub fn target_id_for_object(object: iddcx::IDDCX_MONITOR) -> Option<u32> {
         .iter()
         .find(|m| m.object == Some(object))
         .map(|m| m.target_id)
+}
+
+/// Stash a host frame-channel delivery on the monitor with `target_id` (an ARRIVED monitor — a pending
+/// entry's `target_id` is still 0, which the host can never send since OS target ids are non-zero).
+/// Replacing an unconsumed delivery drops it → its handles close (it WAS adopted by a prior success).
+/// `Err(ch)` if no such monitor exists — the caller must NOT close those handles (the host only sees
+/// the error status and reaps its remote duplicates itself; closing here too would double-close values
+/// the OS may have reused).
+pub fn set_frame_channel(
+    target_id: u32,
+    ch: crate::frame_transport::FrameChannel,
+) -> Result<(), crate::frame_transport::FrameChannel> {
+    if target_id == 0 {
+        return Err(ch);
+    }
+    let mut lock = lock_monitors();
+    if let Some(m) = lock.iter_mut().find(|m| m.target_id == target_id) {
+        m.frame_channel = Some(ch);
+        Ok(())
+    } else {
+        Err(ch)
+    }
+}
+
+/// Take (remove) the pending frame-channel delivery for `target_id`, transferring handle ownership to
+/// the caller (the swap-chain worker's attach). `None` until the host delivers one.
+pub fn take_frame_channel(target_id: u32) -> Option<crate::frame_transport::FrameChannel> {
+    if target_id == 0 {
+        return None;
+    }
+    lock_monitors()
+        .iter_mut()
+        .find(|m| m.target_id == target_id)?
+        .frame_channel
+        .take()
+}
+
+/// Is a frame-channel delivery pending for `target_id`? The swap-chain worker treats a pending
+/// delivery as NEWEST-WINS: it supersedes an attached publisher, because the host only re-delivers
+/// after (re)creating the ring — and a retry-created ring is a DIFFERENT header mapping, whose
+/// generation bump an old publisher (mapped to the previous header) can never observe.
+pub fn has_frame_channel(target_id: u32) -> bool {
+    target_id != 0
+        && lock_monitors()
+            .iter()
+            .any(|m| m.target_id == target_id && m.frame_channel.is_some())
 }
 
 /// Install a swap-chain processor on the monitor whose handle matches, returning any PREVIOUS processor
@@ -351,6 +402,7 @@ pub fn create_monitor(
             adapter_luid_low: 0,
             adapter_luid_high: 0,
             swap_chain_processor: None,
+            frame_channel: None,
             created_at: Instant::now(),
         });
         id

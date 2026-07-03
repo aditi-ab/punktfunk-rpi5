@@ -23,6 +23,8 @@ wdk-build.workspace = true
 [dependencies]
 wdk.workspace = true
 wdk-sys.workspace = true
+pf-driver-proto.workspace = true
+pf-umdf-util.workspace = true
 
 [features]
 default = []

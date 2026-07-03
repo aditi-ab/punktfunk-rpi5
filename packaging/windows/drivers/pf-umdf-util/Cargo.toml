@@ -1,0 +1,17 @@
+# pf-umdf-util - the audited unsafe-primitive layer under the punktfunk UMDF gamepad drivers.
+# Everything a pad driver does with raw pointers or Win32/WDF FFI lives HERE, behind small safe
+# (or explicitly-contracted unsafe) APIs, so the driver crates' business logic is 100% safe Rust:
+#   section  - MappedView: bounds+alignment-checked shared-memory access (atomics for sync fields)
+#   channel  - ChannelClient: the sealed pad channel's driver-side state machine (a SAFE module)
+#   wdf      - Request/queue/device-property helpers over call_unsafe_wdf_function_binding
+[package]
+name = "pf-umdf-util"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+description = "punktfunk UMDF driver util: safe shared-memory + sealed-channel + WDF request primitives"
+
+[dependencies]
+wdk-sys.workspace = true
+pf-driver-proto.workspace = true

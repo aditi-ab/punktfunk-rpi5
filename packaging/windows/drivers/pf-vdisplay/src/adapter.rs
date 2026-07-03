@@ -36,6 +36,8 @@ struct SendAdapter(iddcx::IDDCX_ADAPTER);
 // SAFETY: an opaque IddCx handle, used only as an argument to IddCx DDIs (themselves the synchronisation
 // point) — never dereferenced in Rust. Storing it across threads in a OnceLock is sound.
 unsafe impl Send for SendAdapter {}
+// SAFETY: as above — the handle is only ever passed by value to IddCx DDIs, never dereferenced, so
+// shared `&SendAdapter` access across threads is sound.
 unsafe impl Sync for SendAdapter {}
 
 static ADAPTER: OnceLock<SendAdapter> = OnceLock::new();

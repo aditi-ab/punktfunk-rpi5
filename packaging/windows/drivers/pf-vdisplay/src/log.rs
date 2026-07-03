@@ -45,11 +45,11 @@ pub fn log(s: &str) {
         unsafe { OutputDebugStringA(c.as_ptr().cast()) };
     }
     use std::io::Write;
-    if let Some(m) = file_appender() {
-        if let Ok(mut f) = m.lock() {
-            let _ = writeln!(f, "{s}");
-            let _ = f.flush();
-        }
+    if let Some(m) = file_appender()
+        && let Ok(mut f) = m.lock()
+    {
+        let _ = writeln!(f, "{s}");
+        let _ = f.flush();
     }
 }
 

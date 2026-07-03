@@ -1,33 +1,33 @@
 //! Virtual Sony DualShock 4 on Windows via the UMDF minidriver — the PS4 sibling of
-//! [`super::dualsense_windows`]. Same transport (a per-session `SwDeviceCreate` devnode + the
-//! `Global\pfds-shm-<idx>` shared section the driver maps), same controller model ([`DsState`]); only
-//! the PnP identity (`VID_054C&PID_09CC`, hardware id `pf_dualshock4`) and the report codec
-//! ([`super::dualshock4_proto`]) differ. The host stamps `device_type = 1` (DualShock 4) into the
-//! section so the one UMDF driver serves the DS4 descriptor / attributes / features instead of the
-//! DualSense ones. Feedback is motor rumble (universal 0xCA plane) + the lightbar (0xCD `Led`); a DS4
-//! has no adaptive triggers / player LEDs.
+//! [`super::dualsense_windows`]. Same transport (a per-session `SwDeviceCreate` devnode + the sealed
+//! shared-memory channel bootstrapped via `Global\pfds-boot-<idx>`), same controller model
+//! ([`DsState`]); only the PnP identity (`VID_054C&PID_09CC`, hardware id `pf_dualshock4`) and the
+//! report codec ([`super::dualshock4_proto`]) differ. The host stamps `device_type = 1` (DualShock 4)
+//! into the DATA section so the one UMDF driver serves the DS4 descriptor / attributes / features
+//! instead of the DualSense ones. Feedback is motor rumble (universal 0xCA plane) + the lightbar
+//! (0xCD `Led`); a DS4 has no adaptive triggers / player LEDs.
 
 use super::dualsense_proto::DsState;
 use super::dualsense_windows::{
     create_swdevice, SwDeviceProfile, DEVTYPE_DUALSHOCK4, OFF_DEVTYPE, OFF_DRIVER_PROTO, OFF_INPUT,
-    OFF_OUTPUT, OFF_OUT_SEQ, SHM_MAGIC, SHM_SIZE,
+    OFF_OUTPUT, OFF_OUT_SEQ, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
 };
 use super::dualshock4_proto::{
     parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
 };
+use super::gamepad_raii::PadChannel;
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use anyhow::Result;
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::time::{Duration, Instant};
-use windows::core::HSTRING;
 
-/// A single virtual DualShock 4: the `SwDeviceCreate`'d `pf_ds4_<index>` devnode plus the mapped
-/// shared section. Dropping it removes the devnode and unmaps + closes the section.
+/// A single virtual DualShock 4: the `SwDeviceCreate`'d `pf_ds4_<index>` devnode plus the sealed
+/// shared-memory channel. Dropping it removes the devnode and closes both sections.
 struct Ds4WinPad {
     /// Per-session devnode from SwDeviceCreate, when it succeeds (RAII — `SwDeviceClose` on drop).
     _sw: Option<super::gamepad_raii::SwDevice>,
-    /// The named shared section the driver maps (RAII — unmapped + closed on drop).
-    shm: super::gamepad_raii::Shm,
+    /// The sealed channel: unnamed DATA section (`PadShm`) + bootstrap mailbox + handle delivery.
+    channel: PadChannel,
     /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
     attach: super::gamepad_raii::DriverAttach,
     counter: u8,
@@ -36,16 +36,19 @@ struct Ds4WinPad {
 }
 
 impl Ds4WinPad {
-    /// Create + map the section, stamp `device_type = DualShock 4` + a neutral report + the magic,
-    /// then spawn the `pf_ds4_<index>` devnode (the driver loads on it and maps the section).
+    /// Create the sealed channel, stamp `device_type = DualShock 4` + the pad index + a neutral
+    /// report + the magic LAST, then spawn the `pf_ds4_<index>` devnode (the driver loads on it and
+    /// receives the DATA handle over the bootstrap).
     fn open(index: u8) -> Result<Ds4WinPad> {
-        let shm_name = pf_driver_proto::gamepad::pad_shm_name(index);
-        let shm = super::gamepad_raii::Shm::create(&HSTRING::from(shm_name.as_str()), SHM_SIZE)?;
-        let base = shm.base();
-        // device-type FIRST (so it's visible the moment magic is), neutral report, magic LAST.
-        // SAFETY: base points at SHM_SIZE writable bytes; OFF_DEVTYPE/OFF_INPUT are in range.
+        let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
+        let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
+        let base = channel.data_base();
+        // device-type FIRST (so it's visible the moment magic is), pad index, neutral report,
+        // magic LAST.
+        // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range.
         unsafe {
             *base.add(OFF_DEVTYPE) = DEVTYPE_DUALSHOCK4;
+            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
             std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; DS4_INPUT_REPORT_LEN], {
                 let mut r = [0u8; DS4_INPUT_REPORT_LEN];
                 serialize_state(&mut r, &DsState::neutral(), 0, 0);
@@ -68,14 +71,18 @@ impl Ds4WinPad {
             }
         };
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
+        // Bounded eager delivery — for the DS4 this is what closes the identity race: the driver
+        // must read `device_type = 1` from the delivered DATA section before hidclass asks it for
+        // descriptors, or the pad would enumerate with the (default) DualSense identity.
+        channel.deliver_eager(Duration::from_millis(1500));
         Ok(Ds4WinPad {
             _sw,
-            shm,
+            channel,
             attach: super::gamepad_raii::DriverAttach::new(
                 "pf_dualshock4",
                 "pf_dualsense.inf", // one driver package serves both HID identities
                 "C:\\Users\\Public\\pfds-driver.log",
-                shm_name,
+                boot_name,
                 instance_id,
             ),
             counter: 0,
@@ -92,29 +99,40 @@ impl Ds4WinPad {
         serialize_state(&mut r, st, self.counter, self.ts);
         // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
         unsafe {
-            std::ptr::copy_nonoverlapping(r.as_ptr(), self.shm.base().add(OFF_INPUT), r.len())
+            std::ptr::copy_nonoverlapping(
+                r.as_ptr(),
+                self.channel.data_base().add(OFF_INPUT),
+                r.len(),
+            )
         };
     }
 
     /// Poll the section's output slot; parse a new `0x05` report (rumble / lightbar) into a
     /// [`Ds4Feedback`]. Returns empty feedback if the driver hasn't published anything new. Also
-    /// feeds the driver-attach health watcher (the driver's ~125 Hz timer stamps `driver_proto`).
+    /// ticks the sealed-channel delivery and feeds the driver-attach health watcher (the driver's
+    /// ~125 Hz timer stamps `driver_proto`).
     fn service(&mut self) -> Ds4Feedback {
+        self.channel.pump();
         let mut fb = Ds4Feedback::default();
         // SAFETY: base points at SHM_SIZE bytes.
         let proto = unsafe {
-            std::ptr::read_unaligned(self.shm.base().add(OFF_DRIVER_PROTO) as *const u32)
+            std::ptr::read_unaligned(self.channel.data_base().add(OFF_DRIVER_PROTO) as *const u32)
         };
         self.attach.observe(proto);
         // SAFETY: base points at SHM_SIZE bytes.
-        let seq =
-            unsafe { std::ptr::read_unaligned(self.shm.base().add(OFF_OUT_SEQ) as *const u32) };
+        let seq = unsafe {
+            std::ptr::read_unaligned(self.channel.data_base().add(OFF_OUT_SEQ) as *const u32)
+        };
         if seq != self.last_out_seq {
             self.last_out_seq = seq;
             let mut out = [0u8; 64];
             // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
             unsafe {
-                std::ptr::copy_nonoverlapping(self.shm.base().add(OFF_OUTPUT), out.as_mut_ptr(), 64)
+                std::ptr::copy_nonoverlapping(
+                    self.channel.data_base().add(OFF_OUTPUT),
+                    out.as_mut_ptr(),
+                    64,
+                )
             };
             parse_ds4_output(&out, &mut fb);
         }

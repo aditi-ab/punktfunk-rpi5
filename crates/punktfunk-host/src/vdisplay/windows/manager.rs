@@ -39,11 +39,13 @@ pub(crate) enum MonitorKey {
     Session(u64),
 }
 
-/// What a backend's `add_monitor` returns: the REMOVE key + the OS target id + the render LUID.
+/// What a backend's `add_monitor` returns: the REMOVE key + the OS target id + the render LUID + the
+/// driver's WUDFHost pid (the sealed frame channel's handle-duplication target).
 pub(crate) struct AddedMonitor {
     pub key: MonitorKey,
     pub target_id: u32,
     pub luid: LUID,
+    pub wudf_pid: u32,
 }
 
 /// The backend-specific IOCTL surface — the *only* thing that differs between SudoVDA and pf-vdisplay.
@@ -91,6 +93,9 @@ struct Monitor {
     key: MonitorKey,
     target_id: u32,
     luid: LUID,
+    /// The driver's WUDFHost pid (from the ADD reply) — carried into [`WinCaptureTarget`] so the
+    /// IDD-push capturer knows where to duplicate the sealed frame channel's handles.
+    wudf_pid: u32,
     gdi_name: Option<String>,
     mode: Mode,
     stop: Arc<AtomicBool>,
@@ -109,6 +114,7 @@ impl Monitor {
                 adapter_luid: crate::capture::dxgi::pack_luid(self.luid),
                 gdi_name: n,
                 target_id: self.target_id,
+                wudf_pid: self.wudf_pid,
             })
     }
 }
@@ -164,6 +170,14 @@ pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayMa
 pub(crate) fn vdm() -> &'static VirtualDisplayManager {
     VDM.get()
         .expect("VirtualDisplayManager used before a backend initialised it")
+}
+
+/// The live pf-vdisplay control-device handle, for the IDD-push capturer's sealed-channel delivery
+/// (`IOCTL_SET_FRAME_CHANNEL`). Safe to hand out as a bare `HANDLE`: the device lives in a `OnceLock`
+/// that is never cleared or closed for the process lifetime. `None` before the first backend open —
+/// impossible for a capturer, which only exists on a monitor the manager created.
+pub(crate) fn control_device_handle() -> Option<HANDLE> {
+    VDM.get().and_then(VirtualDisplayManager::device_handle)
 }
 
 impl VirtualDisplayManager {
@@ -436,6 +450,7 @@ impl VirtualDisplayManager {
             key: added.key,
             target_id: added.target_id,
             luid: added.luid,
+            wudf_pid: added.wudf_pid,
             gdi_name,
             mode,
             stop,

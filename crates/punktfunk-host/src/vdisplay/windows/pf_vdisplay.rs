@@ -158,6 +158,33 @@ unsafe fn set_render_adapter(h: HANDLE, luid: LUID) -> Result<()> {
     .context("pf-vdisplay SET_RENDER_ADAPTER")
 }
 
+/// Deliver a monitor's sealed frame channel to the driver: the handle values `req` carries were just
+/// duplicated into the driver's WUDFHost by the IDD-push capturer's broker (`idd_push::ChannelBroker`),
+/// and on IOCTL success the DRIVER owns them. No output buffer. The caller reaps the remote duplicates
+/// on failure (the broker's `DUPLICATE_CLOSE_SOURCE` sweep) so no path leaks WUDFHost handles.
+///
+/// # Safety
+/// `dev` must be a live pf-vdisplay control handle (see [`super::manager::control_device_handle`]).
+pub(crate) unsafe fn send_frame_channel(
+    dev: HANDLE,
+    req: &control::SetFrameChannelRequest,
+) -> Result<()> {
+    let mut none: [u8; 0] = [];
+    // SAFETY: per this fn's contract `dev` is the live control handle. `bytes_of(req)` borrows the
+    // caller's request for the duration of this synchronous call as the input bytes; `none` is empty,
+    // so there is no output buffer.
+    unsafe {
+        ioctl(
+            dev,
+            control::IOCTL_SET_FRAME_CHANNEL,
+            bytemuck::bytes_of(req),
+            &mut none,
+        )
+    }
+    .map(|_| ())
+    .context("pf-vdisplay SET_FRAME_CHANNEL")
+}
+
 unsafe fn open_device() -> Result<HANDLE> {
     let hdev = SetupDiGetClassDevsW(
         Some(&PF_VDISPLAY_INTERFACE),
@@ -354,12 +381,13 @@ impl VdisplayDriver for PfVdisplayDriver {
             HighPart: reply.adapter_luid_high,
         };
         tracing::info!(
-            "pf-vdisplay created {}x{}@{} (target_id={}, adapter_luid={:#x})",
+            "pf-vdisplay created {}x{}@{} (target_id={}, adapter_luid={:#x}, wudf_pid={})",
             mode.width,
             mode.height,
             mode.refresh_hz,
             reply.target_id,
-            luid.LowPart
+            luid.LowPart,
+            reply.wudf_pid
         );
         // Per-client identity diagnostic: did the driver honor the host's preferred (stable) monitor id?
         // A pre-Phase-2 driver leaves resolved_monitor_id=0 (it ignored the field); a current driver echoes
@@ -395,6 +423,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             key: MonitorKey::Session(session_id),
             target_id: reply.target_id,
             luid,
+            wudf_pid: reply.wudf_pid,
         })
     }
 

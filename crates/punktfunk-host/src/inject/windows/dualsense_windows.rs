@@ -1,15 +1,16 @@
-//! Virtual Sony DualSense on Windows via the UMDF minidriver (`packaging/windows/dualsense-driver`).
+//! Virtual Sony DualSense on Windows via the UMDF minidriver (`packaging/windows/drivers/pf-dualsense`).
 //!
 //! The Windows analogue of the Linux UHID backend ([`super::dualsense`]): same [`DsState`] model and
 //! the same byte-level report codec ([`super::dualsense_proto`]), but a different transport. Where
 //! the Linux backend writes report `0x01` to `/dev/uhid` and reads report `0x02` via `UHID_OUTPUT`,
-//! the Windows backend talks to the UMDF driver over a **named shared-memory section**
-//! `Global\pfds-shm-<idx>` (256 B: magic `u32@0`, input report `@8`, output seq `u32@72`, output
-//! report `@76`). The host creates the section (privileged → a permissive SDDL so the WUDFHost can
-//! open it); the driver maps it from its timer, feeds game `READ_REPORT`s from the input bytes, and
-//! publishes a game's `0x02` (rumble / lightbar / player-LEDs / adaptive triggers) into the output
-//! bytes. `hidclass` gates the device stack, so this user-mode IPC is the only viable channel (a
-//! UMDF driver has no control device); see `windows-dualsense-scoping.md`.
+//! the Windows backend talks to the UMDF driver over an **unnamed shared DATA section** (256 B `PadShm`:
+//! magic `u32@0`, input report `@8`, output seq `u32@72`, output report `@76`) reached over the
+//! **sealed channel** ([`PadChannel`], `design/gamepad-channel-sealing.md`): the host duplicates the
+//! section handle into the driver's WUDFHost, bootstrapped via the named `Global\pfds-boot-<idx>`
+//! mailbox. The driver feeds game `READ_REPORT`s from the input bytes and publishes a game's `0x02`
+//! (rumble / lightbar / player-LEDs / adaptive triggers) into the output bytes. `hidclass` gates the
+//! device stack, so this user-mode IPC is the only viable channel (a UMDF driver has no control
+//! device); see `windows-dualsense-scoping.md`.
 //!
 //! Device lifecycle: each pad `SwDeviceCreate`s a `pf_pad_<index>` software devnode (hardware id
 //! `pf_dualsense`, enumerator `punktfunk`) on open and `SwDeviceClose`s it on drop, so the virtual
@@ -20,12 +21,13 @@ use super::dualsense_proto::{
     parse_ds_output, serialize_state, DsFeedback, DsState, DS_INPUT_REPORT_LEN, DS_TOUCH_H,
     DS_TOUCH_W,
 };
+use super::gamepad_raii::PadChannel;
 use crate::gamestream::gamepad::{GamepadEvent, MAX_PADS};
 use anyhow::{anyhow, Result};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
-use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
+use windows::core::{w, GUID, HRESULT, PCWSTR};
 use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
@@ -49,17 +51,19 @@ pub(super) const OFF_DEVTYPE: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, device_type);
 pub(super) const OFF_DRIVER_PROTO: usize =
     core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, driver_proto);
+pub(super) const OFF_PAD_INDEX: usize =
+    core::mem::offset_of!(pf_driver_proto::gamepad::PadShm, pad_index);
 pub(super) const DEVTYPE_DUALSHOCK4: u8 = pf_driver_proto::gamepad::DEVTYPE_DUALSHOCK4;
 
 /// A single virtual DualSense: the SwDeviceCreate'd `pf_pad_<index>` software devnode (the driver
-/// loads on it and the HID DualSense appears to games) plus the shared-memory section the driver maps.
-/// Dropping it removes the devnode (`SwDeviceClose`) and unmaps + closes the section.
+/// loads on it and the HID DualSense appears to games) plus the sealed shared-memory channel.
+/// Dropping it removes the devnode (`SwDeviceClose`) and closes both sections.
 struct DsWinPad {
     /// Per-session devnode from SwDeviceCreate, when it succeeds (RAII — `SwDeviceClose` on drop).
     /// `None` falls back to an out-of-band `pf_dualsense` devnode (installer/devgen).
     _sw: Option<super::gamepad_raii::SwDevice>,
-    /// The named shared section the driver maps (RAII — unmapped + closed on drop).
-    shm: super::gamepad_raii::Shm,
+    /// The sealed channel: unnamed DATA section (`PadShm`) + bootstrap mailbox + handle delivery.
+    channel: PadChannel,
     /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
     attach: super::gamepad_raii::DriverAttach,
     seq: u8,
@@ -184,7 +188,7 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(HSWDEVICE, Option<
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    // The pad index, stamped into the device Location — the driver reads it to map `pfds-shm-<index>`
+    // The pad index, stamped into the device Location — the driver reads it to poll `pfds-boot-<index>`
     // (multi-pad). The buffer outlives the SwDeviceCreate call (we wait on the event before return).
     let loc: Vec<u16> = format!("{}", p.container_index)
         .encode_utf16()
@@ -266,17 +270,20 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(HSWDEVICE, Option<
 }
 
 impl DsWinPad {
-    /// Create + map the section `Global\pfds-shm-<index>`, stamp the magic, then spawn the
-    /// `root\pf_dualsense` devnode (the driver loads on it and maps the section). The devnode lives
-    /// for the pad's lifetime — dropping the pad removes it (`SwDeviceClose`).
+    /// Create the sealed channel (unnamed DATA section + `Global\pfds-boot-<index>` mailbox), stamp
+    /// the pad index + neutral report + the magic LAST, then spawn the `pf_pad_<index>` devnode (the
+    /// driver loads on it and receives the DATA handle over the bootstrap). The devnode lives for the
+    /// pad's lifetime — dropping the pad removes it (`SwDeviceClose`).
     fn open(index: u8) -> Result<DsWinPad> {
-        let shm_name = pf_driver_proto::gamepad::pad_shm_name(index);
-        let shm = super::gamepad_raii::Shm::create(&HSTRING::from(shm_name.as_str()), SHM_SIZE)?;
-        let base = shm.base();
-        // Stamp the neutral input report, then the magic LAST (the driver only accepts the section
-        // once magic is set). The device-type stays 0 (DualSense — the section is already zeroed).
-        // SAFETY: base points at SHM_SIZE writable bytes.
+        let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
+        let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
+        let base = channel.data_base();
+        // Stamp the pad index (the driver validates it on attach) + the neutral input report, then
+        // the magic LAST (the driver only accepts the section once magic is set). The device-type
+        // stays 0 (DualSense — the section arrives zeroed).
+        // SAFETY: base points at SHM_SIZE writable bytes; OFF_PAD_INDEX/OFF_INPUT are in range.
         unsafe {
+            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
             std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; DS_INPUT_REPORT_LEN], {
                 let mut r = [0u8; DS_INPUT_REPORT_LEN];
                 serialize_state(&mut r, &DsState::neutral(), 0, 0);
@@ -286,7 +293,7 @@ impl DsWinPad {
         }
         // Spawn the per-session devnode via SwDeviceCreate; `SwDeviceClose` removes it on drop. On the
         // rare failure we keep the section + data plane and fall back to an out-of-band `pf_dualsense`
-        // devnode (installer / dev-box devgen).
+        // devnode (installer / dev-box devgen) — its persistent driver polls the same mailbox name.
         let inst = format!("pf_pad_{index}");
         let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
             instance: &inst,
@@ -302,14 +309,17 @@ impl DsWinPad {
             }
         };
         let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
+        // Bounded eager delivery so the driver holds the DATA section before hidclass asks it for
+        // descriptors (the driver reads `device_type` from the section to pick its HID identity).
+        channel.deliver_eager(Duration::from_millis(1500));
         Ok(DsWinPad {
             _sw,
-            shm,
+            channel,
             attach: super::gamepad_raii::DriverAttach::new(
                 "pf_dualsense",
                 "pf_dualsense.inf",
                 "C:\\Users\\Public\\pfds-driver.log",
-                shm_name,
+                boot_name,
                 instance_id,
             ),
             seq: 0,
@@ -326,30 +336,40 @@ impl DsWinPad {
         serialize_state(&mut r, st, self.seq, self.ts);
         // SAFETY: base points at SHM_SIZE bytes; input slot is OFF_INPUT..OFF_INPUT+64.
         unsafe {
-            std::ptr::copy_nonoverlapping(r.as_ptr(), self.shm.base().add(OFF_INPUT), r.len())
+            std::ptr::copy_nonoverlapping(
+                r.as_ptr(),
+                self.channel.data_base().add(OFF_INPUT),
+                r.len(),
+            )
         };
     }
 
     /// Poll the section's output slot; parse a new `0x02` report (rumble / LEDs / triggers) into a
     /// [`DsFeedback`] for pad `pad`. Returns empty feedback if the driver hasn't published anything
-    /// new. Also feeds the driver-attach health watcher (the driver's ~125 Hz timer stamps
-    /// `driver_proto` while it has the section mapped).
+    /// new. Also ticks the sealed-channel delivery and feeds the driver-attach health watcher (the
+    /// driver's ~125 Hz timer stamps `driver_proto` while it has the section mapped).
     fn service(&mut self, pad: u8) -> DsFeedback {
+        self.channel.pump();
         let mut fb = DsFeedback::default();
         // SAFETY: base points at SHM_SIZE bytes.
         let proto = unsafe {
-            std::ptr::read_unaligned(self.shm.base().add(OFF_DRIVER_PROTO) as *const u32)
+            std::ptr::read_unaligned(self.channel.data_base().add(OFF_DRIVER_PROTO) as *const u32)
         };
         self.attach.observe(proto);
         // SAFETY: base points at SHM_SIZE bytes.
-        let seq =
-            unsafe { std::ptr::read_unaligned(self.shm.base().add(OFF_OUT_SEQ) as *const u32) };
+        let seq = unsafe {
+            std::ptr::read_unaligned(self.channel.data_base().add(OFF_OUT_SEQ) as *const u32)
+        };
         if seq != self.last_out_seq {
             self.last_out_seq = seq;
             let mut out = [0u8; 64];
             // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
             unsafe {
-                std::ptr::copy_nonoverlapping(self.shm.base().add(OFF_OUTPUT), out.as_mut_ptr(), 64)
+                std::ptr::copy_nonoverlapping(
+                    self.channel.data_base().add(OFF_OUTPUT),
+                    out.as_mut_ptr(),
+                    64,
+                )
             };
             parse_ds_output(pad, &out, &mut fb);
         }

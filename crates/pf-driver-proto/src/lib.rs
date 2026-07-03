@@ -2,11 +2,17 @@
 //!
 //! Two planes:
 //! * [`control`] — the low-frequency `DeviceIoControl` plane (add/remove a virtual monitor, pin the
-//!   render adapter, keepalive, info, clear-all). Owned, clean, versioned — NOT the SudoVDA ABI.
-//! * [`frame`] — the IDD-push frame transport: the host creates a ring of shared keyed-mutex textures
-//!   (+ a header + a frame-ready event) and the driver opens them and publishes composited frames into
-//!   them. This crate owns the [`frame::SharedHeader`] layout, the [`frame::FrameToken`] packing, the
-//!   `Global\` object-name scheme, and the driver-status codes.
+//!   render adapter, keepalive, info, clear-all, deliver the frame channel). Owned, clean, versioned —
+//!   NOT the SudoVDA ABI.
+//! * [`frame`] — the IDD-push frame transport: the host creates a ring of **unnamed** shared
+//!   keyed-mutex textures (+ a header + a frame-ready event), duplicates their handles into the
+//!   driver's WUDFHost process and delivers the handle VALUES over
+//!   [`control::IOCTL_SET_FRAME_CHANNEL`]; the driver publishes composited frames into them. There is
+//!   deliberately no object-name scheme: an unnamed object cannot be enumerated, opened by name, or
+//!   pre-created ("squatted") — only the two endpoint processes ever hold a handle to any frame object
+//!   (the sealed channel, `design/idd-push-security.md`). This crate owns the [`frame::SharedHeader`]
+//!   layout, the [`frame::FrameToken`] packing, the channel-delivery struct, and the driver-status
+//!   codes.
 //!
 //! Both planes were previously hand-duplicated, byte-for-byte, across `idd_push.rs`/`frame_transport.rs`
 //! and `vdisplay/sudovda.rs`/`control.rs` with only "must match" comments guarding them. Defining them
@@ -43,16 +49,22 @@ pub const fn interface_guid_fields() -> (u32, u16, u16, [u8; 8]) {
 
 /// Bumped on any incompatible change to either plane. Exchanged via [`control::IOCTL_GET_INFO`]; host
 /// and driver assert a match at startup so a mismatched pair fails loudly instead of corrupting.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2: the sealed frame channel — the frame objects are unnamed and delivered by handle duplication
+/// ([`control::IOCTL_SET_FRAME_CHANNEL`]), and [`control::AddReply`] grew `wudf_pid` (the duplication
+/// target). A v1 driver has no channel-delivery IOCTL and expects named objects, so the pairing is
+/// incompatible by design.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// `CTL_CODE(FILE_DEVICE_UNKNOWN = 0x22, func, METHOD_BUFFERED = 0, FILE_ANY_ACCESS = 0)`.
 pub const fn ctl_code(func: u32) -> u32 {
     (0x22u32 << 16) | (func << 2)
 }
 
-/// The control (`DeviceIoControl`) plane: add/remove a virtual monitor + adapter pin + keepalive.
+/// The control (`DeviceIoControl`) plane: add/remove a virtual monitor + adapter pin + keepalive +
+/// frame-channel delivery.
 pub mod control {
     use super::ctl_code;
+    use super::frame::RING_LEN;
     use bytemuck::{Pod, Zeroable};
 
     // Contiguous op space at 0x900 — distinct from SudoVDA's gappy 0x800/0x888/0x8FF numbering.
@@ -69,6 +81,10 @@ pub mod control {
     /// Tear down every virtual monitor (host-startup orphan reap). No payload. First-class op — NOT the
     /// SudoVDA "send-and-hope-it's-ignored" hack.
     pub const IOCTL_CLEAR_ALL: u32 = ctl_code(0x905);
+    /// Deliver a monitor's IDD-push frame channel: the handle VALUES of the unnamed shared objects the
+    /// host duplicated into the driver's WUDFHost process. Input [`SetFrameChannelRequest`]. Sent once
+    /// after the ring is created and again on every mid-session ring recreate (HDR-mode flip).
+    pub const IOCTL_SET_FRAME_CHANNEL: u32 = ctl_code(0x906);
 
     /// `IOCTL_ADD` input. A monotonic `session_id` keys the monitor (the host's refcount manager owns
     /// collision safety — no more SudoVDA's 16-byte GUID + pid-mangling). The driver advertises this
@@ -103,6 +119,11 @@ pub mod control {
         /// `_reserved` (offset 12): an un-upgraded driver leaves it `0`, so the host can tell its
         /// preference was ignored (stale driver) and log it instead of silently losing per-client config.
         pub resolved_monitor_id: u32,
+        /// The driver's own process id (the WUDFHost hosting `pf_vdisplay`) — the target the host
+        /// duplicates the unnamed frame-object handles INTO (`OpenProcess(PROCESS_DUP_HANDLE)` +
+        /// `DuplicateHandle`, then [`IOCTL_SET_FRAME_CHANNEL`]). Reported per-ADD, not per-open, so a
+        /// WUDFHost restart between sessions can never leave the host duplicating into a dead process.
+        pub wudf_pid: u32,
     }
 
     /// `IOCTL_REMOVE` input.
@@ -129,6 +150,39 @@ pub mod control {
         pub watchdog_timeout_s: u32,
     }
 
+    /// `IOCTL_SET_FRAME_CHANNEL` input — the sealed frame channel's bootstrap. Every handle field is a
+    /// handle VALUE already duplicated into the driver's WUDFHost process by the host; receiving it, the
+    /// driver OWNS those handles (it closes whatever it doesn't consume — a replaced, invalid, or
+    /// unmatched delivery must not leak entries in its own handle table).
+    ///
+    /// Handle values are only meaningful inside the target process's handle table, so this struct is
+    /// harmless to any third party: reading it leaks nothing openable, and spoofing it (were the control
+    /// device reachable — it is ACL'd to SYSTEM + admins) could at worst feed the driver values that
+    /// don't resolve, a DoS of the attacker's own session. The frame objects themselves are unnamed and
+    /// therefore unreachable by any process that isn't one of the two endpoints.
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+    pub struct SetFrameChannelRequest {
+        /// The OS target id from [`AddReply`] — which monitor this channel belongs to.
+        pub target_id: u32,
+        /// The ring generation these textures belong to (must match the shared header's generation at
+        /// attach time; a stale delivery is dropped by the driver — a fresh one follows every recreate).
+        pub generation: u32,
+        /// How many leading entries of `texture_handles` are valid (`1..=`[`RING_LEN`]).
+        pub ring_len: u32,
+        pub _pad: u32,
+        /// The shared-header file-mapping handle (the driver maps it and writes status/publish tokens).
+        pub header_handle: u64,
+        /// The frame-ready auto-reset event handle (the driver signals it after each publish).
+        pub event_handle: u64,
+        /// The ring textures' shared NT handles (opened via `ID3D11Device1::OpenSharedResource1`).
+        pub texture_handles: [u64; RING_LEN_USIZE],
+    }
+
+    /// [`RING_LEN`] as a usize for the `texture_handles` array length (the wire struct sizes the array
+    /// at the compile-time maximum; `ring_len` says how many entries are live).
+    pub const RING_LEN_USIZE: usize = RING_LEN as usize;
+
     // Layout is load-bearing across the process boundary — pin it. (bytemuck's Pod derive already
     // rejects any internal padding; these assert the externally-visible sizes too.) The `offset_of!`
     // asserts additionally catch a SAME-SIZE field reorder, which the size+Pod checks alone miss.
@@ -142,11 +196,20 @@ pub mod control {
         assert!(offset_of!(AddRequest, refresh_hz) == 16);
         assert!(offset_of!(AddRequest, preferred_monitor_id) == 20);
 
-        assert!(size_of::<AddReply>() == 16);
+        assert!(size_of::<AddReply>() == 20);
         assert!(offset_of!(AddReply, adapter_luid_low) == 0);
         assert!(offset_of!(AddReply, adapter_luid_high) == 4);
         assert!(offset_of!(AddReply, target_id) == 8);
         assert!(offset_of!(AddReply, resolved_monitor_id) == 12);
+        assert!(offset_of!(AddReply, wudf_pid) == 16);
+
+        assert!(size_of::<SetFrameChannelRequest>() == 32 + 8 * RING_LEN_USIZE);
+        assert!(offset_of!(SetFrameChannelRequest, target_id) == 0);
+        assert!(offset_of!(SetFrameChannelRequest, generation) == 4);
+        assert!(offset_of!(SetFrameChannelRequest, ring_len) == 8);
+        assert!(offset_of!(SetFrameChannelRequest, header_handle) == 16);
+        assert!(offset_of!(SetFrameChannelRequest, event_handle) == 24);
+        assert!(offset_of!(SetFrameChannelRequest, texture_handles) == 32);
 
         assert!(size_of::<RemoveRequest>() == 8);
         assert!(offset_of!(RemoveRequest, session_id) == 0);
@@ -161,11 +224,12 @@ pub mod control {
     };
 }
 
-/// The IDD-push frame transport: the host-created shared ring header, the publish token, the names, and
-/// the driver-status codes. The texture ring itself is host-created D3D11 keyed-mutex textures (opened
-/// by name on the driver side); only the *layout/contract* lives here.
+/// The IDD-push frame transport: the host-created shared ring header, the publish token, and the
+/// driver-status codes. The texture ring itself is host-created **unnamed** D3D11 keyed-mutex textures;
+/// the driver reaches them (and the header + event) only through handles the host duplicated into its
+/// process and delivered via [`crate::control::IOCTL_SET_FRAME_CHANNEL`] — the sealed channel. Only the
+/// *layout/contract* lives here.
 pub mod frame {
-    use alloc::string::String;
     use bytemuck::{Pod, Zeroable};
 
     /// Header magic (`"PFVD"` LE). The host stamps it LAST (after the ring textures exist) so the driver
@@ -195,8 +259,10 @@ pub mod frame {
     pub struct SharedHeader {
         pub magic: u32,
         pub version: u32,
-        /// Bumped by the host on a ring recreate (HDR-mode flip → new texture format/names). The driver
-        /// re-attaches when it changes; a publish carries it so the host rejects a stale-ring publish.
+        /// Bumped by the host on a ring recreate (HDR-mode flip → new texture format + a fresh
+        /// [`control::IOCTL_SET_FRAME_CHANNEL`](crate::control::IOCTL_SET_FRAME_CHANNEL) delivery). The
+        /// driver re-attaches when it changes; a publish carries it so the host rejects a stale-ring
+        /// publish.
         pub generation: u32,
         pub ring_len: u32,
         pub width: u32,
@@ -245,21 +311,6 @@ pub mod frame {
         }
     }
 
-    /// `Global\pfvd-hdr-<target>` — the shared metadata header mapping name.
-    pub fn header_name(target_id: u32) -> String {
-        alloc::format!("Global\\pfvd-hdr-{target_id}")
-    }
-    /// `Global\pfvd-evt-<target>` — the frame-ready auto-reset event name.
-    pub fn event_name(target_id: u32) -> String {
-        alloc::format!("Global\\pfvd-evt-{target_id}")
-    }
-    /// `Global\pfvd-tex-<target>-<generation>-<slot>` — a ring texture's shared-handle name. The
-    /// generation in the name means a recreate's new textures never collide with the old ring's
-    /// not-yet-released handles.
-    pub fn texture_name(target_id: u32, generation: u32, slot: u32) -> String {
-        alloc::format!("Global\\pfvd-tex-{target_id}-{generation}-{slot}")
-    }
-
     // Size + per-field offsets are load-bearing: both sides access these via raw atomic views over the
     // mapping, so a same-size field reorder would silently corrupt. Pin every offset. The `_pad` after
     // `dxgi_format` is what 8-aligns the `u64 latest` at offset 32 — assert that too.
@@ -292,8 +343,10 @@ pub mod frame {
 /// (`design/windows-host-rewrite.md` §2.7). Owning them here with `Pod` derives + `offset_of!`
 /// asserts makes a one-sided edit a compile error.
 ///
-/// The host creates the section (privileged, permissive DACL so the restricted WUDFHost token can
-/// open it) and the driver maps it. Layout only; the section itself is host-created shared memory.
+/// Since v2 the channel is **sealed** (`design/gamepad-channel-sealing.md`, mirroring the frame
+/// channel): the host creates the DATA section ([`XusbShm`]/[`PadShm`]) UNNAMED (SYSTEM-only DACL)
+/// and duplicates its handle into the driver's WUDFHost; only the tiny [`PadBootstrap`] mailbox
+/// stays named (it carries nothing exploitable). Layout only; the sections are host-created.
 pub mod gamepad {
     use alloc::string::String;
     use bytemuck::{Pod, Zeroable};
@@ -316,15 +369,68 @@ pub mod gamepad {
     /// The section starts zeroed, so `0` always means "no driver has attached (yet)"; a pre-health
     /// driver never writes the field and reads as not-attached, which the host log line calls out
     /// (the remedy is the same: reinstall the drivers). Bump on a gamepad-layout change.
-    pub const GAMEPAD_PROTO_VERSION: u32 = 1;
+    ///
+    /// v2: the **sealed pad channel** (`design/gamepad-channel-sealing.md`) — the DATA section
+    /// ([`XusbShm`]/[`PadShm`]) is UNNAMED and reaches the driver only as a handle the host duplicated
+    /// into its WUDFHost, bootstrapped through the named [`PadBootstrap`] mailbox; the DATA section
+    /// gained `pad_index` (carved from reserved space) so the driver rejects a cross-pad delivery.
+    /// A v1 driver opens `Global\pf…-shm-<i>` (which no longer exists) and a v1 host never creates
+    /// the mailbox a v2 driver polls, so a mixed pairing fails closed either way.
+    pub const GAMEPAD_PROTO_VERSION: u32 = 2;
 
-    /// `Global\pfxusb-shm-<index>` — the virtual Xbox 360 (XInput) shared section.
-    pub fn xusb_shm_name(index: u8) -> String {
-        alloc::format!("Global\\pfxusb-shm-{index}")
+    /// Bootstrap-mailbox magic (`"PFBT"` LE) — the host stamps it LAST (after `host_proto`), so a
+    /// driver only trusts a fully-initialized mailbox.
+    pub const BOOT_MAGIC: u32 = 0x5442_4650;
+
+    /// `Global\pfxusb-boot-<index>` — the virtual Xbox 360 pad's bootstrap mailbox ([`PadBootstrap`]).
+    pub fn xusb_boot_name(index: u8) -> String {
+        alloc::format!("Global\\pfxusb-boot-{index}")
     }
-    /// `Global\pfds-shm-<index>` — the virtual DualSense / DualShock 4 shared section.
-    pub fn pad_shm_name(index: u8) -> String {
-        alloc::format!("Global\\pfds-shm-{index}")
+    /// `Global\pfds-boot-<index>` — the DualSense / DualShock 4 pad's bootstrap mailbox
+    /// ([`PadBootstrap`]).
+    pub fn pad_boot_name(index: u8) -> String {
+        alloc::format!("Global\\pfds-boot-{index}")
+    }
+
+    /// The per-pad bootstrap mailbox (32 B, named `Global\pf…-boot-<index>`, SY+LS DACL) — the ONLY
+    /// named object left on the gamepad channel. It exists because the pad drivers are UMDF HID
+    /// minidrivers with no control device (hidclass owns the stack), so there is no IOCTL to hand the
+    /// driver a duplicated handle or learn its WUDFHost pid; this mailbox is the late-bound handshake:
+    ///
+    /// 1. host creates it (zeroed), stamps `host_proto` then `magic` (in that order);
+    /// 2. driver opens it by name (pad index from `pszDeviceLocation`), writes `driver_proto`, and —
+    ///    iff `host_proto` matches its own version — publishes `driver_pid`;
+    /// 3. host polls `driver_pid`, verifies the pid is a genuine WUDFHost, duplicates the unnamed DATA
+    ///    section into it, then writes `data_handle` + `handle_pid` and bumps `handle_seq` LAST;
+    /// 4. driver sees a fresh `handle_seq` addressed to its own pid, maps `data_handle`, and validates
+    ///    the mapped section's magic + `pad_index` before use.
+    ///
+    /// Deliberately safe to leave named + LS-openable: it carries only pids (not sensitive) and a
+    /// handle VALUE (meaningless outside the target WUDFHost's handle table). A sibling LocalService
+    /// that tampers with it can at worst mis-route a delivery — a gamepad DoS, never a read or an
+    /// injection (it cannot place a valid section handle in the WUDFHost, and the driver's
+    /// magic+`pad_index` validation rejects any handle that doesn't resolve to this pad's section).
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+    pub struct PadBootstrap {
+        /// [`BOOT_MAGIC`], host-stamped last at creation.
+        pub magic: u32,
+        /// The host's [`GAMEPAD_PROTO_VERSION`]. A driver whose own version differs must NOT publish
+        /// its pid (fail closed) — it still writes `driver_proto` so the host can log the mismatch.
+        pub host_proto: u32,
+        /// The driver's WUDFHost process id (driver-written; `0` = no driver yet). The duplication
+        /// target the host verifies (`verify_is_wudfhost`) before duplicating the DATA section into it.
+        pub driver_pid: u32,
+        /// The driver's [`GAMEPAD_PROTO_VERSION`] (driver-written; diagnostics only).
+        pub driver_proto: u32,
+        /// The DATA-section handle VALUE the host duplicated into `handle_pid`'s handle table
+        /// (host-written; valid only inside that process).
+        pub data_handle: u64,
+        /// The pid `data_handle` was duplicated for — a driver whose pid differs ignores the delivery.
+        pub handle_pid: u32,
+        /// Bumped by the host (host-global monotonic, never 0) AFTER `data_handle`/`handle_pid` are in
+        /// place — the driver's new-delivery trigger.
+        pub handle_seq: u32,
     }
 
     /// Virtual Xbox 360 (XInput) shared section (64 B). The host writes the XInput state (a bumped
@@ -356,7 +462,12 @@ pub mod gamepad {
         /// Bumped by the driver on every serviced XInput IOCTL — proves the game-visible path (it
         /// only advances while something polls the slot, so a static value is not an error).
         pub driver_heartbeat: u32,
-        pub _reserved1: [u8; 24],
+        /// The pad index this section serves (host-stamped before the magic). The driver validates it
+        /// against its own `pszDeviceLocation` index when it maps the delivered handle, so a mis-routed
+        /// (or bootstrap-tampered) cross-pad delivery is rejected instead of silently cross-wiring two
+        /// pads. Carved from v1 reserved space (v2).
+        pub pad_index: u32,
+        pub _reserved1: [u8; 20],
     }
 
     /// Virtual DualSense / DualShock 4 shared section (256 B). The host writes the `0x01`-style HID
@@ -384,7 +495,10 @@ pub mod gamepad {
         /// Bumped by the driver's ~125 Hz timer each tick — a true liveness heartbeat (unlike the
         /// XUSB one, this advances whenever the driver is loaded, game or not).
         pub driver_heartbeat: u32,
-        pub _reserved1: [u8; 104],
+        /// The pad index this section serves (host-stamped before the magic) — see
+        /// [`XusbShm::pad_index`]. Carved from v1 reserved space (v2).
+        pub pad_index: u32,
+        pub _reserved1: [u8; 100],
     }
 
     // Offsets are the wire contract the shipped drivers already read by hand — pin every one. A failing
@@ -408,6 +522,7 @@ pub mod gamepad {
         assert!(offset_of!(XusbShm, rumble_small) == 29);
         assert!(offset_of!(XusbShm, driver_proto) == 32);
         assert!(offset_of!(XusbShm, driver_heartbeat) == 36);
+        assert!(offset_of!(XusbShm, pad_index) == 40);
 
         assert!(size_of::<PadShm>() == 256);
         assert!(offset_of!(PadShm, magic) == 0);
@@ -417,6 +532,16 @@ pub mod gamepad {
         assert!(offset_of!(PadShm, device_type) == 140);
         assert!(offset_of!(PadShm, driver_proto) == 144);
         assert!(offset_of!(PadShm, driver_heartbeat) == 148);
+        assert!(offset_of!(PadShm, pad_index) == 152);
+
+        assert!(size_of::<PadBootstrap>() == 32);
+        assert!(offset_of!(PadBootstrap, magic) == 0);
+        assert!(offset_of!(PadBootstrap, host_proto) == 4);
+        assert!(offset_of!(PadBootstrap, driver_pid) == 8);
+        assert!(offset_of!(PadBootstrap, driver_proto) == 12);
+        assert!(offset_of!(PadBootstrap, data_handle) == 16);
+        assert!(offset_of!(PadBootstrap, handle_pid) == 24);
+        assert!(offset_of!(PadBootstrap, handle_seq) == 28);
     };
 }
 
@@ -487,28 +612,71 @@ mod tests {
             adapter_luid_high: -2,
             target_id: 262,
             resolved_monitor_id: 7,
+            wudf_pid: 4242,
         };
         let rbytes = bytemuck::bytes_of(&reply);
-        assert_eq!(rbytes.len(), 16);
+        assert_eq!(rbytes.len(), 20);
         assert_eq!(*bytemuck::from_bytes::<control::AddReply>(rbytes), reply);
         // resolved_monitor_id occupies the old `_reserved` slot at offset 12 — byte-compatible.
         assert_eq!(rbytes[12..16], 7u32.to_le_bytes());
+        // The v2 duplication-target pid trails at offset 16.
+        assert_eq!(rbytes[16..20], 4242u32.to_le_bytes());
     }
 
     #[test]
-    fn names_are_stable() {
-        assert_eq!(frame::header_name(10), "Global\\pfvd-hdr-10");
-        assert_eq!(frame::event_name(10), "Global\\pfvd-evt-10");
-        assert_eq!(frame::texture_name(10, 3, 5), "Global\\pfvd-tex-10-3-5");
+    fn frame_channel_request_roundtrips_through_bytes() {
+        let mut req = control::SetFrameChannelRequest {
+            target_id: 262,
+            generation: 3,
+            ring_len: frame::RING_LEN,
+            _pad: 0,
+            header_handle: 0x0000_0000_0000_1a2c,
+            event_handle: 0x0000_0000_0000_1b30,
+            texture_handles: [0; control::RING_LEN_USIZE],
+        };
+        for (k, t) in req.texture_handles.iter_mut().enumerate() {
+            *t = 0x2000 + k as u64 * 4;
+        }
+        let bytes = bytemuck::bytes_of(&req);
+        assert_eq!(bytes.len(), 32 + 8 * control::RING_LEN_USIZE);
+        assert_eq!(
+            *bytemuck::from_bytes::<control::SetFrameChannelRequest>(bytes),
+            req
+        );
+        // The handle values ride at 8-byte alignment from offset 16 (header, event, then the ring).
+        assert_eq!(bytes[16..24], 0x1a2cu64.to_le_bytes());
+        assert_eq!(bytes[24..32], 0x1b30u64.to_le_bytes());
+        assert_eq!(bytes[32..40], 0x2000u64.to_le_bytes());
     }
 
     #[test]
     fn gamepad_names_and_magics_are_stable() {
-        assert_eq!(gamepad::xusb_shm_name(0), "Global\\pfxusb-shm-0");
-        assert_eq!(gamepad::pad_shm_name(2), "Global\\pfds-shm-2");
+        assert_eq!(gamepad::xusb_boot_name(0), "Global\\pfxusb-boot-0");
+        assert_eq!(gamepad::pad_boot_name(2), "Global\\pfds-boot-2");
         // Lock the exact u32 magics the shipped host/drivers use (inject/{gamepad,dualsense}_windows.rs).
         assert_eq!(gamepad::XUSB_MAGIC, 0x5558_4650);
         assert_eq!(gamepad::PAD_MAGIC, 0x5046_4453);
+        // "PFBT" little-endian.
+        assert_eq!(gamepad::BOOT_MAGIC.to_le_bytes(), *b"PFBT");
+    }
+
+    #[test]
+    fn pad_bootstrap_roundtrips_through_bytes() {
+        let b = gamepad::PadBootstrap {
+            magic: gamepad::BOOT_MAGIC,
+            host_proto: gamepad::GAMEPAD_PROTO_VERSION,
+            driver_pid: 1234,
+            driver_proto: gamepad::GAMEPAD_PROTO_VERSION,
+            data_handle: 0x0000_0000_0000_2a4c,
+            handle_pid: 1234,
+            handle_seq: 7,
+        };
+        let bytes = bytemuck::bytes_of(&b);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(*bytemuck::from_bytes::<gamepad::PadBootstrap>(bytes), b);
+        // The handle value rides 8-aligned at offset 16; the seq trails at 28 (written LAST by the host).
+        assert_eq!(bytes[16..24], 0x2a4cu64.to_le_bytes());
+        assert_eq!(bytes[28..32], 7u32.to_le_bytes());
     }
 
     #[test]
@@ -521,6 +689,7 @@ mod tests {
             control::IOCTL_PING,
             control::IOCTL_GET_INFO,
             control::IOCTL_CLEAR_ALL,
+            control::IOCTL_SET_FRAME_CHANNEL,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

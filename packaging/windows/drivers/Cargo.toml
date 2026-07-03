@@ -7,7 +7,7 @@
 # crates/pf-driver-proto from the main tree.
 [workspace]
 resolver = "2"
-members = ["wdk-probe", "wdk-iddcx", "pf-vdisplay", "pf-dualsense", "pf-xusb"]
+members = ["wdk-probe", "wdk-iddcx", "pf-umdf-util", "pf-vdisplay", "pf-dualsense", "pf-xusb"]
 
 [workspace.package]
 edition = "2024"
@@ -20,6 +20,7 @@ wdk = "0.4.1"
 wdk-sys = "0.5.1"
 wdk-build = "0.5.1"
 wdk-iddcx = { path = "wdk-iddcx" }
+pf-umdf-util = { path = "pf-umdf-util" }
 pf-driver-proto = { path = "../../../crates/pf-driver-proto" }
 
 # Vendored windows-drivers-rs 0.5.1 (the published, self-contained crates) + an added `iddcx`

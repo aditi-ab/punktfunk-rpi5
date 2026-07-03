@@ -14,8 +14,11 @@ instance (= player slot 0–3) with `CreateFile`, and polls it with buffered IOC
   **System** setup class;
 - registers the XUSB interface with `WdfDeviceCreateDeviceInterface(device, &XUSB_GUID, NULL)`;
 - answers the XUSB IOCTLs (all `METHOD_BUFFERED`, delivered to user mode by the reflector) from
-  controller state the host publishes into a shared section `Global\pfxusb-shm-0`; a game's rumble
-  (`SET_STATE`) is published back for the host to forward to the client.
+  controller state the host publishes into an **unnamed** shared DATA section reached over the
+  **sealed pad channel** (`design/gamepad-channel-sealing.md`): the host duplicates the section
+  handle into this driver's WUDFHost, bootstrapped via the named `Global\pfxusb-boot-<index>`
+  mailbox (`pf_driver_proto::gamepad::PadBootstrap`); a game's rumble (`SET_STATE`) is published
+  back for the host to forward to the client.
 
 The WAIT_* IOCTLs return `STATUS_INVALID_DEVICE_REQUEST`, which makes `xinput1_4` fall back to
 synchronous `GET_STATE` polling — so no manual queue / timer is needed for classic XInput. (WGI/
@@ -37,11 +40,13 @@ GameInput admission additionally needs a `xinputhid` `UpperFilters` registry tri
 `wButtons` is the `XINPUT_GAMEPAD_*` bitmap (DPAD_UP `0x0001` … A `0x1000` B `0x2000` X `0x4000`
 Y `0x8000`). `dwPacketNumber` (GET_STATE `[5]`) must increment whenever the payload changes.
 
-## Shared-memory layout `Global\pfxusb-shm-0` (64 B) — host writes state, driver writes rumble
+## Shared-memory layout (unnamed DATA section, 64 B) — host writes state, driver writes rumble
 
+`pf_driver_proto::gamepad::XusbShm` (the crate owns the offsets; both sides compile against it):
 `magic u32 @0` (`"PFXU"` `0x55584650`) · `packet u32 @4` (host bumps → dwPacketNumber) · `wButtons u16
 @8` · `LT @10` · `RT @11` · `LX/LY/RX/RY i16 @12/@14/@16/@18` · `rumble_seq u32 @24` (driver bumps) ·
-`large @28` · `small @29`.
+`large @28` · `small @29` · health marks `@32/@36` · `pad_index u32 @40` (validated against the
+devnode's Location index when the delivered handle is mapped).
 
 ## Validated live (2026-06-22, maintainer's RTX test box)
 
@@ -66,7 +71,8 @@ the whole build/sign/stage flow in CI. The manual steps:
 ## Host integration (done)
 
 `crates/punktfunk-host/src/inject/windows/gamepad_windows.rs` is the Windows `GamepadManager` (used by
-`PadBackend::Xbox360`): it SwDeviceCreate's the `pf_xusb` companion, maps `pfxusb-shm-<index>`, writes
+`PadBackend::Xbox360`): it SwDeviceCreate's the `pf_xusb` companion, delivers the unnamed DATA
+section over the sealed channel (`PadChannel`), writes
 the XInput state from the client's gamepad frame (already XInput-convention) and forwards rumble. There
 is **no ViGEmBus dependency** anymore. The driver is built + signed from source in CI
 (`build-gamepad-drivers.ps1`) and installed by the Inno Setup installer via
@@ -75,8 +81,8 @@ is **no ViGEmBus dependency** anymore. The driver is built + signed from source 
 ## Multi-pad
 
 The host stamps each pad's index into the device Location (`pszDeviceLocation`); the driver reads it
-via `WdfDeviceAllocAndQueryProperty(DevicePropertyLocationInformation)` in EvtDeviceAdd and maps its own
-`pfxusb-shm-<index>`. `UmdfHostProcessSharing=ProcessSharingDisabled` (the INF) gives each pad its own
+via `WdfDeviceAllocAndQueryProperty(DevicePropertyLocationInformation)` in EvtDeviceAdd and polls its own
+`pfxusb-boot-<index>` bootstrap mailbox (the delivered DATA section's `pad_index` is validated against it). `UmdfHostProcessSharing=ProcessSharingDisabled` (the INF) gives each pad its own
 WUDFHost, so the per-pad `SHM_INDEX` static doesn't collide. Validated live: two pads → two distinct
 XInput slots. (XInput assigns the player slot 0-3 by interface-enumeration order, independent of this
 index — which only routes shared memory.)
