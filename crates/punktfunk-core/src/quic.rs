@@ -114,6 +114,13 @@ pub const VIDEO_CAP_HDR: u8 = 0x02;
 /// [`Welcome::chroma_format`] reflects the real resolved value. Independent of 10-bit/HDR (4:4:4 is a
 /// chroma decision, bit depth is a depth decision; the two may combine where the hardware allows).
 pub const VIDEO_CAP_444: u8 = 0x04;
+/// [`Hello::video_caps`] bit: the client consumes per-AU host-timing datagrams
+/// ([`HOST_TIMING_MAGIC`], 0xCF) — the host's capture→send duration per frame, letting the client
+/// split its `host+network` latency stage into `host` and `network`
+/// (design/stats-unification.md Phase 2). The host emits 0xCF ONLY when this bit is set (an older
+/// host ignores it and simply never sends any); a client that doesn't set it keeps the combined
+/// stage. Purely observability — never changes what the host encodes.
+pub const VIDEO_CAP_HOST_TIMING: u8 = 0x08;
 
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
@@ -1601,6 +1608,50 @@ pub fn decode_hdr_meta_datagram(b: &[u8]) -> Option<HdrMeta> {
     })
 }
 
+/// Per-AU host-timing datagram tag, host → client (see [`HostTiming`]). Next tag after
+/// [`HDR_META_MAGIC`]. Emitted once per access unit, right after its last packet left the host's
+/// socket, and only when the client advertised [`VIDEO_CAP_HOST_TIMING`].
+pub const HOST_TIMING_MAGIC: u8 = 0xCF;
+
+/// One access unit's host-side processing time: capture → fully sent (the whole host pipeline —
+/// capture read/convert, encode, FEC+seal, paced send). The client correlates it to the AU by
+/// `pts_ns` (the AU's capture stamp, unique per frame) and derives
+/// `network = (received + clock_offset − pts_ns) − host_us`, so the unified-stats equation's
+/// `host+network` stage splits into two per-frame-tiling terms. Best-effort like every side-plane
+/// datagram: a lost 0xCF just means that frame contributes no host/network sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostTiming {
+    /// The AU's capture stamp (host capture clock — matches the AU's `pts_ns` exactly).
+    pub pts_ns: u64,
+    /// Host capture→sent duration, µs (saturated at `u32::MAX` ≈ 71 min — far past the 10 s
+    /// client-side sanity clamp anyway).
+    pub host_us: u32,
+}
+
+/// Wire length of a [`HOST_TIMING_MAGIC`] datagram: tag + u64 pts + u32 µs = 13 bytes.
+const HOST_TIMING_LEN: usize = 1 + 8 + 4;
+
+/// Encode a [`HostTiming`] into a [`HOST_TIMING_MAGIC`] datagram.
+pub fn encode_host_timing_datagram(t: &HostTiming) -> Vec<u8> {
+    let mut b = Vec::with_capacity(HOST_TIMING_LEN);
+    b.push(HOST_TIMING_MAGIC);
+    b.extend_from_slice(&t.pts_ns.to_le_bytes());
+    b.extend_from_slice(&t.host_us.to_le_bytes());
+    b
+}
+
+/// Parse a [`HOST_TIMING_MAGIC`] datagram → [`HostTiming`]. `None` on bad tag or a short buffer
+/// (the fixed length bounds every read before it happens).
+pub fn decode_host_timing_datagram(b: &[u8]) -> Option<HostTiming> {
+    if b.len() < HOST_TIMING_LEN || b[0] != HOST_TIMING_MAGIC {
+        return None;
+    }
+    Some(HostTiming {
+        pts_ns: u64::from_le_bytes(b[1..9].try_into().unwrap()),
+        host_us: u32::from_le_bytes(b[9..13].try_into().unwrap()),
+    })
+}
+
 /// Async framed-message IO over a quinn stream (`u16 LE length || payload`).
 pub mod io {
     /// Read one framed message (bounded at 64 KiB — control messages are tiny).
@@ -2187,6 +2238,25 @@ mod tests {
         let mut bad = d.clone();
         bad[0] = HIDOUT_MAGIC;
         assert_eq!(decode_hdr_meta_datagram(&bad), None);
+    }
+
+    #[test]
+    fn host_timing_datagram_roundtrip_and_truncation() {
+        let t = HostTiming {
+            pts_ns: 1_751_500_000_123_456_789, // a realistic 2026 CLOCK_REALTIME capture stamp
+            host_us: 4_321,
+        };
+        let d = encode_host_timing_datagram(&t);
+        assert_eq!(d[0], HOST_TIMING_MAGIC);
+        assert_eq!(d.len(), 13);
+        assert_eq!(decode_host_timing_datagram(&d), Some(t));
+        // Truncated buffers and a wrong tag are rejected (never partially read).
+        for n in 0..d.len() {
+            assert_eq!(decode_host_timing_datagram(&d[..n]), None);
+        }
+        let mut bad = d.clone();
+        bad[0] = HDR_META_MAGIC;
+        assert_eq!(decode_host_timing_datagram(&bad), None);
     }
 
     #[test]

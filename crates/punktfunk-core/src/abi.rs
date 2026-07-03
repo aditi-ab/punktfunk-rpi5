@@ -635,6 +635,22 @@ impl PunktfunkHdrMeta {
     }
 }
 
+/// One access unit's host-side processing time ([`punktfunk_connection_next_host_timing`]):
+/// capture → fully sent, i.e. the whole host pipeline (capture read/convert, encode, FEC+seal,
+/// paced send). Correlate to the AU whose `PunktfunkFrame::pts_ns` equals `pts_ns`, then
+/// `network = (received_instant + clock_offset − pts_ns) − host_us` — the unified stats HUD's
+/// `host` / `network` split (design/stats-unification.md Phase 2). Best-effort: a lost datagram
+/// means that frame simply contributes no sample.
+#[cfg(feature = "quic")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PunktfunkHostTiming {
+    /// The AU's capture stamp (host capture clock — matches `PunktfunkFrame::pts_ns` exactly).
+    pub pts_ns: u64,
+    /// Host capture→sent duration, µs.
+    pub host_us: u32,
+}
+
 /// `PunktfunkRichInput::kind` — a touchpad contact (`finger`/`active`/`x`/`y` valid).
 pub const PUNKTFUNK_RICH_TOUCHPAD: u8 = 1;
 /// `PunktfunkRichInput::kind` — a motion sample (`gyro`/`accel` valid).
@@ -1752,6 +1768,49 @@ pub unsafe extern "C" fn punktfunk_connection_next_hdr_meta(
         {
             Ok(m) => {
                 unsafe { *out = PunktfunkHdrMeta::from_meta(&m) };
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
+    })
+}
+
+/// Pull the next per-AU host timing (0xCF) into `*out`: the host's capture→sent duration for one
+/// access unit, correlated to the AU by `pts_ns` (see [`PunktfunkHostTiming`]).
+/// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once the session ended.
+/// A stats consumer drains this non-blockingly (`timeout_ms = 0`) alongside its frame samples;
+/// an older host never emits any — keep showing the combined `host+network` stage then. Same
+/// threading rules as [`punktfunk_connection_next_rumble`] (one puller, may run alongside the
+/// other planes).
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable for one `PunktfunkHostTiming`.
+#[cfg(feature = "quic")]
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_connection_next_host_timing(
+    c: *mut PunktfunkConnection,
+    out: *mut PunktfunkHostTiming,
+    timeout_ms: u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if out.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        match c
+            .inner
+            .next_host_timing(std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(t) => {
+                unsafe {
+                    *out = PunktfunkHostTiming {
+                        pts_ns: t.pts_ns,
+                        host_us: t.host_us,
+                    }
+                };
                 PunktfunkStatus::Ok
             }
             Err(e) => e.status(),

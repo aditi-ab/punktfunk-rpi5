@@ -140,6 +140,11 @@ const HIDOUT_QUEUE: usize = 32;
 /// and low-rate (one on start, re-sent on mastering changes / keyframes); a small ring is ample.
 const HDR_META_QUEUE: usize = 8;
 
+/// Host-timing plane depth (0xCF, one datagram per AU). Sized for a 240 fps stream whose stats
+/// consumer drains once per second with headroom; overflow drops the newest sample (try_send) —
+/// harmless, it's per-frame observability, not state.
+const HOST_TIMING_QUEUE: usize = 512;
+
 /// One Opus packet from the host's audio datagram stream (48 kHz stereo, 5 ms frames).
 #[derive(Clone, Debug)]
 pub struct AudioPacket {
@@ -161,6 +166,9 @@ pub struct NativeClient {
     hidout: Mutex<Receiver<HidOutput>>,
     /// Inbound static HDR metadata (ST.2086 mastering + content light level) — 0xCE datagrams.
     hdr_meta: Mutex<Receiver<HdrMeta>>,
+    /// Inbound per-AU host capture→send timings — 0xCF datagrams (the client always advertises
+    /// [`quic::VIDEO_CAP_HOST_TIMING`]; an older host simply never sends any).
+    host_timing: Mutex<Receiver<crate::quic::HostTiming>>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     /// Outbound mic frames `(seq, pts_ns, opus)` → encoded as 0xCB datagrams by the worker.
     mic_tx: tokio::sync::mpsc::UnboundedSender<(u32, u64, Vec<u8>)>,
@@ -315,6 +323,8 @@ impl NativeClient {
         let (rumble_tx, rumble_rx) = std::sync::mpsc::sync_channel::<(u16, u16, u16)>(RUMBLE_QUEUE);
         let (hidout_tx, hidout_rx) = std::sync::mpsc::sync_channel::<HidOutput>(HIDOUT_QUEUE);
         let (hdr_meta_tx, hdr_meta_rx) = std::sync::mpsc::sync_channel::<HdrMeta>(HDR_META_QUEUE);
+        let (host_timing_tx, host_timing_rx) =
+            std::sync::mpsc::sync_channel::<crate::quic::HostTiming>(HOST_TIMING_QUEUE);
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
         let (mic_tx, mic_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u64, Vec<u8>)>();
         let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<RichInput>();
@@ -370,6 +380,7 @@ impl NativeClient {
                     rumble_tx,
                     hidout_tx,
                     hdr_meta_tx,
+                    host_timing_tx,
                     input_rx,
                     mic_rx,
                     rich_input_rx,
@@ -412,6 +423,7 @@ impl NativeClient {
             rumble: Mutex::new(rumble_rx),
             hidout: Mutex::new(hidout_rx),
             hdr_meta: Mutex::new(hdr_meta_rx),
+            host_timing: Mutex::new(host_timing_rx),
             input_tx,
             mic_tx,
             rich_input_tx,
@@ -715,6 +727,20 @@ impl NativeClient {
         }
     }
 
+    /// Pull the next per-AU host timing (0xCF): the host's capture→sent duration for one access
+    /// unit, correlated to the AU by `pts_ns`. Feeds the unified stats HUD's `host` / `network`
+    /// split (`network = (received + clock_offset − pts) − host_us`); a stats consumer should
+    /// drain this non-blockingly alongside its frame samples. An older host never sends any —
+    /// the HUD then keeps the combined `host+network` stage. Same timeout/closed semantics as
+    /// [`NativeClient::next_hidout`].
+    pub fn next_host_timing(&self, timeout: Duration) -> Result<crate::quic::HostTiming> {
+        match self.host_timing.lock().unwrap().recv_timeout(timeout) {
+            Ok(t) => Ok(t),
+            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
+            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
+        }
+    }
+
     /// Queue one input event for delivery as a QUIC datagram.
     pub fn send_input(&self, ev: &InputEvent) -> Result<()> {
         self.input_tx.send(*ev).map_err(|_| PunktfunkError::Closed)
@@ -768,6 +794,7 @@ struct WorkerArgs {
     rumble_tx: SyncSender<(u16, u16, u16)>,
     hidout_tx: SyncSender<HidOutput>,
     hdr_meta_tx: SyncSender<HdrMeta>,
+    host_timing_tx: SyncSender<crate::quic::HostTiming>,
     input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     mic_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, u64, Vec<u8>)>,
     rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<RichInput>,
@@ -803,6 +830,7 @@ async fn worker_main(args: WorkerArgs) {
         rumble_tx,
         hidout_tx,
         hdr_meta_tx,
+        host_timing_tx,
         mut input_rx,
         mut mic_rx,
         mut rich_input_rx,
@@ -860,8 +888,10 @@ async fn worker_main(args: WorkerArgs) {
                 launch: launch.clone(),
                 // The embedder's decode/present caps (e.g. the Windows client advertises
                 // VIDEO_CAP_10BIT | VIDEO_CAP_HDR). The host only upgrades to a 10-bit / HDR encode
-                // when the matching bit is set, so `0` stays an 8-bit BT.709 stream.
-                video_caps,
+                // when the matching bit is set, so `0` stays an 8-bit BT.709 stream. HOST_TIMING is
+                // OR'd in unconditionally: every NativeClient build demuxes the 0xCF plane, and the
+                // bit only asks the host for observability datagrams (never changes the encode).
+                video_caps: video_caps | crate::quic::VIDEO_CAP_HOST_TIMING,
                 // Requested surround channel count; the host echoes the resolved value in Welcome.
                 audio_channels,
                 // The codecs this client can decode + its soft preference (0 = auto). The host
@@ -1097,6 +1127,11 @@ async fn worker_main(args: WorkerArgs) {
                 Some(&crate::quic::HDR_META_MAGIC) => {
                     if let Some(m) = crate::quic::decode_hdr_meta_datagram(&d) {
                         let _ = hdr_meta_tx.try_send(m);
+                    }
+                }
+                Some(&crate::quic::HOST_TIMING_MAGIC) => {
+                    if let Some(t) = crate::quic::decode_host_timing_datagram(&d) {
+                        let _ = host_timing_tx.try_send(t);
                     }
                 }
                 _ => {} // unknown tag — a newer host; ignore

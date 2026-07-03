@@ -255,6 +255,16 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::video_caps`] bit: the client consumes per-AU host-timing datagrams
+// ([`HOST_TIMING_MAGIC`], 0xCF) — the host's capture→send duration per frame, letting the client
+// split its `host+network` latency stage into `host` and `network`
+// (design/stats-unification.md Phase 2). The host emits 0xCF ONLY when this bit is set (an older
+// host ignores it and simply never sends any); a client that doesn't set it keeps the combined
+// stage. Purely observability — never changes what the host encodes.
+#define VIDEO_CAP_HOST_TIMING 8
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 // encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 // advertise this.
@@ -393,6 +403,13 @@
 // HDR static-metadata datagram tag, host → client (the static analog of the per-frame VUI;
 // see [`HdrMeta`]). Next tag after [`HIDOUT_MAGIC`].
 #define HDR_META_MAGIC 206
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Per-AU host-timing datagram tag, host → client (see [`HostTiming`]). Next tag after
+// [`HDR_META_MAGIC`]. Emitted once per access unit, right after its last packet left the host's
+// socket, and only when the client advertised [`VIDEO_CAP_HOST_TIMING`].
+#define HOST_TIMING_MAGIC 207
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -670,6 +687,21 @@ typedef struct {
     // Maximum frame-average light level (MaxFALL), nits. 0 = unknown.
     uint16_t max_fall;
 } PunktfunkHdrMeta;
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One access unit's host-side processing time ([`punktfunk_connection_next_host_timing`]):
+// capture → fully sent, i.e. the whole host pipeline (capture read/convert, encode, FEC+seal,
+// paced send). Correlate to the AU whose `PunktfunkFrame::pts_ns` equals `pts_ns`, then
+// `network = (received_instant + clock_offset − pts_ns) − host_us` — the unified stats HUD's
+// `host` / `network` split (design/stats-unification.md Phase 2). Best-effort: a lost datagram
+// means that frame simply contributes no sample.
+typedef struct {
+    // The AU's capture stamp (host capture clock — matches `PunktfunkFrame::pts_ns` exactly).
+    uint64_t pts_ns;
+    // Host capture→sent duration, µs.
+    uint32_t host_us;
+} PunktfunkHostTiming;
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1187,6 +1219,22 @@ PunktfunkStatus punktfunk_connection_next_hidout(PunktfunkConnection *c,
 PunktfunkStatus punktfunk_connection_next_hdr_meta(PunktfunkConnection *c,
                                                    PunktfunkHdrMeta *out,
                                                    uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pull the next per-AU host timing (0xCF) into `*out`: the host's capture→sent duration for one
+// access unit, correlated to the AU by `pts_ns` (see [`PunktfunkHostTiming`]).
+// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once the session ended.
+// A stats consumer drains this non-blockingly (`timeout_ms = 0`) alongside its frame samples;
+// an older host never emits any — keep showing the combined `host+network` stage then. Same
+// threading rules as [`punktfunk_connection_next_rumble`] (one puller, may run alongside the
+// other planes).
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable for one `PunktfunkHostTiming`.
+PunktfunkStatus punktfunk_connection_next_host_timing(PunktfunkConnection *c,
+                                                      PunktfunkHostTiming *out,
+                                                      uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

@@ -1155,6 +1155,11 @@ async fn serve_session(
     let stop_stream = stop.clone();
     let fec_target_dp = fec_target.clone(); // data-plane handle to the adaptive-FEC target
     let conn_stream = conn.clone(); // for sending the source's real HDR metadata (0xCE) mid-stream
+                                    // Per-AU host-timing emission (0xCF): only when the client advertised the cap bit. All
+                                    // first-party clients do (the core connector ORs it in); an older client leaves it clear
+                                    // and gets no extra datagrams.
+    let timing_conn =
+        (hello.video_caps & punktfunk_core::quic::VIDEO_CAP_HOST_TIMING != 0).then(|| conn.clone());
     let stats_dp = stats; // data-plane handle to the shared stats recorder
                           // Short label for web-console stats captures: the client's cert-fingerprint prefix, else its
                           // peer IP (no fingerprint = anonymous TOFU/--open client).
@@ -1197,6 +1202,7 @@ async fn serve_session(
                     &probe_rx,
                     &probe_result_tx,
                     &fec_target_dp,
+                    timing_conn.as_ref(),
                 ),
                 Punktfunk1Source::Virtual => {
                     let compositor = compositor
@@ -1217,6 +1223,7 @@ async fn serve_session(
                         probe_result_tx,
                         fec_target: fec_target_dp,
                         conn: conn_stream,
+                        timing_conn,
                         stats: stats_dp,
                         client_label,
                         launch: launch_for_dp,
@@ -1810,6 +1817,7 @@ fn synthetic_stream(
     probe_rx: &std::sync::mpsc::Receiver<ProbeRequest>,
     probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     fec_target: &AtomicU8,
+    timing_conn: Option<&quinn::Connection>,
 ) -> Result<()> {
     let interval = std::time::Duration::from_millis(1000 / 60);
     for idx in 0..frames {
@@ -1820,9 +1828,19 @@ fn synthetic_stream(
         // Service speed-test probes between synthetic frames (loopback bandwidth tests).
         service_probes(session, stop, probe_rx, probe_result_tx);
         let data = test_frame(idx, 64 * 1024);
+        let pts_ns = now_ns();
         session
-            .submit_frame(&data, now_ns(), (FLAG_PIC | FLAG_SOF) as u32)
+            .submit_frame(&data, pts_ns, (FLAG_PIC | FLAG_SOF) as u32)
             .map_err(|e| anyhow!("submit_frame: {e:?}"))?;
+        // Host timing (0xCF) for protocol tests: near-zero here (no capture/encode), but it
+        // proves the plane end-to-end on a pure loopback run.
+        if let Some(tc) = timing_conn {
+            let t = punktfunk_core::quic::HostTiming {
+                pts_ns,
+                host_us: (now_ns().saturating_sub(pts_ns) / 1000).min(u32::MAX as u64) as u32,
+            };
+            let _ = tc.send_datagram(punktfunk_core::quic::encode_host_timing_datagram(&t).into());
+        }
         std::thread::sleep(interval);
     }
     tracing::info!(frames, "synthetic stream complete");
@@ -2404,6 +2422,9 @@ fn send_loop(
     burst_cap: usize,
     fec_target: Arc<AtomicU8>,
     stats: SendStats,
+    // `Some` = the client advertised VIDEO_CAP_HOST_TIMING: emit one 0xCF datagram per AU right
+    // after its last packet left the socket (capture→sent, the whole host pipeline incl. pacing).
+    timing_conn: Option<quinn::Connection>,
 ) {
     boost_thread_priority(false); // transmit thread: above-normal (Apollo's encoder-thread level)
     let mut last_perf = std::time::Instant::now();
@@ -2446,6 +2467,25 @@ fn send_loop(
                 burst_cap,
             ) {
                 Ok(stat) => {
+                    // Host timing (0xCF): stamped now — the AU's packets have fully left the
+                    // socket — against the same capture anchor the wire pts carries, so the
+                    // client's per-frame math tiles exactly (network = its host+network − this).
+                    // Best-effort like every side-plane datagram; skipped for speed-test filler
+                    // (FLAG_PROBE isn't video and its pts is the burst clock).
+                    if let Some(tc) = &timing_conn {
+                        if msg.flags & FLAG_PROBE as u32 == 0 {
+                            let host_us = (now_ns().saturating_sub(msg.capture_ns) / 1000)
+                                .min(u32::MAX as u64)
+                                as u32;
+                            let t = punktfunk_core::quic::HostTiming {
+                                pts_ns: msg.capture_ns,
+                                host_us,
+                            };
+                            let _ = tc.send_datagram(
+                                punktfunk_core::quic::encode_host_timing_datagram(&t).into(),
+                            );
+                        }
+                    }
                     if perf || stats.rec.is_armed() {
                         // `encode_us`/`pace_us`/fps are valid for every frame (always measured),
                         // including the Windows relay + tail-drain frames. The cap/submit/wait splits
@@ -2719,6 +2759,10 @@ struct SessionContext {
     fec_target: Arc<AtomicU8>,
     /// The QUIC control connection (carries host→client 0xCE source-HDR metadata mid-stream).
     conn: quinn::Connection,
+    /// `Some` when the client advertised [`punktfunk_core::quic::VIDEO_CAP_HOST_TIMING`]: the send
+    /// thread emits one 0xCF datagram per AU (capture→sent µs) on it, so the client can split its
+    /// `host+network` latency stage. `None` = older client, no emission.
+    timing_conn: Option<quinn::Connection>,
     /// Shared streaming-stats recorder. The capture loop reads `is_armed()` per frame to decide
     /// whether to measure the per-stage split; the send thread builds + pushes the aggregated
     /// `StatsSample` at its 2 s boundary.
@@ -2764,6 +2808,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         probe_result_tx,
         fec_target,
         conn,
+        timing_conn,
         stats,
         client_label,
         launch,
@@ -2870,6 +2915,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                     burst_cap,
                     fec_target,
                     send_stats,
+                    timing_conn,
                 )
             }
         })
