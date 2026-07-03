@@ -100,16 +100,39 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   work with no kernel bus driver (validated live: slot connected, state + rumble round-trip; Xbox One
   folds to this 360 path). All three UMDF drivers (DualSense/DS4 + XUSB) are built from source in CI
   (`packaging/windows/drivers/`) and installed by the Inno Setup installer via
-  `punktfunk-host.exe driver install --gamepad`.
+  `punktfunk-host.exe driver install --gamepad`. The gamepad drivers' **business logic is 100 % safe
+  Rust**: every raw shared-memory / sealed-channel / WDF-request operation lives behind
+  `pf-umdf-util` (the audited unsafe layer — `section::MappedView` checked accessors, the
+  `#![forbid(unsafe_code)]` `channel::ChannelClient` state machine, `wdf::Request` tokens), so a
+  memory-safety bug can only live in that one small crate. The whole drivers workspace is lint-gated
+  (`deny(unsafe_op_in_unsafe_fn)` + `deny(clippy::undocumented_unsafe_blocks)`) with a
+  `cargo clippy -D warnings` step in `windows-drivers.yml`; pf-vdisplay stays FFI-bound (D3D11/IddCx)
+  but every `unsafe {}` there now carries a `// SAFETY:` proof (unsafe-audited, not unsafe-free).
   **Multi-pad ready**: the host stamps each pad's index into the device Location (`pszDeviceLocation`),
   the driver reads it (`WdfDeviceAllocAndQueryProperty`) to map its own `*-shm-<index>`, and
   `UmdfHostProcessSharing=ProcessSharingDisabled` gives each pad its own host (per-pad statics) —
   validated live with 2 distinct XInput slots + 2 DualSense pads. (Client-side multi-pad forwarding is
   the remaining piece.)
-- **Windows host: implemented and shipping (all-vendor, x64-only).** `#[cfg(windows)]` backends
+- **Windows host: implemented and shipping (all-vendor, x64-only, Windows 11 22H2+).** The OS floor
+  is HARD: pf-vdisplay is built against IddCx 1.10 (1.10 stub + HDR `*2` DDIs + FP16 caps, no runtime
+  downgrade) — on Windows 10 (incl. LTSC) / Win11 21H2 the driver installs but the device fails start
+  with Code 10 `STATUS_DEVICE_POWER_FAILURE` (field-reported 2026-07); the installer gates on
+  `MinVersion=10.0.22621`. `#[cfg(windows)]` backends
   behind the same traits as Linux — **IDD-push capture** straight into the in-house all-Rust IddCx
   **pf-vdisplay** virtual display (`capture/windows/idd_push.rs`, `vdisplay/windows/pf_vdisplay.rs`;
-  DXGI Desktop Duplication / WGC as fallbacks, `capture/windows/dxgi.rs`), GPU encode (NVENC
+  DXGI Desktop Duplication / WGC as fallbacks, `capture/windows/dxgi.rs`). The host↔driver frame
+  ring is a **sealed channel** (proto v2, `design/idd-push-security.md`): all shared objects
+  UNNAMED, handles `DuplicateHandle`d into the driver's WUDFHost and delivered as values over
+  `IOCTL_SET_FRAME_CHANNEL` (SY+BA-only control device) — only the two endpoint processes can ever
+  reach a frame (DDA's isolation property in user mode; adopt-on-success handle-ownership contract,
+  newest-delivery-wins re-attach). *Sealed channel: CI-pending + on-glass revalidation pending.*
+  The **gamepad SHM channels are sealed the same way** (gamepad proto v2,
+  `design/gamepad-channel-sealing.md`): the pad DATA sections (`XusbShm`/`PadShm`, now with a
+  driver-validated `pad_index`) are unnamed + handle-duplicated into the pad WUDFHost
+  (`gamepad_raii.rs` `PadChannel`); since the HID minidrivers have no control device, the handshake
+  runs over a tiny named bootstrap mailbox (`Global\pf…-boot-<i>`, pid + handle value only — tampering
+  is DoS-bounded). *Sealed pad channel: needs both pad drivers redeployed with the host, physical-pad
+  validation pending.* GPU encode (NVENC
   `--features nvenc`; AMD/Intel `--features amf-qsv`), SendInput + the in-house UMDF gamepad drivers
   (`inject/windows/`), WASAPI loopback + virtual mic (`audio/windows/wasapi_*`). **Keyboard wire
   convention: US-positional VKs** (every first-party client sends the physical key's US-layout VK;
@@ -155,6 +178,25 @@ Low-latency desktop/game streaming stack, Linux-first, with a shared Rust protoc
   HKLM-registered by the installer. **Live-validated: Doom: The Dark Ages enables HDR over the virtual
   display.** **AMF/QSV is CI-green but not yet on-glass validated** (no AMD/Intel Windows box in the
   lab); NVENC is live-validated. Newer/less battle-tested than the Linux host. Packaging: `packaging/windows/`.
+- **Status tray (`crates/punktfunk-tray`, Windows + Linux).** A small per-user companion binary
+  showing the host service state at a glance (running / stopped / starting / degraded / failed +
+  streaming session in the tooltip) with one-click actions: open web console, approve-pairing
+  shortcut, start/stop/restart, open logs, exit. Status precedence is **service manager first**
+  (SCM / systemd user unit — a port-squatter can't fake Running), then the new **loopback-only
+  unauthenticated** `GET /api/v1/local/summary` (counts/booleans only — no PINs/fingerprints/names;
+  gated in `require_auth` by peer address, needed because `mgmt-token`/`cert.pem` are
+  SYSTEM/Admins-DACL'd on Windows so a non-elevated tray cannot bearer-auth). Windows:
+  `#![windows_subsystem = "windows"]` hidden-window + `Shell_NotifyIconW` (per-session `Local\`
+  mutex, TaskbarCreated re-add, `--quit` for the uninstaller), actions elevate per click via
+  `ShellExecuteW "runas"` on `punktfunk-host.exe service start|stop|restart` (new `service restart`
+  subcommand: stop → wait Stopped → start); installed by the Inno `trayicon` task (HKLM Run key).
+  Linux: ksni (SNI over zbus, `async-io`+`blocking` features), `systemctl --user` actions (no
+  polkit), `/etc/xdg/autostart` entry whose `--autostart` self-gates (silent exit unless
+  `~/.config/punktfunk` exists or the unit is enabled); deb/rpm/arch ship binary + autostart +
+  hicolor icons. Icons generated by `scripts/gen-tray-icons.py` (pure-stdlib; committed .ico/.png,
+  brand lens + status dot). *Linux live-validated on the headless KDE session (SNI registration,
+  stop/start transitions, menu-driven start, dbusmenu layout); Windows code MSVC-cross-type-checked
+  + clippy-clean but real Windows CI build + on-glass validation pending.*
 
 ## What's left
 
@@ -447,6 +489,7 @@ crates/punktfunk-host/
   capture/{linux/,windows/{dxgi,idd_push}}.rs · audio/{linux/,windows/wasapi_*}.rs
   windows/{service,install,interactive}.rs   SCM service + in-binary driver/web install
   capture.rs · encode.rs · audio.rs · gpu.rs · spike.rs · punktfunk1.rs · mgmt.rs · native_pairing.rs · stats_recorder.rs · library.rs
+crates/punktfunk-tray/        per-user status tray (Win32 Shell_NotifyIcon · Linux ksni/SNI); icons via scripts/gen-tray-icons.py
 clients/probe/    punktfunk/1 reference/probe client (headless test/measurement tool)
 clients/linux/    native Linux client (GTK4/libadwaita · FFmpeg · PipeWire · SDL3)
 clients/windows/  native Windows client (WinUI 3 via windows-reactor · D3D11 · WASAPI · SDL3)
@@ -454,6 +497,7 @@ clients/apple/    native macOS/iOS/tvOS client (Swift · VideoToolbox · GameCon
 clients/android/  native Android client (Kotlin app + native/ Rust JNI core over punktfunk-core)
 clients/decky/    Steam Deck Decky plugin
 packaging/windows/drivers/{pf-vdisplay,pf-dualsense,pf-xusb}/   in-house UMDF drivers (built from source in CI)
+packaging/windows/drivers/pf-umdf-util/   audited unsafe layer (safe shm + sealed-channel + WDF request primitives) — gamepad drivers' logic is 100% safe over it
 web/                          TanStack web console over the mgmt API (status · devices · pairing · GPU selection · performance graphs)
 packaging/                    apt(deb) · RPM/COPR · Arch/sysext · Flatpak · Bazzite bootc · Windows host installer (per-dir READMEs)
 tools/{loss-harness,latency-probe}/     measurement (plan §10)

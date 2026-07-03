@@ -739,7 +739,7 @@ NOTES:
         "\nWINDOWS SERVICE (end-user deployment — replaces a manual launch):\n\
         \x20   punktfunk-host service install    register an auto-start SYSTEM service + firewall rules\n\
         \x20   punktfunk-host service uninstall  remove the service + firewall rules\n\
-        \x20   punktfunk-host service start|stop|status\n\
+        \x20   punktfunk-host service start|stop|restart|status\n\
         \x20   config: %ProgramData%\\punktfunk\\host.env\n\
         \nWINDOWS DIAGNOSTICS:\n\
         \x20   punktfunk-host hdr-p010-selftest  GPU colour check for the PUNKTFUNK_HDR_SHADER_P010 path\n\

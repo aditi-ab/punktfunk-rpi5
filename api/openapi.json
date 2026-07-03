@@ -578,6 +578,41 @@
         }
       }
     },
+    "/api/v1/local/summary": {
+      "get": {
+        "tags": [
+          "host"
+        ],
+        "summary": "Local status summary for the tray icon",
+        "description": "Non-sensitive status (counts and booleans only — no PIN values, no fingerprints, no device\nnames). Unauthenticated, but served to loopback peers only.",
+        "operationId": "getLocalSummary",
+        "responses": {
+          "200": {
+            "description": "Non-sensitive local host status (loopback peers only)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalSummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Non-loopback peer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
     "/api/v1/logs": {
       "get": {
         "tags": [
@@ -2080,6 +2115,66 @@
           "value": {
             "type": "string",
             "description": "The appid (for `steam_appid`) or the shell command (for `command`)."
+          }
+        }
+      },
+      "LocalSummary": {
+        "type": "object",
+        "description": "Non-sensitive host status for the local tray icon: counts and booleans only — no PIN values,\nno fingerprints, no device names. Served unauthenticated to LOOPBACK peers only (see\n`require_auth`): the bearer-token file is SYSTEM/Administrators-DACL'd on Windows, so the\nper-user tray process cannot authenticate — this narrow read-only route is its status source.",
+        "required": [
+          "version",
+          "video_streaming",
+          "audio_streaming",
+          "paired_clients",
+          "native_paired_clients",
+          "pin_pending",
+          "pending_approvals"
+        ],
+        "properties": {
+          "audio_streaming": {
+            "type": "boolean",
+            "description": "True while the audio stream thread is running."
+          },
+          "native_paired_clients": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of paired native (punktfunk/1) devices.",
+            "minimum": 0
+          },
+          "paired_clients": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of pinned (paired) GameStream client certificates.",
+            "minimum": 0
+          },
+          "pending_approvals": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Native pairing knocks awaiting the operator's approval (count only).",
+            "minimum": 0
+          },
+          "pin_pending": {
+            "type": "boolean",
+            "description": "True while a GameStream pairing handshake is parked waiting for the user's PIN."
+          },
+          "session": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SessionInfo",
+                "description": "The active launch session (set by Moonlight's `/launch`, cleared on cancel/stop)."
+              }
+            ]
+          },
+          "version": {
+            "type": "string",
+            "description": "Host version (mirrors `/health`)."
+          },
+          "video_streaming": {
+            "type": "boolean",
+            "description": "True while the video stream thread is running."
           }
         }
       },

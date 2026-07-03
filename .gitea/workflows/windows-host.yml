@@ -23,8 +23,9 @@
 # (import once to LocalMachine\TrustedPublisher). See packaging/windows/pack-host-installer.ps1.
 #
 # GPU backends: the host builds with --features nvenc,amf-qsv = all three vendors in one installer.
-#  - NVENC (NVIDIA, direct SDK): the only link need is nvencodeapi.lib, synthesised from a 2-export
-#    .def with llvm-dlltool (no GPU/SDK at build time).
+#  - NVENC (NVIDIA, direct SDK): nothing needed at build time — the entry points are resolved at
+#    RUNTIME from the driver's nvEncodeAPI64.dll (a link-time import would kill the binary on
+#    AMD/Intel-only boxes before main).
 #  - AMF/QSV (AMD/Intel, libavcodec): link-imports the FFmpeg libs from FFMPEG_DIR (the BtbN lgpl-shared
 #    tree the client uses; includes the *_amf/*_qsv encoders) and bundles its DLLs into the installer.
 #    lgpl-shared (not gpl-shared) keeps those bundled DLLs LGPL (we never use the GPL-only x264/x265).
@@ -37,6 +38,7 @@ on:
     paths:
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-tray/**'
       - 'packaging/windows/**'
       - 'scripts/windows/**'
       - 'web/**'
@@ -109,21 +111,22 @@ jobs:
           "PUNKTFUNK_BUILD_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Output "host version $v"
 
-      - name: Generate NVENC import lib
-        shell: pwsh
-        run: |
-          & packaging/windows/nvenc/gen-nvenc-importlib.ps1 -OutDir C:\t\nvenc
-          "PUNKTFUNK_NVENC_LIB_DIR=C:\t\nvenc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
       - name: Build (release, nvenc + amf-qsv)
         shell: pwsh
         # All-vendor host: NVENC (NVIDIA, direct SDK) + AMF/QSV (AMD/Intel, libavcodec via FFMPEG_DIR).
         run: cargo build --release -p punktfunk-host --features nvenc,amf-qsv
 
-      - name: Clippy (host, Windows)
+      - name: Build (release, status tray)
+        shell: pwsh
+        # The per-user notification-area companion the installer bundles (punktfunk-tray.exe).
+        run: cargo build --release -p punktfunk-tray
+
+      - name: Clippy (host + tray, Windows)
         shell: pwsh
         # First-ever Windows lint coverage for the host (Linux CI never lints the windows-cfg code).
-        run: cargo clippy -p punktfunk-host --features nvenc,amf-qsv -- -D warnings
+        run: |
+          cargo clippy -p punktfunk-host --features nvenc,amf-qsv -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
+          cargo clippy -p punktfunk-tray -- -D warnings; if ($LASTEXITCODE) { throw "tray clippy" }
 
       - name: Build + lint the HDR Vulkan layer (pf-vkhdr-layer)
         shell: pwsh

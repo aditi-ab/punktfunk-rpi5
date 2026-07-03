@@ -42,6 +42,8 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $iss = Join-Path $here 'punktfunk-host.iss'
 $exe = Join-Path $TargetDir 'punktfunk-host.exe'
 if (-not (Test-Path $exe)) { throw "missing build artifact 'punktfunk-host.exe' in $TargetDir (did 'cargo build --release -p punktfunk-host --features nvenc' run?)" }
+$trayExe = Join-Path $TargetDir 'punktfunk-tray.exe'
+if (-not (Test-Path $trayExe)) { throw "missing build artifact 'punktfunk-tray.exe' in $TargetDir (did 'cargo build --release -p punktfunk-tray' run?)" }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 # --- locate ISCC (Inno Setup) + signtool (Windows SDK) ---------------------------------------
@@ -110,14 +112,15 @@ function Sign-File([string]$Path) {
     }
 }
 
-# --- sign the inner exe before it's packed ----------------------------------------------------
+# --- sign the inner exes before they're packed -------------------------------------------------
 Sign-File $exe
+Sign-File $trayExe
 
 # --- resolve + validate the installer's source files ------------------------------------------
 $repoRoot = (Resolve-Path (Join-Path $here '..\..')).Path
 $hostEnvSrc = Join-Path $repoRoot 'scripts\windows\host.env.example'
 $readmeSrc = Join-Path $here 'README.md'
-foreach ($p in @($exe, $hostEnvSrc, $readmeSrc, $iss)) {
+foreach ($p in @($exe, $trayExe, $hostEnvSrc, $readmeSrc, $iss)) {
     if (-not (Test-Path -LiteralPath $p)) { throw "installer source file missing: $p" }
 }
 

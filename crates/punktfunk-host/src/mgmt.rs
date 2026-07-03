@@ -157,6 +157,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(list_gpus))
                 .routes(routes!(set_gpu_preference))
                 .routes(routes!(get_status))
+                .routes(routes!(get_local_summary))
                 .routes(routes!(list_paired_clients))
                 .routes(routes!(unpair_client))
                 .routes(routes!(get_pairing_status))
@@ -353,6 +354,30 @@ struct StreamInfo {
     codec: ApiCodec,
 }
 
+/// Non-sensitive host status for the local tray icon: counts and booleans only — no PIN values,
+/// no fingerprints, no device names. Served unauthenticated to LOOPBACK peers only (see
+/// `require_auth`): the bearer-token file is SYSTEM/Administrators-DACL'd on Windows, so the
+/// per-user tray process cannot authenticate — this narrow read-only route is its status source.
+#[derive(Serialize, ToSchema)]
+struct LocalSummary {
+    /// Host version (mirrors `/health`).
+    version: String,
+    /// True while the video stream thread is running.
+    video_streaming: bool,
+    /// True while the audio stream thread is running.
+    audio_streaming: bool,
+    /// The active launch session (set by Moonlight's `/launch`, cleared on cancel/stop).
+    session: Option<SessionInfo>,
+    /// Number of pinned (paired) GameStream client certificates.
+    paired_clients: u32,
+    /// Number of paired native (punktfunk/1) devices.
+    native_paired_clients: u32,
+    /// True while a GameStream pairing handshake is parked waiting for the user's PIN.
+    pin_pending: bool,
+    /// Native pairing knocks awaiting the operator's approval (count only).
+    pending_approvals: u32,
+}
+
 /// A paired (certificate-pinned) Moonlight client.
 #[derive(Serialize, ToSchema)]
 struct PairedClient {
@@ -488,12 +513,33 @@ where
 
 /// Auth gate on the `/api/v1` routes: a paired client cert (mTLS, from anywhere) or the bearer token
 /// (from a **loopback** peer only) — required always (the host runs with a token by construction).
-/// `/api/v1/health` stays open for probes. The cert path authorizes only the read-only allowlist
+/// `/api/v1/health` stays open for probes; `/api/v1/local/summary` is open to loopback peers only
+/// (the tray icon's status source). The cert path authorizes only the read-only allowlist
 /// ([`cert_may_access`]); the bearer path authorizes the full admin surface and is therefore confined
 /// to loopback so it is never LAN-exposed even when the listener binds all interfaces by default.
 async fn require_auth(State(st): State<Arc<MgmtState>>, req: Request, next: Next) -> Response {
     if req.uri().path() == "/api/v1/health" {
         return next.run(req).await; // liveness probe is always open
+    }
+    // The tray icon's status source: non-sensitive counts/booleans only, unauthenticated but
+    // confined to LOOPBACK peers. The bearer-token file (and cert.pem) are SYSTEM/Administrators-
+    // DACL'd on Windows, so the per-user tray process cannot authenticate — this one narrow
+    // read-only route is deliberately all it needs. Not on the cert allowlist: LAN mTLS clients
+    // already have the richer `/status`. (No PeerAddr ⇒ a unit test → treat as loopback, matching
+    // the bearer path below.)
+    if req.uri().path() == "/api/v1/local/summary" {
+        let from_loopback = req
+            .extensions()
+            .get::<PeerAddr>()
+            .is_none_or(|a| a.0.ip().is_loopback());
+        return if from_loopback {
+            next.run(req).await
+        } else {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "the local summary is loopback-only",
+            )
+        };
     }
     // A paired native client authenticates by its mTLS certificate — the same identity + trust the
     // QUIC data plane uses. But "paired to STREAM" is not "paired to ADMINISTER": a streaming cert
@@ -941,6 +987,45 @@ async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<RuntimeStatus> {
         paired_clients: st.app.paired.lock().unwrap().len() as u32,
         session,
         stream,
+    })
+}
+
+/// Local status summary for the tray icon
+///
+/// Non-sensitive status (counts and booleans only — no PIN values, no fingerprints, no device
+/// names). Unauthenticated, but served to loopback peers only.
+#[utoipa::path(
+    get,
+    path = "/local/summary",
+    tag = "host",
+    operation_id = "getLocalSummary",
+    // Override the document-global bearerAuth: loopback peers are exempt in `require_auth`.
+    security(()),
+    responses(
+        (status = OK, description = "Non-sensitive local host status (loopback peers only)", body = LocalSummary),
+        (status = UNAUTHORIZED, description = "Non-loopback peer", body = ApiError),
+    )
+)]
+async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<LocalSummary> {
+    let session = st.app.launch.lock().unwrap().map(|l| SessionInfo {
+        width: l.width,
+        height: l.height,
+        fps: l.fps,
+    });
+    let (native_paired_clients, pending_approvals) = st
+        .native
+        .as_ref()
+        .map(|n| (n.status().paired_clients, n.pending().len() as u32))
+        .unwrap_or((0, 0));
+    Json(LocalSummary {
+        version: env!("PUNKTFUNK_VERSION").into(),
+        video_streaming: st.app.streaming.load(Ordering::SeqCst),
+        audio_streaming: st.app.audio_streaming.load(Ordering::SeqCst),
+        session,
+        paired_clients: st.app.paired.lock().unwrap().len() as u32,
+        native_paired_clients,
+        pin_pending: st.app.pairing.pin.awaiting_pin(),
+        pending_approvals,
     })
 }
 
@@ -2029,6 +2114,61 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ok");
         assert_eq!(body["abi_version"], punktfunk_core::ABI_VERSION);
+    }
+
+    /// The tray's `/local/summary` is unauthenticated for LOOPBACK peers only — a LAN peer is
+    /// rejected even though the route needs no bearer token, and the body never carries secret
+    /// material (no PIN values, no fingerprints, no device names — counts/booleans only).
+    #[tokio::test]
+    async fn local_summary_is_loopback_only_and_non_sensitive() {
+        let np = Arc::new(
+            crate::native_pairing::NativePairing::load_with(
+                Some(
+                    std::env::temp_dir()
+                        .join(format!("pf-mgmt-summary-{}.json", std::process::id())),
+                ),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        np.add("secret-device-name", "deadbeefcafe0123").unwrap();
+        let app = test_app_native(test_state(), np);
+
+        // Loopback peer, NO auth header → 200 with the expected shape.
+        let mut req = get_req("/api/v1/local/summary");
+        req.extensions_mut()
+            .insert(PeerAddr("127.0.0.1:40000".parse().unwrap()));
+        let (status, body) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["video_streaming"], false);
+        assert_eq!(body["native_paired_clients"], 1);
+        assert_eq!(body["pending_approvals"], 0);
+        assert!(body["version"].is_string());
+        // No secret material anywhere in the body (paired name / fingerprint must not leak).
+        let raw = body.to_string();
+        assert!(
+            !raw.contains("deadbeefcafe0123") && !raw.contains("secret-device-name"),
+            "summary must not leak fingerprints or device names: {raw}"
+        );
+
+        // The same request from a LAN peer → rejected (route is loopback-gated, not just tokenless).
+        let mut req = get_req("/api/v1/local/summary");
+        req.extensions_mut()
+            .insert(PeerAddr("192.168.1.50:40000".parse().unwrap()));
+        let (status, _) = send(&app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the local summary must be rejected for a LAN peer"
+        );
+
+        // IPv6 loopback counts as loopback.
+        let mut req = get_req("/api/v1/local/summary");
+        req.extensions_mut()
+            .insert(PeerAddr("[::1]:40000".parse().unwrap()));
+        let (status, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK, "::1 is a loopback peer");
     }
 
     #[tokio::test]

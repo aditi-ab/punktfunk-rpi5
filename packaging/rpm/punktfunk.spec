@@ -167,7 +167,7 @@ export RUSTUP_TOOLCHAIN=stable
 # Stamp the exact NVR into the binary for --version / mgmt /health provenance (build.rs reads it).
 export PUNKTFUNK_BUILD_VERSION="%{version}-%{release}"
 # --locked: reproducible from (commit + Cargo.lock), matching the .deb build path.
-cargo build --release --locked -p punktfunk-host -p punktfunk-client-linux
+cargo build --release --locked -p punktfunk-host -p punktfunk-client-linux -p punktfunk-tray
 
 %if %{with web}
 # Management web console: build the Nitro SSR bundle with bun (the `bun` preset + our Bun.serve
@@ -210,6 +210,17 @@ sed -i 's#%h/punktfunk/scripts/headless/run-headless-kde.sh#%{_datadir}/%{name}/
 # KWIN_WAYLAND_NO_PERMISSION_CHECKS hack for the screencast permission.
 install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
                 %{buildroot}%{_datadir}/applications/io.unom.Punktfunk.Host.desktop
+
+# Status tray: the per-user SNI icon + its XDG autostart entry (self-gating: --autostart exits
+# silently for users who don't run a host) + the hicolor status icons it names.
+install -Dm0755 target/release/punktfunk-tray %{buildroot}%{_bindir}/punktfunk-tray
+install -Dm0644 packaging/linux/io.unom.Punktfunk.Tray.desktop \
+                %{buildroot}%{_sysconfdir}/xdg/autostart/io.unom.Punktfunk.Tray.desktop
+for sz in 22x22 48x48; do
+  for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
+    install -Dm0644 "$png" %{buildroot}%{_datadir}/icons/hicolor/$sz/apps/"$(basename "$png")"
+  done
+done
 
 # --- client subpackage ---
 install -Dm0755 target/release/punktfunk-client %{buildroot}%{_bindir}/punktfunk-client
@@ -275,11 +286,14 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %license LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt
 %doc README.md design/implementation-plan.md packaging/README.md
 %{_bindir}/punktfunk-host
+%{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
 %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
 %{_userunitdir}/punktfunk-host.service
 %{_userunitdir}/punktfunk-kde-session.service
 %{_datadir}/applications/io.unom.Punktfunk.Host.desktop
+%{_sysconfdir}/xdg/autostart/io.unom.Punktfunk.Tray.desktop
+%{_datadir}/icons/hicolor/*/apps/punktfunk-tray*.png
 %dir /etc/gamescope-session-plus
 %dir /etc/gamescope-session-plus/sessions.d
 %config(noreplace) /etc/gamescope-session-plus/sessions.d/steam

@@ -91,6 +91,7 @@ pub fn main(args: &[String]) -> Result<()> {
         Some("uninstall") => uninstall(),
         Some("start") => sc(&["start", SERVICE_NAME]),
         Some("stop") => sc(&["stop", SERVICE_NAME]),
+        Some("restart") => restart(),
         Some("status") => sc(&["query", SERVICE_NAME]),
         _ => {
             eprintln!(
@@ -102,6 +103,7 @@ pub fn main(args: &[String]) -> Result<()> {
                  \x20   punktfunk-host service uninstall   stop + remove the service + firewall rules\n\
                  \x20   punktfunk-host service start       start the service now\n\
                  \x20   punktfunk-host service stop        stop the service\n\
+                 \x20   punktfunk-host service restart     stop, wait for exit, start again\n\
                  \x20   punktfunk-host service status      query the service\n\n\
                  Config: %ProgramData%\\punktfunk\\host.env   Logs: %ProgramData%\\punktfunk\\logs\\"
             );
@@ -688,6 +690,40 @@ fn install(args: &[String]) -> Result<()> {
         host_env_path().display(),
         crate::gamestream::config_dir().join("logs").display()
     );
+    Ok(())
+}
+
+/// `service restart`: stop, wait for the service to actually reach Stopped (a bare
+/// `sc stop && sc start` races the stop — START fails with "instance already running" while the
+/// old process winds down), then start. The tray icon's Restart action runs this, elevated.
+fn restart() -> Result<()> {
+    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("open Service Control Manager (run elevated)")?;
+    let svc = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::STOP | ServiceAccess::QUERY_STATUS | ServiceAccess::START,
+        )
+        .context("open service (run elevated)")?;
+    // Best-effort stop: ERROR_SERVICE_NOT_ACTIVE just means restart == start.
+    let _ = svc.stop();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let state = svc.query_status().context("query service status")?;
+        if state.current_state == ServiceState::Stopped {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("service did not stop within 30 s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    svc.start(&[] as &[&std::ffi::OsStr])
+        .context("start service")?;
+    println!("Restarted service '{SERVICE_NAME}'.");
     Ok(())
 }
 
