@@ -232,10 +232,11 @@ pf-driver-proto = { path = "../pf-driver-proto" }
 bytemuck = { version = "1.19", features = ["derive"] }
 
 [features]
-# NVENC hardware encode (Windows). OFF by default: it pulls the NVENC SDK, and the host then needs
-# the NVENC entry points (NvEncodeAPICreateInstance / NvEncodeAPIGetMaxSupportedVersion) at link
-# time — i.e. `nvencodeapi.lib` from the NVIDIA Video Codec SDK (or an import lib generated from
-# nvEncodeAPI64.dll) on the linker path. Build the GPU host with `--features nvenc`.
+# NVENC hardware encode (Windows). OFF by default (it pulls the NVENC SDK crate); nothing is
+# needed at link time — the entry points are resolved at RUNTIME from the driver's
+# nvEncodeAPI64.dll (encode/windows/nvenc.rs `load_api`), so the same binary starts fine on
+# AMD/Intel-only boxes and falls through to AMF/QSV/software. Build the GPU host with
+# `--features nvenc`.
 nvenc = ["dep:nvidia-video-codec-sdk"]
 # AMD/Intel hardware encode on Windows (AMF/QSV via ffmpeg-next). OFF by default: it needs a
 # `FFMPEG_DIR` (BtbN lgpl-shared — includes `*_amf`/`*_qsv`; the GPL-only x264/x265 are never used,

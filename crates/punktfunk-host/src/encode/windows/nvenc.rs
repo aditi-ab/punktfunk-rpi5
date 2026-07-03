@@ -1,7 +1,10 @@
 //! NVENC hardware encoder (Windows, D3D11 input) — zero-copy capture→encode on the GPU.
 //!
-//! Drives the raw NVENC API via `nvidia_video_codec_sdk::{sys, ENCODE_API}` (the safe `Encoder`
-//! wrapper is CUDA-only). Opens an encode session bound to the **same** `ID3D11Device` as the DXGI
+//! Drives the raw NVENC API via the `nvidia_video_codec_sdk` `sys` types and a **runtime-loaded**
+//! entry table ([`EncodeApi`] — the crate's `ENCODE_API`/safe `Encoder` are deliberately unused:
+//! the safe wrapper is CUDA-only, and its statically-declared entry points would put a load-time
+//! `nvEncodeAPI64.dll` import on the all-vendor binary, killing it on every AMD/Intel-only box).
+//! Opens an encode session bound to the **same** `ID3D11Device` as the DXGI
 //! capturer (the device is carried on `FramePayload::D3d11`), and **encodes the capturer's texture in
 //! place** — it registers each input texture with NVENC once (cached by pointer) and `encode_picture`s
 //! it directly, with NO per-frame `CopyResource`. (That's safe because the host encode loop is
@@ -10,8 +13,10 @@
 //! pipelined, the capturer must hand a ring of textures.) Mirrors the Linux NVENC config: CBR +
 //! ultra-low-latency, infinite GOP, P-frames only, forced-IDR for RFI, in-band SPS/PPS each keyframe.
 //!
-//! Needs a real NVIDIA GPU at runtime (session creation fails otherwise) — compiles GPU-less, but
-//! `open`/`submit` only succeed on a GPU box. The software encoder (`super::sw`) is the fallback.
+//! Needs a real NVIDIA GPU at runtime (session creation fails otherwise) — compiles GPU-less and
+//! **starts driver-less** (the DLL resolves at runtime; on an AMD/Intel box [`try_api`] fails
+//! cleanly and the AMF/QSV/software backends carry the session). The software encoder
+//! (`super::sw`) is the fallback.
 //!
 //! **Two-thread async retrieve** (`PUNKTFUNK_NVENC_ASYNC=1`, opt-in until on-glass validated —
 //! gpu-contention plan §5.B): the NVENC guide mandates that the main thread only *submit*
@@ -44,7 +49,182 @@ use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
-use nvidia_video_codec_sdk::ENCODE_API as API;
+
+// ---------------------------------------------------------------------------------------------
+// Runtime-loaded NVENC entry table.
+//
+// The NVENC entry points live in `nvEncodeAPI64.dll`, which exists ONLY where the NVIDIA driver
+// is installed. They must be resolved at runtime (`LoadLibraryExW` + `GetProcAddress`), never as
+// a link-time import: the shipped host binary compiles the `nvenc` feature in unconditionally,
+// and a load-time DLL import makes the Windows loader refuse to start the process on every
+// AMD/Intel-only box ("nvencodeapi64.dll was not found", before `main`) — `encode.rs` never gets
+// the chance to dispatch to AMF/QSV. This is the Windows analogue of the Linux host's dlopen'd
+// libcuda. Only the two real DLL exports are resolved by name; the rest of the table comes back
+// through `NvEncodeAPICreateInstance`.
+// ---------------------------------------------------------------------------------------------
+
+/// The `NV_ENCODE_API_FUNCTION_LIST` entries this encoder uses, unwrapped once at load so call
+/// sites stay `(api().encode_picture)(…)`. Field names mirror the sdk crate's `EncodeAPI`, whose
+/// lazy static must NOT be referenced — it calls the statically-declared externs, which is what
+/// demanded the import lib at link time.
+struct EncodeApi {
+    open_encode_session_ex: unsafe extern "C" fn(
+        *mut nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
+        *mut *mut c_void,
+    ) -> nv::NVENCSTATUS,
+    initialize_encoder:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_INITIALIZE_PARAMS) -> nv::NVENCSTATUS,
+    destroy_encoder: unsafe extern "C" fn(*mut c_void) -> nv::NVENCSTATUS,
+    get_encode_caps: unsafe extern "C" fn(
+        *mut c_void,
+        nv::GUID,
+        *mut nv::NV_ENC_CAPS_PARAM,
+        *mut core::ffi::c_int,
+    ) -> nv::NVENCSTATUS,
+    get_encode_preset_config_ex: unsafe extern "C" fn(
+        *mut c_void,
+        nv::GUID,
+        nv::GUID,
+        nv::NV_ENC_TUNING_INFO,
+        *mut nv::NV_ENC_PRESET_CONFIG,
+    ) -> nv::NVENCSTATUS,
+    create_bitstream_buffer: unsafe extern "C" fn(
+        *mut c_void,
+        *mut nv::NV_ENC_CREATE_BITSTREAM_BUFFER,
+    ) -> nv::NVENCSTATUS,
+    destroy_bitstream_buffer:
+        unsafe extern "C" fn(*mut c_void, nv::NV_ENC_OUTPUT_PTR) -> nv::NVENCSTATUS,
+    lock_bitstream:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_LOCK_BITSTREAM) -> nv::NVENCSTATUS,
+    unlock_bitstream: unsafe extern "C" fn(*mut c_void, nv::NV_ENC_OUTPUT_PTR) -> nv::NVENCSTATUS,
+    register_resource:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_REGISTER_RESOURCE) -> nv::NVENCSTATUS,
+    unregister_resource:
+        unsafe extern "C" fn(*mut c_void, nv::NV_ENC_REGISTERED_PTR) -> nv::NVENCSTATUS,
+    map_input_resource:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_MAP_INPUT_RESOURCE) -> nv::NVENCSTATUS,
+    unmap_input_resource:
+        unsafe extern "C" fn(*mut c_void, nv::NV_ENC_INPUT_PTR) -> nv::NVENCSTATUS,
+    encode_picture:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_PIC_PARAMS) -> nv::NVENCSTATUS,
+    register_async_event:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_EVENT_PARAMS) -> nv::NVENCSTATUS,
+    unregister_async_event:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_EVENT_PARAMS) -> nv::NVENCSTATUS,
+    invalidate_ref_frames: unsafe extern "C" fn(*mut c_void, u64) -> nv::NVENCSTATUS,
+}
+
+/// Local `NVENCSTATUS` → `Result` (replaces the sdk's `result_without_string`, which lives in the
+/// crate's `safe` module — code this file must not pull in, see [`EncodeApi`]). The raw status's
+/// Debug repr (`NV_ENC_ERR_INVALID_PARAM`, …) is the error payload.
+trait NvStatusExt {
+    fn nv_ok(self) -> std::result::Result<(), nv::NVENCSTATUS>;
+}
+impl NvStatusExt for nv::NVENCSTATUS {
+    fn nv_ok(self) -> std::result::Result<(), nv::NVENCSTATUS> {
+        match self {
+            nv::NVENCSTATUS::NV_ENC_SUCCESS => Ok(()),
+            err => Err(err),
+        }
+    }
+}
+
+/// Resolve the table once per process. `Err` = NVENC genuinely unavailable on this machine (no
+/// NVIDIA driver/DLL, or a driver older than our headers) — the entry points
+/// ([`NvencD3d11Encoder::open`], [`probe_can_encode_444`]) gate on it and the AMF/QSV/software
+/// backends carry on.
+fn try_api() -> std::result::Result<&'static EncodeApi, &'static str> {
+    static TABLE: std::sync::OnceLock<std::result::Result<EncodeApi, String>> =
+        std::sync::OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            let table = load_api();
+            if let Err(e) = &table {
+                // Once per process. Only reachable when something resolved to NVENC on this box
+                // (backend misdetect or a forced PUNKTFUNK_ENCODER=nvenc) — say why it will fail.
+                tracing::warn!("NVENC API unavailable: {e}");
+            }
+            table
+        })
+        .as_ref()
+        .map_err(|e| e.as_str())
+}
+
+/// The loaded table, for call sites past a [`try_api`] gate — a live session (or the probe's own
+/// gate) implies the load succeeded, and the table lives for the process lifetime.
+fn api() -> &'static EncodeApi {
+    try_api().expect("NVENC call before a successful try_api() gate")
+}
+
+fn load_api() -> std::result::Result<EncodeApi, String> {
+    use windows::core::{s, w};
+    use windows::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+    // SAFETY: `LoadLibraryExW`/`GetProcAddress` take static NUL-terminated names; the
+    // System32-only search path keeps a planted DLL out of the SYSTEM-service process. The two
+    // transmutes cast the resolved exports to their documented prototypes (nvEncodeAPI.h), the
+    // same contract the C SDK's own loader applies. `NvEncodeAPIGetMaxSupportedVersion` writes
+    // one u32 through a live pointer; `NvEncodeAPICreateInstance` fills `list`, a stack-local
+    // `#[repr(C)]` function list with `version` set, only during the call. The module is never
+    // freed, so every extracted function pointer stays valid for the process lifetime.
+    unsafe {
+        let module = LoadLibraryExW(w!("nvEncodeAPI64.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)
+            .map_err(|e| format!("nvEncodeAPI64.dll not loadable (no NVIDIA driver?): {e}"))?;
+        let get_version = GetProcAddress(module, s!("NvEncodeAPIGetMaxSupportedVersion"))
+            .ok_or("nvEncodeAPI64.dll exports no NvEncodeAPIGetMaxSupportedVersion")?;
+        let create_instance = GetProcAddress(module, s!("NvEncodeAPICreateInstance"))
+            .ok_or("nvEncodeAPI64.dll exports no NvEncodeAPICreateInstance")?;
+        let get_version: unsafe extern "C" fn(*mut u32) -> nv::NVENCSTATUS =
+            std::mem::transmute(get_version);
+        let create_instance: unsafe extern "C" fn(
+            *mut nv::NV_ENCODE_API_FUNCTION_LIST,
+        ) -> nv::NVENCSTATUS = std::mem::transmute(create_instance);
+
+        let mut version = 0u32;
+        get_version(&mut version)
+            .nv_ok()
+            .map_err(|e| format!("NvEncodeAPIGetMaxSupportedVersion: {e:?}"))?;
+        // The sdk's assert_versions_match, minus the panic: an older driver is a clean Err.
+        let (major, minor) = (version >> 4, version & 0xf);
+        if (major, minor) < (nv::NVENCAPI_MAJOR_VERSION, nv::NVENCAPI_MINOR_VERSION) {
+            return Err(format!(
+                "driver NVENC API {major}.{minor} is older than the host's headers {}.{} — \
+                 update the NVIDIA driver",
+                nv::NVENCAPI_MAJOR_VERSION,
+                nv::NVENCAPI_MINOR_VERSION
+            ));
+        }
+
+        let mut list = nv::NV_ENCODE_API_FUNCTION_LIST {
+            version: nv::NV_ENCODE_API_FUNCTION_LIST_VER,
+            ..Default::default()
+        };
+        create_instance(&mut list)
+            .nv_ok()
+            .map_err(|e| format!("NvEncodeAPICreateInstance: {e:?}"))?;
+        const MISSING: &str = "NvEncodeAPICreateInstance left an entry point unfilled";
+        Ok(EncodeApi {
+            open_encode_session_ex: list.nvEncOpenEncodeSessionEx.ok_or(MISSING)?,
+            initialize_encoder: list.nvEncInitializeEncoder.ok_or(MISSING)?,
+            destroy_encoder: list.nvEncDestroyEncoder.ok_or(MISSING)?,
+            get_encode_caps: list.nvEncGetEncodeCaps.ok_or(MISSING)?,
+            get_encode_preset_config_ex: list.nvEncGetEncodePresetConfigEx.ok_or(MISSING)?,
+            create_bitstream_buffer: list.nvEncCreateBitstreamBuffer.ok_or(MISSING)?,
+            destroy_bitstream_buffer: list.nvEncDestroyBitstreamBuffer.ok_or(MISSING)?,
+            lock_bitstream: list.nvEncLockBitstream.ok_or(MISSING)?,
+            unlock_bitstream: list.nvEncUnlockBitstream.ok_or(MISSING)?,
+            register_resource: list.nvEncRegisterResource.ok_or(MISSING)?,
+            unregister_resource: list.nvEncUnregisterResource.ok_or(MISSING)?,
+            map_input_resource: list.nvEncMapInputResource.ok_or(MISSING)?,
+            unmap_input_resource: list.nvEncUnmapInputResource.ok_or(MISSING)?,
+            encode_picture: list.nvEncEncodePicture.ok_or(MISSING)?,
+            register_async_event: list.nvEncRegisterAsyncEvent.ok_or(MISSING)?,
+            unregister_async_event: list.nvEncUnregisterAsyncEvent.ok_or(MISSING)?,
+            invalidate_ref_frames: list.nvEncInvalidateRefFrames.ok_or(MISSING)?,
+        })
+    }
+}
 
 // Output bitstream buffers = max in-flight encodes. The helper deep-pipelines (submits several frames
 // before locking the oldest) so per-frame GPU-scheduling waits OVERLAP instead of serializing under a
@@ -143,7 +323,7 @@ fn retrieve_loop(
                     outputBitstream: job.bs as *mut c_void,
                     ..Default::default()
                 };
-                match (API.lock_bitstream)(enc as *mut c_void, &mut lock).result_without_string() {
+                match (api().lock_bitstream)(enc as *mut c_void, &mut lock).nv_ok() {
                     Ok(()) => {
                         let data = std::slice::from_raw_parts(
                             lock.bitstreamBufferPtr as *const u8,
@@ -155,7 +335,7 @@ fn retrieve_loop(
                             nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR
                                 | nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
                         );
-                        let _ = (API.unlock_bitstream)(enc as *mut c_void, job.bs as *mut c_void);
+                        let _ = (api().unlock_bitstream)(enc as *mut c_void, job.bs as *mut c_void);
                         Ok((data, keyframe))
                     }
                     Err(e) => Err(format!("lock_bitstream (async): {e:?}")),
@@ -255,6 +435,11 @@ impl NvencD3d11Encoder {
         bit_depth: u8,
         chroma: ChromaFormat,
     ) -> Result<Self> {
+        // The runtime DLL load is the real "is NVENC possible here" gate: fail the open with a
+        // clear reason (backend misdetect / forced PUNKTFUNK_ENCODER=nvenc on a non-NVIDIA box)
+        // instead of an opaque session error on the first frame. Every later NVENC call in this
+        // file sits behind this gate (or the probe's), so the infallible `api()` is sound.
+        try_api().map_err(|e| anyhow!("NVENC unavailable: {e}"))?;
         Ok(Self {
             encoder: ptr::null_mut(),
             codec,
@@ -309,11 +494,11 @@ impl NvencD3d11Encoder {
         // Unmap any in-flight inputs, then unregister every cached texture and destroy the bitstreams.
         for (_, map, _) in &self.pending {
             if !map.is_null() {
-                let _ = (API.unmap_input_resource)(self.encoder, *map);
+                let _ = (api().unmap_input_resource)(self.encoder, *map);
             }
         }
         for (reg, _tex) in self.regs.values() {
-            let _ = (API.unregister_resource)(self.encoder, *reg);
+            let _ = (api().unregister_resource)(self.encoder, *reg);
         }
         // Async events: unregister from the session, then close the Win32 handles.
         for &ev in &self.events {
@@ -322,14 +507,14 @@ impl NvencD3d11Encoder {
                 completionEvent: ev as *mut c_void,
                 ..Default::default()
             };
-            let _ = (API.unregister_async_event)(self.encoder, &mut ep);
+            let _ = (api().unregister_async_event)(self.encoder, &mut ep);
             let _ = CloseHandle(HANDLE(ev as *mut c_void));
         }
         self.events.clear();
         for &bs in &self.bitstreams {
-            let _ = (API.destroy_bitstream_buffer)(self.encoder, bs);
+            let _ = (api().destroy_bitstream_buffer)(self.encoder, bs);
         }
-        let _ = (API.destroy_encoder)(self.encoder);
+        let _ = (api().destroy_encoder)(self.encoder);
         self.regs.clear(); // drops the texture clones, releasing our refs
         self.bitstreams.clear();
         self.pending.clear();
@@ -350,9 +535,7 @@ impl NvencD3d11Encoder {
             reserved: [0; 62],
         };
         let mut val: i32 = 0;
-        match (API.get_encode_caps)(enc, self.codec_guid, &mut param, &mut val)
-            .result_without_string()
-        {
+        match (api().get_encode_caps)(enc, self.codec_guid, &mut param, &mut val).nv_ok() {
             Ok(()) => val,
             Err(_) => 0,
         }
@@ -374,8 +557,8 @@ impl NvencD3d11Encoder {
             ..Default::default()
         };
         let mut enc: *mut c_void = ptr::null_mut();
-        (API.open_encode_session_ex)(&mut params, &mut enc)
-            .result_without_string()
+        (api().open_encode_session_ex)(&mut params, &mut enc)
+            .nv_ok()
             .map_err(|e| {
                 anyhow!("NVENC open_encode_session_ex (caps probe): {e:?} (no NVIDIA GPU?)")
             })?;
@@ -392,7 +575,7 @@ impl NvencD3d11Encoder {
             nv::NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE,
         );
         let async_enc = self.get_cap(enc, nv::NV_ENC_CAPS::NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT);
-        let _ = (API.destroy_encoder)(enc);
+        let _ = (api().destroy_encoder)(enc);
 
         // Reject an over-range mode with a clear message instead of an opaque InvalidParam.
         if wmax > 0 && hmax > 0 && (self.width as i32 > wmax || self.height as i32 > hmax) {
@@ -449,8 +632,8 @@ impl NvencD3d11Encoder {
             ..Default::default()
         };
         let mut enc: *mut c_void = ptr::null_mut();
-        (API.open_encode_session_ex)(&mut params, &mut enc)
-            .result_without_string()
+        (api().open_encode_session_ex)(&mut params, &mut enc)
+            .nv_ok()
             .map_err(|e| anyhow!("NVENC open_encode_session_ex: {e:?} (no NVIDIA GPU?)"))?;
 
         // Seed the P1 + ultra-low-latency preset config.
@@ -462,16 +645,16 @@ impl NvencD3d11Encoder {
             },
             ..Default::default()
         };
-        if let Err(e) = (API.get_encode_preset_config_ex)(
+        if let Err(e) = (api().get_encode_preset_config_ex)(
             enc,
             self.codec_guid,
             nv::NV_ENC_PRESET_P1_GUID,
             nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
             &mut preset,
         )
-        .result_without_string()
+        .nv_ok()
         {
-            let _ = (API.destroy_encoder)(enc);
+            let _ = (api().destroy_encoder)(enc);
             return Err(anyhow!("get_encode_preset_config_ex: {e:?}"));
         }
         let mut cfg = preset.presetCfg;
@@ -613,10 +796,10 @@ impl NvencD3d11Encoder {
         // splitEncodeMode is a C bitfield — set via the generated accessor, not a struct field.
         init.set_splitEncodeMode(split_mode);
 
-        match (API.initialize_encoder)(enc, &mut init).result_without_string() {
+        match (api().initialize_encoder)(enc, &mut init).nv_ok() {
             Ok(()) => Ok(enc),
             Err(e) => {
-                let _ = (API.destroy_encoder)(enc);
+                let _ = (api().destroy_encoder)(enc);
                 Err(anyhow!("initialize_encoder: {e:?}"))
             }
         }
@@ -624,8 +807,8 @@ impl NvencD3d11Encoder {
 
     /// Lazily create the session on the first frame's D3D11 device (so capture + encode share it).
     fn init_session(&mut self, device: &ID3D11Device) -> Result<()> {
-        // SAFETY: every call below goes through a function pointer resolved once from the loaded
-        // `nvidia_video_codec_sdk::ENCODE_API` (`nvEncodeAPI`) table, or through this type's own
+        // SAFETY: every call below goes through a function pointer resolved once from the
+        // runtime-loaded [`EncodeApi`] table (`api()`, gated in `open`), or through this type's own
         // `unsafe fn`s whose contract is met here. `query_caps`/`try_open_session` receive `device`,
         // the live `ID3D11Device` the caller pulled off the first frame; each returns either a valid
         // open NVENC session handle or an `Err`. `destroy_encoder` is only ever called on a handle a
@@ -729,7 +912,7 @@ impl NvencD3d11Encoder {
                         match self.try_open_session(device, mid, split_mode, use_async) {
                             Ok(e) => {
                                 if !best.is_null() {
-                                    let _ = (API.destroy_encoder)(best);
+                                    let _ = (api().destroy_encoder)(best);
                                 }
                                 best = e;
                                 best_bps = mid;
@@ -778,8 +961,8 @@ impl NvencD3d11Encoder {
                     version: nv::NV_ENC_CREATE_BITSTREAM_BUFFER_VER,
                     ..Default::default()
                 };
-                (API.create_bitstream_buffer)(enc, &mut cb)
-                    .result_without_string()
+                (api().create_bitstream_buffer)(enc, &mut cb)
+                    .nv_ok()
                     .map_err(|e| anyhow!("create_bitstream_buffer: {e:?}"))?;
                 self.bitstreams.push(cb.bitstreamBuffer);
             }
@@ -795,8 +978,8 @@ impl NvencD3d11Encoder {
                         completionEvent: ev.0,
                         ..Default::default()
                     };
-                    (API.register_async_event)(enc, &mut ep)
-                        .result_without_string()
+                    (api().register_async_event)(enc, &mut ep)
+                        .nv_ok()
                         .map_err(|e| anyhow!("register_async_event: {e:?}"))?;
                     self.events.push(ev.0 as usize);
                 }
@@ -852,7 +1035,7 @@ impl NvencD3d11Encoder {
         // path's poll-side unmap, exactly once per mapping.
         unsafe {
             if !map.is_null() {
-                let _ = (API.unmap_input_resource)(self.encoder, map);
+                let _ = (api().unmap_input_resource)(self.encoder, map);
             }
         }
         let (data, keyframe) = done.result.map_err(|e| anyhow!("{e}"))?;
@@ -953,7 +1136,7 @@ impl Encoder for NvencD3d11Encoder {
         }
         let slot = self.next % POOL;
         self.next += 1;
-        // SAFETY: every NVENC call goes through a function pointer from the loaded `ENCODE_API` table
+        // SAFETY: every NVENC call goes through a function pointer from the runtime-loaded `EncodeApi` table
         // and takes `self.encoder`, the live session `init_session` just established (non-null on the
         // path that reaches here). `NV_ENC_REGISTER_RESOURCE rr` has `version =
         // NV_ENC_REGISTER_RESOURCE_VER` and registers `frame.texture` — a D3D11 texture from
@@ -986,8 +1169,8 @@ impl Encoder for NvencD3d11Encoder {
                     bufferUsage: nv::NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
                     ..Default::default()
                 };
-                (API.register_resource)(self.encoder, &mut rr)
-                    .result_without_string()
+                (api().register_resource)(self.encoder, &mut rr)
+                    .nv_ok()
                     .map_err(|e| anyhow!("register_resource: {e:?}"))?;
                 self.regs
                     .insert(key, (rr.registeredResource, frame.texture.clone()));
@@ -999,8 +1182,8 @@ impl Encoder for NvencD3d11Encoder {
                 registeredResource: reg,
                 ..Default::default()
             };
-            (API.map_input_resource)(self.encoder, &mut mp)
-                .result_without_string()
+            (api().map_input_resource)(self.encoder, &mut mp)
+                .nv_ok()
                 .map_err(|e| anyhow!("map_input_resource: {e:?}"))?;
 
             let pts = self.frame_idx as u64;
@@ -1076,8 +1259,8 @@ impl Encoder for NvencD3d11Encoder {
                     Codec::Av1 => {}
                 }
             }
-            (API.encode_picture)(self.encoder, &mut pic)
-                .result_without_string()
+            (api().encode_picture)(self.encoder, &mut pic)
+                .nv_ok()
                 .map_err(|e| anyhow!("encode_picture: {e:?}"))?;
             self.pending
                 .push_back((self.bitstreams[slot], mp.mappedResource, captured.pts_ns));
@@ -1149,7 +1332,7 @@ impl Encoder for NvencD3d11Encoder {
         // We tag each input with `inputTimeStamp = frame_idx` (0,1,2,…), which is also the client's
         // frame number (the packetizer numbers frames in submit order), so the client's lost-frame
         // range maps 1:1 onto the timestamps NVENC invalidates here.
-        // SAFETY: `invalidate_ref_frames` is a function pointer from the loaded `ENCODE_API` table.
+        // SAFETY: `invalidate_ref_frames` is a function pointer from the runtime-loaded `EncodeApi` table.
         // `self.encoder` was checked non-null at the top of this fn and is the live session; this runs
         // on the encode thread (like submit/poll), so there is no concurrent NVENC use. Each `ts` was
         // clamped to `[oldest_in_dpb, frame_idx - 1]` above, so it names a frame still in the session's
@@ -1157,8 +1340,8 @@ impl Encoder for NvencD3d11Encoder {
         // lifetime concern.
         unsafe {
             for ts in first..=last {
-                if (API.invalidate_ref_frames)(self.encoder, ts as u64)
-                    .result_without_string()
+                if (api().invalidate_ref_frames)(self.encoder, ts as u64)
+                    .nv_ok()
                     .is_err()
                 {
                     return false; // any failure → fall back to IDR
@@ -1195,7 +1378,7 @@ impl Encoder for NvencD3d11Encoder {
         };
         // SAFETY: a non-empty `pending` implies `submit` ran, so `self.encoder` is the live session
         // (`teardown` clears `pending` whenever it nulls the handle); all calls below use function
-        // pointers from the loaded `ENCODE_API` table on the encode thread. `NV_ENC_LOCK_BITSTREAM lock`
+        // pointers from the runtime-loaded `EncodeApi` table on the encode thread. `NV_ENC_LOCK_BITSTREAM lock`
         // (version = `NV_ENC_LOCK_BITSTREAM_VER`) locks `bs`, a pool bitstream a prior `encode_picture`
         // targeted; `lock_bitstream` blocks until that encode finishes, so on success
         // `lock.bitstreamBufferPtr` is non-null and points at `lock.bitstreamSizeInBytes` bytes of
@@ -1209,8 +1392,8 @@ impl Encoder for NvencD3d11Encoder {
                 outputBitstream: bs,
                 ..Default::default()
             };
-            (API.lock_bitstream)(self.encoder, &mut lock)
-                .result_without_string()
+            (api().lock_bitstream)(self.encoder, &mut lock)
+                .nv_ok()
                 .map_err(|e| anyhow!("lock_bitstream: {e:?}"))?;
             let data = std::slice::from_raw_parts(
                 lock.bitstreamBufferPtr as *const u8,
@@ -1221,11 +1404,11 @@ impl Encoder for NvencD3d11Encoder {
                 lock.pictureType,
                 nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
             );
-            (API.unlock_bitstream)(self.encoder, bs)
-                .result_without_string()
+            (api().unlock_bitstream)(self.encoder, bs)
+                .nv_ok()
                 .map_err(|e| anyhow!("unlock_bitstream: {e:?}"))?;
             if !map.is_null() {
-                let _ = (API.unmap_input_resource)(self.encoder, map);
+                let _ = (api().unmap_input_resource)(self.encoder, map);
             }
             Ok(Some(EncodedFrame {
                 data,
@@ -1265,6 +1448,11 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
     };
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
     if codec != Codec::H265 {
+        return false;
+    }
+    // No loadable NVENC on this box (non-NVIDIA / no driver) → the honest 4:4:4 answer is "no".
+    // This is also the `api()` gate for every NVENC call below.
+    if try_api().is_err() {
         return false;
     }
     // SAFETY: a self-contained probe owning every handle it creates. `CreateDXGIFactory1`/
@@ -1321,8 +1509,8 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
             ..Default::default()
         };
         let mut enc: *mut c_void = ptr::null_mut();
-        if (API.open_encode_session_ex)(&mut params, &mut enc)
-            .result_without_string()
+        if (api().open_encode_session_ex)(&mut params, &mut enc)
+            .nv_ok()
             .is_err()
         {
             return false;
@@ -1333,11 +1521,11 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
             reserved: [0; 62],
         };
         let mut val: i32 = 0;
-        let ok = (API.get_encode_caps)(enc, nv::NV_ENC_CODEC_HEVC_GUID, &mut param, &mut val)
-            .result_without_string()
+        let ok = (api().get_encode_caps)(enc, nv::NV_ENC_CODEC_HEVC_GUID, &mut param, &mut val)
+            .nv_ok()
             .is_ok()
             && val != 0;
-        let _ = (API.destroy_encoder)(enc);
+        let _ = (api().destroy_encoder)(enc);
         ok
     }
 }

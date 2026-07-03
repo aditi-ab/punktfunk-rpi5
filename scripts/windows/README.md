@@ -9,11 +9,11 @@ Helper scripts for the Windows host box (the RTX `.173` lab box, repo at
 powershell -ExecutionPolicy Bypass -File scripts\windows\setup-build-env.ps1
 ```
 
-Persists (Machine scope) the three vars the NVENC build needs:
+Persists (Machine scope) the vars the host build needs (NVENC itself needs none — its entry
+points are runtime-loaded from the driver's `nvEncodeAPI64.dll`):
 
 | var | value | why |
 | --- | --- | --- |
-| `PUNKTFUNK_NVENC_LIB_DIR` | `C:\Users\Public\nvenc` | NVENC import lib (`nvencodeapi.lib`) |
 | `LIBCLANG_PATH` | `C:\Program Files\LLVM\bin` | bindgen (`libclang.dll`) |
 | `CMAKE_POLICY_VERSION_MINIMUM` | `3.5` | `audiopus_sys` / cmake crates |
 

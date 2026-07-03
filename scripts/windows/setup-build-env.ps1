@@ -12,9 +12,9 @@ $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
          ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 if (-not $admin) { throw "Run elevated (Machine-scope env requires Administrator)." }
 
-# NVENC import lib (nvencodeapi.lib); libclang for bindgen; cmake policy floor for audiopus_sys.
+# libclang for bindgen; cmake policy floor for audiopus_sys. (NVENC needs no build-time env:
+# its entry points are runtime-loaded from the driver's nvEncodeAPI64.dll.)
 $vars = [ordered]@{
-  'PUNKTFUNK_NVENC_LIB_DIR'      = 'C:\Users\Public\nvenc'
   'LIBCLANG_PATH'               = 'C:\Program Files\LLVM\bin'
   'CMAKE_POLICY_VERSION_MINIMUM' = '3.5'
   # FFMPEG_DIR is only needed for the `amf-qsv` feature (libavcodec). The RTX box builds

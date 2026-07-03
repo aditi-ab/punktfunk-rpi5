@@ -530,7 +530,7 @@ fn open_video_backend(
                 {
                     anyhow::bail!(
                         "NVENC requested/detected but this host was built without it — rebuild \
-                         with `--features nvenc` (needs the NVENC SDK's nvencodeapi.lib at link time)"
+                         with `--features nvenc`"
                     )
                 }
             }
