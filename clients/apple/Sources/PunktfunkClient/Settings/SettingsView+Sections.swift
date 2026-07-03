@@ -224,34 +224,41 @@ extension SettingsView {
     /// Touch-input model (iPhone + iPad) plus the iPad-only pointer-capture toggle: lock the
     /// mouse/trackpad for relative movement (games) vs forward an absolute cursor position.
     @ViewBuilder var pointerSection: some View {
-        let isPad = UIDevice.current.userInterfaceIdiom == .pad
         Section {
             Picker("Touch input", selection: $touchMode) {
                 Text("Trackpad").tag(TouchInputMode.trackpad.rawValue)
                 Text("Direct pointer").tag(TouchInputMode.pointer.rawValue)
                 Text("Touch passthrough").tag(TouchInputMode.touch.rawValue)
             }
-            if isPad {
+            if UIDevice.current.userInterfaceIdiom == .pad {
                 Toggle("Capture pointer for games", isOn: $pointerCapture)
             }
         } header: {
             Text("Touch & pointer")
         } footer: {
-            Text("Trackpad: your finger nudges the host cursor like a laptop touchpad — tap to "
-                + "click, two-finger tap for a right click, two-finger drag to scroll, "
-                + "tap-then-drag to hold the button, three-finger tap for the stats overlay. "
-                + "Direct pointer: the cursor jumps to your finger. Touch passthrough: real "
-                + "multi-touch reaches the host, for apps that understand touch. Applies from "
-                + "the next touch."
-                + (isPad
-                    ? " Pointer capture locks a hardware mouse/trackpad for relative movement "
-                        + "(mouse-look); off keeps the pointer free and sends absolute positions. "
-                        + "The lock needs the stream full-screen and frontmost, and falls back "
-                        + "automatically (Stage Manager, Slide Over)."
-                    : ""))
+            Text(pointerFooterText)
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
+    }
+
+    /// Footer copy for `pointerSection`, built in plain `+=` statements. Deliberately NOT one big
+    /// `+` chain (with a ternary) inside the ViewBuilder — that single expression blew Swift's
+    /// type-checker budget and was what actually broke the iOS archive.
+    private var pointerFooterText: String {
+        var text = "Trackpad: your finger nudges the host cursor like a laptop touchpad — tap to "
+        text += "click, two-finger tap for a right click, two-finger drag to scroll, "
+        text += "tap-then-drag to hold the button, three-finger tap for the stats overlay. "
+        text += "Direct pointer: the cursor jumps to your finger. Touch passthrough: real "
+        text += "multi-touch reaches the host, for apps that understand touch. Applies from "
+        text += "the next touch."
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            text += " Pointer capture locks a hardware mouse/trackpad for relative movement "
+            text += "(mouse-look); off keeps the pointer free and sends absolute positions. "
+            text += "The lock needs the stream full-screen and frontmost, and falls back "
+            text += "automatically (Stage Manager, Slide Over)."
+        }
+        return text
     }
     #endif
 
