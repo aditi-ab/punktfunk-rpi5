@@ -215,7 +215,12 @@ unsafe fn open_win_encoder(
     let mut opts = Dictionary::new();
     match vendor {
         WinVendor::Amf => {
-            opts.set("usage", "ultralowlatency");
+            // Field-tuning override (ultralowlatency | lowlatency | lowlatency_high_quality |
+            // transcoding): AMF usage presets bundle driver-side pipeline behavior that varies by
+            // VCN generation/driver — measured on-box rather than assumed.
+            let usage =
+                std::env::var("PUNKTFUNK_AMF_USAGE").unwrap_or_else(|_| "ultralowlatency".into());
+            opts.set("usage", &usage);
             opts.set("rc", "cbr");
             // Streaming is latency-first: `speed` trims per-frame motion-estimation depth — the
             // difference between ~encode-time and ~frame-budget on iGPU-class VCN (matches the
@@ -1317,10 +1322,15 @@ impl Encoder for FfmpegWinEncoder {
             Some(Inner::ZeroCopy(z)) => &mut z.enc,
             None => return Ok(None),
         };
-        let deadline = (self.in_flight > 0).then(|| {
-            std::time::Instant::now()
-                + std::time::Duration::from_micros((2_000_000 / fps.max(1) as u64).max(10_000))
-        });
+        // Default cap: ~2 frame periods. `PUNKTFUNK_FFWIN_POLL_MS` overrides for on-box latency
+        // forensics (e.g. 150 to see WHEN the AU really lands vs. being gated on the next submit).
+        let cap_us = std::env::var("PUNKTFUNK_FFWIN_POLL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|ms| ms * 1000)
+            .unwrap_or_else(|| (2_000_000 / fps.max(1) as u64).max(10_000));
+        let deadline = (self.in_flight > 0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_micros(cap_us));
         loop {
             match poll_encoder(enc, fps)? {
                 PollOutcome::Packet(au) => {
