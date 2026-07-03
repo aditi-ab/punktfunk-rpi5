@@ -217,9 +217,17 @@ unsafe fn open_win_encoder(
         WinVendor::Amf => {
             opts.set("usage", "ultralowlatency");
             opts.set("rc", "cbr");
-            opts.set("quality", "balanced");
+            // Streaming is latency-first: `speed` trims per-frame motion-estimation depth — the
+            // difference between ~encode-time and ~frame-budget on iGPU-class VCN (matches the
+            // low-latency preset choice on the NVENC path).
+            opts.set("quality", "speed");
             opts.set("preanalysis", "false");
             opts.set("enforce_hrd", "true");
+            // AMF low-latency submission mode (FFmpeg ≥ 6.1; unknown-option-ignored on older).
+            opts.set("latency", "true");
+            // Never B-frames: h264_amf defaults >0 on RDNA3+ HW that supports them, and each
+            // B-frame is a full frame period of added latency. (HEVC VCN has none; ignored there.)
+            opts.set("bf", "0");
             // VPS/SPS/PPS on each IDR (clean mid-stream join) — HEVC/AV1 only; ignored elsewhere.
             opts.set("header_insertion_mode", "idr");
         }
@@ -292,14 +300,22 @@ pub fn probe_can_encode(vendor: WinVendor, codec: Codec) -> bool {
     }
 }
 
+/// One `receive_packet` attempt, with the not-ready states kept distinct so the blocking poll
+/// below can tell "still encoding" (retry) from "stream over" (stop).
+enum PollOutcome {
+    Packet(EncodedFrame),
+    Again,
+    Eof,
+}
+
 /// Drain the encoder for one packet (shared poll logic, identical to the VAAPI/NVENC paths).
-fn poll_encoder(enc: &mut encoder::video::Encoder, fps: u32) -> Result<Option<EncodedFrame>> {
+fn poll_encoder(enc: &mut encoder::video::Encoder, fps: u32) -> Result<PollOutcome> {
     let mut pkt = Packet::empty();
     match enc.receive_packet(&mut pkt) {
         Ok(()) => {
             let data = pkt.data().map(|d| d.to_vec()).unwrap_or_default();
             let pts = pkt.pts().unwrap_or(0).max(0) as u64;
-            Ok(Some(EncodedFrame {
+            Ok(PollOutcome::Packet(EncodedFrame {
                 data,
                 pts_ns: pts * 1_000_000_000 / fps as u64,
                 keyframe: pkt.is_key(),
@@ -309,9 +325,9 @@ fn poll_encoder(enc: &mut encoder::video::Encoder, fps: u32) -> Result<Option<En
             if errno == ffmpeg::util::error::EAGAIN
                 || errno == ffmpeg::util::error::EWOULDBLOCK =>
         {
-            Ok(None)
+            Ok(PollOutcome::Again)
         }
-        Err(ffmpeg::Error::Eof) => Ok(None),
+        Err(ffmpeg::Error::Eof) => Ok(PollOutcome::Eof),
         Err(e) => Err(e).context("receive_packet"),
     }
 }
@@ -1100,6 +1116,9 @@ pub struct FfmpegWinEncoder {
     bound_device: isize,
     frame_idx: i64,
     force_kf: bool,
+    /// Frames sent to libavcodec whose AUs haven't been received yet. `poll` blocks (bounded)
+    /// while this is non-zero — see the poll-contract note on [`Encoder::poll`] below.
+    in_flight: usize,
 }
 
 // Raw FFI pointers + COM objects; the encoder lives on a single thread (same contract as NVENC/VAAPI).
@@ -1161,6 +1180,7 @@ impl FfmpegWinEncoder {
             bound_device: 0,
             frame_idx: 0,
             force_kf: false,
+            in_flight: 0,
         })
     }
 
@@ -1231,7 +1251,7 @@ impl Encoder for FfmpegWinEncoder {
         self.frame_idx += 1;
         let idr = self.force_kf;
         self.force_kf = false;
-        match &captured.payload {
+        let submitted = match &captured.payload {
             FramePayload::D3d11(f) => {
                 self.ensure_inner_d3d11(&f.device)?;
                 // If zero-copy is active but the capturer fell back to a format the NV12/P010 pool
@@ -1271,18 +1291,53 @@ impl Encoder for FfmpegWinEncoder {
                     }
                 }
             }
+        };
+        if submitted.is_ok() {
+            self.in_flight += 1;
         }
+        submitted
     }
 
     fn request_keyframe(&mut self) {
         self.force_kf = true;
     }
 
+    /// Poll-contract note: the session encode loop's pipelining treats a `None` from `poll` as
+    /// "come back next tick" and was designed around direct NVENC, whose poll BLOCKS in
+    /// `lock_bitstream` until the owed AU is done. libavcodec's AMF wrapper is truly async
+    /// (EAGAIN until the ASIC finishes), so a single non-blocking try quantizes AU retrieval to
+    /// the submit cadence — measured +1–2 frame periods (~43 ms p50 at 720p60 on the Ryzen iGPU,
+    /// vs ~3.5 ms of actual encode). While an AU is owed (`in_flight > 0`), spin-poll with short
+    /// sleeps like NVENC's blocking wait, bounded to ~2 frame periods so an overloaded encoder
+    /// degrades back to next-tick pickup instead of stalling capture.
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        match &mut self.inner {
-            Some(Inner::System(s)) => poll_encoder(&mut s.enc, self.fps),
-            Some(Inner::ZeroCopy(z)) => poll_encoder(&mut z.enc, self.fps),
-            None => Ok(None),
+        let fps = self.fps;
+        let enc = match &mut self.inner {
+            Some(Inner::System(s)) => &mut s.enc,
+            Some(Inner::ZeroCopy(z)) => &mut z.enc,
+            None => return Ok(None),
+        };
+        let deadline = (self.in_flight > 0).then(|| {
+            std::time::Instant::now()
+                + std::time::Duration::from_micros((2_000_000 / fps.max(1) as u64).max(10_000))
+        });
+        loop {
+            match poll_encoder(enc, fps)? {
+                PollOutcome::Packet(au) => {
+                    self.in_flight = self.in_flight.saturating_sub(1);
+                    return Ok(Some(au));
+                }
+                PollOutcome::Eof => {
+                    self.in_flight = 0; // flushed: nothing further is owed
+                    return Ok(None);
+                }
+                PollOutcome::Again => match deadline {
+                    Some(d) if std::time::Instant::now() < d => {
+                        std::thread::sleep(std::time::Duration::from_micros(250));
+                    }
+                    _ => return Ok(None),
+                },
+            }
         }
     }
 
