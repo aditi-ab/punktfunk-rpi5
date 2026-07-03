@@ -98,9 +98,8 @@ picture.
 | Setting | Values | Meaning |
 |---|---|---|
 | `PUNKTFUNK_VDISPLAY` | `pf` | Virtual-display backend. The bundled pf-vdisplay IddCx driver is the only backend now — informational; leave as `pf`. |
-| `PUNKTFUNK_IDD_PUSH` | `1` · `0` | Capture straight from the pf-vdisplay driver's shared ring (the validated zero-copy path, incl. the secure desktop). Set `0` to force WGC/DDA capture. |
 | `PUNKTFUNK_SECURE_DDA` | `1` | Capture the secure desktop (UAC / lock / login) so the stream survives those transitions. |
-| `PUNKTFUNK_MONITOR_LINGER_MS` | ms (default `10000`) | Keep a per-client virtual display alive briefly after disconnect so a quick reconnect reuses it (no display connect/disconnect chime). |
+| `PUNKTFUNK_MONITOR_LINGER_MS` | ms (default `10000`) | Defer tearing a per-client virtual display down after disconnect. A reconnect inside the window preempts it and creates a fresh one (a reused IddCx swap-chain is dead); the stable per-client monitor id keeps Windows' saved display config applying either way. |
 | `PUNKTFUNK_RENDER_ADAPTER` | description substring | Multi-GPU boxes only: force the NVENC/capture GPU by adapter Description substring (e.g. `4090`). Leave unset on single-GPU machines. |
 | `PUNKTFUNK_HOST_CMD` | e.g. `serve --gamestream` | The host subcommand the service launches. Default `serve --gamestream`; use `serve` for a secure native-only host. |
 

@@ -6,27 +6,30 @@
 //! to the wdk-sys IddCx world happens via raw pointers in `swap_chain_processor.rs`.
 //!
 //! STEP 5 binds this device to the swap-chain to keep the monitor a live display; STEP 6 reuses the
-//! device's immediate context in the frame publisher's `CopyResource` (both on the swap-chain processor
-//! thread, the one thread this device is touched from).
+//! device's immediate context in the frame publisher's `CopyResource` on each swap-chain processor
+//! thread. The device is POOLED across processors (one per render LUID, [`pooled_device`]), so with
+//! two live monitors two worker threads share it concurrently — creation must NOT pass
+//! `D3D11_CREATE_DEVICE_SINGLETHREADED` (that was sound only pre-pooling, device-per-processor), and
+//! the immediate context is `SetMultithreadProtected` (it has no internal locking of its own).
 
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::{
     Win32::{
-        Foundation::LUID,
+        Foundation::{BOOL, LUID},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
             Direct3D11::{
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 D3D11_CREATE_DEVICE_PREVENT_ALTERING_LAYER_SETTINGS_FROM_REGISTRY,
-                D3D11_CREATE_DEVICE_SINGLETHREADED, D3D11_SDK_VERSION, D3D11CreateDevice,
-                ID3D11Device, ID3D11DeviceContext,
+                D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+                ID3D11Multithread,
             },
             Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory5},
         },
     },
-    core::Error,
+    core::{Error, Interface},
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -53,8 +56,10 @@ pub struct Direct3DDevice {
     _dxgi_factory: IDXGIFactory5,
     _adapter: IDXGIAdapter1,
     pub device: ID3D11Device,
-    /// The single (SINGLETHREADED) immediate context — used by STEP 6's frame-push publisher's
-    /// `CopyResource` on the swap-chain processor thread (the one thread this device is touched from).
+    /// The shared immediate context — used by STEP 6's frame-push publisher's `CopyResource` on each
+    /// swap-chain processor thread. Pooled across processors, so it is `SetMultithreadProtected` at
+    /// init: an immediate context has no internal locking, and two concurrent monitors' workers would
+    /// otherwise race it (undefined behavior inside the UMD).
     pub device_context: ID3D11DeviceContext,
 }
 
@@ -77,8 +82,10 @@ impl Direct3DDevice {
                 &adapter,
                 D3D_DRIVER_TYPE_UNKNOWN,
                 None,
+                // NO `D3D11_CREATE_DEVICE_SINGLETHREADED`: the DEVICE_POOL shares this device (and
+                // its immediate context) across every swap-chain processor on the LUID, so the
+                // single-caller guarantee that flag declares no longer holds with >1 monitor.
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT
-                    | D3D11_CREATE_DEVICE_SINGLETHREADED
                     | D3D11_CREATE_DEVICE_PREVENT_ALTERING_LAYER_SETTINGS_FROM_REGISTRY,
                 None,
                 D3D11_SDK_VERSION,
@@ -90,6 +97,23 @@ impl Direct3DDevice {
 
         let device = device.ok_or("ID3D11Device not found")?;
         let device_context = device_context.ok_or("ID3D11DeviceContext not found")?;
+
+        // The pool hands this device (and its immediate context) to every processor on the LUID, and
+        // an immediate context is not thread-safe by itself — turn on the runtime's per-call critical
+        // section. (D3D11.4 interface, guaranteed on the Win11-22H2 OS floor; if the cast ever fails
+        // we log and continue — a single monitor is still safe, concurrent ones would not be.)
+        match device_context.cast::<ID3D11Multithread>() {
+            Ok(mt) => {
+                // SAFETY: plain setter on the live context's multithread interface; the returned
+                // previous-state BOOL carries no obligation.
+                unsafe {
+                    let _ = mt.SetMultithreadProtected(BOOL::from(true));
+                }
+            }
+            Err(e) => dbglog!(
+                "[pf-vd] ID3D11Multithread unavailable ({e:?}) — immediate context left unprotected"
+            ),
+        }
 
         let live = LIVE_DEVICES.fetch_add(1, Ordering::Relaxed) + 1;
         dbglog!("[pf-vd] Direct3DDevice::init OK — live D3D devices = {live}");

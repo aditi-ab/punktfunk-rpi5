@@ -797,10 +797,9 @@ fn ensure_default_host_env() -> Result<()> {
         # Force one with nvenc | amf | qsv | sw (software H.264). amf/qsv need an FFmpeg-built host.\n\
         PUNKTFUNK_ENCODER=auto\n\
         PUNKTFUNK_VIDEO_SOURCE=virtual\n\
-        # Virtual display = the bundled pf-vdisplay driver; capture from its shared ring (the validated\n\
-        # zero-copy IDD-push path; falls back to DDA if it can't attach). Set PUNKTFUNK_IDD_PUSH=0 to force WGC/DDA.\n\
+        # Virtual display = the bundled pf-vdisplay driver; capture is IDD-push from its shared ring\n\
+        # (the sole capture path — zero-copy, includes the secure desktop; DDA/WGC were removed).\n\
         PUNKTFUNK_VDISPLAY=pf\n\
-        PUNKTFUNK_IDD_PUSH=1\n\
         PUNKTFUNK_SECURE_DDA=1\n\
         RUST_LOG=info\n\
         \n\

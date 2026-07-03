@@ -240,7 +240,7 @@ impl VirtualDisplayManager {
         // NOT a reconnect. Preempting Active would tear a live session down AND churn REMOVE→ADD on every
         // retry — the per-cold-start monitor churn that exhausts the IddCx slot pool and wedges ADD at
         // 0x80070490. Active falls through to the JOIN path below (refcount++, no ADD).
-        if idd_push_mode() && matches!(*state, MgrState::Lingering { .. }) {
+        if matches!(*state, MgrState::Lingering { .. }) {
             if let MgrState::Lingering { mon, .. } = std::mem::replace(&mut *state, MgrState::Idle)
             {
                 tracing::info!(
@@ -676,31 +676,15 @@ impl Drop for MonitorLease {
     }
 }
 
-/// IDD-push mode: a new client connection preempts + recreates the monitor (single-client reconnect),
-/// because a REUSED IddCx monitor's swap-chain is dead. Off → monitors are shared across sessions.
-fn idd_push_mode() -> bool {
-    crate::config::config().idd_push
-}
-
-/// The render-GPU pin decision (backend-neutral): pin the discrete render GPU when explicitly requested,
-/// or under IDD-push (the host runs NVENC on the render adapter, so it MUST be the discrete encoder GPU
-/// on a hybrid box). `None` = let the IDD use its natural adapter (Apollo parity — avoids the cross-GPU
-/// ACCESS_LOST storm SudoVDA hit when pinned).
+/// The render-GPU pin (backend-neutral): IDD-push — the sole Windows capture path — runs NVENC on the
+/// render adapter, so it must always be pinned to the selected encoder GPU (a hybrid box would
+/// otherwise render on the wrong one). The selection itself (web-console preference >
+/// `PUNKTFUNK_RENDER_ADAPTER` > max VRAM) lives in [`crate::win_adapter::resolve_render_adapter_luid`].
+/// (This was gated on the removed `PUNKTFUNK_IDD_PUSH` knob — a dispatch disagreement, since capture
+/// stopped consulting it when DDA/WGC were removed.)
 fn resolve_render_pin() -> Option<LUID> {
-    // A web-console manual GPU preference pins exactly like PUNKTFUNK_RENDER_ADAPTER: the whole
-    // pipeline (driver render device, capture ring, encoder) must sit on the chosen adapter.
-    let manual_pref = crate::gpu::prefs().get().mode == crate::gpu::GpuMode::Manual;
-    if crate::config::config().render_adapter.is_some() || manual_pref {
-        crate::win_adapter::resolve_render_adapter_luid()
-    } else if crate::config::config().idd_push {
-        tracing::info!("IDD push: pinning the discrete render GPU (SET_RENDER_ADAPTER)");
-        crate::win_adapter::resolve_render_adapter_luid()
-    } else {
-        tracing::info!(
-            "SET_RENDER_ADAPTER skipped (Apollo-parity: no render pin; set PUNKTFUNK_RENDER_ADAPTER=<name> to force one)"
-        );
-        None
-    }
+    tracing::info!("IDD push: pinning the render GPU (SET_RENDER_ADAPTER)");
+    crate::win_adapter::resolve_render_adapter_luid()
 }
 
 /// Linger window before a session-less monitor is torn down (default 10 s; `PUNKTFUNK_MONITOR_LINGER_MS`).

@@ -5,7 +5,7 @@
 //! process lifetime**, so a lazily-parsed global is equivalent to "parsed once at startup".
 //!
 //! **Goal-1 stages 1–2** (`design/windows-host-rewrite.md` §2.2): stage 1 stood this up; stage 2 migrated the
-//! genuinely-constant operator/dispatch knobs onto it (the dispatch-disagreement bug class: `idd_push`,
+//! genuinely-constant operator/dispatch knobs onto it (the dispatch-disagreement bug class:
 //! `encoder_pref`, `render_adapter`, the vdisplay backend select — plus the plan-named
 //! `idd_depth`/`zerocopy`/`ten_bit`/`four_four_four` and the multi-site `perf`/`compositor`/
 //! `video_source`/`gamepad`). `SessionPlan` (stage 3) consumes it as the single owner of the
@@ -36,12 +36,6 @@ use std::sync::OnceLock;
 /// derived `Debug` impl, so the parser can stay a single platform-neutral function.
 #[derive(Debug, Clone, Default)]
 pub struct HostConfig {
-    /// `PUNKTFUNK_IDD_PUSH` — IDD direct-push monitor mode (the per-session monitor + ring recreate and
-    /// the discrete-render-GPU pin in [`crate::vdisplay::manager`]). IDD-push is the sole Windows capture
-    /// path (DXGI Desktop Duplication and the WGC relay were removed), so this should stay on — the
-    /// installer's `host.env` sets it. **Value-aware** (`0`/`false`/`no`/`off`/empty ⇒ off, else on);
-    /// unset ⇒ off. NOT a bare presence flag (so an operator can turn it OFF with `=0`).
-    pub idd_push: bool,
     /// `PUNKTFUNK_ENCODER` — explicit encoder-backend override (lowercased; empty = auto-detect by GPU vendor).
     pub encoder_pref: String,
     /// `PUNKTFUNK_RENDER_ADAPTER` — discrete render-GPU pin by description substring (`Some` even when empty:
@@ -80,16 +74,9 @@ impl HostConfig {
         // String value: `var(k).ok()` — `Some` (possibly empty) when set with valid UTF-8, else `None`.
         let val = |k: &str| std::env::var(k).ok();
         Self {
-            // Value-aware (not a bare presence flag): the shipped default `host.env` turns it ON, and an
-            // operator turns it OFF with `PUNKTFUNK_IDD_PUSH=0` (a `var_os` presence check would read `=0`
-            // as "on"). Unset ⇒ off (the dev / non-pf-driver default).
-            idd_push: match std::env::var("PUNKTFUNK_IDD_PUSH") {
-                Ok(v) => !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "" | "0" | "false" | "no" | "off"
-                ),
-                Err(_) => false,
-            },
+            // (`PUNKTFUNK_IDD_PUSH` was removed: IDD-push is the sole Windows capture path, so the knob
+            // only split dispatch — capture ignored it while the vdisplay manager obeyed it, and `=0`
+            // produced dead-swap-chain reuse on reconnect. A stale setting in an old host.env is ignored.)
             encoder_pref: std::env::var("PUNKTFUNK_ENCODER")
                 .unwrap_or_default()
                 .to_ascii_lowercase(),

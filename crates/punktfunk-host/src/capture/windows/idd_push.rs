@@ -10,7 +10,7 @@
 //! target process's handle table, so the bootstrap's ACL is not load-bearing; the only way to reach the
 //! frames is to already be one of the two endpoint processes. The driver copies frames in; we consume
 //! the ring straight into the zero-copy NVENC path — no DXGI Desktop Duplication, no `win32u` hook.
-//! Gated by `PUNKTFUNK_IDD_PUSH`. Driver counterpart: `packaging/windows/drivers/pf-vdisplay/src/
+//! The SOLE Windows capture path. Driver counterpart: `packaging/windows/drivers/pf-vdisplay/src/
 //! frame_transport.rs`. The shared `SharedHeader` layout, `MAGIC`/`VERSION`/`RING_LEN`, the
 //! `DRV_STATUS_*` codes, the channel-delivery struct and the publish token all come from
 //! [`pf_driver_proto`] (which OWNS the contract, with `const` size asserts) — both sides `use` it, so
@@ -133,7 +133,7 @@ struct HostSlot {
     shared: OwnedHandle,
     /// SRV on the slot texture so the HDR path samples the FP16 slot DIRECTLY (no slot→scratch copy);
     /// the convert pass writes the output ring while holding the slot's keyed mutex. Unused for SDR
-    /// (which CopyResource's the BGRA slot straight to the output).
+    /// (which converts the BGRA slot → NV12 on the video engine, via its own per-frame input view).
     srv: ID3D11ShaderResourceView,
 }
 
@@ -147,6 +147,13 @@ struct KeyedMutexGuard<'a> {
     key: u64,
 }
 
+/// `WAIT_ABANDONED` as an HRESULT: the driver died while holding the slot's keyed mutex — ownership
+/// still transferred to this caller. SUCCESS-severity (positive), like `WAIT_TIMEOUT` (0x102): the
+/// windows-rs `Result` wrapper erases both (`.ok()` maps every non-negative HRESULT to `Ok(())`), so
+/// acquisition MUST be classified on the raw vtable HRESULT. Mirrors the driver's constants
+/// (`frame_transport.rs`).
+const WAIT_ABANDONED_HRESULT: i32 = 0x0000_0080;
+
 impl<'a> KeyedMutexGuard<'a> {
     /// Acquire `mutex` at `key`, waiting up to `timeout_ms`. `None` if the acquire times out / errors
     /// (the caller skips the frame), so the guard is only ever held when the lock is genuinely held.
@@ -156,10 +163,19 @@ impl<'a> KeyedMutexGuard<'a> {
         timeout_ms: u32,
     ) -> Option<KeyedMutexGuard<'a>> {
         // SAFETY: `mutex` is a live `IDXGIKeyedMutex` on this thread's immediate-context device.
-        if unsafe { mutex.AcquireSync(key, timeout_ms) }.is_err() {
-            return None;
+        // Raw vtable call, NOT the `Result` wrapper: `.is_err()` treated WAIT_TIMEOUT (positive =
+        // `Ok`) as acquired, handing out a guard for a slot the DRIVER still held — converting from
+        // a texture mid-copy (torn frame) and `ReleaseSync`ing a key this side never took.
+        let hr = unsafe {
+            (Interface::vtable(mutex).AcquireSync)(Interface::as_raw(mutex), key, timeout_ms)
+        };
+        match hr.0 {
+            // Acquired — S_OK, or WAIT_ABANDONED (the driver died holding the slot: the lock is
+            // OURS now, and refusing the guard would leave the key held forever, wedging the slot).
+            0 | WAIT_ABANDONED_HRESULT => Some(KeyedMutexGuard { mutex, key }),
+            // WAIT_TIMEOUT (slot busy — the caller skips this frame) or a genuine error: never held.
+            _ => None,
         }
-        Some(KeyedMutexGuard { mutex, key })
     }
 }
 

@@ -342,19 +342,28 @@ impl SwapChainProcessor {
                     logged_frame = true;
                 }
                 // STEP 6: copy the acquired surface into the shared ring BEFORE FinishedProcessingFrame
-                // (the surface is valid until the next ReleaseAndAcquire). The pointer is BORROWED —
-                // `from_raw_borrowed` does NOT take IddCx's refcount — and the GPU-side copy is ordered
-                // before the consumer via the slot keyed mutex. (Attach happens at the loop top.)
-                if let Some(p) = publisher.as_mut() {
+                // (the surface is valid until the next ReleaseAndAcquire). Every successful acquire
+                // TRANSFERS one surface reference to the driver — the MS sample `Attach`es it into a
+                // ComPtr and `Reset`s BEFORE FinishedProcessingFrame, warning that a driver which
+                // "forgets to release the reference" leaves the surfaces alive after the swap-chain is
+                // destroyed. Holding it (the old `from_raw_borrowed`) leaked the swap-chain's whole
+                // surface set per assign/unassign cycle (reconnect, mode change, HDR flip) — so adopt
+                // the reference UNCONDITIONALLY (publisher or not); it is released when `res` drops at
+                // the end of this block. (Publisher attach happens at the loop top.)
+                {
                     let raw = buffer.MetaData.pSurface as *mut core::ffi::c_void;
                     if !raw.is_null() {
-                        // SAFETY: `raw` is IddCx's live surface pointer (valid until the next
-                        // ReleaseAndAcquire); `from_raw_borrowed` does not consume the refcount.
-                        if let Some(res) = unsafe { IDXGIResource::from_raw_borrowed(&raw) }
+                        // SAFETY: `raw` is the live surface IddCx just handed us, carrying the acquire's
+                        // transferred reference; `from_raw` adopts exactly that reference (released on
+                        // drop, below — the queued GPU copy is unaffected: D3D defers destruction, and
+                        // the copy is ordered before the consumer via the slot keyed mutex).
+                        let res = unsafe { IDXGIResource::from_raw(raw) };
+                        if let Some(p) = publisher.as_mut()
                             && let Ok(tex) = res.cast::<ID3D11Texture2D>()
                         {
                             p.publish(&tex);
                         }
+                        // `res` drops here → the acquire's surface reference is released, pre-Finished.
                     }
                 }
 

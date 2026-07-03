@@ -1129,8 +1129,14 @@ impl VideoConverter {
             pInputSurface: std::mem::ManuallyDrop::new(in_view),
             ..Default::default()
         };
-        self.vctx
-            .VideoProcessorBlt(&self.vp, &out_view, 0, &[stream])
-            .context("VideoProcessorBlt")
+        let blt =
+            self.vctx
+                .VideoProcessorBlt(&self.vp, &out_view, 0, std::slice::from_ref(&stream));
+        // COM in-params never transfer ownership: the Blt only borrowed the input view, and the
+        // struct's `ManuallyDrop` field suppressed its release — drop it by hand, success or not.
+        // (Skipping this leaked one view + its UMD allocation PER CONVERTED FRAME — the SDR hot
+        // path; D3D11 defers the actual destruction until the GPU is done with the blit.)
+        drop(std::mem::ManuallyDrop::into_inner(stream.pInputSurface));
+        blt.context("VideoProcessorBlt")
     }
 }

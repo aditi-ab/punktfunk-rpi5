@@ -38,7 +38,12 @@ use windows::Win32::System::Threading::SetEvent;
 use windows::core::Interface;
 
 /// `WAIT_TIMEOUT` as an HRESULT — `AcquireSync` returns this when the slot is held by the consumer.
+/// SUCCESS-severity (positive), so the windows-rs `Result` wrapper can never surface it (`.ok()` maps
+/// every non-negative HRESULT to `Ok(())`) — the publish loop reads the raw vtable HRESULT instead.
 const WAIT_TIMEOUT_HRESULT: i32 = 0x0000_0102;
+/// `WAIT_ABANDONED` as an HRESULT — the host died while holding the slot's keyed mutex. Also
+/// SUCCESS-severity, and ownership DID transfer to the caller.
+const WAIT_ABANDONED_HRESULT: i32 = 0x0000_0080;
 
 /// One monitor's sealed-channel bootstrap: the handle VALUES the host duplicated into THIS process
 /// (`IOCTL_SET_FRAME_CHANNEL`). Owning a `FrameChannel` means owning those handles — exactly one of
@@ -375,9 +380,18 @@ impl FramePublisher {
             let slot = (start + attempt) % ring_len;
             let s = &self.slots[slot as usize];
             // SAFETY: `s.mutex` is the live keyed mutex on this ring slot's shared texture; a 0 ms
-            // try-acquire of key 0 (released below or on WAIT_TIMEOUT it's never held).
-            match unsafe { s.mutex.AcquireSync(0, 0) } {
-                Ok(()) => {
+            // try-acquire of key 0 (released below; on WAIT_TIMEOUT it's never held). Raw vtable
+            // call, NOT the `Result` wrapper: `.ok()` erases success codes, so through `Result` a
+            // WAIT_TIMEOUT (host holds the slot) is indistinguishable from a real acquire — the
+            // wrapper made the busy-skip arm below dead code and had us copying into (and
+            // publishing) a slot the host was still reading.
+            let hr = unsafe {
+                (Interface::vtable(&s.mutex).AcquireSync)(Interface::as_raw(&s.mutex), 0, 0)
+            };
+            match hr.0 {
+                // Acquired — S_OK, or WAIT_ABANDONED (the host died holding the slot: ownership
+                // still transferred; publish normally, a dead host consumes nothing either way).
+                0 | WAIT_ABANDONED_HRESULT => {
                     // STRAIGHT-LINE, NO `?` between acquire + release — a `?`-return here would leak the
                     // keyed-mutex lock and wedge the host on this slot. The ordering below is load-bearing:
                     // the CopyResource is GPU-ordered before the consumer via the slot keyed mutex, and the
@@ -409,8 +423,10 @@ impl FramePublisher {
                     self.next = (slot + 1) % ring_len;
                     return;
                 }
-                Err(e) if e.code().0 == WAIT_TIMEOUT_HRESULT => continue,
-                Err(_) => return,
+                // Busy — the host holds this slot (the designed backpressure): try the next one.
+                WAIT_TIMEOUT_HRESULT => continue,
+                // Genuine failure (negative HRESULT — device removed / invalid call): drop the frame.
+                _ => return,
             }
         }
         // All slots busy — drop this frame (never block the swap-chain thread).
