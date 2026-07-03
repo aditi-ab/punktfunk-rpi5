@@ -84,7 +84,14 @@ pub fn headless_pair(pin: &str) -> glib::ExitCode {
 /// already pinned at this address connects silently on its stored pin; an unknown host is
 /// routed to the PIN ceremony (never a silent TOFU connect — `fp_hex`/`pair_optional` are
 /// unset, so `initiate_connect`'s manual arm mandates pairing).
+///
+/// `--launch <id>` asks the host to launch that library title (store-qualified id from
+/// `--library`, e.g. `steam:570` — the Decky wrapper's `PF_LAUNCH`); the raw id doubles
+/// as the stream title (best-effort — no extra fetch just for a prettier label).
 pub fn cli_connect_request() -> Option<ConnectRequest> {
+    if arg_value("--browse").is_some() {
+        return None; // browse mode owns the session lifecycle (precedence over --connect)
+    }
     let target = std::env::args().skip_while(|a| a != "--connect").nth(1)?;
     let (addr, port) = parse_host_port(&target);
     Some(ConnectRequest {
@@ -93,8 +100,41 @@ pub fn cli_connect_request() -> Option<ConnectRequest> {
         port: port?,
         fp_hex: None,
         pair_optional: false,
-        launch: None,
+        launch: arg_value("--launch").map(|id| (id.clone(), id)),
     })
+}
+
+/// `--browse host[:port]` — open the gamepad library launcher for that host instead of
+/// connecting (the Decky wrapper's `PF_BROWSE`; native port, default 9777). The host must
+/// already be paired: the stored pin is what lets the launcher fetch the library and
+/// connect silently — no dialog can run under gamescope, so an unpaired target renders
+/// the launcher's pair-first scene. Returns the request (name + stored fingerprint from
+/// the known-hosts store), whether it's paired, and the mgmt port (`--mgmt <port>`, the
+/// wrapper's `PF_MGMT`; default 47990 — browse mode runs no mDNS to learn it).
+pub fn cli_browse_request() -> Option<(ConnectRequest, bool, u16)> {
+    let target = arg_value("--browse")?;
+    let (addr, port) = parse_host_port(&target);
+    let port = port.unwrap_or(9777);
+    let known = crate::trust::KnownHosts::load();
+    let k = known
+        .hosts
+        .iter()
+        .find(|h| h.addr == addr && h.port == port);
+    let mgmt = arg_value("--mgmt")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(crate::library::DEFAULT_MGMT_PORT);
+    Some((
+        ConnectRequest {
+            name: k.map_or_else(|| addr.clone(), |k| k.name.clone()),
+            addr,
+            port,
+            fp_hex: k.map(|k| k.fp_hex.clone()),
+            pair_optional: false,
+            launch: None,
+        },
+        k.is_some_and(|k| k.paired),
+        mgmt,
+    ))
 }
 
 /// `--library host[:mgmt_port]` — fetch and print the host's game library over the real
@@ -219,25 +259,16 @@ pub fn run_shot(app: Rc<App>, scene: &str) {
         // no-art placeholders (monogram tiles), and one solid-color texture standing in
         // for a loaded poster (the real poster path, minus the network).
         "library" | "08-library" => {
-            let game = |id: &str, store: &str, title: &str| crate::library::GameEntry {
-                id: id.to_string(),
-                store: store.to_string(),
-                title: title.to_string(),
-                art: crate::library::Artwork::default(),
-            };
-            let games = vec![
-                game("steam:570", "steam", "Dota 2"),
-                game("steam:1091500", "steam", "Cyberpunk 2077"),
-                game("custom:emu-1", "custom", "RetroArch"),
-                game("heroic:fortnite", "heroic", "Fortnite"),
-                game("gog:witcher3", "gog", "The Witcher 3"),
-                game("lutris:osu", "lutris", "osu!"),
-            ];
-            let art = vec![(
-                "steam:570".to_string(),
-                solid_texture(300, 450, 0x35, 0x84, 0xe4),
-            )];
+            let (games, art) = mock_library();
             crate::ui_library::open_mock(app.clone(), mock_req(), games, art);
+        }
+        // The gamepad launcher (`--browse`) with the same injected entries — cursor sits
+        // at 1 so both recede directions show; aurora + easing render frozen (shot mode).
+        "gamepad-library" | "09-gamepad-library" => {
+            let (games, art) = mock_library();
+            let ui = crate::ui_gamepad_library::open_mock(app.clone(), mock_req(), games, art);
+            app.nav.push(&ui.page);
+            *app.browse.borrow_mut() = Some(ui);
         }
         other => tracing::warn!("unknown PUNKTFUNK_SHOT_SCENE={other:?}; showing hosts only"),
     }
@@ -266,6 +297,33 @@ pub fn run_shot(app: Rc<App>, scene: &str) {
             std::process::exit(0);
         }
     });
+}
+
+/// The mock game set shared by the `library` and `gamepad-library` scenes: mixed stores
+/// exercising the badge set, plus one solid-colour poster texture.
+fn mock_library() -> (
+    Vec<crate::library::GameEntry>,
+    Vec<(String, gtk::gdk::Texture)>,
+) {
+    let game = |id: &str, store: &str, title: &str| crate::library::GameEntry {
+        id: id.to_string(),
+        store: store.to_string(),
+        title: title.to_string(),
+        art: crate::library::Artwork::default(),
+    };
+    let games = vec![
+        game("steam:570", "steam", "Dota 2"),
+        game("steam:1091500", "steam", "Cyberpunk 2077"),
+        game("custom:emu-1", "custom", "RetroArch"),
+        game("heroic:fortnite", "heroic", "Fortnite"),
+        game("gog:witcher3", "gog", "The Witcher 3"),
+        game("lutris:osu", "lutris", "osu!"),
+    ];
+    let art = vec![(
+        "steam:570".to_string(),
+        solid_texture(300, 450, 0x35, 0x84, 0xe4),
+    )];
+    (games, art)
 }
 
 /// A WxH single-colour RGBA texture — the `library` scene's stand-in for a fetched poster.

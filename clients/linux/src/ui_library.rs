@@ -14,11 +14,6 @@ use gtk::{gdk, glib};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-
-/// Concurrent poster fetches — a handful is plenty for a LAN art proxy without turning a
-/// big library into a connection burst.
-const ART_WORKERS: usize = 3;
 
 /// Everything the page re-renders from. Kept alive by the widget closures (reload/retry/
 /// card activation); dropped when the page is popped, which also winds down any in-flight
@@ -295,39 +290,7 @@ fn load_art(state: &Rc<State>, games: &[GameEntry]) {
     }
     let identity = state.app.identity.clone();
     let pin = state.req.fp_hex.as_deref().and_then(trust::parse_hex32);
-    let queue = Arc::new(Mutex::new(jobs));
-    let (tx, rx) = async_channel::unbounded::<(String, Vec<u8>)>();
-    for _ in 0..ART_WORKERS {
-        let queue = queue.clone();
-        let tx = tx.clone();
-        let base = base.clone();
-        let identity = identity.clone();
-        std::thread::Builder::new()
-            .name("punktfunk-lib-art".into())
-            .spawn(move || {
-                let Ok(agent) = library::agent(&identity, pin) else {
-                    return;
-                };
-                loop {
-                    let job = queue.lock().unwrap().pop_front();
-                    let Some((id, candidates)) = job else { break };
-                    for url in &candidates {
-                        match library::fetch_art(&agent, &base, url) {
-                            Ok(bytes) => {
-                                // Receiver gone (page popped) — stop fetching.
-                                if tx.send_blocking((id, bytes)).is_err() {
-                                    return;
-                                }
-                                break;
-                            }
-                            // 404 on a guessed CDN path is routine — try the next kind.
-                            Err(e) => tracing::debug!(%id, url, error = %e, "poster miss"),
-                        }
-                    }
-                }
-            })
-            .expect("spawn art thread");
-    }
+    let rx = library::spawn_art_fetch(base, identity, pin, jobs);
     let weak = Rc::downgrade(state);
     glib::spawn_future_local(async move {
         while let Ok((id, bytes)) = rx.recv().await {
@@ -349,7 +312,8 @@ fn load_art(state: &Rc<State>, games: &[GameEntry]) {
 
 /// The store badge text — `store` comes from the entry (today `steam`/`custom`; future
 /// stores per the host's provider list), with the id prefix as a fallback spelling.
-fn store_label(store: &str) -> &'static str {
+/// Shared with the gamepad launcher's posters.
+pub fn store_label(store: &str) -> &'static str {
     match store {
         "steam" => "Steam",
         "custom" => "Custom",
@@ -363,7 +327,8 @@ fn store_label(store: &str) -> &'static str {
 }
 
 /// Monogram for the placeholder tile: the first letters of the first two words.
-fn initials(title: &str) -> String {
+/// Shared with the gamepad launcher's posters.
+pub fn initials(title: &str) -> String {
     title
         .split_whitespace()
         .take(2)

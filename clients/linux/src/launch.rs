@@ -299,18 +299,24 @@ impl SessionUi {
         }
         // A pinned connect rejected on trust grounds means the host's cert no
         // longer matches the stored pin (rotated cert or impostor) — route to
-        // the PIN ceremony to re-establish trust rather than dead-ending.
-        if trust_rejected && !self.tofu {
+        // the PIN ceremony to re-establish trust rather than dead-ending. Browse
+        // mode can't: gamescope never maps dialogs, so it renders the advice instead
+        // (re-pairing is the plugin's job there).
+        if trust_rejected && !self.tofu && self.app.browse_ui().is_none() {
             self.app
                 .toast("Host fingerprint changed — re-pair with a PIN to continue");
             crate::ui_trust::pin_dialog(self.app.clone(), self.req.clone());
+        } else if trust_rejected && !self.tofu {
+            self.app
+                .connect_error("Host identity changed — re-pair from the Punktfunk plugin.");
         } else {
-            // Errors land on the hosts page banner, not a transient toast.
+            // Errors land on the hosts page banner / launcher strip, not a transient toast.
             self.app.connect_error(&format!("Couldn't connect — {msg}"));
         }
     }
 
-    /// `Ended`: detach gamepads, pop back to the hosts page, and surface the reason.
+    /// `Ended`: detach gamepads, pop back to the launcher (browse mode) or the hosts
+    /// page, and surface the reason.
     fn on_ended(&mut self, err: Option<String>) {
         self.close_waiting();
         self.app.gamepad.detach();
@@ -322,6 +328,18 @@ impl SessionUi {
                 tracing::warn!(error = %e, "session ended");
             }
             self.app.window.close();
+            return;
+        }
+        // Browse mode: back to the launcher to pick the next game — B there quits to
+        // Gaming Mode. (The gamepad worker re-opened the pad and armed the held-state
+        // snapshot on the detach above, so the chord that ended the session fires nothing.)
+        if let Some(l) = self.app.browse_ui() {
+            self.app.nav.pop_to_tag("launcher");
+            l.on_session_ended();
+            if let Some(e) = err {
+                self.app.connect_error(&e);
+            }
+            self.app.busy.set(false);
             return;
         }
         self.app.nav.pop_to_tag("hosts");

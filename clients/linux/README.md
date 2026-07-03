@@ -26,6 +26,10 @@ Built in Rust, it links the shared **`punktfunk-core`** directly (no C ABI) and 
   shows its games (Steam + custom) as a poster grid; click one to launch it in the session.
   Fetched from the host's management API over mTLS — paired devices are authorized by their
   certificate, no extra host setup.
+- **Gamepad library launcher** (`--browse host`) — a console-style, controller-driven coverflow of
+  a paired host's library (drifting aurora backdrop, center-focus posters, button hints): A plays
+  the focused title, B quits, L1/R1 jump. Built for the Steam Deck plugin's "Open library" launch;
+  session end returns to the launcher. Arrow keys/Enter/Esc drive it too (no pad needed).
 
 ## Get it
 
@@ -49,24 +53,28 @@ and SDL3 (with hidapi) development packages.
 ```sh
 # from the repo root
 cargo run -p punktfunk-client-linux                 # launch the app
-cargo run -p punktfunk-client-linux -- --discover   # list hosts on the LAN, then exit
 cargo run -p punktfunk-client-linux -- --connect HOST[:PORT]   # skip the host list and connect
+cargo run -p punktfunk-client-linux -- --browse HOST           # the gamepad library launcher
 ```
 
 The binary is named **`punktfunk-client`**. Handy flags: `--connect host[:port]` (start a session
-immediately — for scripting and the Steam Deck launcher), `--discover [secs]`, and
+immediately — for scripting and the Steam Deck launcher) with optional `--launch <id>` (ask the
+host to launch that library title, id from `--library`), `--browse host[:port]` (the gamepad
+library launcher; `--mgmt <port>` overrides the management port it fetches from),
 `--pair <PIN> --connect host[:port]` (run the pairing ceremony headlessly), and
 `--library host[:mgmt_port]` (print a host's game library headlessly). Force a decoder with
-`PUNKTFUNK_DECODER=software|vaapi`.
+`PUNKTFUNK_DECODER=software|vaapi`; `PUNKTFUNK_FAKE_LIBRARY=<file.json>` feeds the launcher
+canned entries for UI work with no host.
 
 ## Layout
 
 ```
 src/
   main.rs · app.rs        entry point, GTK application, primary menu, CSS
-  cli.rs                  CLI paths (--connect, headless --pair, screenshot scenes)
+  cli.rs                  CLI paths (--connect/--launch, --browse, headless --pair, screenshot scenes)
   ui_hosts.rs             host card grids (saved + discovered) · add-host dialog · banner
   ui_library.rs           game-library poster grid (per-host, launches titles)
+  ui_gamepad_library.rs   the --browse gamepad launcher (aurora · coverflow · hint bar)
   ui_trust.rs             TOFU / PIN-pairing / request-access dialogs
   ui_settings.rs          resolution · refresh · decoder · bitrate · compositor · mic
   ui_stream.rs            the stream window (GtkGraphicsOffload present) + input capture

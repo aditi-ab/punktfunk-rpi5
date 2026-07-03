@@ -26,6 +26,8 @@ mod session;
 #[cfg(target_os = "linux")]
 mod trust;
 #[cfg(target_os = "linux")]
+mod ui_gamepad_library;
+#[cfg(target_os = "linux")]
 mod ui_hosts;
 #[cfg(target_os = "linux")]
 mod ui_library;

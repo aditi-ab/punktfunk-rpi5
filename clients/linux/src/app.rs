@@ -34,6 +34,28 @@ const CSS: &str = "
    xdg_toplevel fullscreen state, so GTK keeps the floating-CSD styling — libadwaita's
    rounded corners + shadow margin stay visible over the stream. Flatten them outright. */
 window.pf-chromeless { border-radius: 0; box-shadow: none; }
+/* The gamepad library launcher (`--browse`, ui_gamepad_library) — always-dark console
+   chrome over the aurora, independent of the desktop theme. */
+.pf-gl-page { background: black; color: white; }
+.pf-gl-host { font-size: 1.15em; font-weight: bold; color: rgba(255, 255, 255, 0.9); }
+.pf-gl-chip { font-size: 0.8em; color: rgba(255, 255, 255, 0.7);
+              background: rgba(255, 255, 255, 0.08);
+              border: 1px solid rgba(255, 255, 255, 0.12);
+              border-radius: 999px; padding: 4px 12px; }
+/* Solid face, not glass: coverflow side cards OVERLAP — a translucent card would bleed
+   the stack through the one on top. */
+.pf-gl-poster { border-radius: 16px; background: rgb(30, 30, 37);
+                border: 1px solid rgba(255, 255, 255, 0.07); }
+.pf-gl-dim { background: black; border-radius: 16px; }
+.pf-gl-detail-title { font-size: 1.7em; font-weight: bold; color: white; }
+.pf-gl-detail-store { font-size: 0.75em; font-weight: 600; letter-spacing: 2px;
+                      color: rgba(255, 255, 255, 0.5); }
+.pf-gl-glyph { font-size: 0.85em; font-weight: bold; color: white;
+               background: rgba(255, 255, 255, 0.14);
+               border-radius: 999px; min-width: 26px; min-height: 26px; padding: 2px 8px; }
+.pf-gl-hint { color: rgba(255, 255, 255, 0.85); }
+.pf-gl-status { font-size: 0.85em; color: #ff938a; }
+.pf-gl-error-title { font-size: 1.4em; font-weight: bold; color: white; }
 ";
 
 pub struct App {
@@ -55,6 +77,9 @@ pub struct App {
     /// The hosts page handle (banner + per-card connecting spinner), set right after the
     /// page is built — `None` only during construction.
     pub hosts: RefCell<Option<Rc<HostsUi>>>,
+    /// The gamepad library launcher — `Some` only under `--browse`, where it replaces the
+    /// hosts page as the root (and session end returns here instead of quitting).
+    pub browse: RefCell<Option<Rc<crate::ui_gamepad_library::LauncherUi>>>,
 }
 
 impl App {
@@ -66,11 +91,17 @@ impl App {
         self.hosts.borrow().clone()
     }
 
-    /// Surface a connect failure on the hosts page banner (toast fallback pre-build).
+    pub fn browse_ui(&self) -> Option<Rc<crate::ui_gamepad_library::LauncherUi>> {
+        self.browse.borrow().clone()
+    }
+
+    /// Surface a connect failure: the launcher in browse mode, else the hosts page banner
+    /// (toast fallback pre-build).
     pub fn connect_error(&self, msg: &str) {
-        match self.hosts_ui() {
-            Some(h) => h.show_error(msg),
-            None => self.toast(msg),
+        match (self.browse_ui(), self.hosts_ui()) {
+            (Some(l), _) => l.show_error(msg),
+            (_, Some(h)) => h.show_error(msg),
+            _ => self.toast(msg),
         }
     }
 }
@@ -112,6 +143,14 @@ fn build_ui(gtk_app: &adw::Application) {
         }
     };
     load_css();
+    // Screenshot scenes must capture settled frames: kill every GTK/libadwaita animation
+    // (nav-push slides especially — a headless session may starve the frame clock and
+    // leave a transition frozen mid-flight in the capture).
+    if crate::cli::shot_scene().is_some() {
+        if let Some(s) = gtk::Settings::default() {
+            s.set_gtk_enable_animations(false);
+        }
+    }
 
     let nav = adw::NavigationView::new();
     let toasts = adw::ToastOverlay::new();
@@ -141,8 +180,11 @@ fn build_ui(gtk_app: &adw::Application) {
         gamepad: crate::gamepad::GamepadService::start(),
         busy: std::cell::Cell::new(false),
         fullscreen,
+        // (`--browse` makes cli_connect_request None — browse mode returns to the
+        // launcher on session end instead of quitting.)
         quit_on_session_end: fullscreen && crate::cli::cli_connect_request().is_some(),
         hosts: RefCell::new(None),
+        browse: RefCell::new(None),
     });
 
     // Re-apply the persisted forwarded-controller pin (stable key; the service matches it
@@ -153,6 +195,18 @@ fn build_ui(gtk_app: &adw::Application) {
         if !forward.is_empty() {
             app.gamepad.set_pinned(Some(forward));
         }
+    }
+
+    // Browse mode (`--browse host`): the app IS the gamepad library launcher — it becomes
+    // the ONE root page. No hosts page (whose construction starts the mDNS browse), no
+    // header-menu actions; `Settings::library_enabled` is deliberately ignored (the flag
+    // gates the desktop menu item — asking to browse IS the opt-in here).
+    if let Some((req, paired, mgmt_port)) = crate::cli::cli_browse_request() {
+        let launcher = crate::ui_gamepad_library::open(app.clone(), req, paired, mgmt_port);
+        nav.add(&launcher.page);
+        *app.browse.borrow_mut() = Some(launcher);
+        window.present();
+        return;
     }
 
     let hosts_ui = Rc::new(crate::ui_hosts::new(

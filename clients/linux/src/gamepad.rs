@@ -18,6 +18,17 @@
 //! idle host-list window would kill the Deck's system input. The pad list for Settings is
 //! built from SDL's ID-based metadata getters, which need no open.
 //!
+//! **Menu mode is the one idle exception.** The gamepad library launcher (`--browse`)
+//! flips [`GamepadService::set_menu_mode`] on for its lifetime: the worker then holds the
+//! active pad open and translates its buttons/stick into [`MenuEvent`]s (polled off the
+//! open handle each loop — Apple `GamepadMenuInput` parity: edge-triggered buttons,
+//! snapshot-on-entry so a button still held from a previous screen or stream can't ghost-
+//! fire, stick/dpad direction with initial-delay auto-repeat). The Valve HIDAPI drivers
+//! stay OFF — a plain SDL open of the virtual X360 / evdev pad doesn't touch lizard mode —
+//! and an attached session always supersedes menu translation (the stream path is
+//! untouched); detach re-snapshots so the escape chord that ended the session fires
+//! nothing in the menu.
+//!
 //! This thread is also the single consumer of the rumble and HID-output pull planes.
 
 use punktfunk_core::client::NativeClient;
@@ -49,6 +60,169 @@ const ESCAPE_CHORD: [u32; 4] = [wire::BTN_LB, wire::BTN_RB, wire::BTN_START, wir
 
 /// Hold the [`ESCAPE_CHORD`] at least this long to disconnect (escalates the leave-fullscreen press).
 const DISCONNECT_HOLD: Duration = Duration::from_millis(1500);
+
+/// Stick deflection below this is ignored for menu navigation (0.5 of full scale — Apple
+/// `GamepadMenuInput` parity; menus want deliberate flicks, not drift).
+const MENU_DEADZONE: u16 = 16384;
+/// A held direction starts auto-repeating after this initial delay…
+const MENU_REPEAT_DELAY: Duration = Duration::from_millis(380);
+/// …and then repeats at this cadence until released or changed.
+const MENU_REPEAT_INTERVAL: Duration = Duration::from_millis(160);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// One controller action for the launcher UI, translated from the open pad while menu
+/// mode is on and no session is attached. Buttons are edge-triggered; `Move` debounces
+/// the stick/dpad and auto-repeats ([`MENU_REPEAT_DELAY`]/[`MENU_REPEAT_INTERVAL`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuEvent {
+    Move(MenuDir),
+    /// A — activate the focused item.
+    Confirm,
+    /// B — back / quit.
+    Back,
+    /// Y (Apple "secondary"; unused by the launcher today, kept for parity).
+    Secondary,
+    /// X (Apple "tertiary"; unused).
+    Tertiary,
+    /// L1 — jump back 5.
+    JumpBack,
+    /// R1 — jump forward 5.
+    JumpForward,
+}
+
+/// Menu haptic pulses — short rumble ticks on the menu pad (never during a stream).
+#[derive(Clone, Copy, Debug)]
+pub enum MenuPulse {
+    Move,
+    Confirm,
+    Boundary,
+}
+
+/// Raw pad state sampled once per worker iteration for menu translation.
+#[derive(Clone, Copy, Default)]
+struct MenuSample {
+    /// a, b, x, y, l1, r1 — the order [`MenuNav::poll`] maps to events.
+    buttons: [bool; 6],
+    /// Left stick, SDL convention (+y = down).
+    lx: i16,
+    ly: i16,
+    /// up, down, left, right.
+    dpad: [bool; 4],
+}
+
+/// The pure menu-input state machine (no SDL types — unit-tested below). Port of the
+/// Swift client's `GamepadMenuInput`: the poll after a [`reset`](Self::reset) adopts the
+/// currently-held buttons and direction WITHOUT firing, so a press that crossed a screen
+/// handoff (the B that closed a stream, a held A on mode entry) must be released before
+/// it can act; buttons fire on the rising edge only.
+struct MenuNav {
+    /// Adopt the next sample silently (set on mode entry / stream detach / pad change).
+    snapshot_pending: bool,
+    /// Previous button states, [`MenuSample::buttons`] order.
+    was: [bool; 6],
+    dir: Option<MenuDir>,
+    /// When `dir` engaged — start of the initial-repeat delay.
+    dir_since: Instant,
+    last_repeat: Instant,
+}
+
+impl MenuNav {
+    fn new() -> MenuNav {
+        MenuNav {
+            snapshot_pending: true,
+            was: [false; 6],
+            dir: None,
+            dir_since: Instant::now(),
+            last_repeat: Instant::now(),
+        }
+    }
+
+    /// Arm the snapshot: the next poll adopts held state without firing.
+    fn reset(&mut self) {
+        self.snapshot_pending = true;
+        self.dir = None;
+    }
+
+    /// Direction from the left stick (dominant axis wins past the deadzone), falling back
+    /// to the discrete dpad. SDL sticks are +y = down.
+    fn resolve_dir(s: &MenuSample) -> Option<MenuDir> {
+        let (ax, ay) = (s.lx.unsigned_abs(), s.ly.unsigned_abs());
+        if ax > MENU_DEADZONE || ay > MENU_DEADZONE {
+            return Some(if ax >= ay {
+                if s.lx > 0 {
+                    MenuDir::Right
+                } else {
+                    MenuDir::Left
+                }
+            } else if s.ly > 0 {
+                MenuDir::Down
+            } else {
+                MenuDir::Up
+            });
+        }
+        let [up, down, left, right] = s.dpad;
+        if left {
+            Some(MenuDir::Left)
+        } else if right {
+            Some(MenuDir::Right)
+        } else if up {
+            Some(MenuDir::Up)
+        } else if down {
+            Some(MenuDir::Down)
+        } else {
+            None
+        }
+    }
+
+    fn poll(&mut self, s: &MenuSample, now: Instant, out: &mut Vec<MenuEvent>) {
+        let dir = Self::resolve_dir(s);
+        if self.snapshot_pending {
+            self.snapshot_pending = false;
+            self.was = s.buttons;
+            self.dir = dir;
+            self.dir_since = now;
+            self.last_repeat = now;
+            return;
+        }
+        // buttons order a, b, x, y, l1, r1 → the matching event per index.
+        const EVENTS: [MenuEvent; 6] = [
+            MenuEvent::Confirm,
+            MenuEvent::Back,
+            MenuEvent::Tertiary,
+            MenuEvent::Secondary,
+            MenuEvent::JumpBack,
+            MenuEvent::JumpForward,
+        ];
+        for (i, ev) in EVENTS.iter().enumerate() {
+            if s.buttons[i] && !self.was[i] {
+                out.push(*ev);
+            }
+            self.was[i] = s.buttons[i];
+        }
+        if dir != self.dir {
+            self.dir = dir;
+            self.dir_since = now;
+            self.last_repeat = now;
+            if let Some(d) = dir {
+                out.push(MenuEvent::Move(d));
+            }
+        } else if let Some(d) = dir {
+            if now.duration_since(self.dir_since) >= MENU_REPEAT_DELAY
+                && now.duration_since(self.last_repeat) >= MENU_REPEAT_INTERVAL
+            {
+                self.last_repeat = now;
+                out.push(MenuEvent::Move(d));
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PadInfo {
@@ -133,6 +307,8 @@ enum Ctl {
     Attach(Arc<NativeClient>),
     Detach,
     Pin(Option<String>),
+    MenuMode(bool),
+    MenuRumble(MenuPulse),
 }
 
 #[derive(Clone)]
@@ -146,6 +322,9 @@ pub struct GamepadService {
     /// Fires once when the [`ESCAPE_CHORD`] is held past [`DISCONNECT_HOLD`]; the stream page
     /// consumes it to end the session (the controller equivalent of Ctrl+Alt+Shift+D).
     disconnect_rx: async_channel::Receiver<()>,
+    /// Menu-navigation events while menu mode is on and no session is attached; the
+    /// launcher page consumes them.
+    menu_rx: async_channel::Receiver<MenuEvent>,
 }
 
 impl GamepadService {
@@ -155,11 +334,12 @@ impl GamepadService {
         let (ctl, ctl_rx) = std::sync::mpsc::channel();
         let (escape_tx, escape_rx) = async_channel::unbounded();
         let (disconnect_tx, disconnect_rx) = async_channel::unbounded();
+        let (menu_tx, menu_rx) = async_channel::unbounded();
         let (p, a) = (pads.clone(), active.clone());
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-gamepad".into())
             .spawn(move || {
-                if let Err(e) = run(&p, &a, &ctl_rx, &escape_tx, &disconnect_tx) {
+                if let Err(e) = run(&p, &a, &ctl_rx, &escape_tx, &disconnect_tx, &menu_tx) {
                     tracing::warn!(error = %e, "gamepad service ended — pads disabled");
                 }
             })
@@ -172,6 +352,7 @@ impl GamepadService {
             ctl,
             escape_rx,
             disconnect_rx,
+            menu_rx,
         }
     }
 
@@ -185,6 +366,25 @@ impl GamepadService {
     /// (controller disconnect). A fresh clone per call; the stream page spawns a future on it.
     pub fn disconnect_events(&self) -> async_channel::Receiver<()> {
         self.disconnect_rx.clone()
+    }
+
+    /// Menu-navigation events ([`MenuEvent`]) — flowing only while menu mode is on and no
+    /// session is attached. A fresh clone per call; the launcher spawns a future on it.
+    pub fn menu_events(&self) -> async_channel::Receiver<MenuEvent> {
+        self.menu_rx.clone()
+    }
+
+    /// Turn menu mode on/off: while on (and no session attached) the worker holds the
+    /// active pad open and translates it into [`MenuEvent`]s. The launcher flips this on
+    /// once for its lifetime — an attached session supersedes translation automatically.
+    pub fn set_menu_mode(&self, on: bool) {
+        let _ = self.ctl.send(Ctl::MenuMode(on));
+    }
+
+    /// Play a short menu haptic tick on the menu pad (no-op while a session is attached
+    /// or no pad is open; best-effort on pads without rumble).
+    pub fn menu_rumble(&self, pulse: MenuPulse) {
+        let _ = self.ctl.send(Ctl::MenuRumble(pulse));
     }
 
     pub fn pads(&self) -> Vec<PadInfo> {
@@ -363,6 +563,11 @@ struct Worker<'a> {
     chord_since: Option<Instant>,
     /// The disconnect signal already fired for the current hold — latched so it fires once.
     disconnect_fired: bool,
+    /// Menu mode ([`GamepadService::set_menu_mode`]): hold the active pad open while idle
+    /// and translate it into [`MenuEvent`]s. An attached session pauses translation.
+    menu_mode: bool,
+    menu_nav: MenuNav,
+    menu_tx: async_channel::Sender<MenuEvent>,
 }
 
 impl Worker<'_> {
@@ -421,12 +626,12 @@ impl Worker<'_> {
         })
     }
 
-    /// Hold exactly the right device: the active pad while a session is attached, nothing
-    /// otherwise. The single place that decides to open (= grab) hardware; dropping the
-    /// old handle closes it (`SDL_CloseGamepad`) — on a Deck the firmware watchdog then
-    /// restores lizard mode.
+    /// Hold exactly the right device: the active pad while a session is attached or menu
+    /// mode owns navigation, nothing otherwise. The single place that decides to open
+    /// (= grab) hardware; dropping the old handle closes it (`SDL_CloseGamepad`) — on a
+    /// Deck the firmware watchdog then restores lizard mode.
     fn sync_open(&mut self) {
-        let want = if self.attached.is_some() {
+        let want = if self.attached.is_some() || self.menu_mode {
             self.active_id()
         } else {
             None
@@ -439,7 +644,15 @@ impl Worker<'_> {
         match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
             Ok(pad) => {
                 self.open = Some((id, pad));
-                self.set_sensors(true);
+                // Sensors stream only for an attached session (USB/BT bandwidth); the
+                // menu needs buttons + stick only.
+                if self.attached.is_some() {
+                    self.set_sensors(true);
+                } else {
+                    // The menu pad changed under us (hot-plug while the launcher is
+                    // open): adopt the new pad's held state instead of firing it.
+                    self.menu_nav.reset();
+                }
             }
             Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
         }
@@ -645,13 +858,41 @@ impl Worker<'_> {
                 Ok(Ctl::Detach) => {
                     self.flush_held();
                     self.attached = None;
-                    self.sync_open(); // closes the held device
+                    self.sync_open(); // closes the held device (menu mode keeps it)
                     set_valve_hidapi(false);
+                    if self.menu_mode {
+                        // Back to the launcher: adopt whatever is still physically held
+                        // (the escape chord that ended the session, a lingering B) so it
+                        // can't ghost-fire menu actions.
+                        self.menu_nav.reset();
+                    }
                 }
                 Ok(Ctl::Pin(key)) => {
                     let before = self.active_id();
                     self.pinned = key;
                     self.refresh_active(before);
+                }
+                Ok(Ctl::MenuMode(on)) => {
+                    self.menu_mode = on;
+                    if on {
+                        self.menu_nav.reset();
+                    }
+                    self.sync_open();
+                }
+                Ok(Ctl::MenuRumble(pulse)) => {
+                    if self.attached.is_none() {
+                        if let Some((_, pad)) = self.open.as_mut() {
+                            let (low, high, ms) = match pulse {
+                                // Light high-freq detent — won't jackhammer at repeat rate.
+                                MenuPulse::Move => (0, 0x3000, 25),
+                                // Fuller both-motor thunk.
+                                MenuPulse::Confirm => (0x5000, 0x5000, 60),
+                                // Dull low-freq wall.
+                                MenuPulse::Boundary => (0x6000, 0, 60),
+                            };
+                            let _ = pad.set_rumble(low, high, ms);
+                        }
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return true,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return false, // app gone
@@ -784,6 +1025,42 @@ impl Worker<'_> {
         }
     }
 
+    /// Sample the open pad and translate it into [`MenuEvent`]s — only while menu mode is
+    /// on and no session is attached (attach supersedes; SDL events merely wake the loop,
+    /// so a press is translated the iteration it arrives).
+    fn menu_poll(&mut self) {
+        if !self.menu_mode || self.attached.is_some() {
+            return;
+        }
+        let Some((_, pad)) = self.open.as_ref() else {
+            return;
+        };
+        use sdl3::gamepad::{Axis, Button};
+        let s = MenuSample {
+            buttons: [
+                pad.button(Button::South),
+                pad.button(Button::East),
+                pad.button(Button::West),
+                pad.button(Button::North),
+                pad.button(Button::LeftShoulder),
+                pad.button(Button::RightShoulder),
+            ],
+            lx: pad.axis(Axis::LeftX),
+            ly: pad.axis(Axis::LeftY),
+            dpad: [
+                pad.button(Button::DPadUp),
+                pad.button(Button::DPadDown),
+                pad.button(Button::DPadLeft),
+                pad.button(Button::DPadRight),
+            ],
+        };
+        let mut out = Vec::new();
+        self.menu_nav.poll(&s, Instant::now(), &mut out);
+        for e in out {
+            let _ = self.menu_tx.try_send(e);
+        }
+    }
+
     /// Drain and render the feedback planes — rumble plus HID output (lightbar /
     /// player LEDs / adaptive triggers) — on the active pad; this thread is their single
     /// consumer. The host re-sends rumble state periodically, so a generous duration with
@@ -847,6 +1124,7 @@ fn run(
     ctl: &Receiver<Ctl>,
     escape_tx: &async_channel::Sender<()>,
     disconnect_tx: &async_channel::Sender<()>,
+    menu_tx: &async_channel::Sender<MenuEvent>,
 ) -> Result<(), String> {
     // Off-main-thread + no video subsystem: keep SDL away from signals, poll pads on its
     // own thread.
@@ -877,6 +1155,9 @@ fn run(
         chord_armed: false,
         chord_since: None,
         disconnect_fired: false,
+        menu_mode: false,
+        menu_nav: MenuNav::new(),
+        menu_tx: menu_tx.clone(),
     };
 
     loop {
@@ -891,8 +1172,13 @@ fn run(
         // rumble/HID feedback, and the escape-chord hold check all run once per wakeup,
         // so their worst case is one timeout (~10 ms attached, imperceptible for
         // haptics; DISCONNECT_HOLD is 1500 ms, so 10 ms hold-check granularity is far
-        // inside tolerance). Idle (no session) wakes lazily at 30 ms for hotplug + ctl.
-        let timeout = Duration::from_millis(if w.attached.is_some() { 10 } else { 30 });
+        // inside tolerance; menu mode needs the same cadence for its repeat timing).
+        // Idle (no session, no menu) wakes lazily at 30 ms for hotplug + ctl.
+        let timeout = Duration::from_millis(if w.attached.is_some() || w.menu_mode {
+            10
+        } else {
+            30
+        });
         if let Some(event) = pump.wait_event_timeout(timeout) {
             w.handle_event(event);
             // Drain whatever else queued while we were waiting or handling.
@@ -905,6 +1191,169 @@ fn run(
         // new button events; the chord itself is only detected while a session is attached).
         w.maybe_fire_disconnect();
 
+        w.menu_poll();
         w.render_feedback();
+    }
+}
+
+#[cfg(test)]
+mod menu_nav_tests {
+    use super::*;
+
+    fn sample() -> MenuSample {
+        MenuSample::default()
+    }
+
+    fn events(nav: &mut MenuNav, s: &MenuSample, at: Instant) -> Vec<MenuEvent> {
+        let mut out = Vec::new();
+        nav.poll(s, at, &mut out);
+        out
+    }
+
+    #[test]
+    fn snapshot_adopts_held_state_without_firing() {
+        let mut nav = MenuNav::new();
+        let t = Instant::now();
+        let mut held = sample();
+        held.buttons[0] = true; // A held on entry
+        held.lx = 30000; // stick already deflected right
+        assert!(events(&mut nav, &held, t).is_empty(), "snapshot poll fired");
+        // Still held: nothing (no rising edge, direction unchanged since snapshot).
+        assert!(events(&mut nav, &held, t + Duration::from_millis(10)).is_empty());
+        // Release, then press again → now it fires.
+        assert!(events(&mut nav, &sample(), t + Duration::from_millis(20)).is_empty());
+        assert_eq!(
+            events(&mut nav, &held, t + Duration::from_millis(30)),
+            vec![MenuEvent::Confirm, MenuEvent::Move(MenuDir::Right)]
+        );
+    }
+
+    #[test]
+    fn buttons_fire_on_rising_edge_only() {
+        let mut nav = MenuNav::new();
+        let t = Instant::now();
+        events(&mut nav, &sample(), t); // consume the snapshot
+        let mut s = sample();
+        s.buttons[1] = true; // B down
+        assert_eq!(
+            events(&mut nav, &s, t + Duration::from_millis(10)),
+            vec![MenuEvent::Back]
+        );
+        for i in 2..20 {
+            assert!(
+                events(&mut nav, &s, t + Duration::from_millis(10 * i)).is_empty(),
+                "held button re-fired"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_rearms_the_snapshot() {
+        let mut nav = MenuNav::new();
+        let t = Instant::now();
+        events(&mut nav, &sample(), t);
+        nav.reset();
+        let mut s = sample();
+        s.buttons[1] = true;
+        assert!(
+            events(&mut nav, &s, t + Duration::from_millis(10)).is_empty(),
+            "post-reset poll fired a held button"
+        );
+    }
+
+    #[test]
+    fn direction_repeats_after_delay_at_interval() {
+        let mut nav = MenuNav::new();
+        let t = Instant::now();
+        events(&mut nav, &sample(), t);
+        let mut s = sample();
+        s.dpad[3] = true; // dpad right
+                          // Engage: fires immediately.
+        assert_eq!(
+            events(&mut nav, &s, t + Duration::from_millis(10)),
+            vec![MenuEvent::Move(MenuDir::Right)]
+        );
+        // Inside the initial delay: silent.
+        assert!(events(&mut nav, &s, t + Duration::from_millis(300)).is_empty());
+        // Past the delay: repeats…
+        assert_eq!(
+            events(&mut nav, &s, t + Duration::from_millis(400)),
+            vec![MenuEvent::Move(MenuDir::Right)]
+        );
+        // …but not faster than the interval…
+        assert!(events(&mut nav, &s, t + Duration::from_millis(500)).is_empty());
+        // …and again once it elapses.
+        assert_eq!(
+            events(&mut nav, &s, t + Duration::from_millis(570)),
+            vec![MenuEvent::Move(MenuDir::Right)]
+        );
+        // Release cancels; re-engage fires immediately again.
+        assert!(events(&mut nav, &sample(), t + Duration::from_millis(580)).is_empty());
+        assert_eq!(
+            events(&mut nav, &s, t + Duration::from_millis(590)),
+            vec![MenuEvent::Move(MenuDir::Right)]
+        );
+    }
+
+    #[test]
+    fn direction_change_fires_immediately() {
+        let mut nav = MenuNav::new();
+        let t = Instant::now();
+        events(&mut nav, &sample(), t);
+        let mut right = sample();
+        right.lx = 30000;
+        let mut left = sample();
+        left.lx = -30000;
+        assert_eq!(
+            events(&mut nav, &right, t + Duration::from_millis(10)),
+            vec![MenuEvent::Move(MenuDir::Right)]
+        );
+        assert_eq!(
+            events(&mut nav, &left, t + Duration::from_millis(20)),
+            vec![MenuEvent::Move(MenuDir::Left)]
+        );
+    }
+
+    #[test]
+    fn direction_resolution() {
+        // Below the deadzone: nothing.
+        let mut s = sample();
+        s.lx = MENU_DEADZONE as i16;
+        assert_eq!(MenuNav::resolve_dir(&s), None);
+        // Dominant axis wins; SDL +y = down.
+        s.lx = 20000;
+        s.ly = 25000;
+        assert_eq!(MenuNav::resolve_dir(&s), Some(MenuDir::Down));
+        s.ly = -25000;
+        assert_eq!(MenuNav::resolve_dir(&s), Some(MenuDir::Up));
+        s.lx = 26000;
+        assert_eq!(MenuNav::resolve_dir(&s), Some(MenuDir::Right));
+        s.lx = -26000;
+        assert_eq!(MenuNav::resolve_dir(&s), Some(MenuDir::Left));
+        // Dpad fallback…
+        let mut d = sample();
+        d.dpad[1] = true;
+        assert_eq!(MenuNav::resolve_dir(&d), Some(MenuDir::Down));
+        // …but the stick overrides it.
+        d.lx = 30000;
+        assert_eq!(MenuNav::resolve_dir(&d), Some(MenuDir::Right));
+    }
+
+    #[test]
+    fn shoulder_and_face_button_mapping() {
+        let mut nav = MenuNav::new();
+        let t = Instant::now();
+        events(&mut nav, &sample(), t);
+        let mut s = sample();
+        s.buttons = [false, false, true, true, true, true]; // x, y, l1, r1
+        assert_eq!(
+            events(&mut nav, &s, t + Duration::from_millis(10)),
+            vec![
+                MenuEvent::Tertiary,
+                MenuEvent::Secondary,
+                MenuEvent::JumpBack,
+                MenuEvent::JumpForward,
+            ]
+        );
     }
 }

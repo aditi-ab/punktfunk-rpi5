@@ -6,8 +6,9 @@
 //! verified by its pinned SHA-256 fingerprint (`KnownHost::fp_hex`), not a CA chain.
 
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The management API's default port — matches `mgmt::DEFAULT_PORT` on the host. A
@@ -179,6 +180,57 @@ pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>,
         .read_to_end(&mut bytes)
         .map_err(|e| LibraryError::Unreachable(format!("read image: {e}")))?;
     Ok(bytes)
+}
+
+/// Concurrent poster fetches — a handful is plenty for a LAN art proxy without turning a
+/// big library into a connection burst.
+const ART_WORKERS: usize = 3;
+
+/// Fetch poster bytes for `jobs` (entry id → candidate URLs, walked in order until one
+/// loads) on a small worker pool; results stream on the returned channel as they land.
+/// Dropping the receiver (the consuming page popped) winds the workers down. Shared by
+/// the touch grid and the gamepad launcher — the consumer does its own texture decode on
+/// the main loop.
+pub fn spawn_art_fetch(
+    base: String,
+    identity: (String, String),
+    pin: Option<[u8; 32]>,
+    jobs: VecDeque<(String, Vec<String>)>,
+) -> async_channel::Receiver<(String, Vec<u8>)> {
+    let queue = Arc::new(Mutex::new(jobs));
+    let (tx, rx) = async_channel::unbounded::<(String, Vec<u8>)>();
+    for _ in 0..ART_WORKERS {
+        let queue = queue.clone();
+        let tx = tx.clone();
+        let base = base.clone();
+        let identity = identity.clone();
+        std::thread::Builder::new()
+            .name("punktfunk-lib-art".into())
+            .spawn(move || {
+                let Ok(agent) = agent(&identity, pin) else {
+                    return;
+                };
+                loop {
+                    let job = queue.lock().unwrap().pop_front();
+                    let Some((id, candidates)) = job else { break };
+                    for url in &candidates {
+                        match fetch_art(&agent, &base, url) {
+                            Ok(bytes) => {
+                                // Receiver gone (page popped) — stop fetching.
+                                if tx.send_blocking((id, bytes)).is_err() {
+                                    return;
+                                }
+                                break;
+                            }
+                            // 404 on a guessed CDN path is routine — try the next kind.
+                            Err(e) => tracing::debug!(%id, url, error = %e, "poster miss"),
+                        }
+                    }
+                }
+            })
+            .expect("spawn art thread");
+    }
+    rx
 }
 
 fn classify(e: ureq::Error) -> LibraryError {
