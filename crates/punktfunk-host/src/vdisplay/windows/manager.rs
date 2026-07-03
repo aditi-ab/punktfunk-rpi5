@@ -149,9 +149,6 @@ struct DeviceSlot {
     /// `CLEAR_ALL` (crashed-host orphan reap) runs only on the FIRST open of the process; a reopen
     /// races sessions this process still considers live and must not raze them.
     opened_once: bool,
-    /// The cross-process single-instance mutex (`Global\punktfunk-vdisplay-manager`), acquired on
-    /// the first open and held — never released — for the process lifetime.
-    instance_guard: Option<OwnedHandle>,
 }
 
 /// The host-lifetime virtual-display manager: the single owner of the monitor lifecycle.
@@ -216,6 +213,31 @@ pub(crate) fn control_device_handle() -> Option<HANDLE> {
 /// next use reopens. The root `windows` error survives anyhow `.context` chains via `downcast_ref`.
 /// NOTE: 0x80070490 (ERROR_NOT_FOUND, the ADD slot-exhaustion wedge) is deliberately NOT here — it
 /// has its own reap-and-retry handling and the device is alive when it fires.
+/// The held single-instance mutex (`None` until claimed). Process-global — not per-manager — so the
+/// serve path can claim it EAGERLY at startup, before any session opens the backend: the claim is
+/// first-comer-wins, and a lazily-claiming service could otherwise lose its own machine's driver to
+/// a stray second host started while the service sat idle (observed on-glass). A failed claim is NOT
+/// memoized: once the other instance exits, the next attempt succeeds.
+static INSTANCE: Mutex<Option<OwnedHandle>> = Mutex::new(None);
+
+/// Claim (or re-verify) the cross-process single-instance guard. Idempotent; retries after failure.
+fn claim_instance() -> Result<()> {
+    let mut g = INSTANCE.lock().unwrap();
+    if g.is_none() {
+        *g = Some(acquire_single_instance()?);
+    }
+    Ok(())
+}
+
+/// Eager startup claim for the serve/service path (Windows): reserves this process as THE
+/// pf-vdisplay manager before any client connects. Failure is a loud warning, not fatal — sessions
+/// then fail with the same clear in-use error until the other instance exits.
+pub(crate) fn claim_instance_eagerly() {
+    if let Err(e) = claim_instance() {
+        tracing::warn!("pf-vdisplay single-instance claim failed at startup: {e:#}");
+    }
+}
+
 /// The cross-process single-instance guard for pf-vdisplay management. A SECOND host process's
 /// first device open used to fire `IOCTL_CLEAR_ALL` and raze the live host's monitors mid-stream —
 /// an admin footgun (run `punktfunk-host serve` while the SCM service streams), masked afterwards
@@ -303,9 +325,7 @@ impl VirtualDisplayManager {
             return Ok(HANDLE(d.as_raw_handle()));
         }
         let reap = !slot.opened_once;
-        if slot.instance_guard.is_none() {
-            slot.instance_guard = Some(acquire_single_instance()?);
-        }
+        claim_instance()?;
         // SAFETY: `VdisplayDriver::open` is `unsafe` only because it issues SetupAPI + `DeviceIoControl`
         // FFI in the caller's apartment; the `device` mutex (held here) serializes it, so there is no
         // concurrent open. `open` has no handle precondition to uphold, and the `OwnedHandle` it

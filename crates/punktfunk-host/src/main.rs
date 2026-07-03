@@ -156,6 +156,11 @@ fn real_main() -> Result<()> {
         // --gamestream — the GameStream/Moonlight-compat planes too (opt-in; #5/#9 trusted-LAN caveat).
         Some("serve") => {
             let (mgmt_opts, native, gamestream) = parse_serve(&args[1..])?;
+            // Claim the pf-vdisplay single-instance guard EAGERLY, before any client connects: the
+            // claim is first-comer-wins, and a lazily-claiming service could lose its own machine's
+            // driver to a stray second host started while the service sat idle.
+            #[cfg(target_os = "windows")]
+            vdisplay::manager::claim_instance_eagerly();
             gamestream::serve(mgmt_opts, native, gamestream)
         }
         // Print the management API's OpenAPI document (for client codegen).
