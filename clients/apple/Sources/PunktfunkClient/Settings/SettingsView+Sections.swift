@@ -7,63 +7,15 @@ import SwiftUI
 extension SettingsView {
     // MARK: - Sections (shared)
 
+    // NOTE: the Section content is deliberately split into the small named builders below — as one
+    // inline expression the iOS branch (wheel + 3-way refresh + bitrate rows) blew Swift's
+    // type-checker budget ("unable to type-check this expression in reasonable time"), which
+    // failed exactly one slice: the iOS archive (macOS/tvOS never compile that branch).
     @ViewBuilder var streamModeSection: some View {
         Section {
             #if os(iOS)
-            // Touch-first: a rotating wheel of common resolutions (this device's own mode first) and
-            // a segmented refresh-rate control — the same family as the Clock/Timer pickers. The host
-            // renders a virtual output at exactly the chosen mode, so these are real pixel sizes. The
-            // last wheel row, "Custom…", reveals width/height/refresh fields for an arbitrary mode.
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Resolution")
-                    .font(.geist(15, relativeTo: .subheadline))
-                    .foregroundStyle(.secondary)
-                Picker("Resolution", selection: resolutionSelection) {
-                    ForEach(resolutionChoices, id: \.tag) { choice in
-                        Text(choice.label).tag(choice.tag)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.wheel)
-                .frame(maxHeight: 140)
-            }
-            if isCustomResolution {
-                // Arbitrary entry: type the exact width × height (and refresh) the host should drive.
-                HStack {
-                    TextField("Width", value: $width, format: .number.grouping(.never))
-                        .keyboardType(.numberPad)
-                    Text("×")
-                    TextField("Height", value: $height, format: .number.grouping(.never))
-                        .labelsHidden()
-                        .keyboardType(.numberPad)
-                }
-                // A row built from an HStack of TextFields otherwise insets its bottom separator to
-                // the inner content, clipping the hairline under "Width"; pin it to the cell edge.
-                .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
-                LabeledContent("Refresh rate") {
-                    TextField("Hz", value: $hz, format: .number.grouping(.never))
-                        .keyboardType(.numberPad)
-                        .multilineTextAlignment(.trailing)
-                }
-            } else if refreshChoices.count > 1 {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Refresh rate")
-                        .font(.geist(15, relativeTo: .subheadline))
-                        .foregroundStyle(.secondary)
-                    Picker("Refresh rate", selection: $hz) {
-                        ForEach(refreshChoices, id: \.self) { rate in
-                            Text("\(rate) Hz").tag(rate)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                }
-            } else {
-                // A device with a single supported rate (e.g. 60 Hz) has nothing to pick.
-                LabeledContent("Refresh rate") {
-                    Text("\(hz) Hz").foregroundStyle(.secondary)
-                }
-            }
+            iosResolutionWheel
+            iosRefreshRows
             Button("Use this display's mode") { fillFromMainScreen() }
             #elseif os(macOS)
             HStack {
@@ -78,23 +30,7 @@ extension SettingsView {
             }
             #endif
             #if !os(tvOS)
-            Toggle("Automatic bitrate", isOn: automaticBitrate)
-            if bitrateKbps != 0 {
-                HStack(spacing: 12) {
-                    Slider(value: bitrateSlider, in: 0...1) {
-                        Text("Bitrate")
-                    }
-                    Text(SpeedTestSheet.mbpsLabel(kbps: bitrateKbps))
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                        .frame(minWidth: 76, alignment: .trailing)
-                }
-                if bitrateKbps > 1_000_000 {
-                    Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
-                        .font(.geist(12, relativeTo: .caption))
-                        .foregroundStyle(.orange)
-                }
-            }
+            bitrateRows
             #endif
         } header: {
             Text("Stream mode")
@@ -108,6 +44,67 @@ extension SettingsView {
 
     #if os(iOS)
     // MARK: - Stream mode (iOS wheel)
+
+    /// Touch-first: a rotating wheel of common resolutions (this device's own mode first) — the
+    /// same family as the Clock/Timer pickers. The host renders a virtual output at exactly the
+    /// chosen mode, so these are real pixel sizes. The last wheel row, "Custom…", reveals
+    /// width/height/refresh fields for an arbitrary mode (see `iosRefreshRows`).
+    @ViewBuilder private var iosResolutionWheel: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Resolution")
+                .font(.geist(15, relativeTo: .subheadline))
+                .foregroundStyle(.secondary)
+            Picker("Resolution", selection: resolutionSelection) {
+                ForEach(resolutionChoices, id: \.tag) { choice in
+                    Text(choice.label).tag(choice.tag)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.wheel)
+            .frame(maxHeight: 140)
+        }
+    }
+
+    /// Custom W×H(+Hz) fields, a segmented refresh picker, or a static single-rate row.
+    @ViewBuilder private var iosRefreshRows: some View {
+        if isCustomResolution {
+            // Arbitrary entry: type the exact width × height (and refresh) the host should drive.
+            HStack {
+                TextField("Width", value: $width, format: .number.grouping(.never))
+                    .keyboardType(.numberPad)
+                Text("×")
+                TextField("Height", value: $height, format: .number.grouping(.never))
+                    .labelsHidden()
+                    .keyboardType(.numberPad)
+            }
+            // A row built from an HStack of TextFields otherwise insets its bottom separator to
+            // the inner content, clipping the hairline under "Width"; pin it to the cell edge.
+            .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
+            LabeledContent("Refresh rate") {
+                TextField("Hz", value: $hz, format: .number.grouping(.never))
+                    .keyboardType(.numberPad)
+                    .multilineTextAlignment(.trailing)
+            }
+        } else if refreshChoices.count > 1 {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Refresh rate")
+                    .font(.geist(15, relativeTo: .subheadline))
+                    .foregroundStyle(.secondary)
+                Picker("Refresh rate", selection: $hz) {
+                    ForEach(refreshChoices, id: \.self) { rate in
+                        Text("\(rate) Hz").tag(rate)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+            }
+        } else {
+            // A device with a single supported rate (e.g. 60 Hz) has nothing to pick.
+            LabeledContent("Refresh rate") {
+                Text("\(hz) Hz").foregroundStyle(.secondary)
+            }
+        }
+    }
 
     /// Sentinel wheel tag for the "Custom…" row. Real tags are "WxH" (digits + "x"), so this can't
     /// collide with a resolution.
@@ -153,6 +150,29 @@ extension SettingsView {
     /// Refresh rates this device can display, plus any stored custom value (see `SettingsOptions`).
     private var refreshChoices: [Int] {
         SettingsOptions.refreshRates(including: hz)
+    }
+    #endif
+
+    #if !os(tvOS)
+    /// The automatic-bitrate toggle + manual slider (and the >1 Gbps warning) rows.
+    @ViewBuilder private var bitrateRows: some View {
+        Toggle("Automatic bitrate", isOn: automaticBitrate)
+        if bitrateKbps != 0 {
+            HStack(spacing: 12) {
+                Slider(value: bitrateSlider, in: 0...1) {
+                    Text("Bitrate")
+                }
+                Text(SpeedTestSheet.mbpsLabel(kbps: bitrateKbps))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 76, alignment: .trailing)
+            }
+            if bitrateKbps > 1_000_000 {
+                Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.geist(12, relativeTo: .caption))
+                    .foregroundStyle(.orange)
+            }
+        }
     }
     #endif
 
