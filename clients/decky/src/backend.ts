@@ -9,6 +9,43 @@ export interface Host {
   fp: string; // host cert SHA-256 fingerprint (lowercase hex) from the mDNS advert
   proto: string; // advertised protocol, e.g. "punktfunk/1"
   paired: boolean; // whether THIS device has already PIN-paired this host (by fingerprint)
+  id: string; // the host's stable instance id (mDNS TXT `id`; "" when not advertised)
+  mgmt: number; // management-API port (mDNS TXT `mgmt`; 0 = not advertised → default 47990)
+}
+
+// One title from a host's game library (the flatpak client's --library TSV, parsed by the
+// backend). `id` is store-qualified (steam:<appid> / custom:<id>) and doubles as the
+// launch handle (PF_LAUNCH → the session Hello).
+export interface GameEntry {
+  id: string;
+  store: string; // "steam" | "custom" | "heroic" | "lutris" | …
+  title: string;
+}
+
+export interface LibraryResult {
+  ok: boolean;
+  games?: GameEntry[];
+  // "flatpak-not-found" | "timeout" | "not-paired" | "pin-mismatch" | "unreachable" |
+  // "http" | "client-outdated" | "client-error"
+  error?: string;
+  detail?: string; // the client's own one-line reason, for the generic error copy
+}
+
+// A pinned game — a one-tap stream row in the QAM. The host is identified primarily by
+// cert fingerprint (survives IP changes; pairing is fp-keyed too), with the stored
+// address as the launch fallback when the host isn't currently advertising.
+export interface PinnedGame {
+  game_id: string;
+  title: string;
+  store: string;
+  host_fp: string;
+  host_id: string;
+  host_name: string;
+  host: string;
+  port: number;
+  mgmt: number;
+  added_at: number; // unix seconds
+  paired?: boolean; // annotated by get_pins from the client's known-hosts store
 }
 
 export interface PairResult {
@@ -68,6 +105,16 @@ export const pair = callable<
   [host: string, port: number, pin: string, name: string],
   PairResult
 >("pair");
+// Fetch a paired host's game library (headless flatpak --library; can take seconds on a
+// cold client start — show a spinner). Pass fp whenever known so the pin can't degrade.
+export const library = callable<
+  [host: string, mgmt_port: number, fp: string],
+  LibraryResult
+>("library");
+export const getPins = callable<[], { pins: PinnedGame[] }>("get_pins");
+export const setPins = callable<[pins: PinnedGame[]], { ok: boolean; error?: string }>(
+  "set_pins",
+);
 export const runnerInfo = callable<[], RunnerInfo>("runner_info");
 export const shortcutArt = callable<[], ShortcutArt>("shortcut_art");
 export const getSettings = callable<[], StreamSettings>("get_settings");

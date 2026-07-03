@@ -12,18 +12,30 @@ import {
 } from "@decky/ui";
 import { definePlugin, routerHook } from "@decky/api";
 import { FC } from "react";
-import { FaDownload, FaLock, FaLockOpen, FaSyncAlt, FaTv } from "react-icons/fa";
+import { FaDownload, FaLock, FaLockOpen, FaPlay, FaSyncAlt, FaTv } from "react-icons/fa";
 import { PluginErrorBoundary } from "./boundary";
-import { applyUpdate, checkForUpdatesNow, hasUpdate, startStream, useHosts, useUpdate } from "./hooks";
+import {
+  applyUpdate,
+  checkForUpdatesNow,
+  hasUpdate,
+  resolvePinHost,
+  startStream,
+  useHosts,
+  usePins,
+  useUpdate,
+} from "./hooks";
+import { streamPin } from "./library";
 import { PunktfunkRoute, ROUTE } from "./page";
 import { PairModal } from "./pair";
 
 // ----------------------------------------------------------------------------------------
-// QAM panel — quick status + entry into the full page + one-tap stream for known hosts.
+// QAM panel — quick status + entry into the full page + one-tap stream for known hosts
+// and pinned games.
 // ----------------------------------------------------------------------------------------
 const QamPanel: FC = () => {
   const { hosts, scanning, refresh } = useHosts();
   const { info: update, checking, check } = useUpdate();
+  const pins = usePins();
 
   return (
     <>
@@ -64,6 +76,31 @@ const QamPanel: FC = () => {
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
+
+      {/* Pinned games — the "jump straight into Playnite" rows. Pin games from a host's
+          picker (fullscreen page → host row → games button). */}
+      {pins.pins.length > 0 && (
+        <PanelSection title="Games">
+          {pins.pins.map((pin) => {
+            const { online } = resolvePinHost(pin, hosts);
+            return (
+              <PanelSectionRow key={`${pin.host_fp}:${pin.game_id}`}>
+                <ButtonItem
+                  layout="below"
+                  onClick={() => streamPin(pin, hosts, pins)}
+                  label={pin.title}
+                  description={`${pin.host_name}${online ? "" : " · offline?"}${
+                    pin.paired ? "" : " · pairing required"
+                  }`}
+                >
+                  <FaPlay style={{ marginRight: "0.5em" }} />
+                  Stream
+                </ButtonItem>
+              </PanelSectionRow>
+            );
+          })}
+        </PanelSection>
+      )}
 
       <PanelSection title="Hosts">
         <PanelSectionRow>

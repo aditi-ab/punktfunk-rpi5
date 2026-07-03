@@ -21,18 +21,23 @@ import {
   FaLockOpen,
   FaPlay,
   FaSyncAlt,
+  FaThLarge,
 } from "react-icons/fa";
 import { Host, UpdateInfo, killStream } from "./backend";
 import { PluginErrorBoundary } from "./boundary";
 import {
   DOCS_URL,
+  PinsApi,
   applyUpdate,
   checkForUpdatesNow,
   hasUpdate,
+  resolvePinHost,
   startStream,
   useHosts,
+  usePins,
   useUpdate,
 } from "./hooks";
+import { GamePickerModal, storeLabel, streamPin } from "./library";
 import { PairModal } from "./pair";
 import { SettingsSection } from "./settings";
 import { stopStream } from "./steam";
@@ -118,7 +123,11 @@ const HostDetailsModal: FC<{ host: Host; closeModal?: () => void }> = ({
 // ----------------------------------------------------------------------------------------
 // One host row: status icon + address, details / pair / stream actions.
 // ----------------------------------------------------------------------------------------
-const HostRow: FC<{ host: Host; onPaired: () => void }> = ({ host, onPaired }) => {
+const HostRow: FC<{ host: Host; onPaired: () => void; onGames: () => void }> = ({
+  host,
+  onPaired,
+  onGames,
+}) => {
   // The host's policy is `pair=required`, but if THIS device is already paired we don't need to
   // pair again — show it as trusted and go straight to Stream.
   const needsPair = host.pair === "required" && !host.paired;
@@ -142,6 +151,9 @@ const HostRow: FC<{ host: Host; onPaired: () => void }> = ({ host, onPaired }) =
         >
           <FaInfoCircle />
         </DialogButton>
+        <DialogButton style={iconButton} onClick={onGames}>
+          <FaThLarge />
+        </DialogButton>
         {needsPair && (
           <DialogButton
             style={{ ...actionButton, minWidth: "5em" }}
@@ -163,7 +175,9 @@ const HostsTab: FC<{
   hosts: Host[];
   scanning: boolean;
   refresh: () => void;
-}> = ({ hosts, scanning, refresh }) => (
+  pins: PinsApi;
+  clientUpdatePending: boolean;
+}> = ({ hosts, scanning, refresh, pins, clientUpdatePending }) => (
   <div style={tabScroll}>
     <Field
       label="Discover"
@@ -193,8 +207,55 @@ const HostsTab: FC<{
       />
     )}
     {hosts.map((h) => (
-      <HostRow key={h.fp || `${h.host}:${h.port}`} host={h} onPaired={refresh} />
+      <HostRow
+        key={h.fp || `${h.host}:${h.port}`}
+        host={h}
+        onPaired={refresh}
+        onGames={() =>
+          showModal(
+            <GamePickerModal host={h} pins={pins} clientUpdatePending={clientUpdatePending} />,
+          )
+        }
+      />
     ))}
+
+    {/* Pinned games — also the cleanup surface for pins whose host is gone from the scan. */}
+    {pins.pins.length > 0 && (
+      <>
+        <Field
+          focusable={false}
+          label="Pinned games"
+          description="One-tap streams — they also live in the quick-access menu"
+          bottomSeparator="standard"
+        />
+        {pins.pins.map((pin) => {
+          const { online } = resolvePinHost(pin, hosts);
+          return (
+            <Field
+              key={`${pin.host_fp}:${pin.game_id}`}
+              label={pin.title}
+              description={`${storeLabel(pin.store)} · ${pin.host_name}${
+                online ? "" : " · offline?"
+              }${pin.paired ? "" : " · pairing required"}`}
+              childrenContainerWidth="max"
+            >
+              <Focusable style={{ display: "flex", gap: "0.5em", justifyContent: "flex-end" }}>
+                <DialogButton style={actionButton} onClick={() => streamPin(pin, hosts, pins)}>
+                  <FaPlay style={{ marginRight: "0.4em" }} />
+                  Play
+                </DialogButton>
+                <DialogButton
+                  style={{ ...actionButton, minWidth: "5em" }}
+                  onClick={() => pins.removePin(pin.host_fp, pin.game_id)}
+                >
+                  Remove
+                </DialogButton>
+              </Focusable>
+            </Field>
+          );
+        })}
+      </>
+    )}
   </div>
 );
 
@@ -295,6 +356,7 @@ const AboutTab: FC<{
 const PunktfunkPage: FC = () => {
   const { hosts, scanning, refresh } = useHosts();
   const { info: update, checking, check } = useUpdate();
+  const pins = usePins();
   const [tab, setTab] = useState("hosts");
 
   return (
@@ -325,7 +387,12 @@ const PunktfunkPage: FC = () => {
         </div>
       </Focusable>
 
-      <div style={{ flex: 1, minHeight: 0 }}>
+      {/* overflow:hidden is load-bearing: Valve's Tabs slides the incoming panel in from the
+          right on L1/R1, and with autoFocusContents it scrollIntoViews a control inside that
+          still-offscreen panel. Without a clip here the scroll pans #GamepadUI itself — the whole
+          Steam UI (top bar included) slides left until you click a tab. Valve's own Tabs always
+          live in a clipped flex box; match that. */}
+      <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
         <Tabs
           activeTab={tab}
           onShowTab={(id: string) => setTab(id)}
@@ -334,7 +401,15 @@ const PunktfunkPage: FC = () => {
             {
               id: "hosts",
               title: "Hosts",
-              content: <HostsTab hosts={hosts} scanning={scanning} refresh={refresh} />,
+              content: (
+                <HostsTab
+                  hosts={hosts}
+                  scanning={scanning}
+                  refresh={refresh}
+                  pins={pins}
+                  clientUpdatePending={!!update?.client_update_available}
+                />
+              ),
             },
             {
               id: "settings",

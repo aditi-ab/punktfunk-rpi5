@@ -184,19 +184,62 @@ function disableSteamInputForShortcut(appId: number): void {
   }
 }
 
+/** Per-launch extras beyond the host target (all optional — {} is the plain stream). */
+export interface LaunchOpts {
+  /** Library id to launch on connect (a pinned game) — rides PF_LAUNCH → `--launch`. */
+  launchId?: string;
+  /** Open the gamepad library launcher instead of streaming (PF_BROWSE → `--browse`). */
+  browse?: boolean;
+  /** Management-API port for the launcher's library fetch (PF_MGMT; 0/absent = default). */
+  mgmt?: number;
+}
+
+// Launch ids ride Steam launch options as an env-prefix token (`PF_LAUNCH=<id>`), so they
+// must be space/quote-free — Steam's tokenizer and the wrapper's env both break otherwise.
+// Real ids are `steam:<digits>` / `custom:<slug>`, so this rejects nothing in practice;
+// it's VALIDATION, never encoding (the host must match the opaque token verbatim).
+const UNSAFE_LAUNCH_ID = /["'\\$`\s]/;
+export function isSafeLaunchId(id: string): boolean {
+  return (
+    id.length > 0 &&
+    id.length <= 128 &&
+    UNSAFE_LAUNCH_ID.exec(id) === null &&
+    /^[\x21-\x7e]+$/.test(id)
+  );
+}
+
 /**
- * Launch a stream to `host:port` fullscreen in Gaming Mode. Encodes the target into the
- * shortcut's launch options (so one generic shortcut serves every host), then RunGame.
+ * Launch a stream to `host:port` fullscreen in Gaming Mode (optionally straight into a
+ * library title, or into the gamepad library launcher). Encodes the target into the
+ * shortcut's launch options (so one generic shortcut serves every host and every pinned
+ * game), then RunGame.
  */
-export async function launchStream(host: string, port: number): Promise<void> {
+export async function launchStream(
+  host: string,
+  port: number,
+  opts: LaunchOpts = {},
+): Promise<void> {
   const { appId, runner } = await ensureShortcut();
   // Best-effort so the Deck's rich controls reach the client; no-op if the API is absent (the user
   // disables Steam Input manually — see the Settings instruction).
   disableSteamInputForShortcut(appId);
   const target = port && port !== 9777 ? `${host}:${port}` : host;
+  const env = [`PF_HOST=${target}`];
+  if (opts.browse) {
+    env.push("PF_BROWSE=1");
+    if (opts.mgmt) {
+      env.push(`PF_MGMT=${Math.floor(opts.mgmt)}`);
+    }
+  } else if (opts.launchId) {
+    if (!isSafeLaunchId(opts.launchId)) {
+      // Enforced at pin time too (the picker disables Pin) — this is the backstop.
+      throw new Error(`unsupported launch id: ${opts.launchId}`);
+    }
+    env.push(`PF_LAUNCH=${opts.launchId}`);
+  }
   // KEY=value ... %command% args — %command% expands to the shortcut exe (/bin/sh); the wrapper
-  // script rides behind it as an argument and reads PF_HOST from the environment.
-  SteamClient.Apps.SetAppLaunchOptions(appId, `PF_HOST=${target} %command% "${runner}"`);
+  // script rides behind it as an argument and reads PF_* from the environment.
+  SteamClient.Apps.SetAppLaunchOptions(appId, `${env.join(" ")} %command% "${runner}"`);
   SteamClient.Apps.RunGame(gameIdFromAppId(appId), "", -1, 100);
 }
 

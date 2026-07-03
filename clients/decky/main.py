@@ -12,6 +12,11 @@ The backend's jobs are the things Steam can't do:
 * **pair(host, port, pin, name)** — run the SPAKE2 PIN ceremony headlessly via the flatpak
   client's ``--pair`` mode, capturing the result. Pairing uses the SAME flatpak (so the same
   identity store the stream uses), so once paired the stream connects silently.
+* **library(host, mgmt_port, fp)** — fetch a paired host's game library headlessly via the
+  flatpak client's ``--library`` mode (mTLS with the client's own identity; TSV on stdout),
+  so the picker UI can offer games to pin.
+* **get_pins() / set_pins()** — the pinned-games store (``decky-pinned.json`` next to the
+  client's config, so pins survive plugin reinstalls), annotated with live pairing state.
 * **runner_info()** — the absolute path to the launch wrapper + the flatpak app id, handed to
   the frontend so it can create/point the Steam shortcut.
 * **get_settings() / set_settings()** — read/write the flatpak client's stream settings JSON
@@ -20,8 +25,8 @@ The backend's jobs are the things Steam can't do:
 * **check_update()** — poll the registry's per-channel ``manifest.json`` and report whether a
   newer build is available (the frontend then drives Decky's own install RPC to apply it).
 
-The TXT-record keys parsed (``proto`` / ``fp`` / ``pair`` / ``id``) are defined by the host
-advert in ``crates/punktfunk-host/src/discovery.rs``.
+The TXT-record keys parsed (``proto`` / ``fp`` / ``pair`` / ``id`` / ``mgmt``) are defined by
+the host advert in ``crates/punktfunk-host/src/discovery.rs``.
 """
 
 import asyncio
@@ -75,6 +80,46 @@ def _paired_fingerprints() -> set[str]:
 def _runner_path() -> str:
     """Absolute path to the launch wrapper shipped with the plugin (bin/punktfunkrun.sh)."""
     return str(Path(decky.DECKY_PLUGIN_DIR) / "bin" / "punktfunkrun.sh")
+
+
+def _pins_path() -> Path:
+    """The pinned-games store — plugin-owned, but deliberately in the CLIENT's config dir
+    (like everything else we persist): the plugins dir is root-owned and wiped on
+    reinstall, while ``~/.config/punktfunk`` survives both."""
+    return _client_config_dir() / "decky-pinned.json"
+
+
+def _parse_library_tsv(stdout: str) -> list[dict]:
+    """Parse the flatpak client's ``--library`` output: one ``id\\tstore\\ttitle`` line per
+    game plus a trailing ``N game(s)`` count line (no tabs — it self-skips here). A title
+    may itself contain tabs, so split at most twice."""
+    games: list[dict] = []
+    for line in stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            games.append({"id": parts[0], "store": parts[1], "title": parts[2]})
+    return games
+
+
+def _classify_library_error(stderr: str) -> str:
+    """Map the client's ``library: <LibraryError Display>`` stderr line to a stable error
+    code for the UI. Substring-matched against the Display strings in
+    ``clients/linux/src/library.rs`` — a wording change degrades to ``client-error``
+    (generic copy), never a crash."""
+    s = stderr.lower()
+    if "didn't recognize this device" in s:
+        return "not-paired"
+    if "pinned fingerprint" in s:
+        return "pin-mismatch"
+    if "couldn't reach the host" in s:
+        return "unreachable"
+    if "management api returned http" in s:
+        return "http"
+    if "display" in s or "gtk" in s:
+        # A flatpak so old it predates --library falls through to GTK init, which fails
+        # headless from this backend.
+        return "client-outdated"
+    return "client-error"
 
 
 # ----------------------------------------------------------------------------------------
@@ -339,6 +384,11 @@ def _parse_avahi_browse(stdout: str) -> list[dict]:
         if props.get("proto") and not props["proto"].startswith("punktfunk/"):
             continue
 
+        try:
+            mgmt = int(props.get("mgmt", ""))
+        except ValueError:
+            mgmt = 0  # not advertised (standalone punktfunk1-host) — callers default 47990
+
         entry = {
             "name": name,
             "host": address,
@@ -346,6 +396,8 @@ def _parse_avahi_browse(stdout: str) -> list[dict]:
             "pair": props.get("pair", "optional"),
             "fp": props.get("fp", ""),
             "proto": props.get("proto", ""),
+            "id": props.get("id", ""),
+            "mgmt": mgmt,
         }
         key = props.get("id") or f"{address}:{port}"
         existing = out.get(key)
@@ -436,6 +488,115 @@ class Plugin:
         # Surface the client's own one-line reason (wrong PIN / not armed) to the UI.
         reason = (err.strip().splitlines() or out.strip().splitlines() or ["pairing failed"])[-1]
         return {"ok": False, "error": reason}
+
+    async def library(self, host: str, mgmt_port: int = 0, fp: str = "") -> dict:
+        """Fetch a paired host's game library via the flatpak client's headless
+        ``--library`` mode (the client's own mTLS identity + pinned-fingerprint transport —
+        no trust logic reimplemented here). ``fp`` is passed through whenever the caller
+        knows the host's cert fingerprint so an IP change can never degrade the pin to a
+        TOFU accept. Returns ``{ok, games: [{id, store, title}]}`` or
+        ``{ok: False, error: <code>, detail}`` (codes: ``flatpak-not-found`` / ``timeout`` /
+        ``not-paired`` / ``pin-mismatch`` / ``unreachable`` / ``http`` /
+        ``client-outdated`` / ``client-error``)."""
+        flatpak = _flatpak()
+        if not flatpak:
+            return {"ok": False, "error": "flatpak-not-found", "detail": ""}
+        target = f"{host}:{int(mgmt_port) or 47990}"
+        argv = [flatpak, "run", "--arch=x86_64", APP_ID, "--library", target]
+        if fp:
+            argv += ["--fp", fp]
+        decky.logger.info("library: fetching %s", target)
+        proc = None
+        try:
+            # Separate pipes (unlike _flatpak_capture): the TSV comes on stdout, the
+            # client's one-line error reason on stderr. Cold flatpak start on a Deck can
+            # take seconds — generous timeout, spinner in the UI.
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_flatpak_env(),
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45.0)
+        except asyncio.TimeoutError:
+            if proc:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            return {"ok": False, "error": "timeout", "detail": ""}
+        except Exception as exc:  # noqa: BLE001
+            decky.logger.exception("library fetch failed to launch")
+            return {"ok": False, "error": "client-error", "detail": str(exc)}
+
+        err = stderr.decode(errors="replace")
+        if proc.returncode != 0:
+            detail = (err.strip().splitlines() or ["library fetch failed"])[-1]
+            code = _classify_library_error(err)
+            decky.logger.warning("library fetch failed (%s): %s", code, detail)
+            return {"ok": False, "error": code, "detail": detail}
+        games = _parse_library_tsv(stdout.decode(errors="replace"))
+        decky.logger.info("library: %d game(s) from %s", len(games), target)
+        return {"ok": True, "games": games}
+
+    async def get_pins(self) -> dict:
+        """The pinned games, each annotated with the LIVE ``paired`` state of its host (by
+        cert fingerprint — an unpaired-since host renders "pairing required" in the QAM)."""
+        try:
+            data = json.loads(_pins_path().read_text())
+        except (OSError, json.JSONDecodeError):
+            return {"pins": []}
+        pins = data.get("pins", []) if isinstance(data, dict) else []
+        paired = _paired_fingerprints()
+        out = []
+        for p in pins:
+            if not isinstance(p, dict) or not p.get("game_id"):
+                continue
+            p = dict(p)
+            p["paired"] = str(p.get("host_fp", "")).lower() in paired
+            out.append(p)
+        return {"pins": out}
+
+    async def set_pins(self, pins: list) -> dict:
+        """Persist the pinned-games list (the frontend sends the whole list — add, remove,
+        and address-refresh all funnel through here). Validated + deduped on
+        ``(host_fp, game_id)``; written atomically (tmp + rename) — pins are long-lived
+        user data."""
+        clean: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for p in pins if isinstance(pins, list) else []:
+            if not isinstance(p, dict):
+                continue
+            game_id = str(p.get("game_id", ""))
+            host_fp = str(p.get("host_fp", ""))
+            if not game_id or not (host_fp or p.get("host")):
+                continue
+            key = (host_fp, game_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            clean.append({
+                "game_id": game_id,
+                "title": str(p.get("title", game_id)),
+                "store": str(p.get("store", "")),
+                "host_fp": host_fp,
+                "host_id": str(p.get("host_id", "")),
+                "host_name": str(p.get("host_name", p.get("host", ""))),
+                "host": str(p.get("host", "")),
+                "port": int(p.get("port", 9777) or 9777),
+                "mgmt": int(p.get("mgmt", 0) or 0),
+                "added_at": int(p.get("added_at", 0) or 0),
+            })
+        try:
+            d = _client_config_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = _pins_path().with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"version": 1, "pins": clean}, indent=2))
+            os.replace(tmp, _pins_path())
+            return {"ok": True}
+        except OSError as exc:
+            decky.logger.exception("could not write pins")
+            return {"ok": False, "error": str(exc)}
 
     async def shortcut_art(self) -> dict:
         """The Steam-shortcut artwork shipped with the plugin (``assets/``, generated by

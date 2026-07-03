@@ -11,10 +11,18 @@
 #
 # Per-session parameters arrive as environment variables, set as the shortcut's Steam launch
 # options by the plugin (SteamClient.Apps.SetAppLaunchOptions), so ONE generic shortcut serves
-# every host:
+# every host (and every pinned game):
 #   PF_HOST   host[:port] to connect to            (required)
+#   PF_LAUNCH library id to launch on connect       (optional, e.g. steam:570 — pinned games)
+#   PF_BROWSE non-empty = open the gamepad library  (optional; --browse instead of --connect)
+#   PF_MGMT   management-API port for --browse       (optional; client defaults to 47990)
 #   PF_APPID  flatpak app id                        (default io.unom.Punktfunk)
 #   PF_FLATPAK  override the flatpak binary path     (default: `flatpak` on PATH)
+#
+# Values are plain tokens (the plugin validates launch ids to space/quote-free ASCII before
+# they ever reach Steam launch options). An older flatpak without --launch/--browse ignores
+# the unknown flags harmlessly (hand-scanned argv): PF_LAUNCH degrades to the plain desktop
+# session, PF_BROWSE to the client's hosts page.
 #
 # Runs as the `deck` user (Steam launched it), so the --user flatpak install is visible and
 # WAYLAND_DISPLAY / XDG_RUNTIME_DIR are already correct for gamescope.
@@ -33,9 +41,23 @@ if [ -z "${PF_HOST:-}" ]; then
     exit 2
 fi
 
-echo "punktfunkrun: streaming $APPID --connect $PF_HOST" >&2
 # exec so the flatpak client IS the game process — when it exits, Steam ends the "game" and
 # Gaming Mode reclaims focus automatically (no manual refocus needed).
 # --fullscreen: present the stream chrome-less and fullscreen (the client also auto-detects the
 # Deck/gamescope env, and ignores the flag harmlessly on older builds that predate it).
+if [ -n "${PF_BROWSE:-}" ]; then
+    # The gamepad library launcher: browse the host's games on-screen, A streams one,
+    # session end returns to the launcher, B quits back to Gaming Mode.
+    echo "punktfunkrun: library $APPID --browse $PF_HOST" >&2
+    if [ -n "${PF_MGMT:-}" ]; then
+        exec "$FLATPAK" run --arch=x86_64 "$APPID" --browse "$PF_HOST" --mgmt "$PF_MGMT" --fullscreen
+    fi
+    exec "$FLATPAK" run --arch=x86_64 "$APPID" --browse "$PF_HOST" --fullscreen
+fi
+if [ -n "${PF_LAUNCH:-}" ]; then
+    # A pinned game: the id rides the session Hello and the host launches that title.
+    echo "punktfunkrun: streaming $APPID --connect $PF_HOST --launch $PF_LAUNCH" >&2
+    exec "$FLATPAK" run --arch=x86_64 "$APPID" --connect "$PF_HOST" --launch "$PF_LAUNCH" --fullscreen
+fi
+echo "punktfunkrun: streaming $APPID --connect $PF_HOST" >&2
 exec "$FLATPAK" run --arch=x86_64 "$APPID" --connect "$PF_HOST" --fullscreen

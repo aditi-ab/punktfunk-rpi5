@@ -18,9 +18,15 @@ the panel looks and feels native to Gaming Mode.
 2. **Pair** — for a host that requires it, a gamepad-navigable PIN keypad runs the SPAKE2 pairing
    ceremony headlessly, then remembers the host so future streams connect silently.
 3. **Stream** — launches fullscreen via a branded "Punktfunk" Steam shortcut so gamescope focuses it.
-4. **Settings** — resolution / refresh / bitrate / gamepad type / host compositor / mic, written
+4. **Games** — each host row has a games button that opens its **library picker**: pin titles as
+   one-tap "Stream <Game>" rows in the QAM (jump straight into e.g. Playnite on the host), or
+   **"Open library on screen"** to launch the client's controller-driven, console-style library
+   browser (aurora backdrop + poster coverflow; A plays, B returns to Gaming Mode). Pins survive
+   plugin reinstalls (stored next to the client's config) and follow a host across IP changes
+   (matched by certificate fingerprint).
+5. **Settings** — resolution / refresh / bitrate / gamepad type / host compositor / mic, written
    to the client's config.
-5. **About** — plugin version, an explicit "Check for updates" button, the setup-guide link, and
+6. **About** — plugin version, an explicit "Check for updates" button, the setup-guide link, and
    a force-stop for a wedged stream client.
 
 To leave a stream: the in-client controller chord (**L1 + R1 + Start + Select**), or close the
@@ -67,11 +73,13 @@ restart is required for an out-of-band install to appear.
 | `src/index.tsx` | Plugin entry: the QAM panel + route registration. |
 | `src/page.tsx` | The `/punktfunk` fullscreen page — Hosts (with per-host details) / Settings / About tabs. |
 | `src/settings.tsx` · `src/pair.tsx` | Stream-settings section; the gamepad-navigable PIN-pairing modal. |
-| `src/hooks.ts` · `src/boundary.tsx` | Shared discovery/update hooks + actions; the render error boundary. |
-| `src/steam.ts` | Steam-shortcut launch (`AddShortcut` / `SetAppLaunchOptions` / `RunGame`) — the focus-correct stream start. The shortcut's exe is `/bin/sh` with the wrapper passed as an argument, so the script never needs an exec bit (Decky's zip extraction drops it and the root-owned plugins dir can't be chmodded by the unprivileged backend). |
+| `src/library.tsx` | The per-host game picker (pin/unpin, "Open library on screen") + the pinned-game launch helper. |
+| `src/hooks.ts` · `src/boundary.tsx` | Shared discovery/update/pins hooks + actions; the render error boundary. |
+| `src/steam.ts` | Steam-shortcut launch (`AddShortcut` / `SetAppLaunchOptions` / `RunGame`) — the focus-correct stream start. The shortcut's exe is `/bin/sh` with the wrapper passed as an argument, so the script never needs an exec bit (Decky's zip extraction drops it and the root-owned plugins dir can't be chmodded by the unprivileged backend). Launch extras ride env-prefix tokens: `PF_LAUNCH=<id>` (pinned game) / `PF_BROWSE=1` + `PF_MGMT=<port>` (on-screen library); ids are validated space/quote-free at pin AND launch time. |
 | `src/backend.ts` | Typed `callable` bridges to `main.py`. |
-| `bin/punktfunkrun.sh` | The launch wrapper the Steam shortcut runs (so the window is focusable). |
-| `main.py` | Backend: `discover` (via `avahi-browse`) / `pair` / settings / `kill_stream` / `check_update` (with an explicit CA-bundle search — Decky's embedded Python has no usable default TLS roots on SteamOS). |
+| `bin/punktfunkrun.sh` | The launch wrapper the Steam shortcut runs (so the window is focusable); maps `PF_LAUNCH`/`PF_BROWSE`/`PF_MGMT` to `--launch`/`--browse`/`--mgmt`. An older flatpak ignores the flags harmlessly (plain stream / hosts page). |
+| `main.py` | Backend: `discover` (via `avahi-browse`) / `pair` / `library` (headless flatpak `--library`, TSV) / pins store (`decky-pinned.json`) / settings / `kill_stream` / `check_update` (with an explicit CA-bundle search — Decky's embedded Python has no usable default TLS roots on SteamOS). |
+| `scripts/test-backend.py` | Stdlib-only checks for the backend's pure parsers (TSV, error classes, avahi TXT) + the pins round trip. |
 | `plugin.json` · `update.json` | Decky manifest; CI-baked update channel. |
 
 ## Limitations / next steps

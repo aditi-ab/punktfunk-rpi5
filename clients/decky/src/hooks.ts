@@ -2,8 +2,18 @@
 import { toaster } from "@decky/api";
 import { Navigation } from "@decky/ui";
 import { useCallback, useEffect, useState } from "react";
-import { checkUpdate, discover, Host, updateClient, UpdateInfo } from "./backend";
-import { launchStream } from "./steam";
+import {
+  checkUpdate,
+  discover,
+  GameEntry,
+  getPins,
+  Host,
+  PinnedGame,
+  setPins as setPinsBackend,
+  updateClient,
+  UpdateInfo,
+} from "./backend";
+import { LaunchOpts, launchStream } from "./steam";
 
 export const DOCS_URL = "https://docs.punktfunk.unom.io/docs/steam-deck";
 
@@ -169,12 +179,153 @@ export async function applyUpdate(
 // ----------------------------------------------------------------------------------------
 // Stream launch — via the hidden Steam shortcut (see steam.ts for why).
 // ----------------------------------------------------------------------------------------
-export async function startStream(h: Host): Promise<void> {
+export async function startStream(
+  h: Host,
+  opts: LaunchOpts = {},
+  label?: string,
+): Promise<void> {
   try {
-    await launchStream(h.host, h.port);
+    await launchStream(h.host, h.port, opts);
     Navigation.CloseSideMenus();
-    toaster.toast({ title: "Punktfunk", body: `Starting stream — ${h.name}` });
+    toaster.toast({ title: "Punktfunk", body: `Starting ${label ?? "stream"} — ${h.name}` });
   } catch (e) {
     toaster.toast({ title: "Punktfunk", body: `Launch failed: ${e}` });
   }
+}
+
+/** Open the GTK client's gamepad library launcher for a host (`--browse` via PF_BROWSE). */
+export async function startBrowse(h: Host): Promise<void> {
+  try {
+    await launchStream(h.host, h.port, { browse: true, mgmt: h.mgmt });
+    Navigation.CloseSideMenus();
+    toaster.toast({ title: "Punktfunk", body: `Opening library — ${h.name}` });
+  } catch (e) {
+    toaster.toast({ title: "Punktfunk", body: `Launch failed: ${e}` });
+  }
+}
+
+// ----------------------------------------------------------------------------------------
+// Pinned games — the QAM's one-tap game rows, persisted by the backend next to the
+// client's config (survives plugin reinstalls).
+// ----------------------------------------------------------------------------------------
+export interface PinsApi {
+  pins: PinnedGame[];
+  addPin: (h: Host, g: GameEntry) => void;
+  removePin: (hostFp: string, gameId: string) => void;
+  isPinned: (hostFp: string, gameId: string) => boolean;
+  /** Refresh a pin's stored address from a live advert (hosts change IPs). */
+  updatePinHost: (pin: PinnedGame, h: Host) => void;
+  refresh: () => Promise<void>;
+}
+
+export function usePins(): PinsApi {
+  const [pins, setPins] = useState<PinnedGame[]>([]);
+
+  const refresh = useCallback(async () => {
+    try {
+      setPins((await getPins()).pins);
+    } catch {
+      /* backend unavailable — keep the current view */
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  // Optimistic local state; the backend validates/dedups and is re-read on failure.
+  const save = useCallback(
+    (next: PinnedGame[]) => {
+      setPins(next);
+      setPinsBackend(next).catch(() => void refresh());
+    },
+    [refresh],
+  );
+
+  const addPin = useCallback(
+    (h: Host, g: GameEntry) => {
+      const pin: PinnedGame = {
+        game_id: g.id,
+        title: g.title,
+        store: g.store,
+        host_fp: h.fp,
+        host_id: h.id,
+        host_name: h.name,
+        host: h.host,
+        port: h.port,
+        mgmt: h.mgmt,
+        added_at: Math.floor(Date.now() / 1000),
+        paired: h.paired,
+      };
+      save([
+        ...pins.filter((p) => !(p.host_fp === pin.host_fp && p.game_id === pin.game_id)),
+        pin,
+      ]);
+    },
+    [pins, save],
+  );
+
+  const removePin = useCallback(
+    (hostFp: string, gameId: string) => {
+      save(pins.filter((p) => !(p.host_fp === hostFp && p.game_id === gameId)));
+    },
+    [pins, save],
+  );
+
+  const isPinned = useCallback(
+    (hostFp: string, gameId: string) =>
+      pins.some((p) => p.host_fp === hostFp && p.game_id === gameId),
+    [pins],
+  );
+
+  const updatePinHost = useCallback(
+    (pin: PinnedGame, h: Host) => {
+      if (pin.host === h.host && pin.port === h.port && pin.mgmt === h.mgmt) {
+        return;
+      }
+      save(
+        pins.map((p) =>
+          p.host_fp === pin.host_fp && p.game_id === pin.game_id
+            ? { ...p, host: h.host, port: h.port, mgmt: h.mgmt, host_name: h.name }
+            : p,
+        ),
+      );
+    },
+    [pins, save],
+  );
+
+  return { pins, addPin, removePin, isPinned, updatePinHost, refresh };
+}
+
+/**
+ * The host a pin should launch against right now: match the live mDNS scan by cert
+ * fingerprint first (pairing is fp-keyed, survives IP changes), then by the host's stable
+ * id, else fall back to the stored address (host offline or scan flaky — still launch).
+ */
+export function resolvePinHost(
+  pin: PinnedGame,
+  live: Host[],
+): { host: Host; online: boolean } {
+  const fp = pin.host_fp.toLowerCase();
+  const match =
+    (fp && live.find((h) => h.fp && h.fp.toLowerCase() === fp)) ||
+    (pin.host_id && live.find((h) => h.id && h.id === pin.host_id)) ||
+    undefined;
+  if (match) {
+    return { host: match, online: true };
+  }
+  return {
+    host: {
+      name: pin.host_name || pin.host,
+      host: pin.host,
+      port: pin.port,
+      pair: pin.paired ? "optional" : "required",
+      fp: pin.host_fp,
+      proto: "",
+      paired: !!pin.paired,
+      id: pin.host_id,
+      mgmt: pin.mgmt,
+    },
+    online: false,
+  };
 }
