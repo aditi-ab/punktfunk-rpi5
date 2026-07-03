@@ -3,7 +3,7 @@ title: "Windows Host"
 description: "Run the Punktfunk streaming host on a Windows PC — a first-class, all-vendor, virtual-display host."
 ---
 
-Set up a Punktfunk host on a **Windows 10/11 PC** and stream its desktop or games to any Punktfunk or
+Set up a Punktfunk host on a **Windows 11 PC (22H2 or newer)** and stream its desktop or games to any Punktfunk or
 [Moonlight](/docs/moonlight) client. A signed installer registers a Windows service that streams at the
 client's **exact resolution and refresh** via Punktfunk's own **virtual display** — including
 **HDR10** (10-bit BT.2020 PQ) when your Windows desktop is in HDR mode. The virtual display is created
@@ -12,13 +12,22 @@ the secure desktop (UAC prompts, the lock screen).
 
 > New to this? Skim [Requirements](/docs/requirements) first.
 
+> **Read [Security & Safe Use](/docs/security) before you set this up.** The Windows host runs as a
+> `LocalSystem` service (so it can capture the secure desktop and stream headless), which makes it a
+> high-privilege component — keep it on a trusted network, never expose it to the internet, and prefer
+> a dedicated or gaming PC over a machine that holds your most sensitive data.
+
 > This page is about the Windows **host** — streaming *from* a Windows PC. To stream *to* a Windows PC,
 > see the [Windows client](/docs/clients#windows-desktop-client).
 
 ## Requirements
 
-- **Windows 10 or 11, x64.** ARM64 is not built (no ARM64 NVIDIA driver, and the virtual-display
-  driver is x64-only).
+- **Windows 11 22H2 (build 22621) or newer, x64.** Windows 10 — including LTSC — and Windows 11
+  21H2 are **not supported**: the virtual-display driver needs the IddCx 1.10 driver framework,
+  which first shipped in Windows 11 22H2. On older Windows the driver installs but can't start
+  ("punktfunk Virtual Display" shows **Code 10** in Device Manager and streaming fails); the
+  installer therefore refuses to run there. ARM64 is not built either (no ARM64 NVIDIA driver, and
+  the virtual-display driver is x64-only).
 - **A GPU for hardware encode** — the host auto-detects the vendor:
   - **NVIDIA** → NVENC
   - **AMD** → AMF
@@ -95,6 +104,13 @@ the interactive session (`CreateProcessAsUserW`). That lets it **capture the sec
 prompts, the lock screen) and keep streaming across reboots with nobody logged in — the same model
 Sunshine and Apollo use. Service registration, firewall rules, and the supervisor all live in
 `punktfunk-host service install`; the installer just lays the exe down and calls it elevated.
+
+Running as SYSTEM is what makes headless, log-in-optional streaming work — and it's why the host is a
+high-privilege component worth being deliberate about. punktfunk mitigates this with **zero kernel
+drivers** (the virtual display and gamepads are user-mode UMDF drivers), **sealed internal channels**
+between the host and its drivers, and Administrators/SYSTEM-only permissions on its secrets. See
+[Security & Safe Use](/docs/security) for the full picture, including why we recommend not hosting on
+your most sensitive machine.
 
 ### One core, Windows backends
 

@@ -85,7 +85,12 @@ DefaultGroupName=punktfunk
 DisableProgramGroupPage=yes
 UsePreviousAppDir=yes
 PrivilegesRequired=admin
-MinVersion=10.0
+; HARD floor: Windows 11 22H2 (build 22621). The pf-vdisplay driver is built against IddCx 1.10
+; (HDR *2 DDIs + FP16 caps, no runtime downgrade) — on anything older (all of Windows 10 incl.
+; LTSC, Windows 11 21H2) the driver package installs but the device fails to start with Code 10
+; STATUS_DEVICE_POWER_FAILURE, and the host can't stream. Gate the install instead; the message
+; is customized in [Messages] below.
+MinVersion=10.0.22621
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 OutputDir={#OutputDir}
@@ -113,6 +118,12 @@ UninstallDisplayIcon={app}\punktfunk.ico
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+; Shown when MinVersion rejects the OS — name the actual requirement instead of Inno's generic
+; "requires Windows version 10.0.22621" (users on Windows 10 LTSC hit this; see the pf-vdisplay
+; IddCx 1.10 note at MinVersion above).
+WinVersionTooLowError=punktfunk host requires Windows 11 22H2 (build 22621) or newer.%n%nIts virtual display driver needs the IddCx 1.10 framework, which is not available on older Windows — including all editions of Windows 10 (LTSC too) and Windows 11 21H2.
+
 [Tasks]
 #ifdef WithDriver
 Name: "installdriver"; Description: "Install the pf-vdisplay virtual display driver (required for native-resolution streaming)"
@@ -134,9 +145,16 @@ Name: "installhdrlayer"; Description: "Install the HDR Vulkan layer (lets Vulkan
 ; host (the common Windows setup); unchecked = the secure native-only host (punktfunk clients only).
 Name: "gamestream"; Description: "Enable GameStream (Moonlight) compatibility - lets stock Moonlight clients connect (uses legacy plain-HTTP pairing; for trusted LANs)"
 Name: "startservice"; Description: "Start the punktfunk host service now (also starts on every boot)"
+; The per-user status tray (punktfunk-tray.exe): shows running/stopped/failed at a glance and
+; offers open-console / start / stop / restart without a terminal. HKLM Run = every user who signs
+; in to this host box gets one (each session keeps exactly one via a Local\ mutex).
+Name: "trayicon"; Description: "Show the punktfunk status icon in the notification area at sign-in"
 
 [Files]
 Source: "{#BinDir}\punktfunk-host.exe"; DestDir: "{app}"; Flags: ignoreversion
+; The status tray companion (windows-subsystem, embeds its own icons). Installed unconditionally
+; (small); only STARTED/registered when the trayicon task is selected.
+Source: "{#BinDir}\punktfunk-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#HostEnv}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Readme}"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
 ; The branded icon, referenced by UninstallDisplayIcon (Apps & features shows it for the entry).
@@ -184,6 +202,10 @@ Source: "{#VkLayerDir}\pf_vkhdr_layer.json"; DestDir: "{app}\vklayer"; Flags: ig
 #endif
 
 [Registry]
+; Auto-start the status tray at sign-in (all users of this host box; uninsdeletevalue removes it
+; with the app). Operators who moved --mgmt-bind can append --mgmt-addr/--mgmt-port here.
+Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
+  ValueName: "PunktfunkTray"; ValueData: """{app}\punktfunk-tray.exe"""; Flags: uninsdeletevalue; Tasks: trayicon
 #ifdef WithVkLayer
 ; Register the HDR Vulkan implicit layer system-wide. The 64-bit Vulkan loader reads
 ; HKLM64\SOFTWARE\Khronos\Vulkan\ImplicitLayers; the value NAME is the manifest path and the DWORD
@@ -222,12 +244,22 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service start"; WorkingDir: "
 #ifdef WithWeb
 ; Provision the console AFTER the host service is up (so the mgmt token exists): write the ACL'd
 ; login password, register the PunktfunkWeb scheduled task (boot, SYSTEM, restart-on-failure),
-; open TCP 3000, and start it. {code:WebSetupParams} appends -PasswordFile only on a fresh install.
+; open TCP 47992, and start it. {code:WebSetupParams} appends -PasswordFile only on a fresh install.
 Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParams}"; WorkingDir: "{app}"; \
   StatusMsg: "Setting up the punktfunk web console..."; Flags: runhidden waituntilterminated
 #endif
+; Launch the status tray as the SIGNED-IN user (not the elevated install user) right away, so the
+; icon appears without waiting for the next sign-in.
+Filename: "{app}\punktfunk-tray.exe"; Flags: runasoriginaluser nowait skipifsilent; Tasks: trayicon
 
 [UninstallRun]
+; Quit the tray FIRST - it is this exe being deleted, so it must not be running. --quit closes the
+; current session's instance (an elevated caller may message a medium-IL window; UIPI only blocks
+; low->high); the taskkill then reaps instances in OTHER signed-in sessions. [UninstallRun] runs
+; before file deletion, so a raced survivor only means a delete-on-reboot leftover, nothing worse.
+; (runasoriginaluser is not valid in [UninstallRun] - both entries run elevated, which is fine.)
+Filename: "{app}\punktfunk-tray.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkTrayQuit"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM punktfunk-tray.exe"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkTrayKill"
 Filename: "{app}\punktfunk-host.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkHostServiceUninstall"
 ; Remove the punktfunk drivers we installed (pf-vdisplay devnode + driver package, then the gamepad
 ; driver packages). AFTER service uninstall so the host no longer holds the devices. Unconditional
@@ -241,7 +273,7 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "driver uninstall --gamepad"; 
 ; Stop + remove the PunktfunkWeb task and its firewall rule (leaves %ProgramData%\punktfunk config,
 ; like the host uninstall does).
 Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Stop-ScheduledTask -TaskName PunktfunkWeb -ErrorAction SilentlyContinue; Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Unregister-ScheduledTask -TaskName PunktfunkWeb -Confirm:$false -ErrorAction SilentlyContinue; Get-NetFirewallRule -DisplayName 'punktfunk web console (*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"""; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Stop-ScheduledTask -TaskName PunktfunkWeb -ErrorAction SilentlyContinue; Get-NetTCPConnection -LocalPort 47992,3000 -State Listen -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Unregister-ScheduledTask -TaskName PunktfunkWeb -Confirm:$false -ErrorAction SilentlyContinue; Get-NetFirewallRule -DisplayName 'punktfunk web console (*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"""; \
   Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkWebCleanup"
 #endif
 
@@ -300,7 +332,7 @@ begin
   FreshWebInstall := not FileExists(WebPasswordPath);
   WebPwPage := CreateInputQueryPage(wpSelectTasks,
     'Web console', 'Set the punktfunk web console login password',
-    'The management console is served on http://this-computer:3000 and is login-gated. Keep the ' +
+    'The management console is served on https://this-computer:47992 and is login-gated. Keep the ' +
     'secure password generated below (it is shown again on the final page) or enter your own - you ' +
     'can change it later in %ProgramData%\punktfunk\web-password.');
   WebPwPage.Add('Console password:', False);   { visible, so the admin can read the generated default }
@@ -329,7 +361,7 @@ procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID = wpFinished) and FreshWebInstall then
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
-      'Web console:  http://<this-PC-IP>:3000' + #13#10 +
+      'Web console:  https://<this-PC-IP>:47992' + #13#10 +
       'Login password:  ' + Trim(WebPwPage.Values[0]);
 end;
 
@@ -343,6 +375,17 @@ begin
     Result := Result + ' --password-file "' + ExpandConstant('{tmp}\webpw.txt') + '"';
 end;
 #endif
+
+{ On upgrade a running tray locks punktfunk-tray.exe - kill every session's instance so the copy
+  can overwrite it (the [Run] entry / next sign-in relaunches the new build). Best-effort; a fresh
+  install is a no-op. }
+procedure StopTrays;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM punktfunk-tray.exe', '',
+    SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
 
 { On upgrade the running service locks punktfunk-host.exe (and the supervisor would respawn it from
   the OLD binary), so stop it and WAIT for STOPPED before files are copied. Best-effort; a fresh
@@ -361,10 +404,11 @@ begin
 end;
 
 #ifdef WithWeb
-{ Stop a running web console + free :3000 BEFORE the file copy, so the old server doesn't lock
-  .output / web-run.cmd / bun.exe and the new task can bind. Killing the :3000 listener owner is
-  runtime-agnostic (an early install may have run node, the current one runs bun). `web setup`
-  repeats this idempotently after the copy. Best-effort; a fresh install is a no-op. }
+{ Stop a running web console + free its port BEFORE the file copy, so the old server doesn't lock
+  .output / web-run.cmd / bun.exe and the new task can bind. Killing the listener owner is
+  runtime-agnostic (an early install may have run node on :3000, the current one runs bun on
+  :47992 - sweep both). `web setup` repeats this idempotently after the copy. Best-effort; a
+  fresh install is a no-op. }
 procedure StopWebConsole;
 var
   ResultCode: Integer;
@@ -373,7 +417,7 @@ begin
     '-NoProfile -ExecutionPolicy Bypass -Command "' +
     '$ErrorActionPreference=''SilentlyContinue''; ' +
     'Stop-ScheduledTask -TaskName PunktfunkWeb; ' +
-    'Get-NetTCPConnection -LocalPort 3000 -State Listen | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }"',
+    'Get-NetTCPConnection -LocalPort 47992,3000 -State Listen | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }"',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 #endif
@@ -383,6 +427,7 @@ begin
   if CurStep = ssInstall then
   begin
     StopHostServiceAndWait;
+    StopTrays;   { upgrade-safe: unlock punktfunk-tray.exe before the copy }
 #ifdef WithWeb
     StopWebConsole;   { upgrade-safe: free :3000 + unlock the web files before the copy }
     { Stash the chosen password for `web setup` (fresh install only); the temp copy is auto-cleaned. }

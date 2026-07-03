@@ -6,7 +6,11 @@ description: Install the punktfunk host — on Linux from its package registry, 
 On Linux, the package registries are the real distribution channel. Pick your distro, add the repo, and
 install with your native package manager. Each row links to the full per-distro guide (add the repo,
 first-run steps, the web console) — those are the source of truth, so this page doesn't duplicate them.
-On **Windows** (NVIDIA), the host ships as a signed installer instead — see [Windows](#windows-nvidia).
+On **Windows**, the host ships as a signed installer instead — see [Windows](#windows).
+
+> **First, read [Security & Safe Use](/docs/security).** A streaming host is remote control of the
+> machine. It's built for trusted local networks — don't expose it to the internet, and be thoughtful
+> about which machine you host on (especially on Windows).
 
 ## Pick your distro
 
@@ -26,10 +30,10 @@ tracks new builds automatically.
 > at the **canary** channel instead (`canary` apt distribution / `*-canary` rpm group). See
 > [Release Channels](/docs/channels).
 
-## Windows (NVIDIA)
+## Windows
 
-punktfunk also runs as a native host on **Windows 10/11 (x64) with an NVIDIA GPU**, shipped as a
-signed installer — see [Windows Host](/docs/windows-host) for what it includes and its limitations.
+punktfunk also runs as a native host on **Windows 11 22H2+ (x64)**, shipped as a signed
+installer — see [Windows Host](/docs/windows-host) for what it includes and its limitations.
 
 1. From the [packages page](https://git.unom.io/unom/-/packages) (generic group), download the newest
    **`punktfunk-host-setup-<ver>.exe`** and its matching **`.cer`**.
@@ -53,7 +57,7 @@ fallback without one. More detail — including the CLI `punktfunk-host service 
 
 ## What the packages are
 
-- **`punktfunk-host`** — the streaming host. Install this on your Linux + NVIDIA gaming machine.
+- **`punktfunk-host`** — the streaming host. Install this on your Linux gaming machine.
 - **`punktfunk-web`** — the browser management console (pairing + status). Recommended alongside the
   host; on RPM list it explicitly (`rpm-ostree install punktfunk punktfunk-web`).
 - **`punktfunk-client`** — the GTK4 desktop client, for streaming *to* a Linux box (also shipped via

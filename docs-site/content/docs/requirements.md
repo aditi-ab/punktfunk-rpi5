@@ -20,8 +20,9 @@ environments it supports today, each with its own guide:
 Other wlroots compositors (Sway/Hyprland) also work but aren't a primary target. If your desktop isn't
 listed, the host still needs one of these compositor backends to create a virtual display.
 
-> **Windows host:** punktfunk also runs as a native host on **Windows 10/11 (x64)** — a signed
-> installer that registers a service and bundles a virtual-display driver. It encodes on NVIDIA
+> **Windows host:** punktfunk also runs as a native host on **Windows 11 22H2 or newer (x64)** — a
+> signed installer that registers a service and bundles a virtual-display driver (whose driver-
+> framework needs make 22H2 the hard floor — Windows 10 is not supported). It encodes on NVIDIA
 > (NVENC), AMD (AMF), or Intel (QSV), with a software fallback, and is newer than the Linux host; see
 > [Windows Host](/docs/windows-host).
 
@@ -63,9 +64,15 @@ Minimum compositor versions (newer is fine):
 ## Network
 
 - Host and client on the **same network** — a LAN, or a VPN that puts them on one subnet. punktfunk
-  assumes a trusted local network; it's not built to be exposed to the public internet.
+  assumes a trusted local network; it's **not built to be exposed to the public internet — don't
+  port-forward it.** To stream from outside your home, use a VPN so the remote client is on the same
+  private subnet.
 - For best results, a wired or fast Wi-Fi link. The host can run a built-in **speed test** to pick a
   bitrate for your link (see [Configuration](/docs/configuration)).
+
+> **Before you set up a host, read [Security & Safe Use](/docs/security).** A streaming host is
+> remote control of the machine — it's important to understand what that exposes, why to keep it on a
+> trusted network, and how pairing protects you.
 
 ## A client
 

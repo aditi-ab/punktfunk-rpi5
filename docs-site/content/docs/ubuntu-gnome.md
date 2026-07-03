@@ -6,7 +6,9 @@ description: Set up a punktfunk host on Ubuntu with the GNOME desktop (Mutter).
 Set up a punktfunk host on **Ubuntu** (Desktop or Server) running **GNOME**. The host uses GNOME's
 Mutter compositor to create a per-client virtual display. Tested on Ubuntu 24.04+ and GNOME 48+.
 
-> New to this? Skim [Requirements](/docs/requirements) first.
+> New to this? Skim [Requirements](/docs/requirements) first, and read
+> [Security & Safe Use](/docs/security) — a streaming host is remote control of the machine, so keep it
+> on a trusted LAN or VPN and require pairing.
 
 ## 1. NVIDIA driver
 

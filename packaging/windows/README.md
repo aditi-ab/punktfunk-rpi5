@@ -5,6 +5,19 @@ generic package registry (`punktfunk-host-windows`) by `.gitea/workflows/windows
 
 > Full picture (drivers-from-source, toolchain, CI, dev loop): **[`design/windows-build-and-packaging.md`](../../design/windows-build-and-packaging.md)**. This README is the `packaging/windows/` file index.
 
+## Windows 11 22H2+ only (no Windows 10)
+
+The installer refuses anything below **Windows 11 22H2 (build 22621)** — `MinVersion=10.0.22621` in
+`punktfunk-host.iss`, with a `[Messages]` override naming the requirement. The floor comes from the
+**pf-vdisplay** driver: it is built against the **IddCx 1.10** class extension (the HDR `*2` DDIs +
+the FP16 adapter cap, linked via the 1.10 `IddCxStub`, no runtime `IddCxGetVersion` downgrade), and
+IddCx 1.10 first shipped in Windows 11 22H2. On older Windows — **all of Windows 10 including LTSC,
+and Windows 11 21H2** — the driver *package* installs fine, but the device then fails to start with
+**Code 10 `STATUS_DEVICE_POWER_FAILURE`** in Device Manager and every session dies with "pf-vdisplay
+driver interface not found". Gating the installer turns that late, confusing failure into an upfront
+message. (Down-level SDR-only support would need a runtime IddCx version check in the driver —
+tracked as a possible future feature, not planned.)
+
 ## x64 only (no ARM64)
 
 Unlike the client (which ships x64 + ARM64 MSIX), the host is **x64-only by design**. It is coupled to
@@ -112,7 +125,6 @@ fresh install uses the generated random console password — read it from
 | `drivers/` | The all-Rust IddCx **driver source** workspace: the `pf-vdisplay` crate on `wdk-sys` / windows-drivers-rs + the owned `pf-driver-proto` ABI + `wdk-iddcx` / `wdk-probe`, plus `deploy-dev.ps1` (build/sign/install for dev). |
 | `reset-pf-vdisplay.ps1` | **Dev:** recover a wedged driver — stop host → reap ghost monitor nodes → reload the adapter → start host (no reboot). See *Dev iteration* below. |
 | `redeploy-pf-vdisplay.ps1` | **Dev:** one-shot redeploy — (optional) build → stop host → `deploy-dev.ps1 -Install` → reload adapter → start host. |
-| `nvenc/nvenc.def`, `nvenc/gen-nvenc-importlib.ps1` | Synthesise `nvencodeapi.lib` for the `--features nvenc` link (llvm-dlltool / lib.exe). |
 | `pf-vkhdr-layer/` | **HDR Vulkan layer** (standalone `cdylib`): lets Vulkan games (Doom: The Dark Ages, etc.) enable HDR over the virtual display by advertising the HDR surface formats the NVIDIA/AMD ICDs hide on an indirect display. Built by the packer, laid into `{app}\vklayer`, registered under `HKLM64\…\Khronos\Vulkan\ImplicitLayers` (opt-out *Install the HDR Vulkan layer* task). Self-gated on the display's HDR state. See its README. |
 
 > **Drivers are built from source, not vendored.** All three (pf-vdisplay + the gamepad pf-dualsense /
@@ -154,14 +166,10 @@ the recovery. From a Linux box drive either over SSH, e.g.
 ## Build locally (Windows, MSVC + Windows SDK + Inno Setup)
 
 ```powershell
-# 1. import lib for the nvenc link
-pwsh -File packaging\windows\nvenc\gen-nvenc-importlib.ps1 -OutDir C:\t\nvenc
-$env:PUNKTFUNK_NVENC_LIB_DIR = 'C:\t\nvenc'
-
-# 2. build the host
+# 1. build the host (NVENC needs no import lib — its entry points are runtime-loaded)
 cargo build --release -p punktfunk-host --features nvenc
 
-# 3. pack (self-signed unless MSIX_CERT_PFX_B64/MSIX_CERT_PASSWORD are set; -NoDriver to skip pf-vdisplay)
+# 2. pack (self-signed unless MSIX_CERT_PFX_B64/MSIX_CERT_PASSWORD are set; -NoDriver to skip pf-vdisplay)
 pwsh -File packaging\windows\pack-host-installer.ps1 -Version 0.0.0-dev -TargetDir C:\t\release -OutDir C:\t\out
 ```
 

@@ -10,6 +10,9 @@ systemd service and uses KWin to create per-client virtual displays, captured ze
 > Validated live on **Fedora 44 KDE Plasma** with an RTX 4090: KWin virtual output + full
 > zero-copy capture. Everything below is the reproducible flow — paste it on a fresh box.
 
+> New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
+> the machine, so keep it on a trusted LAN or VPN and require pairing.
+
 The setup has three parts: **NVIDIA driver** → **host RPM** → **KWin streaming session**.
 
 ## 1. NVIDIA driver (RPM Fusion akmod)

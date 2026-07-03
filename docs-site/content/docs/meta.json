@@ -3,6 +3,7 @@
   "pages": [
     "index",
     "how-it-works",
+    "security",
     "quickstart",
     "install",
     "---Host Setup---",

@@ -73,6 +73,17 @@ Then log out and back in. On other distros this is `sudo usermod -aG input $USER
   concurrent native sessions (up to 4 by default); heavy load is usually bitrate-bound, so
   lower the bitrate first.
 
+## Windows: "punktfunk Virtual Display" shows Code 10 in Device Manager
+
+Sessions end with *"pf-vdisplay driver interface not found"* and Device Manager shows the
+**punktfunk Virtual Display** device failed with **Code 10** (`STATUS_DEVICE_POWER_FAILURE`).
+
+This means your Windows version is too old. The virtual-display driver requires the **IddCx 1.10**
+driver framework, which first shipped in **Windows 11 22H2 (build 22621)** — on Windows 10
+(including LTSC) and Windows 11 21H2 the driver installs but cannot start. Reinstalling won't help;
+the fix is updating to Windows 11 22H2 or newer. (Current installers refuse to run on older
+Windows for this reason; if you see this, the host was likely installed with an older installer.)
+
 ## Still stuck?
 
 Run the host with `RUST_LOG=info` (or `debug`) and check `journalctl --user -u punktfunk-host` for the

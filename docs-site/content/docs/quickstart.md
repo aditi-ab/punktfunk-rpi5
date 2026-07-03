@@ -5,16 +5,20 @@ description: From nothing to streaming — set up a host and connect your first 
 
 This is the shortest path to a working stream. Each step links to the details.
 
+> A streaming host is remote control of the machine, so it's built for **trusted local networks** — keep
+> it on your LAN or a VPN and don't expose it to the internet. Two minutes on
+> [Security & Safe Use](/docs/security) before you start is worth it.
+
 ## 1. Set up the host
 
-On your Linux + NVIDIA machine, follow the guide for your system:
+On your Linux gaming machine (NVIDIA, AMD, or Intel GPU), follow the guide for your system:
 
 - [Ubuntu — GNOME](/docs/ubuntu-gnome)
 - [Ubuntu — KDE Plasma](/docs/ubuntu-kde)
 - [Fedora — KDE Plasma](/docs/fedora-kde)
 - [Bazzite — gamescope / Steam](/docs/bazzite)
 
-Each one covers the NVIDIA driver, the dependencies, and how to build and run the host. Check the
+Each one covers the GPU driver, the dependencies, and how to build and run the host. Check the
 [Requirements](/docs/requirements) first if you're not sure your machine is a fit.
 
 ## 2. Start the host

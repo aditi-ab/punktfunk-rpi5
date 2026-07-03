@@ -12,6 +12,9 @@ desktop-class SteamOS box is a natural always-on streaming host. The **Steam Dec
 device we can test on today, so it's what these instructions are validated against; the same
 on-device build works on any SteamOS 3 system.
 
+> New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
+> the machine, so keep it on a trusted LAN or VPN and require pairing.
+
 SteamOS is an immutable, read-only Arch base, so the host isn't a system package. Instead a single
 script builds the host **natively inside a Debian-trixie distrobox** (ABI-matched to SteamOS's
 FFmpeg/glibc — the binary then runs natively on SteamOS) and wires it up as systemd user services.

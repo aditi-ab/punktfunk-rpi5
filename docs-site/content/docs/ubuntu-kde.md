@@ -6,7 +6,9 @@ description: Set up a punktfunk host on Ubuntu with KDE Plasma (KWin).
 Set up a punktfunk host on **Ubuntu** running **KDE Plasma**. The host uses KDE's KWin compositor to
 create a per-client virtual display. Needs **KWin 6.5.6 or newer**.
 
-> New to this? Skim [Requirements](/docs/requirements) first.
+> New to this? Skim [Requirements](/docs/requirements) first, and read
+> [Security & Safe Use](/docs/security) — a streaming host is remote control of the machine, so keep it
+> on a trusted LAN or VPN and require pairing.
 
 ## 1. NVIDIA driver
 

@@ -19,6 +19,9 @@ mid-stream. You flip between Gaming Mode and Desktop with Bazzite's normal Steam
 > pure desktop machine, [Ubuntu/Fedora KDE](/docs/ubuntu-kde) or [GNOME](/docs/ubuntu-gnome) are
 > simpler.
 
+> New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
+> the machine, so keep it on a trusted LAN or VPN and require pairing.
+
 ## Install
 
 The host ships as an RPM in punktfunk's **Gitea RPM registry** (public), so a Bazzite / Fedora
