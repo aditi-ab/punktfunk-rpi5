@@ -23,7 +23,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use windows::Win32::Foundation::{HANDLE, LUID};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 
 use super::{Mode, VirtualOutput};
 use crate::win_display::{
@@ -54,13 +55,15 @@ pub(crate) struct AddedMonitor {
 /// `&'static` singleton reached from the pinger + linger threads.
 pub(crate) trait VdisplayDriver: Send + Sync {
     fn name(&self) -> &'static str;
-    /// Find + open the control device, validate it (version handshake), read the watchdog timeout, and
-    /// reap monitors orphaned by a crashed previous host (`CLEAR_ALL`). Returns the owned handle +
-    /// watchdog seconds.
+    /// Find + open the control device, validate it (version handshake), and read the watchdog
+    /// timeout. `reap_orphans` (the FIRST open of the process only) additionally `CLEAR_ALL`s
+    /// monitors orphaned by a crashed previous host — a REOPEN (after a dead handle was retired)
+    /// must NOT, since sessions this process still considers live may be racing it. Returns the
+    /// owned handle + watchdog seconds.
     ///
     /// # Safety
     /// Issues setup-API + `DeviceIoControl` calls; runs in the caller's apartment.
-    unsafe fn open(&self) -> Result<(OwnedHandle, u32)>;
+    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32)>;
     /// ADD a virtual monitor at `mode`, pinning the IDD render GPU to `render_luid` first if `Some`, and
     /// requesting `preferred_monitor_id` (the host's per-client stable id; `0` = auto). Returns the REMOVE
     /// key + target id + the adapter LUID the driver actually used.
@@ -125,12 +128,31 @@ enum MgrState {
     Lingering { mon: Monitor, until: Instant },
 }
 
+/// The manager's control-device cache. Reopenable: a driver upgrade / WUDFHost restart kills the
+/// cached handle (every IOCTL fails with a gone-class code forever), so such a failure RETIRES it and
+/// the next [`VirtualDisplayManager::ensure_device`] reopens the (new) device interface, re-running
+/// the version handshake. Retired handles are deliberately kept alive — never closed — for the
+/// process lifetime: the pinger/linger threads and every capturer's `ChannelBroker` hold BARE
+/// `HANDLE` copies whose soundness contract is "never closed"; a retired handle only ever FAILS
+/// IOCTLs, which every holder already tolerates. Reopens are rare (a driver restart), so the retained
+/// list is bounded in practice.
+#[derive(Default)]
+struct DeviceSlot {
+    current: Option<Arc<OwnedHandle>>,
+    /// Never dropped — see the type doc (bare-`HANDLE` holders rely on no-close).
+    retired: Vec<Arc<OwnedHandle>>,
+    /// `CLEAR_ALL` (crashed-host orphan reap) runs only on the FIRST open of the process; a reopen
+    /// races sessions this process still considers live and must not raze them.
+    opened_once: bool,
+}
+
 /// The host-lifetime virtual-display manager: the single owner of the monitor lifecycle.
 pub(crate) struct VirtualDisplayManager {
     driver: Box<dyn VdisplayDriver>,
-    /// Control device, opened once on first acquire. Typed + `Send+Sync`, so the pinger/linger threads
-    /// share it via the `&'static` singleton with no raw-handle smuggling.
-    device: OnceLock<Arc<OwnedHandle>>,
+    /// Control device, opened on first acquire and REOPENED after a gone-classified failure retired
+    /// it (see [`DeviceSlot`]). Typed + `Send+Sync`, so the pinger/linger threads share it via the
+    /// `&'static` singleton with no raw-handle smuggling.
+    device: Mutex<DeviceSlot>,
     watchdog_s: AtomicU32,
     /// Monotonic lease-generation counter (was the `MON_GEN` global).
     gen: AtomicU64,
@@ -155,7 +177,7 @@ static VDM: OnceLock<VirtualDisplayManager> = OnceLock::new();
 pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayManager {
     VDM.get_or_init(|| VirtualDisplayManager {
         driver,
-        device: OnceLock::new(),
+        device: Mutex::new(DeviceSlot::default()),
         watchdog_s: AtomicU32::new(3),
         gen: AtomicU64::new(1),
         state: Mutex::new(MgrState::Idle),
@@ -173,11 +195,57 @@ pub(crate) fn vdm() -> &'static VirtualDisplayManager {
 }
 
 /// The live pf-vdisplay control-device handle, for the IDD-push capturer's sealed-channel delivery
-/// (`IOCTL_SET_FRAME_CHANNEL`). Safe to hand out as a bare `HANDLE`: the device lives in a `OnceLock`
-/// that is never cleared or closed for the process lifetime. `None` before the first backend open —
-/// impossible for a capturer, which only exists on a monitor the manager created.
+/// (`IOCTL_SET_FRAME_CHANNEL`). Safe to hand out as a bare `HANDLE`: cached handles are never closed
+/// for the process lifetime — a dead one is RETIRED (kept alive, see [`DeviceSlot`]), so a stale copy
+/// can only fail IOCTLs, never dangle. `None` before the first backend open — impossible for a
+/// capturer, which only exists on a monitor the manager created.
 pub(crate) fn control_device_handle() -> Option<HANDLE> {
     VDM.get().and_then(VirtualDisplayManager::device_handle)
+}
+
+/// True when an IOCTL failure means the CONTROL DEVICE itself is gone (driver upgrade, WUDFHost
+/// restart, device disable) — the cached handle can only keep failing and must be retired so the
+/// next use reopens. The root `windows` error survives anyhow `.context` chains via `downcast_ref`.
+/// NOTE: 0x80070490 (ERROR_NOT_FOUND, the ADD slot-exhaustion wedge) is deliberately NOT here — it
+/// has its own reap-and-retry handling and the device is alive when it fires.
+/// Best-effort "is this WUDFHost pid still alive?" — the monitor-liveness probe for the JOIN path.
+/// `OpenProcess` failing (pid reaped) or the process being signaled ⇒ dead. Pid reuse could
+/// theoretically alias a fresh process and read "alive"; the joining session then just retries into
+/// its rebuild budget — acceptable for a sub-second reuse window that realistically never hits.
+fn wudf_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true; // pre-v2 driver reports no pid — never preempt on the probe's account
+    }
+    // SAFETY: plain FFI probe; the opened handle (checked) is closed exactly once below, and the
+    // 0 ms wait only reads its signaled state.
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
+            return false;
+        };
+        let alive = WaitForSingleObject(h, 0) != WAIT_OBJECT_0;
+        let _ = CloseHandle(h);
+        alive
+    }
+}
+
+fn is_device_gone(e: &anyhow::Error) -> bool {
+    let Some(w) = e.downcast_ref::<windows::core::Error>() else {
+        return false;
+    };
+    // Win32 codes as HRESULTs: FILE_NOT_FOUND(2), INVALID_HANDLE(6), BAD_COMMAND(22),
+    // GEN_FAILURE(31), DEV_NOT_EXIST(55), OPERATION_ABORTED(995), DEVICE_NOT_CONNECTED(1167 =
+    // 0x48F — one below the 0x490 wedge), DEVICE_REMOVED(1617).
+    const GONE: [i32; 8] = [
+        0x8007_0002u32 as i32,
+        0x8007_0006u32 as i32,
+        0x8007_0016u32 as i32,
+        0x8007_001Fu32 as i32,
+        0x8007_0037u32 as i32,
+        0x8007_03E3u32 as i32,
+        0x8007_048Fu32 as i32,
+        0x8007_0651u32 as i32,
+    ];
+    GONE.contains(&w.code().0)
 }
 
 impl VirtualDisplayManager {
@@ -185,27 +253,51 @@ impl VirtualDisplayManager {
         self.driver.name()
     }
 
-    /// Open + cache the control device (once). Called under the `state` lock so two racing acquires can't
-    /// double-open.
+    /// Open + cache the control device; REOPEN when a gone-classified failure retired the cached one
+    /// (driver upgrade / WUDFHost restart). The `device` mutex serializes racing opens.
     fn ensure_device(&self) -> Result<HANDLE> {
-        if let Some(d) = self.device.get() {
+        let mut slot = self.device.lock().unwrap();
+        if let Some(d) = &slot.current {
             return Ok(HANDLE(d.as_raw_handle()));
         }
+        let reap = !slot.opened_once;
         // SAFETY: `VdisplayDriver::open` is `unsafe` only because it issues SetupAPI + `DeviceIoControl`
-        // FFI in the caller's apartment; `ensure_device` runs that on the acquiring thread under the
-        // `state` lock (callers hold it), so there is no concurrent open. `open` has no handle
-        // precondition to uphold, and the `OwnedHandle` it returns is the sole owner of the device.
-        let (handle, watchdog_s) = unsafe { self.driver.open()? };
+        // FFI in the caller's apartment; the `device` mutex (held here) serializes it, so there is no
+        // concurrent open. `open` has no handle precondition to uphold, and the `OwnedHandle` it
+        // returns is the sole owner of the device.
+        let (handle, watchdog_s) = unsafe { self.driver.open(reap)? };
+        slot.opened_once = true;
         self.watchdog_s.store(watchdog_s, Ordering::Relaxed);
         let raw = HANDLE(handle.as_raw_handle());
-        let _ = self.device.set(Arc::new(handle));
+        slot.current = Some(Arc::new(handle));
+        if !reap {
+            tracing::info!("virtual-display control device reopened (retired handle replaced)");
+        }
         Ok(raw)
     }
 
-    /// The live control handle for the pinger/linger threads (lock-free: the device never changes once
-    /// opened). `None` only before the first acquire opened it.
+    /// The live control handle for the pinger/linger threads. `None` before the first acquire opened
+    /// it, or between a retire and the next reopen.
     fn device_handle(&self) -> Option<HANDLE> {
-        self.device.get().map(|d| HANDLE(d.as_raw_handle()))
+        self.device
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .map(|d| HANDLE(d.as_raw_handle()))
+    }
+
+    /// Retire the cached control handle after a gone-classified IOCTL failure. The handle is retained
+    /// un-closed (see [`DeviceSlot`]); the next [`ensure_device`](Self::ensure_device) reopens the
+    /// (new) device interface and re-runs the version handshake.
+    fn invalidate_device(&self, why: &anyhow::Error) {
+        let mut slot = self.device.lock().unwrap();
+        if let Some(cur) = slot.current.take() {
+            tracing::warn!(
+                "virtual-display control device retired — reopening on next use (cause: {why:#})"
+            );
+            slot.retired.push(cur);
+        }
     }
 
     /// Open + initialise the backend (validates the driver is present). Mirrors the old
@@ -247,13 +339,37 @@ impl VirtualDisplayManager {
                     old_target = mon.target_id,
                     "IDD-push reconnect — preempting the lingering monitor, recreating a fresh one"
                 );
-                // SAFETY: `teardown` requires `dev` to be the live control handle; `dev` is the value
-                // `ensure_device()` returned above (the device is cached in the `OnceLock` and never
-                // closed for the manager's lifetime). `mon` was moved out of the prior `Lingering`
+                // SAFETY: `teardown` requires `dev` to be a valid control handle; `dev` is the value
+                // `ensure_device()` returned above (cached handles are never closed — a dead one is
+                // retired, kept alive; see `DeviceSlot`). `mon` was moved out of the prior `Lingering`
                 // state by `mem::replace`, so it is exclusively owned here — no aliasing.
                 unsafe { self.teardown(dev, mon) };
                 // Let the OS finish the ASYNC monitor departure before the next ADD; a back-to-back
                 // REMOVE→ADD races the teardown and the ADD IOCTL is rejected under reconnect churn.
+                thread::sleep(Duration::from_millis(400));
+            }
+        }
+
+        // An ACTIVE monitor whose WUDFHost has EXITED is dead driver-side (driver crash / upgrade):
+        // the capturer's driver-death watch failed its session, and that session's in-place rebuild
+        // re-acquires here while its old lease is STILL held — so the state is Active. Joining would
+        // hand the rebuild the dead monitor's target (stale wudf_pid) and starve it to the rebuild
+        // budget. Preempt instead: best-effort teardown (REMOVE fails harmlessly on a dead/retired
+        // device) and fall through to a fresh create on the auto-restarted device. Held leases are
+        // gen-stamped, so their eventual release is a no-op.
+        if matches!(&*state, MgrState::Active { mon, .. } if !wudf_alive(mon.wudf_pid)) {
+            if let MgrState::Active { mon, .. } = std::mem::replace(&mut *state, MgrState::Idle) {
+                tracing::warn!(
+                    old_target = mon.target_id,
+                    wudf_pid = mon.wudf_pid,
+                    "virtual monitor's WUDFHost is gone — preempting the dead monitor, recreating"
+                );
+                // SAFETY: `teardown` requires a valid control handle; `dev` is the value
+                // `ensure_device()` returned above (cached handles are never closed — a dead one is
+                // retired, kept alive; see `DeviceSlot`). `mon` was moved out of the replaced state,
+                // so it is exclusively owned here — no aliasing.
+                unsafe { self.teardown(dev, mon) };
+                // Same async-departure settle as the reconnect preempt above.
                 thread::sleep(Duration::from_millis(400));
             }
         }
@@ -292,10 +408,26 @@ impl VirtualDisplayManager {
                 }
                 mon
             }
-            // SAFETY: `create_monitor` requires `dev` to be the live control handle; `dev` is the
-            // handle `ensure_device()` returned above (cached in the `OnceLock`, never closed for the
-            // manager's lifetime), and we hold the `state` lock.
-            MgrState::Idle => unsafe { self.create_monitor(dev, mode, client_fp)? },
+            // SAFETY: `create_monitor` requires `dev` to be a valid control handle; `dev` is the
+            // handle `ensure_device()` returned above (cached handles are never closed — a dead one
+            // is retired, kept alive; see `DeviceSlot`), and we hold the `state` lock.
+            MgrState::Idle => match unsafe { self.create_monitor(dev, mode, client_fp) } {
+                // The cached device died under us (driver upgrade / WUDFHost restart, detected only
+                // now — e.g. the host sat idle past the pinger-less window). Retire it, reopen, and
+                // retry ONCE so the reconnect-after-driver-restart succeeds first try instead of
+                // burning one failed session per restart.
+                Err(e) if is_device_gone(&e) => {
+                    self.invalidate_device(&e);
+                    let dev = self.ensure_device()?;
+                    tracing::info!(
+                        "virtual-display control device reopened — retrying the monitor create"
+                    );
+                    // SAFETY: as above — `dev` is the handle the reopening `ensure_device` just
+                    // returned, and the `state` lock is still held.
+                    unsafe { self.create_monitor(dev, mode, client_fp)? }
+                }
+                r => r?,
+            },
             MgrState::Active { .. } => unreachable!("handled above"),
         };
         let out = self.output_for(&mon);
@@ -353,13 +485,20 @@ impl VirtualDisplayManager {
             let mut warned = false;
             while !stop_t.load(Ordering::Relaxed) {
                 if let Some(h) = vdm().device_handle() {
-                    // SAFETY: `ping` requires `dev` to be the live control handle. `h` is from
-                    // `device_handle()` (the `Some` branch) — the `OnceLock<Arc<OwnedHandle>>` that,
-                    // once set, is never cleared or closed for the process lifetime, so the handle is
-                    // live for this call. The pinger thread only spins while the `&'static` manager
-                    // singleton (and thus the device) lives.
+                    // SAFETY: `ping` requires `dev` to be a valid control handle. `h` is from
+                    // `device_handle()` (the `Some` branch) — cached handles are NEVER closed for the
+                    // process lifetime (a dead one is retired, kept alive; see `DeviceSlot`), so the
+                    // handle stays valid for this call even if it was retired concurrently — at worst
+                    // the IOCTL fails. The pinger thread only spins while the `&'static` manager
+                    // singleton lives.
                     match unsafe { vdm().driver.ping(h) } {
                         Ok(()) => warned = false,
+                        Err(e) if is_device_gone(&e) => {
+                            // The device itself is gone (driver upgrade / WUDFHost restart) — pings
+                            // can only keep failing on this handle. Retire it so the next session's
+                            // `ensure_device` reopens; this monitor is already dead driver-side.
+                            vdm().invalidate_device(&e);
+                        }
                         Err(e) => {
                             if !warned {
                                 tracing::warn!("virtual-display keepalive PING failed (control handle lost?): {e:#}");
@@ -501,6 +640,11 @@ impl VirtualDisplayManager {
         // `remove_monitor` requires exactly that. `&mon.key` borrows the `MonitorKey` inside the
         // still-owned `mon`, alive for this synchronous IOCTL, so the pointer the driver reads stays valid.
         if let Err(e) = unsafe { self.driver.remove_monitor(dev, &mon.key) } {
+            // A gone-classified failure means the device died under this monitor (driver upgrade /
+            // WUDFHost restart) — retire the handle so the NEXT session reopens instead of failing.
+            if is_device_gone(&e) {
+                self.invalidate_device(&e);
+            }
             tracing::warn!("virtual-display REMOVE failed: {e:#}");
         } else {
             tracing::info!(

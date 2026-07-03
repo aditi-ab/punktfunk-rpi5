@@ -324,10 +324,17 @@ fn read_inf_text(path: &Path) -> String {
     }
 }
 
-/// Is a punktfunk virtual-display device already enumerated? Matches the device ID / description, which
+/// Is a punktfunk virtual-display device already enumerated AND connected? `/connected` is
+/// load-bearing: without it a PHANTOM (disconnected) devnode left by an earlier uninstall satisfies
+/// this check, the install skips creating a live ROOT node, and every session then fails "driver not
+/// installed" (the host enumerates present devices only). Matches the device ID / description, which
 /// are NOT localized, so the substring check is locale-safe.
 fn pf_vdisplay_present() -> bool {
-    let lo = run_capture("pnputil", &["/enum-devices", "/class", "Display"]).to_ascii_lowercase();
+    let lo = run_capture(
+        "pnputil",
+        &["/enum-devices", "/connected", "/class", "Display"],
+    )
+    .to_ascii_lowercase();
     lo.contains("pf_vdisplay") || lo.contains("punktfunk virtual display")
 }
 

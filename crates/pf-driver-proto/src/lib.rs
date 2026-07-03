@@ -151,9 +151,13 @@ pub mod control {
     }
 
     /// `IOCTL_SET_FRAME_CHANNEL` input — the sealed frame channel's bootstrap. Every handle field is a
-    /// handle VALUE already duplicated into the driver's WUDFHost process by the host; receiving it, the
-    /// driver OWNS those handles (it closes whatever it doesn't consume — a replaced, invalid, or
-    /// unmatched delivery must not leak entries in its own handle table).
+    /// handle VALUE already duplicated into the driver's WUDFHost process by the host. Ownership is
+    /// **adopt-on-success-only** (`design/idd-push-security.md` invariant 5): the driver owns (and
+    /// eventually closes) the handles IFF it completes the IOCTL successfully — a replaced or
+    /// later-unconsumed delivery is then the driver's to close. On ANY error completion (malformed
+    /// request, unknown `target_id`) the driver must NOT close them: the HOST reaps its remote
+    /// duplicates (`DUPLICATE_CLOSE_SOURCE`). Exactly one side closes each value; a driver that closed
+    /// on error would double-close possibly-reused handle values against the host's reap.
     ///
     /// Handle values are only meaningful inside the target process's handle table, so this struct is
     /// harmless to any third party: reading it leaks nothing openable, and spoofing it (were the control

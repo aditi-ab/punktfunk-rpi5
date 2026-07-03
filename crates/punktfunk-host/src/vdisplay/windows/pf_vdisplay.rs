@@ -19,14 +19,14 @@
 
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::os::windows::io::{FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
-    SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+    SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SPINT_ACTIVE,
     SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
@@ -137,11 +137,9 @@ fn is_slot_exhaustion_wedge(e: &anyhow::Error) -> bool {
 /// Pin the pf-vdisplay IddCx's RENDER GPU to `luid` (the analogue of Apollo's `SetRenderAdapter`). No
 /// output buffer. Issued on the driver handle BEFORE `IOCTL_ADD` to steer which GPU the new target
 /// renders on — on a multi-adapter box this stops DXGI from reparenting the virtual output onto a
-/// different adapter than the one we duplicate/encode on (the ACCESS_LOST storm).
-///
-/// NOTE: the pf-vdisplay driver currently returns `STATUS_NOT_IMPLEMENTED` for this IOCTL (a STEP-4
-/// stub), so this call WILL fail today. Callers tolerate the `Err` (warn + continue) — exactly as the
-/// SudoVDA backend tolerated the driver IGNORING the pin.
+/// different adapter than the one we duplicate/encode on (the ACCESS_LOST storm). The driver
+/// implements it (`control.rs` → `adapter::set_render_adapter`); callers still tolerate an `Err`
+/// (warn + continue) since the driver reports its real render LUID in the shared header either way.
 unsafe fn set_render_adapter(h: HANDLE, luid: LUID) -> Result<()> {
     let req = control::SetRenderAdapterRequest {
         luid_low: luid.LowPart,
@@ -185,42 +183,102 @@ pub(crate) unsafe fn send_frame_channel(
     .context("pf-vdisplay SET_FRAME_CHANNEL")
 }
 
+/// RAII over a SetupAPI device-info list: every exit path of [`open_device`] destroys it (the error
+/// paths used to leak one `HDEVINFO` per failed open — and a driverless / mid-upgrade box probes
+/// repeatedly).
+struct DevInfoList(HDEVINFO);
+
+impl Drop for DevInfoList {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the live device-info list this wrapper solely owns; destroyed exactly
+        // once here.
+        unsafe {
+            let _ = SetupDiDestroyDeviceInfoList(self.0);
+        }
+    }
+}
+
 unsafe fn open_device() -> Result<HANDLE> {
-    let hdev = SetupDiGetClassDevsW(
-        Some(&PF_VDISPLAY_INTERFACE),
-        PCWSTR::null(),
-        None,
-        DIGCF_DEVICEINTERFACE | DIGCF_PRESENT,
-    )
-    .context("SetupDiGetClassDevsW(pf-vdisplay) — is the pf-vdisplay driver installed?")?;
+    // SAFETY: plain SetupAPI enumeration call; the returned list is solely owned by the RAII wrapper.
+    let hdev = DevInfoList(
+        unsafe {
+            SetupDiGetClassDevsW(
+                Some(&PF_VDISPLAY_INTERFACE),
+                PCWSTR::null(),
+                None,
+                DIGCF_DEVICEINTERFACE | DIGCF_PRESENT,
+            )
+        }
+        .context("SetupDiGetClassDevsW(pf-vdisplay) — is the pf-vdisplay driver installed?")?,
+    );
 
-    let mut idata = SP_DEVICE_INTERFACE_DATA {
-        cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
-        ..Default::default()
-    };
-    SetupDiEnumDeviceInterfaces(hdev, None, &PF_VDISPLAY_INTERFACE, 0, &mut idata)
-        .context("SetupDiEnumDeviceInterfaces(pf-vdisplay)")?;
-
-    let mut required = 0u32;
-    let _ = SetupDiGetDeviceInterfaceDetailW(hdev, &idata, None, 0, Some(&mut required), None);
-    let mut buf = vec![0u8; required as usize];
-    let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
-    (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
-    SetupDiGetDeviceInterfaceDetailW(hdev, &idata, Some(detail), required, None, None)
-        .context("SetupDiGetDeviceInterfaceDetailW(pf-vdisplay)")?;
-
-    let handle = CreateFileW(
-        PCWSTR((*detail).DevicePath.as_ptr()),
-        0xC000_0000, // GENERIC_READ | GENERIC_WRITE
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None,
-        OPEN_EXISTING,
-        FILE_FLAGS_AND_ATTRIBUTES(0),
-        None,
-    )
-    .context("CreateFileW(pf-vdisplay device)")?;
-    let _ = SetupDiDestroyDeviceInfoList(hdev);
-    Ok(handle)
+    // Enumerate EVERY interface instance, not just index 0: after a driver upgrade a present-but-
+    // failed devnode (Code 10) can hold index 0 while the LIVE node's interface sits at a later
+    // index — the old single-index read then failed every session with "driver not installed"
+    // even though a working interface existed. `SPINT_ACTIVE` filters dead interfaces (an interface
+    // is active only while its owning device is started); the first active + openable one wins.
+    let mut inactive = 0u32;
+    let mut last_err: Option<anyhow::Error> = None;
+    for index in 0..64u32 {
+        let mut idata = SP_DEVICE_INTERFACE_DATA {
+            cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `hdev.0` is the live list; `idata` is a valid, size-stamped out-param.
+        if unsafe {
+            SetupDiEnumDeviceInterfaces(hdev.0, None, &PF_VDISPLAY_INTERFACE, index, &mut idata)
+        }
+        .is_err()
+        {
+            break; // ERROR_NO_MORE_ITEMS — no further candidates
+        }
+        if idata.Flags & SPINT_ACTIVE == 0 {
+            inactive += 1;
+            continue;
+        }
+        let mut required = 0u32;
+        // SAFETY: sizing call — null buffer plus a valid `required` out-param; the expected
+        // ERROR_INSUFFICIENT_BUFFER "failure" is ignored and only `required` is consumed.
+        let _ = unsafe {
+            SetupDiGetDeviceInterfaceDetailW(hdev.0, &idata, None, 0, Some(&mut required), None)
+        };
+        if (required as usize) < size_of::<u32>() {
+            continue; // sizing failed — never stamp a cbSize through an under-sized buffer
+        }
+        let mut buf = vec![0u8; required as usize];
+        let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+        // SAFETY: `buf` is `required` bytes (>= 4, checked above), so stamping `cbSize` and letting
+        // the API fill up to `required` bytes stays in bounds; `detail` aliases `buf` only within
+        // this iteration, and the `DevicePath` pointer is read before `buf` is dropped.
+        let opened = unsafe {
+            (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            SetupDiGetDeviceInterfaceDetailW(hdev.0, &idata, Some(detail), required, None, None)
+                .context("SetupDiGetDeviceInterfaceDetailW(pf-vdisplay)")
+                .and_then(|()| {
+                    CreateFileW(
+                        PCWSTR((*detail).DevicePath.as_ptr()),
+                        0xC000_0000, // GENERIC_READ | GENERIC_WRITE
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        None,
+                        OPEN_EXISTING,
+                        FILE_FLAGS_AND_ATTRIBUTES(0),
+                        None,
+                    )
+                    .context("CreateFileW(pf-vdisplay device)")
+                })
+        };
+        match opened {
+            Ok(h) => return Ok(h),
+            // A raced-away or wedged device — remember the error, try the next interface.
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "no ACTIVE pf-vdisplay device interface found ({inactive} inactive) — is the \
+             pf-vdisplay driver installed and its device started?"
+        )
+    }))
 }
 
 /// The pf-vdisplay IOCTL surface behind the shared [`VirtualDisplayManager`](super::manager::VirtualDisplayManager)
@@ -232,30 +290,30 @@ impl VdisplayDriver for PfVdisplayDriver {
         "pf-vdisplay"
     }
 
-    unsafe fn open(&self) -> Result<(OwnedHandle, u32)> {
+    unsafe fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32)> {
         // SAFETY: `open_device` is `unsafe` only because it issues SetupAPI enumeration + `CreateFileW`
         // FFI; it takes no arguments and returns an owned raw `HANDLE` (or `Err`). Called here on the
         // backend-init thread, with no precondition beyond a valid thread context.
         let device = unsafe { open_device()? };
+        // Wrap IMMEDIATELY: every `?` below must close the device exactly once — the old
+        // wrap-on-success-only shape leaked the raw handle whenever GET_INFO itself failed.
+        // SAFETY: `device` is the valid handle `open_device` just returned; ownership transfers into
+        // the `OwnedHandle` (single owner, `CloseHandle` on drop).
+        let device = unsafe { OwnedHandle::from_raw_handle(device.0 as _) };
+        let raw = HANDLE(device.as_raw_handle());
         // HARD protocol-version check (unlike SudoVDA's best-effort log): a mismatched host/driver pair
         // fails loudly here rather than corrupting the IOCTL stream.
         let mut info_buf = [0u8; size_of::<control::InfoReply>()];
         // SAFETY: `ioctl` requires `h` to be a valid device handle and its slices to be valid for the
-        // call. `device` is the live handle just returned by `open_device`. `IOCTL_GET_INFO` takes no
-        // input (`&[]`) and writes into `info_buf`, a stack `[u8; size_of::<InfoReply>()]` whose length
-        // is passed as the output size — so `DeviceIoControl` can't write OOB — and which outlives this
-        // synchronous call.
-        unsafe { ioctl(device, control::IOCTL_GET_INFO, &[], &mut info_buf) }
+        // call. `raw` borrows the live `OwnedHandle` above for this synchronous call. `IOCTL_GET_INFO`
+        // takes no input (`&[]`) and writes into `info_buf`, a stack `[u8; size_of::<InfoReply>()]`
+        // whose length is passed as the output size — so `DeviceIoControl` can't write OOB — and which
+        // outlives this synchronous call.
+        unsafe { ioctl(raw, control::IOCTL_GET_INFO, &[], &mut info_buf) }
             .context("pf-vdisplay IOCTL_GET_INFO (version handshake)")?;
         let info: control::InfoReply =
             bytemuck::pod_read_unaligned(&info_buf[..size_of::<control::InfoReply>()]);
         if info.protocol_version != pf_driver_proto::PROTOCOL_VERSION {
-            // SAFETY: `device` is the valid raw handle from `open_device` and has NOT yet been wrapped
-            // in an `OwnedHandle` (that happens only on the success path below), so this error path is
-            // the sole owner closing it exactly once — no double-close.
-            unsafe {
-                let _ = CloseHandle(device);
-            }
             anyhow::bail!(
                 "pf-vdisplay protocol mismatch: host expects {}, driver reports {} — install matching \
                  host + driver",
@@ -269,12 +327,19 @@ impl VdisplayDriver for PfVdisplayDriver {
             info.protocol_version,
             watchdog_s
         );
-        // Reap monitors orphaned by a crashed previous host — a FIRST-CLASS op (driver returns SUCCESS).
+        // Reap monitors orphaned by a crashed previous host — a FIRST-CLASS op (driver returns
+        // SUCCESS). FIRST open of the process only: a REOPEN (the manager retired a dead handle after
+        // a driver upgrade / WUDFHost restart) can race sessions that still believe they are live, and
+        // an unconditional CLEAR_ALL there would raze them.
+        if !reap_orphans {
+            reap_ghost_monitors();
+            return Ok((device, watchdog_s));
+        }
         let mut none: [u8; 0] = [];
-        // SAFETY: `device` is the live handle from `open_device` (still owned here, before it is wrapped
-        // below). `IOCTL_CLEAR_ALL` has no input and no output: `&[]` and the empty `none` slice pass
-        // zero-length buffers, so nothing is read or written through them.
-        if unsafe { ioctl(device, control::IOCTL_CLEAR_ALL, &[], &mut none) }.is_ok() {
+        // SAFETY: `raw` borrows the live `OwnedHandle` above. `IOCTL_CLEAR_ALL` has no input and no
+        // output: `&[]` and the empty `none` slice pass zero-length buffers, so nothing is read or
+        // written through them.
+        if unsafe { ioctl(raw, control::IOCTL_CLEAR_ALL, &[], &mut none) }.is_ok() {
             tracing::info!("cleared orphaned virtual monitors on host startup");
         } else {
             tracing::warn!("pf-vdisplay IOCTL_CLEAR_ALL failed on startup (continuing)");
@@ -285,14 +350,7 @@ impl VdisplayDriver for PfVdisplayDriver {
         // monitor-slot budget — prevents the 0x80070490 slot-exhaustion wedge from carrying across
         // restarts (the reason a restart's CLEAR_ALL alone never recovered it before).
         reap_ghost_monitors();
-        Ok((
-            // SAFETY: `device` is the valid handle from `open_device`, still owned here and NOT closed
-            // on this success path (the error paths above close it and return). `from_raw_handle`'s
-            // contract — caller owns a valid handle — holds, so ownership transfers cleanly into the
-            // `OwnedHandle`: exactly one owner, which `CloseHandle`s it on drop.
-            unsafe { OwnedHandle::from_raw_handle(device.0 as _) },
-            watchdog_s,
-        ))
+        Ok((device, watchdog_s))
     }
 
     unsafe fn add_monitor(

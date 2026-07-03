@@ -29,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     DuplicateHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
-    HANDLE, INVALID_HANDLE_VALUE, LUID,
+    HANDLE, INVALID_HANDLE_VALUE, LUID, WAIT_OBJECT_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
@@ -53,7 +53,7 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
-    PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
 // The frame-transport contract — `SharedHeader` layout, `MAGIC`/`VERSION`/`RING_LEN`, the
@@ -234,11 +234,14 @@ pub(crate) unsafe fn verify_is_wudfhost(process: HANDLE, wudf_pid: u32, what: &s
 /// duplicates (it closes them); on any failure [`Self::send`] reaps every duplicate it already made
 /// (`DUPLICATE_CLOSE_SOURCE`), so a half-delivered channel never leaks handles in WUDFHost.
 struct ChannelBroker {
-    /// `PROCESS_DUP_HANDLE` handle to the driver's WUDFHost (pid from the ADD reply;
-    /// `ProcessSharingDisabled` makes that process exclusively pf-vdisplay's).
+    /// `PROCESS_DUP_HANDLE | SYNCHRONIZE` handle to the driver's WUDFHost (pid from the ADD reply;
+    /// `ProcessSharingDisabled` makes that process exclusively pf-vdisplay's). `SYNCHRONIZE` lets the
+    /// handle double as the driver-death probe ([`Self::driver_alive`]).
     process: OwnedHandle,
+    /// The WUDFHost pid `process` refers to (diagnostics for the driver-death bail).
+    wudf_pid: u32,
     /// The pf-vdisplay control device — owned by the `VirtualDisplayManager`, never closed for the
-    /// process lifetime, so holding the bare `HANDLE` is sound.
+    /// process lifetime (a dead one is retired, kept alive), so holding the bare `HANDLE` is sound.
     control: HANDLE,
 }
 
@@ -264,7 +267,7 @@ impl ChannelBroker {
         // for the duration of the synchronous check and forms no lasting alias.
         let process = unsafe {
             let h = OpenProcess(
-                PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
                 false,
                 wudf_pid,
             )
@@ -273,7 +276,21 @@ impl ChannelBroker {
             verify_is_wudfhost(HANDLE(process.as_raw_handle()), wudf_pid, "frame-channel")?;
             process
         };
-        Ok(Self { process, control })
+        Ok(Self {
+            process,
+            wudf_pid,
+            control,
+        })
+    }
+
+    /// Whether the driver's WUDFHost is still alive. The pinned process handle doubles as the
+    /// liveness probe (`SYNCHRONIZE` requested at open): signaled ⇔ the process exited. This is the
+    /// definitive "driver died mid-session" signal — at the ring, a dead driver and an idle desktop
+    /// are indistinguishable (both simply stop publishing).
+    fn driver_alive(&self) -> bool {
+        // SAFETY: `process` is the live `OwnedHandle` this broker owns (borrowed for this synchronous
+        // call); a 0 ms wait only reads the handle's signaled state.
+        unsafe { WaitForSingleObject(HANDLE(self.process.as_raw_handle()), 0) != WAIT_OBJECT_0 }
     }
 
     /// Duplicate `h` into the WUDFHost handle table, returning the handle VALUE valid there (and only
@@ -437,6 +454,12 @@ pub struct IddPushCapturer {
     /// cleared when a fresh frame resumes. If it stays set past the recovery window, `try_consume` drops
     /// the session (recover-or-drop, no DDA).
     recovering_since: Option<Instant>,
+    /// When the last FRESH driver frame was consumed — feeds the driver-death watch in
+    /// [`Self::try_consume`] (a dead WUDFHost is otherwise indistinguishable from an idle desktop:
+    /// both stop publishing, and the encode loop would repeat the last frame forever).
+    last_fresh: Instant,
+    /// Rate-limits the WUDFHost liveness probe (one 0 ms wait per second, and only while stale).
+    last_liveness: Instant,
     /// Host-owned ROTATING output ring NVENC encodes (one YUV texture per slot). Rotating it per frame
     /// is the precondition for pipelining the encode loop: while NVENC encodes frame N's texture on the
     /// ASIC, frame N+1's convert writes a DIFFERENT texture — the two overlap. Format = `out_format()`:
@@ -753,6 +776,8 @@ impl IddPushCapturer {
                 display_hdr,
                 last_acm_poll: Instant::now(),
                 recovering_since: None,
+                last_fresh: Instant::now(),
+                last_liveness: Instant::now(),
                 out_ring: Vec::new(),
                 out_idx: 0,
                 video_conv: None,
@@ -1074,6 +1099,24 @@ impl IddPushCapturer {
                 );
             }
         }
+        // Driver-death watch (the SDR path has no other signal): a dead WUDFHost stops publishing,
+        // which at the ring is indistinguishable from an idle desktop — the encode loop would repeat
+        // the last frame forever (frozen video + live audio) and `next_frame`'s 20 s bail is
+        // unreachable once anything ever presented. While no fresh frame is arriving, probe the
+        // broker's pinned process handle (rate-limited) and fail the capturer so the session's
+        // rebuild path recreates output + ring against the restarted device.
+        if self.last_fresh.elapsed() > Duration::from_secs(2)
+            && self.last_liveness.elapsed() > Duration::from_secs(1)
+        {
+            self.last_liveness = Instant::now();
+            if !self.broker.driver_alive() {
+                bail!(
+                    "IDD-push: the pf-vdisplay WUDFHost (pid {}) exited mid-session — driver died; \
+                     failing the capturer so the session rebuilds the virtual output",
+                    self.broker.wudf_pid
+                );
+            }
+        }
         let latest = self.latest();
         // `latest` is the proto publish token `(generation << 40) | (seq << 8) | slot`. Reject any publish
         // whose generation isn't our CURRENT ring (a stale old-ring publish racing a recreate, or the 0
@@ -1136,6 +1179,7 @@ impl IddPushCapturer {
         self.last_seq = seq;
         self.last_present = Some((out.clone(), pf));
         self.recovering_since = None; // a fresh frame resumed → recovered
+        self.last_fresh = Instant::now(); // feeds the driver-death watch
         Ok(Some(CapturedFrame {
             width: self.width,
             height: self.height,
