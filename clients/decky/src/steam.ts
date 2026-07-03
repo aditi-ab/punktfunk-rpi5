@@ -8,7 +8,7 @@
 // and start it with RunGame. The wrapper then execs
 // `flatpak run io.unom.Punktfunk --connect <host>` as a reaper descendant.
 
-import { runnerInfo } from "./backend";
+import { runnerInfo, shortcutArt } from "./backend";
 
 // SteamClient is a Steam-internal global injected into the CEF context; it is not fully typed
 // by @decky/ui, so declare the surface we use. Signatures verified against MoonDeck + the
@@ -24,30 +24,75 @@ declare const SteamClient: {
     SetShortcutName(appId: number, name: string): void;
     SetShortcutExe(appId: number, exe: string): void;
     SetShortcutStartDir(appId: number, dir: string): void;
+    SetShortcutIcon(appId: number, iconPath: string): void;
     SetAppLaunchOptions(appId: number, options: string): void;
+    // assetType: 0 = grid (portrait capsule), 1 = hero, 2 = logo, 3 = wide grid.
+    SetCustomArtworkForApp(
+      appId: number,
+      base64Image: string,
+      imageType: string,
+      assetType: number,
+    ): Promise<unknown>;
     RunGame(gameId: string, _unused: string, _i: number, _j: number): void;
     TerminateApp(gameId: string, _b: boolean): void;
   };
 };
 
-// Steam removed `SteamClient.Apps.SetAppHidden`. Hiding a non-Steam shortcut now goes through
-// `collectionStore.SetAppsAsHidden([appId], true)` — but that looks the app up in appStore, which
-// only registers a freshly-created shortcut a moment later (calling it immediately throws on a
-// null overview). So hiding is BEST-EFFORT + DEFERRED and must NEVER block the launch.
+// Steam removed `SteamClient.Apps.SetAppHidden`; visibility goes through
+// `collectionStore.SetAppsAsHidden` — but that looks the app up in appStore, which only
+// registers a freshly-created shortcut a moment later (calling it immediately throws on a
+// null overview). So visibility changes are BEST-EFFORT + DEFERRED, never launch-blocking.
 declare const collectionStore:
   | { SetAppsAsHidden?: (appIds: number[], hidden: boolean) => void }
   | undefined;
 
-function hideShortcut(appId: number): void {
+// The shortcut used to be hidden ("implementation detail"); it is user-visible now — it
+// carries proper artwork and living in the library is how users relaunch their last host.
+// Existing installs still have theirs hidden, so unhide is applied every ensure (idempotent).
+function unhideShortcut(appId: number): void {
   const attempt = () => {
     try {
-      collectionStore?.SetAppsAsHidden?.([appId], true);
+      collectionStore?.SetAppsAsHidden?.([appId], false);
     } catch {
       /* overview not registered yet, or the API changed — cosmetic, ignore */
     }
   };
   attempt(); // succeeds immediately for an already-registered (reused) shortcut
   setTimeout(attempt, 2500); // fresh shortcut: retry once its app overview lands
+}
+
+// Bump when the shipped artwork changes so existing shortcuts re-apply it once.
+const ART_VERSION = 1;
+const ART_KEY = "punktfunk:shortcutArt";
+
+/**
+ * Apply the plugin's grid/hero/logo/icon to the shortcut (idempotent, once per ART_VERSION).
+ * Cosmetic and fully best-effort: any failure is swallowed and retried on the next launch.
+ */
+async function applyArtwork(appId: number): Promise<void> {
+  try {
+    if (localStorage.getItem(ART_KEY) === `${appId}:${ART_VERSION}`) {
+      return;
+    }
+    const art = await shortcutArt();
+    const assets: [string | undefined, number][] = [
+      [art.grid, 0],
+      [art.hero, 1],
+      [art.logo, 2],
+      [art.gridwide, 3],
+    ];
+    for (const [data, assetType] of assets) {
+      if (data) {
+        await SteamClient.Apps.SetCustomArtworkForApp(appId, data, "png", assetType);
+      }
+    }
+    if (art.icon_path) {
+      SteamClient.Apps.SetShortcutIcon(appId, art.icon_path);
+    }
+    localStorage.setItem(ART_KEY, `${appId}:${ART_VERSION}`);
+  } catch (e) {
+    console.warn("punktfunk: shortcut artwork not applied", e);
+  }
 }
 
 // The shortcut name is user-visible (Steam overlay + library while streaming) — brand-case it.
@@ -87,10 +132,11 @@ function recallAppId(): number | null {
 }
 
 /**
- * Ensure exactly one hidden "Punktfunk" shortcut exists (exe = /bin/sh; the wrapper script is
- * appended per-launch via the launch options), and return its appId + the current runner path.
- * Reuses the remembered shortcut, re-pointing it each time — the plugin dir can change across
- * reinstalls, and pre-0.4 shortcuts pointed at the script directly and relied on its exec bit.
+ * Ensure exactly one "Punktfunk" shortcut exists (exe = /bin/sh; the wrapper script is
+ * appended per-launch via the launch options), branded and visible in the library, and
+ * return its appId + the current runner path. Reuses the remembered shortcut, re-pointing
+ * it each time — the plugin dir can change across reinstalls, pre-0.4 shortcuts pointed at
+ * the script directly, and pre-0.7 shortcuts were hidden and artless.
  */
 async function ensureShortcut(): Promise<{ appId: number; runner: string }> {
   const info = await runnerInfo();
@@ -105,14 +151,15 @@ async function ensureShortcut(): Promise<{ appId: number; runner: string }> {
     SteamClient.Apps.SetShortcutExe(remembered, SHELL);
     SteamClient.Apps.SetShortcutStartDir(remembered, startDir);
     SteamClient.Apps.SetShortcutName(remembered, SHORTCUT_NAME);
+    unhideShortcut(remembered); // pre-0.7 installs hid it
+    void applyArtwork(remembered); // fire-and-forget — cosmetic, never blocks the launch
     return { appId: remembered, runner: info.runner };
   }
 
   const appId = await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, "");
   SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
-  // Hide it from the library — it's an implementation detail, launched programmatically.
-  // Best-effort + deferred (see hideShortcut); never let it block the launch.
-  hideShortcut(appId);
+  unhideShortcut(appId);
+  void applyArtwork(appId); // fire-and-forget — cosmetic, never blocks the launch
   rememberAppId(appId);
   return { appId, runner: info.runner };
 }

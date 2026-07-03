@@ -34,10 +34,11 @@ flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
 flatpak run io.unom.Punktfunk
 ```
 
-Updates, from then on:
+Updates, from then on — **without `sudo`** (this is a `--user` install; `sudo flatpak update` only
+touches the *system* scope and silently skips it):
 
 ```sh
-flatpak update                       # or: flatpak update io.unom.Punktfunk
+flatpak update                       # or: flatpak update --user io.unom.Punktfunk
 ```
 
 Prefer your native package manager? The client also ships as real packages (add the repo once —

@@ -2,7 +2,7 @@
 import { toaster } from "@decky/api";
 import { Navigation } from "@decky/ui";
 import { useCallback, useEffect, useState } from "react";
-import { checkUpdate, discover, Host, UpdateInfo } from "./backend";
+import { checkUpdate, discover, Host, updateClient, UpdateInfo } from "./backend";
 import { launchStream } from "./steam";
 
 export const DOCS_URL = "https://docs.punktfunk.unom.io/docs/steam-deck";
@@ -77,6 +77,11 @@ export function useUpdate() {
   return { info, checking, check };
 }
 
+/** True when EITHER the plugin or the flatpak client has a pending update. */
+export function hasUpdate(info: UpdateInfo | null | undefined): boolean {
+  return !!info && (info.update_available || info.client_update_available);
+}
+
 /** The explicit "Check for updates" action — always ends in a toast so the tap has feedback. */
 export async function checkForUpdatesNow(
   check: (force: boolean) => Promise<UpdateInfo | null>,
@@ -85,44 +90,80 @@ export async function checkForUpdatesNow(
   let body: string;
   if (!res || res.error === "fetch-failed") {
     body = "Couldn’t reach the update server — are you online?";
+  } else if (hasUpdate(res)) {
+    const parts: string[] = [];
+    if (res.update_available) parts.push(`plugin v${res.current} → v${res.latest}`);
+    if (res.client_update_available) parts.push("client");
+    body = `Update available: ${parts.join(" + ")}.`;
   } else if (res.error === "update-channel-unknown") {
-    body = "Development build — update checks are disabled.";
-  } else if (res.update_available) {
-    body = `Update available: v${res.current} → v${res.latest}.`;
+    body = "Development build — plugin updates are disabled; the client is up to date.";
   } else {
-    body = `You’re up to date (v${res.current}).`;
+    body = `You’re up to date (plugin v${res.current}).`;
   }
   toaster.toast({ title: "Punktfunk", body });
 }
 
-export async function applyUpdate(info: UpdateInfo): Promise<void> {
-  try {
-    const backend = window.DeckyBackend;
-    if (backend?.callable) {
-      // Fire-and-forget: the loader reinstalls + reloads THIS plugin, tearing the panel down
-      // before any result could arrive — so never await it. Decky shows its own confirm prompt.
-      void backend.callable("utilities/install_plugin")(
-        info.artifact,
-        "punktfunk",
-        info.latest,
-        info.hash,
-        INSTALL_TYPE_UPDATE,
-      );
+/**
+ * Apply whichever updates are pending. The flatpak CLIENT is updated first (a user-scope
+ * `flatpak update`, awaited); then, if the PLUGIN itself has an update, Decky's install RPC
+ * reinstalls it — which reloads the plugin and tears this panel down, so it goes last and is
+ * fire-and-forget. `check` (when passed) refreshes the panel state after a client-only update so
+ * the "Update available" button clears.
+ */
+export async function applyUpdate(
+  info: UpdateInfo,
+  check?: (force: boolean) => Promise<UpdateInfo | null>,
+): Promise<void> {
+  if (info.client_update_available) {
+    toaster.toast({ title: "Punktfunk", body: "Updating the client…" });
+    try {
+      const r = await updateClient();
       toaster.toast({
         title: "Punktfunk",
-        // Decky's installer also phones the plugin store first, which can hang on some
-        // networks before the actual install proceeds — set expectations.
-        body: `Updating to v${info.latest} — confirm Decky’s prompt. This can take a couple of minutes.`,
+        body: !r.ok
+          ? `Client update failed${r.error ? ` (${r.error})` : ""}.`
+          : r.updated
+            ? "Client updated to the latest version."
+            : "Client is already up to date.",
       });
-      return;
+    } catch {
+      toaster.toast({ title: "Punktfunk", body: "Client update failed." });
     }
-  } catch {
-    // fall through to the manual path
   }
-  toaster.toast({
-    title: "Punktfunk",
-    body: "Update from Decky → Developer → Install Plugin from URL.",
-  });
+
+  if (info.update_available) {
+    try {
+      const backend = window.DeckyBackend;
+      if (backend?.callable) {
+        // Fire-and-forget: the loader reinstalls + reloads THIS plugin, tearing the panel down
+        // before any result could arrive — so never await it. Decky shows its own confirm prompt.
+        void backend.callable("utilities/install_plugin")(
+          info.artifact,
+          "punktfunk",
+          info.latest,
+          info.hash,
+          INSTALL_TYPE_UPDATE,
+        );
+        toaster.toast({
+          title: "Punktfunk",
+          // Decky's installer also phones the plugin store first, which can hang on some
+          // networks before the actual install proceeds — set expectations.
+          body: `Updating the plugin to v${info.latest} — confirm Decky’s prompt. This can take a couple of minutes.`,
+        });
+        return;
+      }
+    } catch {
+      // fall through to the manual path
+    }
+    toaster.toast({
+      title: "Punktfunk",
+      body: "Update the plugin from Decky → Developer → Install Plugin from URL.",
+    });
+    return;
+  }
+
+  // Client-only update (no plugin reinstall): refresh so the button clears.
+  if (check) void check(true);
 }
 
 // ----------------------------------------------------------------------------------------

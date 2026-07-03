@@ -38,13 +38,29 @@ export interface StreamSettings {
 }
 
 export interface UpdateInfo {
-  current: string; // installed version (package.json)
-  latest: string; // newest version in our registry for this channel
+  current: string; // installed PLUGIN version (package.json)
+  latest: string; // newest plugin version in our registry for this channel
   artifact: string; // immutable zip URL Decky should install
   hash: string; // sha256 of that zip (Decky verifies it)
   channel: string; // "latest" (stable) | "canary"
-  update_available: boolean;
+  update_available: boolean; // a newer PLUGIN build is available
+  // The flatpak CLIENT (io.unom.Punktfunk) versions independently and is a per-user install, so
+  // `sudo flatpak update` never touches it — the plugin offers a user-scope update instead.
+  client_update_available: boolean;
+  client_current: string; // installed client commit (short) — informational
+  client_latest: string; // remote client commit (short) — informational
   error?: string; // "update-channel-unknown" (dev build) | "fetch-failed"
+}
+
+// Steam-shortcut artwork (assets/ in the plugin dir): base64 PNGs keyed grid / gridwide /
+// hero / logo, plus the icon's absolute path (SetShortcutIcon wants a file). Keys for
+// missing files are absent.
+export interface ShortcutArt {
+  grid?: string;
+  gridwide?: string;
+  hero?: string;
+  logo?: string;
+  icon_path: string;
 }
 
 export const discover = callable<[], Host[]>("discover");
@@ -53,9 +69,15 @@ export const pair = callable<
   PairResult
 >("pair");
 export const runnerInfo = callable<[], RunnerInfo>("runner_info");
+export const shortcutArt = callable<[], ShortcutArt>("shortcut_art");
 export const getSettings = callable<[], StreamSettings>("get_settings");
 export const setSettings = callable<[settings: StreamSettings], { ok: boolean }>(
   "set_settings",
 );
 export const killStream = callable<[], { ok: boolean }>("kill_stream");
 export const checkUpdate = callable<[force: boolean], UpdateInfo>("check_update");
+// Update the flatpak client in the user installation (`flatpak update --user -y io.unom.Punktfunk`).
+export const updateClient = callable<
+  [],
+  { ok: boolean; updated: boolean; error?: string }
+>("update_client");

@@ -62,28 +62,38 @@ page (host list + stream settings).
 - **Pair** — for a locked host, [arm pairing on the host](/docs/pairing) (its console or web
   console shows a 4-digit PIN), then enter that PIN on the Deck's keypad. Pairing persists, so the
   next connection is silent.
-- **Stream** — pick a host and the stream launches fullscreen in Gaming Mode (as a hidden Steam
-  shortcut, so gamescope focuses it).
+- **Stream** — pick a host and the stream launches fullscreen in Gaming Mode (as a "Punktfunk"
+  Steam shortcut, so gamescope focuses it — it shows up in your library with its own artwork, and
+  relaunching it from there streams to the last host).
 - **Settings** — resolution, refresh, bitrate, gamepad type, and mic, written to the client the
-  plugin launches. Leave **Resolution** / **Refresh** on *Native* to get the Deck's own mode.
+  plugin launches. Leave **Resolution** / **Refresh** on *Native* to get the Deck's own mode. With
+  **Gamepad type** on *Automatic* the Deck's built-in controller is forwarded as a **Steam Deck**
+  pad (paddles, both trackpads, gyro) — that needs Steam Input set to **Off** for Punktfunk (game
+  page → ⚙ → Controller Settings), else Steam keeps those controls and only sticks + buttons reach
+  the host.
 
-To **leave a stream**: the in-client controller chord **L1 + R1 + Start + Select**, or close the
-"game" from the Steam overlay. Exiting the client ends the Steam game and drops you back to Gaming
-Mode.
+To **leave a stream**: **hold L1 + R1 + Start + Select** for about two seconds, or close the
+"game" from the Steam overlay. Either ends the session and drops you straight back to Gaming Mode.
 
 ## Updating
 
-The plugin **checks for updates itself** — no Decky store needed. When a newer build is available it
-shows an **Update to vX** button (in the Quick Access Menu panel and on the full page). Tap it,
-confirm Decky's prompt, and the plugin downloads, verifies, replaces itself, and reloads — without
-leaving Gaming Mode.
+The plugin **checks for updates itself** — no Decky store needed. It covers **both** the plugin *and*
+the streaming client (they version independently), so when either has a newer build the panel shows an
+**Update** button (in the Quick Access Menu and on the full page). Tap it: the client updates in
+place, and if the plugin itself changed it downloads, verifies, replaces itself, and reloads — all
+without leaving Gaming Mode.
 
-The check follows the [channel](/docs/channels) you installed from: a plugin installed from the
+The plugin check follows the [channel](/docs/channels) you installed from: a plugin installed from the
 **stable** link tracks stable releases; one installed from the **canary** link tracks `main` builds.
 
-> If the **Update** button never appears (an older Decky Loader, or no network), update manually:
-> Decky → **Developer** → **Install Plugin from URL**, and paste the same channel link again. Decky
-> replaces the installed copy in place.
+> **Updating the client from the terminal?** The client is a **per-user** Flatpak, so run
+> `flatpak update --user io.unom.Punktfunk` — **without `sudo`**. `sudo flatpak update` only touches
+> the *system* installation and silently skips the client. (Un-sudo'd `flatpak update` updates both
+> scopes, so it's the safe default.)
+
+> If the plugin **Update** button never appears (an older Decky Loader, or no network), update the
+> plugin manually: Decky → **Developer** → **Install Plugin from URL**, and paste the same channel
+> link again. Decky replaces the installed copy in place.
 
 ## Troubleshooting
 

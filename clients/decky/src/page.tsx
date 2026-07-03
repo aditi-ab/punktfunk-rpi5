@@ -28,6 +28,7 @@ import {
   DOCS_URL,
   applyUpdate,
   checkForUpdatesNow,
+  hasUpdate,
   startStream,
   useHosts,
   useUpdate,
@@ -50,6 +51,27 @@ const tabScroll: CSSProperties = {
   padding: "0.5em 2.5em",
   paddingBottom: SAFE_BOTTOM,
   boxSizing: "border-box",
+};
+
+// DialogButton stretches to 100% width in the gamepad UI — on a fullscreen row that means a
+// screen-wide button. Size action buttons to their content instead (right-aligned by the
+// Field's children container).
+const actionButton: CSSProperties = {
+  width: "fit-content",
+  minWidth: "6em",
+  flexShrink: 0,
+};
+// Square icon-only button (details ⓘ, header back arrow) — needs an explicit height too, or
+// the zero padding collapses it to the icon's line height.
+const iconButton: CSSProperties = {
+  width: "40px",
+  minWidth: "40px",
+  height: "40px",
+  padding: 0,
+  flexShrink: 0,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
 };
 
 // ----------------------------------------------------------------------------------------
@@ -113,22 +135,22 @@ const HostRow: FC<{ host: Host; onPaired: () => void }> = ({ host, onPaired }) =
       }`}
       childrenContainerWidth="max"
     >
-      <Focusable style={{ display: "flex", gap: "0.5em" }}>
+      <Focusable style={{ display: "flex", gap: "0.5em", justifyContent: "flex-end" }}>
         <DialogButton
-          style={{ width: "3em", minWidth: "3em", padding: 0 }}
+          style={iconButton}
           onClick={() => showModal(<HostDetailsModal host={host} />)}
         >
           <FaInfoCircle />
         </DialogButton>
         {needsPair && (
           <DialogButton
-            style={{ minWidth: "5em" }}
+            style={{ ...actionButton, minWidth: "5em" }}
             onClick={() => showModal(<PairModal host={host} onPaired={onPaired} />)}
           >
             Pair
           </DialogButton>
         )}
-        <DialogButton style={{ minWidth: "6em" }} onClick={() => startStream(host)}>
+        <DialogButton style={actionButton} onClick={() => startStream(host)}>
           <FaPlay style={{ marginRight: "0.4em" }} />
           Stream
         </DialogButton>
@@ -153,7 +175,7 @@ const HostsTab: FC<{
       childrenContainerWidth="max"
       bottomSeparator={hosts.length ? "standard" : "none"}
     >
-      <DialogButton style={{ minWidth: "8em" }} disabled={scanning} onClick={refresh}>
+      <DialogButton style={{ ...actionButton, minWidth: "8em" }} disabled={scanning} onClick={refresh}>
         {scanning ? (
           <Spinner style={{ height: "1em", marginRight: "0.5em" }} />
         ) : (
@@ -212,20 +234,29 @@ const AboutTab: FC<{
       childrenContainerWidth="max"
     >
       <DialogButton
-        style={{ minWidth: "11em" }}
+        style={{ ...actionButton, minWidth: "11em" }}
         disabled={checking}
         onClick={() => void checkForUpdatesNow(check)}
       >
         {checking ? <Spinner style={{ height: "1em" }} /> : "Check for updates"}
       </DialogButton>
     </Field>
-    {update?.update_available && (
+    {hasUpdate(update) && (
       <Field
-        label={`Update available — v${update.latest}`}
+        label={
+          update!.update_available
+            ? `Plugin update — v${update!.latest}${
+                update!.client_update_available ? " + client" : ""
+              }`
+            : "Client update available"
+        }
         description="Installing can take a couple of minutes; Decky reloads the plugin when done"
         childrenContainerWidth="max"
       >
-        <DialogButton style={{ minWidth: "9em" }} onClick={() => applyUpdate(update)}>
+        <DialogButton
+          style={{ ...actionButton, minWidth: "9em" }}
+          onClick={() => applyUpdate(update!, check)}
+        >
           <FaDownload style={{ marginRight: "0.4em" }} />
           Update
         </DialogButton>
@@ -237,7 +268,7 @@ const AboutTab: FC<{
       childrenContainerWidth="max"
     >
       <DialogButton
-        style={{ minWidth: "8em" }}
+        style={{ ...actionButton, minWidth: "8em" }}
         onClick={() => Navigation.NavigateToExternalWeb(DOCS_URL)}
       >
         <FaExternalLinkAlt style={{ marginRight: "0.4em" }} />
@@ -254,7 +285,7 @@ const AboutTab: FC<{
       description="Force-stop the stream client if a session wedges"
       childrenContainerWidth="max"
     >
-      <DialogButton style={{ minWidth: "8em" }} onClick={() => void forceStopStream()}>
+      <DialogButton style={{ ...actionButton, minWidth: "8em" }} onClick={() => void forceStopStream()}>
         Force-stop
       </DialogButton>
     </Field>
@@ -275,6 +306,7 @@ const PunktfunkPage: FC = () => {
         flexDirection: "column",
       }}
     >
+      {/* Header is title + back only — updates live on the About tab (and the QAM banner). */}
       <Focusable
         style={{
           display: "flex",
@@ -285,21 +317,12 @@ const PunktfunkPage: FC = () => {
           flexShrink: 0,
         }}
       >
-        <DialogButton
-          style={{ width: "3em", minWidth: "3em", padding: 0 }}
-          onClick={() => Navigation.NavigateBack()}
-        >
+        <DialogButton style={iconButton} onClick={() => Navigation.NavigateBack()}>
           <FaArrowLeft />
         </DialogButton>
         <div className={staticClasses?.Title} style={{ flex: 1, margin: 0 }}>
           Punktfunk
         </div>
-        {update?.update_available && (
-          <DialogButton style={{ minWidth: "9em" }} onClick={() => applyUpdate(update)}>
-            <FaDownload style={{ marginRight: "0.4em" }} />
-            Update v{update.latest}
-          </DialogButton>
-        )}
       </Focusable>
 
       <div style={{ flex: 1, minHeight: 0 }}>

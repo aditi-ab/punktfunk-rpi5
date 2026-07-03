@@ -17,7 +17,7 @@ the panel looks and feels native to Gaming Mode.
    fingerprint to cross-check against the host's log).
 2. **Pair** — for a host that requires it, a gamepad-navigable PIN keypad runs the SPAKE2 pairing
    ceremony headlessly, then remembers the host so future streams connect silently.
-3. **Stream** — launches fullscreen via a hidden Steam shortcut so gamescope focuses it.
+3. **Stream** — launches fullscreen via a branded "Punktfunk" Steam shortcut so gamescope focuses it.
 4. **Settings** — resolution / refresh / bitrate / gamepad type / host compositor / mic, written
    to the client's config.
 5. **About** — plugin version, an explicit "Check for updates" button, the setup-guide link, and

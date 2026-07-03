@@ -99,10 +99,10 @@ export const SettingsSection: FC = () => {
           onChange={(o) => patch({ gamepad: o.data as string })}
         />
       </Field>
-      {s.gamepad === "steamdeck" && (
+      {(s.gamepad === "steamdeck" || s.gamepad === "auto") && (
         <Field
           label="⚠ Disable Steam Input"
-          description="Steam Deck mode forwards the paddles, both trackpads, and gyro to the host. For that, Steam Input must be OFF for Punktfunk: on the game page tap ⚙ → Controller Settings → set Steam Input to Off. Otherwise Steam keeps the Deck's controls and only the sticks + buttons reach the host."
+          description="On a Deck, Automatic forwards the built-in controller as a Steam Deck pad — paddles, both trackpads, and gyro included. For that, Steam Input must be OFF for Punktfunk: on the game page tap ⚙ → Controller Settings → set Steam Input to Off. Otherwise Steam keeps the Deck's controls and only the sticks + buttons reach the host."
         />
       )}
       <Field

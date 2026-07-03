@@ -14,7 +14,7 @@ import { definePlugin, routerHook } from "@decky/api";
 import { FC } from "react";
 import { FaDownload, FaLock, FaLockOpen, FaSyncAlt, FaTv } from "react-icons/fa";
 import { PluginErrorBoundary } from "./boundary";
-import { applyUpdate, checkForUpdatesNow, startStream, useHosts, useUpdate } from "./hooks";
+import { applyUpdate, checkForUpdatesNow, hasUpdate, startStream, useHosts, useUpdate } from "./hooks";
 import { PunktfunkRoute, ROUTE } from "./page";
 import { PairModal } from "./pair";
 
@@ -27,13 +27,19 @@ const QamPanel: FC = () => {
 
   return (
     <>
-      {update?.update_available && (
+      {hasUpdate(update) && (
         <PanelSection title="Update available">
           <PanelSectionRow>
             <ButtonItem
               layout="below"
-              onClick={() => applyUpdate(update)}
-              label={`v${update.current} → v${update.latest}`}
+              onClick={() => applyUpdate(update!, check)}
+              label={
+                update!.update_available
+                  ? `Plugin v${update!.current} → v${update!.latest}${
+                      update!.client_update_available ? " + client" : ""
+                    }`
+                  : "New client version"
+              }
               description="Installing can take a couple of minutes"
             >
               <FaDownload style={{ marginRight: "0.5em" }} />
