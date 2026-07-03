@@ -392,6 +392,21 @@ fn web_setup(args: &[String]) -> Result<()> {
     register_web_task(&cmd)?;
     // 4. firewall: inbound TCP 47992. The console serves HTTPS (HTTP/1.1 over TLS) with the host's
     //    identity cert. (No UDP/HTTP-3: browsers won't use QUIC against a self-signed/no-SAN cert.)
+    //    Scoped to the same profiles as the streaming ports — Domain + Private by default, Public
+    //    only with `--allow-public-network`. Delete any prior rule first so an upgrade re-scopes it
+    //    instead of stacking a second (possibly all-profiles) rule behind the new one.
+    let fw_profile =
+        crate::service::firewall_profile_arg(crate::service::allow_public_network(args));
+    run_quiet(
+        "netsh",
+        &[
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            "name=punktfunk web console (TCP 47992)",
+        ],
+    );
     if !run_quiet(
         "netsh",
         &[
@@ -404,6 +419,7 @@ fn web_setup(args: &[String]) -> Result<()> {
             "action=allow",
             "protocol=TCP",
             "localport=47992",
+            fw_profile,
         ],
     ) {
         eprintln!("warning: could not add the firewall rule for TCP 47992");

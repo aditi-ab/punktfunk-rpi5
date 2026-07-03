@@ -54,12 +54,21 @@ If you want to stream from outside your home, tunnel in instead of opening up:
 - **Don't** map a router port to the host. A port-forward turns "trusted LAN service" into
   "internet-facing service" with none of the protections that implies.
 
-A note for **portable machines**: the installer opens the streaming ports on the firewall for *all*
-network profiles, including Public. That's convenient at home but means that if you take a laptop host
-onto an untrusted network — a café, a hotel, a conference — other devices on that network can reach the
-ports and attempt to pair. Pairing still protects you (an attacker who doesn't know the PIN can't get
-in), but the safest habit is to stop the host service, or firewall it off, when you're on a network you
-don't control.
+A note on **Windows network profiles**: the installer opens the streaming and console ports only on
+**Private and Domain** networks — the profiles Windows uses for networks you've marked as trusted. On a
+network Windows classifies as **Public** (cafés, hotels, conferences — the default for unknown
+networks), the ports stay **closed**, so a laptop host won't accept connections there. That's the safe
+default, and it's the behavior you want on the move. Two things follow from it:
+
+- **If your home network is *misclassified* as Public, clients won't connect.** Set it to Private
+  (Windows Settings → Network & internet → your network → **Private network**). The host also logs a
+  warning at startup when it detects it's on a Public network, so this doesn't fail silently.
+- **If you have a trusted network that Windows insists on marking Public** (some headless or
+  no-gateway LAN setups), you can opt in during install — the **"Allow connections on Public
+  networks"** checkbox (off by default). Only do this for a network you actually trust.
+
+Either way, pairing is what ultimately gates access — but keeping the host off untrusted networks is
+the first line, and on the move the safest habit is still to stop the service when you don't need it.
 
 ## What actually protects you
 
@@ -109,9 +118,7 @@ We mitigate this deliberately:
   full-system. (This is why punktfunk dropped ViGEmBus.)
 - **Sealed internal channels.** The desktop-frame ring and the gamepad input/output channels are
   passed between the host and its drivers as duplicated handles to unnamed objects, so another local
-  service can't open them by name to read your screen or forge controller input. (Details:
-  [`idd-push-security.md`](https://git.unom.io/unom/punktfunk/src/branch/main/design/idd-push-security.md)
-  and [`gamepad-channel-sealing.md`](https://git.unom.io/unom/punktfunk/src/branch/main/design/gamepad-channel-sealing.md).)
+  service can't open them by name to read your screen or forge controller input.
 - **Secrets are locked down.** The management token, the host identity key, and the console password
   are stored with Administrators/SYSTEM-only permissions.
 
@@ -142,12 +149,20 @@ applies: keep it on a trusted LAN or a VPN, require pairing, and don't expose it
 - **Keep the host updated** — security fixes ship in new builds.
 - **On portable hosts**, stop the service when you're on an untrusted network.
 
-## For the technically curious
+## Reporting a vulnerability
 
-The deeper security design lives in the repository, and it's candid about residual limits:
+Found a security issue? **Email [security@punktfunk.com](mailto:security@punktfunk.com).** Please
+don't open a public issue, pull request, or chat post for a suspected vulnerability — that exposes
+other users before a fix is available.
 
-- [`design/idd-push-security.md`](https://git.unom.io/unom/punktfunk/src/branch/main/design/idd-push-security.md) — the sealed frame channel (why the Windows capture path is isolated), and its honest floor.
-- [`design/gamepad-channel-sealing.md`](https://git.unom.io/unom/punktfunk/src/branch/main/design/gamepad-channel-sealing.md) — the sealed gamepad channel.
-- [`design/security-review-2026-06-28.md`](https://git.unom.io/unom/punktfunk/src/branch/main/design/security-review-2026-06-28.md) and [`design/security-review.md`](https://git.unom.io/unom/punktfunk/src/branch/main/design/security-review.md) — the standing security reviews.
+Helpful things to include:
 
-Found a security issue? Please report it privately rather than opening a public issue.
+- The component and version — e.g. `punktfunk-host 0.6.0`, Windows or Linux, and which client.
+- The impact, and the attacker's position (same LAN, a paired client, a local service account,
+  admin, …).
+- Steps to reproduce, a proof-of-concept, or a crash/log if you have one.
+
+We acknowledge reports within **3 business days** and practice coordinated disclosure — we'll keep
+you posted, agree a disclosure date, and credit you when the fix ships (unless you'd rather stay
+anonymous). The full policy is in
+[`SECURITY.md`](https://git.unom.io/unom/punktfunk/src/branch/main/SECURITY.md).

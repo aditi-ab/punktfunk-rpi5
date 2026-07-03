@@ -146,6 +146,11 @@ Name: "installhdrlayer"; Description: "Install the HDR Vulkan layer (lets Vulkan
 ; in host.env; a hand-customized value is left alone). Checked = the Moonlight-compatible unified
 ; host (the common Windows setup); unchecked = the secure native-only host (punktfunk clients only).
 Name: "gamestream"; Description: "Enable GameStream (Moonlight) compatibility - lets stock Moonlight clients connect (uses legacy plain-HTTP pairing; for trusted LANs)"
+; Firewall scope, forwarded as `--allow-public-network` to `service install` / `web setup`. Unchecked
+; (default) = accept connections on Private + Domain networks only (the trusted-network profiles
+; punktfunk is meant for). Check ONLY for a network you trust that Windows classifies as Public (e.g.
+; some headless / no-gateway LAN setups) - it opens the streaming + console ports on Public too.
+Name: "allowpublicfw"; Description: "Allow connections on Public networks (only for a trusted network Windows marks as Public)"; Flags: unchecked
 Name: "startservice"; Description: "Start the punktfunk host service now (also starts on every boot)"
 ; The per-user status tray (punktfunk-tray.exe): shows running/stopped/failed at a glance and
 ; offers open-console / start / stop / restart without a terminal. HKLM Run = every user who signs
@@ -239,7 +244,7 @@ Filename: "powershell.exe"; \
 ; Register (or re-point, on upgrade - idempotent) the SYSTEM service from its FINAL {app} location:
 ; service install records current_exe() as the SCM binPath, so it must run from {app}, not {tmp}.
 ; --gamestream=on|off carries the wizard's GameStream task choice into host.env's PUNKTFUNK_HOST_CMD.
-Filename: "{app}\punktfunk-host.exe"; Parameters: "service install {code:GamestreamParam}"; WorkingDir: "{app}"; \
+Filename: "{app}\punktfunk-host.exe"; Parameters: "service install {code:GamestreamParam}{code:PublicFwParam}"; WorkingDir: "{app}"; \
   StatusMsg: "Registering the punktfunk host service..."; Flags: runhidden waituntilterminated
 Filename: "{app}\punktfunk-host.exe"; Parameters: "service start"; WorkingDir: "{app}"; \
   StatusMsg: "Starting the punktfunk host service..."; Flags: runhidden waituntilterminated; Tasks: startservice
@@ -247,7 +252,7 @@ Filename: "{app}\punktfunk-host.exe"; Parameters: "service start"; WorkingDir: "
 ; Provision the console AFTER the host service is up (so the mgmt token exists): write the ACL'd
 ; login password, register the PunktfunkWeb scheduled task (boot, SYSTEM, restart-on-failure),
 ; open TCP 47992, and start it. {code:WebSetupParams} appends -PasswordFile only on a fresh install.
-Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParams}"; WorkingDir: "{app}"; \
+Filename: "{app}\punktfunk-host.exe"; Parameters: "web setup {code:WebSetupParams}{code:PublicFwParam}"; WorkingDir: "{app}"; \
   StatusMsg: "Setting up the punktfunk web console..."; Flags: runhidden waituntilterminated
 #endif
 ; Launch the status tray as the SIGNED-IN user (not the elevated install user) right away, so the
@@ -289,6 +294,17 @@ begin
     Result := '--gamestream=on'
   else
     Result := '--gamestream=off';
+end;
+
+{ Firewall scope: the "allowpublicfw" task opens the streaming + console ports on Public networks too
+  (default = Private/Domain only). Forwarded to both `service install` and `web setup`. Returns a
+  LEADING SPACE so it concatenates after the preceding {code:...} param without a gap. }
+function PublicFwParam(Param: String): String;
+begin
+  if WizardIsTaskSelected('allowpublicfw') then
+    Result := ' --allow-public-network'
+  else
+    Result := '';
 end;
 
 #ifdef WithWeb

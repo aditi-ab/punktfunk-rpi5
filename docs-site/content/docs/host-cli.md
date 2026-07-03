@@ -19,8 +19,8 @@ punktfunk-host serve
 Add `--gamestream` (alias `--moonlight`) to **also** run the GameStream/Moonlight-compatible planes
 (nvhttp pairing, RTSP, ENet control, `_nvstream` mDNS) — required for stock [Moonlight](/docs/moonlight)
 clients. This is **opt-in** because GameStream carries inherent on-path weaknesses (pairing over plain
-HTTP; its legacy control encryption can reuse GCM nonces — security-review #5/#9), so enable it **only
-on a trusted LAN**. The native plane is immune to those issues.
+HTTP; its legacy control encryption can reuse GCM nonces), so enable it **only on a trusted LAN**. The
+native plane is immune to those issues.
 
 ```sh
 punktfunk-host serve --gamestream

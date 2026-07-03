@@ -4,8 +4,7 @@ description: "Where the work stands across the core, the host, and the native cl
 ---
 
 A high-level view of where punktfunk stands. The ordered plan of work is on the
-[Roadmap](/docs/roadmap), and milestone-level detail lives in
-[`CLAUDE.md`](https://git.unom.io/unom/punktfunk/src/branch/main/CLAUDE.md).
+[Roadmap](/docs/roadmap).
 
 ## Milestones at a glance
 

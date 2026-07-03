@@ -1,0 +1,9 @@
+# Shown on the "new issue" chooser so security reports go to the private channel, not a public issue.
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://git.unom.io/unom/punktfunk/src/branch/main/SECURITY.md
+    about: >-
+      Found a security issue? Please report it privately by email to security@punktfunk.com — do not
+      open a public issue, so other users aren't exposed before a fix ships. See SECURITY.md for the
+      full policy.

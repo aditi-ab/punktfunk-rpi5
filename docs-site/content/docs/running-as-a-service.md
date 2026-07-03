@@ -8,8 +8,8 @@ always-available host, run it as a service. There are two cases.
 
 > The bundled unit `scripts/punktfunk-host.service` runs `serve --gamestream`, so it serves both the
 > native `punktfunk/1` plane and stock [Moonlight](/docs/moonlight) clients. For a **secure native-only
-> host** (no GameStream — its pairing runs over plain HTTP and its legacy encryption is weaker;
-> security-review #5/#9), drop `--gamestream` from the unit's `ExecStart` and use bare `serve`.
+> host** (no GameStream — its pairing runs over plain HTTP and its legacy encryption is weaker), drop
+> `--gamestream` from the unit's `ExecStart` and use bare `serve`.
 
 ## A. A desktop you log into
 
@@ -101,9 +101,15 @@ registers + starts the service for you (`/VERYSILENT` for unattended). Upgrades 
 handled through Add/Remove Programs.
 
 Prefer the CLI? Run `punktfunk-host service install` from an elevated prompt — see
-[Windows service](https://git.unom.io/unom/punktfunk/src/branch/main/docs/windows-service.md). For
-hardware encode you need a GPU — NVIDIA (NVENC), AMD (AMF), or Intel (QSV); the host falls back to
-software H.264 without one.
+[Windows Host](/docs/windows-host). For hardware encode you need a GPU — NVIDIA (NVENC), AMD (AMF), or
+Intel (QSV); the host falls back to software H.264 without one.
+
+> **Firewall scope.** The installer opens the streaming + console ports on **Private and Domain**
+> networks only — not **Public**. If your LAN is (mis)classified Public, clients won't connect until
+> you set it to Private (Windows Settings → Network), and the host logs a warning when it's on a Public
+> network. For a trusted network Windows insists is Public, tick **"Allow connections on Public
+> networks"** at install (or pass `--allow-public-network` to `service install`). See
+> [Security & Safe Use](/docs/security) for the reasoning.
 
 ## Verifying
 

@@ -15,6 +15,9 @@ your local network.
 💬 **Community: [Discord](https://discord.gg/kaPNvzMuGU)** — chat, support, and **Android beta
 access** · **[r/Punktfunk](https://www.reddit.com/r/Punktfunk/)**.
 
+🔒 **Security:** found a vulnerability? Report it privately to **security@punktfunk.com** — see
+[SECURITY.md](SECURITY.md). Please don't open a public issue.
+
 punktfunk pairs a **virtual-display streaming host** with native clients on every platform. It speaks
 the existing **GameStream** protocol, so any [Moonlight](https://moonlight-stream.org/) client works
 day one — and adds its own faster **`punktfunk/1`** protocol that breaks the ~1 Gbps FEC wall with a
@@ -138,7 +141,6 @@ clients/
 web/                         web console (TanStack) over the management API — status · devices · pairing · GPUs · performance · logs
 packaging/                   apt · rpm / COPR · Arch · Flatpak · Bazzite bootc image
 docs-site/                   public documentation site (Fumadocs) — https://docs.punktfunk.unom.io
-design/                        design notes & deep-dive plans (index: design/README.md)
 include/punktfunk_core.h     cbindgen-generated C header (checked in)
 tools/                       latency-probe · loss-harness (measurement)
 ```
