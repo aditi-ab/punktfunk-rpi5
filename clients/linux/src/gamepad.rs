@@ -114,6 +114,21 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
     }
 }
 
+/// Best-effort "this machine is a Steam Deck". The Gaming-Mode env short-circuits; desktop
+/// mode falls back to DMI (Valve board, Jupiter = LCD / Galileo = OLED — readable inside the
+/// flatpak sandbox). Cached: the answer can't change while we run.
+pub fn is_steam_deck() -> bool {
+    static DECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DECK.get_or_init(|| {
+        if std::env::var_os("SteamDeck").is_some() {
+            return true;
+        }
+        let dmi = |f: &str| std::fs::read_to_string(format!("/sys/class/dmi/id/{f}"));
+        dmi("board_vendor").is_ok_and(|v| v.trim() == "Valve")
+            && dmi("product_name").is_ok_and(|p| matches!(p.trim(), "Jupiter" | "Galileo"))
+    })
+}
+
 enum Ctl {
     Attach(Arc<NativeClient>),
     Detach,
@@ -197,8 +212,19 @@ impl GamepadService {
 
     /// What "Automatic" resolves to right now — the virtual pad matching the physical one
     /// (Swift parity); no pad connected leaves the host's own default.
+    ///
+    /// **Steam Deck special case:** this is read at session start, *before* attach — but the
+    /// Deck's built-in controller is only enumerable with its real 28DE:1205 identity while
+    /// the Valve HIDAPI drivers run, and those are enabled on attach only (see
+    /// [`set_valve_hidapi`]); with Steam Input on, SDL sees nothing but Steam's virtual
+    /// X360 pad anyway. Both cases used to fall through to Xbox 360. On a Deck, a virtual
+    /// pad (or no pad at all) means the physical controller behind it IS the built-in one —
+    /// resolve to the Steam Deck virtual pad so the paddles/trackpads/gyro have somewhere
+    /// to land. A real external controller still wins (it's the one that gets forwarded).
     pub fn auto_pref(&self) -> GamepadPref {
         match self.active() {
+            Some(p) if !p.steam_virtual => p.pref,
+            _ if is_steam_deck() => GamepadPref::SteamDeck,
             Some(p) => p.pref,
             None => GamepadPref::Auto,
         }

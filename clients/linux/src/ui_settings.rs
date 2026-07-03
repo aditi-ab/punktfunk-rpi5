@@ -16,7 +16,14 @@ const RESOLUTIONS: &[(u32, u32)] = &[
 ];
 /// `0` = the monitor's native refresh, resolved at connect.
 const REFRESH: &[u32] = &[0, 30, 60, 90, 120, 144, 165, 240];
-const GAMEPADS: &[&str] = &["auto", "xbox360", "dualsense", "xboxone", "dualshock4"];
+const GAMEPADS: &[&str] = &[
+    "auto",
+    "xbox360",
+    "dualsense",
+    "xboxone",
+    "dualshock4",
+    "steamdeck",
+];
 const COMPOSITORS: &[&str] = &["auto", "kwin", "wlroots", "mutter", "gamescope"];
 /// Codec setting values (persisted) paired with their display labels below.
 const CODECS: &[&str] = &["auto", "hevc", "h264", "av1"];
@@ -403,6 +410,7 @@ pub fn show(
             "DualSense",
             "Xbox One",
             "DualShock 4",
+            "Steam Deck",
         ],
     );
     let inhibit_row = adw::SwitchRow::builder()

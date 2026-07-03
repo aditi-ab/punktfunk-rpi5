@@ -84,6 +84,9 @@ pub struct StreamPageArgs {
     /// reveal-on-notify chrome hiding) may never fire — the title bar would stay drawn
     /// over the stream. Chrome-less by construction cannot regress that way.
     pub chromeless: bool,
+    /// A controller is connected right now — the capture hint mentions the escape chord.
+    /// (Chromeless implies a controller-first device, so the chord shows there regardless.)
+    pub pad_connected: bool,
     pub title: String,
 }
 
@@ -197,9 +200,10 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
         inhibit_shortcuts,
         show_stats,
         chromeless,
+        pad_connected,
         title,
     } = args;
-    let w = build_widgets(&window, &title, chromeless);
+    let w = build_widgets(&window, &title, chromeless, pad_connected);
     w.stats_label.set_visible(show_stats);
 
     let capture = Rc::new(Capture {
@@ -230,7 +234,7 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
         attach_edge_reveal(&w.toolbar, &w.overlay, &window, &capture);
     }
     let active_handler = attach_capture_lifecycle(&w.overlay, &window, &capture);
-    let escape_future = spawn_escape_watch(&window, &capture, escape_rx);
+    let escape_future = spawn_escape_watch(&window, &capture, escape_rx, &w.fs_hint, chromeless);
     let disconnect_future = spawn_disconnect_watch(&window, &capture, &stop, disconnect_rx);
     wire_teardown(
         &w.page,
@@ -254,6 +258,9 @@ struct PageWidgets {
     picture: gtk::Picture,
     stats_label: gtk::Label,
     hint: gtk::Label,
+    /// The transient chord/fullscreen-exit hint — the escape watch re-flashes it in
+    /// chromeless mode.
+    fs_hint: gtk::Label,
     overlay: gtk::Overlay,
     toolbar: adw::ToolbarView,
     page: adw::NavigationPage,
@@ -264,7 +271,12 @@ struct PageWidgets {
 /// The offloaded picture under an overlay (stats HUD, capture hint, fullscreen hint), a
 /// header bar with the fullscreen toggle, and the window's fullscreen behavior.
 /// `chromeless` (Gaming Mode) builds NO header bar at all — see `StreamPageArgs`.
-fn build_widgets(window: &adw::ApplicationWindow, title: &str, chromeless: bool) -> PageWidgets {
+fn build_widgets(
+    window: &adw::ApplicationWindow,
+    title: &str,
+    chromeless: bool,
+    pad_connected: bool,
+) -> PageWidgets {
     let picture = gtk::Picture::new();
     picture.set_content_fit(gtk::ContentFit::Contain);
 
@@ -273,6 +285,22 @@ fn build_widgets(window: &adw::ApplicationWindow, title: &str, chromeless: bool)
     // no-op wrapper. Black letterboxing keeps fullscreen scanout-eligible.
     let offload = gtk::GraphicsOffload::new(Some(&picture));
     offload.set_black_background(true);
+    // Whether the raw video dmabuf may be handed to the compositor as a subsurface.
+    // Under gamescope (chromeless) default OFF: a subsurface makes the COMPOSITOR do the
+    // NV12→RGB conversion, and gamescope's matrix/range choice for it is outside our
+    // control (off-colours reported on the Deck) — GTK compositing it itself applies the
+    // stream's own BT.709-narrow color state. `PUNKTFUNK_OFFLOAD=1|0` overrides either
+    // way, which also makes the colour question bisectable in one run: offload-off heals →
+    // compositor conversion; still off → GTK/Mesa import (then try PUNKTFUNK_DECODER=software).
+    let offload_on = match std::env::var("PUNKTFUNK_OFFLOAD").ok().as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => !chromeless,
+    };
+    if !offload_on {
+        offload.set_enabled(gtk::GraphicsOffloadEnabled::Disabled);
+        tracing::info!("graphics offload disabled — GTK composites the video itself");
+    }
 
     let stats_label = gtk::Label::new(None);
     stats_label.add_css_class("osd");
@@ -282,9 +310,16 @@ fn build_widgets(window: &adw::ApplicationWindow, title: &str, chromeless: bool)
     stats_label.set_margin_start(12);
     stats_label.set_margin_top(12);
 
-    let hint = gtk::Label::new(Some(
-        "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats",
-    ));
+    // The capture hint speaks the input devices actually present: on a controller-first
+    // device (chromeless) or with a pad connected it must surface the chord — keyboard-only
+    // text on a Deck told the user nothing they could press.
+    let hint = gtk::Label::new(Some(if chromeless {
+        "Tap the stream to capture input · hold L1 + R1 + Start + Select to leave"
+    } else if pad_connected {
+        "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+D disconnects · hold L1 + R1 + Start + Select to leave"
+    } else {
+        "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats"
+    }));
     hint.add_css_class("osd");
     hint.set_halign(gtk::Align::Center);
     hint.set_valign(gtk::Align::End);
@@ -296,7 +331,7 @@ fn build_widgets(window: &adw::ApplicationWindow, title: &str, chromeless: bool)
     // devices; the L1+R1+Start+Select chord on a controller). Gaming Mode has no F11,
     // no header to reveal, and Steam owns window management — only the chord applies.
     let fs_hint = gtk::Label::new(Some(if chromeless {
-        "L1 + R1 + Start + Select  —  leave the stream (hold to disconnect)"
+        "Hold L1 + R1 + Start + Select  —  leave the stream"
     } else {
         "F11  ·  mouse to the top edge  ·  L1 + R1 + Start + Select  —  exit fullscreen (hold to disconnect)"
     }));
@@ -372,6 +407,7 @@ fn build_widgets(window: &adw::ApplicationWindow, title: &str, chromeless: bool)
         picture,
         stats_label,
         hint,
+        fs_hint,
         overlay,
         toolbar,
         page,
@@ -461,11 +497,15 @@ impl ColorStateCache {
             });
         }
         let state = cicp.build_color_state().ok();
-        if state.is_none() {
-            tracing::warn!(
+        // One line per signaling change — the on-glass colour bisect reads this to tell
+        // "state applied" from "GDK fell back to its YUV default (BT.601)".
+        match &state {
+            Some(_) => tracing::info!(?desc, rgb, "colour signaling → GDK color state"),
+            None => tracing::warn!(
                 ?desc,
-                "GDK can't represent this colour signaling — using default"
-            );
+                rgb,
+                "GDK can't represent this colour signaling — using default (YUV: BT.601)"
+            ),
         }
         self.0 = Some((desc, state.clone()));
         state
@@ -772,20 +812,30 @@ fn attach_capture_lifecycle(
 
 /// Controller escape chord (gamepad service) → leave fullscreen + release capture. The
 /// chord is the only fullscreen exit a controller has (no F11 key; fullscreen hides the
-/// chrome). Aborted on page-hidden so a stale future can't act on the shared window.
+/// chrome). In chromeless mode there is nothing visible to release INTO — a quick press
+/// re-flashes the hold-to-leave hint instead, so an experimenting user learns the hold.
+/// Aborted on page-hidden so a stale future can't act on the shared window.
 fn spawn_escape_watch(
     window: &adw::ApplicationWindow,
     capture: &Rc<Capture>,
     escape_rx: async_channel::Receiver<()>,
+    fs_hint: &gtk::Label,
+    chromeless: bool,
 ) -> glib::JoinHandle<()> {
     let window = window.clone();
     let cap = capture.clone();
+    let fs_hint = fs_hint.clone();
     glib::spawn_future_local(async move {
         while escape_rx.recv().await.is_ok() {
             if window.is_fullscreen() {
                 window.unfullscreen();
             }
             cap.release();
+            if chromeless {
+                fs_hint.set_visible(true);
+                let fs_hint = fs_hint.clone();
+                glib::timeout_add_seconds_local_once(4, move || fs_hint.set_visible(false));
+            }
         }
     })
 }

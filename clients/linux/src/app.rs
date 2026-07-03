@@ -30,6 +30,10 @@ const CSS: &str = "
 .pf-poster { border-radius: 10px; background: alpha(currentColor, 0.08); }
 .pf-poster-monogram { font-size: 2.4em; font-weight: bold; color: alpha(currentColor, 0.45); }
 .pf-store-badge { color: white; background: rgba(0, 0, 0, 0.55); }
+/* Gaming-Mode launches: gamescope displays the window fullscreen but never ACKs the
+   xdg_toplevel fullscreen state, so GTK keeps the floating-CSD styling — libadwaita's
+   rounded corners + shadow margin stay visible over the stream. Flatten them outright. */
+window.pf-chromeless { border-radius: 0; box-shadow: none; }
 ";
 
 pub struct App {
@@ -44,6 +48,10 @@ pub struct App {
     pub busy: std::cell::Cell<bool>,
     /// Steam Deck / Gaming-Mode launch: fullscreen the window (chrome-less) when a stream starts.
     pub fullscreen: bool,
+    /// Quit when the session ends (Gaming-Mode `--connect` launch): the app IS the stream —
+    /// exiting ends the Steam "game" so the Deck returns to Gaming Mode instead of stranding
+    /// the user on the client's own hosts page.
+    pub quit_on_session_end: bool,
     /// The hosts page handle (banner + per-card connecting spinner), set right after the
     /// page is built — `None` only during construction.
     pub hosts: RefCell<Option<Rc<HostsUi>>>,
@@ -116,6 +124,14 @@ fn build_ui(gtk_app: &adw::Application) {
         .content(&toasts)
         .build();
 
+    let fullscreen = crate::cli::fullscreen_mode();
+    if fullscreen {
+        // Chrome-less shell: no CSD rounding/shadow (see CSS — gamescope never ACKs the
+        // fullscreen state, so GTK would keep them), and ask for fullscreen up front.
+        window.add_css_class("pf-chromeless");
+        window.fullscreen();
+    }
+
     let app = Rc::new(App {
         window: window.clone(),
         nav: nav.clone(),
@@ -124,7 +140,8 @@ fn build_ui(gtk_app: &adw::Application) {
         identity,
         gamepad: crate::gamepad::GamepadService::start(),
         busy: std::cell::Cell::new(false),
-        fullscreen: crate::cli::fullscreen_mode(),
+        fullscreen,
+        quit_on_session_end: fullscreen && crate::cli::cli_connect_request().is_some(),
         hosts: RefCell::new(None),
     });
 

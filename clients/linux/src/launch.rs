@@ -266,6 +266,9 @@ impl SessionUi {
             inhibit_shortcuts: self.inhibit,
             show_stats: self.show_stats,
             chromeless: self.app.fullscreen,
+            // The attach just went out, so a Deck's built-in pad may not have enumerated
+            // yet — chromeless (controller-first) shows the chord hint regardless.
+            pad_connected: self.app.gamepad.active().is_some(),
             title,
         });
         self.app.nav.push(&p.page);
@@ -311,6 +314,16 @@ impl SessionUi {
     fn on_ended(&mut self, err: Option<String>) {
         self.close_waiting();
         self.app.gamepad.detach();
+        // Gaming-Mode `--connect` launch: the app IS the stream. Quit so Steam ends the
+        // "game" and the Deck returns to Gaming Mode — popping to our own hosts page would
+        // strand the user in a fullscreen shell with no way back.
+        if self.app.quit_on_session_end {
+            if let Some(e) = err {
+                tracing::warn!(error = %e, "session ended");
+            }
+            self.app.window.close();
+            return;
+        }
         self.app.nav.pop_to_tag("hosts");
         if let Some(h) = self.app.hosts_ui() {
             h.set_connecting(None);
