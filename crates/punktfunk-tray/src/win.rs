@@ -8,7 +8,7 @@
 //! left admin-gated rather than DACL-opened to every local user.
 
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{w, PCWSTR};
@@ -73,8 +73,9 @@ struct App {
     taskbar_created: u32,
     /// `punktfunk-host.exe` next to this exe (the installer lays both in `{app}`).
     host_exe: Option<std::path::PathBuf>,
-    /// The installer bundled the web console (detected via `{app}\web\web-run.cmd`).
-    web_console: bool,
+    /// The console answered the poller's live loopback probe — the "Open web console" entry is
+    /// shown iff opening it would actually work (repo-run consoles included, stopped ones not).
+    web_console: AtomicBool,
     web_port: u16,
 }
 
@@ -125,16 +126,10 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let exe_dir = std::env::current_exe()
+    let host_exe = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let host_exe = exe_dir
-        .as_ref()
-        .map(|d| d.join("punktfunk-host.exe"))
+        .and_then(|p| p.parent().map(|d| d.join("punktfunk-host.exe")))
         .filter(|p| p.exists());
-    let web_console = exe_dir
-        .as_ref()
-        .is_some_and(|d| d.join("web").join("web-run.cmd").exists());
 
     // SAFETY: RegisterWindowMessageW with a static nul-terminated literal.
     let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
@@ -144,7 +139,7 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
         poller: OnceLock::new(),
         taskbar_created,
         host_exe,
-        web_console,
+        web_console: AtomicBool::new(false), // live-probed by the poller within its first cycle
         web_port: args.web_port,
     })
     .ok()
@@ -200,8 +195,10 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
     let poller = Poller::spawn(
         args.mgmt_addr.clone(),
         args.mgmt_port,
-        Box::new(move |st| {
+        args.web_port,
+        Box::new(move |st, console_up| {
             *app().status.lock().unwrap() = st;
+            app().web_console.store(console_up, Ordering::SeqCst);
             let hwnd = HWND(app().hwnd.load(Ordering::SeqCst) as *mut _);
             // SAFETY: PostMessageW is documented thread-safe; a stale/destroyed hwnd fails
             // harmlessly with an error we ignore.
@@ -308,7 +305,7 @@ fn show_menu(hwnd: HWND) {
         };
         add(IDM_HEADER, &status.headline(), true);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        if app().web_console {
+        if app().web_console.load(Ordering::SeqCst) {
             add(IDM_OPEN_WEB, "Open web console", false);
             let _ = SetMenuDefaultItem(menu, IDM_OPEN_WEB as u32, 0);
             if status.pairing_attention() {
@@ -418,7 +415,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             match (lparam.0 as u32) & 0xffff {
                 WM_CONTEXTMENU => show_menu(hwnd),
                 x if x == NIN_SELECT || x == NIN_KEYSELECT => {
-                    if app.web_console {
+                    if app.web_console.load(Ordering::SeqCst) {
                         open_web_console(hwnd);
                     } else {
                         show_menu(hwnd);

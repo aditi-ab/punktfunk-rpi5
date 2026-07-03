@@ -118,11 +118,15 @@ struct Shared {
 }
 
 impl Poller {
-    /// Spawn the poll thread; `on_change` fires (from that thread) whenever the status changes.
+    /// Spawn the poll thread; `on_change(status, console_up)` fires (from that thread) whenever
+    /// either changes. `console_up` is a live loopback probe of the web console on `web_port` —
+    /// ground truth for the "Open web console" menu entry (a layout sniff would miss consoles run
+    /// from a repo checkout, and shows a dead entry while an installed console is still starting).
     pub fn spawn(
         mgmt_addr: String,
         mgmt_port: u16,
-        on_change: Box<dyn Fn(TrayStatus) + Send>,
+        web_port: u16,
+        on_change: Box<dyn Fn(TrayStatus, bool) + Send>,
     ) -> Poller {
         let shared = Arc::new(Shared {
             poked: Mutex::new(false),
@@ -131,7 +135,7 @@ impl Poller {
         let thread_shared = shared.clone();
         std::thread::Builder::new()
             .name("status-poll".into())
-            .spawn(move || poll_loop(&thread_shared, &mgmt_addr, mgmt_port, on_change))
+            .spawn(move || poll_loop(&thread_shared, &mgmt_addr, mgmt_port, web_port, on_change))
             .expect("spawn status-poll thread");
         Poller { shared }
     }
@@ -147,7 +151,8 @@ fn poll_loop(
     shared: &Shared,
     mgmt_addr: &str,
     mgmt_port: u16,
-    on_change: Box<dyn Fn(TrayStatus) + Send>,
+    web_port: u16,
+    on_change: Box<dyn Fn(TrayStatus, bool) + Send>,
 ) {
     // IPv6 literals bracketed, like the Linux client's `base_url`.
     let url = if mgmt_addr.contains(':') {
@@ -155,8 +160,9 @@ fn poll_loop(
     } else {
         format!("https://{mgmt_addr}:{mgmt_port}/api/v1/local/summary")
     };
+    let console_url = format!("https://127.0.0.1:{web_port}/");
     let agent = agent(load_pin());
-    let mut last: Option<TrayStatus> = None;
+    let mut last: Option<(TrayStatus, bool)> = None;
     // When the summary became unreachable while the service was running (grace anchor).
     // Runs for the process lifetime (the tray exits by process exit; nothing to unwind).
     let mut unreachable_since: Option<Instant> = None;
@@ -176,12 +182,13 @@ fn poll_loop(
         };
         let grace_expired = unreachable_since.is_some_and(|t| t.elapsed() >= START_GRACE);
         let status = map_status(&svc, summary, grace_expired);
-        if last.as_ref() != Some(&status) {
-            on_change(status.clone());
-            last = Some(status);
+        let console_up = probe_console(&agent, &console_url);
+        if last.as_ref() != Some(&(status.clone(), console_up)) {
+            on_change(status.clone(), console_up);
+            last = Some((status, console_up));
         }
         // 3 s while there is anything to watch; back off when the box just doesn't run a host.
-        let cadence = match last {
+        let cadence = match last.as_ref().map(|(s, _)| s) {
             Some(TrayStatus::Stopped) | Some(TrayStatus::NotInstalled) => Duration::from_secs(10),
             _ => Duration::from_secs(3),
         };
@@ -190,6 +197,16 @@ fn poll_loop(
             (poked, _) = shared.cv.wait_timeout(poked, cadence).unwrap();
         }
         *poked = false;
+    }
+}
+
+/// Is the web console answering on loopback? Any HTTP response (incl. the login redirect / 401)
+/// counts as up — only a transport failure (nothing listening, TLS handshake dead) means down.
+fn probe_console(agent: &ureq::Agent, url: &str) -> bool {
+    match agent.get(url).call() {
+        Ok(_) => true,
+        Err(ureq::Error::Status(..)) => true,
+        Err(_) => false,
     }
 }
 

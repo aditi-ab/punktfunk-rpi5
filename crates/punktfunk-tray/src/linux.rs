@@ -10,11 +10,13 @@ use std::sync::{Arc, OnceLock};
 
 use crate::status::{self, Poller, TrayStatus};
 
-/// The tray's D-Bus/menu model. `status` is the only mutable state; the poller rewrites it via
-/// `Handle::update`, which re-emits the SNI properties (icon, tooltip, menu).
+/// The tray's D-Bus/menu model. `status` + `web_console` are the mutable state; the poller
+/// rewrites them via `Handle::update`, which re-emits the SNI properties (icon, tooltip, menu).
 struct HostTray {
     status: TrayStatus,
     web_port: u16,
+    /// The console answered the poller's live loopback probe — the "Open web console" entry is
+    /// shown iff opening it would actually work (repo-run consoles included, stopped ones not).
     web_console: bool,
     /// Filled right after `spawn` (the poller needs the tray handle first) — lets menu actions
     /// force an immediate re-poll instead of waiting out the cadence.
@@ -192,28 +194,6 @@ fn host_present() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// The web console is a separate optional unit/package — only offer "Open web console" when it
-/// exists for this user.
-fn web_console_installed() -> bool {
-    let unit = "punktfunk-web.service";
-    if ["/usr/lib/systemd/user", "/etc/systemd/user"]
-        .iter()
-        .any(|d| std::path::Path::new(d).join(unit).exists())
-    {
-        return true;
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        if std::path::PathBuf::from(home)
-            .join(".config/systemd/user")
-            .join(unit)
-            .exists()
-        {
-            return true;
-        }
-    }
-    false
-}
-
 /// One tray per session: `flock` on a runtime-dir lockfile (held for the process lifetime).
 fn acquire_instance_lock() -> Option<std::fs::File> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
@@ -247,7 +227,7 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
     let tray = HostTray {
         status: TrayStatus::Stopped, // placeholder; the poller fires within its first cycle
         web_port: args.web_port,
-        web_console: web_console_installed(),
+        web_console: false, // live-probed by the poller within its first cycle
         poller: poller_slot.clone(),
     };
     // Autostart races the desktop (the watcher may register after us) → be lenient and wait for
@@ -271,11 +251,13 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
     let poller = Poller::spawn(
         args.mgmt_addr.clone(),
         args.mgmt_port,
-        Box::new(move |st| {
-            if update_handle
-                .update(|t: &mut HostTray| t.status = st)
-                .is_none()
-            {
+        args.web_port,
+        Box::new(move |st, console_up| {
+            let updated = update_handle.update(|t: &mut HostTray| {
+                t.status = st;
+                t.web_console = console_up;
+            });
+            if updated.is_none() {
                 dead_flag.store(true, Ordering::SeqCst); // tray service shut down
             }
         }),
