@@ -112,7 +112,9 @@ SetupIconFile={#BrandingDir}\punktfunk.ico
 WizardImageFile={#BrandingDir}\wizard-image-*.bmp
 WizardSmallImageFile={#BrandingDir}\wizard-small-*.bmp
 UninstallDisplayName=punktfunk host {#MyAppVersion}
-; The branded multi-size .ico (installed below) - the host exe embeds no icon resource.
+; The branded multi-size .ico (installed below). The host exe now embeds the same icon + a
+; "Punktfunk Host" FileDescription (build.rs winresource) for Task Manager/Explorer; the file
+; copy stays as the uninstall-entry icon.
 UninstallDisplayIcon={app}\punktfunk.ico
 
 [Languages]

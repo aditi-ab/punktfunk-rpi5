@@ -57,7 +57,7 @@ use windows::Win32::System::Threading::{
 
 /// SCM service name (the key under HKLM\SYSTEM\CurrentControlSet\Services). Stable identity.
 const SERVICE_NAME: &str = "PunktfunkHost";
-const SERVICE_DISPLAY: &str = "punktfunk streaming host";
+const SERVICE_DISPLAY: &str = "Punktfunk Host";
 const SERVICE_DESCRIPTION: &str =
     "Low-latency desktop/game streaming host. Launches the punktfunk host into the active session.";
 
@@ -301,6 +301,10 @@ fn run_service() -> Result<()> {
         .set_service_status(running.clone())
         .context("set RUNNING")?;
     tracing::info!("punktfunk service started — supervising host in the active console session");
+
+    // Best-effort: warn if this network is Public (streaming ports are firewalled off there unless
+    // the operator opted in). Own thread — a slow `Get-NetConnectionProfile` never delays the host.
+    std::thread::spawn(warn_if_public_network);
 
     load_host_env();
     let result = supervise(stop, session);
@@ -683,7 +687,14 @@ fn install(args: &[String]) -> Result<()> {
     if let Some(on) = gamestream {
         apply_gamestream_choice(on);
     }
-    add_firewall_rules();
+    // Firewall scope: Domain + Private by default; `--allow-public-network` opts into Public too.
+    // Persist the choice (so the startup warning respects an opt-in) and re-scope idempotently —
+    // remove any prior rules first so an upgrade tightens the scope instead of leaving a stale
+    // all-profiles rule behind the new one.
+    let allow_public = allow_public_network(args);
+    set_fw_public_marker(allow_public);
+    remove_firewall_rules();
+    add_firewall_rules(allow_public);
 
     println!(
         "\nInstalled. Config: {}\nLogs:   {}\n\nStart now with:  punktfunk-host service start",
@@ -839,8 +850,28 @@ fn apply_gamestream_choice(enable: bool) {
 
 // ── firewall + sc helpers ────────────────────────────────────────────────────────────────────────
 
+/// The `netsh` `profile=` scope for punktfunk's inbound rules. Default = **Domain + Private** — the
+/// trusted-network profiles punktfunk is meant to run on; `allow_public` widens it to **all profiles
+/// including Public** (untrusted networks like café/hotel Wi-Fi — opt-in only). Shared with the
+/// web-console rule in `install.rs` so both surfaces scope the same way.
+pub(crate) fn firewall_profile_arg(allow_public: bool) -> &'static str {
+    if allow_public {
+        "profile=any"
+    } else {
+        "profile=domain,private"
+    }
+}
+
+/// The `--allow-public-network` install opt-in (the installer's "Allow connections on Public
+/// networks" task forwards it). Absent = the secure default (Domain + Private only).
+pub(crate) fn allow_public_network(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--allow-public-network")
+}
+
 /// Inbound firewall rules for the streaming ports (best-effort; logs but never fails the install).
-fn add_firewall_rules() {
+/// Scoped by [`firewall_profile_arg`]: Domain + Private by default, all profiles when `allow_public`.
+fn add_firewall_rules(allow_public: bool) {
+    let profile = firewall_profile_arg(allow_public);
     // (name suffix, protocol, ports)
     let rules = [
         ("TCP", "TCP", "47984,47989,48010,47990"),
@@ -860,13 +891,21 @@ fn add_firewall_rules() {
                 "action=allow",
                 &format!("protocol={proto}"),
                 &format!("localport={ports}"),
+                profile,
             ],
         );
         if ok {
-            println!("Firewall rule added: {name} ({ports})");
+            println!("Firewall rule added: {name} ({ports}) [{profile}]");
         } else {
             eprintln!("warning: could not add firewall rule '{name}' (add it manually if needed)");
         }
+    }
+    if !allow_public {
+        println!(
+            "Note: streaming ports are open on Private/Domain networks only. On a network Windows \
+             classifies as Public, clients won't connect — set that network to Private, or reinstall \
+             with the 'Allow connections on Public networks' option."
+        );
     }
 }
 
@@ -882,6 +921,62 @@ fn remove_firewall_rules() {
                 "rule",
                 &format!("name={name}"),
             ],
+        );
+    }
+}
+
+/// Marker file recording that the operator opted into opening the firewall on **Public** networks
+/// (`--allow-public-network`). Its presence suppresses the startup Public-network warning (they made
+/// an informed choice); absence = the secure default.
+fn fw_public_marker() -> std::path::PathBuf {
+    crate::gamestream::config_dir().join("fw-allow-public")
+}
+
+/// Record (or clear) the Public-firewall opt-in marker to match this install's choice.
+fn set_fw_public_marker(allow_public: bool) {
+    let path = fw_public_marker();
+    if allow_public {
+        let _ = std::fs::write(&path, b"1\n");
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Best-effort: is any active network connection classified **Public** by Windows? Uses
+/// `Get-NetConnectionProfile` (per-interface category: Public / Private / DomainAuthenticated).
+/// `None` when it can't be determined — the caller then skips the warning.
+fn active_network_is_public() -> Option<bool> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-NetConnectionProfile).NetworkCategory",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    Some(s.lines().any(|l| l.trim().eq_ignore_ascii_case("Public")))
+}
+
+/// One-shot startup diagnostic: if the operator did NOT opt into Public networks and this machine's
+/// current network is classified Public, the streaming ports are firewalled off there — turn that
+/// silent "clients can't connect" into an actionable WARN. Best-effort; meant to run on its own
+/// thread so it never delays the host launch.
+fn warn_if_public_network() {
+    if fw_public_marker().exists() {
+        return; // operator opted into Public — their informed choice, no warning
+    }
+    if active_network_is_public() == Some(true) {
+        tracing::warn!(
+            "this machine's current network is classified Public (an untrusted-network profile), so \
+             punktfunk's streaming ports are firewalled off here and clients on this network can't \
+             reach the host. Fix: set the network to Private (Windows Settings > Network > \
+             properties) — or, only for a network you trust, reinstall with the 'Allow connections \
+             on Public networks' option."
         );
     }
 }

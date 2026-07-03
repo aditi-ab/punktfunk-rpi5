@@ -22,6 +22,9 @@ fn main() {
             println!("cargo:rerun-if-changed={path}");
             res.set_icon_with_id(path, id);
         }
+        // Task Manager / Explorer identity (matches the host's "Punktfunk Host").
+        res.set("FileDescription", "Punktfunk Tray");
+        res.set("ProductName", "Punktfunk");
         res.compile().expect("embed windows icon resources");
     }
 }
