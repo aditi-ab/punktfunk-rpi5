@@ -31,3 +31,6 @@ xcuserdata/
 # Python bytecode (e.g. clients/android/ci tooling)
 __pycache__/
 *.pyc
+
+# Claude Code project instructions — local to each dev box, not part of the repo.
+CLAUDE.md
