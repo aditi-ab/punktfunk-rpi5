@@ -19,10 +19,11 @@
 //! returns `false` and the pump reopens (re-planning, so endpoint churn re-resolves). Before this
 //! existed, the first device change silently killed mic passthrough for the rest of the host's life.
 //!
-//! `push` enqueues decoded interleaved-f32 PCM into a bounded ring (drop-oldest beyond ~80 ms so mic
-//! latency stays bounded); a dedicated COM-apartment thread renders it event-driven, filling silence
-//! when the client isn't talking. WASAPI objects are `!Send`, so they live entirely on that thread
-//! (mirrors `WasapiLoopbackCapturer`).
+//! `push` enqueues decoded interleaved-f32 PCM into a bounded ring (drop-oldest beyond ~120 ms so
+//! mic latency stays bounded); a dedicated COM-apartment thread renders it event-driven through an
+//! adaptive jitter buffer (prime → hold → re-prime, see the render loop — clients arrive in bursts,
+//! the device pulls per-period), filling silence when the client isn't talking. WASAPI objects are
+//! `!Send`, so they live entirely on that thread (mirrors `WasapiLoopbackCapturer`).
 
 // Every `unsafe` block in this file carries a `// SAFETY:` proof; enforce it.
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -40,8 +41,17 @@ use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
 const CHANNELS: u32 = 2;
 /// 48 kHz stereo f32: 2 channels * 4 bytes.
 const BLOCK_ALIGN: usize = 2 * 4;
-/// Bound the inject queue at ~80 ms so the passed-through mic stays low-latency (drop oldest beyond).
-const MAX_QUEUE_BYTES: usize = (SAMPLE_RATE as usize * 80 / 1000) * BLOCK_ALIGN;
+/// Jitter-buffer priming depth (~48 ms): the render loop emits pure silence until this much PCM
+/// is queued, then plays from the cushion. Clients deliver mic audio in BURSTS (the Mac client's
+/// input tap yields ~two 20 ms Opus packets every ~42 ms) while WASAPI pulls a small block every
+/// device period (~10 ms) — with no cushion the queue sits near-empty and most periods insert
+/// mid-stream silence: the "crackling mic" (heard live, Mac → Windows host 2026-07-03; the Linux
+/// backend's process callback primes the same way and the identical stream was clean there). The
+/// depth must cover the worst inter-burst gap (~42 ms), so ~48 ms with re-prime on a full drain.
+const PRIME_BYTES: usize = (SAMPLE_RATE as usize * 48 / 1000) * BLOCK_ALIGN;
+/// Bound the inject queue at ~120 ms so the passed-through mic stays low-latency (drop oldest
+/// beyond): the priming cushion (~48 ms) plus arrival-burst headroom.
+const MAX_QUEUE_BYTES: usize = (SAMPLE_RATE as usize * 120 / 1000) * BLOCK_ALIGN;
 
 pub struct WasapiVirtualMic {
     queue: Arc<Mutex<VecDeque<u8>>>,
@@ -299,7 +309,17 @@ fn render_thread(
 
     // Any error below (endpoint invalidated/removed, engine restart) propagates out of the loop,
     // ending the thread — the `alive` flag flips in the spawn wrapper and the pump reopens.
+    //
+    // Adaptive jitter buffer (mirrors the Linux backend's process callback): clients push mic
+    // audio in bursts on their own clock while the device pulls a block every period from an
+    // independent clock, so a greedy per-period drain leaves the queue near-empty and pads most
+    // periods with mid-stream silence — audible as constant crackling. Instead: emit silence
+    // until [`PRIME_BYTES`] is buffered, then play from the cushion (zero-filling only a
+    // momentary shortfall), and re-prime only after a genuine FULL drain (the client went quiet —
+    // between talk spurts the cushion rebuilds, and [`VirtualMic::discard`] resets it across
+    // session gaps).
     let mut buf: Vec<u8> = Vec::new();
+    let mut primed = false;
     while !stop.load(Ordering::Relaxed) {
         // The device signals when it wants more data; finite timeout keeps `stop` responsive.
         if h_event.wait_for_event(100).is_err() {
@@ -315,13 +335,21 @@ fn render_thread(
         if buf.len() < need {
             buf.resize(need, 0);
         }
-        // Silence base; overwrite with queued mic PCM (zero-pad the tail when the client is quiet).
+        // Silence base; overwrite with queued mic PCM once the cushion is primed.
         buf[..need].fill(0);
         {
             let mut q = queue.lock().unwrap();
-            let n = q.len().min(need);
-            for (i, b) in q.drain(..n).enumerate() {
-                buf[i] = b;
+            if !primed && q.len() >= PRIME_BYTES {
+                primed = true;
+            }
+            if primed {
+                let n = q.len().min(need);
+                for (i, b) in q.drain(..n).enumerate() {
+                    buf[i] = b;
+                }
+                if q.is_empty() {
+                    primed = false; // fully drained — re-prime before producing again
+                }
             }
         }
         render_client

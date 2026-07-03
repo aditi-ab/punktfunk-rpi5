@@ -61,8 +61,12 @@ struct SettingsView: View {
     #if os(macOS)
     @AppStorage(DefaultsKey.speakerUID) var speakerUID = ""
     @AppStorage(DefaultsKey.micUID) var micUID = ""
+    @AppStorage(DefaultsKey.micChannel) var micChannel = 0
     @State var outputDevices: [AudioDevice] = []
     @State var inputDevices: [AudioDevice] = []
+    // Input channels of the selected mic — drives the "Microphone channel" picker, which only
+    // appears for a multi-channel interface (>1). 0 until the Audio tab loads it.
+    @State var micChannelCount = 0
     #endif
 
     #if os(iOS)
@@ -115,6 +119,12 @@ struct SettingsView: View {
             .onAppear {
                 outputDevices = AudioDevices.outputs()
                 inputDevices = AudioDevices.inputs()
+                micChannelCount = AudioDevices.inputChannelCount(forUID: micUID)
+            }
+            .onChange(of: micUID) { _, newUID in
+                // A different mic → different channel count; drop a now-out-of-range pin to Auto.
+                micChannelCount = AudioDevices.inputChannelCount(forUID: newUID)
+                if micChannel > micChannelCount { micChannel = 0 }
             }
             .tabItem { Label("Audio", systemImage: "speaker.wave.2") }
 
