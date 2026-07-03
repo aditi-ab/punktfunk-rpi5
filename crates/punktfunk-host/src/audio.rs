@@ -128,6 +128,10 @@ struct PumpTuning {
     /// An uplink gap longer than this discards the backend's buffered audio before pushing the
     /// next frame (a recorder must never hear a stale burst from before a mute/session end).
     stale_gap: std::time::Duration,
+    /// A backend that dies before living this long counts as a FAILED open for backoff purposes
+    /// (an open that succeeds but dies instantly — e.g. a flapping daemon — must not churn at
+    /// heartbeat rate); one that lived longer resets the backoff.
+    stable_after: std::time::Duration,
 }
 
 const PUMP_TUNING: PumpTuning = PumpTuning {
@@ -135,6 +139,7 @@ const PUMP_TUNING: PumpTuning = PumpTuning {
     backoff_cap: std::time::Duration::from_secs(60),
     heartbeat: std::time::Duration::from_secs(1),
     stale_gap: std::time::Duration::from_millis(600),
+    stable_after: std::time::Duration::from_secs(5),
 };
 
 /// Host-lifetime virtual-microphone pump: one thread owns the [`VirtualMic`] backend + an Opus
@@ -188,6 +193,26 @@ impl MicPump {
     }
 }
 
+/// Sleep for `dur` while draining (and dropping) queued frames, so a closed/reopening backend
+/// never accumulates a stale backlog and senders never see a wedged queue. Returns `false` when
+/// every sender is gone (host shutdown).
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+fn drain_sleep(rx: &std::sync::mpsc::Receiver<Vec<u8>>, dur: std::time::Duration) -> bool {
+    use std::sync::mpsc::RecvTimeoutError;
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        match rx.recv_timeout(left.min(std::time::Duration::from_millis(250))) {
+            Ok(_) => {}                                          // drop frames while closed
+            Err(RecvTimeoutError::Timeout) => {}                 // keep waiting
+            Err(RecvTimeoutError::Disconnected) => return false, // host shutdown
+        }
+    }
+}
+
 /// The pump loop. `opener` is injected so the tests can run the REAL loop against a mock
 /// backend; production passes [`open_virtual_mic`].
 #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
@@ -200,9 +225,8 @@ where
 
     let mut backoff = tuning.backoff_start;
     let mut open_fails: u64 = 0;
-    'reopen: loop {
-        // Open phase — eager, from thread start. While closed, keep draining the queue so a
-        // reopen never replays a backlog of stale frames (and senders never see a wedged queue).
+    loop {
+        // Open phase — eager, from thread start.
         let (mic, mut decoder) = loop {
             let opened = opener().and_then(|m| {
                 let d = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo)
@@ -219,28 +243,20 @@ where
                         tracing::warn!(error = %format!("{e:#}"), attempts = open_fails,
                             "virtual mic unavailable — retrying with backoff");
                     }
-                    let deadline = Instant::now() + backoff;
-                    loop {
-                        let left = deadline.saturating_duration_since(Instant::now());
-                        if left.is_zero() {
-                            break;
-                        }
-                        match rx.recv_timeout(left.min(std::time::Duration::from_millis(250))) {
-                            Ok(_) => {}                                    // drop frames while closed
-                            Err(RecvTimeoutError::Timeout) => {}           // keep waiting
-                            Err(RecvTimeoutError::Disconnected) => return, // host shutdown
-                        }
+                    if !drain_sleep(&rx, backoff) {
+                        return;
                     }
                     backoff = (backoff * 2).min(tuning.backoff_cap);
                 }
             }
         };
-        backoff = tuning.backoff_start;
-        open_fails = 0;
         tracing::info!("virtual mic ready (host-lifetime)");
-        // Drop anything queued while (re)opening — it predates the backend.
+        // Drop anything queued while (re)opening — it predates the backend. (The backoff does
+        // NOT reset here: only an instance that proves stable resets it — see the death triage.)
         while rx.try_recv().is_ok() {}
+        let opened_at = Instant::now();
 
+        // Pump phase — runs until the backend dies (break) or the host shuts down (return).
         let mut decode_fails: u64 = 0;
         let mut pcm = vec![0f32; 5760 * MIC_CHANNELS as usize]; // up to 120 ms scratch
         let mut last_push = Instant::now();
@@ -258,7 +274,7 @@ where
                             let total = (samples_per_ch * MIC_CHANNELS as usize).min(pcm.len());
                             if !mic.push(&pcm[..total]) {
                                 tracing::warn!("virtual mic backend died — reopening");
-                                continue 'reopen;
+                                break;
                             }
                             last_push = Instant::now();
                             decode_fails = 0;
@@ -277,7 +293,7 @@ where
                 Err(RecvTimeoutError::Timeout) => {
                     if !mic.alive() {
                         tracing::warn!("virtual mic backend died while idle — reopening");
-                        continue 'reopen;
+                        break;
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -285,6 +301,21 @@ where
                     return;
                 }
             }
+        }
+
+        // Death triage: an instance that lived is a one-off (PipeWire/audio-engine restart) —
+        // reopen immediately with the backoff reset. One that died right after opening is a
+        // failed open in disguise (flapping daemon, endpoint racing away): back off like the
+        // open loop, or the pump would churn open→die→reopen at heartbeat rate.
+        if opened_at.elapsed() >= tuning.stable_after {
+            backoff = tuning.backoff_start;
+            open_fails = 0;
+        } else {
+            open_fails += 1;
+            if !drain_sleep(&rx, backoff) {
+                return;
+            }
+            backoff = (backoff * 2).min(tuning.backoff_cap);
         }
     }
 }
@@ -343,8 +374,10 @@ mod pump_tests {
     }
 
     /// Run the REAL pump loop against mock backends; `fail_first` opens fail before the first
-    /// success (exercises the eager retry/backoff path).
-    fn start(fail_first: usize) -> Harness {
+    /// success (exercises the eager retry/backoff path). `dead_on_arrival` opens every instance
+    /// pre-killed (exercises the rapid-death churn guard). `stable_after` mirrors the tuning
+    /// field (ZERO = every death counts as stable → immediate reopen, keeping tests fast).
+    fn start_tuned(fail_first: usize, dead_on_arrival: bool, stable_after: Duration) -> Harness {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(MIC_QUEUE_CAP);
         let opens = Arc::new(AtomicUsize::new(0));
         let alive = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
@@ -361,6 +394,7 @@ mod pump_tests {
             backoff_cap: Duration::from_millis(40),
             heartbeat: Duration::from_millis(20),
             stale_gap: Duration::from_millis(80),
+            stable_after,
         };
         let join = std::thread::spawn(move || {
             pump_thread(
@@ -370,7 +404,7 @@ mod pump_tests {
                     if n < fail_first {
                         anyhow::bail!("backend not up yet (simulated)");
                     }
-                    let a = Arc::new(AtomicBool::new(true));
+                    let a = Arc::new(AtomicBool::new(!dead_on_arrival));
                     *alive2.lock().unwrap() = Some(a.clone());
                     Ok(Box::new(MockMic {
                         alive: a,
@@ -389,6 +423,10 @@ mod pump_tests {
             discards,
             join,
         }
+    }
+
+    fn start(fail_first: usize) -> Harness {
+        start_tuned(fail_first, false, Duration::ZERO)
     }
 
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
@@ -467,6 +505,26 @@ mod pump_tests {
         wait_until("reopen", || h.opens.load(Ordering::SeqCst) >= 2);
         h.tx.send(opus_frame()).unwrap();
         wait_until("pcm after reopen", || h.pushed.load(Ordering::SeqCst) > 0);
+        drop(h.tx);
+        h.join.join().unwrap();
+    }
+
+    /// Instances that die immediately after opening must be retried with BACKOFF, not at
+    /// heartbeat rate — a flapping backend (daemon up but dropping us instantly) would
+    /// otherwise churn open→die→reopen every heartbeat forever.
+    #[test]
+    fn rapid_death_backs_off() {
+        // Every instance is dead on arrival; stability threshold high so each death counts
+        // as a failed open. Without the guard: ~1 reopen per heartbeat (20 ms) ≈ 25 opens in
+        // 500 ms. With backoff 10→20→40 (cap): ≈ 7.
+        let h = start_tuned(0, true, Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(500));
+        let opens = h.opens.load(Ordering::SeqCst);
+        assert!(opens >= 2, "must keep retrying (got {opens})");
+        assert!(
+            opens <= 15,
+            "must back off, not churn per heartbeat (got {opens})"
+        );
         drop(h.tx);
         h.join.join().unwrap();
     }
