@@ -55,6 +55,9 @@ use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
     PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
+};
 
 // The frame-transport contract — `SharedHeader` layout, `MAGIC`/`VERSION`/`RING_LEN`, the
 // `DRV_STATUS_*` codes and the channel-delivery struct — lives in `pf_driver_proto`; both sides
@@ -185,6 +188,36 @@ impl Drop for KeyedMutexGuard<'_> {
         unsafe {
             let _ = self.mutex.ReleaseSync(self.key);
         }
+    }
+}
+
+/// Nudge DWM into composing the virtual display: two net-zero 1 px relative mouse moves via
+/// `SendInput`. DWM presents a display only when something DIRTIES it — an idle desktop never does,
+/// so a freshly-attached ring (session open, or a mid-session ring recreate) can sit at E_PENDING
+/// with no first frame even though everything is healthy. pf-vdisplay implements no hardware-cursor
+/// plane, so a cursor move is composited into the frame — a guaranteed real present onto the IDD
+/// swap-chain (empirically what `punktfunk-probe --input-test` always relied on). Net-zero: the
+/// pointer ends exactly where it started; the 1 px round trip is imperceptible, and each event still
+/// dirties the cursor layer. Best-effort — injection can be unavailable on the secure desktop, where
+/// a fresh compose just happened anyway.
+fn kick_dwm_compose() {
+    let mk = |dx: i32| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    // SAFETY: plain FFI; the input slice is valid, fully-initialized local data for this synchronous
+    // call, and `cbsize` is the true element size.
+    unsafe {
+        let _ = SendInput(&[mk(1), mk(-1)], std::mem::size_of::<INPUT>() as i32);
     }
 }
 
@@ -460,6 +493,8 @@ pub struct IddPushCapturer {
     last_fresh: Instant,
     /// Rate-limits the WUDFHost liveness probe (one 0 ms wait per second, and only while stale).
     last_liveness: Instant,
+    /// Rate-limits the mid-session [`kick_dwm_compose`] nudge (recovery window only).
+    last_kick: Instant,
     /// Host-owned ROTATING output ring NVENC encodes (one YUV texture per slot). Rotating it per frame
     /// is the precondition for pipelining the encode loop: while NVENC encodes frame N's texture on the
     /// ASIC, frame N+1's convert writes a DIFFERENT texture — the two overlap. Format = `out_format()`:
@@ -778,6 +813,7 @@ impl IddPushCapturer {
                 recovering_since: None,
                 last_fresh: Instant::now(),
                 last_liveness: Instant::now(),
+                last_kick: Instant::now(),
                 out_ring: Vec::new(),
                 out_idx: 0,
                 video_conv: None,
@@ -810,6 +846,12 @@ impl IddPushCapturer {
     /// so this does not false-fail a normal (even idle) open; no frame within the window = genuinely broken.
     fn wait_for_attach(&self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(4);
+        // Compose-kick schedule: DWM only presents a display something DIRTIED, so on an idle
+        // desktop a perfectly healthy attach sees no first frame (E_PENDING forever) and this gate
+        // used to fail the session — the "idle desktop → no frames" gotcha (a real client escaped
+        // it only because its own input soon dirtied the desktop; a headless probe never did).
+        // Give the natural post-activate compose a moment, then nudge.
+        let mut next_kick = Instant::now() + Duration::from_millis(600);
         loop {
             // SAFETY: `self.header` points into the live shared-header mapping this capturer owns (sized
             // `>= size_of::<SharedHeader>()`, page-aligned), so the field read is in-bounds + aligned, and
@@ -831,10 +873,15 @@ impl IddPushCapturer {
             if st == DRV_STATUS_OPENED && frame::FrameToken::unpack(self.latest()).seq != 0 {
                 return Ok(());
             }
+            if Instant::now() >= next_kick {
+                kick_dwm_compose();
+                next_kick = Instant::now() + Duration::from_millis(800);
+            }
             if Instant::now() > deadline {
                 bail!(
-                    "IDD-push: driver_status={st} but no frame published within 4s — the virtual display \
-                     is likely in a format/size the ring can't match (fullscreen game?); falling back"
+                    "IDD-push: driver_status={st} but no frame published within 4s (despite compose \
+                     kicks) — the virtual display is likely in a format/size the ring can't match \
+                     (fullscreen game?); falling back"
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1097,6 +1144,16 @@ impl IddPushCapturer {
                     "IDD-push: display descriptor changed and the ring could not recover within 3s — \
                      dropping the session so the client reconnects"
                 );
+            }
+            // Same idle-desktop stall as the open-time attach gate: after a mid-session ring
+            // recreate (HDR flip / mode change) an idle desktop composes nothing, so the fresh ring
+            // never sees a frame and the 3 s recover-or-drop above kills a healthy session. Nudge
+            // DWM (rate-limited) once the natural post-recreate compose has had its chance.
+            if since.elapsed() > Duration::from_millis(600)
+                && self.last_kick.elapsed() > Duration::from_millis(800)
+            {
+                self.last_kick = Instant::now();
+                kick_dwm_compose();
             }
         }
         // Driver-death watch (the SDR path has no other signal): a dead WUDFHost stops publishing,
