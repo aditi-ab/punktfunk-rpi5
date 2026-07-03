@@ -208,6 +208,17 @@ extension SettingsView {
                 }
             }
             .disabled(!micEnabled)
+            // Multi-channel interfaces only: the mic sits on ONE discrete input, so let the user
+            // pick it. Auto sums every channel (a lone hot mic still passes at full level).
+            if micChannelCount > 1 {
+                Picker("Microphone channel", selection: $micChannel) {
+                    Text("Auto (all channels)").tag(0)
+                    ForEach(1...micChannelCount, id: \.self) { ch in
+                        Text("Channel \(ch)").tag(ch)
+                    }
+                }
+                .disabled(!micEnabled)
+            }
             #endif
         } header: {
             Text("Audio")

@@ -24,6 +24,12 @@ public enum DefaultsKey {
     public static let micEnabled = "punktfunk.micEnabled"
     public static let speakerUID = "punktfunk.speakerUID"
     public static let micUID = "punktfunk.micUID"
+    /// macOS: which input channel of the chosen mic device feeds the host. 0 = "Auto" (sum every
+    /// channel to mono — a mic on a single input of a multi-channel interface passes at full
+    /// level); n≥1 pins 1-based input channel n. Multi-channel interfaces expose the mic on ONE
+    /// discrete channel, and the default N→stereo downmix grabs channels 0/1 (silence when the mic
+    /// is higher up), so we fold to mono ourselves. Only meaningful for multi-channel devices.
+    public static let micChannel = "punktfunk.micChannel"
     public static let presenter = "punktfunk.presenter"
     /// Request a 10-bit BT.2020 PQ (HDR10) stream. On by default; only takes effect when the host
     /// has HDR content AND this display supports HDR — otherwise the stream stays 8-bit SDR.

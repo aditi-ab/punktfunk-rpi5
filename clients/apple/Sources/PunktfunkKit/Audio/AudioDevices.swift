@@ -33,6 +33,49 @@ public enum AudioDevices {
         }
     }
 
+    /// Input channel count of the mic the picker would use — the device with this UID, or the
+    /// system default input when `uid` is empty. 0 when it can't be resolved. Drives the
+    /// "Microphone channel" picker (only shown for multi-channel interfaces).
+    public static func inputChannelCount(forUID uid: String) -> Int {
+        let id = uid.isEmpty ? defaultInputDevice() : deviceID(forUID: uid)
+        guard let id else { return 0 }
+        return channelCount(id, scope: kAudioObjectPropertyScopeInput)
+    }
+
+    private static func defaultInputDevice() -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var dev = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &dev) == noErr,
+            dev != 0
+        else { return nil }
+        return dev
+    }
+
+    /// Sum of channels across the device's streams in `scope` (its total input/output channels).
+    private static func channelCount(
+        _ id: AudioDeviceID, scope: AudioObjectPropertyScope
+    ) -> Int {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size) == noErr, size > 0
+        else { return 0 }
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, raw) == noErr else { return 0 }
+        let abl = UnsafeMutableAudioBufferListPointer(
+            raw.assumingMemoryBound(to: AudioBufferList.self))
+        return abl.reduce(0) { $0 + Int($1.mNumberChannels) }
+    }
+
     private static func all() -> [AudioDeviceID] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
@@ -62,7 +105,8 @@ public enum AudioDevices {
         return AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size) == noErr && size > 0
     }
 
-    private static func describe(_ id: AudioDeviceID) -> AudioDevice? {
+    /// UID + human name for a live AudioDeviceID (nil if either property is unreadable).
+    static func describe(_ id: AudioDeviceID) -> AudioDevice? {
         guard let uid = stringProperty(id, kAudioDevicePropertyDeviceUID),
               let name = stringProperty(id, kAudioObjectPropertyName)
         else { return nil }

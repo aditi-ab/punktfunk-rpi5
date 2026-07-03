@@ -5,9 +5,10 @@
 //   AVAudioSourceNode pulls from the ring (silence on underrun with re-priming, so a
 //   network gap costs one dip, not permanent crackle).
 //
-//   mic → host: a second AVAudioEngine taps the input device, resamples to 48 kHz
-//   stereo, slices 20 ms chunks, Opus-encodes, and sendMic()s each packet — the host
-//   feeds them into a virtual PipeWire source.
+//   mic → host: a second AVAudioEngine taps the input device, folds it to one mono bus (the
+//   chosen channel of a multi-channel interface, or a sum of all channels), resamples to 48 kHz
+//   stereo, slices 20 ms chunks, Opus-encodes, and sendMic()s each packet — the host feeds them
+//   into a virtual PipeWire source.
 //
 // Devices are chosen by UID ("" = system default: the engine is then never pinned to a
 // concrete device and follows default-device changes). Two engines, not one — a single
@@ -68,10 +69,11 @@ public final class SessionAudio {
     /// ASYNCHRONOUS: it activates the AVAudioSession off the main thread, then starts the engines on
     /// a later main-queue hop (gated by `!flag.isStopped`) — so playback is live shortly after, not
     /// on return. The mic may start later still if the permission prompt is pending.
-    public func start(speakerUID: String, micUID: String, micEnabled: Bool) {
+    public func start(speakerUID: String, micUID: String, micChannel: Int, micEnabled: Bool) {
         #if os(macOS)
         // No AVAudioSession on macOS — start the engines directly (caller's thread, as before).
-        startEngines(speakerUID: speakerUID, micUID: micUID, micEnabled: micEnabled)
+        startEngines(
+            speakerUID: speakerUID, micUID: micUID, micChannel: micChannel, micEnabled: micEnabled)
         #else
         // Configure + activate the session OFF the main thread (it blocks on the audio server),
         // then start the engines back on the main thread once it's active — engine routing/format
@@ -81,7 +83,9 @@ public final class SessionAudio {
             self.activateAudioSession(micEnabled: micEnabled)
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.flag.isStopped else { return }
-                self.startEngines(speakerUID: speakerUID, micUID: micUID, micEnabled: micEnabled)
+                self.startEngines(
+                    speakerUID: speakerUID, micUID: micUID, micChannel: micChannel,
+                    micEnabled: micEnabled)
             }
         }
         #endif
@@ -115,7 +119,9 @@ public final class SessionAudio {
 
     /// Build + start the playback engine (and the mic uplink when enabled + authorized). Main
     /// thread (engine setup); on iOS/tvOS the session is already active by the time this runs.
-    private func startEngines(speakerUID: String, micUID: String, micEnabled: Bool) {
+    private func startEngines(
+        speakerUID: String, micUID: String, micChannel: Int, micEnabled: Bool
+    ) {
         startPlayback(speakerUID: speakerUID)
         #if os(tvOS)
         // No app-accessible microphone input on tvOS — playback only.
@@ -123,12 +129,12 @@ public final class SessionAudio {
         guard micEnabled else { return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
-            startCapture(micUID: micUID)
+            startCapture(micUID: micUID, micChannel: micChannel)
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
                 DispatchQueue.main.async {
                     guard let self, granted, !self.flag.isStopped else { return }
-                    self.startCapture(micUID: micUID)
+                    self.startCapture(micUID: micUID, micChannel: micChannel)
                 }
             }
         default:
@@ -280,7 +286,7 @@ public final class SessionAudio {
     // MARK: - Mic (mic → host)
 
     #if !os(tvOS)
-    private func startCapture(micUID: String) {
+    private func startCapture(micUID: String, micChannel: Int) {
         let engine = AVAudioEngine()
         let input = engine.inputNode
         #if os(macOS)
@@ -300,8 +306,63 @@ public final class SessionAudio {
             log.error("no usable input device — mic uplink disabled")
             return
         }
-        guard let encoder = try? OpusEncoder(),
-              let resampler = AVAudioConverter(from: inFormat, to: encoder.pcmFormat),
+
+        // Multi-channel-interface handling. A pro interface exposes N discrete inputs with the mic
+        // on ONE of them, but AVAudioConverter's N→stereo downmix takes channels 0/1 — dead
+        // silence when the mic sits higher up (the classic "host receives zeros"). So we fold the
+        // input to a single mono bus OURSELVES and resample that. micChannel: 0 = Auto (sum every
+        // channel — a lone hot mic passes at full level), n≥1 pins 1-based input channel n.
+        let inChannels = Int(inFormat.channelCount)
+        let pinnedChannel: Int? = {
+            guard micChannel >= 1 else { return nil }
+            let idx = micChannel - 1
+            guard idx < inChannels else {
+                log.warning(
+                    "mic channel \(micChannel) out of range (device has \(inChannels)) — mixing all")
+                return nil
+            }
+            return idx
+        }()
+        let channelPlan = pinnedChannel.map { "channel \($0 + 1)/\(inChannels)" }
+            ?? (inChannels > 1 ? "mix \(inChannels)ch→mono" : "mono")
+
+        // Name the device we're ACTUALLY recording from + its format + how we fold it, once per
+        // session. This single line localizes the whole class of "host receives silence" failures
+        // that otherwise need a host-side tone injection to pin down: a UID that silently fell back
+        // to the default, the wrong device being live, or the wrong channel picked.
+        #if os(macOS)
+        if let unit = input.audioUnit, let live = Self.currentDevice(of: unit),
+           let dev = AudioDevices.describe(live) {
+            if !micUID.isEmpty, dev.uid != micUID {
+                log.warning("""
+                    mic selection not honored — requested \(micUID) but capturing from \
+                    \(dev.name) [\(dev.uid)]; the device's UID likely changed (replug) — \
+                    reselect it in Settings
+                    """)
+            }
+            log.info("""
+                mic capture: \(dev.name) [\(dev.uid)] — \(Int(inFormat.sampleRate)) Hz, \
+                \(inChannels) ch, \(channelPlan)
+                """)
+        } else {
+            log.info("""
+                mic capture: <device unavailable> — \(Int(inFormat.sampleRate)) Hz, \
+                \(inChannels) ch, \(channelPlan)
+                """)
+        }
+        #else
+        log.info(
+            "mic capture: \(Int(inFormat.sampleRate)) Hz, \(inChannels) ch, \(channelPlan)")
+        #endif
+
+        // Encode a single mono bus (folded from `inFormat` in the tap): the resampler goes
+        // mono@inputSR → the encoder's 48 kHz stereo, so it handles both the rate change and the
+        // mono→stereo duplication, and the wrong-channel downmix never happens.
+        guard let monoFormat = AVAudioFormat(
+                  commonFormat: .pcmFormatFloat32, sampleRate: inFormat.sampleRate,
+                  channels: 1, interleaved: false),
+              let encoder = try? OpusEncoder(),
+              let resampler = AVAudioConverter(from: monoFormat, to: encoder.pcmFormat),
               let chunk = AVAudioPCMBuffer(
                   pcmFormat: encoder.pcmFormat, frameCapacity: OpusEncoder.framesPerPacket)
         else {
@@ -317,11 +378,59 @@ public final class SessionAudio {
         let connection = connection
         let flag = flag
 
+        // Silence tripwire (tap-confined): a "recording" app can be handed pure digital zeros —
+        // a zeroed input-volume slider, a stale TCC grant, a muted device, OR the wrong channel
+        // picked — and everything downstream looks alive while the host gets silence. Track the
+        // peak of the EXTRACTED mono bus over the first ~10 s (not the raw device — a mic present
+        // on a channel we didn't grab must still read as silence) and emit exactly ONE verdict.
+        // This is the log line whose absence made the last occurrence take a host-side tone.
+        let silenceWindow = Int(inFormat.sampleRate * 10)
+        let deviceLabel = micUID.isEmpty ? "default input" : micUID
+        var framesInspected = 0
+        var inputPeak: Float = 0
+        var levelReported = false
+
         input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { buffer, _ in
             if flag.isStopped { return }
+            let frames = Int(buffer.frameLength)
+            guard frames > 0, let src = buffer.floatChannelData,
+                  let mono = AVAudioPCMBuffer(
+                      pcmFormat: monoFormat, frameCapacity: buffer.frameLength),
+                  let dst = mono.floatChannelData?[0]
+            else { return }
+            mono.frameLength = buffer.frameLength
+
+            // Fold the multi-channel input down to the one mono bus we encode.
+            Self.foldToMono(
+                input: src, frames: frames, channels: Int(buffer.format.channelCount),
+                interleaved: buffer.format.isInterleaved, pinned: pinnedChannel, out: dst)
+
+            if !levelReported {
+                var localPeak: Float = 0
+                for i in 0..<frames where abs(dst[i]) > localPeak { localPeak = abs(dst[i]) }
+                if localPeak > inputPeak { inputPeak = localPeak }
+                framesInspected += frames
+                if framesInspected >= silenceWindow {
+                    levelReported = true
+                    if inputPeak == 0 {
+                        log.warning("""
+                            mic uplink has been pure digital SILENCE for 10 s (\(deviceLabel), \
+                            \(channelPlan)) — check the input level (System Settings → Sound → \
+                            Input), Privacy & Security → Microphone, and the Microphone channel in \
+                            Settings; the host is receiving zeros
+                            """)
+                    } else {
+                        let dbfs = 20 * log10(inputPeak)
+                        log.info("""
+                            mic uplink OK — peak \(String(format: "%.1f", dbfs)) dBFS over first \
+                            10 s (\(deviceLabel), \(channelPlan))
+                            """)
+                    }
+                }
+            }
+
             let ratio = 48_000 / inFormat.sampleRate
-            let outCapacity = AVAudioFrameCount(
-                (Double(buffer.frameLength) * ratio).rounded(.up) + 64)
+            let outCapacity = AVAudioFrameCount((Double(frames) * ratio).rounded(.up) + 64)
             guard let staging = AVAudioPCMBuffer(
                 pcmFormat: encoder.pcmFormat, frameCapacity: outCapacity)
             else { return }
@@ -334,7 +443,7 @@ public final class SessionAudio {
                 }
                 fed = true
                 outStatus.pointee = .haveData
-                return buffer
+                return mono
             }
             guard status != .error, let p = staging.floatChannelData?[0] else { return }
             fifo.append(contentsOf: UnsafeBufferPointer(
@@ -378,6 +487,42 @@ public final class SessionAudio {
         stateLock.unlock()
         log.info("mic uplink started (\(micUID.isEmpty ? "default input" : micUID))")
     }
+
+    /// Fold `channels` of input (`floatChannelData` layout: `interleaved` → one buffer strided by
+    /// channel count; else one buffer per channel) down to a single mono bus in `out` (`frames`
+    /// long). `pinned` (0-based, must be `< channels`) copies exactly that channel — the fix for a
+    /// mic on one input of a multi-channel interface; `nil` sums every channel, clamped to
+    /// [-1, 1], so a lone hot channel still passes at full level instead of the silent 0/1 the
+    /// default N→stereo downmix would grab. Pure + `internal` for unit testing the index math.
+    static func foldToMono(
+        input: UnsafePointer<UnsafeMutablePointer<Float>>, frames: Int, channels: Int,
+        interleaved: Bool, pinned: Int?, out: UnsafeMutablePointer<Float>
+    ) {
+        if let ch = pinned, ch < channels {
+            if interleaved {
+                let d = input[0]
+                for i in 0..<frames { out[i] = d[i * channels + ch] }
+            } else {
+                let d = input[ch]
+                for i in 0..<frames { out[i] = d[i] }
+            }
+        } else if interleaved {
+            let d = input[0]
+            for i in 0..<frames {
+                var s: Float = 0
+                for c in 0..<channels { s += d[i * channels + c] }
+                out[i] = max(-1, min(1, s))
+            }
+        } else {
+            let d0 = input[0]
+            for i in 0..<frames { out[i] = d0[i] }
+            for c in 1..<channels {
+                let d = input[c]
+                for i in 0..<frames { out[i] += d[i] }
+            }
+            if channels > 1 { for i in 0..<frames { out[i] = max(-1, min(1, out[i])) } }
+        }
+    }
     #endif
 
     #if os(macOS)
@@ -386,6 +531,19 @@ public final class SessionAudio {
         return AudioUnitSetProperty(
             unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
             &dev, UInt32(MemoryLayout<AudioDeviceID>.size)) == noErr
+    }
+
+    /// Read back the AUHAL's live device — the definitive "what are we actually capturing
+    /// from", which catches a selection that succeeded on paper but silently fell back to
+    /// the system default (a stale/changed UID, a device that vanished between resolve and
+    /// start). 0 / an error means we couldn't tell.
+    private static func currentDevice(of unit: AudioUnit) -> AudioDeviceID? {
+        var dev = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioUnitGetProperty(
+            unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, &size)
+        guard status == noErr, dev != 0 else { return nil }
+        return dev
     }
     #endif
 }

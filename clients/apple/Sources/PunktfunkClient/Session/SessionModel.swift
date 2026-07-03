@@ -338,6 +338,7 @@ final class SessionModel: ObservableObject {
         audio.start(
             speakerUID: defaults.string(forKey: DefaultsKey.speakerUID) ?? "",
             micUID: defaults.string(forKey: DefaultsKey.micUID) ?? "",
+            micChannel: defaults.integer(forKey: DefaultsKey.micChannel),
             micEnabled: defaults.object(forKey: DefaultsKey.micEnabled) as? Bool ?? true)
         self.audio = audio
         // Gamepads: forward GamepadManager's active controller as pad 0 and render the
