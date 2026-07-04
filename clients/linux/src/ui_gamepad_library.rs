@@ -93,6 +93,11 @@ struct State {
     anim_active: Cell<bool>,
     last_tick: Cell<i64>,
     animations: bool,
+    /// Deck (or any low-power box): shrink the per-frame GPU work so navigation stays smooth
+    /// — fewer laid-out cards (fewer 3D offscreen passes) and a frozen aurora (no 30 Hz
+    /// full-screen CPU upscale + multi-MB texture upload contending for the iGPU's shared
+    /// bandwidth). The Deck iGPU otherwise drops to ~16 fps mid-navigation.
+    low_power: bool,
     detail_title: gtk::Label,
     detail_store: gtk::Label,
     /// Transient error strip on the carousel scene (connect failures land here — the
@@ -300,9 +305,12 @@ fn build(app: Rc<App>, req: ConnectRequest, paired: bool, mgmt_port: u16) -> Rc<
     content.append(&stack);
     content.append(&hints);
 
+    let low_power = crate::gamepad::is_steam_deck();
     let root = gtk::Overlay::new();
     root.add_css_class("pf-gl-page");
-    root.set_child(Some(&build_aurora()));
+    // On the Deck the animated aurora's per-frame CPU upscale + texture upload starves the
+    // coverflow of iGPU bandwidth — freeze it (drift is centimeters/minute, unnoticeable).
+    root.set_child(Some(&build_aurora(low_power)));
     root.add_overlay(&content);
     root.set_focusable(true);
 
@@ -330,6 +338,7 @@ fn build(app: Rc<App>, req: ConnectRequest, paired: bool, mgmt_port: u16) -> Rc<
         anim_active: Cell::new(false),
         last_tick: Cell::new(0),
         animations: animations_enabled(),
+        low_power,
         detail_title,
         detail_store,
         status,
@@ -917,10 +926,14 @@ fn relayout(state: &State) {
     }
     let pos = state.anim_pos.get();
     let bump = state.bump.get();
+    // Each laid-out side card is a non-affine (perspective + rotate_3d) transform, which GSK
+    // renders through its own offscreen pass — so the visible count is the per-frame GPU cost.
+    // Trim it hard on the Deck; desktop keeps the full deep shelf.
+    let range = if state.low_power { 3.0 } else { VISIBLE_RANGE };
     for (i, card) in state.cards.borrow().iter().enumerate() {
         let d = i as f64 - pos;
         let a = d.abs();
-        if a > VISIBLE_RANGE {
+        if a > range {
             card.root.set_visible(false);
             continue;
         }
@@ -1033,7 +1046,7 @@ fn animations_enabled() -> bool {
 /// The full-bleed aurora: a DrawingArea re-rendered at ~30 Hz off the frame clock (the
 /// Swift TimelineView cadence — drift is centimeters per minute, display rate would be
 /// wasted heat on a couch device).
-fn build_aurora() -> gtk::DrawingArea {
+fn build_aurora(low_power: bool) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_hexpand(true);
     area.set_vexpand(true);
@@ -1043,7 +1056,9 @@ fn build_aurora() -> gtk::DrawingArea {
         let t = t.clone();
         area.set_draw_func(move |_, cr, w, h| draw_aurora(cr, w, h, t.get(), &cache));
     }
-    if animations_enabled() {
+    // Deck: render once, frozen — the 30 Hz tick's CPU upscale + texture upload is the
+    // bandwidth cost that starves the coverflow. Desktop keeps the live drift.
+    if animations_enabled() && !low_power {
         let start = Cell::new(0i64);
         let last = Cell::new(0i64);
         area.add_tick_callback(move |area, clock| {

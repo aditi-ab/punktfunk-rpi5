@@ -1,7 +1,7 @@
 // Shared state hooks + user actions for the QAM panel and the fullscreen page.
 import { toaster } from "@decky/api";
 import { Navigation } from "@decky/ui";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   checkUpdate,
   discover,
@@ -220,6 +220,14 @@ export interface PinsApi {
 
 export function usePins(): PinsApi {
   const [pins, setPins] = useState<PinnedGame[]>([]);
+  // A live mirror of `pins`. The Games picker is mounted by Decky's `showModal` into a
+  // detached portal that captures this hook's callbacks ONCE and never re-renders with fresh
+  // props, so a mutator closing over the `pins` array reads a frozen base — pinning a second
+  // game in the same session would compute from the stale `[]` and clobber the first (silent
+  // data loss). Reading the ref keeps every mutation based on the current set, and lets the
+  // callbacks keep a stable identity (deps free of `pins`).
+  const pinsRef = useRef<PinnedGame[]>([]);
+  pinsRef.current = pins;
 
   const refresh = useCallback(async () => {
     try {
@@ -236,6 +244,7 @@ export function usePins(): PinsApi {
   // Optimistic local state; the backend validates/dedups and is re-read on failure.
   const save = useCallback(
     (next: PinnedGame[]) => {
+      pinsRef.current = next;
       setPins(next);
       setPinsBackend(next).catch(() => void refresh());
     },
@@ -258,18 +267,20 @@ export function usePins(): PinsApi {
         paired: h.paired,
       };
       save([
-        ...pins.filter((p) => !(p.host_fp === pin.host_fp && p.game_id === pin.game_id)),
+        ...pinsRef.current.filter(
+          (p) => !(p.host_fp === pin.host_fp && p.game_id === pin.game_id),
+        ),
         pin,
       ]);
     },
-    [pins, save],
+    [save],
   );
 
   const removePin = useCallback(
     (hostFp: string, gameId: string) => {
-      save(pins.filter((p) => !(p.host_fp === hostFp && p.game_id === gameId)));
+      save(pinsRef.current.filter((p) => !(p.host_fp === hostFp && p.game_id === gameId)));
     },
-    [pins, save],
+    [save],
   );
 
   const isPinned = useCallback(
@@ -284,14 +295,14 @@ export function usePins(): PinsApi {
         return;
       }
       save(
-        pins.map((p) =>
+        pinsRef.current.map((p) =>
           p.host_fp === pin.host_fp && p.game_id === pin.game_id
             ? { ...p, host: h.host, port: h.port, mgmt: h.mgmt, host_name: h.name }
             : p,
         ),
       );
     },
-    [pins, save],
+    [save],
   );
 
   return { pins, addPin, removePin, isPinned, updatePinHost, refresh };

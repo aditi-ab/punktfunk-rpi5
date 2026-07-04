@@ -94,10 +94,17 @@ pub fn cli_connect_request() -> Option<ConnectRequest> {
     }
     let target = std::env::args().skip_while(|a| a != "--connect").nth(1)?;
     let (addr, port) = parse_host_port(&target);
+    // An unparsable port (`host:notaport`) used to make the whole request `None` → the app
+    // silently landed on the hosts page with no session and no message. Fall back to the
+    // native default like the add-host dialog, and say so, instead of doing nothing.
+    let port = port.unwrap_or_else(|| {
+        eprintln!("--connect: unparsable port in '{target}', using default 9777");
+        9777
+    });
     Some(ConnectRequest {
         name: addr.clone(),
         addr,
-        port: port?,
+        port,
         fp_hex: None,
         pair_optional: false,
         launch: arg_value("--launch").map(|id| (id.clone(), id)),

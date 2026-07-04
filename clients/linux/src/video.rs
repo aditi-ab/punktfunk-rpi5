@@ -136,7 +136,18 @@ pub struct Decoder {
     /// The negotiated codec (from the host's Welcome), so a mid-session VAAPI→software demotion
     /// rebuilds the software decoder for the SAME codec.
     codec_id: ffmpeg::codec::Id,
+    /// Consecutive VAAPI decode errors — a single transient failure (e.g. a reference-missing
+    /// frame after packet loss) shouldn't cost the whole session its hardware decoder.
+    vaapi_fails: u32,
+    /// Set when the decoder needs a fresh IDR to resynchronize (after an error or a demotion).
+    /// The pump drains it and asks the host — under the infinite GOP there is no periodic
+    /// keyframe, so a rebuilt/erroring decoder would otherwise stay gray/frozen forever.
+    want_keyframe: bool,
 }
+
+/// Demote VAAPI→software only after this many consecutive hardware decode errors; a lone
+/// transient error just re-requests an IDR and keeps the hardware decoder.
+const VAAPI_DEMOTE_AFTER: u32 = 3;
 
 /// Map a negotiated `quic` codec bit to the FFmpeg decoder id the client opens.
 pub fn ffmpeg_codec_id(wire: u8) -> ffmpeg::codec::Id {
@@ -183,6 +194,8 @@ impl Decoder {
                     return Ok(Decoder {
                         backend: Backend::Vaapi(v),
                         codec_id,
+                        vaapi_fails: 0,
+                        want_keyframe: false,
                     });
                 }
                 Err(e) => {
@@ -196,20 +209,43 @@ impl Decoder {
         Ok(Decoder {
             backend: Backend::Software(SoftwareDecoder::new(codec_id)?),
             codec_id,
+            vaapi_fails: 0,
+            want_keyframe: false,
         })
+    }
+
+    /// Drain the "please ask the host for an IDR" flag — the pump calls this each iteration
+    /// (throttled) so a demoted/erroring decoder can resynchronize under the infinite GOP.
+    pub fn take_keyframe_request(&mut self) -> bool {
+        std::mem::take(&mut self.want_keyframe)
     }
 
     /// Feed one access unit; returns the decoded frame (the host's streams are
     /// one-in/one-out). A software decode error after packet loss is survivable — log
-    /// upstream and keep feeding. A VAAPI error demotes to software for the rest of the
-    /// session (broken driver, e.g. nvidia-vaapi-driver) — the next IDR resynchronizes.
+    /// upstream and keep feeding. A VAAPI error re-requests an IDR and retries the hardware
+    /// decoder; only a persistent streak of failures (a genuinely broken driver, e.g.
+    /// nvidia-vaapi-driver) demotes to software. Either way `want_keyframe` is set so the
+    /// pump asks the host for a fresh IDR — under the infinite GOP nothing else resyncs a
+    /// rebuilt/erroring decoder, so skipping this leaves the picture gray/frozen for good.
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedImage>> {
         match &mut self.backend {
             Backend::Vaapi(v) => match v.decode(au) {
-                Ok(f) => Ok(f.map(DecodedImage::Dmabuf)),
+                Ok(f) => {
+                    self.vaapi_fails = 0;
+                    Ok(f.map(DecodedImage::Dmabuf))
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "VAAPI decode failed — falling back to software");
-                    self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
+                    self.vaapi_fails += 1;
+                    self.want_keyframe = true;
+                    if self.vaapi_fails >= VAAPI_DEMOTE_AFTER {
+                        tracing::warn!(error = %e, fails = self.vaapi_fails,
+                            "VAAPI decode failing repeatedly — demoting to software");
+                        self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
+                        self.vaapi_fails = 0;
+                    } else {
+                        tracing::warn!(error = %e,
+                            "VAAPI decode error — requesting keyframe, keeping hardware decode");
+                    }
                     Ok(None)
                 }
             },

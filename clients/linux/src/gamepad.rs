@@ -910,7 +910,16 @@ impl Worker<'_> {
                 if !self.order.contains(&which) {
                     self.order.push(which);
                     if let Some(p) = self.pad_info(which) {
-                        tracing::info!(name = p.name, "gamepad attached");
+                        // Full identity: on a Steam Deck this is the one lever for diagnosing an
+                        // empty controller list — it tells you whether SDL sees the physical pad
+                        // (28DE:1205), Steam Input's virtual pad (28DE:11FF), both, or nothing.
+                        tracing::info!(
+                            name = p.name,
+                            key = p.key,
+                            pref = ?p.pref,
+                            steam_virtual = p.steam_virtual,
+                            "gamepad attached"
+                        );
                     }
                     self.refresh_active(active);
                 }

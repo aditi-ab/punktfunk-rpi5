@@ -95,6 +95,24 @@ export const GamePickerModal: FC<{
 }> = ({ host, pins, clientUpdatePending, closeModal }) => {
   const [result, setResult] = useState<LibraryResult | null>(null);
   const [attempt, setAttempt] = useState(0); // bump to refetch (retry / after pairing)
+  // The modal is a detached `showModal` portal that never re-renders from the page's pin
+  // state, so `pins.isPinned` would read a frozen snapshot and the Pin/Unpin label would
+  // never flip within a session. Track this host's pinned ids locally, seeded once from the
+  // snapshot at open; persistence still goes through the (stale-closure-safe) pins API.
+  const [pinnedIds, setPinnedIds] = useState<Set<string>>(
+    () => new Set(pins.pins.filter((p) => p.host_fp === host.fp).map((p) => p.game_id)),
+  );
+  const togglePin = (g: GameEntry) => {
+    const wasPinned = pinnedIds.has(g.id);
+    setPinnedIds((prev) => {
+      const next = new Set(prev);
+      if (wasPinned) next.delete(g.id);
+      else next.add(g.id);
+      return next;
+    });
+    if (wasPinned) pins.removePin(host.fp, g.id);
+    else pins.addPin(host, g);
+  };
 
   useEffect(() => {
     let stale = false;
@@ -188,7 +206,7 @@ export const GamePickerModal: FC<{
       {sorted.length > 0 && (
         <div style={{ maxHeight: "55vh", overflowY: "auto" }}>
           {sorted.map((g: GameEntry) => {
-            const pinned = pins.isPinned(host.fp, g.id);
+            const pinned = pinnedIds.has(g.id);
             const safe = isSafeLaunchId(g.id);
             return (
               <Field
@@ -199,13 +217,7 @@ export const GamePickerModal: FC<{
                 }
                 childrenContainerWidth="max"
               >
-                <DialogButton
-                  style={pickButton}
-                  disabled={!safe}
-                  onClick={() =>
-                    pinned ? pins.removePin(host.fp, g.id) : pins.addPin(host, g)
-                  }
-                >
+                <DialogButton style={pickButton} disabled={!safe} onClick={() => togglePin(g)}>
                   <FaThLarge style={{ marginRight: "0.4em" }} />
                   {pinned ? "Unpin" : "Pin"}
                 </DialogButton>

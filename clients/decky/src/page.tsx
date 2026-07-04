@@ -151,8 +151,11 @@ const HostRow: FC<{ host: Host; onPaired: () => void; onGames: () => void }> = (
         >
           <FaInfoCircle />
         </DialogButton>
-        <DialogButton style={iconButton} onClick={onGames}>
-          <FaThLarge />
+        {/* Labeled, not icon-only: this is the entry to the game picker AND the on-screen
+            library browser, and controller nav has no hover tooltip to explain a bare icon. */}
+        <DialogButton style={{ ...actionButton, minWidth: "6em" }} onClick={onGames}>
+          <FaThLarge style={{ marginRight: "0.4em" }} />
+          Games
         </DialogButton>
         {needsPair && (
           <DialogButton
@@ -162,7 +165,16 @@ const HostRow: FC<{ host: Host; onPaired: () => void; onGames: () => void }> = (
             Pair
           </DialogButton>
         )}
-        <DialogButton style={actionButton} onClick={() => startStream(host)}>
+        <DialogButton
+          style={actionButton}
+          onClick={() =>
+            needsPair
+              ? showModal(
+                  <PairModal host={host} onPaired={() => startStream(host)} />,
+                )
+              : startStream(host)
+          }
+        >
           <FaPlay style={{ marginRight: "0.4em" }} />
           Stream
         </DialogButton>

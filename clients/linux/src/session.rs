@@ -331,6 +331,19 @@ fn pump(
                     // Survivable (loss until the next IDR/RFI recovery) — keep feeding.
                     Err(e) => tracing::debug!(error = %e, "decode error (recovering)"),
                 }
+                // A decode error / VAAPI→software demotion asks for a fresh IDR: the infinite
+                // GOP has no periodic keyframe, so a rebuilt/erroring decoder would stay
+                // gray/frozen until an unrelated packet drop happened to request one. Route it
+                // through the same throttle as loss recovery below.
+                if decoder.take_keyframe_request() {
+                    let now = Instant::now();
+                    if last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
+                    {
+                        last_kf_req = Some(now);
+                        let _ = connector.request_keyframe();
+                        tracing::debug!("requested keyframe (decoder recovery)");
+                    }
+                }
             }
             Err(PunktfunkError::NoFrame) => {}
             Err(PunktfunkError::Closed) => break Some("Host ended the session".to_string()),

@@ -153,6 +153,15 @@ pub fn new(settings: Rc<RefCell<Settings>>, cbs: HostsCallbacks) -> HostsUi {
     let disc_heading = heading("On this network");
     let disc_flow = make_flow();
 
+    // A pointer click (and keyboard activate) emits `child-activated` on the *FlowBox*, never
+    // the child's own `activate` signal — so bridge it back to the child, where each card wires
+    // its connect handler (`saved_card`/`discovered_card`). Without this, clicking a card is dead.
+    for flow in [&saved_flow, &disc_flow] {
+        flow.connect_child_activated(|_, child| {
+            child.activate();
+        });
+    }
+
     // Shown under the discovered heading while no (unsaved) advert is live yet.
     let searching = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let spinner = gtk::Spinner::new();

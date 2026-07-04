@@ -22,10 +22,14 @@ const CSS: &str = "
            color: alpha(currentColor, 0.8); background: alpha(currentColor, 0.1); }
 .pf-pill.pf-green { color: @success_color; background: alpha(@success_color, 0.15); }
 .pf-pill.pf-accent { color: @accent_color; background: alpha(@accent_color, 0.15); }
+.pf-pill.pf-neutral { color: alpha(currentColor, 0.75); background: alpha(currentColor, 0.12); }
 .pf-pip { min-width: 8px; min-height: 8px; border-radius: 999px;
           background: alpha(currentColor, 0.35); }
 .pf-pip.pf-online { background: @success_color; }
-.pf-recent { box-shadow: inset 3px 0 0 0 @accent_bg_color; }
+/* Most-recent host: a full accent ring drawn as an inset outline so it follows the card's
+   rounded corners (an `inset` box-shadow bar gets eaten by the 12px corner clip) and leaves
+   the card's own elevation shadow intact. */
+.pf-recent { outline: 2px solid @accent_color; outline-offset: -2px; }
 .pf-discovered { border: 1px dashed alpha(currentColor, 0.35); }
 .pf-poster { border-radius: 10px; background: alpha(currentColor, 0.08); }
 .pf-poster-monogram { font-size: 2.4em; font-weight: bold; color: alpha(currentColor, 0.45); }

@@ -167,7 +167,13 @@ fn send_abs(widget: &impl IsA<gtk::Widget>, connector: &NativeClient, x: f64, y:
 struct Capture {
     connector: Arc<NativeClient>,
     window: adw::ApplicationWindow,
-    overlay: gtk::Overlay,
+    /// Held WEAKLY. Every input controller + the frame-clock tick are added to this overlay
+    /// and each captures `Rc<Capture>`; a strong ref back here would close the cycle
+    /// `overlay → controller → Rc<Capture> → overlay` that GTK can't collect, leaking the
+    /// whole stream subtree AND the `Arc<NativeClient>` (so `NativeClient::Drop` never runs)
+    /// on every session end — unbounded growth across the reconnects a Deck does constantly.
+    /// The live widget tree owns the overlay for the session's lifetime; upgrade at use.
+    overlay: glib::WeakRef<gtk::Overlay>,
     hint: gtk::Label,
     inhibit_shortcuts: bool,
     captured: Cell<bool>,
@@ -181,13 +187,19 @@ struct Capture {
     /// VKs / GameStream button ids currently held — flushed up on release.
     held_keys: RefCell<HashSet<u8>>,
     held_buttons: RefCell<HashSet<u32>>,
+    /// Fractional wheel remainder per axis (x, y), in 120-unit WHEEL_DELTA space. Precision
+    /// scroll surfaces — the Deck trackpad, hi-res wheels, two-finger touchpad — deliver
+    /// sub-unit deltas; truncating each event drops the tail. Carry it here instead.
+    scroll_acc: Cell<(f64, f64)>,
 }
 
 impl Capture {
     /// Send the coalesced pointer position, if any — one datagram, one fresh mode read.
     fn flush_pending_motion(&self) {
         if let Some((x, y)) = self.pending_abs.take() {
-            send_abs(&self.overlay, &self.connector, x, y);
+            if let Some(overlay) = self.overlay.upgrade() {
+                send_abs(&overlay, &self.connector, x, y);
+            }
         }
     }
 
@@ -195,8 +207,9 @@ impl Capture {
         if self.captured.replace(true) {
             return;
         }
-        self.overlay
-            .set_cursor(gdk::Cursor::from_name("none", None).as_ref());
+        if let Some(overlay) = self.overlay.upgrade() {
+            overlay.set_cursor(gdk::Cursor::from_name("none", None).as_ref());
+        }
         self.hint.set_visible(false);
         if self.inhibit_shortcuts {
             if let Some(tl) = self
@@ -213,7 +226,9 @@ impl Capture {
         if !self.captured.replace(false) {
             return;
         }
-        self.overlay.set_cursor(None);
+        if let Some(overlay) = self.overlay.upgrade() {
+            overlay.set_cursor(None);
+        }
         self.hint.set_visible(true);
         self.pending_abs.set(None); // never flush motion gathered while captured
         if let Some(tl) = self
@@ -261,13 +276,14 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
     let capture = Rc::new(Capture {
         connector,
         window: window.clone(),
-        overlay: w.overlay.clone(),
+        overlay: w.overlay.downgrade(),
         hint: w.hint.clone(),
         inhibit_shortcuts,
         captured: Cell::new(false),
         pending_abs: Cell::new(None),
         held_keys: RefCell::new(HashSet::new()),
         held_buttons: RefCell::new(HashSet::new()),
+        scroll_acc: Cell::new((0.0, 0.0)),
     });
 
     let presented = Rc::new(PresentedStats::default());
@@ -279,7 +295,7 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
         presented.clone(),
         hdr.clone(),
     );
-    attach_keyboard(&w.overlay, &window, &capture, &stop, &w.stats_label);
+    let key_controller = attach_keyboard(&window, &capture, &stop, &w.stats_label);
     attach_mouse(&w.overlay, &capture);
     attach_scroll(&w.overlay, &capture);
     if !chromeless {
@@ -293,6 +309,7 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
         &window,
         &stop,
         (w.fs_handler, active_handler),
+        key_controller,
         escape_future,
         disconnect_future,
     );
@@ -696,13 +713,20 @@ fn spawn_frame_consumer(
 /// Keyboard, capture-phase: the release (Ctrl+Alt+Shift+Q) / disconnect (Ctrl+Alt+Shift+D)
 /// / stats (Ctrl+Alt+Shift+S) chords and F11 are handled locally; everything else becomes
 /// a VK on the wire while captured.
+///
+/// The controller lives on the **window**, not the stream overlay: a `NavigationView` push
+/// followed by `window.fullscreen()` hands keyboard focus to the pushed page's header back
+/// button (a sibling of the overlay), so an overlay-scoped key controller never sees a key and
+/// every chord — plus all gameplay key forwarding — is silently dropped until the user clicks
+/// the stream. The window is always on the key-propagation path regardless of which child holds
+/// focus. Returned so `wire_teardown` can remove it when the page goes away (otherwise the
+/// chords would keep firing app-wide against a dead session).
 fn attach_keyboard(
-    overlay: &gtk::Overlay,
     window: &adw::ApplicationWindow,
     capture: &Rc<Capture>,
     stop: &Arc<AtomicBool>,
     stats: &gtk::Label,
-) {
+) -> gtk::EventControllerKey {
     let key = gtk::EventControllerKey::new();
     key.set_propagation_phase(gtk::PropagationPhase::Capture);
     let cap = capture.clone();
@@ -768,7 +792,8 @@ fn attach_keyboard(
             }
         }
     });
-    overlay.add_controller(key);
+    window.add_controller(key.clone());
+    key
 }
 
 /// Mouse: absolute motion + buttons — forwarded only while captured; the click that
@@ -787,7 +812,8 @@ fn attach_mouse(overlay: &gtk::Overlay, capture: &Rc<Capture>) {
     });
     overlay.add_controller(motion);
 
-    // The per-tick flush. (The tick callback dies with the overlay, so no teardown.)
+    // The per-tick flush. The tick callback dies with the overlay (which `Capture` now holds
+    // only weakly, so it truly can), taking its `Capture` ref with it — no explicit teardown.
     let cap = capture.clone();
     overlay.add_tick_callback(move |_, _| {
         cap.flush_pending_motion();
@@ -797,7 +823,9 @@ fn attach_mouse(overlay: &gtk::Overlay, capture: &Rc<Capture>) {
     let click = gtk::GestureClick::builder().button(0).build();
     let cap = capture.clone();
     click.connect_pressed(move |g, _n, x, y| {
-        cap.overlay.grab_focus();
+        if let Some(overlay) = cap.overlay.upgrade() {
+            overlay.grab_focus();
+        }
         if !cap.captured.get() {
             cap.engage(); // the engaging click is suppressed toward the host
             return;
@@ -833,16 +861,22 @@ fn attach_scroll(overlay: &gtk::Overlay, capture: &Rc<Capture>) {
         }
         cap.flush_pending_motion(); // scroll happens at the latest cursor position
                                     // The wire carries WHEEL_DELTA(120) units, positive = up / right; GTK's dy is
-                                    // positive = down. Smooth fractions survive — libei's discrete scroll is
-                                    // 120-based too.
-        let vy = (-dy * 120.0) as i32;
+                                    // positive = down. libei's discrete scroll is 120-based too. Accumulate the
+                                    // fractional remainder so precision-scroll sub-unit deltas aren't lost.
+        let (mut ax, mut ay) = cap.scroll_acc.get();
+        ay += -dy * 120.0;
+        ax += dx * 120.0;
+        let vy = ay.trunc() as i32;
         if vy != 0 {
+            ay -= f64::from(vy);
             send(&cap.connector, InputKind::MouseScroll, 0, vy, 0, 0);
         }
-        let vx = (dx * 120.0) as i32;
+        let vx = ax.trunc() as i32;
         if vx != 0 {
+            ax -= f64::from(vx);
             send(&cap.connector, InputKind::MouseScroll, 1, vx, 0, 0);
         }
+        cap.scroll_acc.set((ax, ay));
         glib::Propagation::Stop
     });
     overlay.add_controller(scroll);
@@ -938,12 +972,14 @@ fn wire_teardown(
     window: &adw::ApplicationWindow,
     stop: &Arc<AtomicBool>,
     handlers: (glib::SignalHandlerId, glib::SignalHandlerId),
+    key_controller: gtk::EventControllerKey,
     escape_future: glib::JoinHandle<()>,
     disconnect_future: glib::JoinHandle<()>,
 ) {
     let window = window.clone();
     let stop_h = stop.clone();
     let handlers = RefCell::new(Some(handlers));
+    let key_controller = RefCell::new(Some(key_controller));
     let escape_future = RefCell::new(Some(escape_future));
     let disconnect_future = RefCell::new(Some(disconnect_future));
     page.connect_hidden(move |_| {
@@ -951,6 +987,11 @@ fn wire_teardown(
         if let Some((fs, active)) = handlers.borrow_mut().take() {
             window.disconnect(fs);
             window.disconnect(active);
+        }
+        // The key controller lives on the window (see `attach_keyboard`) — remove it so its
+        // chords don't keep firing app-wide against a torn-down session.
+        if let Some(kc) = key_controller.borrow_mut().take() {
+            window.remove_controller(&kc);
         }
         if let Some(f) = escape_future.borrow_mut().take() {
             f.abort();

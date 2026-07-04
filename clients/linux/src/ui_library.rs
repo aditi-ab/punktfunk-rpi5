@@ -71,6 +71,11 @@ fn build(app: Rc<App>, req: ConnectRequest) -> Rc<State> {
         .row_spacing(18)
         .valign(gtk::Align::Start)
         .build();
+    // Click/keyboard activation fires `child-activated` on the FlowBox, not the child's own
+    // `activate` — bridge it so each poster's connect handler (below) runs on click.
+    flow.connect_child_activated(|_, child| {
+        child.activate();
+    });
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_margin_top(24);
     content.set_margin_bottom(24);
