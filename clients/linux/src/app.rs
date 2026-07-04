@@ -116,6 +116,23 @@ pub fn run() -> glib::ExitCode {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming every
+    // physical pad Steam Input has virtualized — SDL then hides the real device so games
+    // only see the virtual X360 pad. Right for games, wrong for us: capturing the Deck's
+    // built-in controller (trackpads/paddles/gyro, 28DE:1205) needs SDL's HIDAPI driver
+    // to enumerate the REAL device, and the built-in pad can never leave Steam Input
+    // ("Steam Controller" is always-required), so this filter is the only off switch we
+    // get. Clear it while still single-threaded (the gamepad worker starts with the UI);
+    // we dedupe the virtual pad ourselves (`gamepad.rs` `active_id` skips steam_virtual).
+    for var in [
+        "SDL_GAMECONTROLLER_IGNORE_DEVICES",
+        "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT",
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            tracing::info!(var, value = %v, "clearing Steam's SDL device filter");
+            std::env::remove_var(var);
+        }
+    }
     // Headless pairing path (no GTK window): `--pair <PIN> --connect host[:port] [--name N]`.
     // Used by the Decky plugin (a GTK dialog can't pop under gamescope) and for scripting.
     if let Some(pin) = crate::cli::arg_value("--pair") {

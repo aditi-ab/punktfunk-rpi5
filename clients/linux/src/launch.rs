@@ -280,12 +280,15 @@ impl SessionUi {
         if self.app.fullscreen || self.app.settings.borrow().fullscreen_on_stream {
             self.app.window.fullscreen();
         }
-        // Steam Input owning the Deck's built-in controller is invisible degradation: SDL
-        // then sees only Steam's virtual X360 pad, so the right trackpad arrives at the
-        // host as a plain right stick (Steam's default template) and the left trackpad,
-        // paddles and gyro not at all. The real 28DE:1205 identity enumerates shortly
-        // after attach (the Valve HIDAPI drivers are session-scoped) — check once that
-        // settles and say so, instead of streaming silently degraded.
+        // A Deck streaming without its raw built-in controller is invisible degradation:
+        // SDL sees only Steam's virtual X360 pad, so the right trackpad arrives at the
+        // host as whatever Steam's template synthesizes (a right stick by default) and
+        // the left trackpad, paddles and gyro not at all. The built-in pad can never
+        // leave Steam Input ("Steam Controller" is always-required in the shortcut's
+        // matrix — Disable Steam Input only affects other brands), so raw capture rides
+        // the session-scoped Valve HIDAPI drivers + the cleared SDL device filter (see
+        // `app::run`). The real 28DE:1205 identity enumerates shortly after attach —
+        // check once that settles and say so, instead of streaming silently degraded.
         if crate::gamepad::is_steam_deck() {
             let app = self.app.clone();
             let stop = self.stop.clone();
@@ -295,14 +298,15 @@ impl SessionUi {
                 }
                 if app.gamepad.active().is_none_or(|pad| pad.steam_virtual) {
                     tracing::warn!(
-                        "Steam Input is holding the built-in controller — trackpads, \
-                         paddles and gyro won't reach the host (right pad degrades to a \
-                         right stick). Disable Steam Input for Punktfunk to fix this."
+                        "the Deck's raw built-in controller (28DE:1205) never enumerated \
+                         — only Steam's virtual pad is visible, so trackpads, paddles and \
+                         gyro can't be captured (sticks + buttons still work). Check the \
+                         startup log for SDL_GAMECONTROLLER_IGNORE_DEVICES and the \
+                         Settings controller list."
                     );
                     let toast = adw::Toast::new(
-                        "Steam Input is holding the Deck's controls — trackpads, paddles \
-                         and gyro won't reach the game. Fix: Punktfunk → controller \
-                         settings → Disable Steam Input.",
+                        "Steam is only exposing its virtual gamepad — trackpads, paddles \
+                         and gyro won't reach the game (sticks and buttons still work).",
                     );
                     toast.set_timeout(12);
                     app.toasts.add_toast(toast);
