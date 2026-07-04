@@ -405,18 +405,41 @@ pub fn apply_session_env(active: &ActiveSession) {
     }
     // Stream the desktop as the SOLE output: promote the per-session virtual output to PRIMARY so
     // the panels + windows land on the streamed surface, not an unstreamed real output (the
-    // auto-detected desktop path *is* "stream this desktop"). Default-on for the auto path; an
-    // explicit `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` still wins.
-    match active.kind {
-        ActiveKind::DesktopKde if std::env::var_os("PUNKTFUNK_KWIN_VIRTUAL_PRIMARY").is_none() => {
-            std::env::set_var("PUNKTFUNK_KWIN_VIRTUAL_PRIMARY", "1");
+    // auto-detected desktop path *is* "stream this desktop"). The per-compositor backends read
+    // `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY`; drive it here from the display-management topology.
+    //
+    // Stage 0 keeps today's behavior exactly UNLESS the console configured a policy: when a
+    // `display-settings.json` exists, the effective topology wins (Exclusive → sole desktop,
+    // Extend → leave the streamed output extended, Primary → treated as Exclusive until the
+    // primary-only path lands in the topology stage). Unconfigured hosts fall through to the
+    // historical default-on-for-desktop behavior, honoring an explicit operator env var.
+    let var = match active.kind {
+        ActiveKind::DesktopKde => Some("PUNKTFUNK_KWIN_VIRTUAL_PRIMARY"),
+        ActiveKind::DesktopGnome => Some("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY"),
+        _ => None,
+    };
+    if let Some(var) = var {
+        match policy::prefs().configured_effective() {
+            Some(eff) => {
+                let sole = match resolve_topology(eff.topology) {
+                    policy::Topology::Extend => false,
+                    policy::Topology::Exclusive => true,
+                    policy::Topology::Primary => {
+                        tracing::info!(
+                            "display policy: topology=primary treated as exclusive at this stage \
+                             (primary-only lands in the topology stage)"
+                        );
+                        true
+                    }
+                    // resolve_topology never returns Auto.
+                    policy::Topology::Auto => true,
+                };
+                std::env::set_var(var, if sole { "1" } else { "0" });
+            }
+            // Unconfigured: today's behavior — default-on unless the operator set it explicitly.
+            None if std::env::var_os(var).is_none() => std::env::set_var(var, "1"),
+            None => {}
         }
-        ActiveKind::DesktopGnome
-            if std::env::var_os("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY").is_none() =>
-        {
-            std::env::set_var("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY", "1");
-        }
-        _ => {}
     }
 }
 #[cfg(not(target_os = "linux"))]
@@ -721,6 +744,29 @@ pub fn start_restore_worker() -> std::sync::Arc<()> {
 #[cfg(not(target_os = "linux"))]
 pub fn start_restore_worker() -> std::sync::Arc<()> {
     std::sync::Arc::new(())
+}
+
+// The user-configurable management policy (keep-alive / topology / conflict / identity / layout),
+// layered above the per-compositor backends — platform-neutral (the mgmt API + both host paths read
+// it), so no cfg gate. See `design/display-management.md`.
+#[path = "vdisplay/policy.rs"]
+pub(crate) mod policy;
+
+/// Resolve a [`policy::Topology`] to a concrete value (never [`policy::Topology::Auto`]). `Auto`
+/// reproduces today's default: **extend** under an explicit `PUNKTFUNK_COMPOSITOR` pin (the CI/test
+/// posture, where the host isn't the sole desktop), else **exclusive** (Windows + the auto-detected
+/// Linux desktop path, where "stream this desktop" means promoting the virtual output to sole).
+pub fn resolve_topology(t: policy::Topology) -> policy::Topology {
+    match t {
+        policy::Topology::Auto => {
+            if crate::config::config().compositor.is_some() {
+                policy::Topology::Extend
+            } else {
+                policy::Topology::Exclusive
+            }
+        }
+        concrete => concrete,
+    }
 }
 
 // Goal-1 stage 6: per-compositor Linux backends under `vdisplay/linux/`, the Windows IddCx/SudoVDA

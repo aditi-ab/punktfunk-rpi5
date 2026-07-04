@@ -156,6 +156,8 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(list_compositors))
                 .routes(routes!(list_gpus))
                 .routes(routes!(set_gpu_preference))
+                .routes(routes!(get_display_settings))
+                .routes(routes!(set_display_settings))
                 .routes(routes!(get_status))
                 .routes(routes!(get_local_summary))
                 .routes(routes!(list_paired_clients))
@@ -210,6 +212,7 @@ pub fn openapi_json() -> String {
     tags(
         (name = "host", description = "Host identity, capabilities, and liveness"),
         (name = "gpu", description = "GPU inventory and selection: list the host's GPUs, choose automatic or a preferred GPU, see the one in use"),
+        (name = "display", description = "Virtual-display management policy: lifecycle (keep-alive), topology (primary/exclusive), conflict handling, identity, and layout"),
         (name = "clients", description = "Paired Moonlight client management"),
         (name = "pairing", description = "Pairing PIN delivery (the out-of-band half of the GameStream pairing handshake)"),
         (name = "native", description = "Native punktfunk/1 pairing: arm a window, display the host PIN, manage paired devices"),
@@ -952,6 +955,144 @@ async fn set_gpu_preference(ApiJson(req): ApiJson<SetGpuPreference>) -> Response
     }
     tracing::info!(mode = %req.mode, gpu_id = ?req.gpu_id, "management API: GPU preference updated");
     Json(gpu_state()).into_response()
+}
+
+// ---------------------------------------------------------------------------------------
+// Display management (design/display-management.md)
+// ---------------------------------------------------------------------------------------
+
+/// One preset's human-facing description + the fields it expands to, so the console can render a
+/// preset picker with an accurate "what this does" preview without hardcoding the expansion.
+#[derive(Serialize, ToSchema)]
+struct PresetInfo {
+    /// The preset id (`default` | `gaming-rig` | `shared-desktop` | `hotdesk` | `workstation`).
+    id: String,
+    /// One-line story shown next to the option.
+    summary: String,
+    /// The effective policy this preset expands to (the same fields a `custom` policy carries).
+    fields: crate::vdisplay::policy::EffectivePolicy,
+}
+
+/// Full display-management state for the console: the stored policy, every preset's expansion, the
+/// resolved effective policy, and which options this build actually enforces yet (Stage 0 wires
+/// keep-alive linger + topology; the rest are stored but not yet acted on).
+#[derive(Serialize, ToSchema)]
+struct DisplaySettingsState {
+    /// The stored policy (preset + custom fields), or the built-in default when unconfigured.
+    settings: crate::vdisplay::policy::DisplayPolicy,
+    /// True once a `display-settings.json` exists (the console has configured this host).
+    configured: bool,
+    /// The effective (preset-expanded) policy currently in force.
+    effective: crate::vdisplay::policy::EffectivePolicy,
+    /// Every named preset and what it expands to (for the picker's preview).
+    presets: Vec<PresetInfo>,
+    /// Option names this build enforces right now (e.g. `keep_alive`, `topology`). The remaining
+    /// stored options (`mode_conflict`, `identity`, `layout`) land in later stages — surfaced so the
+    /// console can mark them "coming soon" instead of implying they already take effect.
+    enforced: Vec<String>,
+}
+
+fn preset_summary(id: &str) -> &'static str {
+    match id {
+        "default" => "Today's behavior: a short linger absorbs reconnects, the streamed output is the sole desktop, extra clients get their own view.",
+        "gaming-rig" => "Dedicated couch/headless box: the game and its display survive disconnects; whoever connects takes the box over.",
+        "shared-desktop" => "A desktop you also use in person: never blank the real monitors, never keep ghost displays, concurrent viewers each get a view.",
+        "hotdesk" => "One user at a time with fast reattach; a second user is told the box is busy; each device+resolution keeps its own scaling.",
+        "workstation" => "Multi-monitor daily driver: your displays come back exactly where you arranged them, per-client identity, exclusive.",
+        _ => "",
+    }
+}
+
+fn display_settings_state() -> DisplaySettingsState {
+    use crate::vdisplay::policy::{self, Preset};
+    let store = policy::prefs();
+    let settings = store.get();
+    let configured = store.configured().is_some();
+    let presets = [
+        ("default", Preset::Default),
+        ("gaming-rig", Preset::GamingRig),
+        ("shared-desktop", Preset::SharedDesktop),
+        ("hotdesk", Preset::Hotdesk),
+        ("workstation", Preset::Workstation),
+    ]
+    .into_iter()
+    .filter_map(|(id, p)| {
+        policy::preset_fields(p).map(|e| PresetInfo {
+            id: id.to_string(),
+            summary: preset_summary(id).to_string(),
+            fields: e,
+        })
+    })
+    .collect();
+    DisplaySettingsState {
+        effective: settings.effective(),
+        settings,
+        configured,
+        presets,
+        enforced: vec!["keep_alive".into(), "topology".into()],
+    }
+}
+
+/// Display-management policy
+///
+/// The stored virtual-display policy (lifecycle, topology, conflict handling, identity, layout),
+/// every preset's expansion, and which options this build enforces yet. See
+/// `design/display-management.md`.
+#[utoipa::path(
+    get,
+    path = "/display/settings",
+    tag = "display",
+    operation_id = "getDisplaySettings",
+    responses(
+        (status = OK, description = "Stored policy + preset expansions + enforced options", body = DisplaySettingsState),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn get_display_settings() -> Json<DisplaySettingsState> {
+    Json(display_settings_state())
+}
+
+/// Set the display-management policy
+///
+/// Persists a new policy (validated + clamped) and applies it from the next connect/teardown — a
+/// running session keeps the display it opened on. `keep_alive: forever` is rejected until the
+/// display-lifecycle stage ships (it would keep physical monitors dark indefinitely with no release
+/// path yet).
+#[utoipa::path(
+    put,
+    path = "/display/settings",
+    tag = "display",
+    operation_id = "setDisplaySettings",
+    request_body = crate::vdisplay::policy::DisplayPolicy,
+    responses(
+        (status = OK, description = "Policy stored; the new state", body = DisplaySettingsState),
+        (status = BAD_REQUEST, description = "An option value is not yet supported (e.g. keep_alive forever)", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Policy could not be persisted", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn set_display_settings(
+    ApiJson(policy): ApiJson<crate::vdisplay::policy::DisplayPolicy>,
+) -> Response {
+    use crate::vdisplay::policy::KeepAlive;
+    // Reject options this build can't honor yet, so the console can't promise a behavior that won't
+    // happen. `keep_alive: forever` (directly or via the `gaming-rig` preset) needs the Pinned
+    // lifecycle + a release path; until then it would strand physical monitors dark.
+    if policy.effective().keep_alive == KeepAlive::Forever {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "keep_alive `forever` (and the `gaming-rig` preset) is not available yet — it arrives \
+             with the display-lifecycle stage. Use a fixed duration for now.",
+        );
+    }
+    if let Err(e) = crate::vdisplay::policy::prefs().set(policy) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("persist display policy: {e:#}"),
+        );
+    }
+    tracing::info!("management API: display policy updated");
+    Json(display_settings_state()).into_response()
 }
 
 /// Live host status
@@ -2471,6 +2612,47 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    /// The display-management endpoints: GET returns the policy surface (presets + effective +
+    /// the Stage-0 enforced list); PUT rejects `keep_alive: forever` (the `gaming-rig` preset)
+    /// *before* persisting, so this stays read-only against the global policy store.
+    #[tokio::test]
+    async fn display_settings_surface_and_forever_rejected() {
+        let app = test_app(test_state(), None);
+
+        let (status, body) = send(&app, get_req("/api/v1/display/settings")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["presets"].as_array().map(|a| a.len()),
+            Some(5),
+            "all five named presets are surfaced for the console picker"
+        );
+        assert!(
+            body["effective"]["keep_alive"].is_object(),
+            "the effective policy is echoed"
+        );
+        let enforced: Vec<&str> = body["enforced"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(enforced.contains(&"keep_alive") && enforced.contains(&"topology"));
+
+        // `gaming-rig` expands to keep_alive: forever → rejected at Stage 0 (before any write).
+        let put = axum::http::Request::put("/api/v1/display/settings")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "preset": "gaming-rig" }).to_string(),
+            ))
+            .unwrap();
+        let (status, body) = send(&app, put).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("forever"),
+            "the rejection names the unsupported option"
+        );
     }
 
     #[tokio::test]

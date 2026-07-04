@@ -634,13 +634,15 @@ impl VirtualDisplayManager {
                 // isn't DWM-composited on this box → Desktop Duplication born-losts. Deactivating the other
                 // display(s) first via the atomic CCD path promotes the IDD to a composited primary with no
                 // MODE_CHANGE storm. Opt out with PUNKTFUNK_NO_ISOLATE=1.
-                if std::env::var("PUNKTFUNK_NO_ISOLATE").is_err() {
+                if should_isolate() {
                     // SAFETY: `isolate_displays_ccd` is `unsafe` for its CCD topology FFI; it takes a
                     // `Copy` `u32` by value and returns an owned `SavedConfig` snapshot (no borrowed
                     // memory crosses). It runs under the `state` lock, the sole mutator of the topology.
                     ccd_saved = unsafe { isolate_displays_ccd(added.target_id) };
                 } else {
-                    tracing::info!("display isolation skipped (PUNKTFUNK_NO_ISOLATE) — IDD stays extended");
+                    tracing::info!(
+                        "display isolation skipped (topology=extend / PUNKTFUNK_NO_ISOLATE) — IDD stays extended"
+                    );
                 }
                 thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture opens
             }
@@ -890,10 +892,44 @@ fn resolve_render_pin() -> Option<LUID> {
     crate::win_adapter::resolve_render_adapter_luid()
 }
 
-/// Linger window before a session-less monitor is torn down (default 10 s; `PUNKTFUNK_MONITOR_LINGER_MS`).
+/// Linger window before a session-less monitor is torn down. The console display-management policy
+/// wins when configured (`keep_alive`); otherwise the legacy `PUNKTFUNK_MONITOR_LINGER_MS` env knob,
+/// else the 10 s default.
 fn linger_ms() -> u64 {
+    use crate::vdisplay::policy::{prefs, Linger};
+    if let Some(eff) = prefs().configured_effective() {
+        return match eff.keep_alive.linger() {
+            Linger::Immediate => 0,
+            Linger::For(d) => d.as_millis() as u64,
+            // Pinned (keep forever) is built in the display-lifecycle stage; until then fall back to
+            // the default rather than silently keeping the monitor — and thus the physical screens —
+            // dark indefinitely. (The mgmt PUT also rejects `forever` at Stage 0, so this is defensive.)
+            Linger::Forever => {
+                tracing::warn!(
+                    "display policy: keep_alive=forever not yet honored — lingering 10 s \
+                     (Pinned lands in the display-lifecycle stage)"
+                );
+                10_000
+            }
+        };
+    }
     std::env::var("PUNKTFUNK_MONITOR_LINGER_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000)
+}
+
+/// Should a freshly-created monitor isolate the desktop to itself (disable the other displays)? The
+/// console policy's effective topology wins when configured — `Extend` leaves the IDD extended,
+/// `Exclusive`/`Primary` isolate (Stage 0 treats `Primary` as `Exclusive`); otherwise the legacy
+/// `PUNKTFUNK_NO_ISOLATE` env knob (unset ⇒ isolate, matching today's default).
+fn should_isolate() -> bool {
+    use crate::vdisplay::policy::Topology;
+    if let Some(eff) = crate::vdisplay::policy::prefs().configured_effective() {
+        return !matches!(
+            crate::vdisplay::resolve_topology(eff.topology),
+            Topology::Extend
+        );
+    }
+    std::env::var("PUNKTFUNK_NO_ISOLATE").is_err()
 }
