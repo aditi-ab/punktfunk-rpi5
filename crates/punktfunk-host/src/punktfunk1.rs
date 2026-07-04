@@ -1911,6 +1911,13 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
 /// two Decks — confirmed conflict-prone on a Deck-as-host (the physical `28DE:1205` + Steam's
 /// `28DE:11FF` XInput output pad are both live). HID device dirs are named `BUS:VID:PID.INST`
 /// (uppercase); a UHID virtual device resolves through `/devices/virtual/…`, a real one does not.
+///
+/// Punktfunk's OWN virtual Decks must never count: the usbip/gadget transports present a real USB
+/// device (vhci resolves through `vhci_hcd`, NOT `/devices/virtual/`), so a just-ended session's
+/// pad still detaching — or a concurrent session's live one — read as "physical" and degraded
+/// every back-to-back Deck session to DualSense (observed live on Bazzite 2026-07-04). Ours are
+/// recognizable by the `PFDK…` serial ([`steam_proto::deck_serial`]) in `HID_UNIQ`, with the
+/// vhci path as belt and braces.
 #[cfg(target_os = "linux")]
 fn physical_steam_controller_present() -> bool {
     let Ok(entries) = std::fs::read_dir("/sys/bus/hid/devices") else {
@@ -1920,8 +1927,16 @@ fn physical_steam_controller_present() -> bool {
         if !e.file_name().to_string_lossy().contains(":28DE:") {
             return false;
         }
+        if std::fs::read_to_string(e.path().join("uevent"))
+            .is_ok_and(|u| u.lines().any(|l| l.starts_with("HID_UNIQ=PFDK")))
+        {
+            return false; // one of our own virtual Decks
+        }
         match std::fs::read_link(e.path()) {
-            Ok(target) => !target.to_string_lossy().contains("/virtual/"),
+            Ok(target) => {
+                let t = target.to_string_lossy();
+                !t.contains("/virtual/") && !t.contains("vhci_hcd")
+            }
             Err(_) => true,
         }
     })
