@@ -62,6 +62,38 @@ systemctl reboot
 > The **reboot is mandatory** — `rpm-ostree install` stages a new deployment that only takes
 > effect on the next boot. This is normal atomic-distro behavior, not a punktfunk quirk.
 
+#### Updating a Path-A host — `rpm-ostree upgrade` is NOT enough
+
+> ⚠️ **`rpm-ostree upgrade` will not update punktfunk on its own.** `upgrade` bumps the **base
+> image** and only re-resolves *layered* packages **when the base changes**. A Bazzite base can
+> sit frozen for months (a pinned `:stable` tag, a paused rebase), so `rpm-ostree upgrade` keeps
+> reporting *"No updates available"* and your layered `punktfunk` stays put even after new RPMs
+> land in the repo. (Diagnose: `rpm-ostree status` shows the base `Version:` unchanged, while
+> `dnf -q repoquery --upgrades punktfunk` lists newer builds.)
+
+To actually pull a newer host on a static base, force rpm-ostree to re-resolve just the punktfunk
+layer — remove + re-add the same names in one transaction:
+
+```sh
+sudo rpm-ostree refresh-md --force
+sudo rpm-ostree update \
+  --uninstall punktfunk --uninstall punktfunk-web \
+  --install   punktfunk --install   punktfunk-web
+systemctl reboot
+```
+
+Or just run the helper, which detects what's layered and does the above:
+
+```sh
+sudo bash packaging/bazzite/update-punktfunk.sh          # stage; reboot when ready
+sudo bash packaging/bazzite/update-punktfunk.sh --reboot # stage + reboot now
+```
+
+> **Channel gotcha:** the re-resolve picks the highest version across **every enabled**
+> `/etc/yum.repos.d/punktfunk*.repo`. If `punktfunk-canary.repo` is enabled alongside the stable
+> `punktfunk.repo`, canary's `<next-minor>.0-0.ciN` **outranks** the stable `X.Y.Z-1` and the box
+> silently tracks canary. Enable exactly one channel — set `enabled=0` in the other repo file.
+
 ### Path B — bootc image (`FROM bazzite-nvidia`)
 
 The image is built **off-host** (on any machine with `podman`) from
