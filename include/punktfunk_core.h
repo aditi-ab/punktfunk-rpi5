@@ -21,6 +21,14 @@
 // clients out-of-band via the mDNS `mac` TXT record, so no connection is required to wake).
 #define ABI_VERSION 3
 
+// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
+// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
+// (functions a client links), which can grow without changing a single wire byte — v3's
+// `punktfunk_wake_on_lan` is client-local, and riding the C-ABI bump onto the wire locked
+// every new client out of every deployed host ("ABI mismatch: client 3 host 2", observed
+// live). Bump this ONLY when the handshake/planes actually change incompatibly.
+#define WIRE_VERSION 2
+
 // `PunktfunkHidOutput::kind` — lightbar RGB (`r`/`g`/`b` valid).
 #define PUNKTFUNK_HIDOUT_LED 1
 

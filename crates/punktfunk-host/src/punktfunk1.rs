@@ -585,10 +585,10 @@ async fn serve_session(
         // the `handshake` future re-decodes for the real session — a few dozen bytes, negligible.
         let gate_hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
         anyhow::ensure!(
-            gate_hello.abi_version == punktfunk_core::ABI_VERSION,
-            "ABI mismatch: client {} host {}",
+            gate_hello.abi_version == punktfunk_core::WIRE_VERSION,
+            "wire version mismatch: client {} host {}",
             gate_hello.abi_version,
-            punktfunk_core::ABI_VERSION
+            punktfunk_core::WIRE_VERSION
         );
         let fp = endpoint::peer_fingerprint(&conn);
         let known = fp
@@ -654,10 +654,10 @@ async fn serve_session(
     let handshake = async {
         let hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
         anyhow::ensure!(
-            hello.abi_version == punktfunk_core::ABI_VERSION,
-            "ABI mismatch: client {} host {}",
+            hello.abi_version == punktfunk_core::WIRE_VERSION,
+            "wire version mismatch: client {} host {}",
             hello.abi_version,
-            punktfunk_core::ABI_VERSION
+            punktfunk_core::WIRE_VERSION
         );
         // The pairing gate (require_pairing → paired? else park for delegated approval) ran above,
         // before this future, so a client reaching here is paired (or the host is `--open`).
@@ -805,7 +805,7 @@ async fn serve_session(
         let mut key = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut key);
         let welcome = Welcome {
-            abi_version: punktfunk_core::ABI_VERSION,
+            abi_version: punktfunk_core::WIRE_VERSION,
             udp_port,
             mode: hello.mode,
             // The post-GameStream point of punktfunk/1: Leopard GF(2¹⁶) FEC + real encryption.

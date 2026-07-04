@@ -54,3 +54,11 @@ pub use stats::Stats;
 /// v3: added `punktfunk_wake_on_lan` (Wake-on-LAN magic packet; the host's wake MAC(s) reach
 /// clients out-of-band via the mDNS `mac` TXT record, so no connection is required to wake).
 pub const ABI_VERSION: u32 = 3;
+
+/// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
+/// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
+/// (functions a client links), which can grow without changing a single wire byte — v3's
+/// `punktfunk_wake_on_lan` is client-local, and riding the C-ABI bump onto the wire locked
+/// every new client out of every deployed host ("ABI mismatch: client 3 host 2", observed
+/// live). Bump this ONLY when the handshake/planes actually change incompatibly.
+pub const WIRE_VERSION: u32 = 2;

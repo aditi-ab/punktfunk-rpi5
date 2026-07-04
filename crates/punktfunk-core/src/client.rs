@@ -876,7 +876,7 @@ async fn worker_main(args: WorkerArgs) {
         io::write_msg(
             &mut send,
             &Hello {
-                abi_version: crate::ABI_VERSION,
+                abi_version: crate::WIRE_VERSION,
                 mode,
                 compositor,
                 gamepad,
