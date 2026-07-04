@@ -892,6 +892,81 @@ fn resolve_render_pin() -> Option<LUID> {
     crate::win_adapter::resolve_render_adapter_luid()
 }
 
+/// A read-only view of the managed monitor for the mgmt `/display/state` endpoint (Goal:
+/// display-management registry facade). Backend-neutral; the [`crate::vdisplay::registry`] facade
+/// maps it into the wire shape.
+pub(crate) struct ManagedInfo {
+    pub backend: &'static str,
+    pub mode: (u32, u32, u32),
+    /// `"active"` | `"lingering"`.
+    pub state: &'static str,
+    /// Milliseconds until a lingering monitor is torn down (`None` when active).
+    pub expires_in_ms: Option<u64>,
+    /// Live sessions holding the monitor.
+    pub sessions: u32,
+    /// The monitor's generation stamp — a stable-enough id for the `/display/release` slot arg.
+    pub gen: u64,
+}
+
+impl VirtualDisplayManager {
+    /// Snapshot the current monitor for the mgmt `/display/state` endpoint. `None` when Idle.
+    pub(crate) fn snapshot(&self) -> Option<ManagedInfo> {
+        let st = self.state.lock().unwrap();
+        let (mon, state, sessions, expires_in_ms) = match &*st {
+            MgrState::Idle => return None,
+            MgrState::Active { mon, refs } => (mon, "active", *refs, None),
+            MgrState::Lingering { mon, until } => {
+                let ms = until.saturating_duration_since(Instant::now()).as_millis() as u64;
+                (mon, "lingering", 0u32, Some(ms))
+            }
+        };
+        Some(ManagedInfo {
+            backend: self.driver.name(),
+            mode: (mon.mode.width, mon.mode.height, mon.mode.refresh_hz),
+            state,
+            expires_in_ms,
+            sessions,
+            gen: mon.gen,
+        })
+    }
+
+    /// Force-tear-down a LINGERING monitor now (the `/display/release` endpoint) — so a
+    /// physical-screen user gets their screen back without waiting out the linger. An Active monitor
+    /// is refused (stopping a live session is session management, not display management). Returns
+    /// `true` if a lingering monitor was released.
+    pub(crate) fn force_release(&self) -> bool {
+        let Some(dev) = self.device_handle() else {
+            return false;
+        };
+        let mut st = self.state.lock().unwrap();
+        if matches!(&*st, MgrState::Lingering { .. }) {
+            if let MgrState::Lingering { mon, .. } = std::mem::replace(&mut *st, MgrState::Idle) {
+                // SAFETY: `teardown` needs a live control handle; `dev` is from `device_handle()`
+                // (cached handles are never closed — a dead one is retired, kept alive; see
+                // `DeviceSlot`). `mon` was moved out of the `Lingering` state under the `state` lock,
+                // so it is exclusively owned here — no aliasing.
+                unsafe { self.teardown(dev, mon) };
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Snapshot the managed monitor, or `None` when no backend has initialised the manager yet (no
+/// session has ever run) or it is Idle. Safe to call per management request.
+pub(crate) fn snapshot() -> Option<ManagedInfo> {
+    VDM.get().and_then(VirtualDisplayManager::snapshot)
+}
+
+/// Force-release a lingering monitor now; `false` if nothing was lingering (or the manager is
+/// uninitialised).
+pub(crate) fn force_release() -> bool {
+    VDM.get()
+        .map(VirtualDisplayManager::force_release)
+        .unwrap_or(false)
+}
+
 /// Linger window before a session-less monitor is torn down. The console display-management policy
 /// wins when configured (`keep_alive`); otherwise the legacy `PUNKTFUNK_MONITOR_LINGER_MS` env knob,
 /// else the 10 s default.

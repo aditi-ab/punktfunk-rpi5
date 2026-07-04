@@ -138,6 +138,48 @@
         }
       }
     },
+    "/api/v1/display/release": {
+      "post": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Release kept virtual displays",
+        "description": "Tear down lingering/pinned displays now — so a physical-screen user gets their screen back\nwithout waiting out the linger. `slot` releases one; omit it to release all kept displays.\nActive (streaming) displays are never torn down here (that is session control).",
+        "operationId": "releaseDisplay",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReleaseDisplayRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The number of kept displays released",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseDisplayResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/display/settings": {
       "get": {
         "tags": [
@@ -219,6 +261,38 @@
           },
           "500": {
             "description": "Policy could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/display/state": {
+      "get": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Live virtual displays",
+        "description": "The host's managed virtual displays right now — active (streaming), lingering (kept after\ndisconnect, counting down to teardown), or pinned (kept indefinitely). See\n`design/display-management.md`.",
+        "operationId": "getDisplayState",
+        "responses": {
+          "200": {
+            "description": "The live/kept virtual displays",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DisplayStateResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
             "content": {
               "application/json": {
                 "schema": {
@@ -1693,6 +1767,59 @@
           "av1"
         ]
       },
+      "ApiDisplayInfo": {
+        "type": "object",
+        "description": "One live or kept virtual display.",
+        "required": [
+          "slot",
+          "backend",
+          "mode",
+          "state",
+          "sessions"
+        ],
+        "properties": {
+          "backend": {
+            "type": "string",
+            "description": "Backend name (`pf-vdisplay`, `kwin`, …)."
+          },
+          "client": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Short client label, when the owner tracks it."
+          },
+          "expires_in_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Milliseconds until a lingering display is torn down (absent when active/pinned).",
+            "minimum": 0
+          },
+          "mode": {
+            "type": "string",
+            "description": "`WIDTHxHEIGHT@HZ`."
+          },
+          "sessions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Live sessions holding the display.",
+            "minimum": 0
+          },
+          "slot": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stable-enough id for the `/display/release` `slot` argument.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`active` | `lingering` | `pinned`."
+          }
+        }
+      },
       "ApiError": {
         "type": "object",
         "description": "Error envelope for every non-2xx response.",
@@ -2073,6 +2200,21 @@
           "settings": {
             "$ref": "#/components/schemas/DisplayPolicy",
             "description": "The stored policy (preset + custom fields), or the built-in default when unconfigured."
+          }
+        }
+      },
+      "DisplayStateResponse": {
+        "type": "object",
+        "description": "The host's managed virtual displays right now.",
+        "required": [
+          "displays"
+        ],
+        "properties": {
+          "displays": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiDisplayInfo"
+            }
           }
         }
       },
@@ -2792,6 +2934,35 @@
           "summary": {
             "type": "string",
             "description": "One-line story shown next to the option."
+          }
+        }
+      },
+      "ReleaseDisplayRequest": {
+        "type": "object",
+        "description": "Request body for `releaseDisplay`.",
+        "properties": {
+          "slot": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Slot to release (see `state`); omit to release **all** kept displays.",
+            "minimum": 0
+          }
+        }
+      },
+      "ReleaseDisplayResult": {
+        "type": "object",
+        "description": "Result of a `/display/release`.",
+        "required": [
+          "released"
+        ],
+        "properties": {
+          "released": {
+            "type": "integer",
+            "description": "Number of kept displays torn down.",
+            "minimum": 0
           }
         }
       },

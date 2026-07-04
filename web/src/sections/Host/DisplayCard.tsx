@@ -2,10 +2,14 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@unom/ui/button";
 import { type FC, useEffect, useState } from "react";
 import {
+	getGetDisplayStateQueryKey,
 	getGetDisplaySettingsQueryKey,
 	useGetDisplaySettings,
+	useGetDisplayState,
+	useReleaseDisplay,
 	useSetDisplaySettings,
 } from "@/api/gen/display/display";
+import type { ApiDisplayInfo } from "@/api/gen/model";
 import { ApiError } from "@/api/fetcher";
 import type {
 	DisplayPolicy,
@@ -70,8 +74,97 @@ export const DisplaySection: FC = () => {
 						/>
 					)}
 				</QueryState>
+				<LiveDisplays />
 			</CardContent>
 		</Card>
+	);
+};
+
+/**
+ * The host's live/kept virtual displays, polled from `/display/state`, each with a Release button
+ * for lingering/pinned ones (active displays can't be released — that's session control).
+ */
+const LiveDisplays: FC = () => {
+	const qc = useQueryClient();
+	const state = useGetDisplayState({ query: { refetchInterval: 2_000 } });
+	const release = useReleaseDisplay();
+	const displays = state.data?.displays ?? [];
+	const kept = displays.filter((d) => d.state !== "active");
+
+	const doRelease = (slot?: number) =>
+		release.mutate(
+			{ data: { slot: slot ?? null } },
+			{ onSuccess: () => qc.invalidateQueries({ queryKey: getGetDisplayStateQueryKey() }) },
+		);
+
+	return (
+		<div className="space-y-2 border-t pt-4">
+			<div className="flex items-center justify-between gap-4">
+				<h4 className="text-sm font-medium">{m.display_live()}</h4>
+				{kept.length > 0 && (
+					<Button
+						size="sm"
+						variant="outline"
+						disabled={release.isPending}
+						onClick={() => doRelease()}
+					>
+						{m.display_release_all()}
+					</Button>
+				)}
+			</div>
+			{displays.length === 0 ? (
+				<p className="text-sm text-muted-foreground">{m.display_none_live()}</p>
+			) : (
+				<ul className="divide-y rounded-md border">
+					{displays.map((d) => (
+						<DisplayRow
+							key={d.slot}
+							d={d}
+							busy={release.isPending}
+							onRelease={() => doRelease(d.slot)}
+						/>
+					))}
+				</ul>
+			)}
+		</div>
+	);
+};
+
+const DisplayRow: FC<{ d: ApiDisplayInfo; busy: boolean; onRelease: () => void }> = ({
+	d,
+	busy,
+	onRelease,
+}) => {
+	const active = d.state === "active";
+	const stateLabel =
+		d.state === "active"
+			? m.display_state_active()
+			: d.state === "pinned"
+				? m.display_state_pinned()
+				: m.display_state_lingering();
+	return (
+		<li className="flex items-center justify-between gap-4 px-4 py-3">
+			<div className="min-w-0">
+				<div className="flex flex-wrap items-center gap-2">
+					<span className="font-medium">{d.mode}</span>
+					<Badge variant={active ? "success" : "secondary"}>{stateLabel}</Badge>
+					{active && d.sessions > 0 && (
+						<Badge variant="outline">{m.display_sessions({ count: d.sessions })}</Badge>
+					)}
+				</div>
+				<code className="text-xs text-muted-foreground">
+					{d.backend}
+					{d.expires_in_ms != null
+						? ` · ${m.display_expires_in({ sec: Math.ceil(d.expires_in_ms / 1000) })}`
+						: ""}
+				</code>
+			</div>
+			{!active && (
+				<Button size="sm" variant="outline" disabled={busy} onClick={onRelease}>
+					{m.display_release_btn()}
+				</Button>
+			)}
+		</li>
 	);
 };
 

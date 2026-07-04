@@ -158,6 +158,8 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(set_gpu_preference))
                 .routes(routes!(get_display_settings))
                 .routes(routes!(set_display_settings))
+                .routes(routes!(get_display_state))
+                .routes(routes!(release_display))
                 .routes(routes!(get_status))
                 .routes(routes!(get_local_summary))
                 .routes(routes!(list_paired_clients))
@@ -1093,6 +1095,104 @@ async fn set_display_settings(
     }
     tracing::info!("management API: display policy updated");
     Json(display_settings_state()).into_response()
+}
+
+/// One live or kept virtual display.
+#[derive(Serialize, ToSchema)]
+struct ApiDisplayInfo {
+    /// Stable-enough id for the `/display/release` `slot` argument.
+    slot: u64,
+    /// Backend name (`pf-vdisplay`, `kwin`, …).
+    backend: String,
+    /// `WIDTHxHEIGHT@HZ`.
+    mode: String,
+    /// `active` | `lingering` | `pinned`.
+    state: String,
+    /// Milliseconds until a lingering display is torn down (absent when active/pinned).
+    expires_in_ms: Option<u64>,
+    /// Live sessions holding the display.
+    sessions: u32,
+    /// Short client label, when the owner tracks it.
+    client: Option<String>,
+}
+
+/// The host's managed virtual displays right now.
+#[derive(Serialize, ToSchema)]
+struct DisplayStateResponse {
+    displays: Vec<ApiDisplayInfo>,
+}
+
+/// Request body for `releaseDisplay`.
+#[derive(Deserialize, ToSchema)]
+struct ReleaseDisplayRequest {
+    /// Slot to release (see `state`); omit to release **all** kept displays.
+    #[serde(default)]
+    slot: Option<u64>,
+}
+
+/// Result of a `/display/release`.
+#[derive(Serialize, ToSchema)]
+struct ReleaseDisplayResult {
+    /// Number of kept displays torn down.
+    released: usize,
+}
+
+/// Live virtual displays
+///
+/// The host's managed virtual displays right now — active (streaming), lingering (kept after
+/// disconnect, counting down to teardown), or pinned (kept indefinitely). See
+/// `design/display-management.md`.
+#[utoipa::path(
+    get,
+    path = "/display/state",
+    tag = "display",
+    operation_id = "getDisplayState",
+    responses(
+        (status = OK, description = "The live/kept virtual displays", body = DisplayStateResponse),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn get_display_state() -> Json<DisplayStateResponse> {
+    let snap = crate::vdisplay::registry::snapshot();
+    Json(DisplayStateResponse {
+        displays: snap
+            .displays
+            .into_iter()
+            .map(|d| ApiDisplayInfo {
+                slot: d.slot,
+                backend: d.backend,
+                mode: format!("{}x{}@{}", d.mode.0, d.mode.1, d.mode.2),
+                state: d.state,
+                expires_in_ms: d.expires_in_ms,
+                sessions: d.sessions,
+                client: d.client,
+            })
+            .collect(),
+    })
+}
+
+/// Release kept virtual displays
+///
+/// Tear down lingering/pinned displays now — so a physical-screen user gets their screen back
+/// without waiting out the linger. `slot` releases one; omit it to release all kept displays.
+/// Active (streaming) displays are never torn down here (that is session control).
+#[utoipa::path(
+    post,
+    path = "/display/release",
+    tag = "display",
+    operation_id = "releaseDisplay",
+    request_body = ReleaseDisplayRequest,
+    responses(
+        (status = OK, description = "The number of kept displays released", body = ReleaseDisplayResult),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn release_display(
+    ApiJson(req): ApiJson<ReleaseDisplayRequest>,
+) -> Json<ReleaseDisplayResult> {
+    let released = crate::vdisplay::registry::release(req.slot);
+    tracing::info!(slot = ?req.slot, released, "management API: display release");
+    Json(ReleaseDisplayResult { released })
 }
 
 /// Live host status
@@ -2650,7 +2750,10 @@ mod tests {
         let (status, body) = send(&app, put).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
-            body["error"].as_str().unwrap_or_default().contains("forever"),
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("forever"),
             "the rejection names the unsupported option"
         );
     }

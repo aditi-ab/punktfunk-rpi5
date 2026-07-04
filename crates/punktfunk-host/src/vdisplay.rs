@@ -752,6 +752,16 @@ pub fn start_restore_worker() -> std::sync::Arc<()> {
 #[path = "vdisplay/policy.rs"]
 pub(crate) mod policy;
 
+// The pure per-display lifecycle state machine (refcount + linger + pin), platform-neutral and
+// property-tested; the registry executes the side effects its transitions dictate.
+#[path = "vdisplay/lifecycle.rs"]
+pub(crate) mod lifecycle;
+
+// The neutral snapshot/release facade over the per-OS lifecycle owners (Windows manager; Linux pool
+// later), for the management API's /display/state + /display/release.
+#[path = "vdisplay/registry.rs"]
+pub(crate) mod registry;
+
 /// Resolve a [`policy::Topology`] to a concrete value (never [`policy::Topology::Auto`]). `Auto`
 /// reproduces today's default: **extend** under an explicit `PUNKTFUNK_COMPOSITOR` pin (the CI/test
 /// posture, where the host isn't the sole desktop), else **exclusive** (Windows + the auto-detected
