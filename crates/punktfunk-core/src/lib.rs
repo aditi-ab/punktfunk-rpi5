@@ -39,6 +39,7 @@ pub mod quic;
 pub mod session;
 pub mod stats;
 pub mod transport;
+pub mod wol;
 
 pub use config::{CompositorPref, Config, FecConfig, FecScheme, Mode, ProtocolPhase, Role};
 pub use error::{PunktfunkError, PunktfunkStatus, Result};
@@ -50,4 +51,6 @@ pub use stats::Stats;
 ///
 /// v2: `punktfunk_connect` gained `client_cert_pem`/`client_key_pem` (pairing identities);
 /// added `punktfunk_pair` / `punktfunk_generate_identity` / `punktfunk_connection_request_mode`.
-pub const ABI_VERSION: u32 = 2;
+/// v3: added `punktfunk_wake_on_lan` (Wake-on-LAN magic packet; the host's wake MAC(s) reach
+/// clients out-of-band via the mDNS `mac` TXT record, so no connection is required to wake).
+pub const ABI_VERSION: u32 = 3;

@@ -15,6 +15,9 @@
 //! - `mgmt` — the management API's TCP port (when it serves one), so a client can fetch the host's
 //!   game library (`GET /api/v1/library`, mTLS) on the SAME IP without assuming the default port.
 //!   Omitted by a host with no mgmt API (the standalone `punktfunk1-host`).
+//! - `mac` — the host's wake-capable NIC MAC(s) (comma-separated, routed NIC first), which a client
+//!   persists so it can Wake-on-LAN this host after it sleeps. Advisory/unauthenticated (a wrong
+//!   MAC only makes a wake fail). Omitted when none can be read.
 
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
@@ -63,6 +66,18 @@ pub fn advertise_native(
     if let Some(mgmt) = mgmt_port {
         props.insert("mgmt".into(), mgmt.to_string());
     }
+    // `mac` — the host's wake-capable NIC MAC(s), comma-separated `aa:bb:cc:dd:ee:ff`, routed NIC
+    // first. A client persists these while the host is awake so it can send a Wake-on-LAN magic
+    // packet to wake it later (when it's asleep and no longer advertising). Unauthenticated like
+    // the rest of the advert, but a wrong MAC only makes a wake fail — the magic packet is inert
+    // and the cert fingerprint still gates the actual connection. Omitted when none can be read.
+    let macs = crate::wol::wake_macs(ip);
+    if !macs.is_empty() {
+        props.insert("mac".into(), macs.join(","));
+    }
+    // Detect & warn (never modifies) if the routed NIC isn't armed to wake — the usual reason WoL
+    // silently fails.
+    crate::wol::warn_if_not_armed(ip);
     let service = ServiceInfo::new(NATIVE_SERVICE, hostname, &host_name, ip, port, props)
         .context("build native mDNS ServiceInfo")?;
     daemon

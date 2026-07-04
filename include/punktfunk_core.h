@@ -17,7 +17,9 @@
 //
 // v2: `punktfunk_connect` gained `client_cert_pem`/`client_key_pem` (pairing identities);
 // added `punktfunk_pair` / `punktfunk_generate_identity` / `punktfunk_connection_request_mode`.
-#define ABI_VERSION 2
+// v3: added `punktfunk_wake_on_lan` (Wake-on-LAN magic packet; the host's wake MAC(s) reach
+// clients out-of-band via the mDNS `mac` TXT record, so no connection is required to wake).
+#define ABI_VERSION 3
 
 // `PunktfunkHidOutput::kind` — lightbar RGB (`r`/`g`/`b` valid).
 #define PUNKTFUNK_HIDOUT_LED 1
@@ -803,6 +805,23 @@ extern "C" {
 
 // Current ABI version. Mismatch with [`crate::ABI_VERSION`] means incompatible core.
 uint32_t punktfunk_abi_version(void);
+
+// Send a Wake-on-LAN magic packet to wake sleeping host NIC(s).
+//
+// `macs` points to `mac_count` contiguous 6-byte MAC addresses (`mac_count * 6` bytes total) —
+// a host may report several NICs; all are woken. `last_known_ip`, if non-NULL, is an IPv4
+// dotted-quad string additionally targeted by unicast (pass NULL to skip). The packet is
+// broadcast to every local interface's subnet-directed broadcast and to `255.255.255.255` on
+// ports 9 and 7. This does NOT require an open connection and is not part of the QUIC surface.
+//
+// Returns `Ok` if at least one datagram was sent. Call off the UI thread.
+//
+// # Safety
+// `macs` must point to at least `mac_count * 6` readable bytes. `last_known_ip`, if non-NULL,
+// must be a NUL-terminated string.
+PunktfunkStatus punktfunk_wake_on_lan(const uint8_t *macs,
+                                      uintptr_t mac_count,
+                                      const char *last_known_ip);
 
 // Create a session over a real UDP transport (`local`/`peer` are `host:port` strings).
 // Returns NULL on error.

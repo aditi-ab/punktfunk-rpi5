@@ -21,6 +21,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
 axum = "0.8"
 mdns-sd = "0.20"
+# Wake-on-LAN: report the host's wake-capable NIC MAC(s) to clients via the mDNS `mac` TXT record.
+# `mac_address` reads a NIC's hardware address; `if-addrs` maps the routed IP to its interface name.
+mac_address = "1"
+if-addrs = "0.13"
 tokio = { version = "1", features = ["full"] }
 rsa = "0.9"
 sha2 = { version = "0.10", features = ["oid"] }
