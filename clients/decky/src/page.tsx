@@ -10,6 +10,7 @@ import {
   showModal,
   staticClasses,
 } from "@decky/ui";
+import { RowActions, actionButton, iconButton } from "./ui";
 import { toaster } from "@decky/api";
 import { CSSProperties, FC, useState } from "react";
 import {
@@ -56,27 +57,6 @@ const tabScroll: CSSProperties = {
   padding: "0.5em 2.5em",
   paddingBottom: SAFE_BOTTOM,
   boxSizing: "border-box",
-};
-
-// DialogButton stretches to 100% width in the gamepad UI — on a fullscreen row that means a
-// screen-wide button. Size action buttons to their content instead (right-aligned by the
-// Field's children container).
-const actionButton: CSSProperties = {
-  width: "fit-content",
-  minWidth: "6em",
-  flexShrink: 0,
-};
-// Square icon-only button (details ⓘ, header back arrow) — needs an explicit height too, or
-// the zero padding collapses it to the icon's line height.
-const iconButton: CSSProperties = {
-  width: "40px",
-  minWidth: "40px",
-  height: "40px",
-  padding: 0,
-  flexShrink: 0,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
 };
 
 // ----------------------------------------------------------------------------------------
@@ -144,7 +124,7 @@ const HostRow: FC<{ host: Host; onPaired: () => void; onGames: () => void }> = (
       }`}
       childrenContainerWidth="max"
     >
-      <Focusable style={{ display: "flex", gap: "0.5em", justifyContent: "flex-end" }}>
+      <RowActions>
         <DialogButton
           style={iconButton}
           onClick={() => showModal(<HostDetailsModal host={host} />)}
@@ -153,13 +133,13 @@ const HostRow: FC<{ host: Host; onPaired: () => void; onGames: () => void }> = (
         </DialogButton>
         {/* Labeled, not icon-only: this is the entry to the game picker AND the on-screen
             library browser, and controller nav has no hover tooltip to explain a bare icon. */}
-        <DialogButton style={{ ...actionButton, minWidth: "6em" }} onClick={onGames}>
+        <DialogButton style={actionButton} onClick={onGames}>
           <FaThLarge style={{ marginRight: "0.4em" }} />
           Games
         </DialogButton>
         {needsPair && (
           <DialogButton
-            style={{ ...actionButton, minWidth: "5em" }}
+            style={actionButton}
             onClick={() => showModal(<PairModal host={host} onPaired={onPaired} />)}
           >
             Pair
@@ -178,7 +158,7 @@ const HostRow: FC<{ host: Host; onPaired: () => void; onGames: () => void }> = (
           <FaPlay style={{ marginRight: "0.4em" }} />
           Stream
         </DialogButton>
-      </Focusable>
+      </RowActions>
     </Field>
   );
 };
@@ -201,14 +181,16 @@ const HostsTab: FC<{
       childrenContainerWidth="max"
       bottomSeparator={hosts.length ? "standard" : "none"}
     >
-      <DialogButton style={{ ...actionButton, minWidth: "8em" }} disabled={scanning} onClick={refresh}>
-        {scanning ? (
-          <Spinner style={{ height: "1em", marginRight: "0.5em" }} />
-        ) : (
-          <FaSyncAlt style={{ marginRight: "0.5em" }} />
-        )}
-        {scanning ? "Scanning…" : "Refresh"}
-      </DialogButton>
+      <RowActions>
+        <DialogButton style={actionButton} disabled={scanning} onClick={refresh}>
+          {scanning ? (
+            <Spinner style={{ height: "1em", marginRight: "0.5em" }} />
+          ) : (
+            <FaSyncAlt style={{ marginRight: "0.5em" }} />
+          )}
+          {scanning ? "Scanning…" : "Refresh"}
+        </DialogButton>
+      </RowActions>
     </Field>
 
     {hosts.length === 0 && !scanning && (
@@ -251,18 +233,18 @@ const HostsTab: FC<{
               }${pin.paired ? "" : " · pairing required"}`}
               childrenContainerWidth="max"
             >
-              <Focusable style={{ display: "flex", gap: "0.5em", justifyContent: "flex-end" }}>
+              <RowActions>
                 <DialogButton style={actionButton} onClick={() => streamPin(pin, hosts, pins)}>
                   <FaPlay style={{ marginRight: "0.4em" }} />
                   Play
                 </DialogButton>
                 <DialogButton
-                  style={{ ...actionButton, minWidth: "5em" }}
+                  style={actionButton}
                   onClick={() => pins.removePin(pin.host_fp, pin.game_id)}
                 >
                   Remove
                 </DialogButton>
-              </Focusable>
+              </RowActions>
             </Field>
           );
         })}
@@ -306,13 +288,15 @@ const AboutTab: FC<{
       }
       childrenContainerWidth="max"
     >
-      <DialogButton
-        style={{ ...actionButton, minWidth: "11em" }}
-        disabled={checking}
-        onClick={() => void checkForUpdatesNow(check)}
-      >
-        {checking ? <Spinner style={{ height: "1em" }} /> : "Check for updates"}
-      </DialogButton>
+      <RowActions>
+        <DialogButton
+          style={actionButton}
+          disabled={checking}
+          onClick={() => void checkForUpdatesNow(check)}
+        >
+          {checking ? <Spinner style={{ height: "1em" }} /> : "Check for updates"}
+        </DialogButton>
+      </RowActions>
     </Field>
     {hasUpdate(update) && (
       <Field
@@ -326,13 +310,12 @@ const AboutTab: FC<{
         description="Installing can take a couple of minutes; Decky reloads the plugin when done"
         childrenContainerWidth="max"
       >
-        <DialogButton
-          style={{ ...actionButton, minWidth: "9em" }}
-          onClick={() => applyUpdate(update!, check)}
-        >
-          <FaDownload style={{ marginRight: "0.4em" }} />
-          Update
-        </DialogButton>
+        <RowActions>
+          <DialogButton style={actionButton} onClick={() => applyUpdate(update!, check)}>
+            <FaDownload style={{ marginRight: "0.4em" }} />
+            Update
+          </DialogButton>
+        </RowActions>
       </Field>
     )}
     <Field
@@ -340,13 +323,15 @@ const AboutTab: FC<{
       description="Hosts, pairing, controllers, and troubleshooting — docs.punktfunk.unom.io"
       childrenContainerWidth="max"
     >
-      <DialogButton
-        style={{ ...actionButton, minWidth: "8em" }}
-        onClick={() => Navigation.NavigateToExternalWeb(DOCS_URL)}
-      >
-        <FaExternalLinkAlt style={{ marginRight: "0.4em" }} />
-        Open
-      </DialogButton>
+      <RowActions>
+        <DialogButton
+          style={actionButton}
+          onClick={() => Navigation.NavigateToExternalWeb(DOCS_URL)}
+        >
+          <FaExternalLinkAlt style={{ marginRight: "0.4em" }} />
+          Open
+        </DialogButton>
+      </RowActions>
     </Field>
     <Field
       focusable={false}
@@ -358,9 +343,11 @@ const AboutTab: FC<{
       description="Force-stop the stream client if a session wedges"
       childrenContainerWidth="max"
     >
-      <DialogButton style={{ ...actionButton, minWidth: "8em" }} onClick={() => void forceStopStream()}>
-        Force-stop
-      </DialogButton>
+      <RowActions>
+        <DialogButton style={actionButton} onClick={() => void forceStopStream()}>
+          Force-stop
+        </DialogButton>
+      </RowActions>
     </Field>
   </div>
 );
@@ -399,16 +386,21 @@ const PunktfunkPage: FC = () => {
         </div>
       </Focusable>
 
-      {/* overflow:hidden is load-bearing: Valve's Tabs slides the incoming panel in from the
-          right on L1/R1, and with autoFocusContents it scrollIntoViews a control inside that
-          still-offscreen panel. Without a clip here the scroll pans #GamepadUI itself — the whole
-          Steam UI (top bar included) slides left until you click a tab. Valve's own Tabs always
-          live in a clipped flex box; match that. */}
+      {/* Two things fight each other on an L1/R1 tab switch:
+          1. Valve's Tabs slides the incoming panel in from the right with a CSS transform.
+          2. `autoFocusContents` then focuses a control inside that still-offscreen panel, which
+             fires scrollIntoView. Because the panel is offset by a *transform* (not by scroll
+             position), scrollIntoView can't satisfy it by scrolling any one ancestor, so it walks
+             up and pans the whole page — the "screen jumps right, then animates back" glitch.
+          Dropping autoFocusContents removes the scrollIntoView entirely, so nothing fights the
+          slide. L1/R1 still cycles tabs (that handler lives on the Tabs focus scope, active while
+          focus is anywhere inside — including the tab strip); after a switch, focus stays on the
+          strip and Down enters the content, which is how Steam's own tabbed pages behave.
+          The overflow:hidden clip stays as defense-in-depth against any stray horizontal pan. */}
       <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
         <Tabs
           activeTab={tab}
           onShowTab={(id: string) => setTab(id)}
-          autoFocusContents
           tabs={[
             {
               id: "hosts",

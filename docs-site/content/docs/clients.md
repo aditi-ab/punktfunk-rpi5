@@ -47,7 +47,7 @@ It ships as a real package, not just a source build — full steps in
   `flatpak update`; this is also what the [Decky plugin](/docs/steam-deck) launches.
 - **Ubuntu / Debian** — `apt install punktfunk-client` from the punktfunk apt registry.
 - **Fedora / Bazzite** — `rpm-ostree install punktfunk-client` from the Gitea RPM registry.
-- **Arch / SteamOS** — the `punktfunk-client` split package from the `PKGBUILD`.
+- **Arch** — `sudo pacman -Sy punktfunk-client` from the signed binary repo (see [Arch Linux](/docs/arch)).
 
 Launch it, pick your host from the list, and stream. For scripting you can skip the host list and
 connect straight away:

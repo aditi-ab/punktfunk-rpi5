@@ -19,7 +19,7 @@ On **Windows**, the host ships as a signed installer instead — see [Windows](#
 | **Ubuntu / Debian** | apt | `sudo apt install punktfunk-host` | [Ubuntu — GNOME](/docs/ubuntu-gnome) · [Ubuntu — KDE](/docs/ubuntu-kde) · [packaging/debian](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/debian/README.md) |
 | **Bazzite / Fedora Atomic** | systemd-sysext | `sudo bash punktfunk-sysext.sh install` (no layering, no reboot) | [Bazzite](/docs/bazzite) · [packaging/bazzite](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/bazzite/README.md) |
 | **Fedora (dnf)** | dnf / rpm-ostree | `dnf install punktfunk punktfunk-web` | [Fedora — KDE](/docs/fedora-kde) · [packaging/rpm](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/rpm/README.md) |
-| **Arch** | pacman | `pacman -Sy punktfunk-host` (binary repo) | [packaging/arch](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/arch/README.md) |
+| **Arch** | pacman | `pacman -Sy punktfunk-host` (binary repo) | [Arch Linux](/docs/arch) · [packaging/arch](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/arch/README.md) |
 | **SteamOS (host)** | on-device script | `bash scripts/steamdeck/install.sh` | [SteamOS (Host)](/docs/steamos-host) |
 
 Each registry is public — no auth, you just trust the repo's signing key. Adding the repo is a

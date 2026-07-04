@@ -2,8 +2,20 @@
 // the flatpak client's JSON (main.py set_settings), which the client reads on launch. The
 // accepted gamepad/compositor names mirror punktfunk-core's `*Pref::from_name`.
 import { Dropdown, Field, SliderField, Spinner, ToggleField } from "@decky/ui";
-import { FC, useEffect, useState } from "react";
+import { CSSProperties, FC, useEffect, useState } from "react";
 import { getSettings, setSettings, StreamSettings } from "./backend";
+import { RowActions } from "./ui";
+
+// Decky's Dropdown has no width prop — it fills whatever container it's in, and a
+// `childrenContainerWidth="max"` Field is the whole row. Wrapping it in this fit-content shell
+// (inside the right-aligned RowActions) shrinks the control to its selected label, with a floor
+// so short values like "60 Hz" don't collapse to a nub and a ceiling so nothing runs edge to
+// edge. Matches the right-aligned, content-sized buttons everywhere else.
+const selectShell: CSSProperties = {
+  width: "fit-content",
+  minWidth: "10em",
+  maxWidth: "24em",
+};
 
 const RESOLUTIONS: [number, number, string][] = [
   [0, 0, "Native display"],
@@ -61,21 +73,29 @@ export const SettingsSection: FC = () => {
         description="The host creates a virtual output at exactly this size"
         childrenContainerWidth="max"
       >
-        <Dropdown
-          rgOptions={RESOLUTIONS.map(([, , label], i) => ({ data: i, label }))}
-          selectedOption={resIdx}
-          onChange={(o) => {
-            const [w, h] = RESOLUTIONS[o.data as number];
-            patch({ width: w, height: h });
-          }}
-        />
+        <RowActions>
+          <div style={selectShell}>
+            <Dropdown
+              rgOptions={RESOLUTIONS.map(([, , label], i) => ({ data: i, label }))}
+              selectedOption={resIdx}
+              onChange={(o) => {
+                const [w, h] = RESOLUTIONS[o.data as number];
+                patch({ width: w, height: h });
+              }}
+            />
+          </div>
+        </RowActions>
       </Field>
       <Field label="Refresh rate" childrenContainerWidth="max">
-        <Dropdown
-          rgOptions={REFRESH.map((r) => ({ data: r, label: r === 0 ? "Native" : `${r} Hz` }))}
-          selectedOption={s.refresh_hz}
-          onChange={(o) => patch({ refresh_hz: o.data as number })}
-        />
+        <RowActions>
+          <div style={selectShell}>
+            <Dropdown
+              rgOptions={REFRESH.map((r) => ({ data: r, label: r === 0 ? "Native" : `${r} Hz` }))}
+              selectedOption={s.refresh_hz}
+              onChange={(o) => patch({ refresh_hz: o.data as number })}
+            />
+          </div>
+        </RowActions>
       </Field>
       <SliderField
         label="Bitrate"
@@ -93,11 +113,15 @@ export const SettingsSection: FC = () => {
         description="Which virtual controller the host creates for your inputs"
         childrenContainerWidth="max"
       >
-        <Dropdown
-          rgOptions={GAMEPADS.map((g) => ({ data: g, label: GAMEPAD_LABELS[g] ?? g }))}
-          selectedOption={s.gamepad}
-          onChange={(o) => patch({ gamepad: o.data as string })}
-        />
+        <RowActions>
+          <div style={selectShell}>
+            <Dropdown
+              rgOptions={GAMEPADS.map((g) => ({ data: g, label: GAMEPAD_LABELS[g] ?? g }))}
+              selectedOption={s.gamepad}
+              onChange={(o) => patch({ gamepad: o.data as string })}
+            />
+          </div>
+        </RowActions>
       </Field>
       {(s.gamepad === "steamdeck" || s.gamepad === "auto") && (
         <Field
@@ -110,11 +134,15 @@ export const SettingsSection: FC = () => {
         description="Which compositor backend the host uses for the virtual display — Automatic suits almost every host"
         childrenContainerWidth="max"
       >
-        <Dropdown
-          rgOptions={COMPOSITORS.map((c) => ({ data: c, label: COMPOSITOR_LABELS[c] ?? c }))}
-          selectedOption={s.compositor}
-          onChange={(o) => patch({ compositor: o.data as string })}
-        />
+        <RowActions>
+          <div style={selectShell}>
+            <Dropdown
+              rgOptions={COMPOSITORS.map((c) => ({ data: c, label: COMPOSITOR_LABELS[c] ?? c }))}
+              selectedOption={s.compositor}
+              onChange={(o) => patch({ compositor: o.data as string })}
+            />
+          </div>
+        </RowActions>
       </Field>
       <ToggleField
         label="Stream microphone"

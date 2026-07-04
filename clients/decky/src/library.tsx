@@ -3,13 +3,14 @@
 // can take seconds, hence the explicit spinner copy) and pins titles as one-tap rows in
 // the QAM's Games section; its header also launches the GTK client's on-screen gamepad
 // library (`--browse`).
-import { DialogButton, Field, Focusable, ModalRoot, Spinner, showModal } from "@decky/ui";
-import { CSSProperties, FC, useEffect, useState } from "react";
+import { DialogButton, Field, ModalRoot, Spinner, showModal } from "@decky/ui";
+import { FC, useEffect, useState } from "react";
 import { FaThLarge, FaTv } from "react-icons/fa";
 import { GameEntry, Host, library, LibraryResult, PinnedGame } from "./backend";
 import { PinsApi, resolvePinHost, startBrowse, startStream } from "./hooks";
 import { isSafeLaunchId } from "./steam";
 import { PairModal } from "./pair";
+import { RowActions, actionButton } from "./ui";
 
 /** Human store tag (mirrors the GTK client's `store_label`). */
 export function storeLabel(store: string): string {
@@ -57,12 +58,6 @@ export function streamPin(pin: PinnedGame, live: Host[], pins: PinsApi): void {
   }
   void startStream(host, { launchId: pin.game_id }, pin.title);
 }
-
-const pickButton: CSSProperties = {
-  width: "fit-content",
-  minWidth: "5em",
-  flexShrink: 0,
-};
 
 // Copy per backend error code (LibraryResult.error); `detail` covers the generic case.
 function errorCopy(res: LibraryResult): string {
@@ -143,16 +138,18 @@ export const GamePickerModal: FC<{
         description="Browse this host's games with the controller, full screen"
         childrenContainerWidth="max"
       >
-        <DialogButton
-          style={pickButton}
-          onClick={() => {
-            closeModal?.();
-            void startBrowse(host);
-          }}
-        >
-          <FaTv style={{ marginRight: "0.4em" }} />
-          Open
-        </DialogButton>
+        <RowActions>
+          <DialogButton
+            style={actionButton}
+            onClick={() => {
+              closeModal?.();
+              void startBrowse(host);
+            }}
+          >
+            <FaTv style={{ marginRight: "0.4em" }} />
+            Open
+          </DialogButton>
+        </RowActions>
       </Field>
 
       {clientUpdatePending && (
@@ -177,10 +174,10 @@ export const GamePickerModal: FC<{
 
       {result !== null && !result.ok && (
         <Field label="Couldn't fetch the library" description={errorCopy(result)} childrenContainerWidth="max">
-          <Focusable style={{ display: "flex", gap: "0.5em", justifyContent: "flex-end" }}>
+          <RowActions>
             {result.error === "not-paired" && (
               <DialogButton
-                style={pickButton}
+                style={actionButton}
                 onClick={() =>
                   showModal(<PairModal host={host} onPaired={() => setAttempt((n) => n + 1)} />)
                 }
@@ -188,10 +185,10 @@ export const GamePickerModal: FC<{
                 Pair
               </DialogButton>
             )}
-            <DialogButton style={pickButton} onClick={() => setAttempt((n) => n + 1)}>
+            <DialogButton style={actionButton} onClick={() => setAttempt((n) => n + 1)}>
               Retry
             </DialogButton>
-          </Focusable>
+          </RowActions>
         </Field>
       )}
 
@@ -217,10 +214,12 @@ export const GamePickerModal: FC<{
                 }
                 childrenContainerWidth="max"
               >
-                <DialogButton style={pickButton} disabled={!safe} onClick={() => togglePin(g)}>
-                  <FaThLarge style={{ marginRight: "0.4em" }} />
-                  {pinned ? "Unpin" : "Pin"}
-                </DialogButton>
+                <RowActions>
+                  <DialogButton style={actionButton} disabled={!safe} onClick={() => togglePin(g)}>
+                    <FaThLarge style={{ marginRight: "0.4em" }} />
+                    {pinned ? "Unpin" : "Pin"}
+                  </DialogButton>
+                </RowActions>
               </Field>
             );
           })}

@@ -80,7 +80,7 @@ const QamPanel: FC = () => {
       {/* Pinned games — the "jump straight into Playnite" rows. Pin games from a host's
           picker (fullscreen page → host row → games button). */}
       {pins.pins.length > 0 && (
-        <PanelSection title="Games">
+        <PanelSection title="Pinned Games">
           {pins.pins.map((pin) => {
             const { online } = resolvePinHost(pin, hosts);
             return (

@@ -48,7 +48,7 @@ see the linked guide — then it tracks updates with your normal `apt upgrade` /
 |--------|---------|-------|
 | **Ubuntu / Debian** | `sudo apt install punktfunk-client` | [packaging/debian](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/debian/README.md) |
 | **Fedora / Bazzite** | `rpm-ostree install punktfunk-client` | [packaging/rpm](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/rpm/README.md) |
-| **Arch / SteamOS** | `punktfunk-client` from the `PKGBUILD` | [packaging/arch](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/arch/README.md) |
+| **Arch** | `sudo pacman -Sy punktfunk-client` (signed binary repo) | [Arch Linux](/docs/arch) |
 
 Then launch it, pick your host from the list, and stream. For scripting, skip the picker:
 
