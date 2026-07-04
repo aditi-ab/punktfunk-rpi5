@@ -48,21 +48,21 @@
 	<key>com.apple.security.device.usb</key>
 	<true/>
 
-	<!-- Controller rumble via CoreHaptics: GCDeviceHaptics.createEngine → CHHapticEngine
-	     (GamepadFeedback's RumbleRenderer), and AVAudioEngine playback, reach the system
-	     audio-analytics daemon `com.apple.audioanalyticsd` over Mach. The sandbox denies that
-	     global-name lookup unless it's whitelisted here, and the framework's own precondition
-	     turns the denial into a HARD CRASH ("Process is sandboxed but
-	     com.apple.security.exception.mach-lookup.global-name doesn't contain
-	     com.apple.audioanalyticsd") the moment a controller's haptics engine starts. This
-	     temporary exception is the documented, App-Store-acceptable way to permit exactly that
-	     lookup — and ONLY that service (the key takes exact names, no wildcards). App Store:
-	     declare it in App Store Connect → App Sandbox Entitlement Usage Information ("CoreHaptics
-	     gamepad rumble contacts the system audio-analytics daemon"). -->
-	<key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
-	<array>
-		<string>com.apple.audioanalyticsd</string>
-	</array>
+	<!-- NO mach-lookup temporary exception here — and none is needed. Build 0.4.2 (3384) shipped a
+	     `com.apple.security.temporary-exception.mach-lookup.global-name` = com.apple.audioanalyticsd
+	     exception on the THEORY that CoreHaptics controller rumble (CHHapticEngine — the session
+	     RumbleRenderer + MenuHaptics) hard-crashes under the App Sandbox without it, because the
+	     framework reaches the audio-analytics daemon over Mach and the sandbox denies that lookup.
+	     App Review REJECTED the exception under guideline 2.4.5(i) (review 2026-07-04). We then
+	     tested the premise directly on macOS: a CHHapticEngine start + full-intensity rumble on a
+	     real Xbox pad, in a genuinely ENFORCED sandbox (NSHomeDirectory redirected into the app
+	     container) with NO exception on the codesigned binary — and it ran WITHOUT crashing, rumble
+	     and all, even with a live AVAudioEngine stream running concurrently. CoreHaptics simply
+	     tolerates the denied audioanalyticsd lookup (it's telemetry, not a hard precondition). So
+	     controller rumble works fully sandboxed with none of these exceptions. Do NOT re-add one —
+	     it will be rejected again AND it buys nothing. (DualSense rumble separately goes over raw
+	     HID via device.usb/device.bluetooth — CoreHaptics genuinely doesn't drive Sony motors on
+	     macOS — but that path needs no exception either; see DualSenseHID.) -->
 
 	<!-- Keychain Sharing (unchanged from the shared file): a team-scoped access group so the
 	     punktfunk/1 client identity in the data-protection keychain is gated by the app's
