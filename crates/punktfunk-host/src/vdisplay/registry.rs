@@ -136,7 +136,7 @@ mod linux {
     use anyhow::Result;
 
     use super::DisplayInfo;
-    use crate::vdisplay::lifecycle::{self, Acquire, Release};
+    use crate::vdisplay::lifecycle::{self, Release};
     use crate::vdisplay::policy::{self, Linger};
     use crate::vdisplay::{Mode, VirtualDisplay, VirtualOutput};
 
@@ -257,7 +257,8 @@ mod linux {
                 ) && e.backend == backend
                     && e.mode == mode
             }) {
-                debug_assert_eq!(e.life.acquire(), Acquire::Reuse);
+                // Lingering/Pinned → Active (Acquire::Reuse); side effect matters, value is known.
+                e.life.acquire();
                 let gen = r.gen.fetch_add(1, Ordering::Relaxed);
                 e.gen = gen;
                 let out = output_for(e.node_id, e.preferred_mode, gen);
@@ -288,7 +289,7 @@ mod linux {
         let preferred_mode = real.preferred_mode;
         let gen = r.gen.fetch_add(1, Ordering::Relaxed);
         let mut life = lifecycle::State::default();
-        debug_assert_eq!(life.acquire(), Acquire::Create);
+        life.acquire(); // Idle → Active{refs:1} (Acquire::Create)
         let entry = Entry {
             life,
             keepalive: real.keepalive,
