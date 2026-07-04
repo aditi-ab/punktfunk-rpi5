@@ -337,7 +337,8 @@ fn pump(
                 // through the same throttle as loss recovery below.
                 if decoder.take_keyframe_request() {
                     let now = Instant::now();
-                    if last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
+                    if last_kf_req
+                        .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
                     {
                         last_kf_req = Some(now);
                         let _ = connector.request_keyframe();
