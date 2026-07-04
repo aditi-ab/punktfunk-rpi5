@@ -128,6 +128,16 @@ virtual display is a real monitor: any process already running in your desktop s
 through the ordinary OS screen-capture APIs, exactly as it could capture a physical monitor. That floor
 is the same for every virtual-display streaming stack.
 
+One nuance specific to how the Windows host captures: because it reads the composed desktop image (what
+the monitor shows) rather than going through Windows' screen-capture APIs, a window that hides itself
+from *recording* tools with `WDA_EXCLUDEFROMCAPTURE` still appears in the stream — just as it appears to
+anyone looking at the physical screen. Conversely, DRM-protected video (Netflix and the like) is blanked
+by Windows for any capture path, so it shows as black rather than the protected frames. Neither weakens
+Windows' protections: the first is exactly what a person at the screen already sees, and the second is
+Windows enforcing its own rule. The consistent way to think about it is the one from the top of this
+page — **a connected client sees and does what a person sitting at that machine could**, no more (and,
+for DRM content, slightly less).
+
 **Recommendation:** run the Windows host on a **dedicated or gaming PC**, not on a machine that also
 holds your most sensitive material (work laptop, financial records, the box with your password vault).
 A gaming rig you stream from is a great fit; your primary secrets machine is not.
