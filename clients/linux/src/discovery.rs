@@ -22,6 +22,9 @@ pub struct DiscoveredHost {
     /// `None` when not advertised (older host / standalone `punktfunk1-host`); the
     /// library client then falls back to the well-known default.
     pub mgmt_port: Option<u16>,
+    /// Wake-on-LAN MAC(s) from the mDNS `mac` TXT (comma-separated `aa:bb:cc:dd:ee:ff`), which the
+    /// hosts page persists onto the matching saved host so it can wake it later. Empty if absent.
+    pub mac: Vec<String>,
 }
 
 /// One discovery update for the UI's advert map.
@@ -81,6 +84,11 @@ pub fn browse() -> async_channel::Receiver<DiscoveryEvent> {
                             fp_hex: val("fp"),
                             pair: val("pair"),
                             mgmt_port: val("mgmt").parse().ok(),
+                            mac: val("mac")
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect(),
                         })
                     }
                     ServiceEvent::ServiceRemoved(_ty, fullname) => {

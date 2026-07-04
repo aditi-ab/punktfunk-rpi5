@@ -40,6 +40,8 @@ mod ui_trust;
 #[cfg(target_os = "linux")]
 mod video;
 
+mod wol;
+
 #[cfg(target_os = "linux")]
 fn main() -> gtk::glib::ExitCode {
     app::run()

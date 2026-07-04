@@ -68,6 +68,9 @@ pub(crate) struct Target {
     pub(crate) port: u16,
     pub(crate) fp_hex: Option<String>,
     pub(crate) pair_optional: bool,
+    /// Wake-on-LAN MAC(s) for this host (from the saved store or the live advert) — used to send a
+    /// magic packet before connecting to an offline host. Empty when none is known.
+    pub(crate) mac: Vec<String>,
 }
 
 /// Stable app services handed to the page components as props. Each routed screen that uses

@@ -86,6 +86,9 @@ struct HostCardView: View {
     let onRemove: () -> Void
     /// Open the experimental library browser — nil (no menu item) unless the feature flag is on.
     var onBrowseLibrary: (() -> Void)? = nil
+    /// Send a Wake-on-LAN magic packet. Shown only when the host is offline and we have a stored
+    /// MAC to target (a tap-to-connect already auto-wakes; this is the explicit "just wake it").
+    var onWake: (() -> Void)? = nil
 
     var body: some View {
         let m = CardMetrics.current
@@ -137,6 +140,9 @@ struct HostCardView: View {
             Button("Test Network Speed…", action: onSpeedTest)
             if let onBrowseLibrary {
                 Button("Browse Library…", action: onBrowseLibrary)
+            }
+            if !isOnline, !host.wakeMacs.isEmpty, PunktfunkConnection.wakeOnLANAvailable, let onWake {
+                Button("Wake Host", systemImage: "power", action: onWake)
             }
             if host.pinnedSHA256 != nil {
                 // Dropping the pin does NOT downgrade to TOFU: the next connect must re-pair via

@@ -154,7 +154,14 @@ struct HomeView: View {
             onSpeedTest: { if !model.isBusy { speedTestTarget = host } },
             onForget: { store.forgetIdentity(host) },
             onRemove: { store.remove(host) },
-            onBrowseLibrary: onBrowseLibrary)
+            onBrowseLibrary: onBrowseLibrary,
+            onWake: {
+                let macs = host.wakeMacs
+                let ip = host.address
+                DispatchQueue.global(qos: .userInitiated).async {
+                    PunktfunkConnection.wakeOnLAN(macs: macs, lastKnownIP: ip)
+                }
+            })
     }
 
     private var discoveredSection: some View {

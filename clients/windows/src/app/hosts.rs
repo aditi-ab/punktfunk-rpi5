@@ -13,6 +13,7 @@ use windows_reactor::*;
 /// Overflow-menu item labels — `on_item_clicked` reports the clicked item by its text.
 const MENU_CONNECT: &str = "Connect";
 const MENU_SPEED: &str = "Test network speed\u{2026}";
+const MENU_WAKE: &str = "Wake host";
 const MENU_RENAME: &str = "Rename\u{2026}";
 const MENU_FORGET: &str = "Forget\u{2026}";
 
@@ -318,10 +319,19 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 port: k.port,
                 fp_hex: Some(k.fp_hex.clone()),
                 pair_optional: false,
+                mac: k.mac.clone(),
             };
             let online = hosts
                 .iter()
                 .any(|h| h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port));
+            // Learn this host's wake MAC(s) from its live advert while it's online, so we can wake
+            // it once it sleeps (no-op / no disk write when unchanged).
+            if let Some(a) = hosts.iter().find(|h| {
+                (h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port)) && !h.mac.is_empty()
+            }) {
+                crate::trust::learn_mac(&k.fp_hex, &k.addr, k.port, &a.mac);
+            }
+            let can_wake = !online && !k.mac.is_empty();
             let menu = {
                 let (svc, target) = (props.svc.clone(), target.clone());
                 let (sf, sr) = (set_forget.clone(), set_rename.clone());
@@ -331,17 +341,22 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     .subtle()
                     .tooltip("More options")
                     .automation_name("More options")
-                    .menu_flyout(vec![
-                        menu_item(MENU_CONNECT),
-                        menu_item(MENU_SPEED),
-                        menu_item(MENU_RENAME),
-                        menu_separator(),
-                        menu_item(MENU_FORGET),
-                    ])
+                    .menu_flyout({
+                        let mut items = vec![menu_item(MENU_CONNECT), menu_item(MENU_SPEED)];
+                        // Offer an explicit wake only when the host is offline and we have a MAC.
+                        if can_wake {
+                            items.push(menu_item(MENU_WAKE));
+                        }
+                        items.push(menu_item(MENU_RENAME));
+                        items.push(menu_separator());
+                        items.push(menu_item(MENU_FORGET));
+                        items
+                    })
                     .on_item_clicked(move |item: String| match item.as_str() {
                         MENU_CONNECT => {
                             initiate(&svc.ctx, target.clone(), &svc.set_screen, &svc.set_status)
                         }
+                        MENU_WAKE => crate::wol::wake(&target.mac, target.addr.parse().ok()),
                         MENU_SPEED => {
                             *svc.ctx.shared.target.lock().unwrap() = target.clone();
                             // New run: invalidate any still-in-flight probe, reset the screen.
@@ -369,7 +384,14 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     if k.paired { Pill::Good } else { Pill::Info },
                 ),
                 Some(menu),
-                Some(Box::new(move || initiate(&ctx2, target.clone(), &ss, &st))),
+                Some(Box::new(move || {
+                    // Auto-wake an offline saved host before connecting; the connect's own
+                    // retry/timeout gives a woken host time to come up.
+                    if can_wake {
+                        crate::wol::wake(&target.mac, target.addr.parse().ok());
+                    }
+                    initiate(&ctx2, target.clone(), &ss, &st)
+                })),
             ));
         }
         body.push(tile_grid(tiles, cols));
@@ -406,6 +428,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 port: h.port,
                 fp_hex: (!h.fp_hex.is_empty()).then(|| h.fp_hex.clone()),
                 pair_optional: h.pair == "optional",
+                mac: h.mac.clone(),
             };
             let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
             let (badge, kind) = if h.pair == "required" {
@@ -486,6 +509,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     port,
                     fp_hex: None,
                     pair_optional: false,
+                    mac: Vec::new(),
                 },
                 &ss,
                 &st,

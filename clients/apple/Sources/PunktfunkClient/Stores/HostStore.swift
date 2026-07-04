@@ -26,9 +26,16 @@ struct StoredHost: Identifiable, Codable, Hashable {
     /// decode: synthesized Decodable ignores property defaults but treats a missing Optional as
     /// nil. Resolve via `effectiveMgmtPort`. (Auth is mTLS by the pinned identity — no token.)
     var mgmtPort: UInt16?
+    /// Wake-on-LAN MAC address(es) of the host's wake-capable NIC(s), each `aa:bb:cc:dd:ee:ff`.
+    /// Learned from the host's mDNS `mac` TXT record while it's awake and persisted here, so the
+    /// client can send a magic packet to wake the host later (when it's asleep and no longer
+    /// advertising). Optional (same forward-compat reason as `mgmtPort`); nil until first learned.
+    var macAddresses: [String]?
 
     var displayName: String { name.isEmpty ? address : name }
     var effectiveMgmtPort: UInt16 { mgmtPort ?? punktfunkDefaultMgmtPort }
+    /// Wake-capable, in a form the wake helper accepts (empty when none learned yet).
+    var wakeMacs: [String] { macAddresses ?? [] }
 }
 
 extension StoredHost {
@@ -99,6 +106,16 @@ final class HostStore: ObservableObject {
     func pin(_ hostID: UUID, fingerprint: Data) {
         guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
         hosts[i].pinnedSHA256 = fingerprint
+    }
+
+    /// Learn/refresh this host's Wake-on-LAN MAC(s) from its live advert (called while the host is
+    /// awake, so the client can wake it once it sleeps). No-op when unchanged, so it doesn't churn
+    /// UserDefaults on every discovery tick.
+    func updateMacs(_ hostID: UUID, macs: [String]) {
+        guard !macs.isEmpty,
+              let i = hosts.firstIndex(where: { $0.id == hostID }),
+              hosts[i].macAddresses != macs else { return }
+        hosts[i].macAddresses = macs
     }
 
     /// Drop the pinned identity (e.g. after a legitimate host reinstall). This does NOT downgrade

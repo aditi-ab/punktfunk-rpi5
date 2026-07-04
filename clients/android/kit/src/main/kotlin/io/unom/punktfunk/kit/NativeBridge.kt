@@ -86,13 +86,22 @@ object NativeBridge {
 
     /**
      * The current resolved-host snapshot for [handle]: newline-joined records, each
-     * `key␟name␟addr␟port␟fp␟pair` (`␟` = U+001F). Empty string = no hosts / `0` handle. Poll ~1 Hz;
+     * `key␟name␟addr␟port␟fp␟pair␟mac` (`␟` = U+001F). Empty string = no hosts / `0` handle. Poll ~1 Hz;
      * cheap (a lock + string build), safe to call on the main thread.
      */
     external fun nativeDiscoveryPoll(handle: Long): String
 
     /** Stop the browse, shut the mDNS daemon down and join its thread. No-op on `0`. */
     external fun nativeDiscoveryStop(handle: Long)
+
+    /**
+     * Send a Wake-on-LAN magic packet to wake a sleeping host. [macsCsv] is comma-separated MAC
+     * addresses (`aa:bb:..,cc:dd:..`), learned from the host's mDNS `mac` TXT while it was online;
+     * [lastIp] is the host's last-known IPv4 (or empty). Returns true if at least one datagram was
+     * sent. No handle — callable without a live session. Do NOT call on the main thread (it does
+     * blocking socket sends); run it on a background dispatcher.
+     */
+    external fun nativeWakeOnLan(macsCsv: String, lastIp: String): Boolean
 
     /**
      * Start the HEVC decode thread rendering onto [surface] (a SurfaceView's surface). Decode runs

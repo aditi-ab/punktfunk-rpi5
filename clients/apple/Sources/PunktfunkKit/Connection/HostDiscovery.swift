@@ -31,6 +31,12 @@ public struct DiscoveredHost: Identifiable, Sendable, Equatable {
     /// reduced-security TOFU "Trust" path. A missing/unknown `pair` field is NOT optional:
     /// pairing is mandatory unless this is true (the policy authority is the host's advert).
     public let allowsTofu: Bool
+    /// Wake-on-LAN MAC address(es) the host advertised (mDNS `mac` TXT, comma-separated
+    /// `aa:bb:cc:dd:ee:ff`, routed NIC first). Empty when not advertised. A client persists these
+    /// onto the saved host so it can wake it after it sleeps; advisory/unauthenticated (a wrong
+    /// value only makes a wake fail — the magic packet is inert and the fingerprint still gates
+    /// the connection).
+    public let macAddresses: [String]
 }
 
 @MainActor
@@ -111,10 +117,15 @@ public final class HostDiscovery: ObservableObject {
         var fp: String?
         var pair: String?
         var id: String?
+        var macs: [String] = []
         if case let .bonjour(txt) = result.metadata {
             fp = Self.entry(txt, "fp")
             pair = Self.entry(txt, "pair")
             id = Self.entry(txt, "id")
+            macs = (Self.entry(txt, "mac") ?? "")
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
         }
         let conn = NWConnection(to: result.endpoint, using: .udp)
         connections[key] = conn
@@ -129,7 +140,7 @@ public final class HostDiscovery: ObservableObject {
                             id: (id?.isEmpty == false) ? id! : name,
                             name: name, host: address, port: port.rawValue,
                             fingerprintHex: fp, requiresPairing: pair == "required",
-                            allowsTofu: pair == "optional")
+                            allowsTofu: pair == "optional", macAddresses: macs)
                         self.publish()
                     }
                     conn.cancel()

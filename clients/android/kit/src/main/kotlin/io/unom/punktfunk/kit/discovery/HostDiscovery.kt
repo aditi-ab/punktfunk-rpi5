@@ -17,15 +17,17 @@ data class DiscoveredHost(
     val port: Int,
     val fingerprint: String? = null, // TXT "fp" (host cert SHA-256, advisory — TOFU still verifies)
     val pairingRequired: Boolean = false,
+    val mac: List<String> = emptyList(), // TXT "mac" (wake-capable NIC MAC(s), for Wake-on-LAN)
 )
 
 /** Field separator the native browse uses inside one record (ASCII Unit Separator). */
 private const val FIELD_SEP = '\u001F'
 
 /**
- * Parse one record from [NativeBridge.nativeDiscoveryPoll] (`key␟name␟addr␟port␟fp␟pair`), or null
- * if it's malformed. Pure — unit-tested without Android (see ParseRecordTest). The native side
- * already applied the protocol gate and address selection, so this is just field marshaling.
+ * Parse one record from [NativeBridge.nativeDiscoveryPoll] (`key␟name␟addr␟port␟fp␟pair␟mac`), or
+ * null if it's malformed. `mac` (7th field) is optional — an older host omits it. Pure —
+ * unit-tested without Android (see ParseRecordTest). The native side already applied the protocol
+ * gate and address selection, so this is just field marshaling.
  */
 fun parseHostRecord(record: String): DiscoveredHost? {
     val f = record.split(FIELD_SEP)
@@ -40,6 +42,8 @@ fun parseHostRecord(record: String): DiscoveredHost? {
         port = port,
         fingerprint = f[4].ifBlank { null },
         pairingRequired = f[5] == "required",
+        mac = if (f.size > 6) f[6].split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        else emptyList(),
     )
 }
 

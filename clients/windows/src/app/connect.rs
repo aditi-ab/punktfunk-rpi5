@@ -245,6 +245,7 @@ fn connect_with(
                         port: target.port,
                         fp_hex: trust::hex(&fingerprint),
                         paired: persist_paired,
+                        mac: target.mac.clone(),
                     });
                     let _ = k.save();
                 }

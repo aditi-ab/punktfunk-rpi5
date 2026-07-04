@@ -489,6 +489,40 @@ class Plugin:
         reason = (err.strip().splitlines() or out.strip().splitlines() or ["pairing failed"])[-1]
         return {"ok": False, "error": reason}
 
+    async def wake(self, host: str, port: int = 9777) -> dict:
+        """Send a Wake-on-LAN magic packet to a saved host via the flatpak client's headless
+        ``--wake`` mode, so a sleeping host is up by the time the stream ``--connect`` runs.
+
+        The MAC comes from the flatpak client's OWN known-hosts store (learned from the host's
+        mDNS ``mac`` TXT while it was online) — no MAC handling here — so this is a no-op if none
+        has been learned yet. Fire it just before launching a stream; it's fast and best-effort.
+        Returns ``{ok, error?}`` (``ok: False`` when no MAC is known / flatpak missing).
+        """
+        flatpak = _flatpak()
+        if not flatpak:
+            return {"ok": False, "error": "flatpak-not-found"}
+        argv = [flatpak, "run", "--arch=x86_64", APP_ID, "--wake", f"{host}:{port}"]
+        decky.logger.info("wake: %s:%s", host, port)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_flatpak_env(),
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "wake timed out"}
+        except Exception as exc:  # noqa: BLE001
+            decky.logger.exception("wake failed to launch")
+            return {"ok": False, "error": str(exc)}
+        if proc.returncode == 0:
+            return {"ok": True}
+        reason = (stderr.decode(errors="replace").strip().splitlines() or
+                  ["no MAC known for this host yet"])[-1]
+        decky.logger.info("wake skipped (rc=%s): %s", proc.returncode, reason)
+        return {"ok": False, "error": reason}
+
     async def library(self, host: str, mgmt_port: int = 0, fp: str = "") -> dict:
         """Fetch a paired host's game library via the flatpak client's headless
         ``--library`` mode (the client's own mTLS identity + pinned-fingerprint transport —

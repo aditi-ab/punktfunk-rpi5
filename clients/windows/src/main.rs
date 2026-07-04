@@ -43,6 +43,8 @@ mod trust;
 #[cfg(windows)]
 mod video;
 
+mod wol;
+
 #[cfg(windows)]
 fn main() {
     // With #![windows_subsystem = "windows"] the process starts with no console, so the GUI/MSIX
@@ -187,6 +189,7 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
                     port,
                     fp_hex: trust::hex(&fp),
                     paired: true,
+                    mac: Vec::new(),
                 });
                 let _ = k.save();
                 tracing::info!(fp = %trust::hex(&fp), "paired");

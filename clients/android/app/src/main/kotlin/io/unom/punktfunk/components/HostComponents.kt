@@ -60,6 +60,7 @@ fun HostCard(
     onConnect: () -> Unit,
     onForget: (() -> Unit)?,
     onRename: (() -> Unit)? = null,
+    onWake: (() -> Unit)? = null,
 ) {
     // D-pad / controller focus highlight: a clickable card is focusable, but the default state
     // layer is too subtle on a TV across a room — draw a clear primary-colour border when focused.
@@ -107,7 +108,7 @@ fun HostCard(
                 StatusPill(status)
             }
 
-            if (onForget != null || onRename != null) {
+            if (onForget != null || onRename != null || onWake != null) {
                 var menu by remember { mutableStateOf(false) }
                 Box(modifier = Modifier.align(Alignment.TopEnd)) {
                     IconButton(enabled = enabled, onClick = { menu = true }) {
@@ -119,6 +120,15 @@ fun HostCard(
                         )
                     }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        if (onWake != null) {
+                            DropdownMenuItem(
+                                text = { Text("Wake host") },
+                                onClick = {
+                                    menu = false
+                                    onWake()
+                                },
+                            )
+                        }
                         if (onRename != null) {
                             DropdownMenuItem(
                                 text = { Text("Rename") },

@@ -39,6 +39,9 @@ mod feedback;
 mod mic;
 mod session;
 mod stats;
+// Ungated like `discovery`: pure `jni` + `punktfunk_core::wol` (no Android framework), so it links
+// into the host workspace build too. Kotlin only ever calls it on device.
+mod wol;
 
 /// Initialize `android_logger` once when the JVM loads the library. Logs land in logcat under the
 /// `punktfunk` tag. Android-only — there is no JVM (and no logcat) on the host build.

@@ -31,7 +31,7 @@ const PROTO: &str = "punktfunk/1";
 /// Field separator inside one serialized record (ASCII Unit Separator — never in a field value).
 const FIELD_SEP: char = '\u{1f}';
 
-/// One resolved host, serialized to Kotlin as `key␟name␟addr␟port␟fp␟pair` (`␟` = [`FIELD_SEP`]).
+/// One resolved host, serialized to Kotlin as `key␟name␟addr␟port␟fp␟pair␟mac` (`␟` = [`FIELD_SEP`]).
 /// Records are newline-joined in a poll snapshot; [`Host::encode`] strips the framing bytes from
 /// every field so no value can break it.
 #[derive(Clone, PartialEq)]
@@ -42,6 +42,8 @@ struct Host {
     port: u16,
     fp: String,
     pair: String,
+    /// Wake-on-LAN MAC(s) from the mDNS `mac` TXT (comma-separated), for later wake. Empty if absent.
+    mac: String,
 }
 
 impl Host {
@@ -54,13 +56,14 @@ impl Host {
             s.replace(['\n', '\r', FIELD_SEP], "")
         }
         format!(
-            "{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}",
+            "{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}",
             clean(&self.key),
             clean(&self.name),
             clean(&self.addr),
             self.port,
             clean(&self.fp),
             clean(&self.pair),
+            clean(&self.mac),
         )
     }
 }
@@ -182,6 +185,7 @@ fn resolve(info: &ResolvedService) -> Option<Host> {
         port: info.get_port(),
         fp: val("fp"),
         pair: val("pair"),
+        mac: val("mac"),
     })
 }
 
@@ -202,7 +206,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoverySt
 }
 
 /// `NativeBridge.nativeDiscoveryPoll(handle): String` — the current resolved-host snapshot,
-/// newline-joined records of `key␟name␟addr␟port␟fp␟pair` (`␟` = U+001F). Empty string = no hosts /
+/// newline-joined records of `key␟name␟addr␟port␟fp␟pair␟mac` (`␟` = U+001F). Empty string = no hosts /
 /// `0` handle. Poll ~1 Hz from the UI thread (cheap: a mutex lock + string build).
 #[no_mangle]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPoll<'local>(
@@ -263,16 +267,18 @@ mod tests {
             port: 9777,
             fp: "ab".repeat(32),
             pair: "required".into(),
+            mac: "aa:bb:cc:dd:ee:ff".into(),
         };
         let encoded = h.encode();
         let fields: Vec<&str> = encoded.split(FIELD_SEP).collect();
-        assert_eq!(fields.len(), 6);
+        assert_eq!(fields.len(), 7);
         assert_eq!(fields[0], "host-123");
         assert_eq!(fields[1], "home-worker-2");
         assert_eq!(fields[2], "192.168.1.70");
         assert_eq!(fields[3], "9777");
         assert_eq!(fields[4], "ab".repeat(32));
         assert_eq!(fields[5], "required");
+        assert_eq!(fields[6], "aa:bb:cc:dd:ee:ff");
         assert!(
             !encoded.contains('\n'),
             "a record must never contain the record separator"
@@ -282,7 +288,7 @@ mod tests {
     #[test]
     fn encode_strips_injected_separators_from_a_hostile_advert() {
         // A rogue advert could carry framing bytes in its instance label / TXT; encode must strip
-        // them so the snapshot stays exactly one record of exactly six fields.
+        // them so the snapshot stays exactly one record of exactly seven fields.
         let h = Host {
             key: "k\u{1f}injected".into(),
             name: "evil\nhost\r".into(),
@@ -290,9 +296,10 @@ mod tests {
             port: 9777,
             fp: "ab\u{1f}cd".into(),
             pair: "required\n".into(),
+            mac: "aa:bb\u{1f}cc".into(),
         };
         let encoded = h.encode();
-        assert_eq!(encoded.matches(FIELD_SEP).count(), 5, "exactly six fields");
+        assert_eq!(encoded.matches(FIELD_SEP).count(), 6, "exactly seven fields");
         assert!(!encoded.contains('\n') && !encoded.contains('\r'));
         let fields: Vec<&str> = encoded.split(FIELD_SEP).collect();
         assert_eq!(fields[0], "kinjected");

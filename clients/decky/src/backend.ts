@@ -122,6 +122,12 @@ export const setSettings = callable<[settings: StreamSettings], { ok: boolean }>
   "set_settings",
 );
 export const killStream = callable<[], { ok: boolean }>("kill_stream");
+// Send a Wake-on-LAN magic packet to a saved host (headless flatpak --wake) so a sleeping host is
+// up by the time the stream connects. The MAC is looked up from the flatpak client's own
+// known-hosts store; `ok: false` (no-op) when none has been learned yet. Fire before launching.
+export const wake = callable<[host: string, port: number], { ok: boolean; error?: string }>(
+  "wake",
+);
 export const checkUpdate = callable<[force: boolean], UpdateInfo>("check_update");
 // Update the flatpak client in the user installation (`flatpak update --user -y io.unom.Punktfunk`).
 export const updateClient = callable<

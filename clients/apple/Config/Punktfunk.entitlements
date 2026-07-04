@@ -11,5 +11,22 @@
 	<array>
 		<string>$(AppIdentifierPrefix)io.unom.punktfunk</string>
 	</array>
+	<!-- Wake-on-LAN needs to send a UDP broadcast magic packet (a sleeping host has no ARP
+	     entry, so unicast can't wake it). Since iOS 14 / tvOS 14 the OS blocks sending to
+	     broadcast/multicast addresses unless the app carries this managed entitlement — it must
+	     be requested from and approved by Apple for the App ID, then enabled in the provisioning
+	     profile. macOS is not gated by this (its App Sandbox network.client/server cover it).
+
+	     GATED pending Apple's approval of the request (form filed) — an unauthorized managed
+	     entitlement breaks iOS/tvOS signing, so it's commented out to keep those apps releasable.
+	     ON APPROVAL: (1) uncomment the two lines below, and (2) flip
+	     PunktfunkConnection.wakeOnLANAvailable (PunktfunkConnection.swift) to enable the iOS/tvOS
+	     wake path + UI. Until then iOS/tvOS Wake-on-LAN is a clean no-op — MACs are still learned
+	     from mDNS so it works immediately once ungated. macOS is unaffected (separate entitlements
+	     file, no multicast entitlement needed). -->
+	<!--
+	<key>com.apple.developer.networking.multicast</key>
+	<true/>
+	-->
 </dict>
 </plist>

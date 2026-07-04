@@ -13,6 +13,11 @@ data class KnownHost(
     val name: String,
     val fpHex: String,
     val paired: Boolean,
+    /**
+     * Wake-on-LAN MAC(s) (`aa:bb:cc:dd:ee:ff`) learned from the host's mDNS `mac` TXT while it was
+     * online, so the client can wake it once it sleeps. Empty until first learned.
+     */
+    val mac: List<String> = emptyList(),
 )
 
 /**
@@ -42,7 +47,20 @@ class KnownHostStore(context: Context) {
             .put("name", host.name)
             .put("fp", host.fpHex.lowercase())
             .put("paired", host.paired)
+            .put("mac", host.mac.joinToString(","))
         prefs.edit().putString(key(host.address, host.port), json.toString()).apply()
+    }
+
+    /**
+     * Learn/refresh a saved host's Wake-on-LAN MAC(s) from its live advert (called while online).
+     * No-op when the host isn't saved, the list is empty, or it's unchanged — so it doesn't churn
+     * prefs on every discovery tick.
+     */
+    fun learnMac(address: String, port: Int, mac: List<String>) {
+        if (mac.isEmpty()) return
+        val h = get(address, port) ?: return
+        if (h.mac == mac) return
+        save(h.copy(mac = mac))
     }
 
     /** Forget [address]:[port] (the next connect re-pairs / re-TOFUs). */
@@ -68,6 +86,7 @@ class KnownHostStore(context: Context) {
             name = j.getString("name"),
             fpHex = j.getString("fp"),
             paired = j.optBoolean("paired", false),
+            mac = j.optString("mac", "").split(",").map { it.trim() }.filter { it.isNotEmpty() },
         )
     }.getOrNull()
 }
