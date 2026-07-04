@@ -299,7 +299,11 @@ mod tests {
             mac: "aa:bb\u{1f}cc".into(),
         };
         let encoded = h.encode();
-        assert_eq!(encoded.matches(FIELD_SEP).count(), 6, "exactly seven fields");
+        assert_eq!(
+            encoded.matches(FIELD_SEP).count(),
+            6,
+            "exactly seven fields"
+        );
         assert!(!encoded.contains('\n') && !encoded.contains('\r'));
         let fields: Vec<&str> = encoded.split(FIELD_SEP).collect();
         assert_eq!(fields[0], "kinjected");

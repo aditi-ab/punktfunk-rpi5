@@ -66,11 +66,17 @@ pub fn wake_macs(primary_ip: IpAddr) -> Vec<String> {
 #[cfg(target_os = "linux")]
 pub fn warn_if_not_armed(primary_ip: IpAddr) {
     let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
-    let Some(iface) = ifaces.iter().find(|i| i.ip() == primary_ip).map(|i| i.name.clone()) else {
+    let Some(iface) = ifaces
+        .iter()
+        .find(|i| i.ip() == primary_ip)
+        .map(|i| i.name.clone())
+    else {
         return;
     };
     match ethtool_wol_has_magic(&iface) {
-        Some(true) => tracing::info!(iface = %iface, "Wake-on-LAN armed (magic packet) on host NIC"),
+        Some(true) => {
+            tracing::info!(iface = %iface, "Wake-on-LAN armed (magic packet) on host NIC")
+        }
         Some(false) => tracing::warn!(
             iface = %iface,
             "Wake-on-LAN is NOT armed on this host's NIC — clients cannot wake it from sleep. \
@@ -88,7 +94,10 @@ pub fn warn_if_not_armed(_primary_ip: IpAddr) {}
 /// (wake on MagicPacket). Returns `None` if ethtool is missing/failed or the field is absent.
 #[cfg(target_os = "linux")]
 fn ethtool_wol_has_magic(iface: &str) -> Option<bool> {
-    let out = std::process::Command::new("ethtool").arg(iface).output().ok()?;
+    let out = std::process::Command::new("ethtool")
+        .arg(iface)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

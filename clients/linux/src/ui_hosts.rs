@@ -319,7 +319,10 @@ fn rebuild(state: &Rc<State>) {
         let online = adverts.values().any(|a| matches(k, a));
         // Learn this host's wake MAC(s) from its live advert while it's online, so we can wake it
         // once it sleeps and stops advertising (no-op / no disk write when unchanged).
-        if let Some(a) = adverts.values().find(|a| matches(k, a) && !a.mac.is_empty()) {
+        if let Some(a) = adverts
+            .values()
+            .find(|a| matches(k, a) && !a.mac.is_empty())
+        {
             crate::trust::learn_mac(&k.fp_hex, &k.addr, k.port, &a.mac);
         }
         let recent = most_recent.as_deref() == Some(k.fp_hex.as_str());
@@ -505,7 +508,10 @@ fn saved_card(
         // Explicit "just wake it" (the tap-to-connect already auto-wakes an offline host).
         let mac = k.mac.clone();
         let addr = k.addr.clone();
-        add("wake", Box::new(move || crate::wol::wake(&mac, addr.parse().ok())));
+        add(
+            "wake",
+            Box::new(move || crate::wol::wake(&mac, addr.parse().ok())),
+        );
     }
     overlay.insert_action_group("card", Some(&actions));
 

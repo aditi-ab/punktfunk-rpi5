@@ -327,7 +327,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             // Learn this host's wake MAC(s) from its live advert while it's online, so we can wake
             // it once it sleeps (no-op / no disk write when unchanged).
             if let Some(a) = hosts.iter().find(|h| {
-                (h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port)) && !h.mac.is_empty()
+                (h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port))
+                    && !h.mac.is_empty()
             }) {
                 crate::trust::learn_mac(&k.fp_hex, &k.addr, k.port, &a.mac);
             }

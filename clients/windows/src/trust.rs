@@ -129,9 +129,11 @@ pub fn learn_mac(fp_hex: &str, addr: &str, port: u16, mac: &[String]) {
         return;
     }
     let mut known = KnownHosts::load();
-    let Some(h) = known.hosts.iter_mut().find(|h| {
-        (!fp_hex.is_empty() && h.fp_hex == fp_hex) || (h.addr == addr && h.port == port)
-    }) else {
+    let Some(h) = known
+        .hosts
+        .iter_mut()
+        .find(|h| (!fp_hex.is_empty() && h.fp_hex == fp_hex) || (h.addr == addr && h.port == port))
+    else {
         return;
     };
     if h.mac == mac {

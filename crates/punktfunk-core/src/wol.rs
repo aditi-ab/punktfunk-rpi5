@@ -64,7 +64,10 @@ pub fn build_magic_packet(mac: Mac) -> [u8; 102] {
 /// could be opened or nothing could be sent at all.
 pub fn send_magic_packet(macs: &[Mac], last_known_ip: Option<Ipv4Addr>) -> io::Result<()> {
     if macs.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no MAC addresses"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no MAC addresses",
+        ));
     }
 
     // Build the target IP set: each interface's directed broadcast, the limited broadcast, and
@@ -100,7 +103,10 @@ pub fn send_magic_packet(macs: &[Mac], last_known_ip: Option<Ipv4Addr>) -> io::R
     if sent_any {
         Ok(())
     } else {
-        Err(io::Error::new(io::ErrorKind::Other, "no magic packet could be sent"))
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "no magic packet could be sent",
+        ))
     }
 }
 
@@ -118,9 +124,9 @@ fn broadcast_addrs() -> Vec<Ipv4Addr> {
             continue;
         }
         if let if_addrs::IfAddr::V4(v4) = iface.addr {
-            let bcast = v4.broadcast.unwrap_or_else(|| {
-                Ipv4Addr::from(u32::from(v4.ip) | !u32::from(v4.netmask))
-            });
+            let bcast = v4
+                .broadcast
+                .unwrap_or_else(|| Ipv4Addr::from(u32::from(v4.ip) | !u32::from(v4.netmask)));
             // Skip a degenerate 0.0.0.0 (unconfigured) and the all-ones limited broadcast we
             // already add unconditionally.
             if !bcast.is_unspecified() && bcast != Ipv4Addr::BROADCAST {
@@ -156,8 +162,14 @@ mod tests {
 
     #[test]
     fn parse_mac_forms() {
-        assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff"), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
-        assert_eq!(parse_mac("AA-BB-CC-DD-EE-FF"), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        assert_eq!(
+            parse_mac("aa:bb:cc:dd:ee:ff"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+        assert_eq!(
+            parse_mac("AA-BB-CC-DD-EE-FF"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
         assert_eq!(parse_mac("01:02:03:04:05:06"), Some([1, 2, 3, 4, 5, 6]));
         assert_eq!(parse_mac("aa:bb:cc:dd:ee"), None); // too few
         assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff:00"), None); // too many
