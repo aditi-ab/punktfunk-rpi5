@@ -3508,7 +3508,11 @@ fn build_pipeline(
     bit_depth: u8,
     plan: crate::session_plan::SessionPlan,
 ) -> Result<Pipeline> {
-    let vout = vd.create(mode).context("create virtual output")?;
+    // Acquire through the registry (design/display-management.md): on Linux this pools the display
+    // for keep-alive (reuse a kept one, or create + keep the backend's keepalive so it outlives the
+    // session per policy); on Windows it delegates to `vd.create` (the manager already leases). The
+    // returned `VirtualOutput`'s keepalive is a registry lease — the capturer holds it as before.
+    let vout = crate::vdisplay::registry::acquire(vd, mode).context("create virtual output")?;
     // The backend reports the refresh it actually achieved in `preferred_mode.2` (KWin may cap a
     // virtual output at 60 Hz if the custom-mode install was rejected). Pace the encoder + frame
     // clock to that, not the requested rate, so we don't emit phantom duplicate frames over a

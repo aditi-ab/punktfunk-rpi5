@@ -286,13 +286,15 @@ fn open_gs_virtual_source(
             std::sync::atomic::AtomicBool::new(false),
         ))
     });
-    let vout = vd
-        .create(punktfunk_core::Mode {
+    let vout = crate::vdisplay::registry::acquire(
+        &mut vd,
+        punktfunk_core::Mode {
             width: cfg.width,
             height: cfg.height,
             refresh_hz: cfg.fps,
-        })
-        .context("create virtual output at client resolution")?;
+        },
+    )
+    .context("create virtual output at client resolution")?;
     // HDR: pass the negotiated `cfg.hdr` (client asked for HDR AND the host can deliver it). On the
     // Windows IDD-push path this proactively enables advanced color on the virtual display so a Main10
     // PQ stream flows even from an SDR desktop; an already-HDR desktop streams PQ regardless (the
