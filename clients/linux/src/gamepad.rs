@@ -551,6 +551,14 @@ struct Worker<'a> {
     /// switch / detach so a contact held at that moment doesn't stick. surface 0 = the legacy single
     /// touchpad, 1/2 = a Steam left/right pad.
     held_touches: std::collections::HashSet<(u8, u8)>,
+    /// Per Steam-pad surface (index 0 = left/surface 1, 1 = right/surface 2): the last wire
+    /// coordinates + whether a finger is on it. Pad CLICKS arrive as buttons with no position,
+    /// so the click forward reuses the surface's live contact point.
+    surface_last: [(i16, i16, bool); 2],
+    /// Steam-pad clicks currently held (surface−1 indexed): keeps the click bit asserted
+    /// through touch-motion frames (which would otherwise clear it host-side) and lets the
+    /// flush lift a click held across detach/pad-switch.
+    held_clicks: [bool; 2],
     last_accel: [i16; 3],
     /// Raises the UI escape signal; the escape chord fires it once per press.
     escape_tx: async_channel::Sender<()>,
@@ -681,6 +689,24 @@ impl Worker<'_> {
                 }
                 *v = i32::MIN;
             }
+            // Lift any Steam-pad click held at this moment — a click that survives a
+            // detach/pad-switch would leave the host's pad pressed forever.
+            for i in 0..2usize {
+                if std::mem::take(&mut self.held_clicks[i]) {
+                    let (x, y, _) = self.surface_last[i];
+                    let _ = c.send_rich_input(RichInput::TouchpadEx {
+                        pad: 0,
+                        surface: (i as u8) + 1,
+                        finger: 0,
+                        touch: false,
+                        click: false,
+                        x,
+                        y,
+                        pressure: 0,
+                    });
+                }
+            }
+            self.surface_last = [(0, 0, false); 2];
             // Lift any touchpad contact the host still believes is down (surface 0 = legacy pad).
             for (surface, finger) in self.held_touches.drain() {
                 let rich = if surface == 0 {
@@ -709,6 +735,8 @@ impl Worker<'_> {
             self.held_buttons.clear();
             self.last_axis = [i32::MIN; 6];
             self.held_touches.clear();
+            self.held_clicks = [false; 2];
+            self.surface_last = [(0, 0, false); 2];
         }
         // A held chord doesn't survive a flush (detach / pad-switch) — clear its latches too.
         self.reset_chord();
@@ -789,26 +817,29 @@ impl Worker<'_> {
         y: f32,
         active: bool,
     ) {
-        let Some(c) = self.attached.as_ref() else {
+        let Some(c) = self.attached.clone() else {
             return;
         };
-        let multi = self
-            .open
-            .as_ref()
-            .filter(|(id, _)| *id == which)
-            .map(|(_, p)| p.touchpads_count() >= 2)
-            .unwrap_or(false);
+        let multi = self.is_multi_touchpad(which);
         let (cx, cy) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
         let surface = if multi { (touchpad as u8) + 1 } else { 0 };
         let rich = if multi {
+            let (wx, wy) = (
+                (cx * 65535.0 - 32768.0) as i16,
+                (cy * 65535.0 - 32768.0) as i16,
+            );
+            let i = (surface - 1).min(1) as usize;
+            self.surface_last[i] = (wx, wy, active);
             RichInput::TouchpadEx {
                 pad: 0,
                 surface,
                 finger,
                 touch: active,
-                click: false,
-                x: (cx * 65535.0 - 32768.0) as i16,
-                y: (cy * 65535.0 - 32768.0) as i16,
+                // The pad's physical click is a separate BUTTON event (see forward_click) —
+                // carry the held state so a motion frame can't clear a click mid-press.
+                click: self.held_clicks[i],
+                x: wx,
+                y: wy,
                 pressure: 0,
             }
         } else {
@@ -826,6 +857,57 @@ impl Worker<'_> {
         } else {
             self.held_touches.remove(&(surface, finger));
         }
+    }
+
+    /// The open pad has two touchpads (Steam Deck / Steam Controller) — the gate for the
+    /// `TouchpadEx` surface encoding and the pad-click button re-route.
+    fn is_multi_touchpad(&self, which: u32) -> bool {
+        self.open
+            .as_ref()
+            .filter(|(id, _)| *id == which)
+            .map(|(_, p)| p.touchpads_count() >= 2)
+            .unwrap_or(false)
+    }
+
+    /// SDL's Steam Deck mapping delivers the pad CLICKS as gamepad buttons — the generic
+    /// `touchpad` button is the LEFT pad's click and `misc2` the RIGHT's (SDL_gamepad_db.h
+    /// `touchpad:b17,misc2:b16`). They must NOT ride the button plane: it has no surface
+    /// identity, and the host maps `BTN_TOUCHPAD` to the RIGHT pad (DualSense convention) —
+    /// which is exactly "a left-pad click registers on the right pad". Only for the open
+    /// multi-touchpad pad; a DualSense's single `touchpad` button stays a wire button.
+    fn steam_click_surface(&self, which: u32, button: sdl3::gamepad::Button) -> Option<u8> {
+        use sdl3::gamepad::Button;
+        if !self.is_multi_touchpad(which) {
+            return None;
+        }
+        match button {
+            Button::Touchpad => Some(1),
+            Button::Misc2 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Forward a Steam-pad click on the rich plane, bound to its surface. Click events carry
+    /// no position, so reuse the surface's live contact point; a physical click implies
+    /// contact, so `touch` stays asserted while the click is down even if the touch event
+    /// hasn't arrived yet (event-order safety).
+    fn forward_click(&mut self, surface: u8, down: bool) {
+        let Some(c) = self.attached.clone() else {
+            return;
+        };
+        let i = (surface - 1).min(1) as usize;
+        self.held_clicks[i] = down;
+        let (x, y, touching) = self.surface_last[i];
+        let _ = c.send_rich_input(RichInput::TouchpadEx {
+            pad: 0,
+            surface,
+            finger: 0,
+            touch: touching || down,
+            click: down,
+            x,
+            y,
+            pressure: 0,
+        });
     }
 
     /// Publish the pad list, active pad, and pin to the UI-facing mutexes.
@@ -935,6 +1017,10 @@ impl Worker<'_> {
                 }
             }
             Event::ControllerButtonDown { which, button, .. } if active == Some(which) => {
+                if let Some(surface) = self.steam_click_surface(which, button) {
+                    self.forward_click(surface, true);
+                    return;
+                }
                 let Some(c) = self.attached.clone() else {
                     return;
                 };
@@ -945,6 +1031,10 @@ impl Worker<'_> {
                 }
             }
             Event::ControllerButtonUp { which, button, .. } if active == Some(which) => {
+                if let Some(surface) = self.steam_click_surface(which, button) {
+                    self.forward_click(surface, false);
+                    return;
+                }
                 let Some(c) = self.attached.clone() else {
                     return;
                 };
@@ -1158,6 +1248,8 @@ fn run(
         last_axis: [i32::MIN; 6],
         held_buttons: Vec::new(),
         held_touches: std::collections::HashSet::new(),
+        surface_last: [(0, 0, false); 2],
+        held_clicks: [false; 2],
         last_accel: [0; 3],
         escape_tx: escape_tx.clone(),
         disconnect_tx: disconnect_tx.clone(),
