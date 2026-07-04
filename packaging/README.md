@@ -17,13 +17,15 @@ packaging/
   rpm/punktfunk.spec      # the RPM (builds punktfunk-host from source with cargo)
   bazzite/host.env        # gamescope-default config for a Bazzite appliance
   bazzite/README.md       # step-by-step Bazzite setup guide
+  bazzite/*sysext*.sh     # the no-layering path: build/install/publish the systemd-sysext
   bootc/Containerfile     # bake punktfunk into a Bazzite-based atomic image
   copr/                   # COPR build-from-SCM settings
 ```
 
 The other packaging targets have their own READMEs: [`debian/`](debian/README.md) (apt),
-[`arch/`](arch/README.md) (PKGBUILD + sysext), [`flatpak/`](flatpak/README.md) (the client),
-[`windows/`](windows/README.md) (host installer + drivers), plus `kde/` and `linux/` helpers.
+[`arch/`](arch/README.md) (pacman binary repo + PKGBUILD + SteamOS sysext),
+[`flatpak/`](flatpak/README.md) (the client), [`windows/`](windows/README.md) (host installer +
+drivers), plus `kde/` and `linux/` helpers.
 
 ## What's needed beyond base Fedora
 
@@ -38,7 +40,22 @@ On **Bazzite** the only genuinely new runtime bits are `ffmpeg-libs` (RPM Fusion
 `libei` — the rest of the stack is already there. The default backend is **gamescope**
 (`packaging/bazzite/host.env`), which the host spawns headless per session — no desktop login.
 
-## Option A — Gitea RPM registry (recommended; per-host, `rpm-ostree`)
+## Option A — systemd-sysext (recommended; no layering, no reboot)
+
+On Bazzite / Fedora Atomic the recommended install is the **systemd-sysext** image — rpm-ostree
+layering is a last resort per the Bazzite docs (it slows every OS update and can block upgrades),
+while a sysext overlays `/usr` at runtime, survives OS updates, and updates in one command with
+no reboot. CI wraps the same RPMs below into the image, so content and channels are identical.
+
+```sh
+curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh
+sudo bash punktfunk-sysext.sh install     # then: sudo punktfunk-sysext update | status | remove
+```
+
+Full walkthrough (incl. the F43→F44 rebase behavior and migration off layering):
+[`bazzite/README.md`](bazzite/README.md).
+
+## Option B — Gitea RPM registry (per-host, `rpm-ostree` layering)
 
 The host's RPM is published to **unom's self-hosted Gitea RPM registry** (CI builds it on every
 push), mirroring the [Debian/apt](debian/README.md) setup. Add one repo file, install, and track
@@ -60,7 +77,7 @@ rpm-ostree install punktfunk && systemctl reboot
 # updates:  rpm-ostree upgrade && systemctl reboot
 ```
 
-## Option B — COPR (per-host, `rpm-ostree install`)
+## Option C — COPR (per-host, `rpm-ostree install`)
 
 1. Create a COPR project, enable **build-from-SCM** pointing at this repo, spec path
    `packaging/rpm/punktfunk.spec` (see `copr/README.md`). Under *External Repositories* add
@@ -78,7 +95,7 @@ rpm-ostree install punktfunk && systemctl reboot
    systemctl reboot
    ```
 
-## Option C — bootc (image-based, atomic)
+## Option D — bootc (image-based, atomic)
 
 Layer punktfunk into a Bazzite image once, then rebase any number of hosts onto it — no
 per-host drift. See `bootc/Containerfile`:
@@ -89,7 +106,7 @@ podman push  ghcr.io/<you>/bazzite-punktfunk
 sudo bootc switch ghcr.io/<you>/bazzite-punktfunk && systemctl reboot
 ```
 
-## First-run setup (either option)
+## First-run setup (all options)
 
 ```sh
 ujust add-user-to-input-group           # virtual gamepads need /dev/uinput (then re-login).
@@ -109,8 +126,8 @@ web console at `https://<host-ip>:47992` or directly.
 
 > ⚠️ **COPR caveat:** COPR's mock chroot has no `bun`, so a COPR build produces only
 > `punktfunk` + `punktfunk-client` — **not** `punktfunk-web`. For the console on a COPR/bootc host,
-> install from the **Gitea RPM registry** (Option A — it carries `punktfunk-web`), which is also why
-> `bootc/Containerfile` installs from there rather than COPR.
+> install from the **Gitea RPM registry** (Option B — it carries `punktfunk-web`; the sysext image
+> includes it too), which is also why `bootc/Containerfile` installs from there rather than COPR.
 
 ## Why not Flatpak (for the HOST)?
 

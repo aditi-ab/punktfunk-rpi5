@@ -35,8 +35,10 @@ jobs:
         include:
           - image: punktfunk-fedora-rpm     # Fedora 43 == Bazzite base
             group: bazzite
+            fedver: 43
           - image: punktfunk-fedora44-rpm   # Fedora 44 == Fedora KDE spin
             group: fedora-44
+            fedver: 44
     container:
       image: git.unom.io/unom/${{ matrix.image }}:latest
     timeout-minutes: 90
@@ -53,6 +55,8 @@ jobs:
         run: |
           git config --global --add safe.directory "$PWD"
           dnf -y install gtk4-devel libadwaita-devel SDL3-devel
+          # sysext build (packaging/bazzite/build-sysext.sh): squashfs + SELinux labeling.
+          dnf -y install squashfs-tools cpio libselinux-utils selinux-policy-targeted
           # bun builds the punktfunk-web console (--with web). Baked into the image; install it
           # here too so the job stays green against the PREVIOUS image (docker.yml bootstrap note).
           command -v bun >/dev/null || {
@@ -117,6 +121,27 @@ jobs:
           done
           echo "published to $OWNER/rpm/$GROUP"
 
+      # The no-layering Bazzite path: wrap the just-built host + web RPMs into a systemd-sysext
+      # image and publish it to the per-Fedora-major feed (punktfunk-sysext/f43[-canary], …) that
+      # `punktfunk-sysext install|update` reads. Same RPMs, same channels — just no rpm-ostree.
+      - name: Build the sysext image
+        run: |
+          bash packaging/bazzite/build-sysext.sh --version-id "${{ matrix.fedver }}" \
+            --out "dist-sysext/punktfunk-${PF_VERSION}-${PF_RELEASE}-x86-64.raw" \
+            dist/punktfunk-"${PF_VERSION}-${PF_RELEASE}"*.rpm \
+            dist/punktfunk-web-"${PF_VERSION}-${PF_RELEASE}"*.rpm
+
+      - name: Publish the sysext feed
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          case "$GROUP" in
+            *-canary) FEED="f${{ matrix.fedver }}-canary"; KEEP=6 ;;  # rolling: bound the pile-up
+            *)        FEED="f${{ matrix.fedver }}";        KEEP=0 ;;  # stable: keep every release
+          esac
+          KEEP=$KEEP bash packaging/bazzite/publish-sysext-feed.sh "$FEED" \
+            "dist-sysext/punktfunk-${PF_VERSION}-${PF_RELEASE}-x86-64.raw"
+
       # On a real release, also attach the .rpms to the unified Gitea Release. Both Fedora bases
       # (bazzite=F43, fedora-44) build the SAME filename, so suffix the asset with the base to keep
       # both on the release; canary builds live in the `*-canary` rpm groups (no release page).
@@ -131,4 +156,7 @@ jobs:
             case "$rpm" in *debuginfo*|*debugsource*) continue;; esac
             base="$(basename "$rpm" .rpm)"
             upsert_asset "$RID" "$rpm" "${base}.${{ matrix.group }}.rpm"
+          done
+          for raw in dist-sysext/*.raw; do
+            upsert_asset "$RID" "$raw" "$(basename "$raw" .raw).f${{ matrix.fedver }}.raw"
           done

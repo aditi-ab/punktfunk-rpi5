@@ -12,34 +12,91 @@ flagged explicitly. For the higher-level packaging rationale ("why not Flatpak",
 > NVENC, from RPM Fusion **nonfree**), `opus`, and `libei`.
 > Source: `packaging/README.md`, `packaging/rpm/punktfunk.spec`.
 
-> ⚠️ **Read this first — the COPR is operator-run, not yet published.**
-> Both install paths below pull the punktfunk RPM from a COPR project named
-> `enricobuehler/punktfunk`. That COPR is a configuration the maintainer has to **create and
-> build** (see `packaging/copr/README.md` — it documents how to set it up, not a live repo URL you
-> can assume exists). If `rpm-ostree install punktfunk` 404s, the COPR hasn't been published yet,
-> and your only path is to **build the RPM yourself** (see the appendix). The guide flags every
-> command that depends on the COPR being live.
+> ⚠️ **COPR note (Path C only).** The legacy layering path's commands reference a COPR project
+> named `enricobuehler/punktfunk` that is operator-run and may not be published (see
+> `packaging/copr/README.md`); layer from the **Gitea RPM registry** instead (`../rpm/README.md`,
+> the repo file `https://git.unom.io/api/packages/unom/rpm/bazzite.repo`) — it's what CI
+> actually publishes to. Paths A (sysext) and B (bootc) don't involve the COPR at all.
 
 ---
 
 ## 1. Choose an install path
 
-There are two supported paths on Bazzite, driven by different files in `packaging/`:
+There are three paths on Bazzite, driven by different files in `packaging/`:
 
 | Path | Driven by | What it does | Best for |
 |---|---|---|---|
-| **A — rpm-ostree layering** | `packaging/copr/README.md` + `packaging/rpm/punktfunk.spec` | Layers the `punktfunk` RPM onto your existing Bazzite deployment with `rpm-ostree install` | One host, quick iteration |
+| **A — systemd-sysext** ✅ recommended | `packaging/bazzite/punktfunk-sysext.sh` + `build-sysext.sh` (published by `.gitea/workflows/rpm.yml`) | Overlays the host onto `/usr` as a system extension — no layering, no reboot, one-command updates | Everyone; the default |
 | **B — bootc / OCI image** | `packaging/bootc/Containerfile` | Bakes punktfunk into a `FROM bazzite-nvidia` image once; you `bootc switch` any number of hosts onto it | Fleets, reproducible appliances, no per-host drift |
+| **C — rpm-ostree layering** (legacy) | `packaging/rpm/` + the Gitea RPM registry | Layers the `punktfunk` RPM onto your deployment with `rpm-ostree install` | Only if you specifically want the RPM database to own the files |
 
-**Trade-off:** Path A is a per-host package layer — simple, but each host accumulates its own
-layered-package state. Path B builds one image (RPM Fusion + the Gitea RPM repo + the host and
-**web console** + udev rule pre-installed) that you push to a registry and rebase hosts onto
-atomically — no per-host `rpm-ostree install` drift, at the cost of running a `podman build`/`push`
-pipeline. Both require the **same first-run setup** (sections 3–6); note Path B installs from the
-**Gitea RPM registry** (which carries `punktfunk-web`), whereas Path A's COPR builds host+client
-only — for the web console on Path A, layer from the Gitea registry instead (`../rpm/README.md`).
+**Why A over C:** the Bazzite docs treat layering as a last resort — every layered package makes
+every OS update slower and can **block upgrades entirely** until removed. A sysext never enters an
+rpm-ostree transaction: it merges/unmerges at runtime, survives OS updates, and updating punktfunk
+is one command with **no reboot** (layering needs one per update). It's the mechanism the Fedora
+Atomic maintainers ship via [fedora-sysexts](https://fedora-sysexts.github.io/). All paths require
+the **same first-run setup** (sections 3–6).
 
-### Path A — rpm-ostree layering from the COPR
+### Path A — systemd-sysext (recommended)
+
+Run on the Bazzite host:
+
+```sh
+# One-time bootstrap; afterwards the tool is on PATH as `punktfunk-sysext` (it ships inside
+# the image). `--channel canary` for rolling main-branch builds instead of releases.
+curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh
+sudo bash punktfunk-sysext.sh install
+```
+
+This downloads the newest image for your Fedora base (host + tray + **web console**,
+SHA-256-verified from the feed `…/packages/unom/generic/punktfunk-sysext/f<ver>[-canary]/`),
+installs it as `/var/lib/extensions/punktfunk.raw`, merges it, and immediately applies what the
+RPM scriptlets would have (udev reload, sysctl) plus the two `/etc` files a sysext can't carry
+(the gamescope-session drop-in and the tray autostart entry, staged under
+`/usr/share/punktfunk/etc/`). No reboot at any point. Day-2:
+
+```sh
+sudo punktfunk-sysext update    # fetch + merge the newest build (then restart the user service)
+sudo punktfunk-sysext status    # merged?, installed vs latest, channel/feed
+sudo punktfunk-sysext remove    # unmerge + delete; ~/.config/punktfunk is left alone
+```
+
+Details worth knowing:
+
+- The image embeds `ID=fedora` + `VERSION_ID` (matched through Bazzite's `ID_LIKE`), so after a
+  **major Bazzite rebase** (F43 → F44) the old image is **refused** instead of merging
+  soname-broken binaries — `punktfunk-sysext update` then fetches the image built for the new
+  base (feeds exist per Fedora major, from the same CI matrix as the RPM groups).
+- SELinux labels are baked into the image at build time (squashfs pseudo-xattrs computed from
+  the targeted policy) — without them udev couldn't read the gamepad rule under enforcing.
+  Validated live on Bazzite 43.
+- **Migrating from layering (path C):** install the sysext (it shadows the layered copy at
+  once), then `sudo rpm-ostree uninstall punktfunk punktfunk-web && systemctl reboot`.
+
+### Path B — bootc image (`FROM bazzite-nvidia`)
+
+The image is built **off-host** (on any machine with `podman`) from
+`packaging/bootc/Containerfile`, which bases on `ghcr.io/ublue-os/bazzite-nvidia:stable`
+(override with `--build-arg BASE_IMAGE=…`), enables RPM Fusion free + nonfree, adds the Gitea RPM
+repo (`--build-arg PUNKTFUNK_RPM_GROUP=…`, default `bazzite`), and installs the host **and the web
+console** (`punktfunk punktfunk-web`). It uses the Gitea registry rather than the COPR specifically
+because the registry carries `punktfunk-web` (COPR's mock chroot can't build it — no `bun`).
+
+```sh
+# Build + push (run from the repo root, on your builder machine):
+podman build -t ghcr.io/<you>/bazzite-punktfunk -f packaging/bootc/Containerfile .
+podman push  ghcr.io/<you>/bazzite-punktfunk
+
+# On each target Bazzite host:
+sudo bootc switch ghcr.io/<you>/bazzite-punktfunk && systemctl reboot
+```
+
+> ⚠️ The image installs from the **Gitea RPM registry** (group `bazzite`), so **Path B depends on
+> that registry being populated** — CI (`.gitea/workflows/rpm.yml`) publishes `punktfunk` +
+> `punktfunk-web` on every push to `main`. Packages are unsigned with GPG-signed metadata
+> (`repo_gpgcheck=1`), matching `packaging/rpm/README.md`.
+
+### Path C — rpm-ostree layering (legacy)
 
 Run on the Bazzite host. (Commands verbatim from `packaging/README.md`.)
 
@@ -62,7 +119,7 @@ systemctl reboot
 > The **reboot is mandatory** — `rpm-ostree install` stages a new deployment that only takes
 > effect on the next boot. This is normal atomic-distro behavior, not a punktfunk quirk.
 
-#### Updating a Path-A host — `rpm-ostree upgrade` is NOT enough
+#### Updating a Path-C host — `rpm-ostree upgrade` is NOT enough
 
 > ⚠️ **`rpm-ostree upgrade` will not update punktfunk on its own.** `upgrade` bumps the **base
 > image** and only re-resolves *layered* packages **when the base changes**. A Bazzite base can
@@ -93,29 +150,6 @@ sudo bash packaging/bazzite/update-punktfunk.sh --reboot # stage + reboot now
 > `/etc/yum.repos.d/punktfunk*.repo`. If `punktfunk-canary.repo` is enabled alongside the stable
 > `punktfunk.repo`, canary's `<next-minor>.0-0.ciN` **outranks** the stable `X.Y.Z-1` and the box
 > silently tracks canary. Enable exactly one channel — set `enabled=0` in the other repo file.
-
-### Path B — bootc image (`FROM bazzite-nvidia`)
-
-The image is built **off-host** (on any machine with `podman`) from
-`packaging/bootc/Containerfile`, which bases on `ghcr.io/ublue-os/bazzite-nvidia:stable`
-(override with `--build-arg BASE_IMAGE=…`), enables RPM Fusion free + nonfree, adds the Gitea RPM
-repo (`--build-arg PUNKTFUNK_RPM_GROUP=…`, default `bazzite`), and installs the host **and the web
-console** (`punktfunk punktfunk-web`). It uses the Gitea registry rather than the COPR specifically
-because the registry carries `punktfunk-web` (COPR's mock chroot can't build it — no `bun`).
-
-```sh
-# Build + push (run from the repo root, on your builder machine):
-podman build -t ghcr.io/<you>/bazzite-punktfunk -f packaging/bootc/Containerfile .
-podman push  ghcr.io/<you>/bazzite-punktfunk
-
-# On each target Bazzite host:
-sudo bootc switch ghcr.io/<you>/bazzite-punktfunk && systemctl reboot
-```
-
-> ⚠️ The image installs from the **Gitea RPM registry** (group `bazzite`), so **Path B depends on
-> that registry being populated** — CI (`.gitea/workflows/rpm.yml`) publishes `punktfunk` +
-> `punktfunk-web` on every push to `main`. Packages are unsigned with GPG-signed metadata
-> (`repo_gpgcheck=1`), matching `packaging/rpm/README.md`.
 
 ---
 

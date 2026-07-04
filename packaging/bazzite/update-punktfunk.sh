@@ -23,6 +23,14 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# The sysext path (packaging/bazzite/punktfunk-sysext.sh) supersedes layering entirely — if the
+# box runs the sysext, it shadows any layered copy and THIS script won't change what executes.
+if [[ -f /var/lib/extensions/punktfunk.raw ]]; then
+  echo "NOTE: the punktfunk sysext is installed — update with 'punktfunk-sysext update' instead." >&2
+  echo "      (a layered punktfunk is shadowed by the sysext; consider removing the layer:" >&2
+  echo "       rpm-ostree uninstall punktfunk punktfunk-web)" >&2
+fi
+
 # Which punktfunk packages are actually layered right now (host, web, or both).
 mapfile -t layered < <(rpm-ostree status --json 2>/dev/null \
   | grep -oE '"punktfunk(-web)?"' | tr -d '"' | sort -u)
