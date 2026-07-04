@@ -1,0 +1,131 @@
+# Build the punktfunk-host / punktfunk-client / punktfunk-web pacman packages from
+# packaging/arch/PKGBUILD and publish them to Gitea's Arch package registry, so Arch boxes
+# get new builds via `pacman -Syu`. Counterpart to deb.yml (apt) and rpm.yml (dnf/rpm-ostree).
+# Arch is rolling, so the packages build against whatever the archlinux:base-devel container
+# resolves today — the same sonames an up-to-date Arch box runs.
+#
+# Registry (public, unom org) — box setup (once), see packaging/arch/README.md:
+#   [punktfunk]                         # or [punktfunk-canary] for main-push builds
+#   SigLevel = Optional TrustAll
+#   Server = https://git.unom.io/api/packages/unom/arch/$repo/$arch
+#
+# REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (shared with docker.yml).
+name: arch
+
+on:
+  push:
+    branches: [main]
+    # Single project version: a `vX.Y.Z` tag is THE release. main publishes to the
+    # `punktfunk-canary` pacman repo as X.Y.Z-0.<run#> (sorts below the eventual X.Y.Z-1),
+    # tags to `punktfunk` — separate repos, so neither channel can shadow the other.
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04
+    container:
+      image: docker.io/library/archlinux:base-devel
+    timeout-minutes: 90
+    env:
+      CARGO_HOME: /usr/local/cargo
+    steps:
+      # git must exist before actions/checkout (base-devel ships without it).
+      - name: Install build + runtime-dev deps
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git rust clang cmake nasm pkgconf python \
+            gtk4 libadwaita sdl3 ffmpeg pipewire wayland libxkbcommon opus libei \
+            mesa libglvnd unzip libarchive
+          # bun builds the punktfunk-web console AND is vendored as its runtime (PF_WITH_WEB=1);
+          # it's AUR-only on Arch, so bootstrap the official binary.
+          command -v bun >/dev/null || {
+            curl -fsSL https://bun.sh/install | bash
+            install -m0755 "$HOME/.bun/bin/bun" /usr/local/bin/bun
+          }
+          bun --version
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: /usr/local/cargo/registry
+          key: cargo-home-arch-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-arch-
+
+      - name: Version + channel
+        # vX.Y.Z tag -> X.Y.Z-1 in the `punktfunk` repo; main push -> <next-minor>-0.<run#> in
+        # `punktfunk-canary` (pkgrel accepts only digits+dots — the run number carries the
+        # monotonic ordering; the commit sha is stamped into the binary via the workflow log).
+        run: |
+          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of latest stable)
+          case "$GITHUB_REF" in
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; R="1";                       REPO=punktfunk ;;
+            *)            V="$PF_BASE";             R="0.${GITHUB_RUN_NUMBER}";  REPO=punktfunk-canary ;;
+          esac
+          echo "PF_PKGVER=$V" >> "$GITHUB_ENV"
+          echo "PF_PKGREL=$R" >> "$GITHUB_ENV"
+          echo "REPO=$REPO" >> "$GITHUB_ENV"
+          echo "pacman $V-$R -> repo '$REPO'"
+
+      - name: Build packages (makepkg)
+        run: |
+          git config --global --add safe.directory "$PWD"
+          # libcuda link stub — same trick as packaging/rpm/build-rpm.sh: the zerocopy FFI
+          # links -lcuda but the builder has no GPU; synthesize every cu* symbol the source
+          # references so a newly-added call can't silently break the link.
+          CU_SYMS="$(grep -rhoE '\bcu[A-Z][A-Za-z0-9_]*' crates/punktfunk-host/src/ | sort -u || true)"
+          if [ -n "$CU_SYMS" ] && [ ! -e /usr/lib/libcuda.so ]; then
+            STUB_C="$(mktemp --suffix=.c)"
+            for s in $CU_SYMS; do printf 'int %s(void){return 0;}\n' "$s" >> "$STUB_C"; done
+            gcc -shared -fPIC -Wl,-soname,libcuda.so.1 -o /usr/lib/libcuda.so.1 "$STUB_C"
+            ln -sf libcuda.so.1 /usr/lib/libcuda.so
+            rm -f "$STUB_C"; ldconfig
+            echo "== libcuda stub: $(printf '%s\n' "$CU_SYMS" | wc -l) symbols =="
+          fi
+          # makepkg refuses to run as root; deps are already installed above (-d skips the
+          # RPM-level check that can't see the script-installed bun anyway).
+          useradd -m builder
+          chown -R builder: "$PWD" "$CARGO_HOME"
+          sudo -u builder git config --global --add safe.directory "$PWD"
+          mkdir -p dist && chown builder: dist
+          cd packaging/arch
+          sudo -u builder env PF_SRCDIR="$GITHUB_WORKSPACE" PF_WITH_WEB=1 \
+            PF_PKGVER="$PF_PKGVER" PF_PKGREL="$PF_PKGREL" \
+            CARGO_HOME="$CARGO_HOME" PKGDEST="$GITHUB_WORKSPACE/dist" \
+            makepkg -f -d --holdver
+          ls -lh "$GITHUB_WORKSPACE/dist"
+
+      - name: Publish to the Gitea Arch registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          for pkg in dist/*.pkg.tar.zst; do
+            echo "uploading $pkg"
+            NAME=$(bsdtar -xOf "$pkg" .PKGINFO | sed -n 's/^pkgname = //p')
+            VER=$(bsdtar -xOf "$pkg" .PKGINFO | sed -n 's/^pkgver = //p')
+            ARCH=$(bsdtar -xOf "$pkg" .PKGINFO | sed -n 's/^arch = //p')
+            # A re-tagged release re-fires this workflow and the registry 409s on duplicate
+            # package versions — delete any prior copy first (404 on the first publish is fine).
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
+              "https://$REGISTRY/api/packages/$OWNER/arch/$REPO/$NAME/$VER/$ARCH" || true
+            curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$pkg" \
+              "https://$REGISTRY/api/packages/$OWNER/arch/$REPO"
+          done
+          echo "published to $OWNER/arch/$REPO"
+
+      # On a real release, also attach the packages to the unified Gitea Release.
+      - name: Attach packages to the Gitea release (stable tags only)
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        env:
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          . scripts/ci/gitea-release.sh
+          RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
+          for pkg in dist/*.pkg.tar.zst; do
+            upsert_asset "$RID" "$pkg"
+          done
