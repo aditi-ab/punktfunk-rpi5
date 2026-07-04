@@ -14,8 +14,12 @@
 # The macOS app is App-SANDBOXED for both channels (Config/Punktfunk-macOS.entitlements —
 # app-sandbox + network client/server + audio-input + bluetooth/usb device access; the
 # shared Config/Punktfunk.entitlements stays iOS/tvOS-only, where app-sandbox is invalid).
-# The Developer ID DMG is codesigned with the SAME macOS entitlements, so what we test
-# locally equals what App Store users get.
+# The Developer ID DMG is codesigned with the SAME macOS entitlements as the App Store build,
+# BUT it must ALSO embed a Developer ID provisioning profile: keychain-access-groups is a
+# MANAGED entitlement that AMFI only honors when an embedded profile authorizes it. A DMG
+# without one is SIGKILLed at spawn ("Launchd job spawn failed", POSIX errno 163) even though
+# it is validly signed AND notarized. ⌘R hides this (Xcode embeds a development profile); the
+# raw Developer ID codesign path does NOT, so ⌘R is NOT equivalent to the shipped DMG here.
 #
 # macOS App Store prerequisites (one-time, Apple portal — NOT done by this workflow; the
 # step is continue-on-error until they exist):
@@ -26,6 +30,15 @@
 #   * The "3rd Party Mac Developer Installer" (Mac Installer Distribution) certificate in
 #     the runner's login keychain, in addition to "Apple Distribution" — the App Store
 #     .pkg is installer-signed with it.
+#
+# macOS Developer ID (DMG) prerequisite (one-time, Apple portal — the DMG step embeds it):
+#   * A "Punktfunk macOS Developer ID" provisioning profile (Distribution -> Developer ID,
+#     App ID io.unom.punktfunk, with the Keychain Sharing capability) installed on the runner
+#     under ~/Library/Developer/Xcode/UserData/Provisioning Profiles/. It authorizes the
+#     managed keychain-access-groups entitlement; without it the DMG is SIGKILLed at launch
+#     (errno 163). If it is missing the DMG step warns and strips that entitlement (the app
+#     then uses ClientIdentityStore's legacy file-keychain fallback) so the build still ships
+#     a launchable app.
 #
 # Signing setup (NOT secret-based anymore): the runner is a LaunchAgent in the user's
 # logged-in Aqua session, so it uses the **login keychain** directly. Install the signing
@@ -156,9 +169,8 @@ jobs:
         run: |
           # Archive UNSIGNED, then codesign with the Developer ID Application identity from the
           # login keychain. Unsigned archive sidesteps Xcode's keychain-access-groups
-          # provisioning-profile gate; codesign just needs the (now valid) identity + the
-          # team-prefixed entitlements, no profile (App Sandbox + the network/device
-          # capabilities are self-asserted for Developer ID — no profile entry needed).
+          # provisioning-profile gate at archive time; we re-assert that authorization below by
+          # EMBEDDING a Developer ID profile before codesign (see the keychain note further down).
           # Bundle is a single static binary.
           DEVELOPER_DIR="$XCODE_DEV_DIR" xcodebuild archive \
             -project "$PROJECT" -scheme Punktfunk \
@@ -173,6 +185,35 @@ jobs:
           RESOLVED="$RUNNER_TEMP/macos.entitlements"
           sed "s/\$(AppIdentifierPrefix)/${TEAM_ID}./g" \
             clients/apple/Config/Punktfunk-macOS.entitlements > "$RESOLVED"
+
+          # keychain-access-groups is a MANAGED (restricted) entitlement: App Sandbox and the
+          # network/device keys are self-asserted for Developer ID, but a keychain access group
+          # must be AUTHORIZED by an embedded provisioning profile. Without one, AMFI refuses to
+          # spawn the sandboxed process at launch — "Launchd job spawn failed" (POSIX errno 163),
+          # SIGKILL before main() — even though the bundle is validly signed and notarized. Embed
+          # a "Developer ID" distribution profile for io.unom.punktfunk (Keychain Sharing) so its
+          # entitlements authorize the access group, exactly like the App Store build's profile
+          # does. Located by profile Name among the profiles installed on the runner (see header).
+          DEVID_PROFILE_NAME="Punktfunk macOS Developer ID"
+          PROFILE_SRC=""
+          for p in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.provisionprofile \
+                   "$HOME/Library/MobileDevice/Provisioning Profiles/"*.provisionprofile; do
+            [ -e "$p" ] || continue
+            NAME=$(security cms -D -i "$p" 2>/dev/null | plutil -extract Name raw - 2>/dev/null || true)
+            [ "$NAME" = "$DEVID_PROFILE_NAME" ] && PROFILE_SRC="$p" && break
+          done
+          if [ -n "$PROFILE_SRC" ]; then
+            # Must land BEFORE codesign so it's sealed into the bundle.
+            cp "$PROFILE_SRC" "$APP/Contents/embedded.provisionprofile"
+            echo "embedded Developer ID profile: $PROFILE_SRC"
+          else
+            # Fallback so a missing/expired profile NEVER reships the errno-163 brick: drop the
+            # managed entitlement and let ClientIdentityStore fall back to the legacy file keychain
+            # (its errSecMissingEntitlement path). Degraded (one Keychain prompt) but launchable.
+            echo "::warning::Developer ID profile '$DEVID_PROFILE_NAME' not installed on the runner — stripping keychain-access-groups so the DMG still launches (legacy file keychain). Create it in the Apple portal + install it on the runner to restore the no-prompt data-protection keychain."
+            /usr/libexec/PlistBuddy -c "Delete :keychain-access-groups" "$RESOLVED" 2>/dev/null || true
+          fi
+
           codesign --force --options runtime --timestamp \
             --entitlements "$RESOLVED" \
             --sign "Developer ID Application" "$APP"
