@@ -34,11 +34,12 @@ jobs:
     env:
       CARGO_HOME: /usr/local/cargo
     steps:
-      # git must exist before actions/checkout (base-devel ships without it).
+      # git + nodejs must exist before actions/checkout — base-devel ships neither, and
+      # act_runner runs the action's JS with the CONTAINER's node, it does not inject one.
       - name: Install build + runtime-dev deps
         run: |
           pacman -Syu --noconfirm --needed \
-            git rust clang cmake nasm pkgconf python \
+            git nodejs rust clang cmake nasm pkgconf python \
             gtk4 libadwaita sdl3 ffmpeg pipewire wayland libxkbcommon opus libei \
             mesa libglvnd unzip libarchive
           # bun builds the punktfunk-web console AND is vendored as its runtime (PF_WITH_WEB=1);
