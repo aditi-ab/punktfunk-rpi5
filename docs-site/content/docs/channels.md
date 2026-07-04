@@ -25,6 +25,8 @@ track per machine; switching is a one-line change.
 |---|---|---|
 | **apt** (host/client) | `deb [signed-by=…] https://git.unom.io/api/packages/unom/debian canary main` | `… debian stable main` |
 | **rpm** (host) | baseurl `…/rpm/bazzite-canary` (or `fedora-44-canary`) | `…/rpm/bazzite` (or `fedora-44`) |
+| **sysext** (Bazzite host) | `sudo punktfunk-sysext install --channel canary` | `… install` / default (feeds `…/punktfunk-sysext/f43[-canary]`) |
+| **pacman** (Arch host/client) | `[punktfunk-canary]` repo section | `[punktfunk]` (`Server = …/api/packages/unom/arch/$repo/$arch`) |
 | **Flatpak** (client) | `flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.Canary.flatpakref` | `…/io.unom.Punktfunk.flatpakref` |
 | **Decky** (Steam Deck) | install-from-URL `…/generic/punktfunk-decky/canary/punktfunk.zip` | `…/punktfunk-decky/latest/punktfunk.zip` |
 | **Windows client** (MSIX) | `…/generic/punktfunk-client-windows/canary/punktfunk-client-windows_x64.msix` | `…/latest/…` + the release page |
