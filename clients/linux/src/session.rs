@@ -43,6 +43,11 @@ pub struct SessionParams {
     /// connection until the operator clicks Approve in its console (so this must exceed the
     /// host's approval window — see `PENDING_APPROVAL_WAIT`).
     pub connect_timeout: Duration,
+    /// Raised by the PRESENTER when hardware frames can't be displayed (GL converter init
+    /// failed / dmabuf import rejected): the pump demotes the decoder to software and
+    /// re-requests a keyframe. Decode itself succeeds in that state, so nothing else
+    /// would recover — without this the stream stays black.
+    pub force_software: Arc<AtomicBool>,
 }
 
 /// The session pump's share of the unified stats window (design/stats-unification.md):
@@ -238,6 +243,7 @@ fn pump(
             return;
         }
     };
+    let force_software = params.force_software.clone();
     // Audio is best-effort: a session without it still streams. Gamepads are the
     // app-lifetime service's job (the UI attaches it on Connected). Audio runs on its own
     // thread (one puller per plane), blocking on the audio queue like the Apple client.
@@ -330,6 +336,15 @@ fn pump(
                     Ok(None) => {}
                     // Survivable (loss until the next IDR/RFI recovery) — keep feeding.
                     Err(e) => tracing::debug!(error = %e, "decode error (recovering)"),
+                }
+                // The presenter's verdict: hardware frames can't be displayed (GL converter
+                // init failed / dmabuf import rejected) — demote to software here, on the
+                // decoder's own thread. Decode succeeds in that state, so the error-streak
+                // demotion above never fires.
+                if force_software.swap(false, Ordering::Relaxed) {
+                    if let Err(e) = decoder.force_software() {
+                        break Some(format!("software decoder rebuild: {e}"));
+                    }
                 }
                 // A decode error / VAAPI→software demotion asks for a fresh IDR: the infinite
                 // GOP has no periodic keyframe, so a rebuilt/erroring decoder would stay

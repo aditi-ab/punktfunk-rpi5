@@ -111,6 +111,10 @@ pub struct StreamPageArgs {
     pub window: adw::ApplicationWindow,
     pub connector: Arc<NativeClient>,
     pub frames: async_channel::Receiver<DecodedFrame>,
+    /// Shared with the session pump: the presenter raises it when hardware frames can't
+    /// be displayed (GL converter init failed / dmabuf import rejected) and the pump
+    /// demotes the decoder to software.
+    pub force_software: Arc<AtomicBool>,
     /// Host-clock offset from the session's clock handshake — added to the local wall
     /// clock to express paintable-set time in the host's capture clock (present latency).
     pub clock_offset_ns: i64,
@@ -253,6 +257,7 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
         window,
         connector,
         frames,
+        force_software,
         clock_offset_ns,
         escape_rx,
         disconnect_rx,
@@ -291,6 +296,7 @@ pub fn new(args: StreamPageArgs) -> StreamPage {
     spawn_frame_consumer(
         &w.picture,
         frames,
+        force_software,
         clock_offset_ns,
         presented.clone(),
         hdr.clone(),
@@ -584,9 +590,33 @@ impl ColorStateCache {
     }
 }
 
+/// How hardware (dmabuf) frames reach the screen.
+#[derive(PartialEq, Clone, Copy)]
+enum HwPresent {
+    /// Hand the NV12 dmabuf straight to `GdkDmabufTexture` — GTK (or the compositor via
+    /// offload) imports + converts. The desktop default: subsurface/scan-out eligible.
+    Direct,
+    /// Convert in-process first (`video_gl`): own EGL import + own YUV→RGB shader → RGBA
+    /// `GdkGLTexture`. The Steam Deck default — GTK's tiled-NV12 import is broken there
+    /// (Mesa ≥ 25.1 tiled VCN export), and this is the Moonlight-proven route around it.
+    Gl,
+}
+
+impl HwPresent {
+    fn pick() -> HwPresent {
+        match std::env::var("PUNKTFUNK_PRESENT").ok().as_deref() {
+            Some("direct") => HwPresent::Direct,
+            Some("gl") => HwPresent::Gl,
+            _ if crate::gamepad::is_steam_deck() => HwPresent::Gl,
+            _ => HwPresent::Direct,
+        }
+    }
+}
+
 fn spawn_frame_consumer(
     picture: &gtk::Picture,
     frames: async_channel::Receiver<DecodedFrame>,
+    force_software: Arc<AtomicBool>,
     clock_offset_ns: i64,
     presented_stats: Rc<PresentedStats>,
     hdr: Rc<Cell<bool>>,
@@ -599,6 +629,11 @@ fn spawn_frame_consumer(
     // (SDR↔HDR flip) just rebuilds once.
     let mut yuv_state = ColorStateCache::default();
     let mut rgb_state = ColorStateCache::default();
+    let hw_present = HwPresent::pick();
+    // Lazy (first dmabuf frame) so software-decode sessions never touch EGL. `Err` after
+    // a failed init = don't retry every frame.
+    let mut gl_conv: Option<Result<crate::video_gl::GlConverter, ()>> = None;
+    let mut gl_fails = 0u32;
     glib::spawn_future_local(async move {
         // Window samples (µs): end-to-end capture→displayed (host-clock corrected) and
         // the client-local display stage decoded→displayed.
@@ -645,6 +680,39 @@ fn spawn_frame_consumer(
                     };
                     picture.set_paintable(Some(&tex));
                     presented = true;
+                }
+                DecodedImage::Dmabuf(d) if hw_present == HwPresent::Gl => {
+                    // In-process conversion (see `HwPresent::Gl`). Init once; a failed
+                    // init or a streak of convert failures demotes the DECODER to
+                    // software via the shared flag — never fall back to the direct path
+                    // here, it's the known-broken one on this hardware.
+                    let conv = gl_conv.get_or_insert_with(|| {
+                        crate::video_gl::GlConverter::new(&picture).map_err(|e| {
+                            tracing::warn!(error = %format!("{e:#}"),
+                                "GL presenter unavailable — demoting to software decode");
+                        })
+                    });
+                    match conv {
+                        Ok(c) => {
+                            let color = d.color;
+                            match c.convert(d, rgb_state.get(color, true).as_ref()) {
+                                Ok(tex) => {
+                                    gl_fails = 0;
+                                    picture.set_paintable(Some(&tex));
+                                    presented = true;
+                                }
+                                Err(e) => {
+                                    gl_fails += 1;
+                                    tracing::warn!(error = %format!("{e:#}"), fails = gl_fails,
+                                        "GL convert failed");
+                                    if gl_fails >= 3 {
+                                        force_software.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                        Err(()) => force_software.store(true, Ordering::Relaxed),
+                    }
                 }
                 DecodedImage::Dmabuf(d) => {
                     let mut b = gdk::DmabufTextureBuilder::new()

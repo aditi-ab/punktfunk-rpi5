@@ -31,6 +31,9 @@ pipewire = "0.9"
 # Gamepads: capture + feedback (full DualSense fidelity — touchpad/motion/triggers/LEDs
 # need the hidapi driver).
 sdl3 = { version = "0.18", features = ["hidapi"] }
+# The VAAPI GL presenter (video_gl.rs): EGL dmabuf import into a GDK-shared context, dlopened
+# at runtime (`dynamic`) so GPU-less boxes and the software path never touch libEGL.
+khronos-egl = { version = "6", features = ["dynamic"] }
 
 mdns-sd = "0.20"
 # Game-library fetch from the host's management API over mTLS + fingerprint pinning.

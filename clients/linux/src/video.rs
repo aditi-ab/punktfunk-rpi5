@@ -187,25 +187,12 @@ impl Decoder {
             .ok()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| pref.to_string());
-        // The Steam Deck's VAAPI zero-copy path renders corrupt/gray/washed-out — validated live;
-        // software decode is clean, correct-colour, and the Deck's APU handles 1280×800 HEVC
-        // easily. Likely cause: since Mesa 25.1 radeonsi exports VCN decode surfaces TILED (with
-        // AMD modifiers) instead of linear, and inside the Flatpak both the VAAPI driver and GTK's
-        // GL come from the runtime's Mesa 26.x — GTK's tiled-NV12 dmabuf import mishandles the new
-        // layout (desktop AMD/Intel boxes validated Tier-1 ran distro Mesa with linear export).
-        // So `auto` resolves to software on a Deck; an explicit `vaapi` (Settings or
-        // PUNKTFUNK_DECODER=vaapi) still forces the hw path for testing — the first-frame
-        // descriptor dump logs the modifier (LINEAR = 0x0), and GSK_RENDERER=ngl|vulkan bisects
-        // the import side.
-        let choice = if (choice == "auto" || choice.is_empty()) && crate::gamepad::is_steam_deck() {
-            tracing::info!(
-                "Steam Deck — defaulting to software decode (AMD VAAPI dmabuf is broken on this \
-                 SteamOS+Mesa combo); set the decoder to `vaapi` to override"
-            );
-            "software".to_string()
-        } else {
-            choice
-        };
+        // Deck note: `auto` means VAAPI here too. GTK's tiled-NV12 dmabuf import is broken on
+        // the Deck (Mesa ≥ 25.1 exports VCN surfaces TILED; artifacts/gray/washed-out), but the
+        // presenter routes Deck frames through the in-process GL converter (`video_gl`) instead
+        // of GdkDmabufTexture — and if THAT can't initialize, it demotes this decoder to
+        // software mid-session via [`Decoder::force_software`]. The broken direct path is never
+        // the fallback.
         if choice != "software" {
             match VaapiDecoder::new(codec_id) {
                 Ok(v) => {
@@ -237,6 +224,21 @@ impl Decoder {
     /// (throttled) so a demoted/erroring decoder can resynchronize under the infinite GOP.
     pub fn take_keyframe_request(&mut self) -> bool {
         std::mem::take(&mut self.want_keyframe)
+    }
+
+    /// Demote to software decode on the PRESENTER's verdict (dmabuf presentation impossible:
+    /// GL converter init failed, texture import rejected). Decode itself succeeds in that
+    /// state, so the error-streak demotion never fires — without this the stream would stay
+    /// black forever. No-op when already software.
+    pub fn force_software(&mut self) -> Result<()> {
+        if matches!(self.backend, Backend::Software(_)) {
+            return Ok(());
+        }
+        tracing::warn!("presenter can't display hardware frames — demoting to software decode");
+        self.backend = Backend::Software(SoftwareDecoder::new(self.codec_id)?);
+        self.vaapi_fails = 0;
+        self.want_keyframe = true;
+        Ok(())
     }
 
     /// Feed one access unit; returns the decoded frame (the host's streams are

@@ -2895,6 +2895,7 @@ dependencies = [
  "async-channel",
  "ffmpeg-next",
  "gtk4",
+ "khronos-egl",
  "libadwaita",
  "mdns-sd",
  "opus",

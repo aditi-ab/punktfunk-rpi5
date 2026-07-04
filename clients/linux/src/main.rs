@@ -39,6 +39,8 @@ mod ui_stream;
 mod ui_trust;
 #[cfg(target_os = "linux")]
 mod video;
+#[cfg(target_os = "linux")]
+mod video_gl;
 
 #[cfg(target_os = "linux")]
 fn main() -> gtk::glib::ExitCode {

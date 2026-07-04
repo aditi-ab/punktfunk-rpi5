@@ -106,6 +106,9 @@ pub fn start_session_with(
     }
     let mode = resolve_mode(&app);
     let s = app.settings.borrow();
+    // The presenter raises this when hardware frames can't be displayed; the session pump
+    // demotes the decoder to software (see `SessionParams::force_software`).
+    let force_software = Arc::new(AtomicBool::new(false));
     let params = SessionParams {
         host: req.addr.clone(),
         port: req.port,
@@ -125,6 +128,7 @@ pub fn start_session_with(
         pin,
         identity: app.identity.clone(),
         connect_timeout: opts.connect_timeout,
+        force_software: force_software.clone(),
     };
     let inhibit = s.inhibit_shortcuts;
     let show_stats = s.show_stats;
@@ -149,6 +153,7 @@ pub fn start_session_with(
         inhibit,
         show_stats,
         frames: Some(frames),
+        force_software,
         waiting: opts.waiting,
         page: None,
     };
@@ -198,6 +203,9 @@ struct SessionUi {
     stop: Arc<AtomicBool>,
     /// Decoded-frame receiver, handed to the stream page once on `Connected`.
     frames: Option<async_channel::Receiver<DecodedFrame>>,
+    /// Shared with the session pump — the stream page's presenter raises it to demote
+    /// the decoder to software when hardware frames can't be displayed.
+    force_software: Arc<AtomicBool>,
     /// The "waiting for approval" dialog (request-access flow), dismissed on the first event.
     waiting: Option<adw::AlertDialog>,
     page: Option<crate::ui_stream::StreamPage>,
@@ -259,6 +267,7 @@ impl SessionUi {
             window: self.app.window.clone(),
             connector,
             frames: self.frames.take().expect("Connected delivered once"),
+            force_software: self.force_software.clone(),
             clock_offset_ns,
             escape_rx: self.app.gamepad.escape_events(),
             disconnect_rx: self.app.gamepad.disconnect_events(),
