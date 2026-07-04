@@ -43,6 +43,7 @@ mod trust;
 #[cfg(windows)]
 mod video;
 
+#[cfg(windows)]
 mod wol;
 
 #[cfg(windows)]

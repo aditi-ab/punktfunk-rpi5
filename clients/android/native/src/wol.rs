@@ -23,7 +23,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeWakeOnLan<'
     };
     let last_ip: String = env
         .get_string(&last_ip)
-        .map(|s| Into::<String>::into(s))
+        .map(Into::<String>::into)
         .unwrap_or_default();
     let macs: Vec<[u8; 6]> = macs_csv
         .split(',')

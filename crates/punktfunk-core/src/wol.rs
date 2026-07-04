@@ -13,6 +13,7 @@
 //!   * the **limited broadcast** `255.255.255.255`, and
 //!   * optionally a **unicast** to the host's last-known IP (covers the brief window where the
 //!     host is reachable but hasn't re-advertised, and NICs that wake on a directed unicast),
+//!
 //! on the two conventional WoL ports (9 and 7), repeated a few times to survive UDP loss.
 
 use std::io;
@@ -36,7 +37,7 @@ const BURST: usize = 3;
 pub fn parse_mac(s: &str) -> Option<Mac> {
     let mut m = [0u8; 6];
     let mut n = 0;
-    for part in s.split(|c| c == ':' || c == '-') {
+    for part in s.split([':', '-']) {
         if n == 6 {
             return None; // too many octets
         }
@@ -103,10 +104,7 @@ pub fn send_magic_packet(macs: &[Mac], last_known_ip: Option<Ipv4Addr>) -> io::R
     if sent_any {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "no magic packet could be sent",
-        ))
+        Err(io::Error::other("no magic packet could be sent"))
     }
 }
 
