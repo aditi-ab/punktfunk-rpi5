@@ -52,9 +52,15 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # Cache cargo's git dir too, not just the registry: the workspace includes
+      # clients/windows, whose windows-reactor/windows deps are git-pinned — cargo must CLONE
+      # them (windows-rs is huge) merely to resolve the workspace, even though nothing Windows
+      # is ever compiled here. Cached, that cost is paid once per runner.
       - uses: actions/cache@v4
         with:
-          path: /usr/local/cargo/registry
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
           key: cargo-home-arch-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-arch-
 
