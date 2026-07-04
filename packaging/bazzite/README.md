@@ -321,10 +321,23 @@ journalctl --user -u punktfunk-host -f
 
 ## 6. Firewall
 
-> ⚠️ **There is no firewall script or firewall doc in the repo.** The ports below are derived
-> directly from the code constants (`crates/punktfunk-host/src/gamestream/mod.rs`, `mgmt.rs`) and
-> the GameStream-host port-map (`design/gamestream-host-plan.md`). Treat the `firewall-cmd` lines as recommended-but-verified,
-> not a checked-in script.
+Bazzite runs **firewalld**, so the ports must be opened. The `punktfunk-host` package installs
+firewalld **service definitions** (`/usr/lib/firewalld/services/punktfunk-gamestream.xml` and
+`punktfunk-native.xml`), so enabling is one command — reload first so firewalld picks up the
+definition, add the service, reload to apply:
+
+```sh
+sudo firewall-cmd --reload
+sudo firewall-cmd --permanent --add-service=punktfunk-gamestream   # Moonlight/GameStream host
+#                              --add-service=punktfunk-native       # …or the native-only host
+sudo firewall-cmd --reload
+```
+
+`punktfunk-gamestream` opens the fixed Moonlight ports + mDNS; `punktfunk-native` opens the QUIC
+control port (UDP 9777) + mDNS. Enable both if the host runs `serve --gamestream` (both planes). The
+per-port breakdown below is for reference (or for opening ports by hand); the ports are the code
+constants (`crates/punktfunk-host/src/gamestream/mod.rs`, `mgmt.rs`) and the GameStream-host port-map
+(`design/gamestream-host-plan.md`).
 
 **GameStream / Moonlight ports** (fixed; Moonlight derives them from the HTTP base). These only apply
 when the host runs `serve --gamestream` (the bundled unit's default); on a bare-`serve` native-only
@@ -344,7 +357,7 @@ host you don't open them:
 default**, so you do **not** open it in the firewall unless you deliberately move it off loopback
 with `--mgmt-bind IP:PORT` (which also requires `--mgmt-token`). Leave it closed for a normal setup.
 
-Open the GameStream ports with `firewalld` (Bazzite uses firewalld):
+To open the GameStream ports by hand instead of the service (equivalent):
 
 ```sh
 sudo firewall-cmd --permanent --add-port=47984/tcp \

@@ -206,7 +206,8 @@ udp dport { 47998-48010, 5353 } accept
 - `punktfunk-host.install` / `punktfunk-client.install` — pacman scriptlets (udev reload + sysctl +
   first-run hint, incl. the firewalld enable command when firewalld is present), mirror the RPM
   `%post` / deb postinst.
-- `punktfunk-gamestream.xml` / `punktfunk-native.xml` — firewalld service definitions the host
-  package installs to `/usr/lib/firewalld/services/` (not auto-enabled; see Firewall above).
+- The firewalld service definitions (`punktfunk-gamestream.xml` / `punktfunk-native.xml`) are shared
+  across all Linux packaging and live in [`../linux/`](../linux/); the host package installs them to
+  `/usr/lib/firewalld/services/` (not auto-enabled; see Firewall above).
 - `build-sysext.sh` — wraps either built `.pkg.tar.zst` into a `systemd-sysext` `.raw` for SteamOS
   (derives the name from the package, so it works for host or client).

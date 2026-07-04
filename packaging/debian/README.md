@@ -52,7 +52,20 @@ journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
 
 ## Firewall
 
-Open the ports the host listens on. The **native `punktfunk/1`** plane:
+**Debian ships no firewall and Ubuntu's `ufw` is installed-but-inactive by default**, so out of the
+box there is nothing to open. If you run one, open the ports the host listens on.
+
+If you use **firewalld**, the `punktfunk-host` package installs service definitions to
+`/usr/lib/firewalld/services/` (not auto-enabled), so it's one command:
+
+```sh
+sudo firewall-cmd --reload                                          # load the installed definition
+sudo firewall-cmd --permanent --add-service=punktfunk-native        # the default native host
+#                              --add-service=punktfunk-gamestream    # …add for Moonlight compat
+sudo firewall-cmd --reload
+```
+
+Otherwise open the ports directly. The **native `punktfunk/1`** plane:
 
 - **QUIC control plane: UDP 9777** (`serve --native-port N` to change).
 - **Data plane: an *ephemeral* UDP port** — negotiated per session, so there is no fixed port to

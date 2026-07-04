@@ -4,9 +4,10 @@
   punktfunk1-host subcommand).
 
   Installed to /usr/lib/firewalld/services/ by the punktfunk-host package. NOT enabled automatically
-  (an Arch package never touches the admin's firewall). Stock Arch has no firewall; on a firewalld
-  spin such as CachyOS, enable it once with firewall-cmd (add-service=punktfunk-native, then reload).
-  Exact commands: the packaging/arch README, Firewall section.
+  (packages never touch the admin's firewall). Stock Arch/Debian ship no active firewall; Fedora/RHEL
+  and CachyOS enable firewalld by default, so enable it once with firewall-cmd
+  (add-service=punktfunk-native, then reload). Exact commands: your distro's install guide, or the
+  per-distro packaging README (Firewall section).
 
   The media DATA plane binds an EPHEMERAL UDP port (0.0.0.0:0) chosen per session and reported to the
   client, so there is no fixed data port to open. On a restrictive firewall you must also allow the

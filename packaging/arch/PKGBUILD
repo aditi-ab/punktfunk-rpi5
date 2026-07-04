@@ -138,9 +138,9 @@ package_punktfunk-host() {
   # firewall). Stock Arch ships none, so they're a no-op there; CachyOS et al. ship firewalld, so
   #   sudo firewall-cmd --reload && sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload
   # (or =punktfunk-native). See README.md → Firewall.
-  install -Dm0644 "$R/packaging/arch/punktfunk-gamestream.xml" \
+  install -Dm0644 "$R/packaging/linux/punktfunk-gamestream.xml" \
     "$pkgdir/usr/lib/firewalld/services/punktfunk-gamestream.xml"
-  install -Dm0644 "$R/packaging/arch/punktfunk-native.xml" \
+  install -Dm0644 "$R/packaging/linux/punktfunk-native.xml" \
     "$pkgdir/usr/lib/firewalld/services/punktfunk-native.xml"
   install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-MIT"
   install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-APACHE"

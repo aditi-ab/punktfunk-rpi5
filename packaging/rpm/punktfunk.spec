@@ -259,6 +259,13 @@ install -Dm0755 packaging/bazzite/kde-desktop-setup.sh %{buildroot}%{_datadir}/%
 install -Dm0644 packaging/bazzite/gamescope-headless-session \
                 %{buildroot}/etc/gamescope-session-plus/sessions.d/steam
 install -Dm0644 api/openapi.json                  %{buildroot}%{_datadir}/%{name}/openapi.json
+# firewalld service definitions (shared across all Linux packaging). Fedora/RHEL enable firewalld by
+# default, so these matter here; NOT auto-enabled — %post prints the enable command. Owned by the
+# firewalld package's dir; we drop only the files (same pattern as the sysctl.d file above).
+install -Dm0644 packaging/linux/punktfunk-gamestream.xml \
+                %{buildroot}%{_prefix}/lib/firewalld/services/punktfunk-gamestream.xml
+install -Dm0644 packaging/linux/punktfunk-native.xml \
+                %{buildroot}%{_prefix}/lib/firewalld/services/punktfunk-native.xml
 
 %if %{with web}
 # --- web console subpackage (punktfunk-web) ---
@@ -289,6 +296,8 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
 %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
+%{_prefix}/lib/firewalld/services/punktfunk-gamestream.xml
+%{_prefix}/lib/firewalld/services/punktfunk-native.xml
 %{_userunitdir}/punktfunk-host.service
 %{_userunitdir}/punktfunk-kde-session.service
 %{_datadir}/applications/io.unom.Punktfunk.Host.desktop
@@ -340,6 +349,12 @@ sysctl -p %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || :
 echo "punktfunk installed. Add yourself to the 'input' group (sudo usermod -aG input \$USER)"
 echo "then enable the host: systemctl --user enable --now punktfunk-host"
 echo "Config: cp %{_datadir}/%{name}/host.env.bazzite ~/.config/punktfunk/host.env"
+# Fedora/RHEL run firewalld by default — point the way to the installed service definitions.
+if command -v firewall-cmd >/dev/null 2>&1; then
+    echo "Firewall (firewalld): sudo firewall-cmd --reload &&"
+    echo "    sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload"
+    echo "    (use punktfunk-native for the native-only host)"
+fi
 
 %if %{with web}
 %post web
