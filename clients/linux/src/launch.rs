@@ -280,6 +280,35 @@ impl SessionUi {
         if self.app.fullscreen || self.app.settings.borrow().fullscreen_on_stream {
             self.app.window.fullscreen();
         }
+        // Steam Input owning the Deck's built-in controller is invisible degradation: SDL
+        // then sees only Steam's virtual X360 pad, so the right trackpad arrives at the
+        // host as a plain right stick (Steam's default template) and the left trackpad,
+        // paddles and gyro not at all. The real 28DE:1205 identity enumerates shortly
+        // after attach (the Valve HIDAPI drivers are session-scoped) — check once that
+        // settles and say so, instead of streaming silently degraded.
+        if crate::gamepad::is_steam_deck() {
+            let app = self.app.clone();
+            let stop = self.stop.clone();
+            glib::timeout_add_seconds_local_once(4, move || {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return; // session already over
+                }
+                if app.gamepad.active().is_none_or(|pad| pad.steam_virtual) {
+                    tracing::warn!(
+                        "Steam Input is holding the built-in controller — trackpads, \
+                         paddles and gyro won't reach the host (right pad degrades to a \
+                         right stick). Disable Steam Input for Punktfunk to fix this."
+                    );
+                    let toast = adw::Toast::new(
+                        "Steam Input is holding the Deck's controls — trackpads, paddles \
+                         and gyro won't reach the game. Fix: Punktfunk → controller \
+                         settings → Disable Steam Input.",
+                    );
+                    toast.set_timeout(12);
+                    app.toasts.add_toast(toast);
+                }
+            });
+        }
         self.page = Some(p);
     }
 

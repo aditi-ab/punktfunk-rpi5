@@ -276,12 +276,43 @@ impl DeckTransport {
     }
 }
 
+/// One-shot diagnostic: InputPlumber (shipped and enabled by default on Bazzite) hidraw-grabs
+/// controllers it decides to manage and re-emits them under a different identity — historically
+/// the Deck config re-emitted an Xbox Elite pad with the trackpads routed to a mouse target. If
+/// it grabs our virtual Deck, everything downstream of hid-steam looks wrong (trackpads surface
+/// as a stick/mouse, gyro vanishes) while punktfunk's own logs stay clean — so name the suspect
+/// up front. Best-effort process-name scan; no dependency on its D-Bus API.
+fn warn_if_inputplumber() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(true);
+    if !ONCE.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let running = std::fs::read_dir("/proc")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            std::fs::read_to_string(e.path().join("comm")).is_ok_and(|c| c.trim() == "inputplumber")
+        });
+    if running {
+        tracing::warn!(
+            "InputPlumber is running on this host — if it manages the virtual Steam Deck pad, \
+             games see InputPlumber's re-emitted device instead (trackpads may arrive as a \
+             stick/mouse, gyro may vanish). Check `inputplumber devices` and exclude the \
+             virtual pad from management if inputs look remapped."
+        );
+    }
+}
+
 /// Open the best Steam-Input-promotable Deck transport available, in preference order:
 /// **`raw_gadget` (SteamOS validated fast-path) → `usbip`/`vhci_hcd` (universal, Secure-Boot-clean)
 /// → UHID (universal, but `Interface: -1` so Steam Input won't promote it).** Each rung degrades to
 /// the next on failure, so a host lacking the gadget modules still gets a *promotable* Deck via
 /// usbip, and one lacking both still gets a working (if non-promoted) UHID pad.
 fn open_transport(idx: u8) -> Result<DeckTransport> {
+    warn_if_inputplumber();
     use crate::inject::{steam_gadget, steam_usbip};
     // 1. raw_gadget — the validated SteamOS fast-path (default on there).
     if steam_gadget::gadget_preferred() {

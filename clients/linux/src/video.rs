@@ -187,6 +187,25 @@ impl Decoder {
             .ok()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| pref.to_string());
+        // The Steam Deck's VAAPI zero-copy path renders corrupt/gray/washed-out — validated live;
+        // software decode is clean, correct-colour, and the Deck's APU handles 1280×800 HEVC
+        // easily. Likely cause: since Mesa 25.1 radeonsi exports VCN decode surfaces TILED (with
+        // AMD modifiers) instead of linear, and inside the Flatpak both the VAAPI driver and GTK's
+        // GL come from the runtime's Mesa 26.x — GTK's tiled-NV12 dmabuf import mishandles the new
+        // layout (desktop AMD/Intel boxes validated Tier-1 ran distro Mesa with linear export).
+        // So `auto` resolves to software on a Deck; an explicit `vaapi` (Settings or
+        // PUNKTFUNK_DECODER=vaapi) still forces the hw path for testing — the first-frame
+        // descriptor dump logs the modifier (LINEAR = 0x0), and GSK_RENDERER=ngl|vulkan bisects
+        // the import side.
+        let choice = if (choice == "auto" || choice.is_empty()) && crate::gamepad::is_steam_deck() {
+            tracing::info!(
+                "Steam Deck — defaulting to software decode (AMD VAAPI dmabuf is broken on this \
+                 SteamOS+Mesa combo); set the decoder to `vaapi` to override"
+            );
+            "software".to_string()
+        } else {
+            choice
+        };
         if choice != "software" {
             match VaapiDecoder::new(codec_id) {
                 Ok(v) => {
@@ -456,6 +475,14 @@ impl VaapiDecoder {
             (*ctx).get_format = Some(pick_vaapi);
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*ctx).thread_count = 1; // hwaccel: threads only add latency
+
+            // The presenter holds mapped surfaces PAST receive_frame (the paintable's
+            // current texture + the newest frame in flight each pin one until GDK's
+            // release func) — surfaces libavcodec doesn't know are missing from its
+            // fixed-size VAAPI pool. Without headroom the decoder can recycle a surface
+            // the renderer is still sampling (intermittent block corruption) or fail
+            // allocation under scheduling jitter.
+            (*ctx).extra_hw_frames = 4;
             let r = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if r < 0 {
                 let mut ctx = ctx;
