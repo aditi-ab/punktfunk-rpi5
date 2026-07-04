@@ -30,15 +30,17 @@ use std::sync::{Arc, Mutex};
 
 // --- EGL_EXT_image_dma_buf_import(+_modifiers) constants (khronos-egl exposes none) ------
 const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
-const EGL_LINUX_DRM_FOURCC_EXT: usize = 0x3271;
-const EGL_DMA_BUF_PLANE0_FD_EXT: usize = 0x3272;
-const EGL_DMA_BUF_PLANE0_OFFSET_EXT: usize = 0x3273;
-const EGL_DMA_BUF_PLANE0_PITCH_EXT: usize = 0x3274;
-const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: usize = 0x3443;
-const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: usize = 0x3444;
-const EGL_WIDTH: usize = 0x3057;
-const EGL_HEIGHT: usize = 0x3056;
-const EGL_NONE: usize = 0x3038;
+// eglCreateImageKHR takes 32-bit EGLint attribs (the core-1.5 eglCreateImage variant is the
+// one with pointer-sized EGLAttrib) — using the wrong width feeds the driver garbage pairs.
+const EGL_LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
+const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
+const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
+const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
+const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
+const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
+const EGL_WIDTH: i32 = 0x3057;
+const EGL_HEIGHT: i32 = 0x3056;
+const EGL_NONE: i32 = 0x3038;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 /// `fourcc('N','V','1','2')` — the only decoder output today (8-bit 4:2:0). P010 joins when
@@ -140,7 +142,7 @@ type EglCreateImageKhr = unsafe extern "C" fn(
     *mut c_void, // EGLContext (EGL_NO_CONTEXT for dmabuf)
     egl::Enum,
     *mut c_void, // EGLClientBuffer (null for dmabuf)
-    *const usize,
+    *const i32,  // EGLint attrib list (KHR variant — NOT pointer-sized EGLAttrib)
 ) -> *const c_void;
 type EglDestroyImageKhr = unsafe extern "C" fn(*mut c_void, *const c_void) -> egl::Boolean;
 
@@ -464,24 +466,24 @@ impl GlConverter {
     ) -> Result<*const c_void> {
         let mut attribs = vec![
             EGL_WIDTH,
-            width as usize,
+            width as i32,
             EGL_HEIGHT,
-            height as usize,
+            height as i32,
             EGL_LINUX_DRM_FOURCC_EXT,
-            fourcc as usize,
+            fourcc as i32,
             EGL_DMA_BUF_PLANE0_FD_EXT,
-            plane.fd as usize,
+            plane.fd,
             EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-            plane.offset as usize,
+            plane.offset as i32,
             EGL_DMA_BUF_PLANE0_PITCH_EXT,
-            plane.stride as usize,
+            plane.stride as i32,
         ];
         if modifier != DRM_FORMAT_MOD_INVALID && modifier != 0 {
             attribs.extend_from_slice(&[
                 EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
-                (modifier & 0xffff_ffff) as usize,
+                (modifier & 0xffff_ffff) as u32 as i32,
                 EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-                (modifier >> 32) as usize,
+                (modifier >> 32) as u32 as i32,
             ]);
         }
         attribs.push(EGL_NONE);
@@ -497,12 +499,12 @@ impl GlConverter {
         };
         if img.is_null() {
             bail!(
-                "eglCreateImageKHR rejected plane ({}x{} {:#x} mod {:#018x}): {:#x}",
+                "eglCreateImageKHR rejected plane ({}x{} {:#x} mod {:#018x}): {:?}",
                 width,
                 height,
                 fourcc,
                 modifier,
-                self.egl.get_error().map(|e| e as u32).unwrap_or(0)
+                self.egl.get_error()
             );
         }
         Ok(img)
