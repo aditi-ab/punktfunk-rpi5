@@ -68,12 +68,11 @@ finish-args:
   #     PulseAudio shim — so it needs the real `pipewire-0` socket in the sandbox. With only
   #     --socket=pulseaudio the sandbox has just `pulse/native`, no `pipewire-0`, and playback +
   #     mic both die with "pw connect (is PipeWire running in this session?)" (observed live on the
-  #     Deck in Gaming Mode). --socket=pipewire is the canonical grant; --filesystem=xdg-run/
-  #     pipewire-0 binds the same socket portably (validated on-Deck: it makes pipewire-0 appear in
-  #     the sandbox where --socket=pipewire's CLI validation was flaky). Neither needs the
-  #     camera/portal dance (that's only for camera nodes). --socket=pulseaudio stays as a fallback
-  #     for any pulse-only path. ---
-  - --socket=pipewire
+  #     Deck in Gaming Mode). We bind the native socket via --filesystem=xdg-run/pipewire-0 (NOT
+  #     --socket=pipewire: this flatpak-builder toolchain rejects it as an "Unknown socket type",
+  #     and the Deck's flatpak 1.16 override CLI does too — the filesystem bind is the portable
+  #     form, validated on-Deck to make pipewire-0 appear + the client register its audio node).
+  #     --socket=pulseaudio stays as a fallback for any pulse-only path. ---
   - --filesystem=xdg-run/pipewire-0
   - --socket=pulseaudio
   # --- network: QUIC control + UDP data plane + mDNS discovery (_punktfunk._udp) ---
