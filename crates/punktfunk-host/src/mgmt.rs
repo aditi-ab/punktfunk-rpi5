@@ -2758,6 +2758,30 @@ mod tests {
         );
     }
 
+    /// The display state/release endpoints are wired + auth-gated. On the test host no backend has
+    /// created a display (and non-Windows reports none), so `/state` is empty and `/release` is a
+    /// no-op — the shapes + the "nothing to release" path, without touching any global owner.
+    #[tokio::test]
+    async fn display_state_and_release_empty() {
+        let app = test_app(test_state(), None);
+
+        let (status, body) = send(&app, get_req("/api/v1/display/state")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["displays"].as_array().map(|a| a.len()),
+            Some(0),
+            "no managed displays on an idle test host"
+        );
+
+        let (status, body) = send(
+            &app,
+            post_json("/api/v1/display/release", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["released"], 0);
+    }
+
     #[tokio::test]
     async fn native_pairing_arm_show_and_unpair() {
         let np = Arc::new(
