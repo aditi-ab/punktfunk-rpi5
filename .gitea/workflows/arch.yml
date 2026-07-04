@@ -4,12 +4,15 @@
 # Arch is rolling, so the packages build against whatever the archlinux:base-devel container
 # resolves today — the same sonames an up-to-date Arch box runs.
 #
-# Registry (public, unom org) — box setup (once), see packaging/arch/README.md:
+# Registry (public, unom org) — box setup (once), see packaging/arch/README.md. The registry
+# SIGNS the DB + packages, so the box imports the registry key first (pacman-key --add +
+# --lsign-key), then no SigLevel line is needed (pacman's default Required verifies):
 #   [punktfunk]                         # or [punktfunk-canary] for main-push builds
-#   SigLevel = Optional TrustAll
 #   Server = https://git.unom.io/api/packages/unom/arch/$repo/$arch
 #
 # REGISTRY_TOKEN: repo Actions secret, a PAT with write:package scope (shared with docker.yml).
+# NOTE: this token + the registry-held private key are the trust root — a token holder can
+# publish a validly-signed package (the signature attests "via the registry", not "built by CI").
 name: arch
 
 on:
