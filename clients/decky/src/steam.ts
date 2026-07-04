@@ -8,7 +8,7 @@
 // and start it with RunGame. The wrapper then execs
 // `flatpak run io.unom.Punktfunk --connect <host>` as a reaper descendant.
 
-import { runnerInfo, shortcutArt } from "./backend";
+import { runnerInfo, shortcutArt, wake } from "./backend";
 
 // SteamClient is a Steam-internal global injected into the CEF context; it is not fully typed
 // by @decky/ui, so declare the surface we use. Signatures verified against MoonDeck + the
@@ -219,6 +219,11 @@ export async function launchStream(
   port: number,
   opts: LaunchOpts = {},
 ): Promise<void> {
+  // Wake-on-LAN: if this host is asleep, nudge it awake before the stream connects. Kicked off now
+  // so it races with the shortcut setup (near-zero added latency), and awaited just before RunGame.
+  // Best-effort — the flatpak client's --wake looks up the host's learned MAC (a no-op if none is
+  // known), and the connect that follows has its own retry window, so a failure never blocks launch.
+  const waking = wake(host, port).catch(() => ({ ok: false }));
   const { appId, runner } = await ensureShortcut();
   // Best-effort so the Deck's rich controls reach the client; no-op if the API is absent (the user
   // disables Steam Input manually — see the Settings instruction).
@@ -240,6 +245,7 @@ export async function launchStream(
   // KEY=value ... %command% args — %command% expands to the shortcut exe (/bin/sh); the wrapper
   // script rides behind it as an argument and reads PF_* from the environment.
   SteamClient.Apps.SetAppLaunchOptions(appId, `${env.join(" ")} %command% "${runner}"`);
+  await waking; // ensure the magic packet is out before the connect attempt
   SteamClient.Apps.RunGame(gameIdFromAppId(appId), "", -1, 100);
 }
 

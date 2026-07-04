@@ -42,6 +42,8 @@ mod video;
 #[cfg(target_os = "linux")]
 mod video_gl;
 
+mod wol;
+
 #[cfg(target_os = "linux")]
 fn main() -> gtk::glib::ExitCode {
     app::run()

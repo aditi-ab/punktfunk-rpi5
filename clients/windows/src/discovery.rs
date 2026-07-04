@@ -15,6 +15,9 @@ pub struct DiscoveredHost {
     pub fp_hex: String,
     /// Pairing requirement: `"required"` or `"optional"`.
     pub pair: String,
+    /// Wake-on-LAN MAC(s) from the mDNS `mac` TXT (comma-separated `aa:bb:cc:dd:ee:ff`), which the
+    /// hosts page persists onto the matching saved host so it can wake it later. Empty if absent.
+    pub mac: Vec<String>,
 }
 
 /// Browse continuously for the app's lifetime. The thread exits when the receiver is
@@ -63,6 +66,11 @@ pub fn browse() -> async_channel::Receiver<DiscoveredHost> {
                         port: info.get_port(),
                         fp_hex: val("fp"),
                         pair: val("pair"),
+                        mac: val("mac")
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
                     };
                     if tx.send_blocking(host).is_err() {
                         break; // UI gone — stop browsing

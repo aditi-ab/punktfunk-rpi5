@@ -101,6 +101,14 @@ pub fn cli_connect_request() -> Option<ConnectRequest> {
         eprintln!("--connect: unparsable port in '{target}', using default 9777");
         9777
     });
+    // Pull the wake MAC(s) from the store (learned from the host's mDNS `mac` TXT while it was
+    // online) so a `--connect` to a known host can still be woken if we add that later.
+    let mac = crate::trust::KnownHosts::load()
+        .hosts
+        .iter()
+        .find(|h| h.addr == addr && h.port == port)
+        .map(|h| h.mac.clone())
+        .unwrap_or_default();
     Some(ConnectRequest {
         name: addr.clone(),
         addr,
@@ -108,7 +116,37 @@ pub fn cli_connect_request() -> Option<ConnectRequest> {
         fp_hex: None,
         pair_optional: false,
         launch: arg_value("--launch").map(|id| (id.clone(), id)),
+        mac,
     })
+}
+
+/// `--wake host[:port]` — send a Wake-on-LAN magic packet to a saved host and exit, without
+/// opening a window. The Decky wrapper calls this before launching the stream so a sleeping host
+/// is up by the time `--connect` runs. The MAC comes from the known-hosts store (learned from the
+/// host's mDNS `mac` TXT while it was online); exits non-zero if none is known yet.
+pub fn cli_wake() -> glib::ExitCode {
+    let Some(target) = arg_value("--wake") else {
+        eprintln!("--wake requires host[:port]");
+        return glib::ExitCode::FAILURE;
+    };
+    let (addr, port) = parse_host_port(&target);
+    let port = port.unwrap_or(9777);
+    let mac = crate::trust::KnownHosts::load()
+        .hosts
+        .iter()
+        .find(|h| h.addr == addr && h.port == port)
+        .map(|h| h.mac.clone())
+        .unwrap_or_default();
+    if mac.is_empty() {
+        eprintln!(
+            "--wake: no MAC known for {addr}:{port} — connect once while the host is awake so its \
+             advertised MAC is learned"
+        );
+        return glib::ExitCode::FAILURE;
+    }
+    crate::wol::wake(&mac, addr.parse().ok());
+    println!("woke {addr}:{port} ({} MAC(s) targeted)", mac.len());
+    glib::ExitCode::SUCCESS
 }
 
 /// `--browse host[:port]` — open the gamepad library launcher for that host instead of
@@ -138,6 +176,7 @@ pub fn cli_browse_request() -> Option<(ConnectRequest, bool, u16)> {
             fp_hex: k.map(|k| k.fp_hex.clone()),
             pair_optional: false,
             launch: None,
+            mac: k.map(|k| k.mac.clone()).unwrap_or_default(),
         },
         k.is_some_and(|k| k.paired),
         mgmt,
@@ -210,6 +249,7 @@ pub fn run_shot(app: Rc<App>, scene: &str) {
         ),
         pair_optional: true,
         launch: None,
+        mac: Vec::new(),
     };
     let mock_advert =
         |key: &str, name: &str, addr: &str, fp: &str| crate::discovery::DiscoveredHost {
@@ -221,6 +261,7 @@ pub fn run_shot(app: Rc<App>, scene: &str) {
             fp_hex: fp.to_string(),
             pair: "required".to_string(),
             mgmt_port: None,
+            mac: Vec::new(),
         };
 
     // What the self-capture renders: the main window, except for scenes that open their

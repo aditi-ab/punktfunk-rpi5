@@ -60,6 +60,11 @@ pub struct KnownHost {
     /// most-recent card with the accent bar. `default` so pre-existing stores load.
     #[serde(default)]
     pub last_used: Option<u64>,
+    /// Wake-on-LAN MAC(s) (`aa:bb:cc:dd:ee:ff`) learned from the host's mDNS `mac` TXT while it
+    /// was online, so we can wake it once it sleeps and stops advertising. `default` so
+    /// pre-existing stores load; empty until first learned.
+    #[serde(default)]
+    pub mac: Vec<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -115,6 +120,10 @@ impl KnownHosts {
             if entry.last_used.is_some() {
                 h.last_used = entry.last_used;
             }
+            // Likewise a trust-decision upsert (which carries no MAC) must not wipe learned MACs.
+            if !entry.mac.is_empty() {
+                h.mac = entry.mac;
+            }
         } else {
             self.hosts.push(entry);
         }
@@ -132,7 +141,30 @@ pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: boo
         fp_hex: fp_hex.to_string(),
         paired,
         last_used: None,
+        mac: Vec::new(),
     });
+    let _ = known.save();
+}
+
+/// Learn/refresh a saved host's Wake-on-LAN MAC(s) from its live advert (called while the host
+/// is online, matched by fingerprint or address). No-op — and no disk write — when unchanged, so
+/// the hosts page can call it on every discovery tick without churning the store.
+pub fn learn_mac(fp_hex: &str, addr: &str, port: u16, mac: &[String]) {
+    if mac.is_empty() {
+        return;
+    }
+    let mut known = KnownHosts::load();
+    let Some(h) = known
+        .hosts
+        .iter_mut()
+        .find(|h| (!fp_hex.is_empty() && h.fp_hex == fp_hex) || (h.addr == addr && h.port == port))
+    else {
+        return;
+    };
+    if h.mac == mac {
+        return;
+    }
+    h.mac = mac.to_vec();
     let _ = known.save();
 }
 

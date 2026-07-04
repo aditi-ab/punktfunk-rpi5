@@ -142,6 +142,11 @@ pub fn run() -> glib::ExitCode {
     if let Some(target) = crate::cli::arg_value("--library") {
         return crate::cli::headless_library(&target);
     }
+    // Headless Wake-on-LAN (no GTK window): `--wake host[:port]`. The Decky wrapper calls this
+    // before the stream launch so a sleeping host is up by the time `--connect` runs.
+    if crate::cli::arg_value("--wake").is_some() {
+        return crate::cli::cli_wake();
+    }
     let mut builder = adw::Application::builder().application_id(APP_ID);
     // Screenshot mode launches the app once per scene back-to-back; NON_UNIQUE keeps each
     // launch its own primary instance instead of forwarding to a still-registered name.

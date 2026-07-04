@@ -408,6 +408,7 @@ struct ContentView: View {
         _ host: StoredHost, launchID: String? = nil,
         allowTofu: Bool, requestAccess: Bool = false
     ) {
+        prepareWake(for: host)
         model.connect(
             to: host,
             width: UInt32(clamping: width), height: UInt32(clamping: height),
@@ -424,6 +425,25 @@ struct ContentView: View {
             launchID: launchID,
             allowTofu: allowTofu,
             requestAccess: requestAccess)
+    }
+
+    /// Learn-while-awake, wake-while-asleep — run just before every connect:
+    ///  • host currently advertising (awake) → refresh its stored Wake-on-LAN MAC(s) from the live
+    ///    advert, so a later wake has an up-to-date target;
+    ///  • host NOT advertising (likely asleep/off) and we have MAC(s) → fire a magic packet first.
+    ///    The connect that follows already retries/times out long enough for a woken host to come
+    ///    up; if it's genuinely off/unreachable the connect fails as before. Best-effort and
+    ///    non-blocking (the send runs off the main thread).
+    private func prepareWake(for host: StoredHost) {
+        if let live = discovery.hosts.first(where: { host.matches($0) }) {
+            store.updateMacs(host.id, macs: live.macAddresses) // learn — on every platform
+        } else if PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty {
+            let macs = host.wakeMacs
+            let ip = host.address
+            DispatchQueue.global(qos: .userInitiated).async {
+                PunktfunkConnection.wakeOnLAN(macs: macs, lastKnownIP: ip)
+            }
+        }
     }
 
     /// The no-PIN delegated-approval flow: open an identified connect the host parks until the
@@ -455,7 +475,9 @@ struct ContentView: View {
     /// inside `connect`.)
     private func connectDiscovered(_ d: DiscoveredHost) {
         guard !model.isBusy else { return }
-        let host = StoredHost(name: d.name, address: d.host, port: d.port)
+        let host = StoredHost(
+            name: d.name, address: d.host, port: d.port,
+            macAddresses: d.macAddresses.isEmpty ? nil : d.macAddresses)
         store.add(host)
         if d.allowsTofu {
             connect(host, allowTofu: true)

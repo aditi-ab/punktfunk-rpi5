@@ -29,6 +29,9 @@ pub struct ConnectRequest {
     /// `("steam:570", "Dota 2")`) — set by the library page's card activation; the id
     /// rides the Hello and the name titles the stream page. `None` = plain desktop session.
     pub launch: Option<(String, String)>,
+    /// Wake-on-LAN MAC(s) for this host (from the saved store or the live advert). Used to send a
+    /// magic packet before connecting to an offline host. Empty when none is known.
+    pub mac: Vec<String>,
 }
 
 impl ConnectRequest {
@@ -314,6 +317,14 @@ fn rebuild(state: &Rc<State>) {
     state.saved_flow.remove_all();
     for k in &known.hosts {
         let online = adverts.values().any(|a| matches(k, a));
+        // Learn this host's wake MAC(s) from its live advert while it's online, so we can wake it
+        // once it sleeps and stops advertising (no-op / no disk write when unchanged).
+        if let Some(a) = adverts
+            .values()
+            .find(|a| matches(k, a) && !a.mac.is_empty())
+        {
+            crate::trust::learn_mac(&k.fp_hex, &k.addr, k.port, &a.mac);
+        }
         let recent = most_recent.as_deref() == Some(k.fp_hex.as_str());
         state
             .saved_flow
@@ -421,6 +432,7 @@ fn saved_card(
         // connect; TOFU eligibility is irrelevant.
         pair_optional: false,
         launch: None,
+        mac: k.mac.clone(),
     };
 
     // Presence pip + spelled-out state, then the trust pill.
@@ -492,11 +504,24 @@ fn saved_card(
             Box::new(move || forget_dialog(&state, &fp, &name)),
         );
     }
+    {
+        // Explicit "just wake it" (the tap-to-connect already auto-wakes an offline host).
+        let mac = k.mac.clone();
+        let addr = k.addr.clone();
+        add(
+            "wake",
+            Box::new(move || crate::wol::wake(&mac, addr.parse().ok())),
+        );
+    }
     overlay.insert_action_group("card", Some(&actions));
 
     let menu = gio::Menu::new();
     menu.append(Some("Pair with PIN…"), Some("card.pair"));
     menu.append(Some("Test network speed…"), Some("card.speed"));
+    // Offer an explicit wake only when the host is offline and we actually have a MAC to target.
+    if !online && !k.mac.is_empty() {
+        menu.append(Some("Wake host"), Some("card.wake"));
+    }
     // Experimental (Preferences gate, Apple parity): browse the host's game library. The
     // item is offered on every saved card — an unpaired host answers with the friendly
     // "not paired" error state rather than the entry hiding itself.
@@ -521,7 +546,16 @@ fn saved_card(
     overlay.add_controller(right_click);
 
     let on_connect = state.cbs.on_connect.clone();
-    child.connect_activate(move |_| on_connect(req.clone()));
+    // Auto-wake: if the host wasn't advertising when this card was built and we have a MAC, fire a
+    // magic packet before connecting — the connect's own retry/timeout gives a woken host time to
+    // come up. A host that's genuinely off/unreachable then fails the connect as before.
+    let wake_first = !online && !req.mac.is_empty();
+    child.connect_activate(move |_| {
+        if wake_first {
+            crate::wol::wake(&req.mac, req.addr.parse().ok());
+        }
+        on_connect(req.clone());
+    });
     child
 }
 
@@ -539,6 +573,7 @@ fn discovered_card(
         // required/empty means mandatory PIN.
         pair_optional: a.pair == "optional",
         launch: None,
+        mac: a.mac.clone(),
     };
 
     let status = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -674,6 +709,7 @@ fn add_host_dialog(state: &Rc<State>) {
                 // Manual entry carries no advertised policy — never eligible for TOFU.
                 pair_optional: false,
                 launch: None,
+                mac: Vec::new(),
             });
         });
     }

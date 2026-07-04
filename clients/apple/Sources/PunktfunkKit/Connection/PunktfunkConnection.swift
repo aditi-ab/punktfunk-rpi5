@@ -67,6 +67,53 @@ func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) 
     return s.withCString { body($0) }
 }
 
+public extension PunktfunkConnection {
+    /// Whether the Wake-on-LAN broadcast path is usable on this platform/build. macOS can always
+    /// broadcast (its App Sandbox network entitlements cover it). iOS/tvOS need the managed
+    /// `com.apple.developer.networking.multicast` entitlement, which is GATED pending Apple's
+    /// approval (see `Config/Punktfunk.entitlements`) — until it's granted, sending a broadcast is
+    /// blocked by the OS, so the wake path + its UI are gated off there to avoid a dead action.
+    /// The MAC-learning path stays active on every platform, so flipping this on once the
+    /// entitlement lands makes wake work immediately. ON APPROVAL: change `#if os(macOS)` below to
+    /// `true` for iOS/tvOS too (and uncomment the entitlement).
+    static var wakeOnLANAvailable: Bool {
+        #if os(macOS)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    /// Send a Wake-on-LAN magic packet to wake a sleeping host. `macs` are the host's NIC MAC(s)
+    /// (`aa:bb:cc:dd:ee:ff`, learned from its mDNS `mac` TXT while awake); malformed entries are
+    /// skipped. `lastKnownIP`, when set, is additionally unicast. The core broadcasts to every
+    /// interface's subnet-directed broadcast + 255.255.255.255 on ports 9/7, repeated.
+    ///
+    /// Returns true if at least one datagram went out. Does blocking sends — call OFF the main
+    /// thread. On iOS/tvOS this requires the `com.apple.developer.networking.multicast` entitlement
+    /// (broadcast is otherwise blocked by the OS); macOS needs only the existing network entitlements.
+    @discardableResult
+    static func wakeOnLAN(macs: [String], lastKnownIP: String? = nil) -> Bool {
+        var bytes: [UInt8] = []
+        var count = 0
+        for mac in macs {
+            let parts = mac.split(separator: ":")
+            guard parts.count == 6 else { continue }
+            let octets = parts.compactMap { UInt8($0, radix: 16) }
+            guard octets.count == 6 else { continue }
+            bytes.append(contentsOf: octets)
+            count += 1
+        }
+        guard count > 0 else { return false }
+        let rc: Int32 = bytes.withUnsafeBufferPointer { buf in
+            withOptionalCString(lastKnownIP) { ip in
+                punktfunk_wake_on_lan(buf.baseAddress, UInt(count), ip)
+            }
+        }
+        return rc == statusOK
+    }
+}
+
 public final class PunktfunkConnection {
     private var handle: OpaquePointer?
     /// Set by close() before it contends for the plane locks: the pullers see it at their

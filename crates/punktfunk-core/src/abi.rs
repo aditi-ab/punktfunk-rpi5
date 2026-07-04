@@ -183,6 +183,60 @@ pub extern "C" fn punktfunk_abi_version() -> u32 {
     crate::ABI_VERSION
 }
 
+/// Send a Wake-on-LAN magic packet to wake sleeping host NIC(s).
+///
+/// `macs` points to `mac_count` contiguous 6-byte MAC addresses (`mac_count * 6` bytes total) —
+/// a host may report several NICs; all are woken. `last_known_ip`, if non-NULL, is an IPv4
+/// dotted-quad string additionally targeted by unicast (pass NULL to skip). The packet is
+/// broadcast to every local interface's subnet-directed broadcast and to `255.255.255.255` on
+/// ports 9 and 7. This does NOT require an open connection and is not part of the QUIC surface.
+///
+/// Returns `Ok` if at least one datagram was sent. Call off the UI thread.
+///
+/// # Safety
+/// `macs` must point to at least `mac_count * 6` readable bytes. `last_known_ip`, if non-NULL,
+/// must be a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn punktfunk_wake_on_lan(
+    macs: *const u8,
+    mac_count: usize,
+    last_known_ip: *const c_char,
+) -> PunktfunkStatus {
+    guard(|| {
+        if macs.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        if mac_count == 0 {
+            return PunktfunkStatus::InvalidArg;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(macs, mac_count * 6) };
+        let mac_vec: Vec<crate::wol::Mac> = bytes
+            .chunks_exact(6)
+            .map(|c| {
+                let mut m = [0u8; 6];
+                m.copy_from_slice(c);
+                m
+            })
+            .collect();
+        let ip = if last_known_ip.is_null() {
+            None
+        } else {
+            match unsafe { CStr::from_ptr(last_known_ip) }
+                .to_str()
+                .ok()
+                .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+            {
+                Some(ip) => Some(ip),
+                None => return PunktfunkStatus::InvalidArg,
+            }
+        };
+        match crate::wol::send_magic_packet(&mac_vec, ip) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(_) => PunktfunkStatus::Io,
+        }
+    })
+}
+
 /// Create a session over a real UDP transport (`local`/`peer` are `host:port` strings).
 /// Returns NULL on error.
 ///

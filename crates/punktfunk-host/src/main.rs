@@ -22,6 +22,7 @@ mod audio;
 mod capture;
 mod config;
 mod discovery;
+mod wol;
 // Goal-1 stage 6: top-level platform-only modules live under `src/linux/` and `src/windows/`; `#[path]`
 // keeps the `crate::*` module names flat (every existing path is unchanged).
 #[cfg(target_os = "linux")]

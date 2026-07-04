@@ -124,6 +124,25 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     val identityStore = remember { IdentityStore(context) }
     val knownHostStore = remember { KnownHostStore(context) }
     var savedHosts by remember { mutableStateOf(knownHostStore.all()) }
+    // Learn wake MAC(s) from live adverts for hosts we've saved (parity with the desktop clients),
+    // so we can Wake-on-LAN them once they sleep. Runs only when the discovered set changes; the
+    // prefs write is guarded (no-op when unchanged), and we refresh the saved list only if a MAC
+    // was actually newly learned.
+    LaunchedEffect(discovered) {
+        val learned = withContext(Dispatchers.IO) {
+            var any = false
+            discovered.forEach { dh ->
+                if (dh.mac.isNotEmpty() &&
+                    knownHostStore.get(dh.host, dh.port)?.let { it.mac != dh.mac } == true
+                ) {
+                    knownHostStore.learnMac(dh.host, dh.port, dh.mac)
+                    any = true
+                }
+            }
+            any
+        }
+        if (learned) savedHosts = knownHostStore.all()
+    }
     // Mint-once on genuine first run; an Unrecoverable store (decrypt failure) surfaces here and
     // refuses to connect — never silently shadow-minting a new identity (which would force re-pair).
     var identity by remember { mutableStateOf<ClientIdentity?>(null) }
@@ -176,6 +195,14 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
         }
         connecting = true
         status = "Connecting to $targetHost:$targetPort…"
+        // Auto-wake: reconnecting to a saved host that may be asleep. If we learned its MAC while it
+        // was online and it isn't currently advertising, fire a magic packet first — the connect's
+        // own timeout gives a woken host time to come up (harmless if it's already awake).
+        knownHostStore.get(targetHost, targetPort)?.mac
+            ?.takeIf { it.isNotEmpty() && discovered.none { d -> d.host == targetHost && d.port == targetPort } }
+            ?.let { macs ->
+                scope.launch(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(macs.joinToString(","), targetHost) }
+            }
         discovery.stop() // free the Wi-Fi radio before the stream session
         scope.launch {
             val handle = connectNative(id, targetHost, targetPort, pinHex ?: "", CONNECT_TIMEOUT_MS)
@@ -359,6 +386,15 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                             savedHosts = knownHostStore.all()
                         },
                         onRename = { renameTarget = kh },
+                        // Explicit wake: offered only when the host is offline and we have a MAC to
+                        // target (a tap-to-connect already auto-wakes an offline saved host).
+                        onWake = if (kh.mac.isNotEmpty() &&
+                            discovered.none { it.host == kh.address && it.port == kh.port }
+                        ) {
+                            { scope.launch(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(kh.mac.joinToString(","), kh.address) } }
+                        } else {
+                            null
+                        },
                     )
                 }
             }

@@ -38,6 +38,10 @@ thiserror = "2"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 rand = "0.9"
 zeroize = "1"
+# Interface enumeration for Wake-on-LAN: computes each NIC's subnet-directed broadcast so a
+# magic packet reaches the host's L2 segment on multi-homed clients (VPN/docker/multiple LANs),
+# not just the default route. Tiny, cross-platform (getifaddrs / GetAdaptersAddresses), no cmake.
+if-addrs = "0.13"
 
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
