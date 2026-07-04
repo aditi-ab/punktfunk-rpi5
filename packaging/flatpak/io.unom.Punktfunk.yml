@@ -64,10 +64,17 @@ finish-args:
   # does not apply.
   - --device=all
   - --filesystem=/run/udev:ro        # SDL/HIDAPI enumerates devices via udev
-  # --- audio: PipeWire via its PulseAudio shim — covers playback AND mic uplink. SteamOS
-  #     exposes PipeWire-pulse here; --socket=pulseaudio is the portable arg Moonlight/chiaki
-  #     also use on the Deck (a bare --socket=pipewire would also need the camera/portal dance
-  #     for capture; the pulse shim gives mic + speaker in one grant). ---
+  # --- audio: the client speaks the NATIVE PipeWire protocol (audio.rs `pw connect`), NOT the
+  #     PulseAudio shim — so it needs the real `pipewire-0` socket in the sandbox. With only
+  #     --socket=pulseaudio the sandbox has just `pulse/native`, no `pipewire-0`, and playback +
+  #     mic both die with "pw connect (is PipeWire running in this session?)" (observed live on the
+  #     Deck in Gaming Mode). --socket=pipewire is the canonical grant; --filesystem=xdg-run/
+  #     pipewire-0 binds the same socket portably (validated on-Deck: it makes pipewire-0 appear in
+  #     the sandbox where --socket=pipewire's CLI validation was flaky). Neither needs the
+  #     camera/portal dance (that's only for camera nodes). --socket=pulseaudio stays as a fallback
+  #     for any pulse-only path. ---
+  - --socket=pipewire
+  - --filesystem=xdg-run/pipewire-0
   - --socket=pulseaudio
   # --- network: QUIC control + UDP data plane + mDNS discovery (_punktfunk._udp) ---
   - --share=network
