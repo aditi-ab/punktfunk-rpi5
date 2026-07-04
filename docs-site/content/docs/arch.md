@@ -34,12 +34,10 @@ curl -fsS https://git.unom.io/api/packages/unom/arch/repository.key \
 sudo pacman-key --lsign-key E0CA04465C99C936E0B0C6510A317015A34DDD69
 
 # Add the repo (append to /etc/pacman.conf). No SigLevel line needed — pacman's default
-# verifies signed packages against the key you just trusted.
-sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
-
-[punktfunk]
-Server = https://git.unom.io/api/packages/unom/arch/$repo/$arch
-EOF
+# verifies signed packages against the key you just trusted. (printf, not a heredoc, so this
+# works in fish too — CachyOS's default shell has no `<<EOF` support.)
+printf '\n[punktfunk]\nServer = https://git.unom.io/api/packages/unom/arch/$repo/$arch\n' \
+  | sudo tee -a /etc/pacman.conf >/dev/null
 ```
 
 > **Stable vs canary.** `[punktfunk]` is the **stable** channel — it moves only when a `vX.Y.Z`
@@ -54,7 +52,7 @@ sudo pacman -S  punktfunk-web       # optional: the browser management console (
 sudo usermod -aG input "$USER"      # /dev/uinput access for virtual gamepads (re-login to apply)
 ```
 
-`punktfunk-client` (the GTK4 couch/Deck client) is in the same repo if this box is also a client.
+`punktfunk-client` (the native GTK4 Linux client) is in the same repo if this box is also a client.
 The host package ships the systemd **user** units, the udev rule, the UDP socket-buffer sysctl
 tuning, and example configs. Updates later are just `sudo pacman -Syu`.
 
@@ -108,7 +106,33 @@ sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password
 To set your own, edit that file and `systemctl --user restart punktfunk-web`. Forgot it? See
 [Forgot your Password?](/docs/forgot-password).
 
-## 5. Connect a client
+## 5. Open the firewall (if you have one)
+
+**Stock Arch ships no firewall** — every port is already open, so you can skip this. But **CachyOS
+enables `firewalld` by default**, and an Arch package never opens ports for you (it won't touch your
+running firewall), so on CachyOS the host is unreachable until you allow it.
+
+The `punktfunk-host` package installs **firewalld service definitions** for exactly this, so
+enabling is one command. Reload once so firewalld sees the just-installed definition, add the
+service, then reload to apply:
+
+```sh
+sudo firewall-cmd --reload
+sudo firewall-cmd --permanent --add-service=punktfunk-native       # the default native host
+#                              --add-service=punktfunk-gamestream   # …or add this for Moonlight compat
+sudo firewall-cmd --reload
+```
+
+`punktfunk-native` opens the QUIC control port (UDP 9777) + mDNS discovery; add
+`punktfunk-gamestream` as well if you run `serve --gamestream` (the fixed Moonlight ports + mDNS).
+The media **data plane** uses an *ephemeral* UDP port per session (nothing fixed to open); a
+restrictive firewall must also allow a UDP range. The web console (47992) and mgmt API (47990,
+loopback-only) are **not** opened by these — reach the console from the host box, or open 47992
+yourself if you want it on the LAN. Not on firewalld? See
+[`packaging/arch/README.md`](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/arch/README.md#firewall)
+for the `ufw`/`nftables` port lists.
+
+## 6. Connect a client
 
 From any [client](/docs/clients), `--discover` finds the host on the LAN. On first connect, complete
 the **PIN pairing** — arm it from the host's web console, which displays a 4-digit PIN to type into

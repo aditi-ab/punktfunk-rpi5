@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  firewalld service definition for the punktfunk GameStream (Moonlight-compatible) host.
+
+  Installed to /usr/lib/firewalld/services/ by the punktfunk-host package. It is NOT enabled
+  automatically: an Arch package never touches the admin's running firewall. Stock Arch ships no
+  firewall (these ports are already open); on a firewalld spin such as CachyOS, enable it once with
+  firewall-cmd (add-service=punktfunk-gamestream, then reload). Exact commands: the packaging/arch
+  README, Firewall section.
+
+  Needed only when the host runs GameStream/Moonlight compat (serve with the gamestream flag). The
+  mgmt REST API (TCP 47990) stays on loopback by default and is deliberately not opened here.
+  Port map: design/gamestream-host-plan.md.
+-->
+<service>
+  <short>Punktfunk (GameStream / Moonlight)</short>
+  <description>Low-latency game-streaming host over the Moonlight-compatible GameStream protocol. Opens the fixed nvhttp (HTTPS/HTTP), RTSP, video RTP, ENet control/input and Opus audio ports, plus mDNS for auto-discovery.</description>
+  <port protocol="tcp" port="47984"/>  <!-- HTTPS nvhttp (paired, mutual TLS)         -->
+  <port protocol="tcp" port="47989"/>  <!-- HTTP nvhttp (/serverinfo, /pair PIN flow) -->
+  <port protocol="tcp" port="48010"/>  <!-- RTSP handshake                            -->
+  <port protocol="udp" port="47998"/>  <!-- Video RTP (+ FEC)                          -->
+  <port protocol="udp" port="47999"/>  <!-- ENet control stream + remote input        -->
+  <port protocol="udp" port="48000"/>  <!-- Audio (Opus)                              -->
+  <port protocol="udp" port="5353"/>   <!-- mDNS auto-discovery (_nvstream._tcp.local) -->
+</service>

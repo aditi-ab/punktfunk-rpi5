@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  firewalld service definition for the native punktfunk/1 host (the secure default 'serve', or the
+  punktfunk1-host subcommand).
+
+  Installed to /usr/lib/firewalld/services/ by the punktfunk-host package. NOT enabled automatically
+  (an Arch package never touches the admin's firewall). Stock Arch has no firewall; on a firewalld
+  spin such as CachyOS, enable it once with firewall-cmd (add-service=punktfunk-native, then reload).
+  Exact commands: the packaging/arch README, Firewall section.
+
+  The media DATA plane binds an EPHEMERAL UDP port (0.0.0.0:0) chosen per session and reported to the
+  client, so there is no fixed data port to open. On a restrictive firewall you must also allow the
+  ephemeral UDP range (the project does not pin one).
+-->
+<service>
+  <short>Punktfunk (native punktfunk/1)</short>
+  <description>Low-latency game-streaming host over the native punktfunk/1 protocol (QUIC control plane). Opens the default QUIC control port plus mDNS for auto-discovery. The media data plane uses an ephemeral UDP port negotiated per session, not opened here.</description>
+  <port protocol="udp" port="9777"/>  <!-- QUIC control plane (default 9777)            -->
+  <port protocol="udp" port="5353"/>  <!-- mDNS auto-discovery (_punktfunk._udp.local) -->
+</service>

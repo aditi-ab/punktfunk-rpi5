@@ -1,7 +1,7 @@
 # Maintainer: unom <noreply@anthropic.com>
 #
 # Arch Linux / SteamOS split package: punktfunk-host (the gaming-rig HOST, NVENC) and
-# punktfunk-client (the GTK4 couch/Deck CLIENT). Mirrors the rpm subpackages
+# punktfunk-client (the native GTK4/libadwaita Linux CLIENT). Mirrors the rpm subpackages
 # (packaging/rpm/punktfunk.spec) and the two deb build scripts. On a Steam Deck you want
 # `punktfunk-client` (it's what the Decky plugin launches); on a gaming rig, `punktfunk-host`.
 #
@@ -134,13 +134,21 @@ package_punktfunk-host() {
   install -Dm0644 "$R/packaging/bazzite/gamescope-headless-session" \
     "$pkgdir/etc/gamescope-session-plus/sessions.d/steam"
   install -Dm0644 "$R/api/openapi.json"                 "$pkgdir/usr/share/punktfunk/openapi.json"
+  # firewalld service definitions — NOT auto-enabled (Arch packages never touch the admin's
+  # firewall). Stock Arch ships none, so they're a no-op there; CachyOS et al. ship firewalld, so
+  #   sudo firewall-cmd --reload && sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload
+  # (or =punktfunk-native). See README.md → Firewall.
+  install -Dm0644 "$R/packaging/arch/punktfunk-gamestream.xml" \
+    "$pkgdir/usr/lib/firewalld/services/punktfunk-gamestream.xml"
+  install -Dm0644 "$R/packaging/arch/punktfunk-native.xml" \
+    "$pkgdir/usr/lib/firewalld/services/punktfunk-native.xml"
   install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-MIT"
   install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-APACHE"
   install -Dm0644 "$R/README.md"      "$pkgdir/usr/share/doc/punktfunk-host/README.md"
 }
 
 package_punktfunk-client() {
-  pkgdesc="Low-latency desktop/game streaming CLIENT (GTK4) — the couch/Deck side"
+  pkgdesc="Low-latency desktop/game streaming CLIENT — native GTK4/libadwaita Linux app"
   # The GTK4/libadwaita client: SDL3 gamepads, FFmpeg (VAAPI) decode, PipeWire audio/mic.
   depends=('gtk4' 'libadwaita' 'sdl3' 'ffmpeg' 'pipewire' 'wireplumber' 'pipewire-pulse'
            'opus' 'libglvnd')

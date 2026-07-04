@@ -9,7 +9,7 @@ to a canary build — see [Release Channels](https://punktfunk.unom.io/docs/chan
 below subscribes to `stable`; swap `stable` → `canary` for the latest main builds.
 
 The same workflow also publishes **`punktfunk-web`** (the browser management console — pairing +
-status) and **`punktfunk-client`** (the GTK4 couch/Deck client). `punktfunk-host` **Recommends**
+status) and **`punktfunk-client`** (the native GTK4/libadwaita Linux client). `punktfunk-host` **Recommends**
 `punktfunk-web`, so a default `apt install punktfunk-host` pulls the console too (alongside the
 udev/sysctl bits) unless you've disabled weak deps; `punktfunk-client` is independent — install it
 on the box you stream *to*. (`punktfunk-probe` is the headless reference/test tool, not packaged
