@@ -91,6 +91,7 @@ jobs:
           # makepkg refuses to run as root; deps are already installed above (-d skips the
           # RPM-level check that can't see the script-installed bun anyway).
           useradd -m builder
+          mkdir -p "$CARGO_HOME"   # actions/cache doesn't create it on a cache miss
           chown -R builder: "$PWD" "$CARGO_HOME"
           sudo -u builder git config --global --add safe.directory "$PWD"
           mkdir -p dist && chown builder: dist
