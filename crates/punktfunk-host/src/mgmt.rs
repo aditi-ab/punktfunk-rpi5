@@ -1065,9 +1065,8 @@ async fn get_display_settings() -> Json<DisplaySettingsState> {
 /// Set the display-management policy
 ///
 /// Persists a new policy (validated + clamped) and applies it from the next connect/teardown — a
-/// running session keeps the display it opened on. `keep_alive: forever` is rejected until the
-/// display-lifecycle stage ships (it would keep physical monitors dark indefinitely with no release
-/// path yet).
+/// running session keeps the display it opened on. `keep_alive: forever` (the gaming-rig preset) is
+/// honored (the display is Pinned; free it via `POST /display/release`).
 #[utoipa::path(
     put,
     path = "/display/settings",
@@ -1076,7 +1075,7 @@ async fn get_display_settings() -> Json<DisplaySettingsState> {
     request_body = crate::vdisplay::policy::DisplayPolicy,
     responses(
         (status = OK, description = "Policy stored; the new state", body = DisplaySettingsState),
-        (status = BAD_REQUEST, description = "An option value is not yet supported (e.g. keep_alive forever)", body = ApiError),
+        (status = BAD_REQUEST, description = "Malformed policy body", body = ApiError),
         (status = INTERNAL_SERVER_ERROR, description = "Policy could not be persisted", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
@@ -1084,17 +1083,8 @@ async fn get_display_settings() -> Json<DisplaySettingsState> {
 async fn set_display_settings(
     ApiJson(policy): ApiJson<crate::vdisplay::policy::DisplayPolicy>,
 ) -> Response {
-    use crate::vdisplay::policy::KeepAlive;
-    // Reject options this build can't honor yet, so the console can't promise a behavior that won't
-    // happen. `keep_alive: forever` (directly or via the `gaming-rig` preset) needs the Pinned
-    // lifecycle + a release path; until then it would strand physical monitors dark.
-    if policy.effective().keep_alive == KeepAlive::Forever {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "keep_alive `forever` (and the `gaming-rig` preset) is not available yet — it arrives \
-             with the display-lifecycle stage. Use a fixed duration for now.",
-        );
-    }
+    // `keep_alive: forever` (the gaming-rig preset) is now honored: the display is Pinned (Linux
+    // registry + Windows `MgrState::Pinned`) and freed via `POST /display/release` (the escape hatch).
     if let Err(e) = crate::vdisplay::policy::prefs().set(policy) {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,

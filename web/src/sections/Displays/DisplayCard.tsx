@@ -572,9 +572,10 @@ const apiErrorMessage = (err: unknown): string | undefined => {
 	return err ? String(err) : undefined;
 };
 
-/** `gaming-rig` expands to `keep_alive: forever`, which the host still rejects (Windows has no
- * Pinned state yet) — surface it, but disabled, rather than let the one-click apply 400. */
-const DISABLED_PRESETS: ReadonlySet<string> = new Set(["gaming-rig"]);
+/** Presets the host can't honor yet (one-click apply would 400) are surfaced but disabled. Empty
+ * now that `gaming-rig` (`keep_alive: forever`) ships: the display is Pinned (Linux + Windows) and
+ * freed via Release. */
+const DISABLED_PRESETS: ReadonlySet<string> = new Set<string>();
 
 const PRESET_LABEL: Record<string, () => string> = {
 	custom: m.display_preset_custom,

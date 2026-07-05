@@ -131,6 +131,12 @@ enum MgrState {
     Idle,
     Active { mon: Monitor, refs: u32 },
     Lingering { mon: Monitor, until: Instant },
+    /// `keep_alive = forever` (gaming-rig): the monitor is kept indefinitely after the last session
+    /// leaves — like `Lingering` but the linger timer never tears it down. A reconnect preempts +
+    /// recreates it (same as `Lingering`, since a reused IddCx swap-chain is dead); only the mgmt
+    /// `/display/release` (or host shutdown) frees it. The physical screens stay off (exclusive) for
+    /// the box's life — the §8 release-now escape hatch (`force_release`) is the way back.
+    Pinned { mon: Monitor },
 }
 
 /// The manager's control-device cache. Reopenable: a driver upgrade / WUDFHost restart kills the
@@ -386,22 +392,28 @@ impl VirtualDisplayManager {
         let mut state = self.state.lock().unwrap();
         let dev = self.ensure_device()?;
 
-        // IDD-push: a new connection while a monitor is LINGERING is a single-client RECONNECT (the
-        // prior session fully released). A REUSED IddCx swap-chain is DEAD, so reusing it hands a black
-        // screen — PREEMPT: tear the lingering monitor down (its key/topology are restored) and create a
-        // fresh one. The old session's lease is gen-stamped, so its later drop is a no-op.
+        // IDD-push: a new connection while a monitor is kept (LINGERING or PINNED) is a single-client
+        // RECONNECT (the prior session fully released). A REUSED IddCx swap-chain is DEAD, so reusing it
+        // hands a black screen — PREEMPT: tear the kept monitor down (its key/topology are restored) and
+        // create a fresh one. The old session's lease is gen-stamped, so its later drop is a no-op.
         //
-        // ONLY Lingering, NOT Active: an Active monitor still has a lease held — that's the build-retry
-        // path (`build_pipeline_with_retry` holds one lease across all attempts) or a concurrent session,
-        // NOT a reconnect. Preempting Active would tear a live session down AND churn REMOVE→ADD on every
-        // retry — the per-cold-start monitor churn that exhausts the IddCx slot pool and wedges ADD at
-        // 0x80070490. Active falls through to the JOIN path below (refcount++, no ADD).
-        if matches!(*state, MgrState::Lingering { .. }) {
-            if let MgrState::Lingering { mon, .. } = std::mem::replace(&mut *state, MgrState::Idle)
-            {
+        // ONLY the kept states, NOT Active: an Active monitor still has a lease held — that's the
+        // build-retry path (`build_pipeline_with_retry` holds one lease across all attempts) or a
+        // concurrent session, NOT a reconnect. Preempting Active would tear a live session down AND churn
+        // REMOVE→ADD on every retry — the per-cold-start monitor churn that exhausts the IddCx slot pool
+        // and wedges ADD at 0x80070490. Active falls through to the JOIN path below (refcount++, no ADD).
+        if matches!(*state, MgrState::Lingering { .. } | MgrState::Pinned { .. }) {
+            let taken = match std::mem::replace(&mut *state, MgrState::Idle) {
+                MgrState::Lingering { mon, .. } | MgrState::Pinned { mon } => Some(mon),
+                other => {
+                    *state = other;
+                    None
+                }
+            };
+            if let Some(mon) = taken {
                 tracing::info!(
                     old_target = mon.target_id,
-                    "IDD-push reconnect — preempting the lingering monitor, recreating a fresh one"
+                    "IDD-push reconnect — preempting the kept (lingering/pinned) monitor, recreating a fresh one"
                 );
                 // SAFETY: `teardown` requires `dev` to be a valid control handle; `dev` is the value
                 // `ensure_device()` returned above (cached handles are never closed — a dead one is
@@ -457,12 +469,14 @@ impl VirtualDisplayManager {
             return Ok(self.output_for(mon));
         }
 
-        // Idle or Lingering: repurpose a lingering monitor / create a fresh one → Active{refs:1}.
+        // Idle or kept: repurpose a kept monitor / create a fresh one → Active{refs:1}. (In practice a
+        // kept Lingering/Pinned monitor was already preempted → Idle above; this arm is the defensive
+        // reuse path if a race left one here — it must stay exhaustive over `Pinned` regardless.)
         let mon = match std::mem::replace(&mut *state, MgrState::Idle) {
-            MgrState::Lingering { mut mon, .. } => {
+            MgrState::Lingering { mut mon, .. } | MgrState::Pinned { mut mon } => {
                 tracing::info!(
                     backend = self.driver.name(),
-                    "virtual monitor reused (reconnect within the linger window)"
+                    "virtual monitor reused (reconnect to a kept monitor)"
                 );
                 if mon.mode != mode {
                     // SAFETY: `reconfigure` needs an exclusive `&mut Monitor` and only touches the live
@@ -747,7 +761,9 @@ impl VirtualDisplayManager {
     fn release(&self, gen: u64) {
         let mut state = self.state.lock().unwrap();
         let stale = match &*state {
-            MgrState::Active { mon, .. } | MgrState::Lingering { mon, .. } => mon.gen != gen,
+            MgrState::Active { mon, .. }
+            | MgrState::Lingering { mon, .. }
+            | MgrState::Pinned { mon } => mon.gen != gen,
             MgrState::Idle => true,
         };
         if stale {
@@ -758,6 +774,14 @@ impl VirtualDisplayManager {
                 mon,
                 refs: refs - 1,
             },
+            // Last session left: keep the monitor forever (Pinned) under `keep_alive = forever`,
+            // else linger for the policy window before the timer tears it down.
+            MgrState::Active { mon, .. } if keep_alive_forever() => {
+                tracing::info!(
+                    "virtual-display: last session left — PINNED (keep_alive=forever); free via /display/release"
+                );
+                MgrState::Pinned { mon }
+            }
             MgrState::Active { mon, .. } => {
                 let ms = linger_ms();
                 tracing::info!(
@@ -918,7 +942,7 @@ fn resolve_render_pin() -> Option<LUID> {
 pub(crate) struct ManagedInfo {
     pub backend: &'static str,
     pub mode: (u32, u32, u32),
-    /// `"active"` | `"lingering"`.
+    /// `"active"` | `"lingering"` | `"pinned"`.
     pub state: &'static str,
     /// Milliseconds until a lingering monitor is torn down (`None` when active).
     pub expires_in_ms: Option<u64>,
@@ -939,6 +963,8 @@ impl VirtualDisplayManager {
                 let ms = until.saturating_duration_since(Instant::now()).as_millis() as u64;
                 (mon, "lingering", 0u32, Some(ms))
             }
+            // Pinned (keep_alive=forever): kept indefinitely, no expiry — the console shows "Pinned".
+            MgrState::Pinned { mon } => (mon, "pinned", 0u32, None),
         };
         Some(ManagedInfo {
             backend: self.driver.name(),
@@ -950,20 +976,28 @@ impl VirtualDisplayManager {
         })
     }
 
-    /// Force-tear-down a LINGERING monitor now (the `/display/release` endpoint) — so a
-    /// physical-screen user gets their screen back without waiting out the linger. An Active monitor
-    /// is refused (stopping a live session is session management, not display management). Returns
-    /// `true` if a lingering monitor was released.
+    /// Force-tear-down a kept (LINGERING **or** PINNED) monitor now (the `/display/release` endpoint) —
+    /// so a physical-screen user gets their screen back without waiting out the linger, and it is the §8
+    /// escape hatch that frees a `keep_alive=forever` (Pinned) monitor. An Active monitor is refused
+    /// (stopping a live session is session management, not display management). Returns `true` if a kept
+    /// monitor was released.
     pub(crate) fn force_release(&self) -> bool {
         let Some(dev) = self.device_handle() else {
             return false;
         };
         let mut st = self.state.lock().unwrap();
-        if matches!(&*st, MgrState::Lingering { .. }) {
-            if let MgrState::Lingering { mon, .. } = std::mem::replace(&mut *st, MgrState::Idle) {
+        if matches!(&*st, MgrState::Lingering { .. } | MgrState::Pinned { .. }) {
+            let mon = match std::mem::replace(&mut *st, MgrState::Idle) {
+                MgrState::Lingering { mon, .. } | MgrState::Pinned { mon } => Some(mon),
+                other => {
+                    *st = other;
+                    None
+                }
+            };
+            if let Some(mon) = mon {
                 // SAFETY: `teardown` needs a live control handle; `dev` is from `device_handle()`
                 // (cached handles are never closed — a dead one is retired, kept alive; see
-                // `DeviceSlot`). `mon` was moved out of the `Lingering` state under the `state` lock,
+                // `DeviceSlot`). `mon` was moved out of the kept state under the `state` lock,
                 // so it is exclusively owned here — no aliasing.
                 unsafe { self.teardown(dev, mon) };
                 return true;
@@ -996,22 +1030,27 @@ fn linger_ms() -> u64 {
         return match eff.keep_alive.linger() {
             Linger::Immediate => 0,
             Linger::For(d) => d.as_millis() as u64,
-            // Pinned (keep forever) is built in the display-lifecycle stage; until then fall back to
-            // the default rather than silently keeping the monitor — and thus the physical screens —
-            // dark indefinitely. (The mgmt PUT also rejects `forever` at Stage 0, so this is defensive.)
-            Linger::Forever => {
-                tracing::warn!(
-                    "display policy: keep_alive=forever not yet honored — lingering 10 s \
-                     (Pinned lands in the display-lifecycle stage)"
-                );
-                10_000
-            }
+            // `forever` is handled BEFORE this by `keep_alive_forever()` in `release` (→ `Pinned`), so
+            // this arm is only reached defensively (e.g. a caller that resolves ms without the pin
+            // check) — fall back to the default rather than a huge linger.
+            Linger::Forever => 10_000,
         };
     }
     std::env::var("PUNKTFUNK_MONITOR_LINGER_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000)
+}
+
+/// Whether the configured console policy's `keep_alive` resolves to **forever** (`Pinned`) — the
+/// gaming-rig preset. `release` uses this to keep the last-released monitor indefinitely instead of
+/// lingering. Unconfigured hosts are never forever (default is a short linger).
+fn keep_alive_forever() -> bool {
+    use crate::vdisplay::policy::{prefs, Linger};
+    prefs()
+        .configured_effective()
+        .map(|eff| matches!(eff.keep_alive.linger(), Linger::Forever))
+        .unwrap_or(false)
 }
 
 /// The effective display topology for a freshly-created monitor (never `Auto`): the console policy's

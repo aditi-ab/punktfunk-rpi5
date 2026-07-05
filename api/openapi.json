@@ -268,7 +268,7 @@
           "display"
         ],
         "summary": "Set the display-management policy",
-        "description": "Persists a new policy (validated + clamped) and applies it from the next connect/teardown — a\nrunning session keeps the display it opened on. `keep_alive: forever` is rejected until the\ndisplay-lifecycle stage ships (it would keep physical monitors dark indefinitely with no release\npath yet).",
+        "description": "Persists a new policy (validated + clamped) and applies it from the next connect/teardown — a\nrunning session keeps the display it opened on. `keep_alive: forever` (the gaming-rig preset) is\nhonored (the display is Pinned; free it via `POST /display/release`).",
         "operationId": "setDisplaySettings",
         "requestBody": {
           "content": {
@@ -292,7 +292,7 @@
             }
           },
           "400": {
-            "description": "An option value is not yet supported (e.g. keep_alive forever)",
+            "description": "Malformed policy body",
             "content": {
               "application/json": {
                 "schema": {
