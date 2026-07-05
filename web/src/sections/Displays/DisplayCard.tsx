@@ -60,27 +60,36 @@ export const DisplaySection: FC = () => {
 		);
 
 	return (
-		<Card>
-			<CardHeader>
-				<CardTitle>{m.host_displays()}</CardTitle>
-			</CardHeader>
-			<CardContent className="space-y-4">
-				<p className="text-sm text-muted-foreground">{m.host_displays_help()}</p>
-				<QueryState isLoading={q.isLoading} error={q.error} refetch={q.refetch}>
-					{q.data && draft && (
-						<DisplayForm
-							draft={draft}
-							setDraft={setDraft}
-							presets={q.data.presets}
-							apply={apply}
-							busy={save.isPending}
-							error={apiErrorMessage(save.error)}
-						/>
-					)}
-				</QueryState>
-				<LiveDisplays />
-			</CardContent>
-		</Card>
+		<div className="flex flex-col gap-card">
+			<Card>
+				<CardHeader>
+					<CardTitle>{m.display_config_title()}</CardTitle>
+				</CardHeader>
+				<CardContent className="space-y-4">
+					<p className="text-sm text-muted-foreground">{m.host_displays_help()}</p>
+					<QueryState isLoading={q.isLoading} error={q.error} refetch={q.refetch}>
+						{q.data && draft && (
+							<DisplayForm
+								draft={draft}
+								setDraft={setDraft}
+								presets={q.data.presets}
+								apply={apply}
+								busy={save.isPending}
+								error={apiErrorMessage(save.error)}
+							/>
+						)}
+					</QueryState>
+				</CardContent>
+			</Card>
+			<Card>
+				<CardHeader>
+					<CardTitle>{m.display_live()}</CardTitle>
+				</CardHeader>
+				<CardContent>
+					<LiveDisplays />
+				</CardContent>
+			</Card>
+		</div>
 	);
 };
 
@@ -142,10 +151,10 @@ const DisplayForm: FC<{
 
 	return (
 		<div className="space-y-4">
-			{/* One-click presets */}
-			<div className="space-y-2">
-				<Label>{m.display_preset()}</Label>
-				<div className="grid gap-2">
+			{/* One-click presets — a 2-up grid so each has room to breathe */}
+			<div className="space-y-3">
+				<Label className="text-base font-semibold">{m.display_preset()}</Label>
+				<div className="grid gap-3 sm:grid-cols-2">
 					{PRESET_ORDER.map((id) => {
 						const p = presets.find((x) => x.id === id);
 						const fields = id === "custom" ? undefined : p?.fields;
@@ -153,8 +162,10 @@ const DisplayForm: FC<{
 						const selected = preset === id;
 						const soon = DISABLED_PRESETS.has(id);
 						const cls = [
-							"w-full rounded-md border p-3 text-left transition-colors",
-							selected ? "border-primary ring-1 ring-primary" : "hover:bg-muted/50",
+							"flex h-full flex-col rounded-lg border p-4 text-left transition-colors",
+							selected
+								? "border-primary ring-1 ring-primary"
+								: "hover:border-primary/40 hover:bg-muted/50",
 							soon ? "opacity-60" : "",
 						].join(" ");
 						return (
@@ -166,7 +177,7 @@ const DisplayForm: FC<{
 								className={cls}
 							>
 								<div className="flex items-center justify-between gap-2">
-									<span className="text-sm font-medium">
+									<span className="text-base font-semibold">
 										{(PRESET_LABEL[id] ?? (() => id))()}
 										{soon && (
 											<span className="ml-2 text-xs font-normal text-muted-foreground">
@@ -178,9 +189,11 @@ const DisplayForm: FC<{
 										<Badge variant="success">{m.display_preset_current()}</Badge>
 									)}
 								</div>
-								{summary && <p className="mt-0.5 text-xs text-muted-foreground">{summary}</p>}
+								{summary && (
+									<p className="mt-1 text-sm text-muted-foreground">{summary}</p>
+								)}
 								{fields && (
-									<div className="mt-1.5 flex flex-wrap gap-1">
+									<div className="mt-auto flex flex-wrap gap-1.5 pt-3">
 										<Badge variant="secondary">{fmtKeepAlive(fields.keep_alive)}</Badge>
 										<Badge variant="secondary">{tr(TOPOLOGY_LABEL, fields.topology)}</Badge>
 										<Badge variant="outline">{tr(CONFLICT_LABEL, fields.mode_conflict)}</Badge>
@@ -361,10 +374,9 @@ const LiveDisplays: FC = () => {
 		);
 
 	return (
-		<div className="space-y-2 border-t pt-4">
-			<div className="flex items-center justify-between gap-4">
-				<h4 className="text-sm font-medium">{m.display_live()}</h4>
-				{kept.length > 0 && (
+		<div className="space-y-3">
+			{kept.length > 0 && (
+				<div className="flex justify-end">
 					<Button
 						size="sm"
 						variant="outline"
@@ -373,8 +385,8 @@ const LiveDisplays: FC = () => {
 					>
 						{m.display_release_all()}
 					</Button>
-				)}
-			</div>
+				</div>
+			)}
 			{displays.length === 0 ? (
 				<p className="text-sm text-muted-foreground">{m.display_none_live()}</p>
 			) : (
