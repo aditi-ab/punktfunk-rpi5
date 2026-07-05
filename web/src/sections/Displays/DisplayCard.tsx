@@ -147,10 +147,11 @@ const DisplayForm: FC<{
 	};
 
 	const ka = customFields.keep_alive;
-	const secondsValue = ka.mode === "duration" ? ka.seconds : 300;
+	// The duration value, remembered across the Off/Keep toggle so switching back restores it.
+	const [keepSecs, setKeepSecs] = useState(ka.mode === "duration" ? ka.seconds : 300);
 
 	return (
-		<div className="space-y-4">
+		<div className="space-y-6">
 			{/* One-click presets — a 2-up grid so each has room to breathe */}
 			<div className="space-y-3">
 				<Label className="text-base font-semibold">{m.display_preset()}</Label>
@@ -208,10 +209,10 @@ const DisplayForm: FC<{
 
 			{/* Custom: every option by hand */}
 			{isCustom && (
-				<div className="space-y-4 rounded-md border p-4">
-					<div className="space-y-2">
+				<div className="space-y-6 rounded-lg border p-5">
+					<div className="space-y-2.5">
 						<Label>{m.display_keep_alive()}</Label>
-						<div className="flex items-center gap-2">
+						<div className="flex flex-wrap items-center gap-2">
 							<Button
 								size="sm"
 								variant={ka.mode === "off" ? "default" : "outline"}
@@ -220,25 +221,35 @@ const DisplayForm: FC<{
 							>
 								{m.display_keep_alive_off()}
 							</Button>
-							<Input
-								type="number"
-								min={0}
-								className="w-24"
-								value={secondsValue}
+							<Button
+								size="sm"
+								variant={ka.mode === "duration" ? "default" : "outline"}
 								disabled={busy}
-								onChange={(e) =>
-									setDraft({
-										...draft,
-										keep_alive: {
-											mode: "duration",
-											seconds: Math.max(0, Number(e.target.value) || 0),
-										},
-									})
+								onClick={() =>
+									setDraft({ ...draft, keep_alive: { mode: "duration", seconds: keepSecs } })
 								}
-							/>
-							<span className="text-sm text-muted-foreground">
-								{m.display_keep_alive_seconds()}
-							</span>
+							>
+								{m.display_keep_alive_keep()}
+							</Button>
+							{ka.mode === "duration" && (
+								<div className="flex items-center gap-2">
+									<Input
+										type="number"
+										min={0}
+										className="w-24"
+										value={ka.seconds}
+										disabled={busy}
+										onChange={(e) => {
+											const n = Math.max(0, Number(e.target.value) || 0);
+											setKeepSecs(n);
+											setDraft({ ...draft, keep_alive: { mode: "duration", seconds: n } });
+										}}
+									/>
+									<span className="text-sm text-muted-foreground">
+										{m.display_keep_alive_seconds()}
+									</span>
+								</div>
+							)}
 						</div>
 						<p className="text-xs text-muted-foreground">{m.display_keep_alive_help()}</p>
 					</div>
@@ -285,7 +296,7 @@ const DisplayForm: FC<{
 						}
 					/>
 
-					<div className="space-y-2">
+					<div className="space-y-2.5">
 						<Label htmlFor="disp-max">{m.display_max()}</Label>
 						<Input
 							id="disp-max"
@@ -304,9 +315,11 @@ const DisplayForm: FC<{
 						/>
 					</div>
 
-					<Button onClick={() => apply(draft)} disabled={busy}>
-						{m.display_save()}
-					</Button>
+					<div className="border-t pt-4">
+						<Button onClick={() => apply(draft)} disabled={busy}>
+							{m.display_save()}
+						</Button>
+					</div>
 				</div>
 			)}
 
@@ -337,7 +350,7 @@ const Choice: FC<{
 	disabled: boolean;
 	onPick: (v: string) => void;
 }> = ({ label, help, value, options, labels, disabled, onPick }) => (
-	<div className="space-y-2">
+	<div className="space-y-2.5">
 		<Label>{label}</Label>
 		<div className="flex flex-wrap gap-2">
 			{options.map((o) => (
