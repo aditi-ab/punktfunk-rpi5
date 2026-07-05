@@ -355,16 +355,10 @@ pub(crate) type SavedConfig = (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_M
 /// doesn't export it, so define it here.
 const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
 
-/// Robust display isolation via the CCD API. The naive GDI approach (EnumDisplayDevices +
-/// ChangeDisplaySettings) MISSES displays on a hybrid box — an iGPU-attached physical monitor isn't
-/// flagged `ATTACHED_TO_DESKTOP` in the GDI enum, so it's never detached and the secure desktop /
-/// lock screen lands on IT while our virtual output freezes. `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)`
-/// sees every active path; we deactivate all of them EXCEPT the SudoVDA target's, leaving the virtual
-/// display as the sole desktop so ALL content (incl. Winlogon) renders to it. Apollo isolates the same
-/// way (CCD). Returns the original active config to restore on teardown.
-// pub(crate) so vdisplay::pf_vdisplay can reuse this backend-neutral CCD isolation helper
-// (it operates on a real OS target id — a pf-vdisplay monitor's target_id qualifies).
-pub(crate) unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedConfig> {
+/// Query the current ACTIVE display config (paths + modes), truncated to the real counts. `None` on
+/// API failure. Shared by [`isolate_displays_ccd`] (snapshot + per-attempt re-query) and
+/// [`count_other_active`].
+unsafe fn query_active_config() -> Option<SavedConfig> {
     let mut np = 0u32;
     let mut nm = 0u32;
     if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
@@ -386,50 +380,77 @@ pub(crate) unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedCo
     }
     paths.truncate(np as usize);
     modes.truncate(nm as usize);
-    let saved = (paths.clone(), modes.clone());
-    let mut others = 0u32;
-    for p in paths.iter_mut() {
-        if p.targetInfo.id == keep_target_id {
-            continue;
+    Some((paths, modes))
+}
+
+/// Count currently-ACTIVE display paths whose target id != `keep_target_id` — i.e. displays that would
+/// still be lit besides the virtual one. `None` on query failure. Used to VERIFY isolation actually took.
+unsafe fn count_other_active(keep_target_id: u32) -> Option<u32> {
+    let (paths, _) = query_active_config()?;
+    Some(
+        paths
+            .iter()
+            .filter(|p| {
+                p.targetInfo.id != keep_target_id && p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
+            })
+            .count() as u32,
+    )
+}
+
+/// Robust display isolation via the CCD API. The naive GDI approach (EnumDisplayDevices +
+/// ChangeDisplaySettings) MISSES displays on a hybrid box — an iGPU-attached physical monitor isn't
+/// flagged `ATTACHED_TO_DESKTOP` in the GDI enum, so it's never detached and the secure desktop /
+/// lock screen lands on IT while our virtual output freezes. `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)`
+/// sees every active path; we deactivate all of them EXCEPT the SudoVDA target's, leaving the virtual
+/// display as the sole desktop so ALL content (incl. Winlogon) renders to it. Apollo isolates the same
+/// way (CCD). Returns the original active config to restore on teardown.
+// pub(crate) so vdisplay::pf_vdisplay can reuse this backend-neutral CCD isolation helper
+// (it operates on a real OS target id — a pf-vdisplay monitor's target_id qualifies).
+pub(crate) unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedConfig> {
+    // Snapshot the ORIGINAL active config ONCE for restore-on-teardown, before any changes.
+    let saved = query_active_config()?;
+
+    // Deactivate every non-keep display, then VERIFY and RETRY. A field-reported bug had a physical
+    // monitor STAY ACTIVE in exclusive mode, so we don't trust a single SetDisplayConfig: re-query the
+    // live topology each attempt and re-apply until ONLY the keep target is active. Secure-desktop
+    // correctness depends on this — the lock screen must not land on a stray panel while we stream.
+    for attempt in 1..=4u32 {
+        let (mut paths, mut modes) = query_active_config()?;
+        let mut others = 0u32;
+        for p in paths.iter_mut() {
+            if p.targetInfo.id == keep_target_id {
+                continue;
+            }
+            if p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0 {
+                p.flags &= !DISPLAYCONFIG_PATH_ACTIVE; // mark this path inactive
+                others += 1;
+            }
         }
-        if p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0 {
-            p.flags &= !DISPLAYCONFIG_PATH_ACTIVE; // mark this path inactive
-            others += 1;
-        }
-    }
-    if others == 0 {
-        // The virtual path shows active in the CCD database (from set_active_mode's legacy
-        // ChangeDisplaySettingsExW), but a legacy mode-set does NOT drive the IddCx adapter's
-        // EVT_IDD_CX_ADAPTER_COMMIT_MODES — and without COMMIT_MODES the OS never calls
-        // ASSIGN_SWAPCHAIN, so the driver never receives composed frames. Force an explicit CCD
-        // SetDisplayConfig commit of the (sole) virtual path so the IddCx path actually activates.
-        // SDC_FORCE_MODE_ENUMERATION makes the OS re-enumerate + re-commit even though the CCD DB
-        // already lists the path active.
-        let rc = SetDisplayConfig(
-            Some(paths.as_slice()),
-            Some(modes.as_slice()),
-            SDC_APPLY
-                | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-                | SDC_ALLOW_CHANGES
-                | SDC_SAVE_TO_DATABASE
-                | SDC_FORCE_MODE_ENUMERATION,
-        );
-        tracing::info!("display isolate (CCD): forced CCD re-commit of sole virtual path {keep_target_id} rc={rc:#x} (drives IddCx COMMIT_MODES → ASSIGN_SWAPCHAIN)");
-        return Some(saved);
-    }
-    let rc = SetDisplayConfig(
-        Some(paths.as_slice()),
-        Some(modes.as_slice()),
-        SDC_APPLY
+        // Commit the config. Even when nothing needed deactivating we re-commit: a legacy mode-set does
+        // NOT drive the IddCx adapter's EVT_IDD_CX_ADAPTER_COMMIT_MODES, and without COMMIT_MODES the OS
+        // never calls ASSIGN_SWAPCHAIN, so the driver receives no frames. SDC_FORCE_MODE_ENUMERATION
+        // forces the re-commit; SAVE_TO_DATABASE only in the sole-path case (matches prior behavior —
+        // don't permanently rewrite the user's multi-display layout; the teardown restore handles it).
+        let mut flags = SDC_APPLY
             | SDC_USE_SUPPLIED_DISPLAY_CONFIG
             | SDC_ALLOW_CHANGES
-            | SDC_FORCE_MODE_ENUMERATION,
-    );
-    if rc == 0 {
-        tracing::info!("display isolate (CCD): deactivated {others} other display(s) — SudoVDA target {keep_target_id} is now the sole desktop");
-    } else {
-        tracing::warn!("display isolate (CCD): SetDisplayConfig failed rc={rc:#x} (tried to deactivate {others} path(s))");
+            | SDC_FORCE_MODE_ENUMERATION;
+        if others == 0 {
+            flags |= SDC_SAVE_TO_DATABASE;
+        }
+        let rc = SetDisplayConfig(Some(paths.as_slice()), Some(modes.as_slice()), flags);
+
+        // VERIFY the OUTCOME (rc alone lies — a "successful" apply can leave a panel active): re-query
+        // and confirm no non-keep display survived. Only then is the virtual truly the sole desktop.
+        let survivors = count_other_active(keep_target_id).unwrap_or(0);
+        if survivors == 0 {
+            tracing::info!("display isolate (CCD): target {keep_target_id} is the SOLE active desktop (attempt {attempt}/4, deactivated {others}, rc={rc:#x})");
+            return Some(saved);
+        }
+        tracing::warn!("display isolate (CCD): {survivors} display(s) STILL active after attempt {attempt}/4 (deactivated {others}, rc={rc:#x}) — re-querying + retrying");
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    tracing::error!("display isolate (CCD): FAILED to isolate target {keep_target_id} after 4 attempts — a non-virtual display stayed active (the field-reported exclusive-mode bug)");
     Some(saved)
 }
 
@@ -464,33 +485,7 @@ pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<Save
     modes.truncate(nm as usize);
     let saved = (paths.clone(), modes.clone());
 
-    // DIAGNOSTIC: dump the active paths this sees (the SSH/session-0 view can't observe the real
-    // interactive-session topology, so the host log is the only window into what we actually operate on).
-    tracing::info!(
-        "display primary (CCD): {} active path(s), keep_target={keep_target_id}",
-        paths.len()
-    );
-    for p in paths.iter() {
-        let sidx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
-        let (px, py, pw) = modes
-            .get(sidx)
-            .filter(|m| m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
-            .map(|m| {
-                (
-                    m.Anonymous.sourceMode.position.x,
-                    m.Anonymous.sourceMode.position.y,
-                    m.Anonymous.sourceMode.width,
-                )
-            })
-            .unwrap_or((-999, -999, 0));
-        tracing::info!(
-            "  path target={} active={} src_idx={sidx} pos=({px},{py}) w={pw}",
-            p.targetInfo.id,
-            p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
-        );
-    }
-
-    // The virtual output's source width, to shift the physicals past it.
+    // The virtual output's source width, to lay the other displays out to its right.
     let virt_width = paths.iter().find_map(|p| {
         if p.targetInfo.id != keep_target_id {
             return None;
@@ -500,10 +495,13 @@ pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<Save
         (m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
             .then(|| m.Anonymous.sourceMode.width as i32)
     })?;
+    let others = paths.len().saturating_sub(1);
 
-    // Reposition each active path's SOURCE once: the virtual to (0,0) (= primary), the rest shifted
-    // right by the virtual's width (kept active, no overlap). Dedup source-mode indices (a cloned
-    // group would share one).
+    // Reposition each active path's SOURCE once: the virtual to (0,0) (= primary), the other
+    // displays PACKED left-to-right from the virtual's right edge — kept active, no overlap and no
+    // gap (vs. blindly shifting each by virt_width, which leaves a dead gap when EXTEND already
+    // placed them to the right). Dedup source-mode indices (a cloned group shares one).
+    let mut next_x = virt_width;
     let mut done = std::collections::HashSet::new();
     for p in paths.iter() {
         let idx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
@@ -519,7 +517,9 @@ pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<Save
         if p.targetInfo.id == keep_target_id {
             m.Anonymous.sourceMode.position = POINTL { x: 0, y: 0 };
         } else {
-            m.Anonymous.sourceMode.position.x += virt_width;
+            let w = m.Anonymous.sourceMode.width as i32;
+            m.Anonymous.sourceMode.position = POINTL { x: next_x, y: 0 };
+            next_x += w;
         }
     }
 
@@ -532,7 +532,7 @@ pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<Save
             | SDC_FORCE_MODE_ENUMERATION,
     );
     if rc == 0 {
-        tracing::info!("display primary (CCD): virtual target {keep_target_id} set PRIMARY at (0,0); physical display(s) kept ACTIVE, shifted right by {virt_width}px");
+        tracing::info!("display primary (CCD): virtual target {keep_target_id} set PRIMARY at (0,0); {others} other display(s) kept ACTIVE + packed to its right");
     } else {
         tracing::warn!("display primary (CCD): SetDisplayConfig failed rc={rc:#x} (virtual {keep_target_id} primary, physicals kept)");
     }
