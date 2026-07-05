@@ -83,7 +83,7 @@ internal fun HostsScene() {
             }
             item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("Saved hosts") }
             items(SAVED) { h ->
-                HostCard(h.name, h.address, h.status, enabled = true, onConnect = {}, onForget = {}, onRename = {})
+                HostCard(h.name, h.address, h.status, enabled = true, onConnect = {}, onForget = {}, onEdit = {})
             }
             item(span = { GridItemSpan(maxLineSpan) }) {
                 Spacer(Modifier.height(12.dp))

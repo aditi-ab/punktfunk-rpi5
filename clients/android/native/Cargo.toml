@@ -34,7 +34,11 @@ android_logger = "0.14"
 # NDK bindings. "media" = AMediaCodec/ANativeWindow (video); "audio" = AAudio (audio playback).
 # Pure-Rust FFI to libmediandk/libnativewindow/libaaudio — no C++/libc++_shared to bundle. Decode +
 # audio run entirely in Rust on native threads (the "no async on the hot path" invariant).
-ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-31"] }
+# api-level-28 matches the app's minSdk floor (Android 9). AAudio (26), AMediaCodec (21) and
+# ANativeWindow_setBuffersDataSpace (28) are all ≤28; the one API-30 call we make
+# (ANativeWindow_setFrameRate) is dlsym-resolved at runtime (see decode::try_set_frame_rate), not
+# linked, so the .so still loads on API 28/29.
+ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-28"] }
 # setpriority/gettid to raise the decode thread toward URGENT_DISPLAY (see decode::boost_thread_priority).
 libc = "0.2"
 # Opus decode for the host→client audio plane (0xC9: 48 kHz stereo, 5 ms frames). Same crate the

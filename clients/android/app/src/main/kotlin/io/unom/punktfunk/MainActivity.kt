@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import android.os.Build
 import android.os.Bundle
 import android.view.InputDevice
 import android.view.KeyEvent
@@ -10,6 +11,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.Keymap
@@ -34,8 +38,30 @@ class MainActivity : ComponentActivity() {
     var padKeyProbe: ((KeyEvent) -> Boolean)? = null
     var padMotionProbe: ((MotionEvent) -> Boolean)? = null
 
+    /**
+     * Set by [StreamScreen] to its disconnect action. The emergency-exit chord (below) invokes it so a
+     * couch user with no keyboard/Back can always leave a stream.
+     */
+    var requestStreamExit: (() -> Unit)? = null
+
+    /** Currently-held forwarded pad buttons (bitmask of `Gamepad.BTN_*`), for chord detection. */
+    private var heldPadButtons = 0
+
+    /**
+     * Whether the last console input came from a real gamepad (face buttons / stick) vs. a TV D-pad
+     * remote (which has no A/B/X/Y). The console UI reads this to show glyphs the user recognises — pad
+     * face buttons, or a select glyph + arrows for a remote. Compose observes it (a snapshot state).
+     */
+    var lastPadIsGamepad by mutableStateOf(false)
+        private set
+
+    /** The panel's highest-refresh display mode (0 = unknown/unsupported), resolved once at startup. */
+    private var highRefreshModeId = 0
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        resolveHighRefreshMode()
+        setConsoleHighRefreshRate(true) // the console UI wants max refresh; streaming manages its own
         // Dark, transparent system bars regardless of the system theme — our UI is always dark, so
         // the status/nav bars blend with our surface and get light icons. (The no-arg edge-to-edge
         // picks the *system* light/dark, which left a black status bar over our dark background.)
@@ -43,10 +69,36 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
+        // Dev escape hatch (mirrors the Apple client's PUNKTFUNK_FORCE_GAMEPAD_UI): force the console
+        // UI without a physical pad — `adb shell am start -n io.unom.punktfunk/.MainActivity --ez
+        // pf_force_gamepad_ui true`. Never set in normal use; real activation is a connected pad / TV.
+        val forceGamepadUi = intent?.getBooleanExtra("pf_force_gamepad_ui", false) ?: false
         setContent {
             PunktfunkTheme {
-                Surface(modifier = Modifier.fillMaxSize()) { App() }
+                Surface(modifier = Modifier.fillMaxSize()) { App(forceGamepadUi = forceGamepadUi) }
             }
+        }
+    }
+
+    /** Resolve the panel's highest-refresh mode (same resolution) once, for [setConsoleHighRefreshRate]. */
+    private fun resolveHighRefreshMode() {
+        @Suppress("DEPRECATION")
+        val disp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display else windowManager.defaultDisplay
+        highRefreshModeId = disp?.supportedModes?.maxWithOrNull(
+            compareBy({ it.refreshRate }, { it.physicalWidth * it.physicalHeight }),
+        )?.modeId ?: 0
+    }
+
+    /**
+     * Opt the CONSOLE UI into the panel's highest refresh mode. Some OEMs (Nothing OS among them) pin
+     * third-party apps to 60Hz unless they explicitly ask for more, which halves the smoothness of the
+     * UI's scrolling/animation on a 120/144Hz panel. [StreamScreen] turns this OFF while streaming so
+     * its own `ANativeWindow_setFrameRate` (matched to the video) governs the panel instead.
+     */
+    fun setConsoleHighRefreshRate(high: Boolean) {
+        if (highRefreshModeId == 0) return
+        window.attributes = window.attributes.apply {
+            preferredDisplayModeId = if (high) highRefreshModeId else 0
         }
     }
 
@@ -60,9 +112,20 @@ class MainActivity : ComponentActivity() {
                 if (bit != 0) {
                     when (event.action) {
                         // repeatCount guard: don't re-send a held button as auto-repeat.
-                        KeyEvent.ACTION_DOWN ->
+                        KeyEvent.ACTION_DOWN -> {
                             if (event.repeatCount == 0) NativeBridge.nativeSendGamepadButton(handle, bit, true)
-                        KeyEvent.ACTION_UP -> NativeBridge.nativeSendGamepadButton(handle, bit, false)
+                            heldPadButtons = heldPadButtons or bit
+                            // Emergency exit: Select + Start + L1 + R1 held together leaves the stream
+                            // (a couch user has no keyboard/Back). Fired once per full chord.
+                            if (heldPadButtons and STREAM_EXIT_CHORD == STREAM_EXIT_CHORD) {
+                                heldPadButtons = 0
+                                requestStreamExit?.let { exit -> window.decorView.post { exit() } }
+                            }
+                        }
+                        KeyEvent.ACTION_UP -> {
+                            NativeBridge.nativeSendGamepadButton(handle, bit, false)
+                            heldPadButtons = heldPadButtons and bit.inv()
+                        }
                     }
                     return true // consumed
                 }
@@ -90,18 +153,29 @@ class MainActivity : ComponentActivity() {
                 }
             }
         } else {
+            // Note which input the console UI is being driven by, so its glyphs match (a TV remote's
+            // D-pad is not from SOURCE_GAMEPAD; a pad's face buttons / D-pad are).
+            if (event.action == KeyEvent.ACTION_DOWN && isConsoleNavKey(event.keyCode)) {
+                lastPadIsGamepad = event.isFromSource(InputDevice.SOURCE_GAMEPAD)
+            }
             // The Controllers debug screen sees pad events before the navigation remap below.
             padKeyProbe?.let { if (it(event)) return true }
             if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
                 // Not streaming: a game controller drives the Compose UI (TV + phone). Map the face
-                // buttons to the navigation keys the focus system understands; D-pad *keys* already
-                // move focus on their own, so they fall through to super untouched.
-                val mapped = when (event.keyCode) {
-                    KeyEvent.KEYCODE_BUTTON_A -> KeyEvent.KEYCODE_DPAD_CENTER // activate focused element
-                    KeyEvent.KEYCODE_BUTTON_B -> KeyEvent.KEYCODE_BACK // back / dismiss
-                    else -> 0
+                // buttons to the navigation the focus system / back stack understand; D-pad *keys*
+                // already move focus on their own, so they fall through to super untouched.
+                when (event.keyCode) {
+                    // B → back. Drive the OnBackPressedDispatcher directly rather than synthesising a
+                    // BACK KeyEvent: a synthetic event isn't "tracking", so the framework's default
+                    // onKeyUp(BACK) never calls onBackPressed() and Compose BackHandlers wouldn't fire.
+                    KeyEvent.KEYCODE_BUTTON_B -> {
+                        if (event.action == KeyEvent.ACTION_UP) onBackPressedDispatcher.onBackPressed()
+                        return true
+                    }
+                    // A → activate the focused element (the focus system understands DPAD_CENTER).
+                    KeyEvent.KEYCODE_BUTTON_A ->
+                        return super.dispatchKeyEvent(KeyEvent(event.action, KeyEvent.KEYCODE_DPAD_CENTER))
                 }
-                if (mapped != 0) return super.dispatchKeyEvent(KeyEvent(event.action, mapped))
             }
         }
         return super.dispatchKeyEvent(event)
@@ -137,6 +211,7 @@ class MainActivity : ComponentActivity() {
             if (dir != lastNavDir) {
                 lastNavDir = dir
                 if (dir != 0) {
+                    lastPadIsGamepad = true // a stick/HAT push can only come from a real gamepad
                     super.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, dir))
                     super.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, dir))
                     return true
@@ -146,5 +221,18 @@ class MainActivity : ComponentActivity() {
             }
         }
         return super.dispatchGenericMotionEvent(event)
+    }
+
+    /** Keys that drive the console UI — D-pad + face buttons; used to classify the last input source. */
+    private fun isConsoleNavKey(kc: Int): Boolean = when (kc) {
+        KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_LEFT,
+        KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+        -> true
+        else -> KeyEvent.isGamepadButton(kc)
+    }
+
+    private companion object {
+        /** Emergency stream-exit chord: Select + Start + L1 + R1 held together. */
+        val STREAM_EXIT_CHORD = Gamepad.BTN_BACK or Gamepad.BTN_START or Gamepad.BTN_LB or Gamepad.BTN_RB
     }
 }

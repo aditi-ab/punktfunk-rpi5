@@ -41,6 +41,19 @@ data class Settings(
      * understand touch. Mirrors the Apple client's TouchInputMode.
      */
     val touchMode: TouchMode = TouchMode.TRACKPAD,
+    /**
+     * Swap the whole home screen for the controller-optimized "console" UI (the host carousel +
+     * gamepad chrome) whenever a controller is connected — mirrors the Apple client's
+     * `gamepadUIEnabled`. On by default; turn it off to keep the touch UI even with a pad attached.
+     * A TV (leanback) is always in this mode regardless (its remote/pad is the only input).
+     */
+    val gamepadUiEnabled: Boolean = true,
+    /**
+     * Show the experimental game-library browser (the coverflow reached with Y from a saved host).
+     * Fetched from the host's management API over mTLS; needs a paired host. Mirrors the Apple
+     * client's `libraryEnabled`.
+     */
+    val libraryEnabled: Boolean = true,
 )
 
 /** [Settings.touchMode] values; persisted by name. */
@@ -67,6 +80,8 @@ class SettingsStore(context: Context) {
             ?.let { name -> TouchMode.entries.firstOrNull { it.name == name } }
             // Migration: the pre-enum Boolean "trackpad_mode" (true = trackpad, false = direct).
             ?: if (prefs.getBoolean(K_TRACKPAD, true)) TouchMode.TRACKPAD else TouchMode.POINTER,
+        gamepadUiEnabled = prefs.getBoolean(K_GAMEPAD_UI, true),
+        libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
     )
 
     fun save(s: Settings) {
@@ -83,6 +98,8 @@ class SettingsStore(context: Context) {
             .putBoolean(K_MIC, s.micEnabled)
             .putBoolean(K_HUD, s.statsHudEnabled)
             .putString(K_TOUCH_MODE, s.touchMode.name)
+            .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
+            .putBoolean(K_LIBRARY, s.libraryEnabled)
             .apply()
     }
 
@@ -99,6 +116,8 @@ class SettingsStore(context: Context) {
         const val K_MIC = "mic_enabled"
         const val K_HUD = "stats_hud_enabled"
         const val K_TOUCH_MODE = "touch_mode"
+        const val K_GAMEPAD_UI = "gamepad_ui_enabled"
+        const val K_LIBRARY = "library_enabled"
 
         /** Legacy Boolean the enum replaced — read once as the migration default, never written. */
         const val K_TRACKPAD = "trackpad_mode"

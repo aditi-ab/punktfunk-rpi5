@@ -9,7 +9,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -33,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.KnownHost
+import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.PendingTrust
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -320,32 +323,75 @@ internal fun AwaitingApprovalDialog(hostLabel: String, onCancel: () -> Unit) {
 }
 
 /**
- * Rename a saved host's label (discovered hosts are named by mDNS; this is how you give one a
- * friendly name like "Living Room" after pairing). Keyed by the host so reopening resets the field.
+ * Edit a saved host: name, address, port, and the Wake-on-LAN MAC. The MAC is auto-learned from the
+ * host's mDNS advert while it's online, but this is where you can enter or correct it (e.g. to wake a
+ * host you've only ever reached by address). [suggestedMacs] prefills the field from the live advert
+ * when nothing's been learned yet. Keyed by the host so reopening resets the fields. Mirrors the
+ * Apple client's edit form.
  */
 @Composable
-internal fun RenameHostDialog(
+internal fun EditHostDialog(
     target: KnownHost,
-    onRename: (String) -> Unit,
+    suggestedMacs: List<String>,
+    onSave: (KnownHost) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var newName by remember(target) { mutableStateOf(target.name) }
+    var name by remember(target) { mutableStateOf(target.name) }
+    var address by remember(target) { mutableStateOf(target.address) }
+    var port by remember(target) { mutableStateOf(target.port.toString()) }
+    var mac by remember(target) {
+        mutableStateOf(target.mac.ifEmpty { suggestedMacs }.joinToString(", "))
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Rename host") },
+        title = { Text("Edit host") },
         text = {
-            OutlinedTextField(
-                value = newName,
-                onValueChange = { newName = it },
-                label = { Text("Name") },
-                placeholder = { Text(target.address) },
-                singleLine = true,
-            )
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Name") },
+                    placeholder = { Text(target.address) },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = address,
+                    onValueChange = { address = it },
+                    label = { Text("Address") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = port,
+                    onValueChange = { v -> port = v.filter { it.isDigit() }.take(5) },
+                    label = { Text("Port") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                OutlinedTextField(
+                    value = mac,
+                    onValueChange = { mac = it },
+                    label = { Text("Wake-on-LAN MAC") },
+                    placeholder = { Text("auto-filled when the host is seen") },
+                    singleLine = true,
+                )
+            }
         },
         confirmButton = {
             TextButton(
-                enabled = newName.isNotBlank(),
-                onClick = { onRename(newName.trim()) },
+                enabled = address.isNotBlank(),
+                onClick = {
+                    onSave(
+                        target.copy(
+                            name = name.trim().ifEmpty { target.address },
+                            address = address.trim(),
+                            port = port.toIntOrNull() ?: target.port,
+                            mac = KnownHostStore.parseMacs(mac),
+                        ),
+                    )
+                },
             ) { Text("Save") }
         },
         dismissButton = {

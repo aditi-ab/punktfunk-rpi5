@@ -41,5 +41,7 @@ fun PunktfunkTheme(content: @Composable () -> Unit) {
     } else {
         BrandDark
     }
-    MaterialTheme(colorScheme = scheme, content = content)
+    // Geist Sans across the whole type scale — the brand typeface the website and the Apple client
+    // already ship (see Type.kt).
+    MaterialTheme(colorScheme = scheme, typography = PunktfunkTypography, content = content)
 }

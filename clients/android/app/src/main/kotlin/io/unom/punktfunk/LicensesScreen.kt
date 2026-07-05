@@ -3,14 +3,21 @@ package io.unom.punktfunk
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -31,6 +38,13 @@ fun LicensesScreen(onBack: () -> Unit) {
             context.assets.open("THIRD-PARTY-NOTICES.txt").bufferedReader().use { it.readText() }
         }.getOrDefault("Third-party notices unavailable.")
     }
+    // The bundled brand typeface (Geist Sans) ships under the SIL Open Font License 1.1. The OFL
+    // requires the license travel with the font, so surface it here (mirrors the Apple client).
+    val fontLicense = remember {
+        runCatching {
+            context.assets.open("GEIST-OFL.txt").bufferedReader().use { it.readText() }
+        }.getOrNull()
+    }
     val version = remember {
         runCatching {
             @Suppress("DEPRECATION")
@@ -38,29 +52,52 @@ fun LicensesScreen(onBack: () -> Unit) {
         }.getOrNull()
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp, vertical = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        Text("Open-source licenses", style = MaterialTheme.typography.headlineMedium)
-        if (version != null) {
-            Text(
-                "punktfunk $version",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+    Column(Modifier.fillMaxSize()) {
+        // Pinned header with a visible Back affordance (Back-button/gesture still work via BackHandler).
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 8.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+            }
+            Text("Open-source licenses", style = MaterialTheme.typography.headlineSmall)
         }
-        Text(
-            "punktfunk is licensed under MIT OR Apache-2.0, at your option. It uses the open-source " +
-                "components below, each under its own license.",
-            style = MaterialTheme.typography.bodyMedium,
-        )
-        Text(
-            notices,
-            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-        )
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            if (version != null) {
+                Text(
+                    "Punktfunk $version",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Text(
+                "Punktfunk is licensed under MIT OR Apache-2.0, at your option. It uses the open-source " +
+                    "components below, each under its own license.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                notices,
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            )
+            if (fontLicense != null) {
+                Text("Bundled font", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "The Geist typeface is licensed under the SIL Open Font License 1.1.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    fontLicense,
+                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                )
+            }
+        }
     }
 }

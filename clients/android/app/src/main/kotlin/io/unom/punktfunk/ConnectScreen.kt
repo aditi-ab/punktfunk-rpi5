@@ -84,7 +84,17 @@ private class RequestAccessState(val target: PendingTrust) {
 }
 
 @Composable
-fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
+fun ConnectScreen(
+    settings: Settings,
+    onConnected: (Long) -> Unit,
+    // Console (gamepad) mode: render the host carousel instead of the touch grid, sharing all of this
+    // screen's connect/trust/discovery logic. [onOpenSettings]/[onOpenLibrary] are the X/Y actions the
+    // gamepad shell owns (the touch UI reaches Settings via the bottom bar and has no library button).
+    gamepadUi: Boolean = false,
+    onOpenSettings: () -> Unit = {},
+    onOpenLibrary: (KnownHost) -> Unit = {},
+    navGate: Boolean = true, // false while the console home is cross-fading out
+) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var host by remember { mutableStateOf("") }
@@ -124,6 +134,10 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     val identityStore = remember { IdentityStore(context) }
     val knownHostStore = remember { KnownHostStore(context) }
     var savedHosts by remember { mutableStateOf(knownHostStore.all()) }
+    // Wakes a sleeping saved host and waits for it to reappear on mDNS before dialing (its overlay
+    // rides over both the touch and console home). Fire-and-forget WoL isn't enough — a cold boot can
+    // take a minute-plus to advertise again.
+    val waker = remember { WakeController(scope) }
     // Learn wake MAC(s) from live adverts for hosts we've saved (parity with the desktop clients),
     // so we can Wake-on-LAN them once they sleep. Runs only when the discovered set changes; the
     // prefs write is guarded (no-op when unchanged), and we refresh the saved list only if a MAC
@@ -156,8 +170,11 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
     var pendingTrust by remember { mutableStateOf<PendingTrust?>(null) }
     // A no-PIN "request access" connect in flight (the cancelable "Waiting for approval…" dialog).
     var awaiting by remember { mutableStateOf<RequestAccessState?>(null) }
-    // A saved host whose label is being edited (the Rename dialog).
-    var renameTarget by remember { mutableStateOf<KnownHost?>(null) }
+    // A saved host being edited (name / address / port / MAC).
+    var editTarget by remember { mutableStateOf<KnownHost?>(null) }
+    // A saved host whose console options menu (Wake / Edit / Forget) is open — reached with Up on the
+    // carousel (the console counterpart of the touch host card's overflow menu).
+    var optionsTarget by remember { mutableStateOf<KnownHost?>(null) }
 
     // Discovered hosts not already saved — a saved host (paired or TOFU) belongs in "Saved hosts",
     // not also in "Discovered", so we hide the overlap (matched by fingerprint when both carry it, so
@@ -184,25 +201,16 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
         }
     }
 
-    // Issue the actual connect with identity + (optional) pin. On a TOFU connect (pinHex null),
-    // pin the fingerprint the host presented (as an unpaired known host) so the next connect goes
-    // straight through and it appears in the saved-hosts list.
-    fun doConnect(targetHost: String, targetPort: Int, name: String, pinHex: String?) {
-        val id = identity
-        if (id == null) {
+    // The actual dial (identity already ready). On a TOFU connect (pinHex null), pin the fingerprint
+    // the host presented (as an unpaired known host) so the next connect goes straight through and it
+    // appears in the saved-hosts list.
+    fun doConnectDirect(targetHost: String, targetPort: Int, name: String, pinHex: String?) {
+        val id = identity ?: run {
             status = "Identity not ready yet — try again in a moment"
             return
         }
         connecting = true
         status = "Connecting to $targetHost:$targetPort…"
-        // Auto-wake: reconnecting to a saved host that may be asleep. If we learned its MAC while it
-        // was online and it isn't currently advertising, fire a magic packet first — the connect's
-        // own timeout gives a woken host time to come up (harmless if it's already awake).
-        knownHostStore.get(targetHost, targetPort)?.mac
-            ?.takeIf { it.isNotEmpty() && discovered.none { d -> d.host == targetHost && d.port == targetPort } }
-            ?.let { macs ->
-                scope.launch(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(macs.joinToString(","), targetHost) }
-            }
         discovery.stop() // free the Wi-Fi radio before the stream session
         scope.launch {
             val handle = connectNative(id, targetHost, targetPort, pinHex ?: "", CONNECT_TIMEOUT_MS)
@@ -219,6 +227,47 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                 status = "Connection failed — check host/port, PIN, and logcat"
                 discovery.start()
             }
+        }
+    }
+
+    // Wake-aware connect. If the target is a saved host with a learned MAC that ISN'T currently
+    // advertising (asleep/off), wake it and WAIT for it to reappear on mDNS (WakeController shows the
+    // "Waking…" overlay) before dialing — discovery stays running meanwhile so we can see it come
+    // back. A fire-and-forget packet + the connect timeout wasn't enough for a cold boot. Otherwise
+    // dial straight through.
+    fun doConnect(targetHost: String, targetPort: Int, name: String, pinHex: String?) {
+        if (identity == null) {
+            status = "Identity not ready yet — try again in a moment"
+            return
+        }
+        val kh = knownHostStore.get(targetHost, targetPort)
+        val macs = kh?.mac ?: emptyList()
+        // "Up" = a live advert that is THIS host — matched by fingerprint first (so it survives a DHCP
+        // address change on a cold boot), else by address:port. Returns the CURRENT advert so we can
+        // dial its live address rather than the stale saved one.
+        fun liveAdvert(): DiscoveredHost? =
+            if (kh != null) discovered.firstOrNull { kh.matches(it) }
+            else discovered.firstOrNull { it.host == targetHost && it.port == targetPort }
+        if (macs.isNotEmpty() && liveAdvert() == null) {
+            waker.start(
+                hostName = name,
+                connectsAfter = true,
+                macs = macs,
+                lastIp = targetHost,
+                isOnline = { liveAdvert() != null },
+                onOnline = {
+                    val live = liveAdvert()
+                    // Woke back on a new address? Re-key the saved record so it (and future connects)
+                    // point at the live one, then dial there.
+                    if (live != null && kh != null && (live.host != kh.address || live.port != kh.port)) {
+                        knownHostStore.update(kh.address, kh.port, kh.copy(address = live.host, port = live.port))
+                        savedHosts = knownHostStore.all()
+                    }
+                    doConnectDirect(live?.host ?: targetHost, live?.port ?: targetPort, name, pinHex)
+                },
+            )
+        } else {
+            doConnectDirect(targetHost, targetPort, name, pinHex)
         }
     }
 
@@ -304,7 +353,62 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
 
     var showManualSheet by remember { mutableStateOf(false) }
 
-    Box(Modifier.fillMaxSize()) {
+    if (gamepadUi) {
+        // Console mode: the host carousel (saved → discovered → Add Host), driven by the pad. Shares
+        // every action above; the trailing Add Host tile opens the same manual-entry sheet.
+        val tiles = buildList {
+            savedHosts.forEach { kh ->
+                add(
+                    HomeTile(
+                        id = "saved-${kh.address}:${kh.port}",
+                        title = kh.name,
+                        subtitle = "${kh.address}:${kh.port}",
+                        filled = true,
+                        online = discovered.any { it.host == kh.address && it.port == kh.port },
+                        paired = kh.paired,
+                        knownHost = kh,
+                        activate = { connect(kh.address, kh.port) },
+                    ),
+                )
+            }
+            discoveredUnsaved.forEach { dh ->
+                add(
+                    HomeTile(
+                        id = "disc-${dh.host}:${dh.port}",
+                        title = dh.name,
+                        subtitle = "${dh.host}:${dh.port}",
+                        online = true,
+                        activate = { connect(dh.host, dh.port, dh) },
+                    ),
+                )
+            }
+            add(
+                HomeTile(
+                    id = "add",
+                    title = "Add Host",
+                    subtitle = "Register a host by address",
+                    isAdd = true,
+                    activate = { showManualSheet = true },
+                ),
+            )
+        }
+        GamepadHome(
+            tiles = tiles,
+            libraryEnabled = settings.libraryEnabled,
+            controllerName = io.unom.punktfunk.kit.Gamepad.firstPad()?.name,
+            // Stop the carousel from consuming the pad while a sheet/dialog/overlay owns the screen,
+            // while a connect is in flight (else a second A launches a concurrent connect that leaks a
+            // handle — the touch grid guards the same way with enabled=!connecting), or while the whole
+            // console home is cross-fading out.
+            navActive = navGate && !connecting && !showManualSheet && pendingTrust == null &&
+                awaiting == null && editTarget == null && optionsTarget == null && waker.waking == null,
+            onActivate = { it.activate() },
+            onOpenLibrary = { it.knownHost?.let(onOpenLibrary) },
+            onOpenSettings = onOpenSettings,
+            onOptions = { it.knownHost?.let { kh -> optionsTarget = kh } },
+        )
+    } else {
+        Box(Modifier.fillMaxSize()) {
         LazyVerticalGrid(
             columns = GridCells.Adaptive(minSize = 160.dp),
             modifier = Modifier.fillMaxSize(),
@@ -385,13 +489,22 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                             knownHostStore.remove(kh.address, kh.port)
                             savedHosts = knownHostStore.all()
                         },
-                        onRename = { renameTarget = kh },
-                        // Explicit wake: offered only when the host is offline and we have a MAC to
-                        // target (a tap-to-connect already auto-wakes an offline saved host).
-                        onWake = if (kh.mac.isNotEmpty() &&
-                            discovered.none { it.host == kh.address && it.port == kh.port }
-                        ) {
-                            { scope.launch(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(kh.mac.joinToString(","), kh.address) } }
+                        onEdit = { editTarget = kh },
+                        // Explicit wake-only: offered when the host is offline and we have a MAC. Runs
+                        // through the WakeController so it shows the "Waking…" overlay and waits for
+                        // the host to come online (matched by fingerprint, so a new DHCP address on a
+                        // cold boot still counts as "up") rather than firing a single silent packet.
+                        onWake = if (kh.mac.isNotEmpty() && discovered.none { kh.matches(it) }) {
+                            {
+                                waker.start(
+                                    hostName = kh.name,
+                                    connectsAfter = false,
+                                    macs = kh.mac,
+                                    lastIp = kh.address,
+                                    isOnline = { discovered.any { kh.matches(it) } },
+                                    onOnline = {},
+                                )
+                            }
                         } else {
                             null
                         },
@@ -451,80 +564,134 @@ fun ConnectScreen(settings: Settings, onConnected: (Long) -> Unit) {
                 .align(Alignment.BottomEnd)
                 .padding(20.dp),
         )
+        }
     }
 
     if (showManualSheet) {
-        AddHostSheet(
-            hostName = hostName,
-            onHostNameChange = { hostName = it },
-            host = host,
-            onHostChange = { host = it },
-            port = port,
-            onPortChange = { port = it },
-            connecting = connecting,
-            modeLabel = "$w×$h@$hz",
-            onDismiss = { showManualSheet = false },
-            onConnect = { h2, p, n -> connect(h2, p, manualName = n) },
-        )
-    }
-
-    pendingTrust?.let { pt ->
-        when (pt.kind) {
-            PendingTrust.Kind.TRUST_NEW -> TrustNewHostDialog(
-                pt = pt,
-                onTrust = { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null) },
-                onPairInstead = { pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) },
-                onDismiss = { pendingTrust = null },
-            )
-            PendingTrust.Kind.FP_CHANGED -> FingerprintChangedDialog(
-                pt = pt,
-                onRepair = { pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) },
-                onDismiss = { pendingTrust = null },
-            )
-            PendingTrust.Kind.REQUEST_ACCESS -> RequestAccessDialog(
-                pt = pt,
-                onRequestAccess = { pendingTrust = null; requestAccess(pt) },
-                onUsePin = { pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) },
-                onDismiss = { pendingTrust = null },
-            )
-            PendingTrust.Kind.PAIR -> PairPinDialog(
-                pt = pt,
-                identity = identity,
-                onPaired = { fp ->
-                    // Verified host fp — save as a paired known host, then connect pinned.
-                    knownHostStore.save(KnownHost(pt.host, pt.port, pt.name, fp, paired = true))
-                    savedHosts = knownHostStore.all()
-                    pendingTrust = null
-                    doConnect(pt.host, pt.port, pt.name, fp)
+        if (gamepadUi) {
+            // Console add-host: field list + on-screen controller keyboard. "Add" connects (which
+            // saves the host on TOFU/pair), exactly like the touch sheet's Connect.
+            GamepadAddHostScreen(
+                onAdd = { n, addr, p ->
+                    showManualSheet = false
+                    connect(addr, p, manualName = n)
                 },
-                onDismiss = { pendingTrust = null },
+                onDismiss = { showManualSheet = false },
+            )
+        } else {
+            AddHostSheet(
+                hostName = hostName,
+                onHostNameChange = { hostName = it },
+                host = host,
+                onHostChange = { host = it },
+                port = port,
+                onPortChange = { port = it },
+                connecting = connecting,
+                modeLabel = "$w×$h@$hz",
+                onDismiss = { showManualSheet = false },
+                onConnect = { h2, p, n -> connect(h2, p, manualName = n) },
             )
         }
     }
 
+    pendingTrust?.let { pt ->
+        // Same trust/pairing logic, console-styled + controller-navigable in gamepad mode.
+        val onPair = { pendingTrust = pt.copy(kind = PendingTrust.Kind.PAIR) }
+        val onSavePaired = { fp: String ->
+            knownHostStore.save(KnownHost(pt.host, pt.port, pt.name, fp, paired = true))
+            savedHosts = knownHostStore.all()
+            pendingTrust = null
+            doConnect(pt.host, pt.port, pt.name, fp)
+        }
+        when (pt.kind) {
+            PendingTrust.Kind.TRUST_NEW ->
+                if (gamepadUi) GamepadTrustNewDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null) }, onPair, { pendingTrust = null })
+                else TrustNewHostDialog(pt, { pendingTrust = null; doConnect(pt.host, pt.port, pt.name, null) }, onPair, { pendingTrust = null })
+            PendingTrust.Kind.FP_CHANGED ->
+                if (gamepadUi) GamepadFingerprintChangedDialog(pt, onPair, { pendingTrust = null })
+                else FingerprintChangedDialog(pt, onPair, { pendingTrust = null })
+            PendingTrust.Kind.REQUEST_ACCESS ->
+                if (gamepadUi) GamepadRequestAccessDialog(pt, { pendingTrust = null; requestAccess(pt) }, onPair, { pendingTrust = null })
+                else RequestAccessDialog(pt, { pendingTrust = null; requestAccess(pt) }, onPair, { pendingTrust = null })
+            PendingTrust.Kind.PAIR ->
+                if (gamepadUi) GamepadPairPinDialog(pt, identity, onSavePaired, { pendingTrust = null })
+                else PairPinDialog(pt, identity, onSavePaired, { pendingTrust = null })
+        }
+    }
+
     awaiting?.let { req ->
-        AwaitingApprovalDialog(
-            hostLabel = req.target.name,
-            onCancel = {
-                req.cancelled.set(true)
-                awaiting = null
-                connecting = false
-                discovery.start() // the request may still be pending on the host; keep scanning
+        val onCancel = {
+            req.cancelled.set(true)
+            awaiting = null
+            connecting = false
+            discovery.start() // the request may still be pending on the host; keep scanning
+        }
+        if (gamepadUi) GamepadAwaitingApprovalDialog(req.target.name, onCancel)
+        else AwaitingApprovalDialog(hostLabel = req.target.name, onCancel = onCancel)
+    }
+
+    // Console host options (Up on a saved carousel tile): Wake / Edit / Forget.
+    optionsTarget?.let { kh ->
+        val offline = discovered.none { kh.matches(it) }
+        GamepadHostOptionsDialog(
+            hostName = kh.name,
+            canWake = kh.mac.isNotEmpty() && offline,
+            onWake = {
+                optionsTarget = null
+                waker.start(
+                    hostName = kh.name, connectsAfter = false, macs = kh.mac, lastIp = kh.address,
+                    isOnline = { discovered.any { kh.matches(it) } },
+                    onOnline = {},
+                )
             },
+            // A saved host always has a library (it's a knownHost) → offer it when the setting's on,
+            // so a TV remote reaches the library here instead of via the Y face button.
+            onLibrary = if (settings.libraryEnabled) {
+                { optionsTarget = null; onOpenLibrary(kh) }
+            } else {
+                null
+            },
+            onEdit = { optionsTarget = null; editTarget = kh },
+            onForget = {
+                knownHostStore.remove(kh.address, kh.port)
+                savedHosts = knownHostStore.all()
+                optionsTarget = null
+            },
+            onDismiss = { optionsTarget = null },
         )
     }
 
-    renameTarget?.let { kh ->
-        RenameHostDialog(
-            target = kh,
-            onRename = { newName ->
-                knownHostStore.rename(kh.address, kh.port, newName)
-                savedHosts = knownHostStore.all()
-                renameTarget = null
-            },
-            onDismiss = { renameTarget = null },
-        )
+    editTarget?.let { kh ->
+        // Prefill a not-yet-learned MAC from the host's live advert, mirroring Apple's
+        // `discovery.hosts.first { host.matches($0) }?.macAddresses`.
+        val suggested = discovered.firstOrNull { kh.matches(it) }?.mac ?: emptyList()
+        val onSaveHost: (KnownHost) -> Unit = { updated ->
+            knownHostStore.update(kh.address, kh.port, updated)
+            savedHosts = knownHostStore.all()
+            editTarget = null
+        }
+        if (gamepadUi) {
+            // Console edit: the same field list + on-screen keyboard as Add-Host, seeded from the
+            // host with an extra MAC row; the action SAVES instead of connecting.
+            GamepadAddHostScreen(
+                onAdd = { _, _, _ -> },
+                onDismiss = { editTarget = null },
+                editHost = kh,
+                suggestedMacs = suggested,
+                onSave = onSaveHost,
+            )
+        } else {
+            EditHostDialog(
+                target = kh,
+                suggestedMacs = suggested,
+                onSave = onSaveHost,
+                onDismiss = { editTarget = null },
+            )
+        }
     }
+
+    // Topmost: the "Waking…" overlay rides over both the touch grid and the console home.
+    WakeOverlay(waker, gamepadUi)
 }
 
 /**

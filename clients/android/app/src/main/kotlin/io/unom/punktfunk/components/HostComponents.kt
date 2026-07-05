@@ -59,7 +59,7 @@ fun HostCard(
     enabled: Boolean,
     onConnect: () -> Unit,
     onForget: (() -> Unit)?,
-    onRename: (() -> Unit)? = null,
+    onEdit: (() -> Unit)? = null,
     onWake: (() -> Unit)? = null,
 ) {
     // D-pad / controller focus highlight: a clickable card is focusable, but the default state
@@ -108,7 +108,7 @@ fun HostCard(
                 StatusPill(status)
             }
 
-            if (onForget != null || onRename != null || onWake != null) {
+            if (onForget != null || onEdit != null || onWake != null) {
                 var menu by remember { mutableStateOf(false) }
                 Box(modifier = Modifier.align(Alignment.TopEnd)) {
                     IconButton(enabled = enabled, onClick = { menu = true }) {
@@ -129,12 +129,12 @@ fun HostCard(
                                 },
                             )
                         }
-                        if (onRename != null) {
+                        if (onEdit != null) {
                             DropdownMenuItem(
-                                text = { Text("Rename") },
+                                text = { Text("Edit…") },
                                 onClick = {
                                     menu = false
-                                    onRename()
+                                    onEdit()
                                 },
                             )
                         }

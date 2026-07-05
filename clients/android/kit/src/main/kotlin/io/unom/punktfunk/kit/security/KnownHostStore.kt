@@ -74,6 +74,16 @@ class KnownHostStore(context: Context) {
         save(h.copy(name = newName))
     }
 
+    /**
+     * Edit a saved host, RE-KEYING if the address or port changed (the pref key IS `address:port`, so
+     * a plain [save] would otherwise leave a stale record under the old key). The caller passes an
+     * [updated] copy that preserves `fpHex`/`paired` (and sets `mac` from the edit form).
+     */
+    fun update(oldAddress: String, oldPort: Int, updated: KnownHost) {
+        if (oldAddress != updated.address || oldPort != updated.port) remove(oldAddress, oldPort)
+        save(updated)
+    }
+
     /** All trusted hosts, name-sorted — backs the saved-hosts list. */
     fun all(): List<KnownHost> =
         prefs.all.values.mapNotNull { (it as? String)?.let(::parse) }.sortedBy { it.name.lowercase() }
@@ -89,4 +99,22 @@ class KnownHostStore(context: Context) {
             mac = j.optString("mac", "").split(",").map { it.trim() }.filter { it.isNotEmpty() },
         )
     }.getOrNull()
+
+    companion object {
+        /**
+         * Parse a free-typed Wake-on-LAN field into normalized `aa:bb:cc:dd:ee:ff` entries (comma /
+         * space / newline separated). Anything that isn't six colon-separated hex octets is dropped;
+         * an empty result clears the host's MAC. Mirrors the Apple client's `AddHostSheet.parseMacs`.
+         */
+        fun parseMacs(s: String): List<String> = s
+            .split(',', ';', ' ', '\n', '\t')
+            .map { it.trim().lowercase() }
+            .filter { m ->
+                // Exactly six octets, each two literal hex digits. (Not toIntOrNull(16) — that accepts
+                // a leading +/- sign, so "aa:bb:cc:dd:ee:-1" would wrongly pass.)
+                m.split(":").let { o ->
+                    o.size == 6 && o.all { it.length == 2 && it.all { c -> c in '0'..'9' || c in 'a'..'f' } }
+                }
+            }
+    }
 }

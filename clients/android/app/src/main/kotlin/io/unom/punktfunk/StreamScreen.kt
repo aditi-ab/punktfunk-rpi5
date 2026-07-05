@@ -91,6 +91,8 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         activity?.streamHandle = handle // route hardware keys to this session
         activity?.axisMapper = Gamepad.AxisMapper(handle) // route joystick axes
+        activity?.requestStreamExit = onDisconnect // Select+Start+L1+R1 chord leaves the stream
+        activity?.setConsoleHighRefreshRate(false) // let the decoder's setFrameRate pick the panel rate
         // Host→client feedback (rumble + DualSense lightbar/LEDs); poll threads stopped before close.
         val feedback = GamepadFeedback(handle).also { it.start() }
         onDispose {
@@ -99,6 +101,8 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             activity?.axisMapper?.reset() // release-all so nothing sticks on the host
             activity?.axisMapper = null
             activity?.streamHandle = 0L
+            activity?.requestStreamExit = null
+            activity?.setConsoleHighRefreshRate(true) // back to the console UI's max refresh
             controller?.show(WindowInsetsCompat.Type.systemBars())
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             // Release the landscape lock so the rest of the app follows the device/system again.

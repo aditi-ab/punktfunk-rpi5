@@ -8,6 +8,7 @@ import android.hardware.lights.LightsRequest
 import android.os.Build
 import android.os.CombinedVibration
 import android.os.VibrationEffect
+import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
 import android.view.InputDevice
@@ -16,7 +17,8 @@ import java.nio.ByteBuffer
 /**
  * Host→client gamepad feedback for one session (single-pad model — pad 0 only). Two daemon poll
  * threads drain the blocking native pulls and render in Kotlin: rumble → the controller's
- * `VibratorManager`; HID-output → lightbar / player-LED via `LightsManager` (API 33+); adaptive
+ * `VibratorManager` (API 31+) or its single legacy `Vibrator` on API 28–30; HID-output → lightbar /
+ * player-LED via `LightsManager` (API 33+); adaptive
  * triggers are parse-validated and logged (Android has no public adaptive-trigger API).
  *
  * Mirrors `nativeStartAudio`'s lifecycle: [start]/[stop] driven by the StreamScreen. [stop] flips a
@@ -40,6 +42,9 @@ class GamepadFeedback(private val handle: Long) {
     private var hidoutThread: Thread? = null
 
     private var vm: VibratorManager? = null
+    // API 28–30 fallback: the controller's single legacy Vibrator (no per-motor VibratorManager
+    // until API 31). Exactly one of [vm] / [legacy] is bound; rumble degrades to one blended motor.
+    private var legacy: Vibrator? = null
     private var vibratorIds: IntArray = IntArray(0)
     private var amplitudeControlled = false
 
@@ -81,6 +86,7 @@ class GamepadFeedback(private val handle: Long) {
         rumbleThread?.interrupt()
         hidoutThread?.interrupt()
         runCatching { vm?.cancel() } // drop any held rumble immediately
+        runCatching { legacy?.cancel() }
         // Join WITHOUT a timeout. These poll threads dereference the native session handle on every
         // pull (nativeNextRumble/nativeNextHidout), so they MUST be dead before StreamScreen's
         // onDispose reaches nativeClose, which frees that handle. A *bounded* join that times out
@@ -98,6 +104,7 @@ class GamepadFeedback(private val handle: Long) {
         rgbLight = null
         playerLight = null
         vm = null
+        legacy = null
         vibratorIds = IntArray(0)
     }
 
@@ -111,39 +118,65 @@ class GamepadFeedback(private val handle: Long) {
             Log.i(TAG, "rumble: no controller connected — rumble no-op (emulator path)")
             return
         }
-        val m = dev.vibratorManager
-        val ids = m.vibratorIds
-        if (ids.isEmpty()) {
-            Log.i(TAG, "rumble: controller '${dev.name}' has no vibrators — rumble no-op")
-            return
+        if (Build.VERSION.SDK_INT >= 31) {
+            val m = dev.vibratorManager
+            val ids = m.vibratorIds
+            if (ids.isEmpty()) {
+                Log.i(TAG, "rumble: controller '${dev.name}' has no vibrators — rumble no-op")
+                return
+            }
+            vm = m
+            vibratorIds = ids
+            amplitudeControlled = ids.all { m.getVibrator(it).hasAmplitudeControl() }
+            Log.i(TAG, "rumble: bound ${ids.size} vibrators amplitudeControl=$amplitudeControlled")
+        } else {
+            // API 28–30: no VibratorManager — fall back to the controller's single legacy Vibrator.
+            @Suppress("DEPRECATION")
+            val v = dev.vibrator
+            if (!v.hasVibrator()) {
+                Log.i(TAG, "rumble: controller '${dev.name}' has no vibrator — rumble no-op")
+                return
+            }
+            legacy = v
+            amplitudeControlled = v.hasAmplitudeControl()
+            Log.i(TAG, "rumble: bound legacy vibrator amplitudeControl=$amplitudeControlled")
         }
-        vm = m
-        vibratorIds = ids
-        amplitudeControlled = ids.all { m.getVibrator(it).hasAmplitudeControl() }
-        Log.i(TAG, "rumble: bound ${ids.size} vibrators amplitudeControl=$amplitudeControlled")
     }
 
     /** low = heavy/left motor, high = light/right motor; both 0..0xFFFF (the host's u16 amplitudes). */
     private fun renderRumble(low: Int, high: Int) {
         Log.i(TAG, "rumble low=$low high=$high") // verification line — BEFORE any no-op return
-        val m = vm ?: return
         val lo = toAmplitude(low)
         val hi = toAmplitude(high)
-        if (lo == 0 && hi == 0) {
-            m.cancel() // (0,0) = stop
+        val m = vm
+        if (m != null) {
+            if (lo == 0 && hi == 0) {
+                m.cancel() // (0,0) = stop
+                return
+            }
+            val combo = CombinedVibration.startParallel()
+            if (amplitudeControlled && vibratorIds.size >= 2) {
+                // ids[0] = light/right, ids[1] = heavy/left (XInput/Moonlight convention).
+                if (hi != 0) combo.addVibrator(vibratorIds[0], oneShot(hi))
+                if (lo != 0) combo.addVibrator(vibratorIds[1], oneShot(lo))
+            } else {
+                // Single motor or no amplitude control: blend both into one effect.
+                val a = (lo * 0.8 + hi * 0.33).toInt().coerceIn(1, 255)
+                for (id in vibratorIds) combo.addVibrator(id, oneShot(a))
+            }
+            runCatching { m.vibrate(combo.combine()) }
             return
         }
-        val combo = CombinedVibration.startParallel()
-        if (amplitudeControlled && vibratorIds.size >= 2) {
-            // ids[0] = light/right, ids[1] = heavy/left (XInput/Moonlight convention).
-            if (hi != 0) combo.addVibrator(vibratorIds[0], oneShot(hi))
-            if (lo != 0) combo.addVibrator(vibratorIds[1], oneShot(lo))
-        } else {
-            // Single motor or no amplitude control: blend both into one effect.
-            val a = (lo * 0.8 + hi * 0.33).toInt().coerceIn(1, 255)
-            for (id in vibratorIds) combo.addVibrator(id, oneShot(a))
+        // API 28–30 legacy single-motor path: blend both motors into one effect.
+        val lv = legacy ?: return
+        if (lo == 0 && hi == 0) {
+            lv.cancel() // (0,0) = stop
+            return
         }
-        runCatching { m.vibrate(combo.combine()) }
+        val a = (lo * 0.8 + hi * 0.33).toInt().coerceIn(1, 255)
+        runCatching {
+            lv.vibrate(if (amplitudeControlled) oneShot(a) else oneShot(VibrationEffect.DEFAULT_AMPLITUDE))
+        }
     }
 
     // 0..0xFFFF → 1..255 (high byte); a nonzero motor never collapses to 0.

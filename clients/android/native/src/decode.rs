@@ -12,11 +12,12 @@ use ndk::media::media_codec::{
     OutputBuffer,
 };
 use ndk::media::media_format::MediaFormat;
-use ndk::native_window::{FrameRateCompatibility, NativeWindow};
+use ndk::native_window::NativeWindow;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -113,11 +114,13 @@ pub fn run(
         mode.height
     );
     // Tell the display the stream's refresh so Android can pick a matching display mode and align
-    // vsync (no 60-in-120 judder on high-refresh panels). minSdk 31 ≥ API 30, so the underlying
-    // ANativeWindow_setFrameRate is always present; non-fatal if the platform declines.
-    if let Err(e) = window.set_frame_rate(mode.refresh_hz as f32, FrameRateCompatibility::Default) {
-        log::warn!(
-            "decode: set_frame_rate({} Hz) failed (non-fatal): {e}",
+    // vsync (no 60-in-120 judder on high-refresh panels). `ANativeWindow_setFrameRate` is NDK API 30,
+    // above our API-28 floor, so we resolve it at runtime (see `try_set_frame_rate`) rather than link
+    // it — a hard import would stop `libpunktfunk_android.so` loading at all on API 28/29. Absent
+    // there ⇒ we simply skip the hint (non-fatal; the stream renders fine without it).
+    if mode.refresh_hz > 0 && !try_set_frame_rate(&window, mode.refresh_hz as f32) {
+        log::debug!(
+            "decode: set_frame_rate({} Hz) unavailable/declined (non-fatal)",
             mode.refresh_hz
         );
     }
@@ -337,6 +340,32 @@ fn boost_thread_priority() {
                 std::io::Error::last_os_error()
             );
         }
+    }
+}
+
+/// `ANativeWindow_setFrameRate` (NDK **API 30**) resolved from `libandroid.so` at runtime, so the lib
+/// still loads on our API-28 floor — a hard import of a >floor symbol makes `dlopen`/`System.load`
+/// fail on every API-28/29 device, even where this path is never hit. Mirrors the dlsym approach in
+/// [`crate::adpf`]. Returns `true` when the platform accepted the hint; `false` on API < 30 (symbol
+/// absent) or when the platform declined. `compatibility` is fixed to the DEFAULT (0) policy.
+fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32) -> bool {
+    // int32_t ANativeWindow_setFrameRate(ANativeWindow*, float frameRate, int8_t compatibility)
+    type SetFrameRateFn = unsafe extern "C" fn(*mut c_void, f32, i8) -> i32;
+    // SAFETY: `dlopen` of the always-mapped `libandroid.so` (only bumps its refcount; never closed —
+    // process-lifetime handle). `dlsym` returns null when the symbol is absent (device API < 30),
+    // checked before transmuting the non-null pointer to its fn-pointer type. `window.ptr()` is the
+    // live `ANativeWindow` this `NativeWindow` owns for the call's duration.
+    unsafe {
+        let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
+        if lib.is_null() {
+            return false;
+        }
+        let sym = libc::dlsym(lib, c"ANativeWindow_setFrameRate".as_ptr());
+        if sym.is_null() {
+            return false; // device API < 30 — no per-surface frame-rate hint
+        }
+        let set_frame_rate = std::mem::transmute::<*mut c_void, SetFrameRateFn>(sym);
+        set_frame_rate(window.ptr().as_ptr().cast(), frame_rate, 0) == 0
     }
 }
 

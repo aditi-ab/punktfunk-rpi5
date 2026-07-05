@@ -15,8 +15,10 @@ android {
     ndkVersion = ndkVer
 
     defaultConfig {
-        minSdk = 31
-        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+        minSdk = 28 // Android 9 — reaches older TV boxes; API 31+ features are runtime-gated.
+        // Keep in lockstep with :app — 32-bit armeabi-v7a for the many 32-bit Google TV / Android TV
+        // boxes, 64-bit arm64-v8a for phones + modern TV, x86_64 for the emulator.
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
@@ -28,6 +30,9 @@ android {
 kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_21) } }
 
 dependencies {
+    // mTLS HTTPS client for the host's management API (the game-library fetch + cover-art loads).
+    // OkHttp lets us present the paired client cert and pin the host's self-signed cert by SHA-256.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2") // JVM unit test for the pure TXT parser
 }
 
@@ -85,9 +90,11 @@ fun registerCargoNdk(taskName: String, release: Boolean) =
         // find their subtools.
         val cmd = mutableListOf(
             "$cargoBin/cargo", "ndk",
-            "-t", "arm64-v8a", "-t", "x86_64",
-            // Link against the minSdk-31 sysroot so libaaudio (API 26+) is found.
-            "--platform", "31",
+            "-t", "arm64-v8a", "-t", "armeabi-v7a", "-t", "x86_64",
+            // Link against the minSdk-28 sysroot: libaaudio (API 26) is present, and building at the
+            // floor makes the linker reject any accidental >28 hard import (the one API-30 call we
+            // make, ANativeWindow_setFrameRate, is dlsym-resolved — see decode::try_set_frame_rate).
+            "--platform", "28",
             "-o", file("src/main/jniLibs").absolutePath,
             "build", "-p", "punktfunk-client-android",
         )

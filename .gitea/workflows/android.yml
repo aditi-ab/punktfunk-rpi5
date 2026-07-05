@@ -1,5 +1,5 @@
 # Android client CI (Gitea Actions). Builds the Rust JNI core (clients/android/native) via
-# cargo-ndk for both shipping ABIs and assembles the debug APK (clients/android). Mirrors apple.yml
+# cargo-ndk for all three shipping ABIs and assembles the debug APK (clients/android). Mirrors apple.yml
 # but on a Linux runner — the NDK is cross-platform, so no self-hosted host is needed.
 #
 # Prereq: the runner needs ~6 GB free + internet (it pulls the Android SDK/NDK and the Gradle
@@ -40,7 +40,7 @@ jobs:
           fi
           RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
           dirname "$RUSTUP" >> "$GITHUB_PATH"
-          "$RUSTUP" target add aarch64-linux-android x86_64-linux-android
+          "$RUSTUP" target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 
       - name: Android SDK
         uses: android-actions/setup-android@v3
@@ -98,7 +98,7 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
           echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > release.jks
-          # AAB for Play; a universal APK (both ABIs) for direct sideload/testing — same upload key.
+          # AAB for Play; a universal APK (all ABIs) for direct sideload/testing — same upload key.
           ./gradlew :app:bundleRelease :app:assembleRelease --stacktrace
 
       # Publish BEFORE the Play upload so artifacts land even while the Play step is still failing.

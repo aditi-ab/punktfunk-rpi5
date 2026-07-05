@@ -22,14 +22,34 @@ android {
         }
 
         applicationId = "io.unom.punktfunk"
-        minSdk = 31
+        // Android 9. Reaches older Android TV boxes (e.g. Amlogic streamers still on Android 9–11);
+        // the handful of API 31+ APIs we use are runtime-gated (Material You → brand palette, rumble
+        // → legacy Vibrator, NEARBY_WIFI/lights/ADPF already gated), so nothing is lost above 28.
+        minSdk = 28
         targetSdk = 36
         val vCode = (props.getProperty("VERSION_CODE") ?: System.getenv("VERSION_CODE"))
         versionCode = vCode?.toInt() ?: 1
         // versionName is the single project version, threaded from CI (a vX.Y.Z release or a
         // canary string). versionCode stays the monotonic run number (Play rejects regressions).
-        versionName = (props.getProperty("VERSION_NAME") ?: System.getenv("VERSION_NAME")) ?: "0.0.2"
-        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+        // Local dev (no VERSION_NAME) falls back to the workspace version from the root Cargo.toml —
+        // the single source of truth — so an on-device build shows the real current version, not a
+        // stale placeholder.
+        val workspaceVersion = runCatching {
+            project.rootProject.file("../../Cargo.toml").readLines()
+                .dropWhile { !it.trim().startsWith("[workspace.package]") }
+                .firstOrNull { it.trim().startsWith("version") }
+                ?.substringAfter('=')?.trim()?.trim('"')
+        }.getOrNull()
+        versionName = (props.getProperty("VERSION_NAME") ?: System.getenv("VERSION_NAME"))
+            ?: workspaceVersion ?: "0.0.0"
+        // Ship 32-bit armeabi-v7a alongside 64-bit arm64-v8a: many Google TV / Android TV streamers
+        // (Walmart onn. 4K, Chromecast with Google TV, budget Amlogic boxes) run a 32-bit Android
+        // userspace, and because this app carries native code, Google Play (and a sideload installer)
+        // filters it as "not compatible" on those devices unless an armeabi-v7a variant is present.
+        // x86_64 stays for the emulator. Google keeps delivering to 32-bit TV devices (see the Aug
+        // 2025 "64-bit app compatibility for Google TV and Android TV" post) — the 64-bit lib is the
+        // required half; the 32-bit lib is what actually reaches the boxes people report failing.
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
 
     signingConfigs {
@@ -97,8 +117,17 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-core") // bottom-bar tab icons
+    implementation("androidx.compose.material:material-icons-core") // bottom-bar / rail tab icons
+    implementation("androidx.compose.material:material-icons-extended") // settings-category icons
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // Cover-art loading for the game-library coverflow. Coil 2.x uses OkHttp under the hood, so we
+    // feed it the same mTLS OkHttpClient the library fetch uses (reaching the host's own art proxy).
+    implementation("io.coil-kt:coil-compose:2.7.0")
+
+    // Real backdrop blur for the floating console legends (RenderEffect on API 31+, a translucent
+    // scrim below). The gamepad UI's frosted pills sample + blur whatever scrolls behind them.
+    implementation("dev.chrisbanes.haze:haze:1.6.0")
 
     // Android TV components (we target phone + TV) land in the TV-UI milestone:
     //   implementation("androidx.tv:tv-material:1.1.0")

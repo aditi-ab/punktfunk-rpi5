@@ -2,39 +2,61 @@ package io.unom.punktfunk
 
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.ExperimentalAnimationApi
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
 import io.unom.punktfunk.models.Tab
 
 @Composable
-fun App() {
+fun App(forceGamepadUi: Boolean = false) {
     val context = LocalContext.current
     val settingsStore = remember { SettingsStore(context) }
     var settings by remember { mutableStateOf(settingsStore.load()) }
     var streamHandle by remember { mutableLongStateOf(0L) } // 0 = not streaming
     var tab by remember { mutableStateOf(Tab.Connect) }
+
+    // Console (gamepad) mode mirrors the Apple client: the setting AND (a pad is attached OR this is
+    // a TV OR the dev force flag). Flips live as controllers connect/disconnect.
+    val tv = remember { isTvDevice(context) }
+    val controllerConnected by rememberControllerConnected()
+    val gamepadUi = gamepadUiActive(settings.gamepadUiEnabled, controllerConnected, tv, forceGamepadUi)
 
     AnimatedContent(
         targetState = streamHandle != 0L,
@@ -46,46 +68,154 @@ fun App() {
         if (isStreaming) {
             // Immersive: the stream takes the whole screen, no bottom bar.
             StreamScreen(streamHandle, micEnabled = settings.micEnabled, onDisconnect = { streamHandle = 0L })
+        } else if (gamepadUi) {
+            GamepadShell(
+                settings = settings,
+                onSettingsChange = { settings = it; settingsStore.save(it) },
+                onConnected = { streamHandle = it },
+            )
         } else {
-            Scaffold(
-                bottomBar = {
-                    NavigationBar {
-                        Tab.entries.forEach { t ->
-                            NavigationBarItem(
-                                selected = tab == t,
-                                onClick = { tab = t },
-                                icon = { Icon(t.icon, contentDescription = t.label) },
-                                label = { Text(t.label) },
-                            )
-                        }
-                    }
-                },
-            ) { innerPadding ->
-                Box(Modifier.fillMaxSize().padding(innerPadding)) {
-                    AnimatedContent(
-                        targetState = tab,
-                        transitionSpec = {
-                            if (targetState.ordinal > initialState.ordinal) {
+            // Adaptive nav: a bottom bar on phones; on tablets / large windows a side NavigationRail
+            // with its items centred vertically (the common Android tablet idiom, mirroring iPad's
+            // side navigation). A short landscape phone keeps the bottom bar (rail needs height too).
+            // Tabs slide along the axis the nav sits on: horizontally with the bottom bar (phone),
+            // vertically with the side rail (tablet), so the motion tracks the direction you moved.
+            val tabContent: @Composable (vertical: Boolean) -> Unit = { vertical ->
+                AnimatedContent(
+                    targetState = tab,
+                    transitionSpec = {
+                        val forward = targetState.ordinal > initialState.ordinal
+                        when {
+                            vertical && forward ->
+                                slideInVertically { it } + fadeIn() togetherWith
+                                        slideOutVertically { -it } + fadeOut()
+                            vertical ->
+                                slideInVertically { -it } + fadeIn() togetherWith
+                                        slideOutVertically { it } + fadeOut()
+                            forward ->
                                 slideInHorizontally { it } + fadeIn() togetherWith
                                         slideOutHorizontally { -it } + fadeOut()
-                            } else {
+                            else ->
                                 slideInHorizontally { -it } + fadeIn() togetherWith
                                         slideOutHorizontally { it } + fadeOut()
+                        }
+                    },
+                    label = "TabTransition"
+                ) { targetTab ->
+                    when (targetTab) {
+                        Tab.Connect -> ConnectScreen(settings = settings, onConnected = { streamHandle = it })
+                        Tab.Settings -> SettingsScreen(
+                            initial = settings,
+                            onChange = { settings = it; settingsStore.save(it) },
+                            onBack = { tab = Tab.Connect },
+                        )
+                    }
+                }
+            }
+
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                if (maxWidth >= 600.dp && maxHeight >= 480.dp) {
+                    Row(Modifier.fillMaxSize()) {
+                        NavigationRail(Modifier.fillMaxHeight()) {
+                            Spacer(Modifier.weight(1f)) // centre the rail items vertically
+                            Tab.entries.forEach { t ->
+                                NavigationRailItem(
+                                    selected = tab == t,
+                                    onClick = { tab = t },
+                                    icon = { Icon(t.icon, contentDescription = t.label) },
+                                    label = { Text(t.label) },
+                                )
+                            }
+                            Spacer(Modifier.weight(1f))
+                        }
+                        // The rail handles its own insets; the content pane insets itself (the screens
+                        // don't, since they used to rely on the Scaffold's padding).
+                        Box(Modifier.weight(1f).fillMaxHeight().systemBarsPadding()) { tabContent(true) }
+                    }
+                } else {
+                    Scaffold(
+                        bottomBar = {
+                            NavigationBar {
+                                Tab.entries.forEach { t ->
+                                    NavigationBarItem(
+                                        selected = tab == t,
+                                        onClick = { tab = t },
+                                        icon = { Icon(t.icon, contentDescription = t.label) },
+                                        label = { Text(t.label) },
+                                    )
+                                }
                             }
                         },
-                        label = "TabTransition"
-                    ) { targetTab ->
-                        when (targetTab) {
-                            Tab.Connect -> ConnectScreen(settings = settings, onConnected = { streamHandle = it })
-                            Tab.Settings -> SettingsScreen(
-                                initial = settings,
-                                onChange = { settings = it; settingsStore.save(it) },
-                                onBack = { tab = Tab.Connect },
-                            )
-                        }
+                    ) { innerPadding ->
+                        Box(Modifier.fillMaxSize().padding(innerPadding)) { tabContent(false) }
                     }
                 }
             }
         }
     }
 }
+
+/** Which console screen the gamepad shell is showing. */
+private enum class GamepadScreen { Home, Settings, Library }
+
+/**
+ * The console (gamepad) shell — the Android mirror of the Apple client's ContentView gamepad branch:
+ * a full-screen host carousel with X → Settings and Y → a saved host's library, all sharing
+ * [ConnectScreen]'s connect logic. No bottom bar; navigation is button-driven.
+ */
+@Composable
+fun GamepadShell(
+    settings: Settings,
+    onSettingsChange: (Settings) -> Unit,
+    onConnected: (Long) -> Unit,
+) {
+    val context = LocalContext.current
+    var screen by remember { mutableStateOf(GamepadScreen.Home) }
+    var libraryHost by remember { mutableStateOf<io.unom.punktfunk.kit.security.KnownHost?>(null) }
+
+    // On a TV, shrink the 10-foot UI so its elements aren't oversized. Density-aware: expand the
+    // effective dp footprint to at least CONSOLE_TV_MIN_WIDTH_DP (→ smaller elements) ONLY when the
+    // panel reports fewer dp than that; a low-density TV that's already spacious, and every phone /
+    // tablet, keep their real density unchanged. This is the "based on pixel density" scale the layout
+    // wanted — one uniform factor across text, cards, spacing, and insets.
+    val isTv = remember { isTvDevice(context) }
+    val baseDensity = LocalDensity.current
+    val screenWidthPx = LocalConfiguration.current.screenWidthDp * baseDensity.density
+    val fitDensity = screenWidthPx / CONSOLE_TV_MIN_WIDTH_DP
+    val consoleDensity = if (isTv && fitDensity < baseDensity.density) fitDensity else baseDensity.density
+
+    CompositionLocalProvider(LocalDensity provides Density(consoleDensity, baseDensity.fontScale)) {
+    // Cross-fade between console screens so switches are smooth. Each slot's controller nav is gated
+    // on being the CURRENT target (`s == screen`), so during the fade only the incoming screen drives
+    // the pad. All screens pin their legend at the same ConsoleLegendInset, so it reads as fixed while
+    // the content behind it fades.
+    Crossfade(targetState = screen, animationSpec = tween(240), label = "consoleScreen") { s ->
+        when (s) {
+            GamepadScreen.Home -> ConnectScreen(
+                settings = settings,
+                onConnected = onConnected,
+                gamepadUi = true,
+                onOpenSettings = { screen = GamepadScreen.Settings },
+                onOpenLibrary = { host -> libraryHost = host; screen = GamepadScreen.Library },
+                navGate = s == screen,
+            )
+            GamepadScreen.Settings -> GamepadSettingsScreen(
+                initial = settings,
+                onChange = onSettingsChange,
+                onBack = { screen = GamepadScreen.Home },
+                navActive = s == screen,
+            )
+            GamepadScreen.Library -> libraryHost?.let { host ->
+                LibraryScreen(
+                    host = host,
+                    onBack = { screen = GamepadScreen.Home; libraryHost = null },
+                    navActive = s == screen,
+                )
+            } ?: run { screen = GamepadScreen.Home }
+        }
+    }
+    }
+}
+
+/** Minimum effective dp width the console UI targets on a TV (bigger → the 10-foot UI shrinks). */
+private const val CONSOLE_TV_MIN_WIDTH_DP = 1180f

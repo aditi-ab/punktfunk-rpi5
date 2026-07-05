@@ -1,0 +1,257 @@
+package io.unom.punktfunk
+
+import android.os.SystemClock
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.platform.LocalContext
+import kotlin.math.abs
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+
+// Controller navigation for the console carousels (host launcher + library coverflow). It taps the
+// SAME MainActivity input probes the Controllers debug screen uses (padMotionProbe / padKeyProbe) so
+// it sees the raw analog stick and consumes it BEFORE MainActivity's stick→D-pad focus synthesis —
+// which is what made carousel scrolling feel wrong: that path is edge-only (no hold-to-repeat, so a
+// held stick did nothing) and a flick could cross the threshold twice (double-move). Here the left
+// stick drives discrete moves with hysteresis (fire once when it crosses HIGH; re-arm only after it
+// falls back under LOW → a flick is exactly one move) and auto-repeat while held. The caller coalesces
+// the moves against a target index so a fast repeat walks smoothly instead of overshooting.
+
+private const val STICK_HIGH = 0.6f   // cross this to commit a move
+private const val STICK_LOW = 0.3f    // fall back under this to re-arm (hysteresis)
+private const val INITIAL_DELAY_MS = 420L // hold this long before the first auto-repeat
+private const val REPEAT_MS = 150L        // then repeat this often while held
+
+private class NavInputState {
+    @Volatile var stickX = 0f
+    @Volatile var stickY = 0f
+    @Volatile var hatX = 0f
+    @Volatile var hatY = 0f
+    @Volatile var dpadX = 0
+    @Volatile var dpadY = 0
+    fun reset() { stickX = 0f; stickY = 0f; hatX = 0f; hatY = 0f; dpadX = 0; dpadY = 0 }
+}
+
+/** A committed navigation direction from the stick / D-pad / HAT. */
+enum class NavDir { UP, DOWN, LEFT, RIGHT }
+
+/**
+ * Installs controller navigation for a console screen while [active]. [onMove] gets -1 (left) / +1
+ * (right) for each committed step; [onActivate] is A / D-pad-center / Enter, [onTertiary] is X,
+ * [onSecondary] is Y. B and the shoulders fall through to MainActivity (B → its BACK remap → the
+ * screen's BackHandler). [active] is set false while a sheet/dialog is on top so the carousel stops
+ * consuming the pad and the overlay can be navigated.
+ */
+@Composable
+fun GamepadNavEffect(
+    active: Boolean,
+    onMove: (Int) -> Unit,
+    onActivate: () -> Unit,
+    onSecondary: () -> Unit = {},
+    onTertiary: () -> Unit = {},
+    // D-pad Up (the carousel is horizontal) → e.g. Settings, since a TV remote has no X face button.
+    onUp: () -> Unit = {},
+    onDown: () -> Unit = {},
+    // Context/options menu — fired by the gamepad Select/View button OR a long-press of the select/OK
+    // button (the Android-TV context-menu convention). A short OK press is [onActivate].
+    onOptions: () -> Unit = {},
+) {
+    val activity = LocalContext.current as? MainActivity ?: return
+    val state = remember { NavInputState() }
+    // The effects below are keyed on `active` only (they must NOT restart on every recomposition), so
+    // they'd otherwise capture the FIRST callbacks — closing over a stale `tiles` (fewer hosts than are
+    // discovered later, which clamped navigation to that old count). rememberUpdatedState keeps the
+    // long-lived coroutine/probes pointed at the CURRENT callbacks.
+    val currentOnMove by rememberUpdatedState(onMove)
+    val currentOnActivate by rememberUpdatedState(onActivate)
+    val currentOnSecondary by rememberUpdatedState(onSecondary)
+    val currentOnTertiary by rememberUpdatedState(onTertiary)
+    val currentOnUp by rememberUpdatedState(onUp)
+    val currentOnDown by rememberUpdatedState(onDown)
+    val currentOnOptions by rememberUpdatedState(onOptions)
+
+    DisposableEffect(active) {
+        // Stable probe refs (see GamepadNavEffect2D) so onDispose only releases the slot if we still
+        // own it — a cross-fading-out screen mustn't null the incoming screen's probes.
+        val motionProbe: (MotionEvent) -> Boolean = probe@{ ev ->
+            if (ev.isFromSource(InputDevice.SOURCE_JOYSTICK) && ev.actionMasked == MotionEvent.ACTION_MOVE) {
+                state.stickX = ev.getAxisValue(MotionEvent.AXIS_X)
+                state.hatX = ev.getAxisValue(MotionEvent.AXIS_HAT_X)
+                return@probe true // consume → MainActivity's stick→D-pad synthesis stays out of it
+            }
+            false
+        }
+        val keyProbe: (KeyEvent) -> Boolean = probe@{ ev ->
+            val down = ev.action == KeyEvent.ACTION_DOWN
+            val edge = down && ev.repeatCount == 0
+            when (ev.keyCode) {
+                KeyEvent.KEYCODE_DPAD_LEFT -> { state.dpadX = if (down) -1 else 0; true }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> { state.dpadX = if (down) 1 else 0; true }
+                // TV remote (no face buttons): Up → Settings, Down → a saved host's Options.
+                KeyEvent.KEYCODE_DPAD_UP -> { if (edge) currentOnUp(); true }
+                KeyEvent.KEYCODE_DPAD_DOWN -> { if (edge) currentOnDown(); true }
+                KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> { if (edge) currentOnActivate(); true }
+                // The gamepad Select / View / Share button → context options (a remote uses Down).
+                KeyEvent.KEYCODE_BUTTON_SELECT -> { if (edge) currentOnOptions(); true }
+                KeyEvent.KEYCODE_BUTTON_X -> { if (edge) currentOnTertiary(); true }
+                KeyEvent.KEYCODE_BUTTON_Y -> { if (edge) currentOnSecondary(); true }
+                else -> false // B / shoulders / etc. → MainActivity handles (B remaps to BACK)
+            }
+        }
+        if (active) {
+            activity.padMotionProbe = motionProbe
+            activity.padKeyProbe = keyProbe
+        }
+        onDispose {
+            if (activity.padMotionProbe === motionProbe) activity.padMotionProbe = null
+            if (activity.padKeyProbe === keyProbe) activity.padKeyProbe = null
+            state.reset()
+        }
+    }
+
+    LaunchedEffect(active) {
+        if (!active) return@LaunchedEffect
+        var committed = 0     // the direction currently held (hysteresis + repeat authority)
+        var fireAt = 0L       // uptime at/after which the next auto-repeat may fire
+        while (isActive) {
+            val now = SystemClock.uptimeMillis()
+            val hat = if (state.hatX <= -0.5f) -1 else if (state.hatX >= 0.5f) 1 else 0
+            val dir = when {
+                state.dpadX != 0 -> state.dpadX
+                hat != 0 -> hat
+                else -> {
+                    val x = state.stickX
+                    when {
+                        x >= STICK_HIGH -> 1
+                        x <= -STICK_HIGH -> -1
+                        abs(x) < STICK_LOW -> 0
+                        else -> committed // inside the hysteresis band → hold the committed value
+                    }
+                }
+            }
+            when {
+                dir == 0 -> committed = 0
+                dir != committed -> { currentOnMove(dir); committed = dir; fireAt = now + INITIAL_DELAY_MS }
+                now >= fireAt -> { currentOnMove(dir); fireAt = now + REPEAT_MS }
+            }
+            delay(16)
+        }
+    }
+}
+
+/**
+ * 2-D controller navigation for the console form screens (settings focus list, add-host, on-screen
+ * keyboard). Same hysteresis + hold-to-repeat as [GamepadNavEffect] but on both axes — the dominant
+ * stick axis (or the pressed D-pad/HAT) commits a [NavDir], and it re-arms only after the stick
+ * returns near centre (so a flick is one step). [onActivate] is A / center, [onTertiary] is X,
+ * [onSecondary] is Y. B is left to MainActivity's BACK remap → the screen's BackHandler (so B "peels
+ * one layer": close the keyboard, then the screen).
+ */
+@Composable
+fun GamepadNavEffect2D(
+    active: Boolean,
+    onDirection: (NavDir) -> Unit,
+    onActivate: () -> Unit,
+    onTertiary: () -> Unit = {},
+    onSecondary: () -> Unit = {},
+) {
+    val activity = LocalContext.current as? MainActivity ?: return
+    val state = remember { NavInputState() }
+    val currentOnDirection by rememberUpdatedState(onDirection)
+    val currentOnActivate by rememberUpdatedState(onActivate)
+    val currentOnTertiary by rememberUpdatedState(onTertiary)
+    val currentOnSecondary by rememberUpdatedState(onSecondary)
+
+    DisposableEffect(active) {
+        // Stable probe refs so onDispose only releases the slot if WE still own it — during a
+        // cross-fade both the outgoing and incoming screen are briefly composed, and the outgoing's
+        // teardown must not null out the incoming screen's just-installed probes.
+        val motionProbe: (MotionEvent) -> Boolean = probe@{ ev ->
+            if (ev.isFromSource(InputDevice.SOURCE_JOYSTICK) && ev.actionMasked == MotionEvent.ACTION_MOVE) {
+                state.stickX = ev.getAxisValue(MotionEvent.AXIS_X)
+                state.stickY = ev.getAxisValue(MotionEvent.AXIS_Y)
+                state.hatX = ev.getAxisValue(MotionEvent.AXIS_HAT_X)
+                state.hatY = ev.getAxisValue(MotionEvent.AXIS_HAT_Y)
+                return@probe true
+            }
+            false
+        }
+        val keyProbe: (KeyEvent) -> Boolean = probe@{ ev ->
+            val down = ev.action == KeyEvent.ACTION_DOWN
+            val edge = down && ev.repeatCount == 0
+            when (ev.keyCode) {
+                KeyEvent.KEYCODE_DPAD_LEFT -> { state.dpadX = if (down) -1 else 0; true }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> { state.dpadX = if (down) 1 else 0; true }
+                KeyEvent.KEYCODE_DPAD_UP -> { state.dpadY = if (down) -1 else 0; true }
+                KeyEvent.KEYCODE_DPAD_DOWN -> { state.dpadY = if (down) 1 else 0; true }
+                KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> { if (edge) currentOnActivate(); true }
+                KeyEvent.KEYCODE_BUTTON_X -> { if (edge) currentOnTertiary(); true }
+                KeyEvent.KEYCODE_BUTTON_Y -> { if (edge) currentOnSecondary(); true }
+                else -> false // B / shoulders → MainActivity (B remaps to BACK → BackHandler)
+            }
+        }
+        if (active) {
+            activity.padMotionProbe = motionProbe
+            activity.padKeyProbe = keyProbe
+        }
+        onDispose {
+            if (activity.padMotionProbe === motionProbe) activity.padMotionProbe = null
+            if (activity.padKeyProbe === keyProbe) activity.padKeyProbe = null
+            state.reset()
+        }
+    }
+
+    LaunchedEffect(active) {
+        if (!active) return@LaunchedEffect
+        var committed: NavDir? = null
+        var fireAt = 0L
+        while (isActive) {
+            val now = SystemClock.uptimeMillis()
+            val raw = resolveDir(state)
+            val nearCentre = state.dpadX == 0 && state.dpadY == 0 &&
+                abs(state.hatX) < 0.5f && abs(state.hatY) < 0.5f &&
+                abs(state.stickX) < STICK_LOW && abs(state.stickY) < STICK_LOW
+            when {
+                raw == null && nearCentre -> committed = null
+                raw == null -> { /* in the hysteresis band → hold, don't fire */ }
+                raw != committed -> { currentOnDirection(raw); committed = raw; fireAt = now + INITIAL_DELAY_MS }
+                now >= fireAt -> { currentOnDirection(raw); fireAt = now + REPEAT_MS }
+            }
+            delay(16)
+        }
+    }
+}
+
+/** The direction currently past the commit threshold (D-pad/HAT first, then the dominant stick axis). */
+private fun resolveDir(s: NavInputState): NavDir? {
+    if (s.dpadY < 0) return NavDir.UP
+    if (s.dpadY > 0) return NavDir.DOWN
+    if (s.dpadX < 0) return NavDir.LEFT
+    if (s.dpadX > 0) return NavDir.RIGHT
+    if (s.hatY <= -0.5f) return NavDir.UP
+    if (s.hatY >= 0.5f) return NavDir.DOWN
+    if (s.hatX <= -0.5f) return NavDir.LEFT
+    if (s.hatX >= 0.5f) return NavDir.RIGHT
+    return if (abs(s.stickY) >= abs(s.stickX)) {
+        when {
+            s.stickY <= -STICK_HIGH -> NavDir.UP
+            s.stickY >= STICK_HIGH -> NavDir.DOWN
+            else -> null
+        }
+    } else {
+        when {
+            s.stickX <= -STICK_HIGH -> NavDir.LEFT
+            s.stickX >= STICK_HIGH -> NavDir.RIGHT
+            else -> null
+        }
+    }
+}

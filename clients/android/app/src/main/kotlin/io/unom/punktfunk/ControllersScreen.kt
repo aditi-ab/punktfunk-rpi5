@@ -1,6 +1,7 @@
 package io.unom.punktfunk
 
 import android.hardware.input.InputManager
+import android.os.Build
 import android.os.CombinedVibration
 import android.os.Handler
 import android.os.Looper
@@ -244,7 +245,7 @@ private fun PadRow(dev: InputDevice, forwarded: Boolean, gamepadSetting: Int) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            val canRumble = dev.vibratorManager.vibratorIds.isNotEmpty()
+            val canRumble = deviceHasVibrator(dev)
             if (canRumble) {
                 OutlinedButton(onClick = { testRumble(dev) }) { Text("Test rumble") }
             } else {
@@ -318,11 +319,27 @@ private fun Group(title: String, content: @Composable ColumnScope.() -> Unit) {
     }
 }
 
+/** Whether the controller reports a rumble motor — via VibratorManager (API 31+) or the legacy Vibrator. */
+private fun deviceHasVibrator(dev: InputDevice): Boolean =
+    if (Build.VERSION.SDK_INT >= 31) {
+        dev.vibratorManager.vibratorIds.isNotEmpty()
+    } else {
+        @Suppress("DEPRECATION")
+        dev.vibrator.hasVibrator()
+    }
+
 private fun testRumble(dev: InputDevice) {
-    val vm = dev.vibratorManager
-    if (vm.vibratorIds.isEmpty()) return
     runCatching {
-        vm.vibrate(CombinedVibration.createParallel(VibrationEffect.createOneShot(300, 200)))
+        if (Build.VERSION.SDK_INT >= 31) {
+            val vm = dev.vibratorManager
+            if (vm.vibratorIds.isEmpty()) return
+            vm.vibrate(CombinedVibration.createParallel(VibrationEffect.createOneShot(300, 200)))
+        } else {
+            @Suppress("DEPRECATION")
+            val v = dev.vibrator
+            if (!v.hasVibrator()) return
+            v.vibrate(VibrationEffect.createOneShot(300, 200))
+        }
     }
 }
 

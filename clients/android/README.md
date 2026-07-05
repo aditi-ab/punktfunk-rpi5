@@ -16,7 +16,9 @@ couch (D-pad / gamepad focus navigation).
   pairing** (or TOFU on trusted LANs), then reconnects on a Keystore-wrapped, pinned identity.
 - **Compose UI** — Connect / Settings / Stream screens with Material You theming.
 
-Built for `arm64-v8a` + `x86_64`.
+Built for `arm64-v8a` + `armeabi-v7a` + `x86_64` — the 32-bit `armeabi-v7a` slice is what keeps the
+app installable on the many 32-bit Google TV / Android TV streamers (Walmart onn. 4K, Chromecast with
+Google TV, budget Amlogic boxes) that otherwise reject a 64-bit-only build as "not compatible".
 
 ## Get it
 
@@ -54,7 +56,7 @@ kit/              :kit — NativeBridge · native mDNS discovery · Gamepad · K
 
 **Prerequisites:** Android SDK + **NDK r30** (`30.0.14904198`), `platforms;android-37.0`,
 `build-tools;37.0.0`, **`cmake;3.22.1`** (builds libopus); **JDK 21** (AGP 9.2 runs on JDK 17–21, not
-a newer default); Rust with `rustup target add aarch64-linux-android x86_64-linux-android` and
+a newer default); Rust with `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android` and
 `cargo install cargo-ndk`. Toolchain is pinned (AGP 9.2 · Gradle 9.4.1 · Kotlin 2.3.21 · Compose BOM
 2026.05.01 · compileSdk 37 · minSdk 31).
 
