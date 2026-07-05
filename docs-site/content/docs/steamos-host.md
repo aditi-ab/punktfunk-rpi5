@@ -86,9 +86,8 @@ When it finishes it prints the web-console URL and how to pair.
 
 By default the host **requires PIN pairing** (secure). Two ways to pair:
 
-- **Web console** (printed at the end of step 2): open `http://<device-ip>:47992`, log in with the
-  generated password (in `~/.config/punktfunk/web.env`), go to **Devices → arm pairing**, and enter
-  the PIN on your client.
+- **Web console** (printed at the end of step 2): open `http://<device-ip>:47992`,
+  [arm pairing](/docs/web-console#arm-pairing), and enter the PIN on your client.
 - **From the client directly**: pick this host (it advertises over mDNS as `_punktfunk._udp`) and
   enter the PIN the host shows.
 
@@ -96,17 +95,9 @@ On a trusted home LAN you can instead install with `--open` and skip pairing ent
 
 ### Console login password
 
-The installer generates a random console login password and writes it to
-`~/.config/punktfunk/web.env` (as `PUNKTFUNK_UI_PASSWORD=…`); it's also printed at the end of the
-install run (step 2). Read it back with:
-
-```sh
-sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web.env
-```
-
-To set your own password, edit that file and restart the console:
-`systemctl --user restart punktfunk-web`. Forgot it? This is the recovery path linked from the
-console login screen — see [Forgot your Password?](/docs/forgot-password).
+The installer generates a random console login password (printed at the end of step 2) and writes it
+to `~/.config/punktfunk/web.env`. To read it back or set your own, see
+[The Web Console](/docs/web-console#login-password).
 
 ## 4. Verify
 
@@ -118,7 +109,8 @@ journalctl --user -u punktfunk-host -f          # watch a client connect
 Connect from a [native client](/docs/clients), or from [Moonlight](/docs/moonlight) (unless you
 installed with `--no-gamestream`). In Game Mode the host attaches to the running gamescope session and
 streams it at your client's resolution; in Desktop Mode it streams the KDE desktop. The host
-auto-detects which session is live per connection.
+auto-detects which session is live per connection. See [Steam / gamescope](/docs/gamescope) for the
+attach-vs-managed detail and known limits.
 
 ## Updating
 

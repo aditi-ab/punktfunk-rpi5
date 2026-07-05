@@ -37,50 +37,21 @@ Start by making the host service start at boot even when nobody logs in:
 sudo loginctl enable-linger "$USER"
 ```
 
-Then bring up a session automatically, depending on your desktop:
+Then bring up a session automatically. How you do that is desktop-specific — auto-login, lock
+disable, and the session unit differ per compositor, so each is documented on its own page:
 
-### Headless GNOME
+- GNOME: [GNOME → Headless session](/docs/gnome#headless-session).
+- KDE Plasma: [KDE → Headless session](/docs/kde#headless-session).
+- Steam / gamescope: [gamescope](/docs/gamescope) — the host launches its own session per client, so
+  there's no separate session unit.
 
-Have GDM auto-login your user, so a GNOME Wayland session is always running:
-
-```ini
-# /etc/gdm3/custom.conf  (Ubuntu)   ·   /etc/gdm/custom.conf  (Fedora)
-[daemon]
-AutomaticLoginEnable = true
-AutomaticLogin = your-user
-```
-
-Then **disable the screen lock** — a locked GNOME session blocks screen capture, and there's no one to
-unlock a headless box:
-
-```sh
-gsettings set org.gnome.desktop.screensaver lock-enabled false
-gsettings set org.gnome.desktop.session idle-delay 0
-```
-
-Enable the host user service (section A) and reboot. The host comes up on the auto-login session.
-
-### Headless KDE
-
-punktfunk ships a unit that brings up a headless KWin/Plasma session with no display manager, so the
-host has a desktop to stream even with no monitor attached:
-
-```sh
-cp scripts/punktfunk-kde-session.service scripts/punktfunk-host.service ~/.config/systemd/user/
-# host.env: PUNKTFUNK_COMPOSITOR=kwin, WAYLAND_DISPLAY=wayland-kde
-systemctl --user daemon-reload
-systemctl --user enable punktfunk-kde-session punktfunk-host
-sudo loginctl enable-linger "$USER"
-reboot
-```
-
-The session unit starts headless KWin; the host unit follows it and starts listening. (KWin only needs
-to be up by the time a client connects, so the ordering is soft.)
+Once a session comes up at boot, enable the host user service (section A) and reboot. The host comes up
+on that session.
 
 ### Headless Bazzite
 
 On Bazzite, the host launches its own gamescope/Steam session per client, so you don't need a separate
-session unit — see [Bazzite](/docs/bazzite).
+session unit — see [Bazzite](/docs/bazzite) and [gamescope](/docs/gamescope).
 
 ## Windows
 

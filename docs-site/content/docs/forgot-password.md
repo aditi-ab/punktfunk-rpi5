@@ -8,21 +8,20 @@ password. That password is generated — or, on Windows, chosen — when the con
 it lives on the **host**. So if you can't get past the login screen, you recover or change it on the
 host machine itself, not from the browser.
 
+New to the console? See [The Web Console](/docs/web-console) to enable it and arm pairing.
+
 > This is **only** the web console login. It is **not** your client/device pairing — if a client
 > won't connect, that's [Pairing](/docs/pairing), not this password.
 
 ## Find your host
 
-Jump to your host platform for exactly where the password lives and how to read or reset it:
+Find your host platform for exactly where the password lives, then read or reset it below:
 
 | Host | Where the password lives | Section |
 |------|--------------------------|---------|
-| **Ubuntu — GNOME** | `~/.config/punktfunk/web-password` | [Console login password](/docs/ubuntu-gnome#console-login-password) |
-| **Ubuntu — KDE Plasma** | `~/.config/punktfunk/web-password` | [Console login password](/docs/ubuntu-kde#console-login-password) |
-| **Fedora — KDE Plasma** | `~/.config/punktfunk/web-password` | [Console login password](/docs/fedora-kde#console-login-password) |
-| **Bazzite — gamescope** | `~/.config/punktfunk/web-password` | [Console login password](/docs/bazzite#console-login-password) |
-| **SteamOS (host)** | `~/.config/punktfunk/web.env` | [Console login password](/docs/steamos-host#console-login-password) |
-| **Windows host** | `%ProgramData%\punktfunk\web-password` | [Console login password](/docs/windows-host#console-login-password) |
+| **Linux packages (apt / RPM / Bazzite)** | `~/.config/punktfunk/web-password` | [Login password](/docs/web-console#login-password) |
+| **SteamOS (host)** | `~/.config/punktfunk/web.env` | [Login password](/docs/web-console#login-password) |
+| **Windows host** | `%ProgramData%\punktfunk\web-password` | [Login password](/docs/web-console#login-password) · [Windows Host](/docs/windows-host) |
 
 ## The short version
 

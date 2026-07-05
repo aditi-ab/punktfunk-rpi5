@@ -68,4 +68,4 @@ LAN.
 ## Multiple devices at once
 
 A host can stream to several clients simultaneously — your laptop and your TV both viewing (and
-controlling) the desktop, each at its own resolution. See [Multiple devices](/docs/configuration#multiple-devices).
+controlling) the desktop, each at its own resolution. See [Multiple devices](/docs/configuration#multiple-devices-at-once).

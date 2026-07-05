@@ -48,8 +48,8 @@ let you pick a mode or default to the device's display.)
 
 ## gamescope / session following (Linux, Bazzite/SteamOS)
 
-Two mutually-exclusive models for a Steam/gamescope box. See [Bazzite](/docs/bazzite) for the full
-picture.
+Two mutually-exclusive models for a Steam/gamescope box. See [Steam / gamescope](/docs/gamescope) for
+the full picture (and [Bazzite](/docs/bazzite) for that distro's specifics).
 
 | Setting | Values | Meaning |
 |---|---|---|
@@ -61,6 +61,8 @@ picture.
 | `PUNKTFUNK_SESSION_WATCH` | `1` · `0` | Follow a Gaming ↔ Desktop switch **mid-stream** (rebuild the backend in place, no reconnect). **On by default** on Bazzite/SteamOS; set `0` to disable. |
 
 ## Compositor-specific (Linux)
+
+See your desktop page ([KDE](/docs/kde), [GNOME](/docs/gnome)) for when to set these.
 
 > **Managing virtual displays** — keep-alive after disconnect, exclusive vs. extend, and (on
 > Windows/KDE) persistent per-client scaling — now has its own settings surface in the web console

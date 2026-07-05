@@ -6,19 +6,31 @@ description: What you need to run a punktfunk host — GPU, driver, desktop, and
 ## Supported setups
 
 A punktfunk host runs primarily on a Linux machine with a dedicated GPU — NVIDIA (NVENC) is the
-most-exercised path, and AMD/Intel GPUs work via VAAPI (a native
-[Windows host](/docs/windows-host) is also available — see below). These are the Linux desktop
-environments it supports today, each with its own guide:
+most-exercised path, and AMD/Intel GPUs work via VAAPI. A native [Windows host](/docs/windows-host)
+is also available. Setup splits along two axes: you **install** the package per distro, then
+**configure** the host — and learn its quirks — per desktop/compositor.
 
-| Setup | Desktop / compositor | Guide |
-|---|---|---|
-| **Ubuntu** (Desktop or Server) | GNOME (Mutter) | [Ubuntu — GNOME](/docs/ubuntu-gnome) |
-| **Ubuntu** (Desktop or Server) | KDE Plasma (KWin) | [Ubuntu — KDE](/docs/ubuntu-kde) |
-| **Fedora** | KDE Plasma (KWin) | [Fedora — KDE](/docs/fedora-kde) |
-| **Bazzite** | gamescope (Steam) | [Bazzite](/docs/bazzite) |
+> New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
+> the machine, so keep it on a trusted LAN or VPN and require pairing.
 
-Other wlroots compositors (Sway/Hyprland) also work but aren't a primary target. If your desktop isn't
-listed, the host still needs one of these compositor backends to create a virtual display.
+**Distros — install the package:**
+
+- [Ubuntu / Debian](/docs/ubuntu)
+- [Fedora](/docs/fedora)
+- [Arch](/docs/arch)
+- [Bazzite](/docs/bazzite)
+- [SteamOS](/docs/steamos-host)
+
+**Desktops — configure and quirks:**
+
+- [KDE Plasma (KWin)](/docs/kde)
+- [GNOME (Mutter)](/docs/gnome)
+- [Steam / gamescope](/docs/gamescope)
+- [Sway / wlroots](/docs/sway)
+
+Pick your distro to install, then your desktop to configure — the two are independent. Other
+wlroots compositors (Hyprland) work but aren't a primary target; the host still needs one of these
+compositor backends to create a virtual display.
 
 > **Windows host:** punktfunk also runs as a native host on **Windows 11 22H2 or newer (x64)** — a
 > signed installer that registers a service and bundles a virtual-display driver (whose driver-
@@ -32,8 +44,8 @@ listed, the host still needs one of these compositor backends to create a virtua
   encodes the video in hardware.
 - **NVIDIA driver 535 or newer** (550+ recommended). The driver must include the **GL/EGL userspace**,
   not just `nvidia-utils` — without it the compositor can't initialise the GPU and capture fails. Each
-  setup guide installs the right package (e.g. `libnvidia-gl-<version>` on Ubuntu).
-- **`nvidia-drm modeset=1`** must be enabled (Wayland on NVIDIA needs it). The setup guides cover this.
+  install guide installs the right package (e.g. `libnvidia-gl-<version>` on Ubuntu).
+- **`nvidia-drm modeset=1`** must be enabled (Wayland on NVIDIA needs it). The install guides cover this.
 - **AMD / Intel GPUs** encode via **VAAPI** instead (install `mesa-va-drivers` or
   `intel-media-driver`; validated live on AMD RDNA3). The NVIDIA-specific notes above don't apply
   there. On modern Intel (Gen12/Tiger Lake and newer, including Arc) the driver only offers the
@@ -57,9 +69,9 @@ needs to be running for the user the host runs as. This can be:
 
 Minimum compositor versions (newer is fine):
 
-- **KWin ≥ 6.5.6** (KDE Plasma) — headless virtual outputs.
-- **GNOME ≥ 48** (Mutter) — virtual-monitor screen-cast.
-- **gamescope ≥ 3.16.22** (Bazzite/Steam) — older versions deadlock during capture.
+- **KWin ≥ 6.5.6** ([KDE Plasma](/docs/kde)) — headless virtual outputs.
+- **GNOME ≥ 48** ([Mutter](/docs/gnome)) — virtual-monitor screen-cast.
+- **gamescope ≥ 3.16.22** ([Bazzite/Steam](/docs/gamescope)) — older versions deadlock during capture.
 
 ## Network
 
@@ -69,10 +81,6 @@ Minimum compositor versions (newer is fine):
   private subnet.
 - For best results, a wired or fast Wi-Fi link. The host can run a built-in **speed test** to pick a
   bitrate for your link (see [Configuration](/docs/configuration)).
-
-> **Before you set up a host, read [Security & Safe Use](/docs/security).** A streaming host is
-> remote control of the machine — it's important to understand what that exposes, why to keep it on a
-> trusted network, and how pairing protects you.
 
 ## A client
 

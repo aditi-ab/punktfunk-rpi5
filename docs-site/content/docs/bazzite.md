@@ -16,8 +16,8 @@ mid-stream. You flip between Gaming Mode and Desktop with Bazzite's normal Steam
 `host.env` forces a mode.
 
 > Ideal for a dedicated game-streaming box that you also occasionally want as a remote desktop. For a
-> pure desktop machine, [Ubuntu/Fedora KDE](/docs/ubuntu-kde) or [GNOME](/docs/ubuntu-gnome) are
-> simpler.
+> pure desktop machine, install on [Ubuntu](/docs/ubuntu) or [Fedora](/docs/fedora) and configure the
+> [KDE](/docs/kde) or [GNOME](/docs/gnome) desktop directly — simpler.
 
 > New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
 > the machine, so keep it on a trusted LAN or VPN and require pairing.
@@ -60,7 +60,7 @@ For a fully baked appliance image there's also a **bootc** Containerfile that in
 from the registry at image-build time — see `packaging/bootc/` in the repo. Plain `rpm-ostree`
 layering from the [RPM registry](https://git.unom.io/unom/-/packages) keeps working too (see
 `packaging/bazzite/README.md`), but the sysext is the supported default. Building from source
-also works (Bazzite is Fedora Atomic underneath — same steps as [Fedora KDE](/docs/fedora-kde)).
+also works (Bazzite is Fedora Atomic underneath — same steps as [Fedora](/docs/fedora)).
 
 ## Allow controller input
 
@@ -99,15 +99,14 @@ PUNKTFUNK_GAMESCOPE_ATTACH=1    # Gaming Mode = attach to the box's own session 
 
 For Gaming Mode there are two models (pick one; the shipped default is **attach**):
 
-- **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`, the default) — the **box** owns its gamescope session
-  and decides Gaming vs Desktop via the normal Steam UI. The host just attaches to whatever's live
-  and never tears it down, so switching Desktop ↔ Game is rock-solid and disconnecting leaves the box
-  where it was. The streamed game-mode resolution is the box's gamescope mode
-  (`SCREEN_WIDTH/HEIGHT` in `/etc/gamescope-session-plus/sessions.d/steam`), not the client's.
-- **Managed** (`PUNKTFUNK_GAMESCOPE_MANAGED=1`, and remove the attach line) — the host tears the
-  box's gamescope down on connect and launches its **own** at the *client's* exact resolution and
-  refresh, restoring on idle. Client-mode-following, but it can't coexist with a box-owned game-mode
-  session, and there must be **no physical gaming session already running**.
+- **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`, the default) — the **box** owns its gamescope session,
+  the host attaches to whatever's live and never tears it down, and the streamed game-mode resolution
+  is the box's own gamescope mode. Switching Desktop ↔ Game is rock-solid.
+- **Managed** (`PUNKTFUNK_GAMESCOPE_MANAGED=1`, and remove the attach line) — the host launches its
+  **own** gamescope at the *client's* exact resolution and refresh. Client-mode-following, but there
+  must be no physical gaming session already running.
+
+Full treatment: [Steam / gamescope → Attach vs managed](/docs/gamescope#attach-vs-managed).
 
 Mid-stream Gaming ↔ Desktop following (`PUNKTFUNK_SESSION_WATCH`) is **on by default** on
 Bazzite/SteamOS. See [Configuration](/docs/configuration) for the full list of knobs.
@@ -116,8 +115,8 @@ Bazzite/SteamOS. See [Configuration](/docs/configuration) for the full list of k
 
 The **virtual output** (video) for the Desktop session needs no config — the host package ships an
 `io.unom.Punktfunk.Host.desktop` file whose `X-KDE-Wayland-Interfaces` grants the host KWin's
-restricted screencast protocol on a normal interactive Plasma session (least-privilege, the same
-mechanism krfb/krdp use). After a **fresh host install, log out and back into the Desktop session
+restricted screencast protocol on a normal interactive Plasma session (background:
+[KDE Plasma](/docs/kde)). After a **fresh host install, log out and back into the Desktop session
 once** so KWin re-reads that grant.
 
 The one thing a normal KDE login lacks is the RemoteDesktop grant for headless **input** injection.
@@ -138,26 +137,11 @@ Desktop; it follows whichever the box is in.
 
 ```sh
 systemctl --user enable --now punktfunk-host
-# Web console (pairing + status) — enable it and read the auto-generated login password,
-# then open http://<host-ip>:47992:
-systemctl --user enable --now punktfunk-web
-journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
+systemctl --user enable --now punktfunk-web     # web console: pairing + status
 ```
 
-### Console login password
-
-The console is password-protected. On first start `punktfunk-web-init` generates a random login
-password and saves it to `~/.config/punktfunk/web-password` (as `PUNKTFUNK_UI_PASSWORD=…`). Read it
-back at any time — from the init service's journal, or straight from the file:
-
-```sh
-journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
-sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password
-```
-
-To set your own password, edit that file (`PUNKTFUNK_UI_PASSWORD=<your-password>`) and restart the
-console: `systemctl --user restart punktfunk-web`. Forgot it? This is the recovery path linked from
-the console login screen — see [Forgot your Password?](/docs/forgot-password).
+Then open [The Web Console](/docs/web-console) for the login password and to
+[arm pairing](/docs/web-console#arm-pairing).
 
 ## Good to know
 
@@ -169,6 +153,8 @@ These apply to the **Gaming Mode (gamescope)** path; the KDE Desktop path is una
   KDE Desktop path renders the cursor normally.)
 - **HDR isn't supported yet** on the gamescope path — gamescope's capture output is 8-bit. SDR streams
   normally.
+
+Canonical list: [gamescope → Known limits](/docs/gamescope#known-limits).
 
 Then [connect a client](/docs/clients) — Moonlight works great for couch gaming, and the Apple app for
 Apple TV / iPad.

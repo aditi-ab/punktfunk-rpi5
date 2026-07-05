@@ -59,29 +59,24 @@ Packaging internals live in
 
 ### Web console & pairing
 
+See [The Web Console](/docs/web-console) for the console + pairing model shared with the Linux host;
+the Windows specifics follow.
+
 The installer also sets up the **web management console** (status, paired devices, the PIN pairing
 flow): it bundles the console plus its own runtime and runs it as the **`PunktfunkWeb`** task on
 **`http://<this-PC>:47992`**, starting at boot.
 
 #### Console login password
 
-During setup you choose the console **login password** — it's pre-filled with a secure random default
-and shown again on the installer's final page. It's stored in `%ProgramData%\punktfunk\web-password`
-(as `PUNKTFUNK_UI_PASSWORD=…`), readable only by Administrators and SYSTEM.
-
-To change it, edit that file and restart the console task. In an **elevated** PowerShell:
-
-```powershell
-notepad "$env:ProgramData\punktfunk\web-password"   # set PUNKTFUNK_UI_PASSWORD=<your-password>
-schtasks /End /TN PunktfunkWeb; schtasks /Run /TN PunktfunkWeb
-```
-
-Forgot it? This is the recovery path linked from the console login screen — see
+You choose the console **login password** during setup — a secure random default is pre-filled and
+shown on the installer's final page. It's stored in `%ProgramData%\punktfunk\web-password`, readable
+only by Administrators and SYSTEM. To read or change it (with the `schtasks` restart), see
+[The Web Console → Login password](/docs/web-console#login-password); forgot it entirely?
 [Forgot your Password?](/docs/forgot-password).
 
 The host **requires PIN pairing** by default (secure on a LAN). To connect the first time, open the
-console from any browser on the LAN, log in, go to **Devices → arm pairing**, and enter the PIN on
-your [client](/docs/clients). The host's own management API stays loopback-only behind the console.
+console from any browser on the LAN, log in, go to **Devices → [arm pairing](/docs/web-console#arm-pairing)**,
+and enter the PIN on your [client](/docs/clients). The host's own management API stays loopback-only behind the console.
 
 ### Configure
 

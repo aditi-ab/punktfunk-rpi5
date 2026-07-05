@@ -11,15 +11,19 @@ This is the shortest path to a working stream. Each step links to the details.
 
 ## 1. Set up the host
 
-On your Linux gaming machine (NVIDIA, AMD, or Intel GPU), follow the guide for your system:
+On your gaming machine (NVIDIA, AMD, or Intel GPU), follow the install guide for your system:
 
-- [Ubuntu — GNOME](/docs/ubuntu-gnome)
-- [Ubuntu — KDE Plasma](/docs/ubuntu-kde)
-- [Fedora — KDE Plasma](/docs/fedora-kde)
-- [Bazzite — gamescope / Steam](/docs/bazzite)
+- [Ubuntu / Debian](/docs/ubuntu)
+- [Fedora](/docs/fedora)
+- [Arch](/docs/arch)
+- [Bazzite](/docs/bazzite)
+- [SteamOS](/docs/steamos-host)
+- [Windows host](/docs/windows-host)
 
-Each one covers the GPU driver, the dependencies, and how to build and run the host. Check the
-[Requirements](/docs/requirements) first if you're not sure your machine is a fit.
+Each one covers the GPU driver, the dependencies, and how to install and run the host. After
+installing, configure for your desktop ([KDE](/docs/kde) / [GNOME](/docs/gnome) /
+[gamescope](/docs/gamescope) / [Sway](/docs/sway)). Check the [Requirements](/docs/requirements)
+first if you're not sure your machine is a fit.
 
 ## 2. Start the host
 
@@ -44,9 +48,9 @@ latency, or any Moonlight client:
   the list of hosts found on your network. Select it, and when prompted, **pair**.
 - **Anything with Moonlight:** add the host (it should be discovered automatically), then pair.
 
-To pair, the host needs to show a PIN. Arm pairing from the host's web console — the host displays a
-4-digit PIN, you type it into the client, and they trust each other from then on. Pairing is required
-by default. Full details: [Pairing & Trust](/docs/pairing).
+To pair, the host needs to show a PIN. [Arm pairing](/docs/web-console#arm-pairing) from the host's
+web console — the host displays a 4-digit PIN, you type it into the client, and they trust each other
+from then on. Pairing is required by default. Full details: [Pairing & Trust](/docs/pairing).
 
 ## 4. Stream
 

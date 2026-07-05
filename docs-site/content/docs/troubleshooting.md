@@ -71,10 +71,14 @@ The NVIDIA **GL/EGL userspace** is missing — the base driver package doesn't a
 - **Ubuntu:** `sudo apt install libnvidia-gl-<version>` (matching your driver).
 - Confirm `/usr/share/glvnd/egl_vendor.d/10_nvidia.json` exists and `nvidia-drm modeset` is `Y`.
 
+See [GNOME](/docs/gnome) for the GL/EGL userspace details.
+
 ## Black screen / no picture, but the client connects
 
 - You must be on a **Wayland** session, not X11 (check the login-screen session picker).
-- KWin must be **≥ 6.5.6** (`kwin_wayland --version`); GNOME **≥ 48**; gamescope **≥ 3.16.22**.
+- KWin must be **≥ 6.5.6** (`kwin_wayland --version`); GNOME **≥ 48**; gamescope **≥ 3.16.22**. See
+  [KDE](/docs/kde) for the KWin/Wayland requirement and [gamescope](/docs/gamescope) for the
+  gamescope one.
 - Confirm `PUNKTFUNK_COMPOSITOR` in [`host.env`](/docs/configuration) matches your desktop.
 
 ## Capture fails: "Session creation inhibited" (GNOME)
@@ -86,7 +90,8 @@ gsettings set org.gnome.desktop.screensaver lock-enabled false
 gsettings set org.gnome.desktop.session idle-delay 0
 ```
 
-See [Running as a Service](/docs/running-as-a-service).
+See [GNOME → Headless session](/docs/gnome#headless-session) and
+[Running as a Service](/docs/running-as-a-service).
 
 ## A controller is detected but does nothing (Bazzite)
 
@@ -96,7 +101,8 @@ The host user needs to be in the `input` group. On Bazzite:
 ujust add-user-to-input-group
 ```
 
-Then log out and back in. On other distros this is `sudo usermod -aG input $USER` + re-login.
+Then log out and back in. On other distros this is `sudo usermod -aG input $USER` + re-login. See
+[Bazzite](/docs/bazzite).
 
 ## Pairing is rejected / the client can't connect
 
