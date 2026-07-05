@@ -242,11 +242,17 @@ fn read_active_refresh(output: &str) -> Option<u32> {
     Some(hz.round() as u32)
 }
 
-/// Names of currently-ENABLED outputs other than our `Virtual-punktfunk` — i.e. the headless
-/// session's bootstrap output(s), which hold the desktop by default. Parsed from `kscreen-doctor -j`
-/// (same source as [`read_active_refresh`]).
-fn other_enabled_outputs(name: &str) -> Vec<String> {
-    let ours = format!("Virtual-{name}");
+/// The prefix EVERY managed KWin output shares — Stage 3 names them `punktfunk` / `punktfunk-<id>`,
+/// which KWin exposes as `Virtual-punktfunk` / `Virtual-punktfunk-<id>`. Group membership (§6.1) is
+/// recognised by this prefix, so we never have to thread the live set through the backend.
+const MANAGED_PREFIX: &str = "Virtual-punktfunk";
+
+/// Names of currently-ENABLED outputs that are **not managed by us** — the headless session's
+/// bootstrap output(s) + any physical monitor, i.e. exactly what `exclusive` must disable.
+/// **Group-aware (§6.1):** excludes the WHOLE managed family (the [`MANAGED_PREFIX`]), not just this
+/// session's own output — so a 2nd `exclusive` session (with a distinct per-slot name) never disables
+/// the 1st session's live output. Parsed from `kscreen-doctor -j` (same source as [`read_active_refresh`]).
+fn other_enabled_outputs() -> Vec<String> {
     let out = match std::process::Command::new("kscreen-doctor")
         .arg("-j")
         .output()
@@ -262,19 +268,46 @@ fn other_enabled_outputs(name: &str) -> Vec<String> {
         .and_then(|o| o.as_array())
         .map(|outs| {
             outs.iter()
-                .filter(|o| {
-                    o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false)
-                        && o.get("name").and_then(|n| n.as_str()) != Some(ours.as_str())
-                })
-                .filter_map(|o| o.get("name").and_then(|n| n.as_str()).map(String::from))
+                .filter(|o| o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false))
+                .filter_map(|o| o.get("name").and_then(|n| n.as_str()))
+                .filter(|n| !n.starts_with(MANAGED_PREFIX))
+                .map(String::from)
                 .collect()
         })
         .unwrap_or_default()
 }
 
-/// Set `Virtual-punktfunk` primary and disable the bootstrap output(s) so it becomes the sole
-/// desktop (KWin re-homes plasmashell + windows onto it). Returns the disabled outputs for the
-/// keepalive to re-enable on teardown. Best-effort: on failure, streaming continues (just possibly
+/// True if any managed group member (the [`MANAGED_PREFIX`] family) is ALREADY the KWin primary —
+/// first-slot-wins support (§6.1) so a later exclusive session doesn't steal primary from the group's
+/// first member. Best-effort: if kscreen reports no primary flag we treat it as "none" (the session
+/// then sets itself primary — the pre-group behavior). Recent kscreen marks the primary with
+/// `"priority": 1`; older builds used a `"primary": true` bool — accept either.
+fn a_managed_output_is_primary() -> bool {
+    let Ok(out) = std::process::Command::new("kscreen-doctor").arg("-j").output() else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return false;
+    };
+    doc.get("outputs")
+        .and_then(|o| o.as_array())
+        .map(|outs| {
+            outs.iter().any(|o| {
+                let managed = o
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| n.starts_with(MANAGED_PREFIX));
+                let primary = o.get("primary").and_then(|p| p.as_bool()).unwrap_or(false)
+                    || o.get("priority").and_then(|p| p.as_u64()) == Some(1);
+                managed && primary
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Set `Virtual-punktfunk` primary and disable the bootstrap output(s) so the managed group becomes
+/// the sole desktop (KWin re-homes plasmashell + windows onto it). Returns the disabled outputs for
+/// the keepalive to re-enable on teardown. Best-effort: on failure, streaming continues (just possibly
 /// showing only the wallpaper) rather than failing the session.
 fn apply_virtual_primary(name: &str) -> Vec<String> {
     let ours = format!("Virtual-{name}");
@@ -285,16 +318,21 @@ fn apply_virtual_primary(name: &str) -> Vec<String> {
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    // Make ours primary — KWin usually then re-homes the desktop and disables the bootstrap on its
-    // own. Let that settle, then belt-and-suspenders: disable anything still enabled besides ours so
-    // the streamed output is unambiguously the sole desktop regardless of KWin's implicit behaviour.
-    if !kscreen(&[format!("output.{ours}.primary")]) {
-        tracing::warn!(
-            "KWin: could not set the virtual output primary; client may see only the wallpaper"
-        );
+    // First-slot-wins (§6.1): only grab primary if no managed group member is primary yet — so a 2nd
+    // exclusive session joins as a secondary monitor of the shared desktop instead of stealing the
+    // shell off the 1st session's output. KWin usually then re-homes the desktop + disables the
+    // bootstrap on its own; the belt-and-suspenders disable below covers the rest.
+    if !a_managed_output_is_primary() {
+        if !kscreen(&[format!("output.{ours}.primary")]) {
+            tracing::warn!(
+                "KWin: could not set the virtual output primary; client may see only the wallpaper"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
-    std::thread::sleep(Duration::from_millis(200));
-    let others = other_enabled_outputs(name);
+    // Disable everything still enabled that ISN'T a managed group member (bootstrap / physical), so
+    // the group is unambiguously the desktop — never a sibling session's output (group-aware filter).
+    let others = other_enabled_outputs();
     if !others.is_empty() {
         let args: Vec<String> = others
             .iter()
@@ -554,4 +592,28 @@ fn run(
     stream.close();
     let _ = conn.flush();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MANAGED_PREFIX;
+
+    /// Group-aware exclusive (§6.1): with two managed group members + a physical panel enabled,
+    /// exclusive disables ONLY the non-managed panel — never a sibling session's per-slot output
+    /// (the Stage-3 naming would otherwise make a 2nd exclusive session black out the 1st).
+    #[test]
+    fn exclusive_disables_only_non_managed() {
+        let enabled = [
+            "Virtual-punktfunk",   // base name (shared identity)
+            "Virtual-punktfunk-1", // client A's per-slot output
+            "Virtual-punktfunk-7", // client B's per-slot output
+            "eDP-1",               // a physical panel
+        ];
+        let to_disable: Vec<&str> = enabled
+            .iter()
+            .copied()
+            .filter(|n| !n.starts_with(MANAGED_PREFIX))
+            .collect();
+        assert_eq!(to_disable, vec!["eDP-1"]);
+    }
 }
