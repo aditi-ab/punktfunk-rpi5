@@ -415,7 +415,7 @@ pub(crate) unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedCo
     // live topology each attempt and re-apply until ONLY the keep target is active. Secure-desktop
     // correctness depends on this — the lock screen must not land on a stray panel while we stream.
     for attempt in 1..=4u32 {
-        let (mut paths, mut modes) = query_active_config()?;
+        let (mut paths, modes) = query_active_config()?;
         let mut others = 0u32;
         for p in paths.iter_mut() {
             if p.targetInfo.id == keep_target_id {
