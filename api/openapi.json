@@ -138,6 +138,58 @@
         }
       }
     },
+    "/api/v1/display/layout": {
+      "put": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Arrange virtual displays",
+        "description": "Set the **manual** desktop arrangement — per-identity-slot `(x, y)` offsets so a multi-monitor\ngroup (§6A/§6B) comes back where the operator placed it. Persisted into the policy's layout block\nand switched to manual mode; applied from the next connect (a live group re-applies on its next\nacquire). Locks in the current effective behavior as explicit fields, so arranging displays never\nsilently changes keep-alive/topology/conflict/identity. See `design/display-management.md` §6.2.",
+        "operationId": "setDisplayLayout",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DisplayLayoutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Layout stored; the new settings state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DisplaySettingsState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Layout could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/display/release": {
       "post": {
         "tags": [
@@ -1775,7 +1827,12 @@
           "backend",
           "mode",
           "state",
-          "sessions"
+          "sessions",
+          "group",
+          "display_index",
+          "x",
+          "y",
+          "topology"
         ],
         "properties": {
           "backend": {
@@ -1789,6 +1846,12 @@
             ],
             "description": "Short client label, when the owner tracks it."
           },
+          "display_index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "This display's ordinal within its group, in acquire order (0-based).",
+            "minimum": 0
+          },
           "expires_in_ms": {
             "type": [
               "integer",
@@ -1796,6 +1859,21 @@
             ],
             "format": "int64",
             "description": "Milliseconds until a lingering display is torn down (absent when active/pinned).",
+            "minimum": 0
+          },
+          "group": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Display group (shared desktop) id — several displays with the same group form one desktop (§6A).",
+            "minimum": 0
+          },
+          "identity_slot": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Stable per-client identity slot keying persistent config + manual layout (absent = shared/anonymous).",
             "minimum": 0
           },
           "mode": {
@@ -1817,6 +1895,20 @@
           "state": {
             "type": "string",
             "description": "`active` | `lingering` | `pinned`."
+          },
+          "topology": {
+            "type": "string",
+            "description": "Effective topology for this display's group (`extend` | `primary` | `exclusive`)."
+          },
+          "x": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Desktop-space top-left `x` (auto-row or the console's manual arrangement, §6.2)."
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Desktop-space top-left `y`."
           }
         }
       },
@@ -2128,6 +2220,22 @@
           }
         }
       },
+      "DisplayLayoutRequest": {
+        "type": "object",
+        "description": "Request body for `setDisplayLayout`: per-identity-slot desktop offsets, keyed by the identity-slot\nid as a string (the same id `/display/state` reports as `identity_slot`).",
+        "properties": {
+          "positions": {
+            "type": "object",
+            "description": "`{\"<identity_slot>\": {\"x\": …, \"y\": …}}` — where each arranged display's top-left sits.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Position"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "DisplayPolicy": {
         "type": "object",
         "description": "The user-facing display-management policy — what `display-settings.json` holds and what the mgmt\nAPI GETs/PUTs. When [`preset`](Self::preset) is not [`Preset::Custom`] the explicit fields are\nignored (the console writes one or the other); [`effective`](Self::effective) resolves both to a\nsingle [`EffectivePolicy`].",
@@ -2188,7 +2296,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Option names this build enforces right now (e.g. `keep_alive`, `topology`). The remaining\nstored options (`mode_conflict`, `identity`, `layout`) land in later stages — surfaced so the\nconsole can mark them \"coming soon\" instead of implying they already take effect."
+            "description": "Option names this build enforces right now. All five axes are now acted on (keep_alive +\ntopology since Stage 0-2, identity Stage 3, mode_conflict Stage 4, layout Stage 5) — the console\nreads this to know which controls are live vs. \"coming soon\" (per-backend nuance, e.g. layout\nposition apply being KWin-only, is reported per display in `/display/state`)."
           },
           "presets": {
             "type": "array",

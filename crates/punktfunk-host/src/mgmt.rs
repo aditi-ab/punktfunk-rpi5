@@ -160,6 +160,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(set_display_settings))
                 .routes(routes!(get_display_state))
                 .routes(routes!(release_display))
+                .routes(routes!(set_display_layout))
                 .routes(routes!(get_status))
                 .routes(routes!(get_local_summary))
                 .routes(routes!(list_paired_clients))
@@ -988,9 +989,10 @@ struct DisplaySettingsState {
     effective: crate::vdisplay::policy::EffectivePolicy,
     /// Every named preset and what it expands to (for the picker's preview).
     presets: Vec<PresetInfo>,
-    /// Option names this build enforces right now (e.g. `keep_alive`, `topology`). The remaining
-    /// stored options (`mode_conflict`, `identity`, `layout`) land in later stages — surfaced so the
-    /// console can mark them "coming soon" instead of implying they already take effect.
+    /// Option names this build enforces right now. All five axes are now acted on (keep_alive +
+    /// topology since Stage 0-2, identity Stage 3, mode_conflict Stage 4, layout Stage 5) — the console
+    /// reads this to know which controls are live vs. "coming soon" (per-backend nuance, e.g. layout
+    /// position apply being KWin-only, is reported per display in `/display/state`).
     enforced: Vec<String>,
 }
 
@@ -1031,7 +1033,13 @@ fn display_settings_state() -> DisplaySettingsState {
         settings,
         configured,
         presets,
-        enforced: vec!["keep_alive".into(), "topology".into()],
+        enforced: vec![
+            "keep_alive".into(),
+            "topology".into(),
+            "mode_conflict".into(),
+            "identity".into(),
+            "layout".into(),
+        ],
     }
 }
 
@@ -1114,6 +1122,18 @@ struct ApiDisplayInfo {
     sessions: u32,
     /// Short client label, when the owner tracks it.
     client: Option<String>,
+    /// Display group (shared desktop) id — several displays with the same group form one desktop (§6A).
+    group: u32,
+    /// This display's ordinal within its group, in acquire order (0-based).
+    display_index: u32,
+    /// Desktop-space top-left `x` (auto-row or the console's manual arrangement, §6.2).
+    x: i32,
+    /// Desktop-space top-left `y`.
+    y: i32,
+    /// Stable per-client identity slot keying persistent config + manual layout (absent = shared/anonymous).
+    identity_slot: Option<u32>,
+    /// Effective topology for this display's group (`extend` | `primary` | `exclusive`).
+    topology: String,
 }
 
 /// The host's managed virtual displays right now.
@@ -1166,6 +1186,12 @@ async fn get_display_state() -> Json<DisplayStateResponse> {
                 expires_in_ms: d.expires_in_ms,
                 sessions: d.sessions,
                 client: d.client,
+                group: d.group,
+                display_index: d.display_index,
+                x: d.position.0,
+                y: d.position.1,
+                identity_slot: d.identity_slot,
+                topology: d.topology,
             })
             .collect(),
     })
@@ -1193,6 +1219,53 @@ async fn release_display(
     let released = crate::vdisplay::registry::release(req.slot);
     tracing::info!(slot = ?req.slot, released, "management API: display release");
     Json(ReleaseDisplayResult { released })
+}
+
+/// Request body for `setDisplayLayout`: per-identity-slot desktop offsets, keyed by the identity-slot
+/// id as a string (the same id `/display/state` reports as `identity_slot`).
+#[derive(Deserialize, ToSchema)]
+struct DisplayLayoutRequest {
+    /// `{"<identity_slot>": {"x": …, "y": …}}` — where each arranged display's top-left sits.
+    #[serde(default)]
+    positions: std::collections::BTreeMap<String, crate::vdisplay::policy::Position>,
+}
+
+/// Arrange virtual displays
+///
+/// Set the **manual** desktop arrangement — per-identity-slot `(x, y)` offsets so a multi-monitor
+/// group (§6A/§6B) comes back where the operator placed it. Persisted into the policy's layout block
+/// and switched to manual mode; applied from the next connect (a live group re-applies on its next
+/// acquire). Locks in the current effective behavior as explicit fields, so arranging displays never
+/// silently changes keep-alive/topology/conflict/identity. See `design/display-management.md` §6.2.
+#[utoipa::path(
+    put,
+    path = "/display/layout",
+    tag = "display",
+    operation_id = "setDisplayLayout",
+    request_body = DisplayLayoutRequest,
+    responses(
+        (status = OK, description = "Layout stored; the new settings state", body = DisplaySettingsState),
+        (status = INTERNAL_SERVER_ERROR, description = "Layout could not be persisted", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn set_display_layout(ApiJson(req): ApiJson<DisplayLayoutRequest>) -> Response {
+    let store = crate::vdisplay::policy::prefs();
+    // Lock the current effective behavior into explicit fields + set the manual arrangement (pure
+    // transform, unit-tested in `policy.rs`) — so arranging displays is orthogonal to the other policy
+    // axes. (`effective` keep_alive is never `Forever` via the API — the settings PUT rejects it.)
+    let policy = store.get().effective().with_manual_layout(req.positions);
+    if let Err(e) = store.set(policy) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("persist display layout: {e:#}"),
+        );
+    }
+    tracing::info!(
+        positions = display_settings_state().settings.layout.positions.len(),
+        "management API: display layout updated"
+    );
+    Json(display_settings_state()).into_response()
 }
 
 /// Live host status
@@ -2740,7 +2813,12 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert!(enforced.contains(&"keep_alive") && enforced.contains(&"topology"));
+        // All five axes are enforced now (Stages 0-5).
+        assert!(enforced.contains(&"keep_alive"));
+        assert!(enforced.contains(&"topology"));
+        assert!(enforced.contains(&"mode_conflict"));
+        assert!(enforced.contains(&"identity"));
+        assert!(enforced.contains(&"layout"));
 
         // `gaming-rig` expands to keep_alive: forever → rejected at Stage 0 (before any write).
         let put = axum::http::Request::put("/api/v1/display/settings")

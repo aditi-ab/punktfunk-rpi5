@@ -64,6 +64,23 @@ pub trait VirtualDisplay: Send {
     /// Default: no-op — only the Windows pf-vdisplay backend uses it (Linux compositors own their virtual
     /// output identity). `None` = anonymous/unpaired/GameStream → the backend's auto (slot-based) identity.
     fn set_client_identity(&mut self, _fingerprint: Option<[u8; 32]>) {}
+    /// The stable identity slot the backend resolved for the most recent [`create`](Self::create) —
+    /// the per-client id the identity policy assigned (`Some`), or `None` for shared/anonymous. The
+    /// registry reads it right after `create` to key the display's group **arrangement** (manual
+    /// per-slot positions) and to label the mgmt `/display/state` slot. Default `None`: a backend
+    /// with no per-client identity (Mutter/wlroots/gamescope) always auto-rows. Only KWin (per-slot
+    /// output naming) reports a real slot on Linux.
+    fn last_identity_slot(&self) -> Option<u32> {
+        None
+    }
+    /// Place the most-recently-[created](Self::create) output at `(x, y)` in the desktop coordinate
+    /// space (design `display-management.md` §6.2 — layout). The registry, which owns the display
+    /// **group**, computes the position from the whole group (auto-row or the console's manual
+    /// arrangement) and calls this right after `create`. Default no-op: only backends that can position
+    /// an output (KWin) implement it; the registry never calls it for the desktop origin `(0, 0)`, so a
+    /// single-display / first-of-group session issues no positioning at all. Best-effort — a failure
+    /// leaves the compositor's default placement.
+    fn apply_position(&mut self, _x: i32, _y: i32) {}
 }
 
 /// Compositors punktfunk knows how to drive (plan §6).
@@ -728,6 +745,11 @@ pub(crate) mod lifecycle;
 // later), for the management API's /display/state + /display/release.
 #[path = "vdisplay/registry.rs"]
 pub(crate) mod registry;
+
+// The pure display-arrangement engine (auto-row / manual → per-member positions), platform-neutral
+// and unit-tested; the registry (state readout) and the KWin position apply consume it.
+#[path = "vdisplay/layout.rs"]
+pub(crate) mod layout;
 
 /// Resolve a [`policy::Topology`] to a concrete value (never [`policy::Topology::Auto`]). `Auto`
 /// reproduces today's default: **extend** under an explicit `PUNKTFUNK_COMPOSITOR` pin (the CI/test

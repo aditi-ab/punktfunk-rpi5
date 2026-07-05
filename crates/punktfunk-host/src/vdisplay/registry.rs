@@ -40,12 +40,38 @@ pub struct DisplayInfo {
     pub sessions: u32,
     /// Short client label (cert-fp prefix / peer), when the owner tracks it.
     pub client: Option<String>,
+    /// Display **group** (shared desktop) id (design §6.1): Linux gives every backend session one
+    /// group; Windows is single-group (`1`).
+    pub group: u32,
+    /// This display's ordinal within its group, in acquire order (0-based) — the §6A "which monitor".
+    pub display_index: u32,
+    /// Desktop-space top-left origin `(x, y)` (design §6.2): auto-row, or the console's manual
+    /// arrangement when configured.
+    pub position: (i32, i32),
+    /// The stable per-client identity slot keying this display's persistent config + manual layout
+    /// (§5.4); `None` for a shared/anonymous identity.
+    pub identity_slot: Option<u32>,
+    /// The effective topology for this display's group (`"extend"` | `"primary"` | `"exclusive"`).
+    pub topology: String,
 }
 
 /// The live display set for the mgmt `/display/state` endpoint.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub displays: Vec<DisplayInfo>,
+}
+
+/// The effective display topology as a lowercase string for the snapshot (`effective_topology`
+/// resolves `Auto` away; the arm is defensive).
+fn topology_str() -> String {
+    use super::policy::Topology;
+    match super::effective_topology() {
+        Topology::Extend => "extend",
+        Topology::Primary => "primary",
+        Topology::Exclusive => "exclusive",
+        Topology::Auto => "auto",
+    }
+    .to_string()
 }
 
 /// Acquire a virtual display for a session: reuse a kept (lingering/pinned) display of the same
@@ -74,6 +100,9 @@ pub fn acquire(
 pub fn snapshot() -> Snapshot {
     #[cfg(target_os = "windows")]
     {
+        // Windows is single-monitor at this stage (§6.6 multi-monitor is Stage 7): one group, index 0,
+        // origin. Its per-client identity lives in the driver (EDID serial / ConnectorIndex), not
+        // surfaced here yet.
         let displays = super::manager::snapshot()
             .map(|i| DisplayInfo {
                 slot: i.gen,
@@ -83,6 +112,11 @@ pub fn snapshot() -> Snapshot {
                 expires_in_ms: i.expires_in_ms,
                 sessions: i.sessions,
                 client: None,
+                group: 1,
+                display_index: 0,
+                position: (0, 0),
+                identity_slot: None,
+                topology: topology_str(),
             })
             .into_iter()
             .collect();
@@ -137,7 +171,7 @@ mod linux {
 
     use super::DisplayInfo;
     use crate::vdisplay::lifecycle::{self, Release};
-    use crate::vdisplay::policy::{self, Linger};
+    use crate::vdisplay::policy::{self, Layout, Linger};
     use crate::vdisplay::{Mode, VirtualDisplay, VirtualOutput};
 
     /// One pooled display: the lifecycle state + the backend's REAL keepalive (kept alive here so the
@@ -152,6 +186,10 @@ mod linux {
         preferred_mode: Option<(u32, u32, u32)>,
         mode: Mode,
         backend: &'static str,
+        /// The identity slot the backend resolved for this display (KWin per-slot naming; `None` for
+        /// shared/anonymous or a backend with no per-client identity) — keys the group arrangement +
+        /// the `/display/state` slot. Captured at create; kept across a keep-alive reuse.
+        identity_slot: Option<u32>,
         /// Generation stamp: a [`DisplayLease`] only releases if its gen still matches (a stale lease
         /// — its entry was reused + re-stamped — is a no-op).
         gen: u64,
@@ -273,6 +311,9 @@ mod linux {
 
         // Create a fresh display (NOT under the lock — `vd.create` blocks + spawns threads).
         let real = vd.create(mode)?;
+        // The identity slot the backend just resolved (KWin per-slot naming; `None` elsewhere) — keys
+        // the group arrangement (manual per-slot positions) + the state slot.
+        let identity_slot = vd.last_identity_slot();
 
         // wlroots (remote_fd = Some, sandboxed xdpw portal) can't be kept without re-opening the
         // portal fd per attach — pass it through unchanged (capturer owns it, teardown on drop). The
@@ -297,9 +338,49 @@ mod linux {
             preferred_mode,
             mode,
             backend,
+            identity_slot,
             gen,
         };
-        r.entries.lock().unwrap().push(entry);
+
+        // Compute this new display's position in its group (design §6.2) BEFORE pushing, then push
+        // under the same lock: the group is the same-backend entries; the new one appends last
+        // (rightmost under auto-row). `position_for_new` is pure; the lock is held only across it
+        // (I/O-free) — the backend apply is below, outside the lock.
+        let position = {
+            use crate::vdisplay::layout::Member;
+            let layout_policy = policy::prefs()
+                .configured_effective()
+                .map(|e| e.layout)
+                .unwrap_or_default();
+            let mut es = r.entries.lock().unwrap();
+            let existing: Vec<(u64, Member)> = es
+                .iter()
+                .filter(|e| e.backend == backend)
+                .map(|e| {
+                    (
+                        e.gen,
+                        Member {
+                            identity_slot: e.identity_slot,
+                            width: e.mode.width as i32,
+                        },
+                    )
+                })
+                .collect();
+            let new_member = Member {
+                identity_slot,
+                width: mode.width as i32,
+            };
+            let pos = position_for_new(existing, new_member, &layout_policy);
+            es.push(entry);
+            pos
+        };
+        // Place the new output (design §6.2), best-effort, OUTSIDE the lock (kscreen blocks). Skip the
+        // desktop origin `(0, 0)` — it's the compositor default, so a single-display / first-of-group
+        // session (and every non-KWin backend, which no-ops `apply_position`) issues no positioning at
+        // all: the historical single-display path is untouched. *On-glass-validation-pending.*
+        if (position.x, position.y) != (0, 0) {
+            vd.apply_position(position.x, position.y);
+        }
         Ok(output_for(node_id, preferred_mode, gen))
     }
 
@@ -343,38 +424,135 @@ mod linux {
         }
     }
 
+    /// One live/kept display, flattened out of the pool under the lock — so the group + arrangement
+    /// math (which calls the layout engine) runs OUTSIDE the lock.
+    struct Row {
+        gen: u64,
+        backend: &'static str,
+        mode: Mode,
+        identity_slot: Option<u32>,
+        state: &'static str,
+        expires_in_ms: Option<u64>,
+        sessions: u32,
+    }
+
     pub(super) fn snapshot() -> Vec<DisplayInfo> {
         let Some(r) = REG.get() else {
             return Vec::new();
         };
         let now = Instant::now();
-        r.entries
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|e| {
-                let (state, expires_in_ms, sessions) = match e.life {
-                    lifecycle::State::Active { refs } => ("active", None, refs),
-                    lifecycle::State::Lingering { until } => (
-                        "lingering",
-                        Some(until.saturating_duration_since(now).as_millis() as u64),
-                        0,
-                    ),
-                    lifecycle::State::Pinned => ("pinned", None, 0),
-                    // Idle entries are never stored (removed on teardown).
-                    lifecycle::State::Idle => return None,
-                };
-                Some(DisplayInfo {
-                    slot: e.gen,
-                    backend: e.backend.to_string(),
-                    mode: (e.mode.width, e.mode.height, e.mode.refresh_hz),
-                    state: state.to_string(),
-                    expires_in_ms,
-                    sessions,
-                    client: None,
+
+        // Flatten the live/kept entries under the lock (skip Idle — never stored anyway).
+        let rows: Vec<Row> = {
+            let es = r.entries.lock().unwrap();
+            es.iter()
+                .filter_map(|e| {
+                    let (state, expires_in_ms, sessions) = match e.life {
+                        lifecycle::State::Active { refs } => ("active", None, refs),
+                        lifecycle::State::Lingering { until } => (
+                            "lingering",
+                            Some(until.saturating_duration_since(now).as_millis() as u64),
+                            0,
+                        ),
+                        lifecycle::State::Pinned => ("pinned", None, 0),
+                        lifecycle::State::Idle => return None,
+                    };
+                    Some(Row {
+                        gen: e.gen,
+                        backend: e.backend,
+                        mode: e.mode,
+                        identity_slot: e.identity_slot,
+                        state,
+                        expires_in_ms,
+                        sessions,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        };
+
+        let topology = super::topology_str();
+        // The arrangement policy: the console's manual layout when configured, else auto-row.
+        let layout_policy: Layout = policy::prefs()
+            .configured_effective()
+            .map(|e| e.layout)
+            .unwrap_or_default();
+
+        assemble_displays(rows, &layout_policy, &topology)
+    }
+
+    /// The desktop position for a display just appended to its group (design §6.2): the group's
+    /// `existing` members (each with its acquire `gen`) plus `new` last, ordered by `gen`, arranged by
+    /// the pure [`layout`] engine, taking the new member's placement. Pure — so the append-in-acquire-
+    /// order + auto-row/manual arrangement is unit-tested independent of the pool/global.
+    fn position_for_new(
+        mut existing: Vec<(u64, crate::vdisplay::layout::Member)>,
+        new: crate::vdisplay::layout::Member,
+        layout_policy: &Layout,
+    ) -> crate::vdisplay::layout::Placement {
+        existing.sort_by_key(|(g, _)| *g);
+        let mut members: Vec<crate::vdisplay::layout::Member> =
+            existing.into_iter().map(|(_, m)| m).collect();
+        members.push(new);
+        *crate::vdisplay::layout::arrange(&members, layout_policy)
+            .last()
+            .expect("members is non-empty (just pushed `new`)")
+    }
+
+    /// Group the flattened rows into the mgmt `/display/state` view (design §6.1/§6.2): group = backend
+    /// (one desktop per compositor session), ordered by acquire (`gen`), with each member's position
+    /// from the pure [`layout`] engine. Pure — no I/O, no global — so the grouping / ordering / position
+    /// assignment is unit-tested against synthetic rows.
+    fn assemble_displays(
+        rows: Vec<Row>,
+        layout_policy: &Layout,
+        topology: &str,
+    ) -> Vec<DisplayInfo> {
+        use crate::vdisplay::layout::{self, Member};
+
+        // Small stable group ids by sorted backend name — deterministic; in practice a host runs one
+        // live backend → group 1.
+        let mut backends: Vec<&'static str> = rows.iter().map(|row| row.backend).collect();
+        backends.sort_unstable();
+        backends.dedup();
+
+        let mut out: Vec<DisplayInfo> = Vec::new();
+        for (gi, backend) in backends.iter().enumerate() {
+            // This group's members in acquire order (gen ascending) → display_index + arrangement.
+            let mut idx: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.backend == *backend)
+                .map(|(i, _)| i)
+                .collect();
+            idx.sort_by_key(|&i| rows[i].gen);
+            let members: Vec<Member> = idx
+                .iter()
+                .map(|&i| Member {
+                    identity_slot: rows[i].identity_slot,
+                    width: rows[i].mode.width as i32,
+                })
+                .collect();
+            let places = layout::arrange(&members, layout_policy);
+            for (ord, &i) in idx.iter().enumerate() {
+                let row = &rows[i];
+                let p = places[ord];
+                out.push(DisplayInfo {
+                    slot: row.gen,
+                    backend: row.backend.to_string(),
+                    mode: (row.mode.width, row.mode.height, row.mode.refresh_hz),
+                    state: row.state.to_string(),
+                    expires_in_ms: row.expires_in_ms,
+                    sessions: row.sessions,
+                    client: None,
+                    group: gi as u32 + 1,
+                    display_index: ord as u32,
+                    position: (p.x, p.y),
+                    identity_slot: row.identity_slot,
+                    topology: topology.to_string(),
+                });
+            }
+        }
+        out
     }
 
     pub(super) fn force_release(slot: Option<u64>) -> usize {
@@ -413,6 +591,107 @@ mod linux {
     impl Drop for DisplayLease {
         fn drop(&mut self) {
             release(self.gen);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::vdisplay::policy::{Layout, LayoutMode, Position};
+        use std::collections::BTreeMap;
+
+        fn row(gen: u64, backend: &'static str, w: u32, slot: Option<u32>) -> Row {
+            Row {
+                gen,
+                backend,
+                mode: Mode {
+                    width: w,
+                    height: 1080,
+                    refresh_hz: 60,
+                },
+                identity_slot: slot,
+                state: "active",
+                expires_in_ms: None,
+                sessions: 1,
+            }
+        }
+
+        #[test]
+        fn groups_by_backend_and_auto_rows_in_acquire_order() {
+            // Two KWin displays (acquired gen 5 then gen 2 — deliberately out of vec order) + a Mutter one.
+            let rows = vec![
+                row(5, "kwin", 2560, Some(1)),
+                row(2, "kwin", 1920, Some(7)),
+                row(9, "mutter", 3840, None),
+            ];
+            let out = assemble_displays(rows, &Layout::default(), "exclusive");
+
+            let kwin: Vec<&DisplayInfo> = out.iter().filter(|d| d.backend == "kwin").collect();
+            assert_eq!(kwin.len(), 2);
+            assert_eq!(kwin[0].slot, 2); // lower gen (earlier acquire) sorts to index 0
+            assert_eq!(kwin[0].display_index, 0);
+            assert_eq!(kwin[0].position, (0, 0));
+            assert_eq!(kwin[1].slot, 5);
+            assert_eq!(kwin[1].display_index, 1);
+            assert_eq!(kwin[1].position, (1920, 0)); // auto-row: after the 1920px gen-2 display
+            assert_eq!(kwin[0].topology, "exclusive");
+
+            // A distinct backend is a distinct group.
+            let mutter = out.iter().find(|d| d.backend == "mutter").unwrap();
+            assert_ne!(mutter.group, kwin[0].group);
+            assert_eq!(mutter.display_index, 0);
+            assert_eq!(mutter.position, (0, 0));
+        }
+
+        #[test]
+        fn position_for_new_appends_right_in_acquire_order() {
+            use crate::vdisplay::layout::{Member, Placement};
+            let m = |slot, w| Member {
+                identity_slot: slot,
+                width: w,
+            };
+            // Existing group (given out of gen order): gen 8 @ 1920 acquired AFTER gen 3 @ 2560.
+            let existing = vec![(8, m(Some(2), 1920)), (3, m(Some(1), 2560))];
+            // A new 1280-wide display appends to the right of 2560 + 1920.
+            let pos = position_for_new(existing, m(Some(5), 1280), &Layout::default());
+            assert_eq!(pos, Placement { x: 4480, y: 0 });
+            // First-of-group lands at the origin (so the registry skips the apply).
+            let first = position_for_new(vec![], m(None, 3840), &Layout::default());
+            assert_eq!(first, Placement { x: 0, y: 0 });
+        }
+
+        #[test]
+        fn position_for_new_honors_a_manual_pin() {
+            use crate::vdisplay::layout::{Member, Placement};
+            let mut positions = BTreeMap::new();
+            positions.insert("5".to_string(), Position { x: 100, y: 200 });
+            let layout = Layout {
+                mode: LayoutMode::Manual,
+                positions,
+            };
+            let new = Member {
+                identity_slot: Some(5),
+                width: 1280,
+            };
+            let pos = position_for_new(vec![(1, new)], new, &layout);
+            assert_eq!(pos, Placement { x: 100, y: 200 });
+        }
+
+        #[test]
+        fn manual_layout_keys_positions_by_identity_slot() {
+            // Client 7 arranged to the LEFT of client 1 (reversed vs. auto-row).
+            let rows = vec![row(1, "kwin", 2560, Some(1)), row(2, "kwin", 1920, Some(7))];
+            let mut positions = BTreeMap::new();
+            positions.insert("1".to_string(), Position { x: 1920, y: 0 });
+            positions.insert("7".to_string(), Position { x: 0, y: 0 });
+            let layout = Layout {
+                mode: LayoutMode::Manual,
+                positions,
+            };
+            let out = assemble_displays(rows, &layout, "extend");
+            let by_slot = |s: u32| out.iter().find(|d| d.identity_slot == Some(s)).unwrap();
+            assert_eq!(by_slot(1).position, (1920, 0));
+            assert_eq!(by_slot(7).position, (0, 0));
         }
     }
 }

@@ -273,6 +273,29 @@ impl DisplayPolicy {
     }
 }
 
+impl EffectivePolicy {
+    /// Build a persistable `Custom` [`DisplayPolicy`] that keeps THIS effective behavior but replaces
+    /// the arrangement with a **manual** layout at `positions` — the `/display/layout` endpoint's
+    /// transform, factored out pure so arranging displays stays orthogonal to the other axes and is
+    /// unit-tested without touching the global store. (`Custom` so the explicit fields — incl. the new
+    /// layout — rule; a named preset would ignore them.)
+    pub fn with_manual_layout(&self, positions: BTreeMap<String, Position>) -> DisplayPolicy {
+        DisplayPolicy {
+            version: 1,
+            preset: Preset::Custom,
+            keep_alive: self.keep_alive,
+            topology: self.topology,
+            mode_conflict: self.mode_conflict,
+            identity: self.identity,
+            layout: Layout {
+                mode: LayoutMode::Manual,
+                positions,
+            },
+            max_displays: self.max_displays,
+        }
+    }
+}
+
 /// The field bundle a named preset expands to; `None` for [`Preset::Custom`]. The single expansion
 /// table — the docs' preset table mirrors this and the `presets_match_doc` test guards the shape.
 pub fn preset_fields(preset: Preset) -> Option<EffectivePolicy> {
@@ -524,6 +547,33 @@ mod tests {
         }
         .sanitized();
         assert_eq!(p.max_displays, 16);
+    }
+
+    #[test]
+    fn with_manual_layout_preserves_behavior_and_sets_positions() {
+        // Start from a preset's effective behavior (workstation: 5-min linger, exclusive, per-client).
+        let eff = DisplayPolicy {
+            preset: Preset::Workstation,
+            ..DisplayPolicy::default()
+        }
+        .effective();
+        let mut positions = BTreeMap::new();
+        positions.insert("1".to_string(), Position { x: 0, y: 0 });
+        positions.insert("7".to_string(), Position { x: 2560, y: 0 });
+        let p = eff.with_manual_layout(positions);
+        // Preset drops to Custom so the explicit fields (incl. the layout) rule…
+        assert_eq!(p.preset, Preset::Custom);
+        // …every other behavior axis is preserved verbatim…
+        assert_eq!(p.keep_alive, eff.keep_alive);
+        assert_eq!(p.topology, eff.topology);
+        assert_eq!(p.mode_conflict, eff.mode_conflict);
+        assert_eq!(p.identity, eff.identity);
+        assert_eq!(p.max_displays, eff.max_displays);
+        // …and the arrangement is the manual layout we asked for, surviving the effective round-trip.
+        let e2 = p.effective();
+        assert_eq!(e2.layout.mode, LayoutMode::Manual);
+        let want = Position { x: 2560, y: 0 };
+        assert_eq!(e2.layout.positions.get("7"), Some(&want));
     }
 
     #[test]

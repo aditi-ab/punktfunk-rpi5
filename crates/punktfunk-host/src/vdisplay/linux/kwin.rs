@@ -75,6 +75,13 @@ const MAX_VERSION: u32 = 5;
 #[derive(Default)]
 pub struct KwinDisplay {
     client_fp: Option<[u8; 32]>,
+    /// The identity slot the last [`create`](VirtualDisplay::create) resolved (the per-client id, or
+    /// `None` for shared/anonymous) — reported to the registry via [`last_identity_slot`] so it can key
+    /// the group arrangement + `/display/state` slot to the same id this backend named the output with.
+    last_slot: Option<u32>,
+    /// The base output name the last `create` used (`punktfunk` / `punktfunk-<id>`) — so
+    /// [`apply_position`](VirtualDisplay::apply_position) can address the KWin output `Virtual-<name>`.
+    last_name: Option<String>,
 }
 
 impl KwinDisplay {
@@ -92,20 +99,45 @@ impl VirtualDisplay for KwinDisplay {
         self.client_fp = fingerprint;
     }
 
+    fn last_identity_slot(&self) -> Option<u32> {
+        self.last_slot
+    }
+
+    fn apply_position(&mut self, x: i32, y: i32) {
+        let Some(name) = self.last_name.clone() else {
+            return;
+        };
+        let output = format!("Virtual-{name}");
+        // kscreen-doctor position syntax: `output.<name>.position.<x>,<y>`.
+        let ok = std::process::Command::new("kscreen-doctor")
+            .arg(format!("output.{output}.position.{x},{y}"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            tracing::info!(output, x, y, "KWin: placed output in the desktop layout");
+        } else {
+            tracing::warn!(output, x, y, "KWin: output position apply failed");
+        }
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         // Per-slot output name (Stage 3): the `identity` policy resolves the client to a stable id →
         // `punktfunk-<id>` (KWin exposes `Virtual-punktfunk-<id>`, whose per-output config KWin
         // persists by name). Shared / anonymous → the base `punktfunk` (today's single name). Linux
         // defaults to Shared when unconfigured, so this is a no-op change until a policy opts in — AND
         // it fixes the latent clash where two concurrent sessions both used `Virtual-punktfunk`.
-        let name = match crate::vdisplay::identity::resolve_slot(
+        let slot = crate::vdisplay::identity::resolve_slot(
             self.client_fp,
             (mode.width, mode.height),
             crate::vdisplay::policy::Identity::Shared,
-        ) {
+        );
+        self.last_slot = slot; // reported to the registry for the group arrangement + state slot
+        let name = match slot {
             Some(id) => format!("{VOUT_NAME}-{id}"),
             None => VOUT_NAME.to_string(),
         };
+        self.last_name = Some(name.clone()); // for apply_position (registry-driven §6.2 layout)
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
@@ -149,6 +181,8 @@ impl VirtualDisplay for KwinDisplay {
             }
             Topology::Extend | Topology::Auto => Vec::new(),
         };
+        // Layout position (§6.2) is applied by the registry via `apply_position` right after create
+        // (it owns the display group, so it computes auto-row / manual placement over the whole group).
         Ok(VirtualOutput {
             node_id,
             remote_fd: None,
