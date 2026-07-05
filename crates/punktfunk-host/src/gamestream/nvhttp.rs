@@ -138,44 +138,32 @@ async fn h_launch(
         _ => None,
     };
 
-    // Mode-conflict ADMISSION (Stage 4). GameStream is single-session (`st.launch`), so when a
-    // DIFFERENT paired client launches while a session is live, the `mode_conflict` policy governs:
-    // `reject` → 503 (Moonlight shows "host is busy"); `join` → serve at the live session's mode;
-    // `steal`/`separate` (GameStream can't do separate) / unconfigured → take over (today's last-wins).
-    // A same-client re-launch is never a conflict.
+    // Mode-conflict ADMISSION (Stage 4) — GameStream is single-session (`st.launch`), so a DIFFERENT
+    // paired client launching while a session is live is governed by `mode_conflict` (see
+    // [`gamestream_admission`]). Snapshot the live owner + mode (Copy) so the lock isn't held over it.
     let mut forced_mode: Option<(u32, u32, u32)> = None;
     {
-        let cur = st.launch.lock().unwrap();
-        if let Some(s) = cur.as_ref() {
-            let different = match (&s.owner_fp, &req_fp) {
-                (Some(owner), Some(req)) => owner != req,
-                _ => true, // unknown owner or anonymous requester → treat as a different client
-            };
-            if different {
-                use crate::vdisplay::policy::{self, ModeConflict};
-                let conflict = policy::prefs()
-                    .configured_effective()
-                    .map(|e| e.mode_conflict)
-                    .unwrap_or(ModeConflict::Separate);
-                match conflict {
-                    ModeConflict::Reject => {
-                        tracing::warn!(
-                            "GameStream launch REJECTED — host busy streaming {}x{}@{} to another client",
-                            s.width, s.height, s.fps
-                        );
-                        return (StatusCode::SERVICE_UNAVAILABLE, xml(error_xml())).into_response();
-                    }
-                    ModeConflict::Join => {
-                        forced_mode = Some((s.width, s.height, s.fps));
-                        tracing::info!(
-                            "GameStream launch JOIN — admitting at the live session's mode {}x{}@{}",
-                            s.width, s.height, s.fps
-                        );
-                    }
-                    ModeConflict::Steal | ModeConflict::Separate => tracing::info!(
-                        "GameStream launch STEAL — a different client is taking over the live session"
-                    ),
-                }
+        let live = st
+            .launch
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| (s.owner_fp, (s.width, s.height, s.fps)));
+        let conflict = crate::vdisplay::policy::prefs()
+            .configured_effective()
+            .map(|e| e.mode_conflict)
+            .unwrap_or(crate::vdisplay::policy::ModeConflict::Separate);
+        match gamestream_admission(live, req_fp, conflict) {
+            GsDecision::Serve => {}
+            GsDecision::Join((w, h, f)) => {
+                forced_mode = Some((w, h, f));
+                tracing::info!("GameStream launch JOIN — admitting at the live session's mode {w}x{h}@{f}");
+            }
+            GsDecision::Reject => {
+                tracing::warn!(
+                    "GameStream launch REJECTED — host busy (mode_conflict=reject, session owned by another client)"
+                );
+                return (StatusCode::SERVICE_UNAVAILABLE, xml(error_xml())).into_response();
             }
         }
     }
@@ -277,6 +265,48 @@ fn parse_mode(mode: &str) -> Option<(u32, u32, u32)> {
     let h = it.next()?.parse().ok()?;
     let fps = it.next()?.parse().ok()?;
     Some((w, h, fps))
+}
+
+/// A live GameStream session's `(owner cert fingerprint, mode)` snapshot for [`gamestream_admission`].
+type LiveGs = (Option<[u8; 32]>, (u32, u32, u32));
+
+/// The outcome of [`gamestream_admission`].
+enum GsDecision {
+    /// Proceed with the launch (no live session, a same-client re-launch, or `steal`/`separate`
+    /// taking over the single session).
+    Serve,
+    /// Serve at the live session's mode (`join` — honest-downgrade).
+    Join((u32, u32, u32)),
+    /// Refuse with a 503 (`reject`).
+    Reject,
+}
+
+/// The GameStream single-session mode-conflict decision (Stage 4, pure so it's unit-tested). `live`
+/// is the currently-live session's `(owner_fp, mode)` (`None` ⇒ no session live). No session or a
+/// same-client re-launch ⇒ `Serve`; a DIFFERENT client launching applies `policy` — `reject` ⇒
+/// `Reject`, `join` ⇒ `Join` the live mode, `steal`/`separate` (GameStream has no separate) ⇒ `Serve`
+/// (take over the one session).
+fn gamestream_admission(
+    live: Option<LiveGs>,
+    req_fp: Option<[u8; 32]>,
+    policy: crate::vdisplay::policy::ModeConflict,
+) -> GsDecision {
+    use crate::vdisplay::policy::ModeConflict;
+    let Some((owner, mode)) = live else {
+        return GsDecision::Serve;
+    };
+    let different = match (owner, req_fp) {
+        (Some(o), Some(r)) => o != r,
+        _ => true, // unknown owner or anonymous requester → treat as a different client
+    };
+    if !different {
+        return GsDecision::Serve;
+    }
+    match policy {
+        ModeConflict::Reject => GsDecision::Reject,
+        ModeConflict::Join => GsDecision::Join(mode),
+        ModeConflict::Steal | ModeConflict::Separate => GsDecision::Serve,
+    }
 }
 
 fn session_url_xml(st: &AppState, tag: &str) -> String {
@@ -404,5 +434,44 @@ mod tests {
             !peer_is_paired(&other, &st),
             "a non-pinned cert stays rejected"
         );
+    }
+
+    #[test]
+    fn gamestream_admission_policy_matrix() {
+        use crate::vdisplay::policy::ModeConflict;
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let live = Some((Some(a), (2560, 1440, 120)));
+        // No live session → always Serve.
+        assert!(matches!(
+            gamestream_admission(None, Some(b), ModeConflict::Reject),
+            GsDecision::Serve
+        ));
+        // Same-client re-launch → Serve regardless of policy.
+        assert!(matches!(
+            gamestream_admission(live, Some(a), ModeConflict::Reject),
+            GsDecision::Serve
+        ));
+        // A DIFFERENT client applies the policy.
+        assert!(matches!(
+            gamestream_admission(live, Some(b), ModeConflict::Reject),
+            GsDecision::Reject
+        ));
+        assert!(matches!(
+            gamestream_admission(live, Some(b), ModeConflict::Join),
+            GsDecision::Join((2560, 1440, 120))
+        ));
+        assert!(matches!(
+            gamestream_admission(live, Some(b), ModeConflict::Steal),
+            GsDecision::Serve
+        ));
+        assert!(matches!(
+            gamestream_admission(live, Some(b), ModeConflict::Separate),
+            GsDecision::Serve
+        ));
+        // Anonymous requester (no cert presented) is treated as a different client.
+        assert!(matches!(
+            gamestream_admission(live, None, ModeConflict::Reject),
+            GsDecision::Reject
+        ));
     }
 }
