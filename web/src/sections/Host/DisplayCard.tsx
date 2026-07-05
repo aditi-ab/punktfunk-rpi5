@@ -10,15 +10,18 @@ import {
 	useSetDisplayLayout,
 	useSetDisplaySettings,
 } from "@/api/gen/display/display";
-import type { ApiDisplayInfo } from "@/api/gen/model";
-import { ApiError } from "@/api/fetcher";
 import type {
+	ApiDisplayInfo,
 	DisplayPolicy,
 	EffectivePolicy,
+	Identity,
 	KeepAlive,
+	LayoutMode,
+	ModeConflict,
 	Preset,
 	Topology,
 } from "@/api/gen/model";
+import { ApiError } from "@/api/fetcher";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -27,26 +30,27 @@ import { Label } from "@/components/ui/label";
 import { m } from "@/paraglide/messages";
 
 /**
- * Container: the host's virtual-display management policy (design/display-management.md). Reads the
- * stored policy + preset expansions, lets the operator pick a preset or set Custom fields, and PUTs
- * the result — a change applies to the next session. Stage 0 enforces keep-alive + topology; the
- * other stored options are shown but marked not-yet-enforced.
+ * Container: the host's virtual-display management policy (design/display-management.md). Lets the
+ * operator pick a one-click preset OR set every option by hand — all WITHOUT any client connected
+ * (this is the host's *next-connect* behavior). The live-display list + multi-monitor arrangement
+ * table below act on whatever is currently streaming.
  */
 export const DisplaySection: FC = () => {
 	const qc = useQueryClient();
 	const q = useGetDisplaySettings();
 	const save = useSetDisplaySettings();
 
-	// Local edit buffer, seeded once from the server and re-seeded after a successful save.
+	// Local edit buffer, seeded once from the server and re-seeded after every successful apply.
 	const [draft, setDraft] = useState<DisplayPolicy | null>(null);
 	useEffect(() => {
 		if (q.data && draft === null) setDraft(q.data.settings);
 	}, [q.data, draft]);
 
-	const onSave = () => {
-		if (!draft) return;
+	// Apply a policy (a one-click preset, or the hand-edited Custom draft). A change takes effect on
+	// the next connect; a live session keeps the display it opened on.
+	const apply = (policy: DisplayPolicy) =>
 		save.mutate(
-			{ data: draft },
+			{ data: policy },
 			{
 				onSuccess: (res) => {
 					setDraft(res.settings);
@@ -54,7 +58,6 @@ export const DisplaySection: FC = () => {
 				},
 			},
 		);
-	};
 
 	return (
 		<Card>
@@ -69,7 +72,7 @@ export const DisplaySection: FC = () => {
 							draft={draft}
 							setDraft={setDraft}
 							presets={q.data.presets}
-							onSave={onSave}
+							apply={apply}
 							busy={save.isPending}
 							error={apiErrorMessage(save.error)}
 						/>
@@ -80,6 +83,265 @@ export const DisplaySection: FC = () => {
 		</Card>
 	);
 };
+
+/** Preset display order — Default first (the safe baseline), the situational ones, then Custom. */
+const PRESET_ORDER = [
+	"default",
+	"shared-desktop",
+	"hotdesk",
+	"workstation",
+	"gaming-rig",
+	"custom",
+] as const;
+
+const DisplayForm: FC<{
+	draft: DisplayPolicy;
+	setDraft: (p: DisplayPolicy) => void;
+	presets: { id: string; summary: string; fields: EffectivePolicy }[];
+	apply: (p: DisplayPolicy) => void;
+	busy: boolean;
+	error?: string;
+}> = ({ draft, setDraft, presets, apply, busy, error }) => {
+	const preset: Preset = draft.preset ?? "custom";
+	const isCustom = preset === "custom";
+
+	// The Custom fields (defaults filled): the edit buffer when preset === "custom", and what a
+	// preset→Custom switch is seeded from, so you customize starting from the current behavior.
+	const customFields: EffectivePolicy = {
+		keep_alive: draft.keep_alive ?? { mode: "duration", seconds: 10 },
+		topology: draft.topology ?? "auto",
+		mode_conflict: draft.mode_conflict ?? "separate",
+		identity: draft.identity ?? "per-client",
+		layout: draft.layout ?? { mode: "auto-row", positions: {} },
+		max_displays: draft.max_displays ?? 4,
+	};
+	const effective: EffectivePolicy =
+		(isCustom ? undefined : presets.find((p) => p.id === preset)?.fields) ?? customFields;
+
+	// The five named presets apply in ONE click; "Custom" reveals the fields, seeded from the current
+	// effective behavior (nothing changes until you Save).
+	const pickPreset = (id: string) => {
+		if (id === "custom") {
+			setDraft({
+				version: 1,
+				preset: "custom",
+				keep_alive: effective.keep_alive,
+				topology: effective.topology,
+				mode_conflict: effective.mode_conflict,
+				identity: effective.identity,
+				layout: effective.layout,
+				max_displays: effective.max_displays,
+			});
+		} else {
+			apply({ ...draft, preset: id as Preset });
+		}
+	};
+
+	const ka = customFields.keep_alive;
+	const secondsValue = ka.mode === "duration" ? ka.seconds : 300;
+
+	return (
+		<div className="space-y-4">
+			{/* One-click presets */}
+			<div className="space-y-2">
+				<Label>{m.display_preset()}</Label>
+				<div className="grid gap-2">
+					{PRESET_ORDER.map((id) => {
+						const p = presets.find((x) => x.id === id);
+						const fields = id === "custom" ? undefined : p?.fields;
+						const summary = id === "custom" ? m.display_custom_desc() : p?.summary;
+						const selected = preset === id;
+						const soon = DISABLED_PRESETS.has(id);
+						const cls = [
+							"w-full rounded-md border p-3 text-left transition-colors",
+							selected ? "border-primary ring-1 ring-primary" : "hover:bg-muted/50",
+							soon ? "opacity-60" : "",
+						].join(" ");
+						return (
+							<button
+								key={id}
+								type="button"
+								disabled={busy || soon}
+								onClick={() => pickPreset(id)}
+								className={cls}
+							>
+								<div className="flex items-center justify-between gap-2">
+									<span className="text-sm font-medium">
+										{(PRESET_LABEL[id] ?? (() => id))()}
+										{soon && (
+											<span className="ml-2 text-xs font-normal text-muted-foreground">
+												{m.display_preset_soon()}
+											</span>
+										)}
+									</span>
+									{selected && (
+										<Badge variant="success">{m.display_preset_current()}</Badge>
+									)}
+								</div>
+								{summary && <p className="mt-0.5 text-xs text-muted-foreground">{summary}</p>}
+								{fields && (
+									<div className="mt-1.5 flex flex-wrap gap-1">
+										<Badge variant="secondary">{fmtKeepAlive(fields.keep_alive)}</Badge>
+										<Badge variant="secondary">{tr(TOPOLOGY_LABEL, fields.topology)}</Badge>
+										<Badge variant="outline">{tr(CONFLICT_LABEL, fields.mode_conflict)}</Badge>
+										<Badge variant="outline">{tr(IDENTITY_LABEL, fields.identity)}</Badge>
+									</div>
+								)}
+							</button>
+						);
+					})}
+				</div>
+			</div>
+
+			{/* Custom: every option by hand */}
+			{isCustom && (
+				<div className="space-y-4 rounded-md border p-4">
+					<div className="space-y-2">
+						<Label>{m.display_keep_alive()}</Label>
+						<div className="flex items-center gap-2">
+							<Button
+								size="sm"
+								variant={ka.mode === "off" ? "default" : "outline"}
+								disabled={busy}
+								onClick={() => setDraft({ ...draft, keep_alive: { mode: "off" } })}
+							>
+								{m.display_keep_alive_off()}
+							</Button>
+							<Input
+								type="number"
+								min={0}
+								className="w-24"
+								value={secondsValue}
+								disabled={busy}
+								onChange={(e) =>
+									setDraft({
+										...draft,
+										keep_alive: {
+											mode: "duration",
+											seconds: Math.max(0, Number(e.target.value) || 0),
+										},
+									})
+								}
+							/>
+							<span className="text-sm text-muted-foreground">
+								{m.display_keep_alive_seconds()}
+							</span>
+						</div>
+						<p className="text-xs text-muted-foreground">{m.display_keep_alive_help()}</p>
+					</div>
+
+					<Choice
+						label={m.display_topology()}
+						help={m.display_topology_help()}
+						value={customFields.topology}
+						options={["auto", "extend", "primary", "exclusive"]}
+						labels={TOPOLOGY_LABEL}
+						disabled={busy}
+						onPick={(v) => setDraft({ ...draft, topology: v as Topology })}
+					/>
+					<Choice
+						label={m.display_conflict()}
+						help={m.display_conflict_help()}
+						value={customFields.mode_conflict}
+						options={["separate", "steal", "join", "reject"]}
+						labels={CONFLICT_LABEL}
+						disabled={busy}
+						onPick={(v) => setDraft({ ...draft, mode_conflict: v as ModeConflict })}
+					/>
+					<Choice
+						label={m.display_identity()}
+						help={m.display_identity_help()}
+						value={customFields.identity}
+						options={["shared", "per-client", "per-client-mode"]}
+						labels={IDENTITY_LABEL}
+						disabled={busy}
+						onPick={(v) => setDraft({ ...draft, identity: v as Identity })}
+					/>
+					<Choice
+						label={m.display_layout_mode()}
+						help={m.display_layout_help()}
+						value={customFields.layout.mode ?? "auto-row"}
+						options={["auto-row", "manual"]}
+						labels={LAYOUT_LABEL}
+						disabled={busy}
+						onPick={(v) =>
+							setDraft({
+								...draft,
+								layout: { mode: v as LayoutMode, positions: draft.layout?.positions ?? {} },
+							})
+						}
+					/>
+
+					<div className="space-y-2">
+						<Label htmlFor="disp-max">{m.display_max()}</Label>
+						<Input
+							id="disp-max"
+							type="number"
+							min={1}
+							max={16}
+							className="w-24"
+							value={draft.max_displays ?? 4}
+							disabled={busy}
+							onChange={(e) =>
+								setDraft({
+									...draft,
+									max_displays: Math.min(16, Math.max(1, Number(e.target.value) || 1)),
+								})
+							}
+						/>
+					</div>
+
+					<Button onClick={() => apply(draft)} disabled={busy}>
+						{m.display_save()}
+					</Button>
+				</div>
+			)}
+
+			{/* What's in force right now */}
+			<div className="flex flex-wrap items-center gap-2 border-t pt-3">
+				<span className="text-sm text-muted-foreground">{m.display_effective()}:</span>
+				<Badge variant="secondary">{fmtKeepAlive(effective.keep_alive)}</Badge>
+				<Badge variant="secondary">{tr(TOPOLOGY_LABEL, effective.topology)}</Badge>
+				<Badge variant="outline">{tr(CONFLICT_LABEL, effective.mode_conflict)}</Badge>
+				<Badge variant="outline">{tr(IDENTITY_LABEL, effective.identity)}</Badge>
+				<Badge variant="outline">{tr(LAYOUT_LABEL, effective.layout.mode)}</Badge>
+				<Badge variant="outline">{`${effective.max_displays}×`}</Badge>
+			</div>
+
+			<p className="text-xs text-muted-foreground">{m.display_pending_note()}</p>
+			{error && <p className="text-sm text-amber-600 dark:text-amber-500">{error}</p>}
+		</div>
+	);
+};
+
+/** A labeled row of mutually-exclusive option buttons (topology / conflict / identity / layout). */
+const Choice: FC<{
+	label: string;
+	help?: string;
+	value: string;
+	options: readonly string[];
+	labels: Record<string, () => string>;
+	disabled: boolean;
+	onPick: (v: string) => void;
+}> = ({ label, help, value, options, labels, disabled, onPick }) => (
+	<div className="space-y-2">
+		<Label>{label}</Label>
+		<div className="flex flex-wrap gap-2">
+			{options.map((o) => (
+				<Button
+					key={o}
+					size="sm"
+					variant={value === o ? "default" : "outline"}
+					disabled={disabled}
+					onClick={() => onPick(o)}
+				>
+					{(labels[o] ?? (() => o))()}
+				</Button>
+			))}
+		</div>
+		{help && <p className="text-xs text-muted-foreground">{help}</p>}
+	</div>
+);
 
 /**
  * The host's live/kept virtual displays, polled from `/display/state`, each with a Release button
@@ -179,8 +441,7 @@ const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({ displays }) =>
 					return (
 						<div key={d.slot} className="flex flex-wrap items-center gap-2 text-sm">
 							<span className="w-44 truncate">
-								{d.mode}{" "}
-								<code className="text-xs text-muted-foreground">#{slot}</code>
+								{d.mode} <code className="text-xs text-muted-foreground">#{slot}</code>
 							</span>
 							<Label className="text-xs" htmlFor={`disp-x-${slot}`}>
 								X
@@ -267,8 +528,8 @@ const apiErrorMessage = (err: unknown): string | undefined => {
 	return err ? String(err) : undefined;
 };
 
-/** The `gaming-rig` preset expands to `keep_alive: forever`, which the host rejects until the
- * display-lifecycle stage — disable it rather than let the Save 400. */
+/** `gaming-rig` expands to `keep_alive: forever`, which the host still rejects (Windows has no
+ * Pinned state yet) — surface it, but disabled, rather than let the one-click apply 400. */
 const DISABLED_PRESETS: ReadonlySet<string> = new Set(["gaming-rig"]);
 
 const PRESET_LABEL: Record<string, () => string> = {
@@ -280,11 +541,35 @@ const PRESET_LABEL: Record<string, () => string> = {
 	workstation: m.display_preset_workstation,
 };
 
-const TOPOLOGY_LABEL: Record<Topology, () => string> = {
+const TOPOLOGY_LABEL: Record<string, () => string> = {
 	auto: m.display_topology_auto,
 	extend: m.display_topology_extend,
 	primary: m.display_topology_primary,
 	exclusive: m.display_topology_exclusive,
+};
+
+const CONFLICT_LABEL: Record<string, () => string> = {
+	separate: m.display_conflict_separate,
+	steal: m.display_conflict_steal,
+	join: m.display_conflict_join,
+	reject: m.display_conflict_reject,
+};
+
+const IDENTITY_LABEL: Record<string, () => string> = {
+	shared: m.display_identity_shared,
+	"per-client": m.display_identity_per_client,
+	"per-client-mode": m.display_identity_per_client_mode,
+};
+
+const LAYOUT_LABEL: Record<string, () => string> = {
+	"auto-row": m.display_layout_auto_row,
+	manual: m.display_layout_manual,
+};
+
+/** Look up a localized label, tolerating an unknown/undefined key (falls back to the raw value). */
+const tr = (map: Record<string, () => string>, key: string | null | undefined): string => {
+	const fn = key == null ? undefined : map[key];
+	return fn ? fn() : String(key ?? "");
 };
 
 const fmtKeepAlive = (k: KeepAlive): string => {
@@ -296,157 +581,4 @@ const fmtKeepAlive = (k: KeepAlive): string => {
 		case "forever":
 			return "∞";
 	}
-};
-
-const DisplayForm: FC<{
-	draft: DisplayPolicy;
-	setDraft: (p: DisplayPolicy) => void;
-	presets: { id: string; summary: string; fields: EffectivePolicy }[];
-	onSave: () => void;
-	busy: boolean;
-	error?: string;
-}> = ({ draft, setDraft, presets, onSave, busy, error }) => {
-	const preset: Preset = draft.preset ?? "custom";
-	const isCustom = preset === "custom";
-	const keepAlive: KeepAlive = draft.keep_alive ?? { mode: "duration", seconds: 10 };
-	const topology: Topology = draft.topology ?? "auto";
-
-	// Preview the effective fields: from the selected preset's expansion, or the Custom fields.
-	const effective: EffectivePolicy | undefined = isCustom
-		? {
-				keep_alive: keepAlive,
-				topology,
-				mode_conflict: draft.mode_conflict ?? "separate",
-				identity: draft.identity ?? "per-client",
-				layout: draft.layout ?? { mode: "auto-row", positions: {} },
-				max_displays: draft.max_displays ?? 4,
-			}
-		: presets.find((p) => p.id === preset)?.fields;
-
-	const presetSummary = presets.find((p) => p.id === preset)?.summary;
-
-	const secondsValue = keepAlive.mode === "duration" ? keepAlive.seconds : 300;
-
-	return (
-		<div className="space-y-5">
-			{/* Preset picker */}
-			<div className="space-y-2">
-				<Label>{m.display_preset()}</Label>
-				<div className="flex flex-wrap gap-2">
-					{(["custom", "default", "gaming-rig", "shared-desktop", "hotdesk", "workstation"] as const).map(
-						(id) => (
-							<Button
-								key={id}
-								size="sm"
-								variant={preset === id ? "default" : "outline"}
-								disabled={busy || DISABLED_PRESETS.has(id)}
-								onClick={() => setDraft({ ...draft, preset: id as Preset })}
-							>
-								{(PRESET_LABEL[id] ?? (() => id))()}
-							</Button>
-						),
-					)}
-				</div>
-				{presetSummary && !isCustom && (
-					<p className="text-xs text-muted-foreground">{presetSummary}</p>
-				)}
-			</div>
-
-			{/* Custom fields: keep-alive + topology + max displays */}
-			{isCustom && (
-				<div className="space-y-4 rounded-md border p-4">
-					<div className="space-y-2">
-						<Label>{m.display_keep_alive()}</Label>
-						<div className="flex items-center gap-2">
-							<Button
-								size="sm"
-								variant={keepAlive.mode === "off" ? "default" : "outline"}
-								disabled={busy}
-								onClick={() => setDraft({ ...draft, keep_alive: { mode: "off" } })}
-							>
-								{m.display_keep_alive_off()}
-							</Button>
-							<Input
-								type="number"
-								min={0}
-								className="w-24"
-								value={secondsValue}
-								disabled={busy}
-								onChange={(e) =>
-									setDraft({
-										...draft,
-										keep_alive: {
-											mode: "duration",
-											seconds: Math.max(0, Number(e.target.value) || 0),
-										},
-									})
-								}
-							/>
-							<span className="text-sm text-muted-foreground">
-								{m.display_keep_alive_seconds()}
-							</span>
-						</div>
-					</div>
-
-					<div className="space-y-2">
-						<Label>{m.display_topology()}</Label>
-						<div className="flex flex-wrap gap-2">
-							{(["auto", "extend", "primary", "exclusive"] as const).map((t) => (
-								<Button
-									key={t}
-									size="sm"
-									variant={topology === t ? "default" : "outline"}
-									disabled={busy}
-									onClick={() => setDraft({ ...draft, topology: t })}
-								>
-									{TOPOLOGY_LABEL[t]()}
-								</Button>
-							))}
-						</div>
-					</div>
-
-					<div className="space-y-2">
-						<Label htmlFor="disp-max">{m.display_max()}</Label>
-						<Input
-							id="disp-max"
-							type="number"
-							min={1}
-							max={16}
-							className="w-24"
-							value={draft.max_displays ?? 4}
-							disabled={busy}
-							onChange={(e) =>
-								setDraft({
-									...draft,
-									max_displays: Math.min(16, Math.max(1, Number(e.target.value) || 1)),
-								})
-							}
-						/>
-					</div>
-				</div>
-			)}
-
-			{/* Effective preview */}
-			{effective && (
-				<div className="flex flex-wrap items-center gap-2">
-					<span className="text-sm text-muted-foreground">{m.display_effective()}:</span>
-					<Badge variant="secondary">{fmtKeepAlive(effective.keep_alive)}</Badge>
-					<Badge variant="secondary">{TOPOLOGY_LABEL[effective.topology]()}</Badge>
-					<Badge variant="outline">{effective.mode_conflict}</Badge>
-					<Badge variant="outline">{effective.identity}</Badge>
-					<Badge variant="outline">{`${effective.max_displays}×`}</Badge>
-				</div>
-			)}
-
-			<p className="text-xs text-muted-foreground">{m.display_pending_note()}</p>
-
-			{error && (
-				<p className="text-sm text-amber-600 dark:text-amber-500">{error}</p>
-			)}
-
-			<Button onClick={onSave} disabled={busy}>
-				{m.display_save()}
-			</Button>
-		</div>
-	);
 };
