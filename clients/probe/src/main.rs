@@ -73,6 +73,10 @@ struct Args {
     /// `--rich-input-test` — drive the DualSense touchpad + motion over 0xCC (host needs
     /// `PUNKTFUNK_GAMEPAD=dualsense`); also logs the 0xCD HID-output feedback that comes back.
     rich_input_test: bool,
+    /// `--quit` — close the connection with the deliberate-quit code (`QUIT_CLOSE_CODE`) at end of
+    /// stream, so the host tears its virtual display down immediately (skips keep-alive linger). A
+    /// bare exit closes with code 0 → the host lingers for a reconnect. Tests the #2 quit path.
+    quit: bool,
     pin: Option<[u8; 32]>,
     /// `--remode WxHxFPS:SECS` — request this mode SECS seconds into the stream.
     remode: Option<(Mode, u32)>,
@@ -211,6 +215,7 @@ fn parse_args() -> Args {
         mic_burst: argv.iter().any(|a| a == "--mic-burst"),
         touch_test: argv.iter().any(|a| a == "--touch-test"),
         rich_input_test: argv.iter().any(|a| a == "--rich-input-test"),
+        quit: argv.iter().any(|a| a == "--quit"),
         pin,
         remode,
         pair: get("--pair").map(String::from),
@@ -1208,7 +1213,14 @@ async fn session(args: Args) -> Result<()> {
         }
     }
 
-    conn.close(0u32.into(), b"done");
+    // `--quit` closes with the deliberate-quit code so the host skips the keep-alive linger; a normal
+    // exit uses code 0 (an unwanted-disconnect close → the host lingers for a reconnect).
+    let close_code = if args.quit {
+        punktfunk_core::quic::QUIT_CLOSE_CODE
+    } else {
+        0
+    };
+    conn.close(close_code.into(), b"done");
     result
 }
 

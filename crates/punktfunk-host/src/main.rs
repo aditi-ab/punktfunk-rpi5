@@ -425,6 +425,13 @@ fn real_main() -> Result<()> {
                     .map(str::to_string)
                     .or_else(|| std::env::var("PUNKTFUNK_DATA_PORT").ok())
                     .and_then(|s| s.parse().ok()),
+                // Disconnect-detection latency (QUIC control-connection idle timeout): --idle-timeout-ms
+                // overrides PUNKTFUNK_IDLE_TIMEOUT_MS; absent = the core default (8s).
+                idle_timeout: get("--idle-timeout-ms")
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&ms| ms > 0)
+                    .map(std::time::Duration::from_millis)
+                    .or_else(punktfunk1::idle_timeout_from_env),
             })
         }
         // Windows service control: install/uninstall/start/stop/status + the SCM `run` entry point.

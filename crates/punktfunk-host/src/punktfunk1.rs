@@ -84,6 +84,12 @@ pub struct Punktfunk1Options {
     /// fixed port only fits one data plane at a time, so a concurrent session finding it busy
     /// falls back to random + hole-punch (see [`bind_data_socket`]).
     pub data_port: Option<u16>,
+    /// Control-connection idle timeout — the **disconnect-detection latency** (how long a vanished
+    /// client takes to be declared dead, which bounds how fast a dropped session tears down / lingers
+    /// and thus the reconnect-overlap window). `None` = the core default (8s). Set from
+    /// `PUNKTFUNK_IDLE_TIMEOUT_MS`; clamped to a ≥1s floor with a keep-alive that scales to it so a
+    /// live session never false-closes.
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 /// Bind the per-session data-plane UDP socket, honoring [`Punktfunk1Options::data_port`]. Returns
@@ -185,6 +191,17 @@ pub(crate) struct NativeServe {
 /// overflow clients wait in the accept queue. Override with `--max-concurrent`.
 pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 4;
 
+/// The control-connection idle timeout (disconnect-detection latency) from
+/// `PUNKTFUNK_IDLE_TIMEOUT_MS`; `None` (unset/invalid/zero) = the core default (8s). Clamped
+/// downstream to a ≥1s floor with a keep-alive that scales to it, so a live session never false-closes.
+pub(crate) fn idle_timeout_from_env() -> Option<std::time::Duration> {
+    std::env::var("PUNKTFUNK_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(std::time::Duration::from_millis)
+}
+
 pub(crate) fn native_serve_opts(cfg: &NativeServe) -> Punktfunk1Options {
     Punktfunk1Options {
         port: cfg.port,
@@ -198,6 +215,7 @@ pub(crate) fn native_serve_opts(cfg: &NativeServe) -> Punktfunk1Options {
         pairing_pin: None,
         paired_store: None,
         data_port: cfg.data_port,
+        idle_timeout: idle_timeout_from_env(),
     }
 }
 
@@ -211,10 +229,11 @@ pub(crate) async fn serve(
         .context("load host identity (~/.config/punktfunk)")?;
     let fingerprint = endpoint::fingerprint_of_pem(&identity.cert_pem)
         .map_err(|e| anyhow!("cert fingerprint: {e}"))?;
-    let ep = endpoint::server_with_identity(
+    let ep = endpoint::server_with_identity_idle(
         ([0, 0, 0, 0], opts.port).into(),
         &identity.cert_pem,
         &identity.key_pem,
+        opts.idle_timeout.unwrap_or(endpoint::DEFAULT_IDLE_TIMEOUT),
     )
     .map_err(|e| anyhow!("QUIC server endpoint: {e}"))?;
     tracing::info!(
@@ -378,6 +397,13 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// carrying the human-readable busy reason (live mode + client label) the client surfaces. A distinct
 /// code lets a client tell "host busy" apart from a transport failure.
 const REJECT_BUSY_CODE: u32 = 0x42;
+
+/// QUIC application error code a client closes with on a **deliberate quit** (a user "stop", not a
+/// network drop). The host reads it off the connection's `ApplicationClosed` reason and tears the
+/// session's virtual display down IMMEDIATELY, skipping the keep-alive linger — an unwanted disconnect
+/// (idle timeout / reset / any other code) still lingers so a reconnect can resume. Shared with the
+/// clients via `punktfunk_core::quic::QUIT_CLOSE_CODE`.
+const QUIT_CODE: u32 = punktfunk_core::quic::QUIT_CLOSE_CODE;
 
 /// Encoder bitrate (kbps) the host falls back to when the client expresses no preference
 /// (`Hello::bitrate_kbps == 0`) — the long-standing 20 Mbps default. A client that knows its
@@ -730,8 +756,32 @@ async fn serve_session(
         // A same-client reconnect never conflicts. THIS session registers in the live set once its
         // data plane is up (below the handshake), so a later client can see + steal it.
         {
-            use crate::vdisplay::admission::{admit, Admission};
-            match admit(endpoint::peer_fingerprint(&conn)) {
+            use crate::vdisplay::admission::{admit, preempt_same_identity, Admission};
+            let peer_fp = endpoint::peer_fingerprint(&conn);
+
+            // Same-client RECONNECT preempt (design §5.3 "preempts downstream"): if THIS client
+            // already has a live session, it's the zombie of an unwanted disconnect whose QUIC idle
+            // timer hasn't fired yet (detection lags a drop by up to `max_idle_timeout`). Signal it to
+            // stop and give it the release grace so it tears its display down — which, keep-alive on,
+            // lingers — and THIS reconnect REUSES that kept display below instead of landing on a
+            // fresh SECOND one. Independent of the mode_conflict arm (it's our OWN prior session, not
+            // a conflict with a different client), and it runs before we register ourselves so we
+            // never signal our own stop flag.
+            let own_zombies = preempt_same_identity(peer_fp);
+            if !own_zombies.is_empty() {
+                tracing::info!(
+                    count = own_zombies.len(),
+                    "reconnect: preempting this client's own zombie session(s) so the kept display is reused"
+                );
+                for z in &own_zombies {
+                    z.store(true, Ordering::SeqCst);
+                }
+                // Same blind release grace the steal path uses — lets the zombie's loops notice the
+                // stop flag and drop its display (→ Lingering) before we acquire below.
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            }
+
+            match admit(peer_fp) {
                 Admission::Separate => {}
                 Admission::Join(m) => {
                     tracing::info!(
@@ -1131,11 +1181,21 @@ async fn serve_session(
 
     // Stop signal: stream duration elapsed or the client went away.
     let stop = Arc::new(AtomicBool::new(false));
+    // Deliberate-quit signal: set (before `stop`, so the display lease reads it on teardown) when the
+    // client closed the connection with `QUIT_CODE` — a user "stop", which skips the keep-alive linger.
+    // A bare disconnect / idle timeout leaves it false → the display lingers for a reconnect.
+    let quit = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
+        let quit = quit.clone();
         let conn = conn.clone();
         tokio::spawn(async move {
-            conn.closed().await;
+            let reason = conn.closed().await;
+            if matches!(&reason, quinn::ConnectionError::ApplicationClosed(ac)
+                if ac.error_code == quinn::VarInt::from_u32(QUIT_CODE))
+            {
+                quit.store(true, Ordering::SeqCst);
+            }
             stop.store(true, Ordering::SeqCst);
         });
     }
@@ -1254,6 +1314,7 @@ async fn serve_session(
         crate::encode::ChromaFormat::Yuv420
     };
     let stop_stream = stop.clone();
+    let quit_stream = quit.clone();
     let fec_target_dp = fec_target.clone(); // data-plane handle to the adaptive-FEC target
     let conn_stream = conn.clone(); // for sending the source's real HDR metadata (0xCE) mid-stream
                                     // Per-AU host-timing emission (0xCF): only when the client advertised the cap bit. All
@@ -1325,6 +1386,7 @@ async fn serve_session(
                         mode,
                         seconds,
                         stop: stop_stream,
+                        quit: quit_stream,
                         reconfig: reconfig_rx,
                         keyframe: keyframe_rx,
                         compositor,
@@ -2864,6 +2926,9 @@ struct SessionContext {
     seconds: u32,
     /// Session stop flag (set on disconnect / reconnect-preempt).
     stop: Arc<AtomicBool>,
+    /// Deliberate-quit flag (set when the client closed with `QUIT_CODE`): the display lease reads it
+    /// on teardown to skip the keep-alive linger for a user "stop" (vs. an unwanted disconnect).
+    quit: Arc<AtomicBool>,
     /// Accepted mid-stream mode switches — the pipeline is rebuilt at the new mode.
     reconfig: std::sync::mpsc::Receiver<punktfunk_core::Mode>,
     /// Client decode-recovery keyframe requests.
@@ -2923,6 +2988,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         mode,
         seconds,
         stop,
+        quit,
         reconfig,
         keyframe,
         compositor,
@@ -2973,7 +3039,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     let _idd_setup_guard = (plan.capture == crate::session_plan::CaptureBackend::IddPush)
         .then(|| crate::vdisplay::manager::vdm().begin_idd_setup(stop.clone()));
     let (mut capturer, mut enc, mut frame, mut interval) =
-        build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan)?;
+        build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan, &quit)?;
     // Setup done — release the IDD-push setup lock so the next reconnect can begin (and preempt us).
     #[cfg(target_os = "windows")]
     drop(_idd_setup_guard);
@@ -3141,6 +3207,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                             bitrate_kbps,
                             bit_depth,
                             plan,
+                            &quit,
                         )?;
                         Ok((new_vd, pipe))
                     })();
@@ -3184,7 +3251,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             // Build the new pipeline BEFORE dropping the old one: the host already acked
             // the switch as accepted, so a rebuild failure must not kill an otherwise
             // healthy session — keep streaming the current mode and log instead.
-            match build_pipeline(&mut vd, new_mode, bitrate_kbps, bit_depth, plan) {
+            match build_pipeline(&mut vd, new_mode, bitrate_kbps, bit_depth, plan, &quit) {
                 Ok(next_pipe) => {
                     (capturer, enc, frame, interval) = next_pipe;
                     cur_mode = new_mode;
@@ -3305,6 +3372,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                         bitrate_kbps,
                         bit_depth,
                         plan,
+                        &quit,
                     ) {
                         Ok(p) => break p,
                         Err(e2) => {
@@ -3531,6 +3599,7 @@ fn build_pipeline_with_retry(
     bitrate_kbps: u32,
     bit_depth: u8,
     plan: crate::session_plan::SessionPlan,
+    quit: &Arc<AtomicBool>,
 ) -> Result<Pipeline> {
     // ~10s first-frame wait per attempt. 8 gives a ~90s budget for the SLOW case: a host-managed
     // gamescope session cold-starting Steam Big Picture (the SteamOS/Bazzite takeover) can take
@@ -3557,7 +3626,7 @@ fn build_pipeline_with_retry(
     const MAX_ATTEMPTS: u32 = 8;
     let mut backoff = std::time::Duration::from_millis(500);
     for attempt in 1..=MAX_ATTEMPTS {
-        match build_pipeline(vd, mode, bitrate_kbps, bit_depth, plan) {
+        match build_pipeline(vd, mode, bitrate_kbps, bit_depth, plan, quit) {
             Ok(pipe) => {
                 if attempt > 1 {
                     tracing::info!(attempt, "pipeline up after retry");
@@ -3620,12 +3689,15 @@ fn build_pipeline(
     bitrate_kbps: u32,
     bit_depth: u8,
     plan: crate::session_plan::SessionPlan,
+    quit: &Arc<AtomicBool>,
 ) -> Result<Pipeline> {
     // Acquire through the registry (design/display-management.md): on Linux this pools the display
     // for keep-alive (reuse a kept one, or create + keep the backend's keepalive so it outlives the
     // session per policy); on Windows it delegates to `vd.create` (the manager already leases). The
-    // returned `VirtualOutput`'s keepalive is a registry lease — the capturer holds it as before.
-    let vout = crate::vdisplay::registry::acquire(vd, mode).context("create virtual output")?;
+    // returned `VirtualOutput`'s keepalive is a registry lease — the capturer holds it as before. The
+    // `quit` flag rides into the lease so a deliberate-quit teardown skips the keep-alive linger.
+    let vout = crate::vdisplay::registry::acquire(vd, mode, quit.clone())
+        .context("create virtual output")?;
     // The backend reports the refresh it actually achieved in `preferred_mode.2` (KWin may cap a
     // virtual output at 60 Hz if the custom-mode install was rejected). Pace the encoder + frame
     // clock to that, not the requested rate, so we don't emit phantom duplicate frames over a
@@ -3933,6 +4005,7 @@ mod tests {
                 pairing_pin: None,
                 paired_store: None,
                 data_port: None,
+                idle_timeout: None,
             })
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4128,6 +4201,7 @@ mod tests {
                     pairing_pin: None,
                     paired_store: None, // unused: the shared `np` IS the store handle
                     data_port: None,
+                    idle_timeout: None,
                 },
                 0, // no mgmt API in this test → advertise no `mgmt` mDNS port
                 np_host,
@@ -4227,6 +4301,7 @@ mod tests {
                 pairing_pin: Some("4321".into()),
                 paired_store: Some(test_paired_path()),
                 data_port: None,
+                idle_timeout: None,
             })
         });
         std::thread::sleep(std::time::Duration::from_millis(500));

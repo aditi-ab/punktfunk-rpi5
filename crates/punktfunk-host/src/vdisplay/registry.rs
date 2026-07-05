@@ -81,16 +81,23 @@ fn topology_str() -> String {
 ///
 /// Windows delegates to the [`manager`](super::manager) via `vd.create` (unchanged); Linux uses the
 /// pool below; other platforms pass through.
+/// `quit` is the session's deliberate-quit flag: when the session ends with it set (the client closed
+/// with the quit application code — a user "stop", not a network drop), the display is torn down
+/// **immediately**, skipping the keep-alive linger. A bare disconnect leaves it `false` → normal linger.
 pub fn acquire(
     vd: &mut Box<dyn super::VirtualDisplay>,
     mode: super::Mode,
+    quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<super::VirtualOutput> {
     #[cfg(target_os = "linux")]
     {
-        linux::acquire(vd, mode)
+        linux::acquire(vd, mode, quit)
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // Windows leases in the manager (its own linger); the deliberate-quit skip is not wired
+        // through there yet, so the flag is accepted but unused off Linux.
+        let _ = quit;
         vd.create(mode)
     }
 }
@@ -163,8 +170,8 @@ pub fn release(slot: Option<u64>) -> usize {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, Once, OnceLock};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, Once, OnceLock};
     use std::time::{Duration, Instant};
 
     use anyhow::Result;
@@ -304,16 +311,21 @@ mod linux {
         node_id: u32,
         preferred_mode: Option<(u32, u32, u32)>,
         gen: u64,
+        quit: Arc<AtomicBool>,
     ) -> VirtualOutput {
         VirtualOutput {
             node_id,
             remote_fd: None,
             preferred_mode,
-            keepalive: Box::new(DisplayLease { gen }),
+            keepalive: Box::new(DisplayLease { gen, quit }),
         }
     }
 
-    pub(super) fn acquire(vd: &mut Box<dyn VirtualDisplay>, mode: Mode) -> Result<VirtualOutput> {
+    pub(super) fn acquire(
+        vd: &mut Box<dyn VirtualDisplay>,
+        mode: Mode,
+        quit: Arc<AtomicBool>,
+    ) -> Result<VirtualOutput> {
         ensure_timer();
         let backend = vd.name();
         let r = reg();
@@ -343,7 +355,7 @@ mod linux {
                 e.life.acquire();
                 let gen = r.gen.fetch_add(1, Ordering::Relaxed);
                 e.gen = gen;
-                let out = output_for(e.node_id, e.preferred_mode, gen);
+                let out = output_for(e.node_id, e.preferred_mode, gen, quit);
                 tracing::info!(
                     backend,
                     node_id = e.node_id,
@@ -443,15 +455,21 @@ mod linux {
         if (position.x, position.y) != (0, 0) {
             vd.apply_position(position.x, position.y);
         }
-        Ok(output_for(node_id, preferred_mode, gen))
+        Ok(output_for(node_id, preferred_mode, gen, quit))
     }
 
     /// The [`DisplayLease`] `Drop` path: release the session's hold on the pooled display. The
     /// lifecycle machine decides linger / pin / teardown; a torn-down entry's keepalive drops *after*
     /// the lock is released.
-    fn release(gen: u64) {
+    fn release(gen: u64, force_immediate: bool) {
         let Some(r) = REG.get() else { return };
-        let linger = linger();
+        // A deliberate quit (the client closed with the quit code — a user "stop") tears the display
+        // down NOW, overriding the keep-alive linger; a bare disconnect honors the policy.
+        let linger = if force_immediate {
+            Linger::Immediate
+        } else {
+            linger()
+        };
         let (torn_down, restore) = {
             let mut es = r.entries.lock().unwrap();
             let Some(idx) = es.iter().position(|e| e.gen == gen) else {
@@ -489,10 +507,17 @@ mod linux {
             restore();
         }
         if let Some(e) = torn_down {
-            tracing::info!(
-                backend = e.backend,
-                "virtual display torn down (keep-alive off / released)"
-            );
+            if force_immediate {
+                tracing::info!(
+                    backend = e.backend,
+                    "virtual display torn down (deliberate quit — keep-alive skipped)"
+                );
+            } else {
+                tracing::info!(
+                    backend = e.backend,
+                    "virtual display torn down (keep-alive off / released)"
+                );
+            }
             drop(e); // outside the lock — the keepalive Drop may block
         }
     }
@@ -683,11 +708,15 @@ mod linux {
     /// registry hold; a stale lease (its entry was reused + re-stamped, or torn down) is a no-op.
     struct DisplayLease {
         gen: u64,
+        /// The session's deliberate-quit flag: set when the client closes with the quit application
+        /// code (a user "stop", not a network drop), so this lease's `Drop` tears the display down
+        /// immediately instead of lingering. `false` on a bare disconnect → normal keep-alive.
+        quit: Arc<AtomicBool>,
     }
 
     impl Drop for DisplayLease {
         fn drop(&mut self) {
-            release(self.gen);
+            release(self.gen, self.quit.load(Ordering::SeqCst));
         }
     }
 

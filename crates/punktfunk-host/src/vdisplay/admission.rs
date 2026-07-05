@@ -115,6 +115,31 @@ pub fn admit(req_identity: Option<[u8; 32]>) -> Admission {
     decide(effective_conflict(), req_identity, &table().lock().unwrap())
 }
 
+/// Pure core of [`preempt_same_identity`]: the stop flags of live sessions owned by the SAME client
+/// as `req_identity` (its own zombies). Testable over a slice (the public fn locks the global table).
+fn same_identity_stops(
+    req_identity: Option<[u8; 32]>,
+    live: &[LiveSession],
+) -> Vec<Arc<AtomicBool>> {
+    live.iter()
+        .filter(|s| same_client(s.identity, req_identity))
+        .map(|s| Arc::clone(&s.stop))
+        .collect()
+}
+
+/// Preempt this reconnecting client's OWN still-live session(s). A client has at most one live
+/// session, so a new connection from an already-registered identity is a **reconnect** — the old
+/// session is a zombie whose QUIC idle timer hasn't fired yet (an unwanted disconnect is only
+/// declared dead after `max_idle_timeout`, ~seconds later). Return its stop flag(s) so the caller
+/// signals them and waits the release grace: the zombie tears its display down, which (keep-alive on)
+/// lingers, and THIS reconnect **reuses** that kept display instead of landing on a fresh SECOND one
+/// (the "thrown onto a second display while the old one keeps streaming" bug). Anonymous (`None`)
+/// never matches — same limitation as `steal`/`reject`. Call this BEFORE [`admit`] and before this
+/// session registers itself, so it only ever signals a *prior* session's flag, never its own.
+pub fn preempt_same_identity(req_identity: Option<[u8; 32]>) -> Vec<Arc<AtomicBool>> {
+    same_identity_stops(req_identity, &table().lock().unwrap())
+}
+
 /// Register a now-admitted, live session; the returned guard removes it on drop (session end). Call
 /// AFTER [`admit`] (so a session never conflicts with itself) and once the mode + stop flag are known.
 pub fn register(
@@ -223,6 +248,20 @@ mod tests {
             decide(ModeConflict::Reject, None, &live),
             Admission::Reject(_)
         ));
+    }
+
+    #[test]
+    fn same_identity_stops_targets_own_zombie_only() {
+        let live = [
+            sess(Some(1), (2560, 1440, 60)), // this client's prior (zombie) session
+            sess(Some(2), (1920, 1080, 60)), // a different client
+        ];
+        // Reconnecting as client 1 → its own zombie's stop is returned (to preempt), not client 2's.
+        assert_eq!(same_identity_stops(fp(1), &live).len(), 1);
+        // A client with no prior session (fp 3) has nothing of its own to preempt.
+        assert_eq!(same_identity_stops(fp(3), &live).len(), 0);
+        // Anonymous never matches — we can't prove it's the same client.
+        assert_eq!(same_identity_stops(None, &live).len(), 0);
     }
 
     #[test]
