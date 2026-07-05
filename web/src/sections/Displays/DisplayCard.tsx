@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@unom/ui/button";
-import { type FC, useEffect, useState } from "react";
+import { type FC, type ReactNode, useEffect, useState } from "react";
 import {
 	getGetDisplayStateQueryKey,
 	getGetDisplaySettingsQueryKey,
@@ -210,8 +210,7 @@ const DisplayForm: FC<{
 			{/* Custom: every option by hand */}
 			{isCustom && (
 				<div className="space-y-6 rounded-lg border p-5">
-					<div className="space-y-2.5">
-						<Label>{m.display_keep_alive()}</Label>
+					<Field label={m.display_keep_alive()} help={m.display_keep_alive_help()}>
 						<div className="flex flex-wrap items-center gap-2">
 							<Button
 								size="sm"
@@ -251,8 +250,7 @@ const DisplayForm: FC<{
 								</div>
 							)}
 						</div>
-						<p className="text-xs text-muted-foreground">{m.display_keep_alive_help()}</p>
-					</div>
+					</Field>
 
 					<Choice
 						label={m.display_topology()}
@@ -296,10 +294,8 @@ const DisplayForm: FC<{
 						}
 					/>
 
-					<div className="space-y-2.5">
-						<Label htmlFor="disp-max">{m.display_max()}</Label>
+					<Field label={m.display_max()}>
 						<Input
-							id="disp-max"
 							type="number"
 							min={1}
 							max={16}
@@ -313,7 +309,7 @@ const DisplayForm: FC<{
 								})
 							}
 						/>
-					</div>
+					</Field>
 
 					<div className="border-t pt-4">
 						<Button onClick={() => apply(draft)} disabled={busy}>
@@ -340,7 +336,21 @@ const DisplayForm: FC<{
 	);
 };
 
-/** A labeled row of mutually-exclusive option buttons (topology / conflict / identity / layout). */
+/** A labeled config field — label, then the control, then optional help. The single source of the
+ * label→control→help spacing so every field (keep-alive, the button groups, max-displays) lines up. */
+const Field: FC<{ label: string; help?: string; children: ReactNode }> = ({
+	label,
+	help,
+	children,
+}) => (
+	<div className="space-y-3">
+		<Label className="block">{label}</Label>
+		{children}
+		{help && <p className="text-xs text-muted-foreground">{help}</p>}
+	</div>
+);
+
+/** A [`Field`] whose control is a row of mutually-exclusive option buttons (topology / conflict / …). */
 const Choice: FC<{
 	label: string;
 	help?: string;
@@ -350,8 +360,7 @@ const Choice: FC<{
 	disabled: boolean;
 	onPick: (v: string) => void;
 }> = ({ label, help, value, options, labels, disabled, onPick }) => (
-	<div className="space-y-2.5">
-		<Label>{label}</Label>
+	<Field label={label} help={help}>
 		<div className="flex flex-wrap gap-2">
 			{options.map((o) => (
 				<Button
@@ -365,8 +374,7 @@ const Choice: FC<{
 				</Button>
 			))}
 		</div>
-		{help && <p className="text-xs text-muted-foreground">{help}</p>}
-	</div>
+	</Field>
 );
 
 /**

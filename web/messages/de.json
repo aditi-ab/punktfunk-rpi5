@@ -100,7 +100,7 @@
 	"display_identity_per_client": "Pro Client",
 	"display_identity_per_client_mode": "Pro Client + Auflösung",
 	"display_layout_mode": "Multi-Monitor-Anordnung",
-	"display_layout_help": "Wie mehrere Anzeigen auf dem Desktop angeordnet werden. Manuell nutzt die Anordnungstabelle unten (ab 2 Anzeigen).",
+	"display_layout_help": "Automatisch ordnet die Anzeigen nebeneinander an (links nach rechts). Manuell: Du platzierst jede selbst — ein X/Y-Editor pro Anzeige erscheint im Abschnitt „Aktive Displays“ unten, sobald zwei oder mehr streamen.",
 	"display_layout_auto_row": "Automatisch (nebeneinander)",
 	"display_layout_manual": "Manuell",
 	"clients_title": "Gekoppelte Geräte",

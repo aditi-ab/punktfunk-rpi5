@@ -100,7 +100,7 @@
 	"display_identity_per_client": "Per client",
 	"display_identity_per_client_mode": "Per client + resolution",
 	"display_layout_mode": "Multi-monitor layout",
-	"display_layout_help": "How several displays are arranged on the desktop. Manual uses the arrangement table below (with 2+ displays).",
+	"display_layout_help": "Auto lays displays out side by side, left to right. Manual: you position each one yourself — a per-display X/Y editor appears in the Live displays section below once two or more are streaming.",
 	"display_layout_auto_row": "Auto (side by side)",
 	"display_layout_manual": "Manual",
 	"clients_title": "Paired clients",
