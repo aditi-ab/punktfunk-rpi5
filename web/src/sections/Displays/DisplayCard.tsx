@@ -27,6 +27,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
 
 /**
@@ -162,20 +163,30 @@ const DisplayForm: FC<{
 						const summary = id === "custom" ? m.display_custom_desc() : p?.summary;
 						const selected = preset === id;
 						const soon = DISABLED_PRESETS.has(id);
-						const cls = [
-							"flex h-full flex-col rounded-lg border p-4 text-left transition-colors",
-							selected
-								? "border-primary ring-1 ring-primary"
-								: "hover:border-primary/40 hover:bg-muted/50",
-							soon ? "opacity-60" : "",
-						].join(" ");
+						const disabled = busy || soon;
+						const pick = () => {
+							if (!disabled) pickPreset(id);
+						};
 						return (
-							<button
+							<Card
 								key={id}
-								type="button"
-								disabled={busy || soon}
-								onClick={() => pickPreset(id)}
-								className={cls}
+								interactive
+								role="button"
+								tabIndex={disabled ? -1 : 0}
+								aria-pressed={selected}
+								aria-disabled={disabled || undefined}
+								onClick={pick}
+								onKeyDown={(e) => {
+									if (e.key === "Enter" || e.key === " ") {
+										e.preventDefault();
+										pick();
+									}
+								}}
+								className={cn(
+									"flex h-full flex-col p-4",
+									disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+									selected && "ring-2 ring-primary",
+								)}
 							>
 								<div className="flex items-center justify-between gap-2">
 									<span className="text-base font-semibold">
@@ -201,7 +212,7 @@ const DisplayForm: FC<{
 										<Badge variant="outline">{tr(IDENTITY_LABEL, fields.identity)}</Badge>
 									</div>
 								)}
-							</button>
+							</Card>
 						);
 					})}
 				</div>
