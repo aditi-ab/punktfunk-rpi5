@@ -118,9 +118,19 @@ fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>, 
         }
     };
     rt.block_on(async move {
-        // Opt-in: snapshot the monitor layout BEFORE the virtual output exists, so we can tell the
-        // new (virtual) connector apart and restore the layout on teardown. Best-effort.
-        let dc_pre = if virtual_primary_enabled() {
+        // Display-management topology (Stage 2): the console policy's level, resolved to a concrete
+        // value. `Extend` leaves the virtual output an extension (no config change); `Primary` makes
+        // it the primary monitor but keeps the physicals as secondaries; `Exclusive` makes it the
+        // SOLE output (physicals disabled). `Auto` never reaches here — it's resolved upstream.
+        let topo = crate::vdisplay::effective_topology();
+        let want_config = matches!(
+            topo,
+            crate::vdisplay::policy::Topology::Primary | crate::vdisplay::policy::Topology::Exclusive
+        );
+        let exclusive = matches!(topo, crate::vdisplay::policy::Topology::Exclusive);
+        // Snapshot the monitor layout BEFORE the virtual output exists (so we can tell the new
+        // connector apart and restore on teardown) whenever we're going to touch the topology.
+        let dc_pre = if want_config {
             match display_config().await {
                 Ok(dc) => match get_state(&dc).await {
                     Ok(state) => Some((dc, state)),
@@ -152,8 +162,12 @@ fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>, 
         // monitor attached, the virtual output is an empty extended desktop — you stream only the
         // wallpaper. Best-effort: any failure just logs and streaming continues unchanged.
         if let Some((dc, pre)) = &dc_pre {
-            match make_virtual_primary(dc, mode, pre).await {
-                Ok(()) => tracing::info!("mutter: virtual output set as the primary monitor"),
+            match make_virtual_primary(dc, mode, pre, exclusive).await {
+                Ok(()) => tracing::info!(
+                    exclusive,
+                    "mutter: virtual output set as the primary monitor (physicals {})",
+                    if exclusive { "disabled" } else { "kept" }
+                ),
                 Err(e) => tracing::warn!(
                     "mutter: could not set the virtual output primary ({e:#}); streaming continues — the desktop may render on the physical monitor"
                 ),
@@ -338,17 +352,6 @@ type CurrentState = (
 type ApplyMon = (String, String, HashMap<String, Value<'static>>); // connector, mode_id, props
 type ApplyLogical = (i32, i32, f64, u32, bool, Vec<ApplyMon>);
 
-fn virtual_primary_enabled() -> bool {
-    std::env::var("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 /// Opt-in: pin the virtual output to the client's exact refresh via RecordVirtual "modes" (true
 /// above-60 Hz). Off by default — Mutter-derived 60 Hz is safe on every host; high-refresh virtual
 /// CRTCs are validated on Mutter 50 + NVIDIA but behaviour can vary, so it stays opt-in. (The
@@ -411,7 +414,12 @@ fn current_mode(state: &CurrentState, connector: &str) -> Option<(String, i32, i
 /// which lands shortly after the node id), then make it the SOLE primary output (physicals
 /// disabled for the session) so the cursor, windows, and keyboard focus stay on the streamed
 /// surface. Restored on teardown.
-async fn make_virtual_primary(dc: &zbus::Proxy<'_>, mode: Mode, pre: &CurrentState) -> Result<()> {
+async fn make_virtual_primary(
+    dc: &zbus::Proxy<'_>,
+    mode: Mode,
+    pre: &CurrentState,
+    exclusive: bool,
+) -> Result<()> {
     let pre_conns = connectors(pre);
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
@@ -437,7 +445,14 @@ async fn make_virtual_primary(dc: &zbus::Proxy<'_>, mode: Mode, pre: &CurrentSta
             let Some(vmode) = vmode else {
                 bail!("virtual monitor {vconn} has no usable mode yet");
             };
-            let config = build_primary_config(&vconn, &vmode);
+            // Exclusive: the virtual output alone (physicals omitted → Mutter disables them).
+            // Primary: the virtual output primary at (0,0) PLUS the physicals kept as secondaries.
+            // (On a headless host with no physicals the two are identical.)
+            let config = if exclusive {
+                build_exclusive_config(&vconn, &vmode)
+            } else {
+                build_primary_keeping_physicals(&state, &vconn, &vmode, mode.width as i32)
+            };
             let _: () = dc
                 .call(
                     "ApplyMonitorsConfig",
@@ -459,12 +474,12 @@ async fn make_virtual_primary(dc: &zbus::Proxy<'_>, mode: Mode, pre: &CurrentSta
     }
 }
 
-/// The virtual output as the SOLE, primary monitor — physical outputs are omitted, so Mutter
-/// disables them for the session. This confines the cursor, windows, and keyboard focus to the
+/// **Exclusive** — the virtual output as the SOLE, primary monitor: physical outputs are omitted, so
+/// Mutter disables them for the session. This confines the cursor, windows, and keyboard focus to the
 /// streamed surface; keeping the physical enabled as a *secondary* monitor instead lets relative
 /// pointer motion and window focus wander onto it (invisible to the client — the cursor seems to
 /// vanish). The physical layout is restored on teardown.
-fn build_primary_config(vconn: &str, vmode: &str) -> Vec<ApplyLogical> {
+fn build_exclusive_config(vconn: &str, vmode: &str) -> Vec<ApplyLogical> {
     vec![(
         0,
         0,
@@ -473,4 +488,48 @@ fn build_primary_config(vconn: &str, vmode: &str) -> Vec<ApplyLogical> {
         true,
         vec![(vconn.to_string(), vmode.to_string(), HashMap::new())],
     )]
+}
+
+/// **Primary** — the virtual output primary at `(0, 0)`, with every currently-active physical
+/// monitor KEPT as a secondary (laid left-to-right past the virtual, each at its current mode). So
+/// the shell + new windows land on the streamed surface, but the operator's physical screen stays
+/// on. On a headless host (no physicals) this is identical to [`build_exclusive_config`].
+///
+/// *Physical-keep is unvalidated on-glass* — the lab boxes are headless (no attached display to keep
+/// on); the layout math is conservative (append to the right) but wants a display-attached box.
+fn build_primary_keeping_physicals(
+    state: &CurrentState,
+    vconn: &str,
+    vmode: &str,
+    virt_width: i32,
+) -> Vec<ApplyLogical> {
+    let mut logicals: Vec<ApplyLogical> = vec![(
+        0,
+        0,
+        1.0,
+        0,
+        true,
+        vec![(vconn.to_string(), vmode.to_string(), HashMap::new())],
+    )];
+    // Append each physical (non-virtual) connector that has a usable current mode, to the right of
+    // the virtual output, as a non-primary secondary.
+    let mut x = virt_width.max(0);
+    for mon in &state.1 {
+        let conn = &mon.0 .0;
+        if conn == vconn {
+            continue;
+        }
+        if let Some((mode_id, w, _h)) = current_mode(state, conn) {
+            logicals.push((
+                x,
+                0,
+                1.0,
+                0,
+                false,
+                vec![(conn.clone(), mode_id, HashMap::new())],
+            ));
+            x += w.max(0);
+        }
+    }
+    logicals
 }

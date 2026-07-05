@@ -403,44 +403,11 @@ pub fn apply_session_env(active: &ActiveSession) {
     if active.kind == ActiveKind::DesktopGnome {
         std::env::set_var("PUNKTFUNK_FORCE_SHM", "1");
     }
-    // Stream the desktop as the SOLE output: promote the per-session virtual output to PRIMARY so
-    // the panels + windows land on the streamed surface, not an unstreamed real output (the
-    // auto-detected desktop path *is* "stream this desktop"). The per-compositor backends read
-    // `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY`; drive it here from the display-management topology.
-    //
-    // Stage 0 keeps today's behavior exactly UNLESS the console configured a policy: when a
-    // `display-settings.json` exists, the effective topology wins (Exclusive → sole desktop,
-    // Extend → leave the streamed output extended, Primary → treated as Exclusive until the
-    // primary-only path lands in the topology stage). Unconfigured hosts fall through to the
-    // historical default-on-for-desktop behavior, honoring an explicit operator env var.
-    let var = match active.kind {
-        ActiveKind::DesktopKde => Some("PUNKTFUNK_KWIN_VIRTUAL_PRIMARY"),
-        ActiveKind::DesktopGnome => Some("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY"),
-        _ => None,
-    };
-    if let Some(var) = var {
-        match policy::prefs().configured_effective() {
-            Some(eff) => {
-                let sole = match resolve_topology(eff.topology) {
-                    policy::Topology::Extend => false,
-                    policy::Topology::Exclusive => true,
-                    policy::Topology::Primary => {
-                        tracing::info!(
-                            "display policy: topology=primary treated as exclusive at this stage \
-                             (primary-only lands in the topology stage)"
-                        );
-                        true
-                    }
-                    // resolve_topology never returns Auto.
-                    policy::Topology::Auto => true,
-                };
-                std::env::set_var(var, if sole { "1" } else { "0" });
-            }
-            // Unconfigured: today's behavior — default-on unless the operator set it explicitly.
-            None if std::env::var_os(var).is_none() => std::env::set_var(var, "1"),
-            None => {}
-        }
-    }
+    // Topology (Stage 2): the per-compositor backends (KWin/Mutter) now read
+    // [`effective_topology`] directly at create time — the console policy, else the legacy
+    // `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` env, else the Auto default (exclusive on the
+    // auto-desktop path). So this connect-path no longer writes that env (one fewer process-env
+    // mutation on the `ENV_LOCK` surface); `effective_topology()` computes the identical result.
 }
 #[cfg(not(target_os = "linux"))]
 pub fn apply_session_env(_active: &ActiveSession) {}
@@ -776,6 +743,34 @@ pub fn resolve_topology(t: policy::Topology) -> policy::Topology {
             }
         }
         concrete => concrete,
+    }
+}
+
+/// The concrete display topology for the current session — what the per-compositor backends (and the
+/// Windows isolate gate) apply at create time. Precedence, mirroring the rest of the policy surface:
+/// the **console policy** when configured, else the legacy **`PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY`**
+/// env (an operator's explicit choice — `1`→exclusive, `0`→extend), else the **Auto** default
+/// ([`resolve_topology`]: exclusive on the auto-detected desktop / Windows, extend under a compositor
+/// pin). Always resolved (never [`policy::Topology::Auto`]). This is the Stage-2 replacement for the
+/// `apply_session_env` boolean write — the backends read policy directly, so the `primary` level
+/// (distinct from `exclusive`) becomes expressible and one process-env mutation drops off the connect
+/// path.
+pub fn effective_topology() -> policy::Topology {
+    if let Some(e) = policy::prefs().configured_effective() {
+        return resolve_topology(e.topology);
+    }
+    // Unconfigured: honor a legacy operator env if present (a host runs one desktop backend, so at
+    // most one of these is set), else the Auto default.
+    let legacy = [
+        "PUNKTFUNK_KWIN_VIRTUAL_PRIMARY",
+        "PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY",
+    ]
+    .iter()
+    .find_map(|k| std::env::var(k).ok());
+    match legacy.as_deref().map(str::trim) {
+        Some("1" | "true" | "yes" | "on") => policy::Topology::Exclusive,
+        Some("0" | "false" | "no" | "off") => policy::Topology::Extend,
+        _ => resolve_topology(policy::Topology::Auto),
     }
 }
 

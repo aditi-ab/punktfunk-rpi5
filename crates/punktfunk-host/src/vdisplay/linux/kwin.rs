@@ -111,14 +111,19 @@ impl VirtualDisplay for KwinDisplay {
         } else {
             mode.refresh_hz
         };
-        // Make our streamed output the SOLE desktop: plasmashell + windows land on the surface we
-        // stream, not on the headless session's `kwin --virtual` bootstrap output (otherwise the
-        // client sees only the wallpaper of an empty extended output). Opt-in
-        // (PUNKTFUNK_KWIN_VIRTUAL_PRIMARY), mirroring the Mutter backend's PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY.
-        let restore = if virtual_primary_enabled() {
-            apply_virtual_primary()
-        } else {
-            Vec::new()
+        // Display-management topology (Stage 2): `Extend` leaves the streamed output an extension;
+        // `Primary` makes it the primary output but keeps the bootstrap/physical outputs enabled;
+        // `Exclusive` makes it the SOLE desktop (others disabled, restored on teardown) — so
+        // plasmashell + windows land on the streamed surface, not the headless `kwin --virtual`
+        // bootstrap output. Read from the policy (replacing the PUNKTFUNK_KWIN_VIRTUAL_PRIMARY boolean).
+        use crate::vdisplay::policy::Topology;
+        let restore = match crate::vdisplay::effective_topology() {
+            Topology::Exclusive => apply_virtual_primary(),
+            Topology::Primary => {
+                apply_virtual_primary_only();
+                Vec::new() // nothing disabled → nothing to restore
+            }
+            Topology::Extend | Topology::Auto => Vec::new(),
         };
         Ok(VirtualOutput {
             node_id,
@@ -213,21 +218,6 @@ fn read_active_refresh(output: &str) -> Option<u32> {
     Some(hz.round() as u32)
 }
 
-/// Opt-in: make the per-session virtual output the sole desktop. Off by default — a host with no
-/// competing output (or one that wants the bootstrap kept) is unaffected; the headless KDE appliance
-/// (run-headless-kde.sh's `kwin --virtual` bootstrap + our streamed output) sets it so the desktop
-/// renders on the streamed surface, not the bootstrap. Mirrors the Mutter backend's gate.
-fn virtual_primary_enabled() -> bool {
-    std::env::var("PUNKTFUNK_KWIN_VIRTUAL_PRIMARY")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 /// Names of currently-ENABLED outputs other than our `Virtual-punktfunk` — i.e. the headless
 /// session's bootstrap output(s), which hold the desktop by default. Parsed from `kscreen-doctor -j`
 /// (same source as [`read_active_refresh`]).
@@ -290,6 +280,23 @@ fn apply_virtual_primary() -> Vec<String> {
     }
     tracing::info!(also_disabled = ?others, "KWin: streamed output set as the sole desktop");
     others
+}
+
+/// **Primary** (Stage 2): make the streamed output the primary but KEEP the other outputs enabled
+/// (don't disable the bootstrap/physical) — so the shell re-homes onto the streamed surface while a
+/// physical screen stays usable. Nothing to restore on teardown (we disabled nothing).
+fn apply_virtual_primary_only() {
+    let ours = format!("Virtual-{VOUT_NAME}");
+    let ok = std::process::Command::new("kscreen-doctor")
+        .arg(format!("output.{ours}.primary"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        tracing::info!("KWin: streamed output set primary (physical outputs kept)");
+    } else {
+        tracing::warn!("KWin: could not set the virtual output primary");
+    }
 }
 
 /// Dropping this releases the KWin virtual output: it flips the keepalive thread's `stop`, which
