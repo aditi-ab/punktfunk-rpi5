@@ -10,11 +10,52 @@ description: Common problems setting up or using a punktfunk host, and how to fi
 - Host and client must be on the **same network/subnet**. Discovery uses mDNS, which doesn't cross
   routed subnets or most VPNs-without-multicast. As a fallback, add the host by **IP address** in your
   client.
-- A firewall on the host can block it. The native protocol's control plane uses UDP port **9777**. The
-  per-session **data plane** uses an *ephemeral* UDP port negotiated at connect time (currently
-  random) — for a strict firewall, open a UDP range or move the data port. GameStream/Moonlight uses
-  TCP **47984/47989/48010** + UDP **47998–48010** + ENet UDP **47999**. Allow them on the host's
-  firewall.
+- A firewall on the host can block it. The native protocol's **control plane** is a fixed UDP port,
+  **9777** — open this one. The per-session **data plane** rides a *separate, random* UDP port and
+  usually needs **no** firewall rule (see [Video is slow to start, or fails across
+  subnets](#video-is-slow-to-start-or-fails-across-subnets) for why, and the one case where opening it
+  helps). GameStream/Moonlight (only with `--gamestream`) uses TCP **47984/47989/48010** + UDP
+  **47998–48010** (video/FEC 47998, ENet control 47999, audio 48000) + mDNS UDP **5353**. Allow those
+  on the host's firewall.
+
+## Video is slow to start, or fails across subnets
+
+The native **data plane** (the raw UDP that carries video, separate from the 9777 control plane) uses
+a **random, per-session UDP port** — the host binds `0.0.0.0:0`, then tells the client which port it
+got during the connect handshake. There is no fixed data port.
+
+Video flows host → client, but the **client sends the first packet**: a small *hole-punch* datagram to
+that port. This is deliberate. It lets the host learn the client's real (possibly NAT-translated)
+source address and stream back to it, so a session can cross a NAT or a stateful inter-VLAN firewall
+**without** a forwarded data port. What it means for a host firewall:
+
+- **Same LAN, no host firewall (or the port allowed):** the punch arrives immediately and video starts
+  at once. Nothing to configure.
+- **Same LAN, host firewall that denies inbound** (ufw/nftables/firewalld default): the punch is
+  dropped, so the host waits **~2.5 s**, then falls back to the address the client reported and streams
+  anyway — a stateful firewall admits the return traffic because the host sent first. **Net effect: it
+  works, but each session takes ~2.5 s longer to start.** That slow start is the symptom of a
+  data-plane rule you're missing.
+- **Across subnets / NAT:** the same punch-then-fallback applies, as long as the host's outbound video
+  can reach the client (the path's stateful firewall then admits the return). If the host itself is
+  behind NAT reached only via a forwarded control port, the data path may not establish — this is the
+  case a fixed, forwardable data port would solve.
+
+To remove the ~2.5 s fallback delay, **pin the data port** with `--data-port` (or the
+`PUNKTFUNK_DATA_PORT` env in `host.env`) and open exactly that one port. The host then binds that
+fixed port, skips the punch-wait, and streams straight to the client — no timeout to pay:
+
+```sh
+punktfunk-host serve --data-port 9778     # or PUNKTFUNK_DATA_PORT=9778 in host.env
+sudo ufw allow 9778/udp                    # open exactly that one port
+```
+
+Two caveats. A fixed data port serves **one session at a time**; a second concurrent session finds it
+busy and transparently falls back to a random port + hole-punch (logged). And `--data-port` streams
+to the client's *reported* address, so use it only where that address is reachable — a flat LAN, or a
+port-forward that doesn't remap the client's source. Leave it **off** (the default) to keep the
+NAT-crossing hole-punch. On a normal single-LAN setup you can also just leave the data port closed and
+accept the one-time ~2.5 s punch-timeout, or not run a host firewall on a trusted LAN at all.
 
 ## `nvidia-smi` says it can't communicate with the driver
 

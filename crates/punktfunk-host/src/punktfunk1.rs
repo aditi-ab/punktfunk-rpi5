@@ -75,6 +75,35 @@ pub struct Punktfunk1Options {
     pub pairing_pin: Option<String>,
     /// Paired-clients store path override (tests); `None` = the default config path.
     pub paired_store: Option<std::path::PathBuf>,
+    /// Fixed data-plane UDP port. `None`/`Some(0)` (default): bind a random ephemeral port and
+    /// **hole-punch** — wait ~2.5 s for the client's punch, then fall back to its reported address
+    /// (traverses NAT / a stateful inter-VLAN firewall with no forwarded port, at the cost of the
+    /// punch-timeout on a firewall that drops the punch). `Some(p)`: bind that fixed port and
+    /// stream **directly** to the client's reported address with no punch-wait — for a host whose
+    /// data port is fixed + firewall-opened/forwarded, this removes the punch-timeout delay. A
+    /// fixed port only fits one data plane at a time, so a concurrent session finding it busy
+    /// falls back to random + hole-punch (see [`bind_data_socket`]).
+    pub data_port: Option<u16>,
+}
+
+/// Bind the per-session data-plane UDP socket, honoring [`Punktfunk1Options::data_port`]. Returns
+/// `(socket, direct)`: `direct = true` (a successfully-bound fixed port) means "stream straight to
+/// the client's reported address, no hole-punch"; `false` (random port, or a busy fixed port) means
+/// "hole-punch". The socket is held from the handshake through streaming — no drop-then-rebind
+/// window in which a concurrent session could steal a fixed port.
+fn bind_data_socket(data_port: Option<u16>) -> std::io::Result<(std::net::UdpSocket, bool)> {
+    if let Some(p) = data_port.filter(|p| *p != 0) {
+        match std::net::UdpSocket::bind(("0.0.0.0", p)) {
+            Ok(sock) => return Ok((sock, true)),
+            Err(e) => tracing::warn!(
+                data_port = p,
+                error = %e,
+                "fixed --data-port is busy (a concurrent session already holds it?) — \
+                 falling back to a random port + hole-punch for this session"
+            ),
+        }
+    }
+    Ok((std::net::UdpSocket::bind("0.0.0.0:0")?, false))
 }
 
 /// The native (punktfunk/1) trust store + on-demand arming PIN, shared with the management API.
@@ -143,6 +172,9 @@ pub(crate) struct NativeServe {
     /// The management API's TCP port, advertised over mDNS so a client browses the game library on
     /// the same host IP (the unified `serve` always runs the mgmt API, so this is its bind port).
     pub mgmt_port: u16,
+    /// Fixed data-plane UDP port (`--data-port` / `PUNKTFUNK_DATA_PORT`); see
+    /// [`Punktfunk1Options::data_port`]. `None` = random port + hole-punch (the default).
+    pub data_port: Option<u16>,
 }
 
 /// Options for the native host when the unified `serve --native` runs it: real virtual capture,
@@ -165,6 +197,7 @@ pub(crate) fn native_serve_opts(cfg: &NativeServe) -> Punktfunk1Options {
         allow_pairing: false,
         pairing_pin: None,
         paired_store: None,
+        data_port: cfg.data_port,
     }
 }
 
@@ -656,6 +689,7 @@ async fn serve_session(
 
     let source = opts.source;
     let frames = opts.frames;
+    let data_port = opts.data_port;
     let handshake = async {
         let mut hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
         anyhow::ensure!(
@@ -846,10 +880,12 @@ async fn serve_session(
             "encode chroma"
         );
 
-        // Reserve a UDP port for the data plane (bind, read it back, rebind in UdpTransport).
-        let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        let udp_port = probe.local_addr()?.port();
-        drop(probe);
+        // Reserve the data-plane UDP socket up front and HOLD it through streaming (no
+        // bind→read→drop→rebind window a concurrent session could race for a fixed port). A fixed
+        // `--data-port` yields `direct = true` (stream straight to the client's reported address,
+        // no punch-wait); otherwise a random ephemeral port + hole-punch.
+        let (data_sock, direct) = bind_data_socket(data_port)?;
+        let udp_port = data_sock.local_addr()?.port();
 
         let mut key = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut key);
@@ -909,9 +945,9 @@ async fn serve_session(
 
         let start = Start::decode(&io::read_msg(&mut recv).await?)
             .map_err(|e| anyhow!("Start decode: {e:?}"))?;
-        Ok::<_, anyhow::Error>((hello, welcome, udp_port, start, compositor))
+        Ok::<_, anyhow::Error>((hello, welcome, udp_port, data_sock, direct, start, compositor))
     };
-    let (hello, welcome, udp_port, start, compositor) =
+    let (hello, welcome, udp_port, data_sock, direct, start, compositor) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
             .await
             .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
@@ -1233,29 +1269,41 @@ async fn serve_session(
         .unwrap_or_else(|| conn.remote_address().ip().to_string());
     let result: Result<()> = async {
         tokio::task::spawn_blocking(move || -> Result<()> {
-            // Wait briefly for the client to hole-punch our data port, then stream to its OBSERVED
-            // source — so video traverses a NAT / stateful inter-VLAN firewall (the client and host
-            // can be on different subnets; control + side planes ride the client-initiated QUIC, but
-            // the raw video UDP needs the client to open the path first). Falls back to the
-            // client-reported address for clients that don't punch (flat-LAN, unchanged).
-            let (transport, punched) = match UdpTransport::connect_via_punch(
-                &format!("0.0.0.0:{udp_port}"),
-                &client_udp.to_string(),
-                std::time::Duration::from_millis(2500),
-            ) {
+            // Bring up the (already-bound) data-plane socket. Default: hole-punch — wait briefly
+            // for the client's punch, then stream to its OBSERVED source, so video traverses a
+            // NAT / stateful inter-VLAN firewall (control + side planes ride the client-initiated
+            // QUIC, but the raw video UDP needs the client to open the path first); falls back to
+            // the reported address for clients that don't punch (flat-LAN, unchanged). With a fixed
+            // `--data-port` (`direct`), skip the punch-wait and stream straight to the reported
+            // address — the operator declared a reachable, firewall-opened port, so there's no
+            // punch-timeout to pay. (Direct trusts the reported port: it can't cross a client-side
+            // NAT that remaps it.)
+            let bound = if direct {
+                UdpTransport::from_socket(data_sock, &client_udp.to_string()).map(|t| (t, false))
+            } else {
+                UdpTransport::from_socket_punch(
+                    data_sock,
+                    &client_udp.to_string(),
+                    std::time::Duration::from_millis(2500),
+                )
+            };
+            let (transport, punched) = match bound {
                 Ok(v) => v,
                 Err(e) => {
                     // Surface the failure here directly: a data-plane bind error would otherwise be
                     // reported only after teardown (and a teardown stall could swallow it entirely).
-                    tracing::error!(error = %e, %client_udp, udp_port, "data-plane socket bind/hole-punch failed");
+                    tracing::error!(error = %e, %client_udp, udp_port, "data-plane socket setup failed");
                     return Err(anyhow::Error::new(e)).context("bind data plane");
                 }
             };
             tracing::info!(
                 %client_udp,
+                udp_port,
+                direct,
                 punched,
-                "data plane bound (punched=true → streaming to the client's observed source; \
-                 false → no hole-punch seen, using the reported address)"
+                "data plane bound (direct=true → fixed --data-port, streaming to the reported \
+                 address with no hole-punch; else punched=true → the client's observed source, \
+                 false → no punch seen, the reported address)"
             );
             let mut session = Session::new(cfg, Box::new(transport))
                 .map_err(|e| anyhow!("host session: {e:?}"))?;
@@ -3651,6 +3699,43 @@ mod tests {
     }
 
     #[test]
+    fn data_socket_defaults_to_random_hole_punch() {
+        // No fixed port (and the explicit-0 alias) → a random ephemeral port, and NOT direct: the
+        // caller hole-punches.
+        for req in [None, Some(0)] {
+            let (sock, direct) = bind_data_socket(req).expect("bind random data socket");
+            assert!(!direct, "req={req:?} must hole-punch, not stream direct");
+            assert_ne!(sock.local_addr().unwrap().port(), 0);
+        }
+    }
+
+    #[test]
+    fn data_socket_fixed_binds_direct_then_falls_back_when_busy() {
+        // Learn a currently-free port (bind :0, read it, drop — the same reserve-then-rebind the
+        // host itself uses; a race here would only make the assert below flaky, not wrong).
+        let free = std::net::UdpSocket::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        // A free fixed port binds exactly it, in DIRECT mode (no hole-punch).
+        let (held, direct) = bind_data_socket(Some(free)).expect("bind fixed data socket");
+        assert!(direct, "a fixed --data-port must stream direct");
+        assert_eq!(held.local_addr().unwrap().port(), free);
+
+        // While it's held, a second session on the same fixed port can't bind it → it must fall
+        // back to a random port + hole-punch rather than fail (so concurrency never regresses).
+        let (fallback, direct2) = bind_data_socket(Some(free)).expect("busy fixed port falls back");
+        assert!(!direct2, "a busy fixed port must fall back to hole-punch");
+        assert_ne!(
+            fallback.local_addr().unwrap().port(),
+            free,
+            "the fallback must not reuse the busy fixed port"
+        );
+    }
+
+    #[test]
     fn compositor_resolution_precedence() {
         use crate::vdisplay::Compositor::*;
         // A concrete, available preference is honored.
@@ -3847,6 +3932,7 @@ mod tests {
                 allow_pairing: false,
                 pairing_pin: None,
                 paired_store: None,
+                data_port: None,
             })
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4041,6 +4127,7 @@ mod tests {
                     allow_pairing: false,
                     pairing_pin: None,
                     paired_store: None, // unused: the shared `np` IS the store handle
+                    data_port: None,
                 },
                 0, // no mgmt API in this test → advertise no `mgmt` mDNS port
                 np_host,
@@ -4139,6 +4226,7 @@ mod tests {
                 allow_pairing: false,
                 pairing_pin: Some("4321".into()),
                 paired_store: Some(test_paired_path()),
+                data_port: None,
             })
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
