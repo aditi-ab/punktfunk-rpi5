@@ -779,8 +779,11 @@ pub fn effective_topology() -> policy::Topology {
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/gamescope.rs"]
 mod gamescope;
-#[cfg(target_os = "windows")]
-#[path = "vdisplay/windows/identity.rs"]
+// Platform-neutral per-client stable display-id map (Stage 3): Windows seeds the monitor EDID +
+// ConnectorIndex from the id; KWin names its output from it. `allow(dead_code)` because only Windows
+// consumes it in non-test code today — the KWin wiring is the next Stage-3 step.
+#[allow(dead_code)]
+#[path = "vdisplay/identity.rs"]
 pub(crate) mod identity;
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/kwin.rs"]

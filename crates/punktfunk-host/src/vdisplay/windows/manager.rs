@@ -172,7 +172,7 @@ pub(crate) struct VirtualDisplayManager {
     /// Persistent per-client (cert-fingerprint) → stable monitor-id map. A monitor CREATE resolves the
     /// connecting client's id here, so the client keeps the same EDID serial + IddCx ConnectorIndex across
     /// reconnects and Windows reapplies its saved per-monitor config (DPI scaling). See [`super::identity`].
-    identity_map: Mutex<super::identity::MonitorIdentityMap>,
+    identity_map: Mutex<super::identity::DisplayIdentityMap>,
 }
 
 static VDM: OnceLock<VirtualDisplayManager> = OnceLock::new();
@@ -188,7 +188,7 @@ pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayMa
         state: Mutex::new(MgrState::Idle),
         setup_lock: Mutex::new(()),
         idd_session_stop: Mutex::new(None),
-        identity_map: Mutex::new(super::identity::MonitorIdentityMap::load()),
+        identity_map: Mutex::new(super::identity::DisplayIdentityMap::load()),
     })
 }
 
@@ -527,9 +527,20 @@ impl VirtualDisplayManager {
     ) -> Result<Monitor> {
         // Resolve the connecting client's STABLE per-client monitor id (so Windows reapplies its saved
         // per-monitor config — DPI scaling — on reconnect); `None`/anonymous → 0 = the driver
-        // auto-allocates the lowest-free id (the original slot-based behavior).
+        // auto-allocates the lowest-free id (the original slot-based behavior). The `identity` policy
+        // picks the key: per-client (fingerprint) or per-client-mode (fingerprint + resolution).
+        let per_client_mode = matches!(
+            crate::vdisplay::policy::prefs()
+                .configured_effective()
+                .map(|e| e.identity),
+            Some(crate::vdisplay::policy::Identity::PerClientMode)
+        );
         let preferred_id = client_fp
-            .map(|fp| self.identity_map.lock().unwrap().resolve(fp))
+            .map(|fp| {
+                let key =
+                    super::identity::identity_key(fp, (mode.width, mode.height), per_client_mode);
+                self.identity_map.lock().unwrap().resolve(&key)
+            })
             .unwrap_or(0);
         // SAFETY: `create_monitor`'s own `# Safety` contract guarantees `dev` is the live control
         // handle; we forward it unchanged to `add_monitor`, whose precondition is exactly that.
