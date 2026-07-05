@@ -170,18 +170,26 @@ pub fn appasset_bytes(appid: u32) -> Option<(Vec<u8>, String)> {
 /// Render the GameStream `/applist` XML. `IsHdrSupported` reflects whether the host can actually deliver
 /// HDR (HEVC Main10 / PQ) for a title — host-wide today ([`crate::gamestream::host_hdr_capable`]); when
 /// true, Moonlight offers its per-app HDR toggle.
+///
+/// The document is emitted **COMPACT — no whitespace between elements** — deliberately, to match
+/// Sunshine/GFE. Moonlight-Android's `getAppListByReader` calls `appList.getLast()` on *every* XML
+/// text node before it checks the current tag, and only fills `appList` on an `<App>` start tag. A
+/// pretty-print newline between `<root>` and the first `<App>` is a whitespace text node while
+/// `appList` is still empty → `NoSuchElementException` → the Android app hard-crashes on host click.
+/// (iOS/macOS parse via moonlight-common-c/expat and are unaffected; `serverinfo`/pairing use the
+/// named-tag `getXmlString` scan, so their whitespace is harmless.) Keep this whitespace-free.
 pub fn applist_xml() -> String {
     let hdr = u8::from(crate::gamestream::host_hdr_capable());
     let mut xml =
-        String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\">\n");
+        String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?><root status_code=\"200\">");
     for app in catalog() {
         xml.push_str(&format!(
-            "<App>\n<IsHdrSupported>{hdr}</IsHdrSupported>\n<AppTitle>{}</AppTitle>\n<ID>{}</ID>\n</App>\n",
+            "<App><IsHdrSupported>{hdr}</IsHdrSupported><AppTitle>{}</AppTitle><ID>{}</ID></App>",
             xml_escape(&app.title),
             app.id
         ));
     }
-    xml.push_str("</root>\n");
+    xml.push_str("</root>");
     xml
 }
 
@@ -248,5 +256,28 @@ mod tests {
         assert!(xml.contains("<AppTitle>Desktop</AppTitle>"));
         assert!(xml.starts_with("<?xml"));
         assert_eq!(xml.matches("<App>").count(), xml.matches("</App>").count());
+    }
+
+    /// Regression: the applist MUST be whitespace-free between elements. Moonlight-Android's
+    /// `getAppListByReader` calls `appList.getLast()` on every text node before an `<App>` has been
+    /// pushed, so a pretty-print newline between `<root>` and the first `<App>` crashes the app
+    /// (`NoSuchElementException`). Reproduced on 2 Android phones; iOS/macOS (moonlight-common-c)
+    /// were unaffected. Keep `applist_xml` compact like Sunshine/GFE.
+    #[test]
+    fn applist_xml_has_no_interelement_whitespace() {
+        let xml = applist_xml();
+        // <root> is immediately followed by the first <App> — no whitespace text node while the
+        // parser's app list is still empty.
+        assert!(
+            xml.contains("status_code=\"200\"><App>"),
+            "no whitespace between <root> and the first <App>: {xml}"
+        );
+        // No pretty-print newlines anywhere in the element stream, and no whitespace-only text
+        // nodes between any adjacent tags.
+        assert!(!xml.contains('\n'), "applist must contain no newlines: {xml}");
+        assert!(
+            !xml.contains("> <"),
+            "applist must contain no inter-element spaces: {xml}"
+        );
     }
 }

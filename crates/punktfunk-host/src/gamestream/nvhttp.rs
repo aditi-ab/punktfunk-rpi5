@@ -149,10 +149,9 @@ async fn h_launch(
             .unwrap()
             .as_ref()
             .map(|s| (s.owner_fp, (s.width, s.height, s.fps)));
-        let conflict = crate::vdisplay::policy::prefs()
-            .configured_effective()
-            .map(|e| e.mode_conflict)
-            .unwrap_or(crate::vdisplay::policy::ModeConflict::Separate);
+        // Same Windows default as the native path (separate → reject; see `effective_conflict`) so a
+        // 2nd Moonlight client gets a clean 503 rather than wedging the shared monitor's capture.
+        let conflict = crate::vdisplay::admission::effective_conflict();
         match gamestream_admission(live, req_fp, conflict) {
             GsDecision::Serve => {}
             GsDecision::Join((w, h, f)) => {
