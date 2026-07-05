@@ -7,6 +7,7 @@ import {
 	useGetDisplaySettings,
 	useGetDisplayState,
 	useReleaseDisplay,
+	useSetDisplayLayout,
 	useSetDisplaySettings,
 } from "@/api/gen/display/display";
 import type { ApiDisplayInfo } from "@/api/gen/model";
@@ -126,6 +127,95 @@ const LiveDisplays: FC = () => {
 					))}
 				</ul>
 			)}
+			<DisplayArrangement displays={displays} />
+		</div>
+	);
+};
+
+/**
+ * The multi-monitor **arrangement** editor (design/display-management.md §6.2): an x/y table over the
+ * live displays that carry a stable identity slot (the manual-layout key). Saving writes
+ * `PUT /display/layout`, which switches the host to a manual layout and applies from the next connect.
+ * Shown only for a ≥2-display group — arranging a single display is moot.
+ */
+const DisplayArrangement: FC<{ displays: ApiDisplayInfo[] }> = ({ displays }) => {
+	const qc = useQueryClient();
+	const saveLayout = useSetDisplayLayout();
+	// Only displays with a stable identity slot can be pinned (shared/anonymous ones have no key).
+	const arrangeable = displays.filter((d) => d.identity_slot != null);
+
+	// Local edit buffer keyed by identity-slot string → {x, y}, seeded once from the current positions.
+	const [pos, setPos] = useState<Record<string, { x: number; y: number }> | null>(null);
+	useEffect(() => {
+		if (pos === null && arrangeable.length > 0) {
+			const seed: Record<string, { x: number; y: number }> = {};
+			for (const d of arrangeable) seed[String(d.identity_slot)] = { x: d.x, y: d.y };
+			setPos(seed);
+		}
+	}, [arrangeable, pos]);
+
+	if (arrangeable.length < 2) return null;
+	const cur = pos ?? {};
+
+	const setXY = (slot: number, key: "x" | "y", val: number) => {
+		const k = String(slot);
+		setPos({ ...cur, [k]: { ...(cur[k] ?? { x: 0, y: 0 }), [key]: val } });
+	};
+
+	const onSave = () =>
+		saveLayout.mutate(
+			{ data: { positions: cur } },
+			{ onSuccess: () => qc.invalidateQueries({ queryKey: getGetDisplayStateQueryKey() }) },
+		);
+
+	return (
+		<div className="space-y-2 border-t pt-4">
+			<h4 className="text-sm font-medium">{m.display_arrange()}</h4>
+			<p className="text-xs text-muted-foreground">{m.display_arrange_help()}</p>
+			<div className="space-y-2">
+				{arrangeable.map((d) => {
+					const slot = d.identity_slot as number;
+					const p = cur[String(slot)] ?? { x: d.x, y: d.y };
+					return (
+						<div key={d.slot} className="flex flex-wrap items-center gap-2 text-sm">
+							<span className="w-44 truncate">
+								{d.mode}{" "}
+								<code className="text-xs text-muted-foreground">#{slot}</code>
+							</span>
+							<Label className="text-xs" htmlFor={`disp-x-${slot}`}>
+								X
+							</Label>
+							<Input
+								id={`disp-x-${slot}`}
+								type="number"
+								className="w-24"
+								value={p.x}
+								disabled={saveLayout.isPending}
+								onChange={(e) => setXY(slot, "x", Math.trunc(Number(e.target.value) || 0))}
+							/>
+							<Label className="text-xs" htmlFor={`disp-y-${slot}`}>
+								Y
+							</Label>
+							<Input
+								id={`disp-y-${slot}`}
+								type="number"
+								className="w-24"
+								value={p.y}
+								disabled={saveLayout.isPending}
+								onChange={(e) => setXY(slot, "y", Math.trunc(Number(e.target.value) || 0))}
+							/>
+						</div>
+					);
+				})}
+			</div>
+			{saveLayout.error && (
+				<p className="text-sm text-amber-600 dark:text-amber-500">
+					{apiErrorMessage(saveLayout.error)}
+				</p>
+			)}
+			<Button size="sm" onClick={onSave} disabled={saveLayout.isPending}>
+				{m.display_arrange_save()}
+			</Button>
 		</div>
 	);
 };
