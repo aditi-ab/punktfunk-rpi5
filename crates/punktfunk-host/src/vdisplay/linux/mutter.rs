@@ -285,15 +285,16 @@ async fn connect(mode: Mode) -> Result<MutterSession> {
     )
     .await?;
 
-    // 3. The virtual monitor. By DEFAULT we let Mutter derive the refresh from the PipeWire
-    // framerate (it defaults the virtual monitor to 60 Hz) — universally safe.
-    // PUNKTFUNK_MUTTER_VIRTUAL_REFRESH=1 pins the client's exact WxH@Hz via RecordVirtual's "modes"
-    // (explicit size + refresh-rate; Mutter ≥ 47) for true >60 Hz — validated at 5120×1440@240 on
-    // Mutter 50 + NVIDIA. (A high-refresh virtual CRTC used to SIGSEGV gnome-shell on teardown; the
-    // stop-screencast-before-any-monitor-reconfig teardown below avoids that.)
+    // 3. The virtual monitor. For >60 Hz we pin the client's exact WxH@Hz via RecordVirtual's
+    // "modes" (explicit size + refresh-rate; Mutter ≥ 47) — validated at 5120×1440@240 on Mutter 50
+    // + NVIDIA. At ≤60 Hz we let Mutter derive the refresh from the PipeWire framerate (its 60 Hz
+    // default is already correct), so the custom-mode path only runs when it buys something.
+    // (A high-refresh virtual CRTC used to SIGSEGV gnome-shell on teardown, which is why this was
+    // once gated behind PUNKTFUNK_MUTTER_VIRTUAL_REFRESH; the stop-screencast-before-any-monitor-
+    // reconfig teardown below fixed the crash, so pinning the client's refresh is now the default.)
     let mut rec: HashMap<&str, Value> = HashMap::new();
     rec.insert("cursor-mode", Value::from(CURSOR_EMBEDDED));
-    if virtual_refresh_enabled() && mode.refresh_hz > 60 {
+    if mode.refresh_hz > 60 {
         let mut vmode: HashMap<&str, Value> = HashMap::new();
         vmode.insert("size", Value::from((mode.width, mode.height)));
         vmode.insert("refresh-rate", Value::from(mode.refresh_hz as f64));
@@ -381,22 +382,6 @@ type CurrentState = (
 /// `ApplyMonitorsConfig` logical-monitor shape: `(iiduba(ssa{sv}))`, monitor = `(ssa{sv})`.
 type ApplyMon = (String, String, HashMap<String, Value<'static>>); // connector, mode_id, props
 type ApplyLogical = (i32, i32, f64, u32, bool, Vec<ApplyMon>);
-
-/// Opt-in: pin the virtual output to the client's exact refresh via RecordVirtual "modes" (true
-/// above-60 Hz). Off by default — Mutter-derived 60 Hz is safe on every host; high-refresh virtual
-/// CRTCs are validated on Mutter 50 + NVIDIA but behaviour can vary, so it stays opt-in. (The
-/// teardown SIGSEGV that first motivated this gate is fixed by stopping the screencast before any
-/// monitor-config change.)
-fn virtual_refresh_enabled() -> bool {
-    std::env::var("PUNKTFUNK_MUTTER_VIRTUAL_REFRESH")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
 
 /// A DisplayConfig proxy on its own session-bus connection (owned, so it stays alive for the
 /// session — independent of the RemoteDesktop/ScreenCast connection).

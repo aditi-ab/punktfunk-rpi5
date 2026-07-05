@@ -72,7 +72,6 @@ picture.
 |---|---|---|
 | `PUNKTFUNK_KWIN_VIRTUAL_PRIMARY` | `1` | Make the streamed per-session output the sole desktop so plasmashell + windows render on it (not on the headless bootstrap output). Set by the KDE appliance `host.env`. Superseded by the console's **Topology** setting. |
 | `PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY` | `1` | GNOME/Mutter equivalent of the above. |
-| `PUNKTFUNK_MUTTER_VIRTUAL_REFRESH` | `1` | Pin the client's exact WxH**@Hz** via `RecordVirtual`'s custom modes (needed for >60 Hz on Mutter). |
 
 ## Video quality
 
