@@ -652,7 +652,7 @@ async fn serve_session(
     let source = opts.source;
     let frames = opts.frames;
     let handshake = async {
-        let hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
+        let mut hello = Hello::decode(&first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
         anyhow::ensure!(
             hello.abi_version == punktfunk_core::WIRE_VERSION,
             "wire version mismatch: client {} host {}",
@@ -683,6 +683,45 @@ async fn serve_session(
             host_codecs = format_args!("0x{host_codecs:02x}"),
             "video codec negotiated"
         );
+
+        // Mode-conflict ADMISSION (Stage 4): a DIFFERENT client connecting while another client's
+        // session is live is resolved by the `mode_conflict` policy BEFORE the Welcome — `separate`
+        // (default, no change), `join` (serve at the live mode — an honest downgrade the client
+        // renders from the Welcome), `steal` (preempt the victim), or `reject` (refuse the handshake).
+        // A same-client reconnect never conflicts. THIS session registers in the live set once its
+        // data plane is up (below the handshake), so a later client can see + steal it.
+        {
+            use crate::vdisplay::admission::{admit, Admission};
+            match admit(endpoint::peer_fingerprint(&conn)) {
+                Admission::Separate => {}
+                Admission::Join(m) => {
+                    tracing::info!(
+                        requested =
+                            %format_args!("{}x{}@{}", hello.mode.width, hello.mode.height, hello.mode.refresh_hz),
+                        live = %format_args!("{}x{}@{}", m.0, m.1, m.2),
+                        "mode-conflict: JOIN — admitting at the live display's mode"
+                    );
+                    hello.mode.width = m.0;
+                    hello.mode.height = m.1;
+                    hello.mode.refresh_hz = m.2;
+                }
+                Admission::Steal(victims) => {
+                    tracing::info!(
+                        victims = victims.len(),
+                        "mode-conflict: STEAL — preempting the live session(s)"
+                    );
+                    for v in &victims {
+                        v.store(true, Ordering::SeqCst);
+                    }
+                    // Give the victims the release grace to tear their display down before we acquire.
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+                Admission::Reject(reason) => {
+                    tracing::warn!("mode-conflict: REJECT — {reason}");
+                    anyhow::bail!("{reason}");
+                }
+            }
+        }
 
         crate::encode::validate_dimensions(codec, hello.mode.width, hello.mode.height)
             .context("client-requested mode")?;
@@ -1054,6 +1093,22 @@ async fn serve_session(
             stop.store(true, Ordering::SeqCst);
         });
     }
+
+    // Register this now-live session for mode-conflict admission (Stage 4): carry its identity, the
+    // negotiated mode, and its stop flag so a LATER connecting client's admission can see it and
+    // (under `steal`) signal it. The guard removes the entry when this session ends.
+    let _live_guard = {
+        let id = endpoint::peer_fingerprint(&conn);
+        let label = id
+            .map(|fp| fp.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>())
+            .unwrap_or_else(|| "client".to_string());
+        crate::vdisplay::admission::register(
+            id,
+            (welcome.mode.width, welcome.mode.height, welcome.mode.refresh_hz),
+            stop.clone(),
+            label,
+        )
+    };
 
     // Audio plane (virtual source only — synthetic runs are protocol tests): desktop Opus
     // → host→client QUIC datagrams, on its own native thread. Best-effort on every failure

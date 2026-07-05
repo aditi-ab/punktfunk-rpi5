@@ -785,6 +785,10 @@ mod gamescope;
 #[allow(dead_code)]
 #[path = "vdisplay/identity.rs"]
 pub(crate) mod identity;
+// Platform-neutral mode-conflict admission (Stage 4): the separate/join/steal/reject decision + the
+// live-session registry, wired into the punktfunk/1 handshake.
+#[path = "vdisplay/admission.rs"]
+pub(crate) mod admission;
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/kwin.rs"]
 mod kwin;
