@@ -3982,10 +3982,18 @@ mod tests {
     /// End-to-end through the C ABI — the exact contract platform clients (Swift) link:
     /// in-process punktfunk/1 host, `punktfunk_connect` (TOFU → pinned reconnect) →
     /// `punktfunk_connection_next_au` pulls verified frames → `punktfunk_connection_send_input`
+    /// In-process-host tests each spin up a host on a fixed loopback port and share the process-global
+    /// admission table, so they must NOT run concurrently: a same-identity connection in one test would
+    /// fire the reconnect-preempt (`preempt_same_identity`) against another test's live session and
+    /// close it. Serialize them on this lock. Poison-tolerant (`into_inner`) so a failing test doesn't
+    /// cascade a poison error into the others.
+    static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// enqueues → `punktfunk_connection_close`. Three sequential sessions against ONE host
     /// process prove the persistent listener, and a wrong pin is rejected.
     #[test]
     fn c_abi_connection_roundtrip() {
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::abi::{
             punktfunk_connect, punktfunk_connection_close, punktfunk_connection_mode,
             punktfunk_connection_send_input,
@@ -4174,6 +4182,7 @@ mod tests {
     /// admitted to a session with no PIN and no reconnect.
     #[test]
     fn delegated_approval_admits_after_knock() {
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::endpoint;
 
@@ -4285,6 +4294,7 @@ mod tests {
     /// identity gets a session on a pairing-required host; an anonymous client does not.
     #[test]
     fn pairing_ceremony_and_gate() {
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use punktfunk_core::client::NativeClient;
         use punktfunk_core::quic::endpoint;
 
