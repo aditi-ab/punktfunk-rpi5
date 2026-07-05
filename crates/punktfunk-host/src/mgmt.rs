@@ -382,6 +382,10 @@ struct LocalSummary {
     pin_pending: bool,
     /// Native pairing knocks awaiting the operator's approval (count only).
     pending_approvals: u32,
+    /// Virtual displays being KEPT with no live session — lingering (keep-alive window) or pinned
+    /// (`keep_alive: forever`). Non-zero means a display (and, exclusive, your physical monitors) is
+    /// held; the tray surfaces it + a one-click release. Active (in-use) displays are not counted.
+    kept_displays: u32,
 }
 
 /// A paired (certificate-pinned) Moonlight client.
@@ -1330,6 +1334,11 @@ async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<LocalSummar
         native_paired_clients,
         pin_pending: st.app.pairing.pin.awaiting_pin(),
         pending_approvals,
+        kept_displays: crate::vdisplay::registry::snapshot()
+            .displays
+            .iter()
+            .filter(|d| d.state == "lingering" || d.state == "pinned")
+            .count() as u32,
     })
 }
 

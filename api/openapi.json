@@ -2671,12 +2671,19 @@
           "paired_clients",
           "native_paired_clients",
           "pin_pending",
-          "pending_approvals"
+          "pending_approvals",
+          "kept_displays"
         ],
         "properties": {
           "audio_streaming": {
             "type": "boolean",
             "description": "True while the audio stream thread is running."
+          },
+          "kept_displays": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Virtual displays being KEPT with no live session — lingering (keep-alive window) or pinned\n(`keep_alive: forever`). Non-zero means a display (and, exclusive, your physical monitors) is\nheld; the tray surfaces it + a one-click release. Active (in-use) displays are not counted.",
+            "minimum": 0
           },
           "native_paired_clients": {
             "type": "integer",
