@@ -374,9 +374,14 @@ sudo firewall-cmd --reload
 default unit):
 
 - **QUIC control plane: UDP 9777** (default `--port`; change with `--port N`).
-- **Data plane: an *ephemeral* UDP port** — `punktfunk1-host` binds `0.0.0.0:0` and tells the client which
-  port it got, so there is **no fixed data port to open**. For a restrictive firewall you'd need to
-  allow the ephemeral UDP range; the repo does not pin one.
+- **Data plane: a separate UDP port** — by default *random* (`0.0.0.0:0`), so there is **no fixed
+  port to open**. Video flows host → client, but the client sends the first packet (a hole-punch): if
+  firewalld drops it, the host waits ~2.5 s and falls back to the client-reported address and streams
+  anyway, so you normally **leave the data port closed**. To skip that ~2.5 s fallback, pin it with
+  `serve --data-port <PORT>` (or `PUNKTFUNK_DATA_PORT`) and open exactly that one port with
+  `firewall-cmd --add-port=<PORT>/udp`. A fixed port serves one session at a time (concurrent ones
+  fall back to random + hole-punch) and streams to the client's reported address (flat LAN /
+  non-remapping forward only).
 
 ```sh
 # Only if you run `punktfunk1-host`:

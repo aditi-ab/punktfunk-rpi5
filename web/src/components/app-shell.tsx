@@ -4,6 +4,7 @@ import {
 	GaugeCircle,
 	KeyRound,
 	LibraryBig,
+	MonitorPlay,
 	ScrollText,
 	Server,
 	Settings,
@@ -21,6 +22,7 @@ const MLink = motion(Link);
 const NAV = [
 	{ to: "/", icon: Activity, label: () => m.nav_dashboard() },
 	{ to: "/host", icon: Server, label: () => m.nav_host() },
+	{ to: "/displays", icon: MonitorPlay, label: () => m.nav_displays() },
 	{ to: "/library", icon: LibraryBig, label: () => m.nav_library() },
 	{ to: "/stats", icon: GaugeCircle, label: () => m.nav_stats() },
 	{ to: "/logs", icon: ScrollText, label: () => m.nav_logs() },

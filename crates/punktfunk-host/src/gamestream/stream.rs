@@ -286,13 +286,19 @@ fn open_gs_virtual_source(
             std::sync::atomic::AtomicBool::new(false),
         ))
     });
-    let vout = vd
-        .create(punktfunk_core::Mode {
+    let vout = crate::vdisplay::registry::acquire(
+        &mut vd,
+        punktfunk_core::Mode {
             width: cfg.width,
             height: cfg.height,
             refresh_hz: cfg.fps,
-        })
-        .context("create virtual output at client resolution")?;
+        },
+        // GameStream's deliberate quit is the Moonlight "Quit App" (nvhttp `h_cancel`), not a QUIC
+        // close code — wiring it to skip-linger is a follow-up, so this path keeps normal keep-alive
+        // (a fresh, never-set flag).
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .context("create virtual output at client resolution")?;
     // HDR: pass the negotiated `cfg.hdr` (client asked for HDR AND the host can deliver it). On the
     // Windows IDD-push path this proactively enables advanced color on the virtual display so a Main10
     // PQ stream flows even from an SDR desktop; an already-HDR desktop streams PQ regardless (the
@@ -397,6 +403,68 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Pacing layout for one frame's `n` packets (`n >= 1`): `(chunk_size, steps)`. The chunk grows
+/// with the frame so the number of paced bursts — each ending in a `thread::sleep` — never exceeds
+/// `MAX_PACE_STEPS`. A fixed 16-packet chunk let the step count scale with bitrate (~38 for a
+/// 4K/250Mbps frame's ~600 packets); the accumulated sub-ms sleep overshoot on the non-RT send
+/// thread then blew the per-frame budget and backed the handoff queue up. Bounding the steps keeps
+/// microburst shaping at low bitrate while making overshoot negligible and bitrate-independent.
+fn pace_layout(n: usize) -> (usize, usize) {
+    const MIN_PACE_CHUNK: usize = 16;
+    const MAX_PACE_STEPS: usize = 12;
+    let chunk_sz = MIN_PACE_CHUNK.max(n.div_ceil(MAX_PACE_STEPS));
+    let steps = n.div_ceil(chunk_sz); // ≤ MAX_PACE_STEPS
+    (chunk_sz, steps)
+}
+
+/// One encoded frame handed from the encode loop to the packetizer thread: the frame's access
+/// units (owned buffers, each with its frame type) plus the shared 90 kHz RTP timestamp. FEC
+/// packetization runs on the packetizer thread — off the encode loop — so it never serializes
+/// behind encode (measured ~3 ms/frame at 4K, which capped GameStream's frame rate well below what
+/// the encoder alone can sustain).
+struct RawFrame {
+    aus: Vec<(Vec<u8>, FrameType)>,
+    ts: u32,
+}
+
+/// Packetizer thread: turns each [`RawFrame`]'s access units into wire datagrams (data + Reed–Solomon
+/// FEC parity shards) via the stateful [`VideoPacketizer`], then hands the batch to the paced sender.
+/// It sits between encode and send so the FEC never blocks the encode loop. Backpressure: the hand-off
+/// to the sender BLOCKS, so if the paced sender falls behind, the packetizer stalls and the
+/// encode→packetizer queue fills — the encode loop then drops the newest frame (see the loop) rather
+/// than stalling. Tallies goodput (bytes handed to the wire) into `goodput` for the encode loop's stats
+/// window. Exits when either neighbor's channel closes (session teardown / client gone).
+fn spawn_packetizer(
+    rx: std::sync::mpsc::Receiver<RawFrame>,
+    tx: std::sync::mpsc::SyncSender<PacketBatch>,
+    mut pk: VideoPacketizer,
+    goodput: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<()> {
+    std::thread::Builder::new()
+        .name("punktfunk-pkt".into())
+        .spawn(move || {
+            // Above-normal, like the send thread — this stage is on the per-frame critical path.
+            crate::punktfunk1::boost_thread_priority(false);
+            while let Ok(frame) = rx.recv() {
+                let mut batch: PacketBatch = Vec::new();
+                for (au, ft) in frame.aus {
+                    batch.extend(pk.packetize(&au, ft, frame.ts));
+                }
+                if batch.is_empty() {
+                    continue;
+                }
+                let bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
+                // Blocking send: propagates the paced sender's backpressure upstream (see above).
+                if tx.send(batch).is_err() {
+                    break; // sender exited (client gone)
+                }
+                goodput.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .context("spawn packetizer thread")?;
+    Ok(())
+}
+
 /// Dedicated send thread: one [`PacketBatch`] per frame arrives on `rx`; its packets go out in
 /// `sendmmsg` chunks, paced so the frame's data spreads over ~3/4 of the frame interval
 /// (microburst shaping at chunk granularity — a real link drops line-rate bursts; the encode
@@ -414,8 +482,14 @@ fn spawn_sender(
             // Transmit thread: above-normal, matching the native path's send thread (includes the
             // Windows session tuning/MMCSS this used to call directly; adds the Linux nice -5).
             crate::punktfunk1::boost_thread_priority(false);
-            // Chunk pacing: 16 packets per burst, bursts spread across the send budget.
-            const PACE_CHUNK: usize = 16;
+            // Chunk pacing: spread the frame's packets across the send budget in a BOUNDED number
+            // of bursts. A fixed 16-packet chunk made the burst count scale with bitrate (~38 for a
+            // 4K/250Mbps frame's ~600 packets), and each burst ends in a `thread::sleep`; on this
+            // non-RT send thread those sub-ms sleeps overshoot, and ~38 per frame blew the 12.5ms
+            // budget past the 16.67ms frame interval — backing the depth-2 handoff queue up and
+            // dropping ~half the frames ("send queue full"). Capping the step count keeps the
+            // microburst shaping (a real link drops line-rate bursts) while making per-frame sleep
+            // overshoot negligible and independent of bitrate.
             let budget = frame_interval.mul_f32(0.75);
             let mut rng = rand::thread_rng();
             let mut sent: u64 = 0;
@@ -434,17 +508,21 @@ fn spawn_sender(
                 if n == 0 {
                     continue;
                 }
-                let per_chunk = budget.mul_f64((PACE_CHUNK as f64 / n as f64).min(1.0));
+                // Chunk size + step count, bounded so a high-bitrate frame doesn't fan out into
+                // dozens of sleeps. Each step gets an equal slice of the budget (total pacing time
+                // == budget regardless of n).
+                let (chunk_sz, steps) = pace_layout(n);
+                let per_step = budget.mul_f64(1.0 / steps as f64);
                 let start = Instant::now();
-                for (i, chunk) in batch.chunks(PACE_CHUNK).enumerate() {
+                for (i, chunk) in batch.chunks(chunk_sz).enumerate() {
                     if let Err(e) = sendmmsg_all(&sock, chunk) {
                         tracing::info!(error = %e, sent, "video: client unreachable — stopping stream");
                         running.store(false, Ordering::SeqCst);
                         return;
                     }
                     sent += chunk.len() as u64;
-                    // Sleep toward the next chunk's deadline; skip sub-500µs sleeps (jitter).
-                    let target = start + per_chunk.mul_f64((i + 1) as f64);
+                    // Sleep toward the next step's deadline; skip sub-500µs sleeps (jitter).
+                    let target = start + per_step.mul_f64((i + 1) as f64);
                     if let Some(ahead) = target.checked_duration_since(Instant::now()) {
                         if ahead >= Duration::from_micros(500) {
                             std::thread::sleep(ahead);
@@ -518,7 +596,7 @@ fn stream_body(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
-    let mut pk = VideoPacketizer::new(cfg.packet_size, fec_pct, cfg.min_fec);
+    let pk = VideoPacketizer::new(cfg.packet_size, fec_pct, cfg.min_fec);
 
     // Pace at the client's negotiated frame rate, re-encoding the last captured frame when the
     // compositor produced no new one. Compositors only emit frames on damage, so a static or
@@ -538,9 +616,15 @@ fn stream_body(
     let mut sent_batches: u64 = 0;
     let mut dropped_batches: u64 = 0;
 
-    // The send thread: one frame's batch at a time over a small bounded queue. Depth 2 means a
-    // slow send can buffer one frame while the next encodes; beyond that the NEWEST batch is
-    // dropped (the client recovers via FEC/RFI) rather than ever stalling the encode loop.
+    // Three-stage pipeline so FEC packetization never blocks encode: `encode loop → [raw AUs] →
+    // packetizer (FEC/RS) → [wire batch] → paced sender`, each stage on its own thread joined by a
+    // depth-2 bounded queue. Depth 2 means a slow stage can buffer one frame while the next is
+    // produced; beyond that the NEWEST frame is dropped (the client recovers via FEC/RFI) rather than
+    // stalling the encode loop. Backpressure chains up: a slow sender blocks the packetizer, which
+    // fills the encode→packetizer queue, which makes the encode loop drop — encode itself never
+    // waits. Goodput (bytes handed to the wire) is tallied by the packetizer into `goodput`, read at
+    // the encode loop's 1 s stats boundary (the old inline batch-byte sum moved with packetization).
+    let goodput = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<PacketBatch>(2);
     spawn_sender(
         sock.try_clone().context("clone video socket")?,
@@ -549,12 +633,14 @@ fn stream_body(
         running.clone(),
         drop_pct,
     )?;
+    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawFrame>(2);
+    spawn_packetizer(raw_rx, batch_tx, pk, goodput.clone())?;
 
     // Per-stage timing (PUNKTFUNK_PERF=1): max µs/stage per second + unique vs re-encoded frames,
     // to pinpoint stalls. `unique` counts genuinely-new captured frames (vs re-encoded holds).
     let perf = crate::config::config().perf;
-    let (mut mx_cap, mut mx_enc, mut mx_pkt, mut mx_send, mut mx_pkts, mut uniq) =
-        (0u128, 0u128, 0u128, 0u128, 0usize, 0u32);
+    let (mut mx_cap, mut mx_enc, mut mx_pkt, mut mx_send, mut uniq) =
+        (0u128, 0u128, 0u128, 0u128, 0u32);
     // Web-console stats accumulation (active when `perf` OR a capture is armed): per-stage vectors
     // for p50/p99, the goodput bytes queued to the sender this window, the previous window's
     // dropped-frame count for delta computation, and the registration id cached on the first sample.
@@ -566,7 +652,6 @@ fn stream_body(
     let mut sid: Option<u32> = None;
     let (mut v_cap, mut v_enc, mut v_pkt, mut v_send): (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut bytes_win: u64 = 0;
     let mut last_dropped_batches: u64 = 0;
     // Absolute next-frame deadline — the single pacing clock for the loop.
     let mut next_frame = Instant::now();
@@ -579,6 +664,22 @@ fn stream_body(
     // dead source can't loop forever — it ends the stream after the cap, falling back to a reconnect.
     const MAX_REBUILDS: u32 = 5;
     let mut rebuilds: u32 = 0;
+
+    // Coalesce forced keyframes. Under loss Moonlight spams IDR/RFI requests; on an encoder without
+    // RFI (VAAPI/AMD — `supports_rfi=false`) each one becomes a full IDR, so an un-coalesced request
+    // stream turns EVERY frame into a 4K IDR, saturates the send path, and collapses the session
+    // instead of recovering. One fresh IDR already resolves all pending loss, so after emitting one
+    // we ignore further keyframe requests for a short in-flight window (~2 frames). NVENC
+    // ref-invalidation (cheap, no IDR spike) is never rate-limited — only full keyframes are.
+    let keyframe_coalesce = frame_interval * 2;
+    let mut last_keyframe: Option<Instant> = None;
+    // A frame dropped at the pipeline head (below) breaks the reference chain for the following
+    // P-frames: the client never receives it, but the encoder advanced its references past it, and —
+    // packetization being downstream now — a dropped frame consumes no frameIndex for the client to
+    // detect the gap. So the host re-anchors itself: a drop arms a keyframe on the next iteration,
+    // routed through the same coalesce gate as client IDR requests so a burst of drops (congestion)
+    // can't become an IDR storm.
+    let mut recover_after_drop = false;
 
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
@@ -645,6 +746,7 @@ fn stream_body(
                 .context("reopen encoder after rebuild")?;
                 supports_rfi = enc.caps().supports_rfi;
                 enc.request_keyframe();
+                last_keyframe = Some(Instant::now());
                 next_frame = Instant::now();
                 tracing::info!("gamestream: source rebuilt — stream continues");
                 continue;
@@ -654,58 +756,71 @@ fn stream_body(
         // Honor a client recovery request. Prefer reference-frame invalidation (the encoder
         // re-references an older still-valid frame — no costly IDR spike); if the encoder can't
         // invalidate (range too old, or no NVENC RFI) it returns false and we force a keyframe.
+        // A prior pipeline drop needs a fresh keyframe to re-anchor the reference chain (see below).
+        let mut want_keyframe = recover_after_drop;
+        recover_after_drop = false;
         if let Some((first, last)) = rfi_range.lock().unwrap().take() {
             // Prefer reference-frame invalidation when the encoder supports it (no costly IDR
-            // spike); otherwise — or if the range is too old to invalidate — force a keyframe.
+            // spike); otherwise — or if the range is too old to invalidate — fall back to a keyframe.
             if !(supports_rfi && enc.invalidate_ref_frames(first, last)) {
-                enc.request_keyframe();
+                want_keyframe = true;
             }
         }
-        // An explicit IDR request (or a rangeless RFI) forces a keyframe so the client resyncs
+        // An explicit IDR request (or a rangeless RFI) asks for a keyframe so the client resyncs
         // immediately instead of waiting for the next GOP boundary.
         if force_idr.swap(false, Ordering::SeqCst) {
-            enc.request_keyframe();
+            want_keyframe = true;
+        }
+        // Coalesce: emit at most one forced keyframe per in-flight window, so a burst of recovery
+        // requests during one loss event doesn't turn every frame into a full IDR (see above).
+        if want_keyframe {
+            let now = Instant::now();
+            let emit = match last_keyframe {
+                Some(t) => now.duration_since(t) >= keyframe_coalesce,
+                None => true,
+            };
+            if emit {
+                enc.request_keyframe();
+                last_keyframe = Some(now);
+            } else {
+                tracing::debug!("video: keyframe request coalesced (IDR still in flight)");
+            }
         }
         enc.submit(&frame).context("encoder submit")?;
         let t_enc = tick.elapsed();
 
         // 90 kHz RTP timestamp from wall-clock, so a variable capture rate stays correct.
         let ts = (stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
-        let mut batch: Vec<Vec<u8>> = Vec::new();
+        // Drain the encoder's access units (owned buffers) — FEC/packetization runs on the
+        // packetizer thread, off this loop, so it never serializes behind encode.
+        let mut aus: Vec<(Vec<u8>, FrameType)> = Vec::new();
         while let Some(au) = enc.poll().context("encoder poll")? {
             let ft = if au.keyframe {
                 FrameType::Idr
             } else {
                 FrameType::P
             };
-            batch.extend(pk.packetize(&au.data, ft, ts));
+            aus.push((au.data, ft));
         }
         let t_pkt = tick.elapsed();
 
-        // Hand the frame's packets to the send thread; never block here. A full queue means
-        // the sender is behind — drop this batch (FEC/RFI covers the client) and keep encoding.
-        let n = batch.len();
-        // Goodput this window = bytes actually queued to the sender (a dropped batch never reaches
-        // the wire, so it's excluded). Summed only when measuring, to keep the idle path free.
-        let batch_bytes: u64 = if measure {
-            batch.iter().map(|p| p.len() as u64).sum()
-        } else {
-            0
-        };
-        if n > 0 {
-            match batch_tx.try_send(batch) {
+        // Hand the frame's AUs to the pipeline; never block here. A full queue means the pipeline
+        // (packetizer, or the paced sender behind it) is behind — drop this frame (FEC/RFI covers the
+        // client) and keep encoding, so a downstream stall can never cap the encode rate.
+        if !aus.is_empty() {
+            match raw_tx.try_send(RawFrame { aus, ts }) {
                 Ok(()) => {
                     sent_batches += 1;
-                    bytes_win += batch_bytes;
                 }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                     dropped_batches += 1;
+                    recover_after_drop = true; // re-anchor the reference chain on the next frame
                     if dropped_batches.is_power_of_two() {
-                        tracing::warn!(dropped_batches, "video: send queue full — frame dropped");
+                        tracing::warn!(dropped_batches, "video: pipeline queue full — frame dropped");
                     }
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                    break; // sender exited (client gone)
+                    break; // packetizer/sender exited (client gone)
                 }
             }
         }
@@ -713,26 +828,33 @@ fn stream_body(
             let t_send = tick.elapsed();
             let cap_us = t_cap.as_micros();
             let enc_us = (t_enc - t_cap).as_micros();
-            let pkt_us = (t_pkt - t_enc).as_micros();
-            let send_us = (t_send - t_pkt).as_micros();
+            // `poll` = drain the encoder's AUs; `enqueue` = hand-off to the pipeline. FEC/packetize
+            // and the paced send now run on their own threads, off this loop — so both of these
+            // should be small; if they aren't, the encode loop is being stalled by pipeline
+            // backpressure (a full queue), which is the signal that a downstream stage can't keep up.
+            let poll_us = (t_pkt - t_enc).as_micros();
+            let enqueue_us = (t_send - t_pkt).as_micros();
             mx_cap = mx_cap.max(cap_us);
             mx_enc = mx_enc.max(enc_us);
-            mx_pkt = mx_pkt.max(pkt_us);
-            mx_send = mx_send.max(send_us);
-            mx_pkts = mx_pkts.max(n);
+            mx_pkt = mx_pkt.max(poll_us);
+            mx_send = mx_send.max(enqueue_us);
             v_cap.push(cap_us as u32);
             v_enc.push(enc_us as u32);
-            v_pkt.push(pkt_us as u32);
-            v_send.push(send_us as u32);
+            v_pkt.push(poll_us as u32);
+            v_send.push(enqueue_us as u32);
         }
 
         fps_count += 1;
         if fps_t.elapsed() >= Duration::from_secs(1) {
             let secs = fps_t.elapsed().as_secs_f64();
+            // Bytes handed to the wire this window, tallied by the packetizer thread (goodput).
+            let win_bytes = goodput.swap(0, std::sync::atomic::Ordering::Relaxed);
             if perf {
-                // Max µs/stage this second: cap=drain channel, enc=submit (zero-copy device
-                // copy + NVENC), pkt=poll+FEC+packetize, send=paced packet send. `uniq`=new
-                // captured frames (vs re-encoded). `pkts`=max packets in one frame (IDR spike).
+                // Max µs/stage this second on the ENCODE loop: cap=drain channel, enc=submit
+                // (zero-copy device copy + NVENC), pkt=poll (AU drain), send=enqueue to the pipeline.
+                // FEC/packetize and the paced send run on their own threads now, so pkt/send here
+                // should be near-zero — a nonzero value means encode is being stalled by pipeline
+                // backpressure. `uniq`=new captured frames (vs re-encoded).
                 tracing::info!(
                     fps = fps_count,
                     uniq,
@@ -740,7 +862,6 @@ fn stream_body(
                     pkt_us = mx_pkt,
                     send_us = mx_send,
                     cap_us = mx_cap,
-                    max_pkts = mx_pkts,
                     "video: streaming (perf)"
                 );
             } else {
@@ -753,7 +874,7 @@ fn stream_body(
             }
             // Web-console capture: build the aggregated sample. The host send side exposes no
             // receiver-side packet loss / FEC-recovery / send-buffer EAGAIN counters, so those stay
-            // 0 (not fabricated); `frames_dropped` is the per-frame send-queue overflow delta.
+            // 0 (not fabricated); `frames_dropped` is the per-frame pipeline-queue overflow delta.
             if stats.is_armed() {
                 let session_id = *sid.get_or_insert_with(|| {
                     stats.register_session(
@@ -792,7 +913,7 @@ fn stream_body(
                     ],
                     fps: (uniq as f64 / secs) as f32,
                     repeat_fps: (fps_count.saturating_sub(uniq) as f64 / secs) as f32,
-                    mbps: (bytes_win as f64 * 8.0 / secs / 1_000_000.0) as f32,
+                    mbps: (win_bytes as f64 * 8.0 / secs / 1_000_000.0) as f32,
                     bitrate_kbps: cfg.bitrate_kbps,
                     frames_dropped: dropped_batches.saturating_sub(last_dropped_batches) as u32,
                     packets_dropped: 0,
@@ -805,13 +926,11 @@ fn stream_body(
             mx_enc = 0;
             mx_pkt = 0;
             mx_send = 0;
-            mx_pkts = 0;
             uniq = 0;
             v_cap.clear();
             v_enc.clear();
             v_pkt.clear();
             v_send.clear();
-            bytes_win = 0;
             last_dropped_batches = dropped_batches;
             fps_count = 0;
             fps_t = Instant::now();
@@ -888,5 +1007,25 @@ mod tests {
         }
         assert_eq!(got, 3 * PER_FRAME);
         assert!(running.load(Ordering::SeqCst), "no spurious client-gone");
+    }
+
+    /// The pacing layout bounds the paced-burst (and thus sleep) count regardless of frame size,
+    /// while always covering every packet and keeping small frames on the 16-packet floor. Guards
+    /// the 4K/high-bitrate "send queue full" regression (a fixed 16-packet chunk fanned a ~600
+    /// packet frame into ~38 sleeps, whose overshoot blew the per-frame send budget).
+    #[test]
+    fn pace_layout_bounds_step_count() {
+        for &n in &[1usize, 16, 146, 610, 1024, 5000, 50_000] {
+            let (chunk, steps) = pace_layout(n);
+            assert!(steps >= 1, "n={n}: at least one step");
+            assert!(steps <= 12, "n={n}: step count {steps} exceeded the cap");
+            assert!(chunk >= 16, "n={n}: chunk {chunk} below the 16-packet floor");
+            assert!(chunk * steps >= n, "n={n}: {chunk}×{steps} must cover all packets");
+        }
+        // Small frames stay on the floor: one 16-packet burst.
+        assert_eq!(pace_layout(1), (16, 1));
+        assert_eq!(pace_layout(16), (16, 1));
+        // A 4K/250Mbps frame (~600 packets) was ~38 bursts at a fixed 16 — now bounded.
+        assert!(pace_layout(610).1 <= 12);
     }
 }

@@ -418,6 +418,20 @@ fn real_main() -> Result<()> {
                 allow_pairing: true,
                 pairing_pin: None,
                 paired_store: None,
+                // Fixed data-plane port: bind it and stream direct (no hole-punch), removing the
+                // ~2.5 s punch-timeout on a firewalled host. Default (absent) = a random port +
+                // hole-punch. Also honors PUNKTFUNK_DATA_PORT.
+                data_port: get("--data-port")
+                    .map(str::to_string)
+                    .or_else(|| std::env::var("PUNKTFUNK_DATA_PORT").ok())
+                    .and_then(|s| s.parse().ok()),
+                // Disconnect-detection latency (QUIC control-connection idle timeout): --idle-timeout-ms
+                // overrides PUNKTFUNK_IDLE_TIMEOUT_MS; absent = the core default (8s).
+                idle_timeout: get("--idle-timeout-ms")
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&ms| ms > 0)
+                    .map(std::time::Duration::from_millis)
+                    .or_else(punktfunk1::idle_timeout_from_env),
             })
         }
         // Windows service control: install/uninstall/start/stop/status + the SCM `run` entry point.
@@ -501,6 +515,12 @@ fn input_test() -> Result<()> {
 fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServe, bool)> {
     let mut opts = mgmt::Options::default();
     let mut native_port: u16 = 9777; // the native plane always runs now
+    // Fixed data-plane UDP port: `Some(p)` binds p and streams direct (no hole-punch, no ~2.5 s
+    // punch-timeout on a firewalled host); `None` (default) = a random port + hole-punch. Env
+    // default, `--data-port` overrides.
+    let mut data_port: Option<u16> = std::env::var("PUNKTFUNK_DATA_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok());
     let mut open = false;
     let mut gamestream = false;
     // Did the operator pin the mgmt bind themselves? If not, we LAN-expose the read surface below so
@@ -541,6 +561,13 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServ
                     .parse()
                     .map_err(|_| anyhow::anyhow!("bad --native-port (want a port number)"))?
             }
+            "--data-port" => {
+                data_port = Some(
+                    next()?
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("bad --data-port (want a port number)"))?,
+                )
+            }
             // Opt into the GameStream/Moonlight-compat planes (off by default — they carry the
             // inherent on-path #5/#9 weaknesses; only for a trusted LAN).
             "--gamestream" | "--moonlight" => gamestream = true,
@@ -576,6 +603,7 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, punktfunk1::NativeServ
         // Advertise the mgmt port over mDNS so clients learn where to browse the library (rather than
         // assuming the default). `opts.bind.port()` is the real port even if the operator moved it.
         mgmt_port: opts.bind.port(),
+        data_port,
     };
     Ok((opts, native, gamestream))
 }
@@ -703,6 +731,10 @@ SERVE OPTIONS:
                                  reuse, security-review #5/#9); enable only on a TRUSTED LAN
     --native                     no-op (the native punktfunk/1 plane always runs in `serve` now)
     --native-port <PORT>         native QUIC port (default 9777)
+    --data-port <PORT>           pin the per-session video data plane to this fixed UDP port and
+                                 stream direct (no hole-punch) — open exactly this port in a host
+                                 firewall to avoid the ~2.5 s punch-timeout. Default (unset) or
+                                 PUNKTFUNK_DATA_PORT: a random port + hole-punch (crosses NAT)
     --open                       disable mandatory native pairing (default: pairing REQUIRED —
                                  an open host any LAN device can stream from is insecure)
 
@@ -714,6 +746,10 @@ PUNKTFUNK1-HOST OPTIONS:
     --max-sessions <N>           exit after N sessions; 0 = serve forever (default: 0)
     --max-concurrent <N>         stream at most N sessions at once (NVENC bound); overflow waits
                                  in the accept queue; 0 = unlimited (default: 4)
+    --data-port <PORT>           pin the video data plane to this fixed UDP port and stream direct
+                                 (no hole-punch; open exactly this port to skip the ~2.5 s punch-
+                                 timeout). Default or PUNKTFUNK_DATA_PORT: random port + hole-punch.
+                                 A fixed port fits one session; concurrent ones fall back to random
     --allow-tofu                 also accept UNPAIRED clients (trust-on-first-use) and advertise
                                  pair=optional. Default: pairing REQUIRED — the host rejects
                                  unpaired clients and logs a 4-digit pairing PIN at startup;

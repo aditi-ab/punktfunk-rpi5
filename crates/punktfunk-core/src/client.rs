@@ -179,6 +179,10 @@ pub struct NativeClient {
     /// Speed-test accumulator, shared with the data-plane pump + control task.
     probe: Arc<Mutex<ProbeState>>,
     shutdown: Arc<AtomicBool>,
+    /// Deliberate-quit flag: [`NativeClient::disconnect_quit`] sets it, so the worker closes the QUIC
+    /// connection with [`crate::quic::QUIT_CLOSE_CODE`] (a user "stop") instead of code 0 — telling the
+    /// host to skip the keep-alive linger. A plain drop leaves it false → an unwanted-disconnect close.
+    quit: Arc<AtomicBool>,
     /// Cumulative count of access units the reassembler gave up on (FEC couldn't recover), mirrored
     /// from the data-plane pump's `Session`. A client video loop watches this for increases to request
     /// a recovery keyframe under infinite GOP — the correct loss trigger, since unrecoverable loss
@@ -331,6 +335,7 @@ impl NativeClient {
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel::<CtrlRequest>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let quit = Arc::new(AtomicBool::new(false));
         let mode_slot = Arc::new(std::sync::Mutex::new(mode));
         let probe = Arc::new(Mutex::new(ProbeState::default()));
         let frames_dropped = Arc::new(AtomicU64::new(0));
@@ -338,6 +343,7 @@ impl NativeClient {
 
         let host = host.to_string();
         let shutdown_w = shutdown.clone();
+        let quit_w = quit.clone();
         let mode_slot_w = mode_slot.clone();
         let probe_w = probe.clone();
         let frames_dropped_w = frames_dropped.clone();
@@ -388,6 +394,7 @@ impl NativeClient {
                     ctrl_tx: ctrl_tx_pump,
                     ready_tx,
                     shutdown: shutdown_w,
+                    quit: quit_w,
                     mode_slot: mode_slot_w,
                     probe: probe_w,
                     frames_dropped: frames_dropped_w,
@@ -430,6 +437,7 @@ impl NativeClient {
             ctrl_tx,
             probe,
             shutdown,
+            quit,
             worker: Some(worker),
             frames_dropped,
             hot_tids,
@@ -764,6 +772,15 @@ impl NativeClient {
             .send(rich)
             .map_err(|_| PunktfunkError::Closed)
     }
+
+    /// Signal a **deliberate quit** (a user "stop", not a network drop): the worker closes the QUIC
+    /// connection with [`crate::quic::QUIT_CLOSE_CODE`] instead of code 0, so the host tears the
+    /// session's virtual display down immediately and skips the keep-alive linger. Then requests
+    /// shutdown. A plain `drop` (without this) closes with code 0 → the host lingers for a reconnect.
+    pub fn disconnect_quit(&self) {
+        self.quit.store(true, Ordering::SeqCst);
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
 }
 
 impl Drop for NativeClient {
@@ -802,6 +819,8 @@ struct WorkerArgs {
     ctrl_tx: tokio::sync::mpsc::UnboundedSender<CtrlRequest>,
     ready_tx: std::sync::mpsc::Sender<Result<Negotiated>>,
     shutdown: Arc<AtomicBool>,
+    /// Deliberate-quit flag (see [`NativeClient::quit`]): the worker closes with the quit code if set.
+    quit: Arc<AtomicBool>,
     mode_slot: Arc<std::sync::Mutex<Mode>>,
     probe: Arc<Mutex<ProbeState>>,
     frames_dropped: Arc<AtomicU64>,
@@ -838,6 +857,7 @@ async fn worker_main(args: WorkerArgs) {
         ctrl_tx,
         ready_tx,
         shutdown,
+        quit,
         mode_slot,
         probe,
         frames_dropped,
@@ -1210,5 +1230,12 @@ async fn worker_main(args: WorkerArgs) {
     })
     .await;
 
-    conn.close(0u32.into(), b"client closed");
+    // Deliberate quit (a user "stop") closes with the quit code → the host skips the keep-alive
+    // linger; a plain drop / disconnect closes with 0 → the host lingers so a reconnect can resume.
+    let close_code = if quit.load(Ordering::SeqCst) {
+        crate::quic::QUIT_CLOSE_CODE
+    } else {
+        0
+    };
+    conn.close(close_code.into(), b"client closed");
 }

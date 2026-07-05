@@ -9,7 +9,5 @@ export const SectionHost: FC = () => {
 	const host = useGetHostInfo();
 	const compositors = useListCompositors();
 
-	return (
-		<HostView host={host} compositors={compositors} gpu={<GpuSection />} />
-	);
+	return <HostView host={host} compositors={compositors} gpu={<GpuSection />} />;
 };

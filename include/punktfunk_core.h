@@ -275,6 +275,15 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// QUIC application error code a punktfunk/1 client closes the control connection with on a
+// **deliberate quit** (a user "stop", not a network drop). The host reads it off the connection's
+// `ApplicationClosed` reason and tears the session's virtual display down immediately, skipping the
+// keep-alive linger; any other close reason (idle timeout, reset, a bare code 0) still lingers so a
+// reconnect can resume. Shared so host + every client agree on the code.
+#define QUIT_CLOSE_CODE 81
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 // encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 // advertise this.

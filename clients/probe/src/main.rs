@@ -73,6 +73,14 @@ struct Args {
     /// `--rich-input-test` — drive the DualSense touchpad + motion over 0xCC (host needs
     /// `PUNKTFUNK_GAMEPAD=dualsense`); also logs the 0xCD HID-output feedback that comes back.
     rich_input_test: bool,
+    /// `--quit` — close the connection with the deliberate-quit code (`QUIT_CLOSE_CODE`) at end of
+    /// stream, so the host tears its virtual display down immediately (skips keep-alive linger). A
+    /// bare exit closes with code 0 → the host lingers for a reconnect. Tests the #2 quit path.
+    quit: bool,
+    /// `--seconds N` — cap the receive loop at N seconds, then end the session gracefully (reach the
+    /// `conn.close`). Without it the loop runs to the 120s cap. Lets a test bound a live-host stream so
+    /// the client-initiated close (with/without `--quit`) fires promptly.
+    seconds: Option<u64>,
     pin: Option<[u8; 32]>,
     /// `--remode WxHxFPS:SECS` — request this mode SECS seconds into the stream.
     remode: Option<(Mode, u32)>,
@@ -211,6 +219,8 @@ fn parse_args() -> Args {
         mic_burst: argv.iter().any(|a| a == "--mic-burst"),
         touch_test: argv.iter().any(|a| a == "--touch-test"),
         rich_input_test: argv.iter().any(|a| a == "--rich-input-test"),
+        quit: argv.iter().any(|a| a == "--quit"),
+        seconds: get("--seconds").and_then(|s| s.parse().ok()),
         pin,
         remode,
         pair: get("--pair").map(String::from),
@@ -1041,6 +1051,9 @@ async fn session(args: Args) -> Result<()> {
         let mut net_us_v: Vec<u64> = Vec::new();
         let mut last_rx = std::time::Instant::now();
         let started = std::time::Instant::now();
+        // Stream-duration cap: `--seconds N`, else the 120s default. Ending the loop here reaches the
+        // graceful `conn.close` below (with the deliberate-quit code if `--quit`).
+        let cap_secs = args.seconds.unwrap_or(120);
         // Adaptive-FEC loss window: publish a fresh estimate every 750 ms for the LossReport task.
         let mut last_loss_report = std::time::Instant::now();
         let (mut last_recovered, mut last_received, mut last_dropped) = (0u64, 0u64, 0u64);
@@ -1076,7 +1089,7 @@ async fn session(args: Args) -> Result<()> {
             {
                 break;
             }
-            if started.elapsed() > std::time::Duration::from_secs(120)
+            if started.elapsed() > std::time::Duration::from_secs(cap_secs)
                 || last_rx.elapsed() > std::time::Duration::from_secs(8)
             {
                 break;
@@ -1208,7 +1221,18 @@ async fn session(args: Args) -> Result<()> {
         }
     }
 
-    conn.close(0u32.into(), b"done");
+    // `--quit` closes with the deliberate-quit code so the host skips the keep-alive linger; a normal
+    // exit uses code 0 (an unwanted-disconnect close → the host lingers for a reconnect).
+    let close_code = if args.quit {
+        punktfunk_core::quic::QUIT_CLOSE_CODE
+    } else {
+        0
+    };
+    conn.close(close_code.into(), b"done");
+    // Flush the CONNECTION_CLOSE frame before we exit: without this the process can drop the endpoint
+    // before quinn sends the close, so the host waits out the idle timeout instead of seeing the close
+    // CODE promptly (deliberate-quit vs. code 0). Bounded so a stuck flush can't hang the probe.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ep.wait_idle()).await;
     result
 }
 

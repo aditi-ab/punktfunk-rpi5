@@ -33,6 +33,10 @@ pub struct Summary {
     pub native_paired_clients: u32,
     pub pin_pending: bool,
     pub pending_approvals: u32,
+    /// Virtual displays kept with no live session (lingering/pinned). `#[serde(default)]` so an older
+    /// host that doesn't send it deserializes as 0.
+    #[serde(default)]
+    pub kept_displays: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
@@ -71,6 +75,14 @@ impl TrayStatus {
                     s.version, sess.width, sess.height, sess.fps
                 ),
                 (_, true) => format!("punktfunk host {} — streaming", s.version),
+                // Idle, but surface a kept (lingering/pinned) display: it — and, under an exclusive
+                // topology, your physical monitors — is being held. Release it from the console.
+                _ if s.kept_displays > 0 => format!(
+                    "punktfunk host {} — idle · {} display{} kept",
+                    s.version,
+                    s.kept_displays,
+                    if s.kept_displays == 1 { "" } else { "s" }
+                ),
                 _ => format!("punktfunk host {} — idle", s.version),
             },
         }
@@ -432,6 +444,7 @@ mod tests {
             native_paired_clients: 2,
             pin_pending: false,
             pending_approvals: 0,
+            kept_displays: 0,
         }
     }
 

@@ -176,8 +176,16 @@ Prefer explicit rules (or a firewall the shipped profiles don't cover)? Open the
 The **native `punktfunk/1`** plane:
 
 - **QUIC control plane: UDP 9777** (`serve --native-port N` to change).
-- **Data plane: an *ephemeral* UDP port** the client hole-punches — nothing to open inbound as long
-  as outbound UDP is allowed (the host streams back out through the client-opened path).
+- **Data plane: a separate UDP port.** By default it's *random* — the host binds `0.0.0.0:0` and
+  tells the client which port it got. Video flows host → client, but the **client sends the first
+  packet** (a hole-punch), so the host learns the client's real source and streams back — this
+  traverses NAT / inter-VLAN with no forwarded port. **You normally don't open it:** if a deny-inbound
+  firewall drops the punch, the host waits ~2.5 s and falls back to the client-reported address, and a
+  stateful firewall then admits the return (it just adds ~2.5 s to session start). To skip that delay,
+  pin it with **`serve --data-port <PORT>`** (or `PUNKTFUNK_DATA_PORT`): the host binds that fixed
+  port and streams direct (no punch-wait) — open exactly that one port. A fixed port serves one
+  session at a time (concurrent ones fall back to random + hole-punch), and direct mode needs the
+  client's reported address to be reachable (flat LAN / a non-remapping port-forward).
 
 And the **GameStream / Moonlight** ports (fixed) — only needed if you run the host with
 `serve --gamestream` (opt-in, trusted LAN only); bare `serve` is native-only and doesn't open these:
@@ -200,7 +208,9 @@ sudo ufw allow 9777/udp                                 # punktfunk/1 control pl
 sudo ufw allow 47984/tcp && sudo ufw allow 47989/tcp && sudo ufw allow 48010/tcp
 sudo ufw allow 47998,47999,48000/udp                    # GameStream video/control/audio
 sudo ufw allow 5353/udp                                 # mDNS discovery
-# The punktfunk/1 data plane is an ephemeral UDP port the host hole-punches — nothing to open here.
+# The punktfunk/1 data plane uses a random UDP port; leave it closed on a LAN — the host hole-punches
+# and falls back (~2.5s at session start if firewalled). To skip that, pin it: `serve --data-port
+# 9778` and `ufw allow 9778/udp`.
 ```
 
 With raw `nftables` (add to your `inet filter input` chain):
@@ -209,8 +219,8 @@ With raw `nftables` (add to your `inet filter input` chain):
 udp dport 9777 accept                  # punktfunk/1 control plane
 tcp dport { 47984, 47989, 48010 } accept
 udp dport { 47998-48000, 5353 } accept # GameStream video/control/audio + mDNS
-# The punktfunk/1 data plane is an ephemeral UDP port the host hole-punches — a stateful chain that
-# accepts ct state established,related (as this one should) passes the return with nothing extra.
+# The punktfunk/1 data plane is a random UDP port — normally left closed (hole-punch + ~2.5s
+# fallback). Pin it with `serve --data-port <PORT>` to open exactly one instead.
 ```
 
 ## Files

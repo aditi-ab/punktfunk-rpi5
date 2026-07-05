@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.6.0"
+    "version": "0.7.4"
   },
   "paths": {
     "/api/v1/clients": {
@@ -121,6 +121,224 @@
                   "items": {
                     "$ref": "#/components/schemas/AvailableCompositor"
                   }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/display/layout": {
+      "put": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Arrange virtual displays",
+        "description": "Set the **manual** desktop arrangement — per-identity-slot `(x, y)` offsets so a multi-monitor\ngroup (§6A/§6B) comes back where the operator placed it. Persisted into the policy's layout block\nand switched to manual mode; applied from the next connect (a live group re-applies on its next\nacquire). Locks in the current effective behavior as explicit fields, so arranging displays never\nsilently changes keep-alive/topology/conflict/identity. See `design/display-management.md` §6.2.",
+        "operationId": "setDisplayLayout",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DisplayLayoutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Layout stored; the new settings state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DisplaySettingsState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Layout could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/display/release": {
+      "post": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Release kept virtual displays",
+        "description": "Tear down lingering/pinned displays now — so a physical-screen user gets their screen back\nwithout waiting out the linger. `slot` releases one; omit it to release all kept displays.\nActive (streaming) displays are never torn down here (that is session control).",
+        "operationId": "releaseDisplay",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReleaseDisplayRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The number of kept displays released",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseDisplayResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/display/settings": {
+      "get": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Display-management policy",
+        "description": "The stored virtual-display policy (lifecycle, topology, conflict handling, identity, layout),\nevery preset's expansion, and which options this build enforces yet. See\n`design/display-management.md`.",
+        "operationId": "getDisplaySettings",
+        "responses": {
+          "200": {
+            "description": "Stored policy + preset expansions + enforced options",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DisplaySettingsState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Set the display-management policy",
+        "description": "Persists a new policy (validated + clamped) and applies it from the next connect/teardown — a\nrunning session keeps the display it opened on. `keep_alive: forever` (the gaming-rig preset) is\nhonored (the display is Pinned; free it via `POST /display/release`).",
+        "operationId": "setDisplaySettings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DisplayPolicy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Policy stored; the new state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DisplaySettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed policy body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Policy could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/display/state": {
+      "get": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Live virtual displays",
+        "description": "The host's managed virtual displays right now — active (streaming), lingering (kept after\ndisconnect, counting down to teardown), or pinned (kept indefinitely). See\n`design/display-management.md`.",
+        "operationId": "getDisplayState",
+        "responses": {
+          "200": {
+            "description": "The live/kept virtual displays",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DisplayStateResponse"
                 }
               }
             }
@@ -1601,6 +1819,99 @@
           "av1"
         ]
       },
+      "ApiDisplayInfo": {
+        "type": "object",
+        "description": "One live or kept virtual display.",
+        "required": [
+          "slot",
+          "backend",
+          "mode",
+          "state",
+          "sessions",
+          "group",
+          "display_index",
+          "x",
+          "y",
+          "topology"
+        ],
+        "properties": {
+          "backend": {
+            "type": "string",
+            "description": "Backend name (`pf-vdisplay`, `kwin`, …)."
+          },
+          "client": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Short client label, when the owner tracks it."
+          },
+          "display_index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "This display's ordinal within its group, in acquire order (0-based).",
+            "minimum": 0
+          },
+          "expires_in_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Milliseconds until a lingering display is torn down (absent when active/pinned).",
+            "minimum": 0
+          },
+          "group": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Display group (shared desktop) id — several displays with the same group form one desktop (§6A).",
+            "minimum": 0
+          },
+          "identity_slot": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Stable per-client identity slot keying persistent config + manual layout (absent = shared/anonymous).",
+            "minimum": 0
+          },
+          "mode": {
+            "type": "string",
+            "description": "`WIDTHxHEIGHT@HZ`."
+          },
+          "sessions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Live sessions holding the display.",
+            "minimum": 0
+          },
+          "slot": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stable-enough id for the `/display/release` `slot` argument.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`active` | `lingering` | `pinned`."
+          },
+          "topology": {
+            "type": "string",
+            "description": "Effective topology for this display's group (`extend` | `primary` | `exclusive`)."
+          },
+          "x": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Desktop-space top-left `x` (auto-row or the console's manual arrangement, §6.2)."
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Desktop-space top-left `y`."
+          }
+        }
+      },
       "ApiError": {
         "type": "object",
         "description": "Error envelope for every non-2xx response.",
@@ -1909,6 +2220,146 @@
           }
         }
       },
+      "DisplayLayoutRequest": {
+        "type": "object",
+        "description": "Request body for `setDisplayLayout`: per-identity-slot desktop offsets, keyed by the identity-slot\nid as a string (the same id `/display/state` reports as `identity_slot`).",
+        "properties": {
+          "positions": {
+            "type": "object",
+            "description": "`{\"<identity_slot>\": {\"x\": …, \"y\": …}}` — where each arranged display's top-left sits.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Position"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "DisplayPolicy": {
+        "type": "object",
+        "description": "The user-facing display-management policy — what `display-settings.json` holds and what the mgmt\nAPI GETs/PUTs. When [`preset`](Self::preset) is not [`Preset::Custom`] the explicit fields are\nignored (the console writes one or the other); [`effective`](Self::effective) resolves both to a\nsingle [`EffectivePolicy`].",
+        "properties": {
+          "identity": {
+            "$ref": "#/components/schemas/Identity"
+          },
+          "keep_alive": {
+            "$ref": "#/components/schemas/KeepAlive"
+          },
+          "layout": {
+            "$ref": "#/components/schemas/Layout"
+          },
+          "max_displays": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Upper bound on simultaneously-live virtual displays (clamped to `1..=16` on write).",
+            "minimum": 0
+          },
+          "mode_conflict": {
+            "$ref": "#/components/schemas/ModeConflict"
+          },
+          "preset": {
+            "$ref": "#/components/schemas/Preset"
+          },
+          "topology": {
+            "$ref": "#/components/schemas/Topology"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Schema version (currently 1) — lets a future field addition migrate rather than reject.",
+            "minimum": 0
+          }
+        }
+      },
+      "DisplaySettingsState": {
+        "type": "object",
+        "description": "Full display-management state for the console: the stored policy, every preset's expansion, the\nresolved effective policy, and which options this build actually enforces yet (Stage 0 wires\nkeep-alive linger + topology; the rest are stored but not yet acted on).",
+        "required": [
+          "settings",
+          "configured",
+          "effective",
+          "presets",
+          "enforced"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "description": "True once a `display-settings.json` exists (the console has configured this host)."
+          },
+          "effective": {
+            "$ref": "#/components/schemas/EffectivePolicy",
+            "description": "The effective (preset-expanded) policy currently in force."
+          },
+          "enforced": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Option names this build enforces right now. All five axes are now acted on (keep_alive +\ntopology since Stage 0-2, identity Stage 3, mode_conflict Stage 4, layout Stage 5) — the console\nreads this to know which controls are live vs. \"coming soon\" (per-backend nuance, e.g. layout\nposition apply being KWin-only, is reported per display in `/display/state`)."
+          },
+          "presets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PresetInfo"
+            },
+            "description": "Every named preset and what it expands to (for the picker's preview)."
+          },
+          "settings": {
+            "$ref": "#/components/schemas/DisplayPolicy",
+            "description": "The stored policy (preset + custom fields), or the built-in default when unconfigured."
+          }
+        }
+      },
+      "DisplayStateResponse": {
+        "type": "object",
+        "description": "The host's managed virtual displays right now.",
+        "required": [
+          "displays"
+        ],
+        "properties": {
+          "displays": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiDisplayInfo"
+            }
+          }
+        }
+      },
+      "EffectivePolicy": {
+        "type": "object",
+        "description": "The six resolved fields after preset expansion — what the lifecycle/registry and the Stage-0 call\nsites read, and what the mgmt API echoes as the \"currently in force\" policy. Pure output of\n[`DisplayPolicy::effective`].",
+        "required": [
+          "keep_alive",
+          "topology",
+          "mode_conflict",
+          "identity",
+          "layout",
+          "max_displays"
+        ],
+        "properties": {
+          "identity": {
+            "$ref": "#/components/schemas/Identity"
+          },
+          "keep_alive": {
+            "$ref": "#/components/schemas/KeepAlive"
+          },
+          "layout": {
+            "$ref": "#/components/schemas/Layout"
+          },
+          "max_displays": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "mode_conflict": {
+            "$ref": "#/components/schemas/ModeConflict"
+          },
+          "topology": {
+            "$ref": "#/components/schemas/Topology"
+          }
+        }
+      },
       "GameEntry": {
         "type": "object",
         "description": "One title in the unified library, regardless of which store it came from.",
@@ -2099,6 +2550,72 @@
           }
         }
       },
+      "Identity": {
+        "type": "string",
+        "description": "Stable display identity, so desktop environments persist per-display config (KDE scaling). Stored\nat Stage 0; carriers wired from the identity stage.",
+        "enum": [
+          "shared",
+          "per-client",
+          "per-client-mode"
+        ]
+      },
+      "KeepAlive": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Tear the display down at session end (today's default on every backend but Windows, which\nlingers 10 s).",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "off"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Keep the display for `seconds` after the last session leaves, then tear it down; a reconnect\ninside the window reuses it.",
+            "required": [
+              "seconds",
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "duration"
+                ]
+              },
+              "seconds": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Linger window in seconds.",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Keep the display until host shutdown or an explicit release (the `Pinned` lifecycle state).\n**Not honored until the display-lifecycle stage** — rejected by the mgmt PUT at Stage 0.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "forever"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How long a virtual display (and, on gamescope's bare spawn, the nested session + its game)\nsurvives after the last client session detaches. Serialized as an object tagged on `mode`\n(`{\"mode\":\"off\"}` / `{\"mode\":\"duration\",\"seconds\":300}` / `{\"mode\":\"forever\"}`) so the web form\nand the OpenAPI schema stay simple."
+      },
       "LaunchSpec": {
         "type": "object",
         "description": "How the host would launch a title (consumed by the session launcher in a later step). Kept\nopen-ended so new stores slot in: `steam_appid` → `steam steam://rungameid/<value>`;\n`command` → run `<value>` nested in a gamescope session.",
@@ -2118,6 +2635,32 @@
           }
         }
       },
+      "Layout": {
+        "type": "object",
+        "description": "Group layout: the arrangement mode plus, for [`LayoutMode::Manual`], per-slot offsets keyed by\nidentity-slot id (string keys for stable JSON).",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/LayoutMode"
+          },
+          "positions": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Position"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "LayoutMode": {
+        "type": "string",
+        "description": "How group members are arranged in the desktop coordinate space. Stored at Stage 0; applied from\nthe multi-monitor stage.",
+        "enum": [
+          "auto-row",
+          "manual"
+        ]
+      },
       "LocalSummary": {
         "type": "object",
         "description": "Non-sensitive host status for the local tray icon: counts and booleans only — no PIN values,\nno fingerprints, no device names. Served unauthenticated to LOOPBACK peers only (see\n`require_auth`): the bearer-token file is SYSTEM/Administrators-DACL'd on Windows, so the\nper-user tray process cannot authenticate — this narrow read-only route is its status source.",
@@ -2128,12 +2671,19 @@
           "paired_clients",
           "native_paired_clients",
           "pin_pending",
-          "pending_approvals"
+          "pending_approvals",
+          "kept_displays"
         ],
         "properties": {
           "audio_streaming": {
             "type": "boolean",
             "description": "True while the audio stream thread is running."
+          },
+          "kept_displays": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Virtual displays being KEPT with no live session — lingering (keep-alive window) or pinned\n(`keep_alive: forever`). Non-zero means a display (and, exclusive, your physical monitors) is\nheld; the tray surfaces it + a one-click release. Active (in-use) displays are not counted.",
+            "minimum": 0
           },
           "native_paired_clients": {
             "type": "integer",
@@ -2241,6 +2791,16 @@
             "minimum": 0
           }
         }
+      },
+      "ModeConflict": {
+        "type": "string",
+        "description": "Admission when a *different* client connects while a display/session is already live and asks for\na different mode. Stored at Stage 0; enforced from the mode-conflict admission stage.",
+        "enum": [
+          "separate",
+          "steal",
+          "join",
+          "reject"
+        ]
       },
       "NativeClient": {
         "type": "object",
@@ -2435,6 +2995,88 @@
           "video": {
             "type": "integer",
             "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "Position": {
+        "type": "object",
+        "description": "A desktop-space offset for a display (top-left origin).",
+        "required": [
+          "x",
+          "y"
+        ],
+        "properties": {
+          "x": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "Preset": {
+        "type": "string",
+        "description": "A named bundle of the fields below. `Custom` (the default) means the explicit fields rule; any\nother preset ignores the stored fields and expands to its own ([`DisplayPolicy::effective`]).",
+        "enum": [
+          "custom",
+          "default",
+          "gaming-rig",
+          "shared-desktop",
+          "hotdesk",
+          "workstation"
+        ]
+      },
+      "PresetInfo": {
+        "type": "object",
+        "description": "One preset's human-facing description + the fields it expands to, so the console can render a\npreset picker with an accurate \"what this does\" preview without hardcoding the expansion.",
+        "required": [
+          "id",
+          "summary",
+          "fields"
+        ],
+        "properties": {
+          "fields": {
+            "$ref": "#/components/schemas/EffectivePolicy",
+            "description": "The effective policy this preset expands to (the same fields a `custom` policy carries)."
+          },
+          "id": {
+            "type": "string",
+            "description": "The preset id (`default` | `gaming-rig` | `shared-desktop` | `hotdesk` | `workstation`)."
+          },
+          "summary": {
+            "type": "string",
+            "description": "One-line story shown next to the option."
+          }
+        }
+      },
+      "ReleaseDisplayRequest": {
+        "type": "object",
+        "description": "Request body for `releaseDisplay`.",
+        "properties": {
+          "slot": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Slot to release (see `state`); omit to release **all** kept displays.",
+            "minimum": 0
+          }
+        }
+      },
+      "ReleaseDisplayResult": {
+        "type": "object",
+        "description": "Result of a `/display/release`.",
+        "required": [
+          "released"
+        ],
+        "properties": {
+          "released": {
+            "type": "integer",
+            "description": "Number of kept displays torn down.",
             "minimum": 0
           }
         }
@@ -2740,6 +3382,16 @@
             "example": "1234"
           }
         }
+      },
+      "Topology": {
+        "type": "string",
+        "description": "What the host does to the box's display topology while managed virtual displays are up.",
+        "enum": [
+          "auto",
+          "extend",
+          "primary",
+          "exclusive"
+        ]
       }
     },
     "securitySchemes": {
@@ -2762,6 +3414,10 @@
     {
       "name": "gpu",
       "description": "GPU inventory and selection: list the host's GPUs, choose automatic or a preferred GPU, see the one in use"
+    },
+    {
+      "name": "display",
+      "description": "Virtual-display management policy: lifecycle (keep-alive), topology (primary/exclusive), conflict handling, identity, and layout"
     },
     {
       "name": "clients",

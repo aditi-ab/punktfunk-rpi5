@@ -416,7 +416,14 @@ impl UdpTransport {
     /// Bind `local` and `connect` to `peer`, so `send`/`recv` need no address and the
     /// kernel filters to this peer. Non-blocking, matching the [`Transport`] contract.
     pub fn connect(local: &str, peer: &str) -> std::io::Result<Self> {
-        let socket = UdpSocket::bind(local)?;
+        Self::from_socket(UdpSocket::bind(local)?, peer)
+    }
+
+    /// Adopt an already-bound socket for the data plane: `connect` it to `peer`, tune buffers +
+    /// QoS, go non-blocking. Lets the host bind the data port up front (e.g. a fixed `--data-port`)
+    /// and keep the *same* socket from handshake through streaming — no drop-then-rebind window in
+    /// which a concurrent session could steal a fixed port.
+    pub fn from_socket(socket: UdpSocket, peer: &str) -> std::io::Result<Self> {
         socket.connect(peer)?;
         super::qos::grow_socket_buffers(&socket);
         // The native data plane is video-dominant — tag it as the video class (opt-in via
@@ -438,7 +445,16 @@ impl UdpTransport {
         fallback_peer: &str,
         punch_timeout: std::time::Duration,
     ) -> std::io::Result<(Self, bool)> {
-        let socket = UdpSocket::bind(local)?;
+        Self::from_socket_punch(UdpSocket::bind(local)?, fallback_peer, punch_timeout)
+    }
+
+    /// [`connect_via_punch`](Self::connect_via_punch) on an already-bound socket — see
+    /// [`from_socket`](Self::from_socket) for why the host binds the data port up front.
+    pub fn from_socket_punch(
+        socket: UdpSocket,
+        fallback_peer: &str,
+        punch_timeout: std::time::Duration,
+    ) -> std::io::Result<(Self, bool)> {
         socket.set_read_timeout(Some(punch_timeout))?;
         let deadline = std::time::Instant::now() + punch_timeout;
         let mut buf = [0u8; 64];

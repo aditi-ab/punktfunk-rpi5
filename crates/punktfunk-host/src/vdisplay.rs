@@ -64,6 +64,43 @@ pub trait VirtualDisplay: Send {
     /// Default: no-op — only the Windows pf-vdisplay backend uses it (Linux compositors own their virtual
     /// output identity). `None` = anonymous/unpaired/GameStream → the backend's auto (slot-based) identity.
     fn set_client_identity(&mut self, _fingerprint: Option<[u8; 32]>) {}
+    /// The stable identity slot the backend resolved for the most recent [`create`](Self::create) —
+    /// the per-client id the identity policy assigned (`Some`), or `None` for shared/anonymous. The
+    /// registry reads it right after `create` to key the display's group **arrangement** (manual
+    /// per-slot positions) and to label the mgmt `/display/state` slot. Default `None`: a backend
+    /// with no per-client identity (Mutter/wlroots/gamescope) always auto-rows. Only KWin (per-slot
+    /// output naming) reports a real slot on Linux.
+    fn last_identity_slot(&self) -> Option<u32> {
+        None
+    }
+    /// Place the most-recently-[created](Self::create) output at `(x, y)` in the desktop coordinate
+    /// space (design `display-management.md` §6.2 — layout). The registry, which owns the display
+    /// **group**, computes the position from the whole group (auto-row or the console's manual
+    /// arrangement) and calls this right after `create`. Default no-op: only backends that can position
+    /// an output (KWin) implement it; the registry never calls it for the desktop origin `(0, 0)`, so a
+    /// single-display / first-of-group session issues no positioning at all. Best-effort — a failure
+    /// leaves the compositor's default placement.
+    fn apply_position(&mut self, _x: i32, _y: i32) {}
+    /// Take the topology **restore** action this [`create`](Self::create) prepared — the work that
+    /// un-does an `exclusive`/`primary` topology change (e.g. re-enable the physical outputs KWin
+    /// disabled). The registry lifts it into the display **group** so it runs **once, when the group's
+    /// last display is torn down** (design §6.1 — per-group restore), not when this one session's
+    /// display drops: a sibling `exclusive` session must not have the physical re-enabled under it.
+    /// Called right after `create`; the backend must not also run it itself. Default `None` — a backend
+    /// whose topology auto-reverts (Mutter `APPLY_TEMPORARY`) or that changes nothing has nothing to
+    /// hand off.
+    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        None
+    }
+    /// Tell the backend whether this create will be the **first** display in its group — i.e. no
+    /// sibling of the same backend is already live (design §6.1). A backend that *establishes* the
+    /// group's topology (Mutter's sole-monitor `exclusive` `ApplyMonitorsConfig`) applies it only when
+    /// first; a later sibling **extends** into the already-exclusive desktop instead of re-clobbering it
+    /// (a fresh sole-monitor config would disable the first session's virtual output). Set by the
+    /// registry right before [`create`](Self::create). Default no-op: KWin recognises siblings at
+    /// runtime by output name (first-slot-wins + a group-aware disable filter), and single-display
+    /// backends never have a sibling.
+    fn set_first_in_group(&mut self, _first: bool) {}
 }
 
 /// Compositors punktfunk knows how to drive (plan §6).
@@ -403,21 +440,11 @@ pub fn apply_session_env(active: &ActiveSession) {
     if active.kind == ActiveKind::DesktopGnome {
         std::env::set_var("PUNKTFUNK_FORCE_SHM", "1");
     }
-    // Stream the desktop as the SOLE output: promote the per-session virtual output to PRIMARY so
-    // the panels + windows land on the streamed surface, not an unstreamed real output (the
-    // auto-detected desktop path *is* "stream this desktop"). Default-on for the auto path; an
-    // explicit `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` still wins.
-    match active.kind {
-        ActiveKind::DesktopKde if std::env::var_os("PUNKTFUNK_KWIN_VIRTUAL_PRIMARY").is_none() => {
-            std::env::set_var("PUNKTFUNK_KWIN_VIRTUAL_PRIMARY", "1");
-        }
-        ActiveKind::DesktopGnome
-            if std::env::var_os("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY").is_none() =>
-        {
-            std::env::set_var("PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY", "1");
-        }
-        _ => {}
-    }
+    // Topology (Stage 2): the per-compositor backends (KWin/Mutter) now read
+    // [`effective_topology`] directly at create time — the console policy, else the legacy
+    // `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` env, else the Auto default (exclusive on the
+    // auto-desktop path). So this connect-path no longer writes that env (one fewer process-env
+    // mutation on the `ENV_LOCK` surface); `effective_topology()` computes the identical result.
 }
 #[cfg(not(target_os = "linux"))]
 pub fn apply_session_env(_active: &ActiveSession) {}
@@ -723,14 +750,87 @@ pub fn start_restore_worker() -> std::sync::Arc<()> {
     std::sync::Arc::new(())
 }
 
+// The user-configurable management policy (keep-alive / topology / conflict / identity / layout),
+// layered above the per-compositor backends — platform-neutral (the mgmt API + both host paths read
+// it), so no cfg gate. See `design/display-management.md`.
+#[path = "vdisplay/policy.rs"]
+pub(crate) mod policy;
+
+// The pure per-display lifecycle state machine (refcount + linger + pin), platform-neutral and
+// property-tested; the registry executes the side effects its transitions dictate.
+#[path = "vdisplay/lifecycle.rs"]
+pub(crate) mod lifecycle;
+
+// The neutral snapshot/release facade over the per-OS lifecycle owners (Windows manager; Linux pool
+// later), for the management API's /display/state + /display/release.
+#[path = "vdisplay/registry.rs"]
+pub(crate) mod registry;
+
+// The pure display-arrangement engine (auto-row / manual → per-member positions), platform-neutral
+// and unit-tested; the registry (state readout) and the KWin position apply consume it.
+#[path = "vdisplay/layout.rs"]
+pub(crate) mod layout;
+
+/// Resolve a [`policy::Topology`] to a concrete value (never [`policy::Topology::Auto`]). `Auto`
+/// reproduces today's default: **extend** under an explicit `PUNKTFUNK_COMPOSITOR` pin (the CI/test
+/// posture, where the host isn't the sole desktop), else **exclusive** (Windows + the auto-detected
+/// Linux desktop path, where "stream this desktop" means promoting the virtual output to sole).
+pub fn resolve_topology(t: policy::Topology) -> policy::Topology {
+    match t {
+        policy::Topology::Auto => {
+            if crate::config::config().compositor.is_some() {
+                policy::Topology::Extend
+            } else {
+                policy::Topology::Exclusive
+            }
+        }
+        concrete => concrete,
+    }
+}
+
+/// The concrete display topology for the current session — what the per-compositor backends (and the
+/// Windows isolate gate) apply at create time. Precedence, mirroring the rest of the policy surface:
+/// the **console policy** when configured, else the legacy **`PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY`**
+/// env (an operator's explicit choice — `1`→exclusive, `0`→extend), else the **Auto** default
+/// ([`resolve_topology`]: exclusive on the auto-detected desktop / Windows, extend under a compositor
+/// pin). Always resolved (never [`policy::Topology::Auto`]). This is the Stage-2 replacement for the
+/// `apply_session_env` boolean write — the backends read policy directly, so the `primary` level
+/// (distinct from `exclusive`) becomes expressible and one process-env mutation drops off the connect
+/// path.
+pub fn effective_topology() -> policy::Topology {
+    if let Some(e) = policy::prefs().configured_effective() {
+        return resolve_topology(e.topology);
+    }
+    // Unconfigured: honor a legacy operator env if present (a host runs one desktop backend, so at
+    // most one of these is set), else the Auto default.
+    let legacy = [
+        "PUNKTFUNK_KWIN_VIRTUAL_PRIMARY",
+        "PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY",
+    ]
+    .iter()
+    .find_map(|k| std::env::var(k).ok());
+    match legacy.as_deref().map(str::trim) {
+        Some("1" | "true" | "yes" | "on") => policy::Topology::Exclusive,
+        Some("0" | "false" | "no" | "off") => policy::Topology::Extend,
+        _ => resolve_topology(policy::Topology::Auto),
+    }
+}
+
 // Goal-1 stage 6: per-compositor Linux backends under `vdisplay/linux/`, the Windows IddCx/SudoVDA
 // backends under `vdisplay/windows/`; `#[path]` keeps the `crate::vdisplay::*` module names flat.
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/gamescope.rs"]
 mod gamescope;
-#[cfg(target_os = "windows")]
-#[path = "vdisplay/windows/identity.rs"]
+// Platform-neutral per-client stable display-id map (Stage 3): Windows seeds the monitor EDID +
+// ConnectorIndex from the id; KWin names its output from it. `allow(dead_code)` because only Windows
+// consumes it in non-test code today — the KWin wiring is the next Stage-3 step.
+#[allow(dead_code)]
+#[path = "vdisplay/identity.rs"]
 pub(crate) mod identity;
+// Platform-neutral mode-conflict admission (Stage 4): the separate/join/steal/reject decision + the
+// live-session registry, wired into the punktfunk/1 handshake.
+#[path = "vdisplay/admission.rs"]
+pub(crate) mod admission;
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/kwin.rs"]
 mod kwin;

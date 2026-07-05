@@ -67,13 +67,42 @@ const VOUT_NAME: &str = "punktfunk";
 /// event (deprecated only since v6) for the node id, so cap the bind at 5.
 const MAX_VERSION: u32 = 5;
 
-/// The KWin virtual-display driver. Stateless — each [`create`](VirtualDisplay::create) spins up
-/// its own Wayland connection/thread that owns the resulting output.
-pub struct KwinDisplay;
+/// The KWin virtual-display driver. Carries the connecting client's cert fingerprint (set before
+/// [`create`](VirtualDisplay::create)) so a paired client gets a STABLE per-slot output NAME
+/// (`Virtual-punktfunk-<id>`) — KWin persists per-output config (scale/mode) keyed by name in
+/// `kwinoutputconfig.json`, so a stable name makes KDE reapply that client's scaling on reconnect
+/// (Stage 3). Each `create` spins up its own Wayland connection/thread that owns the output.
+#[derive(Default)]
+pub struct KwinDisplay {
+    client_fp: Option<[u8; 32]>,
+    /// The identity slot the last [`create`](VirtualDisplay::create) resolved (the per-client id, or
+    /// `None` for shared/anonymous) — reported to the registry via [`last_identity_slot`] so it can key
+    /// the group arrangement + `/display/state` slot to the same id this backend named the output with.
+    last_slot: Option<u32>,
+    /// The base output name the last `create` used (`punktfunk` / `punktfunk-<id>`) — so
+    /// [`apply_position`](VirtualDisplay::apply_position) can address the KWin output `Virtual-<name>`.
+    last_name: Option<String>,
+    /// The topology-restore action the last `create` prepared (re-enable the outputs an `exclusive`
+    /// topology disabled), pending pickup by the registry via [`take_topology_restore`] — so the
+    /// physical is re-enabled only when the display GROUP's last member drops (§6.1), not this session's.
+    /// A backstop [`Drop`] runs it if the registry never took it (so a physical is never left dark).
+    pending_restore: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for KwinDisplay {
+    fn drop(&mut self) {
+        // Backstop only: the registry takes the restore right after `create` (moving it into the group),
+        // so this is normally `None`. If some path skipped the take, re-enable here so a physical is
+        // never stranded dark.
+        if let Some(restore) = self.pending_restore.take() {
+            restore();
+        }
+    }
+}
 
 impl KwinDisplay {
     pub fn new() -> Result<Self> {
-        Ok(KwinDisplay)
+        Ok(KwinDisplay::default())
     }
 }
 
@@ -82,14 +111,61 @@ impl VirtualDisplay for KwinDisplay {
         "kwin"
     }
 
+    fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
+        self.client_fp = fingerprint;
+    }
+
+    fn last_identity_slot(&self) -> Option<u32> {
+        self.last_slot
+    }
+
+    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.pending_restore.take()
+    }
+
+    fn apply_position(&mut self, x: i32, y: i32) {
+        let Some(name) = self.last_name.clone() else {
+            return;
+        };
+        let output = format!("Virtual-{name}");
+        // kscreen-doctor position syntax: `output.<name>.position.<x>,<y>`.
+        let ok = std::process::Command::new("kscreen-doctor")
+            .arg(format!("output.{output}.position.{x},{y}"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            tracing::info!(output, x, y, "KWin: placed output in the desktop layout");
+        } else {
+            tracing::warn!(output, x, y, "KWin: output position apply failed");
+        }
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
+        // Per-slot output name (Stage 3): the `identity` policy resolves the client to a stable id →
+        // `punktfunk-<id>` (KWin exposes `Virtual-punktfunk-<id>`, whose per-output config KWin
+        // persists by name). Shared / anonymous → the base `punktfunk` (today's single name). Linux
+        // defaults to Shared when unconfigured, so this is a no-op change until a policy opts in — AND
+        // it fixes the latent clash where two concurrent sessions both used `Virtual-punktfunk`.
+        let slot = crate::vdisplay::identity::resolve_slot(
+            self.client_fp,
+            (mode.width, mode.height),
+            crate::vdisplay::policy::Identity::Shared,
+        );
+        self.last_slot = slot; // reported to the registry for the group arrangement + state slot
+        let name = match slot {
+            Some(id) => format!("{VOUT_NAME}-{id}"),
+            None => VOUT_NAME.to_string(),
+        };
+        self.last_name = Some(name.clone()); // for apply_position (registry-driven §6.2 layout)
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let (width, height) = (mode.width, mode.height);
+        let name_thread = name.clone();
         thread::Builder::new()
             .name("punktfunk-kwin-vout".into())
-            .spawn(move || virtual_output_thread(width, height, setup_tx, stop_thread))
+            .spawn(move || virtual_output_thread(width, height, name_thread, setup_tx, stop_thread))
             .context("spawn KWin virtual-output thread")?;
 
         let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
@@ -107,26 +183,60 @@ impl VirtualDisplay for KwinDisplay {
         // rejected custom mode leaves the output at 60 Hz). At ≤60 Hz there's nothing to install —
         // the source runs 60 Hz and the encoder downsamples — so carry the requested rate through.
         let achieved_hz = if mode.refresh_hz > 60 {
-            set_custom_refresh(width, height, mode.refresh_hz)
+            set_custom_refresh(width, height, mode.refresh_hz, &name)
         } else {
             mode.refresh_hz
         };
-        // Make our streamed output the SOLE desktop: plasmashell + windows land on the surface we
-        // stream, not on the headless session's `kwin --virtual` bootstrap output (otherwise the
-        // client sees only the wallpaper of an empty extended output). Opt-in
-        // (PUNKTFUNK_KWIN_VIRTUAL_PRIMARY), mirroring the Mutter backend's PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY.
-        let restore = if virtual_primary_enabled() {
-            apply_virtual_primary()
-        } else {
-            Vec::new()
+        // Display-management topology (Stage 2): `Extend` leaves the streamed output an extension;
+        // `Primary` makes it the primary output but keeps the bootstrap/physical outputs enabled;
+        // `Exclusive` makes it the SOLE desktop (others disabled, restored on teardown) — so
+        // plasmashell + windows land on the streamed surface, not the headless `kwin --virtual`
+        // bootstrap output. Read from the policy (replacing the PUNKTFUNK_KWIN_VIRTUAL_PRIMARY boolean).
+        use crate::vdisplay::policy::Topology;
+        let disabled = match crate::vdisplay::effective_topology() {
+            Topology::Exclusive => apply_virtual_primary(&name),
+            Topology::Primary => {
+                apply_virtual_primary_only(&name);
+                Vec::new() // nothing disabled → nothing to restore
+            }
+            Topology::Extend | Topology::Auto => Vec::new(),
         };
+        // Per-group restore (§6.1): DON'T bind the re-enable to this session's keepalive (a per-session
+        // `StopGuard` restore would re-enable the physical the moment the FIRST of several exclusive
+        // sessions drops — under a still-live sibling). Instead stash it as a closure the registry lifts
+        // into the display group and runs once, when the group's LAST member is torn down (ordered before
+        // that display's output is reclaimed, so KWin never sees zero outputs). Empty ⇒ nothing to restore.
+        self.pending_restore = (!disabled.is_empty()).then(|| {
+            let disabled = disabled.clone();
+            Box::new(move || reenable_outputs(&disabled)) as Box<dyn FnOnce() + Send>
+        });
+        // Layout position (§6.2) is applied by the registry via `apply_position` right after create
+        // (it owns the display group, so it computes auto-row / manual placement over the whole group).
         Ok(VirtualOutput {
             node_id,
             remote_fd: None,
             preferred_mode: Some((mode.width, mode.height, achieved_hz)),
-            keepalive: Box::new(StopGuard { stop, restore }),
+            keepalive: Box::new(StopGuard { stop }),
         })
     }
+}
+
+/// Re-enable the outputs an `exclusive` topology disabled (bootstrap / physical), so KWin re-homes onto
+/// them. Called by the registry when the display group's last member is torn down (design §6.1), BEFORE
+/// that member's output is reclaimed — so KWin is never momentarily left with zero enabled outputs.
+fn reenable_outputs(outputs: &[String]) {
+    if outputs.is_empty() {
+        return;
+    }
+    let args: Vec<String> = outputs
+        .iter()
+        .map(|o| format!("output.{o}.enable"))
+        .collect();
+    let _ = std::process::Command::new("kscreen-doctor")
+        .args(&args)
+        .status();
+    std::thread::sleep(Duration::from_millis(200));
+    tracing::info!(reenabled = ?outputs, "KWin: restored the physical/bootstrap outputs (group empty)");
 }
 
 /// Best-effort: raise the just-created virtual output's refresh above KWin's default 60 Hz by
@@ -135,8 +245,8 @@ impl VirtualDisplay for KwinDisplay {
 /// gave us. The apply command can report success yet leave the output at 60 Hz (mode rejected),
 /// and a silent rate mismatch surfaces downstream as judder / duplicated frames — so the caller
 /// paces the encoder to the *achieved* rate, not the requested one.
-fn set_custom_refresh(width: u32, height: u32, hz: u32) -> u32 {
-    let output = format!("Virtual-{VOUT_NAME}");
+fn set_custom_refresh(width: u32, height: u32, hz: u32, name: &str) -> u32 {
+    let output = format!("Virtual-{name}");
     let mhz = hz.saturating_mul(1000);
     let run = |arg: String| {
         std::process::Command::new("kscreen-doctor")
@@ -213,26 +323,17 @@ fn read_active_refresh(output: &str) -> Option<u32> {
     Some(hz.round() as u32)
 }
 
-/// Opt-in: make the per-session virtual output the sole desktop. Off by default — a host with no
-/// competing output (or one that wants the bootstrap kept) is unaffected; the headless KDE appliance
-/// (run-headless-kde.sh's `kwin --virtual` bootstrap + our streamed output) sets it so the desktop
-/// renders on the streamed surface, not the bootstrap. Mirrors the Mutter backend's gate.
-fn virtual_primary_enabled() -> bool {
-    std::env::var("PUNKTFUNK_KWIN_VIRTUAL_PRIMARY")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
+/// The prefix EVERY managed KWin output shares — Stage 3 names them `punktfunk` / `punktfunk-<id>`,
+/// which KWin exposes as `Virtual-punktfunk` / `Virtual-punktfunk-<id>`. Group membership (§6.1) is
+/// recognised by this prefix, so we never have to thread the live set through the backend.
+const MANAGED_PREFIX: &str = "Virtual-punktfunk";
 
-/// Names of currently-ENABLED outputs other than our `Virtual-punktfunk` — i.e. the headless
-/// session's bootstrap output(s), which hold the desktop by default. Parsed from `kscreen-doctor -j`
-/// (same source as [`read_active_refresh`]).
+/// Names of currently-ENABLED outputs that are **not managed by us** — the headless session's
+/// bootstrap output(s) + any physical monitor, i.e. exactly what `exclusive` must disable.
+/// **Group-aware (§6.1):** excludes the WHOLE managed family (the [`MANAGED_PREFIX`]), not just this
+/// session's own output — so a 2nd `exclusive` session (with a distinct per-slot name) never disables
+/// the 1st session's live output. Parsed from `kscreen-doctor -j` (same source as [`read_active_refresh`]).
 fn other_enabled_outputs() -> Vec<String> {
-    let ours = format!("Virtual-{VOUT_NAME}");
     let out = match std::process::Command::new("kscreen-doctor")
         .arg("-j")
         .output()
@@ -248,22 +349,49 @@ fn other_enabled_outputs() -> Vec<String> {
         .and_then(|o| o.as_array())
         .map(|outs| {
             outs.iter()
-                .filter(|o| {
-                    o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false)
-                        && o.get("name").and_then(|n| n.as_str()) != Some(ours.as_str())
-                })
-                .filter_map(|o| o.get("name").and_then(|n| n.as_str()).map(String::from))
+                .filter(|o| o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false))
+                .filter_map(|o| o.get("name").and_then(|n| n.as_str()))
+                .filter(|n| !n.starts_with(MANAGED_PREFIX))
+                .map(String::from)
                 .collect()
         })
         .unwrap_or_default()
 }
 
-/// Set `Virtual-punktfunk` primary and disable the bootstrap output(s) so it becomes the sole
-/// desktop (KWin re-homes plasmashell + windows onto it). Returns the disabled outputs for the
-/// keepalive to re-enable on teardown. Best-effort: on failure, streaming continues (just possibly
+/// True if any managed group member (the [`MANAGED_PREFIX`] family) is ALREADY the KWin primary —
+/// first-slot-wins support (§6.1) so a later exclusive session doesn't steal primary from the group's
+/// first member. Best-effort: if kscreen reports no primary flag we treat it as "none" (the session
+/// then sets itself primary — the pre-group behavior). Recent kscreen marks the primary with
+/// `"priority": 1`; older builds used a `"primary": true` bool — accept either.
+fn a_managed_output_is_primary() -> bool {
+    let Ok(out) = std::process::Command::new("kscreen-doctor").arg("-j").output() else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return false;
+    };
+    doc.get("outputs")
+        .and_then(|o| o.as_array())
+        .map(|outs| {
+            outs.iter().any(|o| {
+                let managed = o
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| n.starts_with(MANAGED_PREFIX));
+                let primary = o.get("primary").and_then(|p| p.as_bool()).unwrap_or(false)
+                    || o.get("priority").and_then(|p| p.as_u64()) == Some(1);
+                managed && primary
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Set `Virtual-punktfunk` primary and disable the bootstrap output(s) so the managed group becomes
+/// the sole desktop (KWin re-homes plasmashell + windows onto it). Returns the disabled outputs for
+/// the keepalive to re-enable on teardown. Best-effort: on failure, streaming continues (just possibly
 /// showing only the wallpaper) rather than failing the session.
-fn apply_virtual_primary() -> Vec<String> {
-    let ours = format!("Virtual-{VOUT_NAME}");
+fn apply_virtual_primary(name: &str) -> Vec<String> {
+    let ours = format!("Virtual-{name}");
     let kscreen = |args: &[String]| {
         std::process::Command::new("kscreen-doctor")
             .args(args)
@@ -271,15 +399,20 @@ fn apply_virtual_primary() -> Vec<String> {
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    // Make ours primary — KWin usually then re-homes the desktop and disables the bootstrap on its
-    // own. Let that settle, then belt-and-suspenders: disable anything still enabled besides ours so
-    // the streamed output is unambiguously the sole desktop regardless of KWin's implicit behaviour.
-    if !kscreen(&[format!("output.{ours}.primary")]) {
-        tracing::warn!(
-            "KWin: could not set the virtual output primary; client may see only the wallpaper"
-        );
+    // First-slot-wins (§6.1): only grab primary if no managed group member is primary yet — so a 2nd
+    // exclusive session joins as a secondary monitor of the shared desktop instead of stealing the
+    // shell off the 1st session's output. KWin usually then re-homes the desktop + disables the
+    // bootstrap on its own; the belt-and-suspenders disable below covers the rest.
+    if !a_managed_output_is_primary() {
+        if !kscreen(&[format!("output.{ours}.primary")]) {
+            tracing::warn!(
+                "KWin: could not set the virtual output primary; client may see only the wallpaper"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
-    std::thread::sleep(Duration::from_millis(200));
+    // Disable everything still enabled that ISN'T a managed group member (bootstrap / physical), so
+    // the group is unambiguously the desktop — never a sibling session's output (group-aware filter).
     let others = other_enabled_outputs();
     if !others.is_empty() {
         let args: Vec<String> = others
@@ -292,29 +425,33 @@ fn apply_virtual_primary() -> Vec<String> {
     others
 }
 
+/// **Primary** (Stage 2): make the streamed output the primary but KEEP the other outputs enabled
+/// (don't disable the bootstrap/physical) — so the shell re-homes onto the streamed surface while a
+/// physical screen stays usable. Nothing to restore on teardown (we disabled nothing).
+fn apply_virtual_primary_only(name: &str) {
+    let ours = format!("Virtual-{name}");
+    let ok = std::process::Command::new("kscreen-doctor")
+        .arg(format!("output.{ours}.primary"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        tracing::info!("KWin: streamed output set primary (physical outputs kept)");
+    } else {
+        tracing::warn!("KWin: could not set the virtual output primary");
+    }
+}
+
 /// Dropping this releases the KWin virtual output: it flips the keepalive thread's `stop`, which
-/// drops the Wayland connection and makes KWin reclaim the output.
+/// drops the Wayland connection and makes KWin reclaim the output. The topology **restore** is no
+/// longer bound here — it moved to the registry's display group (§6.1, [`reenable_outputs`]), which
+/// runs it once when the group's last member drops, BEFORE this keepalive is dropped.
 struct StopGuard {
     stop: Arc<AtomicBool>,
-    /// Bootstrap output(s) `apply_virtual_primary` disabled to make our streamed output the sole
-    /// desktop — re-enabled here FIRST, so KWin is never left with zero enabled outputs as our
-    /// output is reclaimed. Empty unless PUNKTFUNK_KWIN_VIRTUAL_PRIMARY is set.
-    restore: Vec<String>,
 }
 
 impl Drop for StopGuard {
     fn drop(&mut self) {
-        if !self.restore.is_empty() {
-            let args: Vec<String> = self
-                .restore
-                .iter()
-                .map(|o| format!("output.{o}.enable"))
-                .collect();
-            let _ = std::process::Command::new("kscreen-doctor")
-                .args(&args)
-                .status();
-            std::thread::sleep(Duration::from_millis(200));
-        }
         self.stop.store(true, Ordering::Relaxed);
     }
 }
@@ -388,10 +525,11 @@ impl Dispatch<ScreencastStream, ()> for State {
 fn virtual_output_thread(
     width: u32,
     height: u32,
+    name: String,
     setup_tx: Sender<Result<u32, String>>,
     stop: Arc<AtomicBool>,
 ) {
-    if let Err(e) = run(width, height, &setup_tx, &stop) {
+    if let Err(e) = run(width, height, &name, &setup_tx, &stop) {
         // If we never delivered a node id, report the failure to the waiting opener.
         let _ = setup_tx.send(Err(format!("{e:#}")));
     }
@@ -431,6 +569,7 @@ pub fn is_available() -> bool {
 fn run(
     width: u32,
     height: u32,
+    name: &str,
     setup_tx: &Sender<Result<u32, String>>,
     stop: &AtomicBool,
 ) -> Result<()> {
@@ -453,7 +592,7 @@ fn run(
 
     // Create the virtual output sized to the client, cursor composited into the stream.
     let stream = screencast.stream_virtual_output(
-        VOUT_NAME.to_string(),
+        name.to_string(),
         width as i32,
         height as i32,
         1.0, // scale (logical == physical)
@@ -521,4 +660,28 @@ fn run(
     stream.close();
     let _ = conn.flush();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MANAGED_PREFIX;
+
+    /// Group-aware exclusive (§6.1): with two managed group members + a physical panel enabled,
+    /// exclusive disables ONLY the non-managed panel — never a sibling session's per-slot output
+    /// (the Stage-3 naming would otherwise make a 2nd exclusive session black out the 1st).
+    #[test]
+    fn exclusive_disables_only_non_managed() {
+        let enabled = [
+            "Virtual-punktfunk",   // base name (shared identity)
+            "Virtual-punktfunk-1", // client A's per-slot output
+            "Virtual-punktfunk-7", // client B's per-slot output
+            "eDP-1",               // a physical panel
+        ];
+        let to_disable: Vec<&str> = enabled
+            .iter()
+            .copied()
+            .filter(|n| !n.starts_with(MANAGED_PREFIX))
+            .collect();
+        assert_eq!(to_disable, vec!["eDP-1"]);
+    }
 }

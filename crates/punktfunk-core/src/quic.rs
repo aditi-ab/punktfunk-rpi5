@@ -122,6 +122,13 @@ pub const VIDEO_CAP_444: u8 = 0x04;
 /// stage. Purely observability — never changes what the host encodes.
 pub const VIDEO_CAP_HOST_TIMING: u8 = 0x08;
 
+/// QUIC application error code a punktfunk/1 client closes the control connection with on a
+/// **deliberate quit** (a user "stop", not a network drop). The host reads it off the connection's
+/// `ApplicationClosed` reason and tears the session's virtual display down immediately, skipping the
+/// keep-alive linger; any other close reason (idle timeout, reset, a bare code 0) still lingers so a
+/// reconnect can resume. Shared so host + every client agree on the code.
+pub const QUIT_CLOSE_CODE: u32 = 0x51;
+
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 /// advertise this.
@@ -1743,20 +1750,31 @@ pub mod endpoint {
     /// every `KEEP_ALIVE` keeps the path warm. The interval sits well under `MAX_IDLE` so
     /// several keepalives can be lost back-to-back (a wifi roam, a brief blip) without a false
     /// close, while a genuinely dead peer is still detected within `MAX_IDLE`.
+    /// The default control-connection idle timeout (disconnect-detection latency). A vanished client
+    /// is declared dead within this window — the Windows IDD-push path needs it short so a RECONNECT
+    /// recreates a fresh virtual monitor instead of joining the still-lingering old session; the Linux
+    /// path pairs it with the same-client reconnect preempt. Host-tunable via `server_with_identity_idle`.
+    pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
     fn stream_transport() -> Arc<quinn::TransportConfig> {
+        stream_transport_idle(DEFAULT_IDLE_TIMEOUT)
+    }
+
+    /// Transport config with a caller-chosen idle timeout (disconnect-detection latency). The
+    /// keep-alive interval tracks it at half the idle window (capped at the default 4s), so a live
+    /// path is PINGed at least twice per window and a single lost PING (wifi roam / brief blip) won't
+    /// false-close. `idle` is clamped to a ≥1s floor so a misconfigured tiny value can't tear live
+    /// sessions down. Active sessions are unaffected either way: video keeps the connection live and
+    /// the keep-alive holds it open through quiet control periods.
+    fn stream_transport_idle(idle: std::time::Duration) -> Arc<quinn::TransportConfig> {
         use std::time::Duration;
-        // 8s idle (was 20s): a vanished client is declared dead within 8s instead of 20, so its
-        // session tears down promptly — which the Windows IDD-push path needs so a RECONNECT recreates
-        // a fresh virtual monitor (a reused monitor's IddCx swap-chain dies) instead of joining the
-        // still-lingering old session. Active sessions are unaffected: video keeps the connection live,
-        // and the 4s keep-alive holds it open through quiet control periods.
-        const MAX_IDLE: Duration = Duration::from_secs(8);
-        const KEEP_ALIVE: Duration = Duration::from_secs(4);
+        let idle = idle.max(Duration::from_secs(1));
+        let keep_alive = (idle / 2).min(Duration::from_secs(4));
         let mut t = quinn::TransportConfig::default();
         t.max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(MAX_IDLE).expect("8s is a valid QUIC idle timeout"),
+            quinn::IdleTimeout::try_from(idle).expect("clamped idle timeout is a valid QUIC value"),
         ));
-        t.keep_alive_interval(Some(KEEP_ALIVE));
+        t.keep_alive_interval(Some(keep_alive));
         Arc::new(t)
     }
 
@@ -1767,23 +1785,36 @@ pub mod endpoint {
             .map_err(|e| anyhow_result::Error::msg(format!("self-signed cert: {e}")))?;
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
         let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        server_from_der(cert_der, key_der.into(), addr)
+        server_from_der(cert_der, key_der.into(), addr, DEFAULT_IDLE_TIMEOUT)
     }
 
     /// Server endpoint from a persisted PEM identity (certificate + PKCS#8 private key) —
     /// the host's long-lived self-signed cert, so the fingerprint clients pin is stable
-    /// across restarts.
+    /// across restarts. Uses the [`DEFAULT_IDLE_TIMEOUT`]; see [`server_with_identity_idle`] to tune it.
     pub fn server_with_identity(
         addr: std::net::SocketAddr,
         cert_pem: &str,
         key_pem: &str,
+    ) -> anyhow_result::Result<quinn::Endpoint> {
+        server_with_identity_idle(addr, cert_pem, key_pem, DEFAULT_IDLE_TIMEOUT)
+    }
+
+    /// Like [`server_with_identity`] but with a host-chosen control-connection idle timeout — the
+    /// disconnect-detection latency (how long a vanished client takes to be declared dead). Shorter =
+    /// faster teardown/linger of a dropped session; the value is clamped to a ≥1s floor and its
+    /// keep-alive scales with it so a live session never false-closes.
+    pub fn server_with_identity_idle(
+        addr: std::net::SocketAddr,
+        cert_pem: &str,
+        key_pem: &str,
+        idle: std::time::Duration,
     ) -> anyhow_result::Result<quinn::Endpoint> {
         use rustls::pki_types::pem::PemObject;
         let cert_der = rustls::pki_types::CertificateDer::from_pem_slice(cert_pem.as_bytes())
             .map_err(|e| anyhow_result::Error::msg(format!("cert pem: {e}")))?;
         let key_der = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
             .map_err(|e| anyhow_result::Error::msg(format!("key pem: {e}")))?;
-        server_from_der(cert_der, key_der, addr)
+        server_from_der(cert_der, key_der, addr, idle)
     }
 
     /// Fixed ALPN for the punktfunk/1 QUIC handshake. Pinning it rejects a cross-protocol peer at the
@@ -1796,6 +1827,7 @@ pub mod endpoint {
         cert_der: rustls::pki_types::CertificateDer<'static>,
         key_der: rustls::pki_types::PrivateKeyDer<'static>,
         addr: std::net::SocketAddr,
+        idle: std::time::Duration,
     ) -> anyhow_result::Result<quinn::Endpoint> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         // Client auth is OFFERED but optional: a client that presents its self-signed
@@ -1810,7 +1842,7 @@ pub mod endpoint {
         let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
             .map_err(|e| anyhow_result::Error::msg(format!("quic server config: {e}")))?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
-        server_config.transport_config(stream_transport()); // keep-alive — see stream_transport
+        server_config.transport_config(stream_transport_idle(idle)); // keep-alive — see stream_transport_idle
         Ok(quinn::Endpoint::server(server_config, addr)?)
     }
 
