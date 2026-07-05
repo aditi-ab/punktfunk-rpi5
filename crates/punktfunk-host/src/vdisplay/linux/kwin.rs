@@ -82,6 +82,22 @@ pub struct KwinDisplay {
     /// The base output name the last `create` used (`punktfunk` / `punktfunk-<id>`) — so
     /// [`apply_position`](VirtualDisplay::apply_position) can address the KWin output `Virtual-<name>`.
     last_name: Option<String>,
+    /// The topology-restore action the last `create` prepared (re-enable the outputs an `exclusive`
+    /// topology disabled), pending pickup by the registry via [`take_topology_restore`] — so the
+    /// physical is re-enabled only when the display GROUP's last member drops (§6.1), not this session's.
+    /// A backstop [`Drop`] runs it if the registry never took it (so a physical is never left dark).
+    pending_restore: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for KwinDisplay {
+    fn drop(&mut self) {
+        // Backstop only: the registry takes the restore right after `create` (moving it into the group),
+        // so this is normally `None`. If some path skipped the take, re-enable here so a physical is
+        // never stranded dark.
+        if let Some(restore) = self.pending_restore.take() {
+            restore();
+        }
+    }
 }
 
 impl KwinDisplay {
@@ -101,6 +117,10 @@ impl VirtualDisplay for KwinDisplay {
 
     fn last_identity_slot(&self) -> Option<u32> {
         self.last_slot
+    }
+
+    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.pending_restore.take()
     }
 
     fn apply_position(&mut self, x: i32, y: i32) {
@@ -173,7 +193,7 @@ impl VirtualDisplay for KwinDisplay {
         // plasmashell + windows land on the streamed surface, not the headless `kwin --virtual`
         // bootstrap output. Read from the policy (replacing the PUNKTFUNK_KWIN_VIRTUAL_PRIMARY boolean).
         use crate::vdisplay::policy::Topology;
-        let restore = match crate::vdisplay::effective_topology() {
+        let disabled = match crate::vdisplay::effective_topology() {
             Topology::Exclusive => apply_virtual_primary(&name),
             Topology::Primary => {
                 apply_virtual_primary_only(&name);
@@ -181,15 +201,42 @@ impl VirtualDisplay for KwinDisplay {
             }
             Topology::Extend | Topology::Auto => Vec::new(),
         };
+        // Per-group restore (§6.1): DON'T bind the re-enable to this session's keepalive (a per-session
+        // `StopGuard` restore would re-enable the physical the moment the FIRST of several exclusive
+        // sessions drops — under a still-live sibling). Instead stash it as a closure the registry lifts
+        // into the display group and runs once, when the group's LAST member is torn down (ordered before
+        // that display's output is reclaimed, so KWin never sees zero outputs). Empty ⇒ nothing to restore.
+        self.pending_restore = (!disabled.is_empty()).then(|| {
+            let disabled = disabled.clone();
+            Box::new(move || reenable_outputs(&disabled)) as Box<dyn FnOnce() + Send>
+        });
         // Layout position (§6.2) is applied by the registry via `apply_position` right after create
         // (it owns the display group, so it computes auto-row / manual placement over the whole group).
         Ok(VirtualOutput {
             node_id,
             remote_fd: None,
             preferred_mode: Some((mode.width, mode.height, achieved_hz)),
-            keepalive: Box::new(StopGuard { stop, restore }),
+            keepalive: Box::new(StopGuard { stop }),
         })
     }
+}
+
+/// Re-enable the outputs an `exclusive` topology disabled (bootstrap / physical), so KWin re-homes onto
+/// them. Called by the registry when the display group's last member is torn down (design §6.1), BEFORE
+/// that member's output is reclaimed — so KWin is never momentarily left with zero enabled outputs.
+fn reenable_outputs(outputs: &[String]) {
+    if outputs.is_empty() {
+        return;
+    }
+    let args: Vec<String> = outputs
+        .iter()
+        .map(|o| format!("output.{o}.enable"))
+        .collect();
+    let _ = std::process::Command::new("kscreen-doctor")
+        .args(&args)
+        .status();
+    std::thread::sleep(Duration::from_millis(200));
+    tracing::info!(reenabled = ?outputs, "KWin: restored the physical/bootstrap outputs (group empty)");
 }
 
 /// Best-effort: raise the just-created virtual output's refresh above KWin's default 60 Hz by
@@ -396,28 +443,15 @@ fn apply_virtual_primary_only(name: &str) {
 }
 
 /// Dropping this releases the KWin virtual output: it flips the keepalive thread's `stop`, which
-/// drops the Wayland connection and makes KWin reclaim the output.
+/// drops the Wayland connection and makes KWin reclaim the output. The topology **restore** is no
+/// longer bound here — it moved to the registry's display group (§6.1, [`reenable_outputs`]), which
+/// runs it once when the group's last member drops, BEFORE this keepalive is dropped.
 struct StopGuard {
     stop: Arc<AtomicBool>,
-    /// Bootstrap output(s) `apply_virtual_primary` disabled to make our streamed output the sole
-    /// desktop — re-enabled here FIRST, so KWin is never left with zero enabled outputs as our
-    /// output is reclaimed. Empty unless PUNKTFUNK_KWIN_VIRTUAL_PRIMARY is set.
-    restore: Vec<String>,
 }
 
 impl Drop for StopGuard {
     fn drop(&mut self) {
-        if !self.restore.is_empty() {
-            let args: Vec<String> = self
-                .restore
-                .iter()
-                .map(|o| format!("output.{o}.enable"))
-                .collect();
-            let _ = std::process::Command::new("kscreen-doctor")
-                .args(&args)
-                .status();
-            std::thread::sleep(Duration::from_millis(200));
-        }
         self.stop.store(true, Ordering::Relaxed);
     }
 }

@@ -81,6 +81,26 @@ pub trait VirtualDisplay: Send {
     /// single-display / first-of-group session issues no positioning at all. Best-effort — a failure
     /// leaves the compositor's default placement.
     fn apply_position(&mut self, _x: i32, _y: i32) {}
+    /// Take the topology **restore** action this [`create`](Self::create) prepared — the work that
+    /// un-does an `exclusive`/`primary` topology change (e.g. re-enable the physical outputs KWin
+    /// disabled). The registry lifts it into the display **group** so it runs **once, when the group's
+    /// last display is torn down** (design §6.1 — per-group restore), not when this one session's
+    /// display drops: a sibling `exclusive` session must not have the physical re-enabled under it.
+    /// Called right after `create`; the backend must not also run it itself. Default `None` — a backend
+    /// whose topology auto-reverts (Mutter `APPLY_TEMPORARY`) or that changes nothing has nothing to
+    /// hand off.
+    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        None
+    }
+    /// Tell the backend whether this create will be the **first** display in its group — i.e. no
+    /// sibling of the same backend is already live (design §6.1). A backend that *establishes* the
+    /// group's topology (Mutter's sole-monitor `exclusive` `ApplyMonitorsConfig`) applies it only when
+    /// first; a later sibling **extends** into the already-exclusive desktop instead of re-clobbering it
+    /// (a fresh sole-monitor config would disable the first session's virtual output). Set by the
+    /// registry right before [`create`](Self::create). Default no-op: KWin recognises siblings at
+    /// runtime by output name (first-slot-wins + a group-aware disable filter), and single-display
+    /// backends never have a sibling.
+    fn set_first_in_group(&mut self, _first: bool) {}
 }
 
 /// Compositors punktfunk knows how to drive (plan §6).

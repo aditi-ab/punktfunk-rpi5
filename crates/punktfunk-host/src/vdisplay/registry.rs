@@ -190,9 +190,38 @@ mod linux {
         /// shared/anonymous or a backend with no per-client identity) — keys the group arrangement +
         /// the `/display/state` slot. Captured at create; kept across a keep-alive reuse.
         identity_slot: Option<u32>,
+        /// The topology-restore action for this display's GROUP (design §6.1): re-enable the physical
+        /// outputs an `exclusive` topology disabled. At most ONE entry per group carries it (the first
+        /// exclusive session); on teardown it hands off to a surviving sibling, and only runs when the
+        /// group's last member drops. `None` for extend/primary and non-first / non-exclusive members.
+        topology_restore: Option<Restore>,
         /// Generation stamp: a [`DisplayLease`] only releases if its gen still matches (a stale lease
         /// — its entry was reused + re-stamped — is a no-op).
         gen: u64,
+    }
+
+    /// A per-group topology-restore action (see [`Entry::topology_restore`]).
+    type Restore = Box<dyn FnOnce() + Send>;
+
+    /// Hand off a torn-down display's topology restore (design §6.1 — per-group restore): if a
+    /// same-group (backend) sibling survives in `remaining`, MOVE the restore onto it (a later teardown
+    /// runs it); if the group is now empty, RETURN the action so the caller runs it (before dropping the
+    /// reclaimed display's keepalive, so the physical is re-enabled while our output still exists —
+    /// the compositor never sees zero outputs). `None` in → `None` out.
+    fn hand_off_restore(
+        remaining: &mut [Entry],
+        backend: &'static str,
+        restore: Option<Restore>,
+    ) -> Option<Restore> {
+        let action = restore?;
+        // At most one restore per group, so any surviving sibling has `None` to receive it.
+        match remaining.iter_mut().find(|e| e.backend == backend) {
+            Some(sibling) => {
+                sibling.topology_restore = Some(action);
+                None
+            }
+            None => Some(action), // group empty → run it now
+        }
     }
 
     struct Reg {
@@ -220,18 +249,26 @@ mod linux {
 
     /// Remove entries whose linger deadline has passed, returning them so the caller drops (tears
     /// them down) *after* releasing the lock — a backend keepalive `Drop` (Mutter D-Bus Stop) can
-    /// block, and holding the pool lock across it would stall every other acquire/release.
-    fn take_expired(entries: &mut Vec<Entry>, now: Instant) -> Vec<Entry> {
+    /// block, and holding the pool lock across it would stall every other acquire/release. Each
+    /// expired entry's topology restore is [handed off](hand_off_restore) to a surviving group sibling,
+    /// or collected into the returned `restores` when its group empties (run before the entries drop).
+    fn take_expired(entries: &mut Vec<Entry>, now: Instant) -> (Vec<Entry>, Vec<Restore>) {
         let mut expired = Vec::new();
+        let mut restores = Vec::new();
         let mut i = 0;
         while i < entries.len() {
             if entries[i].life.poll_expiry(now) {
-                expired.push(entries.remove(i));
+                let mut e = entries.remove(i);
+                let backend = e.backend;
+                if let Some(r) = hand_off_restore(entries, backend, e.topology_restore.take()) {
+                    restores.push(r);
+                }
+                expired.push(e);
             } else {
                 i += 1;
             }
         }
-        expired
+        (expired, restores)
     }
 
     /// Background thread (started once): reap lingering displays past their deadline.
@@ -242,10 +279,14 @@ mod linux {
                 .name("vdisplay-linger".into())
                 .spawn(|| loop {
                     std::thread::sleep(Duration::from_millis(500));
-                    let expired = {
+                    let (expired, restores) = {
                         let mut es = reg().entries.lock().unwrap();
                         take_expired(&mut es, Instant::now())
                     };
+                    // Re-enable physicals (group emptied) BEFORE dropping the outputs — outside the lock.
+                    for restore in restores {
+                        restore();
+                    }
                     for e in expired {
                         tracing::info!(
                             backend = e.backend,
@@ -277,11 +318,14 @@ mod linux {
         let backend = vd.name();
         let r = reg();
 
-        // Reap expired first (drop outside the lock).
-        let expired = {
+        // Reap expired first (run any group restores + drop outside the lock).
+        let (expired, restores) = {
             let mut es = r.entries.lock().unwrap();
             take_expired(&mut es, Instant::now())
         };
+        for restore in restores {
+            restore();
+        }
         drop(expired);
 
         // Reuse: a kept (lingering/pinned) display of the same backend + mode. A reconnecting session
@@ -309,6 +353,16 @@ mod linux {
             }
         }
 
+        // Tell the backend whether it's the FIRST display of its group (no same-backend sibling live,
+        // §6.1) — so a topology-establishing backend (Mutter exclusive) extends into an already-exclusive
+        // desktop rather than re-clobbering the first session's virtual. Best-effort (a concurrent create
+        // is a narrow race); single-session is always `first == true` → today's behavior.
+        let first_in_group = {
+            let es = r.entries.lock().unwrap();
+            !es.iter().any(|e| e.backend == backend)
+        };
+        vd.set_first_in_group(first_in_group);
+
         // Create a fresh display (NOT under the lock — `vd.create` blocks + spawns threads).
         let real = vd.create(mode)?;
         // The identity slot the backend just resolved (KWin per-slot naming; `None` elsewhere) — keys
@@ -328,6 +382,10 @@ mod linux {
 
         let node_id = real.node_id;
         let preferred_mode = real.preferred_mode;
+        // The backend's topology-restore action (KWin `exclusive` → re-enable the disabled physicals),
+        // lifted into the group so it runs once when the group's last member drops (§6.1), not at this
+        // session's teardown. `None` for non-exclusive / non-first / backends whose topology auto-reverts.
+        let topology_restore = vd.take_topology_restore();
         let gen = r.gen.fetch_add(1, Ordering::Relaxed);
         let mut life = lifecycle::State::default();
         life.acquire(); // Idle → Active{refs:1} (Acquire::Create)
@@ -339,6 +397,7 @@ mod linux {
             mode,
             backend,
             identity_slot,
+            topology_restore,
             gen,
         };
 
@@ -353,9 +412,12 @@ mod linux {
                 .map(|e| e.layout)
                 .unwrap_or_default();
             let mut es = r.entries.lock().unwrap();
+            // Same-group members (design §6.1): same backend for a shared desktop, but each gamescope
+            // spawn is its own group, so a new gamescope never auto-rows against another.
+            let new_group = group_key(backend, gen);
             let existing: Vec<(u64, Member)> = es
                 .iter()
-                .filter(|e| e.backend == backend)
+                .filter(|e| group_key(e.backend, e.gen) == new_group)
                 .map(|e| {
                     (
                         e.gen,
@@ -390,31 +452,42 @@ mod linux {
     fn release(gen: u64) {
         let Some(r) = REG.get() else { return };
         let linger = linger();
-        let torn_down = {
+        let (torn_down, restore) = {
             let mut es = r.entries.lock().unwrap();
             let Some(idx) = es.iter().position(|e| e.gen == gen) else {
                 return; // stale lease (entry reused + re-stamped, or already gone) — no-op
             };
             match es[idx].life.release(Instant::now(), linger) {
-                Release::Teardown | Release::Noop => Some(es.remove(idx)),
+                Release::Teardown | Release::Noop => {
+                    let mut e = es.remove(idx);
+                    let backend = e.backend;
+                    // Per-group restore (§6.1): hand the physical re-enable to a surviving sibling, or run
+                    // it now if this was the group's last member.
+                    let restore = hand_off_restore(&mut es, backend, e.topology_restore.take());
+                    (Some(e), restore)
+                }
                 Release::Linger => {
                     tracing::info!(
                         backend = es[idx].backend,
                         "virtual display: last session left — lingering (keep-alive)"
                     );
-                    None
+                    (None, None)
                 }
                 Release::Pin => {
                     tracing::info!(
                         backend = es[idx].backend,
                         "virtual display: last session left — pinned (keep-alive forever)"
                     );
-                    None
+                    (None, None)
                 }
                 // Linux entries are single-session (refs == 1), so Decref never occurs; harmless.
-                Release::Decref => None,
+                Release::Decref => (None, None),
             }
         };
+        // Re-enable the physicals (group emptied) BEFORE dropping the output — outside the lock.
+        if let Some(restore) = restore {
+            restore();
+        }
         if let Some(e) = torn_down {
             tracing::info!(
                 backend = e.backend,
@@ -498,10 +571,23 @@ mod linux {
             .expect("members is non-empty (just pushed `new`)")
     }
 
-    /// Group the flattened rows into the mgmt `/display/state` view (design §6.1/§6.2): group = backend
-    /// (one desktop per compositor session), ordered by acquire (`gen`), with each member's position
-    /// from the pure [`layout`] engine. Pure — no I/O, no global — so the grouping / ordering / position
-    /// assignment is unit-tested against synthetic rows.
+    /// The display **group** a backend+display belongs to (design §6.1). The desktop compositors
+    /// (KWin/Mutter/wlroots) put every managed output on ONE desktop → one group per backend. A
+    /// gamescope **spawn** is an independent nested session per client (no shared desktop), so each
+    /// gamescope display is its OWN group — never auto-rowed against, or topology-/restore-grouped with,
+    /// another gamescope session.
+    fn group_key(backend: &str, gen: u64) -> String {
+        if backend == "gamescope" {
+            format!("gamescope#{gen}")
+        } else {
+            backend.to_string()
+        }
+    }
+
+    /// Group the flattened rows into the mgmt `/display/state` view (design §6.1/§6.2) by
+    /// [`group_key`], ordered by acquire (`gen`), with each member's position from the pure [`layout`]
+    /// engine. Pure — no I/O, no global — so the grouping / ordering / position assignment is
+    /// unit-tested against synthetic rows.
     fn assemble_displays(
         rows: Vec<Row>,
         layout_policy: &Layout,
@@ -509,19 +595,19 @@ mod linux {
     ) -> Vec<DisplayInfo> {
         use crate::vdisplay::layout::{self, Member};
 
-        // Small stable group ids by sorted backend name — deterministic; in practice a host runs one
-        // live backend → group 1.
-        let mut backends: Vec<&'static str> = rows.iter().map(|row| row.backend).collect();
-        backends.sort_unstable();
-        backends.dedup();
+        // Small stable group ids by sorted group key — deterministic; in practice a host runs one live
+        // desktop backend → group 1 (with each gamescope spawn its own group).
+        let mut keys: Vec<String> = rows.iter().map(|r| group_key(r.backend, r.gen)).collect();
+        keys.sort();
+        keys.dedup();
 
         let mut out: Vec<DisplayInfo> = Vec::new();
-        for (gi, backend) in backends.iter().enumerate() {
+        for (gi, key) in keys.iter().enumerate() {
             // This group's members in acquire order (gen ascending) → display_index + arrangement.
             let mut idx: Vec<usize> = rows
                 .iter()
                 .enumerate()
-                .filter(|(_, row)| row.backend == *backend)
+                .filter(|(_, row)| &group_key(row.backend, row.gen) == key)
                 .map(|(i, _)| i)
                 .collect();
             idx.sort_by_key(|&i| rows[i].gen);
@@ -557,21 +643,32 @@ mod linux {
 
     pub(super) fn force_release(slot: Option<u64>) -> usize {
         let Some(r) = REG.get() else { return 0 };
-        let released = {
+        let (released, restores) = {
             let mut es = r.entries.lock().unwrap();
             let mut out = Vec::new();
+            let mut restores = Vec::new();
             let mut i = 0;
             while i < es.len() {
                 let selected = slot.is_none_or(|s| es[i].gen == s);
                 if selected && es[i].life.force_release() {
-                    out.push(es.remove(i));
+                    let mut e = es.remove(i);
+                    let backend = e.backend;
+                    let restore = e.topology_restore.take();
+                    if let Some(rst) = hand_off_restore(&mut es, backend, restore) {
+                        restores.push(rst);
+                    }
+                    out.push(e);
                 } else {
                     i += 1;
                 }
             }
-            out
+            (out, restores)
         };
         let n = released.len();
+        // Re-enable physicals (group emptied) BEFORE dropping the outputs — outside the lock.
+        for restore in restores {
+            restore();
+        }
         for e in released {
             tracing::info!(
                 backend = e.backend,
@@ -599,6 +696,106 @@ mod linux {
         use super::*;
         use crate::vdisplay::policy::{Layout, LayoutMode, Position};
         use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        /// A minimal pool entry for the pure teardown/restore tests (dummy keepalive; the
+        /// `hand_off_restore` logic only reads `backend` + `topology_restore`).
+        fn test_entry(backend: &'static str, gen: u64, restore: Option<Restore>) -> Entry {
+            Entry {
+                life: lifecycle::State::default(),
+                keepalive: Box::new(()),
+                node_id: 0,
+                preferred_mode: None,
+                mode: Mode {
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 60,
+                },
+                backend,
+                identity_slot: None,
+                topology_restore: restore,
+                gen,
+            }
+        }
+
+        /// A restore closure that flips `flag` when run — so a test can assert exactly WHEN it fires.
+        fn flag_restore(flag: &Arc<AtomicBool>) -> Restore {
+            let f = flag.clone();
+            Box::new(move || f.store(true, Ordering::SeqCst))
+        }
+
+        #[test]
+        fn topology_restore_floats_to_a_sibling_then_runs_on_the_last_teardown() {
+            let ran = Arc::new(AtomicBool::new(false));
+            // Two KWin displays in one group; the first (gen 1) carries the group's restore.
+            let mut pool = vec![
+                test_entry("kwin", 1, Some(flag_restore(&ran))),
+                test_entry("kwin", 2, None),
+            ];
+
+            // Tear down the restore-carrier while its sibling is still alive → transfer, don't run.
+            let mut e1 = pool.remove(0);
+            let out = hand_off_restore(&mut pool, "kwin", e1.topology_restore.take());
+            assert!(out.is_none(), "transferred, not run");
+            assert!(!ran.load(Ordering::SeqCst));
+            // The restore floated onto the surviving sibling.
+            assert!(pool[0].topology_restore.is_some());
+
+            // Tear down the last member → group empty → the restore is returned to run.
+            let mut e2 = pool.remove(0);
+            let out = hand_off_restore(&mut pool, "kwin", e2.topology_restore.take());
+            let action = out.expect("group empty → run the restore");
+            assert!(!ran.load(Ordering::SeqCst), "not run yet");
+            action();
+            assert!(ran.load(Ordering::SeqCst), "runs on the last drop");
+        }
+
+        #[test]
+        fn single_session_topology_restore_runs_on_its_own_teardown() {
+            // The validated single-display case: one exclusive session → restore runs at its teardown.
+            let ran = Arc::new(AtomicBool::new(false));
+            let mut pool = vec![test_entry("kwin", 1, Some(flag_restore(&ran)))];
+            let mut e = pool.remove(0);
+            let action = hand_off_restore(&mut pool, "kwin", e.topology_restore.take())
+                .expect("last (only) member → run");
+            action();
+            assert!(ran.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn tearing_down_a_non_carrier_first_leaves_the_restore_for_last() {
+            let ran = Arc::new(AtomicBool::new(false));
+            // gen 2 carries the restore; gen 1 does not (a later exclusive session found the physical
+            // already disabled).
+            let mut pool = vec![
+                test_entry("kwin", 1, None),
+                test_entry("kwin", 2, Some(flag_restore(&ran))),
+            ];
+            // Tear down the non-carrier first → nothing to hand off, carrier untouched.
+            let mut e1 = pool.remove(0);
+            assert!(hand_off_restore(&mut pool, "kwin", e1.topology_restore.take()).is_none());
+            // The carrier (gen 2) still holds the group's restore.
+            assert!(pool[0].topology_restore.is_some());
+            // Now the carrier (last member) → run.
+            let mut e2 = pool.remove(0);
+            hand_off_restore(&mut pool, "kwin", e2.topology_restore.take())
+                .expect("last member → run")();
+            assert!(ran.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn restore_never_floats_across_backends() {
+            // group = backend: a KWin restore must not land on a Mutter display (a different desktop).
+            let ran = Arc::new(AtomicBool::new(false));
+            let mut pool = vec![test_entry("mutter", 2, None)];
+            let out = hand_off_restore(&mut pool, "kwin", Some(flag_restore(&ran)));
+            assert!(out.is_some(), "no same-backend sibling → return to run");
+            assert!(
+                pool[0].topology_restore.is_none(),
+                "restore must not cross into another backend's group"
+            );
+        }
 
         fn row(gen: u64, backend: &'static str, w: u32, slot: Option<u32>) -> Row {
             Row {
@@ -675,6 +872,23 @@ mod linux {
             };
             let pos = position_for_new(vec![(1, new)], new, &layout);
             assert_eq!(pos, Placement { x: 100, y: 200 });
+        }
+
+        #[test]
+        fn gamescope_spawns_are_separate_groups() {
+            // Two independent gamescope spawns must NOT share a group or auto-row against each other.
+            let rows = vec![
+                row(1, "gamescope", 1920, None),
+                row(2, "gamescope", 1280, None),
+            ];
+            let out = assemble_displays(rows, &Layout::default(), "extend");
+            assert_eq!(out.len(), 2);
+            assert_ne!(out[0].group, out[1].group, "distinct groups");
+            // Each is display 0 of its own group, at the origin (not auto-rowed against the other).
+            assert_eq!(out[0].display_index, 0);
+            assert_eq!(out[1].display_index, 0);
+            assert_eq!(out[0].position, (0, 0));
+            assert_eq!(out[1].position, (0, 0));
         }
 
         #[test]

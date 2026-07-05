@@ -42,11 +42,19 @@ const CURSOR_EMBEDDED: u32 = 1;
 
 /// The Mutter virtual-display driver. Each [`create`](VirtualDisplay::create) spins up a
 /// keepalive thread owning the D-Bus sessions behind the virtual monitor.
-pub struct MutterDisplay;
+pub struct MutterDisplay {
+    /// Whether this display is the FIRST of its group (§6.1) — set by the registry before `create`.
+    /// A later sibling **extends** into the already-exclusive desktop instead of re-applying the
+    /// sole-monitor config (which would disable the first session's virtual). Defaults true (a lone
+    /// session establishes topology as before).
+    first_in_group: bool,
+}
 
 impl MutterDisplay {
     pub fn new() -> Result<Self> {
-        Ok(MutterDisplay)
+        Ok(MutterDisplay {
+            first_in_group: true,
+        })
     }
 }
 
@@ -64,13 +72,18 @@ impl VirtualDisplay for MutterDisplay {
         "mutter"
     }
 
+    fn set_first_in_group(&mut self, first: bool) {
+        self.first_in_group = first;
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let first_in_group = self.first_in_group;
         thread::Builder::new()
             .name("punktfunk-mutter-vout".into())
-            .spawn(move || session_thread(setup_tx, stop_thread, mode))
+            .spawn(move || session_thread(setup_tx, stop_thread, mode, first_in_group))
             .context("spawn Mutter virtual-output thread")?;
 
         let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
@@ -104,8 +117,14 @@ impl Drop for StopGuard {
 }
 
 /// Keepalive thread: run the D-Bus handshake on a private tokio runtime, report the PipeWire
-/// node id, then hold the connection until stopped.
-fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>, mode: Mode) {
+/// node id, then hold the connection until stopped. `first_in_group` gates the topology change (a
+/// non-first sibling extends into the group's already-exclusive desktop instead of re-clobbering it).
+fn session_thread(
+    setup_tx: Sender<Result<u32, String>>,
+    stop: Arc<AtomicBool>,
+    mode: Mode,
+    first_in_group: bool,
+) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -122,12 +141,23 @@ fn session_thread(setup_tx: Sender<Result<u32, String>>, stop: Arc<AtomicBool>, 
         // value. `Extend` leaves the virtual output an extension (no config change); `Primary` makes
         // it the primary monitor but keeps the physicals as secondaries; `Exclusive` makes it the
         // SOLE output (physicals disabled). `Auto` never reaches here — it's resolved upstream.
+        use crate::vdisplay::policy::Topology;
         let topo = crate::vdisplay::effective_topology();
-        let want_config = matches!(
-            topo,
-            crate::vdisplay::policy::Topology::Primary | crate::vdisplay::policy::Topology::Exclusive
-        );
-        let exclusive = matches!(topo, crate::vdisplay::policy::Topology::Exclusive);
+        let topo_policy = matches!(topo, Topology::Primary | Topology::Exclusive);
+        // Group-aware (§6.1): only the FIRST display of the group establishes the topology. A later
+        // sibling extends into the already-exclusive desktop — re-applying the sole-monitor config would
+        // disable the first session's virtual output (Mutter connectors are un-nameable, so we can't
+        // build a config that keeps all group virtuals; skipping is the safe choice). *Concurrent
+        // Mutter exclusive is on-glass-validation-pending; the APPLY_TEMPORARY revert when the FIRST
+        // session leaves under a live sibling is a documented residual (design §7).*
+        let want_config = first_in_group && topo_policy;
+        if topo_policy && !first_in_group {
+            tracing::info!(
+                "mutter: joining an existing display group — extending (the first session owns the \
+                 exclusive/primary topology)"
+            );
+        }
+        let exclusive = matches!(topo, Topology::Exclusive);
         // Snapshot the monitor layout BEFORE the virtual output exists (so we can tell the new
         // connector apart and restore on teardown) whenever we're going to touch the topology.
         let dc_pre = if want_config {
