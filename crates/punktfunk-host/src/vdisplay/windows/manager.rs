@@ -648,6 +648,14 @@ impl VirtualDisplayManager {
                         ccd_saved = unsafe { isolate_displays_ccd(added.target_id) };
                     }
                     Topology::Primary => {
+                        // The IDD auto-activates as the SOLE display on a headless box, so the
+                        // physical (if present) is deactivated and QueryDisplayConfig sees only the
+                        // virtual. Force EXTEND first to (re)activate every CONNECTED display
+                        // alongside the virtual, THEN reposition to make the virtual primary — so the
+                        // physical stays active. (The bring-up above only force-EXTENDs when the
+                        // virtual FAILS to auto-resolve; here it resolved, so we do it explicitly.)
+                        unsafe { force_extend_topology() };
+                        thread::sleep(Duration::from_millis(300));
                         ccd_saved = unsafe { set_virtual_primary_ccd(added.target_id) };
                     }
                     Topology::Extend | Topology::Auto => {
