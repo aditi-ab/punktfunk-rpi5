@@ -655,10 +655,10 @@ impl VirtualDisplayManager {
                 // MODE_CHANGE storm). Opt out (extend) with PUNKTFUNK_NO_ISOLATE=1 / the console policy.
                 use crate::vdisplay::policy::Topology;
                 match topology_action() {
-                    // SAFETY (both arms): the CCD helper is `unsafe` for its topology FFI; it takes a
-                    // `Copy` `u32` by value and returns an owned `SavedConfig` (no borrowed memory crosses),
-                    // and runs under the `state` lock, the sole mutator of the topology.
                     Topology::Exclusive => {
+                        // SAFETY: `isolate_displays_ccd` is `unsafe` for its CCD topology FFI; it takes the
+                        // `Copy` target id by value and returns an owned `SavedConfig` (no borrowed memory
+                        // crosses), under the `state` lock — the sole topology mutator.
                         ccd_saved = unsafe { isolate_displays_ccd(added.target_id) };
                     }
                     Topology::Primary => {
@@ -668,8 +668,12 @@ impl VirtualDisplayManager {
                         // alongside the virtual, THEN reposition to make the virtual primary — so the
                         // physical stays active. (The bring-up above only force-EXTENDs when the
                         // virtual FAILS to auto-resolve; here it resolved, so we do it explicitly.)
+                        // SAFETY: `force_extend_topology` drives the CCD topology FFI (no args, no borrowed
+                        // memory), under the `state` lock — the sole topology mutator.
                         unsafe { force_extend_topology() };
                         thread::sleep(Duration::from_millis(300));
+                        // SAFETY: `set_virtual_primary_ccd` takes the `Copy` target id by value and returns
+                        // an owned `SavedConfig` (no borrowed memory crosses), under the `state` lock.
                         ccd_saved = unsafe { set_virtual_primary_ccd(added.target_id) };
                     }
                     Topology::Extend | Topology::Auto => {

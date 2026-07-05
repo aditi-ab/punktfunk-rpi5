@@ -492,8 +492,10 @@ pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<Save
         }
         let idx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
         let m = modes.get(idx)?;
+        // `then_some` (eager): `sourceMode.width` is a POD `u32` union read, discarded when the arm is
+        // false — no lazy guard needed. (`then(|| …)` here trips clippy::unnecessary_lazy_evaluations.)
         (m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
-            .then(|| m.Anonymous.sourceMode.width as i32)
+            .then_some(m.Anonymous.sourceMode.width as i32)
     })?;
     let others = paths.len().saturating_sub(1);
 
