@@ -464,6 +464,32 @@ pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<Save
     modes.truncate(nm as usize);
     let saved = (paths.clone(), modes.clone());
 
+    // DIAGNOSTIC: dump the active paths this sees (the SSH/session-0 view can't observe the real
+    // interactive-session topology, so the host log is the only window into what we actually operate on).
+    tracing::info!(
+        "display primary (CCD): {} active path(s), keep_target={keep_target_id}",
+        paths.len()
+    );
+    for p in paths.iter() {
+        let sidx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
+        let (px, py, pw) = modes
+            .get(sidx)
+            .filter(|m| m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            .map(|m| {
+                (
+                    m.Anonymous.sourceMode.position.x,
+                    m.Anonymous.sourceMode.position.y,
+                    m.Anonymous.sourceMode.width,
+                )
+            })
+            .unwrap_or((-999, -999, 0));
+        tracing::info!(
+            "  path target={} active={} src_idx={sidx} pos=({px},{py}) w={pw}",
+            p.targetInfo.id,
+            p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
+        );
+    }
+
     // The virtual output's source width, to shift the physicals past it.
     let virt_width = paths.iter().find_map(|p| {
         if p.targetInfo.id != keep_target_id {
