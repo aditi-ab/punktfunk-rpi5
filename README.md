@@ -29,6 +29,11 @@ protocol, FEC, and crypto, linked into the host and every client over a stable C
 - **Your device's exact mode.** For each client that connects, the host spins up a virtual display
   sized to that device — 1080p60 to a laptop, 1440p120 to a desktop, 4K to a TV, all at once. No
   letterboxing, no scaling, no rearranging your real monitors.
+- **Displays you configure, not just create.** Keep a game's display (and the game) alive across
+  disconnects so a reconnect drops straight back in; make the stream your sole desktop or extend
+  alongside your monitors; let several devices become monitors of one desktop; keep each client's
+  scaling. One-click presets in the console — a dedicated couch box, a shared desktop, a multi-monitor
+  workstation. See [Virtual displays](docs-site/content/docs/virtual-displays.md).
 - **A real virtual display on Windows, too.** On Linux the host uses per-compositor virtual outputs;
   on Windows you get the same on-the-fly virtual display — at the client's exact mode, no physical
   monitor or dummy HDMI plug, even on the secure desktop (UAC / lock screen). It also has **its own

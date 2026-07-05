@@ -18,11 +18,12 @@ opened on.
 > Reach for a preset when you want a specific experience — a dedicated couch/gaming box, a desktop
 > you also use in person, or a multi-monitor workstation.
 
-> **What's live today:** this release wires **keep-alive** (linger duration) and **topology**
-> (extend / primary / exclusive). The other options below — conflict handling, identity/scaling
-> persistence on Linux, and multi-monitor layout — are **stored but not yet enforced**; they arrive
-> in following releases. The console marks them accordingly. Windows already persists per-client
-> scaling (see [Persistent scaling](#persistent-scaling)).
+> **What's live today:** **keep-alive** (linger, or **forever**), **topology** (extend / primary /
+> exclusive), **conflict handling**, **per-client identity + persistent scaling** (Windows *and*
+> KDE/KWin), and **multi-monitor layout** (several clients as monitors of one desktop) are all
+> enforced. A reconnect always resumes the kept display — even a fast one — instead of spawning a
+> second. The remaining gaps are noted inline: the Linux `primary` physical-keep *effect*, Sway
+> `exclusive`, and multi-display for a *single* client (that last is the next stage).
 
 ## Pick a preset
 
@@ -32,7 +33,7 @@ the individual options documented further down.
 | Preset | What it's for |
 |---|---|
 | **Default** | Today's behavior. A short linger absorbs reconnects, the streamed output becomes the sole desktop, and extra clients each get their own view. |
-| **Gaming rig** | A dedicated couch/headless box. The game and its display survive disconnects indefinitely, and whoever connects takes the box over. *(Arrives with the keep-alive stage.)* |
+| **Gaming rig** | A dedicated couch/headless box. The game and its display survive disconnects indefinitely (keep-alive **forever**), and whoever connects takes the box over. Release it from the console when you're done. |
 | **Shared desktop** | A desktop you also use in person. punktfunk never blanks your real monitors and never leaves a ghost display behind; concurrent viewers each get a view. |
 | **Hot-desk** | One user at a time with fast reattach — roaming between your own devices. A second user is told the box is busy, and each device+resolution keeps its own scaling. |
 | **Workstation** | The multi-monitor daily driver. Your displays come back exactly where you arranged them, with per-client identity and an exclusive desktop. |
@@ -49,11 +50,18 @@ this also keeps the **game itself running** so you can reconnect straight back i
 - **Off** — tear the display down at session end (nothing lingers).
 - **A duration** (seconds) — keep it for that long; a reconnect inside the window drops you straight
   back in, with no re-negotiation and no desktop reshuffle.
-- **Forever** — keep it until you stop the host or release it from the console. *(Arrives with the
-  keep-alive lifecycle stage; the console won't let you save it before then.)*
+- **Forever** — keep it until you stop the host or **release it** from the console (Host → *Virtual
+  displays* → *Release*). This is the gaming-rig model.
 
 Default: **10 seconds**. Windows has always lingered 10 s; the Linux backends previously tore down
 immediately — a short linger makes reconnects smoother on both.
+
+**A reconnect always resumes the kept display** — the host recognises your device and hands back the
+same display, even if you reconnect a second or two after dropping (before it has noticed you left).
+**Deliberately quitting** (closing the client, not a network drop) tears the display down at once,
+skipping the linger, so you don't leave a ghost behind. How quickly a *dropped* client is noticed is
+the QUIC idle timeout — 8 s by default, tunable with `PUNKTFUNK_IDLE_TIMEOUT_MS` (see
+[Legacy environment knobs](#legacy-environment-knobs)) if you want kept displays freed sooner.
 
 > **Keep-alive + Exclusive keeps your physical monitors dark after you disconnect**, until the
 > linger expires or you release the display. That's intentional for a dedicated gaming box, but
@@ -78,23 +86,25 @@ Per-backend support:
 | | KWin | Mutter/GNOME | Sway/wlroots | Windows |
 |---|---|---|---|---|
 | Extend | ✅ | ✅ | ✅ | ✅ |
-| Primary | ✅ | ✅ | ⚠️ treated as Extend | ✅ *(following release)* |
-| Exclusive | ✅ | ✅ | ✅ *(following release)* | ✅ |
+| Primary | ✅ | ✅ | ⚠️ treated as Extend | ✅ |
+| Exclusive | ✅ | ✅ | ⏳ following release | ✅ |
 
 ### Conflict handling · identity · layout
-
-These are **stored but not yet enforced** — they're documented here so you know what's coming and
-can set them ahead of the release that turns them on:
 
 - **Conflict handling** — what happens when a *different* client connects while one is already
   streaming and asks for a different resolution: give it its own display (**separate**), take the
   box over (**steal**), share the existing display at its current mode (**join**), or refuse it
-  (**reject**).
+  (**reject**). On Linux, `separate` gives each client its own display on the shared desktop. On
+  **Windows** a second client is **rejected** (a clean "host busy") even under `separate` — two
+  clients can't yet share one virtual display's capture there (that's a later stage), so the live
+  session is protected instead. A same-client *reconnect* never conflicts — it resumes.
 - **Identity** — whether each client gets a **stable display identity** so your desktop environment
-  remembers its settings (see below): one shared identity, one **per client**, or one **per client +
-  resolution**.
-- **Layout / max displays** — how multiple virtual displays are arranged (for multi-monitor), and an
-  upper bound on how many can be live at once.
+  remembers its settings (see [Persistent scaling](#persistent-scaling)): one shared identity, one
+  **per client**, or one **per client + resolution**.
+- **Layout / max displays** — when several clients each become a monitor of one desktop, this places
+  them side by side (**auto**) or exactly where you arrange them in the console (**manual**, keyed to
+  each client), up to **max displays**. Arrange them under Host → *Virtual displays* once two or more
+  are streaming.
 
 ## Persistent scaling
 
@@ -104,7 +114,7 @@ client a *stable display identity*, so your desktop environment keys its per-mon
 | Host | Supported | How |
 |---|---|---|
 | **Windows** | ✅ today | Connect, set scaling in Settings while streaming — Windows remembers it per client. |
-| **KDE / KWin** | ⏳ following release | A stable per-client output name lets KWin persist scale/mode per client. |
+| **KDE / KWin** | ✅ today | Set scaling in System Settings while streaming; KWin keys it to a stable per-client output name and reapplies it on reconnect. Validated live (150 %/125 % survive a full disconnect + reconnect). |
 | **GNOME / Mutter** | ❌ | GNOME's virtual-monitor API exposes no stable identity to key config on. |
 | **Sway / wlroots** | ❌ | Headless outputs can't carry a stable identity; pin scale in your sway config instead. |
 
@@ -118,6 +128,14 @@ them — when a settings file exists, it wins.
 | `PUNKTFUNK_MONITOR_LINGER_MS` | **Keep alive** → duration *(Windows)* |
 | `PUNKTFUNK_NO_ISOLATE` | **Topology** → Extend *(Windows)* |
 | `PUNKTFUNK_KWIN_VIRTUAL_PRIMARY` / `PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY` | **Topology** → Exclusive (when set) / Extend (when `0`) |
+
+One knob has no console equivalent — it's a transport tuning, not display policy:
+
+- **`PUNKTFUNK_IDLE_TIMEOUT_MS`** (host, default `8000`) — how long the host waits before declaring a
+  *dropped* client gone, which is when a kept display starts its linger (or is freed). Lower it (e.g.
+  `3000`) to reclaim kept displays sooner after an ungraceful drop; it's clamped to ≥1 s and its
+  keep-alive ping scales with it, so a live session never false-disconnects. A deliberate quit is
+  instant regardless. Also `--idle-timeout-ms` on `punktfunk1-host`.
 
 ## Troubleshooting
 
