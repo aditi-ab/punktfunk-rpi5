@@ -34,7 +34,7 @@ use windows::Win32::System::Threading::{
 use super::{Mode, VirtualOutput};
 use crate::win_display::{
     force_extend_topology, isolate_displays_ccd, resolve_gdi_name, restore_displays_ccd,
-    set_active_mode, SavedConfig,
+    set_active_mode, set_virtual_primary_ccd, SavedConfig,
 };
 
 /// The per-backend REMOVE key the driver stamps on ADD and consumes on REMOVE. SudoVDA keys monitors by
@@ -633,19 +633,28 @@ impl VirtualDisplayManager {
                 tracing::info!(backend = self.driver.name(), "target {} -> {n}", added.target_id);
                 // ADD only advertises the mode; force it active so DXGI captures the requested size.
                 set_active_mode(n, mode);
-                // Make the virtual display the SOLE active output (default): an EXTENDED (non-primary) IDD
-                // isn't DWM-composited on this box → Desktop Duplication born-losts. Deactivating the other
-                // display(s) first via the atomic CCD path promotes the IDD to a composited primary with no
-                // MODE_CHANGE storm. Opt out with PUNKTFUNK_NO_ISOLATE=1.
-                if should_isolate() {
-                    // SAFETY: `isolate_displays_ccd` is `unsafe` for its CCD topology FFI; it takes a
-                    // `Copy` `u32` by value and returns an owned `SavedConfig` snapshot (no borrowed
-                    // memory crosses). It runs under the `state` lock, the sole mutator of the topology.
-                    ccd_saved = unsafe { isolate_displays_ccd(added.target_id) };
-                } else {
-                    tracing::info!(
-                        "display isolation skipped (topology=extend / PUNKTFUNK_NO_ISOLATE) — IDD stays extended"
-                    );
+                // Apply the display-management topology (Stage 2). `Exclusive` (default) deactivates the
+                // other display(s) so the IDD is the SOLE composited primary — an EXTENDED (non-primary)
+                // IDD isn't DWM-composited on this box → Desktop Duplication born-losts. `Primary` keeps the
+                // physical display(s) ACTIVE and makes the IDD primary (repositioned to origin). `Extend`
+                // leaves it a plain extension. Both isolate + primary go through the atomic CCD path (no
+                // MODE_CHANGE storm). Opt out (extend) with PUNKTFUNK_NO_ISOLATE=1 / the console policy.
+                use crate::vdisplay::policy::Topology;
+                match topology_action() {
+                    // SAFETY (both arms): the CCD helper is `unsafe` for its topology FFI; it takes a
+                    // `Copy` `u32` by value and returns an owned `SavedConfig` (no borrowed memory crosses),
+                    // and runs under the `state` lock, the sole mutator of the topology.
+                    Topology::Exclusive => {
+                        ccd_saved = unsafe { isolate_displays_ccd(added.target_id) };
+                    }
+                    Topology::Primary => {
+                        ccd_saved = unsafe { set_virtual_primary_ccd(added.target_id) };
+                    }
+                    Topology::Extend | Topology::Auto => {
+                        tracing::info!(
+                            "display topology=extend — IDD stays extended (no isolate / no primary)"
+                        );
+                    }
                 }
                 thread::sleep(Duration::from_millis(1500)); // let the topology settle before capture opens
             }
@@ -997,17 +1006,22 @@ fn linger_ms() -> u64 {
         .unwrap_or(10_000)
 }
 
-/// Should a freshly-created monitor isolate the desktop to itself (disable the other displays)? The
-/// console policy's effective topology wins when configured — `Extend` leaves the IDD extended,
-/// `Exclusive`/`Primary` isolate (Stage 0 treats `Primary` as `Exclusive`); otherwise the legacy
-/// `PUNKTFUNK_NO_ISOLATE` env knob (unset ⇒ isolate, matching today's default).
-fn should_isolate() -> bool {
+/// The effective display topology for a freshly-created monitor (never `Auto`): the console policy's
+/// [`effective_topology`](crate::vdisplay::effective_topology) when configured, else the legacy
+/// `PUNKTFUNK_NO_ISOLATE` env knob (`Extend`) / `Exclusive` (today's default). `Extend` leaves the IDD
+/// extended; `Primary` makes it primary while keeping the physical(s) active; `Exclusive` disables the
+/// physical(s) so the IDD is the sole composited desktop.
+fn topology_action() -> crate::vdisplay::policy::Topology {
     use crate::vdisplay::policy::Topology;
-    if let Some(eff) = crate::vdisplay::policy::prefs().configured_effective() {
-        return !matches!(
-            crate::vdisplay::resolve_topology(eff.topology),
-            Topology::Extend
-        );
+    if crate::vdisplay::policy::prefs()
+        .configured_effective()
+        .is_some()
+    {
+        return crate::vdisplay::effective_topology();
     }
-    std::env::var("PUNKTFUNK_NO_ISOLATE").is_err()
+    if std::env::var("PUNKTFUNK_NO_ISOLATE").is_ok() {
+        Topology::Extend
+    } else {
+        Topology::Exclusive
+    }
 }

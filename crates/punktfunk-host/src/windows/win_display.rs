@@ -18,11 +18,13 @@ use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
     QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
-    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
+    DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO,
     DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
     QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_FORCE_MODE_ENUMERATION,
     SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
+use windows::Win32::Foundation::POINTL;
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_TEST, CDS_UPDATEREGISTRY, DEVMODEW,
     DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
@@ -427,6 +429,86 @@ pub(crate) unsafe fn isolate_displays_ccd(keep_target_id: u32) -> Option<SavedCo
         tracing::info!("display isolate (CCD): deactivated {others} other display(s) — SudoVDA target {keep_target_id} is now the sole desktop");
     } else {
         tracing::warn!("display isolate (CCD): SetDisplayConfig failed rc={rc:#x} (tried to deactivate {others} path(s))");
+    }
+    Some(saved)
+}
+
+/// **Primary (topology=primary)** — make the virtual output the PRIMARY display while KEEPING every
+/// other display ACTIVE (unlike [`isolate_displays_ccd`], which deactivates them). Windows treats the
+/// display whose source sits at the desktop origin `(0,0)` as primary, so we move the virtual's source
+/// to `(0,0)` and shift every other active source to its right — all paths stay active. Done as ONE
+/// atomic CCD `SetDisplayConfig` (NOT GDI `CDS_SET_PRIMARY`, which storms
+/// `DXGI_ERROR_MODE_CHANGE_IN_PROGRESS` when another display is live — see [`set_active_mode`]).
+/// Returns the original config to restore on teardown.
+pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
+    let mut np = 0u32;
+    let mut nm = 0u32;
+    if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).is_err() {
+        return None;
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+    if QueryDisplayConfig(
+        QDC_ONLY_ACTIVE_PATHS,
+        &mut np,
+        paths.as_mut_ptr(),
+        &mut nm,
+        modes.as_mut_ptr(),
+        None,
+    )
+    .is_err()
+    {
+        return None;
+    }
+    paths.truncate(np as usize);
+    modes.truncate(nm as usize);
+    let saved = (paths.clone(), modes.clone());
+
+    // The virtual output's source width, to shift the physicals past it.
+    let virt_width = paths.iter().find_map(|p| {
+        if p.targetInfo.id != keep_target_id {
+            return None;
+        }
+        let idx = p.sourceInfo.modeInfoIdx as usize;
+        let m = modes.get(idx)?;
+        (m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            .then(|| m.Anonymous.sourceMode.width as i32)
+    })?;
+
+    // Reposition each active path's SOURCE once: the virtual to (0,0) (= primary), the rest shifted
+    // right by the virtual's width (kept active, no overlap). Dedup source-mode indices (a cloned
+    // group would share one).
+    let mut done = std::collections::HashSet::new();
+    for p in paths.iter() {
+        let idx = p.sourceInfo.modeInfoIdx as usize;
+        if !done.insert(idx) {
+            continue;
+        }
+        let Some(m) = modes.get_mut(idx) else {
+            continue;
+        };
+        if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+            continue;
+        }
+        if p.targetInfo.id == keep_target_id {
+            m.Anonymous.sourceMode.position = POINTL { x: 0, y: 0 };
+        } else {
+            m.Anonymous.sourceMode.position.x += virt_width;
+        }
+    }
+
+    let rc = SetDisplayConfig(
+        Some(paths.as_slice()),
+        Some(modes.as_slice()),
+        SDC_APPLY
+            | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+            | SDC_ALLOW_CHANGES
+            | SDC_FORCE_MODE_ENUMERATION,
+    );
+    if rc == 0 {
+        tracing::info!("display primary (CCD): virtual target {keep_target_id} set PRIMARY at (0,0); physical display(s) kept ACTIVE, shifted right by {virt_width}px");
+    } else {
+        tracing::warn!("display primary (CCD): SetDisplayConfig failed rc={rc:#x} (virtual {keep_target_id} primary, physicals kept)");
     }
     Some(saved)
 }
