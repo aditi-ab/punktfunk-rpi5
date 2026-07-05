@@ -1,16 +1,17 @@
-import { Link } from "@tanstack/react-router";
+import { Link, useRouterState } from "@tanstack/react-router";
 import {
 	Activity,
 	GaugeCircle,
 	KeyRound,
 	LibraryBig,
 	MonitorPlay,
+	MoreHorizontal,
 	ScrollText,
 	Server,
 	Settings,
 } from "lucide-react";
 import { motion, stagger } from "motion/react";
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { BrandMark } from "@/components/brand-mark";
 import { Wordmark } from "@/components/wordmark";
 import { changeLocale, type Locale, locales, useLocale } from "@/lib/i18n";
@@ -29,6 +30,11 @@ const NAV = [
 	{ to: "/pairing", icon: KeyRound, label: () => m.nav_pairing() },
 	{ to: "/settings", icon: Settings, label: () => m.nav_settings() },
 ] as const;
+
+// On phones a flat 8-tab bar is too cramped, so the first four are pinned and the rest live behind a
+// "More" tab that opens a sheet above the bar. Keep it ≤ 5 slots including "More".
+const MOBILE_PRIMARY = NAV.slice(0, 4);
+const MOBILE_OVERFLOW = NAV.slice(4);
 
 export function AppShell({ children }: { children: ReactNode }) {
 	// Read the locale so the whole shell re-renders on a language switch.
@@ -108,29 +114,88 @@ export function AppShell({ children }: { children: ReactNode }) {
 				</main>
 			</div>
 
-			{/* Mobile bottom tab bar (< sm): the primary navigation on phones. */}
+			<MobileNav />
+		</div>
+	);
+}
+
+/** Mobile bottom navigation (< sm): four pinned tabs + a "More" tab whose sheet holds the rest. */
+function MobileNav() {
+	const [moreOpen, setMoreOpen] = useState(false);
+	const pathname = useRouterState({ select: (s) => s.location.pathname });
+	// Highlight "More" when the current route lives in the overflow.
+	const overflowActive = MOBILE_OVERFLOW.some(
+		(n) => pathname === n.to || pathname.startsWith(`${n.to}/`),
+	);
+	// Fixed two-line-tall label box so a 1- or 2-line label (labels vary by locale) keeps every icon
+	// at the same height.
+	const tab =
+		"flex flex-1 flex-col items-center justify-center gap-1 px-0.5 py-2 text-muted-foreground transition-colors";
+	const lbl =
+		"flex h-7 w-full items-center justify-center text-center text-[10px] leading-tight";
+	return (
+		<>
+			{/* Tap-outside backdrop, under the bar (z-50) but over the page. */}
+			{moreOpen && (
+				<button
+					type="button"
+					aria-label="Close menu"
+					className="fixed inset-0 z-40 bg-black/40 sm:hidden"
+					onClick={() => setMoreOpen(false)}
+				/>
+			)}
 			<nav
-				className="fixed inset-x-0 bottom-0 z-40 flex border-t bg-card/95 backdrop-blur sm:hidden"
+				className="fixed inset-x-0 bottom-0 z-50 sm:hidden"
 				style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
 			>
-				{NAV.map(({ to, icon: Icon, label }) => (
-					<Link
-						key={to}
-						to={to}
-						activeOptions={{ exact: to === "/" }}
-						className="flex flex-1 flex-col items-center justify-center gap-1 px-0.5 py-2 text-muted-foreground transition-colors"
-						activeProps={{ className: "text-[var(--brand-light)]" }}
+				{/* The "More" sheet sits directly above the bar (bottom-full of the fixed nav). */}
+				{moreOpen && (
+					<div className="absolute inset-x-0 bottom-full border-t bg-card/95 backdrop-blur">
+						<div className="grid grid-cols-4 gap-1 p-2">
+							{MOBILE_OVERFLOW.map(({ to, icon: Icon, label }) => (
+								<Link
+									key={to}
+									to={to}
+									onClick={() => setMoreOpen(false)}
+									className={cn(tab, "rounded-md")}
+									activeProps={{ className: "text-[var(--brand-light)]" }}
+								>
+									<Icon className="size-5 shrink-0" />
+									<span className={lbl}>{label()}</span>
+								</Link>
+							))}
+						</div>
+					</div>
+				)}
+				<div className="flex border-t bg-card/95 backdrop-blur">
+					{MOBILE_PRIMARY.map(({ to, icon: Icon, label }) => (
+						<Link
+							key={to}
+							to={to}
+							onClick={() => setMoreOpen(false)}
+							activeOptions={{ exact: to === "/" }}
+							className={tab}
+							activeProps={{ className: "text-[var(--brand-light)]" }}
+						>
+							<Icon className="size-5 shrink-0" />
+							<span className={lbl}>{label()}</span>
+						</Link>
+					))}
+					<button
+						type="button"
+						onClick={() => setMoreOpen((o) => !o)}
+						aria-expanded={moreOpen}
+						className={cn(
+							tab,
+							(moreOpen || overflowActive) && "text-[var(--brand-light)]",
+						)}
 					>
-						<Icon className="size-5 shrink-0" />
-						{/* Fixed two-line-tall box so a 1- or 2-line label keeps every icon
-                at the same height (the labels vary by locale). */}
-						<span className="flex h-7 w-full items-center justify-center text-center text-[10px] leading-tight">
-							{label()}
-						</span>
-					</Link>
-				))}
+						<MoreHorizontal className="size-5 shrink-0" />
+						<span className={lbl}>{m.nav_more()}</span>
+					</button>
+				</div>
 			</nav>
-		</div>
+		</>
 	);
 }
 

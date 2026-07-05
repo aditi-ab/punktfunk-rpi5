@@ -67,7 +67,7 @@ export const DisplaySection: FC = () => {
 					<CardTitle>{m.display_config_title()}</CardTitle>
 				</CardHeader>
 				<CardContent className="space-y-4">
-					<p className="text-sm text-muted-foreground">{m.host_displays_help()}</p>
+					<p className="max-w-prose text-sm text-muted-foreground">{m.host_displays_help()}</p>
 					<QueryState isLoading={q.isLoading} error={q.error} refetch={q.refetch}>
 						{q.data && draft && (
 							<DisplayForm
@@ -154,8 +154,8 @@ const DisplayForm: FC<{
 	return (
 		<div className="space-y-6">
 			{/* One-click presets — a 2-up grid so each has room to breathe */}
-			<div className="space-y-3">
-				<Label className="text-base font-semibold">{m.display_preset()}</Label>
+			<div className="space-y-4">
+				<Label className="mb-1 block text-base font-semibold">{m.display_preset()}</Label>
 				<div className="grid gap-3 sm:grid-cols-2">
 					{PRESET_ORDER.map((id) => {
 						const p = presets.find((x) => x.id === id);
@@ -341,7 +341,7 @@ const DisplayForm: FC<{
 				<Badge variant="outline">{`${effective.max_displays}×`}</Badge>
 			</div>
 
-			<p className="text-xs text-muted-foreground">{m.display_pending_note()}</p>
+			<p className="max-w-prose text-xs text-muted-foreground">{m.display_pending_note()}</p>
 			{error && <p className="text-sm text-amber-600 dark:text-amber-500">{error}</p>}
 		</div>
 	);
@@ -357,7 +357,7 @@ const Field: FC<{ label: string; help?: string; children: ReactNode }> = ({
 	<div className="space-y-3">
 		<Label className="block">{label}</Label>
 		{children}
-		{help && <p className="text-xs text-muted-foreground">{help}</p>}
+		{help && <p className="max-w-prose text-xs text-muted-foreground">{help}</p>}
 	</div>
 );
 
