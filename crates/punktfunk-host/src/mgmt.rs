@@ -2788,23 +2788,35 @@ mod tests {
             .unwrap()
     }
 
-    /// The display-management endpoints: GET returns the policy surface (presets + effective +
-    /// the Stage-0 enforced list); PUT rejects `keep_alive: forever` (the `gaming-rig` preset)
-    /// *before* persisting, so this stays read-only against the global policy store.
+    /// The display-management GET surface (presets + effective + the enforced-axes list). READ-ONLY
+    /// on purpose: `prefs()` is a process-global `OnceLock`, so a PUT here would clobber it and race
+    /// other tests running in the same process. `keep_alive: forever` (gaming-rig) is now accepted
+    /// (not rejected) — that acceptance is covered on-glass (`.116`) + by the pure `policy` tests, and
+    /// the `forever` value is read off the surfaced preset below without writing.
     #[tokio::test]
-    async fn display_settings_surface_and_forever_rejected() {
+    async fn display_settings_surface() {
         let app = test_app(test_state(), None);
 
         let (status, body) = send(&app, get_req("/api/v1/display/settings")).await;
         assert_eq!(status, StatusCode::OK);
+        let presets = body["presets"].as_array().expect("presets array");
         assert_eq!(
-            body["presets"].as_array().map(|a| a.len()),
-            Some(5),
+            presets.len(),
+            5,
             "all five named presets are surfaced for the console picker"
         );
         assert!(
             body["effective"]["keep_alive"].is_object(),
             "the effective policy is echoed"
+        );
+        // gaming-rig surfaces keep_alive: forever (no longer rejected) — read it off the preset list.
+        let gaming = presets
+            .iter()
+            .find(|p| p["id"] == "gaming-rig")
+            .expect("gaming-rig preset surfaced");
+        assert_eq!(
+            gaming["fields"]["keep_alive"]["mode"], "forever",
+            "gaming-rig is keep_alive: forever"
         );
         let enforced: Vec<&str> = body["enforced"]
             .as_array()
@@ -2818,23 +2830,6 @@ mod tests {
         assert!(enforced.contains(&"mode_conflict"));
         assert!(enforced.contains(&"identity"));
         assert!(enforced.contains(&"layout"));
-
-        // `gaming-rig` expands to keep_alive: forever → rejected at Stage 0 (before any write).
-        let put = axum::http::Request::put("/api/v1/display/settings")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({ "preset": "gaming-rig" }).to_string(),
-            ))
-            .unwrap();
-        let (status, body) = send(&app, put).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("forever"),
-            "the rejection names the unsupported option"
-        );
     }
 
     /// The display state/release endpoints are wired + auth-gated. On the test host no backend has
