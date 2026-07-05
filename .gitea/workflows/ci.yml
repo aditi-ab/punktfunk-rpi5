@@ -28,8 +28,8 @@ jobs:
 
       # Best-effort caches (act_runner's built-in cache server). Keyed on Cargo.lock:
       # registry/git are download caches, target/ the incremental build. The target key
-      # carries the rustc version — rust-toolchain.toml pins the floating "stable"
-      # channel, so the file alone wouldn't invalidate stale incremental state.
+      # carries the rustc version — resolved via `rustc --version` (below) rather than parsed
+      # from rust-toolchain.toml, so a pin bump there invalidates stale incremental state too.
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
       - uses: actions/cache@v4

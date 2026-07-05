@@ -1,3 +1,9 @@
+# Pin an EXACT version, not the floating "stable" channel. The CI image bakes whatever
+# `stable` was at image-build time; when the image is rebuilt onto a newer stable, rustfmt's
+# formatting rules shift and `cargo fmt --all --check` starts failing on files nobody touched
+# (format drift). An exact pin makes rustfmt/rustc identical for every contributor and CI, so
+# formatting only ever changes in a deliberate bump-this-line-and-reformat commit.
+# The CI image (ci/rust-ci.Dockerfile) and the Windows runner both use rustup, which honors this.
 [toolchain]
-channel = "stable"
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]
