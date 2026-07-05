@@ -91,13 +91,33 @@ pub fn decide(
 }
 
 /// Resolve the effective decision for a connecting session: read the console `mode_conflict` policy
-/// (default `Separate` when unconfigured — no behavior change) and [`decide`] against the live set.
+/// (default `Separate` when unconfigured) and [`decide`] against the live set.
+///
+/// **Windows** can't create SEPARATE virtual displays until the multi-monitor stage (§6.6), so a
+/// `separate` outcome — including the **unconfigured default** — resolves to `join` (admit at the live
+/// mode) rather than the old silent last-wins reconfigure of the shared monitor. This is the deliberate
+/// Windows default change (release-note behavior fix); `steal` remains the way to force the new mode.
 pub fn admit(req_identity: Option<[u8; 32]>) -> Admission {
-    let conflict = policy::prefs()
+    #[allow(unused_mut)]
+    let mut conflict = policy::prefs()
         .configured_effective()
         .map(|e| e.mode_conflict)
         .unwrap_or(ModeConflict::Separate);
-    decide(conflict, req_identity, &table().lock().unwrap())
+    let live = table().lock().unwrap();
+    #[cfg(windows)]
+    if matches!(conflict, ModeConflict::Separate) {
+        if live
+            .iter()
+            .any(|s| !same_client(s.identity, req_identity))
+        {
+            tracing::warn!(
+                "mode_conflict=separate is not yet supported on Windows (multi-monitor is §6.6) — \
+                 JOINing the live session's mode instead"
+            );
+        }
+        conflict = ModeConflict::Join;
+    }
+    decide(conflict, req_identity, &live)
 }
 
 /// Register a now-admitted, live session; the returned guard removes it on drop (session end). Call

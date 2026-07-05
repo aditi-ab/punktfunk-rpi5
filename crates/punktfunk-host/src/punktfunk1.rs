@@ -341,6 +341,11 @@ pub(crate) async fn serve(
 /// connects and never finishes the handshake would otherwise wedge the host for everyone.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// QUIC application error code the host closes with on a `mode_conflict = reject` admission refusal,
+/// carrying the human-readable busy reason (live mode + client label) the client surfaces. A distinct
+/// code lets a client tell "host busy" apart from a transport failure.
+const REJECT_BUSY_CODE: u32 = 0x42;
+
 /// Encoder bitrate (kbps) the host falls back to when the client expresses no preference
 /// (`Hello::bitrate_kbps == 0`) — the long-standing 20 Mbps default. A client that knows its
 /// link (e.g. after a speed test) requests an explicit rate instead.
@@ -718,6 +723,11 @@ async fn serve_session(
                 }
                 Admission::Reject(reason) => {
                     tracing::warn!("mode-conflict: REJECT — {reason}");
+                    // Deliver the reason to the client as a TYPED refusal: close the QUIC connection
+                    // with the BUSY application code + the reason bytes, which the client reads from
+                    // the `ApplicationClosed` error (so its UI can say "host is streaming X to <name>")
+                    // instead of seeing a bare connection drop. Then end the handshake.
+                    conn.close(REJECT_BUSY_CODE.into(), reason.as_bytes());
                     anyhow::bail!("{reason}");
                 }
             }

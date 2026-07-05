@@ -126,15 +126,70 @@ async fn h_launch(
     peer: Option<Extension<PeerCertFingerprint>>,
     addr: Option<Extension<PeerAddr>>,
     Query(q): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> Response {
     if !peer_is_paired(&peer, &st) {
         tracing::warn!("launch rejected — client is not paired");
-        return xml(error_xml());
+        return xml(error_xml()).into_response();
     }
+    let req_fp: Option<[u8; 32]> = match &peer {
+        Some(Extension(PeerCertFingerprint(Some(fp)))) => {
+            hex::decode(fp).ok().and_then(|v| <[u8; 32]>::try_from(v).ok())
+        }
+        _ => None,
+    };
+
+    // Mode-conflict ADMISSION (Stage 4). GameStream is single-session (`st.launch`), so when a
+    // DIFFERENT paired client launches while a session is live, the `mode_conflict` policy governs:
+    // `reject` → 503 (Moonlight shows "host is busy"); `join` → serve at the live session's mode;
+    // `steal`/`separate` (GameStream can't do separate) / unconfigured → take over (today's last-wins).
+    // A same-client re-launch is never a conflict.
+    let mut forced_mode: Option<(u32, u32, u32)> = None;
+    {
+        let cur = st.launch.lock().unwrap();
+        if let Some(s) = cur.as_ref() {
+            let different = match (&s.owner_fp, &req_fp) {
+                (Some(owner), Some(req)) => owner != req,
+                _ => true, // unknown owner or anonymous requester → treat as a different client
+            };
+            if different {
+                use crate::vdisplay::policy::{self, ModeConflict};
+                let conflict = policy::prefs()
+                    .configured_effective()
+                    .map(|e| e.mode_conflict)
+                    .unwrap_or(ModeConflict::Separate);
+                match conflict {
+                    ModeConflict::Reject => {
+                        tracing::warn!(
+                            "GameStream launch REJECTED — host busy streaming {}x{}@{} to another client",
+                            s.width, s.height, s.fps
+                        );
+                        return (StatusCode::SERVICE_UNAVAILABLE, xml(error_xml())).into_response();
+                    }
+                    ModeConflict::Join => {
+                        forced_mode = Some((s.width, s.height, s.fps));
+                        tracing::info!(
+                            "GameStream launch JOIN — admitting at the live session's mode {}x{}@{}",
+                            s.width, s.height, s.fps
+                        );
+                    }
+                    ModeConflict::Steal | ModeConflict::Separate => tracing::info!(
+                        "GameStream launch STEAL — a different client is taking over the live session"
+                    ),
+                }
+            }
+        }
+    }
+
     match launch(&st, &q) {
         Ok(mut session) => {
             // Bind the (unauthenticated) RTSP/UDP media plane to this paired client's source IP.
             session.peer_ip = addr.map(|Extension(PeerAddr(a))| a.ip());
+            session.owner_fp = req_fp;
+            if let Some((w, h, f)) = forced_mode {
+                session.width = w;
+                session.height = h;
+                session.fps = f;
+            }
             *st.launch.lock().unwrap() = Some(session);
             tracing::info!(
                 w = session.width,
@@ -144,11 +199,11 @@ async fn h_launch(
                 "launch — session created; RTSP at rtsp://{}:{RTSP_PORT}",
                 st.host.local_ip
             );
-            xml(session_url_xml(&st, "gamesession"))
+            xml(session_url_xml(&st, "gamesession")).into_response()
         }
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "launch failed");
-            xml(error_xml())
+            xml(error_xml()).into_response()
         }
     }
 }
@@ -210,7 +265,8 @@ fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> 
         height,
         fps,
         appid,
-        peer_ip: None, // set by `h_launch` from the verified HTTPS peer address
+        peer_ip: None,  // set by `h_launch` from the verified HTTPS peer address
+        owner_fp: None, // set by `h_launch` from the verified HTTPS peer cert fingerprint
     })
 }
 

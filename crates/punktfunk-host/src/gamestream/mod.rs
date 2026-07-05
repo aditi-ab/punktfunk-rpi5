@@ -108,6 +108,11 @@ pub struct LaunchSession {
     /// unpaired RTSP peer cannot ride a paired client's launch (security-review 2026-06-28 #4).
     /// `None` if the address could not be captured (then RTSP falls back to launch-present only).
     pub peer_ip: Option<std::net::IpAddr>,
+    /// SHA-256 cert fingerprint of the paired client that owns this session — mode-conflict admission
+    /// (Stage 4) compares it against a launching client to tell a same-client re-launch (always
+    /// allowed) from a DIFFERENT client (subject to the `mode_conflict` policy). `[u8; 32]` keeps
+    /// [`LaunchSession`] `Copy`; `None` when the peer cert couldn't be read.
+    pub owner_fp: Option<[u8; 32]>,
 }
 
 /// Shared control-plane state used as the axum app state.
