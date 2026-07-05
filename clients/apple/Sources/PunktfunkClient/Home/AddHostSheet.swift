@@ -1,67 +1,87 @@
-// "+" sheet: name (optional) + address + port → a card in the hosts grid. The first
-// actual connection runs the trust-on-first-use fingerprint prompt.
+// Add / edit a host: name (optional) + address + port + Wake-on-LAN MAC → a card in the grid.
+// The MAC prefills from what we already know — the host's stored MAC, or the live mDNS advert's if
+// it hasn't been learned yet — so it's usually already correct; type/paste it for a host we've
+// never seen advertise. The first actual connection still runs the trust-on-first-use prompt.
 
+import PunktfunkKit
 import SwiftUI
 
 struct AddHostSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
-    @State private var address = ""
-    @State private var port = 9777
+
+    /// nil = add a new host; non-nil = edit this one (fields prefilled, identity/pin preserved).
+    let existing: StoredHost?
+    /// MAC(s) to offer when the host has none stored yet — the live advert's, so the field is
+    /// prefilled the moment the host is on the network, even before a connect has learned it.
+    let suggestedMacs: [String]
+    let onSave: (StoredHost) -> Void
+
+    @State private var name: String
+    @State private var address: String
+    @State private var port: Int
+    @State private var mac: String
     #if os(tvOS)
     private enum EditField: String, Identifiable {
-        case name, address, port
+        case name, address, port, mac
         var id: String { rawValue }
     }
-    @State private var editing: EditField?
+    @State private var editingField: EditField?
     #endif
 
-    let onAdd: (StoredHost) -> Void
+    private var isEditing: Bool { existing != nil }
+    private var actionTitle: String { isEditing ? "Save" : "Add Host" }
+    private var canSave: Bool { !address.trimmingCharacters(in: .whitespaces).isEmpty }
+
+    init(existing: StoredHost? = nil, suggestedMacs: [String] = [], onSave: @escaping (StoredHost) -> Void) {
+        self.existing = existing
+        self.suggestedMacs = suggestedMacs
+        self.onSave = onSave
+        _name = State(initialValue: existing?.name ?? "")
+        _address = State(initialValue: existing?.address ?? "")
+        _port = State(initialValue: Int(existing?.port ?? 9777))
+        let stored = existing?.macAddresses ?? []
+        _mac = State(initialValue: (stored.isEmpty ? suggestedMacs : stored).joined(separator: ", "))
+    }
 
     var body: some View {
         #if os(tvOS)
         // No inline text editing on tvOS — Settings-style value rows; pressing one
         // raises the SYSTEM fullscreen keyboard (TVTextEntry).
         VStack(spacing: 24) {
-            TVFieldRow(
-                label: "Name", value: name, placeholder: "Optional"
-            ) { editing = .name }
-            TVFieldRow(
-                label: "Address", value: address, placeholder: "IP or hostname"
-            ) { editing = .address }
-            TVFieldRow(
-                label: "Port", value: String(port), placeholder: ""
-            ) { editing = .port }
+            TVFieldRow(label: "Name", value: name, placeholder: "Optional") { editingField = .name }
+            TVFieldRow(label: "Address", value: address, placeholder: "IP or hostname") { editingField = .address }
+            TVFieldRow(label: "Port", value: String(port), placeholder: "") { editingField = .port }
+            TVFieldRow(label: "MAC", value: mac, placeholder: "Wake-on-LAN — auto-filled when known") { editingField = .mac }
             HStack(spacing: 32) {
                 Button("Cancel", role: .cancel) { dismiss() }
-                Button("Add Host") { add() }
-                    .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button(actionTitle) { save() }.disabled(!canSave)
             }
             .padding(.top, 12)
         }
         .frame(maxWidth: 1000)
         .padding(60)
-        .navigationTitle("Add Host")
-        .fullScreenCover(item: $editing) { field in
+        .navigationTitle(isEditing ? "Edit Host" : "Add Host")
+        .fullScreenCover(item: $editingField) { field in
             switch field {
             case .name:
                 TVTextEntry(title: "Name (optional, e.g. Living Room)", text: name) {
                     name = $0
-                    editing = nil
+                    editingField = nil
                 }
             case .address:
                 TVTextEntry(title: "IP or hostname", text: address) {
                     address = $0.trimmingCharacters(in: .whitespaces)
-                    editing = nil
+                    editingField = nil
                 }
             case .port:
-                TVTextEntry(
-                    title: "Port", text: String(port), keyboardType: .numberPad
-                ) {
-                    if let value = Int($0), (1...65535).contains(value) {
-                        port = value
-                    }
-                    editing = nil
+                TVTextEntry(title: "Port", text: String(port), keyboardType: .numberPad) {
+                    if let value = Int($0), (1...65535).contains(value) { port = value }
+                    editingField = nil
+                }
+            case .mac:
+                TVTextEntry(title: "MAC address(es), comma-separated — aa:bb:cc:dd:ee:ff", text: mac) {
+                    mac = $0.trimmingCharacters(in: .whitespaces)
+                    editingField = nil
                 }
             }
         }
@@ -71,77 +91,77 @@ struct AddHostSheet: View {
                 TextField("Name", text: $name, prompt: Text("Optional — e.g. Living Room"))
                 TextField("Address", text: $address, prompt: Text("IP or hostname"))
                 TextField("Port", value: $port, format: .number.grouping(.never))
-                    #if os(tvOS)
-                    // tvOS floats the label above a non-empty field INSIDE the pill,
-                    // shoving the value off-center — the field is always prefilled
-                    // here, so drop the label there.
-                    .labelsHidden()
+                TextField("MAC", text: $mac, prompt: Text("Wake-on-LAN — auto-filled when known"))
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
                     #endif
             }
             #if !os(tvOS)
-        .formStyle(.grouped)
-        #endif
+            .formStyle(.grouped)
+            // The grouped form's default system text is oversized next to the app's Geist
+            // typography — bring it down and on-brand so the panel doesn't read out of place.
+            .font(.geist(12, relativeTo: .callout))
+            .controlSize(.small)
+            #endif
             #if os(iOS)
-            // The detent below is sized to fit all 3 rows + the action button exactly, so the
-            // Form must NOT scroll/bounce inside it — lock it. (iOS 16+; safe at iOS 17.)
             .scrollDisabled(true)
             #endif
             #if os(macOS)
-            // macOS: UNCHANGED — Cancel + Spacer + Add in an HStack, both wired to the
-            // window's default/cancel keyboard actions. The 380-wide .fixedSize panel below
-            // keeps this compact and centered.
             HStack {
                 Button("Cancel", role: .cancel) { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Add Host") { add() }
+                Button(actionTitle) { save() }
                     .glassProminentButtonStyle()
                     .keyboardShortcut(.defaultAction)
-                    .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(!canSave)
             }
             .padding(16)
             #else
-            // iOS / iPadOS: NO Cancel — the sheet is dismissed by the drag indicator,
-            // swipe-down, or tap-outside. (AddHostSheet never sets interactiveDismissDisabled,
-            // so all three are live; if anyone adds it later, restore a Cancel here or there is
-            // no way back out.) A single FULL-WIDTH primary action reads as the one thing to do.
-            // The fill must be on the LABEL, not the Button: .frame(maxWidth:.infinity) on the
-            // Button only widens its hit area and leaves the styled capsule hugging the text —
-            // stretching the label is what makes the glass/bordered pill itself go edge-to-edge.
-            // .controlSize(.large) gives the tall, thumb-friendly height; .defaultAction lets a
-            // hardware keyboard / iPad Return submit.
-            Button { add() } label: {
-                Text("Add Host").frame(maxWidth: .infinity)
+            Button { save() } label: {
+                Text(actionTitle).frame(maxWidth: .infinity)
             }
                 .glassProminentButtonStyle()
                 .controlSize(.large)
                 .keyboardShortcut(.defaultAction)
-                .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(!canSave)
                 .padding(16)
             #endif
         }
         #if os(iOS)
-        // A short bottom sheet, not a full-screen modal. .height(320) hugs the 3-field grouped
-        // Form + the full-width action row, instead of the half-screen .medium it used to rest
-        // at. A single fixed detent is enough: the system keeps the content above the keyboard
-        // when Address/Port is focused, and on iPadOS this renders as a short bottom sheet (not a
-        // centered formSheet card). The Form itself is .scrollDisabled (above) so it can't
-        // bounce/scroll inside this fixed detent. (.height(_:) is iOS 16+, safe at iOS 17.)
-        .presentationDetents([.height(320)])
+        // Four fields + the action row — a touch taller than the 3-field add sheet used to be.
+        .presentationDetents([.height(392)])
         .presentationDragIndicator(.visible)
         #endif
         #if os(macOS)
-        .frame(width: 380)
+        .frame(width: 400)
         .fixedSize(horizontal: false, vertical: true)
         #endif
         #endif
     }
 
-    private func add() {
-        onAdd(StoredHost(
-            name: name.trimmingCharacters(in: .whitespaces),
-            address: address.trimmingCharacters(in: .whitespaces),
-            port: UInt16(clamping: port)))
+    private func save() {
+        var host = existing ?? StoredHost(name: "", address: "")
+        host.name = name.trimmingCharacters(in: .whitespaces)
+        host.address = address.trimmingCharacters(in: .whitespaces)
+        host.port = UInt16(clamping: port)
+        host.macAddresses = Self.parseMacs(mac)
+        onSave(host)
         dismiss()
+    }
+
+    /// Split comma/space/newline-separated MACs, keep only well-formed `aa:bb:cc:dd:ee:ff` (six hex
+    /// octets, normalized lower-case); nil when none are valid, so clearing the field clears the
+    /// stored MAC.
+    static func parseMacs(_ s: String) -> [String]? {
+        let macs = s
+            .split(whereSeparator: { ",; \n\t".contains($0) })
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            .filter { m in
+                let parts = m.split(separator: ":")
+                return parts.count == 6 && parts.allSatisfy { $0.count == 2 && UInt8($0, radix: 16) != nil }
+            }
+        return macs.isEmpty ? nil : macs
     }
 }

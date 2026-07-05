@@ -89,6 +89,8 @@ struct HostCardView: View {
     /// Send a Wake-on-LAN magic packet. Shown only when the host is offline and we have a stored
     /// MAC to target (a tap-to-connect already auto-wakes; this is the explicit "just wake it").
     var onWake: (() -> Void)? = nil
+    /// Open the edit sheet (name / address / port / Wake-on-LAN MAC).
+    var onEdit: (() -> Void)? = nil
 
     var body: some View {
         let m = CardMetrics.current
@@ -136,6 +138,9 @@ struct HostCardView: View {
         #endif
         .disabled(isBusy)
         .contextMenu {
+            if let onEdit {
+                Button("Edit…", systemImage: "pencil", action: onEdit)
+            }
             Button("Pair with PIN…", action: onPair)
             Button("Test Network Speed…", action: onSpeedTest)
             if let onBrowseLibrary {

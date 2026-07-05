@@ -67,3 +67,41 @@ extension View {
         modifier(GlassProminentButton())
     }
 }
+
+// MARK: - Console glass (gamepad host tiles + settings rows)
+
+/// Liquid Glass tuned for the gamepad UI's dark "console" surfaces — the host-carousel tiles and
+/// the settings rows. Unlike `glassBackground` (floating-overlay only, per HIG), this deliberately
+/// clads content tiles / dense rows: a chosen part of the 10-foot console look. `tint` washes the
+/// glass toward a color (the brand violet on the focused / primary surface); `interactive` makes
+/// it flex on press. The pre-26 fallback is `.ultraThinMaterial` forced dark — these surfaces
+/// always sit on the near-black backdrop, so the material must stay dark even in a light appearance.
+private struct ConsoleGlass<S: Shape>: ViewModifier {
+    let shape: S
+    var tint: Color?
+    var interactive = false
+
+    func body(content: Content) -> some View {
+        if #available(iOS 26, macOS 26, tvOS 26, *) {
+            content.glassEffect(glass, in: shape)
+        } else {
+            content.background { shape.fill(.ultraThinMaterial).environment(\.colorScheme, .dark) }
+        }
+    }
+
+    @available(iOS 26, macOS 26, tvOS 26, *)
+    private var glass: Glass {
+        var g: Glass = .regular
+        if let tint { g = g.tint(tint) }
+        if interactive { g = g.interactive() }
+        return g
+    }
+}
+
+extension View {
+    /// Liquid Glass for a dark console surface (a host tile / settings row), or `.ultraThinMaterial`
+    /// (forced dark) pre-26. Pass the surface's shape explicitly — glass defaults to a Capsule.
+    func consoleGlass<S: Shape>(_ shape: S, tint: Color? = nil, interactive: Bool = false) -> some View {
+        modifier(ConsoleGlass(shape: shape, tint: tint, interactive: interactive))
+    }
+}

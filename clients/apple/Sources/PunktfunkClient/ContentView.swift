@@ -52,6 +52,9 @@ struct ContentView: View {
     @State private var awaitingApproval: ApprovalRequest?
     @State private var speedTestTarget: StoredHost?
     @State private var libraryTarget: StoredHost?
+    /// Wakes a sleeping host and waits for it to come back online before connecting (drives the
+    /// "Waking…" overlay). macOS-only in practice — WoL is gated off on iOS/tvOS.
+    @StateObject private var waker = HostWaker()
     #if !os(macOS)
     @State private var showSettings = false
     #endif
@@ -212,12 +215,18 @@ struct ContentView: View {
     }
 
     private var home: some View {
+        // The "Waking…" overlay rides over BOTH home UIs (and the pre-connect window is still
+        // `home`, so it covers the whole wake→online→connect sequence).
+        homeBase.overlay { WakeOverlay(waker: waker) }
+    }
+
+    @ViewBuilder private var homeBase: some View {
         #if os(macOS)
         Group {
             if gamepadUIActive {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
-                    libraryTarget: $libraryTarget,
+                    libraryTarget: $libraryTarget, waker: waker,
                     connect: { connect($0) }, connectDiscovered: connectDiscovered)
             } else {
                 HomeView(
@@ -225,7 +234,7 @@ struct ContentView: View {
                     showAddHost: $showAddHost, pairingTarget: $pairingTarget,
                     speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
                     connect: { connect($0) }, connectDiscovered: connectDiscovered,
-                    onPaired: handlePaired, onLaunchTitle: launchTitle)
+                    onPaired: handlePaired, onLaunchTitle: launchTitle, wake: { wakeOnly($0) })
             }
         }
         #elseif os(iOS)
@@ -233,7 +242,7 @@ struct ContentView: View {
             if gamepadUIActive {
                 GamepadHomeView(
                     store: store, model: model, discovery: discovery,
-                    libraryTarget: $libraryTarget,
+                    libraryTarget: $libraryTarget, waker: waker,
                     connect: { connect($0) }, connectDiscovered: connectDiscovered)
             } else {
                 HomeView(
@@ -242,7 +251,7 @@ struct ContentView: View {
                     speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
                     showSettings: $showSettings,
                     connect: { connect($0) }, connectDiscovered: connectDiscovered,
-                    onPaired: handlePaired, onLaunchTitle: launchTitle)
+                    onPaired: handlePaired, onLaunchTitle: launchTitle, wake: { wakeOnly($0) })
             }
         }
         #else
@@ -252,7 +261,7 @@ struct ContentView: View {
             speedTestTarget: $speedTestTarget, libraryTarget: $libraryTarget,
             showSettings: $showSettings,
             connect: { connect($0) }, connectDiscovered: connectDiscovered,
-            onPaired: handlePaired, onLaunchTitle: launchTitle)
+            onPaired: handlePaired, onLaunchTitle: launchTitle, wake: { wakeOnly($0) })
         #endif
     }
 
@@ -406,9 +415,37 @@ struct ContentView: View {
     /// delegated-approval connect (host parks it until the operator approves).
     private func startSession(
         _ host: StoredHost, launchID: String? = nil,
-        allowTofu: Bool, requestAccess: Bool = false
+        allowTofu: Bool, requestAccess: Bool = false, approvalReq: ApprovalRequest? = nil
+    ) {
+        let go = {
+            startSessionDirect(
+                host, launchID: launchID, allowTofu: allowTofu,
+                requestAccess: requestAccess, approvalReq: approvalReq)
+        }
+        // Asleep (not advertising) and we can wake it? Fire the magic packet and WAIT for it to come
+        // back online — a cold box takes far longer to boot than a connect will sit — showing the
+        // "Waking…" overlay meanwhile. Then connect. Otherwise dial straight away.
+        if PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty, !discovery.advertises(host) {
+            discovery.start() // so we can observe it reappear
+            waker.start(
+                host: host, connectsAfter: true, macs: host.wakeMacs, lastIP: host.address,
+                isOnline: { discovery.advertises(host) }, onOnline: go)
+        } else {
+            go()
+        }
+    }
+
+    /// The actual dial — reached directly when the host is awake, or from the waker once a woken
+    /// host is back online. `prepareWake` still runs here to LEARN/refresh the MAC now that the host
+    /// is advertising (and is a harmless no-op otherwise).
+    private func startSessionDirect(
+        _ host: StoredHost, launchID: String? = nil,
+        allowTofu: Bool, requestAccess: Bool = false, approvalReq: ApprovalRequest? = nil
     ) {
         prepareWake(for: host)
+        // The delegated-approval wait prompt only makes sense once we're actually dialing — set it
+        // here (after any wake), not before, so it never stacks under the "Waking…" overlay.
+        if let approvalReq { awaitingApproval = approvalReq }
         model.connect(
             to: host,
             width: UInt32(clamping: width), height: UInt32(clamping: height),
@@ -452,12 +489,24 @@ struct ContentView: View {
     /// as paired (see the `.streaming` branch of `onChange`).
     private func requestAccess(_ req: ApprovalRequest) {
         guard !model.isBusy else { return }
-        awaitingApproval = req
         // Pin the advertised certificate for a discovered host (impostor defence during the long
         // wait); a manually-typed host has no advertised fingerprint, so trust-on-first-use.
         var host = req.host
         host.pinnedSHA256 = req.advertisedFingerprint
-        startSession(host, allowTofu: false, requestAccess: true)
+        // `awaitingApproval` is set inside startSessionDirect (after any wake), so it never stacks
+        // under the "Waking…" overlay.
+        startSession(host, allowTofu: false, requestAccess: true, approvalReq: req)
+    }
+
+    /// Explicit wake-only (the touch card's "Wake Host" menu item / a future gamepad action): fire
+    /// the packet and wait for the host to come online, but don't connect — the user then sees it
+    /// go online and can connect.
+    private func wakeOnly(_ host: StoredHost) {
+        guard PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty else { return }
+        discovery.start()
+        waker.start(
+            host: host, connectsAfter: false, macs: host.wakeMacs, lastIP: host.address,
+            isOnline: { discovery.advertises(host) }, onOnline: {})
     }
 
     /// Picked a title in the (experimental) library: dismiss the browser and start a session that

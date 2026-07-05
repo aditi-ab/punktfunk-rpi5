@@ -58,16 +58,19 @@ struct GamepadAddHostView: View {
             .padding(.top, gamepadTitleTopPadding(compact: compact))
             .padding(.bottom, compact ? 4 : 8)
             .frame(maxWidth: .infinity)
-            .overlay(alignment: .topTrailing) { closeButton.padding(.trailing, 20) }
+            .overlay(alignment: .topTrailing) { closeButton.padding(.top, 20).padding(.trailing, 20) }
             .background { GamepadTrayScrim(edge: .top) }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             bottomTray
-                .padding(.horizontal, 22)
-                .padding(.vertical, compact ? 6 : 10)
+                // Equal distance from the left and bottom edges for the legend pill (see GamepadHomeView).
+                .padding(.horizontal, compact ? 12 : 18)
+                .padding(.bottom, compact ? 12 : 18)
+                .padding(.top, compact ? 6 : 10)
                 .background { GamepadTrayScrim(edge: .bottom) }
         }
-        .background { GamepadScreenBackground() }
+        // No aurora — the same clean Liquid-Glass-over-dark base as the gamepad settings screen.
+        .background { GamepadFormBackground() }
         // A port can't exceed 5 digits — cap while typing so the row can't grow absurd.
         .onChange(of: port) { _, value in
             if value.count > 5 { port = String(value.prefix(5)) }
@@ -165,14 +168,16 @@ struct GamepadAddHostView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 13)
-        .background {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(.white.opacity(focused || editing == row.id ? 0.1 : 0))
-        }
+        // Liquid Glass rows, matching the settings screen; the focused (or actively edited) row
+        // takes the brand wash, and the edited row keeps its brand caret border.
+        .consoleGlass(
+            RoundedRectangle(cornerRadius: 14, style: .continuous),
+            tint: (focused || editing == row.id) ? Color.brand.opacity(0.30) : nil,
+            interactive: focused)
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(
-                    editing == row.id ? Color.brand.opacity(0.7) : .white.opacity(focused ? 0.22 : 0),
+                    editing == row.id ? Color.brand.opacity(0.7) : .white.opacity(focused ? 0.28 : 0.06),
                     lineWidth: 1)
         }
         .scaleEffect(focused ? 1.0 : 0.98)

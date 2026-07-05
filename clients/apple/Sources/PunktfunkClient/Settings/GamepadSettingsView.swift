@@ -81,13 +81,17 @@ struct GamepadSettingsView: View {
                     .init(glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done"),
                 ])
             }
-            .padding(.leading, 22)
+            // Equal distance from the left and bottom edges for the legend pill (see GamepadHomeView).
+            .padding(.leading, compact ? 12 : 18)
             .padding(.trailing, 22)
-            .padding(.vertical, compact ? 6 : 10)
+            .padding(.bottom, compact ? 12 : 18)
+            .padding(.top, compact ? 6 : 10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background { GamepadTrayScrim(edge: .bottom) }
         }
-        .background { GamepadScreenBackground() }
+        // No aurora here — the settings read as clean Liquid Glass over a quiet dark base, so the
+        // glass rows are the only material on the screen.
+        .background { GamepadFormBackground() }
         .onAppear {
             gamepads.refresh()
             gamepads.startDiscovery()
@@ -148,13 +152,14 @@ struct GamepadSettingsView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 13)
-            .background {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(.white.opacity(focused ? 0.1 : 0))
-            }
+            // Every row is Liquid Glass; the focused one takes a brand wash and reacts to press.
+            .consoleGlass(
+                RoundedRectangle(cornerRadius: 14, style: .continuous),
+                tint: focused ? Color.brand.opacity(0.30) : nil,
+                interactive: focused)
             .overlay {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(.white.opacity(focused ? 0.22 : 0), lineWidth: 1)
+                    .strokeBorder(.white.opacity(focused ? 0.28 : 0.06), lineWidth: 1)
             }
             .scaleEffect(focused ? 1.0 : 0.98)
             .animation(.smooth(duration: 0.18), value: focused)

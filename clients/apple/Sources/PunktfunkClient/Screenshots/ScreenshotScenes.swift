@@ -18,23 +18,47 @@ struct ShotScene {
 
 @MainActor
 enum ShotScenes {
-    static let all: [ShotScene] = [
-        ShotScene(name: "01-stream", orientation: .landscape, colorScheme: .dark) {
-            AnyView(ShotStreamHero())
-        },
-        ShotScene(name: "02-hosts", orientation: .natural, colorScheme: .dark) {
-            AnyView(ShotHome())
-        },
-        ShotScene(name: "03-pair", orientation: .natural, colorScheme: .dark) {
-            AnyView(ShotPair())
-        },
-        ShotScene(name: "04-trust", orientation: .landscape, colorScheme: .dark) {
-            AnyView(ShotTrust())
-        },
-        ShotScene(name: "05-settings", orientation: .natural, colorScheme: .dark) {
-            AnyView(ShotSettings())
-        },
-    ]
+    static var all: [ShotScene] {
+        var scenes: [ShotScene] = [
+            ShotScene(name: "01-stream", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotStreamHero())
+            },
+            ShotScene(name: "02-hosts", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotHome())
+            },
+            ShotScene(name: "03-pair", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotPair())
+            },
+            ShotScene(name: "04-trust", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotTrust())
+            },
+            ShotScene(name: "05-settings", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotSettings())
+            },
+        ]
+        #if os(iOS) || os(macOS)
+        // The gamepad-mode console screens (no tvOS — native focus engine there). Dev-only shots
+        // for eyeballing the Liquid Glass host tiles + settings rows.
+        scenes += [
+            ShotScene(name: "06-gamepad-home", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotGamepadHome())
+            },
+            ShotScene(name: "07-gamepad-settings", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotGamepadSettings())
+            },
+            ShotScene(name: "08-gamepad-addhost", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotGamepadAddHost())
+            },
+            ShotScene(name: "09-waking", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotWaking())
+            },
+        ]
+        #endif
+        scenes.append(ShotScene(name: "10-edithost", orientation: .natural, colorScheme: .dark) {
+            AnyView(ShotEditHost())
+        })
+        return scenes
+    }
 }
 
 // MARK: - Mock data
@@ -75,7 +99,7 @@ private struct ShotHome: View {
             showAddHost: .constant(false), pairingTarget: .constant(nil),
             speedTestTarget: .constant(nil), libraryTarget: .constant(nil),
             connect: { _ in }, connectDiscovered: { _ in },
-            onPaired: { _, _ in }, onLaunchTitle: { _, _ in })
+            onPaired: { _, _ in }, onLaunchTitle: { _, _ in }, wake: { _ in })
         #else
         HomeView(
             store: store, model: model, discovery: discovery,
@@ -83,8 +107,74 @@ private struct ShotHome: View {
             speedTestTarget: .constant(nil), libraryTarget: .constant(nil),
             showSettings: .constant(false),
             connect: { _ in }, connectDiscovered: { _ in },
-            onPaired: { _, _ in }, onLaunchTitle: { _, _ in })
+            onPaired: { _, _ in }, onLaunchTitle: { _, _ in }, wake: { _ in })
         #endif
+    }
+}
+
+// MARK: - Gamepad-mode console screens (dev-only glass preview)
+
+#if os(iOS) || os(macOS)
+private struct ShotGamepadHome: View {
+    @StateObject private var store = ShotMock.hostStore()
+    @StateObject private var model = SessionModel()
+    @StateObject private var discovery = HostDiscovery()
+    @StateObject private var waker = HostWaker()
+
+    var body: some View {
+        GamepadHomeView(
+            store: store, model: model, discovery: discovery,
+            libraryTarget: .constant(nil), waker: waker,
+            connect: { _ in }, connectDiscovered: { _ in })
+    }
+}
+
+private struct ShotGamepadSettings: View {
+    var body: some View { GamepadSettingsView() }
+}
+
+private struct ShotGamepadAddHost: View {
+    var body: some View { GamepadAddHostView(onAdd: { _ in }) }
+}
+
+private struct ShotWaking: View {
+    @StateObject private var store = ShotMock.hostStore()
+    @StateObject private var model = SessionModel()
+    @StateObject private var discovery = HostDiscovery()
+    @StateObject private var waker = HostWaker()
+
+    var body: some View {
+        GamepadHomeView(
+            store: store, model: model, discovery: discovery,
+            libraryTarget: .constant(nil), waker: waker,
+            connect: { _ in }, connectDiscovered: { _ in }
+        )
+        .overlay { WakeOverlay(waker: waker) }
+        .onAppear {
+            waker.debugSet(.init(
+                hostID: store.hosts.first?.id ?? UUID(),
+                hostName: "Battlestation", connectsAfter: true, seconds: 14))
+        }
+    }
+}
+#endif
+
+// MARK: - Edit host (add/edit sheet with the Wake-on-LAN MAC field)
+
+private struct ShotEditHost: View {
+    var body: some View {
+        ZStack {
+            ShotHome().blur(radius: 24).overlay(Color.black.opacity(0.45))
+            AddHostSheet(
+                existing: StoredHost(
+                    name: "Battlestation", address: "192.168.1.20", port: 9777,
+                    pinnedSHA256: ShotMock.fingerprint, macAddresses: ["a4:b1:c2:d3:e4:f5"]),
+                onSave: { _ in })
+                #if os(macOS)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .shadow(radius: 40, y: 16)
+                #endif
+        }
     }
 }
 

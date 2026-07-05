@@ -26,8 +26,13 @@ struct HomeView: View {
     let onPaired: (StoredHost, Data) -> Void
     /// Picked a title in the (experimental) library — start a session that launches it.
     let onLaunchTitle: (StoredHost, String) -> Void
+    /// Explicit Wake-on-LAN of an offline host — fires the packet and waits for it to come online
+    /// (the "Waking…" overlay), without connecting. Routed through ContentView's HostWaker.
+    let wake: (StoredHost) -> Void
     /// Experimental game-library browser (gated) — the host-card "Browse Library…" action.
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = false
+    /// The host being edited (name / address / port / Wake-on-LAN MAC) — drives the edit sheet.
+    @State private var editTarget: StoredHost?
 
     var body: some View {
         NavigationStack {
@@ -126,6 +131,13 @@ struct HomeView: View {
         .sheet(isPresented: $showAddHost) {
             AddHostSheet { store.add($0) }
         }
+        .sheet(item: $editTarget) { host in
+            // Prefill the MAC from the live advert when the host hasn't stored one yet.
+            AddHostSheet(
+                existing: host,
+                suggestedMacs: discovery.hosts.first { host.matches($0) }?.macAddresses ?? [],
+                onSave: { store.update($0) })
+        }
         #if os(iOS)
         // SettingsView owns its own NavigationSplitView (sidebar + detail) and Done button, so it
         // is presented directly — wrapping it in a NavigationStack here would nest a split view in
@@ -155,13 +167,8 @@ struct HomeView: View {
             onForget: { store.forgetIdentity(host) },
             onRemove: { store.remove(host) },
             onBrowseLibrary: onBrowseLibrary,
-            onWake: {
-                let macs = host.wakeMacs
-                let ip = host.address
-                DispatchQueue.global(qos: .userInitiated).async {
-                    PunktfunkConnection.wakeOnLAN(macs: macs, lastKnownIP: ip)
-                }
-            })
+            onWake: { wake(host) },
+            onEdit: { editTarget = host })
     }
 
     private var discoveredSection: some View {

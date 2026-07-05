@@ -98,6 +98,13 @@ final class HostStore: ObservableObject {
         hosts.removeAll { $0.id == host.id }
     }
 
+    /// Replace a saved host in place (the edit sheet) — matched by id, so identity/pin/last-connected
+    /// carried on the passed value are preserved.
+    func update(_ host: StoredHost) {
+        guard let i = hosts.firstIndex(where: { $0.id == host.id }) else { return }
+        hosts[i] = host
+    }
+
     func markConnected(_ hostID: UUID) {
         guard let i = hosts.firstIndex(where: { $0.id == hostID }) else { return }
         hosts[i].lastConnected = Date()

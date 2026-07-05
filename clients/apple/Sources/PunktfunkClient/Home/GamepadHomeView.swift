@@ -44,8 +44,8 @@ private struct HomeTile: Identifiable {
     var hasLibrary = false
     /// Shows this SF symbol in the badge instead of the title monogram (the Add Host tile).
     var icon: String?
-    /// Whether the detail panel shows the online/paired pill (hosts yes, actions no).
-    var showsStatus = true
+    /// Offline saved host we hold a MAC for (and WoL is available) — activating it wakes first.
+    var canWake = false
     let activate: () -> Void
 }
 
@@ -54,6 +54,9 @@ struct GamepadHomeView: View {
     @ObservedObject var model: SessionModel
     @ObservedObject var discovery: HostDiscovery
     @Binding var libraryTarget: StoredHost?
+    /// Wake-and-wait driver — gates the carousel while its overlay is up, and the carousel's
+    /// activate routes an offline+wakeable host through it (see ContentView.startSession).
+    @ObservedObject var waker: HostWaker
     let connect: (StoredHost) -> Void
     let connectDiscovered: (DiscoveredHost) -> Void
 
@@ -84,8 +87,11 @@ struct GamepadHomeView: View {
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
             GamepadHintBar(hints: hints)
-                .padding(.leading, 22)
-                .padding(.vertical, compact ? 6 : 10)
+                // Equal distance from the left and bottom edges — the pill's corner inset was the
+                // real asymmetry (leading 22 vs bottom 10), not its internal padding.
+                .padding(.leading, compact ? 12 : 18)
+                .padding(.bottom, compact ? 12 : 18)
+                .padding(.top, compact ? 4 : 8)
         }
         .background { GamepadScreenBackground() }
         .onAppear { discovery.start() }
@@ -115,13 +121,13 @@ struct GamepadHomeView: View {
 
     @ViewBuilder private func hero(for size: CGSize) -> some View {
         let cardWidth = min(340, size.width * 0.84)
-        // 96 ≈ the carousel's own vertical breathing (+40) plus the detail line (~54); clamp so
-        // the strip + detail always fit the region the safe-area insets leave.
-        let cardHeight = min(compact ? 170 : 210, max(118, size.height - 96))
+        // 48 ≈ the carousel's own vertical breathing (+40) plus a small margin; clamp so the strip
+        // always fits the region the pinned title / hints safe-area insets leave. (The old detail
+        // line below the strip is gone — it only re-printed what the centered card already shows.)
+        let cardHeight = min(compact ? 176 : 224, max(118, size.height - 48))
         VStack(spacing: compact ? 8 : 10) {
             Spacer(minLength: 0)
             carousel(cardWidth: cardWidth, cardHeight: cardHeight)
-            detailPanel
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -155,9 +161,9 @@ struct GamepadHomeView: View {
             onActivate: { $0.activate() },
             onSecondary: { openLibraryForSelected() },
             onTertiary: { showSettings = true },
-            // Stop consuming the controller while another screen is presented on top — otherwise
-            // the launcher navigates behind it (invisibly on iPhone, visibly on iPad's page sheet).
-            isActive: libraryTarget == nil && !showSettings && !showAddHost
+            // Stop consuming the controller while another screen (or the wake overlay) is on top —
+            // otherwise the launcher navigates behind it (invisibly on iPhone, visibly on iPad).
+            isActive: libraryTarget == nil && !showSettings && !showAddHost && waker.waking == nil
         ) { tile in
             hostCard(tile, size: CGSize(width: cardWidth, height: cardHeight))
         }
@@ -186,49 +192,14 @@ struct GamepadHomeView: View {
             }
     }
 
-    /// The "now focused" host, spelled out below the strip — empty (not hidden) so the layout
-    /// doesn't jump as the selection changes.
-    @ViewBuilder private var detailPanel: some View {
-        let tile = tiles.first { $0.id == selection }
-        VStack(spacing: 6) {
-            Text(tile?.title ?? " ")
-                .font(.geist(22, .bold, relativeTo: .title2))
-                .foregroundStyle(.white)
-                .lineLimit(1)
-            HStack(spacing: 10) {
-                Text(tile?.subtitle ?? " ")
-                    .font(.geist(13, relativeTo: .caption))
-                    .foregroundStyle(.white.opacity(0.6))
-                if let tile, tile.showsStatus {
-                    statusPill(online: tile.isOnline, paired: tile.isPaired)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, 24)
-        .animation(.smooth(duration: 0.25), value: selection)
-    }
-
-    private func statusPill(online: Bool, paired: Bool) -> some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(online ? Color.green : Color.white.opacity(0.35))
-                .frame(width: 6, height: 6)
-            Text(online ? "ONLINE" : "OFFLINE")
-            if paired { Text("· PAIRED") }
-        }
-        .font(.geist(11, .medium, relativeTo: .caption2))
-        .tracking(0.8)
-        .foregroundStyle(.white.opacity(0.55))
-    }
-
     // MARK: - Hint bar (pinned bottom-leading via safeAreaInset)
 
     private var hints: [GamepadHint] {
         let selected = tiles.first { $0.id == selection }
         var hints = [GamepadHint(
             glyph: buttonGlyph(\.buttonA, fallback: "a.circle"),
-            text: selected?.id == .addHost ? "Add Host" : "Connect")]
+            text: selected?.id == .addHost ? "Add Host"
+                : (selected?.canWake == true ? "Wake & Connect" : "Connect"))]
         if libraryEnabled, selected?.hasLibrary == true {
             hints.append(.init(glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "Library"))
         }
@@ -252,6 +223,8 @@ struct GamepadHomeView: View {
                 isConnecting: model.phase == .connecting && model.activeHost?.id == host.id,
                 filled: true,
                 hasLibrary: true,
+                canWake: PunktfunkConnection.wakeOnLANAvailable
+                    && !discovery.advertises(host) && !host.wakeMacs.isEmpty,
                 activate: { connect(host) })
         }
         let discovered = discovery.unsaved(among: store.hosts).map { d in
@@ -267,7 +240,6 @@ struct GamepadHomeView: View {
             title: "Add Host",
             subtitle: "Register a host by address",
             icon: "plus",
-            showsStatus: false,
             activate: { showAddHost = true })
         return saved + discovered + [add]
     }
@@ -291,14 +263,23 @@ private struct GamepadHostTile: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top) {
+            HStack(alignment: .top, spacing: 8) {
                 monogramBadge
                 Spacer(minLength: 0)
-                if tile.isOnline {
-                    Circle()
-                        .fill(Color.green)
-                        .frame(width: 9, height: 9)
-                        .shadow(color: .green.opacity(0.7), radius: 5)
+                // The status the removed detail panel used to spell out, now on the card itself: a
+                // lock for a paired (pinned-identity) host + a green pip when it's live on the LAN.
+                HStack(spacing: 7) {
+                    if tile.isPaired {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+                    if tile.isOnline {
+                        Circle()
+                            .fill(Color.green)
+                            .frame(width: 9, height: 9)
+                            .shadow(color: .green.opacity(0.7), radius: 5)
+                    }
                 }
             }
             Spacer(minLength: 0)
@@ -315,11 +296,11 @@ private struct GamepadHostTile: View {
         }
         .padding(20)
         .frame(width: size.width, height: size.height, alignment: .leading)
-        .background {
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .environment(\.colorScheme, .dark)
-        }
+        // Liquid Glass console tile — a brand wash marks a saved host as primary; discovered /
+        // Add-Host tiles stay neutral glass with a dashed edge. Glass clips to the shape itself.
+        .consoleGlass(
+            RoundedRectangle(cornerRadius: 26, style: .continuous),
+            tint: tile.filled ? Color.brand.opacity(0.20) : nil)
         .overlay {
             RoundedRectangle(cornerRadius: 26, style: .continuous)
                 .strokeBorder(
@@ -328,7 +309,6 @@ private struct GamepadHostTile: View {
                         startPoint: .top, endPoint: .bottom),
                     style: StrokeStyle(lineWidth: 1, dash: tile.filled ? [] : [6, 5]))
         }
-        .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
         .shadow(color: .black.opacity(0.45), radius: 20, y: 14)
     }
 

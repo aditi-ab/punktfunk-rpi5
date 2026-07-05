@@ -103,7 +103,7 @@ struct PairSheet: View {
                     TextField(
                         "PIN", text: $pin,
                         prompt: Text("Shown in the host's web console"))
-                        .font(.system(.title3, design: .monospaced))
+                        .font(.geistFixed(16)) // prominent, but on-brand mono (not oversized title3)
                         #if os(iOS)
                         .keyboardType(.numberPad)
                         #endif
@@ -134,6 +134,11 @@ struct PairSheet: View {
             }
             #if !os(tvOS)
         .formStyle(.grouped)
+        // Bring the grouped form's default system text down to the app's Geist scale so the sheet
+        // doesn't read oversized / out of place (matches AddHostSheet). The PIN field keeps its own
+        // explicit Geist Mono font.
+        .font(.geist(12, relativeTo: .callout))
+        .controlSize(.small)
         #endif
             HStack {
                 Button("Cancel", role: .cancel) {
