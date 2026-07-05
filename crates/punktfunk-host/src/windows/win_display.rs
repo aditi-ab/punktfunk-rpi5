@@ -469,7 +469,7 @@ pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<Save
         if p.targetInfo.id != keep_target_id {
             return None;
         }
-        let idx = p.sourceInfo.modeInfoIdx as usize;
+        let idx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
         let m = modes.get(idx)?;
         (m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
             .then(|| m.Anonymous.sourceMode.width as i32)
@@ -480,7 +480,7 @@ pub(crate) unsafe fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<Save
     // group would share one).
     let mut done = std::collections::HashSet::new();
     for p in paths.iter() {
-        let idx = p.sourceInfo.modeInfoIdx as usize;
+        let idx = p.sourceInfo.Anonymous.modeInfoIdx as usize;
         if !done.insert(idx) {
             continue;
         }
