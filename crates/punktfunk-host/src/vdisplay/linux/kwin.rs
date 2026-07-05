@@ -67,13 +67,19 @@ const VOUT_NAME: &str = "punktfunk";
 /// event (deprecated only since v6) for the node id, so cap the bind at 5.
 const MAX_VERSION: u32 = 5;
 
-/// The KWin virtual-display driver. Stateless — each [`create`](VirtualDisplay::create) spins up
-/// its own Wayland connection/thread that owns the resulting output.
-pub struct KwinDisplay;
+/// The KWin virtual-display driver. Carries the connecting client's cert fingerprint (set before
+/// [`create`](VirtualDisplay::create)) so a paired client gets a STABLE per-slot output NAME
+/// (`Virtual-punktfunk-<id>`) — KWin persists per-output config (scale/mode) keyed by name in
+/// `kwinoutputconfig.json`, so a stable name makes KDE reapply that client's scaling on reconnect
+/// (Stage 3). Each `create` spins up its own Wayland connection/thread that owns the output.
+#[derive(Default)]
+pub struct KwinDisplay {
+    client_fp: Option<[u8; 32]>,
+}
 
 impl KwinDisplay {
     pub fn new() -> Result<Self> {
-        Ok(KwinDisplay)
+        Ok(KwinDisplay::default())
     }
 }
 
@@ -82,14 +88,32 @@ impl VirtualDisplay for KwinDisplay {
         "kwin"
     }
 
+    fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
+        self.client_fp = fingerprint;
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
+        // Per-slot output name (Stage 3): the `identity` policy resolves the client to a stable id →
+        // `punktfunk-<id>` (KWin exposes `Virtual-punktfunk-<id>`, whose per-output config KWin
+        // persists by name). Shared / anonymous → the base `punktfunk` (today's single name). Linux
+        // defaults to Shared when unconfigured, so this is a no-op change until a policy opts in — AND
+        // it fixes the latent clash where two concurrent sessions both used `Virtual-punktfunk`.
+        let name = match crate::vdisplay::identity::resolve_slot(
+            self.client_fp,
+            (mode.width, mode.height),
+            crate::vdisplay::policy::Identity::Shared,
+        ) {
+            Some(id) => format!("{VOUT_NAME}-{id}"),
+            None => VOUT_NAME.to_string(),
+        };
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let (width, height) = (mode.width, mode.height);
+        let name_thread = name.clone();
         thread::Builder::new()
             .name("punktfunk-kwin-vout".into())
-            .spawn(move || virtual_output_thread(width, height, setup_tx, stop_thread))
+            .spawn(move || virtual_output_thread(width, height, name_thread, setup_tx, stop_thread))
             .context("spawn KWin virtual-output thread")?;
 
         let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
@@ -107,7 +131,7 @@ impl VirtualDisplay for KwinDisplay {
         // rejected custom mode leaves the output at 60 Hz). At ≤60 Hz there's nothing to install —
         // the source runs 60 Hz and the encoder downsamples — so carry the requested rate through.
         let achieved_hz = if mode.refresh_hz > 60 {
-            set_custom_refresh(width, height, mode.refresh_hz)
+            set_custom_refresh(width, height, mode.refresh_hz, &name)
         } else {
             mode.refresh_hz
         };
@@ -118,9 +142,9 @@ impl VirtualDisplay for KwinDisplay {
         // bootstrap output. Read from the policy (replacing the PUNKTFUNK_KWIN_VIRTUAL_PRIMARY boolean).
         use crate::vdisplay::policy::Topology;
         let restore = match crate::vdisplay::effective_topology() {
-            Topology::Exclusive => apply_virtual_primary(),
+            Topology::Exclusive => apply_virtual_primary(&name),
             Topology::Primary => {
-                apply_virtual_primary_only();
+                apply_virtual_primary_only(&name);
                 Vec::new() // nothing disabled → nothing to restore
             }
             Topology::Extend | Topology::Auto => Vec::new(),
@@ -140,8 +164,8 @@ impl VirtualDisplay for KwinDisplay {
 /// gave us. The apply command can report success yet leave the output at 60 Hz (mode rejected),
 /// and a silent rate mismatch surfaces downstream as judder / duplicated frames — so the caller
 /// paces the encoder to the *achieved* rate, not the requested one.
-fn set_custom_refresh(width: u32, height: u32, hz: u32) -> u32 {
-    let output = format!("Virtual-{VOUT_NAME}");
+fn set_custom_refresh(width: u32, height: u32, hz: u32, name: &str) -> u32 {
+    let output = format!("Virtual-{name}");
     let mhz = hz.saturating_mul(1000);
     let run = |arg: String| {
         std::process::Command::new("kscreen-doctor")
@@ -221,8 +245,8 @@ fn read_active_refresh(output: &str) -> Option<u32> {
 /// Names of currently-ENABLED outputs other than our `Virtual-punktfunk` — i.e. the headless
 /// session's bootstrap output(s), which hold the desktop by default. Parsed from `kscreen-doctor -j`
 /// (same source as [`read_active_refresh`]).
-fn other_enabled_outputs() -> Vec<String> {
-    let ours = format!("Virtual-{VOUT_NAME}");
+fn other_enabled_outputs(name: &str) -> Vec<String> {
+    let ours = format!("Virtual-{name}");
     let out = match std::process::Command::new("kscreen-doctor")
         .arg("-j")
         .output()
@@ -252,8 +276,8 @@ fn other_enabled_outputs() -> Vec<String> {
 /// desktop (KWin re-homes plasmashell + windows onto it). Returns the disabled outputs for the
 /// keepalive to re-enable on teardown. Best-effort: on failure, streaming continues (just possibly
 /// showing only the wallpaper) rather than failing the session.
-fn apply_virtual_primary() -> Vec<String> {
-    let ours = format!("Virtual-{VOUT_NAME}");
+fn apply_virtual_primary(name: &str) -> Vec<String> {
+    let ours = format!("Virtual-{name}");
     let kscreen = |args: &[String]| {
         std::process::Command::new("kscreen-doctor")
             .args(args)
@@ -270,7 +294,7 @@ fn apply_virtual_primary() -> Vec<String> {
         );
     }
     std::thread::sleep(Duration::from_millis(200));
-    let others = other_enabled_outputs();
+    let others = other_enabled_outputs(name);
     if !others.is_empty() {
         let args: Vec<String> = others
             .iter()
@@ -285,8 +309,8 @@ fn apply_virtual_primary() -> Vec<String> {
 /// **Primary** (Stage 2): make the streamed output the primary but KEEP the other outputs enabled
 /// (don't disable the bootstrap/physical) — so the shell re-homes onto the streamed surface while a
 /// physical screen stays usable. Nothing to restore on teardown (we disabled nothing).
-fn apply_virtual_primary_only() {
-    let ours = format!("Virtual-{VOUT_NAME}");
+fn apply_virtual_primary_only(name: &str) {
+    let ours = format!("Virtual-{name}");
     let ok = std::process::Command::new("kscreen-doctor")
         .arg(format!("output.{ours}.primary"))
         .status()
@@ -395,10 +419,11 @@ impl Dispatch<ScreencastStream, ()> for State {
 fn virtual_output_thread(
     width: u32,
     height: u32,
+    name: String,
     setup_tx: Sender<Result<u32, String>>,
     stop: Arc<AtomicBool>,
 ) {
-    if let Err(e) = run(width, height, &setup_tx, &stop) {
+    if let Err(e) = run(width, height, &name, &setup_tx, &stop) {
         // If we never delivered a node id, report the failure to the waiting opener.
         let _ = setup_tx.send(Err(format!("{e:#}")));
     }
@@ -438,6 +463,7 @@ pub fn is_available() -> bool {
 fn run(
     width: u32,
     height: u32,
+    name: &str,
     setup_tx: &Sender<Result<u32, String>>,
     stop: &AtomicBool,
 ) -> Result<()> {
@@ -460,7 +486,7 @@ fn run(
 
     // Create the virtual output sized to the client, cursor composited into the stream.
     let stream = screencast.stream_virtual_output(
-        VOUT_NAME.to_string(),
+        name.to_string(),
         width as i32,
         height as i32,
         1.0, // scale (logical == physical)

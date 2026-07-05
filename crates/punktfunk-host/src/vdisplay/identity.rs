@@ -18,6 +18,7 @@
 //! `pf-vdisplay-identity.json`) so ids — and the client→config association — survive host restarts.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -145,6 +146,42 @@ impl DisplayIdentityMap {
             let _ = std::fs::rename(&tmp, &self.path);
         }
     }
+}
+
+/// The process-wide identity map (persisted, loaded once). Shared by the Windows manager and the
+/// Linux KWin backend — never in the same process (a host runs one platform), so one instance ⇒ no
+/// clobbering of the shared `display-identity.json`.
+pub(crate) fn global() -> &'static Mutex<DisplayIdentityMap> {
+    static MAP: OnceLock<Mutex<DisplayIdentityMap>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(DisplayIdentityMap::load()))
+}
+
+/// Resolve the connecting client's stable slot id per the `identity` policy. When no policy is
+/// configured, `default` applies — **PerClient on Windows / Shared on Linux**, preserving each
+/// platform's historical behavior (Windows always keyed monitors per-client; Linux used one shared
+/// output name). `None` ⇒ shared / anonymous → the backend uses its base name / auto slot.
+pub(crate) fn resolve_slot(
+    fp: Option<[u8; 32]>,
+    mode: (u32, u32),
+    default: crate::vdisplay::policy::Identity,
+) -> Option<u32> {
+    use crate::vdisplay::policy::Identity;
+    let id_policy = crate::vdisplay::policy::prefs()
+        .configured_effective()
+        .map(|e| e.identity)
+        .unwrap_or(default);
+    let per_client_mode = match id_policy {
+        Identity::Shared => return None,
+        Identity::PerClient => false,
+        Identity::PerClientMode => true,
+    };
+    let fp = fp?;
+    Some(
+        global()
+            .lock()
+            .unwrap()
+            .resolve(&identity_key(fp, mode, per_client_mode)),
+    )
 }
 
 #[cfg(test)]
