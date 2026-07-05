@@ -995,7 +995,9 @@ async fn serve_session(
 
         let start = Start::decode(&io::read_msg(&mut recv).await?)
             .map_err(|e| anyhow!("Start decode: {e:?}"))?;
-        Ok::<_, anyhow::Error>((hello, welcome, udp_port, data_sock, direct, start, compositor))
+        Ok::<_, anyhow::Error>((
+            hello, welcome, udp_port, data_sock, direct, start, compositor,
+        ))
     };
     let (hello, welcome, udp_port, data_sock, direct, start, compositor) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
@@ -1206,11 +1208,20 @@ async fn serve_session(
     let _live_guard = {
         let id = endpoint::peer_fingerprint(&conn);
         let label = id
-            .map(|fp| fp.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>())
+            .map(|fp| {
+                fp.iter()
+                    .take(4)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            })
             .unwrap_or_else(|| "client".to_string());
         crate::vdisplay::admission::register(
             id,
-            (welcome.mode.width, welcome.mode.height, welcome.mode.refresh_hz),
+            (
+                welcome.mode.width,
+                welcome.mode.height,
+                welcome.mode.refresh_hz,
+            ),
             stop.clone(),
             label,
         )

@@ -132,9 +132,9 @@ async fn h_launch(
         return xml(error_xml()).into_response();
     }
     let req_fp: Option<[u8; 32]> = match &peer {
-        Some(Extension(PeerCertFingerprint(Some(fp)))) => {
-            hex::decode(fp).ok().and_then(|v| <[u8; 32]>::try_from(v).ok())
-        }
+        Some(Extension(PeerCertFingerprint(Some(fp)))) => hex::decode(fp)
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v).ok()),
         _ => None,
     };
 
@@ -156,7 +156,9 @@ async fn h_launch(
             GsDecision::Serve => {}
             GsDecision::Join((w, h, f)) => {
                 forced_mode = Some((w, h, f));
-                tracing::info!("GameStream launch JOIN — admitting at the live session's mode {w}x{h}@{f}");
+                tracing::info!(
+                    "GameStream launch JOIN — admitting at the live session's mode {w}x{h}@{f}"
+                );
             }
             GsDecision::Reject => {
                 tracing::warn!(

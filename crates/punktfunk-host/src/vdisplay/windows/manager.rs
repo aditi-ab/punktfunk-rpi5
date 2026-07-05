@@ -129,14 +129,22 @@ impl Monitor {
 
 enum MgrState {
     Idle,
-    Active { mon: Monitor, refs: u32 },
-    Lingering { mon: Monitor, until: Instant },
+    Active {
+        mon: Monitor,
+        refs: u32,
+    },
+    Lingering {
+        mon: Monitor,
+        until: Instant,
+    },
     /// `keep_alive = forever` (gaming-rig): the monitor is kept indefinitely after the last session
     /// leaves — like `Lingering` but the linger timer never tears it down. A reconnect preempts +
     /// recreates it (same as `Lingering`, since a reused IddCx swap-chain is dead); only the mgmt
     /// `/display/release` (or host shutdown) frees it. The physical screens stay off (exclusive) for
     /// the box's life — the §8 release-now escape hatch (`force_release`) is the way back.
-    Pinned { mon: Monitor },
+    Pinned {
+        mon: Monitor,
+    },
 }
 
 /// The manager's control-device cache. Reopenable: a driver upgrade / WUDFHost restart kills the

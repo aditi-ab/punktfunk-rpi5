@@ -816,7 +816,10 @@ fn stream_body(
                     dropped_batches += 1;
                     recover_after_drop = true; // re-anchor the reference chain on the next frame
                     if dropped_batches.is_power_of_two() {
-                        tracing::warn!(dropped_batches, "video: pipeline queue full — frame dropped");
+                        tracing::warn!(
+                            dropped_batches,
+                            "video: pipeline queue full — frame dropped"
+                        );
                     }
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
@@ -1019,8 +1022,14 @@ mod tests {
             let (chunk, steps) = pace_layout(n);
             assert!(steps >= 1, "n={n}: at least one step");
             assert!(steps <= 12, "n={n}: step count {steps} exceeded the cap");
-            assert!(chunk >= 16, "n={n}: chunk {chunk} below the 16-packet floor");
-            assert!(chunk * steps >= n, "n={n}: {chunk}×{steps} must cover all packets");
+            assert!(
+                chunk >= 16,
+                "n={n}: chunk {chunk} below the 16-packet floor"
+            );
+            assert!(
+                chunk * steps >= n,
+                "n={n}: {chunk}×{steps} must cover all packets"
+            );
         }
         // Small frames stay on the floor: one 16-packet burst.
         assert_eq!(pace_layout(1), (16, 1));

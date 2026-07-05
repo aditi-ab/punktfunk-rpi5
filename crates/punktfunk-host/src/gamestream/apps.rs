@@ -274,7 +274,10 @@ mod tests {
         );
         // No pretty-print newlines anywhere in the element stream, and no whitespace-only text
         // nodes between any adjacent tags.
-        assert!(!xml.contains('\n'), "applist must contain no newlines: {xml}");
+        assert!(
+            !xml.contains('\n'),
+            "applist must contain no newlines: {xml}"
+        );
         assert!(
             !xml.contains("> <"),
             "applist must contain no inter-element spaces: {xml}"

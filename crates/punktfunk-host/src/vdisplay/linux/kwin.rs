@@ -364,7 +364,10 @@ fn other_enabled_outputs() -> Vec<String> {
 /// then sets itself primary — the pre-group behavior). Recent kscreen marks the primary with
 /// `"priority": 1`; older builds used a `"primary": true` bool — accept either.
 fn a_managed_output_is_primary() -> bool {
-    let Ok(out) = std::process::Command::new("kscreen-doctor").arg("-j").output() else {
+    let Ok(out) = std::process::Command::new("kscreen-doctor")
+        .arg("-j")
+        .output()
+    else {
         return false;
     };
     let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
