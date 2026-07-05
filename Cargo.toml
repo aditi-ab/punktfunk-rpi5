@@ -17,7 +17,7 @@ members = [
 exclude = ["packaging/linux/steam-deck-gadget/usbip-poc"]
 
 [workspace.package]
-version = "0.7.4"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
