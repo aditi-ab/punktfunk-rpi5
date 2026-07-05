@@ -53,23 +53,31 @@ journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
 ## Firewall
 
 **Debian ships no firewall and Ubuntu's `ufw` is installed-but-inactive by default**, so out of the
-box there is nothing to open. If you run one, open the ports the host listens on.
-
-If you use **firewalld**, the `punktfunk-host` package installs service definitions to
-`/usr/lib/firewalld/services/` (not auto-enabled), so it's one command:
+box there is nothing to open. If you turn one on, the `punktfunk-host` package ships a one-liner
+opener for both **ufw** and **firewalld** (neither auto-enabled):
 
 ```sh
+# ufw (Ubuntu) — profile at /etc/ufw/applications.d/punktfunk, read at once (no reload):
+sudo ufw allow punktfunk-native        # the default native host
+sudo ufw allow punktfunk-gamestream    # …add for Moonlight compat
+
+# firewalld — service definitions at /usr/lib/firewalld/services/:
 sudo firewall-cmd --reload                                          # load the installed definition
-sudo firewall-cmd --permanent --add-service=punktfunk-native        # the default native host
+sudo firewall-cmd --permanent --add-service=punktfunk-native
 #                              --add-service=punktfunk-gamestream    # …add for Moonlight compat
 sudo firewall-cmd --reload
 ```
 
-Otherwise open the ports directly. The **native `punktfunk/1`** plane:
+If you installed the **web console** (`punktfunk-web`) and want it reachable from another device,
+open its port with the matching one-liner — `sudo ufw allow punktfunk-web` or `sudo firewall-cmd
+--permanent --add-service=punktfunk-web && sudo firewall-cmd --reload` — which opens **TCP 47992**
+(HTTPS, login-gated). The mgmt API (47990) stays loopback-only.
+
+Prefer explicit rules? Open the ports directly. The **native `punktfunk/1`** plane:
 
 - **QUIC control plane: UDP 9777** (`serve --native-port N` to change).
-- **Data plane: an *ephemeral* UDP port** — negotiated per session, so there is no fixed port to
-  open. For a restrictive firewall you'd need to allow a UDP range (the repo does not pin one).
+- **Data plane: an *ephemeral* UDP port** the client hole-punches — nothing to open inbound as long
+  as outbound UDP is allowed (the host streams back out through the client-opened path).
 
 And the **GameStream / Moonlight** ports (fixed) — only needed if you run the host with
 `serve --gamestream` (opt-in, trusted LAN only); bare `serve` is native-only and doesn't open these:
@@ -85,14 +93,14 @@ And the **GameStream / Moonlight** ports (fixed) — only needed if you run the 
 The mgmt API (TCP 47990) binds to loopback by default — leave it closed unless you move it off
 loopback with `--mgmt-bind IP:PORT` (which then requires `--mgmt-token`).
 
-With `ufw`:
+With `ufw` (explicit ports, instead of the shipped profile):
 
 ```sh
 sudo ufw allow 9777/udp                                 # punktfunk/1 control plane
 sudo ufw allow 47984/tcp && sudo ufw allow 47989/tcp && sudo ufw allow 48010/tcp
-sudo ufw allow 47998:48010/udp
-sudo ufw allow 5353/udp
-# plus the ephemeral punktfunk/1 data port — open a UDP range you reserve for it.
+sudo ufw allow 47998,47999,48000/udp                    # GameStream video/control/audio
+sudo ufw allow 5353/udp                                 # mDNS discovery
+# The punktfunk/1 data plane is an ephemeral UDP port the host hole-punches — nothing to open here.
 ```
 
 With raw `nftables` (add to your `inet filter input` chain):

@@ -109,28 +109,40 @@ To set your own, edit that file and `systemctl --user restart punktfunk-web`. Fo
 ## 5. Open the firewall (if you have one)
 
 **Stock Arch ships no firewall** — every port is already open, so you can skip this. But **CachyOS
-enables `firewalld` by default**, and an Arch package never opens ports for you (it won't touch your
-running firewall), so on CachyOS the host is unreachable until you allow it.
+enables `ufw` by default** (firewalld is not installed), and some other spins (e.g. EndeavourOS)
+enable **`firewalld`** — an Arch package never opens ports for you, so on those the host is
+unreachable until you allow it.
 
-The `punktfunk-host` package installs **firewalld service definitions** for exactly this, so
-enabling is one command. Reload once so firewalld sees the just-installed definition, add the
-service, then reload to apply:
+The `punktfunk-host` package installs openers for **both**, so it's a one-liner whichever you run:
 
 ```sh
-sudo firewall-cmd --reload
-sudo firewall-cmd --permanent --add-service=punktfunk-native       # the default native host
-#                              --add-service=punktfunk-gamestream   # …or add this for Moonlight compat
+# ufw — CachyOS (and Ubuntu, once you enable ufw):
+sudo ufw allow punktfunk-native        # the secure native host (the default)
+sudo ufw allow punktfunk-gamestream    # …also this if you run `serve --gamestream` (Moonlight)
+
+# firewalld — Fedora-like spins (EndeavourOS, …):
+sudo firewall-cmd --reload                                    # load the installed definition
+sudo firewall-cmd --permanent --add-service=punktfunk-native
 sudo firewall-cmd --reload
 ```
 
 `punktfunk-native` opens the QUIC control port (UDP 9777) + mDNS discovery; add
 `punktfunk-gamestream` as well if you run `serve --gamestream` (the fixed Moonlight ports + mDNS).
-The media **data plane** uses an *ephemeral* UDP port per session (nothing fixed to open); a
-restrictive firewall must also allow a UDP range. The web console (47992) and mgmt API (47990,
-loopback-only) are **not** opened by these — reach the console from the host box, or open 47992
-yourself if you want it on the LAN. Not on firewalld? See
-[`packaging/arch/README.md`](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/arch/README.md#firewall)
-for the `ufw`/`nftables` port lists.
+The media **data plane** uses an *ephemeral* UDP port that the client opens with a hole-punch — the
+host streams back out through the path the client opened, so there's **nothing fixed to open** as
+long as the firewall allows outbound UDP (the default for both ufw and firewalld).
+
+Enabled the **web console** (`punktfunk-web`, above) and want to reach it from your phone or another
+machine? It's not opened by the streaming rules — open its port too, the same one-liner way:
+
+```sh
+sudo ufw allow punktfunk-web                                                            # ufw
+sudo firewall-cmd --permanent --add-service=punktfunk-web && sudo firewall-cmd --reload  # firewalld
+```
+
+That opens **TCP 47992** (HTTPS, login-gated). The mgmt API (47990) stays loopback-only and is never
+opened. Full port lists (`nftables`, explicit ports) are in
+[`packaging/arch/README.md`](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/arch/README.md#firewall).
 
 ## 6. Connect a client
 

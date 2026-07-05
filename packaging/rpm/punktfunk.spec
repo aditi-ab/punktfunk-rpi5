@@ -266,6 +266,9 @@ install -Dm0644 packaging/linux/punktfunk-gamestream.xml \
                 %{buildroot}%{_prefix}/lib/firewalld/services/punktfunk-gamestream.xml
 install -Dm0644 packaging/linux/punktfunk-native.xml \
                 %{buildroot}%{_prefix}/lib/firewalld/services/punktfunk-native.xml
+# Web console opener (TCP 47992) — only meaningful with the web subpackage, opened deliberately.
+install -Dm0644 packaging/linux/punktfunk-web.xml \
+                %{buildroot}%{_prefix}/lib/firewalld/services/punktfunk-web.xml
 
 %if %{with web}
 # --- web console subpackage (punktfunk-web) ---
@@ -298,6 +301,7 @@ install -Dm0644 web/web.env.example                %{buildroot}%{_datadir}/punkt
 %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf
 %{_prefix}/lib/firewalld/services/punktfunk-gamestream.xml
 %{_prefix}/lib/firewalld/services/punktfunk-native.xml
+%{_prefix}/lib/firewalld/services/punktfunk-web.xml
 %{_userunitdir}/punktfunk-host.service
 %{_userunitdir}/punktfunk-kde-session.service
 %{_datadir}/applications/io.unom.Punktfunk.Host.desktop

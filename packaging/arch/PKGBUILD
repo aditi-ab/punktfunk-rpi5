@@ -134,14 +134,22 @@ package_punktfunk-host() {
   install -Dm0644 "$R/packaging/bazzite/gamescope-headless-session" \
     "$pkgdir/etc/gamescope-session-plus/sessions.d/steam"
   install -Dm0644 "$R/api/openapi.json"                 "$pkgdir/usr/share/punktfunk/openapi.json"
-  # firewalld service definitions — NOT auto-enabled (Arch packages never touch the admin's
-  # firewall). Stock Arch ships none, so they're a no-op there; CachyOS et al. ship firewalld, so
-  #   sudo firewall-cmd --reload && sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload
-  # (or =punktfunk-native). See README.md → Firewall.
+  # Firewall openers — NOT auto-enabled (an Arch package never touches the admin's running firewall).
+  # Stock Arch ships no firewall; CachyOS ships ufw; some spins (EndeavourOS) enable firewalld — so we
+  # install BOTH a ufw application profile and firewalld service definitions, and the one for whatever
+  # firewall you actually run is a one-liner. See README.md → Firewall.
+  #   ufw:       sudo ufw allow punktfunk-native            (or punktfunk-gamestream)
+  #   firewalld: sudo firewall-cmd --reload && sudo firewall-cmd --permanent --add-service=punktfunk-native && sudo firewall-cmd --reload
+  install -Dm0644 "$R/packaging/linux/punktfunk.ufw" \
+    "$pkgdir/etc/ufw/applications.d/punktfunk"
   install -Dm0644 "$R/packaging/linux/punktfunk-gamestream.xml" \
     "$pkgdir/usr/lib/firewalld/services/punktfunk-gamestream.xml"
   install -Dm0644 "$R/packaging/linux/punktfunk-native.xml" \
     "$pkgdir/usr/lib/firewalld/services/punktfunk-native.xml"
+  # Web console opener (TCP 47992) — only meaningful with the optional punktfunk-web package; opened
+  # deliberately (see README.md → Firewall). ufw's equivalent is the punktfunk-web profile above.
+  install -Dm0644 "$R/packaging/linux/punktfunk-web.xml" \
+    "$pkgdir/usr/lib/firewalld/services/punktfunk-web.xml"
   install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-MIT"
   install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-host/LICENSE-APACHE"
   install -Dm0644 "$R/README.md"      "$pkgdir/usr/share/doc/punktfunk-host/README.md"

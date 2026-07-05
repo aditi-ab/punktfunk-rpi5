@@ -1,0 +1,38 @@
+# ufw application profile for the punktfunk host — installed to
+# /etc/ufw/applications.d/punktfunk by the .deb and the Arch/CachyOS package.
+#
+# This is the ufw analogue of the firewalld service definitions
+# (punktfunk-native.xml / punktfunk-gamestream.xml): it turns opening the host's
+# ports into a one-liner on the distros that use ufw instead of firewalld
+# (CachyOS ships ufw enabled; Debian/Ubuntu ship it installed-but-inactive). ufw
+# reads this directory on every command, so no reload is needed after the
+# package drops the file — just:
+#
+#     sudo ufw allow punktfunk-native        # the secure native punktfunk/1 host (the default)
+#     sudo ufw allow punktfunk-gamestream    # add GameStream/Moonlight compat (opt-in)
+#     sudo ufw allow punktfunk-web           # reach the web console from the LAN (if punktfunk-web is installed)
+#     sudo ufw app info punktfunk-native     # show what a profile opens
+#
+# Same port map as the firewalld services. The punktfunk/1 DATA plane is an
+# ephemeral UDP port chosen per session and is NOT listed here: the host
+# hole-punches, so a deny-inbound firewall still works (it just adds ~2.5 s at
+# session start). To open a fixed one instead, run the host with
+# `serve --data-port 9778` and `sudo ufw allow 9778/udp`.
+
+[punktfunk-native]
+title=punktfunk host (native punktfunk/1)
+description=punktfunk/1 native streaming: QUIC control plane + mDNS auto-discovery
+ports=9777/udp|5353/udp
+
+[punktfunk-gamestream]
+title=punktfunk host (GameStream/Moonlight)
+description=GameStream/Moonlight compatibility ports (opt-in, trusted LAN only)
+ports=47984,47989,48010/tcp|47998:48010/udp|5353/udp
+
+# The optional web console (the separate punktfunk-web package). Open only if you installed it and
+# want to reach it from another device — it binds all interfaces on TCP 47992 (HTTPS, login-gated).
+# The mgmt API (47990) is loopback-only and is deliberately not covered here.
+[punktfunk-web]
+title=punktfunk web console
+description=The optional punktfunk management web console (HTTPS, login-gated) reachable from the LAN
+ports=47992/tcp

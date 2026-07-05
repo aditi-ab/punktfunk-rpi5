@@ -80,13 +80,19 @@ install -Dm0644 scripts/host.env.example           "$SHAREDIR/host.env.example"
 install -Dm0644 packaging/bazzite/host.env         "$SHAREDIR/host.env.bazzite"
 install -Dm0644 packaging/kde/host.env             "$SHAREDIR/host.env.kde"
 install -Dm0644 api/openapi.json              "$SHAREDIR/openapi.json"
-# firewalld service definitions (shared across all Linux packaging). NOT auto-enabled — the postinst
-# only prints the enable command when firewalld is present. Debian/Ubuntu ship no active firewall
-# (Ubuntu's ufw is installed-but-inactive), so these are a no-op unless the admin runs firewalld.
+# Firewall openers (shared across all Linux packaging), NOT auto-enabled — the postinst prints the
+# enable command for whichever firewall is present. Debian ships none and Ubuntu's ufw is
+# installed-but-inactive, so these are a no-op until the admin turns a firewall on.
+install -Dm0644 packaging/linux/punktfunk.ufw \
+                "$STAGE/etc/ufw/applications.d/punktfunk"
 install -Dm0644 packaging/linux/punktfunk-gamestream.xml \
                 "$STAGE/usr/lib/firewalld/services/punktfunk-gamestream.xml"
 install -Dm0644 packaging/linux/punktfunk-native.xml \
                 "$STAGE/usr/lib/firewalld/services/punktfunk-native.xml"
+# Web console opener (TCP 47992) — only meaningful with the optional punktfunk-web package; opened
+# deliberately (see README.md → Firewall). ufw's equivalent is the punktfunk-web profile above.
+install -Dm0644 packaging/linux/punktfunk-web.xml \
+                "$STAGE/usr/lib/firewalld/services/punktfunk-web.xml"
 install -Dm0644 LICENSE-MIT                         "$DOCDIR/LICENSE-MIT"
 install -Dm0644 LICENSE-APACHE                      "$DOCDIR/LICENSE-APACHE"
 install -Dm0644 README.md                           "$DOCDIR/README.md"
@@ -193,11 +199,14 @@ if [ "$1" = "configure" ]; then
     echo "    sudo usermod -aG input \"\$USER\"   # then re-login"
     echo "Config:  mkdir -p ~/.config/punktfunk && cp /usr/share/punktfunk-host/host.env.example ~/.config/punktfunk/host.env"
     echo "Enable:  systemctl --user enable --now punktfunk-host"
-    # Debian/Ubuntu ship no active firewall; only hint firewalld users (ufw users: see README).
+    # Debian ships no active firewall and Ubuntu's ufw is inactive by default; hint whichever is present.
+    if command -v ufw >/dev/null 2>&1; then
+        echo "Firewall (ufw detected): sudo ufw allow punktfunk-native   (or punktfunk-gamestream for Moonlight)"
+    fi
     if command -v firewall-cmd >/dev/null 2>&1; then
         echo "Firewall (firewalld detected): sudo firewall-cmd --reload &&"
-        echo "    sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload"
-        echo "    (use punktfunk-native for the native-only host)"
+        echo "    sudo firewall-cmd --permanent --add-service=punktfunk-native && sudo firewall-cmd --reload"
+        echo "    (use punktfunk-gamestream for the Moonlight-compat host)"
     fi
 fi
 exit 0

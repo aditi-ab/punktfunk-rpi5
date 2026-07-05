@@ -5,8 +5,9 @@
 
   Installed to /usr/lib/firewalld/services/ by the punktfunk-host package. NOT enabled automatically
   (packages never touch the admin's firewall). Stock Arch/Debian ship no active firewall; Fedora/RHEL
-  and CachyOS enable firewalld by default, so enable it once with firewall-cmd
-  (add-service=punktfunk-native, then reload). Exact commands: your distro's install guide, or the
+  and some Arch spins (EndeavourOS) enable firewalld by default, so enable it once with firewall-cmd
+  (add-service=punktfunk-native, then reload). CachyOS and Ubuntu use ufw instead — the package also
+  ships a ufw application profile (punktfunk.ufw). Exact commands: your distro's install guide, or the
   per-distro packaging README (Firewall section).
 
   The media DATA plane binds an EPHEMERAL UDP port (0.0.0.0:0) chosen per session and reported to the

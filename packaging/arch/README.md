@@ -139,33 +139,45 @@ so it's a much lighter sysext than the host.
 
 **Stock Arch ships no firewall** — every port is open by default, so there is nothing to do.
 Spins that enable one **do not** get their ports opened for you: an Arch package never touches the
-admin's running firewall. **CachyOS is the common case** — its installer turns on `firewalld` by
-default, so out of the box the host is unreachable until you allow it.
+admin's running firewall. **CachyOS is the common case** — it ships `ufw` enabled by default (not
+firewalld), so out of the box the host is unreachable until you allow it. Some other spins (e.g.
+EndeavourOS) enable `firewalld` instead.
 
-The `punktfunk-host` package ships **firewalld service definitions** (installed to
-`/usr/lib/firewalld/services/`) so enabling is one command — pick the plane your host serves:
+The `punktfunk-host` package ships openers for **both** — a ufw application profile
+(`/etc/ufw/applications.d/punktfunk`) and firewalld service definitions
+(`/usr/lib/firewalld/services/`) — so enabling is one command whichever you run:
 
 ```sh
-# Reload once so firewalld picks up the just-installed service definition, add it, reload to apply.
-sudo firewall-cmd --reload
-sudo firewall-cmd --permanent --add-service=punktfunk-gamestream   # Moonlight/GameStream host
-#                              --add-service=punktfunk-native       # …or the native-only host
+# ufw (CachyOS, and Ubuntu once you enable ufw) — reads the profile at once, no reload needed:
+sudo ufw allow punktfunk-native        # the native-only host (the default)
+sudo ufw allow punktfunk-gamestream    # …or add this for the Moonlight/GameStream host
+
+# firewalld (EndeavourOS and other Fedora-like spins):
+sudo firewall-cmd --reload                                        # pick up the installed def
+sudo firewall-cmd --permanent --add-service=punktfunk-native
+#                              --add-service=punktfunk-gamestream  # …for the Moonlight host
 sudo firewall-cmd --reload
 ```
 
 `punktfunk-gamestream` opens the fixed Moonlight ports + mDNS; `punktfunk-native` opens the QUIC
 control port (UDP 9777) + mDNS. Enable both if the host runs `serve --gamestream` (which serves
-both planes). The **data plane is an *ephemeral* UDP port** negotiated per session, so there is no
-fixed data port in either service; a restrictive firewall must additionally allow a UDP range (the
-project does not pin one). The mgmt REST API (TCP 47990) binds to loopback by default — leave it
-closed unless you move it off loopback with `--mgmt-bind IP:PORT` (which then requires
-`--mgmt-token`).
+both planes). The **data plane is an *ephemeral* UDP port** the client opens with a hole-punch, so
+there is no fixed data port in either service — the host streams back out through the path the
+client opened, which any firewall that allows outbound UDP (the default) passes. The mgmt REST API
+(TCP 47990) binds to loopback by default — leave it closed unless you move it off loopback with
+`--mgmt-bind IP:PORT` (which then requires `--mgmt-token`).
 
-For a non-firewalld setup, open the ports directly. The **native `punktfunk/1`** plane:
+If you installed the **web console** (`punktfunk-web`) and want it reachable from another device,
+open its port with the matching one-liner — `sudo ufw allow punktfunk-web` or `sudo firewall-cmd
+--permanent --add-service=punktfunk-web && sudo firewall-cmd --reload` — which opens **TCP 47992**
+(HTTPS, login-gated). The mgmt API (47990) stays loopback-only.
+
+Prefer explicit rules (or a firewall the shipped profiles don't cover)? Open the ports directly.
+The **native `punktfunk/1`** plane:
 
 - **QUIC control plane: UDP 9777** (`serve --native-port N` to change).
-- **Data plane: an *ephemeral* UDP port** — negotiated per session, so there is no fixed port to
-  open. For a restrictive firewall you'd need to allow a UDP range (the repo does not pin one).
+- **Data plane: an *ephemeral* UDP port** the client hole-punches — nothing to open inbound as long
+  as outbound UDP is allowed (the host streams back out through the client-opened path).
 
 And the **GameStream / Moonlight** ports (fixed) — only needed if you run the host with
 `serve --gamestream` (opt-in, trusted LAN only); bare `serve` is native-only and doesn't open these:
@@ -181,14 +193,14 @@ And the **GameStream / Moonlight** ports (fixed) — only needed if you run the 
 The mgmt API (TCP 47990) binds to loopback by default — leave it closed unless you move it off
 loopback with `--mgmt-bind IP:PORT` (which then requires `--mgmt-token`).
 
-With `ufw`:
+With `ufw` (explicit ports, instead of the shipped `punktfunk-native`/`punktfunk-gamestream` profile):
 
 ```sh
 sudo ufw allow 9777/udp                                 # punktfunk/1 control plane
 sudo ufw allow 47984/tcp && sudo ufw allow 47989/tcp && sudo ufw allow 48010/tcp
-sudo ufw allow 47998:48010/udp
-sudo ufw allow 5353/udp
-# plus the ephemeral punktfunk/1 data port — open a UDP range you reserve for it.
+sudo ufw allow 47998,47999,48000/udp                    # GameStream video/control/audio
+sudo ufw allow 5353/udp                                 # mDNS discovery
+# The punktfunk/1 data plane is an ephemeral UDP port the host hole-punches — nothing to open here.
 ```
 
 With raw `nftables` (add to your `inet filter input` chain):
@@ -196,18 +208,20 @@ With raw `nftables` (add to your `inet filter input` chain):
 ```
 udp dport 9777 accept                  # punktfunk/1 control plane
 tcp dport { 47984, 47989, 48010 } accept
-udp dport { 47998-48010, 5353 } accept
-# plus the ephemeral punktfunk/1 data port (a reserved UDP range).
+udp dport { 47998-48000, 5353 } accept # GameStream video/control/audio + mDNS
+# The punktfunk/1 data plane is an ephemeral UDP port the host hole-punches — a stateful chain that
+# accepts ct state established,related (as this one should) passes the return with nothing extra.
 ```
 
 ## Files
 - `PKGBUILD` — split package: `punktfunk-host` + `punktfunk-client` (builds the working tree via
   `PF_SRCDIR`, or a git tag for AUR).
 - `punktfunk-host.install` / `punktfunk-client.install` — pacman scriptlets (udev reload + sysctl +
-  first-run hint, incl. the firewalld enable command when firewalld is present), mirror the RPM
+  first-run hint, incl. the ufw/firewalld enable command for whichever is present), mirror the RPM
   `%post` / deb postinst.
-- The firewalld service definitions (`punktfunk-gamestream.xml` / `punktfunk-native.xml`) are shared
-  across all Linux packaging and live in [`../linux/`](../linux/); the host package installs them to
-  `/usr/lib/firewalld/services/` (not auto-enabled; see Firewall above).
+- The firewall openers are shared across all Linux packaging and live in [`../linux/`](../linux/):
+  the ufw application profile (`punktfunk.ufw` → `/etc/ufw/applications.d/punktfunk`) and the
+  firewalld service definitions (`punktfunk-native.xml` / `punktfunk-gamestream.xml` /
+  `punktfunk-web.xml` → `/usr/lib/firewalld/services/`). None auto-enabled; see Firewall above.
 - `build-sysext.sh` — wraps either built `.pkg.tar.zst` into a `systemd-sysext` `.raw` for SteamOS
   (derives the name from the package, so it works for host or client).

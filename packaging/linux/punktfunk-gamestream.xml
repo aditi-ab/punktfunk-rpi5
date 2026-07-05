@@ -4,9 +4,10 @@
 
   Installed to /usr/lib/firewalld/services/ by the punktfunk-host package. It is NOT enabled
   automatically: an Arch package never touches the admin's running firewall. Stock Arch ships no
-  firewall (these ports are already open); Fedora/RHEL and CachyOS enable firewalld by default, so
-  enable it once with firewall-cmd (add-service=punktfunk-gamestream, then reload). Exact commands:
-  your distro's install guide, or the per-distro packaging README (Firewall section).
+  firewall (these ports are already open); Fedora/RHEL and some Arch spins (EndeavourOS) enable
+  firewalld by default, so enable it once with firewall-cmd (add-service=punktfunk-gamestream, then
+  reload). CachyOS and Ubuntu use ufw instead — the package also ships a ufw application profile
+  (punktfunk.ufw). Exact commands: your distro's install guide, or the per-distro packaging README.
 
   Needed only when the host runs GameStream/Moonlight compat (serve with the gamestream flag). The
   mgmt REST API (TCP 47990) stays on loopback by default and is deliberately not opened here.

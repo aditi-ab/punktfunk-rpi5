@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  firewalld service definition for the punktfunk management web console (the optional punktfunk-web
+  package: device pairing, status, GPU selection, performance graphs).
+
+  Installed to /usr/lib/firewalld/services/ by the punktfunk-host package. NOT enabled automatically
+  (packages never touch the admin's firewall). Only useful if you installed the console (punktfunk-web)
+  AND want to reach it from another device on the LAN — the console binds all interfaces on TCP 47992
+  (HTTPS, login-gated). The streaming host itself does not need this open; enable it deliberately with
+  firewall-cmd (add-service=punktfunk-web, then reload). CachyOS/Ubuntu: use the ufw punktfunk-web
+  profile instead.
+
+  The mgmt REST API (TCP 47990) is a different, loopback-only surface (the console proxies to it
+  locally) and is deliberately NOT opened here.
+-->
+<service>
+  <short>Punktfunk web console</short>
+  <description>The optional punktfunk management web console (device pairing, status, GPU selection, performance graphs) over HTTPS. Open only if you run the punktfunk-web package and want the console reachable from other devices on the LAN.</description>
+  <port protocol="tcp" port="47992"/>  <!-- HTTPS web console (login-gated) -->
+</service>

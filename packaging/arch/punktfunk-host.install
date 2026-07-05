@@ -17,15 +17,24 @@ punktfunk-host installed.
 NOTE: encode is NVENC-only. Install 'nvidia-utils' on an NVIDIA host. An AMD Steam Deck is NOT
       yet supported — it needs a VAAPI (hevc_vaapi) encoder backend (see packaging/arch/README.md).
 MSG
-  # Firewall: stock Arch ships none (ports already open), but CachyOS et al. enable firewalld. We
-  # install firewalld service definitions but never touch the running firewall — just point the way.
+  # Firewall: stock Arch ships none (ports already open); CachyOS ships ufw; some spins (EndeavourOS)
+  # enable firewalld. We install a ufw app profile AND firewalld service definitions but never touch
+  # the running firewall — just point the way for whichever is active.
+  if command -v ufw >/dev/null 2>&1; then
+    cat <<'MSG'
+
+  4. ufw is installed — open the streaming ports once (native-only host shown; add
+     'punktfunk-gamestream' as well for Moonlight compat):
+       sudo ufw allow punktfunk-native
+MSG
+  fi
   if command -v firewall-cmd >/dev/null 2>&1; then
     cat <<'MSG'
 
-  4. firewalld is active — open the streaming ports once (GameStream/Moonlight shown; use
-     'punktfunk-native' instead for the native-only host):
-       sudo firewall-cmd --reload                                        # load the new service def
-       sudo firewall-cmd --permanent --add-service=punktfunk-gamestream
+  4. firewalld is active — open the streaming ports once (native-only host shown; add
+     'punktfunk-gamestream' as well for Moonlight compat):
+       sudo firewall-cmd --reload                                     # load the new service def
+       sudo firewall-cmd --permanent --add-service=punktfunk-native
        sudo firewall-cmd --reload
 MSG
   fi
