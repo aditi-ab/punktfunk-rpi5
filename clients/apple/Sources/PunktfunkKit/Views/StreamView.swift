@@ -346,10 +346,13 @@ public final class StreamLayerView: NSView {
         super.keyUp(with: event)
     }
     /// Modifier keys (shift/control/option/command) arrive ONLY as flagsChanged on macOS,
-    /// never keyDown/keyUp — InputCapture diffs the raw flags to recover each L/R down/up.
+    /// never keyDown/keyUp — the changed key is `event.keyCode`; InputCapture resolves the
+    /// down-vs-up direction from the flags (diffing the device-dependent flag bits alone
+    /// proved unreliable — some keyboards omit them, which silently dropped Control).
     public override func flagsChanged(with event: NSEvent) {
         if captured, let inputCapture {
-            inputCapture.handleFlagsChanged(UInt(event.modifierFlags.rawValue))
+            inputCapture.handleFlagsChanged(
+                keyCode: event.keyCode, rawFlags: UInt(event.modifierFlags.rawValue))
             return
         }
         super.flagsChanged(with: event)

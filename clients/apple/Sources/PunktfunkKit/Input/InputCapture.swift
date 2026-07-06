@@ -84,15 +84,6 @@ public final class InputCapture {
     /// its Esc suppression need it in both states).
     private var cmdKeysDown: Set<UInt32> = []
 
-    #if os(macOS)
-    /// Previous raw `NSEvent.modifierFlags.rawValue` (LOW 16 bits intact — those carry the
-    /// device-dependent L/R bits). Modifier keys never fire keyDown/keyUp on macOS; they
-    /// arrive as flagsChanged, which doesn't carry down-vs-up — we recover that by diffing
-    /// this snapshot. Resynced (not diffed) while forwarding is off so a modifier held
-    /// across a capture toggle can't produce a phantom transition on re-engage.
-    private var prevModFlags: UInt = 0
-    #endif
-
     /// While true, mouse/keyboard flow to the host and key NSEvents are swallowed
     /// locally; while false the user is interacting with the local UI (dragging the
     /// window, clicking the HUD) and nothing is forwarded. Main-queue only.
@@ -279,12 +270,6 @@ public final class InputCapture {
         residualY = 0
         residualScrollX = 0
         residualScrollY = 0
-        #if os(macOS)
-        // Drop the modifier snapshot too: a flagsChanged transition can be missed if focus
-        // leaves mid-chord, and the next handleFlagsChanged resyncs from a clean slate (it
-        // resyncs while released anyway, but this keeps stuck state from outliving a blur).
-        prevModFlags = 0
-        #endif
     }
 
     /// Release any held MOUSE buttons host-side, leaving keyboard state untouched. Used when
@@ -359,39 +344,52 @@ public final class InputCapture {
     }
 
     /// NSEvent modifier path (macOS): modifier keys never fire keyDown/keyUp — they arrive
-    /// as flagsChanged, which carries no down-vs-up. We diff the raw flags against the prior
-    /// snapshot to recover each transition, and the changed key's L/R identity from the
-    /// device-dependent bits in the LOW 16 bits (the .deviceIndependentFlagsMask the ⌘⎋
-    /// monitor uses deliberately strips exactly these — do NOT pre-mask here). Each side maps
-    /// to the same L/R modifier VK `hidToVK` already emits, so the host needs no change.
-    /// Fed `UInt(event.modifierFlags.rawValue)`.
-    public func handleFlagsChanged(_ rawFlags: UInt) {
-        // While released we only resync the snapshot, so a modifier held across a capture
-        // toggle doesn't show up as a spurious transition the moment forwarding re-engages.
-        guard forwarding else {
-            prevModFlags = rawFlags
-            return
+    /// as flagsChanged, which carries no down-vs-up. `keyCode` names the key that changed
+    /// (kVK_Control & co., already L/R-specific); `resolveModifier` recovers the direction
+    /// from the flags. Fed `event.keyCode` + `UInt(event.modifierFlags.rawValue)` — LOW 16
+    /// bits intact, they carry the device-dependent L/R bits (the .deviceIndependentFlagsMask
+    /// the ⌘⎋ monitor uses deliberately strips exactly these — do NOT pre-mask here).
+    public func handleFlagsChanged(keyCode: UInt16, rawFlags: UInt) {
+        if inputDebug {
+            inputLog.debug(
+                "flagsChanged keyCode \(keyCode, privacy: .public) flags 0x\(String(rawFlags, radix: 16), privacy: .public) forwarding \(self.forwarding, privacy: .public)")
         }
-        // (device-dependent mask, VK). LOW-16-bit masks from IOLLEvent.h (NX_DEVICE*MASK):
-        // Lshift 0x2 Rshift 0x4 | Lctrl 0x1 Rctrl 0x2000 | Lalt 0x20 Ralt 0x40 | Lcmd 0x8 Rcmd 0x10.
-        let table: [(UInt, UInt32)] = [
-            (0x2, 0xA0), (0x4, 0xA1), // VK_LSHIFT / VK_RSHIFT
-            (0x1, 0xA2), (0x2000, 0xA3), // VK_LCONTROL / VK_RCONTROL
-            (0x20, 0xA4), (0x40, 0xA5), // VK_LMENU / VK_RMENU (left/right alt-option)
-            (0x8, 0x5B), (0x10, 0x5C), // VK_LWIN / VK_RWIN (left/right command)
-        ]
-        for (mask, vk) in table {
-            let now = (rawFlags & mask) != 0
-            let was = (prevModFlags & mask) != 0
-            guard now != was else { continue }
-            // Keep cmdKeysDown in step (the ⌘⎋ toggle + Esc suppression read it); sendKey
-            // adds the VK to pressedVKs so releaseAll/blur flushes a held modifier cleanly.
-            if vk == 0x5B || vk == 0x5C {
-                if now { cmdKeysDown.insert(vk) } else { cmdKeysDown.remove(vk) }
-            }
-            sendKey(vk, down: now)
+        guard forwarding else { return }
+        guard let (vk, down) = Self.resolveModifier(
+            keyCode: keyCode, rawFlags: rawFlags, isDown: { pressedVKs.contains($0) })
+        else { return } // Fn / Caps Lock / unknown — nothing the host consumes on this path
+        // Keep cmdKeysDown in step (the ⌘⎋ toggle + Esc suppression read it); sendKey
+        // adds the VK to pressedVKs so releaseAll/blur flushes a held modifier cleanly.
+        if vk == 0x5B || vk == 0x5C {
+            if down { cmdKeysDown.insert(vk) } else { cmdKeysDown.remove(vk) }
         }
-        prevModFlags = rawFlags
+        sendKey(vk, down: down)
+    }
+
+    /// Resolve one flagsChanged transition to (Windows VK, down). The changed key is
+    /// `keyCode`; the direction comes from the flags. The device-dependent L/R bits (LOW
+    /// 16 bits, NX_DEVICE*KEYMASK) disambiguate the two same-class keys, but some
+    /// keyboards ship flagsChanged WITHOUT them — only the device-independent class
+    /// bit (NX_CONTROLMASK & co.) is set. A pure diff of the device bits silently drops
+    /// those keys (seen live: Control never forwarded), so this is keyCode-driven with the
+    /// flags as evidence: class bit clear → the key went up; device bits present → they
+    /// say which side is held now; class bit set with NO device bits → flip the held state
+    /// we track (`isDown`, from pressedVKs — SDL ships the same fallback). Each keyCode
+    /// maps to the L/R modifier VK `hidToVK` already emits, so the host needs no change.
+    /// Returns nil for modifiers the host doesn't consume on this path (Fn, Caps Lock).
+    static func resolveModifier(
+        keyCode: UInt16, rawFlags: UInt, isDown: (UInt32) -> Bool
+    ) -> (vk: UInt32, down: Bool)? {
+        guard let mod = modifierBits[keyCode] else { return nil }
+        let down: Bool
+        if rawFlags & mod.classMask == 0 {
+            down = false
+        } else if rawFlags & (mod.deviceBit | mod.siblingBit) != 0 {
+            down = rawFlags & mod.deviceBit != 0
+        } else {
+            down = !isDown(mod.vk)
+        }
+        return (mod.vk, down)
     }
     #endif
 

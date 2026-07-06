@@ -77,9 +77,10 @@ fn base_codec_mode_support() -> u32 {
         }
     }
     // Windows AMD/Intel (AMF/QSV): advertise only what the GPU actually encodes (AV1 is narrow, an
-    // old iGPU might lack HEVC). NVENC and the GPU-less software path keep the static superset.
-    #[cfg(all(target_os = "windows", feature = "amf-qsv"))]
-    if crate::encode::windows_backend_is_ffmpeg() {
+    // old iGPU might lack HEVC). AMF probes natively (no build feature needed); QSV needs the
+    // libavcodec build. NVENC and the GPU-less software path keep the static superset.
+    #[cfg(target_os = "windows")]
+    if crate::encode::windows_backend_is_probed() {
         if let Some(m) = probed_mask(crate::encode::windows_codec_support()) {
             return m;
         }
@@ -91,7 +92,7 @@ fn base_codec_mode_support() -> u32 {
 /// or `None` if the probe found nothing — meaning the GPU wasn't usable at probe time (GPU-less CI,
 /// a misconfigured/wrong-vendor host), NOT that it encodes zero codecs; the caller then advertises
 /// the static superset (pre-probe behaviour) rather than claiming nothing.
-#[cfg(any(target_os = "linux", all(target_os = "windows", feature = "amf-qsv")))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn probed_mask(caps: crate::encode::CodecSupport) -> Option<u32> {
     use super::{SCM_AV1_MAIN8, SCM_H264, SCM_HEVC};
     let mut m = 0;
