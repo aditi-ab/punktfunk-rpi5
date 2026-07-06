@@ -3198,6 +3198,18 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     let mut cur_mode = mode;
     const MAX_CAPTURE_REBUILDS: u32 = 5;
     let mut capture_rebuilds: u32 = 0;
+    // Encode-stall watchdog: AMF/QSV (and async NVENC) poll non-blocking, so a wedged driver
+    // shows up as poll() returning None forever while submits keep succeeding — `inflight` grows,
+    // no AU ever reaches the send thread, and the client freezes on the last frame with nothing
+    // logged (field reports: AMD/Intel Windows streams freezing after minutes). Track when the
+    // encoder last produced an AU and rebuild it in place (bounded, like the capture rebuilds)
+    // when it stops. `ENCODE_STALL_WINDOW` also sizes the in-flight backlog bound: a backlog worth
+    // more than the window's frames means AUs still trickle (so the gap never trips) but latency
+    // is growing without bound — the slow-leak form of the same stall.
+    const ENCODE_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX_ENCODER_RESETS: u32 = 5;
+    let mut encoder_resets: u32 = 0;
+    let mut last_au_at = std::time::Instant::now();
     // Last HDR mastering metadata we forwarded — re-sent as 0xCE on change/keyframe (see below).
     let mut last_hdr_meta: Option<punktfunk_core::quic::HdrMeta> = None;
     // Frames submitted to NVENC but not yet polled (wire pts, submit stamp, pacing deadline). With a
@@ -3283,6 +3295,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                         vd = new_vd;
                         compositor = sw.compositor;
                         next = std::time::Instant::now();
+                        // The owed AUs died with the old encoder — drop their in-flight records
+                        // and restart the encode-stall clock for the fresh one.
+                        inflight.clear();
+                        last_au_at = std::time::Instant::now();
+                        encoder_resets = 0;
                         tracing::info!(
                             compositor = compositor.id(),
                             "session switch — backend rebuilt, stream continues"
@@ -3317,6 +3334,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                     (capturer, enc, frame, interval, cur_node_id) = next_pipe;
                     cur_mode = new_mode;
                     next = std::time::Instant::now();
+                    // The owed AUs died with the old encoder — drop their in-flight records
+                    // and restart the encode-stall clock for the fresh one.
+                    inflight.clear();
+                    last_au_at = std::time::Instant::now();
+                    encoder_resets = 0;
                 }
                 Err(e) => {
                     tracing::error!(error = %format!("{e:#}"), ?new_mode,
@@ -3485,6 +3507,12 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 cur_node_id = new_node_id;
                 enc.request_keyframe(); // belt-and-suspenders; a fresh encoder opens on an IDR anyway
                 next = std::time::Instant::now();
+                // The owed AUs died with the old encoder — drop their in-flight records and
+                // restart the encode-stall clock (the rebuild loop above may have eaten seconds,
+                // which must not count against the fresh encoder).
+                inflight.clear();
+                last_au_at = std::time::Instant::now();
+                encoder_resets = 0;
                 tracing::info!(
                     compositor = compositor.id(),
                     "capture loss: pipeline rebuilt — stream resumes"
@@ -3551,7 +3579,27 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             st_queue.push(queue_us);
         }
         let t_submit = std::time::Instant::now();
-        enc.submit(&frame).context("encoder submit")?;
+        if let Err(e) = enc.submit(&frame) {
+            // The input half of an encode stall: once the driver stops draining AUs, libavcodec's
+            // one-frame buffer fills and avcodec_send_frame starts failing (EAGAIN) — the same
+            // wedge the watchdog below catches, seen from submit. Rebuild the encoder in place
+            // (bounded) instead of killing an otherwise healthy session; a backend without an
+            // in-place rebuild keeps today's fail-fast behavior.
+            encoder_resets += 1;
+            if encoder_resets > MAX_ENCODER_RESETS || !reset_stalled_encoder(&mut enc, &mut inflight)
+            {
+                return Err(e).context("encoder submit");
+            }
+            tracing::error!(error = %format!("{e:#}"), reset = encoder_resets,
+                max = MAX_ENCODER_RESETS,
+                "encoder submit failed — encoder rebuilt in place, forcing an IDR");
+            last_au_at = std::time::Instant::now();
+            // Re-pace from the rebuild and retry this frame next tick (gives the fresh encoder
+            // one frame period to come up instead of hammering it in a hot loop).
+            next = std::time::Instant::now() + interval;
+            std::thread::sleep(interval);
+            continue;
+        }
         let submit_us = if measure {
             t_submit.elapsed().as_micros() as u32
         } else {
@@ -3569,9 +3617,12 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         // so the encode of N overlaps the convert/copy of N+1. NVENC's `pending` is FIFO, so poll() returns
         // the oldest submitted frame's AU — matching `inflight.pop_front()`.
         let mut send_gone = false;
+        // A poll error is the explicit form of an encode stall (e.g. a QSV device failure);
+        // carry it to the shared stall recovery below instead of killing the session outright.
+        let mut poll_err: Option<anyhow::Error> = None;
         while inflight.len() >= depth {
             let t_wait = std::time::Instant::now();
-            let polled = enc.poll().context("encoder poll")?;
+            let polled = enc.poll();
             let wait_us = if measure {
                 t_wait.elapsed().as_micros() as u32
             } else {
@@ -3581,9 +3632,20 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 st_wait.push(wait_us);
             }
             let au = match polled {
-                Some(au) => au,
-                None => break, // no AU ready for a submitted frame (shouldn't happen — poll blocks)
+                Ok(Some(au)) => au,
+                // No AU ready for a submitted frame. Routine on the non-blocking backends (the
+                // libavcodec AMF/QSV wrapper holds ~2 frames; async NVENC drains a ready queue) —
+                // the frame stays in flight and the next tick re-polls. The stall watchdog below
+                // decides when "not ready yet" has become "the driver is wedged".
+                Ok(None) => break,
+                Err(e) => {
+                    poll_err = Some(e);
+                    break;
+                }
             };
+            // The encoder is alive: feed the stall watchdog, clear the consecutive-reset counter.
+            last_au_at = std::time::Instant::now();
+            encoder_resets = 0;
             let (cap_ns, sub_ns, deadline) = inflight.pop_front().expect("inflight non-empty");
             let flags = if au.keyframe {
                 (FLAG_PIC | FLAG_SOF) as u32
@@ -3623,6 +3685,39 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
         }
         if send_gone {
             break;
+        }
+        // Encode-stall watchdog. Trip on: an explicit poll error; no AU within the window while
+        // frames are owed (the full wedge — AMF/QSV's non-blocking poll returns None forever and
+        // nothing else ever errors); or an owed backlog worth more than the window's frames (the
+        // slow leak — AUs still trickle, so the gap never trips, but latency grows without bound).
+        // Recovery rebuilds the encoder in place and forces an IDR — a logged ~one-second hiccup
+        // instead of a silent permanent freeze — bounded so a genuinely dead encoder still ends
+        // the session with a clear error. The window scales with the frame interval so low-fps
+        // modes (where the AMF wrapper's ~2-frame hold spans seconds) can't false-trip.
+        let stall_window = ENCODE_STALL_WINDOW.max(interval * 8);
+        let stall_backlog =
+            depth + (stall_window.as_secs_f64() / interval.as_secs_f64().max(1e-6)).ceil() as usize;
+        if poll_err.is_some()
+            || (!inflight.is_empty()
+                && (last_au_at.elapsed() >= stall_window || inflight.len() > stall_backlog))
+        {
+            let why = match &poll_err {
+                Some(e) => format!("poll failed: {e:#}"),
+                None => format!(
+                    "no AU for {} ms with {} frame(s) in flight",
+                    last_au_at.elapsed().as_millis(),
+                    inflight.len()
+                ),
+            };
+            encoder_resets += 1;
+            if encoder_resets > MAX_ENCODER_RESETS || !reset_stalled_encoder(&mut enc, &mut inflight)
+            {
+                return Err(poll_err.unwrap_or_else(|| anyhow!("{why}")))
+                    .context("encoder stalled — in-place rebuild unavailable or exhausted");
+            }
+            tracing::error!(reset = encoder_resets, max = MAX_ENCODER_RESETS, %why,
+                "encode stall detected — encoder rebuilt in place, forcing an IDR");
+            last_au_at = std::time::Instant::now();
         }
         match next.checked_duration_since(std::time::Instant::now()) {
             Some(d) => std::thread::sleep(d),
@@ -3777,6 +3872,24 @@ fn is_permanent_build_error(chain: &str) -> bool {
     ];
     let lower = chain.to_ascii_lowercase();
     PERMANENT.iter().any(|p| lower.contains(p))
+}
+
+/// Encode-stall recovery: rebuild the encoder in place (keeping capture + the session up) and
+/// discard the owed in-flight frame records — their AUs died with the old encoder instance.
+/// Returns `false` when the backend has no in-place rebuild ([`crate::encode::Encoder::reset`]'s
+/// default); the caller then surfaces the stall as a session error instead. The forced keyframe
+/// makes the rebuilt encoder's first frame an immediate decoder resync point (belt-and-suspenders:
+/// a fresh encoder opens on an IDR anyway).
+fn reset_stalled_encoder(
+    enc: &mut Box<dyn crate::encode::Encoder>,
+    inflight: &mut std::collections::VecDeque<(u64, u64, std::time::Instant)>,
+) -> bool {
+    if !enc.reset() {
+        return false;
+    }
+    inflight.clear();
+    enc.request_keyframe();
+    true
 }
 
 fn build_pipeline(

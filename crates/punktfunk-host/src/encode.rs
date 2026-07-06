@@ -194,6 +194,15 @@ pub trait Encoder: Send {
     }
     /// Pull the next encoded AU if one is ready.
     fn poll(&mut self) -> Result<Option<EncodedFrame>>;
+    /// Tear the underlying hardware encoder down and rebuild it in place, keeping the session's
+    /// negotiated parameters — the encode-stall watchdog's recovery lever (a wedged AMF/QSV
+    /// driver stops emitting AUs or accepting frames without ever returning an error). Returns
+    /// `true` when the encoder was rebuilt: every submitted-but-unpolled frame is forfeited and
+    /// the next submitted frame starts a fresh stream (IDR). Default `false`: the backend has no
+    /// in-place rebuild and the caller must treat the stall as fatal instead.
+    fn reset(&mut self) -> bool {
+        false
+    }
     /// Signal end-of-stream. After this, drain the remaining AUs with [`poll`](Self::poll)
     /// until it returns `None` — NVENC buffers frames internally even at `delay=0`.
     fn flush(&mut self) -> Result<()>;
@@ -369,6 +378,9 @@ impl Encoder for TrackedEncoder {
     }
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         self.inner.poll()
+    }
+    fn reset(&mut self) -> bool {
+        self.inner.reset()
     }
     fn flush(&mut self) -> Result<()> {
         self.inner.flush()

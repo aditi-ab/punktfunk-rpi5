@@ -1307,6 +1307,18 @@ impl Encoder for FfmpegWinEncoder {
         self.force_kf = true;
     }
 
+    /// Encode-stall recovery: drop the wedged libavcodec encoder (its `Drop` releases the AMF/QSV
+    /// runtime state) and let the next `submit` rebuild it lazily on the current device, exactly
+    /// like first-frame bring-up. The owed AUs are forfeited (`in_flight` zeroed) and the rebuilt
+    /// encoder's first frame is forced IDR so the client resyncs immediately.
+    fn reset(&mut self) -> bool {
+        self.inner = None;
+        self.bound_device = 0;
+        self.in_flight = 0;
+        self.force_kf = true;
+        true
+    }
+
     /// Poll for the next finished AU (single non-blocking `receive_packet`).
     ///
     /// libavcodec's `hevc_amf`/`av1_amf` wrapper holds ~2 frames before releasing the oldest
