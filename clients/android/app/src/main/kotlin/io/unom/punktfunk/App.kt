@@ -208,6 +208,8 @@ fun GamepadShell(
             GamepadScreen.Library -> libraryHost?.let { host ->
                 LibraryScreen(
                     host = host,
+                    settings = settings,
+                    onLaunched = onConnected,
                     onBack = { screen = GamepadScreen.Home; libraryHost = null },
                     navActive = s == screen,
                 )

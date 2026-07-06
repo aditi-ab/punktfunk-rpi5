@@ -1,0 +1,45 @@
+package io.unom.punktfunk
+
+import android.content.Context
+import io.unom.punktfunk.kit.Gamepad
+import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.security.ClientIdentity
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+/** Handshake budget for a normal / library-launch connect (not the long request-access park). */
+const val CONNECT_TIMEOUT_MS = 10_000
+
+/**
+ * The one place [NativeBridge.nativeConnect] is assembled — shared by [ConnectScreen] and the library
+ * launcher ([LibraryScreen]). Derives the mode / HDR / gamepad settings the host needs from
+ * [settings]. [pinHex] is the pinned fingerprint (empty ⇒ TOFU). [launch] is a store-qualified library
+ * id (`steam:<appid>` / `custom:<id>`) to boot straight into a game, or `null` for the desktop.
+ * Returns the session handle, or `0` on failure. Call off the main thread.
+ */
+suspend fun connectToHost(
+    context: Context,
+    settings: Settings,
+    identity: ClientIdentity,
+    host: String,
+    port: Int,
+    pinHex: String,
+    launch: String?,
+    timeoutMs: Int = CONNECT_TIMEOUT_MS,
+): Long {
+    // Advertise HDR only when the user enabled it AND this device's display can present it (else the
+    // host sends a proper SDR stream rather than PQ the panel would mis-tone-map).
+    val (w, h, hz) = settings.effectiveMode(context)
+    val hdrEnabled = settings.hdrEnabled && displaySupportsHdr(context)
+    // "Automatic" resolves to a concrete pad type from the connected controller's VID/PID.
+    val gamepadPref = Gamepad.resolvePref(settings.gamepad)
+    return withContext(Dispatchers.IO) {
+        NativeBridge.nativeConnect(
+            host, port, w, h, hz,
+            identity.certPem, identity.privateKeyPem, pinHex,
+            settings.bitrateKbps, settings.compositor, gamepadPref,
+            hdrEnabled, settings.audioChannels, settings.preferredCodec(), timeoutMs,
+            launch,
+        )
+    }
+}

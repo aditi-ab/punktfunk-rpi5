@@ -51,6 +51,9 @@ object NativeBridge {
         /** Preferred video codec as a `quic::CODEC_*` bit (`0` = auto). Soft — the host falls back. */
         preferredCodec: Int,
         timeoutMs: Int,
+        /** Store-qualified library id (`steam:<appid>` / `custom:<id>`) to boot straight into a game,
+         *  or `null`/empty for a plain desktop connect. Rides the Hello as `launch`. */
+        launch: String?,
     ): Long
 
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */

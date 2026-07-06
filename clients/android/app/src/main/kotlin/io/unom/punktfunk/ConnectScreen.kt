@@ -63,9 +63,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** Handshake budget for a normal connect (the prior hardcoded value, now passed explicitly). */
-private const val CONNECT_TIMEOUT_MS = 10_000
-
 /**
  * Handshake budget for the no-PIN "request access" connect. Must exceed the host's approval-park
  * window (~180 s) so a slow operator approval still lands on this same parked connection rather than
@@ -181,25 +178,10 @@ fun ConnectScreen(
     // it survives a DHCP address change; else by address:port). Mirrors the Apple client.
     val discoveredUnsaved = discovered.filter { dh -> savedHosts.none { it.matches(dh) } }
 
-    // The one place the full nativeConnect is issued (shared by the normal connect and the
-    // request-access path), including the HDR/gamepad derivation both need.
-    suspend fun connectNative(id: ClientIdentity, targetHost: String, targetPort: Int, pinHex: String, timeoutMs: Int): Long {
-        // Advertise HDR only when the user enabled it AND this device's display can present it
-        // (else the host sends a proper SDR stream rather than PQ the panel would mis-tone-map).
-        val hdrEnabled = settings.hdrEnabled && displaySupportsHdr(context)
-        // "Automatic" resolves to a concrete pad type from the connected controller's VID/PID
-        // (Android exposes no controller-type enum) — parity with the Linux/Apple clients. An
-        // explicit choice is passed through unchanged.
-        val gamepadPref = Gamepad.resolvePref(settings.gamepad)
-        return withContext(Dispatchers.IO) {
-            NativeBridge.nativeConnect(
-                targetHost, targetPort, w, h, hz,
-                id.certPem, id.privateKeyPem, pinHex,
-                settings.bitrateKbps, settings.compositor, gamepadPref,
-                hdrEnabled, settings.audioChannels, settings.preferredCodec(), timeoutMs,
-            )
-        }
-    }
+    // Issue the native connect (shared by the normal connect and the request-access path). A plain
+    // desktop connect (no library launch) — the library launcher calls [connectToHost] with an id.
+    suspend fun connectNative(id: ClientIdentity, targetHost: String, targetPort: Int, pinHex: String, timeoutMs: Int): Long =
+        connectToHost(context, settings, id, targetHost, targetPort, pinHex, launch = null, timeoutMs = timeoutMs)
 
     // The actual dial (identity already ready). On a TOFU connect (pinHex null), pin the fingerprint
     // the host presented (as an unpaired known host) so the next connect goes straight through and it

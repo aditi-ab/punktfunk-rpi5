@@ -1,8 +1,10 @@
 package io.unom.punktfunk
 
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -57,6 +59,7 @@ import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
 import io.unom.punktfunk.kit.library.mtlsHttpClient
+import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.obtainIdentity
@@ -73,17 +76,27 @@ import kotlinx.coroutines.withContext
 
 private sealed class LibState {
     object Loading : LibState()
-    data class Ready(val games: List<GameEntry>, val loader: ImageLoader) : LibState()
+    // Carries the client identity so a launch can dial the host over the same pinned mTLS trust.
+    data class Ready(val games: List<GameEntry>, val loader: ImageLoader, val identity: ClientIdentity) : LibState()
     data class Message(val text: String) : LibState() // unauthorized / empty / error
 }
 
 @Composable
-fun LibraryScreen(host: KnownHost, onBack: () -> Unit, navActive: Boolean = true) {
+fun LibraryScreen(
+    host: KnownHost,
+    settings: Settings,
+    onLaunched: (Long) -> Unit,
+    onBack: () -> Unit,
+    navActive: Boolean = true,
+) {
     BackHandler(onBack = onBack)
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val hazeState = remember { HazeState() }
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     var state by remember { mutableStateOf<LibState>(LibState.Loading) }
+    // A launch (connect) in flight: shows an overlay + gates the pad so a second press can't dial twice.
+    var launching by remember { mutableStateOf(false) }
 
     LaunchedEffect(host.address, host.port, host.fpHex) {
         state = LibState.Loading
@@ -101,7 +114,7 @@ fun LibraryScreen(host: KnownHost, onBack: () -> Unit, navActive: Boolean = true
                     LibState.Message("No games found on this host.")
                 } else {
                     val client = mtlsHttpClient(id.certPem, id.privateKeyPem, host.address, host.fpHex)
-                    LibState.Ready(res.games, ImageLoader.Builder(context).okHttpClient(client).build())
+                    LibState.Ready(res.games, ImageLoader.Builder(context).okHttpClient(client).build(), id)
                 }
                 is LibraryResult.Unauthorized -> LibState.Message(res.message)
                 is LibraryResult.Error -> LibState.Message(res.message)
@@ -118,8 +131,42 @@ fun LibraryScreen(host: KnownHost, onBack: () -> Unit, navActive: Boolean = true
                     when (val s = state) {
                         is LibState.Loading -> LoadingState()
                         is LibState.Message -> MessageState(s.text)
-                        is LibState.Ready -> Coverflow(s.games, s.loader, navActive)
+                        is LibState.Ready -> Coverflow(s.games, s.loader, navActive && !launching) { game ->
+                            if (!launching) {
+                                launching = true
+                                scope.launch {
+                                    // Dial the host over the same pinned mTLS trust, booting straight
+                                    // into this title (the host resolves `launch` = its library id).
+                                    val handle = connectToHost(
+                                        context, settings, s.identity,
+                                        host.address, host.port, host.fpHex, launch = game.id,
+                                    )
+                                    launching = false
+                                    if (handle != 0L) onLaunched(handle)
+                                    else Toast.makeText(
+                                        context,
+                                        "Launch failed — check the host and try again.",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                }
+                            }
+                        }
                     }
+                }
+            }
+        }
+        // Launching overlay — the connect + host-side game boot takes a moment; block the pad while it runs.
+        if (launching) {
+            Box(
+                Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.6f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    CircularProgressIndicator(color = Color.White)
+                    Text("Launching…", color = Color.White, style = MaterialTheme.typography.bodyLarge)
                 }
             }
         }
@@ -130,7 +177,13 @@ fun LibraryScreen(host: KnownHost, onBack: () -> Unit, navActive: Boolean = true
                 .then(if (landscape) Modifier else Modifier.systemBarsPadding())
                 .padding(ConsoleLegendInset),
         ) {
-            GamepadHintBar(listOf(PadGlyph.hint('B', "Close", onClick = onBack)), hazeState = hazeState)
+            GamepadHintBar(
+                buildList {
+                    if (state is LibState.Ready) add(PadGlyph.hint('A', "Launch"))
+                    add(PadGlyph.hint('B', "Close", onClick = onBack))
+                },
+                hazeState = hazeState,
+            )
         }
     }
 }
@@ -155,7 +208,12 @@ private fun MessageState(text: String) {
 }
 
 @Composable
-private fun Coverflow(games: List<GameEntry>, loader: ImageLoader, navActive: Boolean) {
+private fun Coverflow(
+    games: List<GameEntry>,
+    loader: ImageLoader,
+    navActive: Boolean,
+    onLaunch: (GameEntry) -> Unit,
+) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         // Fit a 2:3 poster into the height the detail line leaves; clamp so it never dwarfs the screen.
         val coverHeight = (maxHeight * 0.72f).coerceAtMost(360.dp)
@@ -167,16 +225,15 @@ private fun Coverflow(games: List<GameEntry>, loader: ImageLoader, navActive: Bo
         LaunchedEffect(pagerState.settledPage) { navTarget = pagerState.settledPage }
         val current = games.getOrNull(navTarget)
 
-        // Controller nav: the pad drives the coverflow (it wasn't captured before). Left/right steps a
-        // coalesced target the pager chases; A is reserved for launch (browse-only for now); B closes
-        // via the screen's BackHandler.
+        // Controller nav: the pad drives the coverflow. Left/right steps a coalesced target the pager
+        // chases; A launches the centred title; B closes via the screen's BackHandler.
         GamepadNavEffect(
             active = navActive && games.isNotEmpty(),
             onMove = { dir ->
                 val t = (navTarget + dir).coerceIn(0, games.lastIndex)
                 if (t != navTarget) { navTarget = t; scope.launch { pagerState.animateScrollToPage(t) } }
             },
-            onActivate = { /* launch a title — browse-only for now */ },
+            onActivate = { games.getOrNull(navTarget)?.let(onLaunch) },
         )
 
         Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
@@ -198,6 +255,11 @@ private fun Coverflow(games: List<GameEntry>, loader: ImageLoader, navActive: Bo
                         .zIndex(-d) // centred cover on top, neighbours stacked behind
                         .width(coverWidth)
                         .height(coverHeight)
+                        // Touch: tap the centred cover to launch it; tap a neighbour to bring it centre.
+                        .clickable {
+                            if (page == pagerState.currentPage) onLaunch(games[page])
+                            else scope.launch { pagerState.animateScrollToPage(page) }
+                        }
                         .graphicsLayer {
                             // Centre at full size; EVERY neighbour settles to one size, so an even pitch
                             // yields even VISUAL gaps. (A progressive shrink made the outer gaps grow —

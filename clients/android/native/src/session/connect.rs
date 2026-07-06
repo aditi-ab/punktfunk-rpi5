@@ -33,7 +33,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIde
 }
 
 /// `NativeBridge.nativeConnect(host, port, w, h, hz, certPem, keyPem, pinHex, bitrateKbps,
-/// compositorPref, gamepadPref, hdrEnabled, audioChannels, preferredCodec, timeoutMs): Long`.
+/// compositorPref, gamepadPref, hdrEnabled, audioChannels, preferredCodec, timeoutMs, launch): Long`.
+/// `launch` (empty ⇒ none) is a store-qualified library id to boot straight into a game.
 /// `certPem`/`keyPem` empty = anonymous, else presented as the persistent identity. `pinHex` empty
 /// = TOFU (read `nativeHostFingerprint` after), else 64-hex SHA-256 to pin the host (mismatch → 0).
 /// `bitrateKbps` 0 = host default. `compositorPref`/`gamepadPref` are `CompositorPref`/`GamepadPref`
@@ -63,6 +64,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     audio_channels: jint,
     preferred_codec: jint,
     timeout_ms: jint,
+    launch: JString<'local>,
 ) -> jlong {
     let host: String = match env.get_string(&host) {
         Ok(s) => s.into(),
@@ -74,6 +76,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         .unwrap_or_default();
     let key: String = env.get_string(&key_pem).map(Into::into).unwrap_or_default();
     let pin_hex: String = env.get_string(&pin_hex).map(Into::into).unwrap_or_default();
+    // A store-qualified library id (`steam:<appid>` / `custom:<id>`) to boot straight into a game;
+    // null / empty ⇒ None (a plain desktop connect). Rides the Hello as `launch`.
+    let launch: Option<String> = env
+        .get_string(&launch)
+        .map(Into::into)
+        .ok()
+        .filter(|s: &String| !s.is_empty());
 
     let identity: Option<(String, String)> = if cert.is_empty() || key.is_empty() {
         None
@@ -124,7 +133,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // + the soft `preferred_codec` and echoes it in `connector.codec`, which drives the mime below.
         punktfunk_core::quic::CODEC_H264 | punktfunk_core::quic::CODEC_HEVC,
         preferred_codec.clamp(0, u8::MAX as jint) as u8,
-        None,     // launch: default app
+        launch,   // a store-qualified library id to boot into a game, or None for the desktop
         pin,      // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)
         // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
