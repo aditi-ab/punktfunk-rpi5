@@ -212,12 +212,11 @@ impl VirtualDisplay for KwinDisplay {
         });
         // Layout position (§6.2) is applied by the registry via `apply_position` right after create
         // (it owns the display group, so it computes auto-row / manual placement over the whole group).
-        Ok(VirtualOutput {
+        Ok(VirtualOutput::owned(
             node_id,
-            remote_fd: None,
-            preferred_mode: Some((mode.width, mode.height, achieved_hz)),
-            keepalive: Box::new(StopGuard { stop }),
-        })
+            Some((mode.width, mode.height, achieved_hz)),
+            Box::new(StopGuard { stop }),
+        ))
     }
 }
 

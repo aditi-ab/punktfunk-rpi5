@@ -158,6 +158,22 @@ pub struct Layout {
     pub positions: BTreeMap<String, Position>,
 }
 
+/// How a session that **launches a game** (a library id on the Hello / apps.json / Decky pin) is
+/// served (`design/gamemode-and-dedicated-sessions.md` §5.2). Orthogonal to the preset/lifecycle axes
+/// — a top-level [`DisplayPolicy`] field, NOT part of [`EffectivePolicy`], so a preset never clobbers
+/// it. Linux-only in effect (a launching Windows session opens into the one desktop).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GameSession {
+    /// Today's routing: the launch rides whatever session the box is in (managed Steam session on
+    /// Bazzite/SteamOS, bare spawn on plain distros, spawned into the live desktop on KWin/Mutter/wlroots).
+    #[default]
+    Auto,
+    /// A launching session always gets its OWN headless gamescope at the client's mode, nesting just
+    /// the game — no Steam Big Picture, no game mode. Degrades to `auto` when gamescope is unavailable.
+    Dedicated,
+}
+
 /// A named bundle of the fields below. `Custom` (the default) means the explicit fields rule; any
 /// other preset ignores the stored fields and expands to its own ([`DisplayPolicy::effective`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -202,6 +218,11 @@ pub struct DisplayPolicy {
     /// Upper bound on simultaneously-live virtual displays (clamped to `1..=16` on write).
     #[serde(default = "default_max_displays")]
     pub max_displays: u32,
+    /// How a game-launching session is served (`design/gamemode-and-dedicated-sessions.md` §5.2).
+    /// Orthogonal to `preset`/lifecycle — preserved across preset changes; `#[serde(default)]` = `Auto`
+    /// so existing `display-settings.json` files are untouched.
+    #[serde(default)]
+    pub game_session: GameSession,
 }
 
 fn one() -> u32 {
@@ -224,6 +245,7 @@ impl Default for DisplayPolicy {
             identity: Identity::default(),
             layout: Layout::default(),
             max_displays: 4,
+            game_session: GameSession::default(),
         }
     }
 }
@@ -279,7 +301,11 @@ impl EffectivePolicy {
     /// transform, factored out pure so arranging displays stays orthogonal to the other axes and is
     /// unit-tested without touching the global store. (`Custom` so the explicit fields — incl. the new
     /// layout — rule; a named preset would ignore them.)
-    pub fn with_manual_layout(&self, positions: BTreeMap<String, Position>) -> DisplayPolicy {
+    pub fn with_manual_layout(
+        &self,
+        positions: BTreeMap<String, Position>,
+        game_session: GameSession,
+    ) -> DisplayPolicy {
         DisplayPolicy {
             version: 1,
             preset: Preset::Custom,
@@ -292,6 +318,8 @@ impl EffectivePolicy {
                 positions,
             },
             max_displays: self.max_displays,
+            // Preserve the orthogonal game-session axis (EffectivePolicy doesn't carry it).
+            game_session,
         }
     }
 }
@@ -396,6 +424,13 @@ impl DisplayPolicyStore {
     /// The effective (preset-expanded) policy the console configured, or `None` when unconfigured.
     pub fn configured_effective(&self) -> Option<EffectivePolicy> {
         self.configured().map(|p| p.effective())
+    }
+
+    /// The game-session routing axis (`design/gamemode-and-dedicated-sessions.md` §5.2). Orthogonal to
+    /// the preset — read directly off the stored policy (or the default `Auto` when unconfigured), so a
+    /// preset selection never resets it.
+    pub fn game_session(&self) -> GameSession {
+        self.get().game_session
     }
 
     /// Persist + adopt a new policy (sanitized first). The in-memory value changes only if the disk
@@ -560,7 +595,9 @@ mod tests {
         let mut positions = BTreeMap::new();
         positions.insert("1".to_string(), Position { x: 0, y: 0 });
         positions.insert("7".to_string(), Position { x: 2560, y: 0 });
-        let p = eff.with_manual_layout(positions);
+        let p = eff.with_manual_layout(positions, GameSession::Dedicated);
+        // The orthogonal game-session axis is preserved through the layout transform.
+        assert_eq!(p.game_session, GameSession::Dedicated);
         // Preset drops to Custom so the explicit fields (incl. the layout) rule…
         assert_eq!(p.preset, Preset::Custom);
         // …every other behavior axis is preserved verbatim…

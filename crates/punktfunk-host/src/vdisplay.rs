@@ -21,6 +21,29 @@ pub use punktfunk_core::Mode;
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 
+/// Who owns a [`VirtualOutput`]'s lifecycle — the honest declaration that lets the registry
+/// (`design/gamemode-and-dedicated-sessions.md` Part A1) pool **only what it owns** instead of
+/// keeping outputs whose real lifecycle lives elsewhere (the gamescope managed/attach paths, which
+/// are governed by the gamescope module's own session machinery). Extends the CLAUDE.md invariant
+/// "the registry owns display lifecycle" with its converse: what the registry does not own, it must
+/// not pretend to keep.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DisplayOwnership {
+    /// The registry owns the lifecycle: it may pool, linger, pin, and tear this display down (KWin,
+    /// Mutter, wlroots, gamescope **bare spawn**, and the Windows manager-delegated monitor). The
+    /// default — a backend that says nothing is registry-owned.
+    #[default]
+    Owned,
+    /// Someone else's display, merely mirrored: no keep-alive, no topology, no reuse (gamescope
+    /// **attach** to a foreign session). Codifies the design-doc §7 "attach = unmanaged pass-through"
+    /// row.
+    External,
+    /// A box-level session the gamescope module manages (the managed `gamescope-session-plus` /
+    /// SteamOS takeover). Passed through by the registry (its restore lifecycle is the gamescope
+    /// module's until Part A3 hands the registry a real keepalive + restore duty).
+    SessionManaged,
+}
+
 /// A created virtual output: a PipeWire source to capture, plus an owned keepalive whose drop
 /// tears the output down (releases the compositor-side resource).
 ///
@@ -44,6 +67,41 @@ pub struct VirtualOutput {
     pub win_capture: Option<crate::capture::dxgi::WinCaptureTarget>,
     /// Keeps the output — and whatever connection/thread backs it — alive; dropped on teardown.
     pub keepalive: Box<dyn Send>,
+    /// Who owns this display's lifecycle (`design/gamemode-and-dedicated-sessions.md` A1). The
+    /// registry pools/keep-alives only [`DisplayOwnership::Owned`] outputs; `External`/`SessionManaged`
+    /// pass through (the capturer holds the keepalive, teardown on drop). Defaults to `Owned`.
+    pub ownership: DisplayOwnership,
+    /// `Some(gen)` when [`registry::acquire`](crate::vdisplay::registry::acquire) handed this back as a
+    /// **reused** kept display (`design/gamemode-and-dedicated-sessions.md` A2), so the pipeline builder
+    /// can [`registry::mark_failed(gen)`](crate::vdisplay::registry::mark_failed) if the first frame
+    /// fails on it — tearing the corpse down so the retry loop's next acquire creates fresh instead of
+    /// re-wedging on the same dead node. `None` on a fresh create / non-poolable output. Linux-only (the
+    /// keep-alive pool is Linux).
+    #[cfg(target_os = "linux")]
+    pub reused_gen: Option<u64>,
+}
+
+impl VirtualOutput {
+    /// A registry-[owned](DisplayOwnership::Owned) output — the common case (KWin/Mutter/wlroots,
+    /// gamescope bare-spawn, Windows). Fills `ownership: Owned`; the caller sets the platform fields.
+    pub fn owned(
+        node_id: u32,
+        preferred_mode: Option<(u32, u32, u32)>,
+        keepalive: Box<dyn Send>,
+    ) -> VirtualOutput {
+        VirtualOutput {
+            node_id,
+            #[cfg(target_os = "linux")]
+            remote_fd: None,
+            preferred_mode,
+            #[cfg(target_os = "windows")]
+            win_capture: None,
+            keepalive,
+            ownership: DisplayOwnership::Owned,
+            #[cfg(target_os = "linux")]
+            reused_gen: None,
+        }
+    }
 }
 
 /// Pluggable virtual-output creation, per compositor.
@@ -101,6 +159,110 @@ pub trait VirtualDisplay: Send {
     /// runtime by output name (first-slot-wins + a group-aware disable filter), and single-display
     /// backends never have a sibling.
     fn set_first_in_group(&mut self, _first: bool) {}
+    /// Will a [`create`](Self::create) for the CURRENT request produce a registry-poolable
+    /// ([`DisplayOwnership::Owned`], keep-alive-able) display? The registry consults this **before**
+    /// its keep-alive reuse lookup, so it never hands a kept display of one flavor to a request of
+    /// another — specifically a gamescope managed/attach acquire must not reuse a kept **bare-spawn**
+    /// (they share the backend name `"gamescope"`). Default `true`; only gamescope overrides it,
+    /// returning `false` when the env selects attach/managed (consistent with the `ownership` its
+    /// `create` will report). See `design/gamemode-and-dedicated-sessions.md` A1.
+    fn poolable_now(&self) -> bool {
+        true
+    }
+    /// The resolved launch command carried on this backend instance (set via
+    /// [`set_launch_command`](Self::set_launch_command)). The registry reads it to key keep-alive reuse
+    /// on `(backend, mode, launch)` (`design/gamemode-and-dedicated-sessions.md` A2) — a kept display
+    /// running game A must never be handed to a session that asked to launch game B. Default `None`
+    /// (backends that never nest a command); only gamescope reports its `cmd`.
+    fn launch_command(&self) -> Option<String> {
+        None
+    }
+    /// Is the kept display's `node_id` still live, checked **before** the registry REUSES it on a
+    /// reconnect (`design/gamemode-and-dedicated-sessions.md` A2)? A `false` tells the registry to tear
+    /// the dead entry down and create fresh instead of handing back a corpse (which would then fail
+    /// capture and burn a retry). Default `true` (honest optimism — the [`mark_failed`] path is the
+    /// backstop for a display that dies between this check and first frame). Only gamescope overrides
+    /// it (its nested session dies when the game exits, independently of any compositor); KWin/Mutter
+    /// nodes die only with their compositor, which the session-epoch invalidation (A4) already reaps.
+    ///
+    /// [`mark_failed`]: crate::vdisplay::registry::mark_failed
+    fn kept_display_alive(&mut self, _node_id: u32) -> bool {
+        true
+    }
+}
+
+/// The **session epoch** — bumped whenever session detection observes a different compositor
+/// *instance*: an [`ActiveKind`] change, **or** a new compositor PID for the same kind (the
+/// Desktop→Game→Desktop bounce that brings up a fresh KWin/gamescope with an unrelated node-id space).
+/// Pooled displays stamp the epoch at creation; the registry only reuses an entry whose epoch still
+/// matches, and its linger timer reaps entries from dead epochs — so a switch can never hand back a
+/// node id that now means nothing (`design/gamemode-and-dedicated-sessions.md` A4).
+static SESSION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The current [session epoch](SESSION_EPOCH). Read by the registry at acquire (to stamp new entries
+/// and gate reuse) and by its linger timer (to reap dead-epoch zombies).
+pub fn session_epoch() -> u64 {
+    SESSION_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bump the [session epoch](SESSION_EPOCH) — call when session detection sees a new compositor
+/// instance (kind change, or same-kind new PID). Returns the new value.
+pub fn bump_session_epoch() -> u64 {
+    SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// The last-observed compositor instance `(kind, pid)`, so [`observe_session_instance`] can tell a
+/// genuine instance change from a stable re-detect.
+static LAST_INSTANCE: std::sync::Mutex<Option<(ActiveKind, Option<u32>)>> =
+    std::sync::Mutex::new(None);
+
+/// Observe the freshly-[detected](detect_active_session) live session and, if the compositor
+/// *instance* changed since the last observation — a different [`ActiveKind`], **or** the same kind
+/// with a new PID (a compositor restart / Desktop→Game→Desktop bounce) — bump the [session
+/// epoch](SESSION_EPOCH) and [invalidate](registry::invalidate_backend) the previous backend's kept
+/// displays, so a reconnect can never reuse a node id from the dead instance (A4). Idempotent per
+/// instance; the first observation just records the baseline. Cheap on the steady state (one mutex
+/// read); the registry lock is taken only on an actual change. Call from every site that detects the
+/// session (the per-connect resolve, the mid-stream watcher, the capture-loss re-detect).
+pub fn observe_session_instance(active: &ActiveSession) {
+    let cur = (active.kind, active.compositor_pid);
+    let mut last = LAST_INSTANCE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(prev) = *last {
+        // Only a **desktop** compositor (KWin / Mutter / wlroots) instance change bumps the epoch +
+        // invalidates its kept displays — its PipeWire node dies with the compositor. A **gamescope**
+        // session (`ActiveKind::Gaming`) is NOT the epoch's subject: the box's game-mode / managed
+        // gamescope isn't pooled, and dedicated **spawns** are independent nested sessions whose nodes
+        // outlive any active-session change. So a game-mode gamescope restart, a Gaming↔Gaming winning-PID
+        // flap (e.g. B1 stopping the autologin before a dedicated spawn), or a coexisting-gamescope set
+        // change must NOT bump/invalidate — that would tear down a live/kept dedicated session (review
+        // findings #6/#7/#10). Gate the whole action on a desktop kind being involved.
+        if prev != cur && (is_desktop_kind(prev.0) || is_desktop_kind(cur.0)) {
+            // Invalidate only the OLD backend, and only if it was a desktop compositor (never gamescope).
+            if is_desktop_kind(prev.0) {
+                if let Some(old) = compositor_for_kind(prev.0) {
+                    registry::invalidate_backend(old.id());
+                }
+            }
+            let epoch = bump_session_epoch();
+            tracing::info!(
+                from = ?prev.0,
+                to = ?cur.0,
+                epoch,
+                "desktop compositor instance changed — session epoch bumped"
+            );
+        }
+    }
+    *last = Some(cur);
+}
+
+/// Is `kind` a **desktop** compositor (KWin / Mutter / wlroots) — one whose kept PipeWire outputs die
+/// with the compositor instance, so the session epoch tracks it? `Gaming` (gamescope) and `None` are
+/// not (gamescope spawns are independent nested sessions — see [`observe_session_instance`]).
+fn is_desktop_kind(kind: ActiveKind) -> bool {
+    matches!(
+        kind,
+        ActiveKind::DesktopKde | ActiveKind::DesktopGnome | ActiveKind::DesktopWlroots
+    )
 }
 
 /// Compositors punktfunk knows how to drive (plan §6).
@@ -241,6 +403,10 @@ pub struct SessionEnv {
 pub struct ActiveSession {
     pub kind: ActiveKind,
     pub env: SessionEnv,
+    /// PID of the winning compositor process (`None` when nothing live). The session watcher compares
+    /// it across polls so a **same-kind** compositor restart (Desktop→Game→Desktop) bumps the session
+    /// epoch — a fresh instance's node-id space is unrelated to the old one's (A4).
+    pub compositor_pid: Option<u32>,
 }
 
 impl ActiveSession {
@@ -253,6 +419,7 @@ impl ActiveSession {
                 dbus_session_bus_address: default_bus(&default_runtime_dir()),
                 ..Default::default()
             },
+            compositor_pid: None,
         }
     }
 }
@@ -304,6 +471,9 @@ pub fn detect_active_session() -> ActiveSession {
     // `pkill -x` discipline (exact, ≤15 chars so untruncated).
     let mut kind = ActiveKind::None;
     let mut best = 0u8;
+    // The winning compositor's PID — kept so a same-kind compositor RESTART (a new PID) bumps the
+    // session epoch (A4), not just a kind change.
+    let mut winning_pid: Option<u32> = None;
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for e in entries.flatten() {
             let name = e.file_name();
@@ -328,9 +498,22 @@ pub fn detect_active_session() -> ActiveSession {
                 "sway" | "Hyprland" | "hyprland" | "river" => (ActiveKind::DesktopWlroots, 4),
                 _ => continue,
             };
+            let pid = name.parse::<u32>().ok();
             if prio > best {
                 best = prio;
                 kind = k;
+                winning_pid = pid;
+            } else if prio == best {
+                // Deterministic tie-break among same-top-priority processes: keep the LOWEST pid, so a
+                // duplicate same-kind compositor (two `kwin_wayland`) can't make `winning_pid` flap with
+                // `/proc` enumeration order — which `observe_session_instance` would misread as a
+                // compositor restart and tear a live display down (re-review low-severity note).
+                if let (Some(p), Some(w)) = (pid, winning_pid) {
+                    if p < w {
+                        kind = k;
+                        winning_pid = Some(p);
+                    }
+                }
             }
         }
     }
@@ -358,6 +541,7 @@ pub fn detect_active_session() -> ActiveSession {
             dbus_session_bus_address: dbus,
             xdg_current_desktop,
         },
+        compositor_pid: winning_pid,
     }
 }
 
@@ -518,6 +702,7 @@ pub enum GamescopeMode {
 /// default is a per-session bare spawn — the path that nests the client's launch command.
 #[cfg(target_os = "linux")]
 fn pick_gamescope_mode(
+    dedicated_launch: bool,
     force_managed: bool,
     attach_env: bool,
     node_env: bool,
@@ -529,6 +714,11 @@ fn pick_gamescope_mode(
         GamescopeMode::Managed
     } else if attach_env || node_env {
         GamescopeMode::Attach
+    } else if dedicated_launch {
+        // A dedicated game session always spawns its own headless gamescope at the client's mode,
+        // nesting just the game — outranking managed-infra / foreign-attach, but not the explicit
+        // operator MANAGED/ATTACH/NODE overrides above (debug/CI). (design/gamemode-and-dedicated-sessions.md §5.3)
+        GamescopeMode::Spawn
     } else if session_env || managed_infra {
         GamescopeMode::Managed
     } else if foreign_gamescope {
@@ -548,7 +738,7 @@ fn pick_gamescope_mode(
 /// nesting the session's launch command — the plain-distro default). `PUNKTFUNK_GAMESCOPE_MANAGED`
 /// forces managed over all of it.
 #[cfg(target_os = "linux")]
-pub fn apply_input_env(chosen: Compositor) {
+pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) {
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let backend = match chosen {
         Compositor::Gamescope => "gamescope",
@@ -562,6 +752,7 @@ pub fn apply_input_env(chosen: Compositor) {
     std::env::set_var("PUNKTFUNK_INPUT_BACKEND", backend);
     if chosen == Compositor::Gamescope {
         let mode = pick_gamescope_mode(
+            dedicated_launch,
             std::env::var_os("PUNKTFUNK_GAMESCOPE_MANAGED").is_some(),
             std::env::var_os("PUNKTFUNK_GAMESCOPE_ATTACH").is_some(),
             std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_some(),
@@ -593,7 +784,34 @@ pub fn apply_input_env(chosen: Compositor) {
     }
 }
 #[cfg(not(target_os = "linux"))]
-pub fn apply_input_env(_chosen: Compositor) {}
+pub fn apply_input_env(_chosen: Compositor, _dedicated_launch: bool) {}
+
+/// Should a game-launching session get a **dedicated** headless gamescope (`game_session=dedicated`
+/// policy, `design/gamemode-and-dedicated-sessions.md` B0)? True only when the session carries a
+/// launch, the policy selects `dedicated`, AND gamescope is actually available (else it degrades to
+/// `auto` honestly). Computed at the handshake and threaded into [`apply_input_env`] /
+/// [`resolve_compositor`] as a value (no new env knob — the `ENV_LOCK` discipline).
+pub fn wants_dedicated_game_session(has_launch: bool) -> bool {
+    use policy::GameSession;
+    if !has_launch || policy::prefs().game_session() != GameSession::Dedicated {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if gamescope::is_available() {
+            true
+        } else {
+            tracing::info!(
+                "game_session=dedicated but gamescope is unavailable — falling back to auto routing"
+            );
+            false
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false // Windows: a launching session opens into the one desktop (no gamescope)
+    }
+}
 
 /// Will `vd.create` on this backend NEST the session's launch command itself (gamescope's bare
 /// spawn runs it inside the new gamescope)? When true the session must NOT also spawn the command
@@ -615,6 +833,27 @@ pub fn launch_is_nested(compositor: Compositor) -> bool {
 pub fn launch_into_gamescope_session(cmd: &str) -> Result<std::process::Child> {
     gamescope::launch_into_session(cmd)
 }
+
+/// B2: has a **dedicated** gamescope game session's game exited (its `node_id` doesn't reappear within a
+/// short window after capture loss)? The dedicated-spawn session ends cleanly on `true` instead of the
+/// capture-loss rebuild. Scoped to the session's OWN node so a coexisting gamescope doesn't mask the
+/// exit (review #4/#8). Always `false` off Linux.
+#[cfg(target_os = "linux")]
+pub fn dedicated_game_exited(node_id: u32) -> bool {
+    gamescope::game_session_exited(node_id)
+}
+#[cfg(not(target_os = "linux"))]
+pub fn dedicated_game_exited(_node_id: u32) -> bool {
+    false
+}
+
+/// Cancel any pending TV-session restore because a client (re)connected (review #3). No-op off Linux.
+#[cfg(target_os = "linux")]
+pub fn cancel_pending_tv_restore() {
+    gamescope::cancel_pending_restore();
+}
+#[cfg(not(target_os = "linux"))]
+pub fn cancel_pending_tv_restore() {}
 
 /// Detect the compositor to drive: explicit `PUNKTFUNK_COMPOSITOR` override (legacy / CI / forcing
 /// a backend for a test), else the **live session** ([`detect_active_session`] — so a Bazzite box
@@ -750,6 +989,16 @@ pub fn start_restore_worker() -> std::sync::Arc<()> {
     std::sync::Arc::new(())
 }
 
+/// Recover a stranded TV takeover from a crashed previous host instance
+/// (`design/gamemode-and-dedicated-sessions.md` A3). Call once at `serve` startup, alongside
+/// [`start_restore_worker`]. No-op when no takeover was persisted (a clean start).
+#[cfg(target_os = "linux")]
+pub fn restore_takeover_on_startup() {
+    gamescope::restore_takeover_on_startup();
+}
+#[cfg(not(target_os = "linux"))]
+pub fn restore_takeover_on_startup() {}
+
 // The user-configurable management policy (keep-alive / topology / conflict / identity / layout),
 // layered above the per-compositor backends — platform-neutral (the mgmt API + both host paths read
 // it), so no cfg gate. See `design/display-management.md`.
@@ -878,21 +1127,33 @@ mod tests {
     fn gamescope_mode_ladder() {
         use GamescopeMode::*;
         let pick = pick_gamescope_mode;
-        // (force_managed, attach_env, node_env, session_env, managed_infra, foreign_gamescope)
+        // (dedicated_launch, force_managed, attach_env, node_env, session_env, managed_infra, foreign_gamescope)
         // Plain distro, nothing running: bare spawn — the path that nests the launch command.
-        assert_eq!(pick(false, false, false, false, false, false), Spawn);
+        assert_eq!(pick(false, false, false, false, false, false, false), Spawn);
         // Bazzite/SteamOS (session infra present): managed, as validated live.
-        assert_eq!(pick(false, false, false, false, true, false), Managed);
-        assert_eq!(pick(false, false, false, false, true, true), Managed);
+        assert_eq!(
+            pick(false, false, false, false, false, true, false),
+            Managed
+        );
+        assert_eq!(pick(false, false, false, false, false, true, true), Managed);
         // Foreign gamescope on an infra-less box: attach and mirror it.
-        assert_eq!(pick(false, false, false, false, false, true), Attach);
+        assert_eq!(pick(false, false, false, false, false, false, true), Attach);
         // Operator-set PUNKTFUNK_GAMESCOPE_SESSION keeps managed even without detected infra.
-        assert_eq!(pick(false, false, false, true, false, false), Managed);
+        assert_eq!(
+            pick(false, false, false, false, true, false, false),
+            Managed
+        );
         // Explicit attach/node wins over infra…
-        assert_eq!(pick(false, true, false, false, true, false), Attach);
-        assert_eq!(pick(false, false, true, true, true, false), Attach);
+        assert_eq!(pick(false, false, true, false, false, true, false), Attach);
+        assert_eq!(pick(false, false, false, true, true, true, false), Attach);
         // …and force-managed wins over everything.
-        assert_eq!(pick(true, true, true, false, false, false), Managed);
+        assert_eq!(pick(false, true, true, true, false, false, false), Managed);
+        // A dedicated launch forces Spawn, outranking managed-infra + foreign-attach…
+        assert_eq!(pick(true, false, false, false, false, true, true), Spawn);
+        // …but the explicit operator overrides still win over dedicated.
+        assert_eq!(pick(true, true, false, false, false, true, false), Managed);
+        assert_eq!(pick(true, false, true, false, false, false, false), Attach);
+        assert_eq!(pick(true, false, false, true, false, false, false), Attach);
     }
 
     #[test]

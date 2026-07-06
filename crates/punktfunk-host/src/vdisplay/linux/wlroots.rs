@@ -19,7 +19,7 @@
 //! `systemctl --user`, see `scripts/headless/prepare-session.sh`), with the ScreenCast
 //! interface routed to xdpw (`scripts/headless/portals.conf`).
 
-use super::{Mode, VirtualDisplay, VirtualOutput};
+use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
 use std::os::fd::OwnedFd;
 use std::process::Command;
@@ -130,6 +130,11 @@ impl VirtualDisplay for WlrootsDisplay {
                 _stop: StopGuard(stop),
                 _output: output,
             }),
+            // Owned (the compositor output is ours to tear down), but not registry-poolable: the
+            // portal fd can't be re-opened per attach, so the registry passes it through on
+            // `remote_fd.is_some()` (keep-alive stays off for wlroots until fresh-portal re-attach).
+            ownership: DisplayOwnership::Owned,
+            reused_gen: None,
         })
     }
 }

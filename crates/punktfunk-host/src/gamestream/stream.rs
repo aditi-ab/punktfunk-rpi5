@@ -246,14 +246,33 @@ fn open_gs_virtual_source(
         }
         #[cfg(not(target_os = "windows"))]
         {
+            // A client is (re)connecting → cancel any pending TV-session restore (review #3).
+            crate::vdisplay::cancel_pending_tv_restore();
             let active = crate::vdisplay::detect_active_session();
+            // A4: fold any compositor-instance change (idle-time Game↔Desktop switch) into the epoch
+            // before acquiring, so a GameStream reconnect never reuses a dead-instance node.
+            crate::vdisplay::observe_session_instance(&active);
             crate::vdisplay::apply_session_env(&active);
-            let c = crate::vdisplay::compositor_for_kind(active.kind)
-                .map(Ok)
-                .unwrap_or_else(crate::vdisplay::detect)
-                .context("detect compositor")?;
-            crate::vdisplay::apply_input_env(c);
-            c
+            // Dedicated game session (B0): a GameStream app whose launch RESOLVES to a command (library
+            // id / apps.json command), under `game_session=dedicated` with gamescope available, gets its
+            // own headless gamescope spawn at the client mode — same routing as the native plane. Gate on
+            // the resolved command so an unresolvable entry falls back to auto routing (review #9).
+            let has_launch = crate::library::resolve_session_launch(
+                app.and_then(|a| a.library_id.as_deref()),
+                app.and_then(|a| a.cmd.as_deref()),
+            )
+            .is_some();
+            if crate::vdisplay::wants_dedicated_game_session(has_launch) {
+                crate::vdisplay::apply_input_env(crate::vdisplay::Compositor::Gamescope, true);
+                crate::vdisplay::Compositor::Gamescope
+            } else {
+                let c = crate::vdisplay::compositor_for_kind(active.kind)
+                    .map(Ok)
+                    .unwrap_or_else(crate::vdisplay::detect)
+                    .context("detect compositor")?;
+                crate::vdisplay::apply_input_env(c, false);
+                c
+            }
         }
     };
     let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;

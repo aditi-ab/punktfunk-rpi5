@@ -285,6 +285,9 @@ pub(crate) async fn serve(
     // restores the box's autologin gaming session on idle, not per-disconnect — see
     // `vdisplay::restore_managed_session`). Held for serve()'s lifetime; dropping it stops it.
     let _restore_worker = crate::vdisplay::start_restore_worker();
+    // A3: recover a TV takeover stranded by a crashed previous host instance (persisted to
+    // $XDG_RUNTIME_DIR) — schedule a restore after a reconnect grace. No-op on a clean start.
+    crate::vdisplay::restore_takeover_on_startup();
     // Host-lifetime cover-art warmer: fetches + caches GOG/Xbox cover art (no-auth api.gog.com /
     // displaycatalog) off the hot path so `all_games()` (the library list + launch resolve) never
     // blocks on the network. A no-op on a host whose stores all carry their own art.
@@ -826,8 +829,23 @@ async fn serve_session(
         let compositor = match source {
             Punktfunk1Source::Virtual => {
                 let pref = hello.compositor;
+                // Dedicated game session (B0): a launching client under `game_session=dedicated`
+                // (gamescope available) gets its own headless gamescope spawn at the client mode. Gate on
+                // whether the launch id actually RESOLVES to a command in the host's library — an unknown
+                // id must fall back to normal auto routing, not a blank "sleep infinity" gamescope
+                // (review #9). (dedicated is Linux-only; the resolver is the non-Windows launch_command.)
+                #[cfg(not(target_os = "windows"))]
+                let has_resolvable_launch = hello
+                    .launch
+                    .as_deref()
+                    .and_then(crate::library::launch_command)
+                    .is_some();
+                #[cfg(target_os = "windows")]
+                let has_resolvable_launch = false;
+                let dedicated =
+                    crate::vdisplay::wants_dedicated_game_session(has_resolvable_launch);
                 Some(
-                    tokio::task::spawn_blocking(move || resolve_compositor(pref))
+                    tokio::task::spawn_blocking(move || resolve_compositor(pref, dedicated))
                         .await
                         .context("resolve compositor task")??,
                 )
@@ -2223,17 +2241,24 @@ fn pick_compositor(
 /// [`pick_compositor`]): enumerate what's available, auto-detect the default, pick, and log
 /// whether the explicit request was honored or fell back. Runs blocking probes — call off the
 /// async reactor (`spawn_blocking`).
-fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Compositor> {
+fn resolve_compositor(
+    pref: CompositorPref,
+    dedicated_launch: bool,
+) -> Result<crate::vdisplay::Compositor> {
     use crate::vdisplay::Compositor;
     // Windows has a single virtual-display backend (SudoVDA); vdisplay::open ignores the compositor
     // arg there, so short-circuit the Linux session-detection state machine with a placeholder.
     #[cfg(target_os = "windows")]
     {
-        let _ = pref;
+        let _ = (pref, dedicated_launch);
         Ok(Compositor::Kwin)
     }
     #[cfg(not(target_os = "windows"))]
     {
+        // A client is (re)connecting → cancel any pending TV-session restore so the box stays in the
+        // streamed session (covers the keep-alive REUSE reconnect, which skips create_managed_session's
+        // own cancel — review #3). No-op when nothing is pending.
+        crate::vdisplay::cancel_pending_tv_restore();
         // Explicit operator override (legacy / CI / forcing a backend for a test) wins and is assumed
         // to come with a hand-set env — don't retarget the process env in that case.
         let overridden = crate::config::config().compositor.is_some();
@@ -2244,6 +2269,10 @@ fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Composito
             // every backend (video capture + input) this connect opens against the active session —
             // this is the state machine that lets one host follow a Bazzite box across Gaming↔Desktop.
             let active = crate::vdisplay::detect_active_session();
+            // A4: if the compositor instance changed since the last connect (an idle-time Game↔Desktop
+            // switch), bump the epoch + invalidate the old backend's kept displays so this connect never
+            // reuses a node id from the dead instance.
+            crate::vdisplay::observe_session_instance(&active);
             crate::vdisplay::apply_session_env(&active);
             tracing::info!(
                 active = ?active.kind,
@@ -2252,6 +2281,18 @@ fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Composito
             );
             crate::vdisplay::compositor_for_kind(active.kind)
         };
+        // Dedicated game session (design/gamemode-and-dedicated-sessions.md B0): a launching session
+        // under `game_session=dedicated` (gamescope confirmed available) forces its OWN headless
+        // gamescope spawn at the client's mode, overriding the detected desktop/game-mode backend. The
+        // env was already retargeted above (for XDG_RUNTIME_DIR / the PipeWire daemon); we just pin the
+        // backend + input to the spawn sub-mode. Skipped under an explicit operator compositor pin.
+        if dedicated_launch && !overridden {
+            crate::vdisplay::apply_input_env(Compositor::Gamescope, true);
+            tracing::info!(
+                "dedicated game session — routing to a headless gamescope spawn at the client mode"
+            );
+            return Ok(Compositor::Gamescope);
+        }
         let available = crate::vdisplay::available();
         let chosen = pick_compositor(pref, &available, detected).ok_or_else(|| {
         anyhow!("no usable compositor (no live graphical session for this uid; set PUNKTFUNK_COMPOSITOR or start a desktop/gaming session)")
@@ -2259,7 +2300,7 @@ fn resolve_compositor(pref: CompositorPref) -> Result<crate::vdisplay::Composito
         if !overridden {
             // Point input at the same backend and resolve the gamescope sub-mode (managed where the
             // session infra exists, attach to a foreign gamescope, else per-session bare spawn).
-            crate::vdisplay::apply_input_env(chosen);
+            crate::vdisplay::apply_input_env(chosen, false);
         }
         let avail_ids: Vec<&str> = available.iter().map(|c| c.id()).collect();
         match Compositor::from_pref(pref) {
@@ -2886,6 +2927,11 @@ fn session_watcher_loop(tx: std::sync::mpsc::Sender<SessionSwitch>, stop: Arc<At
             break;
         }
         let active = vdisplay::detect_active_session();
+        // A4: bump the session epoch + invalidate the old backend the moment the compositor instance
+        // changes (kind change OR same-kind restart) — even for a same-kind restart the watcher won't
+        // signal a full SessionSwitch for. Self-dedupes; the debounced SessionSwitch below still drives
+        // the in-place rebuild.
+        vdisplay::observe_session_instance(&active);
         let cur = active.kind;
         if cur == current {
             pending = None; // back to the current backend before debounce elapsed — no switch
@@ -3049,7 +3095,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
     #[cfg(target_os = "windows")]
     let _idd_setup_guard = (plan.capture == crate::session_plan::CaptureBackend::IddPush)
         .then(|| crate::vdisplay::manager::vdm().begin_idd_setup(stop.clone()));
-    let (mut capturer, mut enc, mut frame, mut interval) =
+    let (mut capturer, mut enc, mut frame, mut interval, mut cur_node_id) =
         build_pipeline_with_retry(&mut vd, mode, bitrate_kbps, bit_depth, plan, &quit)?;
     // Setup done — release the IDD-push setup lock so the next reconnect can begin (and preempt us).
     #[cfg(target_os = "windows")]
@@ -3196,8 +3242,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 crate::vdisplay::apply_session_env(&crate::vdisplay::ActiveSession {
                     kind: sw.kind,
                     env: sw.env,
+                    compositor_pid: None,
                 });
-                crate::vdisplay::apply_input_env(sw.compositor);
+                // A mid-stream Game↔Desktop switch is not a fresh dedicated launch — route input at the
+                // switched-to backend's normal sub-mode.
+                crate::vdisplay::apply_input_env(sw.compositor, false);
                 // Switching INTO a desktop mid-stream: the xdg portal / systemd-user env may still
                 // point at the old session, so input would silently not land until a reconnect.
                 // Settle it (env push + KWin portal restart) before the injector reopens against it.
@@ -3223,13 +3272,14 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                         Ok((new_vd, pipe))
                     })();
                 match rebuilt {
-                    Ok((new_vd, (new_cap, new_enc, new_frame, new_interval))) => {
+                    Ok((new_vd, (new_cap, new_enc, new_frame, new_interval, new_node_id))) => {
                         // Replace the pipeline first (drops the old capturer → old PipeWire stream +
                         // virtual output), then the factory (drops e.g. the old KWin connection).
                         capturer = new_cap;
                         enc = new_enc;
                         frame = new_frame;
                         interval = new_interval;
+                        cur_node_id = new_node_id;
                         vd = new_vd;
                         compositor = sw.compositor;
                         next = std::time::Instant::now();
@@ -3264,7 +3314,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             // healthy session — keep streaming the current mode and log instead.
             match build_pipeline(&mut vd, new_mode, bitrate_kbps, bit_depth, plan, &quit) {
                 Ok(next_pipe) => {
-                    (capturer, enc, frame, interval) = next_pipe;
+                    (capturer, enc, frame, interval, cur_node_id) = next_pipe;
                     cur_mode = new_mode;
                     next = std::time::Instant::now();
                 }
@@ -3331,6 +3381,27 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             // bounded retry is exhausted; the consecutive cap stops a flapping source from looping the
             // client through endless cold IDRs.
             Err(e) => {
+                // B2: a DEDICATED gamescope game session whose gamescope node is gone = the game
+                // exited (gamescope is a single-app compositor — it dies with its app). End the session
+                // CLEANLY — close with `APP_EXITED_CLOSE_CODE` so a launcher client returns to its
+                // library instead of surfacing a failure — rather than the capture-loss rebuild + 40 s
+                // timeout. Gated to the dedicated bare-spawn launch (`launch_is_nested`), so a normal
+                // Bazzite/desktop capture loss still rebuilds in place.
+                #[cfg(target_os = "linux")]
+                if launch.is_some()
+                    && crate::vdisplay::launch_is_nested(compositor)
+                    && crate::vdisplay::dedicated_game_exited(cur_node_id)
+                {
+                    tracing::info!(
+                        "dedicated game session: the game exited — ending the session cleanly"
+                    );
+                    quit.store(true, Ordering::SeqCst); // skip keep-alive linger — the game is gone
+                    conn.close(
+                        punktfunk_core::quic::APP_EXITED_CLOSE_CODE.into(),
+                        b"game exited",
+                    );
+                    break;
+                }
                 capture_rebuilds += 1;
                 if capture_rebuilds > MAX_CAPTURE_REBUILDS {
                     return Err(e).context("capture lost — rebuild attempts exhausted");
@@ -3348,14 +3419,18 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 // appears — no reconnect.
                 const REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(40);
                 let rebuild_deadline = std::time::Instant::now() + REBUILD_BUDGET;
-                let (new_cap, new_enc, new_frame, new_interval) = loop {
+                let (new_cap, new_enc, new_frame, new_interval, new_node_id) = loop {
                     // Follow the active session unless an explicit PUNKTFUNK_COMPOSITOR pin forbids
                     // retargeting (then we stick to the pinned backend and just rebuild it).
                     if crate::config::config().compositor.is_none() {
                         let active = crate::vdisplay::detect_active_session();
+                        // A4: fold any compositor-instance change into the epoch/invalidation before we
+                        // rebuild, so the rebuild's acquire won't reuse a dead-instance node.
+                        crate::vdisplay::observe_session_instance(&active);
                         if let Some(c) = crate::vdisplay::compositor_for_kind(active.kind) {
                             crate::vdisplay::apply_session_env(&active);
-                            crate::vdisplay::apply_input_env(c);
+                            // Capture-loss rebuild follows the live box session, not a fresh dedicated launch.
+                            crate::vdisplay::apply_input_env(c, false);
                             if c != compositor {
                                 if matches!(
                                     c,
@@ -3402,6 +3477,7 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 enc = new_enc;
                 frame = new_frame;
                 interval = new_interval;
+                cur_node_id = new_node_id;
                 enc.request_keyframe(); // belt-and-suspenders; a fresh encoder opens on an IDR anyway
                 next = std::time::Instant::now();
                 tracing::info!(
@@ -3592,6 +3668,10 @@ type Pipeline = (
     Box<dyn crate::encode::Encoder>,
     crate::capture::CapturedFrame,
     std::time::Duration,
+    // The virtual output's PipeWire node id — used by the B2 dedicated game-exit probe to check THIS
+    // session's own node (scoped), not any gamescope node. `0` for backends without a PipeWire node
+    // (Windows IDD-push), which never take the dedicated-gamescope B2 path anyway.
+    u32,
 );
 
 /// Build the pipeline, retrying *transient* failures with bounded exponential backoff.
@@ -3709,6 +3789,14 @@ fn build_pipeline(
     // `quit` flag rides into the lease so a deliberate-quit teardown skips the keep-alive linger.
     let vout = crate::vdisplay::registry::acquire(vd, mode, quit.clone())
         .context("create virtual output")?;
+    // A2: if this was a REUSED kept display and its first frame fails, tear the (dead) pool entry down
+    // so the retry loop's next acquire creates fresh instead of re-wedging on the same corpse. Read the
+    // gen BEFORE `capture_virtual_output` consumes `vout`. (Linux-only — the pool is Linux.)
+    #[cfg(target_os = "linux")]
+    let reused_gen = vout.reused_gen;
+    // The virtual output's PipeWire node id — kept for the B2 dedicated game-exit probe (scoped to
+    // this session's own node). Read before `capture_virtual_output` consumes `vout`.
+    let node_id = vout.node_id;
     // The backend reports the refresh it actually achieved in `preferred_mode.2` (KWin may cap a
     // virtual output at 60 Hz if the custom-mode install was rejected). Pace the encoder + frame
     // clock to that, not the requested rate, so we don't emit phantom duplicate frames over a
@@ -3733,7 +3821,17 @@ fn build_pipeline(
         crate::capture::capture_virtual_output(vout, plan.output_format(), plan.capture)
             .context("capture virtual output")?;
     capturer.set_active(true);
-    let frame = capturer.next_frame().context("first frame")?;
+    let frame = match capturer.next_frame().context("first frame") {
+        Ok(f) => f,
+        Err(e) => {
+            // A reused kept display was dead — invalidate it so the next attempt creates fresh (A2).
+            #[cfg(target_os = "linux")]
+            if let Some(g) = reused_gen {
+                crate::vdisplay::registry::mark_failed(g);
+            }
+            return Err(e);
+        }
+    };
     // `bit_depth` is the handshake-negotiated value (8, or 10 = HEVC Main10 when the client
     // advertised VIDEO_CAP_10BIT and the host opted in). Threaded down from the Welcome.
     let enc = crate::encode::open_video(
@@ -3760,7 +3858,7 @@ fn build_pipeline(
         );
     }
     let interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
-    Ok((capturer, enc, frame, interval))
+    Ok((capturer, enc, frame, interval, node_id))
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.7.4"
+    "version": "0.8.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -2240,6 +2240,10 @@
         "type": "object",
         "description": "The user-facing display-management policy — what `display-settings.json` holds and what the mgmt\nAPI GETs/PUTs. When [`preset`](Self::preset) is not [`Preset::Custom`] the explicit fields are\nignored (the console writes one or the other); [`effective`](Self::effective) resolves both to a\nsingle [`EffectivePolicy`].",
         "properties": {
+          "game_session": {
+            "$ref": "#/components/schemas/GameSession",
+            "description": "How a game-launching session is served (`design/gamemode-and-dedicated-sessions.md` §5.2).\nOrthogonal to `preset`/lifecycle — preserved across preset changes; `#[serde(default)]` = `Auto`\nso existing `display-settings.json` files are untouched."
+          },
           "identity": {
             "$ref": "#/components/schemas/Identity"
           },
@@ -2398,6 +2402,14 @@
             "type": "string"
           }
         }
+      },
+      "GameSession": {
+        "type": "string",
+        "description": "How a session that **launches a game** (a library id on the Hello / apps.json / Decky pin) is\nserved (`design/gamemode-and-dedicated-sessions.md` §5.2). Orthogonal to the preset/lifecycle axes\n— a top-level [`DisplayPolicy`] field, NOT part of [`EffectivePolicy`], so a preset never clobbers\nit. Linux-only in effect (a launching Windows session opens into the one desktop).",
+        "enum": [
+          "auto",
+          "dedicated"
+        ]
       },
       "GpuState": {
         "type": "object",

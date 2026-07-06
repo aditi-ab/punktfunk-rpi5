@@ -14,7 +14,7 @@
 //! Input uses gamescope's own libei/EIS socket (`LIBEI_SOCKET`), relayed to the libei backend (see
 //! `inject/libei.rs`) — wired and live-validated.
 
-use super::{Mode, VirtualDisplay, VirtualOutput};
+use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -62,6 +62,18 @@ static PENDING_RESTORE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::ne
 /// instead of triggering a stop/relaunch.
 const RESTORE_DEBOUNCE: Duration = Duration::from_secs(5);
 
+/// Per-spawn instance counter (A5): each bare-spawn gets a unique id addressing its own log so two
+/// coexisting gamescopes (a kept lingering spawn + a fresh one) never parse each other's node id.
+static SPAWN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// This spawn instance's log path, under `$XDG_RUNTIME_DIR` (per-user, tmpfs; falls back to `/tmp`
+/// only if unset). Replaces the shared `/tmp/punktfunk-gamescope.log` so concurrent spawns don't
+/// clobber each other's `stream available on node ID:` line.
+fn spawn_log_path(inst: u64) -> std::path::PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::Path::new(&base).join(format!("punktfunk-gamescope-{inst}.log"))
+}
+
 /// systemd --user transient unit name for the host-managed gamescope-session-plus session.
 const SESSION_UNIT: &str = "punktfunk-gamescope";
 /// The gamescope-session-plus launcher script (Bazzite / SteamOS-like hosts).
@@ -82,6 +94,80 @@ const STEAMOS_SESSION_TARGET: &str = "gamescope-session.target";
 /// restart the physical session.
 static STEAMOS_TOOK_OVER: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
+/// Persisted takeover state (`design/gamemode-and-dedicated-sessions.md` A3): the takeover mechanics
+/// ([`STOPPED_AUTOLOGIN`] / [`STEAMOS_TOOK_OVER`]) are process memory, so a host **crash** mid-stream
+/// would strand the box out of gaming mode with no restore. Mirroring the statics to a file lets
+/// [`restore_takeover_on_startup`] put the TV back after a restart.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct TakeoverState {
+    /// Autologin `gamescope-session-plus@*.service` units we stopped (to restart on restore).
+    stopped_autologin: Vec<String>,
+    /// Whether we took over SteamOS's `gamescope-session.target` (restore = remove drop-in + restart).
+    steamos: bool,
+}
+
+/// Path of the persisted [`TakeoverState`], under `$XDG_RUNTIME_DIR` (per-user, 0700, tmpfs — cleared
+/// on reboot, which is correct: a reboot restarts the autologin itself).
+fn takeover_state_path() -> std::path::PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::Path::new(&base).join("punktfunk-session-takeover.json")
+}
+
+/// Persist the current takeover mechanics so a host crash doesn't strand the box out of gaming mode.
+/// Best-effort (a write failure just loses crash-restore, not correctness).
+fn persist_takeover() {
+    let state = TakeoverState {
+        stopped_autologin: STOPPED_AUTOLOGIN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        steamos: *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()),
+    };
+    if state.stopped_autologin.is_empty() && !state.steamos {
+        clear_takeover();
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(&state) {
+        let _ = std::fs::write(takeover_state_path(), bytes);
+    }
+}
+
+/// Remove the persisted takeover file (after a completed restore, or when there's nothing to restore).
+fn clear_takeover() {
+    let _ = std::fs::remove_file(takeover_state_path());
+}
+
+/// On host startup, restore the TV's gaming session if a previous host instance took it over and
+/// crashed before restoring (`design/gamemode-and-dedicated-sessions.md` A3). Loads the persisted
+/// [`TakeoverState`] into the statics and schedules a restore after a short reconnect grace (so a
+/// client reconnecting right after the restart keeps the streamed session instead of bouncing the
+/// box back to gaming mode). No-op when no takeover file exists (a clean start). Call once from
+/// `serve` alongside [`start_restore_worker`].
+pub fn restore_takeover_on_startup() {
+    let Ok(bytes) = std::fs::read(takeover_state_path()) else {
+        return; // no takeover file — clean start
+    };
+    let Ok(state) = serde_json::from_slice::<TakeoverState>(&bytes) else {
+        clear_takeover();
+        return;
+    };
+    if state.stopped_autologin.is_empty() && !state.steamos {
+        clear_takeover();
+        return;
+    }
+    tracing::warn!(
+        units = ?state.stopped_autologin,
+        steamos = state.steamos,
+        "gamescope: found a stranded takeover from a previous host instance — scheduling TV restore"
+    );
+    *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = state.stopped_autologin;
+    *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = state.steamos;
+    // A generous grace so a client reconnecting right after the restart cancels it (create_managed_session
+    // clears PENDING_RESTORE) and keeps the streamed session rather than bouncing to gaming mode.
+    *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(Instant::now() + Duration::from_secs(15));
+}
+
 impl GamescopeDisplay {
     pub fn new() -> Result<Self> {
         Ok(GamescopeDisplay::default())
@@ -95,6 +181,32 @@ impl VirtualDisplay for GamescopeDisplay {
 
     fn set_launch_command(&mut self, cmd: Option<String>) {
         self.cmd = cmd;
+    }
+
+    fn poolable_now(&self) -> bool {
+        // Only a bare SPAWN is registry-poolable (its `create` reports `Owned`); managed
+        // (`PUNKTFUNK_GAMESCOPE_SESSION`) and attach (`PUNKTFUNK_GAMESCOPE_NODE`) report
+        // `SessionManaged`/`External`, so the registry must not reuse a kept spawn for them (same
+        // backend name). Mirrors [`crate::vdisplay::launch_is_nested`]; read under the env lock the
+        // sub-mode ladder writes these keys under.
+        crate::vdisplay::with_env_lock(|| {
+            std::env::var_os("PUNKTFUNK_GAMESCOPE_SESSION").is_none()
+                && std::env::var_os("PUNKTFUNK_GAMESCOPE_NODE").is_none()
+        })
+    }
+
+    fn launch_command(&self) -> Option<String> {
+        // The registry keys keep-alive reuse on (backend, mode, launch): a kept bare-spawn running
+        // game A must never be reused for a session launching game B (A2).
+        self.cmd.clone()
+    }
+
+    fn kept_display_alive(&mut self, node_id: u32) -> bool {
+        // The nested gamescope dies when its game exits (independently of any compositor), leaving a
+        // dead pooled node. Before the registry reuses that node on a reconnect, confirm it still
+        // exists on the daemon; a `false` makes the registry recreate instead of handing back a corpse
+        // (which would then burn a ~10 s first-frame retry before `mark_failed` recovered it).
+        gamescope_node_present(node_id)
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
@@ -121,26 +233,51 @@ impl VirtualDisplay for GamescopeDisplay {
             };
             point_injector_at_eis();
             tracing::info!(node_id, "gamescope: attaching to existing PipeWire node");
+            // ATTACH = mirror a foreign gamescope we don't own → External (no keep-alive/reuse).
             return Ok(VirtualOutput {
                 node_id,
                 remote_fd: None,
                 preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
                 keepalive: Box::new(()),
+                ownership: DisplayOwnership::External,
+                reused_gen: None,
             });
         }
         check_gamescope_version(); // diagnostic only — warns on known-deadlock-prone versions
-        let proc = GamescopeProc(spawn(
+                                   // B1: a dedicated STEAM launch needs Steam's single instance free. If the box autologged into
+                                   // game mode (Bazzite) its Steam holds the instance, and a nested second Steam would see the
+                                   // first and exit (crashing the spawn) — so free the autologin session first. Its restore is the
+                                   // A3 takeover machinery (recorded in STOPPED_AUTOLOGIN + persisted; restarted on session end via
+                                   // schedule_restore_tv_session). Non-Steam launches don't conflict, so they skip this.
+        if self.cmd.as_deref().is_some_and(is_steam_launch) {
+            stop_autologin_sessions();
+        }
+        // A5: a per-spawn instance id addresses this spawn's log + node discovery, so two coexisting
+        // bare-spawns (a kept lingering one + a fresh one) never parse each other's node id from a
+        // shared log. The nested-command's LIBEI relay stays on the global path (per-instance input
+        // isolation is `design/gamescope-multiuser.md` scope, not addressed here).
+        let inst = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let log = spawn_log_path(inst);
+        let child = spawn(
             mode.width,
             mode.height,
             mode.refresh_hz.max(1),
             self.cmd.as_deref(),
-        )?);
+            &log,
+        )?;
+        let child_pid = child.id();
+        let proc = GamescopeProc {
+            child,
+            log: log.clone(),
+        };
         // gamescope creates its PipeWire node a moment after start; poll for it (the proc is held
-        // alive meanwhile, and killed if we give up).
-        let node_id = wait_for_node(Duration::from_secs(15)).ok_or_else(|| {
+        // alive meanwhile, and killed if we give up). Discovery reads THIS spawn's log, and the
+        // fallback is scoped to this spawn's process tree.
+        let node_id = wait_for_node(Duration::from_secs(15), &log, child_pid).ok_or_else(|| {
             anyhow!(
                 "gamescope PipeWire node did not appear within 15s — gamescope may have failed to \
-                 start or headless capture is unsupported on this GPU/driver (see /tmp/punktfunk-gamescope.log)"
+                 start or headless capture is unsupported on this GPU/driver (see {})",
+                log.display()
             )
         })?;
         tracing::info!(
@@ -150,12 +287,12 @@ impl VirtualDisplay for GamescopeDisplay {
             hz = mode.refresh_hz,
             "gamescope virtual output ready"
         );
-        Ok(VirtualOutput {
+        // Bare SPAWN: we own the nested gamescope process → registry-poolable (keep-alive-able).
+        Ok(VirtualOutput::owned(
             node_id,
-            remote_fd: None,
-            preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
-            keepalive: Box::new(proc),
-        })
+            Some((mode.width, mode.height, mode.refresh_hz)),
+            Box::new(proc),
+        ))
     }
 }
 
@@ -192,12 +329,7 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
                 hz = mode.refresh_hz,
                 "gamescope session: reusing the running session (same mode — no Steam restart)"
             );
-            return Ok(VirtualOutput {
-                node_id,
-                remote_fd: None,
-                preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
-                keepalive: Box::new(()),
-            });
+            return Ok(managed_output(node_id, mode));
         }
         tracing::warn!("gamescope session: tracked session has no live node — relaunching");
         *guard = None;
@@ -218,12 +350,23 @@ fn create_managed_session(client: &str, mode: Mode) -> Result<VirtualOutput> {
         hz = mode.refresh_hz,
         "gamescope session: launched gamescope-session-plus at the client's mode"
     );
-    Ok(VirtualOutput {
+    Ok(managed_output(node_id, mode))
+}
+
+/// The [`VirtualOutput`] for a managed / SteamOS-takeover session: a box-level session whose restore
+/// lifecycle is (at Part A1) the gamescope module's own machinery (`schedule_restore_tv_session`), so
+/// it is [`DisplayOwnership::SessionManaged`] — the registry passes it through (no pooling), and the
+/// capturer's unit keepalive tears nothing down on drop. (Part A3 replaces the unit keepalive with a
+/// real `ManagedSessionHandle` and flips this to `Owned`.)
+fn managed_output(node_id: u32, mode: Mode) -> VirtualOutput {
+    VirtualOutput {
         node_id,
         remote_fd: None,
         preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
         keepalive: Box::new(()),
-    })
+        ownership: DisplayOwnership::SessionManaged,
+        reused_gen: None,
+    }
 }
 
 /// SteamOS detection: its session launcher is present and Bazzite's session-plus is NOT (so the
@@ -483,12 +626,7 @@ fn create_managed_session_steamos(mode: Mode) -> Result<VirtualOutput> {
                 hz = mode.refresh_hz,
                 "gamescope (SteamOS): reusing the headless session (same mode — no Steam restart)"
             );
-            return Ok(VirtualOutput {
-                node_id,
-                remote_fd: None,
-                preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
-                keepalive: Box::new(()),
-            });
+            return Ok(managed_output(node_id, mode));
         }
         *guard = None; // tracked session lost its node — fall through to a clean restart
     }
@@ -497,9 +635,11 @@ fn create_managed_session_steamos(mode: Mode) -> Result<VirtualOutput> {
     systemctl_user(&["daemon-reload"]);
     systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
     *STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner()) = true;
-    // gamescope's node appears within a few seconds of the restart; Steam's first FRAME is slower
-    // (Big Picture cold start) and is awaited by the caller's first-frame retry loop.
-    let node_id = wait_for_node(Duration::from_secs(30)).ok_or_else(|| {
+    persist_takeover(); // A3: survive a host crash mid-stream
+                        // gamescope's node appears within a few seconds of the restart; Steam's first FRAME is slower
+                        // (Big Picture cold start) and is awaited by the caller's first-frame retry loop. The managed
+                        // session logs to journald (not a per-spawn file), so poll `find_gamescope_node` directly.
+    let node_id = poll_managed_node(Duration::from_secs(30)).ok_or_else(|| {
         anyhow!(
             "SteamOS headless gamescope node did not appear within 30s after restarting \
              {STEAMOS_SESSION_TARGET} — check `journalctl --user -u gamescope-session.service`"
@@ -518,12 +658,7 @@ fn create_managed_session_steamos(mode: Mode) -> Result<VirtualOutput> {
         hz = mode.refresh_hz,
         "gamescope (SteamOS): took over gamescope-session.target headless at the client's mode"
     );
-    Ok(VirtualOutput {
-        node_id,
-        remote_fd: None,
-        preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
-        keepalive: Box::new(()),
-    })
+    Ok(managed_output(node_id, mode))
 }
 
 /// ATTACH at the CLIENT's resolution: ensure the box's own game-mode session is running at `mode`'s
@@ -670,11 +805,31 @@ fn running_autologin_gamescope_unit() -> Option<String> {
         .map(|u| u.to_string())
 }
 
+/// Tear a gamescope `systemd --user` unit down with **SIGKILL** rather than the default SIGTERM stop
+/// (`design/gamemode-and-dedicated-sessions.md` A3 / `session-aware-host-followups.md` #1): the
+/// hypothesis — validated as the fix on the F44 repro box `.181` — is that gamescope's SIGTERM
+/// teardown handler (the one that SIGSEGVs, exit 139) LEAKS the NVIDIA GPU context, after which every
+/// subsequent gamescope fails `vkCreateDevice` with `VK_ERROR_INITIALIZATION_FAILED` (-3) until a
+/// reboot. SIGKILL skips that handler so the driver reclaims the context cleanly via normal process
+/// exit. Follow with `stop` + `reset-failed` to clear the unit's state so a relaunch is clean.
+fn kill_unit(unit: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "kill", "--signal=SIGKILL", unit])
+        .status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", unit])
+        .status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "reset-failed", unit])
+        .status();
+}
+
 /// Stop every running autologin gaming-mode session (`gamescope-session-plus@*.service`) so its
 /// single-instance Steam is free for our own host-managed session. Records the units so
 /// [`schedule_restore_tv_session`] can restart them on disconnect. Our own session is the transient
 /// `punktfunk-gamescope` unit (not a `@`-instance), so it's never matched here. No-op when nothing
-/// is autologged in (e.g. a box that boots headless).
+/// is autologged in (e.g. a box that boots headless). Uses the **SIGKILL** teardown ([`kill_unit`])
+/// to avoid the F44 GPU-context leak that the autologin's SIGTERM stop triggers.
 fn stop_autologin_sessions() {
     let Ok(out) = Command::new("systemctl")
         .args([
@@ -694,12 +849,10 @@ fn stop_autologin_sessions() {
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some(unit) = line.split_whitespace().next() {
             if unit.starts_with("gamescope-session-plus@") && unit.ends_with(".service") {
-                let _ = Command::new("systemctl")
-                    .args(["--user", "stop", unit])
-                    .status();
+                kill_unit(unit); // SIGKILL teardown — avoid the F44 GPU-context leak
                 tracing::info!(
                     unit,
-                    "freed Steam: stopped the autologin gaming session for this stream"
+                    "freed Steam: SIGKILL-stopped the autologin gaming session for this stream"
                 );
                 stopped.push(unit.to_string());
             }
@@ -707,15 +860,57 @@ fn stop_autologin_sessions() {
     }
     if !stopped.is_empty() {
         *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = stopped;
+        persist_takeover(); // A3: survive a host crash mid-stream
     }
 }
 
-/// Client disconnected: **schedule** a debounced restore of the TV's autologin gaming session(s) we
-/// stopped on connect — the actual restore fires [`RESTORE_DEBOUNCE`] later (via [`start_restore_worker`])
-/// unless a client reconnects first, which cancels it and reuses the warm managed session. Debouncing
-/// means at most one gamescope stop/relaunch per quiet period instead of one per disconnect — the
-/// per-connect churn is what leaked GPU context on F44. No-op when nothing was stolen (non-Bazzite /
-/// headless box). Idempotent / safe to call on every session end.
+/// Cancel any pending TV-session restore — a client has (re)connected, so the box must stay in the
+/// streamed session, not bounce back to gaming mode. This covers the **keep-alive reuse** reconnect
+/// path (a kept dedicated / managed gamescope), which never calls `create_managed_session` (where the
+/// managed path already clears `PENDING_RESTORE`) — so without this, a dedicated Steam reconnect within
+/// the linger window would restart the autologin *underneath* the live session (review finding #3).
+/// Called from the connect path (native `resolve_compositor`, GameStream `open_gs_virtual_source`).
+/// No-op when nothing is pending; the stopped-unit list stays armed for a later real disconnect.
+pub fn cancel_pending_restore() {
+    let mut g = PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_some() {
+        *g = None;
+        tracing::info!(
+            "gamescope: client (re)connected — cancelled the pending TV-session restore"
+        );
+    }
+}
+
+/// The delay before restoring the TV's autologin session after the last client disconnects — the
+/// display-management **keep-alive policy**, replacing the hardcoded [`RESTORE_DEBOUNCE`]
+/// (`design/gamemode-and-dedicated-sessions.md` A3). The managed gamescope session is a single
+/// box-level singleton (not a registry pool entry — A1), so its keep-alive lives here rather than in
+/// the registry, but reads the same policy the pooled backends do:
+///   * `off` → restore immediately (0 s);
+///   * `duration(s)` → restore after `s`;
+///   * `forever` → **`None`**: never auto-restore — the managed session is HELD until host stop or a
+///     manual return to gaming mode (the `gaming-rig` "the TV model" story, now truthful on gamescope);
+///   * unconfigured → the historical 5 s [`RESTORE_DEBOUNCE`] (bit-for-bit today's behavior).
+fn restore_delay() -> Option<Duration> {
+    use crate::vdisplay::policy::{self, Linger};
+    match policy::prefs()
+        .configured_effective()
+        .map(|e| e.keep_alive.linger())
+    {
+        Some(Linger::Immediate) => Some(Duration::from_secs(0)),
+        Some(Linger::For(d)) => Some(d),
+        Some(Linger::Forever) => None,
+        None => Some(RESTORE_DEBOUNCE),
+    }
+}
+
+/// Client disconnected: **schedule** a policy-timed restore of the TV's autologin gaming session(s) we
+/// stopped on connect ([`restore_delay`], via [`start_restore_worker`]) — unless a client reconnects
+/// first, which cancels it and reuses the warm managed session. Debouncing means at most one gamescope
+/// stop/relaunch per quiet period instead of one per disconnect — the per-connect churn is what leaked
+/// GPU context on F44. Under `keep_alive=forever` ([`restore_delay`] `None`) NO restore is scheduled:
+/// the managed session is pinned (gaming-rig). No-op when nothing was stolen (non-Bazzite / headless
+/// box). Idempotent / safe to call on every session end.
 pub fn schedule_restore_tv_session() {
     let nothing_to_restore = STOPPED_AUTOLOGIN
         .lock()
@@ -725,12 +920,24 @@ pub fn schedule_restore_tv_session() {
     if nothing_to_restore {
         return; // nothing was taken over → nothing to restore (also the non-managed path)
     }
-    *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(Instant::now() + RESTORE_DEBOUNCE);
-    tracing::info!(
-        secs = RESTORE_DEBOUNCE.as_secs(),
-        "gamescope: scheduled debounced TV-session restore (cancelled if a client reconnects)"
-    );
+    match restore_delay() {
+        None => {
+            // keep_alive=forever → pin the managed session; leave PENDING_RESTORE unset.
+            *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            tracing::info!(
+                "gamescope: keep-alive=forever — managed session held (no TV-restore scheduled; \
+                 return to gaming mode or restart the host to free it)"
+            );
+        }
+        Some(delay) => {
+            *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Instant::now() + delay);
+            tracing::info!(
+                secs = delay.as_secs(),
+                "gamescope: scheduled TV-session restore (keep-alive policy; cancelled on reconnect)"
+            );
+        }
+    }
 }
 
 /// Tear down our host-managed session (freeing Steam) and restart the autologin gaming session(s)
@@ -745,6 +952,7 @@ fn do_restore_tv_session() {
         let mut took = STEAMOS_TOOK_OVER.lock().unwrap_or_else(|e| e.into_inner());
         if *took {
             *took = false;
+            clear_takeover(); // A3: takeover undone — drop the persisted crash-restore marker
             *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
             remove_steamos_dropin();
             systemctl_user(&["daemon-reload"]);
@@ -770,6 +978,7 @@ fn do_restore_tv_session() {
     if units.is_empty() {
         return; // nothing was stolen → nothing to restore (also the non-Bazzite path)
     }
+    clear_takeover(); // A3: takeover consumed — drop the persisted crash-restore marker
     stop_session(SESSION_UNIT); // our gamescope/Steam session, so Steam is free for the autologin
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // Only bring the gaming autologin BACK if the box is still meant to be in gaming mode. If the
@@ -923,12 +1132,10 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode) -> Result<u32> {
     }
 }
 
-/// Stop the host-managed session's transient unit (best-effort) and clear the EIS relay so a dead
-/// session's socket name can't be reconnected.
+/// Stop the host-managed session's transient unit ([`kill_unit`] — SIGKILL teardown to avoid the F44
+/// GPU-context leak) and clear the EIS relay so a dead session's socket name can't be reconnected.
 fn stop_session(unit_name: &str) {
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", unit_name])
-        .status();
+    kill_unit(unit_name);
     let _ = std::fs::remove_file(ei_socket_file());
 }
 
@@ -949,13 +1156,36 @@ pub fn ei_socket_file() -> std::path::PathBuf {
     }
 }
 
+/// Shape a resolved launch command for a bare-spawn gamescope session. A Steam URI launch
+/// (`steam steam://rungameid/<id>`, produced by `library::command_for`) gets `-silent` inserted so
+/// the game is the gamescope focus with no Steam client window to navigate
+/// (`design/gamemode-and-dedicated-sessions.md` §5.3). Operator-typed custom commands and non-Steam
+/// launches are returned unchanged. Idempotent (never double-inserts `-silent`). Pure + unit-tested.
+/// Does this resolved launch command start Steam (`steam … steam://…`)? Such a launch needs Steam's
+/// single instance free before a dedicated spawn (B1). Pure + unit-tested.
+fn is_steam_launch(cmd: &str) -> bool {
+    let mut it = cmd.split_whitespace();
+    it.next() == Some("steam") && cmd.contains("steam://")
+}
+
+fn shape_dedicated_command(app: &str) -> String {
+    let mut it = app.split_whitespace();
+    if it.next() == Some("steam") {
+        let rest: Vec<&str> = it.collect();
+        if !rest.contains(&"-silent") && rest.iter().any(|t| t.starts_with("steam://")) {
+            return format!("steam -silent {}", rest.join(" "));
+        }
+    }
+    app.to_string()
+}
+
 /// Spawn `gamescope --backend headless -W w -H h -r hz -- <app>`. The app comes from
 /// `PUNKTFUNK_GAMESCOPE_APP` (default a no-op that just keeps gamescope alive — set it to a real
 /// game/GL app for actual content, e.g. `steam -gamepadui` for the SteamOS-like session).
-/// stdout/stderr go to `/tmp/punktfunk-gamescope.log`. The app is launched through a tiny shell
-/// wrapper that relays gamescope's `LIBEI_SOCKET` (set for its children) to [`ei_socket_file`]
+/// stdout/stderr go to `log` (this spawn's per-instance log, A5). The app is launched through a tiny
+/// shell wrapper that relays gamescope's `LIBEI_SOCKET` (set for its children) to [`ei_socket_file`]
 /// so the input injector can connect to gamescope's EIS server from outside.
-fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>) -> Result<Child> {
+fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>, log: &std::path::Path) -> Result<Child> {
     // A non-empty per-session command (set via `set_launch_command`) wins; else the
     // `PUNKTFUNK_GAMESCOPE_APP` env var (the documented manual fallback); else a no-op that keeps
     // gamescope alive. Each level is taken only if non-empty, so a blank per-session cmd transparently
@@ -970,6 +1200,9 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>) -> Result<Child> {
         })
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "sleep infinity".to_string());
+    // Dedicated-launch command shaping (Part B): a Steam URI runs with `-silent` so the game is the
+    // gamescope focus with no Steam client window to navigate.
+    let app = shape_dedicated_command(&app);
     let relay = ei_socket_file();
     let _ = std::fs::remove_file(&relay); // stale socket path from a previous session
     let mut cmd = Command::new("gamescope");
@@ -990,14 +1223,14 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>) -> Result<Child> {
         .args(app.split_whitespace())
         // Prefer the NVIDIA GL vendor for the nested session (harmless on a pure-NVIDIA box).
         .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia");
-    if let Ok(log) = std::fs::File::create("/tmp/punktfunk-gamescope.log") {
-        if let Ok(log2) = log.try_clone() {
-            cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log2));
+    if let Ok(logf) = std::fs::File::create(log) {
+        if let Ok(log2) = logf.try_clone() {
+            cmd.stdout(Stdio::from(logf)).stderr(Stdio::from(log2));
         }
     } else {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
-    tracing::info!(w, h, hz, %app, "spawning gamescope (headless)");
+    tracing::info!(w, h, hz, %app, log = %log.display(), "spawning gamescope (headless)");
     cmd.spawn()
         .context("spawn gamescope (is it installed? `apt install gamescope`)")
 }
@@ -1006,22 +1239,59 @@ fn spawn(w: u32, h: u32, hz: u32, cmd: Option<&str>) -> Result<Child> {
 /// line `stream available on node ID: N` (its node carries `node.name=gamescope` on TWO objects
 /// — the adapter and the inner stream — and only the advertised id is the correct capture
 /// target). Falls back to `pw-dump` discovery if the log line doesn't show.
-fn wait_for_node(timeout: Duration) -> Option<u32> {
+/// B2 (game-exit detection): confirm a **dedicated** gamescope session's game has exited. gamescope is
+/// a single-app compositor — it exits when its nested app exits — so once capture is lost, THIS
+/// session's `node_id` not reappearing within a short confirmation window means the game quit (vs. a
+/// transient PipeWire hiccup). Scoped to the session's own `node_id` (via [`gamescope_node_present`]),
+/// so a **coexisting** gamescope (a second dedicated session, or the box's game-mode gamescope beside a
+/// non-Steam dedicated launch) doesn't mask the exit (review findings #4/#8). Returns `true` when the
+/// node stays absent across the window.
+pub fn game_session_exited(node_id: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    loop {
+        if gamescope_node_present(node_id) {
+            return false; // OUR node is (still) present → not an exit (transient loss)
+        }
+        if Instant::now() >= deadline {
+            return true; // our node stayed gone across the window → the game exited
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Poll [`find_gamescope_node`] (unscoped) up to `timeout` — for the managed / SteamOS session, which
+/// logs to journald (no per-spawn file) and is single-session (no scoping needed).
+fn poll_managed_node(timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(id) = node_from_log() {
+        if let Some(id) = find_gamescope_node() {
             return Some(id);
         }
         if Instant::now() >= deadline {
-            return find_gamescope_node(); // last-resort fallback
+            return None;
         }
         std::thread::sleep(Duration::from_millis(300));
     }
 }
 
-/// Parse `stream available on node ID: N` from the spawned gamescope's log (ANSI-colored).
-fn node_from_log() -> Option<u32> {
-    let log = std::fs::read_to_string("/tmp/punktfunk-gamescope.log").ok()?;
+fn wait_for_node(timeout: Duration, log: &std::path::Path, child_pid: u32) -> Option<u32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(id) = node_from_log(log) {
+            return Some(id);
+        }
+        if Instant::now() >= deadline {
+            // Last-resort fallback scoped to THIS spawn's process tree (A5), so a coexisting gamescope's
+            // node isn't picked by mistake.
+            return find_gamescope_node_scoped(Some(child_pid));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Parse `stream available on node ID: N` from a spawned gamescope's per-instance log (ANSI-colored).
+fn node_from_log(log: &std::path::Path) -> Option<u32> {
+    let log = std::fs::read_to_string(log).ok()?;
     for line in log.lines().rev() {
         if let Some(pos) = line.find("stream available on node ID:") {
             let tail = &line[pos + "stream available on node ID:".len()..];
@@ -1034,6 +1304,27 @@ fn node_from_log() -> Option<u32> {
     None
 }
 
+/// Is a PipeWire node with exactly `node_id` present on the default daemon right now? Used by the
+/// keep-alive reuse liveness probe ([`GamescopeDisplay::kept_display_alive`]): a kept gamescope node
+/// vanishes when its nested game exits, so a missing id means "recreate, don't reuse the corpse".
+fn gamescope_node_present(node_id: u32) -> bool {
+    let Ok(out) = Command::new("pw-dump").arg(node_id.to_string()).output() else {
+        // pw-dump unavailable → don't block reuse (mark_failed is the backstop on a genuinely dead node).
+        return true;
+    };
+    let Ok(dump) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return true;
+    };
+    dump.as_array()
+        .map(|objs| {
+            objs.iter().any(|o| {
+                o.get("id").and_then(|i| i.as_u64()) == Some(node_id as u64)
+                    && o.get("type").and_then(|t| t.as_str()) == Some("PipeWire:Interface:Node")
+            })
+        })
+        .unwrap_or(true)
+}
+
 /// Find the `gamescope` `Video/Source` node id in a `pw-dump` snapshot of the default daemon.
 ///
 /// `node.name=gamescope` appears on TWO objects (the adapter *and* the inner stream node); only
@@ -1041,10 +1332,18 @@ fn node_from_log() -> Option<u32> {
 /// other wedges the link. So we require `Video/Source` first and fall back to a bare name match
 /// only if no class-tagged node is present (older gamescope that doesn't set media.class).
 fn find_gamescope_node() -> Option<u32> {
+    find_gamescope_node_scoped(None)
+}
+
+/// Like [`find_gamescope_node`], but when `scope` is `Some(pid)` only a node whose owning process
+/// (`application.process.id`) is `pid` or a descendant of it qualifies (A5 — a spawn's node must
+/// belong to OUR gamescope's process tree, so a coexisting foreign / other-session gamescope node is
+/// never mistaken for ours). `None` = any gamescope node (the managed/attach paths, single-session).
+fn find_gamescope_node_scoped(scope: Option<u32>) -> Option<u32> {
     let out = Command::new("pw-dump").output().ok()?;
     let dump: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let nodes = dump.as_array()?;
-    let node_props = |obj: &serde_json::Value| -> Option<(u32, String, String)> {
+    let node_props = |obj: &serde_json::Value| -> Option<(u32, String, String, Option<u32>)> {
         if obj.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
             return None;
         }
@@ -1060,20 +1359,40 @@ fn find_gamescope_node() -> Option<u32> {
             .and_then(|n| n.as_str())
             .unwrap_or("")
             .to_string();
-        Some((id, name, class))
+        // PipeWire records the owning process id as a string or an int depending on version.
+        let pid = props
+            .and_then(|p| p.get("application.process.id"))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    .map(|n| n as u32)
+            });
+        Some((id, name, class, pid))
     };
-    // Preferred: a Video/Source node named (or containing) "gamescope".
+    // A node is in-scope when no scope is asked, or its owning pid descends from the scope pid. When
+    // the pid prop is absent (older gamescope / PipeWire) we DON'T exclude it — falling back to the
+    // per-instance log is the primary addressing (design §7 risk note).
+    let in_scope = |pid: Option<u32>| -> bool {
+        match scope {
+            None => true,
+            Some(root) => pid.map(|p| descends_from(p, root)).unwrap_or(true),
+        }
+    };
+    // Preferred: a Video/Source node named (or containing) "gamescope", in scope.
     for obj in nodes {
-        if let Some((id, name, class)) = node_props(obj) {
-            if class == "Video/Source" && (name == "gamescope" || name.contains("gamescope")) {
+        if let Some((id, name, class, pid)) = node_props(obj) {
+            if class == "Video/Source"
+                && (name == "gamescope" || name.contains("gamescope"))
+                && in_scope(pid)
+            {
                 return Some(id);
             }
         }
     }
-    // Fallback: a node literally named "gamescope" with no usable class tag.
+    // Fallback: a node literally named "gamescope" with no usable class tag, in scope.
     for obj in nodes {
-        if let Some((id, name, _)) = node_props(obj) {
-            if name == "gamescope" {
+        if let Some((id, name, _, pid)) = node_props(obj) {
+            if name == "gamescope" && in_scope(pid) {
                 tracing::warn!(
                     node_id = id,
                     "gamescope node has no media.class=Video/Source tag — capturing it anyway"
@@ -1168,22 +1487,62 @@ fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
     None
 }
 
-/// Owns the spawned gamescope process; killing it tears the virtual output down.
-struct GamescopeProc(Child);
+/// Owns the spawned gamescope process (and its per-instance log, A5); killing it tears the virtual
+/// output down.
+struct GamescopeProc {
+    child: Child,
+    log: std::path::PathBuf,
+}
 
 impl Drop for GamescopeProc {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         // Clear the relayed EIS socket name so the host-lifetime injector can't reconnect to this
         // now-dead session's socket between sessions (the stale path is the "Connection refused").
         let _ = std::fs::remove_file(ei_socket_file());
+        // Drop this spawn's per-instance log (A5) so `$XDG_RUNTIME_DIR` doesn't accumulate them.
+        let _ = std::fs::remove_file(&self.log);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_version, MIN_GAMESCOPE};
+    use super::{is_steam_launch, parse_version, shape_dedicated_command, MIN_GAMESCOPE};
+
+    #[test]
+    fn steam_launch_detection() {
+        assert!(is_steam_launch("steam steam://rungameid/570"));
+        assert!(is_steam_launch("steam -silent steam://rungameid/570"));
+        assert!(!is_steam_launch("vkcube"));
+        assert!(!is_steam_launch("lutris lutris:rungameid/42"));
+        assert!(!is_steam_launch("steam -bigpicture")); // no URI = not a game launch
+    }
+
+    #[test]
+    fn dedicated_command_shaping() {
+        // Steam URI → -silent inserted so the game is the gamescope focus.
+        assert_eq!(
+            shape_dedicated_command("steam steam://rungameid/570"),
+            "steam -silent steam://rungameid/570"
+        );
+        // Idempotent: an already-silent command is left alone.
+        assert_eq!(
+            shape_dedicated_command("steam -silent steam://rungameid/570"),
+            "steam -silent steam://rungameid/570"
+        );
+        // Non-Steam launches and operator custom commands are untouched.
+        assert_eq!(shape_dedicated_command("vkcube"), "vkcube");
+        assert_eq!(
+            shape_dedicated_command("lutris lutris:rungameid/42"),
+            "lutris lutris:rungameid/42"
+        );
+        // A bare `steam` with no URI is left alone (not a game launch).
+        assert_eq!(
+            shape_dedicated_command("steam -bigpicture"),
+            "steam -bigpicture"
+        );
+    }
 
     #[test]
     fn parses_version_banner() {

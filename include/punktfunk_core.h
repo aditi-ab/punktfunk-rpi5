@@ -284,6 +284,16 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// QUIC application error code the **host** closes the control connection with when a **dedicated game
+// session's game process exits** (the nested gamescope died — the user quit the game), so a launcher
+// client can distinguish "the game ended" from an error and return to its library cleanly rather than
+// surfacing a failure (`design/gamemode-and-dedicated-sessions.md` §5.3). Sibling of
+// [`QUIT_CLOSE_CODE`]; a client that doesn't special-case it still ends the session (every client
+// returns to its launcher on session end), so it is purely refinement. Shared so host + clients agree.
+#define APP_EXITED_CLOSE_CODE 82
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 // encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 // advertise this.

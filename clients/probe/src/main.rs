@@ -1090,7 +1090,7 @@ async fn session(args: Args) -> Result<()> {
                 break;
             }
             if started.elapsed() > std::time::Duration::from_secs(cap_secs)
-                || last_rx.elapsed() > std::time::Duration::from_secs(8)
+                || last_rx.elapsed() > std::time::Duration::from_secs(45)
             {
                 break;
             }

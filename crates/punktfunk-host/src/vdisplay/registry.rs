@@ -164,6 +164,28 @@ pub fn release(slot: Option<u64>) -> usize {
     }
 }
 
+/// Tear down a **reused-but-dead** pool entry by its generation stamp (A2). Called by the pipeline
+/// builder when the first frame fails on a display [`acquire`] handed back as REUSED — so the retry
+/// loop's next `acquire` creates fresh instead of re-wedging on the same corpse. No-op off Linux / if
+/// the entry is already gone (idempotent — the subsequent stale-gen lease drop no-ops too).
+pub fn mark_failed(gen: u64) {
+    #[cfg(target_os = "linux")]
+    linux::mark_failed(gen);
+    #[cfg(not(target_os = "linux"))]
+    let _ = gen;
+}
+
+/// Invalidate every kept display of `backend` — its compositor instance is gone (a Game↔Desktop switch
+/// tore it down), so `/display/state` must stop listing it and its keepalive must be reaped
+/// (`design/gamemode-and-dedicated-sessions.md` A4). Called from the session-switch watcher / a
+/// per-connect re-detect that finds the previous backend's compositor gone. No-op off Linux.
+pub fn invalidate_backend(backend: &str) {
+    #[cfg(target_os = "linux")]
+    linux::invalidate_backend(backend);
+    #[cfg(not(target_os = "linux"))]
+    let _ = backend;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Linux keep-alive pool
 // ---------------------------------------------------------------------------------------------
@@ -202,6 +224,13 @@ mod linux {
         /// exclusive session); on teardown it hands off to a surviving sibling, and only runs when the
         /// group's last member drops. `None` for extend/primary and non-first / non-exclusive members.
         topology_restore: Option<Restore>,
+        /// The launch command this display was created with (`design/gamemode-and-dedicated-sessions.md`
+        /// A2): keep-alive reuse requires an exact match, so a kept spawn running game A never serves a
+        /// session launching game B. `None` = a plain desktop / no nested command.
+        launch: Option<String>,
+        /// The session epoch at creation (A4). Reuse requires an epoch match; the linger timer reaps
+        /// entries whose epoch is stale (their compositor instance was replaced under them).
+        epoch: u64,
         /// Generation stamp: a [`DisplayLease`] only releases if its gen still matches (a stale lease
         /// — its entry was reused + re-stamped — is a no-op).
         gen: u64,
@@ -209,6 +238,18 @@ mod linux {
 
     /// A per-group topology-restore action (see [`Entry::topology_restore`]).
     type Restore = Box<dyn FnOnce() + Send>;
+
+    /// The result of the keep-alive reuse lookup (A2 validated reuse): a live kept display was reused,
+    /// a dead one was pulled out (recreate), or nothing matched.
+    enum ReuseOutcome {
+        /// A live kept display — the session-facing output to return.
+        Reused(VirtualOutput),
+        /// A dead kept display, removed from the pool, plus its group restore (run before the corpse's
+        /// keepalive drops); the caller falls through to a fresh create.
+        Dead(Entry, Option<Restore>),
+        /// No matching kept display.
+        Miss,
+    }
 
     /// Hand off a torn-down display's topology restore (design §6.1 — per-group restore): if a
     /// same-group (backend) sibling survives in `remaining`, MOVE the restore onto it (a later teardown
@@ -245,6 +286,19 @@ mod linux {
         })
     }
 
+    /// Does a pooled entry's session `epoch` still match the current one for reuse / expiry purposes?
+    /// The session epoch tracks the box's **active-session (desktop) compositor** instance (KWin /
+    /// Mutter / wlroots) — whose PipeWire node dies with the compositor, so a stale-epoch kept output
+    /// is a corpse. A **gamescope** spawn is the exact opposite: an independent nested session (its own
+    /// group), whose node lives with its own child process, wholly unrelated to whatever desktop /
+    /// game-mode compositor the epoch tracks. So gamescope entries are EXEMPT from the epoch — a desktop
+    /// switch, or a game-mode gamescope restart, must never invalidate a kept dedicated game session
+    /// (review findings #2/#5/#6/#7/#10). Their liveness is the `kept_display_alive` node probe + the B2
+    /// game-exit path + `mark_failed`, not the epoch.
+    fn epoch_matches(backend: &str, entry_epoch: u64, cur_epoch: u64) -> bool {
+        backend == "gamescope" || entry_epoch == cur_epoch
+    }
+
     /// The linger resolution for Linux: the console policy's `keep_alive` when configured, else
     /// **Immediate** (today's behavior — a Linux disconnect tears the output down at once).
     fn linger() -> Linger {
@@ -262,9 +316,17 @@ mod linux {
     fn take_expired(entries: &mut Vec<Entry>, now: Instant) -> (Vec<Entry>, Vec<Restore>) {
         let mut expired = Vec::new();
         let mut restores = Vec::new();
+        // A4 backstop: also reap a KEPT (non-Active) DESKTOP display whose session epoch is stale — its
+        // compositor instance was replaced (a Game↔Desktop switch / same-kind restart), so its node id
+        // now means nothing. gamescope spawns are exempt (`epoch_matches` — independent nested sessions).
+        // An Active entry is left to its own session's capture-loss rebuild (which, under the bumped
+        // epoch, won't reuse it); `invalidate_backend` clears a whole desktop backend on a known switch.
+        let cur_epoch = crate::vdisplay::session_epoch();
         let mut i = 0;
         while i < entries.len() {
-            if entries[i].life.poll_expiry(now) {
+            let dead_epoch = !epoch_matches(entries[i].backend, entries[i].epoch, cur_epoch)
+                && !matches!(entries[i].life, lifecycle::State::Active { .. });
+            if entries[i].life.poll_expiry(now) || dead_epoch {
                 let mut e = entries.remove(i);
                 let backend = e.backend;
                 if let Some(r) = hand_off_restore(entries, backend, e.topology_restore.take()) {
@@ -312,13 +374,18 @@ mod linux {
         preferred_mode: Option<(u32, u32, u32)>,
         gen: u64,
         quit: Arc<AtomicBool>,
+        reused: bool,
     ) -> VirtualOutput {
-        VirtualOutput {
+        // The pooled display is registry-owned; the session holds a gen-stamped lease as its keepalive.
+        let mut out = VirtualOutput::owned(
             node_id,
-            remote_fd: None,
             preferred_mode,
-            keepalive: Box::new(DisplayLease { gen, quit }),
-        }
+            Box::new(DisplayLease { gen, quit }),
+        );
+        // A2: tell the pipeline builder this was a REUSED kept display, so a first-frame failure can
+        // `mark_failed(gen)` (tear the corpse down) rather than re-wedge the retry loop on the same node.
+        out.reused_gen = reused.then_some(gen);
+        out
     }
 
     pub(super) fn acquire(
@@ -328,6 +395,10 @@ mod linux {
     ) -> Result<VirtualOutput> {
         ensure_timer();
         let backend = vd.name();
+        // A2 reuse key: the launch command this acquire carries (a kept spawn running game A must never
+        // be reused for a session launching game B). A4 reuse key: the current session epoch.
+        let launch = vd.launch_command();
+        let cur_epoch = crate::vdisplay::session_epoch();
         let r = reg();
 
         // Reap expired first (run any group restores + drop outside the lock).
@@ -340,28 +411,94 @@ mod linux {
         }
         drop(expired);
 
-        // Reuse: a kept (lingering/pinned) display of the same backend + mode. A reconnecting session
-        // re-attaches a fresh PipeWire consumer to the still-live `node_id`.
-        {
-            let mut es = r.entries.lock().unwrap();
-            if let Some(e) = es.iter_mut().find(|e| {
-                matches!(
-                    e.life,
-                    lifecycle::State::Lingering { .. } | lifecycle::State::Pinned
-                ) && e.backend == backend
-                    && e.mode == mode
-            }) {
-                // Lingering/Pinned → Active (Acquire::Reuse); side effect matters, value is known.
-                e.life.acquire();
-                let gen = r.gen.fetch_add(1, Ordering::Relaxed);
-                e.gen = gen;
-                let out = output_for(e.node_id, e.preferred_mode, gen, quit);
-                tracing::info!(
-                    backend,
-                    node_id = e.node_id,
-                    "virtual display reused (keep-alive reconnect)"
-                );
-                return Ok(out);
+        // Reuse: a kept (lingering/pinned) display of the same backend + mode + launch + epoch. A
+        // reconnecting session re-attaches a fresh PipeWire consumer to the still-live `node_id`. Gated
+        // on `vd.poolable_now()` (A1): a gamescope managed/attach acquire must NOT reuse a kept bare-spawn
+        // (they share the backend name `"gamescope"`); its `create` builds a `SessionManaged`/`External`
+        // output that passes through below.
+        if vd.poolable_now() {
+            // Reuse a kept display, matching backend + mode + launch (+ epoch for the desktop backends;
+            // gamescope spawns are independent nested sessions, exempt from the active-session epoch —
+            // see `epoch_matches`). The liveness probe (`kept_display_alive`, which may shell `pw-dump`
+            // for gamescope) must NOT run under the pool lock (it can block / hang the daemon), so:
+            //   1. find the candidate + snapshot (gen, node_id) UNDER the lock, then release it;
+            //   2. probe liveness OUTSIDE the lock;
+            //   3. re-lock and re-find the SAME entry by its gen (another thread may have reused/removed
+            //      it meanwhile — then we just miss and create fresh).
+            let candidate = {
+                let es = r.entries.lock().unwrap();
+                es.iter()
+                    .find(|e| {
+                        matches!(
+                            e.life,
+                            lifecycle::State::Lingering { .. } | lifecycle::State::Pinned
+                        ) && e.backend == backend
+                            && e.mode == mode
+                            && e.launch == launch
+                            && epoch_matches(e.backend, e.epoch, cur_epoch)
+                    })
+                    .map(|e| (e.gen, e.node_id))
+            };
+            if let Some((cand_gen, node_id)) = candidate {
+                let alive = vd.kept_display_alive(node_id); // OUTSIDE the lock (may block)
+                let reuse = {
+                    let mut es = r.entries.lock().unwrap();
+                    // Re-find the SAME entry by its snapshot gen; skip if it's gone or no longer kept
+                    // (a concurrent reconnect adopted it) — we then miss and create fresh.
+                    match es.iter().position(|e| {
+                        e.gen == cand_gen
+                            && matches!(
+                                e.life,
+                                lifecycle::State::Lingering { .. } | lifecycle::State::Pinned
+                            )
+                    }) {
+                        Some(idx) if alive => {
+                            es[idx].life.acquire();
+                            let gen = r.gen.fetch_add(1, Ordering::Relaxed);
+                            es[idx].gen = gen;
+                            let preferred_mode = es[idx].preferred_mode;
+                            tracing::info!(
+                                backend,
+                                node_id,
+                                "virtual display reused (keep-alive reconnect)"
+                            );
+                            ReuseOutcome::Reused(output_for(
+                                node_id,
+                                preferred_mode,
+                                gen,
+                                quit.clone(),
+                                true,
+                            ))
+                        }
+                        Some(idx) => {
+                            // Dead kept display: remove it, hand off its group restore, create fresh.
+                            let mut dead = es.remove(idx);
+                            let restore = hand_off_restore(
+                                &mut es,
+                                dead.backend,
+                                dead.topology_restore.take(),
+                            );
+                            ReuseOutcome::Dead(dead, restore)
+                        }
+                        None => ReuseOutcome::Miss, // adopted/removed by another thread
+                    }
+                };
+                match reuse {
+                    ReuseOutcome::Reused(out) => return Ok(out),
+                    ReuseOutcome::Dead(dead, restore) => {
+                        // Outside the lock: re-enable physicals (if the group emptied) then drop the
+                        // corpse's keepalive (may block) — then fall through to a fresh create below.
+                        if let Some(rst) = restore {
+                            rst();
+                        }
+                        tracing::info!(
+                            backend,
+                            "virtual display: kept display was dead — recreating (validated reuse)"
+                        );
+                        drop(dead);
+                    }
+                    ReuseOutcome::Miss => {}
+                }
             }
         }
 
@@ -381,13 +518,18 @@ mod linux {
         // the group arrangement (manual per-slot positions) + the state slot.
         let identity_slot = vd.last_identity_slot();
 
-        // wlroots (remote_fd = Some, sandboxed xdpw portal) can't be kept without re-opening the
-        // portal fd per attach — pass it through unchanged (capturer owns it, teardown on drop). The
-        // poolable backends put their node on the default daemon (remote_fd = None).
-        if real.remote_fd.is_some() {
+        // Pool ONLY a registry-owned display on the default PipeWire daemon
+        // (design/gamemode-and-dedicated-sessions.md A1). Pass through, unchanged (capturer owns the
+        // keepalive, teardown on drop), everything else:
+        //   * `External`/`SessionManaged` — gamescope attach / managed session: the gamescope module
+        //     owns their lifecycle (its own restore machinery), so the registry must not keep them
+        //     (the stale-node reuse wedge). Their unit keepalive tears nothing down on drop.
+        //   * `remote_fd = Some` — wlroots' sandboxed xdpw portal fd can't be re-opened per attach.
+        if real.ownership != crate::vdisplay::DisplayOwnership::Owned || real.remote_fd.is_some() {
             tracing::debug!(
                 backend,
-                "virtual display not poolable (portal fd) — keep-alive off for this backend"
+                ownership = ?real.ownership,
+                "virtual display not registry-poolable — keep-alive off (owner keeps it / portal fd)"
             );
             return Ok(real);
         }
@@ -410,6 +552,8 @@ mod linux {
             backend,
             identity_slot,
             topology_restore,
+            launch: launch.clone(),
+            epoch: cur_epoch,
             gen,
         };
 
@@ -455,7 +599,7 @@ mod linux {
         if (position.x, position.y) != (0, 0) {
             vd.apply_position(position.x, position.y);
         }
-        Ok(output_for(node_id, preferred_mode, gen, quit))
+        Ok(output_for(node_id, preferred_mode, gen, quit, false))
     }
 
     /// The [`DisplayLease`] `Drop` path: release the session's hold on the pooled display. The
@@ -704,6 +848,71 @@ mod linux {
         n
     }
 
+    /// A2 — tear down a reused-but-dead pool entry by its generation stamp. Removes it (hand off /
+    /// run its group restore), drops the keepalive outside the lock. Idempotent (already gone → no-op).
+    pub(super) fn mark_failed(gen: u64) {
+        let Some(r) = REG.get() else { return };
+        let (torn, restore) = {
+            let mut es = r.entries.lock().unwrap();
+            let Some(idx) = es.iter().position(|e| e.gen == gen) else {
+                return; // already gone — the subsequent stale-gen lease drop no-ops too
+            };
+            let mut e = es.remove(idx);
+            let backend = e.backend;
+            let restore = hand_off_restore(&mut es, backend, e.topology_restore.take());
+            (e, restore)
+        };
+        if let Some(rst) = restore {
+            rst(); // outside the lock, before the keepalive drops
+        }
+        tracing::warn!(
+            backend = torn.backend,
+            "virtual display: reused kept display was dead on first frame — torn down (A2 mark_failed)"
+        );
+        drop(torn); // keepalive Drop outside the lock (may block)
+    }
+
+    /// A4 — invalidate every kept display of `backend` (its compositor instance is gone). Removes them
+    /// all (any lifecycle state — a dead compositor's Active entries are doomed too; their sessions
+    /// rebuild), runs/hands off group restores, drops keepalives outside the lock (they hit dead
+    /// sockets and fail fast). Mirrors `force_release`'s shape but selects by backend, not slot/state.
+    pub(super) fn invalidate_backend(backend: &str) {
+        let Some(r) = REG.get() else { return };
+        let (removed, restores) = {
+            let mut es = r.entries.lock().unwrap();
+            let mut out = Vec::new();
+            let mut restores = Vec::new();
+            let mut i = 0;
+            while i < es.len() {
+                if es[i].backend == backend {
+                    let mut e = es.remove(i);
+                    let b = e.backend;
+                    if let Some(rst) = hand_off_restore(&mut es, b, e.topology_restore.take()) {
+                        restores.push(rst);
+                    }
+                    out.push(e);
+                } else {
+                    i += 1;
+                }
+            }
+            (out, restores)
+        };
+        if removed.is_empty() {
+            return;
+        }
+        for restore in restores {
+            restore();
+        }
+        tracing::info!(
+            backend,
+            count = removed.len(),
+            "virtual displays invalidated — compositor instance gone (A4 session switch)"
+        );
+        for e in removed {
+            drop(e); // outside the lock
+        }
+    }
+
     /// The session's refcount handle — the `keepalive` the capturer holds. `Drop` releases the
     /// registry hold; a stale lease (its entry was reused + re-stamped, or torn down) is a no-op.
     struct DisplayLease {
@@ -744,6 +953,8 @@ mod linux {
                 backend,
                 identity_slot: None,
                 topology_restore: restore,
+                launch: None,
+                epoch: 0,
                 gen,
             }
         }

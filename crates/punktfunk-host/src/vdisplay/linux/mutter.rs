@@ -97,12 +97,11 @@ impl VirtualDisplay for MutterDisplay {
             h = mode.height,
             "Mutter virtual monitor ready"
         );
-        Ok(VirtualOutput {
+        Ok(VirtualOutput::owned(
             node_id,
-            remote_fd: None,
-            preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
-            keepalive: Box::new(StopGuard(stop)),
-        })
+            Some((mode.width, mode.height, mode.refresh_hz)),
+            Box::new(StopGuard(stop)),
+        ))
     }
 }
 

@@ -31,7 +31,7 @@ use windows::Win32::System::Threading::{
     CreateMutexW, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
 };
 
-use super::{Mode, VirtualOutput};
+use super::{DisplayOwnership, Mode, VirtualOutput};
 use crate::win_display::{
     force_extend_topology, isolate_displays_ccd, resolve_gdi_name, restore_displays_ccd,
     set_active_mode, set_virtual_primary_ccd, SavedConfig,
@@ -531,6 +531,9 @@ impl VirtualDisplayManager {
                 mgr: self,
                 gen: mon.gen,
             }),
+            // The Windows manager owns the monitor lifecycle (refcount/linger/pin), so the registry
+            // (which delegates to it via `vd.create`) treats it as Owned.
+            ownership: DisplayOwnership::Owned,
         }
     }
 

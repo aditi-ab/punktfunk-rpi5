@@ -106,6 +106,26 @@ Per-backend support:
   each client), up to **max displays**. Arrange them under Host → *Virtual displays* once two or more
   are streaming.
 
+### Dedicated game sessions
+
+**Dedicated game sessions** control how a session that *launches a game from your library* is served
+(Linux hosts):
+
+- **Auto** (default) — the launch rides whatever session the box is in: the managed Steam session on a
+  Steam Deck / Bazzite couch box, a bare gamescope on a plain distro, or spawned into your live KDE /
+  GNOME / Sway desktop.
+- **Dedicated** — every library launch gets its **own headless gamescope at your exact resolution and
+  refresh**, with just the game inside. The game boots straight in — no Steam Big Picture to navigate,
+  no game-mode desktop. Steam titles launch with the client hidden (`steam -silent`); non-Steam titles
+  start almost instantly (gamescope up in ~1 s, then the game's own boot). Combined with **keep alive**,
+  the game keeps running when you disconnect and you re-attach straight back into it; when you quit the
+  game, the session ends cleanly and your client returns to its library.
+
+Dedicated needs `gamescope` installed on the host; if it isn't, a launch falls back to **Auto**
+routing. This axis is independent of the preset — pick it under Host → *Virtual displays*. On a box
+that's already in Steam game mode, a dedicated Steam launch frees game mode's Steam first and restores
+it when the session ends. (GameStream / Moonlight launches follow the same routing.)
+
 ## Persistent scaling
 
 Set your display **scaling** once and have it stick across reconnects. This works by giving each
@@ -149,3 +169,13 @@ an empty extension. Use **Primary** or **Exclusive** so your desktop actually la
 
 **KWin virtual outputs need KWin ≥ 6.5.6.** Older KWin can't create the virtual output at all —
 see [requirements](/docs/requirements).
+
+**Reconnecting into game mode reconnects cleanly now.** On a Steam Deck / Bazzite box, disconnecting
+and reconnecting within game mode reuses the still-warm session (or cleanly recreates it) instead of
+landing on a dead stream — and switching between game mode and the KDE / GNOME desktop mid-stream
+follows the switch. If a launched game **exits**, a dedicated session ends and returns you to your
+library; a game mode / desktop session keeps streaming.
+
+**My couch box's TV stayed on the streamed session after I disconnected.** With the **gaming-rig**
+preset (keep alive = *forever*), a managed Steam session is held indefinitely so a reconnect resumes
+instantly — return to game mode on the box (or restart the host) to hand the TV back.

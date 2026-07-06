@@ -14,6 +14,7 @@ import type {
 	ApiDisplayInfo,
 	DisplayPolicy,
 	EffectivePolicy,
+	GameSession,
 	Identity,
 	KeepAlive,
 	LayoutMode,
@@ -141,6 +142,8 @@ const DisplayForm: FC<{
 				identity: effective.identity,
 				layout: effective.layout,
 				max_displays: effective.max_displays,
+				// Game-session is orthogonal to the preset — carry it through the Custom switch.
+				game_session: draft.game_session ?? "auto",
 			});
 		} else {
 			apply({ ...draft, preset: id as Preset });
@@ -330,6 +333,24 @@ const DisplayForm: FC<{
 				</div>
 			)}
 
+			{/* Game-session routing — orthogonal to the preset/lifecycle axes, so it lives outside the
+			    Custom block and applies immediately on change (like a preset click). */}
+			<div className="border-t pt-4">
+				<Choice
+					label={m.display_game_session()}
+					help={m.display_game_session_help()}
+					value={draft.game_session ?? "auto"}
+					options={["auto", "dedicated"]}
+					labels={GAME_SESSION_LABEL}
+					disabled={busy}
+					onPick={(v) => {
+						const next = { ...draft, game_session: v as GameSession };
+						setDraft(next);
+						apply(next);
+					}}
+				/>
+			</div>
+
 			{/* What's in force right now */}
 			<div className="flex flex-wrap items-center gap-2 border-t pt-3">
 				<span className="text-sm text-muted-foreground">{m.display_effective()}:</span>
@@ -339,6 +360,9 @@ const DisplayForm: FC<{
 				<Badge variant="outline">{tr(IDENTITY_LABEL, effective.identity)}</Badge>
 				<Badge variant="outline">{tr(LAYOUT_LABEL, effective.layout.mode)}</Badge>
 				<Badge variant="outline">{`${effective.max_displays}×`}</Badge>
+				{(draft.game_session ?? "auto") === "dedicated" && (
+					<Badge variant="secondary">{m.display_game_session_dedicated()}</Badge>
+				)}
 			</div>
 
 			<p className="max-w-prose text-xs text-muted-foreground">{m.display_pending_note()}</p>
@@ -609,6 +633,11 @@ const IDENTITY_LABEL: Record<string, () => string> = {
 const LAYOUT_LABEL: Record<string, () => string> = {
 	"auto-row": m.display_layout_auto_row,
 	manual: m.display_layout_manual,
+};
+
+const GAME_SESSION_LABEL: Record<string, () => string> = {
+	auto: m.display_game_session_auto,
+	dedicated: m.display_game_session_dedicated,
 };
 
 /** Look up a localized label, tolerating an unknown/undefined key (falls back to the raw value). */
