@@ -3586,7 +3586,8 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
             // (bounded) instead of killing an otherwise healthy session; a backend without an
             // in-place rebuild keeps today's fail-fast behavior.
             encoder_resets += 1;
-            if encoder_resets > MAX_ENCODER_RESETS || !reset_stalled_encoder(&mut enc, &mut inflight)
+            if encoder_resets > MAX_ENCODER_RESETS
+                || !reset_stalled_encoder(&mut enc, &mut inflight)
             {
                 return Err(e).context("encoder submit");
             }
@@ -3710,7 +3711,8 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 ),
             };
             encoder_resets += 1;
-            if encoder_resets > MAX_ENCODER_RESETS || !reset_stalled_encoder(&mut enc, &mut inflight)
+            if encoder_resets > MAX_ENCODER_RESETS
+                || !reset_stalled_encoder(&mut enc, &mut inflight)
             {
                 return Err(poll_err.unwrap_or_else(|| anyhow!("{why}")))
                     .context("encoder stalled — in-place rebuild unavailable or exhausted");

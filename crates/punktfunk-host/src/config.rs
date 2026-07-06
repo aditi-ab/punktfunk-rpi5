@@ -89,7 +89,10 @@ impl HostConfig {
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(2),
             zerocopy: val("PUNKTFUNK_ZEROCOPY").map(|s| {
-                !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+                !matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
             }),
             ten_bit: flag("PUNKTFUNK_10BIT"),
             four_four_four: flag("PUNKTFUNK_444"),
