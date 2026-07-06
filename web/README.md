@@ -52,13 +52,14 @@ LAN console.)
 bun run build             # → .output/  (Nitro `bun` preset + our Bun.serve TLS entry)
 PORT=47992 HOST=0.0.0.0 \
   PUNKTFUNK_UI_PASSWORD=… PUNKTFUNK_MGMT_TOKEN=… \
-  PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990 NODE_TLS_REJECT_UNAUTHORIZED=0 \
+  PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990 \
   PUNKTFUNK_UI_TLS_CERT=~/.config/punktfunk/cert.pem \
   PUNKTFUNK_UI_TLS_KEY=~/.config/punktfunk/key.pem PUNKTFUNK_UI_SECURE=1 \
   bun run start           # = bun run .output/server/index.mjs
 # PUNKTFUNK_UI_TLS_* unset ⇒ plain HTTP (local dev); both set ⇒ HTTPS (HTTP/1.1 over TLS).
-# NODE_TLS_REJECT_UNAUTHORIZED=0 is only for the proxy's loopback fetch to the host's self-signed
-# mgmt cert; the console makes no other outbound TLS calls. See .env.example.
+# The host's self-signed mgmt cert is accepted only for the proxy's loopback hop, scoped in code
+# (Bun per-request TLS: server/routes/api/[...].ts) — no process-wide NODE_TLS_REJECT_UNAUTHORIZED.
+# See .env.example.
 bun run lint              # tsc --noEmit
 ```
 

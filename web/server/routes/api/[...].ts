@@ -9,11 +9,12 @@ import {
 	proxyRequest,
 	setResponseStatus,
 } from "h3";
-import { mgmtToken, mgmtUrl } from "../../util/auth";
+import { isLoopbackUrl, mgmtToken, mgmtUrl } from "../../util/auth";
 
 export default defineEventHandler((event) => {
 	const { pathname, search } = getRequestURL(event);
-	const target = `${mgmtUrl()}${pathname}${search}`;
+	const base = mgmtUrl();
+	const target = `${base}${pathname}${search}`;
 	const token = mgmtToken();
 	// The mgmt API now requires a token always. Without one configured, forwarding an empty bearer
 	// would just bounce as 401 — fail fast and legibly instead (the packaged service sources the
@@ -25,7 +26,20 @@ export default defineEventHandler((event) => {
 				"management token not configured (PUNKTFUNK_MGMT_TOKEN / ~/.config/punktfunk/mgmt-token)",
 		};
 	}
+	// TLS scoping (replaces the old process-wide NODE_TLS_REJECT_UNAUTHORIZED=0): the host presents a
+	// SELF-SIGNED, no-SAN identity cert on loopback, which normal verification rejects. We relax
+	// verification ONLY for this one loopback hop, via Bun's per-request `tls` option — so any OTHER
+	// outbound TLS the process ever makes still verifies normally (the global env unverified
+	// everything). If the operator points PUNKTFUNK_MGMT_URL at a NON-loopback host, we do NOT relax:
+	// a remote mgmt API must present a valid chain, which is stricter than the old blanket accept.
+	const fetchOptions = isLoopbackUrl(base)
+		? // `tls` is a Bun.fetch extension (the console runs on bun — Bun.serve/`bun .output/...`), not
+			// in the standard RequestInit type, so cast through unknown.
+			({ tls: { rejectUnauthorized: false } } as unknown as RequestInit)
+		: undefined;
+
 	return proxyRequest(event, target, {
+		fetchOptions,
 		headers: {
 			// Overwrite, not append: the host-held token replaces anything the browser sent.
 			authorization: `Bearer ${token}`,

@@ -29,22 +29,59 @@ export function mgmtToken(): string {
 	return process.env.PUNKTFUNK_MGMT_TOKEN ?? "";
 }
 
+/** Whether `url`'s host is a loopback address — the only place the proxy relaxes TLS verification
+ * for the host's self-signed cert. IPv4 127.0.0.0/8, IPv6 ::1, and the `localhost` name. */
+export function isLoopbackUrl(url: string): boolean {
+	let host: string;
+	try {
+		host = new URL(url).hostname;
+	} catch {
+		return false;
+	}
+	// URL wraps IPv6 in brackets in .host but strips them in .hostname; normalize anyway.
+	const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+	if (h === "localhost" || h === "::1") return true;
+	return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
 /**
- * The cookie-sealing key for h3 `useSession` (must be ≥ 32 chars). Use PUNKTFUNK_UI_SECRET
- * if set; otherwise derive a stable 64-hex key from the password so single-var config works
- * (changing the password then invalidates existing sessions, which is fine).
+ * The cookie-sealing key for h3 `useSession` (must be ≥ 32 chars). Precedence:
+ *   1. PUNKTFUNK_UI_SECRET — explicit operator override.
+ *   2. Derived from the MANAGEMENT TOKEN (a 32-byte / 64-hex CSPRNG value) — the packaged deployment
+ *      always has one, so the seal key is high-entropy without any extra config.
+ *   3. Only as a last resort (dev/local with no token) derive from the password.
+ *
+ * Why not (2)→password by default: the password is low-entropy (a human picks it), so a key DERIVED
+ * from it turns any captured session cookie into an OFFLINE dictionary oracle — an attacker unseals
+ * candidate cookies locally, no server round-trips, so the login throttle can't help. The mgmt token
+ * is unguessable, so a cookie sealed under it leaks nothing about the password. (Deriving from the
+ * token instead of the password also means changing the password no longer silently invalidates
+ * sessions; rotating the mgmt token does — the correct, security-relevant trigger.)
  */
 export function sessionConfig(): SessionConfig {
-	const secret = process.env.PUNKTFUNK_UI_SECRET;
-	const password =
-		secret && secret.length >= 32
-			? secret
-			: createHash("sha256")
-					.update(`punktfunk-session-v1:${uiPassword()}`)
-					.digest("hex");
+	const explicit = process.env.PUNKTFUNK_UI_SECRET;
+	const token = mgmtToken();
+	let secret: string;
+	if (explicit && explicit.length >= 32) {
+		secret = explicit;
+	} else if (token) {
+		// High-entropy source: the CSPRNG mgmt token. Hash it (never use the raw admin token as the
+		// seal key) with a distinct label so the two uses can't be conflated.
+		secret = createHash("sha256")
+			.update(`punktfunk-session-v1:token:${token}`)
+			.digest("hex");
+	} else {
+		// Last resort (no token configured — dev/local only). No worse than before; a real deployment
+		// always has a token and never reaches here.
+		secret = createHash("sha256")
+			.update(`punktfunk-session-v1:${uiPassword()}`)
+			.digest("hex");
+	}
 	return {
 		name: SESSION_NAME,
-		password,
+		// h3's `useSession` calls this seal key `password` (it's the iron/AES-GCM key, not the login
+		// password — see the derivation above).
+		password: secret,
 		// Bounds a stolen/replayed cookie's lifetime (sets the cookie Max-Age AND the iron
 		// seal TTL). 7 days for a single-user console.
 		maxAge: 60 * 60 * 24 * 7,

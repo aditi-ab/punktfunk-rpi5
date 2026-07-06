@@ -208,7 +208,7 @@ Description=punktfunk management web console
 After=punktfunk-host.service
 
 [Service]
-ExecStart=$DISTROBOX enter $BOX -- bash -lc 'cd $SRC/web; set -a; . $CONFIG/mgmt-token; . $CONFIG/web.env; set +a; export PUNKTFUNK_MGMT_URL=https://127.0.0.1:$MGMT_PORT NODE_TLS_REJECT_UNAUTHORIZED=0 PORT=$WEB_PORT HOST=0.0.0.0 NITRO_PORT=$WEB_PORT NITRO_HOST=0.0.0.0 PUNKTFUNK_UI_TLS_CERT=$CONFIG/cert.pem PUNKTFUNK_UI_TLS_KEY=$CONFIG/key.pem PUNKTFUNK_UI_SECURE=1; exec bun .output/server/index.mjs'
+ExecStart=$DISTROBOX enter $BOX -- bash -lc 'cd $SRC/web; set -a; . $CONFIG/mgmt-token; . $CONFIG/web.env; set +a; export PUNKTFUNK_MGMT_URL=https://127.0.0.1:$MGMT_PORT PORT=$WEB_PORT HOST=0.0.0.0 NITRO_PORT=$WEB_PORT NITRO_HOST=0.0.0.0 PUNKTFUNK_UI_TLS_CERT=$CONFIG/cert.pem PUNKTFUNK_UI_TLS_KEY=$CONFIG/key.pem PUNKTFUNK_UI_SECURE=1; exec bun .output/server/index.mjs'
 Restart=on-failure
 RestartSec=3
 

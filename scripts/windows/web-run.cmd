@@ -37,7 +37,8 @@ rem Fixed deployment wiring (the Windows analogue of scripts/punktfunk-web.servi
 set "PORT=47992"
 set "HOST=0.0.0.0"
 set "PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990"
-set "NODE_TLS_REJECT_UNAUTHORIZED=0"
+rem No NODE_TLS_REJECT_UNAUTHORIZED: the host's self-signed cert is accepted only for the loopback
+rem proxy hop, scoped inside the proxy code (Bun per-request TLS), not process-wide.
 rem Serve HTTPS (HTTP/1.1 over TLS) with the host's identity cert; mark the session cookie Secure.
 set "PUNKTFUNK_UI_TLS_CERT=%CERTFILE%"
 set "PUNKTFUNK_UI_TLS_KEY=%KEYFILE%"
