@@ -116,8 +116,10 @@ pub struct AudioPlayback {
 impl AudioPlayback {
     /// Open AAudio (LowLatency, 48 kHz/f32, the host-resolved channel layout) with a realtime
     /// callback draining a jitter ring, then spawn the Opus decode thread. `None` on failure (the
-    /// caller leaves video streaming).
-    pub fn start(client: Arc<NativeClient>) -> Option<AudioPlayback> {
+    /// caller leaves video streaming). `game_audio` (the experimental low-latency mode) tags the
+    /// stream usage=Game for the HAL's game-audio routing; off, the stream is untagged as it was
+    /// before the overhaul.
+    pub fn start(client: Arc<NativeClient>, game_audio: bool) -> Option<AudioPlayback> {
         // Build playback from the host-RESOLVED channel count (never the request): 2 = stereo /
         // 6 = 5.1 / 8 = 7.1, canonical wire order FL FR FC LFE RL RR SL SR.
         let channels = punktfunk_core::audio::normalize_channels(client.audio_channels) as usize;
@@ -226,7 +228,7 @@ impl AudioPlayback {
                 AudioCallbackResult::Continue
             };
 
-            let stream = AudioStreamBuilder::new()?
+            let builder = AudioStreamBuilder::new()?
                 .direction(AudioDirection::Output)
                 .sample_rate(SAMPLE_RATE)
                 // The wire order (FL FR FC LFE RL RR SL SR) is the standard AAudio/Android channel
@@ -234,12 +236,19 @@ impl AudioPlayback {
                 // from `channel_count` (the ndk crate's builder exposes no setChannelMask); the host
                 // captures + Opus-encodes in exactly this order.
                 .channel_count(channels as i32)
-                .format(AudioFormat::PCM_Float)
-                // Tag the stream as game audio (usage=Game / content=Movie): the audio HAL applies
-                // its low-latency game-audio routing/policy and it's grouped correctly with the
-                // game-mode profile. Advisory — ignored where the device has no such policy.
-                .usage(AudioUsage::Game)
-                .content_type(AudioContentType::Movie)
+                .format(AudioFormat::PCM_Float);
+            // Tag the stream as game audio (usage=Game / content=Movie): the audio HAL applies
+            // its low-latency game-audio routing/policy and it's grouped correctly with the
+            // game-mode profile. Advisory — ignored where the device has no such policy. Part of
+            // the experimental low-latency stack; off, the stream stays untagged.
+            let builder = if game_audio {
+                builder
+                    .usage(AudioUsage::Game)
+                    .content_type(AudioContentType::Movie)
+            } else {
+                builder
+            };
+            let stream = builder
                 .performance_mode(AudioPerformanceMode::LowLatency)
                 .sharing_mode(sharing)
                 .data_callback(Box::new(callback))

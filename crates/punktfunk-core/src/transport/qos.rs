@@ -7,11 +7,13 @@
 //! [`set_media_qos`] DSCP-tags the latency-sensitive video/audio traffic (+ Linux `SO_PRIORITY`) so a
 //! QoS-aware path (Wi-Fi WMM access categories, a managed switch, a shaped uplink) can prioritize it
 //! over bulk flows. Mirrors what Apollo/Sunshine tag — DSCP **CS5** for video, **CS6** for audio. It
-//! is **opt-in** (`PUNKTFUNK_DSCP=1`): DSCP can interact badly with some consumer ISPs/routers, and on
+//! is **opt-in** (`PUNKTFUNK_DSCP=1`, or [`set_dscp_default`] from an embedder — the Android client
+//! ties it to its experimental low-latency mode): DSCP can interact badly with some consumer ISPs/routers, and on
 //! Windows a plain `IP_TOS` is silently stripped unless a qWAVE policy is active (Apollo uses the
 //! qWAVE API there — that port is a follow-up; today this is a no-op on the wire on Windows).
 
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Target kernel socket-buffer size (`SO_SNDBUF`/`SO_RCVBUF`). A high-resolution frame is a burst (a
 /// 5120×1440 keyframe is ~130 packets the send thread hands to `sendmmsg` at once); the default UDP
@@ -66,17 +68,27 @@ impl MediaClass {
     }
 }
 
-/// Whether DSCP/QoS marking is enabled. Default **on for Android**, **off elsewhere**: on Wi-Fi
-/// (where most Android clients live) access points commonly map DSCP to WMM access categories, so
-/// tagging the video/audio sockets can win real airtime priority against other traffic on the link;
-/// on the wired paths the other clients use it's rarely honoured and some paths bleach or reject
-/// marked packets, so it stays opt-in there. `PUNKTFUNK_DSCP` overrides either way — `1`/`true`/`on`
-/// forces it on, `0`/`false`/`off` forces it off (e.g. to rule QoS out while debugging a flaky AP).
+/// Runtime default for DSCP marking when `PUNKTFUNK_DSCP` is unset (see [`set_dscp_default`]).
+/// Off unless an embedder opts in — on Wi-Fi, access points commonly map DSCP to WMM access
+/// categories (a real airtime-priority win), but wired paths rarely honour it and some bleach or
+/// reject marked packets, so it never turns on by itself.
+static DSCP_DEFAULT: AtomicBool = AtomicBool::new(false);
+
+/// Opt in to (or back out of) DSCP marking for sockets created from now on. Must be called BEFORE
+/// connecting — the tag is applied at socket creation. The Android client ties this to its
+/// experimental low-latency mode; `PUNKTFUNK_DSCP` still overrides in either direction.
+pub fn set_dscp_default(enabled: bool) {
+    DSCP_DEFAULT.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether DSCP/QoS marking is enabled: `PUNKTFUNK_DSCP` when set (`1`/`true`/`on` forces it on,
+/// `0`/`false`/`off` forces it off — e.g. to rule QoS out while debugging a flaky AP), else the
+/// [`set_dscp_default`] runtime default.
 pub(crate) fn dscp_enabled() -> bool {
     match std::env::var("PUNKTFUNK_DSCP").as_deref() {
         Ok("1") | Ok("true") | Ok("on") => true,
         Ok("0") | Ok("false") | Ok("off") => false,
-        _ => cfg!(target_os = "android"),
+        _ => DSCP_DEFAULT.load(Ordering::Relaxed),
     }
 }
 

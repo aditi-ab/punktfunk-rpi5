@@ -32,6 +32,20 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeGenerateIde
     }
 }
 
+/// `NativeBridge.nativeSetLowLatencyMode(enabled)` — apply the user's "Low-latency mode
+/// (experimental)" toggle to the process-wide transport defaults, today just DSCP/QoS marking on
+/// the media sockets. Must be called BEFORE `nativeConnect` (the tag is applied at socket
+/// creation); Kotlin's one connect choke point (`HostConnect.connectToHost`) does. The rest of the
+/// toggle rides explicit per-session parameters (`nativeStartVideo` / `nativeStartAudio`).
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetLowLatencyMode(
+    _env: JNIEnv,
+    _this: JObject,
+    enabled: jboolean,
+) {
+    punktfunk_core::transport::set_dscp_default(enabled != 0);
+}
+
 /// `NativeBridge.nativeConnect(host, port, w, h, hz, certPem, keyPem, pinHex, bitrateKbps,
 /// compositorPref, gamepadPref, hdrEnabled, audioChannels, preferredCodec, timeoutMs, launch): Long`.
 /// `launch` (empty ⇒ none) is a store-qualified library id to boot straight into a game.

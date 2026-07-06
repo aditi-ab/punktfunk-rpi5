@@ -103,8 +103,10 @@ pub struct HintSession {
 impl HintSession {
     /// Open a session hinting `tids` with an initial per-frame target of `target_ns` nanoseconds.
     /// `None` when ADPF is unavailable (device API < 33) or the platform declines — the caller then
-    /// runs unhinted (a no-op, not an error).
-    pub fn create(target_ns: i64, tids: &[i32]) -> Option<Self> {
+    /// runs unhinted (a no-op, not an error). `prefer_performance` (the experimental low-latency
+    /// mode) additionally biases the governor away from power efficiency (API 35+); off, the
+    /// session runs with the platform default, as it did before the overhaul.
+    pub fn create(target_ns: i64, tids: &[i32], prefer_performance: bool) -> Option<Self> {
         if target_ns <= 0 || tids.is_empty() {
             return None;
         }
@@ -119,9 +121,11 @@ impl HintSession {
         // Tell the governor NOT to bias this session toward power efficiency (API 35+): our loop is
         // latency-critical, so we want it kept on fast cores at high clocks over battery savings.
         // Best-effort; absent below API 35.
-        if let Some(f) = api.set_prefer_power_efficiency {
-            // SAFETY: `session` is the live session just created; the fn takes it + a bool.
-            unsafe { f(session, false) };
+        if prefer_performance {
+            if let Some(f) = api.set_prefer_power_efficiency {
+                // SAFETY: `session` is the live session just created; the fn takes it + a bool.
+                unsafe { f(session, false) };
+            }
         }
         Some(Self { api, session })
     }

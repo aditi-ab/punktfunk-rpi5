@@ -36,9 +36,11 @@ const IN_FLIGHT_CAP: usize = 64;
 /// this deep is a lost datagram (or an old host that never sends any) and gets evicted.
 const PENDING_SPLIT_CAP: usize = 256;
 
-/// Whether to run the event-driven async decode loop (default) or the synchronous poll loop kept as
-/// a bring-up fallback. Flip to `false` to A/B the two on the HUD (`design/…`); the async loop
-/// presents a decoded frame the instant it's ready instead of waiting out a poll interval.
+/// Whether low-latency mode uses the event-driven async decode loop (default) or the synchronous
+/// poll loop. Flip to `false` to A/B the two on the HUD (`design/…`); the async loop presents a
+/// decoded frame the instant it's ready instead of waiting out a poll interval. Only consulted when
+/// the user's "Low-latency mode (experimental)" toggle is ON — off, the sync loop always runs (the
+/// original pipeline).
 const USE_ASYNC_DECODE: bool = true;
 
 /// Per-session decode configuration, resolved by the JNI layer (`nativeStartVideo`) and passed to
@@ -50,8 +52,10 @@ pub(crate) struct DecodeOptions {
     /// Whether Kotlin found the chosen decoder advertises `FEATURE_LowLatency` (queryable only via
     /// the Java `CodecCapabilities` API) — surfaced on the HUD next to the decoder name.
     pub ll_feature: bool,
-    /// The user's "Low-latency mode" master toggle (default on ⇒ full aggressive profile; off ⇒
-    /// conservative, an escape hatch for a device that throttles under the clocks).
+    /// The user's "Low-latency mode (experimental)" master toggle. On ⇒ the full overhaul: async
+    /// decode loop, per-SoC vendor keys, pipeline thread boosts, ADPF max-performance, forced TV
+    /// mode switch. Off (default) ⇒ the original pre-overhaul pipeline, kept as the known-good
+    /// baseline while the overhaul is experimental.
     pub low_latency_mode: bool,
     /// TV form factor (Kotlin's `UiModeManager`): actively drive the HDMI output into the stream's
     /// refresh mode, vs. the softer seamless hint on a phone/tablet.
@@ -67,17 +71,16 @@ pub fn run(
     stats: Arc<crate::stats::VideoStats>,
     opts: DecodeOptions,
 ) {
-    if USE_ASYNC_DECODE {
+    if opts.low_latency_mode && USE_ASYNC_DECODE {
         run_async(client, window, shutdown, stats, opts);
     } else {
         run_sync(client, window, shutdown, stats, opts);
     }
 }
 
-/// The synchronous poll loop — the original decode path, kept as a bring-up fallback behind
-/// [`USE_ASYNC_DECODE`]. Feeds and drains on this one thread; the only blocking wait is a short
-/// output dequeue while input is backed up.
-#[allow(dead_code)]
+/// The synchronous poll loop — the original decode path: the only one when low-latency mode is off,
+/// and the [`USE_ASYNC_DECODE`] A/B fallback when it's on. Feeds and drains on this one thread; the
+/// only blocking wait is a short output dequeue while input is backed up.
 fn run_sync(
     client: Arc<NativeClient>,
     window: NativeWindow,
@@ -160,7 +163,11 @@ fn run_sync(
     // above our API-28 floor, so we resolve it at runtime (see `try_set_frame_rate`) rather than link
     // it — a hard import would stop `libpunktfunk_android.so` loading at all on API 28/29. Absent
     // there ⇒ we simply skip the hint (non-fatal; the stream renders fine without it).
-    if mode.refresh_hz > 0 && !try_set_frame_rate(&window, mode.refresh_hz as f32, is_tv) {
+    // The forced TV mode switch (`is_tv` ⇒ ALWAYS strategy) is part of the experimental stack;
+    // off, every form factor gets the original soft seamless hint.
+    if mode.refresh_hz > 0
+        && !try_set_frame_rate(&window, mode.refresh_hz as f32, is_tv && low_latency_mode)
+    {
         log::debug!(
             "decode: set_frame_rate({} Hz) unavailable/declined (non-fatal)",
             mode.refresh_hz
@@ -319,8 +326,12 @@ fn run_sync(
                 // or where the platform declines → `None`, and the loop runs unhinted).
                 hint_tried = true;
                 let tids = client.hot_thread_ids();
-                boost_hot_threads(&tids);
-                hint = crate::adpf::HintSession::create(frame_period_ns, &tids);
+                // The pump/audio priority boost is part of the experimental low-latency stack; the
+                // ADPF session itself predates it and always runs (max-performance bias gated inside).
+                if low_latency_mode {
+                    boost_hot_threads(&tids);
+                }
+                hint = crate::adpf::HintSession::create(frame_period_ns, &tids, low_latency_mode);
                 log::info!(
                     "decode: ADPF hint session {} — {} hot thread(s), target {frame_period_ns} ns",
                     if hint.is_some() {
@@ -396,12 +407,15 @@ fn create_codec(mime: &str, preferred: Option<&str>) -> Option<MediaCodec> {
     MediaCodec::from_decoder_type(mime)
 }
 
-/// Apply the low-latency MediaFormat keys for `codec_name`. The standard AOSP `low-latency` key is
-/// always set (API 30+, harmless/ignored elsewhere). When `aggressive` (the "Low-latency mode"
-/// master toggle) we additionally set MediaTek's `vdec-lowlatency` (unconditionally — ignored off
-/// MediaTek), the per-SoC vendor extension keys (gated on the decoder-name prefix the way
-/// Moonlight-Android does, since a key one vendor honours is meaningless on another), and one clock
-/// hint. Off ⇒ the standard key only, a gentler profile for a device that throttles under max clocks.
+/// Apply the low-latency MediaFormat keys for `codec_name`.
+///
+/// `aggressive` = the "Low-latency mode (experimental)" master toggle. **Off** (default) ⇒ the
+/// pre-overhaul key set, byte-for-byte — the standard `low-latency` key, the blind Qualcomm vendor
+/// twin, `priority = 0` AND `operating-rate = MAX` set together — kept as the known-good baseline
+/// (the profile every device streamed with before the overhaul). **On** ⇒ the Moonlight-parity
+/// profile: MediaTek's `vdec-lowlatency` (unconditionally — ignored off MediaTek), the per-SoC
+/// vendor extension keys (gated on the decoder-name prefix the way Moonlight-Android does, since a
+/// key one vendor honours is meaningless on another), and one *mutually exclusive* clock hint.
 ///
 /// Vendor keys mirror Moonlight's `MediaCodecHelper` (verified against current source): Qualcomm
 /// picture-order + low-latency, Exynos (also Google Tensor), Amlogic, HiSilicon, MediaTek. NVIDIA
@@ -411,6 +425,12 @@ fn configure_low_latency(format: &mut MediaFormat, codec_name: &str, aggressive:
     // Standard key: request the no-reorder low-latency path where the platform decoder supports it.
     format.set_i32("low-latency", 1);
     if !aggressive {
+        // The original profile: the Qualcomm vendor twin set blind (unknown keys are ignored by
+        // other vendors' codecs), realtime priority, and the AOSP "unbounded" operating-rate
+        // sentinel — decode each frame at max clocks rather than pacing to the frame rate.
+        format.set_i32("vendor.qti-ext-dec-low-latency.enable", 1);
+        format.set_i32("priority", 0); // 0 = realtime
+        format.set_i32("operating-rate", i16::MAX as i32); // 32767 = "as fast as possible"
         return;
     }
     // MediaTek's low-latency key — very common (mid/budget phones + many Google TV / Fire TV boxes).
@@ -600,7 +620,11 @@ fn run_async(
         mode.width,
         mode.height
     );
-    if mode.refresh_hz > 0 && !try_set_frame_rate(&window, mode.refresh_hz as f32, is_tv) {
+    // The forced TV mode switch (`is_tv` ⇒ ALWAYS strategy) is part of the experimental stack;
+    // off, every form factor gets the original soft seamless hint.
+    if mode.refresh_hz > 0
+        && !try_set_frame_rate(&window, mode.refresh_hz as f32, is_tv && low_latency_mode)
+    {
         log::debug!(
             "decode: set_frame_rate({} Hz) unavailable/declined (non-fatal)",
             mode.refresh_hz
@@ -716,8 +740,12 @@ fn run_async(
             if !hint_tried {
                 hint_tried = true;
                 let tids = client.hot_thread_ids();
-                boost_hot_threads(&tids);
-                hint = crate::adpf::HintSession::create(frame_period_ns, &tids);
+                // The pump/audio priority boost is part of the experimental low-latency stack; the
+                // ADPF session itself predates it and always runs (max-performance bias gated inside).
+                if low_latency_mode {
+                    boost_hot_threads(&tids);
+                }
+                hint = crate::adpf::HintSession::create(frame_period_ns, &tids, low_latency_mode);
                 log::info!(
                     "decode: ADPF hint session {} — {} hot thread(s), target {frame_period_ns} ns",
                     if hint.is_some() {

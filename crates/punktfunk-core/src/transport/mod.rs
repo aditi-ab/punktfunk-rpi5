@@ -6,7 +6,7 @@ mod qos;
 mod udp;
 
 pub use loopback::{loopback_pair, LoopbackTransport};
-pub use qos::{grow_socket_buffers, set_media_qos, MediaClass};
+pub use qos::{grow_socket_buffers, set_dscp_default, set_media_qos, MediaClass};
 /// Windows-only: reusable USO (UDP Send Offload) batch send for callers that own their own connected
 /// socket (the GameStream video sender) rather than going through [`UdpTransport`].
 #[cfg(target_os = "windows")]

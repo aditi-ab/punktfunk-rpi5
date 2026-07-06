@@ -57,7 +57,17 @@ object VideoDecoders {
             val name = info.name
             val lower = name.lowercase()
             if (BLOCKED_PREFIXES.any { lower.startsWith(it) } || lower in BLOCKED_EXACT) continue
+            // Never a secure decoder: `.secure` names are the DRM-pipeline twins of the real
+            // decoder and require a secure surface — configuring one for a clear stream fails (or
+            // renders black). The plain twin is also in the list, so drop rather than rank
+            // (a `.secure` twin can otherwise OUT-score its plain sibling when only it advertises
+            // FEATURE_LowLatency). Moonlight filters the same way.
+            if (lower.endsWith(".secure")) continue
             val caps = runCatching { info.getCapabilitiesForType(mime) }.getOrNull() ?: continue
+            val secureRequired = runCatching {
+                caps.isFeatureRequired(CodecCapabilities.FEATURE_SecurePlayback)
+            }.getOrDefault(false)
+            if (secureRequired) continue
 
             val hardware = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 info.isHardwareAccelerated

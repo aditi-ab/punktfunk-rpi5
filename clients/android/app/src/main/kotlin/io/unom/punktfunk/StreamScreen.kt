@@ -64,7 +64,10 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     var showStats by remember { mutableStateOf(initialSettings.statsHudEnabled) }
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
     val touchMode = initialSettings.touchMode
-    // Master low-latency toggle, resolved once for the session and passed to the decoder at start.
+    // "Low-latency mode (experimental)" master toggle, resolved once for the session. Off (the
+    // default) runs the original pre-overhaul pipeline; on enables the whole aggressive stack —
+    // decoder ranking + vendor keys + async loop (native side), the Wi-Fi low-latency lock and
+    // HDMI ALLM below, game-tagged audio, and DSCP marking (applied earlier, at connect).
     val lowLatencyMode = initialSettings.lowLatencyMode
     // TV form factor (leanback): the decoder actively switches the HDMI output mode to the stream
     // refresh; a phone/tablet gets the softer seamless frame-rate hint instead.
@@ -118,7 +121,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     // power-save polling (a common source of tens-of-ms jitter). WIFI_MODE_FULL_LOW_LATENCY (API
     // 29+) is the strongest; older releases fall back to FULL_HIGH_PERF. Needs no extra permission
     // beyond ACCESS_WIFI_STATE (already declared). Non-reference-counted: one explicit acquire/release.
+    // Part of the experimental low-latency stack — not created at all when the toggle is off.
     val wifiLock = remember(handle) {
+        if (!lowLatencyMode) return@remember null
         val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
         val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             WifiManager.WIFI_MODE_FULL_LOW_LATENCY
@@ -133,8 +138,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         runCatching { wifiLock?.acquire() }
         // HDMI Auto Low-Latency Mode: ask the display to drop its post-processing (game mode) —
-        // the biggest panel-side latency win on the TV boxes. No-op where ALLM isn't supported. API 30+.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        // the biggest panel-side latency win on the TV boxes. No-op where ALLM isn't supported. API
+        // 30+. Part of the experimental low-latency stack.
+        if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window?.setPreferMinimalPostProcessing(true)
         }
         controller?.let {
@@ -166,7 +172,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             activity?.setConsoleHighRefreshRate(true) // back to the console UI's max refresh
             controller?.show(WindowInsetsCompat.Type.systemBars())
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 window?.setPreferMinimalPostProcessing(false)
             }
             runCatching { if (wifiLock?.isHeld == true) wifiLock.release() }
@@ -191,11 +197,13 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                 SurfaceView(ctx).apply {
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
-                            // Rank MediaCodecList decoders for the negotiated MIME (framework-only
-                            // API) and hand the chosen one to Rust, which creates it by name and
-                            // applies the per-SoC vendor low-latency keys.
+                            // Low-latency mode: rank MediaCodecList decoders for the negotiated
+                            // MIME (framework-only API) and hand the chosen one to Rust, which
+                            // creates it by name and applies the per-SoC vendor low-latency keys.
+                            // Off ⇒ no ranking: the platform resolves its default decoder for the
+                            // MIME, exactly as before the overhaul.
                             val mime = NativeBridge.nativeVideoMime(handle)
-                            val choice = VideoDecoders.pickDecoder(mime)
+                            val choice = if (lowLatencyMode) VideoDecoders.pickDecoder(mime) else null
                             NativeBridge.nativeStartVideo(
                                 handle,
                                 holder.surface,
@@ -204,7 +212,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                                 choice?.lowLatencyFeature ?: false,
                                 isTv,
                             )
-                            NativeBridge.nativeStartAudio(handle)
+                            NativeBridge.nativeStartAudio(handle, lowLatencyMode)
                             if (micWanted) NativeBridge.nativeStartMic(handle)
                         }
 

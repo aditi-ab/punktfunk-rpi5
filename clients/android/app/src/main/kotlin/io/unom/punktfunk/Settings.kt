@@ -55,13 +55,14 @@ data class Settings(
      */
     val libraryEnabled: Boolean = true,
     /**
-     * Aggressive decoder latency tuning — the master escape hatch. On (default): the decoder runs
-     * the full low-latency profile (per-SoC vendor keys + max-clock operating-rate on Qualcomm).
-     * Off: a conservative profile (the standard `low-latency` key only), for a device that thermally
-     * throttles or misbehaves under the aggressive clocks. Decoder ranking, the Wi-Fi low-latency
-     * lock and HDMI game-mode signalling stay on regardless — they're harmless.
+     * "Low-latency mode (experimental)" — the master switch over the whole latency overhaul: decoder
+     * ranking + per-SoC vendor keys + the async decode loop (native), pipeline thread boosts + ADPF
+     * max-performance, game-tagged AAudio, DSCP marking on the media sockets, the Wi-Fi low-latency
+     * lock, HDMI ALLM, and the forced TV mode switch. Off (default): the original pre-overhaul
+     * pipeline, kept byte-for-byte as the known-good baseline — the overhaul regressed badly on some
+     * phones, so it's opt-in until it's proven per-device.
      */
-    val lowLatencyMode: Boolean = true,
+    val lowLatencyMode: Boolean = false,
     /**
      * Wake-on-LAN a saved host before connecting when it isn't currently seen on mDNS. On (default):
      * a connect to a host with a learned MAC that isn't advertising sends a magic packet and waits
@@ -99,7 +100,7 @@ class SettingsStore(context: Context) {
             ?: if (prefs.getBoolean(K_TRACKPAD, true)) TouchMode.TRACKPAD else TouchMode.POINTER,
         gamepadUiEnabled = prefs.getBoolean(K_GAMEPAD_UI, true),
         libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
-        lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, true),
+        lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, false),
         autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
     )
 
@@ -139,7 +140,14 @@ class SettingsStore(context: Context) {
         const val K_TOUCH_MODE = "touch_mode"
         const val K_GAMEPAD_UI = "gamepad_ui_enabled"
         const val K_LIBRARY = "library_enabled"
-        const val K_LOW_LATENCY = "low_latency_mode"
+
+        /**
+         * Deliberately NOT the original `"low_latency_mode"` key: that one shipped default-ON, so
+         * any install that ever saved settings persisted `true` — under the old key, flipping the
+         * default to off would leave exactly the regressed devices stuck on the overhaul. The fresh
+         * key restarts everyone at the safe default; the stale one is abandoned unread.
+         */
+        const val K_LOW_LATENCY = "low_latency_mode_experimental"
         const val K_AUTO_WAKE = "auto_wake_enabled"
 
         /** Legacy Boolean the enum replaced — read once as the migration default, never written. */

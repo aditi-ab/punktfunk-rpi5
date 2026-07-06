@@ -34,6 +34,9 @@ suspend fun connectToHost(
     // "Automatic" resolves to a concrete pad type from the connected controller's VID/PID.
     val gamepadPref = Gamepad.resolvePref(settings.gamepad)
     return withContext(Dispatchers.IO) {
+        // Transport-level half of "Low-latency mode (experimental)" (DSCP marking on the media
+        // sockets) — must be applied before connect, since sockets are tagged at creation.
+        NativeBridge.nativeSetLowLatencyMode(settings.lowLatencyMode)
         NativeBridge.nativeConnect(
             host, port, w, h, hz,
             identity.certPem, identity.privateKeyPem, pinHex,

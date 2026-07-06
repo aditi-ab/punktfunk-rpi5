@@ -124,6 +124,15 @@ object NativeBridge {
     external fun nativeWakeOnLan(macsCsv: String, lastIp: String): Boolean
 
     /**
+     * Apply the user's "Low-latency mode (experimental)" toggle to the process-wide transport
+     * defaults — today just DSCP/QoS marking on the media sockets. Must be called BEFORE
+     * [nativeConnect] (the tag is applied at socket creation); `HostConnect.connectToHost` does.
+     * The rest of the toggle rides explicit per-session parameters ([nativeStartVideo] /
+     * [nativeStartAudio]). Cheap (one atomic store); UI-safe.
+     */
+    external fun nativeSetLowLatencyMode(enabled: Boolean)
+
+    /**
      * The MediaCodec MIME the host resolved for this session (`"video/hevc"` / `"video/avc"` /
      * `"video/av01"`), or `""` on a `0` handle. Kotlin ranks `MediaCodecList` decoders for this
      * MIME (see [io.unom.punktfunk.kit.VideoDecoders]) before [nativeStartVideo]. Cheap; UI-safe.
@@ -134,10 +143,12 @@ object NativeBridge {
      * Start the decode thread rendering onto [surface] (a SurfaceView's surface). Decode runs
      * entirely in Rust (NDK AMediaCodec → ANativeWindow) — no per-frame JNI. [decoderName] is the
      * decoder Kotlin ranked from `MediaCodecList` (`""` = let the platform resolve the default for
-     * the MIME); [lowLatencyMode] is the user's master toggle (default on → aggressive per-SoC
-     * tuning; off → conservative); [lowLatencyFeature] is whether [decoderName] advertised
-     * `FEATURE_LowLatency` (HUD label only). [isTv] drives an active HDMI mode switch to the stream
-     * refresh on TV boxes (vs. the softer seamless hint on phones). No-op if already started.
+     * the MIME — what the pre-overhaul client always did); [lowLatencyMode] is the user's
+     * "Low-latency mode (experimental)" toggle (off, the default, runs the original decode
+     * pipeline; on, the aggressive per-SoC tuning + async loop); [lowLatencyFeature] is whether
+     * [decoderName] advertised `FEATURE_LowLatency` (HUD label only). [isTv] drives an active HDMI
+     * mode switch to the stream refresh on TV boxes when the toggle is on (vs. the softer seamless
+     * hint otherwise). No-op if already started.
      */
     external fun nativeStartVideo(
         handle: Long,
@@ -183,10 +194,12 @@ object NativeBridge {
     external fun nativeSetVideoStatsEnabled(handle: Long, enabled: Boolean)
 
     /**
-     * Start host→client audio: Opus decode → jitter ring → AAudio (LowLatency), all in Rust. No-op
-     * if already started. Best-effort — a failure leaves video streaming.
+     * Start host→client audio: Opus decode → jitter ring → AAudio (LowLatency), all in Rust.
+     * [lowLatencyMode] (the experimental toggle) additionally tags the stream usage=Game for the
+     * HAL's game-audio routing. No-op if already started. Best-effort — a failure leaves video
+     * streaming.
      */
-    external fun nativeStartAudio(handle: Long)
+    external fun nativeStartAudio(handle: Long, lowLatencyMode: Boolean)
 
     /** Stop + join the audio thread and close AAudio, without closing the session. No-op on `0`. */
     external fun nativeStopAudio(handle: Long)
