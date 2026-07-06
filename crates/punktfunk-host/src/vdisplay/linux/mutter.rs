@@ -412,8 +412,8 @@ fn mode_flag(md: &DbusMode, key: &str) -> bool {
     matches!(md.6.get(key).map(|v| &**v), Some(&Value::Bool(true)))
 }
 
-/// The current (else preferred, else first) mode of `connector` → (mode_id, width, height).
-fn current_mode(state: &CurrentState, connector: &str) -> Option<(String, i32, i32)> {
+/// The current (else preferred, else first) mode of `connector` → `(mode_id, width, height, refresh)`.
+fn current_mode_full(state: &CurrentState, connector: &str) -> Option<(String, i32, i32, f64)> {
     let mon = state.1.iter().find(|m| m.0 .0 == connector)?;
     let pick = mon
         .1
@@ -421,7 +421,83 @@ fn current_mode(state: &CurrentState, connector: &str) -> Option<(String, i32, i
         .find(|md| mode_flag(md, "is-current"))
         .or_else(|| mon.1.iter().find(|md| mode_flag(md, "is-preferred")))
         .or_else(|| mon.1.first())?;
-    Some((pick.0.clone(), pick.1, pick.2))
+    Some((pick.0.clone(), pick.1, pick.2, pick.3))
+}
+
+/// As [`current_mode_full`] but dropping the refresh (callers that only place by width).
+fn current_mode(state: &CurrentState, connector: &str) -> Option<(String, i32, i32)> {
+    current_mode_full(state, connector).map(|(id, w, h, _)| (id, w, h))
+}
+
+/// Pure mode-pick for a KEPT physical (unit-tested). Given the physical's PRE-connect mode
+/// (`pre_mode = (id, w, h, refresh)`; `None` when the connector is new since the snapshot) and the
+/// mode list Mutter reports for it in the POST-virtual state
+/// (`(id, w, h, refresh, is_current, is_preferred)`), return the `(mode_id, width)` to re-apply.
+///
+/// Mutter re-derives its layout when the `RecordVirtual` output appears and can silently drop a
+/// 120 Hz panel to its EDID-preferred 60 Hz — so the post-virtual `is-current` is *already* 60 Hz.
+/// We therefore prefer the PRE mode (its real refresh), resolved to a mode id valid at apply time;
+/// only when the physical genuinely no longer offers that mode do we fall back to the post-virtual
+/// current (never inventing a mode id `ApplyMonitorsConfig` would reject).
+fn pick_keep_mode(
+    pre_mode: Option<(String, i32, i32, f64)>,
+    state_modes: &[(String, i32, i32, f64, bool, bool)],
+) -> Option<(String, i32)> {
+    let state_current = || {
+        state_modes
+            .iter()
+            .find(|m| m.4)
+            .or_else(|| state_modes.iter().find(|m| m.5))
+            .or_else(|| state_modes.first())
+            .map(|m| (m.0.clone(), m.1))
+    };
+    let Some((pre_id, w, h, hz)) = pre_mode else {
+        return state_current();
+    };
+    // The exact pre mode id, if the connector still offers it (same session ⇒ usually true).
+    if state_modes.iter().any(|m| m.0 == pre_id) {
+        return Some((pre_id, w));
+    }
+    // Else a re-keyed id with the same geometry + refresh (still the real 120 Hz).
+    if let Some(m) = state_modes
+        .iter()
+        .find(|m| m.1 == w && m.2 == h && (m.3 - hz).abs() < 0.5)
+    {
+        return Some((m.0.clone(), m.1));
+    }
+    // The physical genuinely no longer offers that mode — use whatever is valid now.
+    state_current()
+}
+
+/// The `(mode_id, width)` a kept physical should be RE-APPLIED at — its PRE-connect mode preserved
+/// across Mutter's virtual-output layout re-derive. See [`pick_keep_mode`].
+fn physical_keep_mode(
+    pre: &CurrentState,
+    state: &CurrentState,
+    conn: &str,
+) -> Option<(String, i32)> {
+    let pre_mode = current_mode_full(pre, conn);
+    let state_modes: Vec<(String, i32, i32, f64, bool, bool)> = state
+        .1
+        .iter()
+        .find(|m| m.0 .0 == conn)
+        .map(|mon| {
+            mon.1
+                .iter()
+                .map(|md| {
+                    (
+                        md.0.clone(),
+                        md.1,
+                        md.2,
+                        md.3,
+                        mode_flag(md, "is-current"),
+                        mode_flag(md, "is-preferred"),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    pick_keep_mode(pre_mode, &state_modes)
 }
 
 /// Wait for the virtual output to appear in DisplayConfig (its size follows PipeWire negotiation,
@@ -465,7 +541,7 @@ async fn make_virtual_primary(
             let config = if exclusive {
                 build_exclusive_config(&vconn, &vmode)
             } else {
-                build_primary_keeping_physicals(&state, &vconn, &vmode, mode.width as i32)
+                build_primary_keeping_physicals(pre, &state, &vconn, &vmode, mode.width as i32)
             };
             let _: () = dc
                 .call(
@@ -505,13 +581,20 @@ fn build_exclusive_config(vconn: &str, vmode: &str) -> Vec<ApplyLogical> {
 }
 
 /// **Primary** — the virtual output primary at `(0, 0)`, with every currently-active physical
-/// monitor KEPT as a secondary (laid left-to-right past the virtual, each at its current mode). So
-/// the shell + new windows land on the streamed surface, but the operator's physical screen stays
-/// on. On a headless host (no physicals) this is identical to [`build_exclusive_config`].
+/// monitor KEPT as a secondary (laid left-to-right past the virtual, each at its **pre-connect**
+/// mode). So the shell + new windows land on the streamed surface, but the operator's physical
+/// screen stays on **at its real refresh**. On a headless host (no physicals) this is identical to
+/// [`build_exclusive_config`].
+///
+/// `pre` is the snapshot taken *before* the virtual output existed (physical still at its true
+/// refresh); `state` is the post-virtual state. We read each physical's mode from `pre` because
+/// Mutter can knock a 120 Hz panel down to 60 Hz when it re-derives the layout for the virtual
+/// monitor — reading `state` would cement that 60 Hz (`physical_keep_mode`).
 ///
 /// *Physical-keep is unvalidated on-glass* — the lab boxes are headless (no attached display to keep
 /// on); the layout math is conservative (append to the right) but wants a display-attached box.
 fn build_primary_keeping_physicals(
+    pre: &CurrentState,
     state: &CurrentState,
     vconn: &str,
     vmode: &str,
@@ -525,15 +608,15 @@ fn build_primary_keeping_physicals(
         true,
         vec![(vconn.to_string(), vmode.to_string(), HashMap::new())],
     )];
-    // Append each physical (non-virtual) connector that has a usable current mode, to the right of
-    // the virtual output, as a non-primary secondary.
+    // Append each physical (non-virtual) connector that has a usable mode, to the right of the
+    // virtual output, as a non-primary secondary — at its PRE-connect mode (real refresh preserved).
     let mut x = virt_width.max(0);
     for mon in &state.1 {
         let conn = &mon.0 .0;
         if conn == vconn {
             continue;
         }
-        if let Some((mode_id, w, _h)) = current_mode(state, conn) {
+        if let Some((mode_id, w)) = physical_keep_mode(pre, state, conn) {
             logicals.push((
                 x,
                 0,
@@ -546,4 +629,85 @@ fn build_primary_keeping_physicals(
         }
     }
     logicals
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_keep_mode;
+
+    // (id, w, h, refresh, is_current, is_preferred)
+    fn m(
+        id: &str,
+        w: i32,
+        h: i32,
+        hz: f64,
+        cur: bool,
+        pref: bool,
+    ) -> (String, i32, i32, f64, bool, bool) {
+        (id.to_string(), w, h, hz, cur, pref)
+    }
+
+    #[test]
+    fn keep_mode_prefers_pre_refresh_over_downgraded_state() {
+        // Physical was 2560x1440@120 pre-connect; after the virtual appeared Mutter marked 60 Hz
+        // current (the reported bug). We must re-apply the 120 Hz mode, not the state's 60 Hz.
+        let pre = Some(("M120".to_string(), 2560, 1440, 120.0));
+        let state = vec![
+            m("M120", 2560, 1440, 120.0, false, false),
+            m("M60", 2560, 1440, 60.0, true, true),
+        ];
+        assert_eq!(
+            pick_keep_mode(pre, &state),
+            Some(("M120".to_string(), 2560))
+        );
+    }
+
+    #[test]
+    fn keep_mode_rekeyed_id_matches_by_geometry_and_refresh() {
+        // The pre id is no longer offered (Mutter re-keyed the mode list), but a 120 Hz mode of the
+        // same geometry exists — match it so the real refresh survives.
+        let pre = Some(("old-120".to_string(), 2560, 1440, 120.0));
+        let state = vec![
+            m("new-120", 2560, 1440, 119.998, false, false),
+            m("new-60", 2560, 1440, 60.0, true, true),
+        ];
+        assert_eq!(
+            pick_keep_mode(pre, &state),
+            Some(("new-120".to_string(), 2560))
+        );
+    }
+
+    #[test]
+    fn keep_mode_falls_back_to_state_current_when_pre_mode_gone() {
+        // The physical genuinely no longer offers its pre mode (e.g. cable renegotiated to a lower
+        // max) — never invent an id; use the post-virtual current.
+        let pre = Some(("gone-165".to_string(), 3440, 1440, 165.0));
+        let state = vec![
+            m("s-100", 3440, 1440, 100.0, true, false),
+            m("s-60", 3440, 1440, 60.0, false, true),
+        ];
+        assert_eq!(
+            pick_keep_mode(pre, &state),
+            Some(("s-100".to_string(), 3440))
+        );
+    }
+
+    #[test]
+    fn keep_mode_no_pre_uses_state_current_then_preferred() {
+        // A connector new since the pre-snapshot (no pre mode): is-current wins, else is-preferred.
+        let state = vec![
+            m("A", 1920, 1080, 60.0, true, false),
+            m("B", 1920, 1080, 144.0, false, true),
+        ];
+        assert_eq!(pick_keep_mode(None, &state), Some(("A".to_string(), 1920)));
+
+        let no_current = vec![
+            m("A", 1920, 1080, 60.0, false, false),
+            m("B", 1920, 1080, 144.0, false, true),
+        ];
+        assert_eq!(
+            pick_keep_mode(None, &no_current),
+            Some(("B".to_string(), 1920))
+        );
+    }
 }

@@ -33,8 +33,8 @@ use windows::Win32::System::Threading::{
 
 use super::{DisplayOwnership, Mode, VirtualOutput};
 use crate::win_display::{
-    force_extend_topology, isolate_displays_ccd, resolve_gdi_name, restore_displays_ccd,
-    set_active_mode, set_virtual_primary_ccd, SavedConfig,
+    count_other_active, force_extend_topology, isolate_displays_ccd, resolve_gdi_name,
+    restore_displays_ccd, set_active_mode, set_virtual_primary_ccd, SavedConfig,
 };
 
 /// The per-backend REMOVE key the driver stamps on ADD and consumes on REMOVE. SudoVDA keys monitors by
@@ -673,16 +673,32 @@ impl VirtualDisplayManager {
                         ccd_saved = unsafe { isolate_displays_ccd(added.target_id) };
                     }
                     Topology::Primary => {
-                        // The IDD auto-activates as the SOLE display on a headless box, so the
-                        // physical (if present) is deactivated and QueryDisplayConfig sees only the
-                        // virtual. Force EXTEND first to (re)activate every CONNECTED display
-                        // alongside the virtual, THEN reposition to make the virtual primary — so the
-                        // physical stays active. (The bring-up above only force-EXTENDs when the
-                        // virtual FAILS to auto-resolve; here it resolved, so we do it explicitly.)
-                        // SAFETY: `force_extend_topology` drives the CCD topology FFI (no args, no borrowed
-                        // memory), under the `state` lock — the sole topology mutator.
-                        unsafe { force_extend_topology() };
-                        thread::sleep(Duration::from_millis(300));
+                        // On a headless box the IDD auto-activates as the SOLE display, so a physical
+                        // (if present) is deactivated and QueryDisplayConfig sees only the virtual —
+                        // force EXTEND to (re)activate every connected display alongside the virtual,
+                        // THEN reposition to make the virtual primary. BUT on a box whose physical is
+                        // ALREADY active (the IDD came up extended beside it — the common desktop case),
+                        // that physical is already lit at its real mode; re-applying the bare
+                        // `SDC_TOPOLOGY_EXTEND` preset would only re-pull each display's mode from the
+                        // persistence DB, RESETTING a 120 Hz panel to 60 Hz. So force-EXTEND only when the
+                        // virtual is currently sole; otherwise skip straight to the reposition, which
+                        // re-supplies each physical's QUERIED mode verbatim (preserving its refresh).
+                        // SAFETY: `count_other_active` runs the CCD QueryDisplayConfig FFI (Copy target id
+                        // by value, owned result), under the `state` lock.
+                        let already_extended =
+                            unsafe { count_other_active(added.target_id) }.unwrap_or(0) > 0;
+                        if already_extended {
+                            tracing::info!(
+                                "display topology=primary — a physical display is already active; \
+                                 skipping force-EXTEND (preserves its refresh) before making the \
+                                 virtual primary"
+                            );
+                        } else {
+                            // SAFETY: `force_extend_topology` drives the CCD topology FFI (no args, no
+                            // borrowed memory), under the `state` lock — the sole topology mutator.
+                            unsafe { force_extend_topology() };
+                            thread::sleep(Duration::from_millis(300));
+                        }
                         // SAFETY: `set_virtual_primary_ccd` takes the `Copy` target id by value and returns
                         // an owned `SavedConfig` (no borrowed memory crosses), under the `state` lock.
                         ccd_saved = unsafe { set_virtual_primary_ccd(added.target_id) };

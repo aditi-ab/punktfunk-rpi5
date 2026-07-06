@@ -223,19 +223,35 @@ impl VirtualDisplay for KwinDisplay {
 /// Re-enable the outputs an `exclusive` topology disabled (bootstrap / physical), so KWin re-homes onto
 /// them. Called by the registry when the display group's last member is torn down (design §6.1), BEFORE
 /// that member's output is reclaimed — so KWin is never momentarily left with zero enabled outputs.
-fn reenable_outputs(outputs: &[String]) {
+fn reenable_outputs(outputs: &[(String, String)]) {
     if outputs.is_empty() {
         return;
     }
-    let args: Vec<String> = outputs
+    // Enable FIRST, as a standalone apply — a bare `output.X.enable` always succeeds, so a physical
+    // can never be left DARK. (Batching a possibly-stale `mode` arg into the same invocation risks
+    // kscreen-doctor rejecting the whole config and leaving the output disabled.)
+    let enable_args: Vec<String> = outputs
         .iter()
-        .map(|o| format!("output.{o}.enable"))
+        .map(|(name, _)| format!("output.{name}.enable"))
         .collect();
     let _ = std::process::Command::new("kscreen-doctor")
-        .args(&args)
+        .args(&enable_args)
         .status();
+    // THEN re-assert each captured mode, best-effort — a bare re-enable lets KWin fall back to the
+    // EDID-preferred mode (a 120 Hz panel returns at ~60 Hz); this restores the exact refresh. The
+    // output is enabled now, so the mode set is valid; a rejected mode just leaves KWin's default.
+    let mode_args: Vec<String> = outputs
+        .iter()
+        .filter(|(_, mode)| !mode.is_empty())
+        .map(|(name, mode)| format!("output.{name}.mode.{mode}"))
+        .collect();
+    if !mode_args.is_empty() {
+        let _ = std::process::Command::new("kscreen-doctor")
+            .args(&mode_args)
+            .status();
+    }
     std::thread::sleep(Duration::from_millis(200));
-    tracing::info!(reenabled = ?outputs, "KWin: restored the physical/bootstrap outputs (group empty)");
+    tracing::info!(reenabled = ?outputs, "KWin: restored the physical/bootstrap outputs at their captured modes (group empty)");
 }
 
 /// Best-effort: raise the just-created virtual output's refresh above KWin's default 60 Hz by
@@ -327,12 +343,39 @@ fn read_active_refresh(output: &str) -> Option<u32> {
 /// recognised by this prefix, so we never have to thread the live set through the backend.
 const MANAGED_PREFIX: &str = "Virtual-punktfunk";
 
-/// Names of currently-ENABLED outputs that are **not managed by us** — the headless session's
-/// bootstrap output(s) + any physical monitor, i.e. exactly what `exclusive` must disable.
+/// The current mode of an output as a kscreen-doctor mode setter, from its `-j` entry — preferring
+/// the human `WxH@Hz` form (survives a mode-id re-enumeration across disable→enable) and falling back
+/// to the raw `currentModeId`. `None` if the current mode can't be resolved.
+fn output_current_mode_spec(o: &serde_json::Value) -> Option<String> {
+    let as_id = |v: &serde_json::Value| -> Option<String> {
+        v.as_str()
+            .map(|s| s.to_string())
+            .or_else(|| v.as_u64().map(|n| n.to_string()))
+    };
+    let current = o.get("currentModeId").and_then(&as_id)?;
+    let mode = o
+        .get("modes")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("id").and_then(&as_id).as_deref() == Some(current.as_str()))?;
+    let human = (|| {
+        let size = mode.get("size")?;
+        let w = size.get("width").and_then(|v| v.as_u64())?;
+        let h = size.get("height").and_then(|v| v.as_u64())?;
+        let hz = mode.get("refreshRate").and_then(|r| r.as_f64())?.round() as u64;
+        Some(format!("{w}x{h}@{hz}"))
+    })();
+    Some(human.unwrap_or(current))
+}
+
+/// Currently-ENABLED outputs that are **not managed by us** — the headless session's bootstrap
+/// output(s) + any physical monitor, i.e. exactly what `exclusive` must disable — EACH PAIRED WITH ITS
+/// CURRENT MODE (`WxH@Hz`, empty if unresolved) so teardown can put it back at that exact refresh (a
+/// bare re-enable drops a 120 Hz panel to KWin's default ~60 Hz).
 /// **Group-aware (§6.1):** excludes the WHOLE managed family (the [`MANAGED_PREFIX`]), not just this
 /// session's own output — so a 2nd `exclusive` session (with a distinct per-slot name) never disables
 /// the 1st session's live output. Parsed from `kscreen-doctor -j` (same source as [`read_active_refresh`]).
-fn other_enabled_outputs() -> Vec<String> {
+fn other_enabled_outputs() -> Vec<(String, String)> {
     let out = match std::process::Command::new("kscreen-doctor")
         .arg("-j")
         .output()
@@ -349,9 +392,15 @@ fn other_enabled_outputs() -> Vec<String> {
         .map(|outs| {
             outs.iter()
                 .filter(|o| o.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false))
-                .filter_map(|o| o.get("name").and_then(|n| n.as_str()))
-                .filter(|n| !n.starts_with(MANAGED_PREFIX))
-                .map(String::from)
+                .filter_map(|o| {
+                    let name = o.get("name").and_then(|n| n.as_str())?;
+                    (!name.starts_with(MANAGED_PREFIX)).then(|| {
+                        (
+                            name.to_string(),
+                            output_current_mode_spec(o).unwrap_or_default(),
+                        )
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -392,7 +441,7 @@ fn a_managed_output_is_primary() -> bool {
 /// the sole desktop (KWin re-homes plasmashell + windows onto it). Returns the disabled outputs for
 /// the keepalive to re-enable on teardown. Best-effort: on failure, streaming continues (just possibly
 /// showing only the wallpaper) rather than failing the session.
-fn apply_virtual_primary(name: &str) -> Vec<String> {
+fn apply_virtual_primary(name: &str) -> Vec<(String, String)> {
     let ours = format!("Virtual-{name}");
     let kscreen = |args: &[String]| {
         std::process::Command::new("kscreen-doctor")
@@ -415,11 +464,12 @@ fn apply_virtual_primary(name: &str) -> Vec<String> {
     }
     // Disable everything still enabled that ISN'T a managed group member (bootstrap / physical), so
     // the group is unambiguously the desktop — never a sibling session's output (group-aware filter).
+    // Each is captured WITH its current mode so teardown restores its real refresh, not KWin's default.
     let others = other_enabled_outputs();
     if !others.is_empty() {
         let args: Vec<String> = others
             .iter()
-            .map(|o| format!("output.{o}.disable"))
+            .map(|(o, _mode)| format!("output.{o}.disable"))
             .collect();
         let _ = kscreen(&args);
     }

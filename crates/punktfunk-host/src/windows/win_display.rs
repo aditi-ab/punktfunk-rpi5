@@ -384,8 +384,10 @@ unsafe fn query_active_config() -> Option<SavedConfig> {
 }
 
 /// Count currently-ACTIVE display paths whose target id != `keep_target_id` — i.e. displays that would
-/// still be lit besides the virtual one. `None` on query failure. Used to VERIFY isolation actually took.
-unsafe fn count_other_active(keep_target_id: u32) -> Option<u32> {
+/// still be lit besides the virtual one. `None` on query failure. Used to VERIFY isolation actually
+/// took, and (in the `primary` topology) to detect a physical that is ALREADY active so we can skip a
+/// force-EXTEND that would reset its refresh.
+pub(crate) unsafe fn count_other_active(keep_target_id: u32) -> Option<u32> {
     let (paths, _) = query_active_config()?;
     Some(
         paths
