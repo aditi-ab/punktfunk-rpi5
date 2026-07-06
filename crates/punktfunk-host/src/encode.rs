@@ -546,17 +546,40 @@ fn open_video_backend(
                     )
                 }
             }
-            backend @ (WindowsBackend::Amf | WindowsBackend::Qsv) => {
-                // AMD AMF / Intel QSV via libavcodec (the Windows analogue of the Linux VAAPI path).
+            WindowsBackend::Amf => {
+                // AMD: the native AMF SDK encoder, unconditionally (design/native-amf-encoder.md
+                // Phase 3). The libavcodec AMF fallback and the `PUNKTFUNK_AMF_FFMPEG` hatch were
+                // removed once the native path was validated — two permanently-maintained AMF
+                // paths double the driver-matrix burden, and the one kept "for safety" is exactly
+                // the one with the wedge/latency pathology. No build feature: amfrt64.dll resolves
+                // at runtime like NVENC's DLL. A missing/ancient runtime fails HERE with the
+                // "install/update the AMD driver" message `AmfEncoder::open` raises (§6), rather
+                // than silently degrading — FFmpeg now serves QSV only.
+                amf::AmfEncoder::open(
+                    codec,
+                    format,
+                    width,
+                    height,
+                    fps,
+                    bitrate_bps,
+                    bit_depth,
+                    chroma,
+                )
+                .map(|e| Box::new(e) as Box<dyn Encoder>)
+                .map_err(|e| {
+                    e.context(
+                        "native AMF encode failed to open (update the AMD driver / amfrt64.dll \
+                         runtime)",
+                    )
+                })
+            }
+            WindowsBackend::Qsv => {
+                // Intel QSV via libavcodec (stays on FFmpeg — design/native-amf-encoder.md §2:
+                // async_depth=1 + low_power VDEnc is already near the hardware latency floor).
                 #[cfg(feature = "amf-qsv")]
                 {
-                    let vendor = if matches!(backend, WindowsBackend::Amf) {
-                        ffmpeg_win::WinVendor::Amf
-                    } else {
-                        ffmpeg_win::WinVendor::Qsv
-                    };
                     ffmpeg_win::FfmpegWinEncoder::open(
-                        vendor,
+                        ffmpeg_win::WinVendor::Qsv,
                         codec,
                         format,
                         width,
@@ -570,11 +593,10 @@ fn open_video_backend(
                 }
                 #[cfg(not(feature = "amf-qsv"))]
                 {
-                    let _ = backend;
                     anyhow::bail!(
-                        "AMD/Intel (AMF/QSV) encode requested/detected but this host was built \
-                         without it — rebuild with `--features amf-qsv` (needs ffmpeg-next + a \
-                         FFMPEG_DIR with the AMF/QSV encoders at build time)"
+                        "Intel (QSV) encode requested/detected but this host was built without \
+                         it — rebuild with `--features amf-qsv` (needs ffmpeg-next + a FFMPEG_DIR \
+                         with the QSV encoders at build time)"
                     )
                 }
             }
@@ -785,14 +807,13 @@ pub fn can_encode_444(codec: Codec) -> bool {
                         false
                     }
                 }
-                WindowsBackend::Amf | WindowsBackend::Qsv => {
+                // AMD: native AMF never encodes 4:4:4 — VCN hardware limit, permanent, no probe
+                // needed (design/native-amf-encoder.md §3.5, Phase 3).
+                WindowsBackend::Amf => false,
+                WindowsBackend::Qsv => {
                     #[cfg(feature = "amf-qsv")]
                     {
-                        let vendor = match windows_resolved_backend() {
-                            WindowsBackend::Qsv => ffmpeg_win::WinVendor::Qsv,
-                            _ => ffmpeg_win::WinVendor::Amf,
-                        };
-                        ffmpeg_win::probe_can_encode_444(vendor, codec)
+                        ffmpeg_win::probe_can_encode_444(ffmpeg_win::WinVendor::Qsv, codec)
                     }
                     #[cfg(not(feature = "amf-qsv"))]
                     {
@@ -859,16 +880,18 @@ pub(crate) fn windows_resolved_backend() -> WindowsBackend {
     }
 }
 
-/// True if the active Windows backend is the libavcodec AMF/QSV path (so the codec advertisement
-/// consults a real GPU probe rather than the NVENC static superset). Always false when the
-/// `amf-qsv` feature is off — there's then no ffmpeg backend to probe.
+/// True if the active Windows backend's codec advertisement comes from a **real GPU probe**
+/// ([`windows_codec_support`]) rather than the NVENC static superset. AMF always qualifies — the
+/// native factory probe (`amf::probe_can_encode`) needs no build feature — while QSV still needs
+/// the `amf-qsv` (libavcodec) build. Formerly `windows_backend_is_ffmpeg`, renamed when the
+/// native AMF probe replaced the ffmpeg open-probe (design/native-amf-encoder.md §4, Phase 2).
 #[cfg(target_os = "windows")]
-pub fn windows_backend_is_ffmpeg() -> bool {
-    cfg!(feature = "amf-qsv")
-        && matches!(
-            windows_resolved_backend(),
-            WindowsBackend::Amf | WindowsBackend::Qsv
-        )
+pub fn windows_backend_is_probed() -> bool {
+    match windows_resolved_backend() {
+        WindowsBackend::Amf => true,
+        WindowsBackend::Qsv => cfg!(feature = "amf-qsv"),
+        WindowsBackend::Nvenc | WindowsBackend::Software => false,
+    }
 }
 
 /// Detect the encode-GPU vendor from the **selected render adapter** ([`crate::gpu::selected_gpu`]:
@@ -897,32 +920,55 @@ fn windows_gpu_vendor() -> Option<GpuVendor> {
     })
 }
 
-/// Probe the active Windows AMF/QSV backend for its encodable codecs (opens a tiny encoder per
-/// codec; cached **per (backend, selected GPU)** — a web-console preference change re-probes on the
-/// newly selected adapter instead of serving the old GPU's answer for the process lifetime).
-/// Mirrors [`vaapi_codec_support`]; called only when [`windows_backend_is_ffmpeg`] is true. AV1 is
-/// narrow (AMD RDNA3+, Intel Arc/Xe2+), so it must be probed, not assumed.
-#[cfg(all(target_os = "windows", feature = "amf-qsv"))]
+/// Probe the active Windows AMF/QSV backend for its encodable codecs (cached **per (backend,
+/// selected GPU)** — a web-console preference change re-probes on the newly selected adapter
+/// instead of serving the old GPU's answer for the process lifetime). Mirrors
+/// [`vaapi_codec_support`]; called only when [`windows_backend_is_probed`] is true. AV1 is narrow
+/// (AMD RDNA3+, Intel Arc/Xe2+), so it must be probed, not assumed.
+///
+/// Mirrors the session dispatch (design/native-amf-encoder.md Phase 3): **AMD advertises from the
+/// native AMF factory probe alone** (`amf::probe_can_encode`, on the selected adapter — the same
+/// path the session opens, so the advertisement can never claim a codec the session can't emit);
+/// **Intel/QSV uses the libavcodec probe** (all-`false` without the `amf-qsv` feature, matching a
+/// build that cannot open QSV at all).
+#[cfg(target_os = "windows")]
 pub fn windows_codec_support() -> CodecSupport {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<HashMap<String, CodecSupport>>> = OnceLock::new();
-    let vendor = match windows_resolved_backend() {
-        WindowsBackend::Qsv => ffmpeg_win::WinVendor::Qsv,
-        _ => ffmpeg_win::WinVendor::Amf,
-    };
-    let key = format!("{vendor:?}:{}", crate::gpu::selection_key());
+    let backend = windows_resolved_backend();
+    let key = format!("{backend:?}:{}", crate::gpu::selection_key());
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(c) = cache.lock().unwrap().get(&key) {
         return *c;
     }
+    let probe_one = |codec: Codec| -> bool {
+        match backend {
+            // AMD: the native factory probe is authoritative — it opens exactly the component the
+            // session will, so the advertisement matches what the encoder can emit by construction.
+            WindowsBackend::Amf => amf::probe_can_encode(codec),
+            WindowsBackend::Qsv => {
+                #[cfg(feature = "amf-qsv")]
+                {
+                    ffmpeg_win::probe_can_encode(ffmpeg_win::WinVendor::Qsv, codec)
+                }
+                #[cfg(not(feature = "amf-qsv"))]
+                {
+                    false
+                }
+            }
+            // Callers gate on `windows_backend_is_probed` — defensively answer "nothing probed"
+            // (the advertisement then falls back to the static superset).
+            WindowsBackend::Nvenc | WindowsBackend::Software => false,
+        }
+    };
     let caps = CodecSupport {
-        h264: ffmpeg_win::probe_can_encode(vendor, Codec::H264),
-        h265: ffmpeg_win::probe_can_encode(vendor, Codec::H265),
-        av1: ffmpeg_win::probe_can_encode(vendor, Codec::Av1),
+        h264: probe_one(Codec::H264),
+        h265: probe_one(Codec::H265),
+        av1: probe_one(Codec::Av1),
     };
     tracing::info!(
-        backend = ?vendor,
+        ?backend,
         h264 = caps.h264,
         h265 = caps.h265,
         av1 = caps.av1,
@@ -933,8 +979,14 @@ pub fn windows_codec_support() -> CodecSupport {
     caps
 }
 
-// Goal-1 stage 6: GPU/CPU encoders confined to `encode/windows/` (NVENC, AMF/QSV ffmpeg, software) and
-// `encode/linux/` (NVENC/CUDA + VAAPI); `#[path]` keeps the `crate::encode::*` module names flat.
+// Goal-1 stage 6: GPU/CPU encoders confined to `encode/windows/` (NVENC, native AMF, AMF/QSV
+// ffmpeg, software) and `encode/linux/` (NVENC/CUDA + VAAPI); `#[path]` keeps the
+// `crate::encode::*` module names flat.
+// Native AMF (direct SDK, design/native-amf-encoder.md): compiled unconditionally on Windows —
+// no build feature, the driver-installed amfrt64.dll resolves at runtime like NVENC's DLL.
+#[cfg(target_os = "windows")]
+#[path = "encode/windows/amf.rs"]
+mod amf;
 #[cfg(all(target_os = "windows", feature = "amf-qsv"))]
 #[path = "encode/windows/ffmpeg_win.rs"]
 mod ffmpeg_win;

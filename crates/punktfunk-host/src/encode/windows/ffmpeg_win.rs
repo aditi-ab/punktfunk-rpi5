@@ -1,8 +1,15 @@
-//! AMD **AMF** and Intel **QSV** hardware encode on Windows via `ffmpeg-next` — the Windows
-//! analogue of the Linux [`super::vaapi`] backend (one libavcodec backend per vendor, selected by
-//! encoder name: `*_amf` / `*_qsv`). This is the sibling of the direct-SDK [`super::nvenc`] path
-//! behind the shared [`Encoder`] trait, selected in [`super::open_video`] (NVIDIA → NVENC,
-//! AMD → AMF, Intel → QSV).
+//! Intel **QSV** (and, retained-but-no-longer-dispatched, AMD **AMF**) hardware encode on Windows
+//! via `ffmpeg-next` — the Windows analogue of the Linux [`super::vaapi`] backend (one libavcodec
+//! backend per vendor, selected by encoder name: `*_qsv` / `*_amf`). Sibling of the direct-SDK
+//! [`super::nvenc`] path behind the shared [`Encoder`] trait.
+//!
+//! **Dispatch (design/native-amf-encoder.md Phase 3):** [`super::open_video`] routes AMD to the
+//! direct-SDK [`super::amf`] encoder, not this module — the libavcodec AMF wrapper's ~2-frame
+//! output hold and its silent-wedge failure mode are exactly why the native path exists. So in
+//! production this file serves **QSV only**. The `WinVendor::Amf` machinery is kept (not deleted)
+//! because it is the comparator in the native-vs-libavcodec latency A/B (`amf::tests::
+//! amf_latency_ab_bench`), and excising it would churn the shared, Intel-unvalidated QSV code for
+//! no production benefit. Treat every `WinVendor::Amf` arm below as benchmark-only.
 //!
 //! The capturer hands a `FramePayload::D3d11` texture (NV12/P010 from the D3D11 video processor, or
 //! BGRA/Rgb10a2 as a fallback) on the capturer's own `ID3D11Device`. Two input paths, chosen lazily
