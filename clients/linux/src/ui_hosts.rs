@@ -162,9 +162,20 @@ pub fn new(settings: Rc<RefCell<Settings>>, cbs: HostsCallbacks) -> HostsUi {
     // A pointer click (and keyboard activate) emits `child-activated` on the *FlowBox*, never
     // the child's own `activate` signal — so bridge it back to the child, where each card wires
     // its connect handler (`saved_card`/`discovered_card`). Without this, clicking a card is dead.
+    //
+    // `child.activate()` in turn runs `GtkFlowBoxChild`'s own default handler, which re-emits
+    // `child-activated` on the FlowBox — bouncing straight back into this closure. Unguarded,
+    // that ping-pong recurses forever and overflows the stack on every single card click/Enter
+    // (a real crash seen live, not hypothetical); the re-entrancy flag breaks the cycle after
+    // the one real activation.
     for flow in [&saved_flow, &disc_flow] {
-        flow.connect_child_activated(|_, child| {
+        let activating = std::cell::Cell::new(false);
+        flow.connect_child_activated(move |_, child| {
+            if activating.replace(true) {
+                return;
+            }
             child.activate();
+            activating.set(false);
         });
     }
 
@@ -719,4 +730,50 @@ fn add_host_dialog(state: &Rc<State>) {
         });
     }
     dialog.present(Some(&state.stack));
+}
+
+#[cfg(test)]
+mod tests {
+    use adw::prelude::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    // Reproduces the exact FlowBox/FlowBoxChild wiring from `new()`: `child-activated` bridges
+    // to `child.activate()`, whose own default handler re-emits `child-activated` on the
+    // FlowBox — that ping-pong recursed forever (stack overflow on every host-card click/Enter)
+    // until the re-entrancy guard was added. This exercises the *real* GTK signal cycle, not a
+    // simulation of it, so it fails the same way the shipped bug did if the guard regresses.
+    #[test]
+    #[ignore = "needs a Wayland/X display"]
+    fn flow_box_activation_bridge_does_not_recurse() {
+        assert!(gtk::init().is_ok(), "no display");
+
+        let flow = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .activate_on_single_click(true)
+            .build();
+        let activating = Cell::new(false);
+        flow.connect_child_activated(move |_, child| {
+            if activating.replace(true) {
+                return;
+            }
+            child.activate();
+            activating.set(false);
+        });
+
+        let child = gtk::FlowBoxChild::new();
+        flow.insert(&child, -1);
+        let fired = Rc::new(Cell::new(0u32));
+        {
+            let fired = fired.clone();
+            child.connect_activate(move |_| fired.set(fired.get() + 1));
+        }
+
+        // What a pointer click with `activate_on_single_click` does internally: emit
+        // `child-activated` directly on the FlowBox. A regression here overflows the stack
+        // instead of returning.
+        flow.emit_by_name::<()>("child-activated", &[&child]);
+
+        assert_eq!(fired.get(), 1, "the per-card handler should fire exactly once");
+    }
 }
