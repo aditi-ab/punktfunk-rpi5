@@ -62,6 +62,15 @@ data class Settings(
      * lock and HDMI game-mode signalling stay on regardless — they're harmless.
      */
     val lowLatencyMode: Boolean = true,
+    /**
+     * Wake-on-LAN a saved host before connecting when it isn't currently seen on mDNS. On (default):
+     * a connect to a host with a learned MAC that isn't advertising sends a magic packet and waits
+     * for it to reappear (see [WakeController]) before dialing. Off: always dial straight through,
+     * skipping the mDNS-presence check entirely — for a host that's actually up but not visible on
+     * mDNS (a flaky discovery path, a VLAN/subnet that blocks multicast, etc.), where auto-wake would
+     * otherwise misfire and wait out its timeout despite the host already being reachable.
+     */
+    val autoWakeEnabled: Boolean = true,
 )
 
 /** [Settings.touchMode] values; persisted by name. */
@@ -91,6 +100,7 @@ class SettingsStore(context: Context) {
         gamepadUiEnabled = prefs.getBoolean(K_GAMEPAD_UI, true),
         libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
         lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, true),
+        autoWakeEnabled = prefs.getBoolean(K_AUTO_WAKE, true),
     )
 
     fun save(s: Settings) {
@@ -110,6 +120,7 @@ class SettingsStore(context: Context) {
             .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
             .putBoolean(K_LIBRARY, s.libraryEnabled)
             .putBoolean(K_LOW_LATENCY, s.lowLatencyMode)
+            .putBoolean(K_AUTO_WAKE, s.autoWakeEnabled)
             .apply()
     }
 
@@ -129,6 +140,7 @@ class SettingsStore(context: Context) {
         const val K_GAMEPAD_UI = "gamepad_ui_enabled"
         const val K_LIBRARY = "library_enabled"
         const val K_LOW_LATENCY = "low_latency_mode"
+        const val K_AUTO_WAKE = "auto_wake_enabled"
 
         /** Legacy Boolean the enum replaced — read once as the migration default, never written. */
         const val K_TRACKPAD = "trackpad_mode"

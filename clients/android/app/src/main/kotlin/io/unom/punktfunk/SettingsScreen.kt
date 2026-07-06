@@ -395,6 +395,14 @@ private fun InterfaceSettings(s: Settings, update: (Settings) -> Unit) {
             onCheckedChange = { on -> update(s.copy(libraryEnabled = on)) },
         )
         ToggleRow(
+            title = "Auto-wake on connect",
+            subtitle = "Send Wake-on-LAN and wait for a saved host to reappear on mDNS before " +
+                "connecting. Turn off if a host that's already on isn't seen on mDNS, so connects " +
+                "go straight through instead of waiting out the wake timeout.",
+            checked = s.autoWakeEnabled,
+            onCheckedChange = { on -> update(s.copy(autoWakeEnabled = on)) },
+        )
+        ToggleRow(
             title = "Stats overlay",
             subtitle = "Show FPS, throughput and latency while streaming (3-finger tap toggles it live)",
             checked = s.statsHudEnabled,

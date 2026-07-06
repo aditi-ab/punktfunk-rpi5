@@ -212,11 +212,12 @@ fun ConnectScreen(
         }
     }
 
-    // Wake-aware connect. If the target is a saved host with a learned MAC that ISN'T currently
-    // advertising (asleep/off), wake it and WAIT for it to reappear on mDNS (WakeController shows the
-    // "Waking…" overlay) before dialing — discovery stays running meanwhile so we can see it come
-    // back. A fire-and-forget packet + the connect timeout wasn't enough for a cold boot. Otherwise
-    // dial straight through.
+    // Wake-aware connect. If auto-wake is on (Settings.autoWakeEnabled) and the target is a saved
+    // host with a learned MAC that ISN'T currently advertising (asleep/off, or just missing from
+    // mDNS), wake it and WAIT for it to reappear on mDNS (WakeController shows the "Waking…" overlay)
+    // before dialing — discovery stays running meanwhile so we can see it come back. A fire-and-forget
+    // packet + the connect timeout wasn't enough for a cold boot. Otherwise (auto-wake off, no MAC, or
+    // already seen live) dial straight through.
     fun doConnect(targetHost: String, targetPort: Int, name: String, pinHex: String?) {
         if (identity == null) {
             status = "Identity not ready yet — try again in a moment"
@@ -230,7 +231,7 @@ fun ConnectScreen(
         fun liveAdvert(): DiscoveredHost? =
             if (kh != null) discovered.firstOrNull { kh.matches(it) }
             else discovered.firstOrNull { it.host == targetHost && it.port == targetPort }
-        if (macs.isNotEmpty() && liveAdvert() == null) {
+        if (settings.autoWakeEnabled && macs.isNotEmpty() && liveAdvert() == null) {
             waker.start(
                 hostName = name,
                 connectsAfter = true,

@@ -51,8 +51,12 @@ class MainActivity : ComponentActivity() {
      * Whether the last console input came from a real gamepad (face buttons / stick) vs. a TV D-pad
      * remote (which has no A/B/X/Y). The console UI reads this to show glyphs the user recognises — pad
      * face buttons, or a select glyph + arrows for a remote. Compose observes it (a snapshot state).
+     * Defaults to the remote glyphs on a TV (its D-pad remote is the typical first input, and often the
+     * only one) and to gamepad glyphs everywhere else (the console UI on a phone/tablet only activates
+     * via a real controller, so a TV-remote glyph would be a wrong first impression there) — set from
+     * [onCreate] once a [Context] is available, then kept live by real input.
      */
-    var lastPadIsGamepad by mutableStateOf(false)
+    var lastPadIsGamepad by mutableStateOf(true)
         private set
 
     /** The panel's highest-refresh display mode (0 = unknown/unsupported), resolved once at startup. */
@@ -60,6 +64,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        lastPadIsGamepad = !isTvDevice(this)
         resolveHighRefreshMode()
         setConsoleHighRefreshRate(true) // the console UI wants max refresh; streaming manages its own
         // Dark, transparent system bars regardless of the system theme — our UI is always dark, so
