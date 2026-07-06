@@ -50,6 +50,9 @@ pub(crate) enum Screen {
     /// The no-PIN "request access" wait: an identified connect is in flight, parked by the host
     /// until the operator approves this device in its console. Cancelable.
     RequestAccess,
+    /// Wake-on-LAN "wait until up": a magic packet was sent to an offline saved host and we're
+    /// polling mDNS for it to reappear (re-sending periodically) before dialing. Cancelable.
+    Waking,
     Stream,
     Settings,
     /// Open-source / third-party license notices (reached from Settings).
@@ -378,10 +381,11 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 set_hover,
             },
         ),
-        // connecting_page / request_access_page / settings_page / licenses_page use no hooks
-        // (they never touch `cx`), so calling them inline is sound.
+        // connecting_page / request_access_page / waking_page / settings_page / licenses_page use
+        // no hooks (they never touch `cx`), so calling them inline is sound.
         Screen::Connecting => connect::connecting_page(ctx, &status),
         Screen::RequestAccess => connect::request_access_page(ctx, &set_screen),
+        Screen::Waking => connect::waking_page(ctx, &set_screen),
         Screen::Settings => settings::settings_page(
             ctx,
             &set_screen,

@@ -5,6 +5,7 @@
 
 use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
+use crate::discovery::DiscoveredHost;
 use crate::session::{self, SessionEvent, SessionParams, Stats};
 use crate::trust::{self, KnownHost, KnownHosts, Settings};
 use crate::video::DecoderPref;
@@ -313,6 +314,97 @@ pub(crate) fn request_access(props: &Svc, target: &Target) {
     );
 }
 
+/// The Wake-on-LAN "wait until up" flow (mirrors the Apple `HostWaker`): the tapped saved host is
+/// offline but has a MAC, so send a magic packet, show a cancelable "Waking…" screen, and POLL mDNS
+/// for the host to reappear — re-sending the packet periodically — on a bounded deadline. A cold box
+/// takes far longer to POST/boot/re-advertise than a connect attempt will sit, so we can't just
+/// fire-and-dial. On reappearance we dial it (re-keying the saved host when it came back on a new
+/// IP); on timeout or Cancel we return to the host list.
+pub(crate) fn wake_and_connect(
+    ctx: &Arc<AppCtx>,
+    target: Target,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) {
+    // First packet now; the poll loop re-sends every RESEND_SECS (a single one can be missed, and
+    // some NICs only wake on a fresh packet after dropping into a deeper sleep state).
+    crate::wol::wake(&target.mac, target.addr.parse().ok());
+    // A fresh cancel flag per wake, installed where the "Waking…" screen's Cancel button reads it
+    // back (the same shared channel as the request-access flow); the poll loop checks the same `Arc`.
+    let cancel = Arc::new(AtomicBool::new(false));
+    *ctx.shared.cancel.lock().unwrap() = Some(cancel.clone());
+    // The busy page reads the host name from the shared target.
+    *ctx.shared.target.lock().unwrap() = target.clone();
+    set_status.call(String::new());
+    set_screen.call(Screen::Waking);
+
+    let (ctx, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
+    std::thread::spawn(move || {
+        // Generous — a cold boot + service start can be a minute-plus; re-send periodically.
+        const TIMEOUT_SECS: u64 = 90;
+        const RESEND_SECS: u64 = 6;
+        let rx = crate::discovery::browse();
+        let mut seen: Vec<DiscoveredHost> = Vec::new();
+        let mut elapsed: u64 = 0;
+        loop {
+            // Cancel already returned the UI to the host list — stop re-sending and tear down.
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            // Drain freshly-resolved adverts into the accumulator (newest wins per key).
+            while let Ok(h) = rx.try_recv() {
+                if let Some(e) = seen.iter_mut().find(|e| e.key == h.key) {
+                    *e = h;
+                } else {
+                    seen.push(h);
+                }
+            }
+            // Match on the pinned fingerprint first (it survives an IP change), else last address.
+            let resolved = seen
+                .iter()
+                .find(|h| match &target.fp_hex {
+                    Some(fp) if !h.fp_hex.is_empty() => h.fp_hex == *fp,
+                    _ => h.addr == target.addr && h.port == target.port,
+                })
+                .map(|h| (h.addr.clone(), h.port));
+            if let Some((addr, port)) = resolved {
+                let mut target = target.clone();
+                // Came back on a new IP (DHCP): dial the fresh address and re-key the saved host so
+                // the pin stays reachable next time (keyed by fingerprint; addr/port overwritten,
+                // `paired`/`mac` preserved by `upsert`).
+                if addr != target.addr || port != target.port {
+                    target.addr = addr;
+                    target.port = port;
+                    if let Some(fp) = target.fp_hex.clone() {
+                        let mut k = KnownHosts::load();
+                        k.upsert(KnownHost {
+                            name: target.name.clone(),
+                            addr: target.addr.clone(),
+                            port: target.port,
+                            fp_hex: fp,
+                            paired: false,
+                            mac: target.mac.clone(),
+                        });
+                        let _ = k.save();
+                    }
+                }
+                initiate(&ctx, target, &ss, &st);
+                return;
+            }
+            if elapsed >= TIMEOUT_SECS {
+                st.call("The host didn't come online.".to_string());
+                ss.call(Screen::Hosts);
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            elapsed += 1;
+            if elapsed % RESEND_SECS == 0 {
+                crate::wol::wake(&target.mac, target.addr.parse().ok());
+            }
+        }
+    });
+}
+
 /// The plain "Connecting…" screen shown while the session worker handshakes. No hooks.
 pub(crate) fn connecting_page(ctx: &Arc<AppCtx>, status: &str) -> Element {
     let target_name = ctx.shared.target.lock().unwrap().name.clone();
@@ -362,6 +454,38 @@ pub(crate) fn request_access_page(
         &headline,
         "Approve this device in the host's console or web UI \u{2014} it connects automatically \
          once you approve it. No PIN needed.",
+        vec![cancel_btn.into()],
+    )
+}
+
+/// The cancelable "Waking…" screen (Wake-on-LAN wait-until-up flow): a spinner + guidance while the
+/// poll loop waits for the woken host to reappear on mDNS, plus a Cancel that returns to the host
+/// list and trips the shared cancel flag so the poll loop stops re-sending and tears down. No hooks.
+pub(crate) fn waking_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Element {
+    let target_name = ctx.shared.target.lock().unwrap().name.clone();
+    let headline = if target_name.is_empty() {
+        "Waking the host\u{2026}".to_string()
+    } else {
+        format!("Waking {target_name}\u{2026}")
+    };
+    let cancel_btn = {
+        let (ctx, ss) = (ctx.clone(), set_screen.clone());
+        button("Cancel")
+            .icon(Symbol::Cancel)
+            .on_click(move || {
+                // Return the UI immediately and trip the flag the poll loop is watching so it stops
+                // re-sending and exits without touching a screen a later action may already own.
+                if let Some(c) = ctx.shared.cancel.lock().unwrap().as_ref() {
+                    c.store(true, Ordering::SeqCst);
+                }
+                ss.call(Screen::Hosts);
+            })
+            .horizontal_alignment(HorizontalAlignment::Center)
+    };
+    busy_page(
+        &headline,
+        "Sent a wake signal and waiting for the host to come online \u{2014} this can take up to a \
+         minute for a sleeping or powered-off machine.",
         vec![cancel_btn.into()],
     )
 }
