@@ -54,7 +54,9 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
     D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC,
+};
 
 // ---------------------------------------------------------------------------------------------
 // Mirrored AMF C ABI (pinned to GPUOpen header release v1.4.36 — amf/public/include).
@@ -283,8 +285,7 @@ mod sys {
         pub get_dx9_device: Slot,
         pub lock_dx9: Slot,
         pub unlock_dx9: Slot,
-        pub init_dx11:
-            unsafe extern "system" fn(*mut AmfContext, *mut c_void, i32) -> AmfResult,
+        pub init_dx11: unsafe extern "system" fn(*mut AmfContext, *mut c_void, i32) -> AmfResult,
         pub get_dx11_device: Slot,
         pub lock_dx11: Slot,
         pub unlock_dx11: Slot,
@@ -371,8 +372,7 @@ mod sys {
         pub terminate: unsafe extern "system" fn(*mut AmfComponent) -> AmfResult,
         pub drain: unsafe extern "system" fn(*mut AmfComponent) -> AmfResult,
         pub flush: unsafe extern "system" fn(*mut AmfComponent) -> AmfResult,
-        pub submit_input:
-            unsafe extern "system" fn(*mut AmfComponent, *mut AmfData) -> AmfResult,
+        pub submit_input: unsafe extern "system" fn(*mut AmfComponent, *mut AmfData) -> AmfResult,
         pub query_output:
             unsafe extern "system" fn(*mut AmfComponent, *mut *mut AmfData) -> AmfResult,
         pub get_context: Slot,
@@ -391,11 +391,8 @@ mod sys {
         // AMFInterface
         pub acquire: Slot,
         pub release: unsafe extern "system" fn(*mut AmfData) -> i32,
-        pub query_interface: unsafe extern "system" fn(
-            *mut AmfData,
-            *const AmfGuid,
-            *mut *mut c_void,
-        ) -> AmfResult,
+        pub query_interface:
+            unsafe extern "system" fn(*mut AmfData, *const AmfGuid, *mut *mut c_void) -> AmfResult,
         // AMFPropertyStorage
         pub set_property:
             unsafe extern "system" fn(*mut AmfData, *const u16, AmfVariant) -> AmfResult,
@@ -1115,7 +1112,12 @@ impl AmfEncoder {
                 // Never B-frames: a full frame period of latency each (RDNA3+ defaults > 0).
                 set_prop(comp, w!("BPicturesPattern"), AmfVariant::from_i64(0), false)?;
                 // Limited-range YUV input/output (matches the video processor's NV12).
-                set_prop(comp, w!("FullRangeColor"), AmfVariant::from_bool(false), false)?;
+                set_prop(
+                    comp,
+                    w!("FullRangeColor"),
+                    AmfVariant::from_bool(false),
+                    false,
+                )?;
             }
             Codec::H265 => {
                 // In-band VPS/SPS/PPS on every IDR — the `EncodedFrame` wire contract (clean
@@ -1800,10 +1802,7 @@ impl Encoder for AmfEncoder {
                 }
                 other => {
                     self.force_kf = true;
-                    bail!(
-                        "AMF SubmitInput failed: {} ({other})",
-                        result_name(other)
-                    );
+                    bail!("AMF SubmitInput failed: {} ({other})", result_name(other));
                 }
             }
         }
@@ -1891,11 +1890,11 @@ impl Encoder for AmfEncoder {
         inner.pending.clear();
         inner.ready.clear(); // owed + buffered AUs are forfeited; the rebuilt stream restarts at IDR
         inner.hdr_pushed = None; // a re-Init'd component needs the HDR metadata again
-        // SAFETY: `inner.comp.0` is the live component, used only on this thread with no AMF
-        // call in flight (the session loop is synchronous). `Flush` discards queued frames,
-        // `Terminate` tears the hw session down (both legal on a wedged component — results are
-        // deliberately ignored), `apply_static_props` + `init` then rebuild it; each call goes
-        // through the runtime's vtable.
+                                 // SAFETY: `inner.comp.0` is the live component, used only on this thread with no AMF
+                                 // call in flight (the session loop is synchronous). `Flush` discards queued frames,
+                                 // `Terminate` tears the hw session down (both legal on a wedged component — results are
+                                 // deliberately ignored), `apply_static_props` + `init` then rebuild it; each call goes
+                                 // through the runtime's vtable.
         let rebuilt = unsafe {
             let comp = inner.comp.0;
             ((*(*comp).vtbl).flush)(comp);
@@ -1915,7 +1914,9 @@ impl Encoder for AmfEncoder {
             }
         };
         if rebuilt {
-            tracing::info!("AMF encoder rebuilt in place (Terminate + re-Init on the same context)");
+            tracing::info!(
+                "AMF encoder rebuilt in place (Terminate + re-Init on the same context)"
+            );
         } else {
             self.ir_active = false;
             // Full teardown; the next submit reopens context + component on the current device.
@@ -1966,7 +1967,10 @@ mod tests {
     #[test]
     fn hdr_metadata_layout_matches_c() {
         assert_eq!(std::mem::size_of::<sys::AmfHdrMetadata>(), 28);
-        assert_eq!(std::mem::offset_of!(sys::AmfHdrMetadata, max_mastering_luminance), 16);
+        assert_eq!(
+            std::mem::offset_of!(sys::AmfHdrMetadata, max_mastering_luminance),
+            16
+        );
         assert_eq!(
             std::mem::offset_of!(sys::AmfHdrMetadata, max_content_light_level),
             24
@@ -2126,7 +2130,9 @@ mod tests {
     #[test]
     fn amf_latency_ab_bench() {
         if std::env::var("PUNKTFUNK_AMF_BENCH").as_deref() != Ok("1") {
-            eprintln!("skipping: set PUNKTFUNK_AMF_BENCH=1 to run the native-vs-ffmpeg latency A/B");
+            eprintln!(
+                "skipping: set PUNKTFUNK_AMF_BENCH=1 to run the native-vs-ffmpeg latency A/B"
+            );
             return;
         }
         if let Err(e) = try_factory() {
@@ -2153,8 +2159,16 @@ mod tests {
             ChromaFormat::Yuv420,
         )
         .expect("native AMF open");
-        let mut native_us =
-            drive_and_measure(&mut native, &device, &tex, w, h, fps, PixelFormat::Nv12, frames);
+        let mut native_us = drive_and_measure(
+            &mut native,
+            &device,
+            &tex,
+            w,
+            h,
+            fps,
+            PixelFormat::Nv12,
+            frames,
+        );
         drop(native);
 
         let mut ffmpeg = crate::encode::ffmpeg_win::FfmpegWinEncoder::open(
@@ -2169,8 +2183,16 @@ mod tests {
             ChromaFormat::Yuv420,
         )
         .expect("libavcodec AMF open");
-        let mut ffmpeg_us =
-            drive_and_measure(&mut ffmpeg, &device, &tex, w, h, fps, PixelFormat::Nv12, frames);
+        let mut ffmpeg_us = drive_and_measure(
+            &mut ffmpeg,
+            &device,
+            &tex,
+            w,
+            h,
+            fps,
+            PixelFormat::Nv12,
+            frames,
+        );
         drop(ffmpeg);
 
         let iv = 1_000_000u128 / fps as u128;
@@ -2195,7 +2217,10 @@ mod tests {
             f50 as f64 / iv as f64
         );
         if n50 > 0 {
-            eprintln!("native p50 is {:.1}x lower than ffmpeg", f50 as f64 / n50 as f64);
+            eprintln!(
+                "native p50 is {:.1}x lower than ffmpeg",
+                f50 as f64 / n50 as f64
+            );
         }
         // The core §5.2 claim: the native path retrieves faster than the libavcodec 2-frame hold,
         // and its per-frame encode_us collapses below one frame period (where the ~2-frame hold
@@ -2291,14 +2316,16 @@ mod tests {
             );
             for run in [&first_run, &second_run] {
                 let first = &run[0];
-                assert!(first.keyframe, "{codec:?}: stream/reset start must be an IDR");
+                assert!(
+                    first.keyframe,
+                    "{codec:?}: stream/reset start must be an IDR"
+                );
                 if codec == Codec::Av1 {
                     // AV1 is an OBU stream, not Annex-B — just require substance.
                     assert!(!first.data.is_empty(), "Av1: empty key AU");
                 } else {
                     assert!(
-                        first.data.starts_with(&[0, 0, 0, 1])
-                            || first.data.starts_with(&[0, 0, 1]),
+                        first.data.starts_with(&[0, 0, 0, 1]) || first.data.starts_with(&[0, 0, 1]),
                         "{codec:?}: AU must be Annex-B (got {:02x?})",
                         &first.data[..first.data.len().min(8)]
                     );
@@ -2387,7 +2414,10 @@ mod tests {
             }
         };
         enc.set_hdr_meta(Some(sample_hdr_meta()));
-        assert!(enc.caps().supports_hdr_metadata, "HEVC 10-bit reports HDR SEI capability");
+        assert!(
+            enc.caps().supports_hdr_metadata,
+            "HEVC 10-bit reports HDR SEI capability"
+        );
         let mut aus: Vec<EncodedFrame> = Vec::new();
         for i in 0..6 {
             let frame = CapturedFrame {
@@ -2491,9 +2521,8 @@ mod tests {
                 let (name, block) = props.intra_refresh.expect("AVC/HEVC define intra-refresh");
                 let blocks = 640u32.div_ceil(block) * 480u32.div_ceil(block);
                 let per_slot = blocks.div_ceil(30).max(1);
-                let applied =
-                    set_prop(comp.0, name, AmfVariant::from_i64(per_slot as i64), false)
-                        .expect("optional set_prop never errors");
+                let applied = set_prop(comp.0, name, AmfVariant::from_i64(per_slot as i64), false)
+                    .expect("optional set_prop never errors");
                 eprintln!(
                     "intra-refresh {codec:?}: {per_slot} units/slot accepted={applied} on this VCN"
                 );
@@ -2607,7 +2636,10 @@ mod tests {
             let ctx = Ctx(ctx);
             let r = ((*(*ctx.0).vtbl).init_dx11)(ctx.0, ptr::null_mut(), sys::AMF_DX11_1);
             if r != sys::AMF_OK {
-                eprintln!("skipping: InitDX11(default device) failed ({})", result_name(r));
+                eprintln!(
+                    "skipping: InitDX11(default device) failed ({})",
+                    result_name(r)
+                );
                 return;
             }
             let mut comp: *mut sys::AmfComponent = ptr::null_mut();
