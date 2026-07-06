@@ -23,10 +23,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 /// How long a virtual display (and, on gamescope's bare spawn, the nested session + its game)
@@ -458,9 +459,162 @@ pub fn prefs() -> &'static DisplayPolicyStore {
     })
 }
 
+// ---------------------------------------------------------------------------------------
+// User-defined custom presets (`<config>/display-presets.json`)
+// ---------------------------------------------------------------------------------------
+
+/// A user-defined named preset: a saved bundle of the six display-behavior axes (exactly what a
+/// built-in [`Preset`] expands to) plus the orthogonal game-session axis, that the operator names
+/// and applies from the console.
+///
+/// Unlike the built-in [`Preset`]s (a closed enum), custom presets are **data** — a catalog stored in
+/// `<config>/display-presets.json`. Applying one writes a `Custom` [`DisplayPolicy`] carrying these
+/// fields (the console reuses `PUT /display/settings`), so [`DisplayPolicy::effective`] stays pure and
+/// the built-in set is never touched. The catalog is decoupled from the active `display-settings.json`:
+/// editing or deleting a preset never mutates the running policy (re-apply to adopt a change).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CustomPreset {
+    /// Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path).
+    pub id: String,
+    /// User-facing name shown on the preset card; editable.
+    pub name: String,
+    /// The six display-behavior axes this preset applies (the same shape a built-in preset expands to).
+    pub fields: EffectivePolicy,
+    /// The game-session routing this preset applies (orthogonal to the six axes; see [`GameSession`]).
+    /// A custom preset captures the operator's *full* setup, so — unlike a built-in preset — applying
+    /// one does set this axis.
+    #[serde(default)]
+    pub game_session: GameSession,
+}
+
+/// Request body to create or replace a custom preset (no `id` — the host owns it).
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct CustomPresetInput {
+    pub name: String,
+    pub fields: EffectivePolicy,
+    #[serde(default)]
+    pub game_session: GameSession,
+}
+
+fn custom_presets_path() -> PathBuf {
+    crate::gamestream::config_dir().join("display-presets.json")
+}
+
+/// Clamp a saved preset's fields to their valid ranges — the same bounds [`DisplayPolicy::sanitized`]
+/// enforces, so a preset can never carry an out-of-range `max_displays` that a later apply would reject.
+fn sanitize_preset_fields(mut fields: EffectivePolicy) -> EffectivePolicy {
+    fields.max_displays = fields.max_displays.clamp(1, 16);
+    fields
+}
+
+/// Load the saved custom presets (empty + non-fatal if the file is absent or malformed — a bad
+/// catalog never breaks the console's settings GET).
+pub fn load_custom_presets() -> Vec<CustomPreset> {
+    match std::fs::read(custom_presets_path()) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "display-presets.json malformed — ignoring custom presets");
+            Vec::new()
+        }),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Persist the catalog (private dir, temp-write + atomic rename — the [`DisplayPolicyStore::set`]
+/// discipline, so a crash mid-write never truncates it).
+fn save_custom_presets(presets: &[CustomPreset]) -> Result<()> {
+    let path = custom_presets_path();
+    if let Some(dir) = path.parent() {
+        crate::gamestream::create_private_dir(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    crate::gamestream::write_secret_file(&tmp, &serde_json::to_vec_pretty(presets)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// 12 hex chars from the name + wall-clock nanos — collision-free in practice, no uuid dep (the
+/// [`crate::library`] custom-entry id scheme).
+fn new_preset_id(name: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    hex::encode(&Sha256::digest(format!("{name}:{nanos}").as_bytes())[..6])
+}
+
+/// Create a custom preset, returning it with its assigned id.
+pub fn add_custom_preset(input: CustomPresetInput) -> Result<CustomPreset> {
+    let mut presets = load_custom_presets();
+    let preset = CustomPreset {
+        id: new_preset_id(&input.name),
+        name: input.name,
+        fields: sanitize_preset_fields(input.fields),
+        game_session: input.game_session,
+    };
+    presets.push(preset.clone());
+    save_custom_presets(&presets)?;
+    Ok(preset)
+}
+
+/// Replace a custom preset's fields (id preserved). `None` ⇒ no preset with that id.
+pub fn update_custom_preset(id: &str, input: CustomPresetInput) -> Result<Option<CustomPreset>> {
+    let mut presets = load_custom_presets();
+    let Some(slot) = presets.iter_mut().find(|p| p.id == id) else {
+        return Ok(None);
+    };
+    slot.name = input.name;
+    slot.fields = sanitize_preset_fields(input.fields);
+    slot.game_session = input.game_session;
+    let updated = slot.clone();
+    save_custom_presets(&presets)?;
+    Ok(Some(updated))
+}
+
+/// Delete a custom preset. `false` ⇒ no preset with that id.
+pub fn delete_custom_preset(id: &str) -> Result<bool> {
+    let mut presets = load_custom_presets();
+    let before = presets.len();
+    presets.retain(|p| p.id != id);
+    if presets.len() == before {
+        return Ok(false);
+    }
+    save_custom_presets(&presets)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_preset_serde_roundtrips_and_defaults_game_session() {
+        let preset = CustomPreset {
+            id: "abc123".into(),
+            name: "My Rig".into(),
+            fields: preset_fields(Preset::GamingRig).unwrap(),
+            game_session: GameSession::Dedicated,
+        };
+        let json = serde_json::to_string(&preset).unwrap();
+        assert_eq!(serde_json::from_str::<CustomPreset>(&json).unwrap(), preset);
+
+        // A catalog written before `game_session` existed still loads (defaults to `Auto`).
+        let legacy: CustomPreset = serde_json::from_value(serde_json::json!({
+            "id": "x",
+            "name": "Legacy",
+            "fields": serde_json::to_value(preset_fields(Preset::Default).unwrap()).unwrap(),
+        }))
+        .unwrap();
+        assert_eq!(legacy.game_session, GameSession::Auto);
+    }
+
+    #[test]
+    fn sanitize_preset_fields_clamps_max_displays() {
+        let mut f = preset_fields(Preset::Default).unwrap();
+        f.max_displays = 999;
+        assert_eq!(sanitize_preset_fields(f.clone()).max_displays, 16);
+        f.max_displays = 0;
+        assert_eq!(sanitize_preset_fields(f).max_displays, 1);
+    }
 
     #[test]
     fn keep_alive_serializes_tagged_on_mode() {

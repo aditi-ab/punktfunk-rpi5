@@ -1,17 +1,22 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@unom/ui/button";
-import { type FC, type ReactNode, useEffect, useState } from "react";
+import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { type FC, type MouseEvent, type ReactNode, useEffect, useState } from "react";
 import {
 	getGetDisplayStateQueryKey,
 	getGetDisplaySettingsQueryKey,
+	useCreateCustomPreset,
+	useDeleteCustomPreset,
 	useGetDisplaySettings,
 	useGetDisplayState,
 	useReleaseDisplay,
 	useSetDisplayLayout,
 	useSetDisplaySettings,
+	useUpdateCustomPreset,
 } from "@/api/gen/display/display";
 import type {
 	ApiDisplayInfo,
+	CustomPreset,
 	DisplayPolicy,
 	EffectivePolicy,
 	GameSession,
@@ -75,6 +80,7 @@ export const DisplaySection: FC = () => {
 								draft={draft}
 								setDraft={setDraft}
 								presets={q.data.presets}
+								customPresets={q.data.custom_presets}
 								apply={apply}
 								busy={save.isPending}
 								error={apiErrorMessage(save.error)}
@@ -109,10 +115,23 @@ const DisplayForm: FC<{
 	draft: DisplayPolicy;
 	setDraft: (p: DisplayPolicy) => void;
 	presets: { id: string; summary: string; fields: EffectivePolicy }[];
+	customPresets: CustomPreset[];
 	apply: (p: DisplayPolicy) => void;
 	busy: boolean;
 	error?: string;
-}> = ({ draft, setDraft, presets, apply, busy, error }) => {
+}> = ({ draft, setDraft, presets, customPresets, apply, busy, error }) => {
+	const qc = useQueryClient();
+	const createPreset = useCreateCustomPreset();
+	const updatePreset = useUpdateCustomPreset();
+	const deletePreset = useDeleteCustomPreset();
+	const invalidateSettings = () =>
+		qc.invalidateQueries({ queryKey: getGetDisplaySettingsQueryKey() });
+	const presetBusy =
+		createPreset.isPending || updatePreset.isPending || deletePreset.isPending;
+	const presetError = apiErrorMessage(
+		createPreset.error ?? updatePreset.error ?? deletePreset.error,
+	);
+
 	const preset: Preset = draft.preset ?? "custom";
 	const isCustom = preset === "custom";
 
@@ -150,6 +169,56 @@ const DisplayForm: FC<{
 		}
 	};
 
+	// Applying a custom preset writes a `Custom` policy carrying its saved fields + game-session (the
+	// one axis a preset DOES set) — the host has no separate apply route (design/gamemode-and-…).
+	const applyCustomPreset = (p: CustomPreset) =>
+		apply({
+			version: 1,
+			preset: "custom",
+			...p.fields,
+			game_session: p.game_session ?? "auto",
+		});
+
+	// A custom card is "current" when the in-force policy is a Custom one whose fields + game-session
+	// value-match this preset (there is no id on DisplayPolicy — match by value).
+	const customSelected = (p: CustomPreset): boolean =>
+		isCustom &&
+		(draft.game_session ?? "auto") === (p.game_session ?? "auto") &&
+		deepEqual(effective, p.fields);
+	const anyCustomSelected = customPresets.some(customSelected);
+
+	// Save the currently-in-force behavior (built-in OR hand-edited) as a new named preset.
+	const saveAsPreset = () => {
+		const name = prompt(m.display_preset_name())?.trim();
+		if (!name) return; // cancelled or empty
+		createPreset.mutate(
+			{
+				data: { name, fields: effective, game_session: draft.game_session ?? "auto" },
+			},
+			{ onSuccess: invalidateSettings },
+		);
+	};
+	const renamePreset = (p: CustomPreset) => {
+		const name = prompt(m.display_preset_name(), p.name)?.trim();
+		if (!name) return;
+		updatePreset.mutate(
+			{ id: p.id, data: { name, fields: p.fields, game_session: p.game_session ?? "auto" } },
+			{ onSuccess: invalidateSettings },
+		);
+	};
+	const updatePresetToCurrent = (p: CustomPreset) =>
+		updatePreset.mutate(
+			{
+				id: p.id,
+				data: { name: p.name, fields: effective, game_session: draft.game_session ?? "auto" },
+			},
+			{ onSuccess: invalidateSettings },
+		);
+	const removePreset = (p: CustomPreset) => {
+		if (!confirm(m.display_preset_delete_confirm())) return;
+		deletePreset.mutate({ id: p.id }, { onSuccess: invalidateSettings });
+	};
+
 	const ka = customFields.keep_alive;
 	// The duration value, remembered across the Off/Keep toggle so switching back restores it.
 	const [keepSecs, setKeepSecs] = useState(ka.mode === "duration" ? ka.seconds : 300);
@@ -164,7 +233,9 @@ const DisplayForm: FC<{
 						const p = presets.find((x) => x.id === id);
 						const fields = id === "custom" ? undefined : p?.fields;
 						const summary = id === "custom" ? m.display_custom_desc() : p?.summary;
-						const selected = preset === id;
+						// The built-in "Custom" card is the hand-edit mode; when the active Custom policy
+						// value-matches a saved preset, that preset's card owns the "current" ring instead.
+						const selected = preset === id && !(id === "custom" && anyCustomSelected);
 						const soon = DISABLED_PRESETS.has(id);
 						const disabled = busy || soon;
 						const pick = () => {
@@ -219,6 +290,44 @@ const DisplayForm: FC<{
 						);
 					})}
 				</div>
+			</div>
+
+			{/* Custom presets — the operator's saved field-bundles, rendered like the built-ins but
+			    editable/deletable, plus a "Save as preset" that captures the current effective behavior. */}
+			<div className="space-y-4">
+				<div className="flex flex-wrap items-center justify-between gap-2">
+					<Label className="text-base font-semibold">
+						{m.display_preset_custom_label()}
+					</Label>
+					<Button
+						size="sm"
+						variant="outline"
+						disabled={busy || presetBusy}
+						onClick={saveAsPreset}
+					>
+						<Plus className="mr-1 size-4" />
+						{m.display_preset_save_as()}
+					</Button>
+				</div>
+				{customPresets.length > 0 && (
+					<div className="grid gap-3 sm:grid-cols-2">
+						{customPresets.map((p) => (
+							<CustomPresetCard
+								key={p.id}
+								preset={p}
+								selected={customSelected(p)}
+								busy={busy || presetBusy}
+								onApply={() => applyCustomPreset(p)}
+								onRename={() => renamePreset(p)}
+								onUpdate={() => updatePresetToCurrent(p)}
+								onDelete={() => removePreset(p)}
+							/>
+						))}
+					</div>
+				)}
+				{presetError && (
+					<p className="text-sm text-amber-600 dark:text-amber-500">{presetError}</p>
+				)}
 			</div>
 
 			{/* Custom: every option by hand */}
@@ -411,6 +520,95 @@ const Choice: FC<{
 		</div>
 	</Field>
 );
+
+/**
+ * One saved custom preset — the same interactive card as the built-ins (click to apply → writes a
+ * `Custom` policy carrying `preset.fields`), plus rename / update-to-current / delete affordances
+ * (each stops propagation so it doesn't also fire the card's apply). Field badges mirror the
+ * built-ins; the game-session badge shows only when it isn't the default `auto`.
+ */
+const CustomPresetCard: FC<{
+	preset: CustomPreset;
+	selected: boolean;
+	busy: boolean;
+	onApply: () => void;
+	onRename: () => void;
+	onUpdate: () => void;
+	onDelete: () => void;
+}> = ({ preset, selected, busy, onApply, onRename, onUpdate, onDelete }) => {
+	const fields = preset.fields;
+	const stop = (fn: () => void) => (e: MouseEvent) => {
+		e.stopPropagation();
+		if (!busy) fn();
+	};
+	return (
+		<Card
+			interactive
+			role="button"
+			tabIndex={busy ? -1 : 0}
+			aria-pressed={selected}
+			aria-disabled={busy || undefined}
+			onClick={() => !busy && onApply()}
+			onKeyDown={(e) => {
+				if (e.key === "Enter" || e.key === " ") {
+					e.preventDefault();
+					if (!busy) onApply();
+				}
+			}}
+			className={cn(
+				"flex h-full flex-col p-4",
+				busy ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+				selected && "ring-2 ring-primary",
+			)}
+		>
+			<div className="flex items-start justify-between gap-2">
+				<span className="min-w-0 truncate text-base font-semibold">{preset.name}</span>
+				<div className="flex shrink-0 items-center gap-1">
+					{selected && <Badge variant="success">{m.display_preset_current()}</Badge>}
+					<Button
+						size="icon"
+						variant="ghost"
+						disabled={busy}
+						title={m.display_preset_edit()}
+						aria-label={m.display_preset_edit()}
+						onClick={stop(onRename)}
+					>
+						<Pencil className="size-4" />
+					</Button>
+					<Button
+						size="icon"
+						variant="ghost"
+						disabled={busy}
+						title={m.display_preset_update()}
+						aria-label={m.display_preset_update()}
+						onClick={stop(onUpdate)}
+					>
+						<RefreshCw className="size-4" />
+					</Button>
+					<Button
+						size="icon"
+						variant="ghost"
+						disabled={busy}
+						title={m.display_preset_delete()}
+						aria-label={m.display_preset_delete()}
+						onClick={stop(onDelete)}
+					>
+						<Trash2 className="size-4" />
+					</Button>
+				</div>
+			</div>
+			<div className="mt-auto flex flex-wrap gap-1.5 pt-3">
+				<Badge variant="secondary">{fmtKeepAlive(fields.keep_alive)}</Badge>
+				<Badge variant="secondary">{tr(TOPOLOGY_LABEL, fields.topology)}</Badge>
+				<Badge variant="outline">{tr(CONFLICT_LABEL, fields.mode_conflict)}</Badge>
+				<Badge variant="outline">{tr(IDENTITY_LABEL, fields.identity)}</Badge>
+				{(preset.game_session ?? "auto") !== "auto" && (
+					<Badge variant="secondary">{tr(GAME_SESSION_LABEL, preset.game_session)}</Badge>
+				)}
+			</div>
+		</Card>
+	);
+};
 
 /**
  * The host's live/kept virtual displays, polled from `/display/state`, each with a Release button
@@ -638,6 +836,19 @@ const LAYOUT_LABEL: Record<string, () => string> = {
 const GAME_SESSION_LABEL: Record<string, () => string> = {
 	auto: m.display_game_session_auto,
 	dedicated: m.display_game_session_dedicated,
+};
+
+/** Structural equality for the value-match of a custom preset's fields against the effective policy
+ * (handles the nested `keep_alive` variants + `layout.positions` map; key order doesn't matter). */
+const deepEqual = (a: unknown, b: unknown): boolean => {
+	if (a === b) return true;
+	if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+	const ak = Object.keys(a as object);
+	const bk = Object.keys(b as object);
+	if (ak.length !== bk.length) return false;
+	return ak.every((k) =>
+		deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]),
+	);
 };
 
 /** Look up a localized label, tolerating an unknown/undefined key (falls back to the raw value). */

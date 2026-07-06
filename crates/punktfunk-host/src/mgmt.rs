@@ -161,6 +161,8 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                 .routes(routes!(get_display_state))
                 .routes(routes!(release_display))
                 .routes(routes!(set_display_layout))
+                .routes(routes!(list_custom_presets, create_custom_preset))
+                .routes(routes!(update_custom_preset, delete_custom_preset))
                 .routes(routes!(get_status))
                 .routes(routes!(get_local_summary))
                 .routes(routes!(list_paired_clients))
@@ -993,6 +995,10 @@ struct DisplaySettingsState {
     effective: crate::vdisplay::policy::EffectivePolicy,
     /// Every named preset and what it expands to (for the picker's preview).
     presets: Vec<PresetInfo>,
+    /// The operator's saved custom presets (`display-presets.json`) — named field-bundles rendered
+    /// alongside the built-ins. Managed via `POST/PUT/DELETE /display/presets`; applied by writing a
+    /// `Custom` policy carrying the preset's fields.
+    custom_presets: Vec<crate::vdisplay::policy::CustomPreset>,
     /// Option names this build enforces right now. All five axes are now acted on (keep_alive +
     /// topology since Stage 0-2, identity Stage 3, mode_conflict Stage 4, layout Stage 5) — the console
     /// reads this to know which controls are live vs. "coming soon" (per-backend nuance, e.g. layout
@@ -1037,6 +1043,7 @@ fn display_settings_state() -> DisplaySettingsState {
         settings,
         configured,
         presets,
+        custom_presets: policy::load_custom_presets(),
         enforced: vec![
             "keep_alive".into(),
             "topology".into(),
@@ -1264,6 +1271,109 @@ async fn set_display_layout(ApiJson(req): ApiJson<DisplayLayoutRequest>) -> Resp
         "management API: display layout updated"
     );
     Json(display_settings_state()).into_response()
+}
+
+/// List the saved custom presets
+///
+/// The operator's named field-bundles (`display-presets.json`). These also ride the
+/// `GET /display/settings` response (`custom_presets`), so the console rarely needs this directly.
+#[utoipa::path(
+    get,
+    path = "/display/presets",
+    tag = "display",
+    operation_id = "listCustomPresets",
+    responses(
+        (status = OK, description = "The saved custom presets", body = Vec<crate::vdisplay::policy::CustomPreset>),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+async fn list_custom_presets() -> Json<Vec<crate::vdisplay::policy::CustomPreset>> {
+    Json(crate::vdisplay::policy::load_custom_presets())
+}
+
+/// Save a custom preset
+///
+/// Stores a named bundle of the display-behavior axes (+ the game-session axis) the operator can
+/// apply later. The host assigns a stable id, returned in the body. Applying a preset is a
+/// `PUT /display/settings` with a `Custom` policy carrying its `fields` — no separate apply route.
+#[utoipa::path(
+    post,
+    path = "/display/presets",
+    tag = "display",
+    operation_id = "createCustomPreset",
+    request_body = crate::vdisplay::policy::CustomPresetInput,
+    responses(
+        (status = CREATED, description = "Preset created", body = crate::vdisplay::policy::CustomPreset),
+        (status = BAD_REQUEST, description = "Empty name", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the catalog", body = ApiError),
+    )
+)]
+async fn create_custom_preset(
+    ApiJson(input): ApiJson<crate::vdisplay::policy::CustomPresetInput>,
+) -> Response {
+    if input.name.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "preset name must not be empty");
+    }
+    match crate::vdisplay::policy::add_custom_preset(input) {
+        Ok(preset) => (StatusCode::CREATED, Json(preset)).into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Update a custom preset
+#[utoipa::path(
+    put,
+    path = "/display/presets/{id}",
+    tag = "display",
+    operation_id = "updateCustomPreset",
+    params(("id" = String, Path, description = "The custom preset id")),
+    request_body = crate::vdisplay::policy::CustomPresetInput,
+    responses(
+        (status = OK, description = "Preset updated", body = crate::vdisplay::policy::CustomPreset),
+        (status = BAD_REQUEST, description = "Empty name", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = NOT_FOUND, description = "No custom preset with that id", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the catalog", body = ApiError),
+    )
+)]
+async fn update_custom_preset(
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<crate::vdisplay::policy::CustomPresetInput>,
+) -> Response {
+    if input.name.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "preset name must not be empty");
+    }
+    match crate::vdisplay::policy::update_custom_preset(&id, input) {
+        Ok(Some(preset)) => Json(preset).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "no custom preset with that id"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Delete a custom preset
+///
+/// Removes it from the catalog. The active policy is untouched — if this preset was the one applied,
+/// the running behavior stays exactly as it was (the catalog and `display-settings.json` are decoupled).
+#[utoipa::path(
+    delete,
+    path = "/display/presets/{id}",
+    tag = "display",
+    operation_id = "deleteCustomPreset",
+    params(("id" = String, Path, description = "The custom preset id")),
+    responses(
+        (status = NO_CONTENT, description = "Preset deleted"),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = NOT_FOUND, description = "No custom preset with that id", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Could not persist the catalog", body = ApiError),
+    )
+)]
+async fn delete_custom_preset(Path(id): Path<String>) -> Response {
+    match crate::vdisplay::policy::delete_custom_preset(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "no custom preset with that id"),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 /// Live host status

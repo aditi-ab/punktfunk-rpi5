@@ -38,6 +38,24 @@ the individual options documented further down.
 | **Hot-desk** | One user at a time with fast reattach — roaming between your own devices. A second user is told the box is busy, and each device+resolution keeps its own scaling. |
 | **Workstation** | The multi-monitor daily driver. Your displays come back exactly where you arranged them, with per-client identity and an exclusive desktop. |
 
+## Save your own preset
+
+The five above are curated starting points. When you've dialed in a setup you like — whether by
+picking a preset and tweaking it or by setting every option under **Custom** — you can **save it as
+your own named preset** and switch back to it in one click later.
+
+- **Save as preset** — names the settings currently in force (all of the options below **plus**
+  *Dedicated game sessions*) and adds it to the picker alongside the built-ins.
+- **Apply** — selecting a saved preset writes exactly those settings, the same as picking a built-in.
+- **Edit / delete** — rename a saved preset, update it to your current settings, or remove it. Deleting
+  a preset never changes what's running — it only takes the card out of the picker.
+
+Unlike the built-in presets (which deliberately leave *Dedicated game sessions* alone so switching
+presets never changes your game-launch routing), a **custom preset captures your full setup**,
+including that axis — because it's *your* saved configuration, not a curated behavior bundle. Custom
+presets live on the host in `display-presets.json` (next to `display-settings.json`); the catalog and
+the active policy are independent, so editing a preset never disturbs a running session.
+
 ## Options reference
 
 Choose **Custom** in the console to set these directly.

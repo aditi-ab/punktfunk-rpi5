@@ -190,6 +190,237 @@
         }
       }
     },
+    "/api/v1/display/presets": {
+      "get": {
+        "tags": [
+          "display"
+        ],
+        "summary": "List the saved custom presets",
+        "description": "The operator's named field-bundles (`display-presets.json`). These also ride the\n`GET /display/settings` response (`custom_presets`), so the console rarely needs this directly.",
+        "operationId": "listCustomPresets",
+        "responses": {
+          "200": {
+            "description": "The saved custom presets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CustomPreset"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Save a custom preset",
+        "description": "Stores a named bundle of the display-behavior axes (+ the game-session axis) the operator can\napply later. The host assigns a stable id, returned in the body. Applying a preset is a\n`PUT /display/settings` with a `Custom` policy carrying its `fields` — no separate apply route.",
+        "operationId": "createCustomPreset",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomPresetInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Preset created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomPreset"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/display/presets/{id}": {
+      "put": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Update a custom preset",
+        "operationId": "updateCustomPreset",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The custom preset id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomPresetInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Preset updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomPreset"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No custom preset with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "display"
+        ],
+        "summary": "Delete a custom preset",
+        "description": "Removes it from the catalog. The active policy is untouched — if this preset was the one applied,\nthe running behavior stays exactly as it was (the catalog and `display-settings.json` are decoupled).",
+        "operationId": "deleteCustomPreset",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The custom preset id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Preset deleted"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No custom preset with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/display/release": {
       "post": {
         "tags": [
@@ -2220,6 +2451,52 @@
           }
         }
       },
+      "CustomPreset": {
+        "type": "object",
+        "description": "A user-defined named preset: a saved bundle of the six display-behavior axes (exactly what a\nbuilt-in [`Preset`] expands to) plus the orthogonal game-session axis, that the operator names\nand applies from the console.\n\nUnlike the built-in [`Preset`]s (a closed enum), custom presets are **data** — a catalog stored in\n`<config>/display-presets.json`. Applying one writes a `Custom` [`DisplayPolicy`] carrying these\nfields (the console reuses `PUT /display/settings`), so [`DisplayPolicy::effective`] stays pure and\nthe built-in set is never touched. The catalog is decoupled from the active `display-settings.json`:\nediting or deleting a preset never mutates the running policy (re-apply to adopt a change).",
+        "required": [
+          "id",
+          "name",
+          "fields"
+        ],
+        "properties": {
+          "fields": {
+            "$ref": "#/components/schemas/EffectivePolicy",
+            "description": "The six display-behavior axes this preset applies (the same shape a built-in preset expands to)."
+          },
+          "game_session": {
+            "$ref": "#/components/schemas/GameSession",
+            "description": "The game-session routing this preset applies (orthogonal to the six axes; see [`GameSession`]).\nA custom preset captures the operator's *full* setup, so — unlike a built-in preset — applying\none does set this axis."
+          },
+          "id": {
+            "type": "string",
+            "description": "Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path)."
+          },
+          "name": {
+            "type": "string",
+            "description": "User-facing name shown on the preset card; editable."
+          }
+        }
+      },
+      "CustomPresetInput": {
+        "type": "object",
+        "description": "Request body to create or replace a custom preset (no `id` — the host owns it).",
+        "required": [
+          "name",
+          "fields"
+        ],
+        "properties": {
+          "fields": {
+            "$ref": "#/components/schemas/EffectivePolicy"
+          },
+          "game_session": {
+            "$ref": "#/components/schemas/GameSession"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "DisplayLayoutRequest": {
         "type": "object",
         "description": "Request body for `setDisplayLayout`: per-identity-slot desktop offsets, keyed by the identity-slot\nid as a string (the same id `/display/state` reports as `identity_slot`).",
@@ -2284,12 +2561,20 @@
           "configured",
           "effective",
           "presets",
+          "custom_presets",
           "enforced"
         ],
         "properties": {
           "configured": {
             "type": "boolean",
             "description": "True once a `display-settings.json` exists (the console has configured this host)."
+          },
+          "custom_presets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CustomPreset"
+            },
+            "description": "The operator's saved custom presets (`display-presets.json`) — named field-bundles rendered\nalongside the built-ins. Managed via `POST/PUT/DELETE /display/presets`; applied by writing a\n`Custom` policy carrying the preset's fields."
           },
           "effective": {
             "$ref": "#/components/schemas/EffectivePolicy",
