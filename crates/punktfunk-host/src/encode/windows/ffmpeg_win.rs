@@ -8,21 +8,23 @@
 //! BGRA/Rgb10a2 as a fallback) on the capturer's own `ID3D11Device`. Two input paths, chosen lazily
 //! from the first frame and the `PUNKTFUNK_ZEROCOPY` knob:
 //!
-//! * **System-memory** ([`SystemInner`], the default): read the captured D3D11 surface back to a CPU
+//! * **System-memory** ([`SystemInner`]): read the captured D3D11 surface back to a CPU
 //!   NV12/P010 [`AVFrame`] (a same-format `CopyResource` → staging → `Map`, plus a `swscale` step for
 //!   the BGRA fallback) and `avcodec_send_frame` it. AMF/QSV upload it internally. One
-//!   GPU→CPU→GPU round-trip per frame — the robust path, and the only one that can be brought up
-//!   without on-glass validation (it is the analogue of the VAAPI "CPU input" fallback).
-//! * **Zero-copy D3D11** ([`ZeroCopyInner`], `PUNKTFUNK_ZEROCOPY=1`): wrap the capturer's
-//!   `ID3D11Device` as an `AV_HWDEVICE_TYPE_D3D11VA` hwdevice (shared, *not* a second device — the
-//!   capture textures are not shared-handle, so a different device couldn't read them), keep an
-//!   FFmpeg D3D11 frames pool, `CopySubresourceRegion` the captured texture into a pooled array
-//!   slice (a GPU-local copy, like NVENC's CUDA path), then feed AMF `AV_PIX_FMT_D3D11` directly,
-//!   or map the D3D11 frame to a derived QSV surface for QSV. If the hw setup fails to open, this
-//!   falls back to the system-memory path for the session.
+//!   GPU→CPU→GPU round-trip per frame — the robust path, the QSV default, and the automatic
+//!   fallback when the zero-copy setup fails (it is the analogue of the VAAPI "CPU input" fallback).
+//! * **Zero-copy D3D11** ([`ZeroCopyInner`], the AMF default; see [`zerocopy_enabled`]): wrap the
+//!   capturer's `ID3D11Device` as an `AV_HWDEVICE_TYPE_D3D11VA` hwdevice (shared, *not* a second
+//!   device — the capture textures are not shared-handle, so a different device couldn't read them),
+//!   keep an FFmpeg D3D11 frames pool, `CopySubresourceRegion` the captured texture into a pooled
+//!   array slice (a GPU-local copy, like NVENC's CUDA path), then feed AMF `AV_PIX_FMT_D3D11`
+//!   directly, or map the D3D11 frame to a derived QSV surface for QSV. If the hw setup fails to
+//!   open, this falls back to the system-memory path for the session.
 //!
-//! **Status: compiles in CI; not yet on-glass validated** (no AMD/Intel Windows box in the lab as of
-//! 2026-06-22). The system path is the conservative default; zero-copy is opt-in until validated.
+//! **Status:** AMF on-glass validated 2026-07-06 (Ryzen 7000 iGPU, 1080p120 HDR P010, both input
+//! paths; zero-copy cut `submit_us` p50 2.8 ms → 0.26 ms) — zero-copy is the AMF default. QSV is
+//! still not on-glass validated (no Intel Windows box in the lab), so its zero-copy path stays
+//! opt-in via `PUNKTFUNK_ZEROCOPY=1`.
 //!
 //! Raw FFI: `ffmpeg-next` has no hwcontext wrappers for D3D11VA, so the hwdevice/hwframes calls go
 //! through `ffmpeg::ffi` (= `ffmpeg_sys_next`), exactly as the Linux CUDA/VAAPI paths do. The
@@ -108,10 +110,16 @@ impl WinVendor {
     }
 }
 
-/// Is the zero-copy D3D11 path enabled? Opt-in (`PUNKTFUNK_ZEROCOPY=1`) until on-glass validated;
-/// the default is the robust system-memory readback path.
-fn zerocopy_enabled() -> bool {
-    crate::config::config().zerocopy
+/// Is the zero-copy D3D11 path enabled for this vendor? An explicit `PUNKTFUNK_ZEROCOPY`
+/// (`0|false|off|no` = off, anything else = on) overrides; unset defers to the per-vendor default:
+/// **on for AMF** — on-glass validated 2026-07-06 (Ryzen iGPU, 1080p120 HDR P010: `submit_us` p50
+/// 2.8 ms → 0.26 ms vs readback) — and **off for QSV** until validated on Intel glass (the
+/// open-failure fallback only catches *setup* errors; a derive that opens but maps wrong would
+/// corrupt silently, so it stays opt-in per the probe-never-assume rule).
+fn zerocopy_enabled(vendor: WinVendor) -> bool {
+    crate::config::config()
+        .zerocopy
+        .unwrap_or(matches!(vendor, WinVendor::Amf))
 }
 
 /// The swscale *source* pixel format for a captured packed-RGB/BGR layout (8-bit BGRA fallback only).
@@ -771,9 +779,9 @@ impl Drop for SystemInner {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Zero-copy D3D11 path (PUNKTFUNK_ZEROCOPY=1): share the capture device, pool D3D11 frames, copy
-// the captured texture into a pooled slice, feed AMF directly / map to QSV. Falls back to the
-// system path if the hw setup fails to open. Untested on glass — opt-in only for now.
+// Zero-copy D3D11 path (the AMF default; QSV opt-in — see `zerocopy_enabled`): share the capture
+// device, pool D3D11 frames, copy the captured texture into a pooled slice, feed AMF directly /
+// map to QSV. Falls back to the system path if the hw setup fails to open.
 // ---------------------------------------------------------------------------------------------
 
 struct D3d11Hw {
@@ -1199,7 +1207,7 @@ impl FfmpegWinEncoder {
         }
         self.inner = None;
         self.bound_device = dev_raw;
-        let inner = if zerocopy_enabled() {
+        let inner = if zerocopy_enabled(self.vendor) {
             match ZeroCopyInner::open(
                 self.vendor,
                 self.codec,

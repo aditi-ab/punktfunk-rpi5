@@ -25,9 +25,12 @@
 //! - **Path / genuinely-dynamic reads**: the config-dir resolution, `PATH` executable search, the
 //!   env-forward-to-child loop, `PUNKTFUNK_MGMT_TOKEN`, `PUNKTFUNK_HOST_CMD`, `PUNKTFUNK_RENDER_NODE`.
 //!
-//! `PUNKTFUNK_ZEROCOPY` note: this field uses **presence** semantics (`var_os(..).is_some()`) to match the
-//! Windows `encode/ffmpeg_win.rs` reader. The Linux `zerocopy` module keeps its own *truthy* parser
-//! (`1|true|yes|on`) — the two are independent features that share a name; do NOT conflate them.
+//! `PUNKTFUNK_ZEROCOPY` note: this field is a **tri-state override** (`None` = unset). Unset defers to
+//! the per-vendor default in `encode/ffmpeg_win.rs::zerocopy_enabled` (AMF on — on-glass validated
+//! 2026-07-06; QSV off until validated on Intel glass); an explicit value forces it (`0|false|off|no`
+//! = off, anything else = on, so the old presence-style `=1` keeps working). The Linux `zerocopy`
+//! module keeps its own *truthy* parser (`1|true|yes|on`) — the two are independent features that
+//! share a name; do NOT conflate them.
 
 use std::sync::OnceLock;
 
@@ -43,8 +46,9 @@ pub struct HostConfig {
     pub render_adapter: Option<String>,
     /// `PUNKTFUNK_IDD_DEPTH` — IDD-push pipeline depth override (default 2; the call site clamps to its `OUT_RING`).
     pub idd_depth: usize,
-    /// `PUNKTFUNK_ZEROCOPY` — opt into the Windows D3D11 zero-copy encode path (presence semantics; see module docs).
-    pub zerocopy: bool,
+    /// `PUNKTFUNK_ZEROCOPY` — Windows D3D11 zero-copy encode input override. `None` (unset) defers to
+    /// the per-vendor default (AMF on, QSV off — see module docs and `encode/ffmpeg_win.rs`).
+    pub zerocopy: Option<bool>,
     /// `PUNKTFUNK_10BIT` — host policy gate for HEVC Main10 (only honored when the client also advertised 10-bit).
     pub ten_bit: bool,
     /// `PUNKTFUNK_444` — host policy gate for full-chroma HEVC 4:4:4 (Range Extensions). Honored only
@@ -84,7 +88,9 @@ impl HostConfig {
             idd_depth: val("PUNKTFUNK_IDD_DEPTH")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(2),
-            zerocopy: flag("PUNKTFUNK_ZEROCOPY"),
+            zerocopy: val("PUNKTFUNK_ZEROCOPY").map(|s| {
+                !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+            }),
             ten_bit: flag("PUNKTFUNK_10BIT"),
             four_four_four: flag("PUNKTFUNK_444"),
             perf: flag("PUNKTFUNK_PERF"),
