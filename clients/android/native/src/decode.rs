@@ -8,8 +8,8 @@
 
 use ndk::data_space::DataSpace;
 use ndk::media::media_codec::{
-    DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
-    OutputBuffer,
+    AsyncNotifyCallback, DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec,
+    MediaCodecDirection, OutputBuffer,
 };
 use ndk::media::media_format::MediaFormat;
 use ndk::native_window::NativeWindow;
@@ -19,8 +19,13 @@ use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Cap on AUs parked in the async loop awaiting a free codec input slot. Matches the connector's
+/// own frame-channel depth; on sustained overflow the oldest is dropped and a keyframe requested
+/// (same recovery as a reassembler drop). In steady state this stays near-empty.
+const FRAME_PARK_CAP: usize = 16;
 
 /// Cap on the pts→received-timestamp map below: MediaCodec holds only a handful of frames in
 /// flight, so anything beyond this is stale (codec flushed / HUD toggled) and gets evicted.
@@ -31,29 +36,80 @@ const IN_FLIGHT_CAP: usize = 64;
 /// this deep is a lost datagram (or an old host that never sends any) and gets evicted.
 const PENDING_SPLIT_CAP: usize = 256;
 
-/// The decode loop. Runs on the `pf-decode` thread until `shutdown` is set or the session closes.
+/// Whether to run the event-driven async decode loop (default) or the synchronous poll loop kept as
+/// a bring-up fallback. Flip to `false` to A/B the two on the HUD (`design/…`); the async loop
+/// presents a decoded frame the instant it's ready instead of waiting out a poll interval.
+const USE_ASYNC_DECODE: bool = true;
+
+/// Per-session decode configuration, resolved by the JNI layer (`nativeStartVideo`) and passed to
+/// the decode loop. Bundled so the loop entry points don't sprout a wide argument list.
+pub(crate) struct DecodeOptions {
+    /// The decoder Kotlin ranked from `MediaCodecList` (`VideoDecoders.pickDecoder`). `None`/empty ⇒
+    /// let the platform resolve the default decoder for the MIME.
+    pub decoder_name: Option<String>,
+    /// Whether Kotlin found the chosen decoder advertises `FEATURE_LowLatency` (queryable only via
+    /// the Java `CodecCapabilities` API) — surfaced on the HUD next to the decoder name.
+    pub ll_feature: bool,
+    /// The user's "Low-latency mode" master toggle (default on ⇒ full aggressive profile; off ⇒
+    /// conservative, an escape hatch for a device that throttles under the clocks).
+    pub low_latency_mode: bool,
+    /// TV form factor (Kotlin's `UiModeManager`): actively drive the HDMI output into the stream's
+    /// refresh mode, vs. the softer seamless hint on a phone/tablet.
+    pub is_tv: bool,
+}
+
+/// The decode entry point on the `pf-decode` thread: dispatches to the async or synchronous loop.
+/// Both run until `shutdown` is set or the session closes.
 pub fn run(
     client: Arc<NativeClient>,
     window: NativeWindow,
     shutdown: Arc<AtomicBool>,
     stats: Arc<crate::stats::VideoStats>,
+    opts: DecodeOptions,
 ) {
+    if USE_ASYNC_DECODE {
+        run_async(client, window, shutdown, stats, opts);
+    } else {
+        run_sync(client, window, shutdown, stats, opts);
+    }
+}
+
+/// The synchronous poll loop — the original decode path, kept as a bring-up fallback behind
+/// [`USE_ASYNC_DECODE`]. Feeds and drains on this one thread; the only blocking wait is a short
+/// output dequeue while input is backed up.
+#[allow(dead_code)]
+fn run_sync(
+    client: Arc<NativeClient>,
+    window: NativeWindow,
+    shutdown: Arc<AtomicBool>,
+    stats: Arc<crate::stats::VideoStats>,
+    opts: DecodeOptions,
+) {
+    let DecodeOptions {
+        decoder_name,
+        ll_feature,
+        low_latency_mode,
+        is_tv,
+    } = opts;
     boost_thread_priority();
     let mode = client.mode();
-    // The MediaCodec MIME for the codec the host resolved (`Welcome.codec`): HEVC or H.264. AMediaCodec
-    // needs no out-of-band extradata — the in-band VPS/SPS/PPS on every IDR configure it either way.
-    let mime = match client.codec {
-        punktfunk_core::quic::CODEC_H264 => "video/avc",
-        _ => "video/hevc",
-    };
-    let codec = match MediaCodec::from_decoder_type(mime) {
+    // The MediaCodec MIME for the codec the host resolved (`Welcome.codec`). AMediaCodec needs no
+    // out-of-band extradata — the in-band VPS/SPS/PPS on every IDR configure it either way.
+    let mime = codec_mime(client.codec);
+    let codec = match create_codec(mime, decoder_name.as_deref()) {
         Some(c) => c,
         None => {
             log::error!("decode: no {mime} decoder on this device");
             return;
         }
     };
-    log::info!("decode: codec mime = {mime}");
+    // The decoder's *actual* resolved name (Kotlin's pick, or the platform default when it fell
+    // back) drives both the HUD label and which vendor low-latency keys apply below.
+    let codec_name = codec.name().unwrap_or_default();
+    stats.set_decoder(&codec_name, ll_feature);
+    log::info!(
+        "decode: codec mime = {mime}, decoder = {codec_name} (low-latency feature: {ll_feature})"
+    );
 
     let mut format = MediaFormat::new();
     format.set_str("mime", mime);
@@ -64,23 +120,9 @@ pub fn run(
         "max-input-size",
         (mode.width * mode.height).max(2_000_000) as i32,
     );
-    // Ask for the low-latency decode path where the decoder supports it (no reordering buffer).
-    format.set_i32("low-latency", 1);
-    // Best-effort vendor twin of the standard key: older Qualcomm decoders only honor their own
-    // extension. Unknown keys are ignored by other vendors' codecs, so this is safe to set blind.
-    format.set_i32("vendor.qti-ext-dec-low-latency.enable", 1);
-    // Advisory low-latency hints (KEY_PRIORITY / KEY_OPERATING_RATE), ignored where unsupported:
-    // realtime priority + the target frame rate, so vendor decoders (e.g. Qualcomm) run at full
-    // clocks instead of a power-saving cadence that adds dequeue latency.
-    format.set_i32("priority", 0); // 0 = realtime
-                                   // Operating rate = the codec's clock hint. Setting it to the display rate merely asks the
-                                   // decoder to *sustain* that cadence — a Qualcomm decoder can meet 60/120 fps at a power-saving
-                                   // clock that adds a millisecond-plus of decode latency per frame. Setting it to the AOSP
-                                   // "unbounded" sentinel (Short.MAX) instead asks the decoder to run each frame at max clocks and
-                                   // finish ASAP, minimising per-frame decode latency — the right trade for a real-time stream
-                                   // (costs power/heat; the dial to lower if a device thermally throttles over a long session).
-                                   // Ignored where unsupported.
-    format.set_i32("operating-rate", i16::MAX as i32); // 32767 = "as fast as possible"
+    // Standard + per-SoC vendor low-latency keys and the clock hints, gated on the resolved decoder
+    // name and the master toggle (see `configure_low_latency`).
+    configure_low_latency(&mut format, &codec_name, low_latency_mode);
 
     // HDR static metadata (ST.2086 mastering + content light level): when an HDR session was
     // negotiated, set KEY_HDR_STATIC_INFO so the display tone-maps from the source's real grade.
@@ -118,7 +160,7 @@ pub fn run(
     // above our API-28 floor, so we resolve it at runtime (see `try_set_frame_rate`) rather than link
     // it — a hard import would stop `libpunktfunk_android.so` loading at all on API 28/29. Absent
     // there ⇒ we simply skip the hint (non-fatal; the stream renders fine without it).
-    if mode.refresh_hz > 0 && !try_set_frame_rate(&window, mode.refresh_hz as f32) {
+    if mode.refresh_hz > 0 && !try_set_frame_rate(&window, mode.refresh_hz as f32, is_tv) {
         log::debug!(
             "decode: set_frame_rate({} Hz) unavailable/declined (non-fatal)",
             mode.refresh_hz
@@ -277,6 +319,7 @@ pub fn run(
                 // or where the platform declines → `None`, and the loop runs unhinted).
                 hint_tried = true;
                 let tids = client.hot_thread_ids();
+                boost_hot_threads(&tids);
                 hint = crate::adpf::HintSession::create(frame_period_ns, &tids);
                 log::info!(
                     "decode: ADPF hint session {} — {} hot thread(s), target {frame_period_ns} ns",
@@ -326,6 +369,609 @@ fn now_realtime_ns() -> i128 {
         .unwrap_or(0)
 }
 
+/// The MediaCodec MIME for the codec the host resolved (`Welcome.codec`). Shared by the decode
+/// thread and `nativeVideoMime` (which tells Kotlin what to rank decoders for). AV1 uses the
+/// AOSP `video/av01` type; anything not H.264/AV1 is treated as HEVC (every pre-negotiation host
+/// emitted HEVC).
+pub(crate) fn codec_mime(codec: u8) -> &'static str {
+    match codec {
+        punktfunk_core::quic::CODEC_H264 => "video/avc",
+        punktfunk_core::quic::CODEC_AV1 => "video/av01",
+        _ => "video/hevc",
+    }
+}
+
+/// Create the decoder: prefer the specific codec Kotlin ranked from `MediaCodecList`
+/// (`from_codec_name`), falling back to the platform's default decoder for the MIME
+/// (`from_decoder_type`) if that name can't be created (codec busy / renamed across an OS update).
+fn create_codec(mime: &str, preferred: Option<&str>) -> Option<MediaCodec> {
+    if let Some(name) = preferred.filter(|n| !n.is_empty()) {
+        if let Some(c) = MediaCodec::from_codec_name(name) {
+            return Some(c);
+        }
+        log::warn!(
+            "decode: from_codec_name({name}) failed — falling back to default {mime} decoder"
+        );
+    }
+    MediaCodec::from_decoder_type(mime)
+}
+
+/// Apply the low-latency MediaFormat keys for `codec_name`. The standard AOSP `low-latency` key is
+/// always set (API 30+, harmless/ignored elsewhere). When `aggressive` (the "Low-latency mode"
+/// master toggle) we additionally set MediaTek's `vdec-lowlatency` (unconditionally — ignored off
+/// MediaTek), the per-SoC vendor extension keys (gated on the decoder-name prefix the way
+/// Moonlight-Android does, since a key one vendor honours is meaningless on another), and one clock
+/// hint. Off ⇒ the standard key only, a gentler profile for a device that throttles under max clocks.
+///
+/// Vendor keys mirror Moonlight's `MediaCodecHelper` (verified against current source): Qualcomm
+/// picture-order + low-latency, Exynos (also Google Tensor), Amlogic, HiSilicon, MediaTek. NVIDIA
+/// Tegra / Rockchip / Realtek expose no such key (nor does Moonlight) — they're covered by the
+/// standard key + clock hint + being ranked first in `VideoDecoders`.
+fn configure_low_latency(format: &mut MediaFormat, codec_name: &str, aggressive: bool) {
+    // Standard key: request the no-reorder low-latency path where the platform decoder supports it.
+    format.set_i32("low-latency", 1);
+    if !aggressive {
+        return;
+    }
+    // MediaTek's low-latency key — very common (mid/budget phones + many Google TV / Fire TV boxes).
+    // Set unconditionally like the standard key: MediaTek decoders honour it, others ignore it, so it
+    // covers MediaTek whatever the exact decoder name (omx.mtk / c2.mtk / an OEM rename). Moonlight
+    // does the same, and also relies on it for Amazon's Amlogic fork.
+    format.set_i32("vdec-lowlatency", 1);
+    let name = codec_name.to_ascii_lowercase();
+    let is = |prefix: &str| name.starts_with(prefix);
+    // Qualcomm Snapdragon (the most common phone SoC): picture-order forces decode-order output
+    // (kills the reorder buffer on decoders that predate the standard key); low-latency is the older
+    // vendor twin.
+    if is("omx.qcom") || is("c2.qti") {
+        format.set_i32("vendor.qti-ext-dec-picture-order.enable", 1);
+        format.set_i32("vendor.qti-ext-dec-low-latency.enable", 1);
+    }
+    // Samsung Exynos — also covers Google Tensor (Pixel 6+), whose hardware decoder is `c2.exynos.*`.
+    if is("omx.exynos") || is("c2.exynos") {
+        format.set_i32("vendor.rtc-ext-dec-low-latency.enable", 1);
+    }
+    // Amlogic — the Android TV boxes (onn 4K, Chromecast w/ Google TV, Homatics).
+    if is("omx.amlogic") || is("c2.amlogic") {
+        format.set_i32("vendor.low-latency.enable", 1);
+    }
+    // HiSilicon / Kirin (older Huawei; paired req/rdy keys).
+    if is("omx.hisi") || is("c2.hisi") {
+        format.set_i32(
+            "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req",
+            1,
+        );
+        format.set_i32(
+            "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-rdy",
+            -1,
+        );
+    }
+    // NVIDIA Tegra (Shield TV) and Rockchip/Realtek (budget TV boxes / smart TVs) expose no
+    // low-latency vendor key (Moonlight has none either) — their decoders are already low-latency
+    // oriented, so the standard `low-latency` key + the clock hint below + being ranked first
+    // (see `VideoDecoders`) is their treatment.
+    //
+    // Clock hint, mutually exclusive (matching Moonlight): the AOSP "unbounded" operating-rate
+    // sentinel (Short.MAX) tells the decoder to run each frame at max clocks and finish ASAP rather
+    // than pace to the frame rate — shaving per-frame decode latency at a power/heat cost. Only
+    // Qualcomm is known to handle the sentinel; every other vendor mis-paces on it, so they get the
+    // plain realtime `priority` hint instead.
+    if decoder_supports_max_operating_rate(&name) {
+        format.set_i32("operating-rate", i16::MAX as i32); // 32767 = "as fast as possible"
+    } else {
+        format.set_i32("priority", 0); // 0 = realtime
+    }
+}
+
+/// Whether a decoder tolerates `operating-rate = Short.MAX` rather than regressing on it. Follows
+/// Moonlight's allowlist: Qualcomm decoders honour the sentinel (the Adreno 620 generation is the
+/// known exception Moonlight excludes by GPU model — undetectable from native code here, so it
+/// rides the master toggle as its escape hatch). Other vendors fall back to the plain `priority`
+/// hint above.
+fn decoder_supports_max_operating_rate(name_lower: &str) -> bool {
+    name_lower.starts_with("omx.qcom") || name_lower.starts_with("c2.qti")
+}
+
+/// One decoded output buffer ready to release: its codec buffer index + the pts the codec echoed
+/// (from the output callback's `BufferInfo`), used to pair the `decode` HUD stat.
+struct OutputReady {
+    index: usize,
+    pts_us: u64,
+}
+
+/// Events the async decode loop reacts to. The codec's async-notify callbacks (which run on its
+/// internal looper thread) push the codec ones; the feeder thread pushes `Au`. Each carries only
+/// owned/`Copy` data so the callback closures satisfy the `Send` bound and never touch the codec.
+enum DecodeEvent {
+    /// A received access unit from the feeder, ready to queue into the decoder.
+    Au(Frame),
+    /// An input buffer slot freed (index) — we can queue an AU into it.
+    InputAvailable(usize),
+    /// A decoded frame is ready (buffer index + echoed pts).
+    OutputAvailable { index: usize, pts_us: u64 },
+    /// The output format changed — re-check the stream's colour signalling (HDR DataSpace).
+    FormatChanged,
+    /// The codec reported an error; `fatal` when neither recoverable nor transient.
+    Error { fatal: bool },
+}
+
+/// The event-driven async decode loop (default; see [`run`]/[`USE_ASYNC_DECODE`]). The codec drives
+/// us: an async-notify callback fires the instant an input buffer frees or a frame finishes
+/// decoding, so a decoded frame is presented immediately instead of waiting out a poll interval (the
+/// latency the sync loop left on the table). The callbacks run on the codec's internal looper thread
+/// and only *push events* — every `AMediaCodec` buffer op stays on this thread, which owns the codec,
+/// sidestepping the self-reference that would arise from a callback calling back into the codec it's
+/// stored in. A small `pf-decode-feed` thread blocks on the network so this loop never does.
+fn run_async(
+    client: Arc<NativeClient>,
+    window: NativeWindow,
+    shutdown: Arc<AtomicBool>,
+    stats: Arc<crate::stats::VideoStats>,
+    opts: DecodeOptions,
+) {
+    let DecodeOptions {
+        decoder_name,
+        ll_feature,
+        low_latency_mode,
+        is_tv,
+    } = opts;
+    boost_thread_priority();
+    let mode = client.mode();
+    let mime = codec_mime(client.codec);
+    let mut codec = match create_codec(mime, decoder_name.as_deref()) {
+        Some(c) => c,
+        None => {
+            log::error!("decode: no {mime} decoder on this device");
+            return;
+        }
+    };
+    let codec_name = codec.name().unwrap_or_default();
+    stats.set_decoder(&codec_name, ll_feature);
+    log::info!(
+        "decode: codec mime = {mime}, decoder = {codec_name} (async, low-latency feature: {ll_feature})"
+    );
+
+    // The event channel: the callbacks + feeder push, this loop pulls. `Sender` is `Send`, so the
+    // callback closures (each capturing a clone) satisfy the async-notify `Send` bound.
+    let (ev_tx, ev_rx) = mpsc::channel::<DecodeEvent>();
+    // Install the callbacks BEFORE configure()/start() so we're in async mode from the first buffer.
+    // Each just forwards an index/flag — no codec access here (the codec owns these closures).
+    {
+        let out_tx = ev_tx.clone();
+        let in_tx = ev_tx.clone();
+        let fmt_tx = ev_tx.clone();
+        let err_tx = ev_tx.clone();
+        let cb = AsyncNotifyCallback {
+            on_input_available: Some(Box::new(move |idx| {
+                let _ = in_tx.send(DecodeEvent::InputAvailable(idx));
+            })),
+            on_output_available: Some(Box::new(move |idx, info| {
+                let _ = out_tx.send(DecodeEvent::OutputAvailable {
+                    index: idx,
+                    pts_us: info.presentation_time_us().max(0) as u64,
+                });
+            })),
+            on_format_changed: Some(Box::new(move |_fmt| {
+                let _ = fmt_tx.send(DecodeEvent::FormatChanged);
+            })),
+            on_error: Some(Box::new(move |e, code, _detail| {
+                let fatal = !code.is_recoverable() && !code.is_transient();
+                log::warn!("decode: codec error {e:?} (fatal={fatal})");
+                let _ = err_tx.send(DecodeEvent::Error { fatal });
+            })),
+        };
+        if let Err(e) = codec.set_async_notify_callback(Some(cb)) {
+            log::error!("decode: set_async_notify_callback failed: {e}");
+            return;
+        }
+    }
+
+    // Build the low-latency format (identical keys to the sync path).
+    let mut format = MediaFormat::new();
+    format.set_str("mime", mime);
+    format.set_i32("width", mode.width as i32);
+    format.set_i32("height", mode.height as i32);
+    format.set_i32(
+        "max-input-size",
+        (mode.width * mode.height).max(2_000_000) as i32,
+    );
+    configure_low_latency(&mut format, &codec_name, low_latency_mode);
+    if client.color.is_hdr() {
+        match client.next_hdr_meta(Duration::from_millis(250)) {
+            Ok(meta) => {
+                format.set_buffer("hdr-static-info", &android_hdr_static_info(&meta));
+                log::info!("decode: HDR static metadata applied (KEY_HDR_STATIC_INFO)");
+            }
+            Err(_) => {
+                log::info!("decode: HDR session but no mastering metadata yet — DataSpace only")
+            }
+        }
+    }
+    if let Err(e) = codec.configure(&format, Some(&window), MediaCodecDirection::Decoder) {
+        log::error!("decode: configure failed: {e}");
+        return;
+    }
+    if let Err(e) = codec.start() {
+        log::error!("decode: start failed: {e}");
+        return;
+    }
+    log::info!(
+        "decode: decoder started (async) at {}x{}",
+        mode.width,
+        mode.height
+    );
+    if mode.refresh_hz > 0 && !try_set_frame_rate(&window, mode.refresh_hz as f32, is_tv) {
+        log::debug!(
+            "decode: set_frame_rate({} Hz) unavailable/declined (non-fatal)",
+            mode.refresh_hz
+        );
+    }
+
+    // Skew-corrected latency stats (spec: design/stats-unification.md). Receipt stamps (keyed by the
+    // pts we queue) live in a shared map: the feeder writes them at receipt, this loop pairs decoded
+    // output back to them. Behind a `Mutex` since two threads touch it — only ever locked while the
+    // HUD is visible.
+    let clock_offset = client.clock_offset_ns;
+    let in_flight = Arc::new(Mutex::new(VecDeque::<(u64, i128)>::new()));
+
+    // Feeder thread: block on the network so this loop doesn't (an AU's arrival becomes an event that
+    // wakes us immediately, with no input-side poll latency). It also records the `received` HUD stat.
+    let feeder = {
+        let client = client.clone();
+        let stats = stats.clone();
+        let in_flight = in_flight.clone();
+        let shutdown = shutdown.clone();
+        let ev_tx = ev_tx.clone();
+        std::thread::Builder::new()
+            .name("pf-decode-feed".into())
+            .spawn(move || {
+                feeder_loop(
+                    client,
+                    stats,
+                    in_flight,
+                    clock_offset as i128,
+                    shutdown,
+                    ev_tx,
+                );
+            })
+            .ok()
+    };
+    drop(ev_tx); // only the feeder + callbacks keep the channel alive now
+
+    // ADPF: same as the sync path — register this thread now, create the session lazily on the first
+    // presented frame (by when the pump + audio + feeder threads have registered their tids too).
+    let frame_period_ns = if mode.refresh_hz > 0 {
+        1_000_000_000i64 / mode.refresh_hz as i64
+    } else {
+        0
+    };
+    client.register_hot_thread();
+    let mut hint: Option<crate::adpf::HintSession> = None;
+    let mut hint_tried = false;
+
+    let mut free_inputs: VecDeque<usize> = VecDeque::new();
+    let mut pending_aus: VecDeque<Frame> = VecDeque::new();
+    let mut ready: Vec<OutputReady> = Vec::new();
+    let mut applied_ds: Option<DataSpace> = None;
+    let mut fed: u64 = 0;
+    let mut rendered: u64 = 0;
+    let mut discarded: u64 = 0;
+    let mut last_dropped = client.frames_dropped();
+    let mut last_kf_req: Option<Instant> = None;
+    // Productive (dispatch+feed+present) time between displayed frames; reported to ADPF once one is
+    // presented. The blocking event wait is excluded (idle, not work) — same accounting as the sync loop.
+    let mut work_accum_ns: i64 = 0;
+    let mut fatal = false;
+
+    while !shutdown.load(Ordering::Relaxed) && !fatal {
+        // Block for the next event (idle wait — excluded from the work tally). The short timeout
+        // drives loss-recovery housekeeping when the pipeline is momentarily quiet.
+        let ev0 = match ev_rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(ev) => Some(ev),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let work_t0 = Instant::now();
+        let mut fmt_dirty = false;
+        let mut au_dropped = false;
+        if let Some(ev) = ev0 {
+            au_dropped |= dispatch_event(
+                ev,
+                &mut pending_aus,
+                &mut free_inputs,
+                &mut ready,
+                &mut fmt_dirty,
+                &mut fatal,
+            );
+        }
+        // Coalesce every other event already queued into this one work pass — correct newest-only
+        // presentation across a decode burst, and batched feeding.
+        while let Ok(ev) = ev_rx.try_recv() {
+            au_dropped |= dispatch_event(
+                ev,
+                &mut pending_aus,
+                &mut free_inputs,
+                &mut ready,
+                &mut fmt_dirty,
+                &mut fatal,
+            );
+        }
+        if fmt_dirty {
+            apply_hdr_dataspace(&codec, &window, &mut applied_ds);
+        }
+        feed_ready(&codec, &mut pending_aus, &mut free_inputs, &mut fed);
+        let had_output = !ready.is_empty();
+        present_ready(
+            &codec,
+            &mut ready,
+            &stats,
+            &in_flight,
+            clock_offset,
+            &mut rendered,
+            &mut discarded,
+        );
+
+        work_accum_ns += work_t0.elapsed().as_nanos() as i64;
+        if had_output {
+            if !hint_tried {
+                hint_tried = true;
+                let tids = client.hot_thread_ids();
+                boost_hot_threads(&tids);
+                hint = crate::adpf::HintSession::create(frame_period_ns, &tids);
+                log::info!(
+                    "decode: ADPF hint session {} — {} hot thread(s), target {frame_period_ns} ns",
+                    if hint.is_some() {
+                        "active"
+                    } else {
+                        "unavailable"
+                    },
+                    tids.len(),
+                );
+            }
+            if let Some(h) = &hint {
+                h.report_actual(work_accum_ns);
+            }
+            work_accum_ns = 0;
+            if rendered > 0 && rendered % 300 == 0 {
+                log::info!("decode: fed={fed} rendered={rendered} discarded={discarded}");
+            }
+        }
+        // Loss recovery: request an IDR when the reassembler's unrecoverable-drop count climbs (or we
+        // dropped a parked AU on overflow), throttled so a multi-frame recovery gap doesn't flood the
+        // control stream.
+        let dropped = client.frames_dropped();
+        if dropped > last_dropped || au_dropped {
+            last_dropped = dropped;
+            let now = Instant::now();
+            if last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
+                last_kf_req = Some(now);
+                let _ = client.request_keyframe();
+            }
+        }
+    }
+
+    let _ = codec.stop();
+    shutdown.store(true, Ordering::SeqCst); // ensure the feeder wakes and exits, then join it
+    if let Some(j) = feeder {
+        let _ = j.join();
+    }
+    log::info!("decode: stopped (async, fed={fed} rendered={rendered} discarded={discarded})");
+}
+
+/// The `pf-decode-feed` thread: block on the connector for the next access unit so the async loop
+/// never has to. Records the `received` HUD stat (receipt point) — including the Phase-2 host/network
+/// split from any matching 0xCF host timings — then hands the AU to the loop via the event channel.
+/// Exits when `shutdown` is set, the session closes, or the loop's receiver is gone.
+fn feeder_loop(
+    client: Arc<NativeClient>,
+    stats: Arc<crate::stats::VideoStats>,
+    in_flight: Arc<Mutex<VecDeque<(u64, i128)>>>,
+    clock_offset: i128,
+    shutdown: Arc<AtomicBool>,
+    ev_tx: mpsc::Sender<DecodeEvent>,
+) {
+    // Received AUs awaiting their 0xCF host timing (Phase-2 split), as (pts_ns, capture→received µs).
+    let mut pending_split: VecDeque<(u64, u64)> = VecDeque::new();
+    while !shutdown.load(Ordering::Relaxed) {
+        match client.next_frame(Duration::from_millis(5)) {
+            Ok(frame) => {
+                if stats.enabled() {
+                    let received_ns = now_realtime_ns();
+                    let lat_ns = received_ns + clock_offset - frame.pts_ns as i128;
+                    let lat_us =
+                        (lat_ns > 0 && lat_ns < 10_000_000_000).then_some((lat_ns / 1000) as u64);
+                    stats.note_received(frame.data.len(), lat_us, clock_offset != 0);
+                    {
+                        let mut g = in_flight
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        g.push_back((frame.pts_ns / 1000, received_ns));
+                        if g.len() > IN_FLIGHT_CAP {
+                            g.pop_front(); // stale — codec never echoed it back
+                        }
+                    }
+                    if let Some(hostnet_us) = lat_us {
+                        pending_split.push_back((frame.pts_ns, hostnet_us));
+                        if pending_split.len() > PENDING_SPLIT_CAP {
+                            pending_split.pop_front();
+                        }
+                    }
+                    while let Ok(t) = client.next_host_timing(Duration::ZERO) {
+                        if let Some(i) = pending_split.iter().position(|&(p, _)| p == t.pts_ns) {
+                            let (_, hostnet_us) = pending_split.remove(i).unwrap();
+                            stats.note_host_split(
+                                t.host_us as u64,
+                                hostnet_us.saturating_sub(t.host_us as u64),
+                            );
+                        }
+                    }
+                }
+                if ev_tx.send(DecodeEvent::Au(frame)).is_err() {
+                    break; // the decode loop is gone
+                }
+            }
+            Err(PunktfunkError::NoFrame) => {} // timeout — re-check shutdown and poll again
+            Err(_) => break,                   // session closed
+        }
+    }
+}
+
+/// Route one [`DecodeEvent`] into the loop's working sets. Returns `true` only when a parked AU was
+/// dropped on overflow (the caller then requests a keyframe).
+fn dispatch_event(
+    ev: DecodeEvent,
+    pending_aus: &mut VecDeque<Frame>,
+    free_inputs: &mut VecDeque<usize>,
+    ready: &mut Vec<OutputReady>,
+    fmt_dirty: &mut bool,
+    fatal: &mut bool,
+) -> bool {
+    match ev {
+        DecodeEvent::Au(f) => {
+            pending_aus.push_back(f);
+            if pending_aus.len() > FRAME_PARK_CAP {
+                pending_aus.pop_front(); // sustained overflow — drop oldest, signal a keyframe request
+                return true;
+            }
+        }
+        DecodeEvent::InputAvailable(i) => free_inputs.push_back(i),
+        DecodeEvent::OutputAvailable { index, pts_us } => ready.push(OutputReady { index, pts_us }),
+        DecodeEvent::FormatChanged => *fmt_dirty = true,
+        DecodeEvent::Error { fatal: f } => {
+            if f {
+                *fatal = true;
+            }
+        }
+    }
+    false
+}
+
+/// Queue as many parked AUs as there are free input buffer slots (async mode: the indices come from
+/// `InputAvailable` callbacks, not a dequeue). Each AU is copied into its codec input buffer and
+/// submitted; a too-large AU is truncated (logged) rather than dropped.
+fn feed_ready(
+    codec: &MediaCodec,
+    pending_aus: &mut VecDeque<Frame>,
+    free_inputs: &mut VecDeque<usize>,
+    fed: &mut u64,
+) {
+    while !pending_aus.is_empty() && !free_inputs.is_empty() {
+        let idx = free_inputs.pop_front().unwrap();
+        let frame = pending_aus.pop_front().unwrap();
+        let pts_us = frame.pts_ns / 1000;
+        let Some(dst) = codec.input_buffer(idx) else {
+            log::warn!("decode: input_buffer({idx}) returned None — dropping AU");
+            continue;
+        };
+        let au = &frame.data;
+        let n = au.len().min(dst.len());
+        if n < au.len() {
+            log::warn!(
+                "decode: AU {} > input buffer {}, truncated",
+                au.len(),
+                dst.len()
+            );
+        }
+        // SAFETY: `au` (wire AU) and `dst` (codec input buffer) are distinct allocations, both valid
+        // for `n` bytes; `MaybeUninit<u8>` is layout-identical to `u8`, so this initializes dst[..n].
+        unsafe {
+            std::ptr::copy_nonoverlapping(au.as_ptr(), dst.as_mut_ptr().cast::<u8>(), n);
+        }
+        if let Err(e) = codec.queue_input_buffer_by_index(idx, 0, n, pts_us, 0) {
+            log::warn!("decode: queue_input_buffer_by_index: {e}");
+        } else {
+            *fed += 1;
+        }
+    }
+}
+
+/// Present only the NEWEST ready output (render = true) and release the rest without rendering — a
+/// burst of stale frames on glass is worse than skipping to the freshest (the sync loop's newest-ready
+/// policy, callback-driven). Every dequeued buffer, rendered or not, is the HUD's `decoded`
+/// measurement point (it finished decoding either way); samples are recorded in pts order so the
+/// receipt-map eviction stays monotonic. `ready` is drained.
+fn present_ready(
+    codec: &MediaCodec,
+    ready: &mut Vec<OutputReady>,
+    stats: &crate::stats::VideoStats,
+    in_flight: &Mutex<VecDeque<(u64, i128)>>,
+    clock_offset: i64,
+    rendered: &mut u64,
+    discarded: &mut u64,
+) {
+    if ready.is_empty() {
+        return;
+    }
+    if stats.enabled() {
+        let mut g = in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for o in ready.iter() {
+            note_decoded_pts(stats, &mut g, clock_offset, o.pts_us);
+        }
+    }
+    let last = ready.len() - 1;
+    for (i, o) in ready.drain(..).enumerate() {
+        let render = i == last;
+        match codec.release_output_buffer_by_index(o.index, render) {
+            Ok(()) if render => *rendered += 1,
+            Ok(()) => *discarded += 1,
+            Err(e) => {
+                log::warn!(
+                    "decode: release_output_buffer_by_index({}, {render}): {e}",
+                    o.index
+                )
+            }
+        }
+    }
+}
+
+/// React to an output-format change by signalling the stream's HDR dataspace on the Surface (SDR
+/// streams leave the default alone). The AMediaCodec analogue of the sync loop's `OutputFormatChanged`
+/// handling; safe to call repeatedly (`applied_ds` dedups).
+fn apply_hdr_dataspace(
+    codec: &MediaCodec,
+    window: &NativeWindow,
+    applied_ds: &mut Option<DataSpace>,
+) {
+    if let Some(ds) = hdr_dataspace(codec) {
+        if *applied_ds != Some(ds) {
+            match window.set_buffers_data_space(ds) {
+                Ok(()) => {
+                    *applied_ds = Some(ds);
+                    log::info!("decode: HDR stream → Surface dataspace {ds}");
+                }
+                Err(e) => {
+                    log::warn!("decode: set_buffers_data_space({ds}) failed (non-fatal): {e}")
+                }
+            }
+        }
+    }
+}
+
+/// Raise the pipeline's OTHER hot threads — the core's data-plane pump (UDP receive + FEC
+/// reassembly) and the audio decode thread — toward the display band, matching this decode thread's
+/// own boost. `setpriority(PRIO_PROCESS, tid)` targets any task in the process, so we do it from
+/// here once their tids are known (the same set ADPF hints), without a per-platform priority hook
+/// in the shared core. Slightly below the decode thread's -10 so the display path still wins.
+/// Best-effort; skips this thread (already boosted) and is non-fatal if the platform refuses.
+fn boost_hot_threads(tids: &[i32]) {
+    // SAFETY: `gettid` is an always-safe syscall on the calling thread.
+    let self_tid = unsafe { libc::gettid() };
+    for &tid in tids {
+        if tid == self_tid {
+            continue;
+        }
+        // SAFETY: `setpriority` with PRIO_PROCESS + a live tid in our own process is an always-safe
+        // syscall; a refusal is reported via the return value, not UB.
+        unsafe {
+            if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -8) != 0 {
+                log::debug!("decode: setpriority(-8) on hot tid {tid} failed (non-fatal)");
+            }
+        }
+    }
+}
+
 /// Best-effort: raise the decode thread toward Android's URGENT_DISPLAY band so background work
 /// can't preempt it under load (which shows up as late/dropped frames). Non-fatal if the platform
 /// refuses (foreground apps may set their own threads; the exact floor is policy-dependent).
@@ -343,22 +989,47 @@ fn boost_thread_priority() {
     }
 }
 
-/// `ANativeWindow_setFrameRate` (NDK **API 30**) resolved from `libandroid.so` at runtime, so the lib
-/// still loads on our API-28 floor — a hard import of a >floor symbol makes `dlopen`/`System.load`
-/// fail on every API-28/29 device, even where this path is never hit. Mirrors the dlsym approach in
-/// [`crate::adpf`]. Returns `true` when the platform accepted the hint; `false` on API < 30 (symbol
-/// absent) or when the platform declined. `compatibility` is fixed to the DEFAULT (0) policy.
-fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32) -> bool {
+/// Set the surface's frame-rate hint to the stream's refresh so SurfaceFlinger picks a matching
+/// display mode and aligns vsync (no 60-in-120 judder). Both NDK entry points sit above our API-28
+/// floor, so both are dlsym-resolved at runtime (a hard import of a >floor symbol makes
+/// `dlopen`/`System.load` fail on every API-28/29 device, even where this path is never hit —
+/// mirrors [`crate::adpf`]):
+///   - On a **TV** (`is_tv`): `ANativeWindow_setFrameRateWithChangeStrategy` (**API 31**) with
+///     `changeFrameRateStrategy = ALWAYS`, which actively drives the HDMI output into the matching
+///     mode (e.g. 60↔120) instead of leaving the panel at its default and judder-matching. The
+///     forced switch may blank the panel briefly — acceptable once at stream start, not wanted on a
+///     phone. Falls through to the 2-arg hint on API 30.
+///   - Otherwise: `ANativeWindow_setFrameRate` (**API 30**) with `compatibility = DEFAULT` — the
+///     softer, seamless-preferred hint for phones/tablets and the universal fallback.
+///
+/// Returns `true` when the platform accepted a hint; `false` on API < 30 (symbols absent) or a
+/// decline.
+fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: bool) -> bool {
     // int32_t ANativeWindow_setFrameRate(ANativeWindow*, float frameRate, int8_t compatibility)
     type SetFrameRateFn = unsafe extern "C" fn(*mut c_void, f32, i8) -> i32;
+    // int32_t ANativeWindow_setFrameRateWithChangeStrategy(
+    //     ANativeWindow*, float frameRate, int8_t compatibility, int8_t changeFrameRateStrategy)
+    type SetFrameRateStrategyFn = unsafe extern "C" fn(*mut c_void, f32, i8, i8) -> i32;
     // SAFETY: `dlopen` of the always-mapped `libandroid.so` (only bumps its refcount; never closed —
-    // process-lifetime handle). `dlsym` returns null when the symbol is absent (device API < 30),
-    // checked before transmuting the non-null pointer to its fn-pointer type. `window.ptr()` is the
-    // live `ANativeWindow` this `NativeWindow` owns for the call's duration.
+    // process-lifetime handle). Each `dlsym` returns null when the symbol is absent (device below the
+    // symbol's API level), checked before transmuting the non-null pointer to its fn-pointer type.
+    // `window.ptr()` is the live `ANativeWindow` this `NativeWindow` owns for the call's duration.
     unsafe {
         let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
         if lib.is_null() {
             return false;
+        }
+        // TV: prefer the API-31 change-strategy form to force the mode switch (strategy 1 = ALWAYS,
+        // compatibility 0 = DEFAULT). Absent on API 30 ⇒ fall through to the 2-arg hint below.
+        if is_tv {
+            let sym = libc::dlsym(
+                lib,
+                c"ANativeWindow_setFrameRateWithChangeStrategy".as_ptr(),
+            );
+            if !sym.is_null() {
+                let set = std::mem::transmute::<*mut c_void, SetFrameRateStrategyFn>(sym);
+                return set(window.ptr().as_ptr().cast(), frame_rate, 0, 1) == 0;
+            }
         }
         let sym = libc::dlsym(lib, c"ANativeWindow_setFrameRate".as_ptr());
         if sym.is_null() {
@@ -499,7 +1170,22 @@ fn note_decoded(
     clock_offset: i64,
     buf: &OutputBuffer<'_>,
 ) {
-    let pts_us = buf.info().presentation_time_us().max(0) as u64;
+    note_decoded_pts(
+        stats,
+        in_flight,
+        clock_offset,
+        buf.info().presentation_time_us().max(0) as u64,
+    );
+}
+
+/// The [`note_decoded`] body keyed by the echoed `presentationTimeUs` directly — the async loop has
+/// the pts (from the output callback's `BufferInfo`) but no borrowed `OutputBuffer`, so it calls this.
+fn note_decoded_pts(
+    stats: &crate::stats::VideoStats,
+    in_flight: &mut VecDeque<(u64, i128)>,
+    clock_offset: i64,
+    pts_us: u64,
+) {
     let decoded_ns = now_realtime_ns();
     // Pair the echoed pts back to its receipt stamp, evicting stale (older) entries as we go.
     let mut received_ns = None;

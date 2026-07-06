@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Game Mode config (Android 13 / API 33+). We support the Performance game mode; and we opt OUT of
+  the two OEM interventions that would corrupt a game-streaming session:
+    - allowGameDownscaling=false: the client renders exactly the host's negotiated resolution; a
+      platform downscale would blur the stream.
+    - allowGameFpsOverride=false: the stream is paced to the host's frame rate; a platform FPS cap
+      would drop frames / add judder.
+  Ignored on releases below API 33.
+-->
+<game-mode-config xmlns:android="http://schemas.android.com/apk/res/android"
+    android:supportsPerformanceGameMode="true"
+    android:allowGameDownscaling="false"
+    android:allowGameFpsOverride="false" />

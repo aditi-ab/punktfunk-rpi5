@@ -43,6 +43,14 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.PunktfunkAndroid">
 
+        <!-- Game Mode config (Android 13+): declare we support Performance mode and opt OUT of the
+             OEM interventions that would fight the negotiated stream — resolution downscaling and
+             FPS overrides. A game-streaming client renders exactly the host's mode; a platform
+             downscale/FPS-cap corrupts that. Ignored below API 33. -->
+        <meta-data
+            android:name="android.game_mode_config"
+            android:resource="@xml/game_mode_config" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -66,12 +66,18 @@ impl MediaClass {
     }
 }
 
-/// Whether DSCP/QoS marking is enabled (`PUNKTFUNK_DSCP=1`). Off by default.
+/// Whether DSCP/QoS marking is enabled. Default **on for Android**, **off elsewhere**: on Wi-Fi
+/// (where most Android clients live) access points commonly map DSCP to WMM access categories, so
+/// tagging the video/audio sockets can win real airtime priority against other traffic on the link;
+/// on the wired paths the other clients use it's rarely honoured and some paths bleach or reject
+/// marked packets, so it stays opt-in there. `PUNKTFUNK_DSCP` overrides either way — `1`/`true`/`on`
+/// forces it on, `0`/`false`/`off` forces it off (e.g. to rule QoS out while debugging a flaky AP).
 pub(crate) fn dscp_enabled() -> bool {
-    matches!(
-        std::env::var("PUNKTFUNK_DSCP").as_deref(),
-        Ok("1") | Ok("true") | Ok("on")
-    )
+    match std::env::var("PUNKTFUNK_DSCP").as_deref() {
+        Ok("1") | Ok("true") | Ok("on") => true,
+        Ok("0") | Ok("false") | Ok("off") => false,
+        _ => cfg!(target_os = "android"),
+    }
 }
 
 /// Best-effort: tag `socket`'s outgoing packets for prioritized delivery of its media class. A no-op

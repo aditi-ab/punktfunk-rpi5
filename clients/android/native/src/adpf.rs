@@ -28,6 +28,7 @@ type CreateSessionFn = unsafe extern "C" fn(*mut c_void, *const i32, usize, i64)
 type ReportFn = unsafe extern "C" fn(*mut c_void, i64) -> c_int;
 type UpdateTargetFn = unsafe extern "C" fn(*mut c_void, i64) -> c_int;
 type CloseFn = unsafe extern "C" fn(*mut c_void);
+type SetPreferPowerEfficiencyFn = unsafe extern "C" fn(*mut c_void, bool) -> c_int;
 
 /// The entry points we use, resolved once from `libandroid.so`, plus the process-wide manager.
 struct Api {
@@ -35,6 +36,9 @@ struct Api {
     report: ReportFn,
     update_target: UpdateTargetFn,
     close: CloseFn,
+    /// `APerformanceHint_setPreferPowerEfficiency` — NDK **API 35**, so `Option`al even when the
+    /// rest of ADPF resolved (a 33/34 device has the session API but not this one).
+    set_prefer_power_efficiency: Option<SetPreferPowerEfficiencyFn>,
     manager: *mut c_void,
 }
 
@@ -70,11 +74,20 @@ fn resolve_api() -> Option<Api> {
         if manager.is_null() {
             return None;
         }
+        // Optional (API 35): resolve if present, else `None` — the session still works without it.
+        let set_prefer_power_efficiency =
+            libc::dlsym(lib, c"APerformanceHint_setPreferPowerEfficiency".as_ptr());
+        let set_prefer_power_efficiency = (!set_prefer_power_efficiency.is_null()).then(|| {
+            std::mem::transmute::<*mut c_void, SetPreferPowerEfficiencyFn>(
+                set_prefer_power_efficiency,
+            )
+        });
         Some(Api {
             create_session: std::mem::transmute::<*mut c_void, CreateSessionFn>(create_session),
             report: std::mem::transmute::<*mut c_void, ReportFn>(report),
             update_target: std::mem::transmute::<*mut c_void, UpdateTargetFn>(update_target),
             close: std::mem::transmute::<*mut c_void, CloseFn>(close),
+            set_prefer_power_efficiency,
             manager,
         })
     }
@@ -102,6 +115,13 @@ impl HintSession {
             unsafe { (api.create_session)(api.manager, tids.as_ptr(), tids.len(), target_ns) };
         if session.is_null() {
             return None;
+        }
+        // Tell the governor NOT to bias this session toward power efficiency (API 35+): our loop is
+        // latency-critical, so we want it kept on fast cores at high clocks over battery savings.
+        // Best-effort; absent below API 35.
+        if let Some(f) = api.set_prefer_power_efficiency {
+            // SAFETY: `session` is the live session just created; the fn takes it + a bool.
+            unsafe { f(session, false) };
         }
         Some(Self { api, session })
     }

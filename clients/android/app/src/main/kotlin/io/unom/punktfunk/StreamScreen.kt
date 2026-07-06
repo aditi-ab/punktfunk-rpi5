@@ -1,8 +1,11 @@
 package io.unom.punktfunk
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
@@ -30,6 +33,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.VideoDecoders
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
 
@@ -55,15 +59,23 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     // comes from Settings.
     val initialSettings = remember { SettingsStore(context).load() }
     var stats by remember { mutableStateOf<DoubleArray?>(null) }
+    var decoderLabel by remember { mutableStateOf("") }
     var showStats by remember { mutableStateOf(initialSettings.statsHudEnabled) }
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
     val touchMode = initialSettings.touchMode
+    // Master low-latency toggle, resolved once for the session and passed to the decoder at start.
+    val lowLatencyMode = initialSettings.lowLatencyMode
+    // TV form factor (leanback): the decoder actively switches the HDMI output mode to the stream
+    // refresh; a phone/tablet gets the softer seamless frame-rate hint instead.
+    val isTv = remember { context.packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) }
     LaunchedEffect(handle, showStats) {
         NativeBridge.nativeSetVideoStatsEnabled(handle, showStats)
         if (showStats) {
             while (true) {
                 delay(1000)
                 stats = NativeBridge.nativeVideoStats(handle)
+                // The decoder is fixed for the session; fetch its label once it's resolved.
+                if (decoderLabel.isEmpty()) decoderLabel = NativeBridge.nativeVideoDecoderLabel(handle)
             }
         } else {
             stats = null // drop the last snapshot so a re-show never flashes stale numbers
@@ -76,8 +88,29 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
     // main thread, so a plain flag is race-free; AtomicBoolean just makes the intent explicit.
     val closed = remember { AtomicBoolean(false) }
 
+    // A Wi-Fi low-latency lock held for the stream's duration: asks the Wi-Fi firmware to drop its
+    // power-save polling (a common source of tens-of-ms jitter). WIFI_MODE_FULL_LOW_LATENCY (API
+    // 29+) is the strongest; older releases fall back to FULL_HIGH_PERF. Needs no extra permission
+    // beyond ACCESS_WIFI_STATE (already declared). Non-reference-counted: one explicit acquire/release.
+    val wifiLock = remember(handle) {
+        val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        } else {
+            @Suppress("DEPRECATION")
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        }
+        wm?.createWifiLock(mode, "punktfunk:stream")?.apply { setReferenceCounted(false) }
+    }
+
     DisposableEffect(handle) {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        runCatching { wifiLock?.acquire() }
+        // HDMI Auto Low-Latency Mode: ask the display to drop its post-processing (game mode) —
+        // the biggest panel-side latency win on the TV boxes. No-op where ALLM isn't supported. API 30+.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window?.setPreferMinimalPostProcessing(true)
+        }
         controller?.let {
             it.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             it.hide(WindowInsetsCompat.Type.systemBars())
@@ -105,6 +138,10 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             activity?.setConsoleHighRefreshRate(true) // back to the console UI's max refresh
             controller?.show(WindowInsetsCompat.Type.systemBars())
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                window?.setPreferMinimalPostProcessing(false)
+            }
+            runCatching { if (wifiLock?.isHeld == true) wifiLock.release() }
             // Release the landscape lock so the rest of the app follows the device/system again.
             activity?.requestedOrientation =
                 priorOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -125,7 +162,19 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
                 SurfaceView(ctx).apply {
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
-                            NativeBridge.nativeStartVideo(handle, holder.surface)
+                            // Rank MediaCodecList decoders for the negotiated MIME (framework-only
+                            // API) and hand the chosen one to Rust, which creates it by name and
+                            // applies the per-SoC vendor low-latency keys.
+                            val mime = NativeBridge.nativeVideoMime(handle)
+                            val choice = VideoDecoders.pickDecoder(mime)
+                            NativeBridge.nativeStartVideo(
+                                handle,
+                                holder.surface,
+                                choice?.name ?: "",
+                                lowLatencyMode,
+                                choice?.lowLatencyFeature ?: false,
+                                isTv,
+                            )
                             NativeBridge.nativeStartAudio(handle)
                             if (micWanted) NativeBridge.nativeStartMic(handle)
                         }
@@ -150,7 +199,7 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         // Live stats HUD (FPS / throughput / capture→client latency), drawn over the video but
         // BEFORE the transparent gesture layer below, so it shows through and never eats touches.
         if (showStats) {
-            stats?.let { StatsOverlay(it, Modifier.align(Alignment.TopStart).padding(12.dp)) }
+            stats?.let { StatsOverlay(it, decoderLabel, Modifier.align(Alignment.TopStart).padding(12.dp)) }
         }
         // Touch input per the Settings model: trackpad/direct-pointer mouse (the shared gesture
         // vocabulary) or real multi-touch passthrough — see TouchInput.kt.

@@ -104,13 +104,39 @@ object NativeBridge {
     external fun nativeWakeOnLan(macsCsv: String, lastIp: String): Boolean
 
     /**
-     * Start the HEVC decode thread rendering onto [surface] (a SurfaceView's surface). Decode runs
-     * entirely in Rust (NDK AMediaCodec → ANativeWindow) — no per-frame JNI. No-op if already started.
+     * The MediaCodec MIME the host resolved for this session (`"video/hevc"` / `"video/avc"` /
+     * `"video/av01"`), or `""` on a `0` handle. Kotlin ranks `MediaCodecList` decoders for this
+     * MIME (see [io.unom.punktfunk.kit.VideoDecoders]) before [nativeStartVideo]. Cheap; UI-safe.
      */
-    external fun nativeStartVideo(handle: Long, surface: android.view.Surface)
+    external fun nativeVideoMime(handle: Long): String
+
+    /**
+     * Start the decode thread rendering onto [surface] (a SurfaceView's surface). Decode runs
+     * entirely in Rust (NDK AMediaCodec → ANativeWindow) — no per-frame JNI. [decoderName] is the
+     * decoder Kotlin ranked from `MediaCodecList` (`""` = let the platform resolve the default for
+     * the MIME); [lowLatencyMode] is the user's master toggle (default on → aggressive per-SoC
+     * tuning; off → conservative); [lowLatencyFeature] is whether [decoderName] advertised
+     * `FEATURE_LowLatency` (HUD label only). [isTv] drives an active HDMI mode switch to the stream
+     * refresh on TV boxes (vs. the softer seamless hint on phones). No-op if already started.
+     */
+    external fun nativeStartVideo(
+        handle: Long,
+        surface: android.view.Surface,
+        decoderName: String,
+        lowLatencyMode: Boolean,
+        lowLatencyFeature: Boolean,
+        isTv: Boolean,
+    )
 
     /** Stop + join the decode thread without closing the session. No-op on `0`. */
     external fun nativeStopVideo(handle: Long)
+
+    /**
+     * The resolved decoder identity for the HUD, e.g. `c2.qti.avc.decoder · low-latency`, or `""`
+     * before the decode thread has resolved one. One-shot (fixed for the session); poll once after
+     * the HUD appears.
+     */
+    external fun nativeVideoDecoderLabel(handle: Long): String
 
     /**
      * Drain ~1 s of live decode stats for the on-stream HUD, or `null` when no decode thread runs.

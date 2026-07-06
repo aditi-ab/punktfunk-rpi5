@@ -324,6 +324,14 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             options = COMPOSITOR_OPTIONS.mapIndexed { i, lbl -> i to lbl },
             selected = s.compositor,
         ) { c -> update(s.copy(compositor = c)) }
+
+        ToggleRow(
+            title = "Low-latency mode",
+            subtitle = "Run the decoder at max clocks for the lowest latency. Turn off only if a " +
+                "device overheats or glitches during long sessions.",
+            checked = s.lowLatencyMode,
+            onCheckedChange = { on -> update(s.copy(lowLatencyMode = on)) },
+        )
     }
 }
 

@@ -18,8 +18,8 @@
 //! grown on XRuns (Google's anti-glitch technique).
 
 use ndk::audio::{
-    AudioCallbackResult, AudioDirection, AudioFormat, AudioPerformanceMode, AudioSharingMode,
-    AudioStream, AudioStreamBuilder,
+    AudioCallbackResult, AudioContentType, AudioDirection, AudioFormat, AudioPerformanceMode,
+    AudioSharingMode, AudioStream, AudioStreamBuilder, AudioUsage,
 };
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::error::PunktfunkError;
@@ -235,6 +235,11 @@ impl AudioPlayback {
                 // captures + Opus-encodes in exactly this order.
                 .channel_count(channels as i32)
                 .format(AudioFormat::PCM_Float)
+                // Tag the stream as game audio (usage=Game / content=Movie): the audio HAL applies
+                // its low-latency game-audio routing/policy and it's grouped correctly with the
+                // game-mode profile. Advisory — ignored where the device has no such policy.
+                .usage(AudioUsage::Game)
+                .content_type(AudioContentType::Movie)
                 .performance_mode(AudioPerformanceMode::LowLatency)
                 .sharing_mode(sharing)
                 .data_callback(Box::new(callback))

@@ -54,6 +54,14 @@ data class Settings(
      * client's `libraryEnabled`.
      */
     val libraryEnabled: Boolean = true,
+    /**
+     * Aggressive decoder latency tuning — the master escape hatch. On (default): the decoder runs
+     * the full low-latency profile (per-SoC vendor keys + max-clock operating-rate on Qualcomm).
+     * Off: a conservative profile (the standard `low-latency` key only), for a device that thermally
+     * throttles or misbehaves under the aggressive clocks. Decoder ranking, the Wi-Fi low-latency
+     * lock and HDMI game-mode signalling stay on regardless — they're harmless.
+     */
+    val lowLatencyMode: Boolean = true,
 )
 
 /** [Settings.touchMode] values; persisted by name. */
@@ -82,6 +90,7 @@ class SettingsStore(context: Context) {
             ?: if (prefs.getBoolean(K_TRACKPAD, true)) TouchMode.TRACKPAD else TouchMode.POINTER,
         gamepadUiEnabled = prefs.getBoolean(K_GAMEPAD_UI, true),
         libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
+        lowLatencyMode = prefs.getBoolean(K_LOW_LATENCY, true),
     )
 
     fun save(s: Settings) {
@@ -100,6 +109,7 @@ class SettingsStore(context: Context) {
             .putString(K_TOUCH_MODE, s.touchMode.name)
             .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
             .putBoolean(K_LIBRARY, s.libraryEnabled)
+            .putBoolean(K_LOW_LATENCY, s.lowLatencyMode)
             .apply()
     }
 
@@ -118,6 +128,7 @@ class SettingsStore(context: Context) {
         const val K_TOUCH_MODE = "touch_mode"
         const val K_GAMEPAD_UI = "gamepad_ui_enabled"
         const val K_LIBRARY = "library_enabled"
+        const val K_LOW_LATENCY = "low_latency_mode"
 
         /** Legacy Boolean the enum replaced — read once as the migration default, never written. */
         const val K_TRACKPAD = "trackpad_mode"

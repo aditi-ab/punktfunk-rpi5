@@ -22,7 +22,19 @@ pub struct VideoStats {
     /// they (and the caller's latency computation — see `enabled`) early-out on this flag alone.
     /// Off until Kotlin shows the HUD.
     enabled: AtomicBool,
+    /// The resolved decoder identity for the HUD: the codec's actual `AMediaCodec` name (e.g.
+    /// `c2.qti.avc.decoder`) and whether it advertised `FEATURE_LowLatency`. Set once when the
+    /// decode thread creates the codec (`set_decoder`), read one-shot by `nativeVideoDecoderLabel`.
+    /// Separate from `inner` (never touched per-frame) so naming it costs nothing on the hot path.
+    decoder: Mutex<Option<DecoderInfo>>,
     inner: Mutex<Inner>,
+}
+
+/// The chosen decoder's identity, surfaced on the stats HUD so before/after latency comparisons
+/// name the codec that produced them.
+struct DecoderInfo {
+    name: String,
+    low_latency: bool,
 }
 
 struct Inner {
@@ -79,6 +91,7 @@ impl VideoStats {
     pub fn new() -> VideoStats {
         VideoStats {
             enabled: AtomicBool::new(false),
+            decoder: Mutex::new(None),
             inner: Mutex::new(Inner {
                 window_start: Instant::now(),
                 frames: 0,
@@ -118,6 +131,36 @@ impl VideoStats {
             g.host_us.clear();
             g.net_us.clear();
             g.decode_us.clear();
+        }
+    }
+
+    /// Record the resolved decoder identity for the HUD — the codec's real `AMediaCodec` name and
+    /// whether it reported `FEATURE_LowLatency`. Called once from the decode thread right after the
+    /// codec is created (before `configure`), overwriting any prior value on a surface recreate.
+    // Set only by the android-only decode thread; unreferenced on the host build — expected.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn set_decoder(&self, name: &str, low_latency: bool) {
+        let mut g = self
+            .decoder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *g = Some(DecoderInfo {
+            name: name.to_owned(),
+            low_latency,
+        });
+    }
+
+    /// The decoder label for the HUD, e.g. `c2.qti.avc.decoder · low-latency`, or `""` before the
+    /// decode thread has resolved one. Cheap (a lock + a string build); safe on the UI thread.
+    pub fn decoder_label(&self) -> String {
+        let g = self
+            .decoder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*g {
+            Some(d) if d.low_latency => format!("{} · low-latency", d.name),
+            Some(d) => d.name.clone(),
+            None => String::new(),
         }
     }
 

@@ -27,7 +27,7 @@ import kotlin.math.roundToInt
  * older layouts just omit those lines.
  */
 @Composable
-internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
+internal fun StatsOverlay(s: DoubleArray, decoderLabel: String = "", modifier: Modifier = Modifier) {
     if (s.size < 10) return
     val w = s[6].toInt()
     val h = s[7].toInt()
@@ -46,6 +46,14 @@ internal fun StatsOverlay(s: DoubleArray, modifier: Modifier = Modifier) {
             fontFamily = FontFamily.Monospace,
             fontSize = 12.sp,
         )
+        if (decoderLabel.isNotEmpty()) {
+            Text(
+                decoderLabel,
+                color = Color(0xFFB0D0FF),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+            )
+        }
         videoFeedLine(s)?.let { feed ->
             Text(
                 feed,
