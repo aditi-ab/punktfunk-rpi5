@@ -154,13 +154,21 @@ pub fn run() -> glib::ExitCode {
         builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
     }
     let app = builder.build();
-    app.connect_activate(build_ui);
+    // One SDL context for the whole process: `activate` fires again on every subsequent
+    // launch forwarded to this already-running singleton (another `--connect`, the desktop
+    // icon clicked twice, …). SDL only ever lets the FIRST thread that calls `sdl3::init()`
+    // hold the "main thread" — a second `GamepadService::start()` from a later `activate`
+    // would spawn a new thread that fails that check forever. Starting it once here and
+    // cloning it into each `build_ui` keeps the worker thread (and its pad state) shared
+    // across every window instead.
+    let gamepad = crate::gamepad::GamepadService::start();
+    app.connect_activate(move |gtk_app| build_ui(gtk_app, gamepad.clone()));
     // GTK doesn't see our argv (`--connect` is handled in `build_ui`); an empty argv also
     // keeps GApplication from rejecting unknown options.
     app.run_with_args(&[] as &[&str])
 }
 
-fn build_ui(gtk_app: &adw::Application) {
+fn build_ui(gtk_app: &adw::Application, gamepad: crate::gamepad::GamepadService) {
     let identity = match crate::trust::load_or_create_identity() {
         Ok(i) => i,
         Err(e) => {
@@ -203,7 +211,7 @@ fn build_ui(gtk_app: &adw::Application) {
         toasts,
         settings: Rc::new(RefCell::new(Settings::load())),
         identity,
-        gamepad: crate::gamepad::GamepadService::start(),
+        gamepad,
         busy: std::cell::Cell::new(false),
         fullscreen,
         // (`--browse` makes cli_connect_request None — browse mode returns to the
