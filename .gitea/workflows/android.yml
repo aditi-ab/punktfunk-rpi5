@@ -43,7 +43,9 @@ jobs:
           "$RUSTUP" target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 
       - name: Android SDK
-        uses: android-actions/setup-android@v3
+        # SHA-pinned: this workflow's release job carries the signing keystore + Play service-account
+        # secrets, so a moved tag on a third-party action could exfiltrate them. v3 = 9fc6c4e.
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
 
       - name: NDK r30 + platform 36 + build-tools + CMake (libopus cross-build)
         # cmake;3.22.1 installs cmake + ninja under $ANDROID_SDK/cmake/3.22.1/bin — the exact path

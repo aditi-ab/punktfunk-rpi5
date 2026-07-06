@@ -1,7 +1,10 @@
-# Supply-chain advisory scan for the (network-facing, crypto-heavy) Rust dependency tree.
-# Runs `cargo audit` against the RustSec advisory DB: weekly (catch newly-disclosed CVEs in
-# pinned deps), on every Cargo.lock change (catch a bad dep the moment it lands), and on demand.
-# To silence a known-unfixable advisory, add it to `.cargo/audit.toml` ([advisories] ignore = [...]).
+# Supply-chain advisory scan for BOTH dependency trees the project ships to users:
+#   * cargo-audit → the (network-facing, crypto-heavy) Rust tree, against the RustSec advisory DB.
+#   * bun audit   → the web management console (Nitro/Bun BFF) — the component that holds the login
+#                   gate, session sealing, and the mgmt bearer token, so its deps matter too.
+# Triggers: weekly (catch newly-disclosed CVEs in pinned deps), on every lockfile change (catch a bad
+# dep the moment it lands), and on demand.
+# To silence a known-unfixable Rust advisory, add it to `.cargo/audit.toml` ([advisories] ignore=[…]).
 name: audit
 
 on:
@@ -9,7 +12,7 @@ on:
     - cron: '0 6 * * 1'   # Mondays 06:00 UTC
   push:
     branches: [main]
-    paths: ['Cargo.lock', '.gitea/workflows/audit.yml']
+    paths: ['Cargo.lock', 'web/bun.lock', '.gitea/workflows/audit.yml']
   workflow_dispatch:
 
 jobs:
@@ -31,3 +34,25 @@ jobs:
           git config --global --add safe.directory "$PWD"
           command -v cargo-audit >/dev/null 2>&1 || cargo install --locked cargo-audit
           cargo audit
+
+  bun-audit:
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      # oven/bun's slim base lacks a CA bundle + git — actions/checkout's HTTPS fetch needs them
+      # (same preamble as web-screenshots.yml / ci.yml's web job).
+      - name: Install git + CA certs
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@v4
+      # `bun audit` queries the registry advisory DB for the versions pinned in web/bun.lock. No
+      # install/build needed — it reads the manifest + lockfile. Fails the job on any advisory, the
+      # same fail-on-vulnerability stance as cargo-audit above; triage a finding by bumping the dep
+      # (or, if genuinely unfixable + inapplicable, pinning a resolution and noting why here).
+      - name: bun audit
+        run: bun audit

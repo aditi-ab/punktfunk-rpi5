@@ -25,7 +25,8 @@ jobs:
           java-version: "21"
 
       - name: Android SDK
-        uses: android-actions/setup-android@v3
+        # SHA-pinned for parity with android.yml (third-party action). v3 = 9fc6c4e.
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
 
       # No NDK/CMake — the screenshot unit tests are pure JVM. compileSdk 37 auto-downloads via AGP
       # if the platform channel lacks it (same note as android.yml).
