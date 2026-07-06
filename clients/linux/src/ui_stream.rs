@@ -806,7 +806,10 @@ fn attach_keyboard(
             | gdk::ModifierType::ALT_MASK
             | gdk::ModifierType::SHIFT_MASK;
         if state.contains(chord) && keyval.to_lower() == gdk::Key::q {
-            tracing::info!(captured = cap.captured.get(), "chord: Ctrl+Alt+Shift+Q (release/engage)");
+            tracing::info!(
+                captured = cap.captured.get(),
+                "chord: Ctrl+Alt+Shift+Q (release/engage)"
+            );
             if cap.captured.get() {
                 cap.release();
             } else {

@@ -774,6 +774,10 @@ mod tests {
         // instead of returning.
         flow.emit_by_name::<()>("child-activated", &[&child]);
 
-        assert_eq!(fired.get(), 1, "the per-card handler should fire exactly once");
+        assert_eq!(
+            fired.get(),
+            1,
+            "the per-card handler should fire exactly once"
+        );
     }
 }
