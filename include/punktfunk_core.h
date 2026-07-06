@@ -1502,6 +1502,18 @@ PunktfunkStatus punktfunk_connection_probe_result(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Signal a **deliberate quit** (a user "stop", not a network drop) before closing: the connection
+// closes with [`QUIT_CLOSE_CODE`] instead of code 0, so the host tears the session down immediately
+// (skips the keep-alive linger) rather than holding it for a reconnect. Call this right before
+// [`punktfunk_connection_close`] on a user-initiated disconnect; a plain close (network drop,
+// backgrounding) leaves the linger intact. NULL is a no-op.
+//
+// # Safety
+// `c` was returned by [`punktfunk_connect`] and remains valid (closed via `punktfunk_connection_close`).
+void punktfunk_connection_disconnect_quit(PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Close the connection and free the handle (joins the internal threads). NULL is a no-op.
 //
 // # Safety

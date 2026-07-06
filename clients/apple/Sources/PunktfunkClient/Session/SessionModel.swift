@@ -276,7 +276,10 @@ final class SessionModel: ObservableObject {
         disconnect()
     }
 
-    func disconnect() {
+    /// Tear the session down. `deliberate` (the default) means a user-initiated quit — signal
+    /// `disconnectQuit()` so the host skips the keep-alive linger; `sessionEnded()` (a host-ended /
+    /// dropped session) passes `false` to leave the linger intact.
+    func disconnect(deliberate: Bool = true) {
         statsTimer?.invalidate()
         statsTimer = nil
         let audio = self.audio
@@ -294,6 +297,8 @@ final class SessionModel: ObservableObject {
             Task.detached {
                 audio?.stop()
                 feedback?.stop()
+                // Deliberate user quit → tell the host to skip the keep-alive linger (must precede close).
+                if deliberate { conn.disconnectQuit() }
                 conn.close()
             }
         } else {
@@ -321,7 +326,7 @@ final class SessionModel: ObservableObject {
     func sessionEnded() {
         guard connection != nil else { return }
         let name = activeHost?.displayName ?? "host"
-        disconnect()
+        disconnect(deliberate: false) // host/network ended it — keep the linger for a reconnect
         errorMessage = "Session ended by \(name)."
     }
 

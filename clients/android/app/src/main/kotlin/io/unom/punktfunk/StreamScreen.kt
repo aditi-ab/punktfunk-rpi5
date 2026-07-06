@@ -150,7 +150,9 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         activity?.streamHandle = handle // route hardware keys to this session
         activity?.axisMapper = Gamepad.AxisMapper(handle) // route joystick axes
-        activity?.requestStreamExit = onDisconnect // Select+Start+L1+R1 chord leaves the stream
+        // Select+Start+L1+R1 chord leaves the stream — a deliberate quit (signal it so the host skips
+        // the keep-alive linger), unlike a host-ended / backgrounded drop.
+        activity?.requestStreamExit = { NativeBridge.nativeDisconnectQuit(handle); onDisconnect() }
         activity?.setConsoleHighRefreshRate(false) // let the decoder's setFrameRate pick the panel rate
         // Host→client feedback (rumble + DualSense lightbar/LEDs); poll threads stopped before close.
         val feedback = GamepadFeedback(handle).also { it.start() }
@@ -179,7 +181,8 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
         }
     }
 
-    BackHandler { onDisconnect() }
+    // Back gesture = a deliberate exit → signal the quit so the host tears down now (no linger).
+    BackHandler { NativeBridge.nativeDisconnectQuit(handle); onDisconnect() }
 
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(

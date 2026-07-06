@@ -759,6 +759,17 @@ public final class PunktfunkConnection {
         _ = punktfunk_connection_send_input(h, &ev)
     }
 
+    /// Signal a **deliberate** user-initiated quit before ``close()``: the connection closes with
+    /// `QUIT_CLOSE_CODE` (81) so the host tears the session down immediately instead of holding the
+    /// keep-alive linger for a reconnect. Call only from an explicit "Disconnect" action — NOT from a
+    /// network drop / host-ended / app-background (those keep the linger). Idempotent, safe pre-close.
+    public func disconnectQuit() {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return }
+        punktfunk_connection_disconnect_quit(h)
+    }
+
     /// Close the connection and free the handle. Safe from any thread, idempotent; waits
     /// for in-flight pulls (≤ their timeouts) before tearing down.
     public func close() {

@@ -281,6 +281,9 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                 // the cursor is free while the session winds down and the UI navigates home.
                 if !up && vk == VK_D.0 && st.ctrl && st.alt && st.shift {
                     set_captured(st, false);
+                    // Deliberate user exit → close with QUIT_CLOSE_CODE so the host tears the session
+                    // down immediately instead of holding the keep-alive linger for a reconnect.
+                    st.connector.disconnect_quit();
                     st.stop.store(true, Ordering::SeqCst);
                     tracing::info!("disconnect requested (Ctrl+Alt+Shift+D)");
                     return LRESULT(1);

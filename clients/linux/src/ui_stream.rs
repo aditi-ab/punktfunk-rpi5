@@ -817,6 +817,9 @@ fn attach_keyboard(
         // the capture toggle alone can't end a stream, so this is the keyboard's explicit exit.
         if state.contains(chord) && keyval.to_lower() == gdk::Key::d {
             cap.release();
+            // Deliberate user exit → close with QUIT_CLOSE_CODE so the host tears the session down
+            // immediately instead of holding the keep-alive linger for a reconnect.
+            cap.connector.disconnect_quit();
             stop_kb.store(true, Ordering::SeqCst);
             return glib::Propagation::Stop;
         }
@@ -1024,6 +1027,8 @@ fn spawn_disconnect_watch(
     glib::spawn_future_local(async move {
         if disconnect_rx.recv().await.is_ok() {
             cap.release();
+            // Deliberate user exit (the controller escape chord) → QUIT_CLOSE_CODE, host skips linger.
+            cap.connector.disconnect_quit();
             if window.is_fullscreen() {
                 window.unfullscreen();
             }

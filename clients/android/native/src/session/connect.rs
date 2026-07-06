@@ -179,6 +179,30 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     })
 }
 
+/// `NativeBridge.nativeDisconnectQuit(handle)` — signal a DELIBERATE user quit before `nativeClose`,
+/// so the session closes with `QUIT_CLOSE_CODE` and the host tears it down immediately instead of
+/// holding the keep-alive linger for a reconnect. Call from an explicit disconnect action only (a
+/// plain drop / app-background keeps the linger). The handle is only BORROWED (not freed). No-op on `0`.
+///
+/// # Safety contract
+/// `handle` must be `0` or a live handle from [`Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect`],
+/// not freed / closed concurrently with this call (Kotlin still owns it and closes it via `nativeClose`).
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQuit(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) {
+    jni_guard((), || {
+        if handle != 0 {
+            // SAFETY: per the contract, `handle` is a live `Box<SessionHandle>` — we only borrow it
+            // (no drop), so it stays owned by Kotlin for the later `nativeClose`.
+            let sh = unsafe { &*(handle as *const SessionHandle) };
+            sh.client.disconnect_quit();
+        }
+    })
+}
+
 /// `NativeBridge.nativeHostFingerprint(handle): String` — the SHA-256 (64-hex) of the cert the host
 /// presented on this connection. Valid after a successful `nativeConnect`; Kotlin pins it on a TOFU
 /// connect. `""` on a `0` handle.

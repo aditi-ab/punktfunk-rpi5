@@ -82,6 +82,14 @@ object NativeBridge {
         name: String,
     ): String
 
+    /**
+     * Signal a **deliberate** user disconnect on [handle] before [nativeClose]: the session closes
+     * with `QUIT_CLOSE_CODE` so the host tears it down immediately instead of holding the keep-alive
+     * linger for a reconnect. Call from an explicit disconnect gesture only — NOT from a
+     * host-ended/network-drop end or an app-background (those keep the linger). No-op on `0`.
+     */
+    external fun nativeDisconnectQuit(handle: Long)
+
     /** Tear down a session handle returned by [nativeConnect]. No-op on `0`. */
     external fun nativeClose(handle: Long)
 
