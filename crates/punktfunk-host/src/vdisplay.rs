@@ -619,11 +619,6 @@ pub fn apply_session_env(active: &ActiveSession) {
     if let Some(d) = &e.xdg_current_desktop {
         std::env::set_var("XDG_CURRENT_DESKTOP", d);
     }
-    // Mutter on NVIDIA has no working dmabuf capture sync — force SHM there; the KWin/gamescope
-    // tiled/LINEAR paths keep zero-copy.
-    if active.kind == ActiveKind::DesktopGnome {
-        std::env::set_var("PUNKTFUNK_FORCE_SHM", "1");
-    }
     // Topology (Stage 2): the per-compositor backends (KWin/Mutter) now read
     // [`effective_topology`] directly at create time — the console policy, else the legacy
     // `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` env, else the Auto default (exclusive on the

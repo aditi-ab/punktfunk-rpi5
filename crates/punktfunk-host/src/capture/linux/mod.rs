@@ -1278,9 +1278,13 @@ mod pipewire {
         } else {
             None
         };
-        // PUNKTFUNK_FORCE_SHM=1 forces the race-free download path (SHM, no dmabuf) — required on
-        // Mutter+NVIDIA where dmabuf capture has no working sync and shows stale frames. KWin/
-        // gamescope don't need it (they blit into the buffer, so no read-before-render race).
+        // PUNKTFUNK_FORCE_SHM=1 forces the race-free download path (SHM, no dmabuf) — a manual
+        // escape hatch, mainly for Mutter+NVIDIA: that combo has no implicit dmabuf fence, so
+        // zero-copy capture can in principle race the compositor's render and show stale frames.
+        // Zero-copy is the Mutter+NVIDIA default (no unconditional override) since live retesting
+        // found no visible staleness; set this if you do see flashing/stale content on such a
+        // host. KWin/gamescope don't need it (they blit into the buffer, so no read-before-render
+        // race).
         let force_shm = std::env::var("PUNKTFUNK_FORCE_SHM").as_deref() == Ok("1");
         // VAAPI zero-copy passthrough: zero-copy on, no EGL→CUDA importer (any non-NVIDIA host), and
         // the encoder backend is VAAPI → hand the raw dmabuf to the encoder (it imports + GPU-CSCs).
