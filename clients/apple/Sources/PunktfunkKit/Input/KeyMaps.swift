@@ -98,5 +98,23 @@ extension InputCapture {
         m[0x47] = 0x90 // KP clear sits where NumLock is → VK_NUMLOCK. (KP equals 0x51 dropped.)
         return m
     }()
+
+    /// NSEvent.keyCode of each modifier key (kVK_Shift & co. — modifiers arrive only as
+    /// flagsChanged) → its Windows VK plus the `NSEvent.modifierFlags` bits that describe
+    /// it: `classMask` is the device-INDEPENDENT NX_*MASK for the modifier class,
+    /// `deviceBit`/`siblingBit` the device-dependent bits (LOW 16 bits, NX_DEVICE*KEYMASK
+    /// in IOLLEvent.h) for this key and its opposite-side twin. Consumed by
+    /// `resolveModifier`, which explains why both kinds of bit are needed.
+    static let modifierBits:
+        [UInt16: (vk: UInt32, classMask: UInt, deviceBit: UInt, siblingBit: UInt)] = [
+            56: (0xA0, 0x2_0000, 0x2, 0x4), // left shift → VK_LSHIFT
+            60: (0xA1, 0x2_0000, 0x4, 0x2), // right shift → VK_RSHIFT
+            59: (0xA2, 0x4_0000, 0x1, 0x2000), // left control → VK_LCONTROL
+            62: (0xA3, 0x4_0000, 0x2000, 0x1), // right control → VK_RCONTROL
+            58: (0xA4, 0x8_0000, 0x20, 0x40), // left option → VK_LMENU
+            61: (0xA5, 0x8_0000, 0x40, 0x20), // right option → VK_RMENU
+            55: (0x5B, 0x10_0000, 0x8, 0x10), // left command → VK_LWIN
+            54: (0x5C, 0x10_0000, 0x10, 0x8), // right command → VK_RWIN
+        ]
     #endif
 }
