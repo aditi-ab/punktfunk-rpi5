@@ -242,6 +242,10 @@ fn build_ui(gtk_app: &adw::Application) {
                 let app = app.clone();
                 Rc::new(move |req| crate::ui_trust::initiate_connect(app.clone(), req))
             },
+            on_wake_connect: {
+                let app = app.clone();
+                Rc::new(move |req| crate::ui_trust::wake_and_connect(app.clone(), req))
+            },
             on_speed_test: {
                 let app = app.clone();
                 Rc::new(move |req| speed_test(app.clone(), req))

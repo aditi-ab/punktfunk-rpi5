@@ -168,6 +168,26 @@ pub fn learn_mac(fp_hex: &str, addr: &str, port: u16, mac: &[String]) {
     let _ = known.save();
 }
 
+/// Re-key a saved host's address/port after it rediscovered on a new DHCP lease (matched by
+/// fingerprint). No-op — and no disk write — when unchanged. Called from the wake-and-wait flow when
+/// a woken host reappears on a different IP than the stored one, so this and future connects dial the
+/// live address instead of the stale one.
+pub fn rekey_addr(fp_hex: &str, addr: &str, port: u16) {
+    if fp_hex.is_empty() {
+        return;
+    }
+    let mut known = KnownHosts::load();
+    let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp_hex) else {
+        return;
+    };
+    if h.addr == addr && h.port == port {
+        return;
+    }
+    h.addr = addr.to_string();
+    h.port = port;
+    let _ = known.save();
+}
+
 /// Stamp "now" as this host's last successful connect (drives the hosts page's
 /// most-recent accent). No-op when the fingerprint isn't stored.
 pub fn touch_last_used(fp_hex: &str) {

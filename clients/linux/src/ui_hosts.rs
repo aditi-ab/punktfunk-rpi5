@@ -48,6 +48,9 @@ impl ConnectRequest {
 /// the library browser).
 pub struct HostsCallbacks {
     pub on_connect: Rc<dyn Fn(ConnectRequest)>,
+    /// Connect to an OFFLINE saved host with a known MAC: wake it, poll until it's up (re-keying a
+    /// new DHCP IP), then connect. Falls back to `on_connect` when there's nothing to wake.
+    pub on_wake_connect: Rc<dyn Fn(ConnectRequest)>,
     pub on_speed_test: Rc<dyn Fn(ConnectRequest)>,
     pub on_pair: Rc<dyn Fn(ConnectRequest)>,
     pub on_library: Rc<dyn Fn(ConnectRequest)>,
@@ -546,15 +549,17 @@ fn saved_card(
     overlay.add_controller(right_click);
 
     let on_connect = state.cbs.on_connect.clone();
-    // Auto-wake: if the host wasn't advertising when this card was built and we have a MAC, fire a
-    // magic packet before connecting — the connect's own retry/timeout gives a woken host time to
-    // come up. A host that's genuinely off/unreachable then fails the connect as before.
+    let on_wake_connect = state.cbs.on_wake_connect.clone();
+    // Auto-wake: if the host wasn't advertising when this card was built and we have a MAC, route to
+    // the wake-and-wait flow (send a magic packet, poll mDNS until it's up — re-keying a new DHCP IP —
+    // then connect). Otherwise a plain connect. A host that's genuinely off then times out as before.
     let wake_first = !online && !req.mac.is_empty();
     child.connect_activate(move |_| {
         if wake_first {
-            crate::wol::wake(&req.mac, req.addr.parse().ok());
+            on_wake_connect(req.clone());
+        } else {
+            on_connect(req.clone());
         }
-        on_connect(req.clone());
     });
     child
 }

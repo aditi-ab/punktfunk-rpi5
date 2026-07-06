@@ -60,6 +60,87 @@ pub fn initiate_connect(app: Rc<App>, req: ConnectRequest) {
     }
 }
 
+/// Wake-and-wait: an **offline** saved host with a known MAC is sent a magic packet, then we poll
+/// mDNS until it comes back online — re-sending every few seconds up to a timeout — and dial it via
+/// [`initiate_connect`], **re-keying the saved record if the host woke on a new DHCP IP** (matched by
+/// fingerprint). A "Waking…" dialog lets the user cancel. Mirrors the Apple/Android `HostWaker` (a
+/// 90 s budget, resend every 6 s). The online path stays on the fast [`initiate_connect`]; this runs
+/// only from the hosts page's auto-wake when a saved host isn't advertising.
+pub fn wake_and_connect(app: Rc<App>, req: ConnectRequest) {
+    if app.busy.get() {
+        return;
+    }
+    let cancel = Rc::new(std::cell::Cell::new(false));
+    let waiting = adw::AlertDialog::new(
+        Some("Waking Host"),
+        Some(&format!(
+            "Sent a wake signal to “{}”. Waiting for it to come online…",
+            req.name
+        )),
+    );
+    waiting.add_responses(&[("cancel", "Cancel")]);
+    waiting.set_close_response("cancel");
+    {
+        let cancel = cancel.clone();
+        waiting.connect_response(Some("cancel"), move |_, _| cancel.set(true));
+    }
+    waiting.present(Some(&app.window));
+
+    glib::spawn_future_local(async move {
+        use std::time::{Duration, Instant};
+        let events = crate::discovery::browse();
+        let started = Instant::now();
+        let budget = Duration::from_secs(90);
+        let resend = Duration::from_secs(6);
+        // Fire the first packet now, then re-send on the resend cadence.
+        crate::wol::wake(&req.mac, req.addr.parse().ok());
+        let mut last_wake = Instant::now();
+        loop {
+            if cancel.get() {
+                waiting.close();
+                return;
+            }
+            if last_wake.elapsed() >= resend {
+                crate::wol::wake(&req.mac, req.addr.parse().ok());
+                last_wake = Instant::now();
+            }
+            // Drain resolved adverts; a match (by fingerprint, else addr:port) means the host is up.
+            while let Ok(ev) = events.try_recv() {
+                let crate::discovery::DiscoveryEvent::Resolved(h) = ev else {
+                    continue;
+                };
+                let matched = match &req.fp_hex {
+                    Some(fp) => !h.fp_hex.is_empty() && &h.fp_hex == fp,
+                    None => h.addr == req.addr && h.port == req.port,
+                };
+                if matched {
+                    waiting.close();
+                    let mut req = req.clone();
+                    // Re-key on a new DHCP lease so this + future connects dial the live address.
+                    if h.addr != req.addr || h.port != req.port {
+                        if let Some(fp) = &req.fp_hex {
+                            trust::rekey_addr(fp, &h.addr, h.port);
+                        }
+                        req.addr = h.addr;
+                        req.port = h.port;
+                    }
+                    initiate_connect(app.clone(), req);
+                    return;
+                }
+            }
+            if started.elapsed() >= budget {
+                waiting.close();
+                app.toast(&format!(
+                    "Couldn't reach “{}” — is it powered and on the network?",
+                    req.name
+                ));
+                return;
+            }
+            glib::timeout_future(Duration::from_millis(500)).await;
+        }
+    });
+}
+
 /// The certificate fingerprint as grouped monospaced hex — 4-char groups over 2 lines
 /// (the Apple TrustCardView format), far easier to compare against the host's log than
 /// one 64-char run.
