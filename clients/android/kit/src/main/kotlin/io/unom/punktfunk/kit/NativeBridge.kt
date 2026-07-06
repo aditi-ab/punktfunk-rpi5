@@ -57,6 +57,15 @@ object NativeBridge {
     external fun nativeHostFingerprint(handle: Long): String
 
     /**
+     * Has the underlying QUIC session ended? `true` once the connection closed — a host suspend /
+     * crash / network drop idle-timed it out (~8 s), or the host closed it — from then on no frame
+     * ever arrives and the video sits frozen on its last one. The stream watchdog polls this (~1 Hz)
+     * to leave a dead stream and return to the menu, where the user can Wake-on-LAN the host, instead
+     * of stranding them on a frozen frame. `false` on a `0` handle. Cheap (one atomic load); UI-safe.
+     */
+    external fun nativeSessionEnded(handle: Long): Boolean
+
+    /**
      * Run the SPAKE2 PIN ceremony, presenting [certPem]/[keyPem]. Returns the host's verified
      * fingerprint (64-hex) to persist + pin, or `""` on failure (wrong PIN / MITM / unreachable).
      * Blocking — call off the main thread.

@@ -9,6 +9,7 @@ import android.os.Build
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -79,6 +80,31 @@ fun StreamScreen(handle: Long, micEnabled: Boolean, onDisconnect: () -> Unit) {
             }
         } else {
             stats = null // drop the last snapshot so a re-show never flashes stale numbers
+        }
+    }
+
+    // Host-gone watchdog. When the host suspends/sleeps (or crashes, or drops off the network) it
+    // stops answering the QUIC keep-alive and the connection idle-times out (~8 s) — no more frames
+    // arrive and the decoder would otherwise sit frozen on its last decoded frame until the user
+    // manually backed out. Poll the native session-liveness flag (one atomic load, independent of the
+    // stats HUD) and, the moment the session is dead, drop back to the menu so the user can
+    // Wake-on-LAN the host instead of being stranded on a frozen picture. Mirrors the Apple client's
+    // onSessionEnd → sessionEnded() → disconnect(). The 1 s cadence + the ~8 s idle timeout is a
+    // deliberately generous window: the keep-alive holds a merely-quiet connection (a static desktop)
+    // open, so this fires only on a genuinely dead peer, never a false positive. Keyed on `handle`, so
+    // it stops the moment we navigate away (the handle is only freed later, in onDispose).
+    LaunchedEffect(handle) {
+        while (true) {
+            delay(1000)
+            if (NativeBridge.nativeSessionEnded(handle)) {
+                Toast.makeText(
+                    context,
+                    "Connection lost — the host may be asleep. Wake it to reconnect.",
+                    Toast.LENGTH_LONG,
+                ).show()
+                onDisconnect()
+                return@LaunchedEffect
+            }
         }
     }
 

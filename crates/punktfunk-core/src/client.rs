@@ -582,6 +582,17 @@ impl NativeClient {
         self.frames_dropped.load(Ordering::Relaxed)
     }
 
+    /// Whether the underlying QUIC session has ended — the worker's connection-close watcher set the
+    /// shutdown flag (`conn.closed()` fired: a host suspend / crash / network drop idle-timed the
+    /// connection out, or the host closed it), or a deliberate [`disconnect_quit`](Self::disconnect_quit)
+    /// / drop did. Once `true`, every `next_*` plane returns [`PunktfunkError::Closed`] and no more
+    /// frames will ever arrive. A client watchdog polls this so it can leave a frozen stream and
+    /// return to the menu (where the user can wake the host) instead of sitting on the last decoded
+    /// frame forever — the poll-friendly counterpart to reacting to a `Closed` in a plane loop.
+    pub fn is_session_ended(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
     /// Register the calling thread as latency-critical so a later
     /// [`hot_thread_ids`](Self::hot_thread_ids) includes it. An embedder calls this from its own
     /// plane threads (e.g. the Android client's decode + audio threads) to fold them into the same

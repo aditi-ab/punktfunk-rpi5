@@ -192,6 +192,28 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerp
     }
 }
 
+/// `NativeBridge.nativeSessionEnded(handle): Boolean` — has the underlying QUIC session ended?
+/// `true` once the connection closed (a host suspend / crash / network drop idle-timed it out, or the
+/// host closed it) — from then on no more frames arrive and the video sits frozen on its last one.
+/// Kotlin's stream watchdog polls this (~1 Hz) to leave a dead stream and return to the menu (where
+/// the user can Wake-on-LAN the host) instead of stranding them on a frozen frame. `false` on a `0`
+/// handle. Cheap (one atomic load); safe on the UI thread.
+#[no_mangle]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnded(
+    _env: JNIEnv,
+    _this: JObject,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(0, || {
+        if handle == 0 {
+            return 0;
+        }
+        // SAFETY: live handle per the nativeConnect/nativeClose contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        jboolean::from(h.client.is_session_ended())
+    })
+}
+
 /// `NativeBridge.nativePair(host, port, certPem, keyPem, pin, name): String` — run the SPAKE2 PIN
 /// ceremony, presenting our persistent identity. On success returns the host's verified fingerprint
 /// (64-hex) to persist + pin; on any failure (wrong PIN / MITM / host reject / unreachable) returns
