@@ -20,7 +20,7 @@ WAYLAND_DISPLAY=wayland-0
 XDG_CURRENT_DESKTOP=KDE
 PUNKTFUNK_COMPOSITOR=kwin
 PUNKTFUNK_VIDEO_SOURCE=virtual
-PUNKTFUNK_ZEROCOPY=1
+# GPU zero-copy (dmabuf → CUDA → NVENC) is ON by default; auto-falls back to CPU. Set =0 to force CPU.
 PUNKTFUNK_INPUT_BACKEND=libei
 ```
 

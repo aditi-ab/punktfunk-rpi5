@@ -51,18 +51,21 @@ pub fn vaapi_dmabuf_forced() -> bool {
     flag_opt("PUNKTFUNK_ZEROCOPY") == Some(true)
 }
 
-/// Whether the zero-copy path is on. `PUNKTFUNK_ZEROCOPY` decides when set (truthy = on, else
-/// off). Unset defaults **on for the VAAPI (AMD/Intel) backend** — the stock AMD/Intel install
-/// gets the GPU dmabuf path, not three full-frame CPU touches — unless a failed negotiation
-/// downgraded it ([`note_vaapi_dmabuf_failed`]); and **off for NVENC**, whose EGL→CUDA import
-/// stays opt-in (Mutter+NVIDIA has known dmabuf-capture races; see `PUNKTFUNK_FORCE_SHM`).
+/// Whether the zero-copy path is on. `PUNKTFUNK_ZEROCOPY` decides when set (truthy = on, else off).
+/// **Unset defaults ON for both GPU backends** — the stock install gets the GPU dmabuf path, not
+/// three full-frame CPU touches. This includes NVENC (previously opt-in): the EGL→CUDA (tiled) and
+/// Vulkan (LINEAR) imports now run in a per-capture worker subprocess
+/// (`design/zerocopy-worker-isolation.md`), so a driver fault on a producer-invalidated dmabuf kills
+/// the worker and the host degrades to its capture-loss rebuild instead of dying — the reason the
+/// NVENC path stayed opt-in is gone. Fallbacks stay in place: VAAPI has a one-shot CPU downgrade if
+/// the LINEAR-dmabuf offer never negotiates ([`note_vaapi_dmabuf_failed`]); NVENC falls back per
+/// capture when no importer/importable modifier is available and latches the import off after
+/// repeated worker deaths. `PUNKTFUNK_ZEROCOPY=0` opts out; `PUNKTFUNK_FORCE_SHM` forces the
+/// race-free SHM path.
 pub fn enabled() -> bool {
     match flag_opt("PUNKTFUNK_ZEROCOPY") {
         Some(v) => v,
-        None => {
-            crate::encode::linux_zero_copy_is_vaapi()
-                && !VAAPI_DMABUF_FAILED.load(Ordering::Relaxed)
-        }
+        None => !VAAPI_DMABUF_FAILED.load(Ordering::Relaxed),
     }
 }
 

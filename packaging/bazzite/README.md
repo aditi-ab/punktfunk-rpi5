@@ -242,8 +242,9 @@ PUNKTFUNK_GAMESCOPE_APP=steam -gamepadui
 # gamescope hosts its own EIS input socket — input lands in the nested session.
 PUNKTFUNK_INPUT_BACKEND=gamescope
 
-# GPU zero-copy capture (dmabuf -> CUDA -> NVENC). Auto-falls back to CPU if unavailable.
-PUNKTFUNK_ZEROCOPY=1
+# GPU zero-copy capture (dmabuf -> CUDA -> NVENC) is ON by default and auto-falls back to CPU if
+# unavailable. No need to set it. Set to 0 only to force the CPU path.
+# PUNKTFUNK_ZEROCOPY=0
 
 #RUST_LOG=info
 ```
@@ -257,7 +258,7 @@ PUNKTFUNK_ZEROCOPY=1
 | `PUNKTFUNK_VIDEO_SOURCE` | `virtual` | Create a per-client virtual output at the client's exact WxH@Hz (the flagship "native resolution, no scaling" mode), vs. `portal` which captures an existing monitor. |
 | `PUNKTFUNK_GAMESCOPE_APP` | `steam -gamepadui` | The command launched **inside** the nested gamescope — here, a SteamOS-style couch UI. Set it to whatever you want the session to run. |
 | `PUNKTFUNK_INPUT_BACKEND` | `gamescope` | Inject mouse/keyboard/gamepad into the nested gamescope via its own EIS socket. |
-| `PUNKTFUNK_ZEROCOPY` | `1` | GPU zero-copy capture (dmabuf → CUDA → NVENC). Falls back to CPU automatically if unavailable. |
+| `PUNKTFUNK_ZEROCOPY` | `on` *(default)* | GPU zero-copy capture (dmabuf → CUDA → NVENC), on by default. Falls back to CPU automatically if unavailable; set `0` to force the CPU path. |
 | `RUST_LOG` | (commented) | Uncomment `RUST_LOG=info` for verbose logs while debugging. |
 
 **Optional — a real DualSense for clients holding one:** add `PUNKTFUNK_GAMEPAD=dualsense` to present
@@ -463,8 +464,8 @@ desktop viewer.
   after an `rpm-ostree`/`bootc` update, confirm the NVIDIA driver still loads (`nvidia-smi`) before
   blaming punktfunk.
 
-- **`PUNKTFUNK_ZEROCOPY=1` but it falls back to CPU.** The zero-copy path needs working EGL/CUDA from
-  the NVIDIA driver. The code falls back to CPU automatically; check the log for the fallback line and
+- **Zero-copy falls back to CPU.** The zero-copy path (on by default) needs working EGL/CUDA from the
+  NVIDIA driver. The code falls back to CPU automatically; check the log for the fallback line and
   verify the `-nvidia` image / driver is healthy.
 
 - **Wrong UID in `host.env`.** `XDG_RUNTIME_DIR=/run/user/1000` and the bus path assume UID 1000. Run

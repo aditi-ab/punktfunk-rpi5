@@ -85,13 +85,13 @@ cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env
 
 The template is deliberately minimal — it does **not** force a compositor, because the host
 auto-detects Gaming Mode (gamescope) vs Desktop (KWin) on every connect and follows the switch
-mid-stream. The only settings that matter are the session anchors plus zero-copy:
+mid-stream. The only settings that matter are the session anchors (GPU zero-copy is on by default):
 
 ```sh
 XDG_RUNTIME_DIR=/run/user/1000
 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 PUNKTFUNK_VIDEO_SOURCE=virtual
-PUNKTFUNK_ZEROCOPY=1            # GPU zero-copy (dmabuf → CUDA → NVENC); auto-falls back to CPU
+# GPU zero-copy (dmabuf → CUDA → NVENC) is ON by default; auto-falls back to CPU. Set =0 to force CPU.
 PUNKTFUNK_GAMESCOPE_ATTACH=1    # Gaming Mode = attach to the box's own session (see below)
 ```
 

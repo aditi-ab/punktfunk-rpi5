@@ -27,7 +27,7 @@ these in `~/.config/punktfunk/host.env`:
 PUNKTFUNK_COMPOSITOR=wlroots      # aliases: sway, hyprland
 PUNKTFUNK_INPUT_BACKEND=wlr
 PUNKTFUNK_VIDEO_SOURCE=virtual
-PUNKTFUNK_ZEROCOPY=1              # GPU zero-copy capture→encode; auto-falls back to CPU
+# GPU zero-copy capture→encode is ON by default; auto-falls back to CPU. Set PUNKTFUNK_ZEROCOPY=0 to force CPU.
 ```
 
 See [Configuration](/docs/configuration) for the full reference.
