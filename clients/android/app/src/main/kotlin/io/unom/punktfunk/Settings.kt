@@ -226,6 +226,10 @@ val BITRATE_OPTIONS = listOf(
     20_000 to "20 Mbps",
     50_000 to "50 Mbps",
     100_000 to "100 Mbps",
+    150_000 to "150 Mbps",
+    200_000 to "200 Mbps",
+    300_000 to "300 Mbps",
+    500_000 to "500 Mbps",
 )
 
 /** index = CompositorPref wire byte. */
