@@ -3387,6 +3387,11 @@ fn virtual_stream(ctx: SessionContext) -> Result<()> {
                 // library instead of surfacing a failure — rather than the capture-loss rebuild + 40 s
                 // timeout. Gated to the dedicated bare-spawn launch (`launch_is_nested`), so a normal
                 // Bazzite/desktop capture loss still rebuilds in place.
+                // `cur_node_id` (the capture 5-tuple's node id) is read only by the Linux
+                // dedicated-game-exit check below; keep it read on other platforms so it isn't a
+                // write-only variable under `-D warnings` (the `let _ = &launch` idiom above).
+                #[cfg(not(target_os = "linux"))]
+                let _ = &cur_node_id;
                 #[cfg(target_os = "linux")]
                 if launch.is_some()
                     && crate::vdisplay::launch_is_nested(compositor)
