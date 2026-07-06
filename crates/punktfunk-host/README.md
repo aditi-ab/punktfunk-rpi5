@@ -20,8 +20,9 @@ platform-facing around it.
 - **Per-client virtual displays at the exact WxH@Hz.** Linux uses per-compositor backends — **KWin**,
   **gamescope**, **Mutter**, and **Sway/wlroots**; Windows uses its own all-Rust IddCx virtual display,
   even on the secure desktop (UAC / lock screen).
-- **GPU zero-copy capture → encode.** dmabuf → CUDA/Vulkan → NVENC on Linux; DXGI/WGC → GPU encode on
-  Windows. Encoders auto-select by GPU vendor: **NVENC** (NVIDIA), **VAAPI** (Linux AMD/Intel),
+- **GPU zero-copy capture → encode.** dmabuf → CUDA/Vulkan → NVENC on Linux; on Windows the host
+  pushes frames straight into its own IDD (sealed IDD-push, no screen-scraping) → GPU encode.
+  Encoders auto-select by GPU vendor: **NVENC** (NVIDIA), **VAAPI** (Linux AMD/Intel),
   **AMF/QSV** (Windows AMD/Intel), or software H.264 as a floor. HDR/10-bit and HEVC 4:4:4 supported.
 - **Input injection.** Mouse/keyboard (libei / gamescope EIS / wlr / Windows SendInput) and virtual
   **gamepads** — Xbox 360/One, DualSense, DualShock 4 — with rumble and HID feedback back-channels.
@@ -70,7 +71,7 @@ src/
   main.rs            CLI + subcommand dispatch
   config.rs · session_plan.rs · session_tuning.rs · pipeline.rs   session setup + the frame pipeline
   vdisplay/          per-compositor virtual outputs (kwin · gamescope · mutter · wlroots)
-  capture/ · capture.rs    screen/dmabuf capture (+ Windows DXGI/WGC)
+  capture/ · capture.rs    screen/dmabuf capture (+ Windows IDD-push)
   encode/ · encode.rs      per-GPU encoders (nvenc · vaapi · ffmpeg_win (AMF/QSV) · sw)
   zerocopy/          dmabuf → CUDA → NVENC bridges (EGL/GL tiled, Vulkan LINEAR)
   inject/ · inject.rs      input backends (libei · wlr · uinput gamepads · UHID DualSense/DS4)
